@@ -1,0 +1,14 @@
+{
+  "name": "nisavid-agent-tools",
+  "owner": {
+    "name": "Ivan D Vasin"
+  },
+  "description": "Personal agent tools: plugins shared across Claude Code and Codex-like harnesses.",
+  "plugins": [
+    {
+      "name": "thermos",
+      "source": "./plugins/thermos",
+      "category": "developer-tools"
+    }
+  ]
+}

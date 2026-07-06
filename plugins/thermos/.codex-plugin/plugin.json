@@ -1,6 +1,6 @@
 {
   "name": "thermos",
-  "version": "1.0.0+codex.20260705211111",
+  "version": "1.0.1+codex.20260705203811",
   "description": "Thermo-nuclear branch review for Codex: deep correctness and security audits, strict maintainability review, and combined synthesis.",
   "author": {
     "name": "Cursor",

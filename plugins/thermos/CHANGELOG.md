@@ -10,7 +10,7 @@ Review-driven refinement, 2026-07-05:
 - Inlined the synthesis rules into the `thermos` skill and removed `skills/thermos/references/`.
 - Deduplicated the subagent files down to dispatch glue plus a degraded-mode fallback summary; the full rubrics live in `skills/*/SKILL.md` and `skills/*/references/`.
 - Repointed manifest `author`, `homepage`, and `repository` at this repository and dropped Cursor's privacy/terms URLs from the Codex interface block; upstream credit stays in the README and this changelog.
-- Unified human-facing naming on the hyphenated "Thermo-Nuclear" form.
+- Unified the hyphenation of the human-facing workflow name, dropping the spaced "Thermo Nuclear" variant; titles use title case ("Thermo-Nuclear Review"), prose keeps sentence case ("Thermo-nuclear branch review").
 - Named the subagent handoff sections in the `thermos` skill and paired the Codex default prompts across the manifest and per-skill interface files.
 - Made the audit checklist's additive-workflow devex carve-out explicit.
 

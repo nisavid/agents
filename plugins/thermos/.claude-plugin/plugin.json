@@ -1,7 +1,7 @@
 {
   "name": "thermos",
   "displayName": "Thermos",
-  "version": "1.0.0+claude.20260705192339",
+  "version": "1.0.1+claude.20260705203811",
   "description": "Thermo-nuclear branch review: deep correctness and security audits, strict maintainability review, parallel review subagents, and combined synthesis.",
   "author": {
     "name": "Cursor",

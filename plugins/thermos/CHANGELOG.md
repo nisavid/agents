@@ -2,6 +2,13 @@
 
 Provenance of the dual-harness adaptation. See [README.md](README.md) for the layout contract.
 
+## 1.0.1
+
+Rubric-equivalence refresh, 2026-07-05:
+
+- Expanded the shared correctness and maintainability references so the Codex and Claude Code port preserves Cursor's original review bar while keeping concise `SKILL.md` entrypoints.
+- Kept harness-specific orchestration in the manifests, Codex `openai.yaml` files, and Claude subagents; the detailed review criteria remain authored once under `skills/*/references/`.
+
 ## Codex adaptation refresh
 
 Refreshed the Codex adapter by Ivan D Vasin, 2026-07-05:

@@ -2,6 +2,13 @@
 
 Provenance of the dual-harness adaptation. The layout, adapter boundary, and maintenance contract live in [README.md](README.md).
 
+## 1.0.3
+
+Codex subagent clarification, 2026-07-06:
+
+- Corrected the adapter documentation: Codex does support harness-level subagent dispatch, but it does not consume the root `agents/*.md` files as plugin-declared review subagents.
+- Updated the shared `thermos` orchestrator to use generic/native subagents in parallel when named Thermos subagents are unavailable but the harness has subagent support; sequential in-context passes are now only the fallback.
+
 ## 1.0.2
 
 Review-driven refinement, 2026-07-05:
@@ -35,7 +42,7 @@ Claude Code adapter, 2026-07-05:
 Codex adapter, 2026-06-25:
 
 - Added `.codex-plugin/plugin.json` with an `interface` block, plus per-skill `skills/<name>/agents/openai.yaml` interface metadata.
-- Omitted the upstream root `agents/*.md` subagents — Codex has no dispatchable-subagent construct.
+- Omitted the upstream root `agents/*.md` subagents because Codex does not consume those files as plugin-declared review subagents.
 - Rewrote the shared skills from upstream's prompt-style form into concise progressive-disclosure skills backed by `references/*.md`, dropping upstream's `disable-model-invocation: true` gate; on harnesses with description-triggered skills, all three skills are model-invocable.
 
 ## 1.0.0 (upstream)

@@ -29,13 +29,13 @@ plugins/thermos/
 |:--------|:------------|:-----------|
 | Manifest | `.claude-plugin/plugin.json` | `.codex-plugin/plugin.json` |
 | Skills | auto-discovered from `skills/` | declared via `"skills": "./skills/"` |
-| Review subagents | auto-discovered from `agents/*.md` | not consumed (no subagent construct) |
+| Review subagents | auto-discovered from `agents/*.md` | root `agents/*.md` not consumed; use native/generic subagent dispatch when available |
 | Per-skill interface | not consumed | `skills/<name>/agents/openai.yaml` |
 | Marketplace | repo-root `.claude-plugin/marketplace.json` | `~/.agents/plugins/marketplace.json` |
 
-The Claude manifest deliberately carries **no** `agents`/`skills` path overrides: a directory-string override for `agents` fails `claude plugin validate`, and default auto-discovery of `skills/` and `agents/` already covers both. The Codex manifest declares only `skills` plus its `interface` block, so Codex never loads the root `agents/`.
+The Claude manifest deliberately carries **no** `agents`/`skills` path overrides: a directory-string override for `agents` fails `claude plugin validate`, and default auto-discovery of `skills/` and `agents/` already covers both. The Codex manifest declares only `skills` plus its `interface` block, so Codex never loads the root `agents/` as plugin components. That is separate from Codex's harness-level subagent support: when generic/native subagent dispatch is available, the shared `thermos` skill can use it.
 
-"Authored once" does not mean strictly harness-neutral: the shared `thermos` skill names the Claude subagents for conditional dispatch (other harnesses take its sequential branch), and each skill directory carries a Codex-only `agents/openai.yaml`. The harness-conditional line lives in the shared file on purpose — one inline branch beats two diverging per-harness skill bodies.
+"Authored once" does not mean strictly harness-neutral: the shared `thermos` skill names the Claude subagents for conditional dispatch, describes the generic/native subagent branch for Codex-like harnesses, and each skill directory carries a Codex-only `agents/openai.yaml`. The harness-conditional lines live in the shared file on purpose — one inline branch beats diverging per-harness skill bodies.
 
 ### Two directories named `agents/`
 
@@ -70,7 +70,7 @@ flowchart TB
   SNCQ --> DIFF
 ```
 
-On Claude the `thermos` orchestrator dispatches the two subagents in parallel; each applies its shared skill rubric to the same scoped diff. On harnesses without a subagent construct, `thermos` runs the two passes sequentially and keeps findings separate until synthesis.
+On Claude the `thermos` orchestrator dispatches the two named subagents in parallel; each applies its shared skill rubric to the same scoped diff. On Codex-like harnesses with generic/native subagent dispatch, `thermos` uses two generic reviewer subagents instead. Sequential in-context passes are the fallback when subagent dispatch is unavailable or clearly not worth the overhead.
 
 ## Components
 
@@ -91,7 +91,7 @@ On Claude the `thermos` orchestrator dispatches the two subagents in parallel; e
 
 ## Maintenance notes
 
-- **Keep the two manifest `description` fields paired.** They differ only by the ` for Codex` qualifier and the omission of the `parallel review subagents` clause (Codex has no subagent construct). Mirror any other wording change across both.
+- **Keep the two manifest `description` fields paired.** They differ only by the ` for Codex` qualifier and the omission of the `parallel review subagents` clause because the root `agents/*.md` wrappers are Claude-only plugin components. Codex can still use native/generic subagent dispatch when the harness exposes it. Mirror any other wording change across both.
 - **Keep the Codex default prompts paired.** Each entry in the Codex manifest's `interface.defaultPrompt` duplicates a per-skill `skills/<name>/agents/openai.yaml` `default_prompt` on a second Codex surface; keep each pair verbatim-identical.
 - **Scope enumerations are paraphrases, not pairs.** The review-dimension lists in the skill descriptions, the `thermos` routing step, the subagent descriptions, and the Components tables above are intentionally loose restatements for their own surfaces. Keep each accurate; do not sync them verbatim.
 - **Versioning.** Both manifests use semver build metadata (`<semver>+claude.<ts>`, `<semver>+codex.<ts>`) to disambiguate the artifacts. Build metadata after `+` does not affect version precedence, so a real release that should trigger an update check must bump `MAJOR.MINOR.PATCH` (or use a pre-release identifier before the `+`) — a new timestamp alone reads as the same version.

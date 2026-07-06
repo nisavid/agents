@@ -17,9 +17,9 @@ thermo-nuclear review workflow for Codex-like harnesses and Claude Code.
 
 ## Installed References
 
-The live local installations point at this repository as their source. Runtime
-caches under each harness are generated install artifacts; edit the source here
-first, then refresh the relevant harness install.
+The live local installations point at this repository as their source. The
+install-cache and refresh workflow lives in the maintenance notes of
+[plugins/thermos/README.md](plugins/thermos/README.md).
 
 ## License
 

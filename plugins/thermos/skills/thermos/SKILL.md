@@ -10,13 +10,18 @@ Run two independent review passes, then synthesize one findings-first verdict.
 ## Workflow
 
 1. Define the review scope. Complete this when the base, head, and included paths are explicit.
-2. Gather the diff and changed-file context needed for both reviewers to evaluate without guessing.
-3. Run the passes independently:
-   - Use `thermo-nuclear-review` for correctness, security, breaking behavior, devex regressions, feature-gate leaks, and branch-audit risk.
-   - Use `thermo-nuclear-code-quality-review` for structure, maintainability, code-judo opportunities, file-size pressure, abstractions, boundaries, and codebase health.
-4. Prefer parallel subagents when available and worth the overhead; if the harness ships the Thermos review subagents (`thermo-nuclear-review-subagent`, `thermo-nuclear-code-quality-review-subagent`), dispatch those with the same scoped diff and file context. Otherwise run sequentially while keeping findings separate until synthesis.
-5. For nontrivial overlap, disagreement, or long reviewer output, read `references/synthesis.md` before writing the final verdict.
+2. Gather the diff and changed-file context needed for both reviewers to evaluate without guessing. Hand each reviewer the same context under labeled sections: `### Git / diff output` and `### Changed file contents`.
+3. On harnesses that ship the Thermos review subagents (Claude Code: `thermos:thermo-nuclear-review-subagent` and `thermos:thermo-nuclear-code-quality-review-subagent`), dispatch both in a single message so they run in parallel, each with the same scoped diff and file context.
+4. Otherwise run the two passes sequentially in the main context: `thermo-nuclear-review` for risk (correctness, security, breaking behavior, devex regressions, feature-gate leaks), then `thermo-nuclear-code-quality-review` for maintainability (structure, code-judo opportunities, file-size pressure, abstractions, boundaries, codebase health).
+
+## Synthesis
+
+- Keep reviewer findings separate until both passes finish.
+- Deduplicate findings that share the same cause, even when one reviewer frames it as risk and the other as maintainability.
+- Weight independently confirmed issues more heavily, but do not merge weaker claims into a stronger finding unless the evidence supports it.
+- Resolve disagreements with direct source inspection, not by averaging reviewer confidence.
+- Do not restate reviewer output that is already visible to the user.
 
 ## Output
 
-Lead with deduplicated findings ordered by severity. Include file:line evidence, impact, and the smallest actionable remedy. If no high-conviction findings survive, say so directly and name residual test or review gaps.
+Lead with deduplicated findings ordered by severity. Include file:line evidence, impact, and the smallest actionable remedy. After the findings, name only residual risk that could change the verdict, such as missing tests, unreachable context, or unresolved disagreement. If no high-conviction findings survive, say so directly.

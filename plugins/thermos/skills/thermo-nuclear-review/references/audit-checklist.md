@@ -28,7 +28,7 @@ Catch changes that impact how developers currently run, build, test, or configur
 - New scripts or services that must be run for behavior that previously worked without them.
 - Local build, test, or run flows that silently lose required defaults.
 
-Adding package-manager dependencies is not itself a devex break unless it creates a new manual workflow outside the normal project setup.
+Purely additive changes are not devex breaks: new alternative ways to run or build things, or dependencies added through the normal package-manager flow. A change breaks devex only when an existing flow stops working or newly requires manual setup outside the normal workflow.
 
 ## Feature Leaks
 

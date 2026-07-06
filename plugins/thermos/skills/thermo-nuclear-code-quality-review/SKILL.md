@@ -3,7 +3,7 @@ name: thermo-nuclear-code-quality-review
 description: Strict maintainability audit for branch/PR changes. Use when the user asks for thermo-nuclear code quality, deep code-quality audit, harsh maintainability review, code-judo, file-size, spaghetti, abstraction, or boundary/type-contract review.
 ---
 
-# Thermo Nuclear Code Quality Review
+# Thermo-Nuclear Code Quality Review
 
 Run an ambitious maintainability audit. Look for code-judo moves: behavior-preserving restructures that delete complexity.
 

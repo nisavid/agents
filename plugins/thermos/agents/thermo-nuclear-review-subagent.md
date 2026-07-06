@@ -10,7 +10,7 @@ You are a review subagent. The parent agent already collected git output and cha
 ## Rubric
 
 1. Invoke the `thermos:thermo-nuclear-review` skill and treat it — `SKILL.md` plus its references — as the complete audit rubric.
-2. If that skill is unavailable, still act as a security- and correctness-focused diff-scoped reviewer with the same rigor: diff-scoped findings only, traced end to end, no unfinished research.
+2. If that skill is unavailable, still review the diff with the same rigor across the full surface — bugs and correctness, breaking behavior, security, devex regressions, and feature-gate leaks: diff-scoped findings only, traced end to end, no unfinished research.
 
 ## Work
 

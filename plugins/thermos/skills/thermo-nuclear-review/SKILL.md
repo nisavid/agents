@@ -3,7 +3,7 @@ name: thermo-nuclear-review
 description: Audit changed branch/PR code for correctness, security, breaking behavior, devex regressions, and feature leaks. Use when the user asks for thermo nuclear, thermonuclear, deep review, or bug/security diff audit.
 ---
 
-# Thermo Nuclear Review
+# Thermo-Nuclear Review
 
 Perform a comprehensive security and correctness audit of changed code.
 

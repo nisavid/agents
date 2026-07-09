@@ -14,6 +14,8 @@ thermo-nuclear review workflow for Codex-like harnesses and Claude Code.
   and Claude Code adapter manifests.
 - `plugins/thermos/README.md` documents the Thermos adapter boundary, layout, and
   maintenance notes.
+- `tooling/hindsight/` contains a first-pass source bundle for the local
+  Hindsight embed LaunchAgent stack and non-secret client configs.
 
 ## Installed References
 

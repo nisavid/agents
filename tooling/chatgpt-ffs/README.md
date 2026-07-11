@@ -1,4 +1,4 @@
-# ChatGPT Unflag
+# ChatGPT FFS
 
 Interactive TUI and CLI for managing `app.asar` patches against the
 ChatGPT desktop app (`ChatGPT.app`). Handles asar extraction, patching, repacking, ASAR integrity
@@ -19,12 +19,12 @@ Statsig.
 ## Installation
 
 ```bash
-./chatgpt-unflag install
+./chatgpt-ffs install
 ```
 
 Symlinks the script into `~/.local/bin/` and ensures `~/.local/bin/env`
 exists (sourced by `~/.profile` and `~/.zshenv` to activate `~/.local/bin`
-on `PATH`). After installing, `chatgpt-unflag` is available from any
+on `PATH`). After installing, `chatgpt-ffs` is available from any
 shell. New terminals pick it up automatically; for the current shell:
 
 ```bash
@@ -36,7 +36,7 @@ source ~/.local/bin/env
 ### Interactive TUI
 
 ```bash
-./chatgpt-unflag
+./chatgpt-ffs
 ```
 
 Navigate with arrow keys, toggle patches with Space, preview the delta with P,
@@ -46,23 +46,23 @@ commit with C, or abort (discard) the pending selection with A.
 
 ```bash
 # List all patches and their current state
-./chatgpt-unflag list
+./chatgpt-ffs list
 
 # Show brief status
-./chatgpt-unflag status
+./chatgpt-ffs status
 
 # Apply specific patches
-./chatgpt-unflag apply worktree-feature-flag
+./chatgpt-ffs apply worktree-feature-flag
 
 # Revert specific patches (or all)
-./chatgpt-unflag revert worktree-feature-flag
-./chatgpt-unflag revert all
+./chatgpt-ffs revert worktree-feature-flag
+./chatgpt-ffs revert all
 ```
 
 ### Specify a different app path
 
 ```bash
-./chatgpt-unflag --app /path/to/ChatGPT.app list
+./chatgpt-ffs --app /path/to/ChatGPT.app list
 ```
 
 ## How It Works
@@ -218,5 +218,5 @@ Press `L` in the TUI to see a legend with descriptions of every label.
 
 ## State
 
-State is stored in `~/.codex/chatgpt-unflag/state.json`, tracking the
+State is stored in `~/.codex/chatgpt-ffs/state.json`, tracking the
 last installed asar hash and which patches were applied.

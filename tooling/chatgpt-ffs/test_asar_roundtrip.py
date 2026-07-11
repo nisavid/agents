@@ -15,7 +15,7 @@ import unittest
 # explicit SourceFileLoader.
 import importlib.util
 from importlib.machinery import SourceFileLoader
-_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chatgpt-unflag")
+_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chatgpt-ffs")
 _loader = SourceFileLoader("codex_patch_manager", _script)
 _spec = importlib.util.spec_from_loader("codex_patch_manager", _loader)
 cpm = importlib.util.module_from_spec(_spec)
@@ -177,3 +177,67 @@ class AsarRoundTripTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class IntegrityEncodingTest(unittest.TestCase):
+    """Verify asar integrity metadata uses hex encoding (not base64).
+
+    Regression test: the tool previously used base64 encoding for SHA256
+    hashes, but Electron's asar format expects hex. This caused the app to
+    freeze during module loading because Electron's integrity validation
+    could not parse the hashes.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="integrity-test-")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_integrity_uses_hex_not_base64(self):
+        """Integrity hashes are hex-encoded (64 hex chars), not base64 (44 chars)."""
+        data = b"test content for integrity"
+        integrity = cpm._compute_integrity(data)
+
+        h = integrity["hash"]
+        # Hex SHA256 = 64 chars, all lowercase hex
+        self.assertEqual(len(h), 64)
+        self.assertTrue(all(c in "0123456789abcdef" for c in h),
+                        f"Hash '{h}' is not hex-encoded")
+
+        for block in integrity["blocks"]:
+            self.assertEqual(len(block), 64)
+            self.assertTrue(all(c in "0123456789abcdef" for c in block),
+                            f"Block hash '{block}' is not hex-encoded")
+
+    def test_empty_file_has_one_block(self):
+        """Empty files get 1 block (SHA256 of empty), not 0 blocks."""
+        integrity = cpm._compute_integrity(b"")
+        self.assertEqual(len(integrity["blocks"]), 1)
+        # SHA256 of empty data
+        import hashlib
+        expected = hashlib.sha256(b"").hexdigest()
+        self.assertEqual(integrity["blocks"][0], expected)
+        self.assertEqual(integrity["hash"], expected)
+
+    def test_executable_flag_preserved(self):
+        """The executable flag is set for executable files."""
+        src = os.path.join(self.tmp, "src")
+        os.makedirs(src)
+        exe_file = os.path.join(src, "script.sh")
+        with open(exe_file, "w") as f:
+            f.write("#!/bin/sh\necho hello\n")
+        os.chmod(exe_file, 0o755)
+
+        regular_file = os.path.join(src, "regular.txt")
+        with open(regular_file, "w") as f:
+            f.write("not executable")
+
+        asar = os.path.join(self.tmp, "test.asar")
+        cpm.pack_asar(src, asar)
+
+        header, _ = cpm.read_asar_header(asar)
+        self.assertTrue(header["files"]["script.sh"].get("executable"),
+                        "Executable file should have executable=True")
+        self.assertNotIn("executable", header["files"]["regular.txt"],
+                         "Non-executable file should not have executable flag")

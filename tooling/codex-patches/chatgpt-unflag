@@ -342,7 +342,8 @@ class Patch:
     id: str
     name: str
     category: str
-    description: str
+    labels: list = field(default_factory=list)
+    description: str = ""
     modifications: list = field(default_factory=list)
 
     @property
@@ -352,32 +353,26 @@ class Patch:
 
 
 BUILTIN_PATCHES = [
-    Patch(
+Patch(
         id="worktree-feature-flag",
         name="Worktree Option in Run Location Menu",
-        category="feature-flags",
+        category="workspace",
+        labels=["local-only", "workspace", "local-dev", "user-facing", "agent-facing"],
         description=(
-            "Enables the worktree option in Codex Desktop's "
-            '"select where to run" menu by bypassing Statsig feature '
-            "flag 505458, which requires ChatGPT authentication to "
-            "evaluate.\n\n"
-            "In air-gapped or restricted environments where ChatGPT auth "
-            "is unavailable, the flag defaults to false, hiding the "
-            "worktree option. This patch replaces all checkGate('505458') "
-            "calls with true (!0), unconditionally enabling the feature."
+            "Enables the worktree option in Codex Desktop's \"select where to run\" menu by bypassing Statsig feature flag 505458, which requires ChatGPT authentication to evaluate.\n\nIn air-gapped or restricted environments where ChatGPT auth is unavailable, the flag defaults to false, hiding the worktree option. This patch replaces all checkGate('505458') calls with true (!0), unconditionally enabling the feature."
         ),
         modifications=[
             Modification(
-                "webview/assets/app-initial~app-main~*.js",
+                "webview/assets/app-initial~app-main~page-*.js",
                 r"\w+\(`505458`\)",
                 "!0",
-                "Bypass gate in composer content module",
+                "Bypass gate in main page bundle",
             ),
             Modification(
-                "webview/assets/local-remote-dropdown-*.js",
+                "webview/assets/home-ambient-suggestions-content-*.js",
                 r"\w+\(`505458`\)",
                 "!0",
-                "Bypass gate in local/remote dropdown",
+                "Bypass gate in home ambient suggestions",
             ),
             Modification(
                 "webview/assets/hotkey-window-home-page-*.js",
@@ -386,15 +381,800 @@ BUILTIN_PATCHES = [
                 "Bypass gate in hotkey window home page",
             ),
             Modification(
-                "webview/assets/home-ambient-suggestions-content-*.js",
+                "webview/assets/local-remote-dropdown-*.js",
                 r"\w+\(`505458`\)",
                 "!0",
-                "Bypass gate in home ambient suggestions",
+                "Bypass gate in local/remote dropdown",
+            ),
+        ],
+    ),
+
+    Patch(
+        id="thread-catalog",
+        name="Persistent Thread Catalog",
+        category="workspace",
+        labels=["local-only", "conversation", "history", "user-facing", "agent-facing"],
+        description=(
+            "Enables persistent local conversation thread catalog by bypassing Statsig feature flag 567837310.\n\nThe thread catalog provides local conversation history persistence and access. Without ChatGPT auth, the flag defaults to false, disabling the catalog. This patch forces the catalog on, enabling local thread history browsing and management."
+        ),
+        modifications=[
+            Modification(
+                "webview/assets/*chatg~*-*.js",
+                r"\w+\(`567837310`\)",
+                "!0",
+                "Bypass gate in onboarding page",
+            ),
+            Modification(
+                "webview/assets/app-initial~app-main~page-*.js",
+                r"\w+\(`567837310`\)",
+                "!0",
+                "Bypass gate in main page bundle",
+            ),
+        ],
+    ),
+
+    Patch(
+        id="headless-chat",
+        name="Headless Chat / Recent Threads View",
+        category="workspace",
+        labels=["local-only", "workspace", "conversation", "local-dev", "history", "user-facing"],
+        description=(
+            "Enables headless chat / recent threads view (projectless chat) by bypassing Statsig feature flag 12346831.\n\nThis feature provides a recent threads view and projectless chat mode, useful for local development workflows. The flag is gated behind ChatGPT auth evaluation."
+        ),
+        modifications=[
+            Modification(
+                "webview/assets/app-initial~app-main~page-*.js",
+                r"\w+\(`12346831`\)",
+                "!0",
+                "Bypass gate in main page bundle",
+            ),
+            Modification(
+                "webview/assets/header-*.js",
+                r"\w+\(`12346831`\)",
+                "!0",
+                "Bypass gate in header component",
+            ),
+        ],
+    ),
+
+    Patch(
+        id="local-project-actions",
+        name="Local Project Actions",
+        category="workspace",
+        labels=["local-only", "workspace", "local-dev", "user-facing", "agent-facing"],
+        description=(
+            "Enables local project actions (start setup, manage local workspaces, harbor/in-app browser integration) by bypassing Statsig feature flag 824038554.\n\nThis gate controls local workspace setup flows, browser use settings, and mobile setup dialogs. Without auth, these actions are hidden."
+        ),
+        modifications=[
+            Modification(
+                "webview/assets/app-initial~app-main~onboarding-page-*.js",
+                r"\w+\(`824038554`\)",
+                "!0",
+                "Bypass gate in gate 824038554",
+            ),
+            Modification(
+                "webview/assets/app-initial~app-main~page-*.js",
+                r"\w+\(`824038554`\)",
+                "!0",
+                "Bypass gate in main page bundle",
+            ),
+            Modification(
+                "webview/assets/browser-use-settings-*.js",
+                r"\w+\(`824038554`\)",
+                "!0",
+                "Bypass gate in browser use settings",
+            ),
+            Modification(
+                "webview/assets/codex-mobile-setup-dialog-*.js",
+                r"\w+\(`824038554`\)",
+                "!0",
+                "Bypass gate in mobile setup dialog",
+            ),
+            Modification(
+                "webview/assets/codex-mobile-setup-flow-*.js",
+                r"\w+\(`824038554`\)",
+                "!0",
+                "Bypass gate in mobile setup flow",
+            ),
+            Modification(
+                "webview/assets/debug-*.js",
+                r"\w+\(`824038554`\)",
+                "!0",
+                "Bypass gate in debug modal",
+            ),
+            Modification(
+                "webview/assets/general-settings-*.js",
+                r"\w+\(`824038554`\)",
+                "!0",
+                "Bypass gate in general settings",
+            ),
+        ],
+    ),
+
+    Patch(
+        id="mode-switching",
+        name="Mode Switching UI",
+        category="workspace",
+        labels=["local-only", "ui-visibility", "mode-switch", "user-facing", "agent-facing"],
+        description=(
+            "Enables agent mode switching UI by bypassing Statsig feature flag 3264431617.\n\nThis gate controls the switchToMode1 configuration that enables switching between agent modes. The gate appears in keyboard shortcuts settings and local conversation threads."
+        ),
+        modifications=[
+            Modification(
+                "webview/assets/app-initial~app-main~onboarding-page-*.js",
+                r"\w+\(`3264431617`\)",
+                "!0",
+                "Bypass gate in gate 3264431617",
+            ),
+            Modification(
+                "webview/assets/app-initial~app-main~page-*.js",
+                r"\w+\(`3264431617`\)",
+                "!0",
+                "Bypass gate in main page bundle",
+            ),
+            Modification(
+                "webview/assets/keyboard-shortcuts-settings-*.js",
+                r"\w+\(`3264431617`\)",
+                "!0",
+                "Bypass gate in keyboard shortcuts settings",
+            ),
+            Modification(
+                "webview/assets/local-*.js",
+                r"\w+\(`3264431617`\)",
+                "!0",
+                "Bypass gate in local conversation thread",
+            ),
+        ],
+    ),
+
+    Patch(
+        id="auth-feature-visibility",
+        name="Feature Visibility (Auth-State)",
+        category="workspace",
+        labels=["custom-provider", "ui-visibility", "user-facing"],
+        description=(
+            "Unblocks features behind auth-state visibility checks by bypassing Statsig feature flag 1372061905.\n\nThis gate controls feature visibility when ChatGPT auth is set. Forcing it true unblocks features that would otherwise be hidden when using a custom model provider instead of ChatGPT auth."
+        ),
+        modifications=[
+            Modification(
+                "webview/assets/app-initial~app-main~page-*.js",
+                r"\w+\(`1372061905`\)",
+                "!0",
+                "Bypass gate in main page bundle",
+            ),
+            Modification(
+                "webview/assets/general-settings-*.js",
+                r"\w+\(`1372061905`\)",
+                "!0",
+                "Bypass gate in general settings",
+            ),
+            Modification(
+                "webview/assets/keyboard-shortcuts-settings-*.js",
+                r"\w+\(`1372061905`\)",
+                "!0",
+                "Bypass gate in keyboard shortcuts settings",
+            ),
+        ],
+    ),
+
+    Patch(
+        id="timeline-tab",
+        name="Timeline Tab in Conversation View",
+        category="conversation",
+        labels=["local-only", "conversation", "ui-visibility", "user-facing", "agent-facing"],
+        description=(
+            "Enables the timeline tab in conversation view by bypassing Statsig feature flag 40604217.\n\nThe timeline tab provides a chronological view of events in a conversation. The gate is gated behind auth evaluation."
+        ),
+        modifications=[
+            Modification(
+                "webview/assets/app-initial~app-main~page-*.js",
+                r"\w+\(`40604217`\)",
+                "!0",
+                "Bypass gate in main page bundle",
+            ),
+        ],
+    ),
+
+    Patch(
+        id="full-review-mode",
+        name="Full Review Mode",
+        category="conversation",
+        labels=["local-only", "conversation", "user-facing", "agent-facing"],
+        description=(
+            "Enables full review mode (vs partial) by bypassing Statsig feature flag 2333235660.\n\nFull review mode provides complete review capabilities for conversation turns, as opposed to the limited partial mode."
+        ),
+        modifications=[
+            Modification(
+                "webview/assets/*chatg~*-*.js",
+                r"\w+\(`2333235660`\)",
+                "!0",
+                "Bypass gate in onboarding page",
+            ),
+        ],
+    ),
+
+    Patch(
+        id="new-window-conversation",
+        name="Open Conversation in New Window",
+        category="conversation",
+        labels=["local-only", "conversation", "multi-window", "user-facing"],
+        description=(
+            "Enables opening conversations in new windows by bypassing Statsig feature flag 459748632.\n\nThis gate controls multi-window conversation support, allowing conversations to be opened in separate windows."
+        ),
+        modifications=[
+            Modification(
+                "webview/assets/app-initial~app-main~page-*.js",
+                r"\w+\(`459748632`\)",
+                "!0",
+                "Bypass gate in main page bundle",
+            ),
+            Modification(
+                "webview/assets/*app-main~*-*.js",
+                r"\w+\(`459748632`\)",
+                "!0",
+                "Bypass gate in remote conversation page",
+            ),
+        ],
+    ),
+
+    Patch(
+        id="thread-v2-format",
+        name="Thread v2 Format",
+        category="conversation",
+        labels=["local-only", "conversation", "thread-v2", "user-facing", "agent-facing"],
+        description=(
+            "Enables the newer thread v2 format (vs v1) by bypassing Statsig feature flag 57256278.\n\nThe v2 format provides improved thread structure and metadata. The gate defaults to v1 when auth is unavailable."
+        ),
+        modifications=[
+            Modification(
+                "webview/assets/app-initial~app-main~onboarding-page-*.js",
+                r"\w+\(`57256278`\)",
+                "!0",
+                "Bypass gate in gate 57256278",
+            ),
+        ],
+    ),
+
+    Patch(
+        id="per-conversation-settings",
+        name="Per-Conversation Settings",
+        category="conversation",
+        labels=["local-only", "conversation", "per-conversation-config", "user-facing", "agent-facing"],
+        description=(
+            "Enables per-conversation settings draft mode by bypassing Statsig feature flag 3736891373.\n\nAllows configuring settings per conversation rather than using only global defaults. The gate is gated behind auth evaluation."
+        ),
+        modifications=[
+            Modification(
+                "webview/assets/app-initial~app-main~onboarding-page-*.js",
+                r"\w+\(`3736891373`\)",
+                "!0",
+                "Bypass gate in gate 3736891373",
+            ),
+        ],
+    ),
+
+    Patch(
+        id="notification-tracking",
+        name="Notification Tracking",
+        category="conversation",
+        labels=["local-only", "notification", "user-facing"],
+        description=(
+            "Enables notification tracking (mark all read, unread run counts) by bypassing Statsig feature flag 3789238711.\n\nThis gate controls the notification system that tracks unread runs and provides mark-all-read functionality."
+        ),
+        modifications=[
+            Modification(
+                "webview/assets/app-initial~app-main~page-*.js",
+                r"\w+\(`3789238711`\)",
+                "!0",
+                "Bypass gate in main page bundle",
+            ),
+        ],
+    ),
+
+    Patch(
+        id="dictation-voice-input",
+        name="Dictation / Voice Input",
+        category="input",
+        labels=["local-only", "voice-input", "user-facing"],
+        description=(
+            "Enables dictation/voice input (global hotkey, hold-to-dictate) by bypassing Statsig feature flag 1244621283.\n\nThis gate controls the voice dictation feature. Both this gate and the companion gate (4100906017) must be true for voice input to work."
+        ),
+        modifications=[
+            Modification(
+                "webview/assets/*projects-index-page~*-*.js",
+                r"\w+\(`1244621283`\)",
+                "!0",
+                "Bypass gate in new thread panel",
+            ),
+            Modification(
+                "webview/assets/app-initial~app-main~page-*.js",
+                r"\w+\(`1244621283`\)",
+                "!0",
+                "Bypass gate in main page bundle",
+            ),
+            Modification(
+                "webview/assets/keyboard-shortcuts-settings-*.js",
+                r"\w+\(`1244621283`\)",
+                "!0",
+                "Bypass gate in keyboard shortcuts settings",
+            ),
+            Modification(
+                "webview/assets/settings-page-*.js",
+                r"\w+\(`1244621283`\)",
+                "!0",
+                "Bypass gate in settings page",
+            ),
+            Modification(
+                "webview/assets/voice-settings-*.js",
+                r"\w+\(`1244621283`\)",
+                "!0",
+                "Bypass gate in voice settings",
+            ),
+        ],
+    ),
+
+    Patch(
+        id="dictation-companion",
+        name="Dictation Companion Gate",
+        category="input",
+        labels=["local-only", "voice-input", "user-facing"],
+        description=(
+            "Enables the dictation companion gate by bypassing Statsig feature flag 4100906017.\n\nBoth this gate and the primary dictation gate (1244621283) must be true for voice input to function. This gate checks media device availability for dictation."
+        ),
+        modifications=[
+            Modification(
+                "webview/assets/*projects-index-page~*-*.js",
+                r"\w+\(`4100906017`\)",
+                "!0",
+                "Bypass gate in new thread panel",
+            ),
+            Modification(
+                "webview/assets/app-initial~app-main~page-*.js",
+                r"\w+\(`4100906017`\)",
+                "!0",
+                "Bypass gate in main page bundle",
+            ),
+            Modification(
+                "webview/assets/keyboard-shortcuts-settings-*.js",
+                r"\w+\(`4100906017`\)",
+                "!0",
+                "Bypass gate in keyboard shortcuts settings",
+            ),
+            Modification(
+                "webview/assets/settings-page-*.js",
+                r"\w+\(`4100906017`\)",
+                "!0",
+                "Bypass gate in settings page",
+            ),
+            Modification(
+                "webview/assets/voice-settings-*.js",
+                r"\w+\(`4100906017`\)",
+                "!0",
+                "Bypass gate in voice settings",
+            ),
+        ],
+    ),
+
+    Patch(
+        id="file-permission-prompts",
+        name="File System Permission Prompts",
+        category="input",
+        labels=["local-only", "file-access", "user-facing", "agent-facing"],
+        description=(
+            "Enables file system permission prompts in prose steps by bypassing Statsig feature flag 1258561229.\n\nThis gate controls whether file system permission prompts appear during prose steps in conversations, allowing users to grant file access interactively."
+        ),
+        modifications=[
+            Modification(
+                "webview/assets/app-initial~app-main~page-*.js",
+                r"\w+\(`1258561229`\)",
+                "!0",
+                "Bypass gate in main page bundle",
+            ),
+        ],
+    ),
+
+    Patch(
+        id="file-permission-companion",
+        name="File System Permission Companion",
+        category="input",
+        labels=["local-only", "file-access", "user-facing", "agent-facing"],
+        description=(
+            "Enables the file system permission companion gate by bypassing Statsig feature flag 1378180112.\n\nWorks alongside gate 1258561229 to control file system permission prompt behavior in conversation steps."
+        ),
+        modifications=[
+            Modification(
+                "webview/assets/app-initial~app-main~page-*.js",
+                r"\w+\(`1378180112`\)",
+                "!0",
+                "Bypass gate in main page bundle",
+            ),
+        ],
+    ),
+
+    Patch(
+        id="image-input",
+        name="Image Input Support",
+        category="input",
+        labels=["custom-provider", "image-input", "user-facing", "agent-facing"],
+        description=(
+            "Enables image input support (attach images to conversations) by bypassing Statsig feature flag 1907601843.\n\nThis gate controls whether the image attachment UI is available. Works with custom model providers that support image input."
+        ),
+        modifications=[
+            Modification(
+                "webview/assets/*ho~*-*.js",
+                r"\w+\(`1907601843`\)",
+                "!0",
+                "Bypass gate in new thread panel",
+            ),
+            Modification(
+                "webview/assets/app-initial~app-main~page-*.js",
+                r"\w+\(`1907601843`\)",
+                "!0",
+                "Bypass gate in main page bundle",
+            ),
+            Modification(
+                "webview/assets/local-remote-dropdown-*.js",
+                r"\w+\(`1907601843`\)",
+                "!0",
+                "Bypass gate in local/remote dropdown",
+            ),
+        ],
+    ),
+
+    Patch(
+        id="ambient-home",
+        name="Ambient Home Features",
+        category="input",
+        labels=["local-only", "ambient-ui", "user-facing"],
+        description=(
+            "Enables ambient home page features by bypassing Statsig feature flag 3207467860.\n\nControls ambient UI elements on the home page including battery indicator, dictation context, and recording UI. Also appears in debug modal and settings page."
+        ),
+        modifications=[
+            Modification(
+                "webview/assets/app-initial~app-main~page-*.js",
+                r"\w+\(`3207467860`\)",
+                "!0",
+                "Bypass gate in main page bundle",
+            ),
+            Modification(
+                "webview/assets/debug-*.js",
+                r"\w+\(`3207467860`\)",
+                "!0",
+                "Bypass gate in debug modal",
+            ),
+            Modification(
+                "webview/assets/settings-page-*.js",
+                r"\w+\(`3207467860`\)",
+                "!0",
+                "Bypass gate in settings page",
+            ),
+        ],
+    ),
+
+    Patch(
+        id="plugins-feature",
+        name="Plugins Feature",
+        category="plugins",
+        labels=["local-only", "plugin-system", "user-facing", "agent-facing"],
+        description=(
+            "Enables the plugins feature (plugin management, mentionable plugins) by bypassing Statsig feature flag 4218407052.\n\nThis gate controls plugin visibility and management across the app, including plugin detail pages and the plugins list."
+        ),
+        modifications=[
+            Modification(
+                "webview/assets/*chatg~*-*.js",
+                r"\w+\(`4218407052`\)",
+                "!0",
+                "Bypass gate in onboarding page",
+            ),
+            Modification(
+                "webview/assets/plugin-detail-page-*.js",
+                r"\w+\(`4218407052`\)",
+                "!0",
+                "Bypass gate in plugin detail page",
+            ),
+            Modification(
+                "webview/assets/plugins-page-*.js",
+                r"\w+\(`4218407052`\)",
+                "!0",
+                "Bypass gate in plugins page",
+            ),
+        ],
+    ),
+
+    Patch(
+        id="plugin-installer",
+        name="Plugin Installer",
+        category="plugins",
+        labels=["local-only", "plugin-system", "user-facing", "agent-facing"],
+        description=(
+            "Enables the plugin installer by bypassing Statsig feature flag 581682073.\n\nThis gate controls whether the plugin installer is enabled, read from the Statsig layer config. Without auth, the installer is disabled."
+        ),
+        modifications=[
+            Modification(
+                "webview/assets/app-initial~app-main~page-*.js",
+                r"\w+\(`581682073`\)",
+                "!0",
+                "Bypass gate in main page bundle",
+            ),
+        ],
+    ),
+
+    Patch(
+        id="skills-apps-page",
+        name="Skills & Apps Page / Downloads",
+        category="plugins",
+        labels=["local-only", "plugin-system", "skill-management", "user-facing", "agent-facing"],
+        description=(
+            "Enables the Skills & Apps page and downloads tab by bypassing Statsig feature flag 1834314516.\n\nThis gate controls the skills/apps management page, browser profile import, and downloads tab visibility. Appears in onboarding, debug modal, and main page."
+        ),
+        modifications=[
+            Modification(
+                "webview/assets/app-initial~app-main~onboarding-page-*.js",
+                r"\w+\(`1834314516`\)",
+                "!0",
+                "Bypass gate in gate 1834314516",
+            ),
+            Modification(
+                "webview/assets/*chatg~*-*.js",
+                r"\w+\(`1834314516`\)",
+                "!0",
+                "Bypass gate in onboarding page",
+            ),
+            Modification(
+                "webview/assets/app-initial~app-main~page-*.js",
+                r"\w+\(`1834314516`\)",
+                "!0",
+                "Bypass gate in main page bundle",
+            ),
+            Modification(
+                "webview/assets/browser-profile-import-dialog-*.js",
+                r"\w+\(`1834314516`\)",
+                "!0",
+                "Bypass gate in browser profile import",
+            ),
+            Modification(
+                "webview/assets/browser-use-settings-*.js",
+                r"\w+\(`1834314516`\)",
+                "!0",
+                "Bypass gate in browser use settings",
+            ),
+            Modification(
+                "webview/assets/debug-*.js",
+                r"\w+\(`1834314516`\)",
+                "!0",
+                "Bypass gate in debug modal",
+            ),
+        ],
+    ),
+
+    Patch(
+        id="plugin-scheduled-tasks",
+        name="Plugin Scheduled Tasks (Local)",
+        category="plugins",
+        labels=["local-only", "plugin-system", "agent-facing"],
+        description=(
+            "Enables plugin scheduled tasks for local hosts by bypassing Statsig feature flag 3309093858.\n\nThis gate controls whether scheduled tasks can be configured for plugins running on local hosts."
+        ),
+        modifications=[
+            Modification(
+                "webview/assets/plugin-detail-page-*.js",
+                r"\w+\(`3309093858`\)",
+                "!0",
+                "Bypass gate in plugin detail page",
+            ),
+        ],
+    ),
+
+    Patch(
+        id="experimental-features",
+        name="Experimental Features Layer",
+        category="experimental",
+        labels=["local-only", "experimental", "ui-visibility", "user-facing"],
+        description=(
+            "Enables the experimental features layer by bypassing Statsig feature flag 1823918333.\n\nThis gate controls the 'enabled' field for experimental features in Settings, including Chronicle, Plugins, and Hotkey Window toggles. Forcing it true exposes these settings."
+        ),
+        modifications=[
+            Modification(
+                "webview/assets/*keyboard-shortcuts-settings~*-*.js",
+                r"\w+\(`1823918333`\)",
+                "!0",
+                "Bypass gate in keyboard shortcuts settings",
+            ),
+            Modification(
+                "webview/assets/app-initial~app-main~page-*.js",
+                r"\w+\(`1823918333`\)",
+                "!0",
+                "Bypass gate in main page bundle",
+            ),
+            Modification(
+                "webview/assets/profile-*.js",
+                r"\w+\(`1823918333`\)",
+                "!0",
+                "Bypass gate in profile component",
+            ),
+        ],
+    ),
+
+    Patch(
+        id="sandbox-mode",
+        name="Sandbox Mode Config",
+        category="config",
+        labels=["local-only", "sandbox", "execution", "user-facing", "agent-facing"],
+        description=(
+            "Enables sandbox mode configuration and automation heartbeat by bypassing Statsig feature flag 1488233300.\n\nThis gate controls sandbox configuration access in local conversations and the automation heartbeat system. Appears in onboarding, conversation pages, and stream events."
+        ),
+        modifications=[
+            Modification(
+                "webview/assets/app-initial~app-main~onboarding-page-*.js",
+                r"\w+\(`1488233300`\)",
+                "!0",
+                "Bypass gate in onboarding page",
+            ),
+            Modification(
+                "webview/assets/*hotkey-window-thread-page~*-*.js",
+                r"\w+\(`1488233300`\)",
+                "!0",
+                "Bypass gate in shared conversation bundle",
+            ),
+            Modification(
+                "webview/assets/app-initial~app-main~page-*.js",
+                r"\w+\(`1488233300`\)",
+                "!0",
+                "Bypass gate in main page bundle",
+            ),
+            Modification(
+                "webview/assets/local-conversation-page-*.js",
+                r"\w+\(`1488233300`\)",
+                "!0",
+                "Bypass gate in local conversation page",
+            ),
+            Modification(
+                "webview/assets/local-conversation-stream-role-product-event-*.js",
+                r"\w+\(`1488233300`\)",
+                "!0",
+                "Bypass gate in conversation stream events",
+            ),
+        ],
+    ),
+
+    Patch(
+        id="profile-sidebar",
+        name="Profile Sidebar Visibility",
+        category="config",
+        labels=["local-only", "ui-visibility", "user-facing"],
+        description=(
+            "Enables profile sidebar visibility and backdrop blur by bypassing Statsig feature flag 2423536643.\n\nThis gate controls whether the profile sidebar is visible and whether backdrop blur is applied."
+        ),
+        modifications=[
+            Modification(
+                "webview/assets/app-initial~app-main~page-*.js",
+                r"\w+\(`2423536643`\)",
+                "!0",
+                "Bypass gate in main page bundle",
+            ),
+            Modification(
+                "webview/assets/settings-page-*.js",
+                r"\w+\(`2423536643`\)",
+                "!0",
+                "Bypass gate in settings page",
+            ),
+        ],
+    ),
+
+    Patch(
+        id="appshots",
+        name="Appshots (Frontmost Window Capture)",
+        category="platform",
+        labels=["local-only", "platform-macos", "screenshot", "user-facing", "agent-facing"],
+        description=(
+            "Enables appshots (frontmost-window screenshot capture) on macOS by bypassing Statsig feature flag 1304276663.\n\nThis gate controls the appshot feature that captures screenshots of the frontmost window. macOS-specific."
+        ),
+        modifications=[
+            Modification(
+                "webview/assets/app-initial~app-main~page-*.js",
+                r"\w+\(`1304276663`\)",
+                "!0",
+                "Bypass gate in main page bundle",
+            ),
+        ],
+    ),
+
+    Patch(
+        id="local-host-features",
+        name="Local Host Features (Custom Avatars)",
+        category="platform",
+        labels=["local-only", "ui-visibility", "user-facing"],
+        description=(
+            "Enables local host features (custom avatars, local-host-specific UI) by bypassing Statsig feature flag 188145323.\n\nThis gate controls local-host-specific UI features including custom avatar support, computer-use settings, and pets settings. Appears across avatar overlay, computer use, and local conversation components."
+        ),
+        modifications=[
+            Modification(
+                "webview/assets/app-initial~app-main~page-*.js",
+                r"\w+\(`188145323`\)",
+                "!0",
+                "Bypass gate in main page bundle",
+            ),
+            Modification(
+                "webview/assets/avatar-*.js",
+                r"\w+\(`188145323`\)",
+                "!0",
+                "Bypass gate in avatar overlay component",
+            ),
+            Modification(
+                "webview/assets/computer-use-settings-*.js",
+                r"\w+\(`188145323`\)",
+                "!0",
+                "Bypass gate in computer use settings",
+            ),
+            Modification(
+                "webview/assets/local-*.js",
+                r"\w+\(`188145323`\)",
+                "!0",
+                "Bypass gate in local conversation thread",
+            ),
+            Modification(
+                "webview/assets/pets-settings-*.js",
+                r"\w+\(`188145323`\)",
+                "!0",
+                "Bypass gate in pets settings",
+            ),
+        ],
+    ),
+
+    Patch(
+        id="pet-install-modal",
+        name="Pet Install Modal",
+        category="companion",
+        labels=["local-only", "desktop-companion", "user-facing"],
+        description=(
+            "Enables the pet install modal by bypassing Statsig feature flag 1848317837.\n\nThis gate controls the pet installation modal that allows users to install desktop companion pets."
+        ),
+        modifications=[
+            Modification(
+                "webview/assets/app-initial~app-main~page-*.js",
+                r"\w+\(`1848317837`\)",
+                "!0",
+                "Bypass gate in main page bundle",
+            ),
+        ],
+    ),
+
+    Patch(
+        id="avatar-overlay",
+        name="Avatar Overlay (Group)",
+        category="companion",
+        labels=["local-only", "desktop-companion", "user-facing"],
+        description=(
+            "Enables the avatar overlay system by bypassing four related Statsig feature flags: 1256703444, 1529702798, 1840974662, and 4167858931.\n\nThese gates all appear in the same avatar overlay page component alongside electron-avatar-overlay-restore-ready. Individual gate purposes within the group are not fully distinguishable from minified code, so they ship as a single patch to enable the complete avatar overlay feature."
+        ),
+        modifications=[
+            Modification(
+                "webview/assets/app-initial~app-main~page-*.js",
+                r"\w+\(`1256703444`\)",
+                "!0",
+                "Bypass gate in main page bundle",
+            ),
+            Modification(
+                "webview/assets/app-initial~app-main~page-*.js",
+                r"\w+\(`1529702798`\)",
+                "!0",
+                "Bypass gate in main page bundle",
+            ),
+            Modification(
+                "webview/assets/app-initial~app-main~page-*.js",
+                r"\w+\(`1840974662`\)",
+                "!0",
+                "Bypass gate in main page bundle",
+            ),
+            Modification(
+                "webview/assets/app-initial~app-main~page-*.js",
+                r"\w+\(`4167858931`\)",
+                "!0",
+                "Bypass gate in main page bundle",
             ),
         ],
     ),
 ]
-
 
 def load_patches():
     """Load built-in patches and any external patches from patches.d/."""
@@ -419,6 +1199,7 @@ def load_patches():
                             id=pd["id"],
                             name=pd["name"],
                             category=pd.get("category", "uncategorized"),
+                            labels=pd.get("labels", []),
                             description=pd.get("description", ""),
                             modifications=mods,
                         )
@@ -738,9 +1519,51 @@ _ARR_R = "→"
 _CHECK = "✓"
 _CROSS = "✗"
 
+# Label metadata: label -> (dimension_key, description)
+LABEL_META = {
+    # Requirements — what it needs externally to function
+    "local-only":               ("req",  "Works within the app; no external service needed"),
+    "custom-provider":          ("req",  "Works with a custom model provider endpoint"),
+    "self-hosted-infra":        ("req",  "Works with user's own remote hosts/infrastructure"),
+    "platform-macos":           ("req",  "Gated to macOS (informational, not a disqualifier)"),
+    # Provisions — what it provides within the app
+    "workspace":                ("prov", "Workspace/project management"),
+    "conversation":             ("prov", "Conversation/thread management"),
+    "execution":                ("prov", "Execution environment configuration"),
+    "ui-visibility":            ("prov", "UI element visibility/toggle"),
+    "plugin-system":            ("prov", "Plugin management and support"),
+    "voice-input":              ("prov", "Voice/dictation input"),
+    "notification":             ("prov", "Notification and unread tracking"),
+    "sandbox":                  ("prov", "Security/sandbox configuration"),
+    "experimental":             ("prov", "Experimental features settings access"),
+    "file-access":              ("prov", "File system access/permissions"),
+    "image-input":              ("prov", "Image attachment input"),
+    "screenshot":               ("prov", "Screen capture"),
+    "multi-window":             ("prov", "Multi-window conversation support"),
+    "desktop-companion":        ("prov", "Avatar/pet overlay"),
+    "ambient-ui":               ("prov", "Ambient home page features"),
+    # Affordances — what it enables the user/agent to do
+    "local-dev":                ("aff",  "Local development workflows"),
+    "history":                  ("aff",  "Conversation history persistence/access"),
+    "mode-switch":              ("aff",  "Agent mode switching"),
+    "thread-v2":                ("aff",  "Newer thread format"),
+    "per-conversation-config":  ("aff",  "Per-conversation settings"),
+    "skill-management":         ("aff",  "Skills/apps management"),
+    # Behaviors — who it serves
+    "user-facing":              ("beh",  "Directly useful to end users"),
+    "agent-facing":             ("beh",  "Supports agent workflows"),
+}
+
+LABEL_DIMENSIONS = [
+    ("req",  "Requirements", "info"),
+    ("prov", "Provisions",   "accent"),
+    ("aff",  "Affordances",  "header"),
+    ("beh",  "Behaviors",    "applied"),
+]
+
 
 class PatchManagerTUI:
-    VIEWS = ("list", "detail", "preview", "commit")
+    VIEWS = ("list", "detail", "preview", "commit", "legend")
 
     def __init__(self, stdscr, patches, states, paths):
         self.stdscr = stdscr
@@ -809,6 +1632,8 @@ class PatchManagerTUI:
                 self._handle_detail_key(key)
             elif self.view == "preview":
                 self._handle_preview_key(key)
+            elif self.view == "legend":
+                self.view = "list"
             elif self.view == "commit":
                 if self.commit_done:
                     self._reset_view_state()
@@ -908,6 +1733,8 @@ class PatchManagerTUI:
             self._draw_preview()
         elif self.view == "commit":
             self._draw_commit()
+        elif self.view == "legend":
+            self._draw_label_legend()
         self.stdscr.refresh()
 
     # ── List View ──
@@ -938,7 +1765,7 @@ class PatchManagerTUI:
         y += 1
 
         # Scroll logic
-        visible = h - y - 4
+        visible = h - y - 6
         if self.cursor < self.scroll:
             self.scroll = self.cursor
         elif self.cursor >= self.scroll + visible:
@@ -950,7 +1777,7 @@ class PatchManagerTUI:
                 continue
             if i >= self.scroll + visible:
                 break
-            if y >= h - 4:
+            if y >= h - 6:
                 break
 
             state = self.states.get(patch.id, "unknown")
@@ -1005,6 +1832,14 @@ class PatchManagerTUI:
             self._safe_addstr(y, cat_x, patch.category, cat_attr)
             y += 1
 
+        # Labels bar for selected patch
+        if self.patches:
+            sel_patch = self.patches[self.cursor]
+            ly = h - 5
+            self._hline(ly, 1, w - 2)
+            ly += 1
+            self._draw_labels_bar(ly, w, sel_patch)
+
         # Footer
         fy = h - 3
         self._hline(fy, 1, w - 2)
@@ -1020,6 +1855,8 @@ class PatchManagerTUI:
             (" Details  ", 0),
             ("P", self._cp("keyhint", bright=True)),
             (" Preview  ", 0),
+            ("L", self._cp("keyhint", bright=True)),
+            (" Labels  ", 0),
             ("A", self._cp("revert", bright=True) if self.has_pending else self._dim()),
             (" Abort  ", 0),
             ("C", self._cp("pending", bright=True) if self.has_pending else self._dim()),
@@ -1097,6 +1934,32 @@ class PatchManagerTUI:
             self._safe_addstr(y, 14, " ? UNKNOWN ", curses.color_pair(_CP["badge_unk"]))
         y += 2
 
+        # Labels section
+        if patch.labels:
+            self._safe_addstr(y, 2, " Labels ",
+                              self._cp("header", bright=True))
+            y += 1
+            self._hline(y, 1, w - 2)
+            y += 1
+            for dim_key, dim_name, dim_color in LABEL_DIMENSIONS:
+                dim_labels = [
+                    l for l in patch.labels
+                    if LABEL_META.get(l, ("?",))[0] == dim_key
+                ]
+                if not dim_labels:
+                    continue
+                self._safe_addstr(y, 4, f"{dim_name}:", self._dim())
+                lx = 18
+                for label in dim_labels:
+                    tag = f" {label} "
+                    if lx + len(tag) >= w:
+                        y += 1
+                        lx = 18
+                    self._safe_addstr(y, lx, tag, self._cp(dim_color))
+                    lx += len(tag) + 1
+                y += 1
+            y += 1
+
         # Description section
         self._safe_addstr(y, 2, " Description ", self._cp("header", bright=True))
         y += 1
@@ -1157,6 +2020,8 @@ class PatchManagerTUI:
             (" Toggle  ", 0),
             ("P", self._cp("keyhint", bright=True)),
             (" Preview  ", 0),
+            ("L", self._cp("keyhint", bright=True)),
+            (" Labels  ", 0),
             ("A", self._cp("revert", bright=True) if self.has_pending else self._dim()),
             (" Abort  ", 0),
             ("C", self._cp("pending", bright=True) if self.has_pending else self._dim()),
@@ -1307,6 +2172,67 @@ class PatchManagerTUI:
 
     # ── Key Handlers ──
 
+    def _draw_labels_bar(self, y, w, patch):
+        """Draw labels for the selected patch as colored tags."""
+        if not patch or not patch.labels:
+            self._safe_addstr(y, 2, "(no labels)", self._dim())
+            return
+        x = 2
+        for label in patch.labels:
+            dim = LABEL_META.get(label, ("?", ""))[0]
+            if dim == "req":
+                attr = self._cp("info")
+            elif dim == "prov":
+                attr = self._cp("accent")
+            elif dim == "aff":
+                attr = self._cp("header")
+            elif dim == "beh":
+                attr = self._cp("applied", bright=True)
+            else:
+                attr = 0
+            tag = f" {label} "
+            if x + len(tag) >= w:
+                y += 1
+                x = 2
+                h_max = self.stdscr.getmaxyx()[0]
+                if y >= h_max - 3:
+                    break
+            self._safe_addstr(y, x, tag, attr)
+            x += len(tag) + 1
+
+    def _draw_label_legend(self):
+        """Full-screen overlay showing all labels with descriptions."""
+        h, w = self.stdscr.getmaxyx()
+        y = 0
+        self._safe_addstr(y, 1, " Label Legend ",
+                          self._cp("title", bright=True))
+        self._hline(y, 0, w, heavy=True)
+        y += 2
+        for dim_key, dim_name, dim_color in LABEL_DIMENSIONS:
+            if y >= h - 4:
+                break
+            self._safe_addstr(y, 2, dim_name,
+                              self._cp(dim_color, bright=True))
+            y += 1
+            for label, (d, desc) in sorted(LABEL_META.items()):
+                if d != dim_key:
+                    continue
+                if y >= h - 4:
+                    break
+                tag = f" {label} "
+                self._safe_addstr(y, 4, tag, self._cp(dim_color))
+                desc_max = w - 4 - len(tag) - 3
+                desc_display = desc[:desc_max] if len(desc) > desc_max else desc
+                self._safe_addstr(y, 4 + len(tag) + 2, desc_display,
+                                  self._dim())
+                y += 1
+            y += 1
+        # Footer
+        fy = h - 3
+        self._hline(fy, 1, w - 2)
+        self._safe_addstr(fy + 1, 2, "L/ESC/Q Back",
+                          self._cp("keyhint", bright=True))
+
     def _handle_list_key(self, key):
         if key in (curses.KEY_UP, ord("k")):
             self.cursor = max(0, self.cursor - 1)
@@ -1326,6 +2252,8 @@ class PatchManagerTUI:
                 self.abort_pending()
         elif key == ord("p"):
             self.view = "preview"
+        elif key == ord("l"):
+            self.view = "legend"
         elif key == ord("c"):
             if self.has_pending:
                 self.view = "commit"

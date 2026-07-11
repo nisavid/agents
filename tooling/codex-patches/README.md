@@ -92,6 +92,7 @@ extended with external JSON files in `patches.d/`:
     "id": "my-custom-patch",
     "name": "My Custom Patch",
     "category": "ui-tweaks",
+    "labels": ["local-only", "ui-visibility", "user-facing"],
     "description": "Description of what this patch does.",
     "modifications": [
       {
@@ -112,6 +113,98 @@ extended with external JSON files in `patches.d/`:
 2. Note which JS files contain the gate check (use `rg` on the extracted asar).
 3. Add a patch entry with the gate ID as the search pattern and `!0` (true) as
    the replacement.
+
+## Label Taxonomy
+
+Each patch is tagged with labels across four dimensions:
+
+- **Requirements** — what it needs externally to function:
+  `local-only`, `custom-provider`, `self-hosted-infra`, `platform-macos`
+- **Provisions** — what it provides within the app:
+  `workspace`, `conversation`, `execution`, `ui-visibility`,
+  `plugin-system`, `voice-input`, `notification`, `sandbox`,
+  `experimental`, `file-access`, `image-input`, `screenshot`,
+  `multi-window`, `desktop-companion`, `ambient-ui`
+- **Affordances** — what it enables the user/agent to do:
+  `local-dev`, `history`, `mode-switch`, `thread-v2`,
+  `per-conversation-config`, `skill-management`
+- **Behaviors** — who it serves:
+  `user-facing`, `agent-facing`
+
+Press `L` in the TUI to see a legend with descriptions of every label.
+
+## Built-in Patches
+
+29 patches across 7 functional groups, covering 32 Statsig gate IDs.
+
+### Workspace & Local Execution
+
+| Patch | Gate | Labels |
+|-------|------|--------|
+| Worktree Option in Run Location Menu | `505458` | `local-only` `workspace` `local-dev` `user-facing` `agent-facing` |
+| Persistent Thread Catalog | `567837310` | `local-only` `conversation` `history` `user-facing` `agent-facing` |
+| Headless Chat / Recent Threads View | `12346831` | `local-only` `workspace` `conversation` `local-dev` `history` `user-facing` |
+| Local Project Actions | `824038554` | `local-only` `workspace` `local-dev` `user-facing` `agent-facing` |
+| Mode Switching UI | `3264431617` | `local-only` `ui-visibility` `mode-switch` `user-facing` `agent-facing` |
+| Feature Visibility (Auth-State) | `1372061905` | `custom-provider` `ui-visibility` `user-facing` |
+
+### Conversation & Thread Management
+
+| Patch | Gate | Labels |
+|-------|------|--------|
+| Timeline Tab in Conversation View | `40604217` | `local-only` `conversation` `ui-visibility` `user-facing` `agent-facing` |
+| Full Review Mode | `2333235660` | `local-only` `conversation` `user-facing` `agent-facing` |
+| Open Conversation in New Window | `459748632` | `local-only` `conversation` `multi-window` `user-facing` |
+| Thread v2 Format | `57256278` | `local-only` `conversation` `thread-v2` `user-facing` `agent-facing` |
+| Per-Conversation Settings | `3736891373` | `local-only` `conversation` `per-conversation-config` `user-facing` `agent-facing` |
+| Notification Tracking | `3789238711` | `local-only` `notification` `user-facing` |
+
+### Input & Interaction
+
+| Patch | Gate | Labels |
+|-------|------|--------|
+| Dictation / Voice Input | `1244621283` | `local-only` `voice-input` `user-facing` |
+| Dictation Companion Gate | `4100906017` | `local-only` `voice-input` `user-facing` |
+| File System Permission Prompts | `1258561229` | `local-only` `file-access` `user-facing` `agent-facing` |
+| File System Permission Companion | `1378180112` | `local-only` `file-access` `user-facing` `agent-facing` |
+| Image Input Support | `1907601843` | `custom-provider` `image-input` `user-facing` `agent-facing` |
+| Ambient Home Features | `3207467860` | `local-only` `ambient-ui` `user-facing` |
+
+### Plugin & Skills System
+
+| Patch | Gate | Labels |
+|-------|------|--------|
+| Plugins Feature | `4218407052` | `local-only` `plugin-system` `user-facing` `agent-facing` |
+| Plugin Installer | `581682073` | `local-only` `plugin-system` `user-facing` `agent-facing` |
+| Skills & Apps Page / Downloads | `1834314516` | `local-only` `plugin-system` `skill-management` `user-facing` `agent-facing` |
+| Plugin Scheduled Tasks (Local) | `3309093858` | `local-only` `plugin-system` `agent-facing` |
+
+### Experimental Features
+
+| Patch | Gate | Labels |
+|-------|------|--------|
+| Experimental Features Layer | `1823918333` | `local-only` `experimental` `ui-visibility` `user-facing` |
+
+### Security & Configuration
+
+| Patch | Gate | Labels |
+|-------|------|--------|
+| Sandbox Mode Config | `1488233300` | `local-only` `sandbox` `execution` `user-facing` `agent-facing` |
+| Profile Sidebar Visibility | `2423536643` | `local-only` `ui-visibility` `user-facing` |
+
+### Platform-Specific
+
+| Patch | Gate | Labels |
+|-------|------|--------|
+| Appshots (Frontmost Window Capture) | `1304276663` | `local-only` `platform-macos` `screenshot` `user-facing` `agent-facing` |
+| Local Host Features (Custom Avatars) | `188145323` | `local-only` `ui-visibility` `user-facing` |
+
+### Desktop Companion
+
+| Patch | Gate | Labels |
+|-------|------|--------|
+| Pet Install Modal | `1848317837` | `local-only` `desktop-companion` `user-facing` |
+| Avatar Overlay (Group) | `1256703444` `1529702798` `1840974662` `4167858931` | `local-only` `desktop-companion` `user-facing` |
 
 ## Caveats
 

@@ -15,7 +15,7 @@ import unittest
 # explicit SourceFileLoader.
 import importlib.util
 from importlib.machinery import SourceFileLoader
-_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "codex-patch-manager")
+_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chatgpt-unflag")
 _loader = SourceFileLoader("codex_patch_manager", _script)
 _spec = importlib.util.spec_from_loader("codex_patch_manager", _loader)
 cpm = importlib.util.module_from_spec(_spec)

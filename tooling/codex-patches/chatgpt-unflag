@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Codex Desktop Patch Manager — TUI for managing app.asar patches.
+"""ChatGPT Unflag — TUI for managing app.asar patches.
 
 Manages search-and-replace patches against the Codex Desktop (ChatGPT.app)
 app.asar bundle. Handles extraction, patching, repacking, integrity hash
@@ -29,7 +29,7 @@ from typing import Optional
 # ─── Constants ──────────────────────────────────────────────────────────────
 
 DEFAULT_APP = "/Applications/ChatGPT.app"
-STATE_DIR = Path.home() / ".codex" / "codex-patch-manager"
+STATE_DIR = Path.home() / ".codex" / "chatgpt-unflag"
 STATE_FILE = STATE_DIR / "state.json"
 SCRIPT_DIR = Path(__file__).parent.resolve()
 EXTERNAL_PATCHES_DIR = SCRIPT_DIR / "patches.d"
@@ -916,7 +916,7 @@ class PatchManagerTUI:
         h, w = self.stdscr.getmaxyx()
 
         # Header
-        self._safe_addstr(0, 1, " Codex Desktop Patch Manager ",
+        self._safe_addstr(0, 1, " ChatGPT Unflag ",
                           self._cp("title", bright=True))
         self._hline(1, 0, w, heavy=True)
 
@@ -1401,7 +1401,7 @@ def _state_symbol(state):
 def cmd_list(patches, paths):
     """List all patches and their current state."""
     print()
-    print(f"  {c.wrap(c.B_CYAN + c.BOLD, 'Codex Desktop Patch Manager')}")
+    print(f"  {c.wrap(c.B_CYAN + c.BOLD, 'ChatGPT Unflag')}")
     print(f"  {c.wrap(c.DIM, 'App:')} {c.wrap(c.CYAN, paths['app'])}")
     print()
 
@@ -1475,11 +1475,11 @@ def cmd_status(patches, paths):
 
 # ─── Install ────────────────────────────────────────────────────────────────
 
-INSTALL_LINK_NAME = "codex-patch-manager"
+INSTALL_LINK_NAME = "chatgpt-unflag"
 
 
 def cmd_install():
-    """Install codex-patch-manager into ~/.local/bin and ensure PATH activation."""
+    """Install chatgpt-unflag into ~/.local/bin and ensure PATH activation."""
     LOCAL_BIN.mkdir(parents=True, exist_ok=True)
 
     # Ensure ~/.local/bin/env exists and activates ~/.local/bin on PATH.
@@ -1499,10 +1499,16 @@ def cmd_install():
     else:
         print(f"  {c.wrap(c.DIM, 'exists')}  {c.wrap(c.CYAN, str(LOCAL_BIN_ENV_FISH))}")
 
+    # Remove a stale symlink from the previous tool name if present.
+    old_link = LOCAL_BIN / "codex-patch-manager"
+    if old_link.is_symlink() or old_link.exists():
+        old_link.unlink()
+        print(f"  {c.wrap(c.DIM, 'removed')} {c.wrap(c.CYAN, str(old_link))} {c.wrap(c.DIM, '(old name)')}")
+
     # Symlink the script into ~/.local/bin so updates to the repo copy
     # are picked up automatically.
     target = LOCAL_BIN / INSTALL_LINK_NAME
-    script = SCRIPT_DIR / "codex-patch-manager"
+    script = SCRIPT_DIR / "chatgpt-unflag"
     if target.is_symlink() or target.exists():
         target.unlink()
     target.symlink_to(script)
@@ -1514,7 +1520,7 @@ def cmd_install():
     on_path = str(LOCAL_BIN) in path_dirs
     if on_path:
         print(f"\n  {c.wrap(c.GREEN + c.BOLD, '✓')} Installed. {c.wrap(c.CYAN, INSTALL_LINK_NAME)} is on your PATH.")
-        print(f"  Run {c.wrap(c.BOLD, 'codex-patch-manager')} from anywhere.")
+        print(f"  Run {c.wrap(c.BOLD, 'chatgpt-unflag')} from anywhere.")
     else:
         print(f"\n  {c.wrap(c.GREEN + c.BOLD, '✓')} Installed to {c.wrap(c.CYAN, str(LOCAL_BIN))}.")
         print(f"  {c.wrap(c.YELLOW, '⚠')} {c.wrap(c.BOLD, str(LOCAL_BIN))} is not on your PATH in this shell.")
@@ -1529,7 +1535,7 @@ def cmd_install():
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Codex Desktop Patch Manager",
+        description="ChatGPT Unflag — asar patch manager for ChatGPT.app",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Run without arguments to launch the interactive TUI.\n"

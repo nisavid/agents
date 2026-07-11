@@ -1,7 +1,7 @@
-# Codex Desktop Patch Manager
+# ChatGPT Unflag
 
-Interactive TUI and CLI for managing `app.asar` patches against Codex Desktop
-(`ChatGPT.app`). Handles asar extraction, patching, repacking, ASAR integrity
+Interactive TUI and CLI for managing `app.asar` patches against the
+ChatGPT desktop app (`ChatGPT.app`). Handles asar extraction, patching, repacking, ASAR integrity
 hash updates, and code signing with proper Electron entitlements — all in pure
 Python with zero external dependencies.
 
@@ -19,12 +19,12 @@ Statsig.
 ## Installation
 
 ```bash
-./codex-patch-manager install
+./chatgpt-unflag install
 ```
 
 Symlinks the script into `~/.local/bin/` and ensures `~/.local/bin/env`
 exists (sourced by `~/.profile` and `~/.zshenv` to activate `~/.local/bin`
-on `PATH`). After installing, `codex-patch-manager` is available from any
+on `PATH`). After installing, `chatgpt-unflag` is available from any
 shell. New terminals pick it up automatically; for the current shell:
 
 ```bash
@@ -36,7 +36,7 @@ source ~/.local/bin/env
 ### Interactive TUI
 
 ```bash
-./codex-patch-manager
+./chatgpt-unflag
 ```
 
 Navigate with arrow keys, toggle patches with Space, preview the delta with P,
@@ -46,23 +46,23 @@ commit with C, or abort (discard) the pending selection with A.
 
 ```bash
 # List all patches and their current state
-./codex-patch-manager list
+./chatgpt-unflag list
 
 # Show brief status
-./codex-patch-manager status
+./chatgpt-unflag status
 
 # Apply specific patches
-./codex-patch-manager apply worktree-feature-flag
+./chatgpt-unflag apply worktree-feature-flag
 
 # Revert specific patches (or all)
-./codex-patch-manager revert worktree-feature-flag
-./codex-patch-manager revert all
+./chatgpt-unflag revert worktree-feature-flag
+./chatgpt-unflag revert all
 ```
 
 ### Specify a different app path
 
 ```bash
-./codex-patch-manager --app /path/to/ChatGPT.app list
+./chatgpt-unflag --app /path/to/ChatGPT.app list
 ```
 
 ## How It Works
@@ -125,5 +125,5 @@ extended with external JSON files in `patches.d/`:
 
 ## State
 
-State is stored in `~/.codex/codex-patch-manager/state.json`, tracking the
+State is stored in `~/.codex/chatgpt-unflag/state.json`, tracking the
 last installed asar hash and which patches were applied.

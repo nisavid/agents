@@ -1374,16 +1374,14 @@ class PatchManagerTUI:
 
         def progress(msg):
             self.commit_log.append(msg)
-            self._draw_commit()
-            self.stdscr.refresh()
+            self._draw()
 
         success, message = commit_changes(self.paths, patches_to_apply, progress)
         self.commit_success = success
         if not success:
             self.commit_log.append(f"ERROR: {message}")
         self.commit_done = True
-        self._draw_commit()
-        self.stdscr.refresh()
+        self._draw()
 
 
 # ─── CLI (non-interactive, colorized) ───────────────────────────────────────

@@ -193,18 +193,31 @@ def find_asar_files(header, glob_pattern):
     return sorted(results)
 
 
-def extract_asar(asar_path, dest_dir):
-    """Extract an asar archive to a directory."""
+def extract_asar(asar_path, dest_dir, unpacked_dir=None):
+    """Extract an asar archive to a directory.
+
+    Packed files (those with an "offset") are read from the asar binary.
+    Unpacked files (those with "unpacked": true and no offset) are copied
+    from the sibling ``unpacked_dir`` (defaults to ``asar_path + ".unpacked"``).
+
+    Returns a set of relative paths that are unpacked.  This set must be
+    passed to :func:`pack_asar` so the repacked header preserves the
+    "unpacked": true flag for those entries.
+    """
     header, fds = read_asar_header(asar_path)
     os.makedirs(dest_dir, exist_ok=True)
+    if unpacked_dir is None:
+        unpacked_dir = asar_path + ".unpacked"
+    unpacked_paths = set()
 
-    def extract_node(node, current_path):
+    def extract_node(node, current_path, rel_path):
         if not isinstance(node, dict):
             return
         if "files" in node:
             os.makedirs(current_path, exist_ok=True)
             for name, child in node["files"].items():
-                extract_node(child, os.path.join(current_path, name))
+                child_rel = f"{rel_path}/{name}" if rel_path else name
+                extract_node(child, os.path.join(current_path, name), child_rel)
         elif "offset" in node:
             os.makedirs(os.path.dirname(current_path), exist_ok=True)
             with open(asar_path, "rb") as f:
@@ -212,8 +225,15 @@ def extract_asar(asar_path, dest_dir):
                 data = f.read(node["size"])
             with open(current_path, "wb") as out:
                 out.write(data)
+        elif node.get("unpacked"):
+            unpacked_paths.add(rel_path)
+            src_file = os.path.join(unpacked_dir, rel_path)
+            if os.path.exists(src_file):
+                os.makedirs(os.path.dirname(current_path), exist_ok=True)
+                shutil.copy2(src_file, current_path)
 
-    extract_node(header, dest_dir)
+    extract_node(header, dest_dir, "")
+    return unpacked_paths
 
 
 def _compute_integrity(data):
@@ -233,33 +253,50 @@ def _compute_integrity(data):
     }
 
 
-def pack_asar(src_dir, dest_path):
-    """Pack a directory into an asar archive."""
+def pack_asar(src_dir, dest_path, unpacked_paths=None):
+    """Pack a directory into an asar archive.
+
+    Files whose relative paths appear in ``unpacked_paths`` are marked
+    "unpacked": true in the header (with size and integrity) but are
+    excluded from the binary payload.  Their data must already exist in a
+    sibling ``<dest_path>.unpacked/`` directory — pack does not create or
+    modify that directory.
+    """
+    if unpacked_paths is None:
+        unpacked_paths = set()
     file_table = {}
     file_chunks = []
     current_offset = 0
 
-    def add_entry(full_path, name, table):
+    def add_entry(full_path, name, table, rel_path):
         nonlocal current_offset
         if os.path.isdir(full_path):
             sub_table = {}
             for entry in sorted(os.listdir(full_path)):
-                add_entry(os.path.join(full_path, entry), entry, sub_table)
+                child_rel = f"{rel_path}/{entry}" if rel_path else entry
+                add_entry(os.path.join(full_path, entry), entry, sub_table, child_rel)
             if sub_table:
                 table[name] = {"files": sub_table}
         elif os.path.isfile(full_path):
             with open(full_path, "rb") as f:
                 data = f.read()
-            table[name] = {
-                "size": len(data),
-                "offset": str(current_offset),
-                "integrity": _compute_integrity(data),
-            }
-            file_chunks.append(data)
-            current_offset += len(data)
+            if rel_path in unpacked_paths:
+                table[name] = {
+                    "size": len(data),
+                    "integrity": _compute_integrity(data),
+                    "unpacked": True,
+                }
+            else:
+                table[name] = {
+                    "size": len(data),
+                    "offset": str(current_offset),
+                    "integrity": _compute_integrity(data),
+                }
+                file_chunks.append(data)
+                current_offset += len(data)
 
     for entry in sorted(os.listdir(src_dir)):
-        add_entry(os.path.join(src_dir, entry), entry, file_table)
+        add_entry(os.path.join(src_dir, entry), entry, file_table, entry)
 
     header = {"files": file_table}
     json_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
@@ -453,6 +490,9 @@ def get_paths(app_path):
         "asar_orig": os.path.join(
             app_path, "Contents", "Resources", "app.asar.orig"
         ),
+        "asar_unpacked": os.path.join(
+            app_path, "Contents", "Resources", "app.asar.unpacked"
+        ),
         "plist": os.path.join(app_path, "Contents", "Info.plist"),
         "frameworks": os.path.join(app_path, "Contents", "Frameworks"),
     }
@@ -597,7 +637,10 @@ def commit_changes(paths, patches_to_apply, progress_cb=None):
         with tempfile.TemporaryDirectory(prefix="codex-pm-") as tmpdir:
             extracted = os.path.join(tmpdir, "extracted")
             report("Extracting original asar...")
-            extract_asar(paths["asar_orig"], extracted)
+            unpacked_paths = extract_asar(
+                paths["asar_orig"], extracted,
+                unpacked_dir=paths["asar_unpacked"],
+            )
 
             for patch in patches_to_apply:
                 report(f"Applying: {patch.name}...")
@@ -606,7 +649,7 @@ def commit_changes(paths, patches_to_apply, progress_cb=None):
 
             patched_asar = os.path.join(tmpdir, "app-patched.asar")
             report("Packing patched asar...")
-            pack_asar(extracted, patched_asar)
+            pack_asar(extracted, patched_asar, unpacked_paths=unpacked_paths)
 
             new_hash = sha256_file(patched_asar)
             report(f"New asar hash: {new_hash[:16]}...")

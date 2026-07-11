@@ -16,6 +16,21 @@ This tool lets you bypass specific feature gates by patching the minified JS
 bundles inside `app.asar`, without needing ChatGPT login or network access to
 Statsig.
 
+## Installation
+
+```bash
+./codex-patch-manager install
+```
+
+Symlinks the script into `~/.local/bin/` and ensures `~/.local/bin/env`
+exists (sourced by `~/.profile` and `~/.zshenv` to activate `~/.local/bin`
+on `PATH`). After installing, `codex-patch-manager` is available from any
+shell. New terminals pick it up automatically; for the current shell:
+
+```bash
+source ~/.local/bin/env
+```
+
 ## Usage
 
 ### Interactive TUI

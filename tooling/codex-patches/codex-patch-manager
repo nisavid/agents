@@ -34,6 +34,27 @@ STATE_FILE = STATE_DIR / "state.json"
 SCRIPT_DIR = Path(__file__).parent.resolve()
 EXTERNAL_PATCHES_DIR = SCRIPT_DIR / "patches.d"
 
+LOCAL_BIN = Path.home() / ".local" / "bin"
+LOCAL_BIN_ENV = LOCAL_BIN / "env"
+LOCAL_BIN_ENV_FISH = LOCAL_BIN / "env.fish"
+LOCAL_BIN_ENV_CONTENT = """#!/bin/sh
+# add binaries to PATH if they aren't added yet
+# affix colons on either side of $PATH to simplify matching
+case ":${PATH}:" in
+    *:"$HOME/.local/bin":*)
+        ;;
+    *)
+        # Prepending path in case a system-installed binary needs to be overridden
+        export PATH="$HOME/.local/bin:$PATH"
+        ;;
+esac
+"""
+LOCAL_BIN_ENV_FISH_CONTENT = """if not contains "$HOME/.local/bin" $PATH
+    # Prepending path in case a system-installed binary needs to be overridden
+    set -x PATH "$HOME/.local/bin" $PATH
+end
+"""
+
 APP_ENTITLEMENTS = """<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -1409,6 +1430,58 @@ def cmd_status(patches, paths):
     print(summary)
 
 
+# ─── Install ────────────────────────────────────────────────────────────────
+
+INSTALL_LINK_NAME = "codex-patch-manager"
+
+
+def cmd_install():
+    """Install codex-patch-manager into ~/.local/bin and ensure PATH activation."""
+    LOCAL_BIN.mkdir(parents=True, exist_ok=True)
+
+    # Ensure ~/.local/bin/env exists and activates ~/.local/bin on PATH.
+    # This file is sourced by ~/.profile and ~/.zshenv.  If it already
+    # exists (e.g. created by another tool), leave it untouched.
+    if not LOCAL_BIN_ENV.exists():
+        LOCAL_BIN_ENV.write_text(LOCAL_BIN_ENV_CONTENT)
+        LOCAL_BIN_ENV.chmod(0o644)
+        print(f"  {c.wrap(c.DIM, 'created')} {c.wrap(c.CYAN, str(LOCAL_BIN_ENV))}")
+    else:
+        print(f"  {c.wrap(c.DIM, 'exists')}  {c.wrap(c.CYAN, str(LOCAL_BIN_ENV))}")
+
+    if not LOCAL_BIN_ENV_FISH.exists():
+        LOCAL_BIN_ENV_FISH.write_text(LOCAL_BIN_ENV_FISH_CONTENT)
+        LOCAL_BIN_ENV_FISH.chmod(0o644)
+        print(f"  {c.wrap(c.DIM, 'created')} {c.wrap(c.CYAN, str(LOCAL_BIN_ENV_FISH))}")
+    else:
+        print(f"  {c.wrap(c.DIM, 'exists')}  {c.wrap(c.CYAN, str(LOCAL_BIN_ENV_FISH))}")
+
+    # Symlink the script into ~/.local/bin so updates to the repo copy
+    # are picked up automatically.
+    target = LOCAL_BIN / INSTALL_LINK_NAME
+    script = SCRIPT_DIR / "codex-patch-manager"
+    if target.is_symlink() or target.exists():
+        target.unlink()
+    target.symlink_to(script)
+    target.chmod(0o755)
+    print(f"  {c.wrap(c.DIM, 'linked')}  {c.wrap(c.CYAN, str(target))} {c.wrap(c.DIM, '->')} {c.wrap(c.CYAN, str(script))}")
+
+    # Check whether ~/.local/bin is on PATH in the *current* shell.
+    path_dirs = os.environ.get("PATH", "").split(":")
+    on_path = str(LOCAL_BIN) in path_dirs
+    if on_path:
+        print(f"\n  {c.wrap(c.GREEN + c.BOLD, '✓')} Installed. {c.wrap(c.CYAN, INSTALL_LINK_NAME)} is on your PATH.")
+        print(f"  Run {c.wrap(c.BOLD, 'codex-patch-manager')} from anywhere.")
+    else:
+        print(f"\n  {c.wrap(c.GREEN + c.BOLD, '✓')} Installed to {c.wrap(c.CYAN, str(LOCAL_BIN))}.")
+        print(f"  {c.wrap(c.YELLOW, '⚠')} {c.wrap(c.BOLD, str(LOCAL_BIN))} is not on your PATH in this shell.")
+        print(f"  It will be activated in new shells via {c.wrap(c.CYAN, '~/.local/bin/env')},")
+        print(f"  which is sourced by {c.wrap(c.CYAN, '~/.profile')} and {c.wrap(c.CYAN, '~/.zshenv')}.")
+        print(f"  For this shell: {c.wrap(c.BOLD, 'source ~/.local/bin/env')}")
+
+
+
+
 # ─── Main ───────────────────────────────────────────────────────────────────
 
 def main():
@@ -1432,8 +1505,14 @@ def main():
         "patches", nargs="*", default=["all"], help="Patch IDs to revert (or 'all')"
     )
     sub.add_parser("tui", help="Launch interactive TUI")
+    sub.add_parser("install", help="Install to ~/.local/bin and ensure PATH activation")
 
     args = parser.parse_args()
+
+    if args.command == "install":
+        cmd_install()
+        return
+
     paths = get_paths(args.app)
 
     if not os.path.exists(paths["asar"]):

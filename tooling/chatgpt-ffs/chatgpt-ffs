@@ -2462,6 +2462,183 @@ def cmd_status(patches, paths):
     print(summary)
 
 
+# ─── Update Workflow ───────────────────────────────────────────────────────
+
+
+def cmd_restore(patches, paths):
+    """Restore pristine app.asar from backup, preserving the applied-patch list.
+
+    Saves the set of currently-applied patches to state so ``reapply`` can
+    restore them after an app update.  Then copies ``app.asar.orig`` over
+    ``app.asar``, updates the integrity hash, and re-signs — leaving the app
+    in a clean state that can safely accept a Sparkle or manual update.
+    """
+    # Detect which patches are currently applied so reapply can restore them.
+    applied_ids = [
+        p.id for p in patches
+        if detect_patch_state(paths["asar"], p) == "applied"
+    ]
+
+    state = load_state()
+    state["applied_patches"] = applied_ids
+
+    orig = paths["asar_orig"]
+    if not os.path.exists(orig):
+        # Already pristine (e.g. app was just updated and no backup exists).
+        state["installed_hash"] = sha256_file(paths["asar"])
+        save_state(state)
+        print(f"  {c.wrap(c.YELLOW, '⚠')} No backup found — app is already pristine.")
+        if applied_ids:
+            ids = ", ".join(c.wrap(c.CYAN, pid) for pid in applied_ids)
+            print(f"  {c.wrap(c.DIM, 'Saved')} {ids} {c.wrap(c.DIM, 'for reapply.')}")
+        else:
+            print(f"  {c.wrap(c.DIM, 'No patches to reapply.')}")
+        return
+
+    def report(msg):
+        print(f"  {c.wrap(c.DIM, msg)}")
+
+    try:
+        report("Quitting app if running...")
+        quit_app(paths["app"])
+
+        report("Restoring pristine app.asar from backup...")
+        shutil.copy2(orig, paths["asar"])
+
+        new_hash = sha256_file(paths["asar"])
+        state["installed_hash"] = new_hash
+        save_state(state)
+
+        report("Updating integrity hash in Info.plist...")
+        update_asar_hash(paths["plist"], new_hash)
+
+        report("Re-signing app...")
+        resign_app(paths["app"])
+
+        report("Verifying signature...")
+        ok, msg = verify_signature(paths["app"])
+        if not ok:
+            report(f"WARNING: Signature verification failed: {msg}")
+        else:
+            report("Signature verified ✓")
+
+        print(f"\n  {c.wrap(c.GREEN + c.BOLD, '✓')} {c.wrap(c.GREEN, 'App restored to pristine state.')}")
+        if applied_ids:
+            ids = ", ".join(c.wrap(c.CYAN, pid) for pid in applied_ids)
+            print(f"  {c.wrap(c.DIM, 'Saved for reapply:')} {ids}")
+            print(f"  {c.wrap(c.DIM, 'Run')} {c.wrap(c.BOLD, 'chatgpt-ffs reapply')} "
+                  f"{c.wrap(c.DIM, 'after updating the app.')}")
+        else:
+            print(f"  {c.wrap(c.DIM, 'No patches were applied — nothing to reapply.')}")
+    except Exception as e:
+        print(f"\n  {c.wrap(c.RED + c.BOLD, '✗')} {c.wrap(c.RED, str(e))}",
+              file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_reapply(patches, paths):
+    """Re-apply the patch set saved by ``restore``.
+
+    Reads ``applied_patches`` from state.  If the current ``app.asar`` hash
+    differs from the stored ``installed_hash`` (i.e. the app was updated),
+    the stale ``app.asar.orig`` backup is deleted so ``ensure_original``
+    creates a fresh one from the new version.
+    """
+    state = load_state()
+    saved_ids = state.get("applied_patches", [])
+
+    if not saved_ids:
+        print(f"  {c.wrap(c.YELLOW, '⚠')} No saved patches to reapply.")
+        print(f"  {c.wrap(c.DIM, 'Run')} {c.wrap(c.BOLD, 'chatgpt-ffs apply <patches>')} "
+              f"{c.wrap(c.DIM, 'instead.')}")
+        return
+
+    # Detect stale backup: if the current asar hash doesn't match what we
+    # stored at restore time, the app was updated and app.asar.orig is stale.
+    current_hash = sha256_file(paths["asar"])
+    stored_hash = state.get("installed_hash")
+    if stored_hash and current_hash != stored_hash:
+        orig = paths["asar_orig"]
+        if os.path.exists(orig):
+            print(f"  {c.wrap(c.DIM, 'App updated — refreshing backup...')}")
+            os.remove(orig)
+
+    # Resolve saved IDs to Patch objects.
+    selected = []
+    unknown = []
+    for pid in saved_ids:
+        patch = next((p for p in patches if p.id == pid), None)
+        if patch:
+            selected.append(patch)
+        else:
+            unknown.append(pid)
+
+    if unknown:
+        ids = ", ".join(c.wrap(c.YELLOW, pid) for pid in unknown)
+        print(f"  {c.wrap(c.YELLOW, '⚠')} Skipping unknown patches: {ids}",
+              file=sys.stderr)
+
+    if not selected:
+        print(f"  {c.wrap(c.RED + c.BOLD, '✗')} No applicable patches found.",
+              file=sys.stderr)
+        sys.exit(1)
+
+    count = len(selected)
+    label = "patch" if count == 1 else "patches"
+    ids = ", ".join(c.wrap(c.CYAN, p.id) for p in selected)
+    print(f"  {c.wrap(c.DIM, f'Reapplying {count} {label}:')} {ids}")
+
+    success, msg = commit_changes(paths, selected,
+                                  lambda m: print(f"  {c.wrap(c.DIM, m)}"))
+    if success:
+        print(f"\n  {c.wrap(c.GREEN + c.BOLD, '✓')} {c.wrap(c.GREEN, msg)}")
+    else:
+        print(f"\n  {c.wrap(c.RED + c.BOLD, '✗')} {c.wrap(c.RED, msg)}",
+              file=sys.stderr)
+        sys.exit(1)
+
+
+def cmd_update(patches, paths):
+    """Guided update workflow: restore → wait for app update → reapply.
+
+    Restores the pristine app, prints update instructions, waits for the
+    user to confirm the update is complete, then reapplies saved patches.
+    """
+    print(f"  {c.wrap(c.B_CYAN + c.BOLD, 'ChatGPT FFS — Update Workflow')}")
+    print()
+
+    # Step 1: Restore
+    print(f"  {c.wrap(c.BOLD, 'Step 1:')} Restore pristine app")
+    cmd_restore(patches, paths)
+    print()
+
+    state = load_state()
+    saved_ids = state.get("applied_patches", [])
+    if not saved_ids:
+        print(f"  {c.wrap(c.DIM, 'No patches to reapply — done.')}")
+        return
+
+    # Step 2: User updates the app
+    print(f"  {c.wrap(c.BOLD, 'Step 2:')} Update ChatGPT.app")
+    print(f"  {c.wrap(c.DIM, 'The app has been restored to its pristine state.')}")
+    print(f"  {c.wrap(c.DIM, 'Update it now via:')}")
+    print(f"    {c.wrap(c.CYAN, '• Sparkle auto-update (restart the app and let it update)')}")
+    print(f"    {c.wrap(c.CYAN, '• Manual download and replace')}")
+    print()
+    try:
+        input(f"  {c.wrap(c.YELLOW + c.BOLD, 'Press Enter when the update is complete...')}")
+    except (EOFError, KeyboardInterrupt):
+        print(f"\n  {c.wrap(c.YELLOW, '⚠')} Update interrupted.")
+        print(f"  {c.wrap(c.DIM, 'Run')} {c.wrap(c.BOLD, 'chatgpt-ffs reapply')} "
+              f"{c.wrap(c.DIM, 'when ready.')}")
+        return
+    print()
+
+    # Step 3: Reapply
+    print(f"  {c.wrap(c.BOLD, 'Step 3:')} Reapply patches")
+    cmd_reapply(patches, paths)
+
+
 # ─── Install ────────────────────────────────────────────────────────────────
 
 INSTALL_LINK_NAME = "chatgpt-ffs"
@@ -2542,6 +2719,9 @@ def main():
     p_revert.add_argument(
         "patches", nargs="*", default=["all"], help="Patch IDs to revert (or 'all')"
     )
+    sub.add_parser("restore", help="Restore pristine app.asar (pre-update step)")
+    sub.add_parser("reapply", help="Reapply saved patches (post-update step)")
+    sub.add_parser("update", help="Guided restore → update → reapply workflow")
     sub.add_parser("tui", help="Launch interactive TUI")
     sub.add_parser("install", help="Install to ~/.local/bin and ensure PATH activation")
 
@@ -2567,6 +2747,12 @@ def main():
         cmd_apply(patches, paths, args.patches)
     elif args.command == "revert":
         cmd_revert(patches, paths, args.patches)
+    elif args.command == "restore":
+        cmd_restore(patches, paths)
+    elif args.command == "reapply":
+        cmd_reapply(patches, paths)
+    elif args.command == "update":
+        cmd_update(patches, paths)
     elif args.command == "tui":
         _run_tui(patches, paths)
     else:

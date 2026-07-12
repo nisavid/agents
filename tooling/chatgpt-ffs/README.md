@@ -57,7 +57,29 @@ commit with C, or abort (discard) the pending selection with A.
 # Revert specific patches (or all)
 ./chatgpt-ffs revert worktree-feature-flag
 ./chatgpt-ffs revert all
+
+# Restore pristine app (before updating ChatGPT.app)
+./chatgpt-ffs restore
+
+# Reapply saved patches (after updating ChatGPT.app)
+./chatgpt-ffs reapply
+
+# Guided restore → update → reapply in one command
+./chatgpt-ffs update
 ```
+
+### Updating ChatGPT.app
+
+App updates replace `app.asar`, which wipes applied patches. Use the
+update workflow to preserve your patch selection across updates:
+
+1. **Restore** — `chatgpt-ffs restore` saves your applied patch list to
+   state and restores the pristine `app.asar` from backup.
+2. **Update** — let Sparkle or a manual download update the app.
+3. **Reapply** — `chatgpt-ffs reapply` detects the updated asar, refreshes
+   the backup, and reapplies your saved patches.
+
+Or run `chatgpt-ffs update` to do all three steps in a guided flow.
 
 ### Specify a different app path
 

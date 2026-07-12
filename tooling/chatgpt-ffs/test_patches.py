@@ -104,7 +104,7 @@ class PatchDefinitionsTest(unittest.TestCase):
 
 
 class PatchStateDetectionTest(unittest.TestCase):
-    """Verify detect_patch_state works on synthetic asar files."""
+    """Verify detect_state works on synthetic asar files."""
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="patch-test-")
@@ -177,7 +177,7 @@ class PatchStateDetectionTest(unittest.TestCase):
         )
         self.assertEqual(patch.detect_state(cpm.AsarArchive(asar)), "unknown")
 
-    def test_apply_modification_replaces_gate_call(self):
+    def test_apply_to_replaces_gate_call(self):
         """apply_to replaces checkGate calls with !0."""
         src = os.path.join(self.tmp, "extracted")
         os.makedirs(os.path.join(src, "webview", "assets"))

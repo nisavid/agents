@@ -1531,9 +1531,7 @@ class PatchState:
 def _make_reporter(progress_cb=None):
     """Create a progress-reporting callable.
 
-    Returns ``progress_cb`` if given, otherwise a no-op.  Eliminates the
-    ``def report(msg): if progress_cb: progress_cb(msg)`` closure that
-    was duplicated across four call sites.
+    Returns ``progress_cb`` if given, otherwise a no-op.
     """
     return progress_cb or (lambda _: None)
 

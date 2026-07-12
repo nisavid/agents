@@ -1,0 +1,16 @@
+[
+  {
+    "id": "example-gate-bypass",
+    "name": "Example: Bypass a Statsig Feature Gate",
+    "category": "feature-flags",
+    "description": "Template patch showing the patches.d/*.json schema. Replace the gate ID and target files with real values discovered in the extracted app.asar, then toggle it in the TUI.",
+    "modifications": [
+      {
+        "file": "webview/assets/some-module-*.js",
+        "search": "\\w+\\(`1234567890`\\)",
+        "replace": "!0",
+        "description": "Replace checkGate('1234567890') with true"
+      }
+    ]
+  }
+]

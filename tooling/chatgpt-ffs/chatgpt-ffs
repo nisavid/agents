@@ -132,12 +132,13 @@ class c:
 
 
 class AsarArchive:
-    """A readable asar archive.
+    """A readable and writable asar archive.
 
     Parses the binary header once on open.  The asar format layout —
     pickle-header framing, 4-byte alignment, offset semantics — stays
-    inside this module.  Callers use three methods: read a file, find
-    files by glob, extract the whole archive.
+    inside this module.  Readers use three methods: read a file, find
+    files by glob, extract the whole archive.  Writers use the static
+    ``pack`` method to build an archive from a directory.
     """
 
     def __init__(self, filepath):
@@ -1537,6 +1538,11 @@ def _make_reporter(progress_cb=None):
     return progress_cb or (lambda _: None)
 
 
+def _dim_reporter(msg):
+    """Print a progress message in dim style (for CLI commands)."""
+    print(f"  {c.wrap(c.DIM, msg)}")
+
+
 def commit_changes(bundle, patches_to_apply, progress_cb=None):
     """Extract original, apply selected patches, repack, install, and sign.
 
@@ -2537,7 +2543,7 @@ def cmd_apply(patches, bundle, patch_ids):
     for p in patches:
         if states[p.id] == "applied" and p not in selected:
             selected.append(p)
-    success, msg = commit_changes(bundle, selected, lambda m: print(f"  {c.wrap(c.DIM, m)}"))
+    success, msg = commit_changes(bundle, selected, _dim_reporter)
     if success:
         print(f"\n  {c.wrap(c.GREEN + c.BOLD, '✓')} {c.wrap(c.GREEN, msg)}")
     else:
@@ -2553,7 +2559,7 @@ def cmd_revert(patches, bundle, patch_ids):
     else:
         to_revert = set(patch_ids)
     selected = [p for p in patches if p.id not in to_revert]
-    success, msg = commit_changes(bundle, selected, lambda m: print(f"  {c.wrap(c.DIM, m)}"))
+    success, msg = commit_changes(bundle, selected, _dim_reporter)
     if success:
         print(f"\n  {c.wrap(c.GREEN + c.BOLD, '✓')} {c.wrap(c.GREEN, msg)}")
     else:
@@ -2701,7 +2707,7 @@ def cmd_restore(patches, bundle):
             print(f"  {c.wrap(c.DIM, 'No patches to reapply.')}")
         return
 
-    report = lambda msg: print(f"  {c.wrap(c.DIM, msg)}")
+    report = _dim_reporter
 
     try:
         report("Quitting app if running...")
@@ -2785,7 +2791,7 @@ def cmd_reapply(patches, bundle):
     print(f"  {c.wrap(c.DIM, f'Reapplying {count} {label}:')} {ids}")
 
     success, msg = commit_changes(bundle, selected,
-                                  lambda m: print(f"  {c.wrap(c.DIM, m)}"))
+                                  _dim_reporter)
     if success:
         print(f"\n  {c.wrap(c.GREEN + c.BOLD, '✓')} {c.wrap(c.GREEN, msg)}")
     else:

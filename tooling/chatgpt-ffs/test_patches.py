@@ -127,7 +127,7 @@ class PatchStateDetectionTest(unittest.TestCase):
         return asar
 
     def test_detect_not_applied(self):
-        """detect_patch_state returns 'not_applied' when search pattern is present."""
+        """detect_state returns 'not_applied' when search pattern is present."""
         asar = self._make_synthetic_asar({
             "webview/assets/test-module-abc123.js": "var x = checkGate(`505458`);",
         })
@@ -144,7 +144,7 @@ class PatchStateDetectionTest(unittest.TestCase):
         self.assertEqual(patch.detect_state(cpm.AsarArchive(asar)), "not_applied")
 
     def test_detect_applied(self):
-        """detect_patch_state returns 'applied' when search pattern is absent."""
+        """detect_state returns 'applied' when search pattern is absent."""
         asar = self._make_synthetic_asar({
             "webview/assets/test-module-abc123.js": "var x = !0;",
         })
@@ -161,7 +161,7 @@ class PatchStateDetectionTest(unittest.TestCase):
         self.assertEqual(patch.detect_state(cpm.AsarArchive(asar)), "applied")
 
     def test_detect_unknown_when_file_missing(self):
-        """detect_patch_state returns 'unknown' when no matching files exist."""
+        """detect_state returns 'unknown' when no matching files exist."""
         asar = self._make_synthetic_asar({
             "other.js": "var x = 1;",
         })
@@ -178,7 +178,7 @@ class PatchStateDetectionTest(unittest.TestCase):
         self.assertEqual(patch.detect_state(cpm.AsarArchive(asar)), "unknown")
 
     def test_apply_modification_replaces_gate_call(self):
-        """apply_modification replaces checkGate calls with !0."""
+        """apply_to replaces checkGate calls with !0."""
         src = os.path.join(self.tmp, "extracted")
         os.makedirs(os.path.join(src, "webview", "assets"))
         test_file = os.path.join(src, "webview", "assets", "test-module-abc123.js")

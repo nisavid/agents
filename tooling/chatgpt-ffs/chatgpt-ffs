@@ -1309,160 +1309,189 @@ def apply_patch(extracted_dir, patch):
     return total
 
 
-# ─── App Operations ─────────────────────────────────────────────────────────
-
-def get_paths(app_path):
-    """Get all relevant paths for the app bundle."""
-    return {
-        "app": app_path,
-        "resources": os.path.join(app_path, "Contents", "Resources"),
-        "asar": os.path.join(app_path, "Contents", "Resources", "app.asar"),
-        "asar_orig": os.path.join(
-            app_path, "Contents", "Resources", "app.asar.orig"
-        ),
-        "asar_unpacked": os.path.join(
-            app_path, "Contents", "Resources", "app.asar.unpacked"
-        ),
-        "plist": os.path.join(app_path, "Contents", "Info.plist"),
-        "frameworks": os.path.join(app_path, "Contents", "Frameworks"),
-    }
+# ─── App Bundle ──────────────────────────────────────────────────────────────
 
 
-def quit_app(app_path):
-    """Quit the app if running. Returns True if killed or not running."""
-    proc_name = os.path.basename(app_path).replace(".app", "")
-    result = subprocess.run(
-        ["killall", proc_name], capture_output=True, text=True
-    )
-    if result.returncode == 0:
-        import time
+class AppBundle:
+    """Owns the full app-bundle mutation lifecycle.
 
-        time.sleep(1)
-        return True
-    return True
+    Encapsulates path layout, process management, backup, asar
+    installation (copy → hash → plist → resign), signature verification,
+    and rollback.  The signing-order constraint — nested helpers →
+    frameworks → main app — stays inside this module.
+    """
 
+    def __init__(self, app_path):
+        self.app_path = app_path
+        self.resources = os.path.join(app_path, "Contents", "Resources")
+        self.asar = os.path.join(self.resources, "app.asar")
+        self.asar_orig = os.path.join(self.resources, "app.asar.orig")
+        self.asar_unpacked = os.path.join(self.resources, "app.asar.unpacked")
+        self.plist = os.path.join(app_path, "Contents", "Info.plist")
+        self.frameworks = os.path.join(app_path, "Contents", "Frameworks")
 
-def ensure_original(paths):
-    """Ensure a pristine backup of the original asar exists."""
-    asar = paths["asar"]
-    orig = paths["asar_orig"]
+    # ── Path compatibility ──────────────────────────────────────────────
 
-    if not os.path.exists(asar):
-        raise FileNotFoundError(f"app.asar not found at {asar}")
-
-    if not os.path.exists(orig):
-        shutil.copy2(asar, orig)
-        return True
-    return False
-
-
-def update_asar_hash(plist_path, asar_hash):
-    """Update the ElectronAsarIntegrity hash in Info.plist."""
-    import plistlib
-
-    with open(plist_path, "rb") as f:
-        plist = plistlib.load(f)
-    if "ElectronAsarIntegrity" not in plist:
-        plist["ElectronAsarIntegrity"] = {}
-    if "Resources/app.asar" not in plist["ElectronAsarIntegrity"]:
-        plist["ElectronAsarIntegrity"]["Resources/app.asar"] = {
-            "algorithm": "SHA256",
-            "hash": asar_hash,
+    @property
+    def paths(self):
+        """Dict view for callers that still use paths["asar"] etc."""
+        return {
+            "app": self.app_path,
+            "resources": self.resources,
+            "asar": self.asar,
+            "asar_orig": self.asar_orig,
+            "asar_unpacked": self.asar_unpacked,
+            "plist": self.plist,
+            "frameworks": self.frameworks,
         }
-    else:
-        plist["ElectronAsarIntegrity"]["Resources/app.asar"]["hash"] = asar_hash
-    with open(plist_path, "wb") as f:
-        plistlib.dump(plist, f)
+
+    # ── Process management ──────────────────────────────────────────────
+
+    def quit(self):
+        """Quit the app if running."""
+        proc_name = os.path.basename(self.app_path).replace(".app", "")
+        result = subprocess.run(
+            ["killall", proc_name], capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            import time
+            time.sleep(1)
+
+    # ── Backup ──────────────────────────────────────────────────────────
+
+    def ensure_backup(self):
+        """Ensure a pristine backup of the original asar exists.
+
+        Returns True if a new backup was created, False if one existed.
+        """
+        if not os.path.exists(self.asar):
+            raise FileNotFoundError(f"app.asar not found at {self.asar}")
+        if not os.path.exists(self.asar_orig):
+            shutil.copy2(self.asar, self.asar_orig)
+            return True
+        return False
+
+    # ── Install + sign ──────────────────────────────────────────────────
+
+    def install_asar(self, source_asar, progress_cb=None):
+        """Copy an asar into place, update the integrity hash, and re-sign.
+
+        Returns the SHA256 hash of the installed asar.  The hash is
+        computed from the destination after copying.
+        """
+        def report(msg):
+            if progress_cb:
+                progress_cb(msg)
+
+        shutil.copy2(source_asar, self.asar)
+        new_hash = sha256_file(self.asar)
+        report("Updating integrity hash in Info.plist...")
+        self._update_plist_hash(new_hash)
+        self._resign(progress_cb=progress_cb)
+        return new_hash
+
+    def _update_plist_hash(self, asar_hash):
+        """Update the ElectronAsarIntegrity hash in Info.plist."""
+        import plistlib
+
+        with open(self.plist, "rb") as f:
+            plist = plistlib.load(f)
+        if "ElectronAsarIntegrity" not in plist:
+            plist["ElectronAsarIntegrity"] = {}
+        if "Resources/app.asar" not in plist["ElectronAsarIntegrity"]:
+            plist["ElectronAsarIntegrity"]["Resources/app.asar"] = {
+                "algorithm": "SHA256",
+                "hash": asar_hash,
+            }
+        else:
+            plist["ElectronAsarIntegrity"]["Resources/app.asar"]["hash"] = asar_hash
+        with open(self.plist, "wb") as f:
+            plistlib.dump(plist, f)
+
+    def _resign(self, progress_cb=None):
+        """Re-sign with ad-hoc signature and proper entitlements.
+
+        Must sign nested helper apps inside frameworks before signing
+        the frameworks themselves, then the main app last. Otherwise
+        macOS library validation rejects the Team ID mismatch between
+        the ad-hoc main app and still-original helper processes.
+        """
+        def report(msg):
+            if progress_cb:
+                progress_cb(msg)
+
+        codex_fw = os.path.join(self.frameworks, "Codex Framework.framework")
+        sparkle_fw = os.path.join(self.frameworks, "Sparkle.framework")
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".plist", delete=False
+        ) as f:
+            f.write(APP_ENTITLEMENTS)
+            app_ents = f.name
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".plist", delete=False
+        ) as f:
+            f.write(FW_ENTITLEMENTS)
+            fw_ents = f.name
+
+        try:
+            report("Signing nested helper apps...")
+            for fw in [codex_fw, sparkle_fw]:
+                if not os.path.exists(fw):
+                    continue
+                for helper in _find_nested_code(fw):
+                    subprocess.run(
+                        ["codesign", "--force", "--sign", "-",
+                         "--entitlements", fw_ents, helper],
+                        capture_output=True, text=True, check=False,
+                    )
+            if os.path.exists(codex_fw):
+                report("Signing Codex Framework...")
+                subprocess.run(
+                    ["codesign", "--force", "--sign", "-",
+                     "--entitlements", fw_ents, codex_fw],
+                    capture_output=True, text=True, check=True,
+                )
+            if os.path.exists(sparkle_fw):
+                report("Signing Sparkle Framework...")
+                subprocess.run(
+                    ["codesign", "--force", "--sign", "-", sparkle_fw],
+                    capture_output=True, text=True, check=False,
+                )
+            report("Signing main app...")
+            subprocess.run(
+                ["codesign", "--force", "--sign", "-",
+                 "--entitlements", app_ents, self.app_path],
+                capture_output=True, text=True, check=True,
+            )
+        finally:
+            for tmp_path in (app_ents, fw_ents):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+    # ── Verification ────────────────────────────────────────────────────
+
+    def verify_signature(self):
+        """Verify the code signature. Returns (bool, message)."""
+        result = subprocess.run(
+            ["codesign", "--verify", "--verbose", self.app_path],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            return True, "valid"
+        return False, result.stderr.strip()
 
 
 def _find_nested_code(framework_path):
-    """Find all nested .app bundles and .node files inside a framework."""
+    """Find all nested .app bundles inside a framework."""
     nested = []
     for root, dirs, files in os.walk(framework_path):
         for name in dirs:
             if name.endswith(".app"):
                 nested.append(os.path.join(root, name))
     return sorted(nested)
-
-
-def resign_app(app_path, progress_cb=None):
-    """Re-sign the app with ad-hoc signature and proper entitlements.
-
-    Must sign all nested helper apps inside frameworks before signing
-    the frameworks themselves, then sign the main app last. Otherwise
-    macOS library validation rejects the Team ID mismatch between the
-    ad-hoc main app and the still-original helper processes, causing
-    the app to spin at 100% CPU in a dlopen retry loop.
-    """
-    def report(msg):
-        if progress_cb:
-            progress_cb(msg)
-
-    frameworks = os.path.join(app_path, "Contents", "Frameworks")
-    codex_fw = os.path.join(frameworks, "Codex Framework.framework")
-    sparkle_fw = os.path.join(frameworks, "Sparkle.framework")
-
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".plist", delete=False
-    ) as f:
-        f.write(APP_ENTITLEMENTS)
-        app_ents = f.name
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".plist", delete=False
-    ) as f:
-        f.write(FW_ENTITLEMENTS)
-        fw_ents = f.name
-
-    try:
-        # Sign nested helper apps first (deepest first).
-        report("Signing nested helper apps...")
-        for fw in [codex_fw, sparkle_fw]:
-            if not os.path.exists(fw):
-                continue
-            for helper in _find_nested_code(fw):
-                subprocess.run(
-                    ["codesign", "--force", "--sign", "-",
-                     "--entitlements", fw_ents, helper],
-                    capture_output=True, text=True, check=False,
-                )
-        # Sign frameworks.
-        if os.path.exists(codex_fw):
-            report("Signing Codex Framework...")
-            subprocess.run(
-                ["codesign", "--force", "--sign", "-",
-                 "--entitlements", fw_ents, codex_fw],
-                capture_output=True, text=True, check=True,
-            )
-        if os.path.exists(sparkle_fw):
-            report("Signing Sparkle Framework...")
-            subprocess.run(
-                ["codesign", "--force", "--sign", "-", sparkle_fw],
-                capture_output=True, text=True, check=False,
-            )
-        # Sign main app last.
-        report("Signing main app...")
-        subprocess.run(
-            ["codesign", "--force", "--sign", "-",
-             "--entitlements", app_ents, app_path],
-            capture_output=True, text=True, check=True,
-        )
-    finally:
-        for tmp_path in (app_ents, fw_ents):
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-
-
-def verify_signature(app_path):
-    """Verify the app's code signature. Returns (bool, message)."""
-    result = subprocess.run(
-        ["codesign", "--verify", "--verbose", app_path],
-        capture_output=True, text=True,
-    )
-    if result.returncode == 0:
-        return True, "valid"
-    return False, result.stderr.strip()
 
 
 # ─── State Management ───────────────────────────────────────────────────────
@@ -1485,39 +1514,19 @@ def save_state(state):
 # ─── Commit Logic ───────────────────────────────────────────────────────────
 
 
-def _install_asar(paths, source_asar, progress_cb=None):
-    """Copy an asar into place, update the integrity hash, and re-sign.
-
-    Returns the SHA256 hash of the installed asar.  The hash is computed
-    from the destination after copying, so it is always correct even if
-    the source is modified during the copy.
-    """
-    def report(msg):
-        if progress_cb:
-            progress_cb(msg)
-
-    shutil.copy2(source_asar, paths["asar"])
-    new_hash = sha256_file(paths["asar"])
-    report("Updating integrity hash in Info.plist...")
-    update_asar_hash(paths["plist"], new_hash)
-    resign_app(paths["app"], progress_cb=progress_cb)
-    return new_hash
-
-
-def commit_changes(paths, patches_to_apply, progress_cb=None):
+def commit_changes(bundle, patches_to_apply, progress_cb=None):
     """Extract original, apply selected patches, repack, install, and sign.
 
     Args:
-        paths: dict from get_paths()
+        bundle: AppBundle instance
         patches_to_apply: list of Patch objects to apply
         progress_cb: optional callback(step_name) for progress updates
 
     Returns:
         (success: bool, message: str)
 
-    If any step after installing the patched asar fails (hash update,
-    re-signing, or signature verification), the original asar is restored
-    from backup so the app is never left in a broken state.
+    If any step after installing the patched asar fails, the original
+    asar is restored from backup so the app is never left broken.
     """
     def report(msg):
         if progress_cb:
@@ -1525,18 +1534,18 @@ def commit_changes(paths, patches_to_apply, progress_cb=None):
 
     try:
         report("Quitting app if running...")
-        quit_app(paths["app"])
+        bundle.quit()
 
         report("Ensuring original backup...")
-        ensure_original(paths)
+        bundle.ensure_backup()
 
         with tempfile.TemporaryDirectory(prefix="codex-pm-") as tmpdir:
             extracted = os.path.join(tmpdir, "extracted")
             report("Extracting original asar...")
-            archive = AsarArchive(paths["asar_orig"])
+            archive = AsarArchive(bundle.asar_orig)
             unpacked_paths = archive.extract(
                 extracted,
-                unpacked_dir=paths["asar_unpacked"],
+                unpacked_dir=bundle.asar_unpacked,
             )
 
             warnings = []
@@ -1558,10 +1567,10 @@ def commit_changes(paths, patches_to_apply, progress_cb=None):
 
             try:
                 report("Installing patched asar...")
-                new_hash = _install_asar(paths, patched_asar, progress_cb=report)
+                new_hash = bundle.install_asar(patched_asar, progress_cb=report)
 
                 report("Verifying signature...")
-                ok, msg = verify_signature(paths["app"])
+                ok, msg = bundle.verify_signature()
                 if not ok:
                     raise RuntimeError(
                         f"Signature verification failed: {msg}"
@@ -1570,12 +1579,14 @@ def commit_changes(paths, patches_to_apply, progress_cb=None):
             except Exception as install_err:
                 report(f"Install failed: {install_err}")
                 report("Rolling back to original asar...")
-                orig_hash = _install_asar(paths, paths["asar_orig"], progress_cb=report)
+                orig_hash = bundle.install_asar(
+                    bundle.asar_orig, progress_cb=report
+                )
                 state = load_state()
                 state["installed_hash"] = orig_hash
                 save_state(state)
                 report("Verifying rollback signature...")
-                ok, msg = verify_signature(paths["app"])
+                ok, msg = bundle.verify_signature()
                 if not ok:
                     report(f"WARNING: Rollback signature invalid: {msg}")
                 report("Rollback complete — app restored to original state.")
@@ -1701,11 +1712,11 @@ LABEL_DIMENSIONS = [
 class PatchManagerTUI:
     VIEWS = ("list", "detail", "preview", "commit", "legend")
 
-    def __init__(self, stdscr, patches, states, paths):
+    def __init__(self, stdscr, patches, states, bundle):
         self.stdscr = stdscr
         self.patches = patches
         self.states = states
-        self.paths = paths
+        self.bundle = bundle
         self.view = "list"
         self.cursor = 0
         self.scroll = 0
@@ -1776,7 +1787,7 @@ class PatchManagerTUI:
                     self.view = "list"
                     for p in self.patches:
                         self.states[p.id] = detect_patch_state(
-                            self.paths["asar"], p
+                            self.bundle.asar, p
                         )
                         self.desired[p.id] = self.states[p.id] == "applied"
 
@@ -1884,7 +1895,7 @@ class PatchManagerTUI:
         self._hline(1, 0, w, heavy=True)
 
         # App path
-        app_short = self.paths["app"]
+        app_short = self.bundle.app_path
         if len(app_short) > w - 12:
             app_short = "…" + app_short[-(w - 14):]
         self._safe_addstr(2, 2, "App:", self._dim())
@@ -2444,7 +2455,7 @@ class PatchManagerTUI:
             self.commit_log.append(msg)
             self._draw()
 
-        success, message = commit_changes(self.paths, patches_to_apply, progress)
+        success, message = commit_changes(self.bundle, patches_to_apply, progress)
         self.commit_success = success
         if not success:
             self.commit_log.append(f"ERROR: {message}")
@@ -2464,15 +2475,15 @@ def _state_symbol(state):
         return ("?", c.YELLOW)
 
 
-def cmd_list(patches, paths):
+def cmd_list(patches, bundle):
     """List all patches and their current state."""
     print()
     print(f"  {c.wrap(c.B_CYAN + c.BOLD, 'ChatGPT FFS')}")
-    print(f"  {c.wrap(c.DIM, 'App:')} {c.wrap(c.CYAN, paths['app'])}")
+    print(f"  {c.wrap(c.DIM, 'App:')} {c.wrap(c.CYAN, bundle.app_path)}")
     print()
 
     for patch in patches:
-        state = detect_patch_state(paths["asar"], patch)
+        state = detect_patch_state(bundle.asar, patch)
         symbol, color = _state_symbol(state)
 
         status_text = {
@@ -2488,9 +2499,9 @@ def cmd_list(patches, paths):
         print()
 
 
-def cmd_apply(patches, paths, patch_ids):
+def cmd_apply(patches, bundle, patch_ids):
     """Apply specified patches."""
-    ensure_original(paths)
+    bundle.ensure_backup()
     selected = []
     for pid in patch_ids:
         patch = next((p for p in patches if p.id == pid), None)
@@ -2499,10 +2510,10 @@ def cmd_apply(patches, paths, patch_ids):
             sys.exit(1)
         selected.append(patch)
     for p in patches:
-        state = detect_patch_state(paths["asar"], p)
+        state = detect_patch_state(bundle.asar, p)
         if state == "applied" and p not in selected:
             selected.append(p)
-    success, msg = commit_changes(paths, selected, lambda m: print(f"  {c.wrap(c.DIM, m)}"))
+    success, msg = commit_changes(bundle, selected, lambda m: print(f"  {c.wrap(c.DIM, m)}"))
     if success:
         print(f"\n  {c.wrap(c.GREEN + c.BOLD, '✓')} {c.wrap(c.GREEN, msg)}")
     else:
@@ -2510,15 +2521,15 @@ def cmd_apply(patches, paths, patch_ids):
         sys.exit(1)
 
 
-def cmd_revert(patches, paths, patch_ids):
+def cmd_revert(patches, bundle, patch_ids):
     """Revert specified patches (or all)."""
-    ensure_original(paths)
+    bundle.ensure_backup()
     if not patch_ids or "all" in patch_ids:
         to_revert = set(p.id for p in patches)
     else:
         to_revert = set(patch_ids)
     selected = [p for p in patches if p.id not in to_revert]
-    success, msg = commit_changes(paths, selected, lambda m: print(f"  {c.wrap(c.DIM, m)}"))
+    success, msg = commit_changes(bundle, selected, lambda m: print(f"  {c.wrap(c.DIM, m)}"))
     if success:
         print(f"\n  {c.wrap(c.GREEN + c.BOLD, '✓')} {c.wrap(c.GREEN, msg)}")
     else:
@@ -2526,11 +2537,11 @@ def cmd_revert(patches, paths, patch_ids):
         sys.exit(1)
 
 
-def cmd_status(patches, paths):
+def cmd_status(patches, bundle):
     """Show brief status."""
     applied = 0
     for p in patches:
-        state = detect_patch_state(paths["asar"], p)
+        state = detect_patch_state(bundle.asar, p)
         if state == "applied":
             applied += 1
             print(f"  {c.wrap(c.GREEN, _CHECK)} {c.wrap(c.CYAN, p.id)}")
@@ -2542,7 +2553,7 @@ def cmd_status(patches, paths):
 # ─── Verify ─────────────────────────────────────────────────────────────────
 
 
-def cmd_verify(patches, paths):
+def cmd_verify(patches, bundle):
     """Verify app integrity: asar, backup, signature, and patch state.
 
     Runs a closed-loop check that the app.asar is readable, the backup
@@ -2555,7 +2566,7 @@ def cmd_verify(patches, paths):
     print()
 
     # 1. app.asar exists and is readable
-    asar_path = paths["asar"]
+    asar_path = bundle.asar
     if not os.path.exists(asar_path):
         print(f"  {c.wrap(c.RED + c.BOLD, _CROSS)} app.asar not found at {asar_path}")
         return False
@@ -2567,13 +2578,13 @@ def cmd_verify(patches, paths):
         return False
 
     # 2. Backup exists
-    if os.path.exists(paths["asar_orig"]):
+    if os.path.exists(bundle.asar_orig):
         print(f"  {c.wrap(c.GREEN, _CHECK)} Backup exists (app.asar.orig)")
     else:
         print(f"  {c.wrap(c.YELLOW, '⚠')} No backup — first patch will create one")
 
     # 3. Signature
-    sig_ok, sig_msg = verify_signature(paths["app"])
+    sig_ok, sig_msg = bundle.verify_signature()
     if sig_ok:
         print(f"  {c.wrap(c.GREEN, _CHECK)} Code signature valid")
     else:
@@ -2635,7 +2646,7 @@ def cmd_verify(patches, paths):
 # ─── Update Workflow ───────────────────────────────────────────────────────
 
 
-def cmd_restore(patches, paths):
+def cmd_restore(patches, bundle):
     """Restore pristine app.asar from backup, preserving the applied-patch list.
 
     Saves the set of currently-applied patches to state so ``reapply`` can
@@ -2646,16 +2657,16 @@ def cmd_restore(patches, paths):
     # Detect which patches are currently applied so reapply can restore them.
     applied_ids = [
         p.id for p in patches
-        if detect_patch_state(paths["asar"], p) == "applied"
+        if detect_patch_state(bundle.asar, p) == "applied"
     ]
 
     state = load_state()
     state["applied_patches"] = applied_ids
 
-    orig = paths["asar_orig"]
+    orig = bundle.asar_orig
     if not os.path.exists(orig):
         # Already pristine (e.g. app was just updated and no backup exists).
-        state["installed_hash"] = sha256_file(paths["asar"])
+        state["installed_hash"] = sha256_file(bundle.asar)
         save_state(state)
         print(f"  {c.wrap(c.YELLOW, '⚠')} No backup found — app is already pristine.")
         if applied_ids:
@@ -2670,16 +2681,16 @@ def cmd_restore(patches, paths):
 
     try:
         report("Quitting app if running...")
-        quit_app(paths["app"])
+        bundle.quit()
 
         report("Restoring pristine app.asar from backup...")
-        new_hash = _install_asar(paths, orig, progress_cb=report)
+        new_hash = bundle.install_asar(orig, progress_cb=report)
 
         state["installed_hash"] = new_hash
         save_state(state)
 
         report("Verifying signature...")
-        ok, msg = verify_signature(paths["app"])
+        ok, msg = bundle.verify_signature()
         if not ok:
             report(f"WARNING: Signature verification failed: {msg}")
         else:
@@ -2699,12 +2710,12 @@ def cmd_restore(patches, paths):
         sys.exit(1)
 
 
-def cmd_reapply(patches, paths):
+def cmd_reapply(patches, bundle):
     """Re-apply the patch set saved by ``restore``.
 
     Reads ``applied_patches`` from state.  If the current ``app.asar`` hash
     differs from the stored ``installed_hash`` (i.e. the app was updated),
-    the stale ``app.asar.orig`` backup is deleted so ``ensure_original``
+    the stale ``app.asar.orig`` backup is deleted so ``ensure_backup``
     creates a fresh one from the new version.
     """
     state = load_state()
@@ -2718,10 +2729,10 @@ def cmd_reapply(patches, paths):
 
     # Detect stale backup: if the current asar hash doesn't match what we
     # stored at restore time, the app was updated and app.asar.orig is stale.
-    current_hash = sha256_file(paths["asar"])
+    current_hash = sha256_file(bundle.asar)
     stored_hash = state.get("installed_hash")
     if stored_hash and current_hash != stored_hash:
-        orig = paths["asar_orig"]
+        orig = bundle.asar_orig
         if os.path.exists(orig):
             print(f"  {c.wrap(c.DIM, 'App updated — refreshing backup...')}")
             os.remove(orig)
@@ -2751,7 +2762,7 @@ def cmd_reapply(patches, paths):
     ids = ", ".join(c.wrap(c.CYAN, p.id) for p in selected)
     print(f"  {c.wrap(c.DIM, f'Reapplying {count} {label}:')} {ids}")
 
-    success, msg = commit_changes(paths, selected,
+    success, msg = commit_changes(bundle, selected,
                                   lambda m: print(f"  {c.wrap(c.DIM, m)}"))
     if success:
         print(f"\n  {c.wrap(c.GREEN + c.BOLD, '✓')} {c.wrap(c.GREEN, msg)}")
@@ -2761,7 +2772,7 @@ def cmd_reapply(patches, paths):
         sys.exit(1)
 
 
-def cmd_update(patches, paths):
+def cmd_update(patches, bundle):
     """Guided update workflow: restore → wait for app update → reapply.
 
     Restores the pristine app, prints update instructions, waits for the
@@ -2895,13 +2906,13 @@ def main():
         cmd_install()
         return
 
-    paths = get_paths(args.app)
+    bundle = AppBundle(args.app)
 
-    if not os.path.exists(paths["asar"]):
-        app_short = os.path.basename(paths["app"])
+    if not os.path.exists(bundle.asar):
+        app_short = os.path.basename(bundle.app_path)
         print(
-            f"Error: {paths['asar']} not found.\n"
-            f"Is {app_short} installed at {paths['app']}?",
+            f"Error: {bundle.asar} not found.\n"
+            f"Is {app_short} installed at {bundle.app_path}?",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -2909,35 +2920,35 @@ def main():
     patches = load_patches()
 
     if args.command == "list":
-        cmd_list(patches, paths)
+        cmd_list(patches, bundle)
     elif args.command == "status":
-        cmd_status(patches, paths)
+        cmd_status(patches, bundle)
     elif args.command == "verify":
-        ok = cmd_verify(patches, paths)
+        ok = cmd_verify(patches, bundle)
         sys.exit(0 if ok else 1)
     elif args.command == "apply":
-        cmd_apply(patches, paths, args.patches)
+        cmd_apply(patches, bundle, args.patches)
     elif args.command == "revert":
-        cmd_revert(patches, paths, args.patches)
+        cmd_revert(patches, bundle, args.patches)
     elif args.command == "restore":
-        cmd_restore(patches, paths)
+        cmd_restore(patches, bundle)
     elif args.command == "reapply":
-        cmd_reapply(patches, paths)
+        cmd_reapply(patches, bundle)
     elif args.command == "update":
-        cmd_update(patches, paths)
+        cmd_update(patches, bundle)
     elif args.command == "tui":
-        _run_tui(patches, paths)
+        _run_tui(patches, bundle)
     else:
-        _run_tui(patches, paths)
+        _run_tui(patches, bundle)
 
 
-def _run_tui(patches, paths):
+def _run_tui(patches, bundle):
     states = {}
     for p in patches:
-        states[p.id] = detect_patch_state(paths["asar"], p)
+        states[p.id] = detect_patch_state(bundle.asar, p)
 
     def tui_main(stdscr):
-        ui = PatchManagerTUI(stdscr, patches, states, paths)
+        ui = PatchManagerTUI(stdscr, patches, states, bundle)
         ui.run()
 
     try:

@@ -132,116 +132,134 @@ class c:
 
 # ─── Asar Format (pure Python, no dependencies) ─────────────────────────────
 
-def read_asar_header(filepath):
-    """Read asar header, returning (json_header_dict, file_data_start_offset)."""
-    with open(filepath, "rb") as f:
-        head = f.read(20)
-        if len(head) < 16:
-            raise ValueError("File too small to be an asar archive")
-        if head[8] == 0x7B:
-            json_offset = 8
-            json_size = struct.unpack("<I", head[4:8])[0]
-        elif head[16] == 0x7B:
-            json_offset = 16
-            json_size = struct.unpack("<I", head[12:16])[0]
-        else:
-            raise ValueError(
-                f"Cannot detect asar header format "
-                f"(byte 8=0x{head[8]:02x}, byte 16=0x{head[16]:02x})"
-            )
-        f.seek(json_offset)
-        header = json.loads(f.read(json_size).decode("utf-8"))
-        padded = math.ceil(json_size / 4) * 4
-        file_data_start = json_offset + padded
-        return header, file_data_start
 
+class AsarArchive:
+    """A readable asar archive.
 
-def read_asar_file(filepath, file_path):
-    """Read a single file from the asar by its internal path. Returns bytes or None."""
-    header, fds = read_asar_header(filepath)
-    node = header
-    for part in file_path.split("/"):
-        if not isinstance(node, dict) or "files" not in node:
-            return None
-        node = node["files"].get(part)
-        if node is None:
-            return None
-    if not isinstance(node, dict) or "offset" not in node:
-        return None
-    with open(filepath, "rb") as f:
-        f.seek(int(node["offset"]) + fds)
-        return f.read(node["size"])
-
-
-def find_asar_files(header, glob_pattern):
-    """Find all file paths in the asar header matching a glob pattern."""
-    results = []
-
-    def walk(node, path):
-        if not isinstance(node, dict):
-            return
-        if "files" in node:
-            for name, child in node["files"].items():
-                walk(child, f"{path}/{name}" if path else name)
-        elif "offset" in node and path:
-            if fnmatch.fnmatch(path, glob_pattern):
-                results.append(path)
-
-    walk(header, "")
-    return sorted(results)
-
-
-def extract_asar(asar_path, dest_dir, unpacked_dir=None):
-    """Extract an asar archive to a directory.
-
-    Packed files (those with an "offset") are read from the asar binary.
-    Unpacked files (those with "unpacked": true and no offset) are copied
-    from the sibling ``unpacked_dir`` (defaults to ``asar_path + ".unpacked"``).
-
-    Returns a set of relative paths that are unpacked.  This set must be
-    passed to :func:`pack_asar` so the repacked header preserves the
-    "unpacked": true flag for those entries.
+    Parses the binary header once on open.  The asar format layout —
+    pickle-header framing, 4-byte alignment, offset semantics — stays
+    inside this module.  Callers use three methods: read a file, find
+    files by glob, extract the whole archive.
     """
-    header, fds = read_asar_header(asar_path)
-    os.makedirs(dest_dir, exist_ok=True)
-    if unpacked_dir is None:
-        unpacked_dir = asar_path + ".unpacked"
-    unpacked_paths = set()
 
-    def extract_node(node, current_path, rel_path):
-        if not isinstance(node, dict):
-            return
-        if "files" in node:
-            os.makedirs(current_path, exist_ok=True)
-            for name, child in node["files"].items():
-                child_rel = f"{rel_path}/{name}" if rel_path else name
-                extract_node(child, os.path.join(current_path, name), child_rel)
-        elif "offset" in node:
-            os.makedirs(os.path.dirname(current_path), exist_ok=True)
-            with open(asar_path, "rb") as f:
-                f.seek(int(node["offset"]) + fds)
-                data = f.read(node["size"])
-            with open(current_path, "wb") as out:
-                out.write(data)
-            if node.get("executable"):
-                os.chmod(current_path, 0o755)
+    def __init__(self, filepath):
+        self.filepath = filepath
+        self._header, self._data_start = self._parse_header(filepath)
+
+    @staticmethod
+    def _parse_header(filepath):
+        """Detect header framing, parse JSON, compute data-start offset."""
+        with open(filepath, "rb") as f:
+            head = f.read(20)
+            if len(head) < 16:
+                raise ValueError("File too small to be an asar archive")
+            if head[8] == 0x7B:
+                json_offset = 8
+                json_size = struct.unpack("<I", head[4:8])[0]
+            elif head[16] == 0x7B:
+                json_offset = 16
+                json_size = struct.unpack("<I", head[12:16])[0]
             else:
-                cur_mode = os.stat(current_path).st_mode
-                os.chmod(current_path, cur_mode & ~0o111)
-        elif node.get("unpacked"):
-            unpacked_paths.add(rel_path)
-            src_file = os.path.join(unpacked_dir, rel_path)
-            if os.path.exists(src_file):
+                raise ValueError(
+                    f"Cannot detect asar header format "
+                    f"(byte 8=0x{head[8]:02x}, byte 16=0x{head[16]:02x})"
+                )
+            f.seek(json_offset)
+            header = json.loads(f.read(json_size).decode("utf-8"))
+            padded = math.ceil(json_size / 4) * 4
+            data_start = json_offset + padded
+            return header, data_start
+
+    @property
+    def header(self):
+        return self._header
+
+    def _resolve_node(self, internal_path):
+        """Navigate the header tree to a leaf node. Returns dict or None."""
+        node = self._header
+        for part in internal_path.split("/"):
+            if not isinstance(node, dict) or "files" not in node:
+                return None
+            node = node["files"].get(part)
+            if node is None:
+                return None
+        return node if isinstance(node, dict) else None
+
+    def read_file(self, internal_path):
+        """Read a single file by its internal path. Returns bytes or None."""
+        node = self._resolve_node(internal_path)
+        if node is None or "offset" not in node:
+            return None
+        with open(self.filepath, "rb") as f:
+            f.seek(int(node["offset"]) + self._data_start)
+            return f.read(node["size"])
+
+    def find_files(self, glob_pattern):
+        """Find all internal paths matching a glob pattern."""
+        results = []
+
+        def walk(node, path):
+            if not isinstance(node, dict):
+                return
+            if "files" in node:
+                for name, child in node["files"].items():
+                    walk(child, f"{path}/{name}" if path else name)
+            elif "offset" in node and path:
+                if fnmatch.fnmatch(path, glob_pattern):
+                    results.append(path)
+
+        walk(self._header, "")
+        return sorted(results)
+
+    def extract(self, dest_dir, unpacked_dir=None):
+        """Extract the entire archive to a directory.
+
+        Packed files are read from the asar binary.  Unpacked files
+        (``"unpacked": true`` with no offset) are copied from the sibling
+        ``unpacked_dir`` (defaults to ``filepath + ".unpacked"``).
+
+        Returns a set of relative paths that are unpacked.  Pass this set
+        to :func:`pack_asar` so the repacked header preserves the flag.
+        """
+        os.makedirs(dest_dir, exist_ok=True)
+        if unpacked_dir is None:
+            unpacked_dir = self.filepath + ".unpacked"
+        unpacked_paths = set()
+
+        def extract_node(node, current_path, rel_path):
+            if not isinstance(node, dict):
+                return
+            if "files" in node:
+                os.makedirs(current_path, exist_ok=True)
+                for name, child in node["files"].items():
+                    child_rel = f"{rel_path}/{name}" if rel_path else name
+                    extract_node(child, os.path.join(current_path, name), child_rel)
+            elif "offset" in node:
                 os.makedirs(os.path.dirname(current_path), exist_ok=True)
-                shutil.copy2(src_file, current_path)
+                with open(self.filepath, "rb") as f:
+                    f.seek(int(node["offset"]) + self._data_start)
+                    data = f.read(node["size"])
+                with open(current_path, "wb") as out:
+                    out.write(data)
                 if node.get("executable"):
                     os.chmod(current_path, 0o755)
                 else:
                     cur_mode = os.stat(current_path).st_mode
                     os.chmod(current_path, cur_mode & ~0o111)
+            elif node.get("unpacked"):
+                unpacked_paths.add(rel_path)
+                src_file = os.path.join(unpacked_dir, rel_path)
+                if os.path.exists(src_file):
+                    os.makedirs(os.path.dirname(current_path), exist_ok=True)
+                    shutil.copy2(src_file, current_path)
+                    if node.get("executable"):
+                        os.chmod(current_path, 0o755)
+                    else:
+                        cur_mode = os.stat(current_path).st_mode
+                        os.chmod(current_path, cur_mode & ~0o111)
 
-    extract_node(header, dest_dir, "")
-    return unpacked_paths
+        extract_node(self._header, dest_dir, "")
+        return unpacked_paths
 
 
 def _compute_integrity(data):
@@ -1245,18 +1263,18 @@ def load_patches():
 def detect_patch_state(asar_path, patch):
     """Detect if a patch is applied. Returns 'applied', 'not_applied', or 'unknown'."""
     try:
-        header, fds = read_asar_header(asar_path)
+        archive = AsarArchive(asar_path)
     except Exception:
         return "unknown"
 
     any_file_found = False
     for mod in patch.modifications:
-        matching_files = find_asar_files(header, mod.file)
+        matching_files = archive.find_files(mod.file)
         if not matching_files:
             continue
         any_file_found = True
         for fpath in matching_files:
-            content = read_asar_file(asar_path, fpath)
+            content = archive.read_file(fpath)
             if content is None:
                 continue
             text = content.decode("utf-8", errors="replace")
@@ -1515,8 +1533,9 @@ def commit_changes(paths, patches_to_apply, progress_cb=None):
         with tempfile.TemporaryDirectory(prefix="codex-pm-") as tmpdir:
             extracted = os.path.join(tmpdir, "extracted")
             report("Extracting original asar...")
-            unpacked_paths = extract_asar(
-                paths["asar_orig"], extracted,
+            archive = AsarArchive(paths["asar_orig"])
+            unpacked_paths = archive.extract(
+                extracted,
                 unpacked_dir=paths["asar_unpacked"],
             )
 
@@ -2541,7 +2560,7 @@ def cmd_verify(patches, paths):
         print(f"  {c.wrap(c.RED + c.BOLD, _CROSS)} app.asar not found at {asar_path}")
         return False
     try:
-        read_asar_header(asar_path)
+        AsarArchive(asar_path)
         print(f"  {c.wrap(c.GREEN, _CHECK)} app.asar is readable")
     except Exception as e:
         print(f"  {c.wrap(c.RED + c.BOLD, _CROSS)} app.asar is corrupted: {e}")

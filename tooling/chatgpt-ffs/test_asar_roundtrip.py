@@ -78,7 +78,8 @@ class AsarRoundTripTest(unittest.TestCase):
 
         # Extract — should return the set of unpacked paths.
         extracted = os.path.join(self.tmp, "extracted")
-        result = cpm.extract_asar(asar1, extracted)
+        archive1 = cpm.AsarArchive(asar1)
+        result = archive1.extract(extracted)
 
         self.assertEqual(result, {"unpacked.node"})
         self.assertTrue(os.path.isfile(os.path.join(extracted, "packed.txt")))
@@ -89,8 +90,8 @@ class AsarRoundTripTest(unittest.TestCase):
         cpm.pack_asar(extracted, asar2, unpacked_paths=result)
 
         # Verify the repacked header.
-        header, fds = cpm.read_asar_header(asar2)
-        files = header["files"]
+        archive2 = cpm.AsarArchive(asar2)
+        files = archive2.header["files"]
 
         # Packed file: has offset, no unpacked flag.
         self.assertIn("packed.txt", files)
@@ -105,11 +106,11 @@ class AsarRoundTripTest(unittest.TestCase):
         self.assertIn("integrity", files["unpacked.node"])
 
         # Packed file data is readable from the asar binary.
-        data = cpm.read_asar_file(asar2, "packed.txt")
+        data = archive2.read_file("packed.txt")
         self.assertEqual(data, packed_data)
 
         # Unpacked file data is NOT in the asar binary (no offset).
-        data = cpm.read_asar_file(asar2, "unpacked.node")
+        data = archive2.read_file("unpacked.node")
         self.assertIsNone(data)
 
     def test_roundtrip_nested_unpacked(self):
@@ -130,7 +131,8 @@ class AsarRoundTripTest(unittest.TestCase):
         self._make_unpacked_dir(asar1, {unpacked_rel: unpacked_data})
 
         extracted = os.path.join(self.tmp, "extracted")
-        result = cpm.extract_asar(asar1, extracted)
+        archive1 = cpm.AsarArchive(asar1)
+        result = archive1.extract(extracted)
 
         self.assertEqual(result, {unpacked_rel})
         self.assertTrue(os.path.isfile(os.path.join(extracted, "root.txt")))
@@ -139,7 +141,8 @@ class AsarRoundTripTest(unittest.TestCase):
         asar2 = os.path.join(self.tmp, "nested2.asar")
         cpm.pack_asar(extracted, asar2, unpacked_paths=result)
 
-        header, fds = cpm.read_asar_header(asar2)
+        archive2 = cpm.AsarArchive(asar2)
+        header = archive2.header
         node = header["files"]["node_modules"]["files"]["better-sqlite3"]["files"]["build"]["files"]["Release"]["files"]["better_sqlite3.node"]
 
         self.assertTrue(node.get("unpacked"))
@@ -156,11 +159,11 @@ class AsarRoundTripTest(unittest.TestCase):
         asar = os.path.join(self.tmp, "compat.asar")
         cpm.pack_asar(src, asar)
 
-        header, fds = cpm.read_asar_header(asar)
-        node = header["files"]["file.txt"]
+        archive = cpm.AsarArchive(asar)
+        node = archive.header["files"]["file.txt"]
         self.assertIn("offset", node)
         self.assertNotIn("unpacked", node)
-        self.assertEqual(cpm.read_asar_file(asar, "file.txt"), b"content")
+        self.assertEqual(archive.read_file("file.txt"), b"content")
 
     def test_extract_without_unpacked_dir(self):
         """Extract gracefully handles missing .unpacked/ directory."""
@@ -169,7 +172,8 @@ class AsarRoundTripTest(unittest.TestCase):
         cpm.pack_asar(src, asar)
 
         extracted = os.path.join(self.tmp, "extracted")
-        result = cpm.extract_asar(asar, extracted)
+        archive = cpm.AsarArchive(asar)
+        result = archive.extract(extracted)
 
         self.assertEqual(result, set())
         self.assertTrue(os.path.isfile(os.path.join(extracted, "packed.txt")))
@@ -234,7 +238,8 @@ class IntegrityEncodingTest(unittest.TestCase):
         asar = os.path.join(self.tmp, "test.asar")
         cpm.pack_asar(src, asar)
 
-        header, _ = cpm.read_asar_header(asar)
+        archive = cpm.AsarArchive(asar)
+        header = archive.header
         self.assertTrue(header["files"]["script.sh"].get("executable"),
                         "Executable file should have executable=True")
         self.assertNotIn("executable", header["files"]["regular.txt"],

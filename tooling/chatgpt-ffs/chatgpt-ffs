@@ -8,8 +8,6 @@ updates, and code signing with proper Electron entitlements.
 Requires no external dependencies — asar format is implemented in pure Python.
 """
 
-import argparse
-import curses
 import fnmatch
 import hashlib
 import json
@@ -1639,7 +1637,7 @@ def commit_changes(bundle, patches_to_apply, progress_cb=None):
         return False, str(e)
 
 
-# ─── TUI ────────────────────────────────────────────────────────────────────
+# ─── Presentation: TUI (lazy-imports curses) ────────────────────────────────────────────────────────────────────
 # Semantic color system using the 8 basic + 8 bright ANSI colors.
 # Bright foreground = basic color + A_BOLD. Every color has a consistent meaning:
 #   green   → applied / success
@@ -1739,8 +1737,9 @@ LABEL_DIMENSIONS = [
 class PatchManagerTUI:
     VIEWS = ("list", "detail", "preview", "commit", "legend")
 
-    def __init__(self, stdscr, patches, states, bundle):
+    def __init__(self, stdscr, patches, states, bundle, curses_mod):
         self.stdscr = stdscr
+        self.curses = curses_mod
         self.patches = patches
         self.states = states
         self.bundle = bundle
@@ -1785,8 +1784,8 @@ class PatchManagerTUI:
 
     def run(self):
         try:
-            curses.curs_set(0)
-        except curses.error:
+            self.curses.curs_set(0)
+        except self.curses.error:
             pass
         self._init_colors()
         while True:
@@ -1827,55 +1826,55 @@ class PatchManagerTUI:
     def _init_colors(self):
         # Degrade gracefully to monochrome when the terminal lacks color
         # support (some PTYs/terminfo entries report COLORS=0 / COLOR_PAIRS=-1).
-        if not curses.has_colors() or curses.COLORS < 1:
+        if not self.curses.has_colors() or self.curses.COLORS < 1:
             return
         try:
-            curses.start_color()
-        except curses.error:
+            self.curses.start_color()
+        except self.curses.error:
             return
         try:
-            curses.use_default_colors()
+            self.curses.use_default_colors()
             bg = -1
-        except curses.error:
-            bg = curses.COLOR_BLACK
+        except self.curses.error:
+            bg = self.curses.COLOR_BLACK
 
         p = _CP
-        cp = curses.init_pair
+        cp = self.curses.init_pair
         try:
-            cp(p["title"],     curses.COLOR_CYAN,    bg)
-            cp(p["subtitle"],  curses.COLOR_CYAN,    bg)
-            cp(p["dim"],       curses.COLOR_WHITE,   bg)  # +A_DIM for gray
-            cp(p["applied"],   curses.COLOR_GREEN,   bg)
-            cp(p["pending"],   curses.COLOR_YELLOW,  bg)
-            cp(p["revert"],    curses.COLOR_RED,     bg)
-            cp(p["info"],      curses.COLOR_CYAN,    bg)
-            cp(p["accent"],    curses.COLOR_MAGENTA, bg)
-            cp(p["success"],   curses.COLOR_GREEN,   bg)
-            cp(p["error"],     curses.COLOR_RED,     bg)
-            cp(p["border"],    curses.COLOR_WHITE,   bg)  # +A_DIM
-            cp(p["keyhint"],   curses.COLOR_CYAN,    bg)
-            cp(p["header"],    curses.COLOR_BLUE,    bg)
-            cp(p["select"],    curses.COLOR_BLACK,   curses.COLOR_BLUE)
-            cp(p["badge_on"],  curses.COLOR_BLACK,   curses.COLOR_GREEN)
-            cp(p["badge_off"], curses.COLOR_BLACK,   curses.COLOR_WHITE)
-            cp(p["badge_pend"],curses.COLOR_BLACK,   curses.COLOR_YELLOW)
-            cp(p["badge_rev"], curses.COLOR_BLACK,   curses.COLOR_RED)
-            cp(p["badge_unk"], curses.COLOR_BLACK,   curses.COLOR_WHITE)
-        except curses.error:
+            cp(p["title"],     self.curses.COLOR_CYAN,    bg)
+            cp(p["subtitle"],  self.curses.COLOR_CYAN,    bg)
+            cp(p["dim"],       self.curses.COLOR_WHITE,   bg)  # +A_DIM for gray
+            cp(p["applied"],   self.curses.COLOR_GREEN,   bg)
+            cp(p["pending"],   self.curses.COLOR_YELLOW,  bg)
+            cp(p["revert"],    self.curses.COLOR_RED,     bg)
+            cp(p["info"],      self.curses.COLOR_CYAN,    bg)
+            cp(p["accent"],    self.curses.COLOR_MAGENTA, bg)
+            cp(p["success"],   self.curses.COLOR_GREEN,   bg)
+            cp(p["error"],     self.curses.COLOR_RED,     bg)
+            cp(p["border"],    self.curses.COLOR_WHITE,   bg)  # +A_DIM
+            cp(p["keyhint"],   self.curses.COLOR_CYAN,    bg)
+            cp(p["header"],    self.curses.COLOR_BLUE,    bg)
+            cp(p["select"],    self.curses.COLOR_BLACK,   self.curses.COLOR_BLUE)
+            cp(p["badge_on"],  self.curses.COLOR_BLACK,   self.curses.COLOR_GREEN)
+            cp(p["badge_off"], self.curses.COLOR_BLACK,   self.curses.COLOR_WHITE)
+            cp(p["badge_pend"],self.curses.COLOR_BLACK,   self.curses.COLOR_YELLOW)
+            cp(p["badge_rev"], self.curses.COLOR_BLACK,   self.curses.COLOR_RED)
+            cp(p["badge_unk"], self.curses.COLOR_BLACK,   self.curses.COLOR_WHITE)
+        except self.curses.error:
             # Color pairs unavailable; render in monochrome. color_pair()
             # calls elsewhere return inert attributes in that case.
             pass
 
     def _cp(self, name, bright=False):
         """Get color attribute for a named pair, optionally brightened."""
-        attr = curses.color_pair(_CP[name])
+        attr = self.curses.color_pair(_CP[name])
         if bright:
-            attr |= curses.A_BOLD
+            attr |= self.curses.A_BOLD
         return attr
 
     def _dim(self, name="default"):
         """Get dimmed color attribute."""
-        return curses.color_pair(_CP[name]) | curses.A_DIM
+        return self.curses.color_pair(_CP[name]) | self.curses.A_DIM
 
     def _safe_addstr(self, y, x, text, attr=0):
         h, w = self.stdscr.getmaxyx()
@@ -1885,7 +1884,7 @@ class PatchManagerTUI:
         if text:
             try:
                 self.stdscr.addstr(y, x, text, attr)
-            except curses.error:
+            except self.curses.error:
                 pass
 
     def _hline(self, y, x, length, heavy=False):
@@ -1930,10 +1929,10 @@ class PatchManagerTUI:
 
         # Column header
         y = 4
-        self._safe_addstr(y, 2, "St", self._cp("header", bright=True) | curses.A_UNDERLINE)
-        self._safe_addstr(y, 6, "Patch", self._cp("header", bright=True) | curses.A_UNDERLINE)
+        self._safe_addstr(y, 2, "St", self._cp("header", bright=True) | self.curses.A_UNDERLINE)
+        self._safe_addstr(y, 6, "Patch", self._cp("header", bright=True) | self.curses.A_UNDERLINE)
         cat_x = max(w - 22, 40)
-        self._safe_addstr(y, cat_x, "Category", self._cp("header", bright=True) | curses.A_UNDERLINE)
+        self._safe_addstr(y, cat_x, "Category", self._cp("header", bright=True) | self.curses.A_UNDERLINE)
         y += 1
         self._hline(y, 1, w - 2)
         y += 1
@@ -1962,16 +1961,16 @@ class PatchManagerTUI:
             # Status badge
             if is_applied and desired:
                 badge = " ON "
-                badge_attr = curses.color_pair(_CP["badge_on"])
+                badge_attr = self.curses.color_pair(_CP["badge_on"])
             elif not is_applied and not desired:
                 badge = "off "
-                badge_attr = curses.color_pair(_CP["badge_off"]) | curses.A_DIM
+                badge_attr = self.curses.color_pair(_CP["badge_off"]) | self.curses.A_DIM
             elif is_applied and not desired:
                 badge = "rev "
-                badge_attr = curses.color_pair(_CP["badge_rev"])
+                badge_attr = self.curses.color_pair(_CP["badge_rev"])
             else:
                 badge = "add "
-                badge_attr = curses.color_pair(_CP["badge_pend"])
+                badge_attr = self.curses.color_pair(_CP["badge_pend"])
 
             # Cursor marker
             marker = _TRI if is_selected else "  "
@@ -1992,10 +1991,10 @@ class PatchManagerTUI:
 
             # Apply selection highlight
             if is_selected:
-                badge_attr = curses.color_pair(_CP["select"])
-                marker_attr = curses.color_pair(_CP["select"]) | curses.A_BOLD
-                name_attr = curses.color_pair(_CP["select"]) | curses.A_BOLD
-                cat_attr = curses.color_pair(_CP["select"])
+                badge_attr = self.curses.color_pair(_CP["select"])
+                marker_attr = self.curses.color_pair(_CP["select"]) | self.curses.A_BOLD
+                name_attr = self.curses.color_pair(_CP["select"]) | self.curses.A_BOLD
+                cat_attr = self.curses.color_pair(_CP["select"])
 
             self._safe_addstr(y, 0, marker, marker_attr)
             self._safe_addstr(y, 3, badge, badge_attr)
@@ -2074,7 +2073,7 @@ class PatchManagerTUI:
 
         # Patch name
         name = patch.name[:w - 4]
-        self._safe_addstr(y, 2, name, curses.A_BOLD)
+        self._safe_addstr(y, 2, name, self.curses.A_BOLD)
         y += 1
         self._hline(y, 1, w - 2)
         y += 2
@@ -2096,16 +2095,16 @@ class PatchManagerTUI:
         self._safe_addstr(y, 4, "Status:", self._dim())
         if state == "applied":
             if desired:
-                self._safe_addstr(y, 14, f" {_CHECK} APPLIED ", curses.color_pair(_CP["badge_on"]))
+                self._safe_addstr(y, 14, f" {_CHECK} APPLIED ", self.curses.color_pair(_CP["badge_on"]))
             else:
-                self._safe_addstr(y, 14, f" ↻ PENDING REVERT ", curses.color_pair(_CP["badge_rev"]))
+                self._safe_addstr(y, 14, f" ↻ PENDING REVERT ", self.curses.color_pair(_CP["badge_rev"]))
         elif state == "not_applied":
             if desired:
-                self._safe_addstr(y, 14, f" + PENDING APPLY ", curses.color_pair(_CP["badge_pend"]))
+                self._safe_addstr(y, 14, f" + PENDING APPLY ", self.curses.color_pair(_CP["badge_pend"]))
             else:
-                self._safe_addstr(y, 14, f" {_CIRC} NOT APPLIED ", curses.color_pair(_CP["badge_off"]) | curses.A_DIM)
+                self._safe_addstr(y, 14, f" {_CIRC} NOT APPLIED ", self.curses.color_pair(_CP["badge_off"]) | self.curses.A_DIM)
         else:
-            self._safe_addstr(y, 14, " ? UNKNOWN ", curses.color_pair(_CP["badge_unk"]))
+            self._safe_addstr(y, 14, " ? UNKNOWN ", self.curses.color_pair(_CP["badge_unk"]))
         y += 2
 
         # Labels section
@@ -2412,15 +2411,15 @@ class PatchManagerTUI:
                           self._cp("keyhint", bright=True))
 
     def _handle_list_key(self, key):
-        if key in (curses.KEY_UP, ord("k")):
+        if key in (self.curses.KEY_UP, ord("k")):
             self.cursor = max(0, self.cursor - 1)
-        elif key in (curses.KEY_DOWN, ord("j")):
+        elif key in (self.curses.KEY_DOWN, ord("j")):
             self.cursor = min(len(self.patches) - 1, self.cursor + 1)
         elif key == ord(" "):
             if self.patches:
                 patch = self.patches[self.cursor]
                 self.desired[patch.id] = not self.desired.get(patch.id, False)
-        elif key in (ord("\n"), curses.KEY_ENTER):
+        elif key in (ord("\n"), self.curses.KEY_ENTER):
             if self.patches:
                 self.detail_patch = self.patches[self.cursor]
                 self.detail_scroll = 0
@@ -2440,15 +2439,15 @@ class PatchManagerTUI:
                 self._do_commit()
 
     def _handle_detail_key(self, key):
-        if key in (curses.KEY_UP, ord("k")):
+        if key in (self.curses.KEY_UP, ord("k")):
             self.detail_scroll = max(0, self.detail_scroll - 1)
-        elif key in (curses.KEY_DOWN, ord("j")):
+        elif key in (self.curses.KEY_DOWN, ord("j")):
             self.detail_scroll += 1
         elif key == ord(" "):
             if self.detail_patch:
                 pid = self.detail_patch.id
                 self.desired[pid] = not self.desired.get(pid, False)
-        elif key in (ord("\n"), curses.KEY_ENTER, 27):
+        elif key in (ord("\n"), self.curses.KEY_ENTER, 27):
             self.view = "list"
         elif key == ord("a"):
             if self.has_pending:
@@ -2490,7 +2489,7 @@ class PatchManagerTUI:
         self._draw()
 
 
-# ─── CLI (non-interactive, colorized) ───────────────────────────────────────
+# ─── Presentation: CLI (lazy-imports argparse) ───────────────────────────────────────
 
 def _state_symbol(state):
     """Return (symbol, color_code) for a patch state."""
@@ -2901,6 +2900,8 @@ def cmd_install():
 # ─── Main ───────────────────────────────────────────────────────────────────
 
 def main():
+    import argparse
+
     parser = argparse.ArgumentParser(
         description="ChatGPT FFS — asar patch manager for ChatGPT.app",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -2970,12 +2971,14 @@ def main():
 
 
 def _run_tui(patches, bundle):
+    import curses
+
     states = {}
     for p in patches:
         states[p.id] = PatchRegistry.detect_state(bundle.asar, p)
 
     def tui_main(stdscr):
-        ui = PatchManagerTUI(stdscr, patches, states, bundle)
+        ui = PatchManagerTUI(stdscr, patches, states, bundle, curses)
         ui.run()
 
     try:

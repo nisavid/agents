@@ -2561,8 +2561,21 @@ def cmd_verify(patches, paths):
         print(f"  {c.wrap(c.RED + c.BOLD, _CROSS)} Code signature invalid: {sig_msg}")
         ok = False
 
-    # 4. Patch states
+    # 4. Hash consistency (checked before patch states so we can
+    #    distinguish "pending reapply" from real drift)
     state = load_state()
+    stored_hash = state.get("installed_hash")
+    hash_ok = False
+    if stored_hash:
+        current_hash = sha256_file(asar_path)
+        hash_ok = current_hash == stored_hash
+        if hash_ok:
+            print(f"  {c.wrap(c.GREEN, _CHECK)} Asar hash matches state record")
+        else:
+            print(f"  {c.wrap(c.YELLOW, '⚠')} Asar hash differs from state record "
+                  f"(app may have been updated)")
+
+    # 5. Patch states
     recorded_ids = set(state.get("applied_patches", []))
     actual_ids = set()
     for p in patches:
@@ -2578,23 +2591,19 @@ def cmd_verify(patches, paths):
     else:
         missing = recorded_ids - actual_ids
         extra = actual_ids - recorded_ids
-        ok = False
         if missing:
             ids = ", ".join(c.wrap(c.YELLOW, i) for i in sorted(missing))
-            print(f"  {c.wrap(c.RED + c.BOLD, _CROSS)} Recorded but not detected: {ids}")
+            if hash_ok:
+                # Hash matches but patches not detected — pending reapply
+                # after restore or rollback.  This is expected, not drift.
+                print(f"  {c.wrap(c.YELLOW, '⚠')} Pending reapply: {ids}")
+            else:
+                ok = False
+                print(f"  {c.wrap(c.RED + c.BOLD, _CROSS)} Recorded but not detected: {ids}")
         if extra:
             ids = ", ".join(c.wrap(c.YELLOW, i) for i in sorted(extra))
-            print(f"  {c.wrap(c.YELLOW, '⚠')} Detected but not recorded: {ids}")
-
-    # 5. Hash consistency
-    stored_hash = state.get("installed_hash")
-    if stored_hash:
-        current_hash = sha256_file(asar_path)
-        if current_hash == stored_hash:
-            print(f"  {c.wrap(c.GREEN, _CHECK)} Asar hash matches state record")
-        else:
-            print(f"  {c.wrap(c.YELLOW, '⚠')} Asar hash differs from state record "
-                  f"(app may have been updated)")
+            ok = False
+            print(f"  {c.wrap(c.RED + c.BOLD, _CROSS)} Detected but not recorded: {ids}")
 
     print()
     if ok:

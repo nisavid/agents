@@ -1264,24 +1264,16 @@ class PatchRegistry:
                 except (json.JSONDecodeError, KeyError) as e:
                     print(f"Warning: skipping {pf.name}: {e}", file=sys.stderr)
 
-    def __iter__(self):
-        return iter(self.patches)
-
-    def __len__(self):
-        return len(self.patches)
-
-    def get(self, patch_id):
-        """Find a patch by ID. Returns Patch or None."""
-        return next((p for p in self.patches if p.id == patch_id), None)
-
     @staticmethod
-    def detect_state(asar_path, patch):
+    def detect_state(archive, patch):
         """Detect if a patch is applied.
 
+        Accepts an AsarArchive instance (parse once, check many patches).
         Returns 'applied', 'not_applied', or 'unknown'.
         """
         try:
-            archive = AsarArchive(asar_path)
+            if isinstance(archive, str):
+                archive = AsarArchive(archive)
         except Exception:
             return "unknown"
 
@@ -1355,21 +1347,6 @@ class AppBundle:
         self.plist = os.path.join(app_path, "Contents", "Info.plist")
         self.frameworks = os.path.join(app_path, "Contents", "Frameworks")
 
-    # ── Path compatibility ──────────────────────────────────────────────
-
-    @property
-    def paths(self):
-        """Dict view for callers that still use paths["asar"] etc."""
-        return {
-            "app": self.app_path,
-            "resources": self.resources,
-            "asar": self.asar,
-            "asar_orig": self.asar_orig,
-            "asar_unpacked": self.asar_unpacked,
-            "plist": self.plist,
-            "frameworks": self.frameworks,
-        }
-
     # ── Process management ──────────────────────────────────────────────
 
     def quit(self):
@@ -1433,6 +1410,16 @@ class AppBundle:
         with open(self.plist, "wb") as f:
             plistlib.dump(plist, f)
 
+    @staticmethod
+    def _find_nested_code(framework_path):
+        """Find all nested .app bundles inside a framework."""
+        nested = []
+        for root, dirs, files in os.walk(framework_path):
+            for name in dirs:
+                if name.endswith(".app"):
+                    nested.append(os.path.join(root, name))
+        return sorted(nested)
+
     def _resign(self, progress_cb=None):
         """Re-sign with ad-hoc signature and proper entitlements.
 
@@ -1464,7 +1451,7 @@ class AppBundle:
             for fw in [codex_fw, sparkle_fw]:
                 if not os.path.exists(fw):
                     continue
-                for helper in _find_nested_code(fw):
+                for helper in self._find_nested_code(fw):
                     subprocess.run(
                         ["codesign", "--force", "--sign", "-",
                          "--entitlements", fw_ents, helper],
@@ -1507,17 +1494,6 @@ class AppBundle:
         if result.returncode == 0:
             return True, "valid"
         return False, result.stderr.strip()
-
-
-def _find_nested_code(framework_path):
-    """Find all nested .app bundles inside a framework."""
-    nested = []
-    for root, dirs, files in os.walk(framework_path):
-        for name in dirs:
-            if name.endswith(".app"):
-                nested.append(os.path.join(root, name))
-    return sorted(nested)
-
 
 # ─── State Management ───────────────────────────────────────────────────────
 
@@ -1737,9 +1713,10 @@ LABEL_DIMENSIONS = [
 class PatchManagerTUI:
     VIEWS = ("list", "detail", "preview", "commit", "legend")
 
-    def __init__(self, stdscr, patches, states, bundle, curses_mod):
+    def __init__(self, stdscr, patches, states, bundle):
+        import curses
         self.stdscr = stdscr
-        self.curses = curses_mod
+        self.curses = curses
         self.patches = patches
         self.states = states
         self.bundle = bundle
@@ -1811,9 +1788,10 @@ class PatchManagerTUI:
                 if self.commit_done:
                     self._reset_view_state()
                     self.view = "list"
+                    archive = AsarArchive(self.bundle.asar)
                     for p in self.patches:
                         self.states[p.id] = PatchRegistry.detect_state(
-                            self.bundle.asar, p
+                            archive, p
                         )
                         self.desired[p.id] = self.states[p.id] == "applied"
 
@@ -2508,8 +2486,9 @@ def cmd_list(patches, bundle):
     print(f"  {c.wrap(c.DIM, 'App:')} {c.wrap(c.CYAN, bundle.app_path)}")
     print()
 
+    archive = AsarArchive(bundle.asar)
     for patch in patches:
-        state = PatchRegistry.detect_state(bundle.asar, patch)
+        state = PatchRegistry.detect_state(archive, patch)
         symbol, color = _state_symbol(state)
 
         status_text = {
@@ -2535,8 +2514,9 @@ def cmd_apply(patches, bundle, patch_ids):
             print(f"{c.wrap(c.RED + c.BOLD, '✗')} Unknown patch: {pid}", file=sys.stderr)
             sys.exit(1)
         selected.append(patch)
+    archive = AsarArchive(bundle.asar)
     for p in patches:
-        state = PatchRegistry.detect_state(bundle.asar, p)
+        state = PatchRegistry.detect_state(archive, p)
         if state == "applied" and p not in selected:
             selected.append(p)
     success, msg = commit_changes(bundle, selected, lambda m: print(f"  {c.wrap(c.DIM, m)}"))
@@ -2565,9 +2545,10 @@ def cmd_revert(patches, bundle, patch_ids):
 
 def cmd_status(patches, bundle):
     """Show brief status."""
+    archive = AsarArchive(bundle.asar)
     applied = 0
     for p in patches:
-        state = PatchRegistry.detect_state(bundle.asar, p)
+        state = PatchRegistry.detect_state(archive, p)
         if state == "applied":
             applied += 1
             print(f"  {c.wrap(c.GREEN, _CHECK)} {c.wrap(c.CYAN, p.id)}")
@@ -2634,8 +2615,9 @@ def cmd_verify(patches, bundle):
     # 5. Patch states
     recorded_ids = set(state.get("applied_patches", []))
     actual_ids = set()
+    archive = AsarArchive(asar_path)
     for p in patches:
-        st = PatchRegistry.detect_state(asar_path, p)
+        st = PatchRegistry.detect_state(archive, p)
         if st == "applied":
             actual_ids.add(p.id)
         elif st == "unknown":
@@ -2681,9 +2663,10 @@ def cmd_restore(patches, bundle):
     in a clean state that can safely accept a Sparkle or manual update.
     """
     # Detect which patches are currently applied so reapply can restore them.
+    archive = AsarArchive(bundle.asar)
     applied_ids = [
         p.id for p in patches
-        if PatchRegistry.detect_state(bundle.asar, p) == "applied"
+        if PatchRegistry.detect_state(archive, p) == "applied"
     ]
 
     state = load_state()
@@ -2809,7 +2792,7 @@ def cmd_update(patches, bundle):
 
     # Step 1: Restore
     print(f"  {c.wrap(c.BOLD, 'Step 1:')} Restore pristine app")
-    cmd_restore(patches, paths)
+    cmd_restore(patches, bundle)
     print()
 
     state = load_state()
@@ -2836,7 +2819,7 @@ def cmd_update(patches, bundle):
 
     # Step 3: Reapply
     print(f"  {c.wrap(c.BOLD, 'Step 3:')} Reapply patches")
-    cmd_reapply(patches, paths)
+    cmd_reapply(patches, bundle)
 
 
 # ─── Install ────────────────────────────────────────────────────────────────
@@ -2974,11 +2957,12 @@ def _run_tui(patches, bundle):
     import curses
 
     states = {}
+    archive = AsarArchive(bundle.asar)
     for p in patches:
-        states[p.id] = PatchRegistry.detect_state(bundle.asar, p)
+        states[p.id] = PatchRegistry.detect_state(archive, p)
 
     def tui_main(stdscr):
-        ui = PatchManagerTUI(stdscr, patches, states, bundle, curses)
+        ui = PatchManagerTUI(stdscr, patches, states, bundle)
         ui.run()
 
     try:

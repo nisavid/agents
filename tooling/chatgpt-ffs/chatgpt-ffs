@@ -1485,19 +1485,47 @@ class AppBundle:
 
 # ─── State Management ───────────────────────────────────────────────────────
 
-def load_state():
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    if STATE_FILE.exists():
-        try:
-            return json.loads(STATE_FILE.read_text())
-        except json.JSONDecodeError:
-            pass
-    return {}
 
+class PatchState:
+    """Owns the persistent state file schema.
 
-def save_state(state):
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps(state, indent=2))
+    Tracks the installed asar hash and the list of applied patch IDs
+    so that ``reapply`` can restore patches after an app update.
+    """
+
+    def __init__(self, installed_hash=None, applied_patches=None):
+        self.installed_hash = installed_hash
+        self.applied_patches = applied_patches or []
+
+    @classmethod
+    def load(cls):
+        """Load state from disk, returning an empty state if missing or corrupt."""
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        if STATE_FILE.exists():
+            try:
+                data = json.loads(STATE_FILE.read_text())
+                return cls(
+                    installed_hash=data.get("installed_hash"),
+                    applied_patches=data.get("applied_patches", []),
+                )
+            except json.JSONDecodeError:
+                pass
+        return cls()
+
+    def save(self):
+        """Persist state to disk."""
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        STATE_FILE.write_text(json.dumps({
+            "installed_hash": self.installed_hash,
+            "applied_patches": self.applied_patches,
+        }, indent=2))
+
+    def is_stale(self, current_hash):
+        """True if the current asar hash differs from the stored one.
+
+        Indicates the app was updated since the last tool operation.
+        """
+        return bool(self.installed_hash and current_hash != self.installed_hash)
 
 
 # ─── Commit Logic ───────────────────────────────────────────────────────────
@@ -1571,9 +1599,9 @@ def commit_changes(bundle, patches_to_apply, progress_cb=None):
                 orig_hash = bundle.install_asar(
                     bundle.asar_orig, progress_cb=report
                 )
-                state = load_state()
-                state["installed_hash"] = orig_hash
-                save_state(state)
+                state = PatchState.load()
+                state.installed_hash = orig_hash
+                state.save()
                 report("Verifying rollback signature...")
                 ok, msg = bundle.verify_signature()
                 if not ok:
@@ -1581,10 +1609,10 @@ def commit_changes(bundle, patches_to_apply, progress_cb=None):
                 report("Rollback complete — app restored to original state.")
                 return False, f"Install failed and rolled back: {install_err}"
 
-            state = load_state()
-            state["installed_hash"] = new_hash
-            state["applied_patches"] = [p.id for p in patches_to_apply]
-            save_state(state)
+            state = PatchState.load()
+            state.installed_hash = new_hash
+            state.applied_patches = [p.id for p in patches_to_apply]
+            state.save()
 
             for w in warnings:
                 report(f"WARNING: {w}")
@@ -2587,8 +2615,8 @@ def cmd_verify(patches, bundle):
     #    A mismatch indicates the asar changed since the last tool operation
     #    (restore, rollback, or app update) and helps explain why patches
     #    may show as "pending reapply" in step 5.
-    state = load_state()
-    stored_hash = state.get("installed_hash")
+    state = PatchState.load()
+    stored_hash = state.installed_hash
     if stored_hash:
         current_hash = sha256_file(asar_path)
         if current_hash == stored_hash:
@@ -2598,7 +2626,7 @@ def cmd_verify(patches, bundle):
                   f"(app may have been updated)")
 
     # 5. Patch states
-    recorded_ids = set(state.get("applied_patches", []))
+    recorded_ids = set(state.applied_patches)
     actual_ids = set()
     for p in patches:
         st = p.detect_state(archive)
@@ -2653,14 +2681,14 @@ def cmd_restore(patches, bundle):
         if states[p.id] == "applied"
     ]
 
-    state = load_state()
-    state["applied_patches"] = applied_ids
+    state = PatchState.load()
+    state.applied_patches = applied_ids
 
     orig = bundle.asar_orig
     if not os.path.exists(orig):
         # Already pristine (e.g. app was just updated and no backup exists).
-        state["installed_hash"] = sha256_file(bundle.asar)
-        save_state(state)
+        state.installed_hash = sha256_file(bundle.asar)
+        state.save()
         print(f"  {c.wrap(c.YELLOW, '⚠')} No backup found — app is already pristine.")
         if applied_ids:
             ids = ", ".join(c.wrap(c.CYAN, pid) for pid in applied_ids)
@@ -2679,8 +2707,8 @@ def cmd_restore(patches, bundle):
         report("Restoring pristine app.asar from backup...")
         new_hash = bundle.install_asar(orig, progress_cb=report)
 
-        state["installed_hash"] = new_hash
-        save_state(state)
+        state.installed_hash = new_hash
+        state.save()
 
         report("Verifying signature...")
         ok, msg = bundle.verify_signature()
@@ -2711,8 +2739,8 @@ def cmd_reapply(patches, bundle):
     the stale ``app.asar.orig`` backup is deleted so ``ensure_backup``
     creates a fresh one from the new version.
     """
-    state = load_state()
-    saved_ids = state.get("applied_patches", [])
+    state = PatchState.load()
+    saved_ids = state.applied_patches
 
     if not saved_ids:
         print(f"  {c.wrap(c.YELLOW, '⚠')} No saved patches to reapply.")
@@ -2722,9 +2750,7 @@ def cmd_reapply(patches, bundle):
 
     # Detect stale backup: if the current asar hash doesn't match what we
     # stored at restore time, the app was updated and app.asar.orig is stale.
-    current_hash = sha256_file(bundle.asar)
-    stored_hash = state.get("installed_hash")
-    if stored_hash and current_hash != stored_hash:
+    if state.is_stale(sha256_file(bundle.asar)):
         orig = bundle.asar_orig
         if os.path.exists(orig):
             print(f"  {c.wrap(c.DIM, 'App updated — refreshing backup...')}")
@@ -2779,8 +2805,8 @@ def cmd_update(patches, bundle):
     cmd_restore(patches, bundle)
     print()
 
-    state = load_state()
-    saved_ids = state.get("applied_patches", [])
+    state = PatchState.load()
+    saved_ids = state.applied_patches
     if not saved_ids:
         print(f"  {c.wrap(c.DIM, 'No patches to reapply — done.')}")
         return

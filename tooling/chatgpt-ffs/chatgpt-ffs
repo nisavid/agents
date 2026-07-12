@@ -1369,9 +1369,7 @@ class AppBundle:
         Returns the SHA256 hash of the installed asar.  The hash is
         computed from the destination after copying.
         """
-        def report(msg):
-            if progress_cb:
-                progress_cb(msg)
+        report = _make_reporter(progress_cb)
 
         shutil.copy2(source_asar, self.asar)
         new_hash = sha256_file(self.asar)
@@ -1416,9 +1414,7 @@ class AppBundle:
         macOS library validation rejects the Team ID mismatch between
         the ad-hoc main app and still-original helper processes.
         """
-        def report(msg):
-            if progress_cb:
-                progress_cb(msg)
+        report = _make_reporter(progress_cb)
 
         codex_fw = os.path.join(self.frameworks, "Codex Framework.framework")
         sparkle_fw = os.path.join(self.frameworks, "Sparkle.framework")
@@ -1531,6 +1527,16 @@ class PatchState:
 # ─── Commit Logic ───────────────────────────────────────────────────────────
 
 
+def _make_reporter(progress_cb=None):
+    """Create a progress-reporting callable.
+
+    Returns ``progress_cb`` if given, otherwise a no-op.  Eliminates the
+    ``def report(msg): if progress_cb: progress_cb(msg)`` closure that
+    was duplicated across four call sites.
+    """
+    return progress_cb or (lambda _: None)
+
+
 def commit_changes(bundle, patches_to_apply, progress_cb=None):
     """Extract original, apply selected patches, repack, install, and sign.
 
@@ -1545,9 +1551,7 @@ def commit_changes(bundle, patches_to_apply, progress_cb=None):
     If any step after installing the patched asar fails, the original
     asar is restored from backup so the app is never left broken.
     """
-    def report(msg):
-        if progress_cb:
-            progress_cb(msg)
+    report = _make_reporter(progress_cb)
 
     try:
         report("Quitting app if running...")
@@ -2697,8 +2701,7 @@ def cmd_restore(patches, bundle):
             print(f"  {c.wrap(c.DIM, 'No patches to reapply.')}")
         return
 
-    def report(msg):
-        print(f"  {c.wrap(c.DIM, msg)}")
+    report = lambda msg: print(f"  {c.wrap(c.DIM, msg)}")
 
     try:
         report("Quitting app if running...")

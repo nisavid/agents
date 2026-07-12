@@ -572,6 +572,24 @@ Patch(
     ),
 
     Patch(
+        id="background-subagents-panel",
+        name="Background Subagents Panel",
+        category="workspace",
+        labels=["local-only", "execution", "user-facing", "agent-facing"],
+        description=(
+            "Enables the background subagents panel in the conversation sidebar by bypassing Statsig feature flag 1221508807.\n\nThis gate controls isBackgroundSubagentsEnabled, which determines whether the expandable panel showing active, waiting, and completed subagent activity renders in the thread summary. Without ChatGPT auth, the gate defaults to false, hiding all subagent status rows, the 'Stop all' control, and per-agent model labels."
+        ),
+        modifications=[
+            Modification(
+                "webview/assets/app-initial~app-main~projects-index-page~*-*.js",
+                r"\w+\(`1221508807`\)",
+                "!0",
+                "Bypass gate in thread app shell bundle",
+            ),
+        ],
+    ),
+
+    Patch(
         id="timeline-tab",
         name="Timeline Tab in Conversation View",
         category="conversation",

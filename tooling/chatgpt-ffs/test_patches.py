@@ -27,8 +27,8 @@ class PatchDefinitionsTest(unittest.TestCase):
         self.patches = cpm.load_patches()
 
     def test_builtin_patches_loaded(self):
-        """BUILTIN_PATCHES has at least 29 entries (28 feature + example external)."""
-        self.assertGreaterEqual(len(self.patches), 29)
+        """BUILTIN_PATCHES has at least 30 entries (29 feature + example external)."""
+        self.assertGreaterEqual(len(self.patches), 30)
 
     def test_all_patches_have_required_fields(self):
         """Every patch has id, name, category, description, modifications, labels."""

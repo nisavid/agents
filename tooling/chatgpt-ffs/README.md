@@ -135,7 +135,7 @@ Press `L` in the TUI to see a legend with descriptions of every label.
 
 ## Built-in Patches
 
-29 patches across 7 functional groups, covering 32 Statsig gate IDs.
+30 patches across 7 functional groups, covering 33 Statsig gate IDs.
 
 ### Workspace & Local Execution
 
@@ -147,6 +147,7 @@ Press `L` in the TUI to see a legend with descriptions of every label.
 | Local Project Actions | `824038554` | `local-only` `workspace` `local-dev` `user-facing` `agent-facing` |
 | Mode Switching UI | `3264431617` | `local-only` `ui-visibility` `mode-switch` `user-facing` `agent-facing` |
 | Feature Visibility (Auth-State) | `1372061905` | `custom-provider` `ui-visibility` `user-facing` |
+| Background Subagents Panel | `1221508807` | `local-only` `execution` `user-facing` `agent-facing` |
 
 ### Conversation & Thread Management
 

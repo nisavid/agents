@@ -210,6 +210,15 @@ class AsarArchive:
         walk(self._header, "")
         return sorted(results)
 
+    @staticmethod
+    def _set_exec_mode(path, node):
+        """Set executable permissions based on the asar node's 'executable' flag."""
+        if node.get("executable"):
+            os.chmod(path, 0o755)
+        else:
+            cur_mode = os.stat(path).st_mode
+            os.chmod(path, cur_mode & ~0o111)
+
     def extract(self, dest_dir, unpacked_dir=None):
         """Extract the entire archive to a directory.
 
@@ -240,22 +249,14 @@ class AsarArchive:
                     data = f.read(node["size"])
                 with open(current_path, "wb") as out:
                     out.write(data)
-                if node.get("executable"):
-                    os.chmod(current_path, 0o755)
-                else:
-                    cur_mode = os.stat(current_path).st_mode
-                    os.chmod(current_path, cur_mode & ~0o111)
+                self._set_exec_mode(current_path, node)
             elif node.get("unpacked"):
                 unpacked_paths.add(rel_path)
                 src_file = os.path.join(unpacked_dir, rel_path)
                 if os.path.exists(src_file):
                     os.makedirs(os.path.dirname(current_path), exist_ok=True)
                     shutil.copy2(src_file, current_path)
-                    if node.get("executable"):
-                        os.chmod(current_path, 0o755)
-                    else:
-                        cur_mode = os.stat(current_path).st_mode
-                        os.chmod(current_path, cur_mode & ~0o111)
+                    self._set_exec_mode(current_path, node)
 
         extract_node(self._header, dest_dir, "")
         return unpacked_paths
@@ -1607,6 +1608,9 @@ def commit_changes(bundle, patches_to_apply, progress_cb=None):
                 orig_hash = bundle.install_asar(
                     bundle.asar_orig, progress_cb=report
                 )
+                # Preserve applied_patches: the asar is now pristine, so
+                # verify will show "pending reapply" — matching cmd_restore's
+                # behavior and letting the user reapply via reapply/update.
                 state = PatchState.load()
                 state.installed_hash = orig_hash
                 state.save()
@@ -1614,6 +1618,10 @@ def commit_changes(bundle, patches_to_apply, progress_cb=None):
                 ok, msg = bundle.verify_signature()
                 if not ok:
                     report(f"WARNING: Rollback signature invalid: {msg}")
+                    return False, (
+                        f"Install failed, rollback incomplete "
+                        f"(signature invalid): {install_err}"
+                    )
                 report("Rollback complete — app restored to original state.")
                 return False, f"Install failed and rolled back: {install_err}"
 

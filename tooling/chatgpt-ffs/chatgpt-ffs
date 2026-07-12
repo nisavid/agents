@@ -1466,6 +1466,26 @@ def save_state(state):
 
 # ─── Commit Logic ───────────────────────────────────────────────────────────
 
+
+def _install_asar(paths, source_asar, progress_cb=None):
+    """Copy an asar into place, update the integrity hash, and re-sign.
+
+    Returns the SHA256 hash of the installed asar.  The hash is computed
+    from the destination after copying, so it is always correct even if
+    the source is modified during the copy.
+    """
+    def report(msg):
+        if progress_cb:
+            progress_cb(msg)
+
+    shutil.copy2(source_asar, paths["asar"])
+    new_hash = sha256_file(paths["asar"])
+    report("Updating integrity hash in Info.plist...")
+    update_asar_hash(paths["plist"], new_hash)
+    resign_app(paths["app"], progress_cb=progress_cb)
+    return new_hash
+
+
 def commit_changes(paths, patches_to_apply, progress_cb=None):
     """Extract original, apply selected patches, repack, install, and sign.
 
@@ -1515,17 +1535,11 @@ def commit_changes(paths, patches_to_apply, progress_cb=None):
             report("Packing patched asar...")
             pack_asar(extracted, patched_asar, unpacked_paths=unpacked_paths)
 
-            new_hash = sha256_file(patched_asar)
-            report(f"New asar hash: {new_hash[:16]}...")
+            report(f"New asar hash: {sha256_file(patched_asar)[:16]}...")
 
             try:
                 report("Installing patched asar...")
-                shutil.copy2(patched_asar, paths["asar"])
-
-                report("Updating integrity hash in Info.plist...")
-                update_asar_hash(paths["plist"], new_hash)
-
-                resign_app(paths["app"], progress_cb=report)
+                new_hash = _install_asar(paths, patched_asar, progress_cb=report)
 
                 report("Verifying signature...")
                 ok, msg = verify_signature(paths["app"])
@@ -1537,10 +1551,14 @@ def commit_changes(paths, patches_to_apply, progress_cb=None):
             except Exception as install_err:
                 report(f"Install failed: {install_err}")
                 report("Rolling back to original asar...")
-                shutil.copy2(paths["asar_orig"], paths["asar"])
-                orig_hash = sha256_file(paths["asar"])
-                update_asar_hash(paths["plist"], orig_hash)
-                resign_app(paths["app"], progress_cb=report)
+                orig_hash = _install_asar(paths, paths["asar_orig"], progress_cb=report)
+                state = load_state()
+                state["installed_hash"] = orig_hash
+                save_state(state)
+                report("Verifying rollback signature...")
+                ok, msg = verify_signature(paths["app"])
+                if not ok:
+                    report(f"WARNING: Rollback signature invalid: {msg}")
                 report("Rollback complete — app restored to original state.")
                 return False, f"Install failed and rolled back: {install_err}"
 
@@ -2627,17 +2645,10 @@ def cmd_restore(patches, paths):
         quit_app(paths["app"])
 
         report("Restoring pristine app.asar from backup...")
-        shutil.copy2(orig, paths["asar"])
+        new_hash = _install_asar(paths, orig, progress_cb=report)
 
-        new_hash = sha256_file(paths["asar"])
         state["installed_hash"] = new_hash
         save_state(state)
-
-        report("Updating integrity hash in Info.plist...")
-        update_asar_hash(paths["plist"], new_hash)
-
-        report("Re-signing app...")
-        resign_app(paths["app"])
 
         report("Verifying signature...")
         ok, msg = verify_signature(paths["app"])

@@ -217,7 +217,7 @@ class AsarArchive:
         ``unpacked_dir`` (defaults to ``filepath + ".unpacked"``).
 
         Returns a set of relative paths that are unpacked.  Pass this set
-        to :func:`pack_asar` so the repacked header preserves the flag.
+        to :meth:`AsarArchive.pack` so the repacked header preserves the flag.
         """
         os.makedirs(dest_dir, exist_ok=True)
         if unpacked_dir is None:
@@ -259,92 +259,92 @@ class AsarArchive:
         extract_node(self._header, dest_dir, "")
         return unpacked_paths
 
+    @staticmethod
+    def _compute_integrity(data):
+        """Compute asar integrity metadata for file content.
 
-def _compute_integrity(data):
-    """Compute asar integrity metadata for file content.
+        Electron's asar format uses hex-encoded SHA256 digests (not base64).
+        Mismatched encoding causes Electron's integrity validation to fail,
+        which can freeze the app during module loading.
+        """
+        block_size = 4 * 1024 * 1024
+        blocks = []
+        if len(data) == 0:
+            blocks.append(hashlib.sha256(b"").hexdigest())
+        else:
+            for i in range(0, len(data), block_size):
+                block = data[i : i + block_size]
+                blocks.append(hashlib.sha256(block).hexdigest())
+        return {
+            "algorithm": "SHA256",
+            "hash": hashlib.sha256(data).hexdigest(),
+            "blockSize": block_size,
+            "blocks": blocks,
+        }
 
-    Electron's asar format uses hex-encoded SHA256 digests (not base64).
-    Mismatched encoding causes Electron's integrity validation to fail,
-    which can freeze the app during module loading.
-    """
-    block_size = 4 * 1024 * 1024
-    blocks = []
-    if len(data) == 0:
-        blocks.append(hashlib.sha256(b"").hexdigest())
-    else:
-        for i in range(0, len(data), block_size):
-            block = data[i : i + block_size]
-            blocks.append(hashlib.sha256(block).hexdigest())
-    return {
-        "algorithm": "SHA256",
-        "hash": hashlib.sha256(data).hexdigest(),
-        "blockSize": block_size,
-        "blocks": blocks,
-    }
+    @staticmethod
+    def pack(src_dir, dest_path, unpacked_paths=None):
+        """Pack a directory into an asar archive.
 
+        Files whose relative paths appear in ``unpacked_paths`` are marked
+        "unpacked": true in the header (with size and integrity) but are
+        excluded from the binary payload.  Their data must already exist in a
+        sibling ``<dest_path>.unpacked/`` directory — pack does not create or
+        modify that directory.
+        """
+        if unpacked_paths is None:
+            unpacked_paths = set()
+        file_table = {}
+        file_chunks = []
+        current_offset = 0
 
-def pack_asar(src_dir, dest_path, unpacked_paths=None):
-    """Pack a directory into an asar archive.
+        def add_entry(full_path, name, table, rel_path):
+            nonlocal current_offset
+            if os.path.isdir(full_path):
+                sub_table = {}
+                for entry in sorted(os.listdir(full_path)):
+                    child_rel = f"{rel_path}/{entry}" if rel_path else entry
+                    add_entry(os.path.join(full_path, entry), entry, sub_table, child_rel)
+                if sub_table:
+                    table[name] = {"files": sub_table}
+            elif os.path.isfile(full_path):
+                with open(full_path, "rb") as f:
+                    data = f.read()
+                entry = {
+                    "size": len(data),
+                    "integrity": AsarArchive._compute_integrity(data),
+                }
+                if os.access(full_path, os.X_OK):
+                    entry["executable"] = True
+                if rel_path in unpacked_paths:
+                    entry["unpacked"] = True
+                else:
+                    entry["offset"] = str(current_offset)
+                    file_chunks.append(data)
+                    current_offset += len(data)
+                table[name] = entry
 
-    Files whose relative paths appear in ``unpacked_paths`` are marked
-    "unpacked": true in the header (with size and integrity) but are
-    excluded from the binary payload.  Their data must already exist in a
-    sibling ``<dest_path>.unpacked/`` directory — pack does not create or
-    modify that directory.
-    """
-    if unpacked_paths is None:
-        unpacked_paths = set()
-    file_table = {}
-    file_chunks = []
-    current_offset = 0
+        for entry in sorted(os.listdir(src_dir)):
+            add_entry(os.path.join(src_dir, entry), entry, file_table, entry)
 
-    def add_entry(full_path, name, table, rel_path):
-        nonlocal current_offset
-        if os.path.isdir(full_path):
-            sub_table = {}
-            for entry in sorted(os.listdir(full_path)):
-                child_rel = f"{rel_path}/{entry}" if rel_path else entry
-                add_entry(os.path.join(full_path, entry), entry, sub_table, child_rel)
-            if sub_table:
-                table[name] = {"files": sub_table}
-        elif os.path.isfile(full_path):
-            with open(full_path, "rb") as f:
-                data = f.read()
-            entry = {
-                "size": len(data),
-                "integrity": _compute_integrity(data),
-            }
-            if os.access(full_path, os.X_OK):
-                entry["executable"] = True
-            if rel_path in unpacked_paths:
-                entry["unpacked"] = True
-            else:
-                entry["offset"] = str(current_offset)
-                file_chunks.append(data)
-                current_offset += len(data)
-            table[name] = entry
+        header = {"files": file_table}
+        json_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
+        json_size = len(json_bytes)
+        padded_size = math.ceil(json_size / 4) * 4
 
-    for entry in sorted(os.listdir(src_dir)):
-        add_entry(os.path.join(src_dir, entry), entry, file_table, entry)
+        outer_size = 8 + padded_size
+        inner_size = 4 + padded_size
 
-    header = {"files": file_table}
-    json_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
-    json_size = len(json_bytes)
-    padded_size = math.ceil(json_size / 4) * 4
-
-    outer_size = 8 + padded_size
-    inner_size = 4 + padded_size
-
-    with open(dest_path, "wb") as f:
-        f.write(struct.pack("<I", 4))
-        f.write(struct.pack("<I", outer_size))
-        f.write(struct.pack("<I", inner_size))
-        f.write(struct.pack("<I", json_size))
-        f.write(json_bytes)
-        if padded_size > json_size:
-            f.write(b"\x00" * (padded_size - json_size))
-        for chunk in file_chunks:
-            f.write(chunk)
+        with open(dest_path, "wb") as f:
+            f.write(struct.pack("<I", 4))
+            f.write(struct.pack("<I", outer_size))
+            f.write(struct.pack("<I", inner_size))
+            f.write(struct.pack("<I", json_size))
+            f.write(json_bytes)
+            if padded_size > json_size:
+                f.write(b"\x00" * (padded_size - json_size))
+            for chunk in file_chunks:
+                f.write(chunk)
 
 
 def sha256_file(path):
@@ -1578,7 +1578,7 @@ def commit_changes(bundle, patches_to_apply, progress_cb=None):
 
             patched_asar = os.path.join(tmpdir, "app-patched.asar")
             report("Packing patched asar...")
-            pack_asar(extracted, patched_asar, unpacked_paths=unpacked_paths)
+            AsarArchive.pack(extracted, patched_asar, unpacked_paths=unpacked_paths)
 
             report(f"New asar hash: {sha256_file(patched_asar)[:16]}...")
 

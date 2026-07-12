@@ -70,9 +70,9 @@ class AsarRoundTripTest(unittest.TestCase):
 
         # Pack with one file marked unpacked.
         asar1 = os.path.join(self.tmp, "test1.asar")
-        cpm.pack_asar(src, asar1, unpacked_paths={"unpacked.node"})
+        cpm.AsarArchive.pack(src, asar1, unpacked_paths={"unpacked.node"})
 
-        # pack_asar excludes unpacked files from the payload, so we must
+        # AsarArchive.pack excludes unpacked files from the payload, so we must
         # provide the sibling .unpacked/ directory for extract to find them.
         self._make_unpacked_dir(asar1, {"unpacked.node": unpacked_data})
 
@@ -87,7 +87,7 @@ class AsarRoundTripTest(unittest.TestCase):
 
         # Repack.
         asar2 = os.path.join(self.tmp, "test2.asar")
-        cpm.pack_asar(extracted, asar2, unpacked_paths=result)
+        cpm.AsarArchive.pack(extracted, asar2, unpacked_paths=result)
 
         # Verify the repacked header.
         archive2 = cpm.AsarArchive(asar2)
@@ -126,7 +126,7 @@ class AsarRoundTripTest(unittest.TestCase):
         unpacked_rel = "node_modules/better-sqlite3/build/Release/better_sqlite3.node"
 
         asar1 = os.path.join(self.tmp, "nested1.asar")
-        cpm.pack_asar(src, asar1, unpacked_paths={unpacked_rel})
+        cpm.AsarArchive.pack(src, asar1, unpacked_paths={unpacked_rel})
 
         self._make_unpacked_dir(asar1, {unpacked_rel: unpacked_data})
 
@@ -139,7 +139,7 @@ class AsarRoundTripTest(unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(extracted, unpacked_rel)))
 
         asar2 = os.path.join(self.tmp, "nested2.asar")
-        cpm.pack_asar(extracted, asar2, unpacked_paths=result)
+        cpm.AsarArchive.pack(extracted, asar2, unpacked_paths=result)
 
         archive2 = cpm.AsarArchive(asar2)
         header = archive2.header
@@ -154,10 +154,10 @@ class AsarRoundTripTest(unittest.TestCase):
         self.assertNotIn("unpacked", root_node)
 
     def test_pack_without_unpacked_paths_works(self):
-        """Backward compat: pack_asar without unpacked_paths packs everything normally."""
+        """Backward compat: AsarArchive.pack without unpacked_paths packs everything normally."""
         src = self._make_src({"file.txt": b"content"})
         asar = os.path.join(self.tmp, "compat.asar")
-        cpm.pack_asar(src, asar)
+        cpm.AsarArchive.pack(src, asar)
 
         archive = cpm.AsarArchive(asar)
         node = archive.header["files"]["file.txt"]
@@ -169,7 +169,7 @@ class AsarRoundTripTest(unittest.TestCase):
         """Extract gracefully handles missing .unpacked/ directory."""
         src = self._make_src({"packed.txt": b"data"})
         asar = os.path.join(self.tmp, "no-unpacked.asar")
-        cpm.pack_asar(src, asar)
+        cpm.AsarArchive.pack(src, asar)
 
         extracted = os.path.join(self.tmp, "extracted")
         archive = cpm.AsarArchive(asar)
@@ -199,7 +199,7 @@ class IntegrityEncodingTest(unittest.TestCase):
     def test_integrity_uses_hex_not_base64(self):
         """Integrity hashes are hex-encoded (64 hex chars), not base64 (44 chars)."""
         data = b"test content for integrity"
-        integrity = cpm._compute_integrity(data)
+        integrity = cpm.AsarArchive._compute_integrity(data)
 
         h = integrity["hash"]
         # Hex SHA256 = 64 chars, all lowercase hex
@@ -214,7 +214,7 @@ class IntegrityEncodingTest(unittest.TestCase):
 
     def test_empty_file_has_one_block(self):
         """Empty files get 1 block (SHA256 of empty), not 0 blocks."""
-        integrity = cpm._compute_integrity(b"")
+        integrity = cpm.AsarArchive._compute_integrity(b"")
         self.assertEqual(len(integrity["blocks"]), 1)
         # SHA256 of empty data
         import hashlib
@@ -236,7 +236,7 @@ class IntegrityEncodingTest(unittest.TestCase):
             f.write("not executable")
 
         asar = os.path.join(self.tmp, "test.asar")
-        cpm.pack_asar(src, asar)
+        cpm.AsarArchive.pack(src, asar)
 
         archive = cpm.AsarArchive(asar)
         header = archive.header

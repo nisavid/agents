@@ -123,7 +123,7 @@ class PatchStateDetectionTest(unittest.TestCase):
             with open(full, "wb") as f:
                 f.write(content if isinstance(content, bytes) else content.encode())
         asar = os.path.join(self.tmp, "test.asar")
-        cpm.pack_asar(src, asar)
+        cpm.AsarArchive.pack(src, asar)
         return asar
 
     def test_detect_not_applied(self):

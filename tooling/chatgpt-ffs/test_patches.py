@@ -24,8 +24,7 @@ class PatchDefinitionsTest(unittest.TestCase):
     """Verify built-in patch definitions are well-formed."""
 
     def setUp(self):
-        self.registry = cpm.PatchRegistry()
-        self.patches = self.registry.patches
+        self.patches = cpm.load_patches()
 
     def test_builtin_patches_loaded(self):
         """BUILTIN_PATCHES has at least 30 entries (29 feature + example external)."""
@@ -142,7 +141,7 @@ class PatchStateDetectionTest(unittest.TestCase):
                                  r"\w+\(`505458`\)", "!0", "test"),
             ],
         )
-        self.assertEqual(cpm.PatchRegistry.detect_state(asar, patch), "not_applied")
+        self.assertEqual(patch.detect_state(cpm.AsarArchive(asar)), "not_applied")
 
     def test_detect_applied(self):
         """detect_patch_state returns 'applied' when search pattern is absent."""
@@ -159,7 +158,7 @@ class PatchStateDetectionTest(unittest.TestCase):
                                  r"\w+\(`505458`\)", "!0", "test"),
             ],
         )
-        self.assertEqual(cpm.PatchRegistry.detect_state(asar, patch), "applied")
+        self.assertEqual(patch.detect_state(cpm.AsarArchive(asar)), "applied")
 
     def test_detect_unknown_when_file_missing(self):
         """detect_patch_state returns 'unknown' when no matching files exist."""
@@ -176,7 +175,7 @@ class PatchStateDetectionTest(unittest.TestCase):
                                  r"\w+\(`505458`\)", "!0", "test"),
             ],
         )
-        self.assertEqual(cpm.PatchRegistry.detect_state(asar, patch), "unknown")
+        self.assertEqual(patch.detect_state(cpm.AsarArchive(asar)), "unknown")
 
     def test_apply_modification_replaces_gate_call(self):
         """apply_modification replaces checkGate calls with !0."""
@@ -188,7 +187,7 @@ class PatchStateDetectionTest(unittest.TestCase):
 
         mod = cpm.Modification("webview/assets/test-module-*.js",
                                r"\w+\(`505458`\)", "!0", "test")
-        count = cpm.PatchRegistry._apply_modification(src, mod)
+        count = mod.apply_to(src)
         self.assertEqual(count, 2)
 
         with open(test_file, "r") as f:
@@ -229,7 +228,7 @@ class ExternalPatchLabelsTest(unittest.TestCase):
             json.dump(patch_data, f)
 
         # Temporarily override EXTERNAL_PATCHES_DIR
-        patches = cpm.PatchRegistry(external_dir=cpm.Path(ext_dir)).patches
+        patches = cpm.load_patches(external_dir=cpm.Path(ext_dir))
 
         ext = next((p for p in patches if p.id == "ext-test"), None)
         self.assertIsNotNone(ext, "External patch not loaded")
@@ -256,7 +255,7 @@ class ExternalPatchLabelsTest(unittest.TestCase):
         with open(os.path.join(ext_dir, "nolabels.json"), "w") as f:
             json.dump(patch_data, f)
 
-        patches = cpm.PatchRegistry(external_dir=cpm.Path(ext_dir)).patches
+        patches = cpm.load_patches(external_dir=cpm.Path(ext_dir))
 
         ext = next((p for p in patches if p.id == "ext-no-labels"), None)
         self.assertIsNotNone(ext, "External patch not loaded")

@@ -1225,88 +1225,115 @@ Patch(
     ),
 ]
 
-def load_patches():
-    """Load built-in patches and any external patches from patches.d/."""
-    patches = list(BUILTIN_PATCHES)
-    if EXTERNAL_PATCHES_DIR.is_dir():
-        for pf in sorted(EXTERNAL_PATCHES_DIR.glob("*.json")):
-            try:
-                data = json.loads(pf.read_text())
-                patch_list = data if isinstance(data, list) else [data]
-                for pd in patch_list:
-                    mods = [
-                        Modification(
-                            file=m["file"],
-                            search=m["search"],
-                            replace=m["replace"],
-                            description=m.get("description", ""),
+class PatchRegistry:
+    """Owns the patch lifecycle: loading, detection, and application.
+
+    Loads built-in patches and any external patches from patches.d/.
+    Detection reads the asar binary to check if a patch's search pattern
+    is present.  Application walks the extracted filesystem and applies
+    regex search-and-replace operations.
+    """
+
+    def __init__(self, external_dir=None):
+        if external_dir is None:
+            external_dir = EXTERNAL_PATCHES_DIR
+        self.patches = list(BUILTIN_PATCHES)
+        if external_dir.is_dir():
+            for pf in sorted(external_dir.glob("*.json")):
+                try:
+                    data = json.loads(pf.read_text())
+                    patch_list = data if isinstance(data, list) else [data]
+                    for pd in patch_list:
+                        mods = [
+                            Modification(
+                                file=m["file"],
+                                search=m["search"],
+                                replace=m["replace"],
+                                description=m.get("description", ""),
+                            )
+                            for m in pd.get("modifications", [])
+                        ]
+                        self.patches.append(
+                            Patch(
+                                id=pd["id"],
+                                name=pd["name"],
+                                category=pd.get("category", "uncategorized"),
+                                labels=pd.get("labels", []),
+                                description=pd.get("description", ""),
+                                modifications=mods,
+                            )
                         )
-                        for m in pd.get("modifications", [])
-                    ]
-                    patches.append(
-                        Patch(
-                            id=pd["id"],
-                            name=pd["name"],
-                            category=pd.get("category", "uncategorized"),
-                            labels=pd.get("labels", []),
-                            description=pd.get("description", ""),
-                            modifications=mods,
-                        )
-                    )
-            except (json.JSONDecodeError, KeyError) as e:
-                print(f"Warning: skipping {pf.name}: {e}", file=sys.stderr)
-    return patches
+                except (json.JSONDecodeError, KeyError) as e:
+                    print(f"Warning: skipping {pf.name}: {e}", file=sys.stderr)
 
+    def __iter__(self):
+        return iter(self.patches)
 
-# ─── Patch Operations ───────────────────────────────────────────────────────
+    def __len__(self):
+        return len(self.patches)
 
-def detect_patch_state(asar_path, patch):
-    """Detect if a patch is applied. Returns 'applied', 'not_applied', or 'unknown'."""
-    try:
-        archive = AsarArchive(asar_path)
-    except Exception:
-        return "unknown"
+    def get(self, patch_id):
+        """Find a patch by ID. Returns Patch or None."""
+        return next((p for p in self.patches if p.id == patch_id), None)
 
-    any_file_found = False
-    for mod in patch.modifications:
-        matching_files = archive.find_files(mod.file)
-        if not matching_files:
-            continue
-        any_file_found = True
-        for fpath in matching_files:
-            content = archive.read_file(fpath)
-            if content is None:
+    @staticmethod
+    def detect_state(asar_path, patch):
+        """Detect if a patch is applied.
+
+        Returns 'applied', 'not_applied', or 'unknown'.
+        """
+        try:
+            archive = AsarArchive(asar_path)
+        except Exception:
+            return "unknown"
+
+        any_file_found = False
+        for mod in patch.modifications:
+            matching_files = archive.find_files(mod.file)
+            if not matching_files:
                 continue
-            text = content.decode("utf-8", errors="replace")
-            if re.search(mod.search, text):
-                return "not_applied"
-    return "applied" if any_file_found else "unknown"
+            any_file_found = True
+            for fpath in matching_files:
+                content = archive.read_file(fpath)
+                if content is None:
+                    continue
+                text = content.decode("utf-8", errors="replace")
+                if re.search(mod.search, text):
+                    return "not_applied"
+        return "applied" if any_file_found else "unknown"
+
+    @staticmethod
+    def apply(extracted_dir, patch):
+        """Apply all modifications of a patch. Returns total replacement count."""
+        total = 0
+        for mod in patch.modifications:
+            total += PatchRegistry._apply_modification(extracted_dir, mod)
+        return total
+
+    @staticmethod
+    def _apply_modification(extracted_dir, mod):
+        """Apply a single modification to the extracted directory."""
+        count = 0
+        for root, dirs, files in os.walk(extracted_dir):
+            for fname in sorted(files):
+                full = os.path.join(root, fname)
+                rel = os.path.relpath(full, extracted_dir)
+                if fnmatch.fnmatch(rel, mod.file):
+                    with open(full, "r", errors="replace") as f:
+                        content = f.read()
+                    new_content, n = re.subn(mod.search, mod.replace, content)
+                    if n > 0:
+                        with open(full, "w") as f:
+                            f.write(new_content)
+                        count += n
+        return count
 
 
-def apply_modification(extracted_dir, mod):
-    """Apply a single modification to the extracted directory. Returns replacement count."""
-    count = 0
-    for root, dirs, files in os.walk(extracted_dir):
-        for fname in sorted(files):
-            full = os.path.join(root, fname)
-            rel = os.path.relpath(full, extracted_dir)
-            if fnmatch.fnmatch(rel, mod.file):
-                with open(full, "r", errors="replace") as f:
-                    content = f.read()
-                new_content, n = re.subn(mod.search, mod.replace, content)
-                if n > 0:
-                    with open(full, "w") as f:
-                        f.write(new_content)
-                    count += n
-    return count
+# Module-level convenience for callers that don't need a registry instance.
 
-
-def apply_patch(extracted_dir, patch):
-    """Apply all modifications of a patch. Returns total replacement count."""
-    total = 0
-    for mod in patch.modifications:
-        total += apply_modification(extracted_dir, mod)
-    return total
+def load_patches():
+    """Load built-in and external patches. Returns a list of Patch objects."""
+    return PatchRegistry().patches
 
 
 # ─── App Bundle ──────────────────────────────────────────────────────────────
@@ -1551,7 +1578,7 @@ def commit_changes(bundle, patches_to_apply, progress_cb=None):
             warnings = []
             for patch in patches_to_apply:
                 report(f"Applying: {patch.name}...")
-                count = apply_patch(extracted, patch)
+                count = PatchRegistry.apply(extracted, patch)
                 report(f"  → {count} replacement(s)")
                 if count == 0:
                     warnings.append(
@@ -1786,7 +1813,7 @@ class PatchManagerTUI:
                     self._reset_view_state()
                     self.view = "list"
                     for p in self.patches:
-                        self.states[p.id] = detect_patch_state(
+                        self.states[p.id] = PatchRegistry.detect_state(
                             self.bundle.asar, p
                         )
                         self.desired[p.id] = self.states[p.id] == "applied"
@@ -2483,7 +2510,7 @@ def cmd_list(patches, bundle):
     print()
 
     for patch in patches:
-        state = detect_patch_state(bundle.asar, patch)
+        state = PatchRegistry.detect_state(bundle.asar, patch)
         symbol, color = _state_symbol(state)
 
         status_text = {
@@ -2510,7 +2537,7 @@ def cmd_apply(patches, bundle, patch_ids):
             sys.exit(1)
         selected.append(patch)
     for p in patches:
-        state = detect_patch_state(bundle.asar, p)
+        state = PatchRegistry.detect_state(bundle.asar, p)
         if state == "applied" and p not in selected:
             selected.append(p)
     success, msg = commit_changes(bundle, selected, lambda m: print(f"  {c.wrap(c.DIM, m)}"))
@@ -2541,7 +2568,7 @@ def cmd_status(patches, bundle):
     """Show brief status."""
     applied = 0
     for p in patches:
-        state = detect_patch_state(bundle.asar, p)
+        state = PatchRegistry.detect_state(bundle.asar, p)
         if state == "applied":
             applied += 1
             print(f"  {c.wrap(c.GREEN, _CHECK)} {c.wrap(c.CYAN, p.id)}")
@@ -2609,7 +2636,7 @@ def cmd_verify(patches, bundle):
     recorded_ids = set(state.get("applied_patches", []))
     actual_ids = set()
     for p in patches:
-        st = detect_patch_state(asar_path, p)
+        st = PatchRegistry.detect_state(asar_path, p)
         if st == "applied":
             actual_ids.add(p.id)
         elif st == "unknown":
@@ -2657,7 +2684,7 @@ def cmd_restore(patches, bundle):
     # Detect which patches are currently applied so reapply can restore them.
     applied_ids = [
         p.id for p in patches
-        if detect_patch_state(bundle.asar, p) == "applied"
+        if PatchRegistry.detect_state(bundle.asar, p) == "applied"
     ]
 
     state = load_state()
@@ -2945,7 +2972,7 @@ def main():
 def _run_tui(patches, bundle):
     states = {}
     for p in patches:
-        states[p.id] = detect_patch_state(bundle.asar, p)
+        states[p.id] = PatchRegistry.detect_state(bundle.asar, p)
 
     def tui_main(stdscr):
         ui = PatchManagerTUI(stdscr, patches, states, bundle)

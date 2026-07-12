@@ -2592,15 +2592,15 @@ def cmd_verify(patches, paths):
         missing = recorded_ids - actual_ids
         extra = actual_ids - recorded_ids
         if missing:
+            # Patches saved in state but not detected in the asar.
+            # This is the expected "pending reapply" state after
+            # restore, rollback, or app update — not drift.  The
+            # signature check (step 3) already validated the app.
             ids = ", ".join(c.wrap(c.YELLOW, i) for i in sorted(missing))
-            if hash_ok:
-                # Hash matches but patches not detected — pending reapply
-                # after restore or rollback.  This is expected, not drift.
-                print(f"  {c.wrap(c.YELLOW, '⚠')} Pending reapply: {ids}")
-            else:
-                ok = False
-                print(f"  {c.wrap(c.RED + c.BOLD, _CROSS)} Recorded but not detected: {ids}")
+            print(f"  {c.wrap(c.YELLOW, '⚠')} Pending reapply: {ids}")
         if extra:
+            # Patches detected in the asar but not in the state record.
+            # This indicates unexpected drift.
             ids = ", ".join(c.wrap(c.YELLOW, i) for i in sorted(extra))
             ok = False
             print(f"  {c.wrap(c.RED + c.BOLD, _CROSS)} Detected but not recorded: {ids}")

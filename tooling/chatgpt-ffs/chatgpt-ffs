@@ -581,10 +581,10 @@ Patch(
         ),
         modifications=[
             Modification(
-                "webview/assets/app-initial~app-main~projects-index-page~*-*.js",
+                "webview/assets/app-initial~app-main~*-*.js",
                 r"\w+\(`1221508807`\)",
                 "!0",
-                "Bypass gate in thread app shell bundle",
+                "Bypass gate 1221508807 wherever the bundler places it",
             ),
         ],
     ),

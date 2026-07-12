@@ -2561,15 +2561,15 @@ def cmd_verify(patches, paths):
         print(f"  {c.wrap(c.RED + c.BOLD, _CROSS)} Code signature invalid: {sig_msg}")
         ok = False
 
-    # 4. Hash consistency (checked before patch states so we can
-    #    distinguish "pending reapply" from real drift)
+    # 4. Hash consistency (diagnostic only — does not affect pass/fail).
+    #    A mismatch indicates the asar changed since the last tool operation
+    #    (restore, rollback, or app update) and helps explain why patches
+    #    may show as "pending reapply" in step 5.
     state = load_state()
     stored_hash = state.get("installed_hash")
-    hash_ok = False
     if stored_hash:
         current_hash = sha256_file(asar_path)
-        hash_ok = current_hash == stored_hash
-        if hash_ok:
+        if current_hash == stored_hash:
             print(f"  {c.wrap(c.GREEN, _CHECK)} Asar hash matches state record")
         else:
             print(f"  {c.wrap(c.YELLOW, '⚠')} Asar hash differs from state record "

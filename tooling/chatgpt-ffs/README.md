@@ -51,6 +51,9 @@ commit with C, or abort (discard) the pending selection with A.
 # Show brief status
 ./chatgpt-ffs status
 
+# Verify app integrity, signature, and patch state
+./chatgpt-ffs verify
+
 # Apply specific patches
 ./chatgpt-ffs apply worktree-feature-flag
 

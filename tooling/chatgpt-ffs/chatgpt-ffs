@@ -23,7 +23,6 @@ import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 # ─── Constants ──────────────────────────────────────────────────────────────
 
@@ -1368,7 +1367,7 @@ def _find_nested_code(framework_path):
     return sorted(nested)
 
 
-def resign_app(app_path):
+def resign_app(app_path, progress_cb=None):
     """Re-sign the app with ad-hoc signature and proper entitlements.
 
     Must sign all nested helper apps inside frameworks before signing
@@ -1377,6 +1376,10 @@ def resign_app(app_path):
     ad-hoc main app and the still-original helper processes, causing
     the app to spin at 100% CPU in a dlopen retry loop.
     """
+    def report(msg):
+        if progress_cb:
+            progress_cb(msg)
+
     frameworks = os.path.join(app_path, "Contents", "Frameworks")
     codex_fw = os.path.join(frameworks, "Codex Framework.framework")
     sparkle_fw = os.path.join(frameworks, "Sparkle.framework")
@@ -1394,6 +1397,7 @@ def resign_app(app_path):
 
     try:
         # Sign nested helper apps first (deepest first).
+        report("Signing nested helper apps...")
         for fw in [codex_fw, sparkle_fw]:
             if not os.path.exists(fw):
                 continue
@@ -1405,25 +1409,31 @@ def resign_app(app_path):
                 )
         # Sign frameworks.
         if os.path.exists(codex_fw):
+            report("Signing Codex Framework...")
             subprocess.run(
                 ["codesign", "--force", "--sign", "-",
                  "--entitlements", fw_ents, codex_fw],
                 capture_output=True, text=True, check=True,
             )
         if os.path.exists(sparkle_fw):
+            report("Signing Sparkle Framework...")
             subprocess.run(
                 ["codesign", "--force", "--sign", "-", sparkle_fw],
                 capture_output=True, text=True, check=False,
             )
         # Sign main app last.
+        report("Signing main app...")
         subprocess.run(
             ["codesign", "--force", "--sign", "-",
              "--entitlements", app_ents, app_path],
             capture_output=True, text=True, check=True,
         )
     finally:
-        os.unlink(app_ents)
-        os.unlink(fw_ents)
+        for tmp_path in (app_ents, fw_ents):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 def verify_signature(app_path):
@@ -1466,6 +1476,10 @@ def commit_changes(paths, patches_to_apply, progress_cb=None):
 
     Returns:
         (success: bool, message: str)
+
+    If any step after installing the patched asar fails (hash update,
+    re-signing, or signature verification), the original asar is restored
+    from backup so the app is never left in a broken state.
     """
     def report(msg):
         if progress_cb:
@@ -1486,10 +1500,16 @@ def commit_changes(paths, patches_to_apply, progress_cb=None):
                 unpacked_dir=paths["asar_unpacked"],
             )
 
+            warnings = []
             for patch in patches_to_apply:
                 report(f"Applying: {patch.name}...")
                 count = apply_patch(extracted, patch)
                 report(f"  → {count} replacement(s)")
+                if count == 0:
+                    warnings.append(
+                        f"{patch.id}: 0 matches "
+                        f"(app may have been updated)"
+                    )
 
             patched_asar = os.path.join(tmpdir, "app-patched.asar")
             report("Packing patched asar...")
@@ -1498,30 +1518,46 @@ def commit_changes(paths, patches_to_apply, progress_cb=None):
             new_hash = sha256_file(patched_asar)
             report(f"New asar hash: {new_hash[:16]}...")
 
-            report("Installing patched asar...")
-            shutil.copy2(patched_asar, paths["asar"])
+            try:
+                report("Installing patched asar...")
+                shutil.copy2(patched_asar, paths["asar"])
 
-            report("Updating integrity hash in Info.plist...")
-            update_asar_hash(paths["plist"], new_hash)
+                report("Updating integrity hash in Info.plist...")
+                update_asar_hash(paths["plist"], new_hash)
 
-            report("Re-signing Codex Framework...")
-            report("Re-signing Sparkle Framework...")
-            report("Re-signing main app...")
-            resign_app(paths["app"])
+                resign_app(paths["app"], progress_cb=report)
 
-            report("Verifying signature...")
-            ok, msg = verify_signature(paths["app"])
-            if not ok:
-                report(f"WARNING: Signature verification failed: {msg}")
-            else:
+                report("Verifying signature...")
+                ok, msg = verify_signature(paths["app"])
+                if not ok:
+                    raise RuntimeError(
+                        f"Signature verification failed: {msg}"
+                    )
                 report("Signature verified ✓")
+            except Exception as install_err:
+                report(f"Install failed: {install_err}")
+                report("Rolling back to original asar...")
+                shutil.copy2(paths["asar_orig"], paths["asar"])
+                orig_hash = sha256_file(paths["asar"])
+                update_asar_hash(paths["plist"], orig_hash)
+                resign_app(paths["app"], progress_cb=report)
+                report("Rollback complete — app restored to original state.")
+                return False, f"Install failed and rolled back: {install_err}"
 
             state = load_state()
             state["installed_hash"] = new_hash
             state["applied_patches"] = [p.id for p in patches_to_apply]
             save_state(state)
 
+            for w in warnings:
+                report(f"WARNING: {w}")
+
             report("Done!")
+            if warnings:
+                return True, (
+                    "Changes committed with warnings "
+                    f"({len(warnings)} patch(es) had 0 matches)"
+                )
             return True, "Changes committed successfully"
 
     except Exception as e:
@@ -2205,6 +2241,10 @@ class PatchManagerTUI:
                 self._safe_addstr(y, 2, entry, self._cp("accent"))
             elif entry.startswith("New asar hash"):
                 self._safe_addstr(y, 2, entry, self._dim())
+            elif entry.startswith("Rolling back") or entry.startswith("Rollback complete"):
+                self._safe_addstr(y, 2, f"↻ {entry}", self._cp("pending", bright=True))
+            elif entry.startswith("Install failed"):
+                self._safe_addstr(y, 2, f"{_CROSS} {entry}", self._cp("error"))
             else:
                 self._safe_addstr(y, 2, entry, self._dim())
             y += 1
@@ -2462,6 +2502,90 @@ def cmd_status(patches, paths):
     print(summary)
 
 
+# ─── Verify ─────────────────────────────────────────────────────────────────
+
+
+def cmd_verify(patches, paths):
+    """Verify app integrity: asar, backup, signature, and patch state.
+
+    Runs a closed-loop check that the app.asar is readable, the backup
+    exists, the code signature is valid, and the recorded state matches
+    the actual patch states detected in the asar.
+    """
+    ok = True
+    print()
+    print(f"  {c.wrap(c.B_CYAN + c.BOLD, 'ChatGPT FFS — Verification')}")
+    print()
+
+    # 1. app.asar exists and is readable
+    asar_path = paths["asar"]
+    if not os.path.exists(asar_path):
+        print(f"  {c.wrap(c.RED + c.BOLD, _CROSS)} app.asar not found at {asar_path}")
+        return False
+    try:
+        read_asar_header(asar_path)
+        print(f"  {c.wrap(c.GREEN, _CHECK)} app.asar is readable")
+    except Exception as e:
+        print(f"  {c.wrap(c.RED + c.BOLD, _CROSS)} app.asar is corrupted: {e}")
+        return False
+
+    # 2. Backup exists
+    if os.path.exists(paths["asar_orig"]):
+        print(f"  {c.wrap(c.GREEN, _CHECK)} Backup exists (app.asar.orig)")
+    else:
+        print(f"  {c.wrap(c.YELLOW, '⚠')} No backup — first patch will create one")
+
+    # 3. Signature
+    sig_ok, sig_msg = verify_signature(paths["app"])
+    if sig_ok:
+        print(f"  {c.wrap(c.GREEN, _CHECK)} Code signature valid")
+    else:
+        print(f"  {c.wrap(c.RED + c.BOLD, _CROSS)} Code signature invalid: {sig_msg}")
+        ok = False
+
+    # 4. Patch states
+    state = load_state()
+    recorded_ids = set(state.get("applied_patches", []))
+    actual_ids = set()
+    for p in patches:
+        st = detect_patch_state(asar_path, p)
+        if st == "applied":
+            actual_ids.add(p.id)
+        elif st == "unknown":
+            print(f"  {c.wrap(c.YELLOW, '⚠')} {p.id}: state unknown (file not found)")
+
+    if recorded_ids == actual_ids:
+        print(f"  {c.wrap(c.GREEN, _CHECK)} Patch state matches record "
+              f"({len(actual_ids)} applied)")
+    else:
+        missing = recorded_ids - actual_ids
+        extra = actual_ids - recorded_ids
+        ok = False
+        if missing:
+            ids = ", ".join(c.wrap(c.YELLOW, i) for i in sorted(missing))
+            print(f"  {c.wrap(c.RED + c.BOLD, _CROSS)} Recorded but not detected: {ids}")
+        if extra:
+            ids = ", ".join(c.wrap(c.YELLOW, i) for i in sorted(extra))
+            print(f"  {c.wrap(c.YELLOW, '⚠')} Detected but not recorded: {ids}")
+
+    # 5. Hash consistency
+    stored_hash = state.get("installed_hash")
+    if stored_hash:
+        current_hash = sha256_file(asar_path)
+        if current_hash == stored_hash:
+            print(f"  {c.wrap(c.GREEN, _CHECK)} Asar hash matches state record")
+        else:
+            print(f"  {c.wrap(c.YELLOW, '⚠')} Asar hash differs from state record "
+                  f"(app may have been updated)")
+
+    print()
+    if ok:
+        print(f"  {c.wrap(c.GREEN + c.BOLD, _CHECK)} All checks passed.")
+    else:
+        print(f"  {c.wrap(c.RED + c.BOLD, _CROSS)} Verification failed.")
+    return ok
+
+
 # ─── Update Workflow ───────────────────────────────────────────────────────
 
 
@@ -2713,6 +2837,7 @@ def main():
 
     sub.add_parser("list", help="List patches and their states")
     sub.add_parser("status", help="Brief status of applied patches")
+    sub.add_parser("verify", help="Verify app integrity, signature, and patch state")
     p_apply = sub.add_parser("apply", help="Apply patches")
     p_apply.add_argument("patches", nargs="+", help="Patch IDs to apply")
     p_revert = sub.add_parser("revert", help="Revert patches")
@@ -2734,7 +2859,12 @@ def main():
     paths = get_paths(args.app)
 
     if not os.path.exists(paths["asar"]):
-        print(f"Error: {paths['asar']} not found", file=sys.stderr)
+        app_short = os.path.basename(paths["app"])
+        print(
+            f"Error: {paths['asar']} not found.\n"
+            f"Is {app_short} installed at {paths['app']}?",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     patches = load_patches()
@@ -2743,6 +2873,9 @@ def main():
         cmd_list(patches, paths)
     elif args.command == "status":
         cmd_status(patches, paths)
+    elif args.command == "verify":
+        ok = cmd_verify(patches, paths)
+        sys.exit(0 if ok else 1)
     elif args.command == "apply":
         cmd_apply(patches, paths, args.patches)
     elif args.command == "revert":

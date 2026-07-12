@@ -175,8 +175,6 @@ class AsarRoundTripTest(unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(extracted, "packed.txt")))
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
 
 
 class IntegrityEncodingTest(unittest.TestCase):
@@ -241,3 +239,7 @@ class IntegrityEncodingTest(unittest.TestCase):
                         "Executable file should have executable=True")
         self.assertNotIn("executable", header["files"]["regular.txt"],
                          "Non-executable file should not have executable flag")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

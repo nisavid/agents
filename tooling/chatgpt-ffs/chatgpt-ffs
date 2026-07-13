@@ -1382,10 +1382,22 @@ Patch(
                 original=bytes.fromhex("0a404039"),
                 patched=bytes.fromhex("2a008052"),
                 description=(
-                    "Replace ldrb w10, [x0, #0x10] with mov w10, #1 at the "
-                    "no_auth_holdout gate read site (0x57244). The gate value "
-                    "is read directly from cached storage at [ptr+0x10]; this "
-                    "forces it to always be true."
+                    "Replace ldrb w10, [x0, #0x10] with mov w10, #1 at "
+                    "gate read site 1 (0x57244, in the gate config builder "
+                    "function at 0x54b90)."
+                ),
+            ),
+            BinaryModification(
+                file="Contents/Frameworks/ChatGPT.framework/Versions/A/ChatGPT",
+                offset=0x45705b8,
+                original=bytes.fromhex("17414039"),
+                patched=bytes.fromhex("37008052"),
+                description=(
+                    "Replace ldrb w23, [x8, #0x10] with mov w23, #1 at "
+                    "gate read site 2 (0x45705b8, in the holdout evaluation "
+                    "function at 0x457042c). This function is called from "
+                    "0x9b3ba4 and is the code path that controls the login "
+                    "dialog."
                 ),
             ),
         ],

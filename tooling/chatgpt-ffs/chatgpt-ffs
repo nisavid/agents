@@ -1378,26 +1378,20 @@ Patch(
         binary_modifications=[
             BinaryModification(
                 file="Contents/Frameworks/ChatGPT.framework/Versions/A/ChatGPT",
-                offset=0x57244,
-                original=bytes.fromhex("0a404039"),
-                patched=bytes.fromhex("2a008052"),
+                offset=0x457042c,
+                original=bytes.fromhex("ff4302d1f85f05a9"),
+                patched=bytes.fromhex("20008052c0035fd6"),
                 description=(
-                    "Replace ldrb w10, [x0, #0x10] with mov w10, #1 at "
-                    "gate read site 1 (0x57244, in the gate config builder "
-                    "function at 0x54b90)."
-                ),
-            ),
-            BinaryModification(
-                file="Contents/Frameworks/ChatGPT.framework/Versions/A/ChatGPT",
-                offset=0x45705b8,
-                original=bytes.fromhex("17414039"),
-                patched=bytes.fromhex("37008052"),
-                description=(
-                    "Replace ldrb w23, [x8, #0x10] with mov w23, #1 at "
-                    "gate read site 2 (0x45705b8, in the holdout evaluation "
-                    "function at 0x457042c). This function is called from "
-                    "0x9b3ba4 and is the code path that controls the login "
-                    "dialog."
+                    "Replace the prologue of the no-auth holdout evaluation "
+                    "function (sub sp, sp, #0x90; stp x24, x23, [sp, #0x50]) "
+                    "with an immediate return (mov w0, #1; ret). "
+                    "This function is called from 0x9b3ba4 (a lazy accessor "
+                    "invoked at 0x9aa70c) and its return value bit 0 "
+                    "determines whether the login dialog is shown (0) or "
+                    "skipped in favor of no-auth mode (1). The function "
+                    "originally evaluated the chatgpt_ios_login_screen_"
+                    "presentation_style Statsig gate, which defaults to "
+                    "false without network access, forcing login."
                 ),
             ),
         ],

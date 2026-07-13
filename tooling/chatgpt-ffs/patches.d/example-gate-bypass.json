@@ -7,7 +7,7 @@
     "modifications": [
       {
         "file": "webview/assets/some-module-*.js",
-        "search": "\\w+\\(`1234567890`\\)",
+        "search": "[\\w$?.]+\\(`1234567890`\\)",
         "replace": "!0",
         "description": "Replace checkGate('1234567890') with true"
       }

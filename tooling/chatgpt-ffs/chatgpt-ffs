@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ChatGPT FFS — TUI for managing app.asar patches.
+"""ChatGPT FFS — TUI for managing ChatGPT.app patches.
 
 Manages search-and-replace patches against the Codex Desktop (ChatGPT.app)
 app.asar bundle. Handles extraction, patching, repacking, integrity hash
@@ -27,6 +27,7 @@ from pathlib import Path
 DEFAULT_APP = "/Applications/ChatGPT.app"
 STATE_DIR = Path.home() / ".codex" / "chatgpt-ffs"
 STATE_FILE = STATE_DIR / "state.json"
+SCAN_CACHE_FILE = STATE_DIR / "scan_cache.json"
 SCRIPT_DIR = Path(__file__).parent.resolve()
 EXTERNAL_PATCHES_DIR = SCRIPT_DIR / "patches.d"
 
@@ -388,6 +389,76 @@ class Modification:
         return count
 
 
+
+
+@dataclass
+class BinaryModification:
+    """A byte-level patch at a fixed offset in a file within the app bundle.
+
+    Unlike Modification (regex search-and-replace on extracted asar files),
+    BinaryModification targets native Mach-O binaries directly.  Each
+    modification specifies a file path relative to the app bundle root, a
+    file offset, the original bytes expected at that offset, and the
+    replacement bytes.
+    """
+    file: str
+    offset: int
+    original: bytes
+    patched: bytes
+    description: str = ""
+
+    def detect_state(self, app_path):
+        """Return 'applied', 'not_applied', or 'unknown'."""
+        target = os.path.join(app_path, self.file)
+        if not os.path.exists(target):
+            return "unknown"
+        with open(target, "rb") as f:
+            f.seek(self.offset)
+            current = f.read(len(self.patched))
+        if len(current) < len(self.patched):
+            return "unknown"
+        if current == self.patched:
+            return "applied"
+        if len(current) >= len(self.original) and current[:len(self.original)] == self.original:
+            return "not_applied"
+        return "unknown"
+
+    def apply(self, app_path):
+        """Apply this modification. Returns True if bytes were changed."""
+        target = os.path.join(app_path, self.file)
+        with open(target, "rb") as f:
+            f.seek(self.offset)
+            current = f.read(len(self.original))
+        if current == self.patched[:len(current)]:
+            return False  # already patched
+        if current != self.original[:len(current)]:
+            raise ValueError(
+                f"Byte mismatch at {self.file}:{hex(self.offset)}: "
+                f"expected {self.original.hex()}, got {current.hex()}"
+            )
+        with open(target, "r+b") as f:
+            f.seek(self.offset)
+            f.write(self.patched)
+        return True
+
+    def revert(self, app_path):
+        """Revert this modification. Returns True if bytes were changed."""
+        target = os.path.join(app_path, self.file)
+        with open(target, "rb") as f:
+            f.seek(self.offset)
+            current = f.read(len(self.patched))
+        if current == self.original[:len(current)]:
+            return False  # already original
+        if current != self.patched[:len(current)]:
+            raise ValueError(
+                f"Byte mismatch at {self.file}:{hex(self.offset)}: "
+                f"expected {self.patched.hex()}, got {current.hex()}"
+            )
+        with open(target, "r+b") as f:
+            f.seek(self.offset)
+            f.write(self.original)
+        return True
+
 @dataclass
 class Patch:
     id: str
@@ -396,6 +467,7 @@ class Patch:
     labels: list = field(default_factory=list)
     description: str = ""
     modifications: list = field(default_factory=list)
+    binary_modifications: list = field(default_factory=list)
 
     @property
     def short_desc(self):
@@ -426,6 +498,28 @@ class Patch:
         """Apply all modifications. Returns total replacement count."""
         return sum(mod.apply_to(extracted_dir) for mod in self.modifications)
 
+    def detect_binary_state(self, app_path):
+        """Detect patch state from binary modifications.
+
+        Returns 'applied', 'not_applied', or 'unknown'.
+        """
+        if not self.binary_modifications:
+            return "unknown"
+        states = [m.detect_state(app_path) for m in self.binary_modifications]
+        if all(s == "applied" for s in states):
+            return "applied"
+        if all(s == "not_applied" for s in states):
+            return "not_applied"
+        return "unknown"
+
+    def apply_binary(self, app_path):
+        """Apply all binary modifications. Returns count of changes."""
+        return sum(1 for m in self.binary_modifications if m.apply(app_path))
+
+    def revert_binary(self, app_path):
+        """Revert all binary modifications. Returns count of changes."""
+        return sum(1 for m in self.binary_modifications if m.revert(app_path))
+
 
 BUILTIN_PATCHES = [
 Patch(
@@ -438,26 +532,26 @@ Patch(
         ),
         modifications=[
             Modification(
-                "webview/assets/app-initial~app-main~page-*.js",
-                r"\w+\(`505458`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`505458`\)",
                 "!0",
-                "Bypass gate in main page bundle",
+                "Bypass gate in shared new-thread-panel page bundle (controls isWorktreePickerEnabled)",
             ),
             Modification(
-                "webview/assets/home-ambient-suggestions-content-*.js",
-                r"\w+\(`505458`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`505458`\)",
                 "!0",
                 "Bypass gate in home ambient suggestions",
             ),
             Modification(
-                "webview/assets/hotkey-window-home-page-*.js",
-                r"\w+\(`505458`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`505458`\)",
                 "!0",
                 "Bypass gate in hotkey window home page",
             ),
             Modification(
-                "webview/assets/local-remote-dropdown-*.js",
-                r"\w+\(`505458`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`505458`\)",
                 "!0",
                 "Bypass gate in local/remote dropdown",
             ),
@@ -474,14 +568,14 @@ Patch(
         ),
         modifications=[
             Modification(
-                "webview/assets/*chatg~*-*.js",
-                r"\w+\(`567837310`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`567837310`\)",
                 "!0",
                 "Bypass gate in onboarding page",
             ),
             Modification(
-                "webview/assets/app-initial~app-main~page-*.js",
-                r"\w+\(`567837310`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`567837310`\)",
                 "!0",
                 "Bypass gate in main page bundle",
             ),
@@ -498,14 +592,14 @@ Patch(
         ),
         modifications=[
             Modification(
-                "webview/assets/app-initial~app-main~page-*.js",
-                r"\w+\(`12346831`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`12346831`\)",
                 "!0",
                 "Bypass gate in main page bundle",
             ),
             Modification(
-                "webview/assets/header-*.js",
-                r"\w+\(`12346831`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`12346831`\)",
                 "!0",
                 "Bypass gate in header component",
             ),
@@ -522,44 +616,44 @@ Patch(
         ),
         modifications=[
             Modification(
-                "webview/assets/app-initial~app-main~onboarding-page-*.js",
-                r"\w+\(`824038554`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`824038554`\)",
                 "!0",
                 "Bypass gate in gate 824038554",
             ),
             Modification(
-                "webview/assets/app-initial~app-main~page-*.js",
-                r"\w+\(`824038554`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`824038554`\)",
                 "!0",
                 "Bypass gate in main page bundle",
             ),
             Modification(
-                "webview/assets/browser-use-settings-*.js",
-                r"\w+\(`824038554`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`824038554`\)",
                 "!0",
                 "Bypass gate in browser use settings",
             ),
             Modification(
-                "webview/assets/codex-mobile-setup-dialog-*.js",
-                r"\w+\(`824038554`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`824038554`\)",
                 "!0",
                 "Bypass gate in mobile setup dialog",
             ),
             Modification(
-                "webview/assets/codex-mobile-setup-flow-*.js",
-                r"\w+\(`824038554`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`824038554`\)",
                 "!0",
                 "Bypass gate in mobile setup flow",
             ),
             Modification(
-                "webview/assets/debug-*.js",
-                r"\w+\(`824038554`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`824038554`\)",
                 "!0",
                 "Bypass gate in debug modal",
             ),
             Modification(
-                "webview/assets/general-settings-*.js",
-                r"\w+\(`824038554`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`824038554`\)",
                 "!0",
                 "Bypass gate in general settings",
             ),
@@ -576,26 +670,26 @@ Patch(
         ),
         modifications=[
             Modification(
-                "webview/assets/app-initial~app-main~onboarding-page-*.js",
-                r"\w+\(`3264431617`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`3264431617`\)",
                 "!0",
                 "Bypass gate in gate 3264431617",
             ),
             Modification(
-                "webview/assets/app-initial~app-main~page-*.js",
-                r"\w+\(`3264431617`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`3264431617`\)",
                 "!0",
                 "Bypass gate in main page bundle",
             ),
             Modification(
-                "webview/assets/keyboard-shortcuts-settings-*.js",
-                r"\w+\(`3264431617`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`3264431617`\)",
                 "!0",
                 "Bypass gate in keyboard shortcuts settings",
             ),
             Modification(
-                "webview/assets/local-*.js",
-                r"\w+\(`3264431617`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`3264431617`\)",
                 "!0",
                 "Bypass gate in local conversation thread",
             ),
@@ -612,20 +706,20 @@ Patch(
         ),
         modifications=[
             Modification(
-                "webview/assets/app-initial~app-main~page-*.js",
-                r"\w+\(`1372061905`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`1372061905`\)",
                 "!0",
                 "Bypass gate in main page bundle",
             ),
             Modification(
-                "webview/assets/general-settings-*.js",
-                r"\w+\(`1372061905`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`1372061905`\)",
                 "!0",
                 "Bypass gate in general settings",
             ),
             Modification(
-                "webview/assets/keyboard-shortcuts-settings-*.js",
-                r"\w+\(`1372061905`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`1372061905`\)",
                 "!0",
                 "Bypass gate in keyboard shortcuts settings",
             ),
@@ -642,8 +736,8 @@ Patch(
         ),
         modifications=[
             Modification(
-                "webview/assets/app-initial~app-main~*-*.js",
-                r"\w+\(`1221508807`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`1221508807`\)",
                 "!0",
                 "Bypass gate 1221508807 wherever the bundler places it",
             ),
@@ -660,8 +754,8 @@ Patch(
         ),
         modifications=[
             Modification(
-                "webview/assets/app-initial~app-main~page-*.js",
-                r"\w+\(`40604217`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`40604217`\)",
                 "!0",
                 "Bypass gate in main page bundle",
             ),
@@ -678,8 +772,8 @@ Patch(
         ),
         modifications=[
             Modification(
-                "webview/assets/*chatg~*-*.js",
-                r"\w+\(`2333235660`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`2333235660`\)",
                 "!0",
                 "Bypass gate in onboarding page",
             ),
@@ -696,14 +790,14 @@ Patch(
         ),
         modifications=[
             Modification(
-                "webview/assets/app-initial~app-main~page-*.js",
-                r"\w+\(`459748632`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`459748632`\)",
                 "!0",
                 "Bypass gate in main page bundle",
             ),
             Modification(
-                "webview/assets/*app-main~*-*.js",
-                r"\w+\(`459748632`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`459748632`\)",
                 "!0",
                 "Bypass gate in remote conversation page",
             ),
@@ -720,8 +814,8 @@ Patch(
         ),
         modifications=[
             Modification(
-                "webview/assets/app-initial~app-main~onboarding-page-*.js",
-                r"\w+\(`57256278`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`57256278`\)",
                 "!0",
                 "Bypass gate in gate 57256278",
             ),
@@ -738,8 +832,8 @@ Patch(
         ),
         modifications=[
             Modification(
-                "webview/assets/app-initial~app-main~onboarding-page-*.js",
-                r"\w+\(`3736891373`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`3736891373`\)",
                 "!0",
                 "Bypass gate in gate 3736891373",
             ),
@@ -756,8 +850,8 @@ Patch(
         ),
         modifications=[
             Modification(
-                "webview/assets/app-initial~app-main~page-*.js",
-                r"\w+\(`3789238711`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`3789238711`\)",
                 "!0",
                 "Bypass gate in main page bundle",
             ),
@@ -774,32 +868,32 @@ Patch(
         ),
         modifications=[
             Modification(
-                "webview/assets/*projects-index-page~*-*.js",
-                r"\w+\(`1244621283`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`1244621283`\)",
                 "!0",
                 "Bypass gate in new thread panel",
             ),
             Modification(
-                "webview/assets/app-initial~app-main~page-*.js",
-                r"\w+\(`1244621283`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`1244621283`\)",
                 "!0",
                 "Bypass gate in main page bundle",
             ),
             Modification(
-                "webview/assets/keyboard-shortcuts-settings-*.js",
-                r"\w+\(`1244621283`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`1244621283`\)",
                 "!0",
                 "Bypass gate in keyboard shortcuts settings",
             ),
             Modification(
-                "webview/assets/settings-page-*.js",
-                r"\w+\(`1244621283`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`1244621283`\)",
                 "!0",
                 "Bypass gate in settings page",
             ),
             Modification(
-                "webview/assets/voice-settings-*.js",
-                r"\w+\(`1244621283`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`1244621283`\)",
                 "!0",
                 "Bypass gate in voice settings",
             ),
@@ -816,32 +910,32 @@ Patch(
         ),
         modifications=[
             Modification(
-                "webview/assets/*projects-index-page~*-*.js",
-                r"\w+\(`4100906017`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`4100906017`\)",
                 "!0",
                 "Bypass gate in new thread panel",
             ),
             Modification(
-                "webview/assets/app-initial~app-main~page-*.js",
-                r"\w+\(`4100906017`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`4100906017`\)",
                 "!0",
                 "Bypass gate in main page bundle",
             ),
             Modification(
-                "webview/assets/keyboard-shortcuts-settings-*.js",
-                r"\w+\(`4100906017`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`4100906017`\)",
                 "!0",
                 "Bypass gate in keyboard shortcuts settings",
             ),
             Modification(
-                "webview/assets/settings-page-*.js",
-                r"\w+\(`4100906017`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`4100906017`\)",
                 "!0",
                 "Bypass gate in settings page",
             ),
             Modification(
-                "webview/assets/voice-settings-*.js",
-                r"\w+\(`4100906017`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`4100906017`\)",
                 "!0",
                 "Bypass gate in voice settings",
             ),
@@ -858,8 +952,8 @@ Patch(
         ),
         modifications=[
             Modification(
-                "webview/assets/app-initial~app-main~page-*.js",
-                r"\w+\(`1258561229`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`1258561229`\)",
                 "!0",
                 "Bypass gate in main page bundle",
             ),
@@ -876,8 +970,8 @@ Patch(
         ),
         modifications=[
             Modification(
-                "webview/assets/app-initial~app-main~page-*.js",
-                r"\w+\(`1378180112`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`1378180112`\)",
                 "!0",
                 "Bypass gate in main page bundle",
             ),
@@ -894,20 +988,20 @@ Patch(
         ),
         modifications=[
             Modification(
-                "webview/assets/*ho~*-*.js",
-                r"\w+\(`1907601843`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`1907601843`\)",
                 "!0",
                 "Bypass gate in new thread panel",
             ),
             Modification(
-                "webview/assets/app-initial~app-main~page-*.js",
-                r"\w+\(`1907601843`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`1907601843`\)",
                 "!0",
                 "Bypass gate in main page bundle",
             ),
             Modification(
-                "webview/assets/local-remote-dropdown-*.js",
-                r"\w+\(`1907601843`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`1907601843`\)",
                 "!0",
                 "Bypass gate in local/remote dropdown",
             ),
@@ -924,20 +1018,20 @@ Patch(
         ),
         modifications=[
             Modification(
-                "webview/assets/app-initial~app-main~page-*.js",
-                r"\w+\(`3207467860`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`3207467860`\)",
                 "!0",
                 "Bypass gate in main page bundle",
             ),
             Modification(
-                "webview/assets/debug-*.js",
-                r"\w+\(`3207467860`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`3207467860`\)",
                 "!0",
                 "Bypass gate in debug modal",
             ),
             Modification(
-                "webview/assets/settings-page-*.js",
-                r"\w+\(`3207467860`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`3207467860`\)",
                 "!0",
                 "Bypass gate in settings page",
             ),
@@ -954,20 +1048,20 @@ Patch(
         ),
         modifications=[
             Modification(
-                "webview/assets/*chatg~*-*.js",
-                r"\w+\(`4218407052`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`4218407052`\)",
                 "!0",
                 "Bypass gate in onboarding page",
             ),
             Modification(
-                "webview/assets/plugin-detail-page-*.js",
-                r"\w+\(`4218407052`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`4218407052`\)",
                 "!0",
                 "Bypass gate in plugin detail page",
             ),
             Modification(
-                "webview/assets/plugins-page-*.js",
-                r"\w+\(`4218407052`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`4218407052`\)",
                 "!0",
                 "Bypass gate in plugins page",
             ),
@@ -984,8 +1078,8 @@ Patch(
         ),
         modifications=[
             Modification(
-                "webview/assets/app-initial~app-main~page-*.js",
-                r"\w+\(`581682073`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`581682073`\)",
                 "!0",
                 "Bypass gate in main page bundle",
             ),
@@ -1002,38 +1096,38 @@ Patch(
         ),
         modifications=[
             Modification(
-                "webview/assets/app-initial~app-main~onboarding-page-*.js",
-                r"\w+\(`1834314516`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`1834314516`\)",
                 "!0",
                 "Bypass gate in gate 1834314516",
             ),
             Modification(
-                "webview/assets/*chatg~*-*.js",
-                r"\w+\(`1834314516`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`1834314516`\)",
                 "!0",
                 "Bypass gate in onboarding page",
             ),
             Modification(
-                "webview/assets/app-initial~app-main~page-*.js",
-                r"\w+\(`1834314516`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`1834314516`\)",
                 "!0",
                 "Bypass gate in main page bundle",
             ),
             Modification(
-                "webview/assets/browser-profile-import-dialog-*.js",
-                r"\w+\(`1834314516`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`1834314516`\)",
                 "!0",
                 "Bypass gate in browser profile import",
             ),
             Modification(
-                "webview/assets/browser-use-settings-*.js",
-                r"\w+\(`1834314516`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`1834314516`\)",
                 "!0",
                 "Bypass gate in browser use settings",
             ),
             Modification(
-                "webview/assets/debug-*.js",
-                r"\w+\(`1834314516`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`1834314516`\)",
                 "!0",
                 "Bypass gate in debug modal",
             ),
@@ -1050,8 +1144,8 @@ Patch(
         ),
         modifications=[
             Modification(
-                "webview/assets/plugin-detail-page-*.js",
-                r"\w+\(`3309093858`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`3309093858`\)",
                 "!0",
                 "Bypass gate in plugin detail page",
             ),
@@ -1068,20 +1162,20 @@ Patch(
         ),
         modifications=[
             Modification(
-                "webview/assets/*keyboard-shortcuts-settings~*-*.js",
-                r"\w+\(`1823918333`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`1823918333`\)",
                 "!0",
                 "Bypass gate in keyboard shortcuts settings",
             ),
             Modification(
-                "webview/assets/app-initial~app-main~page-*.js",
-                r"\w+\(`1823918333`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`1823918333`\)",
                 "!0",
                 "Bypass gate in main page bundle",
             ),
             Modification(
-                "webview/assets/profile-*.js",
-                r"\w+\(`1823918333`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`1823918333`\)",
                 "!0",
                 "Bypass gate in profile component",
             ),
@@ -1098,32 +1192,32 @@ Patch(
         ),
         modifications=[
             Modification(
-                "webview/assets/app-initial~app-main~onboarding-page-*.js",
-                r"\w+\(`1488233300`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`1488233300`\)",
                 "!0",
                 "Bypass gate in onboarding page",
             ),
             Modification(
-                "webview/assets/*hotkey-window-thread-page~*-*.js",
-                r"\w+\(`1488233300`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`1488233300`\)",
                 "!0",
                 "Bypass gate in shared conversation bundle",
             ),
             Modification(
-                "webview/assets/app-initial~app-main~page-*.js",
-                r"\w+\(`1488233300`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`1488233300`\)",
                 "!0",
                 "Bypass gate in main page bundle",
             ),
             Modification(
-                "webview/assets/local-conversation-page-*.js",
-                r"\w+\(`1488233300`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`1488233300`\)",
                 "!0",
                 "Bypass gate in local conversation page",
             ),
             Modification(
-                "webview/assets/local-conversation-stream-role-product-event-*.js",
-                r"\w+\(`1488233300`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`1488233300`\)",
                 "!0",
                 "Bypass gate in conversation stream events",
             ),
@@ -1140,14 +1234,14 @@ Patch(
         ),
         modifications=[
             Modification(
-                "webview/assets/app-initial~app-main~page-*.js",
-                r"\w+\(`2423536643`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`2423536643`\)",
                 "!0",
                 "Bypass gate in main page bundle",
             ),
             Modification(
-                "webview/assets/settings-page-*.js",
-                r"\w+\(`2423536643`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`2423536643`\)",
                 "!0",
                 "Bypass gate in settings page",
             ),
@@ -1164,8 +1258,8 @@ Patch(
         ),
         modifications=[
             Modification(
-                "webview/assets/app-initial~app-main~page-*.js",
-                r"\w+\(`1304276663`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`1304276663`\)",
                 "!0",
                 "Bypass gate in main page bundle",
             ),
@@ -1182,32 +1276,32 @@ Patch(
         ),
         modifications=[
             Modification(
-                "webview/assets/app-initial~app-main~page-*.js",
-                r"\w+\(`188145323`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`188145323`\)",
                 "!0",
                 "Bypass gate in main page bundle",
             ),
             Modification(
-                "webview/assets/avatar-*.js",
-                r"\w+\(`188145323`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`188145323`\)",
                 "!0",
                 "Bypass gate in avatar overlay component",
             ),
             Modification(
-                "webview/assets/computer-use-settings-*.js",
-                r"\w+\(`188145323`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`188145323`\)",
                 "!0",
                 "Bypass gate in computer use settings",
             ),
             Modification(
-                "webview/assets/local-*.js",
-                r"\w+\(`188145323`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`188145323`\)",
                 "!0",
                 "Bypass gate in local conversation thread",
             ),
             Modification(
-                "webview/assets/pets-settings-*.js",
-                r"\w+\(`188145323`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`188145323`\)",
                 "!0",
                 "Bypass gate in pets settings",
             ),
@@ -1224,8 +1318,8 @@ Patch(
         ),
         modifications=[
             Modification(
-                "webview/assets/app-initial~app-main~page-*.js",
-                r"\w+\(`1848317837`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`1848317837`\)",
                 "!0",
                 "Bypass gate in main page bundle",
             ),
@@ -1242,28 +1336,57 @@ Patch(
         ),
         modifications=[
             Modification(
-                "webview/assets/app-initial~app-main~page-*.js",
-                r"\w+\(`1256703444`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`1256703444`\)",
                 "!0",
                 "Bypass gate in main page bundle",
             ),
             Modification(
-                "webview/assets/app-initial~app-main~page-*.js",
-                r"\w+\(`1529702798`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`1529702798`\)",
                 "!0",
                 "Bypass gate in main page bundle",
             ),
             Modification(
-                "webview/assets/app-initial~app-main~page-*.js",
-                r"\w+\(`1840974662`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`1840974662`\)",
                 "!0",
                 "Bypass gate in main page bundle",
             ),
             Modification(
-                "webview/assets/app-initial~app-main~page-*.js",
-                r"\w+\(`4167858931`\)",
+                "webview/assets/*.js",
+                r"[\w$?.]+\(`4167858931`\)",
                 "!0",
                 "Bypass gate in main page bundle",
+            ),
+        ],
+    ),
+    Patch(
+        id="no-auth-holdout",
+        name="Bypass Login Dialog (No-Auth Mode)",
+        category="auth",
+        labels=["local-only", "auth", "air-gapped", "user-facing"],
+        description=(
+            "Forces the chatgpt_ios_no_auth_holdout Statsig gate to true so the app "
+            "launches directly into the main window without requiring login.\n\n"
+            "In air-gapped or restricted environments where ChatGPT auth is unavailable, "
+            "the gate defaults to false, showing a login dialog. This patch replaces the "
+            "gate boolean read (ldrb w10, [x0, #0x10]) with a constant true (mov w10, #1) "
+            "at the call site where the gate value is consumed.\n\n"
+            "Targets the native ChatGPT.framework binary (v1.2026.183+)."
+        ),
+        binary_modifications=[
+            BinaryModification(
+                file="Contents/Frameworks/ChatGPT.framework/Versions/A/ChatGPT",
+                offset=0x57244,
+                original=bytes.fromhex("0a404039"),
+                patched=bytes.fromhex("2a008052"),
+                description=(
+                    "Replace ldrb w10, [x0, #0x10] with mov w10, #1 at the "
+                    "no_auth_holdout gate read site (0x57244). The gate value "
+                    "is read directly from cached storage at [ptr+0x10]; this "
+                    "forces it to always be true."
+                ),
             ),
         ],
     ),
@@ -1289,6 +1412,16 @@ def load_patches(external_dir=None):
                         )
                         for m in pd.get("modifications", [])
                     ]
+                    binary_mods = [
+                        BinaryModification(
+                            file=m["file"],
+                            offset=int(m["offset"], 0) if isinstance(m["offset"], str) else m["offset"],
+                            original=bytes.fromhex(m["original_hex"]),
+                            patched=bytes.fromhex(m["patched_hex"]),
+                            description=m.get("description", ""),
+                        )
+                        for m in pd.get("binary_modifications", [])
+                    ]
                     patches.append(
                         Patch(
                             id=pd["id"],
@@ -1297,6 +1430,7 @@ def load_patches(external_dir=None):
                             labels=pd.get("labels", []),
                             description=pd.get("description", ""),
                             modifications=mods,
+                            binary_modifications=binary_mods,
                         )
                     )
             except (json.JSONDecodeError, KeyError) as e:
@@ -1304,16 +1438,246 @@ def load_patches(external_dir=None):
     return patches
 
 
+def _extract_gate_ids(patches):
+    """Extract all gate ID byte-strings from patch search patterns.
+
+    Returns {patch_id: [gate_id_bytes, ...]}.
+    """
+    result = {}
+    for patch in patches:
+        gate_ids = []
+        for mod in patch.modifications:
+            m = re.search(r"`(\d+)`", mod.search)
+            if m:
+                gate_ids.append(b"`" + m.group(1).encode() + b"`")
+        result[patch.id] = gate_ids
+    return result
+
+
+def _batch_scan_gate_ids(archive, patches):
+    """Scan all JS files once for every gate ID.
+
+    Uses fast byte-level ``in`` checks instead of regex.
+    Returns {patch_id: bool} — True if any gate ID was found.
+    """
+    gate_map = _extract_gate_ids(patches)
+    # Flatten to unique gate IDs for the scan loop.
+    all_gate_ids = set()
+    for gids in gate_map.values():
+        all_gate_ids.update(gids)
+
+    found_gates = {gid: False for gid in all_gate_ids}
+    all_files = archive.find_files("webview/assets/*.js")
+
+    for fpath in all_files:
+        content = archive.read_file(fpath)
+        if content is None:
+            continue
+        for gid in all_gate_ids:
+            if not found_gates[gid] and gid in content:
+                found_gates[gid] = True
+        # Early exit if all found.
+        if all(found_gates.values()):
+            break
+
+    return {
+        pid: any(found_gates.get(gid, False) for gid in gids)
+        for pid, gids in gate_map.items()
+    }
+
+
 def _detect_patch_states(bundle, patches):
     """Detect states for all patches. Returns {patch_id: state}.
 
-    Returns 'unknown' for all patches if the asar is unreadable.
+    For Electron apps, uses a hash-based cache so the full asar scan
+    only runs when the asar binary changes.  For native apps, checks
+    binary modifications directly (instant — no cache needed).
     """
+    # Native app: check binary modifications directly.
+    if not bundle.has_asar and bundle.has_framework_binary:
+        return {
+            p.id: p.detect_binary_state(bundle.app_path)
+            if p.binary_modifications
+            else "unknown"
+            for p in patches
+        }
+
     try:
         archive = AsarArchive(bundle.asar)
     except Exception:
         return {p.id: "unknown" for p in patches}
-    return {p.id: p.detect_state(archive) for p in patches}
+
+    asar_hash = sha256_file(bundle.asar)
+    cached = _load_scan_cache(asar_hash)
+    if cached is not None:
+        return {p.id: cached.get(p.id, "unknown") for p in patches}
+
+    # Phase 1: fast byte-level pre-filter.  A negative result (gate ID
+    # absent) means the patch is definitely applied.
+    gate_found = _batch_scan_gate_ids(archive, patches)
+
+    # Phase 2: regex verification for positive hits.  A gate ID can
+    # appear in a non-call context (e.g. variable assignment
+    # ``Ezt=`505458```) and survive patching, so only count a patch
+    # as not_applied when the full search regex still matches.
+    states = {}
+    to_verify = []
+    for patch in patches:
+        if patch.id not in gate_found:
+            states[patch.id] = "unknown"
+        elif gate_found[patch.id]:
+            to_verify.append(patch)
+        else:
+            states[patch.id] = "applied"
+
+    if to_verify:
+        verify_patterns = {}  # patch_id -> [compiled_regex]
+        verify_globs = set()
+        for patch in to_verify:
+            patterns = [re.compile(mod.search) for mod in patch.modifications]
+            verify_patterns[patch.id] = patterns
+            for mod in patch.modifications:
+                verify_globs.add(mod.file)
+
+        all_files = sorted(
+            f for g in verify_globs for f in archive.find_files(g)
+        )
+        for fpath in all_files:
+            content = archive.read_file(fpath)
+            if content is None:
+                continue
+            text = content.decode("utf-8", errors="replace")
+            for pid, patterns in verify_patterns.items():
+                if pid in states:
+                    continue
+                for pat in patterns:
+                    if pat.search(text):
+                        states[pid] = "not_applied"
+                        break
+            if all(pid in states for pid in verify_patterns):
+                break
+
+        for patch in to_verify:
+            states.setdefault(patch.id, "applied")
+
+    for patch in patches:
+        if patch.id not in states:
+            states[patch.id] = "unknown"
+
+    _save_scan_cache(asar_hash, states)
+    return {p.id: states.get(p.id, "unknown") for p in patches}
+
+
+def _load_scan_cache(asar_hash):
+    """Load cached scan results for a given asar hash.
+
+    The cache file stores a dict of {hash: {patch_id: state}} entries
+    so both the current and original asar can be cached simultaneously.
+
+    Returns the states dict for this hash, or None on cache miss.
+    """
+    if not SCAN_CACHE_FILE.exists():
+        return None
+    try:
+        data = json.loads(SCAN_CACHE_FILE.read_text())
+        if isinstance(data, dict):
+            entry = data.get(asar_hash)
+            if isinstance(entry, dict):
+                return entry
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return None
+
+
+def _save_scan_cache(asar_hash, states):
+    """Persist scan results for a hash into the multi-entry cache."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    cache = {}
+    if SCAN_CACHE_FILE.exists():
+        try:
+            cache = json.loads(SCAN_CACHE_FILE.read_text())
+            if not isinstance(cache, dict):
+                cache = {}
+        except (json.JSONDecodeError, TypeError):
+            cache = {}
+    cache[asar_hash] = states
+    SCAN_CACHE_FILE.write_text(json.dumps(cache))
+
+
+def _check_stale_patches(bundle, patches):
+    """Check patches for staleness against the original app.
+
+    For asar patches, a patch is stale if its gate ID no longer exists
+    in the original asar.  For binary patches, staleness is checked by
+    verifying the original bytes still match at the expected offset.
+
+    Returns a set of stale patch IDs.
+    """
+    # Native app: check binary modifications against the backup.
+    # A binary patch is stale if the original bytes in the backup don't
+    # match what the patch expects (app was updated and code shifted).
+    if not bundle.has_asar and bundle.has_framework_binary:
+        orig = bundle.framework_binary_orig
+        if not os.path.exists(orig):
+            return set()
+        stale = set()
+        for patch in patches:
+            if not patch.binary_modifications:
+                continue
+            for mod in patch.binary_modifications:
+                with open(orig, "rb") as f:
+                    f.seek(mod.offset)
+                    current = f.read(len(mod.original))
+                if current != mod.original[:len(current)]:
+                    stale.add(patch.id)
+                    break
+        return stale
+
+    if not os.path.exists(bundle.asar_orig):
+        return set()
+    try:
+        archive = AsarArchive(bundle.asar_orig)
+    except Exception:
+        return set()
+
+    orig_hash = sha256_file(bundle.asar_orig)
+    cached = _load_scan_cache(orig_hash)
+    if cached is not None:
+        states = cached
+    else:
+        gate_found = _batch_scan_gate_ids(archive, patches)
+        states = {
+            pid: ("found" if found else "missing")
+            for pid, found in gate_found.items()
+        }
+        for patch in patches:
+            if patch.id not in states:
+                states[patch.id] = "missing"
+        _save_scan_cache(orig_hash, states)
+
+    return {p.id for p in patches if states.get(p.id) == "missing"}
+
+def _warn_stale_patches(patches, bundle):
+    """Print a warning if any patches are stale (gate IDs missing from asar).
+
+    Uses the hash-based cache so the check is instant on repeat invocations.
+    """
+    stale_ids = _check_stale_patches(bundle, patches)
+    if not stale_ids:
+        return
+    stale_names = [p.name for p in patches if p.id in stale_ids]
+    print(
+        f"  {c.wrap(c.YELLOW + c.BOLD, '⚠')} "
+        f"{c.wrap(c.YELLOW, f'{len(stale_ids)} patch(es) have stale gate IDs —')}",
+        file=sys.stderr,
+    )
+    for name in stale_names:
+        print(f"    {c.wrap(c.DIM, '•')} {name}", file=sys.stderr)
+    print(
+        f"    {c.wrap(c.DIM, 'The app may have been updated. These patches had 0 matches.')}",
+        file=sys.stderr,
+    )
+    print(file=sys.stderr)
 
 
 # ─── App Bundle ──────────────────────────────────────────────────────────────
@@ -1336,6 +1700,19 @@ class AppBundle:
         self.asar_unpacked = os.path.join(self.resources, "app.asar.unpacked")
         self.plist = os.path.join(app_path, "Contents", "Info.plist")
         self.frameworks = os.path.join(app_path, "Contents", "Frameworks")
+        # Native app (v1.2026.183+): main binary lives in ChatGPT.framework
+        self.framework_binary = os.path.join(
+            self.frameworks, "ChatGPT.framework", "Versions", "A", "ChatGPT"
+        )
+        self.framework_binary_orig = self.framework_binary + ".orig"
+
+    @property
+    def has_asar(self):
+        return os.path.exists(self.asar)
+
+    @property
+    def has_framework_binary(self):
+        return os.path.exists(self.framework_binary)
 
     # ── Process management ──────────────────────────────────────────────
 
@@ -1352,16 +1729,24 @@ class AppBundle:
     # ── Backup ──────────────────────────────────────────────────────────
 
     def ensure_backup(self):
-        """Ensure a pristine backup of the original asar exists.
+        """Ensure a pristine backup of the original app exists.
 
-        Returns True if a new backup was created, False if one existed.
+        For Electron apps, backs up app.asar.  For native apps, backs up
+        the framework binary.  Returns True if a new backup was created.
         """
-        if not os.path.exists(self.asar):
-            raise FileNotFoundError(f"app.asar not found at {self.asar}")
-        if not os.path.exists(self.asar_orig):
-            shutil.copy2(self.asar, self.asar_orig)
-            return True
-        return False
+        if self.has_asar:
+            if not os.path.exists(self.asar_orig):
+                shutil.copy2(self.asar, self.asar_orig)
+                return True
+            return False
+        if self.has_framework_binary:
+            if not os.path.exists(self.framework_binary_orig):
+                shutil.copy2(self.framework_binary, self.framework_binary_orig)
+                return True
+            return False
+        raise FileNotFoundError(
+            f"Neither app.asar nor framework binary found in {self.app_path}"
+        )
 
     # ── Install + sign ──────────────────────────────────────────────────
 
@@ -1379,6 +1764,16 @@ class AppBundle:
         self._update_plist_hash(new_hash)
         self._resign(progress_cb=progress_cb)
         return new_hash
+
+    def install_binary(self, source_path, progress_cb=None):
+        """Copy a framework binary into place and re-sign.
+
+        Returns the SHA256 hash of the installed binary.
+        """
+        report = _make_reporter(progress_cb)
+        shutil.copy2(source_path, self.framework_binary)
+        self._resign(progress_cb=progress_cb)
+        return sha256_file(self.framework_binary)
 
     def _update_plist_hash(self, asar_hash):
         """Update the ElectronAsarIntegrity hash in Info.plist."""
@@ -1419,6 +1814,7 @@ class AppBundle:
         report = _make_reporter(progress_cb)
 
         codex_fw = os.path.join(self.frameworks, "Codex Framework.framework")
+        chatgpt_fw = os.path.join(self.frameworks, "ChatGPT.framework")
         sparkle_fw = os.path.join(self.frameworks, "Sparkle.framework")
 
         with tempfile.NamedTemporaryFile(
@@ -1455,6 +1851,13 @@ class AppBundle:
                 subprocess.run(
                     ["codesign", "--force", "--sign", "-", sparkle_fw],
                     capture_output=True, text=True, check=False,
+                )
+            if os.path.exists(chatgpt_fw):
+                report("Signing ChatGPT Framework...")
+                subprocess.run(
+                    ["codesign", "--force", "--sign", "-",
+                     "--entitlements", fw_ents, chatgpt_fw],
+                    capture_output=True, text=True, check=True,
                 )
             report("Signing main app...")
             subprocess.run(
@@ -1544,6 +1947,66 @@ def _dim_reporter(msg):
     print(f"  {c.wrap(c.DIM, msg)}")
 
 
+def commit_binary_changes(bundle, patches_to_apply, progress_cb=None):
+    """Apply binary patches directly to the framework binary.
+
+    For native (non-Electron) apps, patches are byte-level modifications
+    to the Mach-O framework binary.  No asar extraction or repacking is
+    needed — the backup is copied to the live path, patches are applied
+    in-place, and the app is re-signed.
+    """
+    report = _make_reporter(progress_cb)
+
+    try:
+        report("Quitting app if running...")
+        bundle.quit()
+
+        report("Ensuring original backup...")
+        bundle.ensure_backup()
+
+        report("Restoring pristine binary from backup...")
+        shutil.copy2(bundle.framework_binary_orig, bundle.framework_binary)
+
+        warnings = []
+        for patch in patches_to_apply:
+            if not patch.binary_modifications:
+                continue
+            report(f"Applying: {patch.name}...")
+            count = patch.apply_binary(bundle.app_path)
+            report(f"  → {count} byte patch(es)")
+            if count == 0:
+                warnings.append(f"{patch.id}: 0 changes (already patched?)")
+
+        report("Re-signing app...")
+        bundle._resign(progress_cb=report)
+
+        report("Verifying signature...")
+        ok, msg = bundle.verify_signature()
+        if not ok:
+            raise RuntimeError(f"Signature verification failed: {msg}")
+        report("Signature verified ✓")
+
+        new_hash = sha256_file(bundle.framework_binary)
+        state = PatchState.load()
+        state.installed_hash = new_hash
+        state.applied_patches = [p.id for p in patches_to_apply]
+        state.save()
+
+        for w in warnings:
+            report(f"WARNING: {w}")
+
+        report("Done!")
+        if warnings:
+            return True, (
+                "Changes committed with warnings "
+                f"({len(warnings)} patch(es) had 0 changes)"
+            )
+        return True, "Changes committed successfully"
+
+    except Exception as e:
+        return False, str(e)
+
+
 def commit_changes(bundle, patches_to_apply, progress_cb=None):
     """Extract original, apply selected patches, repack, install, and sign.
 
@@ -1559,6 +2022,10 @@ def commit_changes(bundle, patches_to_apply, progress_cb=None):
     asar is restored from backup so the app is never left broken.
     """
     report = _make_reporter(progress_cb)
+
+    # Dispatch to binary workflow for native (non-Electron) apps.
+    if not bundle.has_asar and bundle.has_framework_binary:
+        return commit_binary_changes(bundle, patches_to_apply, progress_cb)
 
     try:
         report("Quitting app if running...")
@@ -1705,6 +2172,7 @@ _CROSS = "✗"
 LABEL_META = {
     # Requirements — what it needs externally to function
     "local-only":               ("req",  "Works within the app; no external service needed"),
+    "air-gapped":               ("req",  "Works without network access to OpenAI"),
     "custom-provider":          ("req",  "Works with a custom model provider endpoint"),
     "self-hosted-infra":        ("req",  "Works with user's own remote hosts/infrastructure"),
     "platform-macos":           ("req",  "Gated to macOS (informational, not a disqualifier)"),
@@ -1713,6 +2181,7 @@ LABEL_META = {
     "conversation":             ("prov", "Conversation/thread management"),
     "execution":                ("prov", "Execution environment configuration"),
     "ui-visibility":            ("prov", "UI element visibility/toggle"),
+    "auth":                     ("prov", "Authentication/login flow"),
     "plugin-system":            ("prov", "Plugin management and support"),
     "voice-input":              ("prov", "Voice/dictation input"),
     "notification":             ("prov", "Notification and unread tracking"),
@@ -2564,9 +3033,14 @@ def cmd_revert(patches, bundle, patch_ids):
     bundle.ensure_backup()
     if not patch_ids or "all" in patch_ids:
         to_revert = set(p.id for p in patches)
+        selected = []
     else:
         to_revert = set(patch_ids)
-    selected = [p for p in patches if p.id not in to_revert]
+        states = _detect_patch_states(bundle, patches)
+        selected = [
+            p for p in patches
+            if states[p.id] == "applied" and p.id not in to_revert
+        ]
     success, msg = commit_changes(bundle, selected, _dim_reporter)
     if success:
         print(f"\n  {c.wrap(c.GREEN + c.BOLD, '✓')} {c.wrap(c.GREEN, msg)}")
@@ -2592,34 +3066,44 @@ def cmd_status(patches, bundle):
 
 
 def cmd_verify(patches, bundle):
-    """Verify app integrity: asar, backup, signature, and patch state.
+    """Verify app integrity: binary/asar, backup, signature, and patch state.
 
-    Runs a closed-loop check that the app.asar is readable, the backup
-    exists, the code signature is valid, and the recorded state matches
-    the actual patch states detected in the asar.
+    For native apps, checks the framework binary.  For Electron apps,
+    checks app.asar.  In both cases, verifies the backup exists, the
+    code signature is valid, and the recorded state matches the actual
+    patch states.
     """
     ok = True
     print()
     print(f"  {c.wrap(c.B_CYAN + c.BOLD, 'ChatGPT FFS — Verification')}")
     print()
 
-    # 1. app.asar exists and is readable
-    asar_path = bundle.asar
-    if not os.path.exists(asar_path):
-        print(f"  {c.wrap(c.RED + c.BOLD, _CROSS)} app.asar not found at {asar_path}")
-        return False
-    try:
-        archive = AsarArchive(asar_path)
-        print(f"  {c.wrap(c.GREEN, _CHECK)} app.asar is readable")
-    except Exception as e:
-        print(f"  {c.wrap(c.RED + c.BOLD, _CROSS)} app.asar is corrupted: {e}")
-        return False
-
-    # 2. Backup exists
-    if os.path.exists(bundle.asar_orig):
-        print(f"  {c.wrap(c.GREEN, _CHECK)} Backup exists (app.asar.orig)")
+    # Native app: verify framework binary
+    if not bundle.has_asar and bundle.has_framework_binary:
+        if not os.path.exists(bundle.framework_binary):
+            print(f"  {c.wrap(c.RED + c.BOLD, _CROSS)} Framework binary not found")
+            return False
+        print(f"  {c.wrap(c.GREEN, _CHECK)} Framework binary exists")
+        if os.path.exists(bundle.framework_binary_orig):
+            print(f"  {c.wrap(c.GREEN, _CHECK)} Backup exists (ChatGPT.orig)")
+        else:
+            print(f"  {c.wrap(c.YELLOW, '⚠')} No backup — first patch will create one")
     else:
-        print(f"  {c.wrap(c.YELLOW, '⚠')} No backup — first patch will create one")
+        # Electron app: verify app.asar
+        asar_path = bundle.asar
+        if not os.path.exists(asar_path):
+            print(f"  {c.wrap(c.RED + c.BOLD, _CROSS)} app.asar not found at {asar_path}")
+            return False
+        try:
+            archive = AsarArchive(asar_path)
+            print(f"  {c.wrap(c.GREEN, _CHECK)} app.asar is readable")
+        except Exception as e:
+            print(f"  {c.wrap(c.RED + c.BOLD, _CROSS)} app.asar is corrupted: {e}")
+            return False
+        if os.path.exists(bundle.asar_orig):
+            print(f"  {c.wrap(c.GREEN, _CHECK)} Backup exists (app.asar.orig)")
+        else:
+            print(f"  {c.wrap(c.YELLOW, '⚠')} No backup — first patch will create one")
 
     # 3. Signature
     sig_ok, sig_msg = bundle.verify_signature()
@@ -2630,24 +3114,31 @@ def cmd_verify(patches, bundle):
         ok = False
 
     # 4. Hash consistency (diagnostic only — does not affect pass/fail).
-    #    A mismatch indicates the asar changed since the last tool operation
-    #    (restore, rollback, or app update) and helps explain why patches
-    #    may show as "pending reapply" in step 5.
+    #    A mismatch indicates the binary/asar changed since the last tool
+    #    operation (restore, rollback, or app update) and helps explain
+    #    why patches may show as "pending reapply" in step 5.
     state = PatchState.load()
     stored_hash = state.installed_hash
     if stored_hash:
-        current_hash = sha256_file(asar_path)
+        hash_path = bundle.framework_binary if not bundle.has_asar and bundle.has_framework_binary else bundle.asar
+        current_hash = sha256_file(hash_path)
         if current_hash == stored_hash:
-            print(f"  {c.wrap(c.GREEN, _CHECK)} Asar hash matches state record")
+            print(f"  {c.wrap(c.GREEN, _CHECK)} Binary hash matches state record")
         else:
-            print(f"  {c.wrap(c.YELLOW, '⚠')} Asar hash differs from state record "
+            print(f"  {c.wrap(c.YELLOW, '⚠')} Binary hash differs from state record "
                   f"(app may have been updated)")
 
     # 5. Patch states
     recorded_ids = set(state.applied_patches)
     actual_ids = set()
     for p in patches:
-        st = p.detect_state(archive)
+        if not bundle.has_asar and bundle.has_framework_binary:
+            st = p.detect_binary_state(bundle.app_path)
+            # Asar-only patches show as "unknown" on native apps — expected.
+            if st == "unknown" and not p.binary_modifications:
+                continue
+        else:
+            st = p.detect_state(archive)
         if st == "applied":
             actual_ids.add(p.id)
         elif st == "unknown":
@@ -2685,12 +3176,13 @@ def cmd_verify(patches, bundle):
 
 
 def cmd_restore(patches, bundle):
-    """Restore pristine app.asar from backup, preserving the applied-patch list.
+    """Restore pristine app from backup, preserving the applied-patch list.
 
-    Saves the set of currently-applied patches to state so ``reapply`` can
-    restore them after an app update.  Then copies ``app.asar.orig`` over
-    ``app.asar``, updates the integrity hash, and re-signs — leaving the app
-    in a clean state that can safely accept a Sparkle or manual update.
+    For Electron apps, copies ``app.asar.orig`` over ``app.asar``, updates
+    the integrity hash, and re-signs.  For native apps, copies the framework
+    binary backup over the live binary and re-signs.  In both cases, the
+    applied-patch list is saved so ``reapply`` can restore them after an
+    app update.
     """
     # Detect which patches are currently applied so reapply can restore them.
     states = _detect_patch_states(bundle, patches)
@@ -2702,6 +3194,49 @@ def cmd_restore(patches, bundle):
     state = PatchState.load()
     state.applied_patches = applied_ids
 
+    # Native app: restore framework binary
+    if not bundle.has_asar and bundle.has_framework_binary:
+        orig = bundle.framework_binary_orig
+        if not os.path.exists(orig):
+            state.installed_hash = sha256_file(bundle.framework_binary)
+            state.save()
+            print(f"  {c.wrap(c.YELLOW, '⚠')} No backup found — app is already pristine.")
+            if applied_ids:
+                ids = ", ".join(c.wrap(c.CYAN, pid) for pid in applied_ids)
+                print(f"  {c.wrap(c.DIM, 'Saved')} {ids} {c.wrap(c.DIM, 'for reapply.')}")
+            else:
+                print(f"  {c.wrap(c.DIM, 'No patches to reapply.')}")
+            return
+
+        report = _dim_reporter
+        try:
+            report("Quitting app if running...")
+            bundle.quit()
+            report("Restoring pristine framework binary from backup...")
+            new_hash = bundle.install_binary(orig, progress_cb=report)
+            state.installed_hash = new_hash
+            state.save()
+            report("Verifying signature...")
+            ok, msg = bundle.verify_signature()
+            if not ok:
+                report(f"WARNING: Signature verification failed: {msg}")
+            else:
+                report("Signature verified ✓")
+            print(f"\n  {c.wrap(c.GREEN + c.BOLD, '✓')} {c.wrap(c.GREEN, 'App restored to pristine state.')}")
+            if applied_ids:
+                ids = ", ".join(c.wrap(c.CYAN, pid) for pid in applied_ids)
+                print(f"  {c.wrap(c.DIM, 'Saved for reapply:')} {ids}")
+                print(f"  {c.wrap(c.DIM, 'Run')} {c.wrap(c.BOLD, 'chatgpt-ffs reapply')} "
+                      f"{c.wrap(c.DIM, 'after updating the app.')}")
+            else:
+                print(f"  {c.wrap(c.DIM, 'No patches were applied — nothing to reapply.')}")
+        except Exception as e:
+            print(f"\n  {c.wrap(c.RED + c.BOLD, '✗')} {c.wrap(c.RED, str(e))}",
+                  file=sys.stderr)
+            sys.exit(1)
+        return
+
+    # Electron app: restore app.asar
     orig = bundle.asar_orig
     if not os.path.exists(orig):
         # Already pristine (e.g. app was just updated and no backup exists).
@@ -2765,13 +3300,15 @@ def cmd_reapply(patches, bundle):
               f"{c.wrap(c.DIM, 'instead.')}")
         return
 
-    # Detect stale backup: if the current asar hash doesn't match what we
-    # stored at restore time, the app was updated and app.asar.orig is stale.
-    if state.is_stale(sha256_file(bundle.asar)):
-        orig = bundle.asar_orig
-        if os.path.exists(orig):
+    # Detect stale backup: if the current binary/asar hash doesn't match
+    # what we stored at restore time, the app was updated and the backup
+    # is stale.
+    current_path = bundle.framework_binary if bundle.has_framework_binary and not bundle.has_asar else bundle.asar
+    orig_path = bundle.framework_binary_orig if bundle.has_framework_binary and not bundle.has_asar else bundle.asar_orig
+    if state.is_stale(sha256_file(current_path)):
+        if os.path.exists(orig_path):
             print(f"  {c.wrap(c.DIM, 'App updated — refreshing backup...')}")
-            os.remove(orig)
+            os.remove(orig_path)
 
     # Resolve saved IDs to Patch objects.
     selected = []
@@ -2913,7 +3450,7 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="ChatGPT FFS — asar patch manager for ChatGPT.app",
+        description="ChatGPT FFS — patch manager for ChatGPT.app",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Run without arguments to launch the interactive TUI.\n"
@@ -2946,19 +3483,20 @@ def main():
 
     bundle = AppBundle(args.app)
 
-    if not os.path.exists(bundle.asar):
+    if not bundle.has_asar and not bundle.has_framework_binary:
         app_short = os.path.basename(bundle.app_path)
         print(
-            f"Error: {bundle.asar} not found.\n"
+            f"Error: Neither app.asar nor ChatGPT.framework found.\n"
             f"Is {app_short} installed at {bundle.app_path}?",
             file=sys.stderr,
         )
         sys.exit(1)
 
     patches = load_patches()
+    if args.command not in ("install", "tui", None):
+        _warn_stale_patches(patches, bundle)
 
-    if args.command == "list":
-        cmd_list(patches, bundle)
+    if args.command == "list":        cmd_list(patches, bundle)
     elif args.command == "status":
         cmd_status(patches, bundle)
     elif args.command == "verify":

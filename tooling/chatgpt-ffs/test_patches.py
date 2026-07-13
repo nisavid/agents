@@ -38,7 +38,10 @@ class PatchDefinitionsTest(unittest.TestCase):
             self.assertTrue(p.category, f"Patch {p.id} missing category")
             self.assertTrue(p.description, f"Patch {p.id} missing description")
             self.assertIsInstance(p.labels, list, f"Patch {p.id} labels not a list")
-            self.assertTrue(p.modifications, f"Patch {p.id} has no modifications")
+            self.assertTrue(
+                p.modifications or p.binary_modifications,
+                f"Patch {p.id} has no modifications or binary_modifications"
+            )
 
     def test_all_patch_ids_unique(self):
         """No two patches share the same id."""
@@ -193,6 +196,48 @@ class PatchStateDetectionTest(unittest.TestCase):
         with open(test_file, "r") as f:
             result = f.read()
         self.assertEqual(result, "var a = !0; var b = !0;")
+
+
+    def test_apply_to_handles_method_call(self):
+        """apply_to replaces n?.checkGate(`GATE`) without breaking syntax.
+
+        The regex must capture the full method-call chain (n?.checkGate)
+        so the replacement produces valid JS (!0), not n?.!0.
+        """
+        src = os.path.join(self.tmp, "extracted")
+        os.makedirs(os.path.join(src, "webview", "assets"))
+        test_file = os.path.join(src, "webview", "assets", "test-module-abc123.js")
+        with open(test_file, "w") as f:
+            f.write("t||n?.checkGate(`505458`)===!0")
+
+        mod = cpm.Modification("webview/assets/test-module-*.js",
+                               r"[\w$?.]+\(`505458`\)", "!0", "test")
+        count = mod.apply_to(src)
+        self.assertEqual(count, 1)
+
+        with open(test_file, "r") as f:
+            result = f.read()
+        self.assertEqual(result, "t||!0===!0")
+        self.assertNotIn("n?.!0", result)
+
+    def test_detect_state_with_non_call_gate_id(self):
+        """detect_state returns 'applied' when gate ID survives in a
+        non-call context (e.g. variable assignment) after patching."""
+        asar = self._make_synthetic_asar({
+            "webview/assets/test-module-abc123.js":
+                "Ezt=`505458`,SD=G(Y,({get:e})=>{return !0===!0})",
+        })
+        patch = cpm.Patch(
+            id="test",
+            name="Test",
+            category="test",
+            description="test",
+            modifications=[
+                cpm.Modification("webview/assets/test-module-*.js",
+                                 r"[\w$?.]+\(`505458`\)", "!0", "test"),
+            ],
+        )
+        self.assertEqual(patch.detect_state(cpm.AsarArchive(asar)), "applied")
 
 
 class ExternalPatchLabelsTest(unittest.TestCase):

@@ -57,7 +57,7 @@ observed results.
 The exact-copy run above and earlier direct development runs exposed brittle
 submission and result selectors. Synthetic DOM insertion did not prove
 submission; trusted renderer input and Enter did, but the exact-sentinel result
-check missed non-exact model output. The replacement renderer oracle submits
+check missed non-exact model output. The then-current renderer oracle submits
 `What is 73 plus 19? Your final answer must include the decimal result.` and
 accepts only one standalone `92` occurrence in one assistant-message output
 line. It anchors the output to the assistant's `Copy` action and excludes the
@@ -137,8 +137,9 @@ home, Electron user-data directory, provider configuration, Seatbelt profile,
 and loopback endpoints. The CDP driver selects the persisted local thread by
 its first-prompt task label, requires the bound first prompt and the same
 normalized full renderer text observed in phase one to be visible, then submits
-a different deterministic arithmetic prompt whose final result must contain one
-standalone `63`.
+a different deterministic arithmetic prompt. Its assistant output must contain
+one or more standalone `63` tokens, every standalone integer must be one of
+`46`, `17`, or `63`, and the final standalone integer must be `63`.
 
 The runner finally requires that the second prompt and result were persisted
 exactly once in the original rollout with the original thread UUID, that the
@@ -169,3 +170,41 @@ This remains a development-only semantic probe: it launches only the copied
 bundle and retains the existing outer Seatbelt plus `--no-sandbox` constraint.
 It does not modify the copied bundle identifier, signature, ASAR, native code,
 the installed app, or the operator's real profile and global state.
+
+## Repeated-result arithmetic oracle correction
+
+A later live phase-one attempt produced the correct response:
+
+```text
+73 plus 19 is 92.
+
+73 + 19 = 92
+```
+
+The previous exact-one-occurrence oracle rejected that response solely because
+`92` appeared twice, so the run stopped before the cold restart. The renderer,
+persisted rollout, and completed task were present. First-turn transport was not
+attributed because the CDP failure stopped the later accounting; that attempt is
+not cold-restart evidence.
+
+The arithmetic oracle now accepts one or more expected-result occurrences only
+when every standalone integer in the assistant message belongs to the two
+operands or expected result and the final standalone integer equals the expected
+result. Phase one therefore allows only `{73, 19, 92}` and must end in `92`;
+phase two allows only `{46, 17, 63}` and must end in `63`. A wrong intermediate
+integer, a correction from a wrong integer, an unrelated integer, or a wrong
+final integer fails closed. Persisted-rollout selection uses the same predicate.
+
+The driver includes a no-app self-test covering repeated-correct, single-result,
+wrong-then-corrected, conflicting, and wrong-final responses. It also builds a
+synthetic DOM where the exact user prompt contains out-of-set `999`; the oracle
+passes the valid assistant node because prompt text outside that anchored node
+is excluded.
+
+Run the static oracle cases with:
+
+```sh
+node .scratch/chatgpt-airgap-unlock/research/12-cdp-gui-driver.mjs --self-test
+```
+
+The cold-restart workflow has not been rerun after this correction.

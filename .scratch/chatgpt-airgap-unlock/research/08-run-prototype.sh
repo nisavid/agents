@@ -605,6 +605,15 @@ codex_dir = pathlib.Path(sys.argv[1])
 state_path = pathlib.Path(sys.argv[2])
 cdp_path = pathlib.Path(sys.argv[3])
 first_prompt = "What is 73 plus 19? Your final answer must include the decimal result."
+def arithmetic_output_matches(message, operands, expected_result):
+    integers = [int(value) for value in re.findall(r"(?<![\w.])[+-]?\d+(?!\w|\.\d)", message)]
+    allowed = {*operands, expected_result}
+    return (
+        bool(integers)
+        and all(value in allowed for value in integers)
+        and integers[-1] == expected_result
+    )
+
 candidates = []
 for rollout in codex_dir.glob("sessions/*/*/*/rollout-*.jsonl"):
     records = [json.loads(line) for line in rollout.read_text().splitlines() if line]
@@ -630,7 +639,7 @@ for rollout in codex_dir.glob("sessions/*/*/*/rollout-*.jsonl"):
     ]
     first_outputs = [
         message for message in assistant_messages
-        if len(re.findall(r"(?<!\d)92(?!\d)", message)) == 1
+        if arithmetic_output_matches(message, (73, 19), 92)
     ]
     if len(session_ids) == 1 and sum(message.strip() == first_prompt for message in user_messages) == 1 and len(first_outputs) == 1:
         candidates.append((session_ids[0], rollout, first_outputs[0]))
@@ -642,7 +651,9 @@ renderer_oracles = [
     if record.get("kind") == "assistant-output-oracle"
     and record.get("phase") == "first"
     and record.get("matched") is True
-    and record.get("occurrenceCount") == 1
+    and record.get("expectedOccurrenceCount", 0) >= 1
+    and record.get("conflictingIntegers") == []
+    and record.get("finalInteger") == 92
     and isinstance(record.get("textSha256"), str)
     and re.fullmatch(r"[0-9a-f]{64}", record["textSha256"])
 ]
@@ -704,6 +715,15 @@ if session_ids != [state["threadId"]]:
     raise SystemExit(f"thread identity changed: {session_ids!r}")
 first_prompt = "What is 73 plus 19? Your final answer must include the decimal result."
 second_prompt = "What is 46 plus 17? Your final answer must include the decimal result."
+def arithmetic_output_matches(message, operands, expected_result):
+    integers = [int(value) for value in re.findall(r"(?<![\w.])[+-]?\d+(?!\w|\.\d)", message)]
+    allowed = {*operands, expected_result}
+    return (
+        bool(integers)
+        and all(value in allowed for value in integers)
+        and integers[-1] == expected_result
+    )
+
 user_messages = [
     item.get("text", "")
     for record in records
@@ -721,7 +741,7 @@ assistant_messages = [
 ]
 first_outputs = [
     message for message in assistant_messages
-    if len(re.findall(r"(?<!\d)92(?!\d)", message)) == 1
+    if arithmetic_output_matches(message, (73, 19), 92)
 ]
 if sum(message.strip() == first_prompt for message in user_messages) != 1 or len(first_outputs) != 1:
     raise SystemExit("original persisted assistant output is no longer unique")
@@ -730,7 +750,7 @@ if first_persisted_output_sha256 != state["firstPersistedOutputSha256"]:
     raise SystemExit("original persisted assistant output changed across restart")
 second_outputs = [
     message for message in assistant_messages
-    if len(re.findall(r"(?<!\d)63(?!\d)", message)) == 1
+    if arithmetic_output_matches(message, (46, 17), 63)
 ]
 if sum(message.strip() == second_prompt for message in user_messages) != 1 or len(second_outputs) != 1:
     raise SystemExit("deterministic continuation was not persisted exactly once")
@@ -739,7 +759,9 @@ second_oracles = [
     if record.get("kind") == "assistant-output-oracle"
     and record.get("phase") == "second"
     and record.get("matched") is True
-    and record.get("occurrenceCount") == 1
+    and record.get("expectedOccurrenceCount", 0) >= 1
+    and record.get("conflictingIntegers") == []
+    and record.get("finalInteger") == 63
     and isinstance(record.get("textSha256"), str)
     and re.fullmatch(r"[0-9a-f]{64}", record["textSha256"])
 ]

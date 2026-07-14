@@ -785,6 +785,50 @@ class ProxyIntegrationTest(unittest.TestCase):
         client.join(2)
         self.assertFalse(client.is_alive())
 
+    def test_shutdown_race_after_getresponse_returns_503_and_closes_handler(self):
+        reached_registration = threading.Event()
+        allow_registration = threading.Event()
+        original_register = self.gateway.register_upstream_response
+
+        def synchronized_register(lifecycle, response):
+            reached_registration.set()
+            self.assertTrue(allow_registration.wait(2))
+            return original_register(lifecycle, response)
+
+        self.gateway.register_upstream_response = synchronized_register
+        result = []
+
+        def request_during_shutdown():
+            try:
+                result.append(self.request("GET", "/v1/models"))
+            except Exception as error:
+                result.append(error)
+
+        client = threading.Thread(target=request_during_shutdown)
+        client.start()
+        self.assertTrue(reached_registration.wait(1))
+        self.gateway.shutdown()
+        self.gateway_thread.join(2)
+        close_thread = threading.Thread(target=self.gateway.server_close)
+        close_thread.start()
+        deadline = time.monotonic() + 1
+        while not self.gateway.is_closing() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.assertTrue(self.gateway.is_closing())
+        allow_registration.set()
+        close_thread.join(1)
+        client.join(1)
+        self.assertFalse(close_thread.is_alive())
+        self.assertFalse(client.is_alive())
+        self.assertEqual(1, len(result))
+        self.assertIsInstance(result[0], tuple)
+        status, headers, raw = result[0]
+        self.assertEqual(503, status)
+        self.assertEqual("close", headers["Connection"])
+        self.assertEqual(
+            {"error": {"message": "gateway shutting down"}}, json.loads(raw)
+        )
+
     def test_multiline_crlf_sse_reconstructs_only_changed_frame(self):
         sse = (
             b": comment\r\n"

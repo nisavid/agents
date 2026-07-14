@@ -361,6 +361,37 @@ class _NamespaceState:
                 self._maps.popitem(last=False)
 
 
+class _UpstreamLifecycle:
+    """Own one upstream transport and its eventual response during shutdown."""
+
+    def __init__(self, connection: http.client.HTTPConnection):
+        self._connection = connection
+        self._response: http.client.HTTPResponse | None = None
+        self._closing = False
+        self._lock = threading.Lock()
+
+    def attach_response(self, response: http.client.HTTPResponse) -> bool:
+        with self._lock:
+            if not self._closing:
+                self._response = response
+                return True
+        response.close()
+        return False
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closing:
+                return
+            self._closing = True
+            response = self._response
+        # Close the transport first, then the file wrapper. Both are needed to
+        # interrupt a thread blocked in HTTPResponse.readline() on all supported
+        # Python/macOS combinations.
+        self._connection.close()
+        if response is not None:
+            response.close()
+
+
 def _merge_reconstruction(
     inherited: dict[str, tuple[str, str]], current: dict[str, tuple[str, str]]
 ) -> dict[str, tuple[str, str]]:
@@ -603,9 +634,10 @@ def _handler_for(config: ProxyConfig, namespace_state: _NamespaceState):
             if upstream.scheme == "https":
                 kwargs["context"] = ssl.create_default_context()
             connection = connection_class(upstream.hostname, port, **kwargs)
+            lifecycle = _UpstreamLifecycle(connection)
             response = None
-            if not self.server.track_upstream(connection):
-                connection.close()
+            if not self.server.track_upstream(lifecycle):
+                lifecycle.close()
                 self._send_json(503, {"error": {"message": "gateway shutting down"}})
                 return
             try:
@@ -616,8 +648,12 @@ def _handler_for(config: ProxyConfig, namespace_state: _NamespaceState):
                     headers=headers,
                 )
                 response = connection.getresponse()
-                if not self.server.track_upstream(response):
-                    response.close()
+                if not self.server.register_upstream_response(lifecycle, response):
+                    self.close_connection = True
+                    if not self._response_started:
+                        self._send_json(
+                            503, {"error": {"message": "gateway shutting down"}}
+                        )
                     return
                 content_type = response.getheader("Content-Type", "")
                 if "text/event-stream" in content_type.lower():
@@ -626,18 +662,21 @@ def _handler_for(config: ProxyConfig, namespace_state: _NamespaceState):
                     self._forward_plain(response, reconstruction)
             except (TimeoutError, socket.timeout):
                 if not self.wfile.closed:
-                    self._send_json(504, {"error": {"message": "upstream timeout"}})
+                    if self.server.is_closing():
+                        self._send_json(503, {"error": {"message": "gateway shutting down"}})
+                    else:
+                        self._send_json(504, {"error": {"message": "upstream timeout"}})
             except (http.client.HTTPException, OSError) as error:
                 if config.debug:
                     _safe_log(f"upstream transport error type={type(error).__name__}")
                 if not self.wfile.closed:
-                    self._send_json(502, {"error": {"message": "upstream unavailable"}})
+                    if self.server.is_closing():
+                        self._send_json(503, {"error": {"message": "gateway shutting down"}})
+                    else:
+                        self._send_json(502, {"error": {"message": "upstream unavailable"}})
             finally:
-                if response is not None:
-                    self.server.untrack_upstream(response)
-                    response.close()
-                self.server.untrack_upstream(connection)
-                connection.close()
+                self.server.untrack_upstream(lifecycle)
+                lifecycle.close()
 
         def _forward_headers(self) -> dict[str, str]:
             connection_names = {
@@ -841,31 +880,39 @@ class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     allow_reuse_address = True
 
     def __init__(self, *args: Any, **kwargs: Any):
-        self._active_upstreams: set[Any] = set()
+        self._active_upstreams: set[_UpstreamLifecycle] = set()
         self._upstream_lock = threading.Lock()
         self._closing = False
         super().__init__(*args, **kwargs)
 
-    def track_upstream(self, closeable: Any) -> bool:
+    def track_upstream(self, lifecycle: _UpstreamLifecycle) -> bool:
         with self._upstream_lock:
             if self._closing:
                 return False
-            self._active_upstreams.add(closeable)
+            self._active_upstreams.add(lifecycle)
             return True
 
-    def untrack_upstream(self, closeable: Any) -> None:
+    def register_upstream_response(
+        self,
+        lifecycle: _UpstreamLifecycle,
+        response: http.client.HTTPResponse,
+    ) -> bool:
+        return lifecycle.attach_response(response)
+
+    def untrack_upstream(self, lifecycle: _UpstreamLifecycle) -> None:
         with self._upstream_lock:
-            self._active_upstreams.discard(closeable)
+            self._active_upstreams.discard(lifecycle)
+
+    def is_closing(self) -> bool:
+        with self._upstream_lock:
+            return self._closing
 
     def server_close(self) -> None:
         with self._upstream_lock:
             self._closing = True
             active = tuple(self._active_upstreams)
-        for closeable in active:
-            try:
-                closeable.close()
-            except OSError:
-                pass
+        for lifecycle in active:
+            lifecycle.close()
         super().server_close()
 
 

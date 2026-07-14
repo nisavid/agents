@@ -20,6 +20,7 @@ Produce an implementation-ready, empirically validated plan for running the exac
 
 - [Reconstruct the legacy patcher contract](issues/01-reconstruct-legacy-patcher-contract.md) — Keep the artifact-bound, integrity-aware, rollback-first lifecycle as requirements; rediscover every historical gate, path, entitlement, and native control point against the exact baseline.
 - [Map the rewritten app auth architecture](issues/02-map-rewritten-app-auth-architecture.md) — The bundled app-server supplies `account/read`; the renderer routes to login only when no auth method exists and OpenAI auth remains required.
+- [Trace pristine offline startup](issues/03-trace-pristine-offline-startup.md) — A fresh isolated profile returns no account with OpenAI auth required and deterministically reaches the login wall; only changing the semantic host policy, not hiding UI, enables no-auth startup.
 - [Trace the GLM provider path](issues/04-trace-glm-provider-path.md) — A cold file-configured custom provider naturally disables the OpenAI-auth requirement and reaches a loopback Responses endpoint; UI provisioning and arbitrary model metadata remain absent.
 - [Assess integrity, signing, and security](issues/06-assess-integrity-signing-and-security.md) — Prefer a pristine-bundle configuration or loopback-service route; any derived bundle must use exact-artifact binding, complete least-privilege signing, strict fail-closed verification, and whole-copy rollback.
 

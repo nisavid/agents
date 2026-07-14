@@ -9,7 +9,9 @@ import http.client
 import http.server
 import ipaddress
 import json
+import math
 import os
+import queue
 import re
 import socket
 import socketserver
@@ -93,6 +95,7 @@ class ProxyConfig:
     max_body_bytes: int = 8 * 1024 * 1024
     upstream_timeout_seconds: float = 30.0
     inbound_timeout_seconds: float = 30.0
+    sse_heartbeat_seconds: float = 15.0
     adapter: str = "identity"
     namespace_map_capacity: int = 256
     debug: bool = False
@@ -125,6 +128,8 @@ class ProxyConfig:
             raise ConfigurationError("NS_PROXY_MAX_BODY_BYTES must be positive")
         if self.upstream_timeout_seconds <= 0 or self.inbound_timeout_seconds <= 0:
             raise ConfigurationError("proxy timeouts must be positive")
+        if not math.isfinite(self.sse_heartbeat_seconds) or self.sse_heartbeat_seconds <= 0:
+            raise ConfigurationError("NS_PROXY_SSE_HEARTBEAT must be positive")
         if self.adapter not in {"identity", "codex-namespace"}:
             raise ConfigurationError("NS_PROXY_ADAPTER must be identity or codex-namespace")
         if self.namespace_map_capacity <= 0:
@@ -147,6 +152,7 @@ class ProxyConfig:
             max_body_bytes=int(env.get("NS_PROXY_MAX_BODY_BYTES", str(8 * 1024 * 1024))),
             upstream_timeout_seconds=float(env.get("NS_PROXY_UPSTREAM_TIMEOUT", "30")),
             inbound_timeout_seconds=float(env.get("NS_PROXY_INBOUND_TIMEOUT", "30")),
+            sse_heartbeat_seconds=float(env.get("NS_PROXY_SSE_HEARTBEAT", "15")),
             adapter=env.get("NS_PROXY_ADAPTER", "identity"),
             namespace_map_capacity=int(env.get("NS_PROXY_NAMESPACE_MAP_CAPACITY", "256")),
             debug=_env_bool(env.get("NS_PROXY_DEBUG")),
@@ -397,6 +403,62 @@ class _UpstreamLifecycle:
                     response.close()
                 except Exception:
                     pass
+
+
+class _SSELineReader:
+    """Read one upstream SSE response without blocking downstream keep-alives."""
+
+    def __init__(
+        self,
+        response: http.client.HTTPResponse,
+        lifecycle: _UpstreamLifecycle,
+    ) -> None:
+        self._response = response
+        self._lifecycle = lifecycle
+        self._items: queue.Queue[tuple[str, bytes | Exception]] = queue.Queue(
+            maxsize=64
+        )
+        self._stopping = threading.Event()
+        self._thread = threading.Thread(
+            target=self._read,
+            name="codex-ns-proxy-sse-reader",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def next_item(
+        self, timeout: float
+    ) -> tuple[str, bytes | Exception] | None:
+        try:
+            return self._items.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def close(self) -> None:
+        self._stopping.set()
+        self._lifecycle.close()
+        self._thread.join(timeout=1.0)
+
+    def _read(self) -> None:
+        try:
+            while not self._stopping.is_set():
+                line = self._response.readline()
+                if not line:
+                    self._put(("eof", b""))
+                    return
+                if not self._put(("line", line)):
+                    return
+        except Exception as error:
+            self._put(("error", error))
+
+    def _put(self, item: tuple[str, bytes | Exception]) -> bool:
+        while not self._stopping.is_set():
+            try:
+                self._items.put(item, timeout=0.1)
+                return True
+            except queue.Full:
+                pass
+        return False
 
 
 def _merge_reconstruction(
@@ -664,7 +726,7 @@ def _handler_for(config: ProxyConfig, namespace_state: _NamespaceState):
                     return
                 content_type = response.getheader("Content-Type", "")
                 if "text/event-stream" in content_type.lower():
-                    self._stream_sse(response, reconstruction)
+                    self._stream_sse(response, lifecycle, reconstruction)
                 else:
                     self._forward_plain(response, reconstruction)
             except (TimeoutError, socket.timeout):
@@ -740,6 +802,7 @@ def _handler_for(config: ProxyConfig, namespace_state: _NamespaceState):
         def _stream_sse(
             self,
             response: http.client.HTTPResponse,
+            lifecycle: _UpstreamLifecycle,
             reconstruction: dict[str, tuple[str, str]],
         ) -> None:
             self.close_connection = True
@@ -750,10 +813,21 @@ def _handler_for(config: ProxyConfig, namespace_state: _NamespaceState):
             self.end_headers()
             terminal_observed = False
             frame: list[bytes] = []
+            reader = _SSELineReader(response, lifecycle)
             try:
                 while True:
-                    line = response.readline()
-                    if not line:
+                    item = reader.next_item(config.sse_heartbeat_seconds)
+                    if item is None:
+                        if not frame and not terminal_observed:
+                            self.wfile.write(b": codex-ns-proxy keep-alive\n\n")
+                            self.wfile.flush()
+                        continue
+                    kind, value = item
+                    if kind == "error":
+                        if config.debug:
+                            _safe_log("SSE stream ended before upstream EOF")
+                        break
+                    if kind == "eof":
                         if frame:
                             transformed_frame, is_terminal, response_ids = _transform_sse_frame(
                                 frame, reconstruction
@@ -763,6 +837,9 @@ def _handler_for(config: ProxyConfig, namespace_state: _NamespaceState):
                             terminal_observed = terminal_observed or is_terminal
                             self.wfile.write(transformed_frame)
                             self.wfile.flush()
+                        break
+                    line = value
+                    if not isinstance(line, bytes):
                         break
                     frame.append(line)
                     if line in {b"\n", b"\r\n"}:
@@ -786,6 +863,7 @@ def _handler_for(config: ProxyConfig, namespace_state: _NamespaceState):
                 if config.debug:
                     _safe_log("SSE stream ended before upstream EOF")
             finally:
+                reader.close()
                 if config.debug:
                     _safe_log(f"SSE terminal_completed={str(terminal_observed).lower()}")
 

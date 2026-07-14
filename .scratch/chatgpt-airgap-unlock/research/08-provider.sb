@@ -1,0 +1,18 @@
+(version 1)
+
+; THROWAWAY PROTOTYPE ONLY. OptiQ may load the exact local snapshot and use
+; Metal, but may communicate only over loopback.
+(allow default)
+(deny network-outbound (remote ip))
+(deny network-inbound (local ip))
+(allow network-outbound (remote ip "localhost:*"))
+(allow network-inbound (local ip "localhost:*"))
+
+; The only operator-home read allowed to the provider is the exact pinned
+; Hugging Face model repository. It may not write anywhere under that home.
+(deny file-read* (subpath (param "REAL_HOME")))
+(deny file-write* (subpath (param "REAL_HOME")))
+(allow file-read* (subpath (param "MODEL_REPO")))
+(allow file-read* (subpath (param "OPTIQ_RUNTIME")))
+(allow process-exec (subpath (param "OPTIQ_RUNTIME")))
+(deny file-write* (subpath "/Applications/ChatGPT.app"))

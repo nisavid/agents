@@ -18,6 +18,8 @@ Produce an implementation-ready, empirically validated plan for running the exac
 
 ## Decisions so far
 
+- [Reconstruct the legacy patcher contract](issues/01-reconstruct-legacy-patcher-contract.md) — Keep the artifact-bound, integrity-aware, rollback-first lifecycle as requirements; rediscover every historical gate, path, entitlement, and native control point against the exact baseline.
+
 ## Not yet specified
 
 - Whether the authoritative startup barrier lives in renderer JavaScript, Electron main/preload code, a native module, the bundled Codex host, or a combination cannot be specified until static and runtime tracing agree.

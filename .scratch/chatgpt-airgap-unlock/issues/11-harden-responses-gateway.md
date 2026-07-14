@@ -1,5 +1,5 @@
 Type: implementation
-Status: open
+Status: closed
 Assignee: nisavid
 
 ## Question
@@ -19,3 +19,9 @@ Can `tooling/codex-ns-proxy` become the profile-owned authenticated loopback gat
 - Add a red-capable local test suite for authentication, allowlisting, transformations, streaming, failure handling, cleanup, and non-leakage.
 - Validate the exact proxy commit between bundled Codex `0.144.2` and the pinned Qwen3.5-2B OptiQ snapshot under the Ticket 08 isolation boundary.
 - Keep the production ChatGPT app, normal profile, global Codex configuration, Systalyze systems, and the unavailable air-gapped GLM endpoint untouched.
+
+## Evidence
+
+- `tooling/codex-ns-proxy` requires explicit upstream and separate inbound and upstream credentials, binds to loopback by default, restricts routes and methods, authenticates before reading request bodies, preserves Responses streaming, and fails closed for unsupported namespace transformations.
+- `tooling/codex-ns-proxy/tests/test_proxy.py` covers authentication, allowlisting, transformations, continuation state, streaming, HTTP framing, failure handling, shutdown, cleanup, and non-leakage.
+- The exact reviewed gateway commit `7c960b15267e82ef5d5a854bdd54bf53fb9e8135` passes the Ticket 08 end-to-end route against bundled Codex `0.144.2` and the pinned Qwen3.5-2B OptiQ snapshot. See [research/08-validate-preferred-route.md](../research/08-validate-preferred-route.md).

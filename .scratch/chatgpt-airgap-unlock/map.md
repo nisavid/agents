@@ -19,6 +19,7 @@ Produce an implementation-ready, empirically validated plan for running the exac
 ## Decisions so far
 
 - [Reconstruct the legacy patcher contract](issues/01-reconstruct-legacy-patcher-contract.md) — Keep the artifact-bound, integrity-aware, rollback-first lifecycle as requirements; rediscover every historical gate, path, entitlement, and native control point against the exact baseline.
+- [Map the rewritten app auth architecture](issues/02-map-rewritten-app-auth-architecture.md) — The bundled app-server supplies `account/read`; the renderer routes to login only when no auth method exists and OpenAI auth remains required.
 
 ## Not yet specified
 

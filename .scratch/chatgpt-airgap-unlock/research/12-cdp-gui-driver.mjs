@@ -6,8 +6,8 @@ const phase = process.argv[3] ?? "first";
 const timeoutMs = Number(process.argv[4] ?? 120000);
 const base = `http://127.0.0.1:${port}`;
 const started = Date.now();
-const firstPrompt = "Reply exactly LOCAL_RENDERER_OK and nothing else.";
-const firstReply = "LOCAL_RENDERER_OK";
+const firstPrompt = "What is 73 plus 19? Your final answer must include the decimal result.";
+const firstResult = "92";
 
 function emit(kind, data) {
   process.stdout.write(`${JSON.stringify({ at: new Date().toISOString(), kind, phase, ...data })}\n`);
@@ -171,7 +171,47 @@ async function reachMainUi() {
   return Boolean(mainUi);
 }
 
-async function submitPrompt(prompt, expectedReply) {
+function assistantOutputProbeExpression(prompt, expectedResult) {
+  return `(() => {
+    const userMessage = [...document.querySelectorAll('[aria-label="Edit user message"]')]
+      .filter((element) => (element.innerText ?? "").trim() === ${JSON.stringify(prompt)})
+      .at(-1);
+    if (!userMessage) return { matched: false, lines: [], occurrenceCount: 0 };
+    const copyButton = [...document.querySelectorAll('button[aria-label="Copy"]')]
+      .filter((element) => userMessage.compareDocumentPosition(element) & Node.DOCUMENT_POSITION_FOLLOWING)
+      .at(-1);
+    if (!copyButton) return { matched: false, lines: [], occurrenceCount: 0 };
+    const standaloneResult = new RegExp("(^|\\\\D)" + ${JSON.stringify(expectedResult)} + "(?=\\\\D|$)");
+    let assistantMessage = copyButton.parentElement;
+    while (assistantMessage && assistantMessage !== document.body) {
+      const text = (assistantMessage.innerText ?? "").trim();
+      if (!assistantMessage.contains(userMessage) && standaloneResult.test(text)) break;
+      assistantMessage = assistantMessage.parentElement;
+    }
+    if (!assistantMessage || assistantMessage === document.body) {
+      return { matched: false, lines: [], occurrenceCount: 0 };
+    }
+    const lines = (assistantMessage.innerText ?? "")
+      .split("\\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+    const resultPattern = new RegExp("(^|\\\\D)" + ${JSON.stringify(expectedResult)} + "(?=\\\\D|$)", "g");
+    const occurrencesByLine = lines.map((line) => ({
+      line,
+      count: (line.match(resultPattern) ?? []).length,
+    }));
+    const occurrenceCount = occurrencesByLine.reduce((total, entry) => total + entry.count, 0);
+    const resultLines = occurrencesByLine.filter((entry) => entry.count > 0).map((entry) => entry.line);
+    return {
+      matched: occurrenceCount === 1 && resultLines.length === 1,
+      lines,
+      occurrenceCount,
+      resultLines,
+    };
+  })()`;
+}
+
+async function submitPrompt(prompt, expectedResult) {
   const focused = await evaluate(`(() => {
     const editor = document.querySelector('[contenteditable=true][data-codex-composer=true]');
     if (!editor) return false;
@@ -230,33 +270,27 @@ async function submitPrompt(prompt, expectedReply) {
   }
   if (!sent) return false;
 
+  const assistantOutputProbe = assistantOutputProbeExpression(prompt, expectedResult);
   const completed = await waitFor(
-    `(document.body?.innerText ?? "").split("\\n").some((line) => line.trim() === ${JSON.stringify(expectedReply)})`,
-    `exact renderer reply ${expectedReply}`,
+    `${assistantOutputProbe}.matched`,
+    `unique semantic renderer result ${expectedResult} in assistant output`,
     timeoutMs
   );
+  emit("assistant-output-oracle", await evaluate(assistantOutputProbe));
   await snapshot(completed ? "renderer-reply-completed" : "renderer-reply-missing");
   return completed;
 }
 
-async function inspectTasks() {
-  const clicked = await clickMatching(
-    `[...document.querySelectorAll("button")].find((element) => element.innerText?.trim() === "Tasks")`,
-    "open Tasks"
-  );
-  if (!clicked) return { inspected: false, reopened: false };
-  await sleep(1000);
+async function inspectTasks(prompt) {
+  const taskPrefix = prompt.slice(0, 32);
   const taskVisible = await waitFor(
-    `!Boolean(document.querySelector('[contenteditable=true][data-codex-composer=true]')) &&
-      !(document.body?.innerText ?? "").includes("No tasks") &&
-      [...document.querySelectorAll("button, [role=button], a")].some((element) => {
-        const text = (element.innerText ?? "").trim();
-        return text.length > 0 && !["Tasks", "New task", "Search", "Plugins", "Project", "Settings"].includes(text);
-      })`,
-    "renderer-created task in Tasks",
+    `[...document.querySelectorAll('[role=button]')].some((element) =>
+      (element.innerText ?? "").includes(${JSON.stringify(taskPrefix)})
+    )`,
+    "renderer-created local thread entry",
     15000
   );
-  await snapshot("tasks");
+  await snapshot("local-thread-entry");
   return { inspected: taskVisible };
 }
 
@@ -327,9 +361,9 @@ await send("Runtime.enable");
 try {
   if (phase !== "first") throw new Error(`unknown driver phase: ${phase}`);
   const mainUi = await reachMainUi();
-  const rendererPromptCompleted = mainUi && await submitPrompt(firstPrompt, firstReply);
+  const rendererPromptCompleted = mainUi && await submitPrompt(firstPrompt, firstResult);
   const tasks = rendererPromptCompleted
-    ? await inspectTasks()
+    ? await inspectTasks(firstPrompt)
     : { inspected: false };
   await clickMatching(
     `[...document.querySelectorAll("button")].find((element) => element.innerText?.includes("New task"))`,

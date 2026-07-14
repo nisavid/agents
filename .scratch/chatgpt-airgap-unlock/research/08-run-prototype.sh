@@ -190,9 +190,8 @@ if test "$GUI_WORKFLOW" = true; then
   cat >"$CODEX_DIR/AGENTS.md" <<'EOF'
 # Offline renderer smoke fixture
 
-When the user asks for `LOCAL_RENDERER_OK` or `LOCAL_RENDERER_RESUME_OK`, do
-not use tools and do not send a preamble. Reply with exactly the requested
-all-caps token and nothing else.
+For the arithmetic renderer smoke prompt, do not use tools and do not send a
+preamble. Answer directly and include the requested decimal result.
 EOF
 fi
 cat >"$WORKSPACE_DIR/README.md" <<'EOF'

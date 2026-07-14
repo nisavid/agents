@@ -387,9 +387,16 @@ class _UpstreamLifecycle:
         # Close the transport first, then the file wrapper. Both are needed to
         # interrupt a thread blocked in HTTPResponse.readline() on all supported
         # Python/macOS combinations.
-        self._connection.close()
-        if response is not None:
-            response.close()
+        try:
+            self._connection.close()
+        except Exception:
+            pass
+        finally:
+            if response is not None:
+                try:
+                    response.close()
+                except Exception:
+                    pass
 
 
 def _merge_reconstruction(
@@ -661,15 +668,17 @@ def _handler_for(config: ProxyConfig, namespace_state: _NamespaceState):
                 else:
                     self._forward_plain(response, reconstruction)
             except (TimeoutError, socket.timeout):
-                if not self.wfile.closed:
+                self.close_connection = True
+                if not self._response_started and not self.wfile.closed:
                     if self.server.is_closing():
                         self._send_json(503, {"error": {"message": "gateway shutting down"}})
                     else:
                         self._send_json(504, {"error": {"message": "upstream timeout"}})
             except (http.client.HTTPException, OSError) as error:
+                self.close_connection = True
                 if config.debug:
                     _safe_log(f"upstream transport error type={type(error).__name__}")
-                if not self.wfile.closed:
+                if not self._response_started and not self.wfile.closed:
                     if self.server.is_closing():
                         self._send_json(503, {"error": {"message": "gateway shutting down"}})
                     else:
@@ -911,9 +920,14 @@ class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
         with self._upstream_lock:
             self._closing = True
             active = tuple(self._active_upstreams)
-        for lifecycle in active:
-            lifecycle.close()
-        super().server_close()
+        try:
+            for lifecycle in active:
+                try:
+                    lifecycle.close()
+                except Exception:
+                    pass
+        finally:
+            super().server_close()
 
 
 def create_server(config: ProxyConfig) -> ThreadingHTTPServer:

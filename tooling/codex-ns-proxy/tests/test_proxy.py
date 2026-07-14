@@ -829,6 +829,38 @@ class ProxyIntegrationTest(unittest.TestCase):
             {"error": {"message": "gateway shutting down"}}, json.loads(raw)
         )
 
+    def test_timeout_after_sse_headers_never_writes_second_status(self):
+        FakeUpstreamHandler.response_headers = {"Content-Type": "text/event-stream"}
+        FakeUpstreamHandler.response_body = b"data: {}\n\n"
+        handler_class = self.gateway.RequestHandlerClass
+        original_stream = handler_class._stream_sse
+
+        def timeout_after_headers(handler, _response, _reconstruction):
+            handler.close_connection = True
+            handler._response_started = True
+            handler.send_response(200)
+            handler.send_header("Content-Type", "text/event-stream")
+            handler.send_header("Connection", "close")
+            handler.end_headers()
+            handler.wfile.write(b"data: {}\n\n")
+            handler.wfile.flush()
+            raise socket.timeout()
+
+        handler_class._stream_sse = timeout_after_headers
+        body = b'{"input":[]}'
+        try:
+            raw = self.raw_request(
+                b"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                + f"Authorization: Bearer {INBOUND_TOKEN}\r\n".encode()
+                + f"Content-Length: {len(body)}\r\n\r\n".encode()
+                + body
+            )
+        finally:
+            handler_class._stream_sse = original_stream
+        self.assertTrue(raw.startswith(b"HTTP/1.1 200"), raw)
+        self.assertEqual(1, raw.count(b"HTTP/1.1"), raw)
+        self.assertNotIn(b"504", raw)
+
     def test_multiline_crlf_sse_reconstructs_only_changed_frame(self):
         sse = (
             b": comment\r\n"
@@ -973,6 +1005,68 @@ class PureTransformAndConfigTest(unittest.TestCase):
             )
         )
         second.server_close()
+
+    def test_close_failures_are_contained_and_listener_still_closes(self):
+        class RaisingConnection:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+                raise RuntimeError("injected connection close failure")
+
+        class RecordingResponse:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        connection = RaisingConnection()
+        response = RecordingResponse()
+        lifecycle = proxy._UpstreamLifecycle(connection)
+        self.assertTrue(lifecycle.attach_response(response))
+        lifecycle.close()
+        self.assertTrue(connection.closed)
+        self.assertTrue(response.closed)
+
+        class RaisingLifecycle:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+                raise RuntimeError("injected lifecycle close failure")
+
+        class RecordingLifecycle:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        server = proxy.create_server(
+            proxy.ProxyConfig(
+                upstream_url="http://127.0.0.1:1/v1",
+                inbound_token=INBOUND_TOKEN,
+                listen_port=0,
+            )
+        )
+        port = server.server_address[1]
+        raising = RaisingLifecycle()
+        recording = RecordingLifecycle()
+        server._active_upstreams.update({raising, recording})
+        server.server_close()
+        self.assertTrue(raising.closed)
+        self.assertTrue(recording.closed)
+        rebound = proxy.create_server(
+            proxy.ProxyConfig(
+                upstream_url="http://127.0.0.1:1/v1",
+                inbound_token=INBOUND_TOKEN,
+                listen_port=port,
+            )
+        )
+        rebound.server_close()
 
 
 if __name__ == "__main__":

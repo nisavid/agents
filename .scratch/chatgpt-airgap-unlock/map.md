@@ -25,14 +25,14 @@ Produce an implementation-ready, empirically validated plan for running the exac
 - [Classify the minimum offline workflow](issues/05-classify-minimum-offline-workflow.md) — The minimum workflow is predominantly local; only bounded provider compatibility, metadata, secret delivery, and extension dependencies remain, so no account shim or bundle mutation is justified.
 - [Assess integrity, signing, and security](issues/06-assess-integrity-signing-and-security.md) — Prefer a pristine-bundle configuration or loopback-service route; any derived bundle must use exact-artifact binding, complete least-privilege signing, strict fail-closed verification, and whole-copy rollback.
 - [Select a local smoke-test model](issues/10-select-local-smoke-model.md) — Use Qwen3.5-2B-OptiQ-4bit at immutable revision `adc8669eb431e3168aeb4e320bd7b757914350e2` through an isolated OptiQ runner; it is the smallest compared candidate with a credible tool-calling margin and passed deterministic Responses text, function-call, and function-output checks.
+- [Choose the preferred architecture](issues/07-choose-bypass-architecture.md) — Use a closed profile-driven runner around the pristine vendor bundle, backed by one private typed lifecycle module and internal seams only for proven variation; OptiQ is the local development profile, GLM is explicit with no fallback, and bundle mutation is rejected absent new exact-build evidence.
 
 ## Not yet specified
 
-- Whether the authoritative startup barrier lives in renderer JavaScript, Electron main/preload code, a native module, the bundled Codex host, or a combination cannot be specified until static and runtime tracing agree.
-- The exact cross-version discovery strategy depends on whether the stable identifier is a semantic gate name, a control-flow shape, a resource contract, or a native function signature.
-- Any local bootstrap/session shim cannot be specified until the app's pristine startup requests, persisted state, and failure transitions are known.
-- Provider-compatibility work beyond existing GLM 5.2 support cannot be specified until the self-hosted provider path is traced through both UI and bundled host.
-- Update, rollback, and integrity-repair mechanics depend on which signed resources the preferred route must modify.
+- Real GLM 5.2 compatibility with bundled Codex's exact Responses streaming and tool-call dialect remains environment-dependent because that air-gapped endpoint is not locally available.
+- The safe model-metadata contract remains to be validated against the full configured renderer route; bundled fallback metadata is not authoritative.
+- Local semantic validation currently requires reconciling outer network confinement with Chromium's nested sandbox. Production acceptance must preserve the vendor Chromium sandbox on a disconnected VM or true air-gapped machine.
+- Cross-version discovery and migration remain deferred until a second exact app build is explicitly brought into scope.
 
 ## Out of scope
 

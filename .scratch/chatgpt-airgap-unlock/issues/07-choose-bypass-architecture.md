@@ -1,5 +1,6 @@
 Type: research
 Status: open
+Assignee: nisavid
 Blocked by: 01, 02, 03, 04, 05, 06
 
 ## Question

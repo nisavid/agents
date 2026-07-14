@@ -1,6 +1,6 @@
 Type: prototype
 Status: open
-Blocked by: 07, 10
+Blocked by: 07
 
 ## Question
 

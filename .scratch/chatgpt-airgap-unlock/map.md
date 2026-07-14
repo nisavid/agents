@@ -24,6 +24,7 @@ Produce an implementation-ready, empirically validated plan for running the exac
 - [Trace the GLM provider path](issues/04-trace-glm-provider-path.md) — A cold file-configured custom provider naturally disables the OpenAI-auth requirement and reaches a loopback Responses endpoint; UI provisioning and arbitrary model metadata remain absent.
 - [Classify the minimum offline workflow](issues/05-classify-minimum-offline-workflow.md) — The minimum workflow is predominantly local; only bounded provider compatibility, metadata, secret delivery, and extension dependencies remain, so no account shim or bundle mutation is justified.
 - [Assess integrity, signing, and security](issues/06-assess-integrity-signing-and-security.md) — Prefer a pristine-bundle configuration or loopback-service route; any derived bundle must use exact-artifact binding, complete least-privilege signing, strict fail-closed verification, and whole-copy rollback.
+- [Select a local smoke-test model](issues/10-select-local-smoke-model.md) — Use Qwen3.5-2B-OptiQ-4bit at immutable revision `adc8669eb431e3168aeb4e320bd7b757914350e2` through an isolated OptiQ runner; it is the smallest compared candidate with a credible tool-calling margin and passed deterministic Responses text, function-call, and function-output checks.
 
 ## Not yet specified
 

@@ -159,7 +159,7 @@ The intended live command is:
 
 ```sh
 ROUTE_MODE=gateway \
-GATEWAY_COMMIT=7c960b15267e82ef5d5a854bdd54bf53fb9e8135 \
+GATEWAY_COMMIT=8703dbe96841d591e77c1f274e22eb4b2aea9d64 \
 GUI_WORKFLOW=true \
 GUI_COLD_RESUME=true \
 PROBE_EXPECT=renderer-cold-resume \

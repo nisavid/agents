@@ -31,6 +31,8 @@ Produce an implementation-ready, empirically validated plan for running the exac
 ## Active work
 
 - [Validate the preferred route](issues/08-validate-preferred-route.md) — Prove the configured pristine-bundle route against the local OptiQ fixture and grade every minimum-workflow and platform-isolation gate from artifact-bound evidence.
+- [Validate the offline GUI workflow](issues/12-validate-offline-gui-workflow.md) — Exercise renderer submission, thread persistence, projects, worktrees, permissions, modes, extensions, settings, and model metadata against the pinned local route.
+- [Validate production isolation](issues/13-validate-production-isolation.md) — Preserve the vendor Chromium sandbox and signed code posture while a disconnected VM or true air gap makes hosted egress unavailable.
 
 ## Not yet specified
 

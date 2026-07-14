@@ -34,6 +34,7 @@ Produce an implementation-ready, empirically validated plan for running the exac
 - [Validate the preferred route](issues/08-validate-preferred-route.md) — Prove the configured pristine-bundle route against the local OptiQ fixture and grade every minimum-workflow and platform-isolation gate from artifact-bound evidence.
 - [Validate the offline GUI workflow](issues/12-validate-offline-gui-workflow.md) — Complete native project, worktree, permission, mode, cold-resume, project-local skill, and exact renderer-visible model-metadata acceptance against the pinned local route.
 - [Validate production isolation](issues/13-validate-production-isolation.md) — Preserve the vendor Chromium sandbox and signed code posture while a disconnected VM or true air gap makes hosted egress unavailable.
+- [Prototype the native GUI probe](issues/14-prototype-native-gui-probe.md) — Build a PID-bound, fail-closed Accessibility helper for the exact copied app; the live project-picker run requires a manual one-time grant to the final reviewed helper artifact.
 
 ## Not yet specified
 

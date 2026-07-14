@@ -116,3 +116,56 @@ Ticket 12 remains open for real native project-picker, permission, and worktree
 interaction; project-local skill visibility and exact model metadata; and cold
 GUI reopen and continuation. Those gates were not exercised or did not pass in
 the scoped renderer run.
+
+## Cold-restart continuation prototype design
+
+The renderer workflow now has an opt-in, two-phase cold-restart path. It has
+not been run yet and contributes no runtime evidence to the verdict above.
+
+Phase one retains the validated renderer prompt, task, and surface assertions.
+After it completes, the runner reads the isolated Codex rollout and writes a
+mode-0600 state artifact binding the exact thread UUID and rollout path to
+SHA-256 digests of the first prompt, unique persisted assistant output, and
+unique normalized phase-one renderer text. The distinct source and rendered
+digests avoid conflating Markdown with its rendered form. The runner then stops
+only the copied app's process group, which includes its app-server, and requires
+both that process group and its CDP listener to disappear. The pinned OptiQ
+server, authenticated gateway, and observers remain alive.
+
+Phase two relaunches the same copied bundle with the same isolated home, Codex
+home, Electron user-data directory, provider configuration, Seatbelt profile,
+and loopback endpoints. The CDP driver selects the persisted local thread by
+its first-prompt task label, requires the bound first prompt and the same
+normalized full renderer text observed in phase one to be visible, then submits
+a different deterministic arithmetic prompt whose final result must contain one
+standalone `63`.
+
+The runner finally requires that the second prompt and result were persisted
+exactly once in the original rollout with the original thread UUID, that the
+original persisted output digest is unchanged, and that phase two records one
+unique persisted-output digest plus one unique renderer-output digest. For the
+gateway route it records gateway and upstream terminal baselines immediately
+before the first renderer launch. It then requires at least one completion
+beyond baseline for phase one, at least one additional completion after the
+restart for phase two, and a total renderer delta of at least two. This keeps
+the two renderer transports distinct from pre-renderer namespace traffic. The
+new resume-state and assistant-oracle records retain only hashes, lengths, and
+semantic results; the gateway and upstream observers log neither credentials
+nor request bodies. Existing CDP snapshots continue to capture renderer text as
+the GUI evidence surface.
+
+The intended live command is:
+
+```sh
+ROUTE_MODE=gateway \
+GATEWAY_COMMIT=7c960b15267e82ef5d5a854bdd54bf53fb9e8135 \
+GUI_WORKFLOW=true \
+GUI_COLD_RESUME=true \
+PROBE_EXPECT=renderer-cold-resume \
+  .scratch/chatgpt-airgap-unlock/research/08-run-prototype.sh
+```
+
+This remains a development-only semantic probe: it launches only the copied
+bundle and retains the existing outer Seatbelt plus `--no-sandbox` constraint.
+It does not modify the copied bundle identifier, signature, ASAR, native code,
+the installed app, or the operator's real profile and global state.

@@ -42,6 +42,7 @@ GATEWAY_TERMINAL_PATTERN="[codex-ns-proxy] SSE terminal_completed=true"
 PROBE_DURATION_MS="${PROBE_DURATION_MS:-20000}"
 PROBE_EXPECT="${PROBE_EXPECT:-usable-ui}"
 GUI_WORKFLOW="${GUI_WORKFLOW:-false}"
+GUI_COLD_RESUME="${GUI_COLD_RESUME:-false}"
 RUN_LOCK="/private/tmp/chatgpt-route-prototype-08.lock"
 
 lock_acquired=false
@@ -80,6 +81,7 @@ OBSERVER_EXEC="$RUN_ROOT/proxy-observer.py"
 CDP_OBSERVER_EXEC="$RUN_ROOT/cdp-observer.mjs"
 GUI_DRIVER_EXEC="$RUN_ROOT/gui-driver.mjs"
 NAMESPACE_PROBE_EXEC="$RUN_ROOT/namespace-probe.py"
+GUI_RESUME_STATE="$LOG_DIR/gui-resume-state.json"
 
 case "$ROUTE_MODE" in
   direct)
@@ -101,6 +103,14 @@ case "$GUI_WORKFLOW" in
   false|true) ;;
   *) echo "GUI_WORKFLOW must be true or false" >&2; exit 64 ;;
 esac
+case "$GUI_COLD_RESUME" in
+  false|true) ;;
+  *) echo "GUI_COLD_RESUME must be true or false" >&2; exit 64 ;;
+esac
+if test "$GUI_COLD_RESUME" = true; then
+  test "$GUI_WORKFLOW" = true
+  test "$ROUTE_MODE" = gateway
+fi
 
 test -d "$SOURCE_APP"
 test -x "$OPTIQ"
@@ -247,6 +257,38 @@ signal_owned() {
     /bin/kill "-$signal" -- "-$pid" 2>/dev/null || true
   fi
   /bin/kill "-$signal" "$pid" 2>/dev/null || true
+}
+
+stop_app_group() {
+  stopped_pid="$app_pid"
+  test -n "$stopped_pid"
+  signal_owned TERM "$stopped_pid"
+  i=0
+  while test "$i" -lt 100 && process_group_exists "$stopped_pid"; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  if process_group_exists "$stopped_pid"; then
+    signal_owned KILL "$stopped_pid"
+  fi
+  wait "$stopped_pid" 2>/dev/null || true
+  i=0
+  while test "$i" -lt 50 && process_group_exists "$stopped_pid"; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  if process_group_exists "$stopped_pid"; then
+    echo "copied app process group $stopped_pid survived cold stop" >&2
+    exit 70
+  fi
+  if /usr/sbin/lsof -nP -iTCP:"$CDP_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+    echo "copied app CDP listener survived cold stop" >&2
+    exit 70
+  fi
+  printf 'first_app_process_group=%s\n' "$stopped_pid" >"$LOG_DIR/gui-cold-stop.txt"
+  printf 'process_group_exited=true\n' >>"$LOG_DIR/gui-cold-stop.txt"
+  printf 'cdp_listener_closed=true\n' >>"$LOG_DIR/gui-cold-stop.txt"
+  app_pid=""
 }
 
 cleanup() {
@@ -459,40 +501,55 @@ if test "$GUI_WORKFLOW" = false; then
       >"$LOG_DIR/host-restart-probe.stdout" 2>"$LOG_DIR/host-restart-probe.stderr"
 fi
 
-/usr/bin/env -i \
-  PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
-  HOME="$HOME_DIR" \
-  CFFIXED_USER_HOME="$HOME_DIR" \
-  XDG_CONFIG_HOME="$HOME_DIR/.config" \
-  XDG_CACHE_HOME="$HOME_DIR/.cache" \
-  XDG_DATA_HOME="$HOME_DIR/.local/share" \
-  CODEX_HOME="$CODEX_DIR" \
-  CODEX_ELECTRON_USER_DATA_PATH="$USER_DATA_DIR" \
-  TMPDIR="$TMP_DIR" \
-  USER="offline-probe" \
-  LOGNAME="offline-probe" \
-  SHELL="/bin/sh" \
-  LANG="en_US.UTF-8" \
-  "$CODEX_PROVIDER_TOKEN_ENV=$CODEX_PROVIDER_TOKEN" \
-  HTTP_PROXY="http://127.0.0.1:$PROXY_PORT" \
-  HTTPS_PROXY="http://127.0.0.1:$PROXY_PORT" \
-  ALL_PROXY="http://127.0.0.1:$PROXY_PORT" \
-  NO_PROXY="127.0.0.1,localhost" \
-  http_proxy="http://127.0.0.1:$PROXY_PORT" \
-  https_proxy="http://127.0.0.1:$PROXY_PORT" \
-  all_proxy="http://127.0.0.1:$PROXY_PORT" \
-  no_proxy="127.0.0.1,localhost" \
-  ELECTRON_ENABLE_LOGGING=1 \
-  RUST_LOG=info \
-  /usr/bin/python3 "$PROCESS_GROUP" \
-  /usr/bin/sandbox-exec -f "$PROFILE" -D "REAL_HOME=$REAL_HOME" "$APP_EXEC" \
-    --no-sandbox \
-    --user-data-dir="$USER_DATA_DIR" \
-    --remote-debugging-port="$CDP_PORT" \
-    --enable-logging=stderr \
-    --v=1 \
-    >"$LOG_DIR/app.stdout" 2>"$LOG_DIR/app.stderr" &
-app_pid=$!
+launch_app() {
+  log_stem="$1"
+  /usr/bin/env -i \
+    PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+    HOME="$HOME_DIR" \
+    CFFIXED_USER_HOME="$HOME_DIR" \
+    XDG_CONFIG_HOME="$HOME_DIR/.config" \
+    XDG_CACHE_HOME="$HOME_DIR/.cache" \
+    XDG_DATA_HOME="$HOME_DIR/.local/share" \
+    CODEX_HOME="$CODEX_DIR" \
+    CODEX_ELECTRON_USER_DATA_PATH="$USER_DATA_DIR" \
+    TMPDIR="$TMP_DIR" \
+    USER="offline-probe" \
+    LOGNAME="offline-probe" \
+    SHELL="/bin/sh" \
+    LANG="en_US.UTF-8" \
+    "$CODEX_PROVIDER_TOKEN_ENV=$CODEX_PROVIDER_TOKEN" \
+    HTTP_PROXY="http://127.0.0.1:$PROXY_PORT" \
+    HTTPS_PROXY="http://127.0.0.1:$PROXY_PORT" \
+    ALL_PROXY="http://127.0.0.1:$PROXY_PORT" \
+    NO_PROXY="127.0.0.1,localhost" \
+    http_proxy="http://127.0.0.1:$PROXY_PORT" \
+    https_proxy="http://127.0.0.1:$PROXY_PORT" \
+    all_proxy="http://127.0.0.1:$PROXY_PORT" \
+    no_proxy="127.0.0.1,localhost" \
+    ELECTRON_ENABLE_LOGGING=1 \
+    RUST_LOG=info \
+    /usr/bin/python3 "$PROCESS_GROUP" \
+    /usr/bin/sandbox-exec -f "$PROFILE" -D "REAL_HOME=$REAL_HOME" "$APP_EXEC" \
+      --no-sandbox \
+      --user-data-dir="$USER_DATA_DIR" \
+      --remote-debugging-port="$CDP_PORT" \
+      --enable-logging=stderr \
+      --v=1 \
+      >"$LOG_DIR/$log_stem.stdout" 2>"$LOG_DIR/$log_stem.stderr" &
+  app_pid=$!
+}
+
+gateway_terminal_baseline=not-applicable
+upstream_terminal_baseline=not-applicable
+gateway_terminal_after_first=not-applicable
+upstream_terminal_after_first=not-applicable
+if test "$ROUTE_MODE" = gateway; then
+  gateway_terminal_baseline="$(/usr/bin/grep -Fxc "$GATEWAY_TERMINAL_PATTERN" "$LOG_DIR/gateway.stderr" || true)"
+  upstream_terminal_baseline="$(/usr/bin/grep -Fc '"upstream_terminal_completed": true' "$LOG_DIR/upstream-auth.jsonl" || true)"
+  gateway_terminal_after_first="$gateway_terminal_baseline"
+  upstream_terminal_after_first="$upstream_terminal_baseline"
+fi
+launch_app app
 
 sleep 1
 {
@@ -530,6 +587,174 @@ elif test "$GUI_WORKFLOW" = false && /usr/bin/env -i \
   cdp_exit=0
 else
   cdp_exit=$?
+fi
+
+if test "$GUI_COLD_RESUME" = true && test "$cdp_exit" -eq 0; then
+  gateway_terminal_after_first="$(/usr/bin/grep -Fxc "$GATEWAY_TERMINAL_PATTERN" "$LOG_DIR/gateway.stderr" || true)"
+  upstream_terminal_after_first="$(/usr/bin/grep -Fc '"upstream_terminal_completed": true' "$LOG_DIR/upstream-auth.jsonl" || true)"
+  test "$((gateway_terminal_after_first - gateway_terminal_baseline))" -ge 1
+  test "$((upstream_terminal_after_first - upstream_terminal_baseline))" -ge 1
+  /usr/bin/python3 - "$CODEX_DIR" "$GUI_RESUME_STATE" "$LOG_DIR/cdp.jsonl" <<'PY'
+import json
+import hashlib
+import pathlib
+import re
+import sys
+
+codex_dir = pathlib.Path(sys.argv[1])
+state_path = pathlib.Path(sys.argv[2])
+cdp_path = pathlib.Path(sys.argv[3])
+first_prompt = "What is 73 plus 19? Your final answer must include the decimal result."
+candidates = []
+for rollout in codex_dir.glob("sessions/*/*/*/rollout-*.jsonl"):
+    records = [json.loads(line) for line in rollout.read_text().splitlines() if line]
+    session_ids = [
+        record["payload"].get("id") or record["payload"].get("session_id")
+        for record in records
+        if record.get("type") == "session_meta"
+    ]
+    user_messages = [
+        item.get("text", "")
+        for record in records
+        if record.get("type") == "response_item"
+        and record.get("payload", {}).get("type") == "message"
+        and record["payload"].get("role") == "user"
+        for item in record["payload"].get("content", [])
+        if item.get("type") == "input_text"
+    ]
+    assistant_messages = [
+        record.get("payload", {}).get("message", "")
+        for record in records
+        if record.get("type") == "event_msg"
+        and record.get("payload", {}).get("type") == "agent_message"
+    ]
+    first_outputs = [
+        message for message in assistant_messages
+        if len(re.findall(r"(?<!\d)92(?!\d)", message)) == 1
+    ]
+    if len(session_ids) == 1 and sum(message.strip() == first_prompt for message in user_messages) == 1 and len(first_outputs) == 1:
+        candidates.append((session_ids[0], rollout, first_outputs[0]))
+if len(candidates) != 1:
+    raise SystemExit(f"expected one persisted renderer thread, found {len(candidates)}")
+thread_id, rollout, first_output = candidates[0]
+renderer_oracles = [
+    record for record in (json.loads(line) for line in cdp_path.read_text().splitlines() if line)
+    if record.get("kind") == "assistant-output-oracle"
+    and record.get("phase") == "first"
+    and record.get("matched") is True
+    and record.get("occurrenceCount") == 1
+    and isinstance(record.get("textSha256"), str)
+    and re.fullmatch(r"[0-9a-f]{64}", record["textSha256"])
+]
+if len(renderer_oracles) != 1:
+    raise SystemExit(f"expected one first-phase renderer output oracle, found {len(renderer_oracles)}")
+normalized_first_output = " ".join(first_output.split())
+state = {
+    "threadId": thread_id,
+    "rolloutPath": str(rollout),
+    "firstPromptSha256": hashlib.sha256(first_prompt.encode()).hexdigest(),
+    "firstResult": "92",
+    "firstPersistedOutputSha256": hashlib.sha256(normalized_first_output.encode()).hexdigest(),
+    "firstRendererOutputSha256": renderer_oracles[0]["textSha256"],
+    "firstOutputBinding": "unique-turn",
+}
+state_path.write_text(json.dumps(state, sort_keys=True) + "\n")
+state_path.chmod(0o600)
+PY
+  stop_app_group
+  kill -0 "$optiq_pid"
+  kill -0 "$proxy_pid"
+  if test "$ROUTE_MODE" = gateway; then
+    kill -0 "$upstream_observer_pid"
+    kill -0 "$gateway_pid"
+  fi
+  launch_app app-restart
+  sleep 1
+  if /usr/bin/env -i \
+    PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+    HOME="$HOME_DIR" \
+    TMPDIR="$TMP_DIR" \
+    LANG="en_US.UTF-8" \
+    /usr/bin/sandbox-exec -f "$GATEWAY_PROFILE" -D "REAL_HOME=$REAL_HOME" \
+      "$NODE" "$GUI_DRIVER_EXEC" "$CDP_PORT" second 120000 "$GUI_RESUME_STATE" \
+    >>"$LOG_DIR/cdp.jsonl" 2>>"$LOG_DIR/cdp.stderr"; then
+    cdp_exit=0
+  else
+    cdp_exit=$?
+  fi
+  if test "$cdp_exit" -eq 0; then
+    /usr/bin/python3 - "$GUI_RESUME_STATE" "$LOG_DIR/cdp.jsonl" <<'PY'
+import json
+import hashlib
+import pathlib
+import re
+import sys
+
+state_path = pathlib.Path(sys.argv[1])
+cdp_path = pathlib.Path(sys.argv[2])
+state = json.loads(state_path.read_text())
+rollout = pathlib.Path(state["rolloutPath"])
+records = [json.loads(line) for line in rollout.read_text().splitlines() if line]
+session_ids = [
+    record["payload"].get("id") or record["payload"].get("session_id")
+    for record in records
+    if record.get("type") == "session_meta"
+]
+if session_ids != [state["threadId"]]:
+    raise SystemExit(f"thread identity changed: {session_ids!r}")
+first_prompt = "What is 73 plus 19? Your final answer must include the decimal result."
+second_prompt = "What is 46 plus 17? Your final answer must include the decimal result."
+user_messages = [
+    item.get("text", "")
+    for record in records
+    if record.get("type") == "response_item"
+    and record.get("payload", {}).get("type") == "message"
+    and record["payload"].get("role") == "user"
+    for item in record["payload"].get("content", [])
+    if item.get("type") == "input_text"
+]
+assistant_messages = [
+    record.get("payload", {}).get("message", "")
+    for record in records
+    if record.get("type") == "event_msg"
+    and record.get("payload", {}).get("type") == "agent_message"
+]
+first_outputs = [
+    message for message in assistant_messages
+    if len(re.findall(r"(?<!\d)92(?!\d)", message)) == 1
+]
+if sum(message.strip() == first_prompt for message in user_messages) != 1 or len(first_outputs) != 1:
+    raise SystemExit("original persisted assistant output is no longer unique")
+first_persisted_output_sha256 = hashlib.sha256(" ".join(first_outputs[0].split()).encode()).hexdigest()
+if first_persisted_output_sha256 != state["firstPersistedOutputSha256"]:
+    raise SystemExit("original persisted assistant output changed across restart")
+second_outputs = [
+    message for message in assistant_messages
+    if len(re.findall(r"(?<!\d)63(?!\d)", message)) == 1
+]
+if sum(message.strip() == second_prompt for message in user_messages) != 1 or len(second_outputs) != 1:
+    raise SystemExit("deterministic continuation was not persisted exactly once")
+second_oracles = [
+    record for record in (json.loads(line) for line in cdp_path.read_text().splitlines() if line)
+    if record.get("kind") == "assistant-output-oracle"
+    and record.get("phase") == "second"
+    and record.get("matched") is True
+    and record.get("occurrenceCount") == 1
+    and isinstance(record.get("textSha256"), str)
+    and re.fullmatch(r"[0-9a-f]{64}", record["textSha256"])
+]
+if len(second_oracles) != 1:
+    raise SystemExit(f"expected one second-phase renderer output oracle, found {len(second_oracles)}")
+second_output_sha256 = hashlib.sha256(" ".join(second_outputs[0].split()).encode()).hexdigest()
+state["secondResult"] = "63"
+state["secondPromptSha256"] = hashlib.sha256(second_prompt.encode()).hexdigest()
+state["secondPersistedOutputSha256"] = second_output_sha256
+state["secondRendererOutputSha256"] = second_oracles[0]["textSha256"]
+state["secondOutputBinding"] = "unique-turn"
+state["sameRolloutContinuationValidated"] = True
+state_path.write_text(json.dumps(state, sort_keys=True) + "\n")
+PY
+  fi
 fi
 
 {
@@ -571,6 +796,8 @@ native_permission_decision_exercised=not-applicable
 native_worktree_control_exercised=not-applicable
 renderer_thread_reopened=not-applicable
 renderer_continuation_completed=not-applicable
+renderer_same_rollout_continuation=not-applicable
+copied_app_cold_stopped=not-applicable
 if test "$GUI_WORKFLOW" = false; then
   host_sentinel_completed=false
   if /usr/bin/grep -Fq '"sentinel_completed": true' "$LOG_DIR/host-summary.json" && /usr/bin/grep -Fq '"sentinel_text_observed": true' "$LOG_DIR/host-summary.json"; then host_sentinel_completed=true; fi
@@ -590,6 +817,8 @@ else
   native_worktree_control_exercised=false
   renderer_thread_reopened=false
   renderer_continuation_completed=false
+  renderer_same_rollout_continuation=false
+  copied_app_cold_stopped=false
   if /usr/bin/grep -Fq '"rendererPromptCompleted":true' "$LOG_DIR/cdp.jsonl"; then renderer_prompt_completed=true; fi
   if /usr/bin/grep -Fq '"tasksSurfaceObserved":true' "$LOG_DIR/cdp.jsonl"; then renderer_tasks_observed=true; fi
   if /usr/bin/grep -Fq '"settingsSurfaceObserved":true' "$LOG_DIR/cdp.jsonl"; then renderer_settings_observed=true; fi
@@ -598,6 +827,14 @@ else
   if /usr/bin/grep -Fq '"localSkillVisible":true' "$LOG_DIR/cdp.jsonl"; then renderer_local_skill_visible=true; fi
   if /usr/bin/grep -Fq '"modelSurfaceObserved":true' "$LOG_DIR/cdp.jsonl"; then renderer_model_surface_observed=true; fi
   if /usr/bin/grep -Fq '"rendererModelMetadataMatched":true' "$LOG_DIR/cdp.jsonl"; then renderer_model_metadata_matched=true; fi
+  if /usr/bin/grep -Fq '"rendererThreadReopened":true' "$LOG_DIR/cdp.jsonl"; then renderer_thread_reopened=true; fi
+  if /usr/bin/grep -Fq '"rendererContinuationCompleted":true' "$LOG_DIR/cdp.jsonl"; then renderer_continuation_completed=true; fi
+  if test -f "$GUI_RESUME_STATE" && /usr/bin/grep -Fq '"sameRolloutContinuationValidated": true' "$GUI_RESUME_STATE"; then renderer_same_rollout_continuation=true; fi
+  if test -f "$LOG_DIR/gui-cold-stop.txt" && \
+    /usr/bin/grep -Fq 'process_group_exited=true' "$LOG_DIR/gui-cold-stop.txt" && \
+    /usr/bin/grep -Fq 'cdp_listener_closed=true' "$LOG_DIR/gui-cold-stop.txt"; then
+    copied_app_cold_stopped=true
+  fi
 fi
 provider_request_observed=false
 if /usr/bin/grep -Fq 'POST /v1/responses HTTP/1.1" 200' "$LOG_DIR/optiq.stderr"; then provider_request_observed=true; fi
@@ -617,6 +854,47 @@ gateway_wrong_auth_rejected=not-applicable
 upstream_token_replaced=not-applicable
 upstream_terminal_completed=not-applicable
 namespace_tool_continuation=not-applicable
+gateway_terminal_count=not-applicable
+upstream_terminal_count=not-applicable
+gateway_renderer_terminal_delta=not-applicable
+upstream_renderer_terminal_delta=not-applicable
+gateway_first_renderer_terminal_delta=not-applicable
+upstream_first_renderer_terminal_delta=not-applicable
+gateway_continuation_terminal_delta=not-applicable
+upstream_continuation_terminal_delta=not-applicable
+renderer_continuation_transport_observed=not-applicable
+refresh_gateway_log_observations() {
+  if /usr/bin/grep -Fxq "$GATEWAY_TERMINAL_PATTERN" "$LOG_DIR/gateway.stderr"; then
+    gateway_terminal_observed=true
+  fi
+  if /usr/bin/grep -Fq '"upstream_terminal_completed": true' "$LOG_DIR/upstream-auth.jsonl"; then
+    upstream_terminal_completed=true
+  fi
+  if /usr/bin/grep -Fq 'Reply with exactly LOCAL_APP_OK' "$LOG_DIR/gateway.stdout" "$LOG_DIR/gateway.stderr" || \
+    /usr/bin/grep -Fq 'LOCAL_APP_OK' "$LOG_DIR/gateway.stdout" "$LOG_DIR/gateway.stderr" || \
+    /usr/bin/grep -Fq 'What is 73 plus 19?' "$LOG_DIR/gateway.stdout" "$LOG_DIR/gateway.stderr" || \
+    /usr/bin/grep -Fq 'What is 46 plus 17?' "$LOG_DIR/gateway.stdout" "$LOG_DIR/gateway.stderr" || \
+    /usr/bin/grep -Fq 'MISSING_OR_WRONG_AUTH_BODY_CANARY' "$LOG_DIR/gateway.stdout" "$LOG_DIR/gateway.stderr"; then
+    gateway_body_leak_observed=true
+  fi
+  gateway_terminal_count="$(/usr/bin/grep -Fxc "$GATEWAY_TERMINAL_PATTERN" "$LOG_DIR/gateway.stderr" || true)"
+  upstream_terminal_count="$(/usr/bin/grep -Fc '"upstream_terminal_completed": true' "$LOG_DIR/upstream-auth.jsonl" || true)"
+  gateway_renderer_terminal_delta=$((gateway_terminal_count - gateway_terminal_baseline))
+  upstream_renderer_terminal_delta=$((upstream_terminal_count - upstream_terminal_baseline))
+  gateway_first_renderer_terminal_delta=$((gateway_terminal_after_first - gateway_terminal_baseline))
+  upstream_first_renderer_terminal_delta=$((upstream_terminal_after_first - upstream_terminal_baseline))
+  gateway_continuation_terminal_delta=$((gateway_terminal_count - gateway_terminal_after_first))
+  upstream_continuation_terminal_delta=$((upstream_terminal_count - upstream_terminal_after_first))
+  if test "$GUI_COLD_RESUME" = true && \
+    test "$gateway_renderer_terminal_delta" -ge 2 && \
+    test "$upstream_renderer_terminal_delta" -ge 2 && \
+    test "$gateway_first_renderer_terminal_delta" -ge 1 && \
+    test "$upstream_first_renderer_terminal_delta" -ge 1 && \
+    test "$gateway_continuation_terminal_delta" -ge 1 && \
+    test "$upstream_continuation_terminal_delta" -ge 1; then
+    renderer_continuation_transport_observed=true
+  fi
+}
 if test "$ROUTE_MODE" = gateway; then
   gateway_listener_observed=false
   gateway_terminal_observed=false
@@ -626,8 +904,16 @@ if test "$ROUTE_MODE" = gateway; then
   upstream_token_replaced=false
   upstream_terminal_completed=false
   namespace_tool_continuation=false
+  gateway_terminal_count=0
+  upstream_terminal_count=0
+  gateway_renderer_terminal_delta=0
+  upstream_renderer_terminal_delta=0
+  gateway_first_renderer_terminal_delta=0
+  upstream_first_renderer_terminal_delta=0
+  gateway_continuation_terminal_delta=0
+  upstream_continuation_terminal_delta=0
+  renderer_continuation_transport_observed=false
   if /usr/sbin/lsof -nP -a -p "$gateway_pid" -iTCP:"$GATEWAY_PORT" -sTCP:LISTEN | /usr/bin/grep -Fq "127.0.0.1:$GATEWAY_PORT"; then gateway_listener_observed=true; fi
-  if /usr/bin/grep -Fxq "$GATEWAY_TERMINAL_PATTERN" "$LOG_DIR/gateway.stderr"; then gateway_terminal_observed=true; fi
   if test "$missing_auth_status" = 401; then gateway_missing_auth_rejected=true; fi
   if test "$wrong_auth_status" = 401; then gateway_wrong_auth_rejected=true; fi
   if /usr/bin/grep -Fq '"exact_upstream_token": true' "$LOG_DIR/upstream-auth.jsonl" && \
@@ -635,18 +921,11 @@ if test "$ROUTE_MODE" = gateway; then
     ! /usr/bin/grep -Fq '"inbound_token_reused": true' "$LOG_DIR/upstream-auth.jsonl"; then
     upstream_token_replaced=true
   fi
-  if /usr/bin/grep -Fq '"upstream_terminal_completed": true' "$LOG_DIR/upstream-auth.jsonl"; then
-    upstream_terminal_completed=true
-  fi
   if /usr/bin/grep -Fq '"continuation_mapping_reused": true' "$LOG_DIR/namespace-probe.json" && \
     /usr/bin/grep -Fq '"second_call_reconstructed": true' "$LOG_DIR/namespace-probe.json"; then
     namespace_tool_continuation=true
   fi
-  if /usr/bin/grep -Fq 'Reply with exactly LOCAL_APP_OK' "$LOG_DIR/gateway.stdout" "$LOG_DIR/gateway.stderr" || \
-    /usr/bin/grep -Fq 'LOCAL_APP_OK' "$LOG_DIR/gateway.stdout" "$LOG_DIR/gateway.stderr" || \
-    /usr/bin/grep -Fq 'MISSING_OR_WRONG_AUTH_BODY_CANARY' "$LOG_DIR/gateway.stdout" "$LOG_DIR/gateway.stderr"; then
-    gateway_body_leak_observed=true
-  fi
+  refresh_gateway_log_observations
 fi
 remote_socket_observed=false
 if test -s "$LOG_DIR/lsof-final.txt" && /usr/bin/awk '$8 == "TCP" || $8 == "UDP" {print}' "$LOG_DIR/lsof-final.txt" | /usr/bin/grep -Ev '127\.0\.0\.1|localhost|\[::1\]|::1' | /usr/bin/grep -q .; then remote_socket_observed=true; fi
@@ -659,17 +938,7 @@ codex_after="$(/usr/bin/shasum -a 256 "$APP/Contents/Resources/codex" | /usr/bin
 cleanup
 trap - EXIT INT TERM
 if test "$ROUTE_MODE" = gateway; then
-  if /usr/bin/grep -Fxq "$GATEWAY_TERMINAL_PATTERN" "$LOG_DIR/gateway.stderr"; then
-    gateway_terminal_observed=true
-  fi
-  if /usr/bin/grep -Fq '"upstream_terminal_completed": true' "$LOG_DIR/upstream-auth.jsonl"; then
-    upstream_terminal_completed=true
-  fi
-  if /usr/bin/grep -Fq 'Reply with exactly LOCAL_APP_OK' "$LOG_DIR/gateway.stdout" "$LOG_DIR/gateway.stderr" || \
-    /usr/bin/grep -Fq 'LOCAL_APP_OK' "$LOG_DIR/gateway.stdout" "$LOG_DIR/gateway.stderr" || \
-    /usr/bin/grep -Fq 'MISSING_OR_WRONG_AUTH_BODY_CANARY' "$LOG_DIR/gateway.stdout" "$LOG_DIR/gateway.stderr"; then
-    gateway_body_leak_observed=true
-  fi
+  refresh_gateway_log_observations
 fi
 for token in "$INBOUND_TOKEN" "$UPSTREAM_TOKEN" "$WRONG_INBOUND_TOKEN"; do
   if find "$HOME_DIR" "$CODEX_DIR" "$USER_DATA_DIR" "$TMP_DIR" "$LOG_DIR" -type f \
@@ -708,6 +977,8 @@ done
   printf 'RENDERER_MODEL_METADATA_MATCHED=%s\n' "$renderer_model_metadata_matched"
   printf 'RENDERER_THREAD_REOPENED=%s\n' "$renderer_thread_reopened"
   printf 'RENDERER_CONTINUATION_COMPLETED=%s\n' "$renderer_continuation_completed"
+  printf 'RENDERER_SAME_ROLLOUT_CONTINUATION=%s\n' "$renderer_same_rollout_continuation"
+  printf 'COPIED_APP_COLD_STOPPED=%s\n' "$copied_app_cold_stopped"
   printf 'NATIVE_PROJECT_PICKER_EXERCISED=%s\n' "$native_project_picker_exercised"
   printf 'NATIVE_PERMISSION_DECISION_EXERCISED=%s\n' "$native_permission_decision_exercised"
   printf 'NATIVE_WORKTREE_CONTROL_EXERCISED=%s\n' "$native_worktree_control_exercised"
@@ -723,6 +994,17 @@ done
   printf 'UPSTREAM_TOKEN_REPLACED=%s\n' "$upstream_token_replaced"
   printf 'UPSTREAM_TERMINAL_COMPLETED=%s\n' "$upstream_terminal_completed"
   printf 'NAMESPACE_TOOL_CONTINUATION=%s\n' "$namespace_tool_continuation"
+  printf 'GATEWAY_TERMINAL_COUNT=%s\n' "$gateway_terminal_count"
+  printf 'UPSTREAM_TERMINAL_COUNT=%s\n' "$upstream_terminal_count"
+  printf 'GATEWAY_TERMINAL_BASELINE=%s\n' "$gateway_terminal_baseline"
+  printf 'UPSTREAM_TERMINAL_BASELINE=%s\n' "$upstream_terminal_baseline"
+  printf 'GATEWAY_RENDERER_TERMINAL_DELTA=%s\n' "$gateway_renderer_terminal_delta"
+  printf 'UPSTREAM_RENDERER_TERMINAL_DELTA=%s\n' "$upstream_renderer_terminal_delta"
+  printf 'GATEWAY_FIRST_RENDERER_TERMINAL_DELTA=%s\n' "$gateway_first_renderer_terminal_delta"
+  printf 'UPSTREAM_FIRST_RENDERER_TERMINAL_DELTA=%s\n' "$upstream_first_renderer_terminal_delta"
+  printf 'GATEWAY_CONTINUATION_TERMINAL_DELTA=%s\n' "$gateway_continuation_terminal_delta"
+  printf 'UPSTREAM_CONTINUATION_TERMINAL_DELTA=%s\n' "$upstream_continuation_terminal_delta"
+  printf 'RENDERER_CONTINUATION_TRANSPORT_OBSERVED=%s\n' "$renderer_continuation_transport_observed"
   printf 'MODEL_LIST_ISOLATED=true\n'
   printf 'REMOTE_SOCKET_OBSERVED=%s\n' "$remote_socket_observed"
   printf 'TOKEN_LEAK_OBSERVED=%s\n' "$token_leak_observed"
@@ -748,6 +1030,12 @@ else
   test "$renderer_plugins_observed" = true
   test "$renderer_skills_observed" = true
   test "$renderer_model_surface_observed" = true
+  if test "$GUI_COLD_RESUME" = true; then
+    test "$copied_app_cold_stopped" = true
+    test "$renderer_thread_reopened" = true
+    test "$renderer_continuation_completed" = true
+    test "$renderer_same_rollout_continuation" = true
+  fi
 fi
 test "$provider_request_observed" = true
 test "$auth_json_present" = false
@@ -762,6 +1050,15 @@ if test "$ROUTE_MODE" = gateway; then
   test "$upstream_token_replaced" = true
   test "$upstream_terminal_completed" = true
   test "$namespace_tool_continuation" = true
+  if test "$GUI_COLD_RESUME" = true; then
+    test "$gateway_renderer_terminal_delta" -ge 2
+    test "$upstream_renderer_terminal_delta" -ge 2
+    test "$gateway_first_renderer_terminal_delta" -ge 1
+    test "$upstream_first_renderer_terminal_delta" -ge 1
+    test "$gateway_continuation_terminal_delta" -ge 1
+    test "$upstream_continuation_terminal_delta" -ge 1
+    test "$renderer_continuation_transport_observed" = true
+  fi
 fi
 test "$remote_socket_observed" = false
 test "$token_leak_observed" = false
@@ -774,5 +1071,6 @@ case "$PROBE_EXPECT" in
   no-login) test "$login_wall_observed" = false ;;
   usable-ui) test "$login_wall_observed" = false; test "$main_ui_observed" = true ;;
   renderer-workflow) test "$GUI_WORKFLOW" = true; test "$login_wall_observed" = false; test "$main_ui_observed" = true ;;
+  renderer-cold-resume) test "$GUI_COLD_RESUME" = true; test "$login_wall_observed" = false; test "$main_ui_observed" = true ;;
   *) echo "unknown PROBE_EXPECT: $PROBE_EXPECT" >&2; exit 64 ;;
 esac

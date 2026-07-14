@@ -27,6 +27,11 @@ Produce an implementation-ready, empirically validated plan for running the exac
 - [Select a local smoke-test model](issues/10-select-local-smoke-model.md) — Use Qwen3.5-2B-OptiQ-4bit at immutable revision `adc8669eb431e3168aeb4e320bd7b757914350e2` through an isolated OptiQ runner; it is the smallest compared candidate with a credible tool-calling margin and passed deterministic Responses text, function-call, and function-output checks.
 - [Choose the preferred architecture](issues/07-choose-bypass-architecture.md) — Use a closed profile-driven runner around the pristine vendor bundle, backed by one private typed lifecycle module and internal seams only for proven variation; OptiQ is the local development profile, GLM is explicit with no fallback, and bundle mutation is rejected absent new exact-build evidence.
 
+## Active work
+
+- [Validate the preferred route](issues/08-validate-preferred-route.md) — Prove the configured pristine-bundle route against the local OptiQ fixture and grade every minimum-workflow and platform-isolation gate from artifact-bound evidence.
+- [Harden the Responses gateway](issues/11-harden-responses-gateway.md) — Turn `codex-ns-proxy` into the authenticated, allowlisted, secret-separating loopback boundary required by the selected OptiQ and GLM profiles.
+
 ## Not yet specified
 
 - Real GLM 5.2 compatibility with bundled Codex's exact Responses streaming and tool-call dialect remains environment-dependent because that air-gapped endpoint is not locally available.

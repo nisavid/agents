@@ -895,17 +895,35 @@ class ProxyIntegrationTest(unittest.TestCase):
         )
         FakeUpstreamHandler.hold_open = True
         client_errors = []
+        downstream_stream_started = threading.Event()
 
         def consume():
+            connection = http.client.HTTPConnection(
+                "127.0.0.1", self.gateway.server_address[1], timeout=2
+            )
             try:
-                self.request("POST", "/v1/responses", {"input": []})
+                body = json.dumps({"input": []}).encode()
+                connection.request(
+                    "POST",
+                    "/v1/responses",
+                    body=body,
+                    headers={
+                        "Authorization": f"Bearer {INBOUND_TOKEN}",
+                        "Content-Type": "application/json",
+                    },
+                )
+                response = connection.getresponse()
+                if response.read(1):
+                    downstream_stream_started.set()
+                response.read()
             except (OSError, http.client.HTTPException) as error:
                 client_errors.append(type(error).__name__)
+            finally:
+                connection.close()
 
         client = threading.Thread(target=consume)
         client.start()
-        self.assertTrue(FakeUpstreamHandler.read_started.wait(1))
-        time.sleep(0.05)
+        self.assertTrue(downstream_stream_started.wait(1))
         self.gateway.shutdown()
         self.gateway_thread.join(2)
         close_thread = threading.Thread(target=self.gateway.server_close)
@@ -919,7 +937,7 @@ class ProxyIntegrationTest(unittest.TestCase):
         client.join(2)
         self.assertFalse(client.is_alive())
 
-    def test_downstream_disconnect_closes_sse_reader_and_upstream_lifecycle(self):
+    def test_downstream_disconnect_closes_upstream_stream_and_gateway_stays_healthy(self):
         FakeUpstreamHandler.response_headers = {"Content-Type": "text/event-stream"}
         FakeUpstreamHandler.response_body = b""
         FakeUpstreamHandler.hold_open = True

@@ -1,13 +1,19 @@
 #!/usr/bin/env node
 // THROWAWAY PROTOTYPE ONLY: drive renderer-only ticket 12 checks over loopback CDP.
 
+import { readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+
 const port = Number(process.argv[2]);
 const phase = process.argv[3] ?? "first";
 const timeoutMs = Number(process.argv[4] ?? 120000);
+const resumeStatePath = process.argv[5];
 const base = `http://127.0.0.1:${port}`;
 const started = Date.now();
 const firstPrompt = "What is 73 plus 19? Your final answer must include the decimal result.";
 const firstResult = "92";
+const secondPrompt = "What is 46 plus 17? Your final answer must include the decimal result.";
+const secondResult = "63";
 
 function emit(kind, data) {
   process.stdout.write(`${JSON.stringify({ at: new Date().toISOString(), kind, phase, ...data })}\n`);
@@ -15,6 +21,10 @@ function emit(kind, data) {
 
 function sleep(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function normalizedTextSha256(value) {
+  return createHash("sha256").update(value.replace(/\s+/g, " ").trim()).digest("hex");
 }
 
 async function targets() {
@@ -204,6 +214,7 @@ function assistantOutputProbeExpression(prompt, expectedResult) {
     const resultLines = occurrencesByLine.filter((entry) => entry.count > 0).map((entry) => entry.line);
     return {
       matched: occurrenceCount === 1 && resultLines.length === 1,
+      text: (assistantMessage.innerText ?? "").replace(/\\s+/g, " ").trim(),
       lines,
       occurrenceCount,
       resultLines,
@@ -276,7 +287,15 @@ async function submitPrompt(prompt, expectedResult) {
     `unique semantic renderer result ${expectedResult} in assistant output`,
     timeoutMs
   );
-  emit("assistant-output-oracle", await evaluate(assistantOutputProbe));
+  const outputOracle = await evaluate(assistantOutputProbe);
+  const { text = "", lines = [], resultLines = [], ...safeOutputOracle } = outputOracle;
+  emit("assistant-output-oracle", {
+    ...safeOutputOracle,
+    lineCount: lines.length,
+    resultLineCount: resultLines.length,
+    textLength: text.length,
+    textSha256: normalizedTextSha256(text),
+  });
   await snapshot(completed ? "renderer-reply-completed" : "renderer-reply-missing");
   return completed;
 }
@@ -292,6 +311,45 @@ async function inspectTasks(prompt) {
   );
   await snapshot("local-thread-entry");
   return { inspected: taskVisible };
+}
+
+async function reopenPersistedThread(state) {
+  const taskPrefix = firstPrompt.slice(0, 32);
+  const clicked = await clickMatching(
+    `[...document.querySelectorAll('[role=button]')].find((element) =>
+      (element.innerText ?? "").includes(${JSON.stringify(taskPrefix)})
+    )`,
+    `reopen persisted local thread ${state.threadId}`
+  );
+  if (!clicked) return { reopened: false, persistedOutputVisible: false };
+  const firstPromptVisible = await waitFor(
+    `[...document.querySelectorAll('[aria-label="Edit user message"]')].some((element) =>
+      (element.innerText ?? "").trim() === ${JSON.stringify(firstPrompt)}
+    )`,
+    `persisted first prompt for ${state.threadId}`,
+    15000
+  );
+  const firstOutputProbe = assistantOutputProbeExpression(firstPrompt, state.firstResult);
+  const firstOutputSemanticMatch = firstPromptVisible && await waitFor(
+    `${firstOutputProbe}.matched`,
+    `persisted first output for ${state.threadId}`,
+    15000
+  );
+  const reopenedOutput = firstOutputSemanticMatch
+    ? await evaluate(firstOutputProbe)
+    : { text: "" };
+  const firstOutputVisible = firstOutputSemanticMatch &&
+    normalizedTextSha256(reopenedOutput.text) === state.firstRendererOutputSha256;
+  emit("persisted-thread-oracle", {
+    threadId: state.threadId,
+    firstPromptVisible,
+    firstOutputVisible,
+  });
+  await snapshot(firstOutputVisible ? "persisted-thread-reopened" : "persisted-thread-missing");
+  return {
+    reopened: firstPromptVisible && firstOutputVisible,
+    persistedOutputVisible: firstOutputVisible,
+  };
 }
 
 async function inspectSurfaces() {
@@ -359,32 +417,63 @@ await send("Network.enable");
 await send("Runtime.enable");
 
 try {
-  if (phase !== "first") throw new Error(`unknown driver phase: ${phase}`);
-  const mainUi = await reachMainUi();
-  const rendererPromptCompleted = mainUi && await submitPrompt(firstPrompt, firstResult);
-  const tasks = rendererPromptCompleted
-    ? await inspectTasks(firstPrompt)
-    : { inspected: false };
-  await clickMatching(
-    `[...document.querySelectorAll("button")].find((element) => element.innerText?.includes("New task"))`,
-    "return to new task before surface inspection"
-  );
-  await sleep(500);
-  const surfaces = await inspectSurfaces();
-  const summary = {
-    mainUi,
-    rendererPromptCompleted,
-    tasksSurfaceObserved: tasks.inspected,
-    ...surfaces,
-    nativeProjectPickerExercised: false,
-    nativePermissionDecisionExercised: false,
-    nativeWorktreeControlExercised: false,
-  };
-  emit("gui-summary", summary);
-  const required = [summary.mainUi, summary.rendererPromptCompleted, summary.tasksSurfaceObserved,
-    summary.settingsSurfaceObserved, summary.pluginSurfaceObserved,
-    summary.skillSurfaceObserved, summary.modelSurfaceObserved];
-  if (required.some((value) => value !== true)) process.exitCode = 1;
+  if (phase === "first") {
+    const mainUi = await reachMainUi();
+    const rendererPromptCompleted = mainUi && await submitPrompt(firstPrompt, firstResult);
+    const tasks = rendererPromptCompleted
+      ? await inspectTasks(firstPrompt)
+      : { inspected: false };
+    await clickMatching(
+      `[...document.querySelectorAll("button")].find((element) => element.innerText?.includes("New task"))`,
+      "return to new task before surface inspection"
+    );
+    await sleep(500);
+    const surfaces = await inspectSurfaces();
+    const summary = {
+      mainUi,
+      rendererPromptCompleted,
+      tasksSurfaceObserved: tasks.inspected,
+      ...surfaces,
+      nativeProjectPickerExercised: false,
+      nativePermissionDecisionExercised: false,
+      nativeWorktreeControlExercised: false,
+    };
+    emit("gui-summary", summary);
+    const required = [summary.mainUi, summary.rendererPromptCompleted, summary.tasksSurfaceObserved,
+      summary.settingsSurfaceObserved, summary.pluginSurfaceObserved,
+      summary.skillSurfaceObserved, summary.modelSurfaceObserved];
+    if (required.some((value) => value !== true)) process.exitCode = 1;
+  } else if (phase === "second") {
+    if (!resumeStatePath) throw new Error("second phase requires a resume-state path");
+    const state = JSON.parse(readFileSync(resumeStatePath, "utf8"));
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(state.threadId)) {
+      throw new Error(`invalid persisted thread identity: ${state.threadId}`);
+    }
+    if (state.firstPromptSha256 !== normalizedTextSha256(firstPrompt) ||
+      state.firstResult !== firstResult || !state.firstPersistedOutputSha256 ||
+      !state.firstRendererOutputSha256 || state.firstOutputBinding !== "unique-turn") {
+      throw new Error("resume state does not bind the first deterministic turn");
+    }
+    const mainUi = await reachMainUi();
+    const reopened = mainUi
+      ? await reopenPersistedThread(state)
+      : { reopened: false, persistedOutputVisible: false };
+    const rendererContinuationCompleted = reopened.reopened &&
+      await submitPrompt(secondPrompt, secondResult);
+    const summary = {
+      mainUi,
+      persistedThreadId: state.threadId,
+      rendererThreadReopened: reopened.reopened,
+      persistedOutputVisible: reopened.persistedOutputVisible,
+      rendererContinuationCompleted,
+    };
+    emit("gui-resume-summary", summary);
+    const required = [summary.mainUi, summary.rendererThreadReopened,
+      summary.persistedOutputVisible, summary.rendererContinuationCompleted];
+    if (required.some((value) => value !== true)) process.exitCode = 1;
+  } else {
+    throw new Error(`unknown driver phase: ${phase}`);
+  }
 } catch (error) {
   emit("driver-error", { message: error instanceof Error ? error.message : String(error) });
   process.exitCode = 1;

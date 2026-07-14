@@ -22,6 +22,16 @@ def load_gateway(path: pathlib.Path):
 
 def main() -> None:
     gateway = load_gateway(pathlib.Path(sys.argv[1]).resolve())
+    expected_upstream_timeout_seconds = float(sys.argv[2])
+    config = gateway.ProxyConfig.from_env(
+        {
+            "NS_PROXY_UPSTREAM": "http://127.0.0.1:18997/v1",
+            "NS_PROXY_INBOUND_TOKEN": "fixture-inbound-token-000000000000",
+            "NS_PROXY_UPSTREAM_TIMEOUT": sys.argv[2],
+        }
+    )
+    assert config.upstream_timeout_seconds == expected_upstream_timeout_seconds
+    assert config.sse_heartbeat_seconds == 15.0
     declaration = {
         "model": "fixture-model",
         "tools": [
@@ -114,6 +124,8 @@ def main() -> None:
                 "function_output_preserved": True,
                 "continuation_mapping_reused": True,
                 "second_call_reconstructed": True,
+                "upstream_timeout_seconds": config.upstream_timeout_seconds,
+                "default_sse_heartbeat_seconds": config.sse_heartbeat_seconds,
             },
             sort_keys=True,
         )

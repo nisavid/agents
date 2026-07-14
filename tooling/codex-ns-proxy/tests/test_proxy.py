@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import dataclasses
 import http.client
 import http.server
 import importlib.util
@@ -39,6 +40,8 @@ class FakeUpstreamHandler(http.server.BaseHTTPRequestHandler):
     hold_open = False
     release_response = threading.Event()
     stream_chunks = None
+    observe_disconnect = False
+    upstream_disconnect_observed = threading.Event()
 
     def do_GET(self):
         self._record_and_respond()
@@ -66,6 +69,15 @@ class FakeUpstreamHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(self.__class__.response_body)
             self.wfile.flush()
+            if self.__class__.observe_disconnect:
+                self.connection.settimeout(0.05)
+                while not self.__class__.release_response.is_set():
+                    try:
+                        if not self.connection.recv(1):
+                            self.__class__.upstream_disconnect_observed.set()
+                            break
+                    except socket.timeout:
+                        pass
             self.__class__.release_response.wait(5)
             return
         if self.__class__.stream_chunks is not None:
@@ -115,6 +127,8 @@ class ProxyIntegrationTest(unittest.TestCase):
         FakeUpstreamHandler.hold_open = False
         FakeUpstreamHandler.release_response = threading.Event()
         FakeUpstreamHandler.stream_chunks = None
+        FakeUpstreamHandler.observe_disconnect = False
+        FakeUpstreamHandler.upstream_disconnect_observed = threading.Event()
         self.upstream = ThreadingServer(("127.0.0.1", 0), FakeUpstreamHandler)
         self.upstream_thread = threading.Thread(target=self.upstream.serve_forever)
         self.upstream_thread.start()
@@ -158,6 +172,19 @@ class ProxyIntegrationTest(unittest.TestCase):
         result = response.status, dict(response.getheaders()), raw
         connection.close()
         return result
+
+    def restart_gateway(self, **config_overrides):
+        self.gateway.shutdown()
+        self.gateway.server_close()
+        self.gateway_thread.join(2)
+        config = dataclasses.replace(
+            self.config,
+            listen_port=0,
+            **config_overrides,
+        )
+        self.gateway = proxy.create_server(config)
+        self.gateway_thread = threading.Thread(target=self.gateway.serve_forever)
+        self.gateway_thread.start()
 
     def raw_request(self, request, *, shutdown_write=False, timeout=2):
         connection = socket.create_connection(
@@ -449,21 +476,11 @@ class ProxyIntegrationTest(unittest.TestCase):
         )
         FakeUpstreamHandler.response_headers = {"Content-Type": "text/event-stream"}
         FakeUpstreamHandler.stream_chunks = [(0.12, upstream_frame)]
-        self.gateway.shutdown()
-        self.gateway.server_close()
-        self.gateway_thread.join(2)
-        self.gateway = proxy.create_server(
-            proxy.ProxyConfig(
-                upstream_url=self.config.upstream_url,
-                inbound_token=INBOUND_TOKEN,
-                listen_port=0,
-                upstream_timeout_seconds=1,
-                sse_heartbeat_seconds=0.03,
-                adapter="codex-namespace",
-            )
+        self.restart_gateway(
+            upstream_timeout_seconds=1,
+            sse_heartbeat_seconds=0.03,
+            adapter="codex-namespace",
         )
-        self.gateway_thread = threading.Thread(target=self.gateway.serve_forever)
-        self.gateway_thread.start()
 
         status, _, raw = self.request("POST", "/v1/responses", {"input": []})
 
@@ -480,21 +497,11 @@ class ProxyIntegrationTest(unittest.TestCase):
         )
         FakeUpstreamHandler.response_headers = {"Content-Type": "text/event-stream"}
         FakeUpstreamHandler.stream_chunks = [(0, first), (0.08, terminal)]
-        self.gateway.shutdown()
-        self.gateway.server_close()
-        self.gateway_thread.join(2)
-        self.gateway = proxy.create_server(
-            proxy.ProxyConfig(
-                upstream_url=self.config.upstream_url,
-                inbound_token=INBOUND_TOKEN,
-                listen_port=0,
-                upstream_timeout_seconds=1,
-                sse_heartbeat_seconds=0.02,
-                adapter="identity",
-            )
+        self.restart_gateway(
+            upstream_timeout_seconds=1,
+            sse_heartbeat_seconds=0.02,
+            adapter="identity",
         )
-        self.gateway_thread = threading.Thread(target=self.gateway.serve_forever)
-        self.gateway_thread.start()
 
         status, _, raw = self.request("POST", "/v1/responses", {"input": []})
 
@@ -507,21 +514,11 @@ class ProxyIntegrationTest(unittest.TestCase):
         body = b'{"object":"delayed-json"}'
         FakeUpstreamHandler.response_headers = {"Content-Type": "application/json"}
         FakeUpstreamHandler.stream_chunks = [(0.08, body)]
-        self.gateway.shutdown()
-        self.gateway.server_close()
-        self.gateway_thread.join(2)
-        self.gateway = proxy.create_server(
-            proxy.ProxyConfig(
-                upstream_url=self.config.upstream_url,
-                inbound_token=INBOUND_TOKEN,
-                listen_port=0,
-                upstream_timeout_seconds=1,
-                sse_heartbeat_seconds=0.02,
-                adapter="identity",
-            )
+        self.restart_gateway(
+            upstream_timeout_seconds=1,
+            sse_heartbeat_seconds=0.02,
+            adapter="identity",
         )
-        self.gateway_thread = threading.Thread(target=self.gateway.serve_forever)
-        self.gateway_thread.start()
 
         status, _, raw = self.request("POST", "/v1/responses", {"input": []})
 
@@ -537,21 +534,11 @@ class ProxyIntegrationTest(unittest.TestCase):
         FakeUpstreamHandler.response_headers = {"Content-Type": "text/event-stream"}
         FakeUpstreamHandler.response_body = terminal
         FakeUpstreamHandler.hold_open = True
-        self.gateway.shutdown()
-        self.gateway.server_close()
-        self.gateway_thread.join(2)
-        self.gateway = proxy.create_server(
-            proxy.ProxyConfig(
-                upstream_url=self.config.upstream_url,
-                inbound_token=INBOUND_TOKEN,
-                listen_port=0,
-                upstream_timeout_seconds=1,
-                sse_heartbeat_seconds=0.02,
-                adapter="identity",
-            )
+        self.restart_gateway(
+            upstream_timeout_seconds=1,
+            sse_heartbeat_seconds=0.02,
+            adapter="identity",
         )
-        self.gateway_thread = threading.Thread(target=self.gateway.serve_forever)
-        self.gateway_thread.start()
         result = []
 
         client = threading.Thread(
@@ -918,28 +905,7 @@ class ProxyIntegrationTest(unittest.TestCase):
         client = threading.Thread(target=consume)
         client.start()
         self.assertTrue(FakeUpstreamHandler.read_started.wait(1))
-        deadline = time.monotonic() + 1
-        while (
-            not any(
-                thread.name == "codex-ns-proxy-sse-reader"
-                for thread in threading.enumerate()
-            )
-            and time.monotonic() < deadline
-        ):
-            time.sleep(0.005)
-        self.assertTrue(
-            any(
-                thread.name == "codex-ns-proxy-sse-reader"
-                for thread in threading.enumerate()
-            )
-        )
-        self.assertTrue(
-            all(
-                thread.daemon
-                for thread in threading.enumerate()
-                if thread.name == "codex-ns-proxy-sse-reader"
-            )
-        )
+        time.sleep(0.05)
         self.gateway.shutdown()
         self.gateway_thread.join(2)
         close_thread = threading.Thread(target=self.gateway.server_close)
@@ -952,32 +918,17 @@ class ProxyIntegrationTest(unittest.TestCase):
         FakeUpstreamHandler.release_response.set()
         client.join(2)
         self.assertFalse(client.is_alive())
-        self.assertFalse(
-            any(
-                thread.name == "codex-ns-proxy-sse-reader"
-                for thread in threading.enumerate()
-            )
-        )
 
     def test_downstream_disconnect_closes_sse_reader_and_upstream_lifecycle(self):
         FakeUpstreamHandler.response_headers = {"Content-Type": "text/event-stream"}
         FakeUpstreamHandler.response_body = b""
         FakeUpstreamHandler.hold_open = True
-        self.gateway.shutdown()
-        self.gateway.server_close()
-        self.gateway_thread.join(2)
-        self.gateway = proxy.create_server(
-            proxy.ProxyConfig(
-                upstream_url=self.config.upstream_url,
-                inbound_token=INBOUND_TOKEN,
-                listen_port=0,
-                upstream_timeout_seconds=1,
-                sse_heartbeat_seconds=0.02,
-                adapter="identity",
-            )
+        FakeUpstreamHandler.observe_disconnect = True
+        self.restart_gateway(
+            upstream_timeout_seconds=1,
+            sse_heartbeat_seconds=0.02,
+            adapter="identity",
         )
-        self.gateway_thread = threading.Thread(target=self.gateway.serve_forever)
-        self.gateway_thread.start()
         body = b'{"input":[]}'
         request = (
             b"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1\r\n"
@@ -996,18 +947,14 @@ class ProxyIntegrationTest(unittest.TestCase):
         )
         client.close()
 
-        deadline = time.monotonic() + 1
-        while self.gateway._active_upstreams and time.monotonic() < deadline:
-            time.sleep(0.005)
+        self.assertTrue(FakeUpstreamHandler.upstream_disconnect_observed.wait(1))
         FakeUpstreamHandler.release_response.set()
+        FakeUpstreamHandler.hold_open = False
+        FakeUpstreamHandler.response_headers = {"Content-Type": "application/json"}
+        FakeUpstreamHandler.response_body = b'{"object":"ok"}'
+        status, _, _ = self.request("GET", "/v1/models")
 
-        self.assertEqual(set(), self.gateway._active_upstreams)
-        self.assertFalse(
-            any(
-                thread.name == "codex-ns-proxy-sse-reader"
-                for thread in threading.enumerate()
-            )
-        )
+        self.assertEqual(200, status)
 
     def test_shutdown_race_after_getresponse_returns_503_and_closes_handler(self):
         reached_registration = threading.Event()

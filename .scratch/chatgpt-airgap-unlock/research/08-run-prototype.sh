@@ -20,6 +20,7 @@ PROVIDER_PROFILE="$HERE/08-provider.sb"
 GATEWAY_PROFILE="$HERE/08-gateway.sb"
 OBSERVER="$HERE/08-proxy-observer.py"
 CDP_OBSERVER="$HERE/08-cdp-observer.mjs"
+GUI_DRIVER="$HERE/12-cdp-gui-driver.mjs"
 HOST_PROBE="$HERE/08-appserver-probe.py"
 HOST_RESTART_PROBE="$HERE/08-appserver-restart-probe.py"
 PROCESS_GROUP="$HERE/08-process-group.py"
@@ -40,6 +41,7 @@ GATEWAY_UPSTREAM_URL="http://127.0.0.1:$UPSTREAM_OBSERVER_PORT/v1"
 GATEWAY_TERMINAL_PATTERN="[codex-ns-proxy] SSE terminal_completed=true"
 PROBE_DURATION_MS="${PROBE_DURATION_MS:-20000}"
 PROBE_EXPECT="${PROBE_EXPECT:-usable-ui}"
+GUI_WORKFLOW="${GUI_WORKFLOW:-false}"
 RUN_LOCK="/private/tmp/chatgpt-route-prototype-08.lock"
 
 lock_acquired=false
@@ -76,6 +78,7 @@ GATEWAY_EXEC=""
 UPSTREAM_OBSERVER_EXEC="$RUN_ROOT/upstream-observer.py"
 OBSERVER_EXEC="$RUN_ROOT/proxy-observer.py"
 CDP_OBSERVER_EXEC="$RUN_ROOT/cdp-observer.mjs"
+GUI_DRIVER_EXEC="$RUN_ROOT/gui-driver.mjs"
 NAMESPACE_PROBE_EXEC="$RUN_ROOT/namespace-probe.py"
 
 case "$ROUTE_MODE" in
@@ -93,6 +96,10 @@ case "$ROUTE_MODE" in
     PROVIDER_BASE_URL="http://127.0.0.1:$GATEWAY_PORT/v1"
     ;;
   *) echo "unknown ROUTE_MODE: $ROUTE_MODE" >&2; exit 64 ;;
+esac
+case "$GUI_WORKFLOW" in
+  false|true) ;;
+  *) echo "GUI_WORKFLOW must be true or false" >&2; exit 64 ;;
 esac
 
 test -d "$SOURCE_APP"
@@ -124,8 +131,9 @@ chmod 700 "$HOME_DIR" "$CODEX_DIR" "$USER_DATA_DIR" "$TMP_DIR" "$LOG_DIR" "$WORK
 /bin/cp "$UPSTREAM_OBSERVER" "$UPSTREAM_OBSERVER_EXEC"
 /bin/cp "$OBSERVER" "$OBSERVER_EXEC"
 /bin/cp "$CDP_OBSERVER" "$CDP_OBSERVER_EXEC"
+/bin/cp "$GUI_DRIVER" "$GUI_DRIVER_EXEC"
 /bin/cp "$NAMESPACE_PROBE" "$NAMESPACE_PROBE_EXEC"
-chmod 500 "$UPSTREAM_OBSERVER_EXEC" "$OBSERVER_EXEC" "$CDP_OBSERVER_EXEC" "$NAMESPACE_PROBE_EXEC"
+chmod 500 "$UPSTREAM_OBSERVER_EXEC" "$OBSERVER_EXEC" "$CDP_OBSERVER_EXEC" "$GUI_DRIVER_EXEC" "$NAMESPACE_PROBE_EXEC"
 test -x "$APP_EXEC"
 test ! -L "$APP"
 /usr/bin/codesign --verify --deep --strict "$APP"
@@ -178,6 +186,15 @@ exclude = ["$CODEX_PROVIDER_TOKEN_ENV"]
 [features]
 shell_snapshot = false
 EOF
+if test "$GUI_WORKFLOW" = true; then
+  cat >"$CODEX_DIR/AGENTS.md" <<'EOF'
+# Offline renderer smoke fixture
+
+When the user asks for `LOCAL_RENDERER_OK` or `LOCAL_RENDERER_RESUME_OK`, do
+not use tools and do not send a preamble. Reply with exactly the requested
+all-caps token and nothing else.
+EOF
+fi
 cat >"$WORKSPACE_DIR/README.md" <<'EOF'
 # Disposable ChatGPT route fixture
 
@@ -407,39 +424,41 @@ if test "$ROUTE_MODE" = gateway; then
   test ! -s "$LOG_DIR/upstream-auth.jsonl"
 fi
 
-/usr/bin/env -i \
-  PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
-  HOME="$HOME_DIR" \
-  CODEX_HOME="$CODEX_DIR" \
-  TMPDIR="$TMP_DIR" \
-  CODEX_PROVIDER_TOKEN_ENV="$CODEX_PROVIDER_TOKEN_ENV" \
-  "$CODEX_PROVIDER_TOKEN_ENV=$CODEX_PROVIDER_TOKEN" \
-  /usr/bin/python3 "$HOST_PROBE" \
-    "$APP/Contents/Resources/codex" \
-    "$WORKSPACE_DIR" \
-    "$PROFILE" \
-    "$REAL_HOME" \
-    "$LOG_DIR" \
-    "$MODEL_ID" \
-    "$PROXY_PORT" \
-    >"$LOG_DIR/host-probe.stdout" 2>"$LOG_DIR/host-probe.stderr"
-THREAD_ID="$(/usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["thread_id"])' "$LOG_DIR/host-summary.json")"
-/usr/bin/env -i \
-  PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
-  HOME="$HOME_DIR" \
-  CODEX_HOME="$CODEX_DIR" \
-  TMPDIR="$TMP_DIR" \
-  CODEX_PROVIDER_TOKEN_ENV="$CODEX_PROVIDER_TOKEN_ENV" \
-  "$CODEX_PROVIDER_TOKEN_ENV=$CODEX_PROVIDER_TOKEN" \
-  /usr/bin/python3 "$HOST_RESTART_PROBE" \
-    "$APP/Contents/Resources/codex" \
-    "$WORKSPACE_DIR" \
-    "$PROFILE" \
-    "$REAL_HOME" \
-    "$LOG_DIR" \
-    "$THREAD_ID" \
-    "$PROXY_PORT" \
-    >"$LOG_DIR/host-restart-probe.stdout" 2>"$LOG_DIR/host-restart-probe.stderr"
+if test "$GUI_WORKFLOW" = false; then
+  /usr/bin/env -i \
+    PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+    HOME="$HOME_DIR" \
+    CODEX_HOME="$CODEX_DIR" \
+    TMPDIR="$TMP_DIR" \
+    CODEX_PROVIDER_TOKEN_ENV="$CODEX_PROVIDER_TOKEN_ENV" \
+    "$CODEX_PROVIDER_TOKEN_ENV=$CODEX_PROVIDER_TOKEN" \
+    /usr/bin/python3 "$HOST_PROBE" \
+      "$APP/Contents/Resources/codex" \
+      "$WORKSPACE_DIR" \
+      "$PROFILE" \
+      "$REAL_HOME" \
+      "$LOG_DIR" \
+      "$MODEL_ID" \
+      "$PROXY_PORT" \
+      >"$LOG_DIR/host-probe.stdout" 2>"$LOG_DIR/host-probe.stderr"
+  THREAD_ID="$(/usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["thread_id"])' "$LOG_DIR/host-summary.json")"
+  /usr/bin/env -i \
+    PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+    HOME="$HOME_DIR" \
+    CODEX_HOME="$CODEX_DIR" \
+    TMPDIR="$TMP_DIR" \
+    CODEX_PROVIDER_TOKEN_ENV="$CODEX_PROVIDER_TOKEN_ENV" \
+    "$CODEX_PROVIDER_TOKEN_ENV=$CODEX_PROVIDER_TOKEN" \
+    /usr/bin/python3 "$HOST_RESTART_PROBE" \
+      "$APP/Contents/Resources/codex" \
+      "$WORKSPACE_DIR" \
+      "$PROFILE" \
+      "$REAL_HOME" \
+      "$LOG_DIR" \
+      "$THREAD_ID" \
+      "$PROXY_PORT" \
+      >"$LOG_DIR/host-restart-probe.stdout" 2>"$LOG_DIR/host-restart-probe.stderr"
+fi
 
 /usr/bin/env -i \
   PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
@@ -483,13 +502,31 @@ sleep 1
     /bin/ps -p "$pid" -o pid=,ppid=,pgid=,state=,etime=,command=
   done
 } >"$LOG_DIR/processes-01s.txt"
-if /usr/bin/env -i \
+if test "$GUI_WORKFLOW" = true; then
+  cdp_command="$GUI_DRIVER_EXEC"
+  cdp_argument="first"
+  cdp_timeout="120000"
+else
+  cdp_command="$CDP_OBSERVER_EXEC"
+  cdp_argument="$PROBE_DURATION_MS"
+  cdp_timeout=""
+fi
+if test "$GUI_WORKFLOW" = true && /usr/bin/env -i \
   PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
   HOME="$HOME_DIR" \
   TMPDIR="$TMP_DIR" \
   LANG="en_US.UTF-8" \
   /usr/bin/sandbox-exec -f "$GATEWAY_PROFILE" -D "REAL_HOME=$REAL_HOME" \
-    "$NODE" "$CDP_OBSERVER_EXEC" "$CDP_PORT" "$PROBE_DURATION_MS" \
+    "$NODE" "$cdp_command" "$CDP_PORT" "$cdp_argument" "$cdp_timeout" \
+  >"$LOG_DIR/cdp.jsonl" 2>"$LOG_DIR/cdp.stderr"; then
+  cdp_exit=0
+elif test "$GUI_WORKFLOW" = false && /usr/bin/env -i \
+  PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+  HOME="$HOME_DIR" \
+  TMPDIR="$TMP_DIR" \
+  LANG="en_US.UTF-8" \
+  /usr/bin/sandbox-exec -f "$GATEWAY_PROFILE" -D "REAL_HOME=$REAL_HOME" \
+    "$NODE" "$cdp_command" "$CDP_PORT" "$cdp_argument" \
   >"$LOG_DIR/cdp.jsonl" 2>"$LOG_DIR/cdp.stderr"; then
   cdp_exit=0
 else
@@ -516,13 +553,53 @@ cdp_observer_healthy=false
 if test "$cdp_exit" -eq 0 && \
   /usr/bin/grep -Fq '"kind":"target"' "$LOG_DIR/cdp.jsonl" && \
   /usr/bin/grep -Fq '"kind":"renderer-state"' "$LOG_DIR/cdp.jsonl" && \
-  ! /usr/bin/grep -Fq '"kind":"observer-error"' "$LOG_DIR/cdp.jsonl"; then
+  ! /usr/bin/grep -Fq '"kind":"observer-error"' "$LOG_DIR/cdp.jsonl" && \
+  ! /usr/bin/grep -Fq '"kind":"driver-error"' "$LOG_DIR/cdp.jsonl"; then
   cdp_observer_healthy=true
 fi
-host_sentinel_completed=false
-if /usr/bin/grep -Fq '"sentinel_completed": true' "$LOG_DIR/host-summary.json" && /usr/bin/grep -Fq '"sentinel_text_observed": true' "$LOG_DIR/host-summary.json"; then host_sentinel_completed=true; fi
-cold_host_resume_observed=false
-if /usr/bin/grep -Fq '"thread_resumed_after_cold_restart": true' "$LOG_DIR/host-restart-summary.json" && /usr/bin/grep -Fq '"thread_read_after_cold_restart": true' "$LOG_DIR/host-restart-summary.json"; then cold_host_resume_observed=true; fi
+host_sentinel_completed=not-applicable
+cold_host_resume_observed=not-applicable
+renderer_prompt_completed=not-applicable
+renderer_tasks_observed=not-applicable
+renderer_settings_observed=not-applicable
+renderer_plugins_observed=not-applicable
+renderer_skills_observed=not-applicable
+renderer_local_skill_visible=not-applicable
+renderer_model_surface_observed=not-applicable
+renderer_model_metadata_matched=not-applicable
+native_project_picker_exercised=not-applicable
+native_permission_decision_exercised=not-applicable
+native_worktree_control_exercised=not-applicable
+renderer_thread_reopened=not-applicable
+renderer_continuation_completed=not-applicable
+if test "$GUI_WORKFLOW" = false; then
+  host_sentinel_completed=false
+  if /usr/bin/grep -Fq '"sentinel_completed": true' "$LOG_DIR/host-summary.json" && /usr/bin/grep -Fq '"sentinel_text_observed": true' "$LOG_DIR/host-summary.json"; then host_sentinel_completed=true; fi
+  cold_host_resume_observed=false
+  if /usr/bin/grep -Fq '"thread_resumed_after_cold_restart": true' "$LOG_DIR/host-restart-summary.json" && /usr/bin/grep -Fq '"thread_read_after_cold_restart": true' "$LOG_DIR/host-restart-summary.json"; then cold_host_resume_observed=true; fi
+else
+  renderer_prompt_completed=false
+  renderer_tasks_observed=false
+  renderer_settings_observed=false
+  renderer_plugins_observed=false
+  renderer_skills_observed=false
+  renderer_local_skill_visible=false
+  renderer_model_surface_observed=false
+  renderer_model_metadata_matched=false
+  native_project_picker_exercised=false
+  native_permission_decision_exercised=false
+  native_worktree_control_exercised=false
+  renderer_thread_reopened=false
+  renderer_continuation_completed=false
+  if /usr/bin/grep -Fq '"rendererPromptCompleted":true' "$LOG_DIR/cdp.jsonl"; then renderer_prompt_completed=true; fi
+  if /usr/bin/grep -Fq '"tasksSurfaceObserved":true' "$LOG_DIR/cdp.jsonl"; then renderer_tasks_observed=true; fi
+  if /usr/bin/grep -Fq '"settingsSurfaceObserved":true' "$LOG_DIR/cdp.jsonl"; then renderer_settings_observed=true; fi
+  if /usr/bin/grep -Fq '"pluginSurfaceObserved":true' "$LOG_DIR/cdp.jsonl"; then renderer_plugins_observed=true; fi
+  if /usr/bin/grep -Fq '"skillSurfaceObserved":true' "$LOG_DIR/cdp.jsonl"; then renderer_skills_observed=true; fi
+  if /usr/bin/grep -Fq '"localSkillVisible":true' "$LOG_DIR/cdp.jsonl"; then renderer_local_skill_visible=true; fi
+  if /usr/bin/grep -Fq '"modelSurfaceObserved":true' "$LOG_DIR/cdp.jsonl"; then renderer_model_surface_observed=true; fi
+  if /usr/bin/grep -Fq '"rendererModelMetadataMatched":true' "$LOG_DIR/cdp.jsonl"; then renderer_model_metadata_matched=true; fi
+fi
 provider_request_observed=false
 if /usr/bin/grep -Fq 'POST /v1/responses HTTP/1.1" 200' "$LOG_DIR/optiq.stderr"; then provider_request_observed=true; fi
 auth_json_present=false
@@ -622,6 +699,19 @@ done
   printf 'CDP_OBSERVER_HEALTHY=%s\n' "$cdp_observer_healthy"
   printf 'HOST_SENTINEL_COMPLETED=%s\n' "$host_sentinel_completed"
   printf 'COLD_HOST_RESUME_OBSERVED=%s\n' "$cold_host_resume_observed"
+  printf 'RENDERER_PROMPT_COMPLETED=%s\n' "$renderer_prompt_completed"
+  printf 'RENDERER_TASKS_OBSERVED=%s\n' "$renderer_tasks_observed"
+  printf 'RENDERER_SETTINGS_OBSERVED=%s\n' "$renderer_settings_observed"
+  printf 'RENDERER_PLUGINS_OBSERVED=%s\n' "$renderer_plugins_observed"
+  printf 'RENDERER_SKILLS_OBSERVED=%s\n' "$renderer_skills_observed"
+  printf 'RENDERER_LOCAL_SKILL_VISIBLE=%s\n' "$renderer_local_skill_visible"
+  printf 'RENDERER_MODEL_SURFACE_OBSERVED=%s\n' "$renderer_model_surface_observed"
+  printf 'RENDERER_MODEL_METADATA_MATCHED=%s\n' "$renderer_model_metadata_matched"
+  printf 'RENDERER_THREAD_REOPENED=%s\n' "$renderer_thread_reopened"
+  printf 'RENDERER_CONTINUATION_COMPLETED=%s\n' "$renderer_continuation_completed"
+  printf 'NATIVE_PROJECT_PICKER_EXERCISED=%s\n' "$native_project_picker_exercised"
+  printf 'NATIVE_PERMISSION_DECISION_EXERCISED=%s\n' "$native_permission_decision_exercised"
+  printf 'NATIVE_WORKTREE_CONTROL_EXERCISED=%s\n' "$native_worktree_control_exercised"
   printf 'PROVIDER_REQUEST_OBSERVED=%s\n' "$provider_request_observed"
   printf 'AUTH_JSON_PRESENT=%s\n' "$auth_json_present"
   printf 'SHELL_SNAPSHOT_ABSENT=%s\n' "$shell_snapshot_absent"
@@ -649,8 +739,17 @@ cat "$LOG_DIR/probe-verdict.txt"
 
 test "$account_read_observed" = true
 test "$cdp_observer_healthy" = true
-test "$host_sentinel_completed" = true
-test "$cold_host_resume_observed" = true
+if test "$GUI_WORKFLOW" = false; then
+  test "$host_sentinel_completed" = true
+  test "$cold_host_resume_observed" = true
+else
+  test "$renderer_prompt_completed" = true
+  test "$renderer_tasks_observed" = true
+  test "$renderer_settings_observed" = true
+  test "$renderer_plugins_observed" = true
+  test "$renderer_skills_observed" = true
+  test "$renderer_model_surface_observed" = true
+fi
 test "$provider_request_observed" = true
 test "$auth_json_present" = false
 test "$shell_snapshot_absent" = true
@@ -675,5 +774,6 @@ case "$PROBE_EXPECT" in
   capture) ;;
   no-login) test "$login_wall_observed" = false ;;
   usable-ui) test "$login_wall_observed" = false; test "$main_ui_observed" = true ;;
+  renderer-workflow) test "$GUI_WORKFLOW" = true; test "$login_wall_observed" = false; test "$main_ui_observed" = true ;;
   *) echo "unknown PROBE_EXPECT: $PROBE_EXPECT" >&2; exit 64 ;;
 esac

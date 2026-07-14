@@ -46,6 +46,96 @@ GUI_WORKFLOW="${GUI_WORKFLOW:-false}"
 GUI_COLD_RESUME="${GUI_COLD_RESUME:-false}"
 RUN_LOCK="/private/tmp/chatgpt-route-prototype-08.lock"
 
+record_cold_handoff_phase() {
+  cold_handoff_phase_name="$1"
+  cold_handoff_phase_state="$2"
+  if test -n "${LOG_DIR:-}" && test -d "$LOG_DIR"; then
+    printf '{"kind":"phase","phase":"%s","state":"%s"}\n' \
+      "$cold_handoff_phase_name" "$cold_handoff_phase_state" \
+        2>/dev/null >>"$LOG_DIR/cold-handoff.jsonl" || true
+  fi
+}
+
+record_top_level_signal() {
+  top_level_signal_kind="$1"
+  top_level_signal_status="$2"
+  trap - INT TERM
+  if test -n "${LOG_DIR:-}" && test -d "$LOG_DIR"; then
+    printf '{"kind":"signal","signal":"%s","status":%s}\n' \
+      "$top_level_signal_kind" "$top_level_signal_status" \
+        2>/dev/null >>"$LOG_DIR/cold-handoff.jsonl" || true
+  fi
+  exit "$top_level_signal_status"
+}
+
+require_positive_terminal_delta() {
+  checked_terminal_name="$1"
+  checked_terminal_after="$2"
+  checked_terminal_baseline="$3"
+  checked_terminal_delta=$((checked_terminal_after - checked_terminal_baseline))
+  if test "$checked_terminal_delta" -lt 1; then
+    printf 'cold handoff %s terminal delta check failed: expected >=1, baseline=%s, after=%s, delta=%s\n' \
+      "$checked_terminal_name" "$checked_terminal_baseline" "$checked_terminal_after" \
+      "$checked_terminal_delta" >&2
+    return 1
+  fi
+}
+
+run_cold_handoff_self_test() (
+  self_test_root="$(mktemp -d /private/tmp/chatgpt-cold-handoff-self-test.XXXXXX)"
+  trap '/bin/rm -rf "$self_test_root"' EXIT INT TERM
+  LOG_DIR="$self_test_root"
+  for phase in terminal-delta-capture terminal-delta-check resume-state-python stop-app-group relaunch; do
+    record_cold_handoff_phase "$phase" before
+    record_cold_handoff_phase "$phase" after
+  done
+  expected_phases="$(
+    for phase in terminal-delta-capture terminal-delta-check resume-state-python stop-app-group relaunch; do
+      printf '{"kind":"phase","phase":"%s","state":"before"}\n' "$phase"
+      printf '{"kind":"phase","phase":"%s","state":"after"}\n' "$phase"
+    done
+  )"
+  actual_phases="$(/bin/cat "$LOG_DIR/cold-handoff.jsonl")"
+  test "$actual_phases" = "$expected_phases"
+  production_phase_order="$(/usr/bin/awk '
+    /^if test "\$GUI_COLD_RESUME" = true && test "\$cdp_exit" -eq 0; then$/ { handoff=1 }
+    handoff && /record_cold_handoff_phase (terminal-delta-capture|terminal-delta-check|resume-state-python|stop-app-group|relaunch) (before|after)$/ {
+      marker=$0
+      sub(/^.*record_cold_handoff_phase /, "", marker)
+      print marker
+      if (marker == "relaunch after") exit
+    }
+  ' "$0")"
+  expected_production_phase_order="$(
+    for phase in terminal-delta-capture terminal-delta-check resume-state-python stop-app-group relaunch; do
+      printf '%s before\n%s after\n' "$phase" "$phase"
+    done
+  )"
+  test "$production_phase_order" = "$expected_production_phase_order"
+  require_positive_terminal_delta gateway 2 0
+  if require_positive_terminal_delta upstream 0 0 2>"$self_test_root/delta.stderr"; then
+    echo "zero terminal delta unexpectedly passed" >&2
+    return 1
+  fi
+  test "$(/bin/cat "$self_test_root/delta.stderr")" = \
+    'cold handoff upstream terminal delta check failed: expected >=1, baseline=0, after=0, delta=0'
+  if (trap - EXIT INT TERM; record_top_level_signal TERM 143); then
+    echo "TERM diagnostic unexpectedly returned success" >&2
+    return 1
+  else
+    signal_status=$?
+  fi
+  test "$signal_status" -eq 143
+  test "$(/usr/bin/tail -n 1 "$LOG_DIR/cold-handoff.jsonl")" = \
+    '{"kind":"signal","signal":"TERM","status":143}'
+  printf 'cold handoff self-test passed\n'
+)
+
+if test "${1:-}" = --self-test; then
+  run_cold_handoff_self_test
+  exit 0
+fi
+
 lock_acquired=false
 release_lock() {
   if test "$lock_acquired" = true; then
@@ -60,8 +150,8 @@ else
   exit 75
 fi
 trap 'release_lock' EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
+trap 'record_top_level_signal INT 130' INT
+trap 'record_top_level_signal TERM 143' TERM
 
 RUN_ROOT="$(mktemp -d /private/tmp/chatgpt-route-prototype-08.XXXXXX)"
 INBOUND_TOKEN="sk-optiq-inbound-$(/usr/bin/uuidgen | /usr/bin/tr '[:upper:]' '[:lower:]')"
@@ -305,8 +395,8 @@ cleanup() {
   release_lock
 }
 trap 'status=$?; trap - EXIT INT TERM; cleanup; exit "$status"' EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
+trap 'record_top_level_signal INT 130' INT
+trap 'record_top_level_signal TERM 143' TERM
 
 printf '%s\n' "$RUN_ROOT" >"$LOG_DIR/run-root.txt"
 {
@@ -605,10 +695,21 @@ else
 fi
 
 if test "$GUI_COLD_RESUME" = true && test "$cdp_exit" -eq 0; then
+  record_cold_handoff_phase terminal-delta-capture before
   gateway_terminal_after_first="$(/usr/bin/grep -Fxc "$GATEWAY_TERMINAL_PATTERN" "$LOG_DIR/gateway.stderr" || true)"
   upstream_terminal_after_first="$(/usr/bin/grep -Fc '"upstream_terminal_completed": true' "$LOG_DIR/upstream-auth.jsonl" || true)"
-  test "$((gateway_terminal_after_first - gateway_terminal_baseline))" -ge 1
-  test "$((upstream_terminal_after_first - upstream_terminal_baseline))" -ge 1
+  record_cold_handoff_phase terminal-delta-capture after
+  record_cold_handoff_phase terminal-delta-check before
+  if ! require_positive_terminal_delta gateway "$gateway_terminal_after_first" "$gateway_terminal_baseline"; then
+    record_cold_handoff_phase terminal-delta-check failed
+    exit 1
+  fi
+  if ! require_positive_terminal_delta upstream "$upstream_terminal_after_first" "$upstream_terminal_baseline"; then
+    record_cold_handoff_phase terminal-delta-check failed
+    exit 1
+  fi
+  record_cold_handoff_phase terminal-delta-check after
+  record_cold_handoff_phase resume-state-python before
   /usr/bin/python3 - "$CODEX_DIR" "$GUI_RESUME_STATE" "$LOG_DIR/cdp.jsonl" <<'PY'
 import json
 import hashlib
@@ -687,15 +788,20 @@ state = {
 state_path.write_text(json.dumps(state, sort_keys=True) + "\n")
 state_path.chmod(0o600)
 PY
+  record_cold_handoff_phase resume-state-python after
+  record_cold_handoff_phase stop-app-group before
   stop_app_group
+  record_cold_handoff_phase stop-app-group after
   kill -0 "$optiq_pid"
   kill -0 "$proxy_pid"
   if test "$ROUTE_MODE" = gateway; then
     kill -0 "$upstream_observer_pid"
     kill -0 "$gateway_pid"
   fi
+  record_cold_handoff_phase relaunch before
   launch_app app-restart
   sleep 1
+  record_cold_handoff_phase relaunch after
   if /usr/bin/env -i \
     PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
     HOME="$HOME_DIR" \

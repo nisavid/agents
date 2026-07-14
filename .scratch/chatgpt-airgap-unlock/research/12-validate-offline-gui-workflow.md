@@ -267,5 +267,7 @@ loads the materialized gateway and asserts that it parses the upstream timeout
 as 300 seconds while retaining the 15-second default heartbeat.
 
 The failed run cleaned up all owned processes and listeners and left the copied
-app ASAR and bundled Codex binary unchanged. The workflow has not been rerun
-after the timeout correction.
+app ASAR and bundled Codex binary unchanged. A later attempt passed phase one
+but ended before writing its resume-state or cold-stop artifacts. The next run's
+structured cold-handoff phases and top-level signal record will disambiguate
+that handoff without changing its cleanup behavior.

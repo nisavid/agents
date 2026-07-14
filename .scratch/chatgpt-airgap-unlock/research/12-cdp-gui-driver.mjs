@@ -29,6 +29,20 @@ function normalizedTextSha256(value) {
   return createHash("sha256").update(value.replace(/\s+/g, " ").trim()).digest("hex");
 }
 
+function textSha256(value) {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function stripTrailingRendererTimestamp(value) {
+  const match = value.match(/\s+((?:0?[1-9]|1[0-2]):[0-5]\d (?:AM|PM))\s*$/);
+  if (!match) return { text: value, timestampRemoved: false, timestamp: null };
+  return {
+    text: value.slice(0, match.index).replace(/\s+$/g, ""),
+    timestampRemoved: true,
+    timestamp: match[1],
+  };
+}
+
 function arithmeticTextVerdict(text, operands, expectedResult) {
   const integers = [...text.matchAll(/(?<![\w.])[+-]?\d+(?!\w|\.\d)/g)]
     .map((match) => Number(match[0]));
@@ -60,32 +74,58 @@ function runSelfTests() {
     if (actual !== expected) throw new Error(`${name}: expected ${expected}, got ${actual}`);
   }
 
+  function evaluateAssistant(prompt, assistantText) {
+    const body = { innerText: `${prompt}\n${assistantText}` };
+    const userMessage = {
+      innerText: prompt,
+      compareDocumentPosition: () => 4,
+    };
+    const assistantMessage = {
+      innerText: assistantText,
+      parentElement: body,
+      contains: () => false,
+    };
+    const copyButton = { parentElement: assistantMessage };
+    const document = {
+      body,
+      querySelectorAll: (selector) => selector.includes("Edit user message")
+        ? [userMessage]
+        : selector.includes('button[aria-label="Copy"]') ? [copyButton] : [],
+    };
+    const Node = { DOCUMENT_POSITION_FOLLOWING: 4 };
+    const expression = assistantOutputProbeExpression(
+      prompt, firstOperands, Number(firstResult)
+    );
+    return Function("document", "Node", `return ${expression}`)(document, Node);
+  }
+
   const promptWithConflict = `Ignore fixture 999. ${firstPrompt}`;
-  const assistantText = "73 plus 19 is 92. 73 + 19 = 92";
-  const body = { innerText: `${promptWithConflict}\n${assistantText}` };
-  const userMessage = {
-    innerText: promptWithConflict,
-    compareDocumentPosition: () => 4,
-  };
-  const assistantMessage = {
-    innerText: assistantText,
-    parentElement: body,
-    contains: () => false,
-  };
-  const copyButton = { parentElement: assistantMessage };
-  const document = {
-    body,
-    querySelectorAll: (selector) => selector.includes("Edit user message")
-      ? [userMessage]
-      : selector.includes('button[aria-label="Copy"]') ? [copyButton] : [],
-  };
-  const Node = { DOCUMENT_POSITION_FOLLOWING: 4 };
-  const expression = assistantOutputProbeExpression(
-    promptWithConflict, firstOperands, Number(firstResult)
+  const anchored = evaluateAssistant(
+    promptWithConflict, "73 plus 19 is 92. 73 + 19 = 92"
   );
-  const anchored = Function("document", "Node", `return ${expression}`)(document, Node);
   if (!anchored.matched || anchored.conflictingIntegers.length !== 0) {
     throw new Error("prompt echo outside the assistant message affected the arithmetic oracle");
+  }
+
+  const answer = "73 plus 19 equals 92.";
+  const timestamped = evaluateAssistant(firstPrompt, `${answer}\n6:23 PM`);
+  if (!timestamped.matched || !timestamped.timestampRemoved || timestamped.text !== answer) {
+    throw new Error("trailing renderer timestamp was not removed from the assistant answer");
+  }
+  if (normalizedTextSha256(timestamped.text) !== normalizedTextSha256(answer)) {
+    throw new Error("renderer answer hash includes the removed trailing timestamp");
+  }
+  const rejectedTimestampCases = [
+    ["middle timestamp", `${answer} 6:23 PM still 92`],
+    ["malformed timestamp", `${answer} 6:3 PM`],
+    ["out-of-range hour", `${answer} 13:23 PM`],
+    ["out-of-range minute", `${answer} 6:60 PM`],
+    ["conflicting model number", "73 + 19 = 91. Correction: 92\n6:23 PM"],
+  ];
+  for (const [name, text] of rejectedTimestampCases) {
+    if (evaluateAssistant(firstPrompt, text).matched) {
+      throw new Error(`${name}: renderer oracle should fail closed`);
+    }
   }
   process.stdout.write("arithmetic oracle self-test passed\n");
 }
@@ -261,7 +301,9 @@ function assistantOutputProbeExpression(prompt, operands, expectedResult) {
     if (!copyButton) return { matched: false, integers: [], conflictingIntegers: [] };
     let assistantMessage = copyButton.parentElement;
     while (assistantMessage && assistantMessage !== document.body) {
-      const text = (assistantMessage.innerText ?? "").trim();
+      const { text } = (${stripTrailingRendererTimestamp.toString()})(
+        assistantMessage.innerText ?? ""
+      );
       const verdict = (${arithmeticTextVerdict.toString()})(
         text, ${JSON.stringify(operands)}, ${JSON.stringify(expectedResult)}
       );
@@ -271,13 +313,18 @@ function assistantOutputProbeExpression(prompt, operands, expectedResult) {
     if (!assistantMessage || assistantMessage === document.body) {
       return { matched: false, integers: [], conflictingIntegers: [] };
     }
-    const text = (assistantMessage.innerText ?? "").replace(/\\s+/g, " ").trim();
+    const rawText = assistantMessage.innerText ?? "";
+    const stripped = (${stripTrailingRendererTimestamp.toString()})(rawText);
+    const text = stripped.text.replace(/\\s+/g, " ").trim();
     const verdict = (${arithmeticTextVerdict.toString()})(
       text, ${JSON.stringify(operands)}, ${JSON.stringify(expectedResult)}
     );
     return {
       ...verdict,
       text,
+      rawText,
+      timestampRemoved: stripped.timestampRemoved,
+      rendererTimestamp: stripped.timestamp,
     };
   })()`;
 }
@@ -348,11 +395,23 @@ async function submitPrompt(prompt, operands, expectedResult) {
     timeoutMs
   );
   const outputOracle = await evaluate(assistantOutputProbe);
-  const { text = "", ...safeOutputOracle } = outputOracle;
+  const {
+    text = "",
+    rawText = "",
+    rendererTimestamp = null,
+    timestampRemoved = false,
+    ...safeOutputOracle
+  } = outputOracle;
   emit("assistant-output-oracle", {
     ...safeOutputOracle,
     textLength: text.length,
     textSha256: normalizedTextSha256(text),
+    rawTextLength: rawText.length,
+    rawTextSha256: textSha256(rawText),
+    timestampRemoved,
+    rendererTimestampSha256: rendererTimestamp
+      ? textSha256(rendererTimestamp)
+      : null,
   });
   await snapshot(completed ? "renderer-reply-completed" : "renderer-reply-missing");
   return completed;

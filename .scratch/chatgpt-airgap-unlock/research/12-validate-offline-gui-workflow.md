@@ -208,3 +208,29 @@ node .scratch/chatgpt-airgap-unlock/research/12-cdp-gui-driver.mjs --self-test
 ```
 
 The cold-restart workflow has not been rerun after this correction.
+
+## Trailing renderer timestamp correction
+
+A second live phase-one attempt persisted the correct response, `73 plus 19
+equals 92.`, and completed its task, but the CDP arithmetic oracle returned no
+assistant output. The run stopped before the cold restart, so it is not
+cold-restart evidence.
+
+The earlier artifact proves that the assistant container can append a rendered
+timestamp: its 30-character model output became a 38-character DOM value after
+the renderer added `6:23 PM`. The second attempt is consistent with the same
+renderer behavior, but its exact appended timestamp was not captured.
+
+The renderer-only oracle now removes exactly one terminal 12-hour timestamp in
+uppercase `AM` or `PM` before applying the arithmetic predicate and hashing the
+rendered answer. It records whether a timestamp was removed, along with the raw
+container length and hashes of the raw container and removed timestamp. The
+structured `assistant-output-oracle` event does not emit the raw container body
+or timestamp value. Existing renderer-state snapshots continue to capture the
+visible GUI for workflow evidence. A timestamp in the middle, a malformed or
+out-of-range timestamp, or a conflicting model-produced integer still fails
+closed. Persisted-rollout selection is unchanged.
+
+The no-app self-test covers the terminal timestamp, verifies that the renderer
+answer hash excludes it, and rejects middle, malformed, and conflicting-number
+cases. The cold-restart workflow has not been rerun after this correction.

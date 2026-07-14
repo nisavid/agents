@@ -1,0 +1,15 @@
+(version 1)
+
+; RESEARCH PROBE ONLY. The target is a disposable app copy in /private/tmp.
+(allow default)
+
+; Permit loopback observers, but deny every connection to a remote IP.
+(deny network-outbound (remote ip))
+(deny network-inbound (local ip))
+(allow network-outbound (remote ip "localhost:*"))
+(allow network-inbound (local ip "localhost:*"))
+
+; Do not let this process tree consult the operator's home or login keychain services.
+(deny file-read* (subpath (param "REAL_HOME")))
+(deny file-write* (subpath (param "REAL_HOME")))
+(deny mach-lookup (regex #"^com\\.apple\\.securityd"))

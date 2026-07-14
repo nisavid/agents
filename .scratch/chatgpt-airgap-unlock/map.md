@@ -27,17 +27,18 @@ Produce an implementation-ready, empirically validated plan for running the exac
 - [Select a local smoke-test model](issues/10-select-local-smoke-model.md) — Use Qwen3.5-2B-OptiQ-4bit at immutable revision `adc8669eb431e3168aeb4e320bd7b757914350e2` through an isolated OptiQ runner; it is the smallest compared candidate with a credible tool-calling margin and passed deterministic Responses text, function-call, and function-output checks.
 - [Choose the preferred architecture](issues/07-choose-bypass-architecture.md) — Use a closed profile-driven runner around the pristine vendor bundle, backed by one private typed lifecycle module and internal seams only for proven variation; OptiQ is the local development profile, GLM is explicit with no fallback, and bundle mutation is rejected absent new exact-build evidence.
 - [Harden the Responses gateway](issues/11-harden-responses-gateway.md) — `codex-ns-proxy` is now an authenticated, allowlisted, secret-separating loopback boundary with deterministic coverage and an exact end-to-end OptiQ validation through the preferred route.
+- [Validate the offline GUI workflow](issues/12-validate-offline-gui-workflow.md) — The scoped renderer slice now submits a semantic turn, persists the local thread, exposes its task entry and required core surfaces, and preserves every gateway, credential, integrity, and cleanup boundary; native project, worktree, permission, cold-resume, mode, project-local skill, and exact metadata gates remain.
 
 ## Active work
 
 - [Validate the preferred route](issues/08-validate-preferred-route.md) — Prove the configured pristine-bundle route against the local OptiQ fixture and grade every minimum-workflow and platform-isolation gate from artifact-bound evidence.
-- [Validate the offline GUI workflow](issues/12-validate-offline-gui-workflow.md) — Exercise renderer submission, thread persistence, projects, worktrees, permissions, modes, extensions, settings, and model metadata against the pinned local route.
+- [Validate the offline GUI workflow](issues/12-validate-offline-gui-workflow.md) — Complete native project, worktree, permission, mode, cold-resume, project-local skill, and exact renderer-visible model-metadata acceptance against the pinned local route.
 - [Validate production isolation](issues/13-validate-production-isolation.md) — Preserve the vendor Chromium sandbox and signed code posture while a disconnected VM or true air gap makes hosted egress unavailable.
 
 ## Not yet specified
 
 - Real GLM 5.2 compatibility with bundled Codex's exact Responses streaming and tool-call dialect remains environment-dependent because that air-gapped endpoint is not locally available.
-- The full configured renderer route still needs GUI-level validation for model metadata, provider submission, thread reopening, projects and worktrees, permissions, plugins, and settings; bundled fallback metadata is not authoritative.
+- The configured renderer route still needs GUI-level validation for thread reopening and continuation, projects and worktrees, permission decisions, Default and Plan modes, project-local skills, and exact model metadata; bundled fallback metadata is not authoritative.
 - Local semantic validation currently requires reconciling outer network confinement with Chromium's nested sandbox. Production acceptance must preserve the vendor Chromium sandbox on a disconnected VM or true air-gapped machine.
 - Cross-version discovery and migration remain deferred until a second exact app build is explicitly brought into scope.
 

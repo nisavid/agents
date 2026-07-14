@@ -8,6 +8,22 @@ Related: 08
 
 Does the exact copied app complete the minimum offline workflow through its renderer and persist the resulting local state when configured for the pinned OptiQ profile through the hardened gateway?
 
+## Current evidence
+
+The scoped renderer slice passes. The exact copied app reached the main UI
+without OpenAI state, submitted a semantic turn through the renderer, received
+the expected assistant result, persisted a completed local thread, exposed that
+thread in local task navigation, and displayed Settings, Plugins, Skills,
+Tasks, and the model control. The request reached only the authenticated gateway
+and pinned OptiQ upstream; gateway authentication, secret separation,
+namespaced tool continuation, listener isolation, integrity, and cleanup checks
+all passed. See
+[`research/12-validate-offline-gui-workflow.md`](../research/12-validate-offline-gui-workflow.md).
+
+The ticket remains open for native project-picker, worktree, and permission
+interaction; Default and Plan mode behavior; project-local skill visibility;
+exact renderer-visible model metadata; and cold GUI reopen and continuation.
+
 ## Acceptance
 
 - Launch only the separately named exact app copy with fresh isolated state and the pinned OptiQ profile; keep the installed app, normal profile, global Codex state, and unrelated model servers untouched.

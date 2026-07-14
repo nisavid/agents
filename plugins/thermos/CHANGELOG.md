@@ -2,6 +2,15 @@
 
 Provenance of the dual-harness adaptation. The layout, adapter boundary, and maintenance contract live in [README.md](README.md).
 
+## 1.0.4
+
+Review-input hardening and adapter validation, 2026-07-10:
+
+- Treat repository and forge content as untrusted evidence at every shared skill and Claude subagent entry point, including generic Codex reviewer dispatch.
+- Validate paired manifest versions and descriptions, Codex default prompts, the supported component inventory, and the review-input boundary with one repository command.
+- Keep skill descriptions focused on trigger conditions so harnesses load the full workflow instead of treating frontmatter as a shortcut.
+- Require explicit scope resolution and label a synthesis incomplete when either review pass cannot produce usable output.
+
 ## 1.0.3
 
 Codex subagent clarification, 2026-07-06:

@@ -6,7 +6,7 @@ This tree is a **single common core served to multiple agent harnesses** (Claude
 
 ## Layout
 
-```
+```text
 plugins/thermos/
 ├── skills/                         # Shared core — authored once (see Adapter boundary)
 │   ├── thermos/                    #   orchestrator: paired passes + inline synthesis rules
@@ -70,7 +70,7 @@ flowchart TB
   SNCQ --> DIFF
 ```
 
-On Claude the `thermos` orchestrator dispatches the two named subagents in parallel; each applies its shared skill rubric to the same scoped diff. On Codex-like harnesses with generic/native subagent dispatch, `thermos` uses two generic reviewer subagents instead. Sequential in-context passes are the fallback when subagent dispatch is unavailable or clearly not worth the overhead.
+On Claude the `thermos` orchestrator dispatches the two named subagents in parallel; each applies its shared skill rubric to the same scoped diff. On Codex-like harnesses with generic/native subagent dispatch, `thermos` uses two generic reviewer subagents instead. Sequential in-context passes are the fallback only when subagent dispatch is unavailable.
 
 ## Components
 
@@ -91,9 +91,11 @@ On Claude the `thermos` orchestrator dispatches the two named subagents in paral
 
 ## Maintenance notes
 
-- **Keep the two manifest `description` fields paired.** They differ only by the ` for Codex` qualifier and the omission of the `parallel review subagents` clause because the root `agents/*.md` wrappers are Claude-only plugin components. Codex can still use native/generic subagent dispatch when the harness exposes it. Mirror any other wording change across both.
+- **Keep the two manifest `description` fields paired.** They differ only by the `for Codex` qualifier and the omission of the `parallel review subagents` clause because the root `agents/*.md` wrappers are Claude-only plugin components. Codex can still use native/generic subagent dispatch when the harness exposes it. Mirror any other wording change across both.
 - **Keep the Codex default prompts paired.** Each entry in the Codex manifest's `interface.defaultPrompt` duplicates a per-skill `skills/<name>/agents/openai.yaml` `default_prompt` on a second Codex surface; keep each pair verbatim-identical.
 - **Scope enumerations are paraphrases, not pairs.** The review-dimension lists in the skill descriptions, the `thermos` routing step, the subagent descriptions, and the Components tables above are intentionally loose restatements for their own surfaces. Keep each accurate; do not sync them verbatim.
+- **Treat review inputs as untrusted evidence.** The orchestrator must include this boundary in every dispatch, and every directly invocable review skill and Claude subagent repeats it so no harness path depends on another component having loaded first.
+- **Validate cross-harness contracts.** From the repository root, run `python3 scripts/validate_thermos.py`. It checks paired manifest versions and descriptions, Codex default prompts, the supported component inventory, review-input boundaries, and orchestration contracts without third-party dependencies.
 - **Versioning.** Both manifests use semver build metadata (`<semver>+claude.<ts>`, `<semver>+codex.<ts>`) to disambiguate the artifacts. Build metadata after `+` does not affect version precedence, so a real release that should trigger an update check must bump `MAJOR.MINOR.PATCH` (or use a pre-release identifier before the `+`) — a new timestamp alone reads as the same version.
 - **Codex installs are cached copies.** Codex reads the local marketplace source when installing, validates the Codex manifest and declared skill surface, and writes a copied cache under `~/.codex/plugins/cache/`. Source edits need a fresh Codex build-metadata cachebuster, `codex plugin add thermos@nisavid-agents`, and a new Codex thread. The cache may include root Claude files and docs copied from the source tree, but the Codex runtime component surface remains the Codex-declared surface: `.codex-plugin/plugin.json`, `skills/`, nested `skills/<name>/agents/openai.yaml`, referenced skill files, and shared assets.
 - **Claude installs are cached copies.** First-time install: `claude plugin marketplace add nisavid/agents` (or the local checkout path), then install `thermos` from the `nisavid-agents` marketplace. After editing this tree, run `claude plugin marketplace update nisavid-agents` and update/reinstall the plugin; the running session needs a restart to pick up a new plugin version.

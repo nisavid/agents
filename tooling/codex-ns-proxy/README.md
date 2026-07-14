@@ -26,6 +26,7 @@ The gateway:
 - optionally injects a distinct upstream bearer credential;
 - optionally flattens Codex namespace tools before forwarding and reconstructs
   only the exact mapped namespace function calls in plain and SSE output;
+- sends configurable SSE comment heartbeats while an upstream stream is silent;
 - preserves unchanged SSE lines and event order; and
 - applies request-size and connection-timeout limits.
 
@@ -77,6 +78,13 @@ function-call output, is also supported.
 Shutdown closes active upstream connections before joining request threads, so
 a live Responses stream cannot hold gateway teardown open indefinitely.
 
+SSE heartbeats default to every 15 seconds and are emitted only after the
+downstream SSE headers, between complete upstream frames, and before a terminal
+event or EOF. Each heartbeat is an SSE comment, so it carries no model data and
+does not alter the relative order or bytes of upstream frames. Heartbeats keep
+the downstream transport active; they do not extend the configured upstream
+read timeout.
+
 The configured `NS_PROXY_UPSTREAM` URL is the complete upstream allowlist. Its
 origin and base path are parsed once; fixed route suffixes are appended without
 accepting caller-controlled path segments. Sanitized terminal evidence is
@@ -95,6 +103,7 @@ written only to stderr when `NS_PROXY_DEBUG=true`, as
 | `NS_PROXY_MAX_BODY_BYTES` | `8388608` | Maximum request body size |
 | `NS_PROXY_UPSTREAM_TIMEOUT` | `30` | Upstream connection/read timeout in seconds |
 | `NS_PROXY_INBOUND_TIMEOUT` | `30` | Inbound socket timeout in seconds |
+| `NS_PROXY_SSE_HEARTBEAT` | `15` | Positive SSE silence interval before sending a downstream comment heartbeat |
 | `NS_PROXY_ADAPTER` | `identity` | `identity` or explicit `codex-namespace` adaptation |
 | `NS_PROXY_NAMESPACE_MAP_CAPACITY` | `256` | Maximum remembered response-ID mappings |
 | `NS_PROXY_DEBUG` | `false` | Enable sanitized structural diagnostics |

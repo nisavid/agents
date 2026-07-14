@@ -10,6 +10,7 @@ import json
 import pathlib
 import socket
 import socketserver
+import struct
 import sys
 import threading
 import time
@@ -37,6 +38,7 @@ class FakeUpstreamHandler(http.server.BaseHTTPRequestHandler):
     response_delay = 0
     hold_open = False
     release_response = threading.Event()
+    stream_chunks = None
 
     def do_GET(self):
         self._record_and_respond()
@@ -65,6 +67,21 @@ class FakeUpstreamHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(self.__class__.response_body)
             self.wfile.flush()
             self.__class__.release_response.wait(5)
+            return
+        if self.__class__.stream_chunks is not None:
+            self.send_response(self.__class__.response_status)
+            for key, value in self.__class__.response_headers.items():
+                self.send_header(key, value)
+            self.send_header("Connection", "close")
+            self.end_headers()
+            for delay, chunk in self.__class__.stream_chunks:
+                if delay:
+                    time.sleep(delay)
+                try:
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    break
             return
         self.send_response(self.__class__.response_status)
         for key, value in self.__class__.response_headers.items():
@@ -97,6 +114,7 @@ class ProxyIntegrationTest(unittest.TestCase):
         FakeUpstreamHandler.response_delay = 0
         FakeUpstreamHandler.hold_open = False
         FakeUpstreamHandler.release_response = threading.Event()
+        FakeUpstreamHandler.stream_chunks = None
         self.upstream = ThreadingServer(("127.0.0.1", 0), FakeUpstreamHandler)
         self.upstream_thread = threading.Thread(target=self.upstream.serve_forever)
         self.upstream_thread.start()
@@ -423,6 +441,135 @@ class ProxyIntegrationTest(unittest.TestCase):
         self.assertIn(unchanged, lines)
         self.assertLess(raw.index(b"response.output_item.added"), raw.index(b"response.completed"))
         self.assertIn("SSE terminal_completed=true", stderr.getvalue())
+
+    def test_sse_heartbeat_precedes_delayed_first_upstream_frame(self):
+        upstream_frame = (
+            b"event: response.completed\n"
+            b'data: {"type":"response.completed","response":{"id":"one","output":[]}}\n\n'
+        )
+        FakeUpstreamHandler.response_headers = {"Content-Type": "text/event-stream"}
+        FakeUpstreamHandler.stream_chunks = [(0.12, upstream_frame)]
+        self.gateway.shutdown()
+        self.gateway.server_close()
+        self.gateway_thread.join(2)
+        self.gateway = proxy.create_server(
+            proxy.ProxyConfig(
+                upstream_url=self.config.upstream_url,
+                inbound_token=INBOUND_TOKEN,
+                listen_port=0,
+                upstream_timeout_seconds=1,
+                sse_heartbeat_seconds=0.03,
+                adapter="codex-namespace",
+            )
+        )
+        self.gateway_thread = threading.Thread(target=self.gateway.serve_forever)
+        self.gateway_thread.start()
+
+        status, _, raw = self.request("POST", "/v1/responses", {"input": []})
+
+        self.assertEqual(200, status)
+        heartbeat = b": codex-ns-proxy keep-alive\n\n"
+        self.assertIn(heartbeat, raw)
+        self.assertLess(raw.index(heartbeat), raw.index(upstream_frame))
+
+    def test_sse_heartbeats_preserve_exact_upstream_frames_and_order(self):
+        first = b"event: response.output_text.delta\ndata: {\"delta\":\"a\"}\n\n"
+        terminal = (
+            b"event: response.completed\n"
+            b'data: {"type":"response.completed","response":{"id":"two","output":[]}}\n\n'
+        )
+        FakeUpstreamHandler.response_headers = {"Content-Type": "text/event-stream"}
+        FakeUpstreamHandler.stream_chunks = [(0, first), (0.08, terminal)]
+        self.gateway.shutdown()
+        self.gateway.server_close()
+        self.gateway_thread.join(2)
+        self.gateway = proxy.create_server(
+            proxy.ProxyConfig(
+                upstream_url=self.config.upstream_url,
+                inbound_token=INBOUND_TOKEN,
+                listen_port=0,
+                upstream_timeout_seconds=1,
+                sse_heartbeat_seconds=0.02,
+                adapter="identity",
+            )
+        )
+        self.gateway_thread = threading.Thread(target=self.gateway.serve_forever)
+        self.gateway_thread.start()
+
+        status, _, raw = self.request("POST", "/v1/responses", {"input": []})
+
+        heartbeat = b": codex-ns-proxy keep-alive\n\n"
+        self.assertEqual(200, status)
+        self.assertGreaterEqual(raw.count(heartbeat), 1)
+        self.assertEqual(first + terminal, raw.replace(heartbeat, b""))
+
+    def test_plain_json_never_receives_sse_heartbeats(self):
+        body = b'{"object":"delayed-json"}'
+        FakeUpstreamHandler.response_headers = {"Content-Type": "application/json"}
+        FakeUpstreamHandler.stream_chunks = [(0.08, body)]
+        self.gateway.shutdown()
+        self.gateway.server_close()
+        self.gateway_thread.join(2)
+        self.gateway = proxy.create_server(
+            proxy.ProxyConfig(
+                upstream_url=self.config.upstream_url,
+                inbound_token=INBOUND_TOKEN,
+                listen_port=0,
+                upstream_timeout_seconds=1,
+                sse_heartbeat_seconds=0.02,
+                adapter="identity",
+            )
+        )
+        self.gateway_thread = threading.Thread(target=self.gateway.serve_forever)
+        self.gateway_thread.start()
+
+        status, _, raw = self.request("POST", "/v1/responses", {"input": []})
+
+        self.assertEqual(200, status)
+        self.assertEqual(body, raw)
+        self.assertNotIn(b"codex-ns-proxy keep-alive", raw)
+
+    def test_sse_heartbeat_stops_after_terminal_frame(self):
+        terminal = (
+            b"event: response.completed\n"
+            b'data: {"type":"response.completed","response":{"id":"done","output":[]}}\n\n'
+        )
+        FakeUpstreamHandler.response_headers = {"Content-Type": "text/event-stream"}
+        FakeUpstreamHandler.response_body = terminal
+        FakeUpstreamHandler.hold_open = True
+        self.gateway.shutdown()
+        self.gateway.server_close()
+        self.gateway_thread.join(2)
+        self.gateway = proxy.create_server(
+            proxy.ProxyConfig(
+                upstream_url=self.config.upstream_url,
+                inbound_token=INBOUND_TOKEN,
+                listen_port=0,
+                upstream_timeout_seconds=1,
+                sse_heartbeat_seconds=0.02,
+                adapter="identity",
+            )
+        )
+        self.gateway_thread = threading.Thread(target=self.gateway.serve_forever)
+        self.gateway_thread.start()
+        result = []
+
+        client = threading.Thread(
+            target=lambda: result.append(
+                self.request("POST", "/v1/responses", {"input": []})
+            )
+        )
+        client.start()
+        self.assertTrue(FakeUpstreamHandler.read_started.wait(1))
+        time.sleep(0.08)
+        FakeUpstreamHandler.release_response.set()
+        client.join(2)
+
+        self.assertFalse(client.is_alive())
+        self.assertEqual(1, len(result))
+        status, _, raw = result[0]
+        self.assertEqual(200, status)
+        self.assertEqual(terminal, raw)
 
     def test_upstream_error_is_forwarded_without_dump_or_fabrication(self):
         FakeUpstreamHandler.response_status = 429
@@ -771,7 +918,28 @@ class ProxyIntegrationTest(unittest.TestCase):
         client = threading.Thread(target=consume)
         client.start()
         self.assertTrue(FakeUpstreamHandler.read_started.wait(1))
-        time.sleep(0.05)
+        deadline = time.monotonic() + 1
+        while (
+            not any(
+                thread.name == "codex-ns-proxy-sse-reader"
+                for thread in threading.enumerate()
+            )
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.005)
+        self.assertTrue(
+            any(
+                thread.name == "codex-ns-proxy-sse-reader"
+                for thread in threading.enumerate()
+            )
+        )
+        self.assertTrue(
+            all(
+                thread.daemon
+                for thread in threading.enumerate()
+                if thread.name == "codex-ns-proxy-sse-reader"
+            )
+        )
         self.gateway.shutdown()
         self.gateway_thread.join(2)
         close_thread = threading.Thread(target=self.gateway.server_close)
@@ -784,6 +952,62 @@ class ProxyIntegrationTest(unittest.TestCase):
         FakeUpstreamHandler.release_response.set()
         client.join(2)
         self.assertFalse(client.is_alive())
+        self.assertFalse(
+            any(
+                thread.name == "codex-ns-proxy-sse-reader"
+                for thread in threading.enumerate()
+            )
+        )
+
+    def test_downstream_disconnect_closes_sse_reader_and_upstream_lifecycle(self):
+        FakeUpstreamHandler.response_headers = {"Content-Type": "text/event-stream"}
+        FakeUpstreamHandler.response_body = b""
+        FakeUpstreamHandler.hold_open = True
+        self.gateway.shutdown()
+        self.gateway.server_close()
+        self.gateway_thread.join(2)
+        self.gateway = proxy.create_server(
+            proxy.ProxyConfig(
+                upstream_url=self.config.upstream_url,
+                inbound_token=INBOUND_TOKEN,
+                listen_port=0,
+                upstream_timeout_seconds=1,
+                sse_heartbeat_seconds=0.02,
+                adapter="identity",
+            )
+        )
+        self.gateway_thread = threading.Thread(target=self.gateway.serve_forever)
+        self.gateway_thread.start()
+        body = b'{"input":[]}'
+        request = (
+            b"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            + f"Authorization: Bearer {INBOUND_TOKEN}\r\n".encode()
+            + f"Content-Length: {len(body)}\r\n\r\n".encode()
+            + body
+        )
+        client = socket.create_connection(("127.0.0.1", self.gateway.server_address[1]))
+        client.settimeout(1)
+        client.sendall(request)
+        received = b""
+        while b": codex-ns-proxy keep-alive\n\n" not in received:
+            received += client.recv(65536)
+        client.setsockopt(
+            socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0)
+        )
+        client.close()
+
+        deadline = time.monotonic() + 1
+        while self.gateway._active_upstreams and time.monotonic() < deadline:
+            time.sleep(0.005)
+        FakeUpstreamHandler.release_response.set()
+
+        self.assertEqual(set(), self.gateway._active_upstreams)
+        self.assertFalse(
+            any(
+                thread.name == "codex-ns-proxy-sse-reader"
+                for thread in threading.enumerate()
+            )
+        )
 
     def test_shutdown_race_after_getresponse_returns_503_and_closes_handler(self):
         reached_registration = threading.Event()
@@ -835,7 +1059,7 @@ class ProxyIntegrationTest(unittest.TestCase):
         handler_class = self.gateway.RequestHandlerClass
         original_stream = handler_class._stream_sse
 
-        def timeout_after_headers(handler, _response, _reconstruction):
+        def timeout_after_headers(handler, _response, _lifecycle, _reconstruction):
             handler.close_connection = True
             handler._response_started = True
             handler.send_response(200)
@@ -942,6 +1166,24 @@ class PureTransformAndConfigTest(unittest.TestCase):
             proxy.ProxyConfig(
                 upstream_url="http://127.0.0.1/v1", inbound_token="short", listen_port=0
             )
+
+    def test_sse_heartbeat_configuration_has_positive_finite_env_contract(self):
+        base_env = {
+            "NS_PROXY_UPSTREAM": "http://127.0.0.1/v1",
+            "NS_PROXY_INBOUND_TOKEN": INBOUND_TOKEN,
+        }
+        self.assertEqual(15.0, proxy.ProxyConfig.from_env(base_env).sse_heartbeat_seconds)
+        configured = proxy.ProxyConfig.from_env(
+            {**base_env, "NS_PROXY_SSE_HEARTBEAT": "7.5"}
+        )
+        self.assertEqual(7.5, configured.sse_heartbeat_seconds)
+        for invalid in ("0", "-1", "nan", "inf"):
+            with self.subTest(invalid=invalid), self.assertRaises(
+                proxy.ConfigurationError
+            ):
+                proxy.ProxyConfig.from_env(
+                    {**base_env, "NS_PROXY_SSE_HEARTBEAT": invalid}
+                )
 
     def test_configuration_rejects_non_loopback_listener_and_embedded_credentials(self):
         with self.assertRaises(proxy.ConfigurationError):

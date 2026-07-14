@@ -38,6 +38,7 @@ GATEWAY_COMMIT="${GATEWAY_COMMIT:-}"
 GATEWAY_REVIEWED_COMMIT="8703dbe96841d591e77c1f274e22eb4b2aea9d64"
 GATEWAY_FILE="tooling/codex-ns-proxy/codex-ns-proxy.py"
 GATEWAY_UPSTREAM_URL="http://127.0.0.1:$UPSTREAM_OBSERVER_PORT/v1"
+GATEWAY_UPSTREAM_TIMEOUT_SECONDS="300"
 GATEWAY_TERMINAL_PATTERN="[codex-ns-proxy] SSE terminal_completed=true"
 PROBE_DURATION_MS="${PROBE_DURATION_MS:-20000}"
 PROBE_EXPECT="${PROBE_EXPECT:-usable-ui}"
@@ -163,6 +164,8 @@ if test "$ROUTE_MODE" = gateway; then
     printf 'blob=%s\n' "$gateway_blob"
     printf 'adapter=codex-namespace\n'
     printf 'upstream=%s\n' "$GATEWAY_UPSTREAM_URL"
+    printf 'upstream_timeout_seconds=%s\n' "$GATEWAY_UPSTREAM_TIMEOUT_SECONDS"
+    printf 'sse_heartbeat_seconds=default\n'
   } >"$LOG_DIR/gateway-source.txt"
   /usr/bin/env -i \
     PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
@@ -170,10 +173,13 @@ if test "$ROUTE_MODE" = gateway; then
     TMPDIR="$TMP_DIR" \
     LANG="en_US.UTF-8" \
     /usr/bin/sandbox-exec -f "$GATEWAY_PROFILE" -D "REAL_HOME=$REAL_HOME" \
-      /usr/bin/python3 "$NAMESPACE_PROBE_EXEC" "$GATEWAY_EXEC" \
+      /usr/bin/python3 "$NAMESPACE_PROBE_EXEC" \
+        "$GATEWAY_EXEC" "$GATEWAY_UPSTREAM_TIMEOUT_SECONDS" \
     >"$LOG_DIR/namespace-probe.json" 2>"$LOG_DIR/namespace-probe.stderr"
   /usr/bin/grep -Fq '"continuation_mapping_reused": true' "$LOG_DIR/namespace-probe.json"
   /usr/bin/grep -Fq '"second_call_reconstructed": true' "$LOG_DIR/namespace-probe.json"
+  /usr/bin/grep -Fq '"upstream_timeout_seconds": 300.0' "$LOG_DIR/namespace-probe.json"
+  /usr/bin/grep -Fq '"default_sse_heartbeat_seconds": 15.0' "$LOG_DIR/namespace-probe.json"
 fi
 
 cat >"$CODEX_DIR/config.toml" <<EOF
@@ -311,6 +317,14 @@ printf '%s\n' "$RUN_ROOT" >"$LOG_DIR/run-root.txt"
   printf 'mlx_lm=%s\n' "0.31.3"
   printf 'mlx_lm_commit=%s\n' "$mlx_lm_commit"
   printf 'mlx=%s\n' "0.32.0"
+  printf 'route_mode=%s\n' "$ROUTE_MODE"
+  if test "$ROUTE_MODE" = gateway; then
+    printf 'gateway_upstream_timeout_seconds=%s\n' "$GATEWAY_UPSTREAM_TIMEOUT_SECONDS"
+    printf 'gateway_sse_heartbeat_seconds=%s\n' "default"
+  else
+    printf 'gateway_upstream_timeout_seconds=%s\n' "not-applicable"
+    printf 'gateway_sse_heartbeat_seconds=%s\n' "not-applicable"
+  fi
 } >"$LOG_DIR/runtime-manifest.txt"
 /usr/bin/env -i \
   PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
@@ -416,6 +430,7 @@ if test "$ROUTE_MODE" = gateway; then
     NS_PROXY_HOST="127.0.0.1" \
     NS_PROXY_PORT="$GATEWAY_PORT" \
     NS_PROXY_UPSTREAM="$GATEWAY_UPSTREAM_URL" \
+    NS_PROXY_UPSTREAM_TIMEOUT="$GATEWAY_UPSTREAM_TIMEOUT_SECONDS" \
     NS_PROXY_ADAPTER="codex-namespace" \
     NS_PROXY_INBOUND_TOKEN="$INBOUND_TOKEN" \
     NS_PROXY_UPSTREAM_TOKEN="$UPSTREAM_TOKEN" \

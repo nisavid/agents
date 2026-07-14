@@ -233,4 +233,39 @@ closed. Persisted-rollout selection is unchanged.
 
 The no-app self-test covers the terminal timestamp, verifies that the renderer
 answer hash excludes it, and rejects middle, malformed, and conflicting-number
-cases. The cold-restart workflow has not been rerun after this correction.
+cases. The next workflow attempt is documented below; it stopped during phase
+one before exercising the cold restart.
+
+## Heartbeat gateway low-RAM timeout diagnosis
+
+The first cold-restart attempt against reviewed heartbeat gateway commit
+`8703dbe96841d591e77c1f274e22eb4b2aea9d64`, blob
+`b5428c5f938ddf0c27fc3b8e8effe64006ca4382`, stopped in phase one. The run-root
+suffix was `MbrNDI`; it contributes no cold-restart evidence.
+
+The renderer request reached OptiQ at 19:16:42. OptiQ began a 13,558-token
+prefill, and Codex issued the retry at 19:17:12, exactly 30 seconds later. Both
+attempts completed the full prefill and then raised `BrokenPipeError` while
+writing their first response frames. The gateway recorded two renderer streams
+with `terminal_completed=false`; its one completed stream was the separate
+namespaces-zero request. The upstream observer likewise recorded one completed
+stream and two incomplete renderer streams. The phase-one gateway and upstream
+terminal deltas were both zero, and the GUI reported `stream disconnected before
+completion: stream closed before response.completed`.
+
+The gateway's 15-second SSE heartbeat kept the downstream Codex connection
+alive during silent prefill, but it did not change the independent 30-second
+upstream socket timeout. That default closed the OptiQ connection before this
+low-RAM smoke workload could produce its first SSE frame.
+
+The disposable runner now sets `NS_PROXY_UPSTREAM_TIMEOUT=300`. This leaves the
+gateway's reviewed default unchanged, retains its default 15-second heartbeat,
+and prevents the gateway from becoming the first deadline; the renderer oracle
+still bounds each GUI phase to 120 seconds. The runtime manifest and immutable
+gateway-source record include the selected timeout. The namespace preflight
+loads the materialized gateway and asserts that it parses the upstream timeout
+as 300 seconds while retaining the 15-second default heartbeat.
+
+The failed run cleaned up all owned processes and listeners and left the copied
+app ASAR and bundled Codex binary unchanged. The workflow has not been rerun
+after the timeout correction.

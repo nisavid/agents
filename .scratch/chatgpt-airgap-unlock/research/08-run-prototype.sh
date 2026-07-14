@@ -40,6 +40,25 @@ GATEWAY_UPSTREAM_URL="http://127.0.0.1:$UPSTREAM_OBSERVER_PORT/v1"
 GATEWAY_TERMINAL_PATTERN="[codex-ns-proxy] SSE terminal_completed=true"
 PROBE_DURATION_MS="${PROBE_DURATION_MS:-20000}"
 PROBE_EXPECT="${PROBE_EXPECT:-usable-ui}"
+RUN_LOCK="/private/tmp/chatgpt-route-prototype-08.lock"
+
+lock_acquired=false
+release_lock() {
+  if test "$lock_acquired" = true; then
+    /bin/rmdir "$RUN_LOCK" 2>/dev/null || true
+    lock_acquired=false
+  fi
+}
+if /bin/mkdir "$RUN_LOCK" 2>/dev/null; then
+  lock_acquired=true
+else
+  echo "another ticket 08 prototype run owns $RUN_LOCK" >&2
+  exit 75
+fi
+trap 'release_lock' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 RUN_ROOT="$(mktemp -d /private/tmp/chatgpt-route-prototype-08.XXXXXX)"
 INBOUND_TOKEN="sk-optiq-inbound-$(/usr/bin/uuidgen | /usr/bin/tr '[:upper:]' '[:lower:]')"
 UPSTREAM_TOKEN="sk-optiq-upstream-$(/usr/bin/uuidgen | /usr/bin/tr '[:upper:]' '[:lower:]')"
@@ -219,6 +238,7 @@ cleanup() {
   sleep 1
   for pid in $(owned_pids); do signal_owned KILL "$pid"; done
   for pid in $(owned_pids); do wait "$pid" 2>/dev/null || true; done
+  release_lock
 }
 trap 'status=$?; trap - EXIT INT TERM; cleanup; exit "$status"' EXIT
 trap 'exit 130' INT

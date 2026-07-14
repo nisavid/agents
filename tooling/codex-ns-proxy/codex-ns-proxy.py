@@ -10,6 +10,7 @@ import http.server
 import ipaddress
 import json
 import os
+import re
 import socket
 import socketserver
 import ssl
@@ -33,6 +34,7 @@ HOP_BY_HOP_HEADERS = {
     "keep-alive",
     "proxy-authenticate",
     "proxy-authorization",
+    "proxy-connection",
     "te",
     "trailer",
     "transfer-encoding",
@@ -115,6 +117,10 @@ class ProxyConfig:
             raise ConfigurationError("NS_PROXY_INBOUND_TOKEN contains invalid characters")
         if self.upstream_token is not None and not _valid_bearer_value(self.upstream_token):
             raise ConfigurationError("NS_PROXY_UPSTREAM_TOKEN contains invalid characters")
+        if self.upstream_token is not None and hmac.compare_digest(
+            self.inbound_token, self.upstream_token
+        ):
+            raise ConfigurationError("inbound and upstream tokens must be distinct")
         if self.max_body_bytes <= 0:
             raise ConfigurationError("NS_PROXY_MAX_BODY_BYTES must be positive")
         if self.upstream_timeout_seconds <= 0 or self.inbound_timeout_seconds <= 0:
@@ -246,12 +252,23 @@ def _flatten_input_item(
     transformed = dict(item)
     item_type = transformed.get("type", "")
 
-    if item_type == "custom_tool_call" and transformed.get("namespace"):
+    if item_type == "custom_tool_call" and "namespace" in transformed:
+        namespace = transformed.get("namespace")
+        name = transformed.get("name")
+        if not isinstance(namespace, str) or not namespace:
+            raise TransformationError("history namespace must be a non-empty string")
+        if not isinstance(name, str) or not name:
+            raise TransformationError("history function name must be a non-empty string")
         raise TransformationError("namespaced custom tool history is not supported")
 
-    if item_type == "function_call" and transformed.get("namespace"):
-        namespace = transformed.pop("namespace")
-        call_name = transformed.get("name", "")
+    if item_type == "function_call" and "namespace" in transformed:
+        namespace = transformed.get("namespace")
+        call_name = transformed.get("name")
+        if not isinstance(namespace, str) or not namespace:
+            raise TransformationError("history namespace must be a non-empty string")
+        if not isinstance(call_name, str) or not call_name:
+            raise TransformationError("history function name must be a non-empty string")
+        transformed.pop("namespace")
         flat_name = f"{namespace}{DELIMITER}{call_name}"
         _register_flat_name(
             reconstruction,
@@ -335,7 +352,7 @@ class _NamespaceState:
             return dict(mapping)
 
     def remember(self, response_id: str, mapping: dict[str, tuple[str, str]]) -> None:
-        if not response_id or not mapping:
+        if not response_id:
             return
         with self._lock:
             self._maps[response_id] = dict(mapping)
@@ -354,6 +371,19 @@ def _merge_reconstruction(
             raise TransformationError(f"flattened tool name collision: {flat_name}")
         merged[flat_name] = target
     return merged
+
+
+def _ordinary_tool_names(data: dict[str, Any]) -> set[str]:
+    tools = data.get("tools")
+    if not isinstance(tools, list):
+        return set()
+    return {
+        tool["name"]
+        for tool in tools
+        if isinstance(tool, dict)
+        and tool.get("type") in {"function", "custom"}
+        and isinstance(tool.get("name"), str)
+    }
 
 
 def _response_ids(data: Any) -> set[str]:
@@ -468,7 +498,13 @@ def _handler_for(config: ProxyConfig, namespace_state: _NamespaceState):
                                     "previous_response_id namespace state is unavailable"
                                 )
                             inherited = inherited_mapping
+                        current_ordinary_names = _ordinary_tool_names(body)
                         body, current = flatten_request(body)
+                        inherited_collisions = inherited.keys() & current_ordinary_names
+                        if inherited_collisions:
+                            raise TransformationError(
+                                "inherited namespace mapping collides with current ordinary tool"
+                            )
                         reconstruction = _merge_reconstruction(inherited, current)
                     except TransformationError as error:
                         self._send_json(400, {"error": {"message": str(error)}})
@@ -505,20 +541,20 @@ def _handler_for(config: ProxyConfig, namespace_state: _NamespaceState):
             if not lengths:
                 self._send_json(411, {"error": {"message": "content length required"}})
                 return None
-            if len(lengths) != 1 or "," in lengths[0]:
+            if len(lengths) != 1:
                 self._send_json(400, {"error": {"message": "ambiguous content length"}})
                 return None
-            try:
-                length = int(lengths[0])
-            except ValueError:
+            if re.fullmatch(r"[0-9]+", lengths[0], flags=re.ASCII) is None:
                 self._send_json(400, {"error": {"message": "invalid content length"}})
                 return None
-            if length < 0:
-                self._send_json(400, {"error": {"message": "invalid content length"}})
-                return None
-            if length > config.max_body_bytes:
+            normalized_length = lengths[0].lstrip("0") or "0"
+            maximum = str(config.max_body_bytes)
+            if len(normalized_length) > len(maximum) or (
+                len(normalized_length) == len(maximum) and normalized_length > maximum
+            ):
                 self._send_json(413, {"error": {"message": "request body too large"}})
                 return None
+            length = int(normalized_length)
             return length
 
         def _read_json_body(self) -> dict[str, Any] | None:
@@ -568,6 +604,10 @@ def _handler_for(config: ProxyConfig, namespace_state: _NamespaceState):
                 kwargs["context"] = ssl.create_default_context()
             connection = connection_class(upstream.hostname, port, **kwargs)
             response = None
+            if not self.server.track_upstream(connection):
+                connection.close()
+                self._send_json(503, {"error": {"message": "gateway shutting down"}})
+                return
             try:
                 connection.request(
                     self.command,
@@ -576,6 +616,9 @@ def _handler_for(config: ProxyConfig, namespace_state: _NamespaceState):
                     headers=headers,
                 )
                 response = connection.getresponse()
+                if not self.server.track_upstream(response):
+                    response.close()
+                    return
                 content_type = response.getheader("Content-Type", "")
                 if "text/event-stream" in content_type.lower():
                     self._stream_sse(response, reconstruction)
@@ -591,7 +634,9 @@ def _handler_for(config: ProxyConfig, namespace_state: _NamespaceState):
                     self._send_json(502, {"error": {"message": "upstream unavailable"}})
             finally:
                 if response is not None:
+                    self.server.untrack_upstream(response)
                     response.close()
+                self.server.untrack_upstream(connection)
                 connection.close()
 
         def _forward_headers(self) -> dict[str, str]:
@@ -794,6 +839,34 @@ class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = False
     block_on_close = True
     allow_reuse_address = True
+
+    def __init__(self, *args: Any, **kwargs: Any):
+        self._active_upstreams: set[Any] = set()
+        self._upstream_lock = threading.Lock()
+        self._closing = False
+        super().__init__(*args, **kwargs)
+
+    def track_upstream(self, closeable: Any) -> bool:
+        with self._upstream_lock:
+            if self._closing:
+                return False
+            self._active_upstreams.add(closeable)
+            return True
+
+    def untrack_upstream(self, closeable: Any) -> None:
+        with self._upstream_lock:
+            self._active_upstreams.discard(closeable)
+
+    def server_close(self) -> None:
+        with self._upstream_lock:
+            self._closing = True
+            active = tuple(self._active_upstreams)
+        for closeable in active:
+            try:
+                closeable.close()
+            except OSError:
+                pass
+        super().server_close()
 
 
 def create_server(config: ProxyConfig) -> ThreadingHTTPServer:

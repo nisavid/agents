@@ -63,7 +63,8 @@ CODEX_LOCAL_GATEWAY_TOKEN="$run_token" codex
 ```
 
 For an upstream that requires its own bearer credential, set
-`NS_PROXY_UPSTREAM_TOKEN` separately. Do not reuse the inbound token.
+`NS_PROXY_UPSTREAM_TOKEN` separately. The gateway rejects reuse of the inbound
+token so the two credential seams cannot be conflated.
 
 `NS_PROXY_ADAPTER` defaults to `identity`. Select `codex-namespace` only for a
 profile whose captured Responses traffic proves namespace adaptation is
@@ -72,6 +73,9 @@ namespace children. It keeps a bounded, process-local least-recently-used map
 for `previous_response_id` continuation; a missing or evicted ID fails closed.
 Restarting the gateway clears this state. Full inline history, including
 function-call output, is also supported.
+
+Shutdown closes active upstream connections before joining request threads, so
+a live Responses stream cannot hold gateway teardown open indefinitely.
 
 The configured `NS_PROXY_UPSTREAM` URL is the complete upstream allowlist. Its
 origin and base path are parsed once; fixed route suffixes are appended without

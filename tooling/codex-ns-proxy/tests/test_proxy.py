@@ -35,6 +35,8 @@ class FakeUpstreamHandler(http.server.BaseHTTPRequestHandler):
     response_body = b'{"object":"ok"}'
     read_started = threading.Event()
     response_delay = 0
+    hold_open = False
+    release_response = threading.Event()
 
     def do_GET(self):
         self._record_and_respond()
@@ -54,6 +56,16 @@ class FakeUpstreamHandler(http.server.BaseHTTPRequestHandler):
         )
         if self.__class__.response_delay:
             time.sleep(self.__class__.response_delay)
+        if self.__class__.hold_open:
+            self.send_response(self.__class__.response_status)
+            for key, value in self.__class__.response_headers.items():
+                self.send_header(key, value)
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(self.__class__.response_body)
+            self.wfile.flush()
+            self.__class__.release_response.wait(5)
+            return
         self.send_response(self.__class__.response_status)
         for key, value in self.__class__.response_headers.items():
             self.send_header(key, value)
@@ -83,6 +95,8 @@ class ProxyIntegrationTest(unittest.TestCase):
         FakeUpstreamHandler.response_body = b'{"object":"ok"}'
         FakeUpstreamHandler.read_started = threading.Event()
         FakeUpstreamHandler.response_delay = 0
+        FakeUpstreamHandler.hold_open = False
+        FakeUpstreamHandler.release_response = threading.Event()
         self.upstream = ThreadingServer(("127.0.0.1", 0), FakeUpstreamHandler)
         self.upstream_thread = threading.Thread(target=self.upstream.serve_forever)
         self.upstream_thread.start()
@@ -174,8 +188,11 @@ class ProxyIntegrationTest(unittest.TestCase):
             "missing": b"",
             "duplicate": b"Content-Length: 2\r\nContent-Length: 2\r\n",
             "comma": b"Content-Length: 2, 2\r\n",
+            "plus": b"Content-Length: +2\r\n",
             "negative": b"Content-Length: -1\r\n",
             "malformed": b"Content-Length: no\r\n",
+            "trailing-space": b"Content-Length: 2 \r\n",
+            "non-ascii-digit": "Content-Length: ٢\r\n".encode("utf-8"),
             "transfer": b"Transfer-Encoding: chunked\r\nContent-Length: 2\r\n",
         }
         for name, framing in cases.items():
@@ -199,6 +216,19 @@ class ProxyIntegrationTest(unittest.TestCase):
             shutdown_write=True,
         )
         self.assertTrue(raw.startswith(b"HTTP/1.1 400"), raw)
+        self.assertEqual([], FakeUpstreamHandler.requests)
+
+    def test_very_long_digit_content_length_is_rejected_without_integer_conversion(self):
+        auth = f"Authorization: Bearer {INBOUND_TOKEN}\r\n".encode()
+        raw = self.raw_request(
+            b"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            + auth
+            + b"Content-Length: "
+            + (b"9" * 5000)
+            + b"\r\n\r\n"
+        )
+        self.assertTrue(raw.startswith(b"HTTP/1.1 413"), raw[:100])
+        self.assertIn(b"Connection: close", raw)
         self.assertEqual([], FakeUpstreamHandler.requests)
 
     def test_inbound_body_timeout_is_fixed_and_closes(self):
@@ -227,11 +257,14 @@ class ProxyIntegrationTest(unittest.TestCase):
         self.assertEqual([], FakeUpstreamHandler.requests)
 
     def test_inbound_credential_is_not_forwarded(self):
-        status, _, _ = self.request("GET", "/v1/models")
+        status, _, _ = self.request(
+            "GET", "/v1/models", headers={"Proxy-Connection": "keep-alive"}
+        )
         self.assertEqual(200, status)
         forwarded = FakeUpstreamHandler.requests[0]
         self.assertEqual("/provider/v1/models", forwarded["path"])
         self.assertNotIn("Authorization", forwarded["headers"])
+        self.assertNotIn("Proxy-Connection", forwarded["headers"])
 
     def test_optional_upstream_bearer_is_injected_separately(self):
         self.gateway.shutdown()
@@ -418,17 +451,62 @@ class ProxyIntegrationTest(unittest.TestCase):
         self.assertEqual([], FakeUpstreamHandler.requests)
 
     def test_logs_do_not_contain_tokens_or_content(self):
+        self.gateway.shutdown()
+        self.gateway.server_close()
+        self.gateway_thread.join(2)
+        self.gateway = proxy.create_server(
+            proxy.ProxyConfig(
+                upstream_url=self.config.upstream_url,
+                inbound_token=INBOUND_TOKEN,
+                upstream_token=UPSTREAM_TOKEN,
+                listen_port=0,
+                adapter="codex-namespace",
+                debug=True,
+            )
+        )
+        self.gateway_thread = threading.Thread(target=self.gateway.serve_forever)
+        self.gateway_thread.start()
+        FakeUpstreamHandler.response_body = (
+            b'{"output":[{"type":"message","content":['
+            b'{"type":"output_text","text":"generated-secret"}]}]}'
+        )
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
             status, _, _ = self.request(
                 "POST",
                 "/v1/responses",
-                {"input": "prompt-secret", "tools": [{"type": "function", "name": "tool-secret"}]},
+                {
+                    "input": [{"role": "user", "content": "prompt-secret"}],
+                    "tools": [
+                        {
+                            "type": "namespace",
+                            "name": "namespace-secret",
+                            "description": "description-secret",
+                            "tools": [
+                                {
+                                    "type": "function",
+                                    "name": "tool-secret",
+                                    "description": "argument-secret",
+                                }
+                            ],
+                        }
+                    ],
+                },
             )
         self.assertEqual(200, status)
         logs = stderr.getvalue()
-        for secret in (INBOUND_TOKEN, UPSTREAM_TOKEN, "prompt-secret", "tool-secret"):
+        for secret in (
+            INBOUND_TOKEN,
+            UPSTREAM_TOKEN,
+            "prompt-secret",
+            "namespace-secret",
+            "description-secret",
+            "tool-secret",
+            "argument-secret",
+            "generated-secret",
+        ):
             self.assertNotIn(secret, logs)
+        self.assertIn("request transformed namespaces=1", logs)
 
     def test_flattening_collision_is_rejected_before_upstream(self):
         body = {
@@ -579,6 +657,62 @@ class ProxyIntegrationTest(unittest.TestCase):
         forwarded = json.loads(FakeUpstreamHandler.requests[1]["body"])
         self.assertEqual("response-one", forwarded["previous_response_id"])
 
+    def test_previous_response_id_preserves_known_empty_mapping(self):
+        FakeUpstreamHandler.response_body = b'{"id":"ordinary-one","output":[]}'
+        first_status, _, _ = self.request(
+            "POST", "/v1/responses", {"input": [], "tools": []}
+        )
+        self.assertEqual(200, first_status)
+        FakeUpstreamHandler.response_body = b'{"id":"ordinary-two","output":[]}'
+        second_status, _, _ = self.request(
+            "POST",
+            "/v1/responses",
+            {"previous_response_id": "ordinary-one", "input": [], "tools": []},
+        )
+        self.assertEqual(200, second_status)
+        self.assertEqual(2, len(FakeUpstreamHandler.requests))
+
+    def test_inherited_namespace_mapping_rejects_changed_ordinary_tool_collision(self):
+        namespace_tools = [
+            {
+                "type": "namespace",
+                "name": "math",
+                "tools": [{"type": "function", "name": "add"}],
+            }
+        ]
+        FakeUpstreamHandler.response_body = b'{"id":"mapped-one","output":[]}'
+        first_status, _, _ = self.request(
+            "POST", "/v1/responses", {"input": [], "tools": namespace_tools}
+        )
+        self.assertEqual(200, first_status)
+        status, _, raw = self.request(
+            "POST",
+            "/v1/responses",
+            {
+                "previous_response_id": "mapped-one",
+                "input": [],
+                "tools": [{"type": "function", "name": "math__add"}],
+            },
+        )
+        self.assertEqual(400, status)
+        self.assertIn("collides", json.loads(raw)["error"]["message"])
+        self.assertEqual(1, len(FakeUpstreamHandler.requests))
+
+    def test_malformed_namespaced_history_fails_closed(self):
+        malformed = [
+            {"type": "function_call", "namespace": "", "name": "add"},
+            {"type": "function_call", "namespace": 1, "name": "add"},
+            {"type": "function_call", "namespace": "math", "name": ""},
+            {"type": "function_call", "namespace": "math", "name": 1},
+        ]
+        for item in malformed:
+            with self.subTest(item=item):
+                status, _, _ = self.request(
+                    "POST", "/v1/responses", {"input": [item], "tools": []}
+                )
+                self.assertEqual(400, status)
+        self.assertEqual([], FakeUpstreamHandler.requests)
+
     def test_upstream_timeout_is_fixed_and_sanitized(self):
         FakeUpstreamHandler.response_delay = 0.2
         self.gateway.shutdown()
@@ -618,6 +752,38 @@ class ProxyIntegrationTest(unittest.TestCase):
         status, _, _ = self.request("GET", "/v1/models")
         self.assertEqual(200, status)
         self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_server_close_interrupts_live_sse_and_returns_bounded(self):
+        FakeUpstreamHandler.response_headers = {"Content-Type": "text/event-stream"}
+        FakeUpstreamHandler.response_body = (
+            b"event: response.output_text.delta\n"
+            b'data: {"type":"response.output_text.delta","delta":"x"}\n\n'
+        )
+        FakeUpstreamHandler.hold_open = True
+        client_errors = []
+
+        def consume():
+            try:
+                self.request("POST", "/v1/responses", {"input": []})
+            except (OSError, http.client.HTTPException) as error:
+                client_errors.append(type(error).__name__)
+
+        client = threading.Thread(target=consume)
+        client.start()
+        self.assertTrue(FakeUpstreamHandler.read_started.wait(1))
+        time.sleep(0.05)
+        self.gateway.shutdown()
+        self.gateway_thread.join(2)
+        close_thread = threading.Thread(target=self.gateway.server_close)
+        close_thread.start()
+        close_thread.join(1)
+        if close_thread.is_alive():
+            FakeUpstreamHandler.release_response.set()
+            close_thread.join(2)
+            self.fail("server_close did not interrupt the live SSE upstream")
+        FakeUpstreamHandler.release_response.set()
+        client.join(2)
+        self.assertFalse(client.is_alive())
 
     def test_multiline_crlf_sse_reconstructs_only_changed_frame(self):
         sse = (
@@ -718,6 +884,12 @@ class PureTransformAndConfigTest(unittest.TestCase):
                 upstream_url="http://127.0.0.1/v1",
                 inbound_token=INBOUND_TOKEN,
                 upstream_token="unsafe\r\nvalue",
+            )
+        with self.assertRaises(proxy.ConfigurationError):
+            proxy.ProxyConfig(
+                upstream_url="http://127.0.0.1/v1",
+                inbound_token=INBOUND_TOKEN,
+                upstream_token=INBOUND_TOKEN,
             )
 
     def test_creating_server_does_not_contact_upstream(self):

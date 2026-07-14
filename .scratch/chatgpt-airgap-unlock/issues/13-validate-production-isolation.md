@@ -7,6 +7,28 @@ Related: 08
 
 Can the exact copied app complete the accepted offline workflow with hosted egress physically unavailable while preserving the vendor Chromium sandbox, signature, entitlements, and normal hardened-runtime posture?
 
+## Current state
+
+Environment design accepted; runtime acceptance unrun.
+
+## Decision
+
+Run the production-isolation prototype inside a disposable Apple-silicon macOS
+VM with no virtual network, socket, directory-sharing, serial/console, custom
+Virtio, USB-passthrough, or audio device. Keep the exact app, model, gateway,
+observers, and state inside the guest and use guest loopback as their only
+network path. This preserves the vendor Chromium sandbox and signed-code posture
+without changing the app or the development Mac's global packet filter.
+
+The ticket stays open until an artifact-bound run satisfies every acceptance
+condition below.
+
+## Evidence
+
+The environment contract, exact artifact baseline, runtime oracles, and
+fail-closed acceptance procedure are recorded in
+[`research/13-production-isolation.md`](../research/13-production-isolation.md).
+
 ## Acceptance
 
 - Run on a disconnected VM or true air-gapped Apple-silicon macOS environment whose network boundary does not require modifying or interposing on the app bundle.

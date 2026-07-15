@@ -68,6 +68,20 @@ struct ProcessIdentity: Equatable {
     let executable: String
 }
 
+enum AppKitRegistrationSample: Equatable {
+    case unavailable
+    case published(isTerminated: Bool, bundlePath: String?, executablePath: String?)
+}
+
+struct ProcessRegistrationReadiness: Equatable {
+    let pollCount: Int
+}
+
+struct ProcessVerification: Equatable {
+    let identity: ProcessIdentity
+    let registrationPollCount: Int
+}
+
 struct ElementDescription: Equatable {
     let role: String
     let subrole: String?
@@ -438,25 +452,96 @@ func signingInformation(_ code: SecStaticCode) throws -> [String: Any] {
     return info
 }
 
-func verifyProcess(options: Options, paths: ValidatedPaths) throws -> ProcessIdentity {
-    let before = try processIdentity(options.pid)
-    guard try PathPolicy.canonicalExisting(before.executable) == paths.executable else {
-        throw ProbeError.validation("PID executable does not match expected copied executable")
+func requireProcessIdentity(_ actual: ProcessIdentity, matches expected: ProcessIdentity) throws {
+    guard actual == expected else {
+        throw ProbeError.validation("PID, process start, or kernel executable changed")
     }
-    guard let running = NSRunningApplication(processIdentifier: options.pid), !running.isTerminated,
-          let bundleURL = running.bundleURL, let executableURL = running.executableURL,
-          try PathPolicy.canonicalExisting(bundleURL.path) == paths.bundle,
-          try PathPolicy.canonicalExisting(executableURL.path) == paths.executable else {
-        throw ProbeError.validation("running application paths do not match the copied bundle")
-    }
+}
 
+func registrationIsReady(
+    _ sample: AppKitRegistrationSample,
+    expectedBundle: String,
+    expectedExecutable: String
+) throws -> Bool {
+    switch sample {
+    case .unavailable:
+        return false
+    case .published(let isTerminated, let bundlePath, let executablePath):
+        guard !isTerminated else {
+            throw ProbeError.validation("AppKit published a terminated process")
+        }
+        if let bundlePath, bundlePath != expectedBundle {
+            throw ProbeError.validation("AppKit published an unexpected bundle path")
+        }
+        if let executablePath, executablePath != expectedExecutable {
+            throw ProbeError.validation("AppKit published an unexpected executable path")
+        }
+        return bundlePath != nil && executablePath != nil
+    }
+}
+
+// BEGIN_PROCESS_REGISTRATION_VALIDATION
+func verifyProcessRegistration(
+    timeoutNanoseconds: UInt64,
+    pollMicroseconds: useconds_t,
+    expectedBundle: String,
+    expectedExecutable: String,
+    nowNanoseconds: () throws -> UInt64,
+    validateIdentity: () throws -> Void,
+    readSample: () throws -> AppKitRegistrationSample,
+    validateFinal: () throws -> Void,
+    pause: (useconds_t) -> Void
+) throws -> ProcessRegistrationReadiness {
+    precondition(timeoutNanoseconds > 0 && pollMicroseconds > 0)
+    let started = try nowNanoseconds()
+    let addition = started.addingReportingOverflow(timeoutNanoseconds)
+    let deadline = addition.overflow ? UInt64.max : addition.partialValue
+    var pollCount = 0
+    while try nowNanoseconds() < deadline {
+        try validateIdentity()
+        let sample = try readSample()
+        try validateIdentity()
+        pollCount += 1
+        if try registrationIsReady(sample, expectedBundle: expectedBundle,
+                                   expectedExecutable: expectedExecutable) {
+            try validateIdentity()
+            try validateFinal()
+            try validateIdentity()
+            return ProcessRegistrationReadiness(pollCount: pollCount)
+        }
+        let current = try nowNanoseconds()
+        guard current < deadline else { break }
+        let remainingMicroseconds = (deadline - current + 999) / 1_000
+        pause(useconds_t(min(UInt64(pollMicroseconds), remainingMicroseconds)))
+    }
+    throw ProbeError.unavailable(
+        "AppKit process registration did not become ready after \(pollCount) polls")
+}
+
+func appKitRegistrationSample(pid: pid_t) throws -> AppKitRegistrationSample {
+    guard let running = NSRunningApplication(processIdentifier: pid) else {
+        return .unavailable
+    }
+    let bundlePath = try running.bundleURL.map {
+        try PathPolicy.canonicalExisting($0.path)
+    }
+    let executablePath = try running.executableURL.map {
+        try PathPolicy.canonicalExisting($0.path)
+    }
+    return .published(isTerminated: running.isTerminated,
+                      bundlePath: bundlePath, executablePath: executablePath)
+}
+
+func validateCodeIdentity(pid: pid_t, paths: ValidatedPaths) throws {
     var staticCode: SecStaticCode?
-    guard SecStaticCodeCreateWithPath(URL(fileURLWithPath: paths.bundle) as CFURL, [], &staticCode) == errSecSuccess,
+    guard SecStaticCodeCreateWithPath(URL(fileURLWithPath: paths.bundle) as CFURL, [],
+                                      &staticCode) == errSecSuccess,
           let staticCode else { throw ProbeError.validation("cannot create static code identity") }
-    guard SecStaticCodeCheckValidity(staticCode, SecCSFlags(rawValue: kSecCSCheckAllArchitectures), nil) == errSecSuccess else {
+    guard SecStaticCodeCheckValidity(
+        staticCode, SecCSFlags(rawValue: kSecCSCheckAllArchitectures), nil) == errSecSuccess else {
         throw ProbeError.validation("copied bundle signature is invalid")
     }
-    let attributes = [kSecGuestAttributePid as String: NSNumber(value: options.pid)] as CFDictionary
+    let attributes = [kSecGuestAttributePid as String: NSNumber(value: pid)] as CFDictionary
     var dynamicCode: SecCode?
     guard SecCodeCopyGuestWithAttributes(nil, attributes, [], &dynamicCode) == errSecSuccess,
           let dynamicCode,
@@ -480,10 +565,28 @@ func verifyProcess(options: Options, paths: ValidatedPaths) throws -> ProcessIde
           staticIdentifier == dynamicIdentifier, staticUnique == dynamicUnique else {
         throw ProbeError.validation("live process signature does not match copied bundle signature")
     }
-    let after = try processIdentity(options.pid)
-    guard before == after else { throw ProbeError.validation("PID identity changed during validation") }
-    return after
 }
+
+func verifyProcess(options: Options, paths: ValidatedPaths) throws -> ProcessVerification {
+    let before = try processIdentity(options.pid)
+    guard try PathPolicy.canonicalExisting(before.executable) == paths.executable else {
+        throw ProbeError.validation("PID executable does not match expected copied executable")
+    }
+    let readiness = try verifyProcessRegistration(
+        timeoutNanoseconds: 5_000_000_000,
+        pollMicroseconds: 100_000,
+        expectedBundle: paths.bundle,
+        expectedExecutable: paths.executable,
+        nowNanoseconds: monotonicNanoseconds,
+        validateIdentity: {
+            try requireProcessIdentity(try processIdentity(options.pid), matches: before)
+        },
+        readSample: { try appKitRegistrationSample(pid: options.pid) },
+        validateFinal: { try validateCodeIdentity(pid: options.pid, paths: paths) },
+        pause: { _ = usleep($0) })
+    return ProcessVerification(identity: before, registrationPollCount: readiness.pollCount)
+}
+// END_PROCESS_REGISTRATION_VALIDATION
 
 func attribute(_ element: AXUIElement, _ name: CFString) -> CFTypeRef? {
     var value: CFTypeRef?
@@ -928,10 +1031,13 @@ func revalidateOriginalOpenPanel(
 }
 
 func execute(options: Options, paths: ValidatedPaths, log: EventLog) throws {
-    let identity = try verifyProcess(options: options, paths: paths)
+    let verification = try verifyProcess(options: options, paths: paths)
+    let identity = verification.identity
     try log.write("process-validated", ["pid": Int(identity.pid),
                                          "startSeconds": identity.startSeconds,
-                                         "executableSha256": sha256(identity.executable)])
+                                         "executableSha256": sha256(identity.executable),
+                                         "appKitRegistrationPollCount":
+                                            verification.registrationPollCount])
     guard AXIsProcessTrusted() else {
         try log.write("accessibility-not-trusted", ["pid": Int(identity.pid)])
         throw ProbeError.permission("Accessibility is not granted to this exact helper artifact")
@@ -1045,6 +1151,161 @@ func runSelfTests() throws {
         if !condition { throw ProbeError.validation("self-test failed: \(message)") }
     }
     func sameString(_ left: String, _ right: String) -> Bool { left == right }
+    let expectedProcess = ProcessIdentity(pid: 42, startSeconds: 10,
+                                          startMicroseconds: 20,
+                                          executable: "/private/tmp/copied/ChatGPT")
+    let exactRegistration = AppKitRegistrationSample.published(
+        isTerminated: false, bundlePath: "/private/tmp/copied/ChatGPT.app",
+        executablePath: expectedProcess.executable)
+    var registrationSamples: [AppKitRegistrationSample] = [.unavailable, exactRegistration]
+    var registrationNow: UInt64 = 0
+    var registrationIdentityChecks = 0
+    var registrationFinalChecks = 0
+    let delayedRegistration = try verifyProcessRegistration(
+        timeoutNanoseconds: 1_000_000_000, pollMicroseconds: 100,
+        expectedBundle: "/private/tmp/copied/ChatGPT.app",
+        expectedExecutable: expectedProcess.executable,
+        nowNanoseconds: { registrationNow },
+        validateIdentity: { registrationIdentityChecks += 1 },
+        readSample: { registrationSamples.removeFirst() },
+        validateFinal: { registrationFinalChecks += 1 },
+        pause: { registrationNow += UInt64($0) * 1_000 })
+    try require(delayedRegistration.pollCount == 2 &&
+                registrationIdentityChecks == 6 && registrationFinalChecks == 1,
+                "missing AppKit registration did not retry before final validation")
+
+    registrationSamples = [
+        .published(isTerminated: false, bundlePath: nil,
+                   executablePath: expectedProcess.executable),
+        .published(isTerminated: false, bundlePath: "/private/tmp/copied/ChatGPT.app",
+                   executablePath: nil),
+        exactRegistration,
+    ]
+    registrationNow = 0
+    let nilURLRegistration = try verifyProcessRegistration(
+        timeoutNanoseconds: 1_000_000_000, pollMicroseconds: 100,
+        expectedBundle: "/private/tmp/copied/ChatGPT.app",
+        expectedExecutable: expectedProcess.executable,
+        nowNanoseconds: { registrationNow }, validateIdentity: {},
+        readSample: { registrationSamples.removeFirst() }, validateFinal: {},
+        pause: { registrationNow += UInt64($0) * 1_000 })
+    try require(nilURLRegistration.pollCount == 3,
+                "missing AppKit bundle or executable URL did not retry")
+
+    func requireImmediateRegistrationRejection(
+        _ sample: AppKitRegistrationSample,
+        _ message: String
+    ) throws {
+        var reads = 0
+        var pauses = 0
+        var finals = 0
+        var rejected = false
+        do {
+            _ = try verifyProcessRegistration(
+                timeoutNanoseconds: 1_000_000_000, pollMicroseconds: 100,
+                expectedBundle: "/private/tmp/copied/ChatGPT.app",
+                expectedExecutable: expectedProcess.executable,
+                nowNanoseconds: { 0 }, validateIdentity: {},
+                readSample: { reads += 1; return sample },
+                validateFinal: { finals += 1 }, pause: { _ in pauses += 1 })
+        } catch ProbeError.validation { rejected = true }
+        try require(rejected && reads == 1 && pauses == 0 && finals == 0, message)
+    }
+    try requireImmediateRegistrationRejection(
+        .published(isTerminated: false, bundlePath: "/private/tmp/wrong.app",
+                   executablePath: expectedProcess.executable),
+        "published AppKit bundle mismatch did not fail immediately")
+    try requireImmediateRegistrationRejection(
+        .published(isTerminated: false, bundlePath: "/private/tmp/copied/ChatGPT.app",
+                   executablePath: "/private/tmp/wrong/ChatGPT"),
+        "published AppKit executable mismatch did not fail immediately")
+    try requireImmediateRegistrationRejection(
+        .published(isTerminated: true, bundlePath: nil, executablePath: nil),
+        "terminated AppKit registration did not fail immediately")
+
+    registrationNow = 0
+    var registrationTimeoutReads = 0
+    var rejected = false
+    do {
+        _ = try verifyProcessRegistration(
+            timeoutNanoseconds: 300_000, pollMicroseconds: 100,
+            expectedBundle: "/private/tmp/copied/ChatGPT.app",
+            expectedExecutable: expectedProcess.executable,
+            nowNanoseconds: { registrationNow }, validateIdentity: {},
+            readSample: { registrationTimeoutReads += 1; return .unavailable },
+            validateFinal: {},
+            pause: { registrationNow += UInt64($0) * 1_000 })
+    } catch ProbeError.unavailable(let message) {
+        rejected = message == "AppKit process registration did not become ready after 3 polls"
+    }
+    try require(rejected && registrationTimeoutReads == 3,
+                "AppKit registration timeout used the wrong poll bound")
+
+    func requireRegistrationIdentityDrift(
+        identities: [ProcessIdentity],
+        samples: [AppKitRegistrationSample],
+        expectedReads: Int,
+        expectedFinals: Int,
+        _ message: String
+    ) throws {
+        var remainingIdentities = identities
+        var remainingSamples = samples
+        var reads = 0
+        var finals = 0
+        var now: UInt64 = 0
+        var driftRejected = false
+        do {
+            _ = try verifyProcessRegistration(
+                timeoutNanoseconds: 1_000_000_000, pollMicroseconds: 100,
+                expectedBundle: "/private/tmp/copied/ChatGPT.app",
+                expectedExecutable: expectedProcess.executable,
+                nowNanoseconds: { now },
+                validateIdentity: {
+                    let actual = remainingIdentities.removeFirst()
+                    try requireProcessIdentity(actual, matches: expectedProcess)
+                },
+                readSample: { reads += 1; return remainingSamples.removeFirst() },
+                validateFinal: { finals += 1 },
+                pause: { now += UInt64($0) * 1_000 })
+        } catch ProbeError.validation { driftRejected = true }
+        try require(driftRejected && reads == expectedReads && finals == expectedFinals,
+                    message)
+    }
+    let pidDrift = ProcessIdentity(pid: 43, startSeconds: 10, startMicroseconds: 20,
+                                   executable: expectedProcess.executable)
+    let startDrift = ProcessIdentity(pid: 42, startSeconds: 11, startMicroseconds: 20,
+                                     executable: expectedProcess.executable)
+    let pathDrift = ProcessIdentity(pid: 42, startSeconds: 10, startMicroseconds: 20,
+                                    executable: "/private/tmp/wrong/ChatGPT")
+    let identityDrifts = [
+        ("PID", pidDrift),
+        ("process start", startDrift),
+        ("kernel executable", pathDrift),
+    ]
+    for (label, drift) in identityDrifts {
+        try requireRegistrationIdentityDrift(
+            identities: [drift], samples: [exactRegistration],
+            expectedReads: 0, expectedFinals: 0,
+            "\(label) drift before AppKit sampling was not rejected")
+        try requireRegistrationIdentityDrift(
+            identities: [expectedProcess, drift], samples: [exactRegistration],
+            expectedReads: 1, expectedFinals: 0,
+            "\(label) drift after AppKit sampling was not rejected")
+        try requireRegistrationIdentityDrift(
+            identities: [expectedProcess, expectedProcess, drift],
+            samples: [.unavailable, exactRegistration], expectedReads: 1,
+            expectedFinals: 0,
+            "\(label) drift before the next AppKit sample was not rejected")
+        try requireRegistrationIdentityDrift(
+            identities: [expectedProcess, expectedProcess, drift],
+            samples: [exactRegistration], expectedReads: 1, expectedFinals: 0,
+            "\(label) drift before final validation was not rejected")
+        try requireRegistrationIdentityDrift(
+            identities: [expectedProcess, expectedProcess, expectedProcess, drift],
+            samples: [exactRegistration], expectedReads: 1, expectedFinals: 1,
+            "\(label) drift after final validation was not rejected")
+    }
+
     func menuBar(menuBarRole: String = kAXMenuBarRole,
                  parentTitle: String? = "File", parentRole: String = kAXMenuBarItemRole,
                  menuRole: String = kAXMenuRole, itemTitle: String = "Open Folder…",
@@ -1098,7 +1359,7 @@ func runSelfTests() throws {
                             "missing Open Folder command character passed")
     try requireRejectedMenu(menuBar(enabled: nil),
                             "missing Open Folder enabled state passed")
-    var rejected = false
+    rejected = false
     let ambiguousMenuBar = testElement(
         role: kAXMenuBarRole,
         children: menuBar(parentTitle: "File").children +

@@ -83,6 +83,16 @@ definition, so the initial sandbox command failed before app launch. The runner
 now propagates the exact protected path to the initial and cold-restart host
 sandbox commands without exporting it into their isolated child environments.
 
+The sixth run reached the exact granted helper after the kernel executable
+already matched, but AppKit had not registered the copied process yet. A
+read-only diagnostic observed no `NSRunningApplication` for samples 0–5 at
+100-millisecond intervals, exact copied bundle and executable URLs from sample
+6, and `finishedLaunching` only at sample 13. Process validation now performs a
+bounded five-second registration wait. Missing registration or URLs retries;
+termination or a published path mismatch fails immediately. Immutable kernel
+identity is checked around every sample and around the unchanged code-signature
+validation. No AX object or action is available before that gate completes.
+
 No new Accessibility request, TCC mutation, installed-app launch, or live AX
 action has occurred for this revision. The reviewed no-permission artifact is
 recorded in `research/14-native-gui-probe.md`; read-only menu inspection with the

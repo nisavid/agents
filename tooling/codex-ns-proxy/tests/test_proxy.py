@@ -1264,6 +1264,10 @@ class PureTransformAndConfigTest(unittest.TestCase):
             [b"data: [done]\n", b"\n"],
             [b"data: [DONE]\n", b"data: extra\n", b"\n"],
             [b": [DONE]\n", b"\n"],
+            [b"event: response.completed\n", b"data: [DONE]\n", b"\n"],
+            [b"id: done\n", b"data: [DONE]\n", b"\n"],
+            [b"retry: 1\n", b"data: [DONE]\n", b"\n"],
+            [b": comment\n", b"data: [DONE]\n", b"\n"],
         ]:
             with self.subTest(frame=frame):
                 self.assertFalse(proxy._is_sse_done_frame(frame))

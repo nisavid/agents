@@ -849,45 +849,36 @@ def _handler_for(config: ProxyConfig, namespace_state: _NamespaceState):
                         if config.debug:
                             _safe_log("SSE stream ended before upstream EOF")
                         break
+                    upstream_eof = kind == "eof"
                     if kind == "eof":
-                        if frame:
-                            transport_done = _is_sse_done_frame(frame)
-                            transformed_frame, is_terminal, response_ids = _transform_sse_frame(
-                                frame, reconstruction
-                            )
-                            for response_id in response_ids:
-                                namespace_state.remember(response_id, reconstruction)
-                            self.wfile.write(transformed_frame)
-                            self.wfile.flush()
-                            if is_terminal:
-                                terminal_observed = True
-                                if config.debug and not terminal_logged:
-                                    _safe_log("SSE terminal_completed=true")
-                                    terminal_logged = True
-                            transport_done_observed = transport_done
-                        break
-                    line = value
-                    if not isinstance(line, bytes):
-                        break
-                    frame.append(line)
-                    if line in {b"\n", b"\r\n"}:
-                        transport_done = _is_sse_done_frame(frame)
-                        transformed_frame, is_terminal, response_ids = _transform_sse_frame(
-                            frame, reconstruction
-                        )
-                        for response_id in response_ids:
-                            namespace_state.remember(response_id, reconstruction)
-                        self.wfile.write(transformed_frame)
-                        self.wfile.flush()
-                        if is_terminal:
-                            terminal_observed = True
-                            if config.debug and not terminal_logged:
-                                _safe_log("SSE terminal_completed=true")
-                                terminal_logged = True
-                        frame = []
-                        if transport_done:
-                            transport_done_observed = True
+                        if not frame:
                             break
+                    else:
+                        line = value
+                        if not isinstance(line, bytes):
+                            break
+                        frame.append(line)
+                        if line not in {b"\n", b"\r\n"}:
+                            continue
+
+                    transport_done = _is_sse_done_frame(frame)
+                    transformed_frame, is_terminal, response_ids = _transform_sse_frame(
+                        frame, reconstruction
+                    )
+                    for response_id in response_ids:
+                        namespace_state.remember(response_id, reconstruction)
+                    self.wfile.write(transformed_frame)
+                    self.wfile.flush()
+                    if is_terminal:
+                        terminal_observed = True
+                        if config.debug and not terminal_logged:
+                            _safe_log("SSE terminal_completed=true")
+                            terminal_logged = True
+                    frame = []
+                    if transport_done:
+                        transport_done_observed = True
+                    if upstream_eof or transport_done:
+                        break
             except (
                 BrokenPipeError,
                 ConnectionResetError,
@@ -1007,11 +998,14 @@ def _is_sse_done_frame(lines: list[bytes]) -> bool:
             if line.endswith(b"\n")
             else line
         )
-        if content.startswith(b"data:"):
-            payload = content[5:]
-            if payload.startswith(b" "):
-                payload = payload[1:]
-            data_parts.append(payload)
+        if not content:
+            continue
+        if not content.startswith(b"data:"):
+            return False
+        payload = content[5:]
+        if payload.startswith(b" "):
+            payload = payload[1:]
+        data_parts.append(payload)
     return data_parts == [b"[DONE]"]
 
 

@@ -63,7 +63,12 @@ created child of the original validated panel, and the final press remains
 bound to that original panel's exact AX identity. Project adoption requires a
 nonce renderer transition plus an exact authoritative `threads.cwd` transition.
 
-No Accessibility request, TCC mutation, installed-app launch, or live AX action
-has occurred. The reviewed no-permission artifact is recorded in
-`research/14-native-gui-probe.md`; the manual permission gate above remains the
-next live step.
+A manually granted first live invocation validated the exact copied-app process
+and helper trust, then failed closed before any AX mutation because the Open
+panel was not yet visible. It issued no project selection, created no project
+record, preserved app integrity and isolation, and cleaned up every owned
+process and listener. The helper now performs one bounded, read-only readiness
+wait while retaining the exact process identity; ambiguity, malformed state,
+or drift still fails immediately. Rebuilding changed the helper identity, so
+the fresh manual permission gate above remains the next live step. The reviewed
+artifact and evidence are recorded in `research/14-native-gui-probe.md`.

@@ -81,5 +81,21 @@ API and sensitive-symbol allowlists, path-policy fixtures, renderer transition
 oracle, authoritative project-state fixtures, runner shell syntax, and
 cold-handoff self-test all passed.
 
-The live native project selection remains intentionally unexecuted and blocked
-on the manual Accessibility grant for this exact artifact.
+## First live invocation
+
+The manually granted first invocation proved the exact helper was trusted and
+bound to the copied app's validated PID, paths, and live/static signatures. The
+renderer issued one trusted click on the unique project control, but the helper
+performed its first AX enumeration before the native Open panel was published
+and failed closed with zero qualifying panels. It emitted no panel-validated or
+project-selection event, and authoritative project state remained at zero exact
+fixture rows. All owned processes and listeners closed; route isolation and
+source/copied app integrity remained intact.
+
+The runner no longer relies on a fixed delay after the renderer click. The
+helper now polls read-only for at most five monotonic seconds, validates the
+same process identity before and after every AX snapshot, retries only while no
+panel-shaped candidate exists, and fails immediately on malformed, duplicate,
+unauthorized, ambiguous, or drifted state. The wait contains no AX or input
+action. The rebuilt artifact above requires a fresh manual Accessibility grant
+before the next live invocation.

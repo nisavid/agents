@@ -17,6 +17,98 @@ the development machine cannot afford the VM's memory overhead.
 No production-isolation run has occurred. This document fixes its environment,
 oracles, and pass conditions; it does not satisfy them.
 
+## Sealed staging and terminal evidence
+
+`13-production-evidence.py` is the provider- and VM-neutral local preparation
+slice for this gate. It does not launch the app or configure a virtual machine.
+It exposes two small interfaces:
+
+- a staging manifest seals every regular file beneath one staging root, rejects
+  links and special files, and binds explicitly named artifacts to their exact
+  SHA-256 and review identity; and
+- a guarded runner establishes a fresh safe evidence directory, validates that
+  sealed tree before and after executing a guest lifecycle command, then writes
+  `cleanup-final.json`, `processes-final.txt`, `sockets-final.txt`, and
+  `verdict.json` after success or a later manifest or command failure. Invalid
+  output paths and a linked, non-directory, nonempty, or uncreatable evidence
+  path return before this four-artifact guarantee begins.
+
+The bindings file is run-owned JSON with this shape:
+
+```json
+{
+  "schema": 1,
+  "artifacts": [
+    {
+      "name": "reviewed-artifact",
+      "path": "payload/reviewed-artifact.bin",
+      "sha256": "<reviewed lowercase SHA-256>",
+      "identity": {
+        "role": "application, model, gateway, runtime, observer, or fixture",
+        "review": "<immutable review identity>"
+      }
+    }
+  ]
+}
+```
+
+Populate it from the exact app baseline below, the accepted model revision and
+blob, the reviewed gateway commit and blob, and the pinned runtime and observer
+identities. The manifest contains only relative paths and rejects secret-shaped
+metadata. Keep the manifest, owned-state file, and fresh evidence directory
+outside the sealed staging tree.
+
+Build and validate a manifest with:
+
+```sh
+python3 .scratch/chatgpt-airgap-unlock/research/13-production-evidence.py \
+  manifest-build --stage-root guest-staging --bindings bindings.json \
+  --output staging-manifest.json
+python3 .scratch/chatgpt-airgap-unlock/research/13-production-evidence.py \
+  manifest-validate --stage-root guest-staging --manifest staging-manifest.json
+```
+
+Do not create the owned-state file before the run. The runner creates it with a
+fresh nonce and a `prepared` transition, then provides its absolute path and
+nonce to the lifecycle command through `PRODUCTION_EVIDENCE_STATE_PATH` and
+`PRODUCTION_EVIDENCE_RUN_NONCE`. The command owns reverse-order shutdown, retains
+that nonce, and changes the transition to `completed` before returning:
+
+```json
+{
+  "schema": 1,
+  "run_nonce": "<current PRODUCTION_EVIDENCE_RUN_NONCE>",
+  "transition": "completed",
+  "owned_pids": [1234],
+  "owned_process_groups": [1234],
+  "reserved_tcp_ports": [18999],
+  "cleanup_steps": [
+    {"name": "stop-owned-process-groups", "completed": true}
+  ]
+}
+```
+
+Wrap that lifecycle command with:
+
+```sh
+python3 .scratch/chatgpt-airgap-unlock/research/13-production-evidence.py run \
+  --stage-root guest-staging --manifest staging-manifest.json \
+  --evidence-dir run-evidence --owned-state owned-state.json -- \
+  ./guest-lifecycle
+```
+
+The runner never invokes a shell around the guarded command. It records complete
+process and TCP/UDP socket snapshots, checks the declared PIDs, process groups,
+descendants, and listener ports, and fails red if cleanup is incomplete, a
+collector fails, or secret-shaped text must be redacted. A nonzero guest lifecycle
+status is preserved. Once the evidence directory is established, a manifest or
+command preflight failure prevents command execution and the same four terminal
+artifacts record the red verdict. Run the deterministic synthetic cases with:
+
+```sh
+python3 .scratch/chatgpt-airgap-unlock/research/13-test-production-evidence.py
+```
+
 ## Isolation boundary
 
 Use Apple's

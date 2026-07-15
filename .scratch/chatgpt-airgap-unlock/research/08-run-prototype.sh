@@ -764,7 +764,7 @@ if test "$GUI_NATIVE_PROJECT_PICKER" = true; then
       "$NODE" "$GUI_DRIVER_EXEC" "$CDP_PORT" open-project-picker 30000 \
       "$(realpath "$WORKSPACE_DIR")" \
     >"$LOG_DIR/cdp-native-open.jsonl" 2>"$LOG_DIR/cdp-native-open.stderr"
-  /usr/bin/grep -Fq '"kind":"native-project-picker-requested"' \
+  /usr/bin/grep -Fq '"kind":"native-project-picker-precondition-ready"' \
     "$LOG_DIR/cdp-native-open.jsonl"
   /usr/bin/grep -Fq '"preSelectionMatchedExpected":false' \
     "$LOG_DIR/cdp-native-open.jsonl"
@@ -780,7 +780,8 @@ if test "$GUI_NATIVE_PROJECT_PICKER" = true; then
     --expected-executable "$APP_EXEC" \
     --fixture-root "$WORKSPACE_DIR" \
     --phase select-project \
-    --event-log "$LOG_DIR/native-gui-probe.jsonl"
+    --event-log "$LOG_DIR/native-gui-probe.jsonl" \
+    --invoke-open-folder
   if test "$NATIVE_GUI_PROBE_KEY_FALLBACK" = true; then
     set -- "$@" --permit-key-fallback
   fi
@@ -792,6 +793,19 @@ if test "$GUI_NATIVE_PROJECT_PICKER" = true; then
   /usr/bin/codesign --verify --strict "$NATIVE_GUI_PROBE_BIN"
   "$NATIVE_GUI_PROBE_BIN" "$@" \
     >"$LOG_DIR/native-gui-probe.stdout" 2>"$LOG_DIR/native-gui-probe.stderr"
+  test "$(/usr/bin/grep -Fc '"kind":"open-folder-accelerator-posted"' \
+    "$LOG_DIR/native-gui-probe.jsonl")" -eq 1
+  test "$(/usr/bin/grep -Fc '"kind":"open-panel-validated"' \
+    "$LOG_DIR/native-gui-probe.jsonl")" -eq 1
+  open_folder_accelerator_line="$(/usr/bin/grep -nF \
+    '"kind":"open-folder-accelerator-posted"' \
+    "$LOG_DIR/native-gui-probe.jsonl" | /usr/bin/awk -F: '{print $1}')"
+  open_panel_validated_line="$(/usr/bin/grep -nF \
+    '"kind":"open-panel-validated"' \
+    "$LOG_DIR/native-gui-probe.jsonl" | /usr/bin/awk -F: '{print $1}')"
+  test -n "$open_folder_accelerator_line"
+  test -n "$open_panel_validated_line"
+  test "$open_folder_accelerator_line" -lt "$open_panel_validated_line"
   /usr/bin/grep -Fq '"kind":"project-selection-requested"' \
     "$LOG_DIR/native-gui-probe.jsonl"
   /usr/bin/env -i \

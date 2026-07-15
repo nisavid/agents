@@ -48,6 +48,7 @@ struct Options {
     let phase: Phase
     let eventLog: String
     let permitKeyFallback: Bool
+    let invokeOpenFolder: Bool
     let validateInputsOnly: Bool
 }
 
@@ -276,6 +277,7 @@ func sha256(_ value: String) -> String {
 func parseOptions(_ arguments: [String]) throws -> Options {
     var values: [String: String] = [:]
     var permitKeyFallback = false
+    var invokeOpenFolder = false
     var validateInputsOnly = false
     var index = 0
     let orderedValueOptions = ["--pid", "--run-root", "--expected-bundle", "--expected-executable",
@@ -286,6 +288,10 @@ func parseOptions(_ arguments: [String]) throws -> Options {
         if argument == "--permit-key-fallback" {
             guard !permitKeyFallback else { throw ProbeError.usage("duplicate --permit-key-fallback") }
             permitKeyFallback = true
+            index += 1
+        } else if argument == "--invoke-open-folder" {
+            guard !invokeOpenFolder else { throw ProbeError.usage("duplicate --invoke-open-folder") }
+            invokeOpenFolder = true
             index += 1
         } else if argument == "--validate-inputs-only" {
             guard !validateInputsOnly else { throw ProbeError.usage("duplicate --validate-inputs-only") }
@@ -310,11 +316,18 @@ func parseOptions(_ arguments: [String]) throws -> Options {
     guard let rawPhase = values["--phase"], let phase = Phase(rawValue: rawPhase) else {
         throw ProbeError.usage("--phase must be inspect-project-picker or select-project")
     }
+    if phase == .selectProject && !invokeOpenFolder {
+        throw ProbeError.usage("select-project requires --invoke-open-folder")
+    }
+    if phase != .selectProject && invokeOpenFolder {
+        throw ProbeError.usage("--invoke-open-folder is only valid for select-project")
+    }
     return Options(pid: numericPID, runRoot: values["--run-root"]!,
                    expectedBundle: values["--expected-bundle"]!,
                    expectedExecutable: values["--expected-executable"]!,
                    fixtureRoot: values["--fixture-root"]!, phase: phase,
                    eventLog: values["--event-log"]!, permitKeyFallback: permitKeyFallback,
+                   invokeOpenFolder: invokeOpenFolder,
                    validateInputsOnly: validateInputsOnly)
 }
 
@@ -537,18 +550,39 @@ func press(_ element: AXUIElement, purpose: String, process: ProcessIdentity) th
     }
 }
 
-func postCommandShiftG(to process: ProcessIdentity) throws {
-    try requireSameProcess(process)
+// BEGIN_PID_OPEN_FOLDER_SHORTCUT
+struct KeyboardShortcut: Equatable {
+    let virtualKey: CGKeyCode
+    let flags: CGEventFlags
+
+    static let openFolder = KeyboardShortcut(virtualKey: 31, flags: [.maskCommand])
+    static let pathEntry = KeyboardShortcut(virtualKey: 5, flags: [.maskCommand, .maskShift])
+}
+
+func postKeyboardShortcut(_ shortcut: KeyboardShortcut, to process: ProcessIdentity) throws {
     guard let source = CGEventSource(stateID: .privateState),
-          let down = CGEvent(keyboardEventSource: source, virtualKey: 5, keyDown: true),
-          let up = CGEvent(keyboardEventSource: source, virtualKey: 5, keyDown: false) else {
-        throw ProbeError.unavailable("cannot create audited Command-Shift-G events")
+          let down = CGEvent(keyboardEventSource: source, virtualKey: shortcut.virtualKey,
+                             keyDown: true),
+          let up = CGEvent(keyboardEventSource: source, virtualKey: shortcut.virtualKey,
+                           keyDown: false) else {
+        throw ProbeError.unavailable("cannot create audited PID-targeted keyboard events")
     }
-    down.flags = [.maskCommand, .maskShift]
-    up.flags = [.maskCommand, .maskShift]
+    down.flags = shortcut.flags
+    up.flags = shortcut.flags
+    try requireSameProcess(process)
     down.postToPid(process.pid)
     up.postToPid(process.pid)
+    try requireSameProcess(process)
 }
+
+func postOpenFolder(to process: ProcessIdentity) throws {
+    try postKeyboardShortcut(.openFolder, to: process)
+}
+
+func postCommandShiftG(to process: ProcessIdentity) throws {
+    try postKeyboardShortcut(.pathEntry, to: process)
+}
+// END_PID_OPEN_FOLDER_SHORTCUT
 
 func sameAXElement(_ left: AXUIElement, _ right: AXUIElement) -> Bool {
     CFEqual(left, right)
@@ -672,9 +706,21 @@ func execute(options: Options, paths: ValidatedPaths, log: EventLog) throws {
         throw ProbeError.permission("Accessibility is not granted to this exact helper artifact")
     }
     let application = AXUIElementCreateApplication(options.pid)
+    // BEGIN_PID_OPEN_FOLDER_REQUEST
+    if options.invokeOpenFolder {
+        try postOpenFolder(to: identity)
+        try log.write("open-folder-accelerator-posted", [
+            "pid": Int(identity.pid),
+            "virtualKey": Int(KeyboardShortcut.openFolder.virtualKey),
+            "modifier": "command",
+            "eventCount": 2,
+            "actionCount": 1,
+        ])
+    }
     let readiness = try waitForValidatedOpenPanel(
         application: application, identity: identity,
         permitKeyFallback: options.permitKeyFallback)
+    // END_PID_OPEN_FOLDER_REQUEST
     let panel = readiness.panel
     let plan = readiness.plan
     let initialWindows = readiness.initialElements
@@ -898,6 +944,43 @@ func runSelfTests() throws {
     try require(!PathPolicy.contains("/private/tmp/root", "/private/tmp/root2/file"), "prefix collision")
     try require(PathPolicy.contains("/private/tmp/root", "/private/tmp/root/file"), "contained path")
     try require(Phase(rawValue: "select-project") == .selectProject, "phase parsing")
+    try require(KeyboardShortcut.openFolder.virtualKey == 31 &&
+                KeyboardShortcut.openFolder.flags == [.maskCommand], "Open Folder shortcut")
+    try require(KeyboardShortcut.pathEntry.virtualKey == 5 &&
+                KeyboardShortcut.pathEntry.flags == [.maskCommand, .maskShift], "path-entry shortcut")
+
+    let optionArguments = [
+        "--pid", "2",
+        "--run-root", "/private/tmp/chatgpt-route-prototype-08.options",
+        "--expected-bundle", "/private/tmp/chatgpt-route-prototype-08.options/Probe.app",
+        "--expected-executable",
+        "/private/tmp/chatgpt-route-prototype-08.options/Probe.app/Contents/MacOS/ChatGPT",
+        "--fixture-root", "/private/tmp/chatgpt-route-prototype-08.options/workspace",
+        "--phase", "select-project",
+        "--event-log", "/private/tmp/chatgpt-route-prototype-08.options/logs/native-gui-probe.jsonl",
+    ]
+    rejected = false
+    do { _ = try parseOptions(optionArguments) }
+    catch ProbeError.usage(let message) {
+        rejected = message == "select-project requires --invoke-open-folder"
+    }
+    try require(rejected, "select-project omitted explicit Open Folder authorization")
+    let authorizedOptions = try parseOptions(optionArguments + ["--invoke-open-folder"])
+    try require(authorizedOptions.invokeOpenFolder, "Open Folder authorization was not retained")
+    let inspectArguments = optionArguments.map { $0 == "select-project" ? "inspect-project-picker" : $0 }
+    rejected = false
+    do { _ = try parseOptions(inspectArguments + ["--invoke-open-folder"]) }
+    catch ProbeError.usage(let message) {
+        rejected = message == "--invoke-open-folder is only valid for select-project"
+    }
+    try require(rejected, "inspect-project-picker accepted Open Folder authorization")
+    rejected = false
+    do {
+        _ = try parseOptions(optionArguments + ["--invoke-open-folder", "--invoke-open-folder"])
+    } catch ProbeError.usage(let message) {
+        rejected = message == "duplicate --invoke-open-folder"
+    }
+    try require(rejected, "duplicate Open Folder authorization passed")
     print("native GUI probe self-test passed")
 }
 
@@ -915,7 +998,8 @@ do {
                                         "runRootSha256": sha256(paths.runRoot),
                                         "bundleSha256": sha256(paths.bundle),
                                         "fixtureSha256": sha256(paths.fixture),
-                                        "keyFallbackAuthorized": options.permitKeyFallback])
+                                        "keyFallbackAuthorized": options.permitKeyFallback,
+                                        "openFolderAuthorized": options.invokeOpenFolder])
     if !options.validateInputsOnly {
         try execute(options: options, paths: paths, log: log)
     }

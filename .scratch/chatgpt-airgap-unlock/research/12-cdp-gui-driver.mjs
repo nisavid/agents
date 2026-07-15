@@ -75,7 +75,7 @@ function uniqueVisibleControlVerdict(candidates) {
   return { status: "ready", count: 1, ...candidate };
 }
 
-async function runSelfTests() {
+function runSelfTests() {
   const cases = [
     ["exact", firstSentinel, true],
     ["surrounding whitespace", `  ${firstSentinel}\n`, true],
@@ -182,65 +182,6 @@ async function runSelfTests() {
     throw new Error("unique visible renderer control coordinates were not retained");
   }
 
-  const boundaryEvents = [];
-  let sendInFlight = false;
-  const fakeSend = async (method, params) => {
-    if (sendInFlight) throw new Error("accelerator key events were not awaited in sequence");
-    sendInFlight = true;
-    boundaryEvents.push({ kind: "send-start", method, params });
-    await new Promise((resolve) => queueMicrotask(resolve));
-    boundaryEvents.push({ kind: "send-end", type: params.type });
-    sendInFlight = false;
-    return {};
-  };
-  const fakeEmit = (kind, data) => boundaryEvents.push({ kind: "emit", eventKind: kind, data });
-  const expectedFixtureRoot = "/private/tmp/native-gui-boundary/workspace";
-  const chooseProject = {
-    count: 1,
-    get text() {
-      boundaryEvents.push({ kind: "precondition" });
-      return "Choose project";
-    },
-    title: null,
-    ariaDescription: null,
-  };
-  await requestNativeProjectPickerFromPrecondition(
-    expectedFixtureRoot, chooseProject, fakeSend, fakeEmit
-  );
-  const outbound = boundaryEvents
-    .filter((event) => event.kind === "send-start")
-    .map(({ method, params }) => ({ method, params }));
-  const expectedOutbound = ["rawKeyDown", "keyUp"].map((type) => ({
-    method: "Input.dispatchKeyEvent",
-    params: {
-      type,
-      modifiers: 4,
-      key: "o",
-      code: "KeyO",
-      windowsVirtualKeyCode: 79,
-      nativeVirtualKeyCode: 31,
-    },
-  }));
-  if (JSON.stringify(outbound) !== JSON.stringify(expectedOutbound)) {
-    throw new Error(`unexpected Open Folder CDP boundary: ${JSON.stringify(outbound)}`);
-  }
-  const boundaryOrder = boundaryEvents.map((event) =>
-    event.kind === "send-start" || event.kind === "send-end"
-      ? `${event.kind}:${event.params?.type ?? event.type}`
-      : event.kind === "emit" ? `emit:${event.eventKind}` : event.kind
-  );
-  const expectedBoundaryOrder = [
-    "precondition",
-    "send-start:rawKeyDown",
-    "send-end:rawKeyDown",
-    "send-start:keyUp",
-    "send-end:keyUp",
-    "emit:action",
-    "emit:native-project-picker-requested",
-  ];
-  if (JSON.stringify(boundaryOrder) !== JSON.stringify(expectedBoundaryOrder)) {
-    throw new Error(`unexpected Open Folder boundary order: ${JSON.stringify(boundaryOrder)}`);
-  }
   process.stdout.write("sentinel oracle self-test passed\n");
 }
 
@@ -251,7 +192,7 @@ async function targets() {
 }
 
 if (process.argv[2] === "--self-test") {
-  await runSelfTests();
+  runSelfTests();
   process.exit(0);
 }
 
@@ -421,54 +362,8 @@ async function waitForUniqueVisibleControl(query, description, milliseconds = 10
   throw new Error(`${description} control did not become uniquely visible: ${JSON.stringify(lastResult)}`);
 }
 
-// BEGIN_TRUSTED_RENDERER_ACCELERATOR
-async function dispatchTrustedOpenFolderAccelerator(sendCommand = send, emitEvent = emit) {
-  await sendCommand("Input.dispatchKeyEvent", {
-    type: "rawKeyDown",
-    modifiers: 4,
-    key: "o",
-    code: "KeyO",
-    windowsVirtualKeyCode: 79,
-    nativeVirtualKeyCode: 31,
-  });
-  await sendCommand("Input.dispatchKeyEvent", {
-    type: "keyUp",
-    modifiers: 4,
-    key: "o",
-    code: "KeyO",
-    windowsVirtualKeyCode: 79,
-    nativeVirtualKeyCode: 31,
-  });
-  emitEvent("action", {
-    description: "invoke Open Folder command",
-    accelerator: "Meta+O",
-    trustedRendererInput: true,
-  });
-}
-// END_TRUSTED_RENDERER_ACCELERATOR
-
-async function requestNativeProjectPickerFromPrecondition(
-  expectedFixtureRoot, chooseProject, sendCommand = send, emitEvent = emit
-) {
-  const preSelection = projectSelectionVerdict(chooseProject, expectedFixtureRoot);
-  if (preSelection.matched) {
-    throw new Error("nonce fixture was already selected before the native action");
-  }
-  await dispatchTrustedOpenFolderAccelerator(sendCommand, emitEvent);
-
-  emitEvent("native-project-picker-requested", {
-    uniqueControl: true,
-    trustedRendererInput: true,
-    preconditionAccessibleName: "Choose project",
-    accelerator: "Meta+O",
-    acceleratorEventCount: 2,
-    preSelectionMatchedExpected: false,
-    expectedFixtureSha256: textSha256(expectedFixtureRoot),
-  });
-}
-
-// BEGIN_NATIVE_PROJECT_PICKER_REQUEST
-async function openNativeProjectPicker(expectedFixtureRoot) {
+// BEGIN_NATIVE_PROJECT_PICKER_PRECONDITION
+async function assertNativeProjectPickerPrecondition(expectedFixtureRoot) {
   if (!expectedFixtureRoot?.startsWith("/")) {
     throw new Error("open-project-picker requires an absolute nonce fixture root");
   }
@@ -476,9 +371,18 @@ async function openNativeProjectPicker(expectedFixtureRoot) {
     selector: 'button[aria-label="Choose project"]',
     accessibleName: "Choose project",
   }, "Choose project");
-  await requestNativeProjectPickerFromPrecondition(expectedFixtureRoot, chooseProject);
+  const preSelection = projectSelectionVerdict(chooseProject, expectedFixtureRoot);
+  if (preSelection.matched) {
+    throw new Error("nonce fixture was already selected before the native action");
+  }
+  emit("native-project-picker-precondition-ready", {
+    uniqueControl: true,
+    preconditionAccessibleName: "Choose project",
+    preSelectionMatchedExpected: false,
+    expectedFixtureSha256: textSha256(expectedFixtureRoot),
+  });
 }
-// END_NATIVE_PROJECT_PICKER_REQUEST
+// END_NATIVE_PROJECT_PICKER_PRECONDITION
 
 async function confirmNativeProjectSelection(expectedFixtureRoot) {
   if (!expectedFixtureRoot?.startsWith("/")) {
@@ -785,7 +689,7 @@ try {
   if (phase === "open-project-picker") {
     const mainUi = await reachMainUi();
     if (!mainUi) throw new Error("main UI unavailable before native project picker request");
-    await openNativeProjectPicker(phaseArgument);
+    await assertNativeProjectPickerPrecondition(phaseArgument);
   } else if (phase === "confirm-project-selection") {
     const mainUi = await reachMainUi();
     if (!mainUi) throw new Error("main UI unavailable after native project selection");

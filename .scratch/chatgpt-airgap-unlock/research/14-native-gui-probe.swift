@@ -278,6 +278,22 @@ enum OpenPanelPolicy {
 }
 
 enum OpenFolderMenuPolicy {
+    enum PendingState: String, Equatable {
+        case applicationMenuBar = "application menu bar is unpublished"
+        case fileMenuItem = "File menu item is unpublished"
+        case fileAXMenu = "File AX menu is unpublished"
+        case openFolderMenuItem = "Open Folder menu item is unpublished"
+        case commandCharacter = "command character is unpublished"
+        case emptyCommandCharacter = "command character is empty"
+        case commandVirtualKey = "command virtual key is unpublished"
+        case commandModifiers = "command modifiers are unpublished"
+    }
+
+    enum Readiness: Equatable {
+        case pending(PendingState)
+        case ready(OpenFolderMenuPlan)
+    }
+
     static let parentTitle = "File"
     static let itemTitle = "Open Folder…"
     static let commandVirtualKey = 31
@@ -291,13 +307,20 @@ enum OpenFolderMenuPolicy {
     }
 
     static func readinessPlan(menuBar: ElementDescription) throws -> OpenFolderMenuPlan? {
+        switch try readiness(menuBar: menuBar) {
+        case .pending: return nil
+        case .ready(let plan): return plan
+        }
+    }
+
+    static func readiness(menuBar: ElementDescription) throws -> Readiness {
         guard menuBar.role == kAXMenuBarRole else {
             throw ProbeError.validation("application AX menu bar has the wrong role")
         }
         let parentIndices = menuBar.children.indices.filter {
             menuBar.children[$0].title == parentTitle
         }
-        guard !parentIndices.isEmpty else { return nil }
+        guard !parentIndices.isEmpty else { return .pending(.fileMenuItem) }
         guard parentIndices.count == 1, let parentIndex = parentIndices.first else {
             throw ProbeError.validation(
                 "expected exactly one direct File menu path; found \(min(parentIndices.count, 2))")
@@ -306,7 +329,7 @@ enum OpenFolderMenuPolicy {
         guard parent.role == kAXMenuBarItemRole else {
             throw ProbeError.validation("Open Folder parent has the wrong AX role")
         }
-        guard !parent.children.isEmpty else { return nil }
+        guard !parent.children.isEmpty else { return .pending(.fileAXMenu) }
         let menuIndices = parent.children.indices.filter {
             parent.children[$0].role == kAXMenuRole
         }
@@ -315,11 +338,11 @@ enum OpenFolderMenuPolicy {
             throw ProbeError.validation("Open Folder parent does not expose exactly one direct AX menu")
         }
         let menu = parent.children[menuIndex]
-        guard !menu.children.isEmpty else { return nil }
+        guard !menu.children.isEmpty else { return .pending(.openFolderMenuItem) }
         let itemIndices = menu.children.indices.filter {
             menu.children[$0].title == itemTitle
         }
-        guard !itemIndices.isEmpty else { return nil }
+        guard !itemIndices.isEmpty else { return .pending(.openFolderMenuItem) }
         guard itemIndices.count == 1, let itemIndex = itemIndices.first else {
             throw ProbeError.validation(
                 "expected exactly one direct Open Folder menu item; found \(min(itemIndices.count, 2))")
@@ -336,17 +359,17 @@ enum OpenFolderMenuPolicy {
         }
         let commandCharacter: String
         switch item.menuCommandCharacter {
-        case .missing: return nil
+        case .missing: return .pending(.commandCharacter)
         case .malformed:
             throw ProbeError.validation(
                 "Open Folder menu item has malformed command character type")
         case .value(let value):
-            guard !value.isEmpty else { return nil }
+            guard !value.isEmpty else { return .pending(.emptyCommandCharacter) }
             commandCharacter = value
         }
         let menuCommandVirtualKey: Int
         switch item.menuCommandVirtualKey {
-        case .missing: return nil
+        case .missing: return .pending(.commandVirtualKey)
         case .malformed:
             throw ProbeError.validation(
                 "Open Folder menu item has malformed command virtual key type")
@@ -354,7 +377,7 @@ enum OpenFolderMenuPolicy {
         }
         let menuCommandModifiers: Int
         switch item.menuCommandModifiers {
-        case .missing: return nil
+        case .missing: return .pending(.commandModifiers)
         case .malformed:
             throw ProbeError.validation(
                 "Open Folder menu item has malformed command modifiers type")
@@ -372,9 +395,9 @@ enum OpenFolderMenuPolicy {
             throw ProbeError.validation(
                 "Open Folder menu item has unexpected command modifiers: \(menuCommandModifiers)")
         }
-        return OpenFolderMenuPlan(menuBarItemIndex: parentIndex, menuIndex: menuIndex,
-                                  menuItemIndex: itemIndex, parentTitle: parent.title!,
-                                  itemTitle: itemTitle)
+        return .ready(OpenFolderMenuPlan(
+            menuBarItemIndex: parentIndex, menuIndex: menuIndex,
+            menuItemIndex: itemIndex, parentTitle: parent.title!, itemTitle: itemTitle))
     }
 }
 
@@ -946,13 +969,23 @@ func waitForReadyOpenFolderMenu<Element>(
     let addition = started.addingReportingOverflow(timeoutNanoseconds)
     let deadline = addition.overflow ? UInt64.max : addition.partialValue
     var pollCount = 0
+    var lastPendingState: OpenFolderMenuPolicy.PendingState?
     while try nowNanoseconds() < deadline {
         try validateIdentity()
         let snapshot = try readSnapshot()
         try validateIdentity()
         pollCount += 1
-        if let snapshot,
-           let plan = try OpenFolderMenuPolicy.readinessPlan(menuBar: snapshot.description) {
+        guard let snapshot else {
+            lastPendingState = .applicationMenuBar
+            let current = try nowNanoseconds()
+            guard current < deadline else { break }
+            let remainingMicroseconds = (deadline - current + 999) / 1_000
+            pause(useconds_t(min(UInt64(pollMicroseconds), remainingMicroseconds)))
+            continue
+        }
+        switch try OpenFolderMenuPolicy.readiness(menuBar: snapshot.description) {
+        case .pending(let state): lastPendingState = state
+        case .ready(let plan):
             guard let item = snapshot.items[plan] else {
                 throw ProbeError.validation(
                     "validated Open Folder path has no unique live AX identity")
@@ -964,8 +997,11 @@ func waitForReadyOpenFolderMenu<Element>(
         let remainingMicroseconds = (deadline - current + 999) / 1_000
         pause(useconds_t(min(UInt64(pollMicroseconds), remainingMicroseconds)))
     }
+    let pendingSuffix = lastPendingState.map {
+        "; last pending state: \($0.rawValue)"
+    } ?? ""
     throw ProbeError.unavailable(
-        "Open Folder menu did not become ready after \(pollCount) polls")
+        "Open Folder menu did not become ready after \(pollCount) polls\(pendingSuffix)")
 }
 
 func waitForValidatedOpenFolderMenu(
@@ -1561,7 +1597,8 @@ func runSelfTests() throws {
                 missingMetadataNow += UInt64($0) * 1_000
             })
     } catch ProbeError.unavailable(let message) {
-        rejected = message == "Open Folder menu did not become ready after 3 polls"
+        rejected = message == "Open Folder menu did not become ready after 3 polls; " +
+            "last pending state: command virtual key is unpublished"
     }
     try require(rejected && missingMetadataReads == 3 && missingMetadataPauses == 3,
                 "persistent missing command metadata did not use the exact timeout")
@@ -1640,6 +1677,74 @@ func runSelfTests() throws {
                         role: kAXMenuItemRole, title: "New Window",
                         actions: [kAXPressAction])])])]),
         items: [:])
+    let pendingTimeoutCases: [(String, OpenFolderMenuSnapshot<String>?, String)] = [
+        ("application menu bar", nil, "application menu bar is unpublished"),
+        ("File menu item", wrongFileTitleSnapshot, "File menu item is unpublished"),
+        ("File AX menu", missingDirectMenuSnapshot, "File AX menu is unpublished"),
+        ("Open Folder item", otherMenuChildrenSnapshot,
+         "Open Folder menu item is unpublished"),
+        ("command character", OpenFolderMenuSnapshot<String>(
+            description: menuBar(commandCharacter: nil), items: [:]),
+         "command character is unpublished"),
+        ("empty command character", OpenFolderMenuSnapshot<String>(
+            description: menuBar(commandCharacter: ""), items: [:]),
+         "command character is empty"),
+        ("command virtual key", OpenFolderMenuSnapshot<String>(
+            description: menuBar(commandVirtualKey: nil), items: [:]),
+         "command virtual key is unpublished"),
+        ("command modifiers", OpenFolderMenuSnapshot<String>(
+            description: menuBar(commandModifiers: nil), items: [:]),
+         "command modifiers are unpublished"),
+    ]
+    for (label, snapshot, pendingState) in pendingTimeoutCases {
+        var now: UInt64 = 0
+        var reads = 0
+        var pauses = 0
+        var exactTimeout = false
+        do {
+            _ = try waitForReadyOpenFolderMenu(
+                timeoutNanoseconds: 300_000,
+                pollMicroseconds: 100,
+                nowNanoseconds: { now },
+                validateIdentity: {},
+                readSnapshot: { reads += 1; return snapshot },
+                pause: { pauses += 1; now += UInt64($0) * 1_000 })
+        } catch ProbeError.unavailable(let message) {
+            exactTimeout = message ==
+                "Open Folder menu did not become ready after 3 polls; " +
+                "last pending state: \(pendingState)" && !message.contains("New Window")
+        }
+        try require(exactTimeout && reads == 3 && pauses == 3,
+                    "\(label) timeout did not report the bounded final pending state")
+    }
+    var changingPendingSnapshots: [OpenFolderMenuSnapshot<String>?] = [
+        nil,
+        OpenFolderMenuSnapshot<String>(
+            description: menuBar(commandVirtualKey: nil), items: [:]),
+        OpenFolderMenuSnapshot<String>(
+            description: menuBar(commandModifiers: nil), items: [:]),
+    ]
+    var changingPendingNow: UInt64 = 0
+    rejected = false
+    do {
+        _ = try waitForReadyOpenFolderMenu(
+            timeoutNanoseconds: 300_000,
+            pollMicroseconds: 100,
+            nowNanoseconds: { changingPendingNow },
+            validateIdentity: {},
+            readSnapshot: { changingPendingSnapshots.removeFirst() },
+            pause: { changingPendingNow += UInt64($0) * 1_000 })
+    } catch ProbeError.unavailable(let message) {
+        rejected = message == "Open Folder menu did not become ready after 3 polls; " +
+            "last pending state: command modifiers are unpublished"
+    }
+    try require(rejected, "menu timeout did not report the final observed pending state")
+    rejected = false
+    do { _ = try OpenFolderMenuPolicy.plan(menuBar: menuBar(commandVirtualKey: nil)) }
+    catch ProbeError.validation(let message) {
+        rejected = message == "direct File to Open Folder menu path is absent"
+    }
+    try require(rejected, "pending plan wrapper changed its validation contract")
     var menuSnapshots: [OpenFolderMenuSnapshot<String>?] = [
         nil, wrongFileTitleSnapshot, missingFileTitleSnapshot,
         missingDirectMenuSnapshot, emptyDirectMenuSnapshot,
@@ -1699,7 +1804,8 @@ func runSelfTests() throws {
                 menuNow += UInt64($0) * 1_000
             })
     } catch ProbeError.unavailable(let message) {
-        rejected = message == "Open Folder menu did not become ready after 3 polls"
+        rejected = message == "Open Folder menu did not become ready after 3 polls; " +
+            "last pending state: Open Folder menu item is unpublished"
     }
     try require(rejected && menuTimeoutReads == 3 && menuTimeoutPauses == 3,
                 "Open Folder menu timeout used the wrong poll bound")

@@ -104,6 +104,37 @@ if printf '%s\n' "$readiness_body" | /usr/bin/grep -Eq \
   echo 'Open panel readiness wait contains an AX or input action' >&2
   exit 1
 fi
+process_validation_body="$(/usr/bin/sed -n \
+  '/BEGIN_PROCESS_REGISTRATION_VALIDATION/,/END_PROCESS_REGISTRATION_VALIDATION/p' \
+  "$HERE/14-native-gui-probe.swift")"
+test "$(printf '%s\n' "$process_validation_body" | \
+  /usr/bin/grep -Fc 'try validateIdentity()')" -eq 4
+for required_process_gate in SecStaticCodeCheckValidity SecCodeCopyGuestWithAttributes \
+  SecCodeCheckValidity SecCodeCopyStaticCode 'staticIdentifier == dynamicIdentifier' \
+  'staticUnique == dynamicUnique' 'timeoutNanoseconds: 5_000_000_000' \
+  'pollMicroseconds: 100_000'; do
+  printf '%s\n' "$process_validation_body" | /usr/bin/grep -Fq "$required_process_gate"
+done
+if printf '%s\n' "$process_validation_body" | /usr/bin/grep -Eq \
+  'AXUIElement|CGEvent|postToPid|pressOpenFolderMenuItem'; then
+  echo 'process registration validation contains an AX or input action' >&2
+  exit 1
+fi
+execute_body="$(/usr/bin/sed -n '/^func execute(/,/^func testElement/p' \
+  "$HERE/14-native-gui-probe.swift")"
+process_verified_line="$(printf '%s\n' "$execute_body" | \
+  /usr/bin/grep -nF 'let verification = try verifyProcess(' | /usr/bin/awk -F: '{print $1}')"
+trust_line="$(printf '%s\n' "$execute_body" | \
+  /usr/bin/grep -nF 'guard AXIsProcessTrusted() else {' | /usr/bin/awk -F: '{print $1}')"
+application_line="$(printf '%s\n' "$execute_body" | \
+  /usr/bin/grep -nF 'let application = AXUIElementCreateApplication(options.pid)' | \
+  /usr/bin/awk -F: '{print $1}')"
+menu_action_line="$(printf '%s\n' "$execute_body" | \
+  /usr/bin/grep -nF 'let menuReadiness = try pressOpenFolderMenuItem(' | \
+  /usr/bin/awk -F: '{print $1}')"
+test "$process_verified_line" -lt "$trust_line"
+test "$trust_line" -lt "$application_line"
+test "$application_line" -lt "$menu_action_line"
 picker_request_body="$(/usr/bin/sed -n \
   '/BEGIN_NATIVE_PROJECT_PICKER_PRECONDITION/,/END_NATIVE_PROJECT_PICKER_PRECONDITION/p' \
   "$HERE/12-cdp-gui-driver.mjs")"

@@ -119,6 +119,19 @@ the exact protected helper path as a sandbox profile definition to both the
 initial and cold-restart host app-server commands; the helper path is not added
 to either isolated child environment.
 
+The sixth inspection run reached the exact granted helper and confirmed the
+kernel PID executable path matched the copied executable, but failed before AX
+inspection because AppKit had not registered an `NSRunningApplication` yet. A
+separate non-AX diagnostic sampled registration every 100 milliseconds: samples
+0–5 were unavailable, sample 6 onward exposed the exact copied bundle and
+executable, and `finishedLaunching` remained false until sample 13. The helper
+now waits up to five monotonic seconds for a nonterminated AppKit registration
+with those exact canonical paths. Missing registration or either missing URL is
+retryable; termination or any published mismatch fails immediately. The helper
+revalidates PID, process start, and kernel executable before and after every
+sample and around the unchanged static/dynamic signature validation. Launch
+completion is diagnostic only and is not part of this identity gate.
+
 ## Permission boundary
 
 Do not run the live seam until Ivan has reviewed the final artifact hash and
@@ -130,13 +143,14 @@ Ivan; the helper never requests a prompt itself.
 ## No-permission verdict
 
 Green for the source, build, input-policy, selector-policy, and runner-seam
-slice. The retained final no-permission artifact is arm64 and ad-hoc signed,
-with SHA-256 `7127f8d2f6903a4381dc86d2030e98c3be4a16a3ae964a9fed6721aa4d682c3c`
-and CDHash `0379633126d0a4758dcd001d0118f9fe310eccf6`. A clean build in a second
+slice. The temporary no-permission artifact for this revision is arm64 and ad-hoc signed,
+with SHA-256 `e6bdacd5308c6aaea296e1bb3e06e59c6fa7abed5c9cbb68f52f20ef3c57a1e4`
+and CDHash `360e0a7ae789cfbf594e5dd3cbf8efcca3607f16`. A clean build in a second
 disposable directory produced the same SHA-256. The helper self-test, forbidden
 API and sensitive-symbol allowlists, path-policy fixtures, renderer transition
 oracle, authoritative project-state fixtures, runner shell syntax, and
-cold-handoff self-test all passed.
+cold-handoff self-test all passed. The previously granted canonical artifact
+was not rebuilt or modified.
 
 ## First live invocation
 
@@ -154,5 +168,6 @@ helper now polls read-only for at most five monotonic seconds, validates the
 same process identity before and after every AX snapshot, retries only while no
 panel-shaped candidate exists, and fails immediately on malformed, duplicate,
 unauthorized, ambiguous, or drifted state. The wait contains no AX or input
-action. The live native project selection remains unexecuted with the rebuilt
-artifact above and blocked on its fresh manual Accessibility grant.
+action. The live native project selection remains unexecuted with this
+temporary artifact and blocked on a manual Accessibility grant to the rebuilt
+canonical artifact.

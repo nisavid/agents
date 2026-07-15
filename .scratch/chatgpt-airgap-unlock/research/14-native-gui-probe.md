@@ -63,8 +63,8 @@ Ivan; the helper never requests a prompt itself.
 Green for the source, build, input-policy, selector-policy, and runner-seam
 slice. The final no-permission build produced the arm64 ad-hoc-signed artifact
 `/private/tmp/chatgpt-native-gui-probe-build/chatgpt-native-gui-probe` with
-SHA-256 `dc53235409bc1fa5888ad6f16df8c491e72565ea48540c7a667fcf15cdda67c9`
-and CDHash `b157076f06751402d0119af276d6d845ff03d2f9`. A clean build in a second
+SHA-256 `ede3a79ff51cf25822990570c9d93fcbe9fece5e9372a8facbb050b4bc3b8d36`
+and CDHash `ba4020dc8d090b12e97a2bbfdec13ee31028e636`. A clean build in a second
 disposable directory produced the same SHA-256. The helper self-test, forbidden
 API scan, path-policy fixtures, renderer oracle self-test, runner shell syntax,
 and cold-handoff self-test all passed.

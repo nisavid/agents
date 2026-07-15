@@ -28,12 +28,17 @@ Run the deterministic no-permission checks with:
 
 The live runner seam is opt-in. It requires the exact artifact path and SHA-256,
 passes the copied app PID and canonical copied paths explicitly, requires
-`--invoke-open-folder` for the selection phase, and authorizes the PID-targeted
-Command-Shift-G fallback separately. The helper checks path, process-start,
+`--press-open-folder-menu-item` for the selection phase, and authorizes the
+PID-targeted Command-Shift-G fallback separately. The helper checks path, process-start,
 executable, running-bundle, static signature, and live signature identity before
-checking trust or reading AX state. After trust, it posts one Command-O action to
-the exact PID, with process-identity checks immediately before and after the two
-keyboard events, then records bounded evidence. It also rechecks process-start
+checking trust or reading AX state. After trust, it waits up to five monotonic
+seconds for the exact source-backed `File` → `Open Folder…` menu path. The item
+must be unique, direct, enabled, advertise `AXPress`, and expose Command-O
+character, virtual-key, and modifier metadata. Missing or unpublished menu state
+is retried; malformed, duplicate, disabled, or mismatched published state fails
+immediately. The helper revalidates the exact AX identity and process, performs
+one `AXPress`, rechecks the process immediately afterward, then records bounded
+evidence. It also rechecks process-start
 and executable identity before and after every Open-panel readiness snapshot and
 immediately before every AX mutation. The readiness wait is limited to five
 monotonic seconds at 100-millisecond intervals. Any malformed, duplicate, or
@@ -59,8 +64,8 @@ checks that control only to prove the per-run nonce fixture is not already
 selected; it does not infer broader project state from the label or perform any
 input action. The runner resolves exactly one copied-app executable in the owned
 process group and invokes the helper with explicit Open Folder authorization.
-The helper posts the PID-targeted accelerator, records exactly one
-`open-folder-accelerator-posted` event, and validates the native panel afterward.
+The helper presses the exact PID-scoped menu item, records exactly one
+`open-folder-menu-item-pressed` event, and validates the native panel afterward.
 The runner requires that evidence order before accepting panel validation, then
 requires a renderer transition from a nonmatching project to the per-run nonce
 project. After the renderer creates its first task, the runner waits for the
@@ -72,6 +77,25 @@ The copied app's Seatbelt profile denies writes to the exact reviewed helper
 path, and the runner rechecks its inode, SHA-256, and signature immediately
 before execution.
 
+Before the first mutation, the same granted artifact can run a read-only menu
+inspection through the runner:
+
+```sh
+GUI_NATIVE_PROJECT_PICKER=true \
+NATIVE_GUI_PROBE_INSPECT_MENU_ONLY=true \
+NATIVE_GUI_PROBE_BIN=<reviewed-artifact-path> \
+NATIVE_GUI_PROBE_SHA256=<reviewed-sha256> \
+GUI_WORKFLOW=false \
+PROBE_EXPECT=native-menu-inspection \
+  .scratch/chatgpt-airgap-unlock/research/08-run-prototype.sh
+```
+
+That mode validates the same bounded topology and metadata, emits one
+`open-folder-menu-validated` event with `actionCount: 0`, performs no panel wait
+or input action, and continues through the common process, listener, signature,
+and copied-app integrity closeout before reporting success. Key fallback must be
+disabled.
+
 The first live attempt clicked `Choose project` and started the helper after
 that single renderer interaction. That control only opens the project-selector
 menu, so no native panel existed for the helper to inspect. Driving the menu is
@@ -80,8 +104,12 @@ not deterministic: the empty-project menu can expose either a direct
 on a feature gate. A later third live run sent the stable `Meta+O` accelerator
 through CDP, but it did not reach AppKit; the helper observed no native panel and
 timed out after 45 readiness polls. The renderer is therefore limited to the
-precondition, while the already PID-bound helper owns the real Command-O action
-and the subsequent native-panel evidence.
+precondition. A fourth run proved that the exact trusted helper posted one
+Command-O action to the focused copied PID, but AppKit still exposed no native
+panel. PID-targeted keyboard delivery is therefore not a sufficient menu-command
+contract. Extracted build 26.707.71524 (5263) source confirms the command is a
+direct `File` → `Open Folder…` item; the PID-bound helper now invokes that exact
+item through AX and owns the subsequent native-panel evidence.
 
 ## Permission boundary
 
@@ -95,8 +123,8 @@ Ivan; the helper never requests a prompt itself.
 
 Green for the source, build, input-policy, selector-policy, and runner-seam
 slice. The retained final no-permission artifact is arm64 and ad-hoc signed,
-with SHA-256 `d121b249e880c2042182e59dd974af781ef8c3ec930deae3c2c4c4c200f61d0f`
-and CDHash `1f8ba727c27c1b26c437bf21795d1c301f4902b5`. A clean build in a second
+with SHA-256 `7127f8d2f6903a4381dc86d2030e98c3be4a16a3ae964a9fed6721aa4d682c3c`
+and CDHash `0379633126d0a4758dcd001d0118f9fe310eccf6`. A clean build in a second
 disposable directory produced the same SHA-256. The helper self-test, forbidden
 API and sensitive-symbol allowlists, path-policy fixtures, renderer transition
 oracle, authoritative project-state fixtures, runner shell syntax, and

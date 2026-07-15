@@ -35,6 +35,7 @@ enum ProbeError: Error, CustomStringConvertible {
 }
 
 enum Phase: String, CaseIterable {
+    case inspectOpenFolderMenu = "inspect-open-folder-menu"
     case inspectProjectPicker = "inspect-project-picker"
     case selectProject = "select-project"
 }
@@ -48,7 +49,7 @@ struct Options {
     let phase: Phase
     let eventLog: String
     let permitKeyFallback: Bool
-    let invokeOpenFolder: Bool
+    let pressOpenFolderMenuItem: Bool
     let validateInputsOnly: Bool
 }
 
@@ -73,6 +74,10 @@ struct ElementDescription: Equatable {
     let identifier: String?
     let title: String?
     let help: String?
+    let enabled: Bool?
+    let menuCommandCharacter: String?
+    let menuCommandVirtualKey: Int?
+    let menuCommandModifiers: Int?
     let actions: Set<String>
     let children: [ElementDescription]
 
@@ -83,6 +88,14 @@ struct ElementDescription: Equatable {
     var descendants: [ElementDescription] {
         children + children.flatMap(\.descendants)
     }
+}
+
+struct OpenFolderMenuPlan: Equatable, Hashable {
+    let menuBarItemIndex: Int
+    let menuIndex: Int
+    let menuItemIndex: Int
+    let parentTitle: String
+    let itemTitle: String
 }
 
 struct SelectionPlan: Equatable {
@@ -244,6 +257,73 @@ enum OpenPanelPolicy {
     }
 }
 
+enum OpenFolderMenuPolicy {
+    static let parentTitle = "File"
+    static let itemTitle = "Open Folder…"
+    static let commandVirtualKey = 31
+    static let commandModifiers = 0 // Command is implicit when AXNoCommand is absent.
+
+    static func plan(menuBar: ElementDescription) throws -> OpenFolderMenuPlan {
+        guard let plan = try readinessPlan(menuBar: menuBar) else {
+            throw ProbeError.validation("direct File to Open Folder menu path is absent")
+        }
+        return plan
+    }
+
+    static func readinessPlan(menuBar: ElementDescription) throws -> OpenFolderMenuPlan? {
+        guard menuBar.role == kAXMenuBarRole else {
+            throw ProbeError.validation("application AX menu bar has the wrong role")
+        }
+        let parentIndices = menuBar.children.indices.filter {
+            menuBar.children[$0].title == parentTitle
+        }
+        guard !parentIndices.isEmpty else { return nil }
+        guard parentIndices.count == 1, let parentIndex = parentIndices.first else {
+            throw ProbeError.validation(
+                "expected exactly one direct File menu path; found \(min(parentIndices.count, 2))")
+        }
+        let parent = menuBar.children[parentIndex]
+        guard parent.role == kAXMenuBarItemRole else {
+            throw ProbeError.validation("Open Folder parent has the wrong AX role")
+        }
+        guard !parent.children.isEmpty else { return nil }
+        let menuIndices = parent.children.indices.filter {
+            parent.children[$0].role == kAXMenuRole
+        }
+        guard parent.children.count == 1, menuIndices.count == 1,
+              let menuIndex = menuIndices.first else {
+            throw ProbeError.validation("Open Folder parent does not expose exactly one direct AX menu")
+        }
+        let menu = parent.children[menuIndex]
+        guard !menu.children.isEmpty else { return nil }
+        let itemIndices = menu.children.indices.filter {
+            menu.children[$0].title == itemTitle
+        }
+        guard itemIndices.count == 1, let itemIndex = itemIndices.first else {
+            throw ProbeError.validation(
+                "expected exactly one direct Open Folder menu item; found \(min(itemIndices.count, 2))")
+        }
+        let item = menu.children[itemIndex]
+        guard item.role == kAXMenuItemRole else {
+            throw ProbeError.validation("Open Folder has the wrong AX role")
+        }
+        guard item.enabled == true else {
+            throw ProbeError.validation("Open Folder menu item is not enabled")
+        }
+        guard item.actions.contains(kAXPressAction) else {
+            throw ProbeError.validation("Open Folder menu item does not advertise AXPress")
+        }
+        guard item.menuCommandCharacter?.lowercased() == "o",
+              item.menuCommandVirtualKey == commandVirtualKey,
+              item.menuCommandModifiers == commandModifiers else {
+            throw ProbeError.validation("Open Folder menu item does not advertise Command-O")
+        }
+        return OpenFolderMenuPlan(menuBarItemIndex: parentIndex, menuIndex: menuIndex,
+                                  menuItemIndex: itemIndex, parentTitle: parent.title!,
+                                  itemTitle: itemTitle)
+    }
+}
+
 final class EventLog {
     private let descriptor: Int32
 
@@ -277,7 +357,7 @@ func sha256(_ value: String) -> String {
 func parseOptions(_ arguments: [String]) throws -> Options {
     var values: [String: String] = [:]
     var permitKeyFallback = false
-    var invokeOpenFolder = false
+    var pressOpenFolderMenuItem = false
     var validateInputsOnly = false
     var index = 0
     let orderedValueOptions = ["--pid", "--run-root", "--expected-bundle", "--expected-executable",
@@ -289,9 +369,11 @@ func parseOptions(_ arguments: [String]) throws -> Options {
             guard !permitKeyFallback else { throw ProbeError.usage("duplicate --permit-key-fallback") }
             permitKeyFallback = true
             index += 1
-        } else if argument == "--invoke-open-folder" {
-            guard !invokeOpenFolder else { throw ProbeError.usage("duplicate --invoke-open-folder") }
-            invokeOpenFolder = true
+        } else if argument == "--press-open-folder-menu-item" {
+            guard !pressOpenFolderMenuItem else {
+                throw ProbeError.usage("duplicate --press-open-folder-menu-item")
+            }
+            pressOpenFolderMenuItem = true
             index += 1
         } else if argument == "--validate-inputs-only" {
             guard !validateInputsOnly else { throw ProbeError.usage("duplicate --validate-inputs-only") }
@@ -314,20 +396,21 @@ func parseOptions(_ arguments: [String]) throws -> Options {
         throw ProbeError.usage("--pid must be an integer greater than one")
     }
     guard let rawPhase = values["--phase"], let phase = Phase(rawValue: rawPhase) else {
-        throw ProbeError.usage("--phase must be inspect-project-picker or select-project")
+        throw ProbeError.usage(
+            "--phase must be inspect-open-folder-menu, inspect-project-picker, or select-project")
     }
-    if phase == .selectProject && !invokeOpenFolder {
-        throw ProbeError.usage("select-project requires --invoke-open-folder")
+    if phase == .selectProject && !pressOpenFolderMenuItem {
+        throw ProbeError.usage("select-project requires --press-open-folder-menu-item")
     }
-    if phase != .selectProject && invokeOpenFolder {
-        throw ProbeError.usage("--invoke-open-folder is only valid for select-project")
+    if phase != .selectProject && pressOpenFolderMenuItem {
+        throw ProbeError.usage("--press-open-folder-menu-item is only valid for select-project")
     }
     return Options(pid: numericPID, runRoot: values["--run-root"]!,
                    expectedBundle: values["--expected-bundle"]!,
                    expectedExecutable: values["--expected-executable"]!,
                    fixtureRoot: values["--fixture-root"]!, phase: phase,
                    eventLog: values["--event-log"]!, permitKeyFallback: permitKeyFallback,
-                   invokeOpenFolder: invokeOpenFolder,
+                   pressOpenFolderMenuItem: pressOpenFolderMenuItem,
                    validateInputsOnly: validateInputsOnly)
 }
 
@@ -412,6 +495,14 @@ func stringAttribute(_ element: AXUIElement, _ name: CFString) -> String? {
     attribute(element, name) as? String
 }
 
+func boolAttribute(_ element: AXUIElement, _ name: CFString) -> Bool? {
+    attribute(element, name) as? Bool
+}
+
+func intAttribute(_ element: AXUIElement, _ name: CFString) -> Int? {
+    (attribute(element, name) as? NSNumber)?.intValue
+}
+
 func actions(_ element: AXUIElement) -> Set<String> {
     var names: CFArray?
     guard AXUIElementCopyActionNames(element, &names) == .success,
@@ -427,12 +518,26 @@ func describe(_ element: AXUIElement, depth: Int = 0, budget: inout Int) throws 
     guard depth <= 16, budget > 0 else { throw ProbeError.validation("AX tree exceeded traversal limit") }
     budget -= 1
     let children = try childElements(element).map { try describe($0, depth: depth + 1, budget: &budget) }
-    return ElementDescription(role: stringAttribute(element, kAXRoleAttribute as CFString) ?? "",
-                              subrole: stringAttribute(element, kAXSubroleAttribute as CFString),
-                              identifier: stringAttribute(element, kAXIdentifierAttribute as CFString),
-                              title: stringAttribute(element, kAXTitleAttribute as CFString),
-                              help: stringAttribute(element, kAXHelpAttribute as CFString),
-                              actions: actions(element), children: children)
+    return describeShallow(element, children: children)
+}
+
+func describeShallow(
+    _ element: AXUIElement,
+    children: [ElementDescription] = []
+) -> ElementDescription {
+    ElementDescription(role: stringAttribute(element, kAXRoleAttribute as CFString) ?? "",
+                       subrole: stringAttribute(element, kAXSubroleAttribute as CFString),
+                       identifier: stringAttribute(element, kAXIdentifierAttribute as CFString),
+                       title: stringAttribute(element, kAXTitleAttribute as CFString),
+                       help: stringAttribute(element, kAXHelpAttribute as CFString),
+                       enabled: boolAttribute(element, kAXEnabledAttribute as CFString),
+                       menuCommandCharacter: stringAttribute(
+                        element, kAXMenuItemCmdCharAttribute as CFString),
+                       menuCommandVirtualKey: intAttribute(
+                        element, kAXMenuItemCmdVirtualKeyAttribute as CFString),
+                       menuCommandModifiers: intAttribute(
+                        element, kAXMenuItemCmdModifiersAttribute as CFString),
+                       actions: actions(element), children: children)
 }
 
 func liveWindows(_ application: AXUIElement) throws -> [(AXUIElement, ElementDescription)] {
@@ -550,12 +655,11 @@ func press(_ element: AXUIElement, purpose: String, process: ProcessIdentity) th
     }
 }
 
-// BEGIN_PID_OPEN_FOLDER_SHORTCUT
+// BEGIN_PID_PATH_ENTRY_SHORTCUT
 struct KeyboardShortcut: Equatable {
     let virtualKey: CGKeyCode
     let flags: CGEventFlags
 
-    static let openFolder = KeyboardShortcut(virtualKey: 31, flags: [.maskCommand])
     static let pathEntry = KeyboardShortcut(virtualKey: 5, flags: [.maskCommand, .maskShift])
 }
 
@@ -575,14 +679,10 @@ func postKeyboardShortcut(_ shortcut: KeyboardShortcut, to process: ProcessIdent
     try requireSameProcess(process)
 }
 
-func postOpenFolder(to process: ProcessIdentity) throws {
-    try postKeyboardShortcut(.openFolder, to: process)
-}
-
 func postCommandShiftG(to process: ProcessIdentity) throws {
     try postKeyboardShortcut(.pathEntry, to: process)
 }
-// END_PID_OPEN_FOLDER_SHORTCUT
+// END_PID_PATH_ENTRY_SHORTCUT
 
 func sameAXElement(_ left: AXUIElement, _ right: AXUIElement) -> Bool {
     CFEqual(left, right)
@@ -593,6 +693,137 @@ func axElementAttribute(_ element: AXUIElement, _ name: CFString) -> AXUIElement
           CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
     return unsafeBitCast(value, to: AXUIElement.self)
 }
+
+// BEGIN_PID_OPEN_FOLDER_MENU_PRESS
+struct OpenFolderMenuSnapshot<Element> {
+    let description: ElementDescription
+    let items: [OpenFolderMenuPlan: Element]
+}
+
+struct OpenFolderMenuReadiness<Element> {
+    let plan: OpenFolderMenuPlan
+    let item: Element
+    let pollCount: Int
+}
+
+func openFolderMenuSnapshot(application: AXUIElement) throws
+    -> OpenFolderMenuSnapshot<AXUIElement>? {
+    guard let menuBar = axElementAttribute(application, kAXMenuBarAttribute as CFString) else {
+        return nil
+    }
+    let menuBarItems = childElements(menuBar)
+    guard menuBarItems.count <= 64 else {
+        throw ProbeError.validation("application AX menu bar exceeds the 64-item bound")
+    }
+    var liveItems: [OpenFolderMenuPlan: AXUIElement] = [:]
+    let parentDescriptions = try menuBarItems.enumerated().map { parentIndex, parent in
+        let parentTitle = stringAttribute(parent, kAXTitleAttribute as CFString)
+        guard parentTitle == OpenFolderMenuPolicy.parentTitle else {
+            return describeShallow(parent)
+        }
+        let menus = childElements(parent)
+        guard menus.count <= 4 else {
+            throw ProbeError.validation("Open Folder parent exceeds the four-menu bound")
+        }
+        let menuDescriptions = try menus.enumerated().map { menuIndex, menu in
+            let menuItems = childElements(menu)
+            guard menuItems.count <= 128 else {
+                throw ProbeError.validation("Open Folder menu exceeds the 128-item bound")
+            }
+            let itemDescriptions = menuItems.enumerated().map { itemIndex, item in
+                let description = describeShallow(item)
+                if description.title == OpenFolderMenuPolicy.itemTitle,
+                   let parentTitle {
+                    let path = OpenFolderMenuPlan(
+                        menuBarItemIndex: parentIndex, menuIndex: menuIndex,
+                        menuItemIndex: itemIndex, parentTitle: parentTitle,
+                        itemTitle: OpenFolderMenuPolicy.itemTitle)
+                    liveItems[path] = item
+                }
+                return description
+            }
+            return describeShallow(menu, children: itemDescriptions)
+        }
+        return describeShallow(parent, children: menuDescriptions)
+    }
+    return OpenFolderMenuSnapshot<AXUIElement>(
+        description: describeShallow(menuBar, children: parentDescriptions),
+        items: liveItems)
+}
+
+// BEGIN_READ_ONLY_OPEN_FOLDER_MENU_WAIT
+func waitForReadyOpenFolderMenu<Element>(
+    timeoutNanoseconds: UInt64,
+    pollMicroseconds: useconds_t,
+    nowNanoseconds: () throws -> UInt64,
+    validateIdentity: () throws -> Void,
+    readSnapshot: () throws -> OpenFolderMenuSnapshot<Element>?,
+    pause: (useconds_t) -> Void
+) throws -> OpenFolderMenuReadiness<Element> {
+    precondition(timeoutNanoseconds > 0 && pollMicroseconds > 0)
+    let started = try nowNanoseconds()
+    let addition = started.addingReportingOverflow(timeoutNanoseconds)
+    let deadline = addition.overflow ? UInt64.max : addition.partialValue
+    var pollCount = 0
+    while try nowNanoseconds() < deadline {
+        try validateIdentity()
+        let snapshot = try readSnapshot()
+        try validateIdentity()
+        pollCount += 1
+        if let snapshot,
+           let plan = try OpenFolderMenuPolicy.readinessPlan(menuBar: snapshot.description) {
+            guard let item = snapshot.items[plan] else {
+                throw ProbeError.validation(
+                    "validated Open Folder path has no unique live AX identity")
+            }
+            return OpenFolderMenuReadiness(plan: plan, item: item, pollCount: pollCount)
+        }
+        let current = try nowNanoseconds()
+        guard current < deadline else { break }
+        let remainingMicroseconds = (deadline - current + 999) / 1_000
+        pause(useconds_t(min(UInt64(pollMicroseconds), remainingMicroseconds)))
+    }
+    throw ProbeError.unavailable(
+        "Open Folder menu did not become ready after \(pollCount) polls")
+}
+
+func waitForValidatedOpenFolderMenu(
+    application: AXUIElement,
+    process: ProcessIdentity
+) throws -> OpenFolderMenuReadiness<AXUIElement> {
+    try waitForReadyOpenFolderMenu(
+        timeoutNanoseconds: 5_000_000_000,
+        pollMicroseconds: 100_000,
+        nowNanoseconds: monotonicNanoseconds,
+        validateIdentity: { try requireSameProcess(process) },
+        readSnapshot: { try openFolderMenuSnapshot(application: application) },
+        pause: { _ = usleep($0) })
+}
+// END_READ_ONLY_OPEN_FOLDER_MENU_WAIT
+
+func pressOpenFolderMenuItem(
+    application: AXUIElement,
+    process: ProcessIdentity
+) throws -> OpenFolderMenuReadiness<AXUIElement> {
+    let readiness = try waitForValidatedOpenFolderMenu(
+        application: application, process: process)
+    guard let snapshot = try openFolderMenuSnapshot(application: application),
+          let revalidatedPlan = try OpenFolderMenuPolicy.readinessPlan(
+            menuBar: snapshot.description),
+          let menuItem = snapshot.items[revalidatedPlan],
+          revalidatedPlan == readiness.plan,
+          sameAXElement(menuItem, readiness.item) else {
+        throw ProbeError.validation("Open Folder menu topology changed before AXPress")
+    }
+    try requireSameProcess(process)
+    let pressStatus = AXUIElementPerformAction(menuItem, kAXPressAction as CFString)
+    guard pressStatus == .success else {
+        throw ProbeError.unavailable("AXPress failed for Open Folder menu item")
+    }
+    try requireSameProcess(process)
+    return readiness
+}
+// END_PID_OPEN_FOLDER_MENU_PRESS
 
 func pathEntry(in container: AXUIElement) throws -> (AXUIElement, AXUIElement)? {
     let fields = try matchingLiveElements(container) {
@@ -706,15 +937,38 @@ func execute(options: Options, paths: ValidatedPaths, log: EventLog) throws {
         throw ProbeError.permission("Accessibility is not granted to this exact helper artifact")
     }
     let application = AXUIElementCreateApplication(options.pid)
-    // BEGIN_PID_OPEN_FOLDER_REQUEST
-    if options.invokeOpenFolder {
-        try postOpenFolder(to: identity)
-        try log.write("open-folder-accelerator-posted", [
+    if options.phase == .inspectOpenFolderMenu {
+        let menuReadiness = try waitForValidatedOpenFolderMenu(
+            application: application, process: identity)
+        let menuPlan = menuReadiness.plan
+        try log.write("open-folder-menu-validated", [
             "pid": Int(identity.pid),
-            "virtualKey": Int(KeyboardShortcut.openFolder.virtualKey),
-            "modifier": "command",
-            "eventCount": 2,
+            "parentTitle": menuPlan.parentTitle,
+            "itemTitle": menuPlan.itemTitle,
+            "commandCharacter": "O",
+            "commandVirtualKey": OpenFolderMenuPolicy.commandVirtualKey,
+            "commandModifiers": OpenFolderMenuPolicy.commandModifiers,
+            "enabled": true,
+            "action": kAXPressAction,
+            "actionCount": 0,
+            "pollCount": menuReadiness.pollCount,
+        ])
+        return
+    }
+    // BEGIN_PID_OPEN_FOLDER_REQUEST
+    if options.pressOpenFolderMenuItem {
+        let menuReadiness = try pressOpenFolderMenuItem(
+            application: application, process: identity)
+        let menuPlan = menuReadiness.plan
+        try log.write("open-folder-menu-item-pressed", [
+            "pid": Int(identity.pid),
+            "parentTitle": menuPlan.parentTitle,
+            "itemTitle": menuPlan.itemTitle,
+            "commandCharacter": "O",
+            "commandVirtualKey": OpenFolderMenuPolicy.commandVirtualKey,
+            "commandModifiers": OpenFolderMenuPolicy.commandModifiers,
             "actionCount": 1,
+            "pollCount": menuReadiness.pollCount,
         ])
     }
     let readiness = try waitForValidatedOpenPanel(
@@ -773,10 +1027,17 @@ func execute(options: Options, paths: ValidatedPaths, log: EventLog) throws {
 }
 
 func testElement(role: String, title: String? = nil, identifier: String? = nil,
-                 subrole: String? = nil, actions: Set<String> = [],
+                 subrole: String? = nil, enabled: Bool? = nil,
+                 menuCommandCharacter: String? = nil,
+                 menuCommandVirtualKey: Int? = nil,
+                 menuCommandModifiers: Int? = nil, actions: Set<String> = [],
                  children: [ElementDescription] = []) -> ElementDescription {
     ElementDescription(role: role, subrole: subrole, identifier: identifier, title: title,
-                       help: nil, actions: actions, children: children)
+                       help: nil, enabled: enabled,
+                       menuCommandCharacter: menuCommandCharacter,
+                       menuCommandVirtualKey: menuCommandVirtualKey,
+                       menuCommandModifiers: menuCommandModifiers,
+                       actions: actions, children: children)
 }
 
 func runSelfTests() throws {
@@ -784,6 +1045,195 @@ func runSelfTests() throws {
         if !condition { throw ProbeError.validation("self-test failed: \(message)") }
     }
     func sameString(_ left: String, _ right: String) -> Bool { left == right }
+    func menuBar(menuBarRole: String = kAXMenuBarRole,
+                 parentTitle: String? = "File", parentRole: String = kAXMenuBarItemRole,
+                 menuRole: String = kAXMenuRole, itemTitle: String = "Open Folder…",
+                 itemRole: String = kAXMenuItemRole, enabled: Bool? = true,
+                 actions: Set<String> = [kAXPressAction], commandCharacter: String? = "O",
+                 commandVirtualKey: Int? = 31, commandModifiers: Int? = 0)
+        -> ElementDescription {
+        let item = testElement(role: itemRole, title: itemTitle, enabled: enabled,
+                               menuCommandCharacter: commandCharacter,
+                               menuCommandVirtualKey: commandVirtualKey,
+                               menuCommandModifiers: commandModifiers, actions: actions)
+        let menu = testElement(role: menuRole, children: [item])
+        let parent = testElement(role: parentRole, title: parentTitle,
+                                 children: [menu])
+        return testElement(role: menuBarRole, children: [parent])
+    }
+    func requireRejectedMenu(_ candidate: ElementDescription, _ message: String) throws {
+        var wasRejected = false
+        do { _ = try OpenFolderMenuPolicy.plan(menuBar: candidate) }
+        catch ProbeError.validation { wasRejected = true }
+        try require(wasRejected, message)
+    }
+    let validMenuPlan = try OpenFolderMenuPolicy.plan(menuBar: menuBar())
+    try require(validMenuPlan.parentTitle == "File" &&
+                validMenuPlan.itemTitle == "Open Folder…", "valid Open Folder menu plan")
+    try requireRejectedMenu(menuBar(menuBarRole: kAXWindowRole),
+                            "wrong menu-bar role passed")
+    try requireRejectedMenu(menuBar(menuBarRole: ""),
+                            "missing menu-bar role passed")
+    try requireRejectedMenu(menuBar(parentTitle: "Workspace"),
+                            "wrong File parent title passed")
+    try requireRejectedMenu(menuBar(parentTitle: nil),
+                            "missing File parent title passed")
+    try requireRejectedMenu(menuBar(parentRole: kAXButtonRole),
+                            "wrong File parent role passed")
+    try requireRejectedMenu(menuBar(parentRole: ""),
+                            "missing File parent role passed")
+    try requireRejectedMenu(menuBar(menuRole: kAXGroupRole),
+                            "wrong direct menu role passed")
+    try requireRejectedMenu(menuBar(menuRole: ""),
+                            "missing direct menu role passed")
+    try requireRejectedMenu(menuBar(commandVirtualKey: 35),
+                            "wrong Open Folder command virtual key passed")
+    try requireRejectedMenu(menuBar(commandVirtualKey: nil),
+                            "missing Open Folder command virtual key passed")
+    try requireRejectedMenu(menuBar(commandModifiers: 1),
+                            "wrong Open Folder command modifiers passed")
+    try requireRejectedMenu(menuBar(commandModifiers: nil),
+                            "missing Open Folder command modifiers passed")
+    try requireRejectedMenu(menuBar(commandCharacter: nil),
+                            "missing Open Folder command character passed")
+    try requireRejectedMenu(menuBar(enabled: nil),
+                            "missing Open Folder enabled state passed")
+    var rejected = false
+    let ambiguousMenuBar = testElement(
+        role: kAXMenuBarRole,
+        children: menuBar(parentTitle: "File").children +
+            menuBar(parentTitle: "File").children)
+    do { _ = try OpenFolderMenuPolicy.plan(menuBar: ambiguousMenuBar) }
+    catch ProbeError.validation { rejected = true }
+    try require(rejected, "duplicate File menu paths passed")
+    rejected = false
+    do { _ = try OpenFolderMenuPolicy.plan(menuBar: menuBar(enabled: false)) }
+    catch ProbeError.validation { rejected = true }
+    try require(rejected, "disabled Open Folder menu item passed")
+    rejected = false
+    do { _ = try OpenFolderMenuPolicy.plan(menuBar: menuBar(itemTitle: "Open Folder...")) }
+    catch ProbeError.validation { rejected = true }
+    try require(rejected, "wrong Open Folder title passed")
+    rejected = false
+    do { _ = try OpenFolderMenuPolicy.plan(menuBar: menuBar(actions: [])) }
+    catch ProbeError.validation { rejected = true }
+    try require(rejected, "Open Folder item without AXPress passed")
+    rejected = false
+    do { _ = try OpenFolderMenuPolicy.plan(menuBar: menuBar(itemRole: kAXButtonRole)) }
+    catch ProbeError.validation { rejected = true }
+    try require(rejected, "Open Folder item with wrong role passed")
+    rejected = false
+    do { _ = try OpenFolderMenuPolicy.plan(menuBar: menuBar(commandCharacter: "P")) }
+    catch ProbeError.validation { rejected = true }
+    try require(rejected, "Open Folder item with wrong command metadata passed")
+    rejected = false
+    let duplicateItems = testElement(
+        role: kAXMenuBarRole,
+        children: [testElement(
+            role: kAXMenuBarItemRole, title: "File",
+            children: [testElement(
+                role: kAXMenuRole,
+                children: menuBar().children[0].children[0].children +
+                    menuBar().children[0].children[0].children)])])
+    do { _ = try OpenFolderMenuPolicy.plan(menuBar: duplicateItems) }
+    catch ProbeError.validation { rejected = true }
+    try require(rejected, "duplicate Open Folder menu items passed")
+    let validMenuSnapshot = OpenFolderMenuSnapshot<String>(
+        description: menuBar(), items: [validMenuPlan: "open-folder-item"])
+    let wrongFileTitleSnapshot = OpenFolderMenuSnapshot<String>(
+        description: menuBar(parentTitle: "Workspace"), items: [:])
+    let missingFileTitleSnapshot = OpenFolderMenuSnapshot<String>(
+        description: menuBar(parentTitle: nil), items: [:])
+    let missingDirectMenuSnapshot = OpenFolderMenuSnapshot<String>(
+        description: testElement(
+            role: kAXMenuBarRole,
+            children: [testElement(role: kAXMenuBarItemRole, title: "File")]),
+        items: [:])
+    let emptyDirectMenuSnapshot = OpenFolderMenuSnapshot<String>(
+        description: testElement(
+            role: kAXMenuBarRole,
+            children: [testElement(
+                role: kAXMenuBarItemRole, title: "File",
+                children: [testElement(role: kAXMenuRole)])]),
+        items: [:])
+    var menuSnapshots: [OpenFolderMenuSnapshot<String>?] = [
+        nil, wrongFileTitleSnapshot, missingFileTitleSnapshot,
+        missingDirectMenuSnapshot, emptyDirectMenuSnapshot, validMenuSnapshot,
+    ]
+    var menuNow: UInt64 = 0
+    var menuIdentityChecks = 0
+    let menuReadiness = try waitForReadyOpenFolderMenu(
+        timeoutNanoseconds: 1_000_000_000,
+        pollMicroseconds: 100,
+        nowNanoseconds: { menuNow },
+        validateIdentity: { menuIdentityChecks += 1 },
+        readSnapshot: { menuSnapshots.removeFirst() },
+        pause: { menuNow += UInt64($0) * 1_000 })
+    try require(menuReadiness.item == "open-folder-item" && menuReadiness.pollCount == 6,
+                "bounded menu readiness did not select the delayed menu")
+    try require(menuIdentityChecks == 12,
+                "PID identity was not checked around every menu snapshot")
+    var malformedMenuReads = 0
+    var malformedMenuPauses = 0
+    rejected = false
+    do {
+        _ = try waitForReadyOpenFolderMenu(
+            timeoutNanoseconds: 1_000_000_000,
+            pollMicroseconds: 100,
+            nowNanoseconds: { 0 },
+            validateIdentity: {},
+            readSnapshot: {
+                malformedMenuReads += 1
+                return OpenFolderMenuSnapshot<String>(
+                    description: menuBar(itemTitle: "Open Folder..."), items: [:])
+            },
+            pause: { _ in malformedMenuPauses += 1 })
+    } catch ProbeError.validation { rejected = true }
+    try require(rejected && malformedMenuReads == 1 && malformedMenuPauses == 0,
+                "malformed published menu did not fail immediately")
+    menuNow = 0
+    var menuTimeoutReads = 0
+    rejected = false
+    do {
+        _ = try waitForReadyOpenFolderMenu(
+            timeoutNanoseconds: 300_000,
+            pollMicroseconds: 100,
+            nowNanoseconds: { menuNow },
+            validateIdentity: {},
+            readSnapshot: {
+                menuTimeoutReads += 1
+                return nil as OpenFolderMenuSnapshot<String>?
+            },
+            pause: { menuNow += UInt64($0) * 1_000 })
+    } catch ProbeError.unavailable(let message) {
+        rejected = message == "Open Folder menu did not become ready after 3 polls"
+    }
+    try require(rejected && menuTimeoutReads == 3,
+                "Open Folder menu timeout used the wrong poll bound")
+    menuNow = 0
+    var menuDriftChecks = 0
+    var menuDriftReads = 0
+    rejected = false
+    do {
+        _ = try waitForReadyOpenFolderMenu(
+            timeoutNanoseconds: 1_000_000_000,
+            pollMicroseconds: 100,
+            nowNanoseconds: { menuNow },
+            validateIdentity: {
+                menuDriftChecks += 1
+                if menuDriftChecks == 3 {
+                    throw ProbeError.validation("test menu PID drift")
+                }
+            },
+            readSnapshot: {
+                menuDriftReads += 1
+                return nil as OpenFolderMenuSnapshot<String>?
+            },
+            pause: { menuNow += UInt64($0) * 1_000 })
+    } catch ProbeError.validation { rejected = true }
+    try require(rejected && menuDriftChecks == 3 && menuDriftReads == 1,
+                "menu PID drift did not stop before another AX read")
+
     let cancel = testElement(role: kAXButtonRole, title: "Cancel", actions: [kAXPressAction])
     let choose = testElement(role: kAXButtonRole, title: "Open", actions: [kAXPressAction])
     let direct = testElement(role: kAXTextFieldRole, identifier: "path", actions: [])
@@ -795,7 +1245,7 @@ func runSelfTests() throws {
     let fallbackPanel = testElement(role: kAXSheetRole, children: [cancel, choose, fileBrowser])
     try require(try OpenPanelPolicy.plan(windows: [fallbackPanel], permitKeyFallback: true).navigation ==
                 .commandShiftG, "explicit key fallback")
-    var rejected = false
+    rejected = false
     do { _ = try OpenPanelPolicy.plan(windows: [fallbackPanel], permitKeyFallback: false) }
     catch ProbeError.validation { rejected = true }
     try require(rejected, "unauthorized fallback passed")
@@ -944,8 +1394,6 @@ func runSelfTests() throws {
     try require(!PathPolicy.contains("/private/tmp/root", "/private/tmp/root2/file"), "prefix collision")
     try require(PathPolicy.contains("/private/tmp/root", "/private/tmp/root/file"), "contained path")
     try require(Phase(rawValue: "select-project") == .selectProject, "phase parsing")
-    try require(KeyboardShortcut.openFolder.virtualKey == 31 &&
-                KeyboardShortcut.openFolder.flags == [.maskCommand], "Open Folder shortcut")
     try require(KeyboardShortcut.pathEntry.virtualKey == 5 &&
                 KeyboardShortcut.pathEntry.flags == [.maskCommand, .maskShift], "path-entry shortcut")
 
@@ -962,25 +1410,34 @@ func runSelfTests() throws {
     rejected = false
     do { _ = try parseOptions(optionArguments) }
     catch ProbeError.usage(let message) {
-        rejected = message == "select-project requires --invoke-open-folder"
+        rejected = message == "select-project requires --press-open-folder-menu-item"
     }
     try require(rejected, "select-project omitted explicit Open Folder authorization")
-    let authorizedOptions = try parseOptions(optionArguments + ["--invoke-open-folder"])
-    try require(authorizedOptions.invokeOpenFolder, "Open Folder authorization was not retained")
+    let authorizedOptions = try parseOptions(optionArguments + ["--press-open-folder-menu-item"])
+    try require(authorizedOptions.pressOpenFolderMenuItem,
+                "Open Folder menu authorization was not retained")
     let inspectArguments = optionArguments.map { $0 == "select-project" ? "inspect-project-picker" : $0 }
     rejected = false
-    do { _ = try parseOptions(inspectArguments + ["--invoke-open-folder"]) }
+    do { _ = try parseOptions(inspectArguments + ["--press-open-folder-menu-item"]) }
     catch ProbeError.usage(let message) {
-        rejected = message == "--invoke-open-folder is only valid for select-project"
+        rejected = message == "--press-open-folder-menu-item is only valid for select-project"
     }
     try require(rejected, "inspect-project-picker accepted Open Folder authorization")
     rejected = false
     do {
-        _ = try parseOptions(optionArguments + ["--invoke-open-folder", "--invoke-open-folder"])
+        _ = try parseOptions(optionArguments + ["--press-open-folder-menu-item",
+                                                 "--press-open-folder-menu-item"])
     } catch ProbeError.usage(let message) {
-        rejected = message == "duplicate --invoke-open-folder"
+        rejected = message == "duplicate --press-open-folder-menu-item"
     }
     try require(rejected, "duplicate Open Folder authorization passed")
+    let menuInspectArguments = optionArguments.map {
+        $0 == "select-project" ? "inspect-open-folder-menu" : $0
+    }
+    let menuInspectOptions = try parseOptions(menuInspectArguments)
+    try require(menuInspectOptions.phase == .inspectOpenFolderMenu &&
+                !menuInspectOptions.pressOpenFolderMenuItem,
+                "read-only Open Folder menu inspection options")
     print("native GUI probe self-test passed")
 }
 
@@ -999,7 +1456,8 @@ do {
                                         "bundleSha256": sha256(paths.bundle),
                                         "fixtureSha256": sha256(paths.fixture),
                                         "keyFallbackAuthorized": options.permitKeyFallback,
-                                        "openFolderAuthorized": options.invokeOpenFolder])
+                                        "openFolderMenuPressAuthorized":
+                                            options.pressOpenFolderMenuItem])
     if !options.validateInputsOnly {
         try execute(options: options, paths: paths, log: log)
     }

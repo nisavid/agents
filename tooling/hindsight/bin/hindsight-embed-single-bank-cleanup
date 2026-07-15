@@ -1,0 +1,1685 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+umask 077
+
+typeset -g HINDSIGHT_CLEANUP_STACK_LOADED=0
+
+usage() {
+  cat <<EOF
+Usage: hindsight-embed-single-bank-cleanup [--dry-run] [--apply] [--allow-nonempty-target]
+
+Dry-run is the default. --apply archives local profile/pg0 state, migrates rows
+from explicitly configured legacy source bank ids into the configured canonical
+bank, normalizes the active profile, and deletes explicitly configured profiles.
+
+Required environment:
+  HINDSIGHT_BANK_ID                 Canonical target bank id
+  HINDSIGHT_CLEANUP_SOURCE_BANKS   Comma-separated source bank ids
+  HINDSIGHT_CLEANUP_ARCHIVE_SOURCES
+                                    Comma-separated paths to archive
+  HINDSIGHT_CLEANUP_BANKS_URL       Loopback tenant banks endpoint
+  HINDSIGHT_CLEANUP_API_TOKEN       Bearer token for the selected profile
+  HINDSIGHT_CLEANUP_ARCHIVE_ROOT    Parent directory for verified archives
+  HINDSIGHT_CLEANUP_ARCHIVE_ENCRYPT_COMMAND
+                                    Executable accepting plaintext directory and
+                                    encrypted output path arguments
+  HINDSIGHT_CLEANUP_ARCHIVE_DECRYPT_COMMAND
+                                    Executable accepting encrypted input and a
+                                    plaintext verification directory
+  HINDSIGHT_EMBED_STACK_LIB         Reusable stack library path
+  HINDSIGHT_EMBED_API_PYTHON        Hindsight API Python executable
+  HINDSIGHT_EMBED_MIGRATION_HELPER  Migration helper path
+  HINDSIGHT_EMBED_SERVICE_COMMAND   Consumer service command
+
+Optional environment:
+  HINDSIGHT_CLEANUP_ARCHIVE_TIMEOUT_SECONDS
+                                    Per-command archive timeout; defaults to 3600
+  HINDSIGHT_CLEANUP_MIGRATION_TIMEOUT_SECONDS
+                                    Migration helper timeout; defaults to 3600
+  HINDSIGHT_CLEANUP_LEGACY_PROFILES
+                                    Comma-separated profiles to stop; use
+                                    @default for the unnamed default profile
+  HINDSIGHT_CLEANUP_DELETE_PROFILES
+                                    Comma-separated profiles to delete
+
+Options:
+  --dry-run                 Print planned archive, schema, and profile changes
+  --apply                   Perform the archive, database migration, and profile cleanup
+  --allow-nonempty-target   Permit merge into a target bank that already has non-bank rows
+  -h, --help                Show this help
+EOF
+}
+
+die() {
+  print -ru2 -- "hindsight-embed-single-bank-cleanup: $*"
+  exit 1
+}
+
+validate_no_acl() {
+  emulate -L zsh
+  local path="$1" label="$2" listing permissions
+  listing="$(/bin/ls -lde "$path")" || die "could not inspect ${label} ACL: ${path}"
+  permissions="${listing%% *}"
+  ! print -r -- "$listing" |
+    /usr/bin/grep -Eq '^[[:space:]]*[0-9]+:.*[[:space:]]allow[[:space:]]' ||
+    die "${label} must not have permissive ACL entries: ${path}"
+}
+
+validate_trusted_artifact() {
+  emulate -L zsh
+  local path="$1"
+  local label="$2"
+  local access="${3:-readable}"
+  local symlink_policy="${4:-reject-symlink}"
+
+  [[ "$path" == /* ]] || die "${label} must use an absolute path: ${path}"
+  if [[ -L "$path" ]]; then
+    [[ "$symlink_policy" == allow-symlink ]] || die "${label} must not be a symlink: ${path}"
+    local link_owner
+    link_owner="$(/usr/bin/stat -f '%u' "$path")" || die "could not inspect ${label} symlink owner: ${path}"
+    (( link_owner == EUID || link_owner == 0 )) ||
+      die "${label} symlink must be owned by the current user or root: ${path}"
+  fi
+
+  local resolved="${path:A}"
+  [[ -f "$resolved" && ! -L "$resolved" ]] || die "${label} must resolve to a regular file: ${path}"
+  if [[ "$access" == executable ]]; then
+    [[ -x "$resolved" ]] || die "${label} is not executable: ${path}"
+  else
+    [[ -r "$resolved" ]] || die "${label} is not readable: ${path}"
+  fi
+
+  local owner mode ancestor ancestor_root
+  validate_no_acl "$resolved" "$label"
+  owner="$(/usr/bin/stat -f '%u' "$resolved")" || die "could not inspect ${label} owner: ${path}"
+  mode="$(/usr/bin/stat -f '%Lp' "$resolved")" || die "could not inspect ${label} mode: ${path}"
+  (( owner == EUID || owner == 0 )) || die "${label} must be owned by the current user or root: ${path}"
+  (( (8#$mode & 8#0022) == 0 )) || die "${label} must not be group or world writable: ${path}"
+
+  for ancestor_root in "${path:h}" "${resolved:h}"; do
+    ancestor="$ancestor_root"
+    while true; do
+      validate_no_acl "$ancestor" "${label} ancestor"
+      owner="$(/usr/bin/stat -f '%u' "$ancestor")" || die "could not inspect ${label} ancestor: ${ancestor}"
+      mode="$(/usr/bin/stat -f '%Lp' "$ancestor")" || die "could not inspect ${label} ancestor: ${ancestor}"
+      (( owner == EUID || owner == 0 )) || die "${label} ancestor is not trusted: ${ancestor}"
+      if (( (8#$mode & 8#0022) != 0 && !(owner == 0 && (8#$mode & 8#01000) != 0) )); then
+        die "${label} ancestor is group or world writable: ${ancestor}"
+      fi
+      [[ "$ancestor" == / ]] && break
+      ancestor="${ancestor:h}"
+    done
+  done
+}
+
+load_stack_lib() {
+  emulate -L zsh
+  (( HINDSIGHT_CLEANUP_STACK_LOADED )) && return 0
+  local stack_lib="${HINDSIGHT_EMBED_STACK_LIB:-}"
+  validate_trusted_artifact "$stack_lib" "stack library"
+  . "$stack_lib" || die "failed to source stack library at ${stack_lib}"
+  local required_function
+  for required_function in \
+    hindsight_stack_broker_status \
+    hindsight_stack_broker_stop \
+    hindsight_stack_control_running \
+    hindsight_stack_daemon_running \
+    hindsight_stack_daemon_start \
+    hindsight_stack_enabled_profiles \
+    hindsight_stack_load_config \
+    hindsight_stack_prepare_lifecycle_lock \
+    hindsight_stack_require_current_user \
+    hindsight_stack_require_tools \
+    hindsight_stack_run_bounded \
+    hindsight_stack_run_stop_helper \
+    hindsight_stack_ui_running \
+    hindsight_stack_valid_profile_name \
+    hindsight_stack_wait_daemon \
+    hindsight_stack_wait_stopped_for; do
+    (( $+functions[$required_function] )) ||
+      die "stack library is missing required function ${required_function}"
+  done
+  typeset -g HINDSIGHT_CLEANUP_STACK_LOADED=1
+}
+
+validate_cleanup_timeout() {
+  emulate -L zsh
+  local value="$1" label="$2"
+  [[ "$value" =~ '^[1-9][0-9]*$' ]] ||
+    die "${label} must be a canonical positive decimal timeout"
+  (( value <= 3600 )) || die "${label} must be at most 3600 seconds"
+}
+
+validate_cleanup_timeouts() {
+  emulate -L zsh
+  validate_cleanup_timeout \
+    "${HINDSIGHT_CLEANUP_ARCHIVE_TIMEOUT_SECONDS:-3600}" \
+    HINDSIGHT_CLEANUP_ARCHIVE_TIMEOUT_SECONDS
+  validate_cleanup_timeout \
+    "${HINDSIGHT_CLEANUP_MIGRATION_TIMEOUT_SECONDS:-3600}" \
+    HINDSIGHT_CLEANUP_MIGRATION_TIMEOUT_SECONDS
+}
+
+hindsight_cleanup_run_archive_command() {
+  emulate -L zsh
+  hindsight_stack_run_bounded \
+    "${HINDSIGHT_CLEANUP_ARCHIVE_TIMEOUT_SECONDS:-3600}" "$@"
+}
+
+hindsight_cleanup_run_migration_command() {
+  emulate -L zsh
+  hindsight_stack_run_bounded \
+    "${HINDSIGHT_CLEANUP_MIGRATION_TIMEOUT_SECONDS:-3600}" "$@"
+}
+
+hindsight_cleanup_run_lifecycle_command() {
+  emulate -L zsh
+  hindsight_stack_run_bounded \
+    "${HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS:-300}" "$@"
+}
+
+api_python() {
+  emulate -L zsh
+  local candidate="${HINDSIGHT_EMBED_API_PYTHON:-}"
+  validate_trusted_artifact "$candidate" "Hindsight API Python" executable allow-symlink
+  print -r -- "$candidate"
+}
+
+migration_helper() {
+  emulate -L zsh
+  local candidate="${HINDSIGHT_EMBED_MIGRATION_HELPER:-}"
+  validate_trusted_artifact "$candidate" "migration helper" readable allow-symlink
+  print -r -- "$candidate"
+}
+
+start_managed_stack() {
+  emulate -L zsh
+  local service="${HINDSIGHT_EMBED_SERVICE_COMMAND:-}"
+  validate_trusted_artifact "$service" "service command" executable allow-symlink
+  hindsight_cleanup_run_lifecycle_command "$service" start
+}
+
+archive_root_for_timestamp() {
+  emulate -L zsh
+  local stamp
+  stamp="$(/bin/date -u +%Y%m%dT%H%M%SZ)"
+  local archive_root="${HINDSIGHT_CLEANUP_ARCHIVE_ROOT:-}"
+  [[ -n "$archive_root" ]] || die "HINDSIGHT_CLEANUP_ARCHIVE_ROOT is required"
+  print -r -- "${archive_root%/}/single-bank-cleanup-${stamp}-$$.age"
+}
+
+run_with_cleanup_lock() (
+  emulate -L zsh
+  unsetopt ERR_EXIT
+  local archive_root="${HINDSIGHT_CLEANUP_ARCHIVE_ROOT:-}"
+  [[ "$archive_root" == /* && ! -L "$archive_root" ]] ||
+    die "cleanup archive root must be an absolute non-symlink path"
+  validate_archive_creation_ancestry "$archive_root"
+  ( umask 077; mkdir -p -m 700 "$archive_root" ) ||
+    die "failed to prepare cleanup archive root"
+  validate_archive_parent "$archive_root"
+  local lock_file="${archive_root%/}/.single-bank-cleanup.lock"
+  if [[ -L "$lock_file" ]] || { [[ -e "$lock_file" ]] && [[ ! -f "$lock_file" ]]; }; then
+    die "refusing unsafe cleanup lifecycle lock: ${lock_file}"
+  fi
+  ( umask 077; : >> "$lock_file" ) || die "failed to prepare cleanup lifecycle lock"
+  /bin/chmod 600 "$lock_file" || die "failed to secure cleanup lifecycle lock"
+  [[ "$(/usr/bin/stat -f '%u:%Lp' "$lock_file")" == "${EUID}:600" ]] ||
+    die "cleanup lifecycle lock must be private and owned by the current user"
+  zmodload zsh/system || die "zsh/system is required for cleanup lifecycle locking"
+  integer lock_descriptor
+  zsystem flock -f lock_descriptor -t 30 "$lock_file" ||
+    die "timed out acquiring cleanup lifecycle lock"
+  "$@"
+  local result=$?
+  zsystem flock -u "$lock_descriptor" || return 1
+  return "$result"
+)
+
+validate_archive_creation_ancestry() {
+  emulate -L zsh
+  local requested="$1" candidate existing
+  for candidate in "${requested:h}" "${requested:A:h}"; do
+    existing="$candidate"
+    while [[ ! -e "$existing" && ! -L "$existing" && "$existing" != / ]]; do
+      existing="${existing:h}"
+    done
+    validate_archive_parent "$existing"
+  done
+}
+
+acquire_cleanup_maintenance_lease() {
+  emulate -L zsh
+  hindsight_stack_prepare_lifecycle_lock >/dev/null ||
+    die "failed to prepare trusted Hindsight maintenance state"
+  local lock_file="${HINDSIGHT_EMBED_STATE_DIR}/.maintenance.lock"
+  if [[ -L "$lock_file" ]] || { [[ -e "$lock_file" ]] && [[ ! -f "$lock_file" ]]; }; then
+    die "refusing unsafe cleanup maintenance lease: ${lock_file}"
+  fi
+  ( umask 077; : >>"$lock_file" ) || die "failed to prepare cleanup maintenance lease"
+  /bin/chmod 600 "$lock_file" || die "failed to secure cleanup maintenance lease"
+  [[ "$(/usr/bin/stat -f '%u:%Lp' "$lock_file")" == "${EUID}:600" ]] ||
+    die "cleanup maintenance lease must be private and current-user-owned"
+  zmodload zsh/system || die "zsh/system is required for cleanup maintenance leasing"
+  integer descriptor
+  zsystem flock -f descriptor -t 30 "$lock_file" ||
+    die "timed out acquiring cleanup maintenance lease"
+  typeset -gi HINDSIGHT_CLEANUP_MAINTENANCE_DESCRIPTOR="$descriptor"
+  typeset -gi HINDSIGHT_CLEANUP_MAINTENANCE_LEASE_HELD=1
+}
+
+release_cleanup_maintenance_lease() {
+  emulate -L zsh
+  (( ${HINDSIGHT_CLEANUP_MAINTENANCE_LEASE_HELD:-0} )) || return 0
+  zmodload zsh/system || return 1
+  zsystem flock -u "$HINDSIGHT_CLEANUP_MAINTENANCE_DESCRIPTOR" || return 1
+  typeset -gi HINDSIGHT_CLEANUP_MAINTENANCE_LEASE_HELD=0
+}
+
+cleanup_commit_receipt_path() {
+  emulate -L zsh
+  print -r -- "${1}.commit.json"
+}
+
+cleanup_archive_digest() {
+  emulate -L zsh
+  local archive="$1" digest
+  digest="$(hindsight_cleanup_run_archive_command /usr/bin/shasum -a 256 "$archive")" || return 1
+  digest="${digest%% *}"
+  [[ "$digest" =~ '^[0-9a-f]{64}$' ]] || return 1
+  print -r -- "$digest"
+}
+
+write_cleanup_commit_receipt() {
+  emulate -L zsh
+  local archive="$1" digest="$2" receipt
+  receipt="$(cleanup_commit_receipt_path "$archive")" || return 1
+  [[ ! -e "$receipt" && ! -L "$receipt" ]] || return 1
+  hindsight_cleanup_run_archive_command /usr/bin/python3 -I -c '
+import json
+import os
+import secrets
+import sys
+
+receipt, archive, digest, target_bank, source_banks = sys.argv[1:]
+payload = {
+    "archive": archive,
+    "archive_sha256": digest,
+    "source_banks": source_banks.split(","),
+    "target_bank": target_bank,
+    "version": 1,
+}
+parent_path = os.path.dirname(receipt)
+receipt_name = os.path.basename(receipt)
+parent = os.open(
+    parent_path,
+    os.O_RDONLY
+    | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_NOFOLLOW", 0),
+)
+temporary_name = f".{receipt_name}.tmp.{secrets.token_hex(16)}"
+flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+descriptor = None
+published = False
+try:
+    descriptor = os.open(temporary_name, flags, 0o600, dir_fd=parent)
+    data = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    view = memoryview(data)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise OSError("receipt write made no progress")
+        view = view[written:]
+    os.fsync(descriptor)
+    os.close(descriptor)
+    descriptor = None
+    os.link(
+        temporary_name,
+        receipt_name,
+        src_dir_fd=parent,
+        dst_dir_fd=parent,
+        follow_symlinks=False,
+    )
+    published = True
+    os.fsync(parent)
+    os.unlink(temporary_name, dir_fd=parent)
+    os.fsync(parent)
+except Exception:
+    if published:
+        try:
+            temporary = os.stat(temporary_name, dir_fd=parent, follow_symlinks=False)
+            current = os.stat(receipt_name, dir_fd=parent, follow_symlinks=False)
+            if (temporary.st_dev, temporary.st_ino) == (current.st_dev, current.st_ino):
+                os.unlink(receipt_name, dir_fd=parent)
+                os.fsync(parent)
+        except FileNotFoundError:
+            pass
+    raise
+finally:
+    if descriptor is not None:
+        os.close(descriptor)
+    try:
+        os.unlink(temporary_name, dir_fd=parent)
+    except FileNotFoundError:
+        pass
+    os.close(parent)
+' "$receipt" "$archive" "$digest" "$HINDSIGHT_BANK_ID" \
+    "$HINDSIGHT_CLEANUP_SOURCE_BANKS"
+}
+
+cleanup_commit_receipt_valid() {
+  emulate -L zsh
+  local archive="$1" digest="$2" receipt actual_digest
+  actual_digest="$(cleanup_archive_digest "$archive")" || return 1
+  [[ "$actual_digest" == "$digest" ]] || return 1
+  receipt="$(cleanup_commit_receipt_path "$archive")" || return 1
+  [[ -f "$receipt" && ! -L "$receipt" ]] || return 1
+  [[ "$(/usr/bin/stat -f '%u:%Lp' "$receipt")" == "${EUID}:600" ]] || return 1
+  hindsight_cleanup_run_archive_command /usr/bin/python3 -I -c '
+import json
+import sys
+
+receipt, archive, digest, target_bank, source_banks = sys.argv[1:]
+try:
+    with open(receipt, "rb") as handle:
+        payload = json.load(handle)
+except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+    raise SystemExit(1)
+expected = {
+    "archive": archive,
+    "archive_sha256": digest,
+    "source_banks": source_banks.split(","),
+    "target_bank": target_bank,
+    "version": 1,
+}
+raise SystemExit(0 if payload == expected else 1)
+' "$receipt" "$archive" "$digest" "$HINDSIGHT_BANK_ID" \
+    "$HINDSIGHT_CLEANUP_SOURCE_BANKS"
+}
+
+validate_archive_parent() {
+  emulate -L zsh
+  local parent="$1"
+  [[ "$parent" == /* ]] || die "archive parent must use an absolute path: ${parent}"
+  [[ -d "$parent" && ! -L "$parent" ]] || die "archive parent must be a real directory: ${parent}"
+
+  local owner mode ancestor ancestor_root
+  owner="$(/usr/bin/stat -f '%u' "$parent")" || die "could not inspect archive parent owner: ${parent}"
+  mode="$(/usr/bin/stat -f '%Lp' "$parent")" || die "could not inspect archive parent mode: ${parent}"
+  (( owner == EUID || owner == 0 )) || die "archive parent is not trusted: ${parent}"
+  (( (8#$mode & 8#0022) == 0 )) || die "archive parent must not be group or world writable: ${parent}"
+
+  for ancestor_root in "$parent" "${parent:A}"; do
+    ancestor="$ancestor_root"
+    while [[ "$ancestor" != / ]]; do
+      owner="$(/usr/bin/stat -f '%u' "$ancestor")" || die "could not inspect archive ancestor: ${ancestor}"
+      mode="$(/usr/bin/stat -f '%Lp' "$ancestor")" || die "could not inspect archive ancestor mode: ${ancestor}"
+      (( owner == EUID || owner == 0 )) || die "archive ancestor is not trusted: ${ancestor}"
+      if (( (8#$mode & 8#0022) != 0 && !(owner == 0 && (8#$mode & 8#01000) != 0) )); then
+        die "archive ancestor is group or world writable: ${ancestor}"
+      fi
+      ancestor="${ancestor:h}"
+    done
+  done
+}
+
+validate_archive_parent_separation() {
+  emulate -L zsh
+  local parent="$1"
+  shift
+  local canonical_parent="${parent:A}"
+  local source canonical_source
+
+  for source in "$@"; do
+    canonical_source="${source:A}"
+    if [[ "$canonical_parent" == "$canonical_source" || "$canonical_parent" == "${canonical_source}"/* ]]; then
+      die "archive parent must be outside every archive source: ${parent}"
+    fi
+  done
+}
+
+archive_source_snapshot() {
+  emulate -L zsh
+  local source="$1"
+  local target="$2"
+  local helper rc
+  helper="$(mktemp -t hindsight-archive-snapshot.XXXXXX)" ||
+    die "failed to create archive snapshot helper"
+  /bin/cat >"$helper" <<'PY'
+import ctypes
+import hashlib
+import os
+import stat
+import sys
+
+path = os.path.abspath(sys.argv[1])
+target = os.path.abspath(sys.argv[2])
+components = [part for part in path.split(os.sep) if part]
+descriptors = []
+libc = ctypes.CDLL(None, use_errno=True)
+
+def copy_extended_metadata(source_fd, destination_fd):
+    size = libc.flistxattr(source_fd, None, 0, 0)
+    if size < 0:
+        raise OSError(ctypes.get_errno(), "could not list source extended attributes")
+    if size:
+        names_buffer = ctypes.create_string_buffer(size)
+        if libc.flistxattr(source_fd, names_buffer, size, 0) != size:
+            raise OSError(ctypes.get_errno(), "could not read source extended attribute names")
+        for raw_name in names_buffer.raw.split(b"\0"):
+            if not raw_name:
+                continue
+            value_size = libc.fgetxattr(source_fd, raw_name, None, 0, 0, 0)
+            if value_size < 0:
+                raise OSError(ctypes.get_errno(), "could not size source extended attribute")
+            value = ctypes.create_string_buffer(value_size)
+            if libc.fgetxattr(source_fd, raw_name, value, value_size, 0, 0) != value_size:
+                raise OSError(ctypes.get_errno(), "could not read source extended attribute")
+            if libc.fsetxattr(destination_fd, raw_name, value, value_size, 0, 0) != 0:
+                raise OSError(ctypes.get_errno(), "could not copy source extended attribute")
+
+    libc.acl_get_fd.restype = ctypes.c_void_p
+    libc.acl_set_fd.argtypes = (ctypes.c_int, ctypes.c_void_p)
+    libc.acl_set_fd.restype = ctypes.c_int
+    acl = libc.acl_get_fd(source_fd)
+    if acl:
+        try:
+            if libc.acl_set_fd(destination_fd, acl) != 0:
+                raise OSError(ctypes.get_errno(), "could not copy source ACL")
+        finally:
+            libc.acl_free(ctypes.c_void_p(acl))
+
+def stable_fields(info):
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_uid,
+        info.st_gid,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+        getattr(info, "st_flags", 0),
+    )
+
+def reject_bsd_flags(info):
+    if getattr(info, "st_flags", 0):
+        raise OSError("source uses unsupported BSD file flags")
+
+def apply_metadata(source_fd, destination_fd, destination_path, info):
+    try:
+        os.fchown(destination_fd, info.st_uid, info.st_gid)
+    except PermissionError:
+        current = os.fstat(destination_fd)
+        if (current.st_uid, current.st_gid) != (info.st_uid, info.st_gid):
+            raise
+    copy_extended_metadata(source_fd, destination_fd)
+    os.utime(destination_fd, ns=(info.st_atime_ns, info.st_mtime_ns))
+    os.fchmod(destination_fd, stat.S_IMODE(info.st_mode))
+
+def copy_regular(source_fd, destination_path, initial):
+    reject_bsd_flags(initial)
+    destination_fd = os.open(
+        destination_path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        stat.S_IMODE(initial.st_mode),
+    )
+    digest = hashlib.sha256()
+    try:
+        os.lseek(source_fd, 0, os.SEEK_SET)
+        while True:
+            chunk = os.read(source_fd, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            view = memoryview(chunk)
+            while view:
+                written = os.write(destination_fd, view)
+                if written <= 0:
+                    raise OSError("destination write made no progress")
+                view = view[written:]
+        if stable_fields(os.fstat(source_fd)) != stable_fields(initial):
+            raise OSError("source file changed while snapshotting")
+        os.lseek(source_fd, 0, os.SEEK_SET)
+        verification = hashlib.sha256()
+        while True:
+            chunk = os.read(source_fd, 1024 * 1024)
+            if not chunk:
+                break
+            verification.update(chunk)
+        if verification.digest() != digest.digest():
+            raise OSError("source file content changed while snapshotting")
+        apply_metadata(source_fd, destination_fd, destination_path, initial)
+        os.fsync(destination_fd)
+    finally:
+        os.close(destination_fd)
+
+def copy_directory(source_fd, destination_path, initial):
+    reject_bsd_flags(initial)
+    # Populate through a private writable mode even when the source is
+    # read-only; apply the source mode and metadata only after all children are
+    # durably copied.
+    os.mkdir(destination_path, 0o700)
+    names = sorted(os.listdir(source_fd))
+    entries = {}
+    for name in names:
+        if name in (".", "..") or os.sep in name:
+            raise OSError("invalid directory entry")
+        entry = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
+        if not (stat.S_ISDIR(entry.st_mode) or stat.S_ISREG(entry.st_mode)):
+            raise OSError(f"unsupported or symlinked archive entry: {name}")
+        entries[name] = entry
+
+    for name in names:
+        entry = entries[name]
+        flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+        if stat.S_ISDIR(entry.st_mode):
+            flags |= getattr(os, "O_DIRECTORY", 0)
+        child_fd = os.open(name, flags, dir_fd=source_fd)
+        try:
+            if stable_fields(os.fstat(child_fd)) != stable_fields(entry):
+                raise OSError(f"archive entry was replaced before snapshotting: {name}")
+            child_target = os.path.join(destination_path, name)
+            if stat.S_ISDIR(entry.st_mode):
+                copy_directory(child_fd, child_target, entry)
+            else:
+                copy_regular(child_fd, child_target, entry)
+            if stable_fields(os.fstat(child_fd)) != stable_fields(entry):
+                raise OSError(f"archive entry changed while snapshotting: {name}")
+        finally:
+            os.close(child_fd)
+
+    if sorted(os.listdir(source_fd)) != names:
+        raise OSError("source directory membership changed while snapshotting")
+    for name in names:
+        current = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
+        if stable_fields(current) != stable_fields(entries[name]):
+            raise OSError(f"archive entry was replaced while snapshotting: {name}")
+
+    destination_fd = os.open(
+        destination_path,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        apply_metadata(source_fd, destination_fd, destination_path, initial)
+        os.fsync(destination_fd)
+    finally:
+        os.close(destination_fd)
+
+try:
+    parent_fd = os.open(os.sep, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    descriptors.append(parent_fd)
+    source_fd = parent_fd
+    for index, component in enumerate(components):
+        flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0)
+        if index < len(components) - 1:
+            flags |= getattr(os, "O_DIRECTORY", 0)
+        descriptor = os.open(component, flags, dir_fd=source_fd)
+        descriptors.append(descriptor)
+        source_fd = descriptor
+    info = os.fstat(source_fd)
+    if stat.S_ISDIR(info.st_mode):
+        copy_directory(source_fd, target, info)
+    elif stat.S_ISREG(info.st_mode):
+        copy_regular(source_fd, target, info)
+    else:
+        raise OSError("source is not a regular file or directory")
+except (OSError, ValueError) as exc:
+    print(f"unsafe archive source {path}: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+finally:
+    for descriptor in reversed(descriptors):
+        os.close(descriptor)
+PY
+  hindsight_cleanup_run_archive_command /usr/bin/python3 -I "$helper" "$source" "$target"
+  rc=$?
+  /bin/rm -f "$helper"
+  return "$rc"
+}
+
+verify_archive_copy() {
+  emulate -L zsh
+  local source="$1"
+  local target="$2"
+  local metadata_dir source_bom target_bom source_metadata target_metadata
+  local source_extended target_extended
+  metadata_dir="$(mktemp -d -t hindsight-archive-metadata.XXXXXX)" ||
+    die "failed to create archive verification directory"
+  source_bom="${metadata_dir}/source.bom"
+  target_bom="${metadata_dir}/target.bom"
+  source_extended="${metadata_dir}/source.extended"
+  target_extended="${metadata_dir}/target.extended"
+
+  hindsight_cleanup_run_archive_command /bin/zsh -c '
+    cd "$1" || exit 1
+    /bin/ls -leR@ -- "$2"
+    /usr/bin/xattr -lr -- "$2"
+  ' verify-archive-metadata "${source:h}" "${source:t}" >"$source_extended" 2>&1 || {
+    rm -rf -- "$metadata_dir"
+    return 1
+  }
+  hindsight_cleanup_run_archive_command /bin/zsh -c '
+    cd "$1" || exit 1
+    /bin/ls -leR@ -- "$2"
+    /usr/bin/xattr -lr -- "$2"
+  ' verify-archive-metadata "${target:h}" "${target:t}" >"$target_extended" 2>&1 || {
+    rm -rf -- "$metadata_dir"
+    return 1
+  }
+  hindsight_cleanup_run_archive_command /usr/bin/cmp -s \
+    "$source_extended" "$target_extended" || {
+    rm -rf -- "$metadata_dir"
+    return 1
+  }
+
+  if [[ -d "$source" ]]; then
+    if hindsight_cleanup_run_archive_command /usr/bin/mkbom "$source" "$source_bom" &&
+      hindsight_cleanup_run_archive_command /usr/bin/mkbom "$target" "$target_bom" &&
+      hindsight_cleanup_run_archive_command /usr/bin/cmp -s "$source_bom" "$target_bom"; then
+      rm -rf -- "$metadata_dir"
+      return 0
+    fi
+  else
+    source_metadata="$(hindsight_cleanup_run_archive_command \
+      /usr/bin/stat -f '%Mp%Lp|%u|%g|%z|%m|%f' "$source")" || source_metadata=""
+    target_metadata="$(hindsight_cleanup_run_archive_command \
+      /usr/bin/stat -f '%Mp%Lp|%u|%g|%z|%m|%f' "$target")" || target_metadata=""
+    if [[ -n "$source_metadata" && "$source_metadata" == "$target_metadata" ]] &&
+      hindsight_cleanup_run_archive_command /usr/bin/cmp -s "$source" "$target"; then
+      rm -rf -- "$metadata_dir"
+      return 0
+    fi
+  fi
+
+  if [[ -d "$metadata_dir" ]]; then
+    rm -rf -- "$metadata_dir"
+  fi
+  return 1
+}
+
+verify_encrypted_archive() {
+  emulate -L zsh
+  local encrypted="$1"
+  local staging_dir="$2"
+  local verification_dir="$3"
+  local decrypt_command="${HINDSIGHT_CLEANUP_ARCHIVE_DECRYPT_COMMAND:-}"
+  local -a sources=("${(@s:,:)HINDSIGHT_CLEANUP_ARCHIVE_SOURCES}")
+  local -a actual_entries
+  local source expected actual
+
+  validate_trusted_artifact "$decrypt_command" "archive decryption command" executable allow-symlink
+  hindsight_cleanup_run_archive_command \
+    "$decrypt_command" "$encrypted" "$verification_dir" || return 1
+  [[ -d "$verification_dir" && ! -L "$verification_dir" ]] || return 1
+  actual_entries=("$verification_dir"/*(DN))
+  (( ${#actual_entries} == ${#sources} )) || return 1
+  for source in "${sources[@]}"; do
+    expected="${staging_dir}/${source:t}"
+    actual="${verification_dir}/${source:t}"
+    [[ -e "$actual" && ! -L "$actual" ]] || return 1
+    verify_archive_copy "$expected" "$actual" || return 1
+  done
+}
+
+publish_encrypted_archive() {
+  emulate -L zsh
+  local temporary="$1"
+  local destination="$2"
+  local expected_digest="$3"
+  local helper rc
+  helper="$(mktemp -t hindsight-archive-publish.XXXXXX)" ||
+    die "failed to create archive publication helper"
+  /bin/cat >"$helper" <<'PY'
+import hashlib
+import os
+import stat
+import sys
+
+source, destination = map(os.path.abspath, sys.argv[1:3])
+expected_digest = sys.argv[3]
+if os.path.dirname(source) != os.path.dirname(destination):
+    raise SystemExit("archive publication must remain within one directory")
+metadata = os.lstat(source)
+if (
+    not stat.S_ISREG(metadata.st_mode)
+    or metadata.st_uid not in {0, os.geteuid()}
+    or stat.S_IMODE(metadata.st_mode) != 0o600
+    or metadata.st_nlink != 1
+):
+    raise SystemExit("encrypted archive temporary is untrusted")
+source_descriptor = os.open(
+    source,
+    os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+)
+parent_descriptor = os.open(
+    os.path.dirname(source),
+    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0),
+)
+try:
+    opened = os.fstat(source_descriptor)
+    if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+        raise SystemExit("encrypted archive temporary identity changed")
+    payload = hashlib.sha256()
+    while chunk := os.read(source_descriptor, 1024 * 1024):
+        payload.update(chunk)
+    if payload.hexdigest() != expected_digest:
+        raise SystemExit("encrypted archive temporary content changed")
+    os.fsync(source_descriptor)
+    os.fsync(parent_descriptor)
+    current = os.lstat(source)
+    if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+        raise SystemExit("encrypted archive temporary identity changed")
+    os.link(source, destination, follow_symlinks=False)
+    published = os.lstat(destination)
+    if (published.st_dev, published.st_ino) != (opened.st_dev, opened.st_ino):
+        raise SystemExit("encrypted archive publication identity changed")
+    os.fsync(parent_descriptor)
+    os.unlink(source)
+    os.fsync(parent_descriptor)
+finally:
+    os.close(source_descriptor)
+    os.close(parent_descriptor)
+PY
+  hindsight_cleanup_run_archive_command \
+    /usr/bin/python3 -I "$helper" "$temporary" "$destination" "$expected_digest"
+  rc=$?
+  /bin/rm -f "$helper"
+  return "$rc"
+}
+
+validate_archive_plan() {
+  emulate -L zsh
+  local archive_dir="$1"
+  local -a sources=("${(@s:,:)HINDSIGHT_CLEANUP_ARCHIVE_SOURCES}")
+  local source target parent existing_parent
+  local -A target_names=()
+  [[ ! -e "$archive_dir" && ! -L "$archive_dir" ]] ||
+    die "refusing existing archive artifact: ${archive_dir}"
+  for source in "${sources[@]}"; do
+    [[ "$source" == /* ]] || die "archive source must use an absolute path: ${source}"
+    [[ -e "$source" && ! -L "$source" ]] || die "archive source is missing or symlinked: ${source}"
+    [[ -f "$source" || -d "$source" ]] ||
+      die "archive source must be a regular file or directory: ${source}"
+    target="${source:t}"
+    [[ -z "${target_names[$target]:-}" ]] || die "archive sources have duplicate basename: ${target}"
+    target_names[$target]="$source"
+  done
+  validate_archive_parent_separation "${archive_dir:h}" "${sources[@]}"
+  parent="${archive_dir:h}"
+  existing_parent="$parent"
+  while [[ ! -e "$existing_parent" ]]; do
+    existing_parent="${existing_parent:h}"
+  done
+  validate_archive_parent "$existing_parent"
+}
+
+archive_sources() {
+  emulate -L zsh
+  local archive_dir="$1"
+  local encrypt_command="${HINDSIGHT_CLEANUP_ARCHIVE_ENCRYPT_COMMAND:-}"
+  local -a sources=("${(@s:,:)HINDSIGHT_CLEANUP_ARCHIVE_SOURCES}")
+  local source target
+
+  validate_trusted_artifact "$encrypt_command" "archive encryption command" executable allow-symlink
+  validate_archive_plan "$archive_dir"
+  mkdir -p -m 700 "${archive_dir:h}" || die "failed to create archive parent directory: ${archive_dir:h}"
+  validate_archive_parent "${archive_dir:h}"
+  (
+    local staging_dir="" verification_dir="" encrypted_tmp="" encrypted_digest encrypted_identity
+    staging_dir="$(mktemp -d -t hindsight-cleanup.plaintext)" ||
+      die "failed to create temporary archive staging directory"
+    trap '
+      [[ -z "${staging_dir:-}" ]] || /bin/rm -rf -- "$staging_dir"
+      [[ -z "${verification_dir:-}" ]] || /bin/rm -rf -- "$verification_dir"
+      [[ -z "${encrypted_tmp:-}" ]] || /bin/rm -f -- "$encrypted_tmp"
+    ' EXIT
+    [[ "$staging_dir" != "${archive_dir:h}"/* ]] ||
+      die "plaintext staging must be outside the archive root"
+    [[ -d "$staging_dir" && ! -L "$staging_dir" ]] ||
+      die "plaintext staging directory is unsafe"
+    [[ "$(/usr/bin/stat -f '%u:%Lp' "$staging_dir")" == "${EUID}:700" ]] ||
+      die "plaintext staging directory is not current-user private"
+    encrypted_tmp="$(mktemp "${archive_dir:h}/.single-bank-cleanup.encrypted.XXXXXX")" ||
+      die "failed to reserve encrypted archive output"
+    /bin/chmod 600 "$encrypted_tmp" || die "failed to protect reserved encrypted archive output"
+    encrypted_identity="$(/usr/bin/stat -f '%d:%i' "$encrypted_tmp")" ||
+      die "failed to inspect reserved encrypted archive output"
+    verification_dir="$(mktemp -d -t hindsight-cleanup.verify)" ||
+      die "failed to create temporary archive verification directory"
+    [[ "$verification_dir" != "${archive_dir:h}"/* ]] ||
+      die "plaintext verification must be outside the archive root"
+    [[ -d "$verification_dir" && ! -L "$verification_dir" ]] ||
+      die "plaintext verification directory is unsafe"
+    [[ "$(/usr/bin/stat -f '%u:%Lp' "$verification_dir")" == "${EUID}:700" ]] ||
+      die "plaintext verification directory is not current-user private"
+    for source in "${sources[@]}"; do
+      target="${staging_dir}/${source:t}"
+      archive_source_snapshot "$source" "$target" ||
+        die "archive source failed descriptor-bound snapshot: ${source}"
+      verify_archive_copy "$source" "$target" ||
+        die "archive content or metadata verification failed: ${source}"
+    done
+    hindsight_cleanup_run_archive_command \
+      "$encrypt_command" "$staging_dir" "$encrypted_tmp" ||
+      die "archive encryption command failed"
+    for source in "${sources[@]}"; do
+      verify_archive_copy "$source" "${staging_dir}/${source:t}" ||
+        die "archive staging changed during encryption: ${source}"
+    done
+    [[ -f "$encrypted_tmp" && ! -L "$encrypted_tmp" && -s "$encrypted_tmp" ]] ||
+      die "archive encryption command did not create a nonempty regular artifact"
+    [[ "$(/usr/bin/stat -f '%d:%i' "$encrypted_tmp")" == "$encrypted_identity" ]] ||
+      die "archive encryption command replaced its exclusively reserved output"
+    /bin/chmod 600 "$encrypted_tmp" || die "failed to protect encrypted archive artifact"
+    encrypted_digest="$(hindsight_cleanup_run_archive_command \
+      /usr/bin/shasum -a 256 "$encrypted_tmp")" ||
+      die "failed to digest encrypted archive artifact"
+    encrypted_digest="${encrypted_digest%% *}"
+    [[ "$encrypted_digest" =~ '^[0-9a-f]{64}$' ]] ||
+      die "encrypted archive artifact digest is invalid"
+    verify_encrypted_archive "$encrypted_tmp" "$staging_dir" "$verification_dir" ||
+      die "encrypted archive did not reproduce the verified snapshot"
+    /bin/rm -rf -- "$staging_dir" "$verification_dir" ||
+      die "failed to remove ephemeral plaintext archive state"
+    staging_dir=""
+    verification_dir=""
+    publish_encrypted_archive "$encrypted_tmp" "$archive_dir" "$encrypted_digest" ||
+      die "failed to publish encrypted archive artifact without replacement"
+    print -r -- "archived, verified, and encrypted: ${archive_dir}"
+  ) || return 1
+}
+
+profile_name_present() {
+  emulate -L zsh
+  local profile="$1"
+  profile_config_path "$profile" >/dev/null
+}
+
+profile_config_path() {
+  emulate -L zsh
+  local profile="$1"
+  local python tmp rc
+  python="$(api_python)"
+  tmp="$(mktemp -t hindsight-profiles.XXXXXX)" || die "failed to create temporary profile-list file"
+
+  if ! hindsight_cleanup_run_lifecycle_command \
+    "$HINDSIGHT_EMBED_UVX" hindsight-embed profile list -o json >"$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    print -ru2 -- "hindsight-embed-single-bank-cleanup: failed to list Hindsight profiles"
+    return 2
+  fi
+
+  if hindsight_cleanup_run_lifecycle_command "$python" -I -c '
+import json
+import sys
+
+profile = sys.argv[1]
+path = sys.argv[2]
+try:
+    with open(path, encoding="utf-8") as handle:
+        profiles = json.load(handle)
+except (OSError, json.JSONDecodeError):
+    raise SystemExit(2)
+
+if not isinstance(profiles, list):
+    raise SystemExit(2)
+
+for item in profiles:
+    if isinstance(item, dict) and item.get("name") == profile:
+        config = item.get("config")
+        if not isinstance(config, str) or not config:
+            raise SystemExit(2)
+        print(config)
+        raise SystemExit(0)
+
+raise SystemExit(1)
+' "$profile" "$tmp"
+  then
+    rc=0
+  else
+    rc=$?
+  fi
+  rm -f "$tmp"
+  case "$rc" in
+    0)
+      return 0
+      ;;
+    1)
+      return 1
+      ;;
+    *)
+      print -ru2 -- "hindsight-embed-single-bank-cleanup: failed to parse Hindsight profile list"
+      return 2
+      ;;
+  esac
+}
+
+profile_env_value() {
+  emulate -L zsh
+  local profile="$1"
+  local key="$2"
+  local python config_path profile_rc
+  python="$(api_python)"
+  if config_path="$(profile_config_path "$profile")"; then
+    profile_rc=0
+  else
+    profile_rc=$?
+  fi
+  case "$profile_rc" in
+    0)
+      ;;
+    1)
+      return 1
+      ;;
+    *)
+      return "$profile_rc"
+      ;;
+  esac
+
+  hindsight_cleanup_run_lifecycle_command "$python" -I -c '
+import sys
+
+path = sys.argv[1]
+key = sys.argv[2]
+prefix = f"{key}="
+
+try:
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            line = line.rstrip("\n").strip()
+            if line.startswith("export "):
+                line = line[7:].strip()
+            if line.startswith(prefix):
+                print(line[len(prefix):])
+                raise SystemExit(0)
+except OSError:
+    raise SystemExit(2)
+
+raise SystemExit(1)
+' "$config_path" "$key"
+}
+
+set_profile_bank() {
+  emulate -L zsh
+  local bank_id="$1"
+  hindsight_stack_load_config || return 1
+
+  hindsight_cleanup_run_lifecycle_command \
+    "$HINDSIGHT_EMBED_UVX" hindsight-embed profile set-env "$HINDSIGHT_EMBED_PROFILE" HINDSIGHT_BANK_ID "$bank_id" >/dev/null ||
+    die "failed to set ${HINDSIGHT_EMBED_PROFILE} HINDSIGHT_BANK_ID"
+}
+
+restore_profile_bank() {
+  emulate -L zsh
+  local previous_present="$1"
+  local previous_value="$2"
+  hindsight_stack_load_config || return 1
+
+  if [[ "$previous_present" == "1" ]]; then
+    hindsight_cleanup_run_lifecycle_command \
+      "$HINDSIGHT_EMBED_UVX" hindsight-embed profile set-env "$HINDSIGHT_EMBED_PROFILE" HINDSIGHT_BANK_ID "$previous_value" >/dev/null ||
+      return 1
+  else
+    hindsight_cleanup_run_lifecycle_command \
+      "$HINDSIGHT_EMBED_UVX" hindsight-embed profile remove-env "$HINDSIGHT_EMBED_PROFILE" HINDSIGHT_BANK_ID >/dev/null 2>&1 ||
+      return 1
+  fi
+}
+
+print_api_bank_counts() {
+  emulate -L zsh
+  hindsight_stack_load_config || return 1
+
+  local python url token
+  python="$(api_python)"
+  url="${HINDSIGHT_CLEANUP_BANKS_URL:-}"
+  token="${HINDSIGHT_CLEANUP_API_TOKEN:-}"
+  [[ "$url" =~ '^https?://(127\.0\.0\.1|\[::1\]):[0-9]+/v1/[A-Za-z0-9._-]+/banks$' ]] ||
+    die "HINDSIGHT_CLEANUP_BANKS_URL must select a literal-loopback tenant banks endpoint"
+  [[ "$token" =~ '^[A-Za-z0-9._~+/-]+=*$' ]] ||
+    die "HINDSIGHT_CLEANUP_API_TOKEN must be a non-empty bearer token"
+  local tmp
+  tmp="$(mktemp -t hindsight-banks.XXXXXX)" || die "failed to create temporary bank-count file"
+
+  if print -r -- "header = \"Authorization: Bearer ${token}\"" \
+    | /usr/bin/curl --disable --config - --noproxy '*' -fsS --max-time 5 "$url" >"$tmp"; then
+    print -r -- "API bank counts from ${url}:"
+    hindsight_cleanup_run_lifecycle_command "$python" -I -m json.tool "$tmp" || {
+      rm -f "$tmp"
+      return 1
+    }
+  else
+    print -r -- "API bank counts unavailable from ${url}"
+    rm -f "$tmp"
+    return 1
+  fi
+  rm -f "$tmp"
+}
+
+stop_managed_and_legacy_services() {
+  emulate -L zsh
+  hindsight_stack_load_config || return 1
+
+  capture_service_topology
+  typeset -g HINDSIGHT_CLEANUP_TOPOLOGY_CAPTURED=1
+
+  local service="${HINDSIGHT_EMBED_SERVICE_COMMAND:-}"
+  validate_trusted_artifact "$service" "service command" executable allow-symlink
+  HINDSIGHT_EMBED_MAINTENANCE_LEASE_HELD=1 \
+    hindsight_cleanup_run_lifecycle_command \
+      "$service" stop --maintenance-lease-held >/dev/null 2>&1 ||
+    die "failed to stop managed Hindsight service"
+  hindsight_stack_broker_stop || die "failed to stop Hindsight runtime broker"
+
+  local legacy_profile stop_profile display_profile
+  for legacy_profile in "${(@s:,:)HINDSIGHT_CLEANUP_LEGACY_PROFILES}"; do
+    [[ -n "$legacy_profile" ]] || continue
+    if [[ "$legacy_profile" == "@default" ]]; then
+      stop_profile=""
+      display_profile="default"
+    else
+      stop_profile="$legacy_profile"
+      display_profile="$legacy_profile"
+    fi
+    hindsight_stack_run_stop_helper \
+      --mode stop \
+      --profile "$stop_profile" \
+      --allow-unregistered-profile ||
+      die "failed to stop ${display_profile} profile services"
+  done
+
+  hindsight_stack_ui_running && die "${HINDSIGHT_EMBED_PROFILE} UI is still running after stop"
+  hindsight_stack_daemon_running && die "${HINDSIGHT_EMBED_PROFILE} daemon is still running after stop"
+  hindsight_stack_broker_status && die "runtime broker is still running after stop"
+  hindsight_stack_control_running && die "control center is still running after stop"
+  return 0
+}
+
+legacy_profile_cli_args() {
+  emulate -L zsh
+  local profile="$1"
+  if [[ "$profile" == "@default" ]]; then
+    reply=()
+  else
+    reply=(--profile "$profile")
+  fi
+}
+
+legacy_component_running() {
+  emulate -L zsh
+  local profile="$1" component="$2"
+  local -a reply
+  legacy_profile_cli_args "$profile"
+  hindsight_cleanup_run_lifecycle_command \
+    "$HINDSIGHT_EMBED_UVX" hindsight-embed "${reply[@]}" "$component" status >/dev/null 2>&1
+}
+
+wait_legacy_daemon_ready() {
+  emulate -L zsh
+  local profile="$1"
+  local timeout="${HINDSIGHT_EMBED_DAEMON_WAIT_SECONDS:-120}"
+  local -a reply
+  integer deadline=$(( $(/bin/date +%s) + timeout ))
+  integer remaining
+  legacy_profile_cli_args "$profile"
+  while true; do
+    remaining=$(( deadline - $(/bin/date +%s) ))
+    (( remaining > 0 )) || return 1
+    hindsight_stack_run_bounded "$remaining" \
+      "$HINDSIGHT_EMBED_UVX" hindsight-embed "${reply[@]}" daemon status >/dev/null 2>&1 &&
+      return 0
+    sleep 0.5
+  done
+}
+
+capture_service_topology() {
+  emulate -L zsh
+  typeset -g HINDSIGHT_CLEANUP_MANAGED_WAS_LOADED=0
+  typeset -g HINDSIGHT_CLEANUP_MANAGED_WAS_RUNNING=0
+  typeset -gA HINDSIGHT_CLEANUP_LEGACY_DAEMON_WAS_RUNNING=()
+  typeset -gA HINDSIGHT_CLEANUP_LEGACY_UI_WAS_RUNNING=()
+  local managed_status loaded_status
+  if managed_service_loaded; then
+    loaded_status=0
+  else
+    loaded_status=$?
+  fi
+  case "$loaded_status" in
+    0) HINDSIGHT_CLEANUP_MANAGED_WAS_LOADED=1 ;;
+    1) HINDSIGHT_CLEANUP_MANAGED_WAS_LOADED=0 ;;
+    *) die "failed to inspect managed Hindsight LaunchAgent state" ;;
+  esac
+  if managed_service_running; then
+    managed_status=0
+  else
+    managed_status=$?
+  fi
+  case "$managed_status" in
+    0) HINDSIGHT_CLEANUP_MANAGED_WAS_RUNNING=1 ;;
+    1) HINDSIGHT_CLEANUP_MANAGED_WAS_RUNNING=0 ;;
+    *) die "failed to inspect managed Hindsight service state" ;;
+  esac
+
+  local profile component_status
+  for profile in "${(@s:,:)HINDSIGHT_CLEANUP_LEGACY_PROFILES}"; do
+    [[ -n "$profile" ]] || continue
+    if legacy_component_running "$profile" daemon; then
+      component_status=0
+    else
+      component_status=$?
+    fi
+    case "$component_status" in
+      0) HINDSIGHT_CLEANUP_LEGACY_DAEMON_WAS_RUNNING[$profile]=1 ;;
+      1) HINDSIGHT_CLEANUP_LEGACY_DAEMON_WAS_RUNNING[$profile]=0 ;;
+      *) die "failed to inspect legacy ${profile} daemon state" ;;
+    esac
+    if legacy_component_running "$profile" ui; then
+      component_status=0
+    else
+      component_status=$?
+    fi
+    case "$component_status" in
+      0) HINDSIGHT_CLEANUP_LEGACY_UI_WAS_RUNNING[$profile]=1 ;;
+      1) HINDSIGHT_CLEANUP_LEGACY_UI_WAS_RUNNING[$profile]=0 ;;
+      *) die "failed to inspect legacy ${profile} UI state" ;;
+    esac
+  done
+}
+
+managed_service_loaded() {
+  emulate -L zsh
+  local label="${HINDSIGHT_EMBED_STACK_LABEL:-}"
+  [[ -n "$label" ]] || return 1
+  /bin/launchctl print "gui/${EUID}/${label}" >/dev/null 2>&1
+}
+
+managed_service_running() {
+  emulate -L zsh
+  # launchd being loaded does not prove that any managed component was active,
+  # and an unloaded job can leave children behind. Snapshot live runtime state.
+  hindsight_stack_control_running ||
+    hindsight_stack_broker_running ||
+    hindsight_stack_daemon_running ||
+    hindsight_stack_ui_running
+}
+
+restore_service_topology() {
+  emulate -L zsh
+  (( HINDSIGHT_CLEANUP_TOPOLOGY_CAPTURED )) || return 1
+  local result=0 profile component
+  integer daemon_ready
+  local -a reply
+  if (( ${HINDSIGHT_CLEANUP_MANAGED_WAS_LOADED:-0} || HINDSIGHT_CLEANUP_MANAGED_WAS_RUNNING )); then
+    start_managed_stack >/dev/null 2>&1 || result=1
+  fi
+  for profile in "${(@s:,:)HINDSIGHT_CLEANUP_LEGACY_PROFILES}"; do
+    [[ -n "$profile" ]] || continue
+    legacy_profile_cli_args "$profile"
+    daemon_ready=0
+    if (( ${HINDSIGHT_CLEANUP_LEGACY_DAEMON_WAS_RUNNING[$profile]:-0} )); then
+      if hindsight_cleanup_run_lifecycle_command \
+        "$HINDSIGHT_EMBED_UVX" hindsight-embed "${reply[@]}" daemon start >/dev/null 2>&1 &&
+        wait_legacy_daemon_ready "$profile"; then
+        daemon_ready=1
+      else
+        result=1
+      fi
+    fi
+    if (( ${HINDSIGHT_CLEANUP_LEGACY_UI_WAS_RUNNING[$profile]:-0} )); then
+      if (( ! daemon_ready )) && wait_legacy_daemon_ready "$profile"; then
+        daemon_ready=1
+      fi
+      if (( daemon_ready )); then
+        hindsight_cleanup_run_lifecycle_command \
+          "$HINDSIGHT_EMBED_UVX" hindsight-embed "${reply[@]}" ui start >/dev/null 2>&1 || result=1
+      else
+        result=1
+      fi
+    fi
+  done
+  return "$result"
+}
+
+validate_cleanup_helpers() {
+  emulate -L zsh
+  local include_archive_helpers="$1"
+  validate_trusted_artifact "$HINDSIGHT_EMBED_STACK_LIB" "stack library"
+  validate_trusted_artifact "$HINDSIGHT_EMBED_API_PYTHON" "Hindsight API Python" executable allow-symlink
+  validate_trusted_artifact "$HINDSIGHT_EMBED_MIGRATION_HELPER" "migration helper" readable allow-symlink
+  validate_trusted_artifact "$HINDSIGHT_EMBED_SERVICE_COMMAND" "service command" executable allow-symlink
+  validate_trusted_artifact "$HINDSIGHT_EMBED_UVX" "uvx" executable allow-symlink
+  if [[ -n "${HINDSIGHT_EMBED_STOP_HELPER:-}" ]]; then
+    validate_trusted_artifact "$HINDSIGHT_EMBED_STOP_HELPER" "stop helper" readable allow-symlink
+  fi
+  if (( include_archive_helpers )); then
+    validate_trusted_artifact "$HINDSIGHT_CLEANUP_ARCHIVE_ENCRYPT_COMMAND" "archive encryption command" executable allow-symlink
+    validate_trusted_artifact "$HINDSIGHT_CLEANUP_ARCHIVE_DECRYPT_COMMAND" "archive decryption command" executable allow-symlink
+  fi
+}
+
+start_profile_daemon_only() {
+  emulate -L zsh
+  hindsight_stack_load_config || return 1
+
+  typeset -g HINDSIGHT_CLEANUP_TEMPORARY_DAEMON_STARTED=1
+  hindsight_stack_daemon_start || return 1
+  print -r -- started
+}
+
+wait_profile_daemon_only() {
+  emulate -L zsh
+  hindsight_stack_load_config || return 1
+
+  hindsight_stack_wait_daemon
+}
+
+stop_profile_daemon_only() {
+  emulate -L zsh
+  hindsight_stack_load_config || return 1
+
+  hindsight_stack_run_stop_helper \
+    --mode stop-api \
+    --profile "$HINDSIGHT_EMBED_PROFILE" \
+    --desired-api-port "$HINDSIGHT_EMBED_API_PORT" ||
+    return 1
+  hindsight_stack_wait_stopped_for daemon "$HINDSIGHT_EMBED_STOP_WAIT_SECONDS" ||
+    return 1
+}
+
+run_migration_helper() {
+  emulate -L zsh
+  local mode="$1"
+  local allow_nonempty="$2"
+  local python helper
+  local -a source_banks=("${(@s:,:)HINDSIGHT_CLEANUP_SOURCE_BANKS}")
+  python="$(api_python)"
+  helper="$(migration_helper)"
+
+  local -a args=(
+    "$helper"
+    --mode "$mode"
+    --profile "$HINDSIGHT_EMBED_PROFILE"
+    --target-bank "$HINDSIGHT_BANK_ID"
+  )
+  local source_bank
+  for source_bank in "${source_banks[@]}"; do
+    args+=(--source-bank "$source_bank")
+  done
+  if [[ "$allow_nonempty" == "1" ]]; then
+    args+=(--allow-nonempty-target)
+  fi
+
+  hindsight_cleanup_run_migration_command "$python" "${args[@]}"
+}
+
+validate_delete_profiles() {
+  emulate -L zsh
+  hindsight_stack_load_config || return 1
+
+  local delete_profile enabled_profile
+  local -a enabled_profiles
+  enabled_profiles=("${(@f)$(hindsight_stack_enabled_profiles)}") ||
+    die "failed to resolve enabled Hindsight fleet profiles"
+  for delete_profile in "${(@s:,:)HINDSIGHT_CLEANUP_DELETE_PROFILES}"; do
+    [[ -n "$delete_profile" ]] || continue
+    hindsight_stack_valid_profile_name "$delete_profile" ||
+      die "refusing invalid delete profile name ${delete_profile}"
+    [[ "$delete_profile" != "$HINDSIGHT_EMBED_PROFILE" ]] ||
+      die "refusing to delete canonical profile ${HINDSIGHT_EMBED_PROFILE}"
+    for enabled_profile in "${enabled_profiles[@]}"; do
+      [[ "$delete_profile" != "$enabled_profile" ]] ||
+        die "refusing to delete enabled fleet profile ${delete_profile}"
+    done
+  done
+}
+
+validate_legacy_profiles() {
+  emulate -L zsh
+  hindsight_stack_load_config || return 1
+  local profile normalized
+  typeset -A seen=()
+  for profile in "${(@s:,:)HINDSIGHT_CLEANUP_LEGACY_PROFILES}"; do
+    [[ -n "$profile" ]] || continue
+    if [[ "$profile" == "@default" ]]; then
+      normalized=default
+    else
+      hindsight_stack_valid_profile_name "$profile" ||
+        die "refusing invalid legacy profile name ${profile}"
+      normalized="$profile"
+    fi
+    [[ "$normalized" != "$HINDSIGHT_EMBED_PROFILE" ]] ||
+      die "refusing canonical profile ${HINDSIGHT_EMBED_PROFILE} in legacy profile cleanup"
+    [[ -z "${seen[$normalized]:-}" ]] ||
+      die "refusing duplicate legacy profile ${profile}"
+    seen[$normalized]=1
+  done
+}
+
+validate_cleanup_policy() {
+  emulate -L zsh
+  validate_delete_profiles
+  validate_legacy_profiles
+}
+
+normalize_profile_config() {
+  emulate -L zsh
+  hindsight_stack_load_config || return 1
+  local delete_profile profile_rc
+
+  validate_delete_profiles
+  set_profile_bank "$HINDSIGHT_BANK_ID"
+  hindsight_cleanup_run_lifecycle_command \
+    "$HINDSIGHT_EMBED_UVX" hindsight-embed profile set-active "$HINDSIGHT_EMBED_PROFILE" >/dev/null ||
+    die "failed to set active profile to ${HINDSIGHT_EMBED_PROFILE}"
+  stop_profile_daemon_only ||
+    die "failed to stop temporary ${HINDSIGHT_EMBED_PROFILE} migration daemon"
+  for delete_profile in "${(@s:,:)HINDSIGHT_CLEANUP_DELETE_PROFILES}"; do
+    [[ -n "$delete_profile" ]] || continue
+    if profile_name_present "$delete_profile"; then
+      profile_rc=0
+    else
+      profile_rc=$?
+    fi
+    case "$profile_rc" in
+      0)
+        hindsight_stack_run_stop_helper \
+          --mode stop \
+          --profile "$delete_profile" \
+          --allow-unregistered-profile ||
+          die "failed to stop ${delete_profile} profile services before delete"
+        hindsight_cleanup_run_lifecycle_command \
+          "$HINDSIGHT_EMBED_UVX" hindsight-embed profile delete "$delete_profile" >/dev/null ||
+          die "failed to delete ${delete_profile} profile"
+        ;;
+      1)
+        ;;
+      *)
+        die "failed to check ${delete_profile} profile before delete"
+        ;;
+    esac
+
+    if profile_name_present "$delete_profile"; then
+      profile_rc=0
+    else
+      profile_rc=$?
+    fi
+    case "$profile_rc" in
+      0)
+        die "${delete_profile} profile still exists after delete"
+        ;;
+      1)
+        ;;
+      *)
+        die "failed to verify ${delete_profile} profile deletion"
+        ;;
+    esac
+  done
+  return 0
+}
+
+dry_run() {
+  emulate -L zsh
+  hindsight_stack_require_tools || exit 1
+  validate_cleanup_timeouts
+  validate_cleanup_policy
+
+  local archive_dir
+  archive_dir="$(archive_root_for_timestamp)"
+  validate_archive_plan "$archive_dir"
+  print_api_bank_counts || exit 1
+  print -r -- ""
+  print -r -- "planned archive directory: ${archive_dir}"
+  print -r -- "planned profile changes:"
+  print -r -- "  set ${HINDSIGHT_EMBED_PROFILE} HINDSIGHT_BANK_ID=${HINDSIGHT_BANK_ID}"
+  print -r -- "  set active profile to ${HINDSIGHT_EMBED_PROFILE}"
+  local delete_profile
+  for delete_profile in "${(@s:,:)HINDSIGHT_CLEANUP_DELETE_PROFILES}"; do
+    [[ -n "$delete_profile" ]] || continue
+    print -r -- "  delete ${delete_profile} profile after archive exists"
+  done
+  print -r -- ""
+  run_migration_helper dry-run "${allow_nonempty_target}" || exit 1
+}
+
+apply_cleanup_locked() {
+  emulate -L zsh
+  hindsight_stack_require_current_user || exit 1
+  hindsight_stack_require_tools || exit 1
+  validate_cleanup_timeouts
+  validate_cleanup_policy
+
+  local archive_dir
+  archive_dir="$(archive_root_for_timestamp)"
+  local previous_bank_id_rc
+  typeset -g HINDSIGHT_CLEANUP_RECOVERY_NEEDED=0
+  typeset -g HINDSIGHT_CLEANUP_BANK_RESTORE_NEEDED=0
+  typeset -g HINDSIGHT_CLEANUP_TEMPORARY_DAEMON_STARTED=0
+  typeset -g HINDSIGHT_CLEANUP_PREVIOUS_BANK_ID_PRESENT=0
+  typeset -g HINDSIGHT_CLEANUP_PREVIOUS_BANK_ID=""
+  typeset -g HINDSIGHT_CLEANUP_TOPOLOGY_CAPTURED=0
+  typeset -g HINDSIGHT_CLEANUP_PRECOMMIT=1
+  typeset -g HINDSIGHT_CLEANUP_OUTCOME_INDETERMINATE=0
+  typeset -g HINDSIGHT_CLEANUP_ARCHIVE_DIGEST=""
+  typeset -gi HINDSIGHT_CLEANUP_MAINTENANCE_LEASE_HELD=0
+  typeset -gi HINDSIGHT_CLEANUP_RESTART_AFTER_RELEASE=0
+  prepare_recovery_before_lease_release() {
+    emulate -L zsh
+    unsetopt ERR_EXIT
+    integer should_recover="$HINDSIGHT_CLEANUP_RECOVERY_NEEDED"
+    if (( HINDSIGHT_CLEANUP_TEMPORARY_DAEMON_STARTED )); then
+      if stop_profile_daemon_only; then
+        :
+      else
+        print -ru2 -- "hindsight-embed-single-bank-cleanup: failed to stop temporary migration daemon before recovery"
+        should_recover=0
+      fi
+    fi
+    if (( HINDSIGHT_CLEANUP_BANK_RESTORE_NEEDED )); then
+      print -ru2 -- "hindsight-embed-single-bank-cleanup: cleanup failed; restoring previous profile bank config"
+      if ! restore_profile_bank "$HINDSIGHT_CLEANUP_PREVIOUS_BANK_ID_PRESENT" "$HINDSIGHT_CLEANUP_PREVIOUS_BANK_ID"; then
+        print -ru2 -- "hindsight-embed-single-bank-cleanup: bank config restore failed; not restarting managed stack automatically"
+        should_recover=0
+      fi
+    fi
+    if (( HINDSIGHT_CLEANUP_OUTCOME_INDETERMINATE )); then
+      should_recover=0
+    fi
+    typeset -gi HINDSIGHT_CLEANUP_RESTART_AFTER_RELEASE="$should_recover"
+  }
+  restore_service_after_lease_release() {
+    emulate -L zsh
+    unsetopt ERR_EXIT
+    (( HINDSIGHT_CLEANUP_RESTART_AFTER_RELEASE )) || return 0
+    if (( HINDSIGHT_CLEANUP_PRECOMMIT )); then
+      print -ru2 -- "hindsight-embed-single-bank-cleanup: cleanup failed; restoring pre-cleanup service topology"
+      restore_service_topology >/dev/null 2>&1 ||
+        print -ru2 -- "hindsight-embed-single-bank-cleanup: service topology restore failed; restore the prior managed and legacy services manually"
+    else
+      print -ru2 -- "hindsight-embed-single-bank-cleanup: post-commit cleanup failed; attempting to restart managed stack"
+      if (( ${HINDSIGHT_CLEANUP_MANAGED_WAS_LOADED:-0} || HINDSIGHT_CLEANUP_MANAGED_WAS_RUNNING )); then
+        start_managed_stack >/dev/null 2>&1 ||
+          print -ru2 -- "hindsight-embed-single-bank-cleanup: restart attempt failed; run hindsight-embed-service start"
+      fi
+    fi
+  }
+  finish_cleanup_transaction() {
+    emulate -L zsh
+    unsetopt ERR_EXIT
+    integer lease_released=0
+    if (( HINDSIGHT_CLEANUP_RECOVERY_NEEDED )); then
+      prepare_recovery_before_lease_release
+    fi
+    if release_cleanup_maintenance_lease; then
+      lease_released=1
+    else
+      print -ru2 -- "hindsight-embed-single-bank-cleanup: failed to release maintenance lease during recovery"
+    fi
+    if (( HINDSIGHT_CLEANUP_RECOVERY_NEEDED && lease_released )); then
+      restore_service_after_lease_release
+    fi
+  }
+  {
+  acquire_cleanup_maintenance_lease
+  print_api_bank_counts || die "failed to record API bank counts"
+  validate_archive_plan "$archive_dir"
+  HINDSIGHT_CLEANUP_RECOVERY_NEEDED=1
+  stop_managed_and_legacy_services || die "failed to stop managed and legacy services"
+  archive_sources "$archive_dir" || die "failed to archive cleanup sources"
+  HINDSIGHT_CLEANUP_ARCHIVE_DIGEST="$(cleanup_archive_digest "$archive_dir")" ||
+    die "failed to bind cleanup commit to the encrypted archive"
+  if HINDSIGHT_CLEANUP_PREVIOUS_BANK_ID="$(profile_env_value "$HINDSIGHT_EMBED_PROFILE" HINDSIGHT_BANK_ID)"; then
+    previous_bank_id_rc=0
+  else
+    previous_bank_id_rc=$?
+  fi
+  case "$previous_bank_id_rc" in
+    0)
+      HINDSIGHT_CLEANUP_PREVIOUS_BANK_ID_PRESENT=1
+      ;;
+    1)
+      HINDSIGHT_CLEANUP_PREVIOUS_BANK_ID_PRESENT=0
+      HINDSIGHT_CLEANUP_PREVIOUS_BANK_ID=""
+      ;;
+    *)
+      die "failed to read previous ${HINDSIGHT_EMBED_PROFILE} HINDSIGHT_BANK_ID"
+      ;;
+  esac
+  HINDSIGHT_CLEANUP_BANK_RESTORE_NEEDED=1
+  set_profile_bank "$HINDSIGHT_BANK_ID" ||
+    die "failed to set ${HINDSIGHT_EMBED_PROFILE} HINDSIGHT_BANK_ID"
+  local daemon_start_state daemon_start_output
+  daemon_start_output="$(mktemp -t hindsight-cleanup-daemon-start.XXXXXX)" ||
+    die "failed to reserve daemon start result"
+  if ! start_profile_daemon_only >"$daemon_start_output"; then
+    /bin/rm -f "$daemon_start_output"
+    die "failed to start migration daemon"
+  fi
+  daemon_start_state="$(<"$daemon_start_output")"
+  /bin/rm -f "$daemon_start_output"
+  [[ "$daemon_start_state" == started ]] ||
+    die "migration daemon start returned unexpected state: ${daemon_start_state}"
+  HINDSIGHT_CLEANUP_TEMPORARY_DAEMON_STARTED=1
+  wait_profile_daemon_only || die "${HINDSIGHT_EMBED_PROFILE} daemon did not become healthy"
+  local migration_apply_rc=0 migration_reconcile_rc=0
+  run_migration_helper apply "${allow_nonempty_target}" || migration_apply_rc=$?
+  if (( migration_apply_rc != 0 )); then
+    run_migration_helper verify-committed "${allow_nonempty_target}" || migration_reconcile_rc=$?
+    case "$migration_reconcile_rc" in
+      0)
+        print -ru2 -- "hindsight-embed-single-bank-cleanup: migration helper exited ${migration_apply_rc}, but read-only reconciliation proved the migration committed"
+        ;;
+      3)
+        die "bank migration failed before commit"
+        ;;
+      *)
+        # The database outcome is unknown. Restoring the previous bank binding
+        # or service topology could point a committed database back at legacy
+        # state, so leave the canonical binding in place for manual recovery.
+        HINDSIGHT_CLEANUP_PRECOMMIT=0
+        HINDSIGHT_CLEANUP_BANK_RESTORE_NEEDED=0
+        HINDSIGHT_CLEANUP_OUTCOME_INDETERMINATE=1
+        die "bank migration outcome is indeterminate; read-only commit reconciliation failed"
+        ;;
+    esac
+  fi
+  # At this point either apply returned success or read-only reconciliation
+  # proved its transaction committed. The receipt records that durable result;
+  # it is not the commit boundary and later failures must not restore config.
+  HINDSIGHT_CLEANUP_PRECOMMIT=0
+  HINDSIGHT_CLEANUP_BANK_RESTORE_NEEDED=0
+  write_cleanup_commit_receipt \
+    "$archive_dir" "$HINDSIGHT_CLEANUP_ARCHIVE_DIGEST" ||
+    die "failed to durably record cleanup commit receipt"
+  cleanup_commit_receipt_valid \
+    "$archive_dir" "$HINDSIGHT_CLEANUP_ARCHIVE_DIGEST" ||
+    die "cleanup commit receipt failed verification"
+  normalize_profile_config || die "failed to normalize profile config"
+  HINDSIGHT_CLEANUP_TEMPORARY_DAEMON_STARTED=0
+  release_cleanup_maintenance_lease || die "failed to release cleanup maintenance lease"
+  if (( ${HINDSIGHT_CLEANUP_MANAGED_WAS_LOADED:-0} || HINDSIGHT_CLEANUP_MANAGED_WAS_RUNNING )); then
+    start_managed_stack || die "failed to restart managed stack"
+  fi
+  HINDSIGHT_CLEANUP_RECOVERY_NEEDED=0
+  print -r -- "archive directory: ${archive_dir}"
+  print -r -- "commit receipt: $(cleanup_commit_receipt_path "$archive_dir")"
+  } always {
+    # Unlike an EXIT trap, a Zsh always block finishes nested lifecycle
+    # helpers even when die exits from inside this transaction.
+    finish_cleanup_transaction
+  }
+}
+
+apply_cleanup() {
+  emulate -L zsh
+  hindsight_stack_require_current_user || exit 1
+  hindsight_stack_require_tools || exit 1
+  validate_cleanup_timeouts
+  validate_cleanup_policy
+  run_with_cleanup_lock apply_cleanup_locked
+}
+
+main() {
+  emulate -L zsh
+  setopt pipe_fail no_unset
+
+  apply=0
+  allow_nonempty_target=0
+  HINDSIGHT_CLEANUP_SOURCE_BANKS="${HINDSIGHT_CLEANUP_SOURCE_BANKS:-}"
+  HINDSIGHT_CLEANUP_ARCHIVE_SOURCES="${HINDSIGHT_CLEANUP_ARCHIVE_SOURCES:-}"
+  HINDSIGHT_CLEANUP_LEGACY_PROFILES="${HINDSIGHT_CLEANUP_LEGACY_PROFILES:-}"
+  HINDSIGHT_CLEANUP_DELETE_PROFILES="${HINDSIGHT_CLEANUP_DELETE_PROFILES:-}"
+  HINDSIGHT_CLEANUP_ARCHIVE_TIMEOUT_SECONDS="${HINDSIGHT_CLEANUP_ARCHIVE_TIMEOUT_SECONDS:-3600}"
+  HINDSIGHT_CLEANUP_MIGRATION_TIMEOUT_SECONDS="${HINDSIGHT_CLEANUP_MIGRATION_TIMEOUT_SECONDS:-3600}"
+
+  while (( $# )); do
+    case "$1" in
+      --dry-run)
+        apply=0
+        shift
+        ;;
+      --apply)
+        apply=1
+        shift
+        ;;
+      --allow-nonempty-target)
+        allow_nonempty_target=1
+        shift
+        ;;
+      -h|--help|help)
+        usage
+        return 0
+        ;;
+      *)
+        usage >&2
+        die "unknown argument: $1"
+        ;;
+    esac
+  done
+
+  [[ -n "${HINDSIGHT_BANK_ID:-}" ]] || die "HINDSIGHT_BANK_ID is required"
+  [[ -n "$HINDSIGHT_CLEANUP_SOURCE_BANKS" ]] || die "HINDSIGHT_CLEANUP_SOURCE_BANKS is required"
+  [[ -n "$HINDSIGHT_CLEANUP_ARCHIVE_SOURCES" ]] || die "HINDSIGHT_CLEANUP_ARCHIVE_SOURCES is required"
+  [[ -n "${HINDSIGHT_CLEANUP_BANKS_URL:-}" ]] || die "HINDSIGHT_CLEANUP_BANKS_URL is required"
+  [[ -n "${HINDSIGHT_CLEANUP_API_TOKEN:-}" ]] || die "HINDSIGHT_CLEANUP_API_TOKEN is required"
+  [[ -n "${HINDSIGHT_CLEANUP_ARCHIVE_ROOT:-}" ]] || die "HINDSIGHT_CLEANUP_ARCHIVE_ROOT is required"
+  [[ -n "${HINDSIGHT_EMBED_STACK_LIB:-}" ]] || die "HINDSIGHT_EMBED_STACK_LIB is required"
+  [[ -n "${HINDSIGHT_EMBED_API_PYTHON:-}" ]] || die "HINDSIGHT_EMBED_API_PYTHON is required"
+  [[ -n "${HINDSIGHT_EMBED_MIGRATION_HELPER:-}" ]] || die "HINDSIGHT_EMBED_MIGRATION_HELPER is required"
+  [[ -n "${HINDSIGHT_EMBED_SERVICE_COMMAND:-}" ]] || die "HINDSIGHT_EMBED_SERVICE_COMMAND is required"
+  load_stack_lib
+  hindsight_stack_load_config || return 1
+  if (( apply )); then
+    [[ -n "${HINDSIGHT_CLEANUP_ARCHIVE_ENCRYPT_COMMAND:-}" ]] ||
+      die "HINDSIGHT_CLEANUP_ARCHIVE_ENCRYPT_COMMAND is required for --apply"
+    [[ -n "${HINDSIGHT_CLEANUP_ARCHIVE_DECRYPT_COMMAND:-}" ]] ||
+      die "HINDSIGHT_CLEANUP_ARCHIVE_DECRYPT_COMMAND is required for --apply"
+    validate_cleanup_helpers 1
+    apply_cleanup
+  else
+    validate_cleanup_helpers 0
+    dry_run
+  fi
+}
+
+main "$@"

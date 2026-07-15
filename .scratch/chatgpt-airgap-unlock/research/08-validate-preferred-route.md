@@ -321,21 +321,82 @@ host RPC pass.
 | Permission enforcement/approval | Profiles listed; no denial and approval scenario run | Red/unproven |
 | Plugin install/settings UI | Local capability exists in prior research; not exercised here | Red/unproven |
 
-## Metadata and usage degradation
+## Pinned model metadata
 
-The host warned that the exact local model has no bundled metadata and used
-fallback metadata with a `258400` context window. OptiQ reported
-`input_tokens: 0` even though its log showed roughly 3.4k prompt tokens
-processed. The short sentinel remains valid, but this run does not validate:
+The supported Codex startup seam is `model_catalog_json`. The runner now builds
+a catalog under isolated `CODEX_HOME` instead of changing the copied app or its
+bundled Codex binary. The catalog keeps three concepts separate:
 
-- context limits;
-- compaction thresholds;
-- reasoning or modality metadata; or
-- input-token usage accounting.
+| Concept | Pinned value | Evidence |
+| --- | --- | --- |
+| Semantic model identity | Exact snapshot path plus `:no-think` | Matches the identifiers served by OptiQ `/v1/models` |
+| Renderer display metadata | `Qwen3.5-2B-OptiQ-4bit (no-think)` | App-server `model/list` and copied-app model control |
+| Capability metadata | No reasoning levels, default `none`, text input, `262144` model context | Pinned model config, model card, and conservative unsupported-feature values |
 
-The implementation needs pinned local metadata appropriate to the exact model.
-Usage normalization belongs only at a seam with authoritative tokenizer-backed
-counts.
+`08-model-catalog.py` also preserves the exact fallback instructions embedded
+in the pinned Codex 0.144.2 binary, verified by SHA-256, so supplying display
+metadata does not silently replace the agent instructions. The no-app contract
+in `08-model-catalog-test.py` passes through both `codex debug models` and the
+stdio app-server `model/list` interface. The app-server result contains one
+exact model, the pinned display name, `defaultReasoningEffort: none`, no
+supported reasoning efforts, and text-only input.
+
+The single copied-app proof retained under run-root
+`$TMPDIR/chatgpt-route-prototype-08.PUfaZS` passed the scoped renderer gates:
+
+```text
+RENDERER_MODEL_SURFACE_OBSERVED=true
+RENDERER_MODEL_METADATA_MATCHED=true
+RENDERER_FALLBACK_MODEL_METADATA_ABSENT=true
+LOGIN_WALL_OBSERVED=false
+ACCOUNT_READ_OBSERVED=true
+MAIN_UI_OBSERVED=true
+PROVIDER_REQUEST_OBSERVED=true
+PROVIDER_LISTENER_OBSERVED=true
+GATEWAY_LISTENER_OBSERVED=true
+GATEWAY_TERMINAL_OBSERVED=true
+GATEWAY_BODY_LEAK_OBSERVED=false
+GATEWAY_MISSING_AUTH_REJECTED=true
+GATEWAY_WRONG_AUTH_REJECTED=true
+UPSTREAM_TOKEN_REPLACED=true
+UPSTREAM_TERMINAL_COMPLETED=true
+NAMESPACE_TOOL_CONTINUATION=true
+MODEL_LIST_ISOLATED=true
+REMOTE_SOCKET_OBSERVED=false
+TOKEN_LEAK_OBSERVED=false
+OWNED_PROCESSES_EXITED=true
+OWNED_LISTENERS_CLOSED=true
+APP_ASAR_UNCHANGED=true
+CODEX_UNCHANGED=true
+```
+
+The visible control read `Qwen3.5-2B-OptiQ-4bit (no-think) Medium`. The model
+identity is now exact and the generic `Custom Light` fallback is absent.
+`Medium` is renderer composer-selection state, not a catalog capability claim:
+the app-server catalog still reports default `none` with no selectable
+reasoning efforts. Reconciling that appended selection label remains part of
+the full renderer-visible capability contract.
+
+The overall prototype command exited red without a rerun on these unrelated
+workflow gates:
+
+```text
+CDP_OBSERVER_HEALTHY=false
+RENDERER_PROMPT_COMPLETED=false
+RENDERER_TASKS_OBSERVED=false
+RENDERER_LOCAL_SKILL_VISIBLE=false
+```
+
+The renderer turn did not complete, so Tasks and the project-local skill were
+not observed and the CDP observer inherited the driver failure. Settings,
+Plugins, Skills, the model surface, provider routing, isolation, integrity, and
+cleanup checks completed. This red does not weaken the independently asserted
+metadata slice and is not presented as a full workflow pass.
+
+Input-token usage accounting remains degraded: OptiQ reports `input_tokens: 0`
+even when its log shows prompt processing. Usage normalization belongs only at
+a seam with authoritative tokenizer-backed counts. Compaction behavior at the
+pinned model limit also remains unexercised.
 
 ## Failed-probe history
 

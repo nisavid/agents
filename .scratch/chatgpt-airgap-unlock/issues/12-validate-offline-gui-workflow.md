@@ -21,16 +21,15 @@ all passed. See
 [`research/12-validate-offline-gui-workflow.md`](../research/12-validate-offline-gui-workflow.md).
 
 The ticket remains open for native project-picker, worktree, and permission
-interaction; a persisted Plan-mode turn and its renderer/persistence binding;
-project-local skill visibility; and exact renderer-visible model metadata.
+interaction; project-local skill visibility; and reconciliation of the
+renderer's appended reasoning-selection label with the pinned catalog.
 
-The dedicated mode slice now observes the Default `/plan` command and selected
-Plan indicator through renderer controls. Its first run persisted a completed
-Default turn with `collaboration_mode.mode=default`, then stopped before the
-Plan turn because the initial probe imposed an unrelated exact-answer oracle.
-The revised no-app probe compares nonempty renderer and persisted completion
-hashes while preserving exact prompt, turn, and mode binding. It remains live
-unvalidated. See
+Default and Plan mode behavior is complete. The copied-app probe observed both
+renderer controls, completed one turn in each mode, and bound each renderer
+output hash to a persisted completion with the exact corresponding
+`collaboration_mode.mode` value. Exact renderer-visible model identity is also
+complete: the renderer displayed `Qwen3.5-2B-OptiQ-4bit (no-think)` and did not
+display the fallback `Custom Light` label. See
 [`research/12-validate-offline-gui-workflow.md`](../research/12-validate-offline-gui-workflow.md).
 
 ## Acceptance
@@ -40,7 +39,7 @@ unvalidated. See
 - **Complete:** Materialize a local thread from a user message, reopen it after a cold restart, and continue it from the renderer.
 - Select or create a local project and Git worktree without remote Git and verify their state survives a cold restart.
 - Observe one allowed and one denied local operation by their effects, not merely by prompt visibility.
-- Exercise Default and Plan modes and verify their observable local turn settings.
+- **Complete:** Exercise Default and Plan modes and verify their observable local turn settings.
 - Exercise bundled and preseeded local skill or plugin paths and verify network-dependent extensions fail explicitly without blocking the local core.
 - Verify settings expose every control required by this workflow and that renderer-visible model metadata matches the pinned profile or fails red.
 - Capture one to three focused screenshots plus artifact-bound, secret-redacted assertions; remove all owned processes, listeners, and disposable state at completion.

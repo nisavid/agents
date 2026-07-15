@@ -46,6 +46,10 @@ PROBE_DURATION_MS="${PROBE_DURATION_MS:-20000}"
 PROBE_EXPECT="${PROBE_EXPECT:-usable-ui}"
 GUI_WORKFLOW="${GUI_WORKFLOW:-false}"
 GUI_COLD_RESUME="${GUI_COLD_RESUME:-false}"
+GUI_NATIVE_PROJECT_PICKER="${GUI_NATIVE_PROJECT_PICKER:-false}"
+NATIVE_GUI_PROBE_BIN="${NATIVE_GUI_PROBE_BIN:-}"
+NATIVE_GUI_PROBE_SHA256="${NATIVE_GUI_PROBE_SHA256:-}"
+NATIVE_GUI_PROBE_KEY_FALLBACK="${NATIVE_GUI_PROBE_KEY_FALLBACK:-false}"
 RUN_LOCK="/private/tmp/chatgpt-route-prototype-08.lock"
 
 record_cold_handoff_phase() {
@@ -202,9 +206,35 @@ case "$GUI_COLD_RESUME" in
   false|true) ;;
   *) echo "GUI_COLD_RESUME must be true or false" >&2; exit 64 ;;
 esac
+case "$GUI_NATIVE_PROJECT_PICKER" in
+  false|true) ;;
+  *) echo "GUI_NATIVE_PROJECT_PICKER must be true or false" >&2; exit 64 ;;
+esac
+case "$NATIVE_GUI_PROBE_KEY_FALLBACK" in
+  false|true) ;;
+  *) echo "NATIVE_GUI_PROBE_KEY_FALLBACK must be true or false" >&2; exit 64 ;;
+esac
 if test "$GUI_COLD_RESUME" = true; then
   test "$GUI_WORKFLOW" = true
   test "$ROUTE_MODE" = gateway
+fi
+if test "$GUI_NATIVE_PROJECT_PICKER" = true; then
+  test "$GUI_WORKFLOW" = true
+  test -n "$NATIVE_GUI_PROBE_BIN"
+  test -n "$NATIVE_GUI_PROBE_SHA256"
+  test "${NATIVE_GUI_PROBE_BIN#/}" != "$NATIVE_GUI_PROBE_BIN"
+  test ! -L "$NATIVE_GUI_PROBE_BIN"
+  native_gui_probe_realpath="$(realpath "$NATIVE_GUI_PROBE_BIN")"
+  test "$(basename "$native_gui_probe_realpath")" = chatgpt-native-gui-probe
+  case "$native_gui_probe_realpath" in
+    /Applications/*) echo "native GUI helper must not be inside /Applications" >&2; exit 65 ;;
+  esac
+  printf '%s\n' "$NATIVE_GUI_PROBE_SHA256" | /usr/bin/grep -Eq '^[0-9a-f]{64}$'
+  test -x "$native_gui_probe_realpath"
+  test "$(/usr/bin/shasum -a 256 "$native_gui_probe_realpath" | /usr/bin/awk '{print $1}')" = \
+    "$NATIVE_GUI_PROBE_SHA256"
+  /usr/bin/codesign --verify --strict "$native_gui_probe_realpath"
+  NATIVE_GUI_PROBE_BIN="$native_gui_probe_realpath"
 fi
 
 test -d "$SOURCE_APP"
@@ -672,6 +702,39 @@ sleep 1
     /bin/ps -p "$pid" -o pid=,ppid=,pgid=,state=,etime=,command=
   done
 } >"$LOG_DIR/processes-01s.txt"
+if test "$GUI_NATIVE_PROJECT_PICKER" = true; then
+  /usr/bin/env -i \
+    PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+    HOME="$HOME_DIR" \
+    TMPDIR="$TMP_DIR" \
+    LANG="en_US.UTF-8" \
+    /usr/bin/sandbox-exec -f "$GATEWAY_PROFILE" -D "REAL_HOME=$REAL_HOME" \
+      "$NODE" "$GUI_DRIVER_EXEC" "$CDP_PORT" open-project-picker 30000 \
+    >"$LOG_DIR/cdp-native-open.jsonl" 2>"$LOG_DIR/cdp-native-open.stderr"
+  /usr/bin/grep -Fq '"kind":"native-project-picker-requested"' \
+    "$LOG_DIR/cdp-native-open.jsonl"
+  copied_app_pid="$(/bin/ps -axo pid=,pgid=,command= | \
+    /usr/bin/awk -v wanted_group="$app_pid" -v wanted_executable="$APP_EXEC" \
+      '$2 == wanted_group && $3 == wanted_executable {print $1}')"
+  test -n "$copied_app_pid"
+  test "$(printf '%s\n' "$copied_app_pid" | /usr/bin/wc -l | /usr/bin/tr -d ' ')" -eq 1
+  set -- \
+    --pid "$copied_app_pid" \
+    --run-root "$RUN_ROOT" \
+    --expected-bundle "$APP" \
+    --expected-executable "$APP_EXEC" \
+    --fixture-root "$WORKSPACE_DIR" \
+    --phase select-project \
+    --event-log "$LOG_DIR/native-gui-probe.jsonl"
+  if test "$NATIVE_GUI_PROBE_KEY_FALLBACK" = true; then
+    set -- "$@" --permit-key-fallback
+  fi
+  "$NATIVE_GUI_PROBE_BIN" "$@" \
+    >"$LOG_DIR/native-gui-probe.stdout" 2>"$LOG_DIR/native-gui-probe.stderr"
+  /usr/bin/grep -Fq '"kind":"project-selection-issued"' \
+    "$LOG_DIR/native-gui-probe.jsonl"
+  sleep 1
+fi
 if test "$GUI_WORKFLOW" = true; then
   cdp_command="$GUI_DRIVER_EXEC"
   cdp_argument="first"
@@ -811,6 +874,11 @@ else
   native_project_picker_exercised=false
   native_permission_decision_exercised=false
   native_worktree_control_exercised=false
+  if test "$GUI_NATIVE_PROJECT_PICKER" = true && \
+    test -f "$LOG_DIR/native-gui-probe.jsonl" && \
+    /usr/bin/grep -Fq '"kind":"project-selection-issued"' "$LOG_DIR/native-gui-probe.jsonl"; then
+    native_project_picker_exercised=true
+  fi
   renderer_thread_reopened=false
   renderer_continuation_completed=false
   renderer_same_rollout_continuation=false
@@ -1034,6 +1102,9 @@ else
     test "$renderer_continuation_completed" = true
     test "$renderer_same_rollout_continuation" = true
   fi
+  if test "$GUI_NATIVE_PROJECT_PICKER" = true; then
+    test "$native_project_picker_exercised" = true
+  fi
 fi
 test "$provider_request_observed" = true
 test "$auth_json_present" = false
@@ -1070,5 +1141,6 @@ case "$PROBE_EXPECT" in
   usable-ui) test "$login_wall_observed" = false; test "$main_ui_observed" = true ;;
   renderer-workflow) test "$GUI_WORKFLOW" = true; test "$login_wall_observed" = false; test "$main_ui_observed" = true ;;
   renderer-cold-resume) test "$GUI_COLD_RESUME" = true; test "$login_wall_observed" = false; test "$main_ui_observed" = true ;;
+  renderer-native-project) test "$GUI_NATIVE_PROJECT_PICKER" = true; test "$login_wall_observed" = false; test "$main_ui_observed" = true ;;
   *) echo "unknown PROBE_EXPECT: $PROBE_EXPECT" >&2; exit 64 ;;
 esac

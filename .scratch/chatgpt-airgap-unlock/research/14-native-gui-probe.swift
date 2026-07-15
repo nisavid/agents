@@ -154,8 +154,12 @@ enum PathPolicy {
               isDirectory.boolValue else {
             throw ProbeError.validation("fixture root is not a directory")
         }
-        guard FileManager.default.fileExists(atPath: (canonicalFixture as NSString).appendingPathComponent(".git")) else {
-            throw ProbeError.validation("fixture root is not a Git worktree")
+        let gitMetadata = (canonicalFixture as NSString).appendingPathComponent(".git")
+        var gitIsDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: gitMetadata, isDirectory: &gitIsDirectory),
+              gitIsDirectory.boolValue,
+              try canonicalExisting(gitMetadata) == gitMetadata else {
+            throw ProbeError.validation("fixture root does not contain owned Git metadata")
         }
         guard (canonicalEventLog as NSString).deletingLastPathComponent ==
                 (root as NSString).appendingPathComponent("logs"),
@@ -179,7 +183,8 @@ enum OpenPanelPolicy {
 
     static func plan(windows: [ElementDescription], permitKeyFallback: Bool) throws -> SelectionPlan {
         let candidates = windows.filter { window in
-            guard window.role == kAXWindowRole || window.role == kAXSheetRole else { return false }
+            guard (window.role == kAXWindowRole && window.subrole == kAXStandardWindowSubrole) ||
+                    window.role == kAXSheetRole else { return false }
             let descendants = [window] + window.descendants
             let hasCancel = descendants.contains {
                 $0.role == kAXButtonRole && $0.title?.lowercased() == "cancel" &&
@@ -529,8 +534,9 @@ func execute(options: Options, paths: ValidatedPaths, log: EventLog) throws {
 }
 
 func testElement(role: String, title: String? = nil, identifier: String? = nil,
-                 actions: Set<String> = [], children: [ElementDescription] = []) -> ElementDescription {
-    ElementDescription(role: role, subrole: nil, identifier: identifier, title: title,
+                 subrole: String? = nil, actions: Set<String> = [],
+                 children: [ElementDescription] = []) -> ElementDescription {
+    ElementDescription(role: role, subrole: subrole, identifier: identifier, title: title,
                        help: nil, actions: actions, children: children)
 }
 
@@ -541,10 +547,11 @@ func runSelfTests() throws {
     let cancel = testElement(role: kAXButtonRole, title: "Cancel", actions: [kAXPressAction])
     let choose = testElement(role: kAXButtonRole, title: "Open", actions: [kAXPressAction])
     let direct = testElement(role: kAXTextFieldRole, identifier: "path", actions: [])
-    let panel = testElement(role: kAXWindowRole, children: [cancel, choose, direct])
+    let panel = testElement(role: kAXWindowRole, subrole: kAXStandardWindowSubrole,
+                            children: [cancel, choose, direct])
     try require(try OpenPanelPolicy.plan(windows: [panel], permitKeyFallback: false) ==
                 SelectionPlan(navigation: .direct, chooserTitle: "Open"), "direct plan")
-    let fallbackPanel = testElement(role: kAXWindowRole, children: [cancel, choose])
+    let fallbackPanel = testElement(role: kAXSheetRole, children: [cancel, choose])
     try require(try OpenPanelPolicy.plan(windows: [fallbackPanel], permitKeyFallback: true).navigation ==
                 .commandShiftG, "explicit key fallback")
     var rejected = false
@@ -555,7 +562,8 @@ func runSelfTests() throws {
     do { _ = try OpenPanelPolicy.plan(windows: [panel, panel], permitKeyFallback: false) }
     catch ProbeError.validation { rejected = true }
     try require(rejected, "duplicate panels passed")
-    let duplicateChooser = testElement(role: kAXWindowRole, children: [cancel, choose, choose, direct])
+    let duplicateChooser = testElement(role: kAXWindowRole, subrole: kAXStandardWindowSubrole,
+                                       children: [cancel, choose, choose, direct])
     rejected = false
     do { _ = try OpenPanelPolicy.plan(windows: [duplicateChooser], permitKeyFallback: false) }
     catch ProbeError.validation { rejected = true }

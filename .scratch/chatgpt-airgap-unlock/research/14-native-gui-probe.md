@@ -111,6 +111,14 @@ contract. Extracted build 26.707.71524 (5263) source confirms the command is a
 direct `File` → `Open Folder…` item; the PID-bound helper now invokes that exact
 item through AX and owns the subsequent native-panel evidence.
 
+A fifth inspection-only run stopped before launching either the copied app or
+the helper. The host app-server sandbox rejected the shared profile because its
+`NATIVE_GUI_PROBE_BIN` path parameter had no value, then the host probe timed
+out. This was runner plumbing, not native-menu evidence. The runner now passes
+the exact protected helper path as a sandbox profile definition to both the
+initial and cold-restart host app-server commands; the helper path is not added
+to either isolated child environment.
+
 ## Permission boundary
 
 Do not run the live seam until Ivan has reviewed the final artifact hash and

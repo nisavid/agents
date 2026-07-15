@@ -77,6 +77,12 @@ Extracted build source confirms a direct `File` → `Open Folder…` command, so
 helper now rejects keyboard delivery for that step and performs one exact
 PID-scoped AX menu press instead.
 
+The fifth inspection run did not reach the copied app or helper. Both host
+app-server drivers omitted the shared profile's required protected-helper path
+definition, so the initial sandbox command failed before app launch. The runner
+now propagates the exact protected path to the initial and cold-restart host
+sandbox commands without exporting it into their isolated child environments.
+
 No new Accessibility request, TCC mutation, installed-app launch, or live AX
 action has occurred for this revision. The reviewed no-permission artifact is
 recorded in `research/14-native-gui-probe.md`; read-only menu inspection with the

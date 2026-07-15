@@ -51,8 +51,10 @@ PROBE_EXPECT=renderer-native-project \
 ```
 
 The runner first requires one enabled, visible renderer control with the exact
-accessible name `Choose project`, proving that no project is selected. It then
-sends one trusted CDP `Meta+O` accelerator to the copied app. The bundled
+accessible name `Choose project` as the expected selector precondition. It
+checks that control only to prove the per-run nonce fixture is not already
+selected; it does not infer broader project state from the label. The runner
+then sends one trusted CDP `Meta+O` accelerator to the copied app. The bundled
 `Open Folder…` command routes directly through the local workspace bridge to
 `pickLocalWorkspaceRoots` and its parented `showOpenDialog`; it does not depend
 on the project-selector menu's feature-gated shape. The runner resolves exactly

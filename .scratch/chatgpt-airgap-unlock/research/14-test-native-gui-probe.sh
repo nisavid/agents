@@ -108,18 +108,17 @@ test "$(printf '%s\n' "$trusted_accelerator_body" | /usr/bin/grep -Fc 'type: "ke
 test "$(printf '%s\n' "$trusted_accelerator_body" | /usr/bin/grep -Fc 'modifiers: 4')" -eq 2
 test "$(printf '%s\n' "$trusted_accelerator_body" | /usr/bin/grep -Fc 'code: "KeyO"')" -eq 2
 test "$(printf '%s\n' "$trusted_accelerator_body" | /usr/bin/grep -Fc 'key: "o"')" -eq 2
-test "$(printf '%s\n' "$picker_request_body" | /usr/bin/grep -Fc 'await dispatchTrustedOpenFolderAccelerator()')" -eq 1
+test "$(printf '%s\n' "$picker_request_body" | /usr/bin/grep -Fc \
+  'await requestNativeProjectPickerFromPrecondition(expectedFixtureRoot, chooseProject);')" -eq 1
 choose_project_line="$(printf '%s\n' "$picker_request_body" | \
   /usr/bin/grep -nF 'accessibleName: "Choose project"' | /usr/bin/awk -F: '{print $1}')"
-accelerator_line="$(printf '%s\n' "$picker_request_body" | \
-  /usr/bin/grep -nF 'await dispatchTrustedOpenFolderAccelerator()' | /usr/bin/awk -F: '{print $1}')"
-picker_requested_line="$(printf '%s\n' "$picker_request_body" | \
-  /usr/bin/grep -nF 'emit("native-project-picker-requested"' | /usr/bin/awk -F: '{print $1}')"
+picker_request_line="$(printf '%s\n' "$picker_request_body" | \
+  /usr/bin/grep -nF \
+  'await requestNativeProjectPickerFromPrecondition(expectedFixtureRoot, chooseProject);' | \
+  /usr/bin/awk -F: '{print $1}')"
 test -n "$choose_project_line"
-test -n "$accelerator_line"
-test -n "$picker_requested_line"
-test "$choose_project_line" -lt "$accelerator_line"
-test "$accelerator_line" -lt "$picker_requested_line"
+test -n "$picker_request_line"
+test "$choose_project_line" -lt "$picker_request_line"
 /usr/bin/grep -Fq 'preconditionAccessibleName: "Choose project"' \
   "$HERE/12-cdp-gui-driver.mjs"
 if printf '%s\n' "$picker_request_body" | /usr/bin/grep -Eq \

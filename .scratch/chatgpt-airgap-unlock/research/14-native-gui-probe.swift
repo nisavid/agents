@@ -85,6 +85,7 @@ struct ProcessVerification: Equatable {
 enum AttributePublication<Value: Equatable>: Equatable {
     case missing
     case malformed
+    case readFailure(Int32)
     case value(Value)
 }
 
@@ -116,6 +117,7 @@ struct OpenFolderMenuPlan: Equatable, Hashable {
     let menuItemIndex: Int
     let parentTitle: String
     let itemTitle: String
+    let commandVirtualKey: Int?
 }
 
 struct SelectionPlan: Equatable {
@@ -285,7 +287,6 @@ enum OpenFolderMenuPolicy {
         case openFolderMenuItem = "Open Folder menu item is unpublished"
         case commandCharacter = "command character is unpublished"
         case emptyCommandCharacter = "command character is empty"
-        case commandVirtualKey = "command virtual key is unpublished"
         case commandModifiers = "command modifiers are unpublished"
     }
 
@@ -363,17 +364,28 @@ enum OpenFolderMenuPolicy {
         case .malformed:
             throw ProbeError.validation(
                 "Open Folder menu item has malformed command character type")
+        case .readFailure(let status):
+            throw ProbeError.unavailable(
+                "Open Folder menu item command character read failed: \(status)")
         case .value(let value):
             guard !value.isEmpty else { return .pending(.emptyCommandCharacter) }
             commandCharacter = value
         }
-        let menuCommandVirtualKey: Int
+        let menuCommandVirtualKey: Int?
         switch item.menuCommandVirtualKey {
-        case .missing: return .pending(.commandVirtualKey)
+        case .missing: menuCommandVirtualKey = nil
         case .malformed:
             throw ProbeError.validation(
                 "Open Folder menu item has malformed command virtual key type")
-        case .value(let value): menuCommandVirtualKey = value
+        case .readFailure(let status):
+            throw ProbeError.unavailable(
+                "Open Folder menu item command virtual key read failed: \(status)")
+        case .value(let value):
+            guard value == commandVirtualKey else {
+                throw ProbeError.validation(
+                    "Open Folder menu item has unexpected command virtual key: \(value)")
+            }
+            menuCommandVirtualKey = value
         }
         let menuCommandModifiers: Int
         switch item.menuCommandModifiers {
@@ -381,15 +393,14 @@ enum OpenFolderMenuPolicy {
         case .malformed:
             throw ProbeError.validation(
                 "Open Folder menu item has malformed command modifiers type")
+        case .readFailure(let status):
+            throw ProbeError.unavailable(
+                "Open Folder menu item command modifiers read failed: \(status)")
         case .value(let value): menuCommandModifiers = value
         }
         guard commandCharacter.lowercased() == "o" else {
             throw ProbeError.validation(
                 "Open Folder menu item has unexpected command character: \(commandCharacter)")
-        }
-        guard menuCommandVirtualKey == commandVirtualKey else {
-            throw ProbeError.validation(
-                "Open Folder menu item has unexpected command virtual key: \(menuCommandVirtualKey)")
         }
         guard menuCommandModifiers == commandModifiers else {
             throw ProbeError.validation(
@@ -397,7 +408,8 @@ enum OpenFolderMenuPolicy {
         }
         return .ready(OpenFolderMenuPlan(
             menuBarItemIndex: parentIndex, menuIndex: menuIndex,
-            menuItemIndex: itemIndex, parentTitle: parent.title!, itemTitle: itemTitle))
+            menuItemIndex: itemIndex, parentTitle: parent.title!, itemTitle: itemTitle,
+            commandVirtualKey: menuCommandVirtualKey))
     }
 }
 
@@ -674,10 +686,17 @@ func stringAttributePublication(
     _ name: CFString
 ) -> AttributePublication<String> {
     var value: CFTypeRef?
-    guard AXUIElementCopyAttributeValue(element, name, &value) == .success else {
-        return .missing
-    }
-    return stringPublication(value)
+    let status = AXUIElementCopyAttributeValue(element, name, &value)
+    return attributePublication(status: status) { stringPublication(value) }
+}
+
+func attributePublication<Value: Equatable>(
+    status: AXError,
+    published: () -> AttributePublication<Value>
+) -> AttributePublication<Value> {
+    if status == .success { return published() }
+    if status == .attributeUnsupported || status == .noValue { return .missing }
+    return .readFailure(status.rawValue)
 }
 
 func stringPublication(_ value: CFTypeRef?) -> AttributePublication<String> {
@@ -701,10 +720,8 @@ func intAttributePublication(
     _ name: CFString
 ) -> AttributePublication<Int> {
     var value: CFTypeRef?
-    guard AXUIElementCopyAttributeValue(element, name, &value) == .success else {
-        return .missing
-    }
-    return integralIntPublication(value)
+    let status = AXUIElementCopyAttributeValue(element, name, &value)
+    return attributePublication(status: status) { integralIntPublication(value) }
 }
 
 func actions(_ element: AXUIElement) -> Set<String> {
@@ -938,10 +955,16 @@ func openFolderMenuSnapshot(application: AXUIElement) throws
                 let description = describeShallow(item)
                 if description.title == OpenFolderMenuPolicy.itemTitle,
                    let parentTitle {
+                    let commandVirtualKey: Int?
+                    switch description.menuCommandVirtualKey {
+                    case .value(let value): commandVirtualKey = value
+                    case .missing, .malformed, .readFailure: commandVirtualKey = nil
+                    }
                     let path = OpenFolderMenuPlan(
                         menuBarItemIndex: parentIndex, menuIndex: menuIndex,
                         menuItemIndex: itemIndex, parentTitle: parentTitle,
-                        itemTitle: OpenFolderMenuPolicy.itemTitle)
+                        itemTitle: OpenFolderMenuPolicy.itemTitle,
+                        commandVirtualKey: commandVirtualKey)
                     liveItems[path] = item
                 }
                 return description
@@ -1161,18 +1184,22 @@ func execute(options: Options, paths: ValidatedPaths, log: EventLog) throws {
         let menuReadiness = try waitForValidatedOpenFolderMenu(
             application: application, process: identity)
         let menuPlan = menuReadiness.plan
-        try log.write("open-folder-menu-validated", [
+        var menuFields: [String: Any] = [
             "pid": Int(identity.pid),
             "parentTitle": menuPlan.parentTitle,
             "itemTitle": menuPlan.itemTitle,
             "commandCharacter": "O",
-            "commandVirtualKey": OpenFolderMenuPolicy.commandVirtualKey,
+            "commandVirtualKeyPublished": menuPlan.commandVirtualKey != nil,
             "commandModifiers": OpenFolderMenuPolicy.commandModifiers,
             "enabled": true,
             "action": kAXPressAction,
             "actionCount": 0,
             "pollCount": menuReadiness.pollCount,
-        ])
+        ]
+        if let commandVirtualKey = menuPlan.commandVirtualKey {
+            menuFields["commandVirtualKey"] = commandVirtualKey
+        }
+        try log.write("open-folder-menu-validated", menuFields)
         return
     }
     // BEGIN_PID_OPEN_FOLDER_REQUEST
@@ -1180,16 +1207,20 @@ func execute(options: Options, paths: ValidatedPaths, log: EventLog) throws {
         let menuReadiness = try pressOpenFolderMenuItem(
             application: application, process: identity)
         let menuPlan = menuReadiness.plan
-        try log.write("open-folder-menu-item-pressed", [
+        var menuFields: [String: Any] = [
             "pid": Int(identity.pid),
             "parentTitle": menuPlan.parentTitle,
             "itemTitle": menuPlan.itemTitle,
             "commandCharacter": "O",
-            "commandVirtualKey": OpenFolderMenuPolicy.commandVirtualKey,
+            "commandVirtualKeyPublished": menuPlan.commandVirtualKey != nil,
             "commandModifiers": OpenFolderMenuPolicy.commandModifiers,
             "actionCount": 1,
             "pollCount": menuReadiness.pollCount,
-        ])
+        ]
+        if let commandVirtualKey = menuPlan.commandVirtualKey {
+            menuFields["commandVirtualKey"] = commandVirtualKey
+        }
+        try log.write("open-folder-menu-item-pressed", menuFields)
     }
     let readiness = try waitForValidatedOpenPanel(
         application: application, identity: identity,
@@ -1248,8 +1279,10 @@ func execute(options: Options, paths: ValidatedPaths, log: EventLog) throws {
 
 func testPublication<Value: Equatable>(
     _ value: Value?,
-    malformed: Bool
+    malformed: Bool,
+    readFailure: Int32? = nil
 ) -> AttributePublication<Value> {
+    if let readFailure { return .readFailure(readFailure) }
     if malformed { return .malformed }
     return value.map(AttributePublication.value) ?? .missing
 }
@@ -1258,20 +1291,26 @@ func testElement(role: String, title: String? = nil, identifier: String? = nil,
                  subrole: String? = nil, enabled: Bool? = nil,
                  menuCommandCharacter: String? = nil,
                  menuCommandCharacterMalformed: Bool = false,
+                 menuCommandCharacterReadFailure: Int32? = nil,
                  menuCommandVirtualKey: Int? = nil,
                  menuCommandVirtualKeyMalformed: Bool = false,
+                 menuCommandVirtualKeyReadFailure: Int32? = nil,
                  menuCommandModifiers: Int? = nil,
                  menuCommandModifiersMalformed: Bool = false,
+                 menuCommandModifiersReadFailure: Int32? = nil,
                  actions: Set<String> = [],
                  children: [ElementDescription] = []) -> ElementDescription {
     ElementDescription(role: role, subrole: subrole, identifier: identifier, title: title,
                        help: nil, enabled: enabled,
                        menuCommandCharacter: testPublication(
-                        menuCommandCharacter, malformed: menuCommandCharacterMalformed),
+                        menuCommandCharacter, malformed: menuCommandCharacterMalformed,
+                        readFailure: menuCommandCharacterReadFailure),
                        menuCommandVirtualKey: testPublication(
-                        menuCommandVirtualKey, malformed: menuCommandVirtualKeyMalformed),
+                        menuCommandVirtualKey, malformed: menuCommandVirtualKeyMalformed,
+                        readFailure: menuCommandVirtualKeyReadFailure),
                        menuCommandModifiers: testPublication(
-                        menuCommandModifiers, malformed: menuCommandModifiersMalformed),
+                        menuCommandModifiers, malformed: menuCommandModifiersMalformed,
+                        readFailure: menuCommandModifiersReadFailure),
                        actions: actions, children: children)
 }
 
@@ -1290,6 +1329,26 @@ func runSelfTests() throws {
                 "string AX command value was coerced to an integer")
     try require(stringPublication(NSNumber(value: 31)) == .malformed,
                 "numeric AX command character was coerced to a string")
+    let unsupportedPublication: AttributePublication<Int> = attributePublication(
+        status: .attributeUnsupported) { .value(31) }
+    let noValuePublication: AttributePublication<Int> = attributePublication(
+        status: .noValue) { .value(31) }
+    try require(unsupportedPublication == .missing && noValuePublication == .missing,
+                "unsupported or valueless AX attribute was not classified as unpublished")
+    let successfulPublication: AttributePublication<Int> = attributePublication(
+        status: .success) { .value(31) }
+    try require(successfulPublication == .value(31),
+                "successful AX attribute read discarded its published value")
+    let hardReadFailures: [AXError] = [
+        .failure, .invalidUIElement, .cannotComplete, .notImplemented, .apiDisabled,
+    ]
+    for status in hardReadFailures {
+        let publication: AttributePublication<Int> = attributePublication(status: status) {
+            .value(31)
+        }
+        try require(publication == .readFailure(status.rawValue),
+                    "hard AX read failure was classified as unpublished")
+    }
     let expectedProcess = ProcessIdentity(pid: 42, startSeconds: 10,
                                           startMicroseconds: 20,
                                           executable: "/private/tmp/copied/ChatGPT")
@@ -1451,18 +1510,24 @@ func runSelfTests() throws {
                  itemRole: String = kAXMenuItemRole, enabled: Bool? = true,
                  actions: Set<String> = [kAXPressAction], commandCharacter: String? = "O",
                  commandCharacterMalformed: Bool = false,
+                 commandCharacterReadFailure: Int32? = nil,
                  commandVirtualKey: Int? = 31,
                  commandVirtualKeyMalformed: Bool = false,
+                 commandVirtualKeyReadFailure: Int32? = nil,
                  commandModifiers: Int? = 0,
-                 commandModifiersMalformed: Bool = false)
+                 commandModifiersMalformed: Bool = false,
+                 commandModifiersReadFailure: Int32? = nil)
         -> ElementDescription {
         let item = testElement(role: itemRole, title: itemTitle, enabled: enabled,
                                menuCommandCharacter: commandCharacter,
                                menuCommandCharacterMalformed: commandCharacterMalformed,
+                               menuCommandCharacterReadFailure: commandCharacterReadFailure,
                                menuCommandVirtualKey: commandVirtualKey,
                                menuCommandVirtualKeyMalformed: commandVirtualKeyMalformed,
+                               menuCommandVirtualKeyReadFailure: commandVirtualKeyReadFailure,
                                menuCommandModifiers: commandModifiers,
                                menuCommandModifiersMalformed: commandModifiersMalformed,
+                               menuCommandModifiersReadFailure: commandModifiersReadFailure,
                                actions: actions)
         let menu = testElement(role: menuRole, children: [item])
         let parent = testElement(role: parentRole, title: parentTitle,
@@ -1477,7 +1542,15 @@ func runSelfTests() throws {
     }
     let validMenuPlan = try OpenFolderMenuPolicy.plan(menuBar: menuBar())
     try require(validMenuPlan.parentTitle == "File" &&
-                validMenuPlan.itemTitle == "Open Folder…", "valid Open Folder menu plan")
+                validMenuPlan.itemTitle == "Open Folder…" &&
+                validMenuPlan.commandVirtualKey == 31, "valid Open Folder menu plan")
+    let unpublishedVirtualKeyPlan = try OpenFolderMenuPolicy.plan(
+        menuBar: menuBar(commandVirtualKey: nil))
+    try require(unpublishedVirtualKeyPlan.menuBarItemIndex == validMenuPlan.menuBarItemIndex &&
+                unpublishedVirtualKeyPlan.menuIndex == validMenuPlan.menuIndex &&
+                unpublishedVirtualKeyPlan.menuItemIndex == validMenuPlan.menuItemIndex &&
+                unpublishedVirtualKeyPlan.commandVirtualKey == nil,
+                "unpublished optional virtual key did not preserve the exact menu path")
     let lowercaseCommandPlan = try OpenFolderMenuPolicy.plan(
         menuBar: menuBar(commandCharacter: "o"))
     try require(lowercaseCommandPlan == validMenuPlan,
@@ -1500,8 +1573,6 @@ func runSelfTests() throws {
                             "missing direct menu role passed")
     try requireRejectedMenu(menuBar(commandVirtualKey: 35),
                             "wrong Open Folder command virtual key passed")
-    try requireRejectedMenu(menuBar(commandVirtualKey: nil),
-                            "missing Open Folder command virtual key passed")
     try requireRejectedMenu(menuBar(commandModifiers: 1),
                             "wrong Open Folder command modifiers passed")
     try requireRejectedMenu(menuBar(commandModifiers: nil),
@@ -1555,7 +1626,6 @@ func runSelfTests() throws {
     let unpublishedCommandMetadataCases: [(String, ElementDescription)] = [
         ("missing character", menuBar(commandCharacter: nil)),
         ("empty character", menuBar(commandCharacter: "")),
-        ("missing virtual key", menuBar(commandVirtualKey: nil)),
         ("missing modifiers", menuBar(commandModifiers: nil)),
     ]
     for (label, description) in unpublishedCommandMetadataCases {
@@ -1590,7 +1660,7 @@ func runSelfTests() throws {
             readSnapshot: {
                 missingMetadataReads += 1
                 return OpenFolderMenuSnapshot<String>(
-                    description: menuBar(commandVirtualKey: nil), items: [:])
+                    description: menuBar(commandModifiers: nil), items: [:])
             },
             pause: {
                 missingMetadataPauses += 1
@@ -1598,7 +1668,7 @@ func runSelfTests() throws {
             })
     } catch ProbeError.unavailable(let message) {
         rejected = message == "Open Folder menu did not become ready after 3 polls; " +
-            "last pending state: command virtual key is unpublished"
+            "last pending state: command modifiers are unpublished"
     }
     try require(rejected && missingMetadataReads == 3 && missingMetadataPauses == 3,
                 "persistent missing command metadata did not use the exact timeout")
@@ -1650,6 +1720,42 @@ func runSelfTests() throws {
         menuBar(commandModifiersMalformed: true),
         expectedMessage: "Open Folder menu item has malformed command modifiers type",
         "published malformed command modifiers did not fail immediately")
+    func requireImmediateCommandMetadataReadFailure(
+        _ description: ElementDescription,
+        expectedMessage: String,
+        _ message: String
+    ) throws {
+        var reads = 0
+        var pauses = 0
+        var exactError = false
+        do {
+            _ = try waitForReadyOpenFolderMenu(
+                timeoutNanoseconds: 1_000_000_000,
+                pollMicroseconds: 100,
+                nowNanoseconds: { 0 },
+                validateIdentity: {},
+                readSnapshot: {
+                    reads += 1
+                    return OpenFolderMenuSnapshot<String>(description: description, items: [:])
+                },
+                pause: { _ in pauses += 1 })
+        } catch ProbeError.unavailable(let actualMessage) {
+            exactError = actualMessage == expectedMessage
+        }
+        try require(exactError && reads == 1 && pauses == 0, message)
+    }
+    try requireImmediateCommandMetadataReadFailure(
+        menuBar(commandCharacterReadFailure: -25204),
+        expectedMessage: "Open Folder menu item command character read failed: -25204",
+        "command character AX read failure did not fail immediately")
+    try requireImmediateCommandMetadataReadFailure(
+        menuBar(commandVirtualKeyReadFailure: -25204),
+        expectedMessage: "Open Folder menu item command virtual key read failed: -25204",
+        "optional virtual key AX read failure did not fail immediately")
+    try requireImmediateCommandMetadataReadFailure(
+        menuBar(commandModifiersReadFailure: -25204),
+        expectedMessage: "Open Folder menu item command modifiers read failed: -25204",
+        "command modifiers AX read failure did not fail immediately")
     let wrongFileTitleSnapshot = OpenFolderMenuSnapshot<String>(
         description: menuBar(parentTitle: "Workspace"), items: [:])
     let missingFileTitleSnapshot = OpenFolderMenuSnapshot<String>(
@@ -1689,9 +1795,6 @@ func runSelfTests() throws {
         ("empty command character", OpenFolderMenuSnapshot<String>(
             description: menuBar(commandCharacter: ""), items: [:]),
          "command character is empty"),
-        ("command virtual key", OpenFolderMenuSnapshot<String>(
-            description: menuBar(commandVirtualKey: nil), items: [:]),
-         "command virtual key is unpublished"),
         ("command modifiers", OpenFolderMenuSnapshot<String>(
             description: menuBar(commandModifiers: nil), items: [:]),
          "command modifiers are unpublished"),
@@ -1720,7 +1823,7 @@ func runSelfTests() throws {
     var changingPendingSnapshots: [OpenFolderMenuSnapshot<String>?] = [
         nil,
         OpenFolderMenuSnapshot<String>(
-            description: menuBar(commandVirtualKey: nil), items: [:]),
+            description: menuBar(commandCharacter: nil), items: [:]),
         OpenFolderMenuSnapshot<String>(
             description: menuBar(commandModifiers: nil), items: [:]),
     ]
@@ -1740,7 +1843,7 @@ func runSelfTests() throws {
     }
     try require(rejected, "menu timeout did not report the final observed pending state")
     rejected = false
-    do { _ = try OpenFolderMenuPolicy.plan(menuBar: menuBar(commandVirtualKey: nil)) }
+    do { _ = try OpenFolderMenuPolicy.plan(menuBar: menuBar(commandCharacter: nil)) }
     catch ProbeError.validation(let message) {
         rejected = message == "direct File to Open Folder menu path is absent"
     }

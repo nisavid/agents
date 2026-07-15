@@ -26,7 +26,26 @@ test "$probe_sha256" = "$probe_second_sha256"
 "$PROBE" --self-test
 /usr/bin/python3 "$HERE/14-project-state.py" --self-test
 /bin/sh -n "$HERE/08-run-prototype.sh"
+/bin/sh -n "$HERE/14-build-native-gui-probe.sh"
+/bin/sh -n "$HERE/14-test-native-gui-probe.sh"
+"$HERE/08-run-prototype.sh" --self-test
 "$NODE" "$HERE/12-cdp-gui-driver.mjs" --self-test
+
+if "$PROBE" 2>"$BUILD_ROOT/options.stderr"; then
+  echo 'optionless helper invocation unexpectedly passed' >&2
+  exit 1
+fi
+test "$(/bin/cat "$BUILD_ROOT/options.stderr")" = \
+  'native-gui-probe: missing required option: --pid'
+
+mkdir -p "$BUILD_ROOT/nonregular-output/chatgpt-native-gui-probe"
+if "$HERE/14-build-native-gui-probe.sh" \
+  "$BUILD_ROOT/nonregular-output" 2>"$BUILD_ROOT/nonregular-output.stderr"; then
+  echo 'non-regular build artifact path unexpectedly passed' >&2
+  exit 1
+fi
+/usr/bin/grep -Fq 'refusing non-regular artifact path' \
+  "$BUILD_ROOT/nonregular-output.stderr"
 
 if /usr/bin/grep -Eq 'AXUIElementCreateSystemWide|AXIsProcessTrustedWithOptions|NSWorkspace|NSTask|NSAppleScript|NSClassFromString|dlopen|dlsym|objc_msgSend|osascript|tccutil|System Events|CGEventPost\(|\.post\(|(^|[^[:alnum:]_])Process\(|posix_spawn|exec[lv]|system\(|(^|[^[:alnum:]_])kill\(|terminate\(' \
   "$HERE/14-native-gui-probe.swift"; then
@@ -54,6 +73,21 @@ fi
 /usr/bin/grep -Fq 'test "$(/usr/bin/stat -f '\''%d:%i'\'' "$NATIVE_GUI_PROBE_BIN")" = "$native_gui_probe_device_inode"' \
   "$HERE/08-run-prototype.sh"
 /usr/bin/grep -Fq '"transitionValidated": true' "$HERE/08-run-prototype.sh"
+/usr/bin/grep -Fq 'PATH="/usr/bin:/bin:/usr/sbin:/sbin"' \
+  "$HERE/14-build-native-gui-probe.sh"
+/usr/bin/grep -Fq '(deny file-write* (literal (param "NATIVE_GUI_PROBE_BIN")))' \
+  "$HERE/08-probe.sb"
+/usr/bin/grep -Fq 'NATIVE_GUI_PROBE_PROTECTED_PATH="$RUN_ROOT/.native-gui-probe-disabled"' \
+  "$HERE/08-run-prototype.sh"
+/usr/bin/grep -Fq 'test ! -e "$NATIVE_GUI_PROBE_PROTECTED_PATH"' \
+  "$HERE/08-run-prototype.sh"
+if /usr/bin/grep -Fq 'NATIVE_GUI_PROBE_PROTECTED_PATH="/dev/null"' \
+  "$HERE/08-run-prototype.sh"; then
+  echo 'non-native sandbox still protects a shared device path' >&2
+  exit 1
+fi
+/usr/bin/grep -Fq -- '-D "NATIVE_GUI_PROBE_BIN=$NATIVE_GUI_PROBE_PROTECTED_PATH"' \
+  "$HERE/08-run-prototype.sh"
 
 sensitive_symbols="$(/usr/bin/nm -u "$PROBE" | /usr/bin/awk '{print $NF}' | \
   /usr/bin/grep -E '(^_(AX|CGEvent|IOHID|NSAppleScript|LS(Open|Launch)|posix_spawn|exec|fork|system|kill|Sec(Code|StaticCode)|proc_))|NSTask|NSWorkspace' | \

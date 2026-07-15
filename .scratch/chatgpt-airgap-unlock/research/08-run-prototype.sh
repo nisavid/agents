@@ -51,6 +51,7 @@ GUI_NATIVE_PROJECT_PICKER="${GUI_NATIVE_PROJECT_PICKER:-false}"
 NATIVE_GUI_PROBE_BIN="${NATIVE_GUI_PROBE_BIN:-}"
 NATIVE_GUI_PROBE_SHA256="${NATIVE_GUI_PROBE_SHA256:-}"
 NATIVE_GUI_PROBE_KEY_FALLBACK="${NATIVE_GUI_PROBE_KEY_FALLBACK:-false}"
+NATIVE_GUI_PROBE_PROTECTED_PATH=""
 RUN_LOCK="/private/tmp/chatgpt-route-prototype-08.lock"
 
 record_cold_handoff_phase() {
@@ -86,6 +87,20 @@ require_positive_terminal_delta() {
       "$checked_terminal_delta" >&2
     return 1
   fi
+}
+
+wait_for_native_project_database() {
+  state_validator="$1"
+  state_database="$2"
+  attempts="$3"
+  attempt=0
+  while test "$attempt" -lt "$attempts"; do
+    if /usr/bin/python3 "$state_validator" ready "$state_database"; then return 0; fi
+    sleep 0.1
+    attempt=$((attempt + 1))
+  done
+  echo "authoritative native project database did not become ready" >&2
+  return 1
 }
 
 run_cold_handoff_self_test() (
@@ -137,6 +152,22 @@ run_cold_handoff_self_test() (
   test "$signal_status" -eq 143
   test "$(/usr/bin/tail -n 1 "$LOG_DIR/cold-handoff.jsonl")" = \
     '{"kind":"signal","signal":"TERM","status":143}'
+  delayed_database="$self_test_root/delayed-state.sqlite"
+  (
+    sleep 0.2
+    /usr/bin/sqlite3 "$delayed_database" \
+      'CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT NOT NULL);'
+  ) &
+  delayed_database_writer=$!
+  wait_for_native_project_database "$NATIVE_PROJECT_STATE" "$delayed_database" 20
+  wait "$delayed_database_writer"
+  if wait_for_native_project_database "$NATIVE_PROJECT_STATE" \
+    "$self_test_root/missing-state.sqlite" 2 2>"$self_test_root/database.stderr"; then
+    echo "missing authoritative project database unexpectedly passed" >&2
+    return 1
+  fi
+  test "$(/bin/cat "$self_test_root/database.stderr")" = \
+    'authoritative native project database did not become ready'
   printf 'cold handoff self-test passed\n'
 )
 
@@ -163,6 +194,8 @@ trap 'record_top_level_signal INT 130' INT
 trap 'record_top_level_signal TERM 143' TERM
 
 RUN_ROOT="$(mktemp -d /private/tmp/chatgpt-route-prototype-08.XXXXXX)"
+NATIVE_GUI_PROBE_PROTECTED_PATH="$RUN_ROOT/.native-gui-probe-disabled"
+test ! -e "$NATIVE_GUI_PROBE_PROTECTED_PATH"
 INBOUND_TOKEN="sk-optiq-inbound-$(/usr/bin/uuidgen | /usr/bin/tr '[:upper:]' '[:lower:]')"
 UPSTREAM_TOKEN="sk-optiq-upstream-$(/usr/bin/uuidgen | /usr/bin/tr '[:upper:]' '[:lower:]')"
 WRONG_INBOUND_TOKEN="sk-optiq-wrong-$(/usr/bin/uuidgen | /usr/bin/tr '[:upper:]' '[:lower:]')"
@@ -246,6 +279,7 @@ if test "$GUI_NATIVE_PROJECT_PICKER" = true; then
   /usr/bin/codesign --verify --strict "$native_gui_probe_realpath"
   native_gui_probe_device_inode="$(/usr/bin/stat -f '%d:%i' "$native_gui_probe_realpath")"
   NATIVE_GUI_PROBE_BIN="$native_gui_probe_realpath"
+  NATIVE_GUI_PROBE_PROTECTED_PATH="$native_gui_probe_realpath"
 fi
 
 test -d "$SOURCE_APP"
@@ -686,7 +720,8 @@ launch_app() {
     ELECTRON_ENABLE_LOGGING=1 \
     RUST_LOG=info \
     /usr/bin/python3 "$PROCESS_GROUP" \
-    /usr/bin/sandbox-exec -f "$PROFILE" -D "REAL_HOME=$REAL_HOME" "$APP_EXEC" \
+    /usr/bin/sandbox-exec -f "$PROFILE" -D "REAL_HOME=$REAL_HOME" \
+      -D "NATIVE_GUI_PROBE_BIN=$NATIVE_GUI_PROBE_PROTECTED_PATH" "$APP_EXEC" \
       --no-sandbox \
       --user-data-dir="$USER_DATA_DIR" \
       --remote-debugging-port="$CDP_PORT" \
@@ -716,7 +751,8 @@ sleep 1
   done
 } >"$LOG_DIR/processes-01s.txt"
 if test "$GUI_NATIVE_PROJECT_PICKER" = true; then
-  test -f "$CODEX_DIR/state_5.sqlite"
+  wait_for_native_project_database "$NATIVE_PROJECT_STATE_EXEC" \
+    "$CODEX_DIR/state_5.sqlite" 200
   /usr/bin/python3 "$NATIVE_PROJECT_STATE_EXEC" capture \
     "$CODEX_DIR/state_5.sqlite" "$(realpath "$WORKSPACE_DIR")" "$NATIVE_PROJECT_BASELINE"
   /usr/bin/env -i \

@@ -321,7 +321,8 @@ if test "$GUI_WORKFLOW" = true; then
 # Offline renderer smoke fixture
 
 For the renderer smoke prompts, do not use tools and do not send a preamble.
-Return only the exact phase or mode sentinel requested by the user.
+Return only the exact phase sentinel requested by the user. For a mode prompt,
+return one short nonempty sentence.
 EOF
 fi
 cat >"$WORKSPACE_DIR/README.md" <<'EOF'

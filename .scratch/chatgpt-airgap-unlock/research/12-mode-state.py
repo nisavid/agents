@@ -10,10 +10,8 @@ import sys
 import tempfile
 
 
-DEFAULT_PROMPT = "Reply exactly MODE_DEFAULT_OK and nothing else. Do not use tools."
-DEFAULT_SENTINEL = "MODE_DEFAULT_OK"
-PLAN_PROMPT = "Reply exactly MODE_PLAN_OK and nothing else. Do not use tools."
-PLAN_SENTINEL = "MODE_PLAN_OK"
+DEFAULT_PROMPT = "Confirm Default mode in one short sentence. Do not use tools."
+PLAN_PROMPT = "Confirm Plan mode in one short sentence. Do not use tools."
 
 
 class ContractError(RuntimeError):
@@ -40,7 +38,7 @@ def exact_input_text(record: dict) -> str | None:
     return content[0].get("text", "").strip()
 
 
-def bind_turn(rollout: list[dict], prompt: str, sentinel: str, expected_mode: str) -> dict:
+def bind_turn(rollout: list[dict], prompt: str, expected_mode: str) -> dict:
     matches: list[dict] = []
     active_context: dict | None = None
     for record in rollout:
@@ -71,8 +69,8 @@ def bind_turn(rollout: list[dict], prompt: str, sentinel: str, expected_mode: st
     match = matches[0]
     if match["mode"] != expected_mode:
         raise ContractError(f"{expected_mode} prompt persisted mode {match['mode']!r}")
-    if match["final"] != sentinel:
-        raise ContractError(f"{expected_mode} turn did not complete with exact sentinel")
+    if not match["final"]:
+        raise ContractError(f"{expected_mode} turn completed with empty output")
     return {
         "mode": expected_mode,
         "turnIdSha256": sha256_text(match["turn_id"]),
@@ -99,16 +97,38 @@ def validate(codex_home: pathlib.Path, cdp_path: pathlib.Path) -> dict:
     )
     if any(summary.get(field) is not True for field in required):
         raise ContractError("renderer mode summary is not fully green")
+    mode_outputs = [record for record in cdp if record.get("kind") == "mode-turn-output"]
+    if len(mode_outputs) != 2:
+        raise ContractError(f"expected two renderer mode outputs, found {len(mode_outputs)}")
+    renderer_by_mode: dict[str, dict] = {}
+    for output in mode_outputs:
+        mode = output.get("mode")
+        if mode in renderer_by_mode or mode not in ("default", "plan"):
+            raise ContractError("renderer mode outputs are not unique Default and Plan records")
+        if output.get("matched") is not True or output.get("outputLength", 0) < 1:
+            raise ContractError(f"renderer {mode} output is empty or unmatched")
+        renderer_by_mode[mode] = output
     rollout = records(rollouts[0])
+    default = bind_turn(rollout, DEFAULT_PROMPT, "default")
+    plan = bind_turn(rollout, PLAN_PROMPT, "plan")
+    for mode, prompt, persisted in (
+        ("default", DEFAULT_PROMPT, default),
+        ("plan", PLAN_PROMPT, plan),
+    ):
+        renderer = renderer_by_mode.get(mode, {})
+        if renderer.get("promptSha256") != sha256_text(prompt):
+            raise ContractError(f"renderer {mode} prompt hash does not match")
+        if renderer.get("outputSha256") != persisted["outputSha256"]:
+            raise ContractError(f"renderer {mode} output does not match persisted completion")
     return {
-        "default": bind_turn(rollout, DEFAULT_PROMPT, DEFAULT_SENTINEL, "default"),
-        "plan": bind_turn(rollout, PLAN_PROMPT, PLAN_SENTINEL, "plan"),
+        "default": default,
+        "plan": plan,
         "rolloutSha256": hashlib.sha256(rollouts[0].read_bytes()).hexdigest(),
         "rendererAndPersistenceMatched": True,
     }
 
 
-def fixture_turn(turn_id: str, mode: str, prompt: str, sentinel: str) -> list[dict]:
+def fixture_turn(turn_id: str, mode: str, prompt: str, output: str) -> list[dict]:
     return [
         {
             "type": "turn_context",
@@ -127,7 +147,7 @@ def fixture_turn(turn_id: str, mode: str, prompt: str, sentinel: str) -> list[di
             "payload": {
                 "type": "task_complete",
                 "turn_id": turn_id,
-                "last_agent_message": sentinel,
+                "last_agent_message": output,
             },
         },
     ]
@@ -139,23 +159,39 @@ def self_test() -> None:
         sessions = root / "codex-home" / "sessions" / "2026" / "07" / "15"
         sessions.mkdir(parents=True)
         rollout_path = sessions / "rollout-fixture.jsonl"
-        fixture = fixture_turn("default-turn", "default", DEFAULT_PROMPT, DEFAULT_SENTINEL)
-        fixture += fixture_turn("plan-turn", "plan", PLAN_PROMPT, PLAN_SENTINEL)
+        default_output = "Default mode is active."
+        plan_output = "Plan mode is active."
+        fixture = fixture_turn("default-turn", "default", DEFAULT_PROMPT, default_output)
+        fixture += fixture_turn("plan-turn", "plan", PLAN_PROMPT, plan_output)
         rollout_path.write_text("".join(json.dumps(item) + "\n" for item in fixture))
         cdp_path = root / "cdp.jsonl"
-        cdp_path.write_text(
-            json.dumps(
-                {
-                    "kind": "gui-modes-summary",
-                    "mainUi": True,
-                    "defaultModeControlObserved": True,
-                    "defaultPromptCompleted": True,
-                    "planModeControlObserved": True,
-                    "planPromptCompleted": True,
-                }
-            )
-            + "\n"
-        )
+        cdp_fixture = [
+            {
+                "kind": "gui-modes-summary",
+                "mainUi": True,
+                "defaultModeControlObserved": True,
+                "defaultPromptCompleted": True,
+                "planModeControlObserved": True,
+                "planPromptCompleted": True,
+            },
+            {
+                "kind": "mode-turn-output",
+                "mode": "default",
+                "matched": True,
+                "promptSha256": sha256_text(DEFAULT_PROMPT),
+                "outputLength": len(default_output),
+                "outputSha256": sha256_text(default_output),
+            },
+            {
+                "kind": "mode-turn-output",
+                "mode": "plan",
+                "matched": True,
+                "promptSha256": sha256_text(PLAN_PROMPT),
+                "outputLength": len(plan_output),
+                "outputSha256": sha256_text(plan_output),
+            },
+        ]
+        cdp_path.write_text("".join(json.dumps(item) + "\n" for item in cdp_fixture))
         result = validate(root / "codex-home", cdp_path)
         if not result["rendererAndPersistenceMatched"]:
             raise AssertionError("valid mode fixture did not pass")
@@ -169,6 +205,18 @@ def self_test() -> None:
                 raise
         else:
             raise AssertionError("wrong persisted Plan mode unexpectedly passed")
+
+        fixture[3]["payload"]["collaboration_mode"]["mode"] = "plan"
+        rollout_path.write_text("".join(json.dumps(item) + "\n" for item in fixture))
+        cdp_fixture[2]["outputSha256"] = sha256_text("different renderer output")
+        cdp_path.write_text("".join(json.dumps(item) + "\n" for item in cdp_fixture))
+        try:
+            validate(root / "codex-home", cdp_path)
+        except ContractError as error:
+            if "renderer plan output does not match persisted completion" not in str(error):
+                raise
+        else:
+            raise AssertionError("renderer/persisted output mismatch unexpectedly passed")
     print("mode persistence self-test passed")
 
 

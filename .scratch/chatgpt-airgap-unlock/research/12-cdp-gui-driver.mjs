@@ -64,6 +64,17 @@ function projectSelectionVerdict(control, expectedFixtureRoot) {
   return { matched, expectedName, visibleTextLength: visibleText.length };
 }
 
+function uniqueVisibleControlVerdict(candidates) {
+  if (candidates.length === 0) return { status: "pending", reason: "missing", count: 0 };
+  if (candidates.length !== 1) {
+    return { status: "duplicate", reason: "duplicate", count: candidates.length };
+  }
+  const candidate = candidates[0];
+  if (candidate.disabled) return { status: "disabled", reason: "disabled", count: 1 };
+  if (!candidate.visible) return { status: "pending", reason: "not-visible", count: 1 };
+  return { status: "ready", count: 1, ...candidate };
+}
+
 function runSelfTests() {
   const cases = [
     ["exact", firstSentinel, true],
@@ -151,6 +162,24 @@ function runSelfTests() {
   }
   if (projectSelectionVerdict({ count: 1, text: "workspace-old" }, "/tmp/run/workspace").matched) {
     throw new Error("similarly prefixed renderer project name was accepted");
+  }
+  if (uniqueVisibleControlVerdict([]).reason !== "missing") {
+    throw new Error("missing renderer control was not reported as pending");
+  }
+  if (uniqueVisibleControlVerdict([{ visible: true }, { visible: true }]).status !== "duplicate") {
+    throw new Error("duplicate renderer controls were not rejected");
+  }
+  if (uniqueVisibleControlVerdict([{ disabled: true, visible: true }]).status !== "disabled") {
+    throw new Error("disabled renderer control was not rejected");
+  }
+  if (uniqueVisibleControlVerdict([{ disabled: false, visible: false }]).reason !== "not-visible") {
+    throw new Error("hidden renderer control was not reported as pending");
+  }
+  const readyControl = uniqueVisibleControlVerdict([{
+    disabled: false, visible: true, x: 10, y: 20, width: 30, height: 40,
+  }]);
+  if (readyControl.status !== "ready" || readyControl.x !== 10 || readyControl.height !== 40) {
+    throw new Error("unique visible renderer control coordinates were not retained");
   }
   process.stdout.write("sentinel oracle self-test passed\n");
 }
@@ -288,51 +317,97 @@ async function clickMatching(expression, description) {
   return result;
 }
 
+function visibleExactControlProbeExpression({ selector, exactText, accessibleName }) {
+  return `(() => {
+    const normalize = (value) => (value ?? "").replace(/\\s+/g, " ").trim();
+    const candidates = [...document.querySelectorAll(${JSON.stringify(selector)})]
+      .filter((element) => ${exactText == null
+        ? `element.getAttribute("aria-label") === ${JSON.stringify(accessibleName)}`
+        : `normalize(element.innerText ?? element.textContent) === ${JSON.stringify(exactText)}`})
+      .map((element) => {
+        const rect = element.getBoundingClientRect();
+        const style = getComputedStyle(element);
+        return {
+          disabled: Boolean(element.disabled) || element.getAttribute("aria-disabled") === "true",
+          visible: rect.width > 0 && rect.height > 0 &&
+            rect.bottom > 0 && rect.right > 0 &&
+            rect.top < window.innerHeight && rect.left < window.innerWidth &&
+            style.display !== "none" && style.visibility === "visible" &&
+            style.opacity !== "0" && style.pointerEvents !== "none",
+          x: rect.left + rect.width / 2,
+          y: rect.top + rect.height / 2,
+          width: rect.width,
+          height: rect.height,
+          text: normalize(element.innerText ?? element.textContent),
+          title: element.getAttribute("title"),
+          ariaDescription: element.getAttribute("aria-description"),
+        };
+      });
+    return (${uniqueVisibleControlVerdict.toString()})(candidates);
+  })()`;
+}
+
+async function waitForUniqueVisibleControl(query, description, milliseconds = 10000) {
+  const deadline = Date.now() + milliseconds;
+  let lastResult = { status: "pending", reason: "not-probed", count: 0 };
+  while (Date.now() < deadline) {
+    lastResult = await evaluate(visibleExactControlProbeExpression(query));
+    if (lastResult.status === "ready") return lastResult;
+    if (lastResult.status === "duplicate" || lastResult.status === "disabled") {
+      throw new Error(`${description} control is ${lastResult.reason}: ${JSON.stringify(lastResult)}`);
+    }
+    await sleep(100);
+  }
+  throw new Error(`${description} control did not become uniquely visible: ${JSON.stringify(lastResult)}`);
+}
+
+// BEGIN_TRUSTED_RENDERER_ACCELERATOR
+async function dispatchTrustedOpenFolderAccelerator() {
+  await send("Input.dispatchKeyEvent", {
+    type: "rawKeyDown",
+    modifiers: 4,
+    key: "o",
+    code: "KeyO",
+    windowsVirtualKeyCode: 79,
+    nativeVirtualKeyCode: 31,
+  });
+  await send("Input.dispatchKeyEvent", {
+    type: "keyUp",
+    modifiers: 4,
+    key: "o",
+    code: "KeyO",
+    windowsVirtualKeyCode: 79,
+    nativeVirtualKeyCode: 31,
+  });
+  emit("action", {
+    description: "invoke Open Folder command",
+    accelerator: "Meta+O",
+    trustedRendererInput: true,
+  });
+}
+// END_TRUSTED_RENDERER_ACCELERATOR
+
 // BEGIN_NATIVE_PROJECT_PICKER_REQUEST
 async function openNativeProjectPicker(expectedFixtureRoot) {
   if (!expectedFixtureRoot?.startsWith("/")) {
     throw new Error("open-project-picker requires an absolute nonce fixture root");
   }
-  const target = await evaluate(`(() => {
-    const matches = [...document.querySelectorAll('button[aria-label="Choose project"]')]
-      .filter((element) => {
-        if (element.disabled) return false;
-        const rect = element.getBoundingClientRect();
-        const style = getComputedStyle(element);
-        return rect.width > 0 && rect.height > 0 &&
-          rect.bottom > 0 && rect.right > 0 &&
-          rect.top < window.innerHeight && rect.left < window.innerWidth &&
-          style.visibility === "visible" && style.pointerEvents !== "none";
-      });
-    if (matches.length !== 1) return { count: matches.length };
-    const rect = matches[0].getBoundingClientRect();
-    return {
-      count: 1,
-      x: rect.left + rect.width / 2,
-      y: rect.top + rect.height / 2,
-      width: rect.width,
-      height: rect.height,
-      text: (matches[0].innerText ?? "").trim(),
-      title: matches[0].getAttribute("title"),
-      ariaDescription: matches[0].getAttribute("aria-description"),
-    };
-  })()`);
-  if (target.count !== 1 || target.width <= 0 || target.height <= 0) {
-    throw new Error(`Choose project control is missing, duplicate, or not visible: ${JSON.stringify(target)}`);
-  }
-  const preSelection = projectSelectionVerdict(target, expectedFixtureRoot);
+  const chooseProject = await waitForUniqueVisibleControl({
+    selector: 'button[aria-label="Choose project"]',
+    accessibleName: "Choose project",
+  }, "Choose project");
+  const preSelection = projectSelectionVerdict(chooseProject, expectedFixtureRoot);
   if (preSelection.matched) {
     throw new Error("nonce fixture was already selected before the native action");
   }
-  await send("Input.dispatchMouseEvent", {
-    type: "mousePressed", x: target.x, y: target.y, button: "left", clickCount: 1,
-  });
-  await send("Input.dispatchMouseEvent", {
-    type: "mouseReleased", x: target.x, y: target.y, button: "left", clickCount: 1,
-  });
+  await dispatchTrustedOpenFolderAccelerator();
+
   emit("native-project-picker-requested", {
     uniqueControl: true,
     trustedRendererInput: true,
+    preconditionAccessibleName: "Choose project",
+    accelerator: "Meta+O",
+    acceleratorEventCount: 2,
     preSelectionMatchedExpected: false,
     expectedFixtureSha256: textSha256(expectedFixtureRoot),
   });

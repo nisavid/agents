@@ -25,6 +25,10 @@ OUTPUT="$OUTPUT_DIR/chatgpt-native-gui-probe"
 PENDING="$OUTPUT_DIR/.chatgpt-native-gui-probe.pending"
 
 mkdir -p "$OUTPUT_DIR/module-cache"
+if test -e "$PENDING" || test -L "$PENDING"; then
+  echo "refusing pre-existing pending artifact: $PENDING" >&2
+  exit 65
+fi
 trap '/bin/rm -f "$PENDING"' EXIT INT TERM
 CLANG_MODULE_CACHE_PATH="$OUTPUT_DIR/module-cache" \
 SWIFT_MODULECACHE_PATH="$OUTPUT_DIR/module-cache" \

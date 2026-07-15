@@ -92,6 +92,13 @@ require_positive_terminal_delta() {
   fi
 }
 
+persisted_fixture_path_observed() {
+  expected_fixture_path="$1"
+  shift
+  find "$@" -type f -exec /usr/bin/grep -aFl -- "$expected_fixture_path" {} + 2>/dev/null |
+    /usr/bin/grep -q .
+}
+
 run_cold_handoff_self_test() (
   /usr/bin/python3 "$COLD_RESUME_STATE" --self-test
   /usr/bin/python3 "$MODE_STATE" --self-test
@@ -141,6 +148,13 @@ run_cold_handoff_self_test() (
   test "$signal_status" -eq 143
   test "$(/usr/bin/tail -n 1 "$LOG_DIR/cold-handoff.jsonl")" = \
     '{"kind":"signal","signal":"TERM","status":143}'
+  mkdir -p "$self_test_root/persisted"
+  printf 'fixture=%s\n' "$self_test_root/workspace" >"$self_test_root/persisted/state.bin"
+  persisted_fixture_path_observed "$self_test_root/workspace" "$self_test_root/persisted"
+  if persisted_fixture_path_observed "$self_test_root/wrong-workspace" "$self_test_root/persisted"; then
+    echo "wrong persisted fixture path unexpectedly passed" >&2
+    return 1
+  fi
   printf 'cold handoff self-test passed\n'
 )
 
@@ -257,6 +271,7 @@ if test "$GUI_NATIVE_PROJECT_PICKER" = true; then
   test "$(/usr/bin/shasum -a 256 "$native_gui_probe_realpath" | /usr/bin/awk '{print $1}')" = \
     "$NATIVE_GUI_PROBE_SHA256"
   /usr/bin/codesign --verify --strict "$native_gui_probe_realpath"
+  native_gui_probe_device_inode="$(/usr/bin/stat -f '%d:%i' "$native_gui_probe_realpath")"
   NATIVE_GUI_PROBE_BIN="$native_gui_probe_realpath"
 fi
 
@@ -769,11 +784,42 @@ if test "$GUI_NATIVE_PROJECT_PICKER" = true; then
   if test "$NATIVE_GUI_PROBE_KEY_FALLBACK" = true; then
     set -- "$@" --permit-key-fallback
   fi
+  test ! -L "$NATIVE_GUI_PROBE_BIN"
+  test "$(realpath "$NATIVE_GUI_PROBE_BIN")" = "$NATIVE_GUI_PROBE_BIN"
+  test "$(/usr/bin/stat -f '%d:%i' "$NATIVE_GUI_PROBE_BIN")" = "$native_gui_probe_device_inode"
+  test "$('/usr/bin/shasum' -a 256 "$NATIVE_GUI_PROBE_BIN" | /usr/bin/awk '{print $1}')" = \
+    "$NATIVE_GUI_PROBE_SHA256"
+  /usr/bin/codesign --verify --strict "$NATIVE_GUI_PROBE_BIN"
   "$NATIVE_GUI_PROBE_BIN" "$@" \
     >"$LOG_DIR/native-gui-probe.stdout" 2>"$LOG_DIR/native-gui-probe.stderr"
-  /usr/bin/grep -Fq '"kind":"project-selection-issued"' \
+  /usr/bin/grep -Fq '"kind":"project-selection-requested"' \
     "$LOG_DIR/native-gui-probe.jsonl"
-  sleep 1
+  /usr/bin/env -i \
+    PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+    HOME="$HOME_DIR" \
+    TMPDIR="$TMP_DIR" \
+    LANG="en_US.UTF-8" \
+    /usr/bin/sandbox-exec -f "$GATEWAY_PROFILE" -D "REAL_HOME=$REAL_HOME" \
+      "$NODE" "$GUI_DRIVER_EXEC" "$CDP_PORT" confirm-project-selection 30000 \
+      "$(realpath "$WORKSPACE_DIR")" \
+    >"$LOG_DIR/cdp-native-confirm.jsonl" 2>"$LOG_DIR/cdp-native-confirm.stderr"
+  /usr/bin/grep -Fq '"kind":"renderer-project-selection-confirmed"' \
+    "$LOG_DIR/cdp-native-confirm.jsonl"
+  /usr/bin/grep -Fq '"matched":true' "$LOG_DIR/cdp-native-confirm.jsonl"
+  i=0
+  while test "$i" -lt 50 && \
+    ! persisted_fixture_path_observed "$(realpath "$WORKSPACE_DIR")" "$CODEX_DIR" "$USER_DATA_DIR"; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  persisted_fixture_path_observed "$(realpath "$WORKSPACE_DIR")" "$CODEX_DIR" "$USER_DATA_DIR"
+  {
+    printf 'helper_selection_requested=true\n'
+    printf 'renderer_project_name_matched=true\n'
+    printf 'persisted_fixture_path_matched=true\n'
+    printf 'fixture_path_sha256=%s\n' \
+      "$(printf '%s' "$(realpath "$WORKSPACE_DIR")" | /usr/bin/shasum -a 256 | /usr/bin/awk '{print $1}')"
+  } >"$LOG_DIR/native-project-verdict.txt"
 fi
 if test "$GUI_WORKFLOW" = true; then
   cdp_command="$GUI_DRIVER_EXEC"
@@ -932,8 +978,10 @@ else
   native_permission_decision_exercised=false
   native_worktree_control_exercised=false
   if test "$GUI_NATIVE_PROJECT_PICKER" = true && \
-    test -f "$LOG_DIR/native-gui-probe.jsonl" && \
-    /usr/bin/grep -Fq '"kind":"project-selection-issued"' "$LOG_DIR/native-gui-probe.jsonl"; then
+    test -f "$LOG_DIR/native-project-verdict.txt" && \
+    /usr/bin/grep -Fq 'helper_selection_requested=true' "$LOG_DIR/native-project-verdict.txt" && \
+    /usr/bin/grep -Fq 'renderer_project_name_matched=true' "$LOG_DIR/native-project-verdict.txt" && \
+    /usr/bin/grep -Fq 'persisted_fixture_path_matched=true' "$LOG_DIR/native-project-verdict.txt"; then
     native_project_picker_exercised=true
   fi
   renderer_thread_reopened=false

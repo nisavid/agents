@@ -454,26 +454,52 @@ func postCommandShiftG(to process: ProcessIdentity) throws {
     up.postToPid(process.pid)
 }
 
-func waitForUniquePathEntry(application: AXUIElement) throws -> (AXUIElement, AXUIElement) {
+func sameAXElement(_ left: AXUIElement, _ right: AXUIElement) -> Bool {
+    CFEqual(left, right)
+}
+
+func axElementAttribute(_ element: AXUIElement, _ name: CFString) -> AXUIElement? {
+    guard let value = attribute(element, name),
+          CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
+    return unsafeBitCast(value, to: AXUIElement.self)
+}
+
+func pathEntry(in container: AXUIElement) throws -> (AXUIElement, AXUIElement)? {
+    let fields = try matchingLiveElements(container) {
+        stringAttribute($0, kAXRoleAttribute as CFString) == kAXTextFieldRole
+    }
+    let confirms = try matchingLiveElements(container) {
+        stringAttribute($0, kAXRoleAttribute as CFString) == kAXButtonRole &&
+            actions($0).contains(kAXPressAction) &&
+            ["go", "open"].contains(stringAttribute($0, kAXTitleAttribute as CFString)?.lowercased() ?? "")
+    }
+    return fields.count == 1 && confirms.count == 1 ? (fields[0], confirms[0]) : nil
+}
+
+func waitForUniquePathEntry(
+    application: AXUIElement,
+    openPanel: AXUIElement,
+    initialWindows: [AXUIElement]
+) throws -> (AXUIElement, AXUIElement) {
     let deadline = Date().addingTimeInterval(3)
     while Date() < deadline {
-        let windows = try liveWindows(application)
-        let entries = try windows.compactMap { window, _ -> (AXUIElement, AXUIElement)? in
-            let fields = try matchingLiveElements(window) {
-                stringAttribute($0, kAXRoleAttribute as CFString) == kAXTextFieldRole
-            }
-            let confirms = try matchingLiveElements(window) {
-                stringAttribute($0, kAXRoleAttribute as CFString) == kAXButtonRole &&
-                    actions($0).contains(kAXPressAction) &&
-                    ["go", "open"].contains(stringAttribute($0, kAXTitleAttribute as CFString)?.lowercased() ?? "")
-            }
-            return fields.count == 1 && confirms.count == 1 ? (fields[0], confirms[0]) : nil
+        let panelSheets = try matchingLiveElements(openPanel) {
+            stringAttribute($0, kAXRoleAttribute as CFString) == kAXSheetRole
+        }.filter { !sameAXElement($0, openPanel) }
+        let currentWindows = try liveWindows(application).map(\.0)
+        let relatedNewWindows = currentWindows.filter { candidate in
+            guard !initialWindows.contains(where: { sameAXElement($0, candidate) }) else { return false }
+            let parent = axElementAttribute(candidate, kAXParentAttribute as CFString)
+            let topLevel = axElementAttribute(candidate, kAXTopLevelUIElementAttribute as CFString)
+            return (parent.map { sameAXElement($0, openPanel) } ?? false) ||
+                (topLevel.map { sameAXElement($0, openPanel) } ?? false)
         }
+        let entries = try (panelSheets + relatedNewWindows).compactMap { try pathEntry(in: $0) }
         if entries.count == 1 { return entries[0] }
-        if entries.count > 1 { throw ProbeError.validation("path-entry sheet is ambiguous") }
+        if entries.count > 1 { throw ProbeError.validation("validated Open panel has ambiguous path-entry children") }
         usleep(100_000)
     }
-    throw ProbeError.unavailable("unique Command-Shift-G path-entry sheet did not appear")
+    throw ProbeError.unavailable("validated Open panel did not expose one related path-entry child")
 }
 
 func chooseButton(in panel: AXUIElement, title: String) throws -> AXUIElement {
@@ -483,6 +509,22 @@ func chooseButton(in panel: AXUIElement, title: String) throws -> AXUIElement {
     }
     guard matches.count == 1 else { throw ProbeError.validation("chooser button is missing or ambiguous") }
     return matches[0]
+}
+
+func validatedOpenPanel(
+    application: AXUIElement,
+    permitKeyFallback: Bool
+) throws -> (AXUIElement, SelectionPlan, [AXUIElement]) {
+    let windows = try liveWindows(application)
+    let plan = try OpenPanelPolicy.plan(windows: windows.map(\.1),
+                                        permitKeyFallback: permitKeyFallback)
+    let selected = windows.filter { pair in
+        (try? OpenPanelPolicy.plan(windows: [pair.1], permitKeyFallback: permitKeyFallback)) != nil
+    }
+    guard selected.count == 1, let panel = selected.first?.0 else {
+        throw ProbeError.validation("live Open panel identity is missing or ambiguous")
+    }
+    return (panel, plan, windows.map(\.0))
 }
 
 func execute(options: Options, paths: ValidatedPaths, log: EventLog) throws {
@@ -495,20 +537,12 @@ func execute(options: Options, paths: ValidatedPaths, log: EventLog) throws {
         throw ProbeError.permission("Accessibility is not granted to this exact helper artifact")
     }
     let application = AXUIElementCreateApplication(options.pid)
-    let windows = try liveWindows(application)
-    let plan = try OpenPanelPolicy.plan(windows: windows.map(\.1),
-                                        permitKeyFallback: options.permitKeyFallback)
-    try log.write("open-panel-validated", ["windowCount": windows.count,
+    let (panel, plan, initialWindows) = try validatedOpenPanel(
+        application: application, permitKeyFallback: options.permitKeyFallback)
+    try log.write("open-panel-validated", ["windowCount": initialWindows.count,
                                             "navigation": plan.navigation == .direct ? "direct" : "command-shift-g",
                                             "chooserTitle": plan.chooserTitle])
     if options.phase == .inspectProjectPicker { return }
-
-    let selectedDescriptions = windows.filter { pair in
-        (try? OpenPanelPolicy.plan(windows: [pair.1], permitKeyFallback: options.permitKeyFallback)) != nil
-    }
-    guard selectedDescriptions.count == 1, let panel = selectedDescriptions.first?.0 else {
-        throw ProbeError.validation("live Open panel identity changed before action")
-    }
     switch plan.navigation {
     case .direct:
         let fields = try matchingLiveElements(panel) {
@@ -527,7 +561,8 @@ func execute(options: Options, paths: ValidatedPaths, log: EventLog) throws {
         }
     case .commandShiftG:
         try postCommandShiftG(to: identity)
-        let (pathField, confirmButton) = try waitForUniquePathEntry(application: application)
+        let (pathField, confirmButton) = try waitForUniquePathEntry(
+            application: application, openPanel: panel, initialWindows: initialWindows)
         try requireSameProcess(identity)
         guard AXUIElementSetAttributeValue(pathField, kAXValueAttribute as CFString,
                                            paths.fixture as CFString) == .success else {
@@ -536,12 +571,17 @@ func execute(options: Options, paths: ValidatedPaths, log: EventLog) throws {
         try press(confirmButton, purpose: "path-entry confirmation", process: identity)
         usleep(250_000)
     }
-    try press(try chooseButton(in: panel, title: plan.chooserTitle),
+    let (currentPanel, currentPlan, _) = try validatedOpenPanel(
+        application: application, permitKeyFallback: options.permitKeyFallback)
+    guard currentPlan.chooserTitle == plan.chooserTitle else {
+        throw ProbeError.validation("Open panel chooser identity changed before final action")
+    }
+    try press(try chooseButton(in: currentPanel, title: currentPlan.chooserTitle),
               purpose: "Open panel chooser", process: identity)
     let finalIdentity = try processIdentity(options.pid)
     guard finalIdentity == identity else { throw ProbeError.validation("PID identity changed during AX action") }
-    try log.write("project-selection-issued", ["pid": Int(identity.pid),
-                                                "fixtureSha256": sha256(paths.fixture)])
+    try log.write("project-selection-requested", ["pid": Int(identity.pid),
+                                                   "fixtureSha256": sha256(paths.fixture)])
 }
 
 func testElement(role: String, title: String? = nil, identifier: String? = nil,
@@ -579,6 +619,18 @@ func runSelfTests() throws {
     do { _ = try OpenPanelPolicy.plan(windows: [duplicateChooser], permitKeyFallback: false) }
     catch ProbeError.validation { rejected = true }
     try require(rejected, "duplicate chooser passed")
+    let customWindow = testElement(role: kAXWindowRole, children: [cancel, choose, direct])
+    rejected = false
+    do { _ = try OpenPanelPolicy.plan(windows: [customWindow], permitKeyFallback: false) }
+    catch ProbeError.validation { rejected = true }
+    try require(rejected, "nonstandard custom window passed")
+    let wrongSheet = testElement(role: kAXSheetRole,
+                                 children: [cancel, testElement(role: kAXButtonRole,
+                                                               title: "Save", actions: [kAXPressAction])])
+    rejected = false
+    do { _ = try OpenPanelPolicy.plan(windows: [wrongSheet], permitKeyFallback: true) }
+    catch ProbeError.validation { rejected = true }
+    try require(rejected, "wrong native dialog passed")
     try require(!PathPolicy.contains("/private/tmp/root", "/private/tmp/root2/file"), "prefix collision")
     try require(PathPolicy.contains("/private/tmp/root", "/private/tmp/root/file"), "contained path")
     try require(Phase(rawValue: "select-project") == .selectProject, "phase parsing")

@@ -22,7 +22,8 @@ all passed. See
 
 The ticket remains open for native project-picker, worktree, and permission
 interaction; Default and Plan mode behavior; project-local skill visibility;
-and exact renderer-visible model metadata.
+and reconciliation of the renderer's appended reasoning-selection label with
+the pinned catalog.
 
 ## Acceptance
 

@@ -18,6 +18,14 @@ model control. Every gateway, credential, integrity, and cleanup assertion
 remained green. See
 [research/12-validate-offline-gui-workflow.md](../research/12-validate-offline-gui-workflow.md).
 
+The renderer model identity and fallback gates now pass through a run-local
+`model_catalog_json`: the copied app displays the pinned OptiQ name instead of
+`Custom Light`, while the app-server catalog reports default reasoning `none`,
+no reasoning levels, text-only input, and the model-config context limit. The
+full renderer capability presentation remains open because the composer still
+appends its independent `Medium` selection label. See
+[research/08-validate-preferred-route.md](../research/08-validate-preferred-route.md#pinned-model-metadata).
+
 ## Remaining acceptance
 
 - Reopen and continue a local thread through the GUI.
@@ -25,6 +33,7 @@ remained green. See
 - Exercise permission denial and approval through the GUI.
 - Exercise Default and Plan modes through the GUI.
 - Verify a project-local skill after selecting a real local project.
-- Validate the full renderer-visible model-metadata contract.
+- Reconcile the renderer's appended reasoning-selection label with the pinned
+  catalog's default `none` and empty supported-reasoning set.
 - Preserve the vendor Chromium sandbox on a disconnected VM or true air-gapped machine; the current local semantic harness uses an outer Seatbelt profile and disables Chromium's nested sandbox.
 - Validate the explicit GLM 5.2 profile in its target environment when that endpoint becomes available.

@@ -14,9 +14,12 @@ Green for the scoped renderer cold-restart continuation. Run-root suffix
 the copied app, reopening the same persisted thread and rollout, and preserving
 the provider, gateway, observer, isolation, integrity, and cleanup contracts.
 
-The project-local skill, exact configured model metadata, native project
-picker, native permission decision, and native worktree controls remain red or
-unexercised. Ticket 12 remains open for those separate surfaces.
+The project-local skill, native project picker, native permission decision, and
+native worktree controls remain red or unexercised. A later single-run metadata
+slice replaced the generic model identity with the pinned OptiQ display name
+and is recorded in `08-validate-preferred-route.md`; the appended renderer
+reasoning-selection label remains open. Ticket 12 remains open for those
+separate surfaces.
 
 The successful run used:
 

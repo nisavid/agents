@@ -101,7 +101,17 @@ termination or a published path mismatch fails immediately. Immutable kernel
 identity is checked around every sample and around the unchanged code-signature
 validation. No AX object or action is available before that gate completes.
 
+The seventh inspection run passed process validation after seven AppKit polls
+and passed Accessibility trust, then observed a direct File menu with other
+published children but no exact `Open Folder…` item. The readiness policy now
+retries zero matching items as an unpublished intermediate within the existing
+deadline. Duplicate matches and matching items with malformed role, enabled,
+action, or Command-O metadata remain immediate failures. Identity validation
+still brackets every read, and the inspection phase remains mutation-free with
+`actionCount: 0`.
+
 No new Accessibility request, TCC mutation, installed-app launch, or live AX
 action has occurred for this revision. The reviewed no-permission artifact is
-recorded in `research/14-native-gui-probe.md`; read-only menu inspection with the
-same final artifact is the next live step.
+recorded in `research/14-native-gui-probe.md`; read-only menu inspection requires
+separate review and a manual grant for that exact artifact before the next live
+step.

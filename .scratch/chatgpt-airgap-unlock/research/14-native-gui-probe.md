@@ -132,6 +132,17 @@ revalidates PID, process start, and kernel executable before and after every
 sample and around the unchanged static/dynamic signature validation. Launch
 completion is diagnostic only and is not part of this identity gate.
 
+The seventh inspection run passed process validation after seven AppKit polls
+and passed the existing Accessibility trust gate. Its first menu snapshot
+published the direct File menu and other children but no exact `Open Folder…`
+item, so the helper failed before any action. Zero matching items is now treated
+as an unpublished intermediate and retried within the existing five-second
+monotonic bound. A published duplicate or a matching item with the wrong role,
+enabled state, action, or Command-O metadata still fails on its first snapshot.
+The retry loop continues to validate process identity around every read and
+contains no AX mutation; inspection evidence continues to require
+`actionCount: 0`.
+
 ## Permission boundary
 
 Do not run the live seam until Ivan has reviewed the final artifact hash and
@@ -143,14 +154,14 @@ Ivan; the helper never requests a prompt itself.
 ## No-permission verdict
 
 Green for the source, build, input-policy, selector-policy, and runner-seam
-slice. The retained no-permission artifact for this revision is arm64 and ad-hoc signed,
-with SHA-256 `e6bdacd5308c6aaea296e1bb3e06e59c6fa7abed5c9cbb68f52f20ef3c57a1e4`
-and CDHash `360e0a7ae789cfbf594e5dd3cbf8efcca3607f16`. A clean build in a second
+slice. The temporary no-permission artifact for this revision is arm64 and ad-hoc signed,
+with SHA-256 `ad76e34b416fb5d8be9bc4baec09c09bba4073c66275acfd459c0b6d7068aa6c`
+and CDHash `c3a03b2510a2ca6486daf0c18a2cf6cb67249335`. A clean build in a second
 disposable directory produced the same SHA-256. The helper self-test, forbidden
 API and sensitive-symbol allowlists, path-policy fixtures, renderer transition
 oracle, authoritative project-state fixtures, runner shell syntax, and
-cold-handoff self-test all passed. The reviewed revision is now installed at
-the canonical helper path recorded above and requires a fresh manual grant.
+cold-handoff self-test all passed. The previously granted canonical artifact
+does not contain this revision and remains untouched.
 
 ## First live invocation
 
@@ -168,5 +179,6 @@ helper now polls read-only for at most five monotonic seconds, validates the
 same process identity before and after every AX snapshot, retries only while no
 panel-shaped candidate exists, and fails immediately on malformed, duplicate,
 unauthorized, ambiguous, or drifted state. The wait contains no AX or input
-action. The live native project selection remains unexecuted with this retained
-artifact and blocked on its fresh manual Accessibility grant.
+action. The live native project selection remains unexecuted with this
+temporary artifact and blocked on the canonical rebuild and fresh manual
+Accessibility grant.

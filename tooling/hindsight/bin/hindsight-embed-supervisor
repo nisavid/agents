@@ -1,0 +1,177 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+STACK_LIB="${HINDSIGHT_EMBED_STACK_LIB:-}"
+
+die() {
+  print -ru2 -- "hindsight-embed-supervisor: $*"
+  exit 1
+}
+
+require_current_user_identity() {
+  emulate -L zsh
+
+  (( UID == EUID && EUID != 0 )) || die "refusing root or mismatched real/effective user ids"
+  local account
+  account="$(/usr/bin/id -un "$EUID" 2>/dev/null)" || die "could not resolve current user id ${EUID}"
+  [[ -n "${USER:-}" && "$USER" == "$account" ]] ||
+    die "USER does not match current user id ${EUID}"
+}
+
+validate_trusted_stack_lib() {
+  emulate -L zsh
+
+  [[ "$STACK_LIB" == /* ]] || die "HINDSIGHT_EMBED_STACK_LIB must be an absolute path"
+  [[ -f "$STACK_LIB" && ! -L "$STACK_LIB" && -r "$STACK_LIB" ]] ||
+    die "HINDSIGHT_EMBED_STACK_LIB must name a readable regular file"
+  STACK_LIB="${STACK_LIB:A}"
+  [[ -f "$STACK_LIB" && ! -L "$STACK_LIB" && -r "$STACK_LIB" ]] ||
+    die "HINDSIGHT_EMBED_STACK_LIB must resolve to a readable regular file"
+
+  local owner mode path acl_permissions acl_listing
+  acl_listing="$(/bin/ls -lde "$STACK_LIB")" || die "could not inspect stack library ACL"
+  acl_permissions="${acl_listing%% *}"
+  [[ "$acl_permissions" != *+* ]] &&
+    ! print -r -- "$acl_listing" | /usr/bin/grep -Eq '^[[:space:]]*[0-9]+:' ||
+    die "stack library must not have an ACL"
+  owner="$(/usr/bin/stat -f '%u' "$STACK_LIB")" || die "could not inspect stack library owner"
+  mode="$(/usr/bin/stat -f '%Lp' "$STACK_LIB")" || die "could not inspect stack library mode"
+  (( owner == EUID || owner == 0 )) || die "stack library must be owned by the current user or root"
+  (( (8#$mode & 8#0022) == 0 )) || die "stack library must not be group or world writable"
+
+  path="${STACK_LIB:h}"
+  while true; do
+    acl_listing="$(/bin/ls -lde "$path")" || die "could not inspect stack library ancestor ACL: ${path}"
+    acl_permissions="${acl_listing%% *}"
+    [[ "$acl_permissions" != *+* ]] &&
+      ! print -r -- "$acl_listing" | /usr/bin/grep -Eq '^[[:space:]]*[0-9]+:' ||
+      die "stack library ancestor must not have an ACL: ${path}"
+    owner="$(/usr/bin/stat -f '%u' "$path")" || die "could not inspect stack library ancestor: ${path}"
+    mode="$(/usr/bin/stat -f '%Lp' "$path")" || die "could not inspect stack library ancestor: ${path}"
+    (( owner == EUID || owner == 0 )) || die "stack library ancestor is not trusted: ${path}"
+    if (( (8#$mode & 8#0022) != 0 && !(owner == 0 && (8#$mode & 8#01000) != 0) )); then
+      die "stack library ancestor is group or world writable: ${path}"
+    fi
+    [[ "$path" == / ]] && break
+    path="${path:h}"
+  done
+}
+
+require_current_user_identity
+validate_trusted_stack_lib
+
+source_stack_lib() {
+  emulate -L zsh
+
+  . "$STACK_LIB" || {
+    print -ru2 -- "hindsight-embed-supervisor: failed to source stack library at ${STACK_LIB}"
+    exit 1
+  }
+
+  local required_function
+  for required_function in \
+    hindsight_stack_load_config \
+    hindsight_stack_log \
+    hindsight_stack_broker_status \
+    hindsight_stack_fleet_profiles_csv \
+    hindsight_stack_initialize_desired_state \
+    hindsight_stack_reconcile_once \
+    hindsight_stack_require_current_user \
+    hindsight_stack_require_runtime_helpers \
+    hindsight_stack_require_tools \
+    hindsight_stack_stop_all \
+    hindsight_stack_with_lifecycle_lock \
+    hindsight_stack_validate_fleet; do
+    if (( ! ${+functions[$required_function]} )); then
+      print -ru2 -- "hindsight-embed-supervisor: invalid stack library at ${STACK_LIB}; missing ${required_function}"
+      exit 1
+    fi
+  done
+}
+
+source_stack_lib
+
+fail() {
+  hindsight_stack_log "fatal: $*"
+  exit 1
+}
+
+typeset -g HINDSIGHT_EMBED_SHUTDOWN_STATE=idle
+typeset -g HINDSIGHT_EMBED_SHUTDOWN_STATUS=0
+shutdown() {
+  [[ "$HINDSIGHT_EMBED_SHUTDOWN_STATE" == done ]] && return "$HINDSIGHT_EMBED_SHUTDOWN_STATUS"
+  [[ "$HINDSIGHT_EMBED_SHUTDOWN_STATE" == running ]] && return 0
+  typeset -g HINDSIGHT_EMBED_SHUTDOWN_STATE=running
+  trap '' INT TERM
+  hindsight_stack_log "stopping stack" || true
+  if hindsight_stack_with_lifecycle_lock hindsight_stack_stop_all; then
+    HINDSIGHT_EMBED_SHUTDOWN_STATUS=0
+  else
+    HINDSIGHT_EMBED_SHUTDOWN_STATUS=1
+    hindsight_stack_log "stack stop failed" || true
+  fi
+  HINDSIGHT_EMBED_SHUTDOWN_STATE=done
+  return "$HINDSIGHT_EMBED_SHUTDOWN_STATUS"
+}
+
+handle_signal() {
+  local signal_status="$1"
+  trap '' INT TERM
+  if shutdown; then
+    trap - EXIT
+    exit "$signal_status"
+  else
+    local shutdown_status=$?
+    trap - EXIT
+    exit "$shutdown_status"
+  fi
+}
+
+main() {
+  emulate -L zsh
+  setopt err_exit pipe_fail no_unset
+
+  hindsight_stack_load_config
+  hindsight_stack_require_current_user || fail "current user check failed"
+
+  local poll_seconds="${HINDSIGHT_EMBED_POLL_SECONDS:-10}"
+  local max_failures="${HINDSIGHT_EMBED_MAX_CONSECUTIVE_FAILURES:-3}"
+  local cooldown_seconds="${HINDSIGHT_EMBED_START_COOLDOWN_SECONDS:-0}"
+  [[ "$poll_seconds" =~ '^[1-9][0-9]*$' ]] && (( poll_seconds <= 3600 )) ||
+    fail "HINDSIGHT_EMBED_POLL_SECONDS must be an integer from 1 to 3600"
+  [[ "$max_failures" =~ '^[1-9][0-9]*$' ]] && (( max_failures <= 100 )) ||
+    fail "HINDSIGHT_EMBED_MAX_CONSECUTIVE_FAILURES must be an integer from 1 to 100"
+  [[ "$cooldown_seconds" =~ '^(0|[1-9][0-9]*)$' ]] && (( cooldown_seconds <= 3600 )) ||
+    fail "HINDSIGHT_EMBED_START_COOLDOWN_SECONDS must be a canonical integer from 0 to 3600"
+
+  hindsight_stack_require_tools || fail "missing required tools"
+  hindsight_stack_require_runtime_helpers || fail "missing required helper runtime"
+  hindsight_stack_validate_fleet || fail "invalid fleet configuration"
+  hindsight_stack_initialize_desired_state || fail "could not initialize desired component state"
+
+  trap shutdown EXIT
+  trap 'handle_signal 130' INT
+  trap 'handle_signal 143' TERM
+
+  hindsight_stack_log "supervisor started pid=$$ profiles=$(hindsight_stack_fleet_profiles_csv) broker_socket=${HINDSIGHT_MEMORY_BROKER_SOCKET} control_port=${HINDSIGHT_EMBED_CONTROL_PORT}"
+
+  local consecutive_failures=0
+  local retry_seconds
+  while true; do
+    if hindsight_stack_with_lifecycle_lock hindsight_stack_reconcile_once; then
+      consecutive_failures=0
+      sleep "$poll_seconds"
+      continue
+    fi
+    (( consecutive_failures += 1 ))
+    hindsight_stack_log "reconcile degraded consecutive_failures=${consecutive_failures}"
+    (( consecutive_failures < max_failures )) ||
+      fail "reconcile failed ${consecutive_failures} consecutive times"
+    retry_seconds=$(( poll_seconds * (consecutive_failures + 1) ))
+    (( retry_seconds >= cooldown_seconds )) || retry_seconds=$cooldown_seconds
+    (( retry_seconds <= 3600 )) || retry_seconds=3600
+    sleep "$retry_seconds"
+  done
+}
+
+main "$@"

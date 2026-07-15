@@ -1,0 +1,1215 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+STACK_LABEL="${HINDSIGHT_EMBED_STACK_LABEL:-}"
+LEGACY_LABEL="${HINDSIGHT_EMBED_LEGACY_LABEL:-}"
+PLIST="${HINDSIGHT_EMBED_SERVICE_MANIFEST:-}"
+LEGACY_PLIST="${HINDSIGHT_EMBED_LEGACY_MANIFEST:-}"
+SUPERVISOR="${HINDSIGHT_EMBED_SUPERVISOR:-}"
+STACK_LIB="${HINDSIGHT_EMBED_STACK_LIB:-}"
+STATE_DIR="${HINDSIGHT_EMBED_STATE_DIR:-}"
+LOG_FILE="${HINDSIGHT_EMBED_SERVICE_LOG:-}"
+typeset -g HINDSIGHT_EMBED_STACK_LIB_LOADED=0
+
+usage() {
+  cat <<EOF
+Usage: hindsight-embed-service <command> [options]
+
+Commands:
+  install   Validate, retire legacy launchd state, and load the LaunchAgent
+  start     Load or restart the LaunchAgent for this user
+  restart   Cleanly stop and start the LaunchAgent and managed stack
+  stop      Unload the LaunchAgent and stop control, API, and UI
+  status [--profile <name>]  Show fleet or selected-profile health
+  logs      Tail the supervisor log
+EOF
+}
+
+die() {
+  print -ru2 -- "hindsight-embed-service: $*"
+  exit 1
+}
+
+require_current_user_identity() {
+  emulate -L zsh
+
+  (( UID == EUID && EUID != 0 )) || die "refusing root or mismatched real/effective user ids"
+  local account
+  account="$(/usr/bin/id -un "$EUID" 2>/dev/null)" || die "could not resolve current user id ${EUID}"
+  [[ -n "${USER:-}" && "$USER" == "$account" ]] ||
+    die "USER does not match current user id ${EUID}"
+}
+
+validate_no_acl() {
+  emulate -L zsh
+  local path="$1" label="$2" listing permissions
+  listing="$(/bin/ls -lde "$path")" || die "could not inspect ${label} ACL: ${path}"
+  permissions="${listing%% *}"
+  ! print -r -- "$listing" |
+    /usr/bin/grep -Eq '^[[:space:]]*[0-9]+:.*[[:space:]]allow[[:space:]]' ||
+    die "${label} must not have permissive ACL entries: ${path}"
+}
+
+validate_trusted_artifact() {
+  emulate -L zsh
+  local path="$1"
+  local label="$2"
+  local access="${3:-readable}"
+  local symlink_policy="${4:-reject-symlink}"
+
+  [[ "$path" == /* ]] || die "${label} must use an absolute path: ${path}"
+  if [[ -L "$path" ]]; then
+    [[ "$symlink_policy" == allow-symlink ]] || die "${label} must not be a symlink: ${path}"
+    local link_owner
+    link_owner="$(/usr/bin/stat -f '%u' "$path")" || die "could not inspect ${label} symlink owner: ${path}"
+    (( link_owner == EUID || link_owner == 0 )) ||
+      die "${label} symlink must be owned by the current user or root: ${path}"
+  fi
+
+  local resolved="${path:A}"
+  [[ -f "$resolved" && ! -L "$resolved" ]] || die "${label} must resolve to a regular file: ${path}"
+  if [[ "$access" == executable ]]; then
+    [[ -x "$resolved" ]] || die "${label} is not executable: ${path}"
+  else
+    [[ -r "$resolved" ]] || die "${label} is not readable: ${path}"
+  fi
+
+  local owner mode ancestor ancestor_root
+  validate_no_acl "$resolved" "$label"
+  owner="$(/usr/bin/stat -f '%u' "$resolved")" || die "could not inspect ${label} owner: ${path}"
+  mode="$(/usr/bin/stat -f '%Lp' "$resolved")" || die "could not inspect ${label} mode: ${path}"
+  (( owner == EUID || owner == 0 )) || die "${label} must be owned by the current user or root: ${path}"
+  (( (8#$mode & 8#0022) == 0 )) || die "${label} must not be group or world writable: ${path}"
+
+  for ancestor_root in "${path:h}" "${resolved:h}"; do
+    ancestor="$ancestor_root"
+    while true; do
+      validate_no_acl "$ancestor" "${label} ancestor"
+      owner="$(/usr/bin/stat -f '%u' "$ancestor")" || die "could not inspect ${label} ancestor: ${ancestor}"
+      mode="$(/usr/bin/stat -f '%Lp' "$ancestor")" || die "could not inspect ${label} ancestor: ${ancestor}"
+      (( owner == EUID || owner == 0 )) || die "${label} ancestor is not trusted: ${ancestor}"
+      if (( (8#$mode & 8#0022) != 0 && !(owner == 0 && (8#$mode & 8#01000) != 0) )); then
+        die "${label} ancestor is group or world writable: ${ancestor}"
+      fi
+      [[ "$ancestor" == / ]] && break
+      ancestor="${ancestor:h}"
+    done
+  done
+}
+
+require_service_bindings() {
+  emulate -L zsh
+  local -a missing=()
+  [[ -n "$STACK_LABEL" ]] || missing+=(HINDSIGHT_EMBED_STACK_LABEL)
+  [[ -n "$LEGACY_LABEL" ]] || missing+=(HINDSIGHT_EMBED_LEGACY_LABEL)
+  [[ -n "$PLIST" ]] || missing+=(HINDSIGHT_EMBED_SERVICE_MANIFEST)
+  [[ -n "$LEGACY_PLIST" ]] || missing+=(HINDSIGHT_EMBED_LEGACY_MANIFEST)
+  [[ -n "$SUPERVISOR" ]] || missing+=(HINDSIGHT_EMBED_SUPERVISOR)
+  [[ -n "$STACK_LIB" ]] || missing+=(HINDSIGHT_EMBED_STACK_LIB)
+  [[ -n "$STATE_DIR" ]] || missing+=(HINDSIGHT_EMBED_STATE_DIR)
+  [[ -n "$LOG_FILE" ]] || missing+=(HINDSIGHT_EMBED_SERVICE_LOG)
+  (( ${#missing} == 0 )) || die "missing required consumer bindings: ${missing[*]}"
+  [[ "$STACK_LABEL" =~ '^[A-Za-z0-9][A-Za-z0-9._-]*$' ]] ||
+    die "HINDSIGHT_EMBED_STACK_LABEL contains unsafe launchd label characters"
+  [[ "$LEGACY_LABEL" =~ '^[A-Za-z0-9][A-Za-z0-9._-]*$' ]] ||
+    die "HINDSIGHT_EMBED_LEGACY_LABEL contains unsafe launchd label characters"
+  [[ "$STACK_LABEL" != "$LEGACY_LABEL" ]] ||
+    die "managed and legacy launchd labels must be distinct"
+  [[ "$PLIST" == /* && "$LEGACY_PLIST" == /* ]] ||
+    die "managed and legacy service manifests must use absolute paths"
+  [[ "${PLIST:A}" != "${LEGACY_PLIST:A}" ]] ||
+    die "managed and legacy service manifests must resolve to distinct paths"
+}
+
+prepare_private_directory() {
+  emulate -L zsh
+  local directory="$1" label="$2"
+  [[ "$directory" == /* ]] ||
+    die "${label} must be an absolute non-symlink path: ${directory}"
+  validate_trusted_directory_ancestry "${directory:h}" "$label"
+  validate_trusted_directory_ancestry "${directory:A:h}" "$label"
+  ( umask 077; /bin/mkdir -p "$directory" ) || die "failed to create ${label}: ${directory}"
+  [[ -d "$directory" && ! -L "$directory" ]] || die "${label} is not a real directory: ${directory}"
+  local owner mode
+  owner="$(/usr/bin/stat -f '%u' "$directory")" || die "failed to inspect ${label} owner"
+  (( owner == EUID )) || die "${label} must be owned by the current user"
+  /bin/chmod 700 "$directory" || die "failed to secure ${label}: ${directory}"
+  ancestor="$directory"
+  while [[ "$ancestor" != / ]]; do
+    if [[ -L "$ancestor" ]]; then
+      [[ "$(/usr/bin/stat -f '%u' "$ancestor")" == 0 ]] ||
+        die "${label} ancestor symlink is not root-owned: ${ancestor}"
+    fi
+    owner="$(/usr/bin/stat -f '%u' "$ancestor")" || die "failed to inspect ${label}: ${ancestor}"
+    mode="$(/usr/bin/stat -f '%Lp' "$ancestor")" || die "failed to inspect ${label} mode: ${ancestor}"
+    (( owner == EUID || owner == 0 )) || die "${label} ancestor is not trusted: ${ancestor}"
+    if (( (8#$mode & 8#0022) != 0 && !(owner == 0 && (8#$mode & 8#01000) != 0) )); then
+      die "${label} ancestor is group or world writable: ${ancestor}"
+    fi
+    ancestor="${ancestor:h}"
+  done
+  owner="$(/usr/bin/stat -f '%u' "$directory")" || die "failed to inspect ${label} owner"
+  mode="$(/usr/bin/stat -f '%Lp' "$directory")" || die "failed to inspect ${label} mode"
+  (( owner == EUID && (8#$mode & 8#0077) == 0 )) ||
+    die "${label} must be private and owned by the current user"
+  validate_trusted_directory_ancestry "$directory" "$label"
+  validate_trusted_directory_ancestry "${directory:A}" "$label"
+}
+
+validate_trusted_directory_ancestry() {
+  emulate -L zsh
+  local ancestor="$1" label="$2" owner mode
+  while [[ ! -e "$ancestor" && ! -L "$ancestor" && "$ancestor" != / ]]; do
+    ancestor="${ancestor:h}"
+  done
+  while [[ "$ancestor" != / ]]; do
+    if [[ -L "$ancestor" ]]; then
+      owner="$(/usr/bin/stat -f '%u' "$ancestor")" ||
+        die "failed to inspect ${label} ancestor symlink: ${ancestor}"
+      (( owner == 0 )) || die "${label} ancestor symlink is not root-owned: ${ancestor}"
+    fi
+    owner="$(/usr/bin/stat -f '%u' "$ancestor")" || die "failed to inspect ${label}: ${ancestor}"
+    mode="$(/usr/bin/stat -f '%Lp' "$ancestor")" || die "failed to inspect ${label} mode: ${ancestor}"
+    (( owner == EUID || owner == 0 )) || die "${label} ancestor is not trusted: ${ancestor}"
+    if (( (8#$mode & 8#0022) != 0 && !(owner == 0 && (8#$mode & 8#01000) != 0) )); then
+      die "${label} ancestor is group or world writable: ${ancestor}"
+    fi
+    ancestor="${ancestor:h}"
+  done
+}
+
+prepare_service_state() {
+  emulate -L zsh
+  prepare_private_directory "$STATE_DIR" "service state directory"
+  local state_child
+  for state_child in logs staged-manifests rollback legacy; do
+    prepare_private_directory "${STATE_DIR}/${state_child}" "service ${state_child} directory"
+  done
+  [[ "$LOG_FILE" == /* && ! -L "$LOG_FILE" ]] ||
+    die "service log must be an absolute non-symlink path: ${LOG_FILE}"
+  prepare_private_directory "${LOG_FILE:h}" "service log parent"
+  if [[ -e "$LOG_FILE" && ! -f "$LOG_FILE" ]]; then
+    die "service log must be a regular file: ${LOG_FILE}"
+  fi
+  ( umask 077; : >> "$LOG_FILE" ) || die "failed to prepare service log: ${LOG_FILE}"
+  /bin/chmod 600 "$LOG_FILE" || die "failed to secure service log: ${LOG_FILE}"
+  local owner mode
+  owner="$(/usr/bin/stat -f '%u' "$LOG_FILE")" || die "failed to inspect service log owner"
+  mode="$(/usr/bin/stat -f '%Lp' "$LOG_FILE")" || die "failed to inspect service log mode"
+  (( owner == EUID && (8#$mode & 8#0077) == 0 )) ||
+    die "service log must be private and owned by the current user"
+}
+
+run_with_service_lifecycle_lock() (
+  emulate -L zsh
+  unsetopt ERR_EXIT
+  require_current_user_identity
+  prepare_service_state
+
+  # This is the same trusted lock used by the supervisor's stack entrypoints.
+  local lock_file="${STATE_DIR}/.lifecycle.lock"
+  if [[ -L "$lock_file" ]] || { [[ -e "$lock_file" ]] && [[ ! -f "$lock_file" ]]; }; then
+    die "refusing unsafe service lifecycle lock: ${lock_file}"
+  fi
+  ( umask 077; : >> "$lock_file" ) || die "failed to prepare service lifecycle lock"
+  /bin/chmod 600 "$lock_file" || die "failed to secure service lifecycle lock"
+  zmodload zsh/system || die "zsh/system is required for service lifecycle locking"
+  integer lock_descriptor
+  zsystem flock -f lock_descriptor -t 30 "$lock_file" ||
+    die "timed out acquiring service lifecycle lock"
+  "$@"
+  local result=$?
+  zsystem flock -u "$lock_descriptor" || return 1
+  return "$result"
+)
+
+run_with_service_command_lock() (
+  emulate -L zsh
+  unsetopt ERR_EXIT
+  require_current_user_identity
+  prepare_service_state
+
+  local lock_file="${STATE_DIR}/.service-command.lock"
+  if [[ -L "$lock_file" ]] || { [[ -e "$lock_file" ]] && [[ ! -f "$lock_file" ]]; }; then
+    die "refusing unsafe service command lock: ${lock_file}"
+  fi
+  ( umask 077; : >>"$lock_file" ) || die "failed to prepare service command lock"
+  /bin/chmod 600 "$lock_file" || die "failed to secure service command lock"
+  [[ "$(/usr/bin/stat -f '%u:%Lp' "$lock_file")" == "${EUID}:600" ]] ||
+    die "service command lock must be private and current-user-owned"
+  zmodload zsh/system || die "zsh/system is required for service command locking"
+  integer lock_descriptor
+  zsystem flock -f lock_descriptor -t 30 "$lock_file" ||
+    die "timed out acquiring service command lock"
+  "$@"
+  local result=$?
+  zsystem flock -u "$lock_descriptor" || return 1
+  return "$result"
+)
+
+run_with_service_maintenance_lease() (
+  emulate -L zsh
+  unsetopt ERR_EXIT
+  require_current_user_identity
+  prepare_service_state
+
+  local lock_file="${STATE_DIR}/.maintenance.lock"
+  if [[ -L "$lock_file" ]] || { [[ -e "$lock_file" ]] && [[ ! -f "$lock_file" ]]; }; then
+    die "refusing unsafe service maintenance lease: ${lock_file}"
+  fi
+  ( umask 077; : >>"$lock_file" ) || die "failed to prepare service maintenance lease"
+  /bin/chmod 600 "$lock_file" || die "failed to secure service maintenance lease"
+  [[ "$(/usr/bin/stat -f '%u:%Lp' "$lock_file")" == "${EUID}:600" ]] ||
+    die "service maintenance lease must be private and current-user-owned"
+  zmodload zsh/system || die "zsh/system is required for service maintenance leasing"
+  integer lock_descriptor
+  zsystem flock -f lock_descriptor -t 30 "$lock_file" ||
+    die "timed out waiting for Hindsight maintenance to finish"
+  trap 'run_with_service_lifecycle_lock cleanup_service_staging' EXIT
+  "$@"
+  local result=$?
+  run_with_service_lifecycle_lock cleanup_service_staging
+  trap - EXIT
+  zsystem flock -u "$lock_descriptor" || return 1
+  return "$result"
+)
+
+cleanup_service_staging() {
+  emulate -L zsh
+  unsetopt ERR_EXIT
+  local staged
+  for staged in "${STATE_DIR}/staged-manifests"/manifest.plist.*(N); do
+    /usr/bin/chflags nouchg "$staged" >/dev/null 2>&1 || true
+    /bin/chmod 600 "$staged" >/dev/null 2>&1 || true
+    /bin/rm -f "$staged" || true
+  done
+}
+
+load_stack_lib() {
+  emulate -L zsh
+  local diagnostic="${1:-0}"
+
+  if (( HINDSIGHT_EMBED_STACK_LIB_LOADED )); then
+    return 0
+  fi
+  if [[ "$diagnostic" == diagnostic ]]; then
+    ( require_current_user_identity ) >/dev/null 2>&1 || return 1
+    ( validate_trusted_artifact "$STACK_LIB" "stack library" ) >/dev/null 2>&1 || return 1
+  else
+    require_current_user_identity
+    validate_trusted_artifact "$STACK_LIB" "stack library"
+  fi
+  . "$STACK_LIB" || {
+    print -ru2 -- "hindsight-embed-service: failed to source stack library at ${STACK_LIB}"
+    return 1
+  }
+  local required_function
+  for required_function in \
+    hindsight_stack_log \
+    hindsight_stack_load_config \
+    hindsight_stack_broker_status \
+    hindsight_stack_enabled_profiles \
+    hindsight_stack_fleet_profiles_csv \
+    hindsight_stack_reconcile_once \
+    hindsight_stack_reset_desired_state \
+    hindsight_stack_require_current_user \
+    hindsight_stack_require_fleet_profiles \
+    hindsight_stack_profile_exists \
+    hindsight_stack_require_profile \
+    hindsight_stack_require_tools \
+    hindsight_stack_require_runtime_helpers \
+    hindsight_stack_start_all \
+    hindsight_stack_status_report \
+    hindsight_stack_stop_all \
+    hindsight_stack_with_lifecycle_lock \
+    hindsight_stack_wait_all \
+    hindsight_stack_validate_fleet \
+    hindsight_stack_wait_stopped_for; do
+    if (( ! ${+functions[$required_function]} )); then
+      print -ru2 -- "hindsight-embed-service: invalid stack library at ${STACK_LIB}; missing ${required_function}"
+      return 1
+    fi
+  done
+  typeset -g HINDSIGHT_EMBED_STACK_LIB_LOADED=1
+}
+
+domain() {
+  emulate -L zsh
+  print -r -- "gui/${UID}"
+}
+
+service_name() {
+  emulate -L zsh
+  local label="$1"
+  print -r -- "$(domain)/${label}"
+}
+
+is_loaded() {
+  emulate -L zsh
+  local label="$1"
+  /bin/launchctl print "$(service_name "$label")" >/dev/null 2>&1
+}
+
+has_disabled_override() {
+  emulate -L zsh
+  local label="$1"
+  /bin/launchctl print-disabled "$(domain)" 2>/dev/null \
+    | /usr/bin/grep -F "\"${label}\" =>" \
+    | /usr/bin/grep -E "=>[[:space:]]*(true|disabled)" >/dev/null 2>&1
+}
+
+bootout_if_loaded() {
+  emulate -L zsh
+  local label="$1"
+
+  if is_loaded "$label"; then
+    /bin/launchctl bootout "$(service_name "$label")" || return 1
+    print -r -- "${label} unloaded for this login session"
+  fi
+}
+
+bootstrap_manifest() {
+  emulate -L zsh
+  local manifest="$1" expected_label="$2" actual_label
+  actual_label="$(/usr/bin/plutil -extract Label raw -o - "$manifest" 2>/dev/null)" || {
+    print -ru2 -- "hindsight-embed-service: manifest has no valid Label: ${manifest}"
+    return 1
+  }
+  [[ "$actual_label" == "$expected_label" ]] || {
+    print -ru2 -- "hindsight-embed-service: manifest Label ${actual_label} does not match expected ${expected_label}"
+    return 1
+  }
+  /bin/launchctl bootstrap "$(domain)" "$manifest"
+}
+
+validate_manifest_contract() {
+  emulate -L zsh
+  local manifest="$1" expected_label="$2" expected_program="${3:-}" binding_mode="${4:-current}"
+  /usr/bin/python3 -I -c '
+import os
+import plistlib
+import sys
+
+path, expected_label, expected_program, binding_mode = sys.argv[1:]
+required_environment = {
+    "HINDSIGHT_EMBED_STACK_LIB", "HINDSIGHT_EMBED_UVX",
+    "HINDSIGHT_EMBED_CONTROL_PORT", "HINDSIGHT_EMBED_CONTROL_HOSTNAME",
+    "HINDSIGHT_EMBED_PRIMARY_PROFILE", "HINDSIGHT_EMBED_FLEET_PROFILES",
+    "HINDSIGHT_EMBED_API_BASE_PORT", "HINDSIGHT_EMBED_UI_BASE_PORT",
+    "HINDSIGHT_EMBED_UI_HOSTNAME", "HINDSIGHT_EMBED_PYTHON",
+    "HINDSIGHT_EMBED_STOP_HELPER", "HINDSIGHT_MEMORY_CLI",
+    "HINDSIGHT_MEMORY_STATE_DIR", "HINDSIGHT_MEMORY_BROKER_SOCKET",
+    "HINDSIGHT_EMBED_STATE_DIR", "HINDSIGHT_EMBED_AUTOSTART_DAEMON",
+    "HINDSIGHT_EMBED_AUTOSTART_UI",
+}
+with open(path, "rb") as handle:
+    value = plistlib.load(handle)
+if not isinstance(value, dict) or value.get("Label") != expected_label:
+    raise SystemExit("manifest Label does not match the expected job")
+arguments = value.get("ProgramArguments")
+if (
+    not isinstance(arguments, list) or not arguments
+    or any(not isinstance(item, str) or not item for item in arguments)
+    or not arguments[0].startswith("/")
+    or (expected_program and arguments != [expected_program])
+):
+    raise SystemExit("manifest ProgramArguments are not canonical")
+environment = value.get("EnvironmentVariables")
+if not isinstance(environment, dict):
+    raise SystemExit("manifest EnvironmentVariables are missing")
+if binding_mode in {"current", "rollback"}:
+    missing = sorted(
+        key for key in required_environment
+        if not isinstance(environment.get(key), str) or not environment[key]
+    )
+    if missing:
+        raise SystemExit("manifest is missing required environment: " + ", ".join(missing))
+if binding_mode == "current":
+    mismatched = sorted(
+        key for key in required_environment
+        if environment.get(key) != os.environ.get(key)
+    )
+    if mismatched:
+        raise SystemExit("manifest lifecycle bindings differ from current configuration: " + ", ".join(mismatched))
+' "$manifest" "$expected_label" "$expected_program" "$binding_mode"
+}
+
+stage_validated_manifest() {
+  emulate -L zsh
+  local source="$1" label="$2" expected_label="$3" expected_program="${4:-}" binding_mode="${5:-current}"
+  validate_trusted_artifact "$source" "$label"
+  /usr/bin/plutil -lint "$source" >/dev/null || return 1
+  validate_manifest_contract "$source" "$expected_label" "$expected_program" "$binding_mode" || return 1
+  local stage_dir="${STATE_DIR}/staged-manifests" staged
+  mkdir -p "$stage_dir" || return 1
+  /bin/chmod 700 "$stage_dir" || return 1
+  staged="$(mktemp "${stage_dir}/manifest.plist.XXXXXX")" || return 1
+  /bin/cp "$source" "$staged" || {
+    /bin/rm -f "$staged"
+    return 1
+  }
+  /bin/chmod 400 "$staged" || {
+    /bin/rm -f "$staged"
+    return 1
+  }
+  validate_trusted_artifact "$staged" "staged ${label}" || {
+    /bin/chmod 600 "$staged" >/dev/null 2>&1 || true
+    /bin/rm -f "$staged"
+    return 1
+  }
+  /usr/bin/plutil -lint "$staged" >/dev/null || {
+    /bin/chmod 600 "$staged" >/dev/null 2>&1 || true
+    /bin/rm -f "$staged"
+    return 1
+  }
+  validate_manifest_contract "$staged" "$expected_label" "$expected_program" "$binding_mode" || {
+    /bin/chmod 600 "$staged" >/dev/null 2>&1 || true
+    /bin/rm -f "$staged"
+    return 1
+  }
+  /usr/bin/chflags uchg "$staged" || {
+    /bin/chmod 600 "$staged" >/dev/null 2>&1 || true
+    /bin/rm -f "$staged"
+    return 1
+  }
+  print -r -- "$staged"
+}
+
+manifest_program_argument() {
+  emulate -L zsh
+  local manifest="$1"
+  /usr/bin/python3 -I -c '
+import plistlib
+import sys
+with open(sys.argv[1], "rb") as handle:
+    value = plistlib.load(handle)
+arguments = value.get("ProgramArguments") if isinstance(value, dict) else None
+if (
+    not isinstance(arguments, list) or len(arguments) != 1
+    or not isinstance(arguments[0], str) or not arguments[0].startswith("/")
+):
+    raise SystemExit("manifest requires one absolute lifecycle program")
+print(arguments[0])
+' "$manifest"
+}
+
+manifest_environment_file() {
+  emulate -L zsh
+  local manifest="$1" destination="$2"
+  /usr/bin/python3 -I -c '
+import plistlib
+import re
+import shlex
+import sys
+
+with open(sys.argv[1], "rb") as handle:
+    manifest = plistlib.load(handle)
+environment = manifest.get("EnvironmentVariables")
+if not isinstance(environment, dict):
+    raise SystemExit("manifest has no environment")
+for key, value in sorted(environment.items()):
+    if not isinstance(key, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+        raise SystemExit("manifest has an invalid environment key")
+    if not isinstance(value, str):
+        raise SystemExit("manifest has a non-string environment value")
+    print(f"export {key}={shlex.quote(value)}")
+' "$manifest" >"$destination"
+}
+
+wait_for_manifest_stack_health() {
+  emulate -L zsh
+  local manifest="$1" environment_file rollback_stack_lib
+  mkdir -p "${STATE_DIR}/rollback" || return 1
+  /bin/chmod 700 "${STATE_DIR}/rollback" || return 1
+  environment_file="$(mktemp "${STATE_DIR}/rollback/service-environment.zsh.XXXXXX")" || return 1
+  manifest_environment_file "$manifest" "$environment_file" || {
+    /bin/rm -f "$environment_file"
+    return 1
+  }
+  rollback_stack_lib="$(
+    /usr/bin/env -i HOME="$HOME" USER="$USER" LOGNAME="${LOGNAME:-$USER}" \
+      PATH=/usr/bin:/bin:/usr/sbin:/sbin SHELL=/bin/zsh \
+      /bin/zsh -f -c 'source "$1" || exit 1; print -r -- "${HINDSIGHT_EMBED_STACK_LIB:-}"' \
+      manifest-environment "$environment_file"
+  )" || {
+    /bin/rm -f "$environment_file"
+    return 1
+  }
+  [[ -n "$rollback_stack_lib" ]] &&
+    ( validate_trusted_artifact "$rollback_stack_lib" "manifest stack library" ) || {
+      /bin/rm -f "$environment_file"
+      return 1
+    }
+  /usr/bin/env -i HOME="$HOME" USER="$USER" LOGNAME="${LOGNAME:-$USER}" \
+    PATH=/usr/bin:/bin:/usr/sbin:/sbin SHELL=/bin/zsh \
+    /bin/zsh -f -c '
+      set -euo pipefail
+      source "$1"
+      source "$HINDSIGHT_EMBED_STACK_LIB"
+      hindsight_stack_load_config
+      hindsight_stack_require_tools
+      hindsight_stack_require_runtime_helpers
+      hindsight_stack_wait_all
+    ' manifest-environment "$environment_file"
+  local result=$?
+  /bin/rm -f "$environment_file"
+  return "$result"
+}
+
+remove_staged_manifest() {
+  emulate -L zsh
+  local staged="${1:-}"
+  [[ -n "$staged" ]] || return 0
+  /usr/bin/chflags nouchg "$staged" >/dev/null 2>&1 || true
+  /bin/chmod 600 "$staged" >/dev/null 2>&1 || true
+  /bin/rm -f "$staged"
+}
+
+snapshot_service_manifest() {
+  emulate -L zsh
+  local snapshot_dir="${STATE_DIR}/rollback"
+  local snapshot source="${HINDSIGHT_EMBED_SERVICE_ROLLBACK_MANIFEST:-}"
+  if [[ -z "$source" && -f "${snapshot_dir}/last-known-good.plist" ]]; then
+    source="${snapshot_dir}/last-known-good.plist"
+  fi
+  [[ -n "$source" ]] || {
+    print -ru2 -- "no verified prior service definition is available for rollback"
+    return 1
+  }
+  validate_trusted_artifact "$source" "service rollback manifest"
+  /usr/bin/plutil -lint "$source" >/dev/null || return 1
+  mkdir -p "$snapshot_dir" || return 1
+  snapshot="$(mktemp "${snapshot_dir}/service-manifest.plist.XXXXXX")" || return 1
+  /bin/cp "$source" "$snapshot" || {
+    /bin/rm -f "$snapshot"
+    return 1
+  }
+  /bin/chmod 600 "$snapshot" || {
+    /bin/rm -f "$snapshot"
+    return 1
+  }
+  /usr/bin/plutil -lint "$snapshot" >/dev/null || {
+    /bin/rm -f "$snapshot"
+    return 1
+  }
+  print -r -- "$snapshot"
+}
+
+persist_service_manifest_snapshot() {
+  emulate -L zsh
+  local source="${1:-$PLIST}"
+  local snapshot_dir="${STATE_DIR}/rollback"
+  local target="${snapshot_dir}/last-known-good.plist"
+  local temporary
+  mkdir -p "$snapshot_dir" || return 1
+  temporary="$(mktemp "${snapshot_dir}/last-known-good.plist.XXXXXX")" || return 1
+  /bin/cp "$source" "$temporary" || {
+    /bin/rm -f "$temporary"
+    return 1
+  }
+  /bin/chmod 600 "$temporary" || {
+    /bin/rm -f "$temporary"
+    return 1
+  }
+  /usr/bin/plutil -lint "$temporary" >/dev/null || {
+    /bin/rm -f "$temporary"
+    return 1
+  }
+  /usr/bin/python3 -I - "$temporary" "$target" <<'PY'
+import os
+import sys
+
+temporary, target = sys.argv[1:]
+parent = os.path.dirname(target)
+descriptor = os.open(
+    temporary,
+    os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+)
+try:
+    os.fsync(descriptor)
+finally:
+    os.close(descriptor)
+os.replace(temporary, target)
+directory_descriptor = os.open(
+    parent,
+    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0),
+)
+try:
+    os.fsync(directory_descriptor)
+finally:
+    os.close(directory_descriptor)
+PY
+  local rc=$?
+  (( rc == 0 )) || /bin/rm -f "$temporary"
+  return "$rc"
+}
+
+validate_legacy_rollback_manifest() {
+  emulate -L zsh
+  validate_trusted_artifact "$LEGACY_PLIST" "legacy rollback manifest"
+  /usr/bin/plutil -lint "$LEGACY_PLIST" >/dev/null ||
+    die "legacy rollback manifest failed lint: ${LEGACY_PLIST}"
+}
+
+retire_legacy_plist() {
+  emulate -L zsh
+  [[ -e "$LEGACY_PLIST" ]] || return 0
+  # The legacy definition remains rollback-relevant even when launchd no longer
+  # has it loaded. Validate it before moving the only on-disk copy.
+  validate_legacy_rollback_manifest
+
+  local legacy_dir="${STATE_DIR}/legacy"
+  local archive="${legacy_dir}/${LEGACY_LABEL}.$(/bin/date -u +%Y%m%dT%H%M%SZ).plist"
+  mkdir -p "$legacy_dir" || die "failed to create legacy archive directory: ${legacy_dir}"
+  /bin/mv "$LEGACY_PLIST" "$archive" || die "failed to archive legacy plist at ${LEGACY_PLIST}"
+  print -r -- "legacy plist archived: ${archive}"
+}
+
+validate_installed_files() {
+  emulate -L zsh
+  hindsight_stack_load_config || die "Hindsight stack configuration failed validation"
+
+  validate_trusted_artifact "$PLIST" "service manifest"
+  validate_trusted_artifact "$SUPERVISOR" "supervisor" executable
+  validate_trusted_artifact "$STACK_LIB" "stack library"
+  validate_trusted_artifact "$HINDSIGHT_EMBED_UVX" "uvx" executable allow-symlink
+  validate_trusted_artifact "$HINDSIGHT_EMBED_PYTHON" "Hindsight embed Python" executable allow-symlink
+  validate_trusted_artifact "$HINDSIGHT_EMBED_STOP_HELPER" "stop helper" readable allow-symlink
+  hindsight_stack_require_runtime_helpers || die "Hindsight helper runtime failed validation"
+  hindsight_stack_require_profile || die "configured Hindsight profile preflight failed"
+  hindsight_stack_require_fleet_profiles || die "configured Hindsight fleet preflight failed"
+  hindsight_stack_validate_fleet || die "configured Hindsight fleet validation failed"
+  validate_trusted_artifact "$HINDSIGHT_MEMORY_CLI" "memory controller" executable allow-symlink
+  /usr/bin/plutil -lint "$PLIST" >/dev/null || die "plist failed lint: ${PLIST}"
+}
+
+validate_launchd_state() {
+  emulate -L zsh
+  if has_disabled_override "$STACK_LABEL"; then
+    die "launchd has a disabled override for ${STACK_LABEL}; clear it explicitly before starting"
+  fi
+}
+
+show_installed_file_checks() {
+  emulate -L zsh
+  local ok=0
+  local stack_loaded=0
+  local uvx="${HINDSIGHT_EMBED_UVX:-$HOME/.local/bin/uvx}"
+
+  if load_stack_lib diagnostic >/dev/null 2>&1 &&
+    hindsight_stack_load_config >/dev/null 2>&1; then
+    stack_loaded=1
+    uvx="$HINDSIGHT_EMBED_UVX"
+  else
+    typeset -g HINDSIGHT_EMBED_STACK_LIB_LOADED=0
+  fi
+
+  print -r -- "installed files:"
+
+  if ( validate_trusted_artifact "$PLIST" "service manifest" ) >/dev/null 2>&1; then
+    print -r -- "  plist: ok (${PLIST})"
+    if /usr/bin/plutil -lint "$PLIST" >/dev/null 2>&1; then
+      print -r -- "  plist lint: ok"
+      if validate_manifest_contract "$PLIST" "$STACK_LABEL" "$SUPERVISOR" current >/dev/null 2>&1; then
+        print -r -- "  plist contract: ok"
+      else
+        print -r -- "  plist contract: failed"
+        ok=1
+      fi
+    else
+      print -r -- "  plist lint: failed"
+      ok=1
+    fi
+  else
+    print -r -- "  plist: missing, untrusted, or symlinked (${PLIST})"
+    ok=1
+  fi
+
+  if ( validate_trusted_artifact "$SUPERVISOR" "supervisor" executable ) >/dev/null 2>&1; then
+    print -r -- "  supervisor: ok (${SUPERVISOR})"
+  else
+    print -r -- "  supervisor: missing, untrusted, or not executable (${SUPERVISOR})"
+    ok=1
+  fi
+
+  if (( stack_loaded )); then
+    print -r -- "  stack library: ok (${STACK_LIB})"
+  elif [[ -r "$STACK_LIB" ]]; then
+    print -r -- "  stack library: failed to load or invalid (${STACK_LIB})"
+    ok=1
+  else
+    print -r -- "  stack library: missing (${STACK_LIB})"
+    ok=1
+  fi
+
+  if ( validate_trusted_artifact "$uvx" "uvx" executable allow-symlink ) >/dev/null 2>&1; then
+    print -r -- "  uvx: ok (${uvx})"
+  else
+    print -r -- "  uvx: missing, untrusted, or not executable (${uvx})"
+    ok=1
+  fi
+
+  if (( stack_loaded )) &&
+    ( validate_trusted_artifact "$HINDSIGHT_MEMORY_CLI" "memory controller" executable allow-symlink ) >/dev/null 2>&1; then
+    print -r -- "  memory controller: ok (${HINDSIGHT_MEMORY_CLI})"
+  else
+    print -r -- "  memory controller: missing, untrusted, or not executable (${HINDSIGHT_MEMORY_CLI:-unknown})"
+    ok=1
+  fi
+
+  if (( stack_loaded )) && hindsight_stack_require_runtime_helpers >/dev/null 2>&1; then
+    print -r -- "  helper runtime: ok"
+  else
+    print -r -- "  helper runtime: failed"
+    ok=1
+  fi
+
+  if (( stack_loaded )) && hindsight_stack_profile_exists; then
+    print -r -- "  configured profile: ok (${HINDSIGHT_EMBED_PROFILE})"
+  else
+    print -r -- "  configured profile: missing (${HINDSIGHT_EMBED_PROFILE:-unknown})"
+    ok=1
+  fi
+
+  if (( stack_loaded )) &&
+    hindsight_stack_require_fleet_profiles >/dev/null 2>&1 &&
+    hindsight_stack_validate_fleet >/dev/null 2>&1; then
+    print -r -- "  enabled profiles: ok ($(hindsight_stack_fleet_profiles_csv))"
+  else
+    print -r -- "  enabled profiles: invalid"
+    ok=1
+  fi
+
+  return "$ok"
+}
+
+preflight_launchd_service() {
+  emulate -L zsh
+  hindsight_stack_require_current_user || exit 1
+  validate_installed_files
+  validate_launchd_state
+}
+
+load_launchd_service() {
+  emulate -L zsh
+  local reload_loaded="${1:-0}"
+  local manifest="${2:-$PLIST}"
+
+  if is_loaded "$STACK_LABEL"; then
+    if (( reload_loaded )); then
+      bootout_if_loaded "$STACK_LABEL" || return 1
+      bootstrap_manifest "$manifest" "$STACK_LABEL" || return 1
+    else
+      /bin/launchctl kickstart -k "$(service_name "$STACK_LABEL")" ||
+        return 1
+    fi
+  else
+    bootstrap_manifest "$manifest" "$STACK_LABEL" ||
+      return 1
+  fi
+  is_loaded "$STACK_LABEL" || return 1
+
+  if wait_for_manifest_stack_health "$manifest"; then
+    print -r -- "${STACK_LABEL} is loaded and Hindsight stack is healthy"
+  else
+    return 1
+  fi
+}
+
+cleanup_failed_replacement() {
+  emulate -L zsh
+  unsetopt ERR_EXIT
+  local result=0
+  bootout_if_loaded "$STACK_LABEL" >/dev/null 2>&1 || result=1
+  hindsight_stack_with_lifecycle_lock hindsight_stack_stop_all >/dev/null 2>&1 || result=1
+  return "$result"
+}
+
+restore_loaded_stack_health() {
+  emulate -L zsh
+  local rollback_manifest="${1:-$PLIST}"
+  local staged_rollback="" rollback_supervisor
+  cleanup_failed_replacement || return 1
+  rollback_supervisor="$(manifest_program_argument "$rollback_manifest")" || return 1
+  validate_trusted_artifact "$rollback_supervisor" "rollback supervisor" executable || return 1
+  staged_rollback="$(run_with_service_lifecycle_lock stage_validated_manifest \
+    "$rollback_manifest" "stack rollback manifest" "$STACK_LABEL" \
+    "$rollback_supervisor" rollback)" || return 1
+
+  bootstrap_manifest "$staged_rollback" "$STACK_LABEL" || {
+    cleanup_failed_replacement >/dev/null 2>&1 || true
+    return 1
+  }
+  rollback_restore_failed() {
+    cleanup_failed_replacement >/dev/null 2>&1 || true
+    return 1
+  }
+  is_loaded "$STACK_LABEL" || {
+    rollback_restore_failed
+    return 1
+  }
+  wait_for_manifest_stack_health "$staged_rollback" && return 0
+  rollback_restore_failed
+  return 1
+}
+
+start_launchd_service() {
+  emulate -L zsh
+  local stack_was_loaded=0
+  local stack_was_healthy=0
+  local stack_rollback_manifest=""
+  local staged_manifest=""
+
+  is_loaded "$LEGACY_LABEL" &&
+    die "refusing start while legacy service ${LEGACY_LABEL} is loaded"
+
+  preflight_launchd_service
+  staged_manifest="$(run_with_service_lifecycle_lock stage_validated_manifest \
+    "$PLIST" "service manifest" "$STACK_LABEL" "$SUPERVISOR" current)" ||
+    die "failed to stage validated service manifest"
+  if is_loaded "$STACK_LABEL"; then
+    stack_was_loaded=1
+    stack_rollback_manifest="$(run_with_service_lifecycle_lock snapshot_service_manifest)" ||
+      die "failed to snapshot the loaded ${STACK_LABEL} manifest before restart"
+    wait_for_manifest_stack_health "$stack_rollback_manifest" >/dev/null 2>&1 &&
+      stack_was_healthy=1
+  fi
+  if ! hindsight_stack_reset_desired_state; then
+    if (( stack_was_loaded && stack_was_healthy )) &&
+      restore_loaded_stack_health "$stack_rollback_manifest"; then
+      /bin/rm -f "$stack_rollback_manifest"
+      die "failed to reset desired component state; restored previously healthy stack"
+    fi
+    die "failed to reset desired component state and could not restore prior health"
+  fi
+  if ! load_launchd_service "$stack_was_loaded" "$staged_manifest"; then
+    if (( stack_was_loaded && stack_was_healthy )); then
+      if restore_loaded_stack_health "$stack_rollback_manifest"; then
+        /bin/rm -f "$stack_rollback_manifest"
+        die "failed to restart ${STACK_LABEL}; restored previously healthy stack"
+      fi
+    fi
+    cleanup_failed_replacement ||
+      die "failed to load a healthy ${STACK_LABEL} and could not clean up its replacement; see ${LOG_FILE}"
+    if (( stack_was_loaded && stack_was_healthy )); then
+      die "failed to restart ${STACK_LABEL} and failed to restore its prior health"
+    fi
+    die "failed to load a healthy ${STACK_LABEL}; unloaded failed service; see ${LOG_FILE}"
+  fi
+  if ! run_with_service_lifecycle_lock persist_service_manifest_snapshot "$staged_manifest"; then
+    if (( stack_was_loaded && stack_was_healthy )); then
+      if restore_loaded_stack_health "$stack_rollback_manifest"; then
+        /bin/rm -f "$stack_rollback_manifest"
+        die "failed to persist ${STACK_LABEL} rollback definition; restored previously healthy stack"
+      fi
+      die "failed to persist ${STACK_LABEL} rollback definition and failed to restore its prior health"
+    fi
+    cleanup_failed_replacement ||
+      die "failed to persist ${STACK_LABEL} rollback definition and could not clean up the replacement"
+    die "failed to persist ${STACK_LABEL} rollback definition; cleaned up the replacement"
+  fi
+  [[ -z "$stack_rollback_manifest" ]] || /bin/rm -f "$stack_rollback_manifest"
+}
+
+install_service() {
+  emulate -L zsh
+
+  local legacy_was_loaded=0
+  local stack_was_loaded=0
+  local stack_was_healthy=0
+  local stack_rollback_manifest=""
+  local staged_manifest=""
+  local staged_legacy_manifest=""
+  is_loaded "$LEGACY_LABEL" && legacy_was_loaded=1
+  is_loaded "$STACK_LABEL" && stack_was_loaded=1
+  if (( legacy_was_loaded && stack_was_loaded )); then
+    die "refusing install while both ${LEGACY_LABEL} and ${STACK_LABEL} are loaded"
+  fi
+  preflight_launchd_service
+  if [[ -e "$LEGACY_PLIST" || -L "$LEGACY_PLIST" ]]; then
+    validate_legacy_rollback_manifest
+  fi
+  staged_manifest="$(run_with_service_lifecycle_lock stage_validated_manifest \
+    "$PLIST" "service manifest" "$STACK_LABEL" "$SUPERVISOR" current)" ||
+    die "failed to stage validated service manifest"
+  if (( stack_was_loaded )); then
+    stack_rollback_manifest="$(run_with_service_lifecycle_lock snapshot_service_manifest)" ||
+      die "failed to snapshot the loaded ${STACK_LABEL} manifest before reload"
+    wait_for_manifest_stack_health "$stack_rollback_manifest" >/dev/null 2>&1 &&
+      stack_was_healthy=1
+  fi
+  if (( legacy_was_loaded )); then
+    validate_legacy_rollback_manifest
+    local legacy_program
+    legacy_program="$(manifest_program_argument "$LEGACY_PLIST")" ||
+      die "legacy rollback manifest has invalid ProgramArguments"
+    validate_trusted_artifact "$legacy_program" "legacy rollback program" executable ||
+      die "legacy rollback program is not trusted"
+    staged_legacy_manifest="$(run_with_service_lifecycle_lock stage_validated_manifest \
+      "$LEGACY_PLIST" "legacy rollback manifest" "$LEGACY_LABEL" \
+      "$legacy_program" legacy)" ||
+      die "failed to stage validated legacy rollback manifest"
+  fi
+  if ! hindsight_stack_reset_desired_state; then
+    if (( stack_was_loaded && stack_was_healthy )) &&
+      restore_loaded_stack_health "$stack_rollback_manifest"; then
+      /bin/rm -f "$stack_rollback_manifest"
+      die "failed to reset desired component state; restored previously healthy stack"
+    fi
+    die "failed to reset desired component state and could not restore prior health"
+  fi
+  bootout_if_loaded "$LEGACY_LABEL" || die "failed to unload ${LEGACY_LABEL}"
+  if ! load_launchd_service "$stack_was_loaded" "$staged_manifest"; then
+    if (( stack_was_loaded && ! legacy_was_loaded )); then
+      if (( stack_was_healthy )) && restore_loaded_stack_health "$stack_rollback_manifest"; then
+        /bin/rm -f "$stack_rollback_manifest"
+        die "failed to install ${STACK_LABEL}; restored previously healthy stack"
+      fi
+      cleanup_failed_replacement ||
+        die "failed to install ${STACK_LABEL} and could not clean up the unhealthy replacement"
+      if (( stack_was_healthy )); then
+        die "failed to install ${STACK_LABEL} and failed to restore its prior health"
+      fi
+      die "failed to install ${STACK_LABEL}; unloaded replacement for previously unhealthy stack"
+    fi
+    cleanup_failed_replacement ||
+      die "replacement failed and ${STACK_LABEL} could not be cleaned up"
+    if (( legacy_was_loaded )); then
+      bootstrap_manifest "$staged_legacy_manifest" "$LEGACY_LABEL" ||
+        die "replacement failed and ${LEGACY_LABEL} could not be restored"
+      is_loaded "$LEGACY_LABEL" ||
+        die "replacement failed and ${LEGACY_LABEL} was not loaded after rollback"
+      die "failed to load a healthy ${STACK_LABEL}; restored prior launchd state"
+    fi
+    die "failed to load a healthy ${STACK_LABEL}"
+  fi
+  if ! run_with_service_lifecycle_lock persist_service_manifest_snapshot "$staged_manifest"; then
+    if (( stack_was_loaded && stack_was_healthy )); then
+      if restore_loaded_stack_health "$stack_rollback_manifest"; then
+        /bin/rm -f "$stack_rollback_manifest"
+        die "failed to persist ${STACK_LABEL} rollback definition; restored previously healthy stack"
+      fi
+      die "failed to persist ${STACK_LABEL} rollback definition and failed to restore its prior health"
+    fi
+    cleanup_failed_replacement ||
+      die "failed to persist ${STACK_LABEL} rollback definition and could not clean up the replacement"
+    if (( legacy_was_loaded )); then
+      bootstrap_manifest "$staged_legacy_manifest" "$LEGACY_LABEL" ||
+        die "failed to persist ${STACK_LABEL} rollback definition and could not restore ${LEGACY_LABEL}"
+      is_loaded "$LEGACY_LABEL" ||
+        die "failed to persist ${STACK_LABEL} rollback definition and ${LEGACY_LABEL} was not loaded after rollback"
+    fi
+    die "failed to persist ${STACK_LABEL} rollback definition; cleaned up the replacement"
+  fi
+  [[ -z "$stack_rollback_manifest" ]] || /bin/rm -f "$stack_rollback_manifest"
+  run_with_service_lifecycle_lock retire_legacy_plist
+}
+
+restart_service() {
+  emulate -L zsh
+  local stack_was_loaded=0
+  local stack_was_healthy=0
+  local stack_rollback_manifest=""
+  local staged_manifest=""
+
+  is_loaded "$LEGACY_LABEL" &&
+    die "refusing restart while legacy service ${LEGACY_LABEL} is loaded"
+  preflight_launchd_service
+  if is_loaded "$STACK_LABEL"; then
+    stack_was_loaded=1
+    stack_rollback_manifest="$(run_with_service_lifecycle_lock snapshot_service_manifest)" ||
+      die "failed to snapshot the loaded ${STACK_LABEL} manifest before clean restart"
+    wait_for_manifest_stack_health "$stack_rollback_manifest" >/dev/null 2>&1 &&
+      stack_was_healthy=1
+  fi
+  if ! staged_manifest="$(run_with_service_lifecycle_lock stage_validated_manifest \
+    "$PLIST" "service manifest" "$STACK_LABEL" "$SUPERVISOR" current)"; then
+    if (( stack_was_loaded && stack_was_healthy )) &&
+      restore_loaded_stack_health "$stack_rollback_manifest"; then
+      /bin/rm -f "$stack_rollback_manifest"
+      die "failed to stage validated service manifest; restored previously healthy stack"
+    fi
+    die "failed to stage validated service manifest and could not restore prior health"
+  fi
+  bootout_if_loaded "$STACK_LABEL" || die "failed to unload ${STACK_LABEL}"
+  if ! hindsight_stack_with_lifecycle_lock hindsight_stack_stop_all; then
+    if (( stack_was_loaded && stack_was_healthy )) &&
+      restore_loaded_stack_health "$stack_rollback_manifest"; then
+      /bin/rm -f "$stack_rollback_manifest"
+      die "failed to stop Hindsight stack; restored previously healthy stack"
+    fi
+    die "failed to stop Hindsight stack and could not restore its prior health"
+  fi
+  if ! hindsight_stack_reset_desired_state; then
+    if (( stack_was_loaded && stack_was_healthy )) &&
+      restore_loaded_stack_health "$stack_rollback_manifest"; then
+      /bin/rm -f "$stack_rollback_manifest"
+      die "failed to reset desired component state; restored previously healthy stack"
+    fi
+    die "failed to reset desired component state and could not restore prior health"
+  fi
+  if ! load_launchd_service 0 "$staged_manifest"; then
+    if (( stack_was_loaded && stack_was_healthy )) &&
+      restore_loaded_stack_health "$stack_rollback_manifest"; then
+      /bin/rm -f "$stack_rollback_manifest"
+      die "failed to load a healthy ${STACK_LABEL} after clean restart; restored previously healthy stack"
+    fi
+    cleanup_failed_replacement ||
+      die "failed to load a healthy ${STACK_LABEL} and could not clean up its replacement; see ${LOG_FILE}"
+    die "failed to load a healthy ${STACK_LABEL} after clean restart and could not restore prior health; see ${LOG_FILE}"
+  fi
+  if ! run_with_service_lifecycle_lock persist_service_manifest_snapshot "$staged_manifest"; then
+    if (( stack_was_loaded && stack_was_healthy )) &&
+      restore_loaded_stack_health "$stack_rollback_manifest"; then
+      /bin/rm -f "$stack_rollback_manifest"
+      die "failed to persist ${STACK_LABEL} restart definition; restored previously healthy stack"
+    fi
+    cleanup_failed_replacement ||
+      die "failed to persist ${STACK_LABEL} restart definition and could not clean it up"
+    die "failed to persist ${STACK_LABEL} restart definition; cleaned up replacement"
+  fi
+  [[ -z "$stack_rollback_manifest" ]] || /bin/rm -f "$stack_rollback_manifest"
+}
+
+stop_service() {
+  emulate -L zsh
+  require_current_user_identity
+  # Unload the trusted launchd job before importing consumer-controlled helper
+  # paths. A broken replacement must not leave an old supervisor running.
+  bootout_if_loaded "$STACK_LABEL" || die "failed to unload ${STACK_LABEL}"
+  bootout_if_loaded "$LEGACY_LABEL" || die "failed to unload ${LEGACY_LABEL}"
+
+  load_stack_lib ||
+    die "stack cleanup preflight failed after unloading launchd"
+  hindsight_stack_load_config ||
+    die "stack configuration preflight failed after unloading launchd"
+  hindsight_stack_require_current_user ||
+    die "current user preflight failed after unloading launchd"
+  hindsight_stack_require_runtime_helpers ||
+    die "runtime helper preflight failed after unloading launchd"
+  hindsight_stack_require_tools ||
+    die "runtime tool preflight failed after unloading launchd"
+  hindsight_stack_with_lifecycle_lock hindsight_stack_stop_all ||
+    die "failed to stop Hindsight stack"
+}
+
+run_stop_command() {
+  emulate -L zsh
+  local lease_mode="$1"
+  case "$lease_mode" in
+    external)
+      run_with_service_maintenance_lease \
+        run_with_service_command_lock stop_service
+      ;;
+    inherited)
+      [[ "${HINDSIGHT_EMBED_MAINTENANCE_LEASE_HELD:-}" == 1 ]] ||
+        die "internal stop requires an inherited maintenance lease"
+      run_with_service_command_lock stop_service
+      ;;
+    *) die "invalid service stop lease mode: ${lease_mode}" ;;
+  esac
+}
+
+show_status() {
+  emulate -L zsh
+  if (( EUID == 0 || UID == 0 )); then
+    die "refusing to run as root"
+  fi
+  local selected_profile="${1:-}"
+  local install_ok=0
+
+  if is_loaded "$STACK_LABEL"; then
+    print -r -- "launchd: loaded ($(service_name "$STACK_LABEL"))"
+  else
+    print -r -- "launchd: not loaded ($(service_name "$STACK_LABEL"))"
+  fi
+
+  if has_disabled_override "$STACK_LABEL"; then
+    print -r -- "disabled override: true"
+  else
+    print -r -- "disabled override: false"
+  fi
+
+  print -r -- ""
+  show_installed_file_checks || install_ok=1
+
+  print -r -- ""
+  if (( install_ok == 0 && HINDSIGHT_EMBED_STACK_LIB_LOADED )); then
+    hindsight_stack_status_report "$selected_profile" || install_ok=1
+  else
+    print -r -- "stack health: unavailable (install or runtime checks failed)"
+  fi
+
+  return "$install_ok"
+}
+
+show_logs() {
+  emulate -L zsh
+  require_current_user_identity
+  prepare_service_state
+  tail -n 80 -f "$LOG_FILE"
+}
+
+main() {
+  emulate -L zsh
+  setopt pipe_fail no_unset
+
+  local command="${1:-}"
+  local selected_profile=""
+
+  case "$command" in
+    -h|--help|help|"")
+      usage
+      return 0
+      ;;
+  esac
+  require_service_bindings
+
+  case "$command" in
+    install)
+      (( $# == 1 )) || die "install accepts no arguments"
+      load_stack_lib || exit 1
+      run_with_service_maintenance_lease run_with_service_command_lock install_service
+      ;;
+    start)
+      (( $# == 1 )) || die "start accepts no arguments"
+      load_stack_lib || exit 1
+      run_with_service_maintenance_lease run_with_service_command_lock start_launchd_service
+      ;;
+    restart)
+      (( $# == 1 )) || die "restart accepts no arguments"
+      load_stack_lib || exit 1
+      run_with_service_maintenance_lease run_with_service_command_lock restart_service
+      ;;
+    stop)
+      if (( $# == 1 )); then
+        run_stop_command external
+      elif (( $# == 2 )) && [[ "$2" == --maintenance-lease-held ]]; then
+        run_stop_command inherited
+      else
+        die "stop accepts only the internal --maintenance-lease-held option"
+      fi
+      ;;
+    status)
+      if (( $# == 1 )); then
+        show_status
+      elif (( $# == 3 )) && [[ "$2" == --profile && -n "$3" ]]; then
+        selected_profile="$3"
+        show_status "$selected_profile"
+      else
+        usage >&2
+        die "status accepts only --profile <name>"
+      fi
+      ;;
+    logs)
+      (( $# == 1 )) || die "logs accepts no arguments"
+      show_logs
+      ;;
+    *)
+      usage >&2
+      die "unknown command: ${command}"
+      ;;
+  esac
+}
+
+main "$@"

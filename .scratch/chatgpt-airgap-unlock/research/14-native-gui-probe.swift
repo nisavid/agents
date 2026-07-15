@@ -1079,18 +1079,29 @@ func strictActions(_ element: AXUIElement, purpose: String) throws -> Set<String
     return Set(values)
 }
 
+func requireSettableAttribute(
+    _ element: AXUIElement,
+    _ name: CFString,
+    purpose: String
+) throws {
+    var settable = DarwinBoolean(false)
+    let status = AXUIElementIsAttributeSettable(element, name, &settable)
+    guard status == .success else {
+        throw ProbeError.unavailable(
+            "\(purpose) writability read failed: \(status.rawValue)")
+    }
+    guard settable.boolValue else {
+        throw ProbeError.validation("\(purpose) is not writable")
+    }
+}
+
 func readOpenPanelFocusSnapshot(
     application: AXUIElement,
     panel: AXUIElement,
     process: ProcessIdentity
 ) throws -> OpenPanelFocusSnapshot {
-    try requireSameProcess(process)
-    let windows = try strictElementArrayAttribute(
-        application, kAXWindowsAttribute as CFString,
-        purpose: "application windows during Open panel focus")
-    guard windows.filter({ sameAXElement($0, panel) }).count == 1 else {
-        throw ProbeError.validation("original Open panel is missing or ambiguous during focus")
-    }
+    try requireExactOpenPanelCurrent(
+        application: application, panel: panel, process: process)
     let focusedWindow = try strictElementAttribute(
         application, kAXFocusedWindowAttribute as CFString,
         purpose: "application focused window")
@@ -1104,6 +1115,21 @@ func readOpenPanelFocusSnapshot(
             purpose: "Open panel focused state"))
     try requireSameProcess(process)
     return snapshot
+}
+
+func requireExactOpenPanelCurrent(
+    application: AXUIElement,
+    panel: AXUIElement,
+    process: ProcessIdentity
+) throws {
+    try requireSameProcess(process)
+    let windows = try strictElementArrayAttribute(
+        application, kAXWindowsAttribute as CFString,
+        purpose: "application windows during Open panel focus")
+    guard windows.filter({ sameAXElement($0, panel) }).count == 1 else {
+        throw ProbeError.validation("original Open panel is missing or ambiguous during focus")
+    }
+    try requireSameProcess(process)
 }
 
 func waitForOpenPanelFocus(
@@ -1145,30 +1171,56 @@ func waitForOpenPanelFocus(
 
 func performOpenPanelFocusActions(
     initial: OpenPanelFocusSnapshot,
-    validateIdentity: () throws -> Void,
+    validateTarget: () throws -> Void,
     preflightFrontmost: () throws -> Void,
     preflightRaise: () throws -> Void,
+    preflightFocusedWindow: () throws -> Void,
+    preflightPanelFocus: () throws -> Void,
     setFrontmost: () throws -> Void,
-    raisePanel: () throws -> Void
+    raisePanel: () throws -> Void,
+    setFocusedWindow: () throws -> Void,
+    readPanelFocused: () throws -> Bool,
+    setPanelFocus: () throws -> Void
 ) throws -> Int {
     if initial.ready { return 0 }
 
-    try validateIdentity()
+    try validateTarget()
     if !initial.applicationFrontmost { try preflightFrontmost() }
     try preflightRaise()
-    try validateIdentity()
+    if !initial.focusedWindowMatchesPanel { try preflightFocusedWindow() }
+    try validateTarget()
 
     var actionCount = 0
     if !initial.applicationFrontmost {
-        try validateIdentity()
+        try validateTarget()
         try setFrontmost()
-        try validateIdentity()
+        try validateTarget()
         actionCount += 1
     }
-    try validateIdentity()
+    try validateTarget()
     try raisePanel()
-    try validateIdentity()
+    try validateTarget()
     actionCount += 1
+    if !initial.focusedWindowMatchesPanel {
+        try validateTarget()
+        try setFocusedWindow()
+        try validateTarget()
+        actionCount += 1
+    }
+    if !initial.panelFocused {
+        try validateTarget()
+        let panelFocused = try readPanelFocused()
+        try validateTarget()
+        if !panelFocused {
+            try validateTarget()
+            try preflightPanelFocus()
+            try validateTarget()
+            try validateTarget()
+            try setPanelFocus()
+            try validateTarget()
+            actionCount += 1
+        }
+    }
     return actionCount
 }
 
@@ -1181,19 +1233,29 @@ func focusOpenPanel(
         application: application, panel: panel, process: process)
     let actionCount = try performOpenPanelFocusActions(
         initial: initial,
-        validateIdentity: { try requireSameProcess(process) },
+        validateTarget: {
+            try requireExactOpenPanelCurrent(
+                application: application, panel: panel, process: process)
+        },
         preflightFrontmost: {
-            var frontmostSettable = DarwinBoolean(false)
-            let status = AXUIElementIsAttributeSettable(
-                application, kAXFrontmostAttribute as CFString, &frontmostSettable)
-            guard status == .success, frontmostSettable.boolValue else {
-                throw ProbeError.validation("application frontmost state is not writable")
-            }
+            try requireSettableAttribute(
+                application, kAXFrontmostAttribute as CFString,
+                purpose: "application frontmost state")
         },
         preflightRaise: {
             guard try strictActions(panel, purpose: "Open panel").contains(kAXRaiseAction) else {
                 throw ProbeError.validation("Open panel does not advertise AXRaise")
             }
+        },
+        preflightFocusedWindow: {
+            try requireSettableAttribute(
+                application, kAXFocusedWindowAttribute as CFString,
+                purpose: "application focused window")
+        },
+        preflightPanelFocus: {
+            try requireSettableAttribute(
+                panel, kAXFocusedAttribute as CFString,
+                purpose: "Open panel focused state")
         },
         setFrontmost: {
             guard AXUIElementSetAttributeValue(
@@ -1206,6 +1268,25 @@ func focusOpenPanel(
             guard AXUIElementPerformAction(
                 panel, kAXRaiseAction as CFString) == .success else {
                 throw ProbeError.unavailable("AXRaise failed for exact Open panel")
+            }
+        },
+        setFocusedWindow: {
+            guard AXUIElementSetAttributeValue(
+                application, kAXFocusedWindowAttribute as CFString,
+                panel) == .success else {
+                throw ProbeError.unavailable("setting exact application focused window failed")
+            }
+        },
+        readPanelFocused: {
+            try strictBoolAttribute(
+                panel, kAXFocusedAttribute as CFString,
+                purpose: "Open panel focused state after focused-window write")
+        },
+        setPanelFocus: {
+            guard AXUIElementSetAttributeValue(
+                panel, kAXFocusedAttribute as CFString,
+                kCFBooleanTrue) == .success else {
+                throw ProbeError.unavailable("setting exact Open panel focused state failed")
             }
         })
 
@@ -3323,11 +3404,19 @@ func runSelfTests() throws {
     var focusActionTrace: [String] = []
     let readyActionCount = try performOpenPanelFocusActions(
         initial: focusReady,
-        validateIdentity: { focusActionTrace.append("identity") },
+        validateTarget: { focusActionTrace.append("target") },
         preflightFrontmost: { focusActionTrace.append("preflight-frontmost") },
         preflightRaise: { focusActionTrace.append("preflight-raise") },
+        preflightFocusedWindow: { focusActionTrace.append("preflight-focused-window") },
+        preflightPanelFocus: { focusActionTrace.append("preflight-panel-focus") },
         setFrontmost: { focusActionTrace.append("frontmost") },
-        raisePanel: { focusActionTrace.append("raise") })
+        raisePanel: { focusActionTrace.append("raise") },
+        setFocusedWindow: { focusActionTrace.append("focused-window") },
+        readPanelFocused: {
+            focusActionTrace.append("panel-focus-read")
+            return true
+        },
+        setPanelFocus: { focusActionTrace.append("panel-focus") })
     try require(readyActionCount == 0 && focusActionTrace.isEmpty,
                 "already-focused Open panel performed an action")
     focusActionTrace = []
@@ -3336,32 +3425,133 @@ func runSelfTests() throws {
         panelFocused: false)
     let focusActionCount = try performOpenPanelFocusActions(
         initial: unfocused,
-        validateIdentity: { focusActionTrace.append("identity") },
+        validateTarget: { focusActionTrace.append("target") },
         preflightFrontmost: { focusActionTrace.append("preflight-frontmost") },
         preflightRaise: { focusActionTrace.append("preflight-raise") },
+        preflightFocusedWindow: { focusActionTrace.append("preflight-focused-window") },
+        preflightPanelFocus: { focusActionTrace.append("preflight-panel-focus") },
         setFrontmost: { focusActionTrace.append("frontmost") },
-        raisePanel: { focusActionTrace.append("raise") })
-    try require(focusActionCount == 2 && focusActionTrace == [
-        "identity", "preflight-frontmost", "preflight-raise", "identity",
-        "identity", "frontmost", "identity", "identity", "raise", "identity",
+        raisePanel: { focusActionTrace.append("raise") },
+        setFocusedWindow: { focusActionTrace.append("focused-window") },
+        readPanelFocused: {
+            focusActionTrace.append("panel-focus-read")
+            return false
+        },
+        setPanelFocus: { focusActionTrace.append("panel-focus") })
+    try require(focusActionCount == 4 && focusActionTrace == [
+        "target", "preflight-frontmost", "preflight-raise",
+        "preflight-focused-window", "target",
+        "target", "frontmost", "target", "target", "raise", "target",
+        "target", "focused-window", "target",
+        "target", "panel-focus-read", "target", "target",
+        "preflight-panel-focus", "target", "target", "panel-focus", "target",
     ], "Open panel focus actions violated preflight, order, or PID bracketing")
+    focusActionTrace = []
+    let pendingActionCount = try performOpenPanelFocusActions(
+        initial: focusPending,
+        validateTarget: { focusActionTrace.append("target") },
+        preflightFrontmost: { focusActionTrace.append("preflight-frontmost") },
+        preflightRaise: { focusActionTrace.append("preflight-raise") },
+        preflightFocusedWindow: { focusActionTrace.append("preflight-focused-window") },
+        preflightPanelFocus: { focusActionTrace.append("preflight-panel-focus") },
+        setFrontmost: { focusActionTrace.append("frontmost") },
+        raisePanel: { focusActionTrace.append("raise") },
+        setFocusedWindow: { focusActionTrace.append("focused-window") },
+        readPanelFocused: {
+            focusActionTrace.append("panel-focus-read")
+            return true
+        },
+        setPanelFocus: { focusActionTrace.append("panel-focus") })
+    try require(pendingActionCount == 2 && focusActionTrace == [
+        "target", "preflight-raise", "preflight-focused-window", "target",
+        "target", "raise", "target", "target", "focused-window", "target",
+        "target", "panel-focus-read", "target",
+    ], "live pending focus repeated or skipped exact focus actions")
     focusActionTrace = []
     rejected = false
     do {
         _ = try performOpenPanelFocusActions(
             initial: unfocused,
-            validateIdentity: { focusActionTrace.append("identity") },
+            validateTarget: { focusActionTrace.append("target") },
             preflightFrontmost: { focusActionTrace.append("preflight-frontmost") },
             preflightRaise: {
                 focusActionTrace.append("preflight-raise")
                 throw ProbeError.validation("test missing AXRaise")
             },
+            preflightFocusedWindow: {
+                focusActionTrace.append("preflight-focused-window")
+            },
+            preflightPanelFocus: { focusActionTrace.append("preflight-panel-focus") },
             setFrontmost: { focusActionTrace.append("frontmost") },
-            raisePanel: { focusActionTrace.append("raise") })
+            raisePanel: { focusActionTrace.append("raise") },
+            setFocusedWindow: { focusActionTrace.append("focused-window") },
+            readPanelFocused: {
+                focusActionTrace.append("panel-focus-read")
+                return false
+            },
+            setPanelFocus: { focusActionTrace.append("panel-focus") })
     } catch ProbeError.validation { rejected = true }
     try require(rejected && !focusActionTrace.contains("frontmost") &&
-                    !focusActionTrace.contains("raise"),
+                    !focusActionTrace.contains("raise") &&
+                    !focusActionTrace.contains("focused-window") &&
+                    !focusActionTrace.contains("panel-focus"),
                 "failed focus preflight allowed a partial mutation")
+    focusActionTrace = []
+    rejected = false
+    do {
+        _ = try performOpenPanelFocusActions(
+            initial: unfocused,
+            validateTarget: { focusActionTrace.append("target") },
+            preflightFrontmost: { focusActionTrace.append("preflight-frontmost") },
+            preflightRaise: { focusActionTrace.append("preflight-raise") },
+            preflightFocusedWindow: {
+                focusActionTrace.append("preflight-focused-window")
+            },
+            preflightPanelFocus: {
+                focusActionTrace.append("preflight-panel-focus")
+                throw ProbeError.validation("test read-only panel focus")
+            },
+            setFrontmost: { focusActionTrace.append("frontmost") },
+            raisePanel: { focusActionTrace.append("raise") },
+            setFocusedWindow: { focusActionTrace.append("focused-window") },
+            readPanelFocused: {
+                focusActionTrace.append("panel-focus-read")
+                return false
+            },
+            setPanelFocus: { focusActionTrace.append("panel-focus") })
+    } catch ProbeError.validation { rejected = true }
+    try require(rejected && focusActionTrace.contains("focused-window") &&
+                    focusActionTrace.contains("preflight-panel-focus") &&
+                    !focusActionTrace.contains("panel-focus"),
+                "panel-focus fallback failure did not stop its exact write")
+    focusActionTrace = []
+    rejected = false
+    do {
+        _ = try performOpenPanelFocusActions(
+            initial: focusPending,
+            validateTarget: { focusActionTrace.append("target") },
+            preflightFrontmost: { focusActionTrace.append("preflight-frontmost") },
+            preflightRaise: { focusActionTrace.append("preflight-raise") },
+            preflightFocusedWindow: {
+                focusActionTrace.append("preflight-focused-window")
+            },
+            preflightPanelFocus: { focusActionTrace.append("preflight-panel-focus") },
+            setFrontmost: { focusActionTrace.append("frontmost") },
+            raisePanel: { focusActionTrace.append("raise") },
+            setFocusedWindow: {
+                focusActionTrace.append("focused-window")
+                throw ProbeError.unavailable("test focused-window write failure")
+            },
+            readPanelFocused: {
+                focusActionTrace.append("panel-focus-read")
+                return false
+            },
+            setPanelFocus: { focusActionTrace.append("panel-focus") })
+    } catch ProbeError.unavailable { rejected = true }
+    try require(rejected && focusActionTrace.contains("focused-window") &&
+                    !focusActionTrace.contains("panel-focus-read") &&
+                    !focusActionTrace.contains("panel-focus"),
+                "focused-window write failure allowed panel-focus fallback")
 
     var keyboardTrace: [String] = []
     try performValidatedKeyboardPost(

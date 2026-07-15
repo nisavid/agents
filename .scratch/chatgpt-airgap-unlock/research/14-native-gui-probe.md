@@ -71,11 +71,14 @@ Before Command-Shift-G, it requires the original panel to remain the unique
 current exact-PID window, strictly reads the application frontmost, focused
 window, and panel-focused attributes, and performs no focus action when they
 already prove readiness. Otherwise, separate authorization permits only setting
-that exact application's `AXFrontmost` attribute and raising that exact panel.
-It preflights both capabilities before the first mutation, brackets each action
-with process-identity checks, waits two monotonic seconds for all three focus
-postconditions, recaptures the path-entry baseline, and rechecks exact focus
-immediately before the adjacent PID-targeted key events.
+that exact application's `AXFrontmost` attribute, raising that exact panel, and
+setting that application's focused window to the same validated panel. It then
+rereads panel focus and sets only that panel's focused attribute to true if the
+focused-window write did not establish it. Every boundary revalidates the PID
+and unique current panel identity; writability read failures remain distinct
+from confirmed read-only attributes. It waits two monotonic seconds for all
+three focus postconditions, recaptures the path-entry baseline, and rechecks
+exact focus immediately before the adjacent PID-targeted key events.
 The runner requires that evidence order before accepting panel validation, then
 requires a renderer transition from a nonmatching project to the per-run nonce
 project. After the renderer creates its first task, the runner waits for the
@@ -176,8 +179,8 @@ Ivan; the helper never requests a prompt itself.
 
 Green for the source, build, input-policy, selector-policy, and runner-seam
 slice. The retained no-permission artifact for this revision is arm64 and ad-hoc signed,
-with SHA-256 `b797cca31ba50627b4bb7d17d870d67778e055fff5431094568a25bc9c00e085`
-and CDHash `c9f6321572d96e89e34d1cd919df5f3d6039df47`. A clean build in a second
+with SHA-256 `e3b184ad22566a565a55068f7b7418fed862bcd4551a1705e1f9725d1b209b54`
+and CDHash `331175d81b4da5876a74934563ec982547166a85`. A clean build in a second
 disposable directory produced the same SHA-256. The helper self-test, forbidden
 API and sensitive-symbol allowlists, path-policy fixtures, renderer transition
 oracle, authoritative project-state fixtures, runner shell syntax, and
@@ -213,6 +216,15 @@ keeps the original Open panel's unique membership requirement and strict focus
 typing but treats any other focused-window identity as pending until exact-app
 frontmost plus exact-panel raise establishes the required equality. The run
 cleaned up every owned listener and process, its isolated database passed
+`quick_check` with zero threads, and source/copy ASAR hashes matched.
+
+The next focus-enabled run, suffix `MYh8h3`, performed exact-app frontmost and
+exact-panel raise successfully, but all 19 bounded polls retained
+`frontmost=true focused-window-matches=false panel-focused=false`. The helper
+therefore still emitted no keyboard input or project-selection request. The
+retained contract adds only the two exact AX focus selectors described above,
+with a staged reread to avoid a redundant panel-focus write. Cleanup again
+closed every owned listener and process; the isolated database passed
 `quick_check` with zero threads, and source/copy ASAR hashes matched.
 
 ## First live invocation

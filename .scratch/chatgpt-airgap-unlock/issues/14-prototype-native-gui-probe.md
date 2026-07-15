@@ -168,12 +168,14 @@ The helper now strictly proves the exact copied application is frontmost, its
 focused window is the original panel, and that panel is focused. If those
 postconditions are absent, separate authorization permits only setting the
 exact application's `AXFrontmost` attribute and performing `AXRaise` on the
-exact panel, after both capabilities are preflighted and with process identity
-checks around each action. It then recaptures the path-entry baseline and checks
-focus inside the final keyboard-post boundary. Two reproducible builds matched
-SHA-256 `b797cca31ba50627b4bb7d17d870d67778e055fff5431094568a25bc9c00e085`;
+exact panel, setting that application's focused window to the validated panel,
+and, only after a strict reread still reports false, setting that panel's focused
+attribute to true. Every boundary revalidates both PID and unique current panel
+identity. It then recaptures the path-entry baseline and checks focus inside the
+final keyboard-post boundary. Two reproducible builds matched SHA-256
+`e3b184ad22566a565a55068f7b7418fed862bcd4551a1705e1f9725d1b209b54`;
 the canonical arm64 ad-hoc artifact has CDHash
-`c9f6321572d96e89e34d1cd919df5f3d6039df47` and awaits a fresh manual grant.
+`331175d81b4da5876a74934563ec982547166a85` and awaits a fresh manual grant.
 
 The first focus-enabled run, suffix `XX7Egp`, reached the exact menu press and
 Open panel, then failed before focus mutation because the inactive exact app's
@@ -184,3 +186,13 @@ window as pending until the authorized exact-app frontmost and exact-panel raise
 actions establish equality. Cleanup closed every owned process and listener;
 the isolated database passed `quick_check` with zero threads, and source/copy
 ASAR hashes matched.
+
+The next focus-enabled run, suffix `MYh8h3`, successfully made the exact copied
+application frontmost and raised the exact panel. All 19 bounded focus polls
+still reported `frontmost=true focused-window-matches=false
+panel-focused=false`, so no keyboard input or project-selection request
+occurred. The retained contract adds only exact focused-window and panel-focused
+selectors, with a staged reread to avoid the latter write when the former is
+sufficient. Cleanup closed every owned process and listener; the isolated
+database passed `quick_check` with zero threads, and source/copy ASAR hashes
+matched.

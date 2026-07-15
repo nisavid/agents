@@ -277,10 +277,29 @@ for required_focus_contract in kAXFrontmostAttribute kAXFocusedWindowAttribute \
   /usr/bin/grep -Fq "$required_focus_contract" "$focus_body_file"
 done
 test "$(printf '%s\n' "$focus_body" | \
-  /usr/bin/grep -Fc 'AXUIElementSetAttributeValue(')" -eq 1
+  /usr/bin/grep -Fc 'AXUIElementSetAttributeValue(')" -eq 3
+test "$(printf '%s\n' "$focus_body" | \
+  /usr/bin/grep -Fc 'try requireSettableAttribute(')" -eq 3
+test "$(printf '%s\n' "$focus_body" | \
+  /usr/bin/grep -Fc 'AXUIElementIsAttributeSettable(')" -eq 1
 test "$(printf '%s\n' "$focus_body" | \
   /usr/bin/grep -Fc 'AXUIElementPerformAction(')" -eq 1
 /usr/bin/grep -Fq 'panel, kAXRaiseAction as CFString' "$focus_body_file"
+/usr/bin/grep -Fq 'application, kAXFocusedWindowAttribute as CFString' \
+  "$focus_body_file"
+/usr/bin/grep -Fq 'panel, kAXFocusedAttribute as CFString' "$focus_body_file"
+focused_window_setter_body="$(printf '%s\n' "$focus_body" | /usr/bin/sed -n \
+  '/^        setFocusedWindow: {$/,/^        },$/p')"
+printf '%s\n' "$focused_window_setter_body" | \
+  /usr/bin/grep -Fq 'application, kAXFocusedWindowAttribute as CFString'
+printf '%s\n' "$focused_window_setter_body" | \
+  /usr/bin/grep -Fq 'panel) == .success'
+panel_focus_setter_body="$(printf '%s\n' "$focus_body" | /usr/bin/sed -n \
+  '/^        setPanelFocus: {$/,/^        })$/p')"
+printf '%s\n' "$panel_focus_setter_body" | \
+  /usr/bin/grep -Fq 'panel, kAXFocusedAttribute as CFString'
+printf '%s\n' "$panel_focus_setter_body" | \
+  /usr/bin/grep -Fq 'kCFBooleanTrue) == .success'
 if printf '%s\n' "$focus_body" | /usr/bin/grep -Eq \
   'NSWorkspace|NSRunningApplication|activateIgnoringOtherApps|AXUIElementCreateSystemWide|postToPid'; then
   echo 'Open panel focus contract contains a broader activation or input surface' >&2
@@ -297,6 +316,13 @@ command_shortcut_line="$(printf '%s\n' "$execute_body" | \
   /usr/bin/awk -F: '{print $1}')"
 test "$command_focus_line" -lt "$command_baseline_line"
 test "$command_baseline_line" -lt "$command_shortcut_line"
+direct_navigation_body="$(printf '%s\n' "$execute_body" | \
+  /usr/bin/sed -n '/^    case \.direct:/,/^    case \.commandShiftG:/p')"
+if printf '%s\n' "$direct_navigation_body" | /usr/bin/grep -Eq \
+  'focusOpenPanel|postCommandShiftG|kAXFocused(Window)?Attribute'; then
+  echo 'direct navigation unexpectedly uses focus authorization or mutation' >&2
+  exit 1
+fi
 keyboard_post_body="$(/usr/bin/sed -n \
   '/^func performValidatedKeyboardPost(/,/^}/p' \
   "$HERE/14-native-gui-probe.swift")"

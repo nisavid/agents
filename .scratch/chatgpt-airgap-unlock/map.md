@@ -35,7 +35,7 @@ Produce an implementation-ready, empirically validated plan for running the exac
 - [Validate the preferred route](issues/08-validate-preferred-route.md) — Prove the configured pristine-bundle route against the local OptiQ fixture and grade every minimum-workflow and platform-isolation gate from artifact-bound evidence.
 - [Validate the offline GUI workflow](issues/12-validate-offline-gui-workflow.md) — Complete native project, worktree, permission, project-local skill, and reasoning-label acceptance against the pinned local route.
 - [Validate production isolation](issues/13-validate-production-isolation.md) — Preserve the vendor Chromium sandbox and signed code posture while a disconnected VM or true air gap makes hosted egress unavailable.
-- [Prototype the native GUI probe](issues/14-prototype-native-gui-probe.md) — The PID-bound helper now requires explicit exact-app/panel focus authorization and proof inside the final keyboard-post boundary; two reproducible builds matched SHA-256 `b797cca31ba50627b4bb7d17d870d67778e055fff5431094568a25bc9c00e085`, and the canonical artifact awaits its fresh manual Accessibility grant before the next project-selection run.
+- [Prototype the native GUI probe](issues/14-prototype-native-gui-probe.md) — The PID-bound helper now requires explicit exact-app/panel focus authorization and proof inside the final keyboard-post boundary; two reproducible builds matched SHA-256 `e3b184ad22566a565a55068f7b7418fed862bcd4551a1705e1f9725d1b209b54`, and the canonical artifact awaits its fresh manual Accessibility grant before the next project-selection run.
 
 ## Not yet specified
 

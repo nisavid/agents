@@ -18,6 +18,13 @@ The project-local skill, exact configured model metadata, native project
 picker, native permission decision, and native worktree controls remain red or
 unexercised. Ticket 12 remains open for those separate surfaces.
 
+The first dedicated mode run was also intentionally red. It proved both mode
+controls and one persisted Default turn, then stopped before the Plan turn
+because the initial probe incorrectly treated an exact model phrase as part of
+the mode contract. The revised no-app probe binds nonempty renderer output to
+the persisted completion by hash instead; that revision has not received a
+second live run.
+
 The successful run used:
 
 ```sh
@@ -28,6 +35,51 @@ GUI_COLD_RESUME=true \
 PROBE_EXPECT=renderer-cold-resume \
   .scratch/chatgpt-airgap-unlock/research/08-run-prototype.sh
 ```
+
+## Dedicated mode run and diagnosis
+
+Run-root suffix `jJuSa5` used the exact copied app, fresh isolated state, the
+pinned OptiQ revision, and reviewed gateway commit
+`6307d37b76918c19f2e3bc0fd506434531aadeb2`:
+
+```sh
+ROUTE_MODE=gateway \
+GATEWAY_COMMIT=6307d37b76918c19f2e3bc0fd506434531aadeb2 \
+GUI_WORKFLOW=true \
+GUI_MODES=true \
+PROBE_EXPECT=renderer-modes \
+  .scratch/chatgpt-airgap-unlock/research/08-run-prototype.sh
+```
+
+- In Default mode, entering `/plan` displayed `Plan mode` and `Turn plan mode
+  on`. Selecting that renderer control displayed a `Plan` button with the
+  accessible label `Plan`; selecting the button removed the indicator and
+  returned the composer to Default mode.
+- The Default turn completed and persisted with
+  `collaboration_mode.mode=default`. Its turn-identity SHA-256 was
+  `cdba4837fcbfe48b869d242679c22c5eca5bbb8977f5de44cbc0f131b3c68c3f`;
+  its completed-output SHA-256 was
+  `a1635fe337e61157be3c8f37976926bd00feecba358e15ecf0d02ca60aafedec`.
+- The initial driver required an unrelated exact answer. The local model
+  returned a different nonempty completion, so the driver failed closed before
+  selecting Plan for the second turn. The Plan control is proven; a persisted
+  Plan turn and cross-surface output binding remain unvalidated.
+- The gateway and upstream completed the renderer transport with authentication
+  replacement and namespace continuation intact. No credential, request-body,
+  or remote-socket leak was observed. All owned processes and listeners exited.
+- The copied ASAR and bundled Codex hashes remained
+  `d28f31b4bbb04c519be65c2af8277d8c5faf77b4239ee89b928f0a7423dacd84`
+  and `28699add67540b93390329a740649a9eb9bdbc5538d92c1679c8c6b6fa2c623c`.
+  The copied bundle retained its strict deep signature.
+
+The revised driver accepts any nonempty mode-turn output, records only its
+length and SHA-256, and requires the persisted `task_complete` output to have
+the same SHA-256. The companion validator still requires exactly one Default
+prompt and one Plan prompt, each bound to exactly one matching turn context and
+completion in one rollout. Its self-test rejects a Plan prompt persisted as
+Default and rejects a renderer/persistence output-hash mismatch. This isolates
+the mode contract from small-model wording without weakening turn identity,
+mode identity, renderer visibility, or persistence evidence.
 
 ## Successful cold-restart evidence
 

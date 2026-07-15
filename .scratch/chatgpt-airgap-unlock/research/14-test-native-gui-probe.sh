@@ -100,10 +100,39 @@ fi
 picker_request_body="$(/usr/bin/sed -n \
   '/BEGIN_NATIVE_PROJECT_PICKER_REQUEST/,/END_NATIVE_PROJECT_PICKER_REQUEST/p' \
   "$HERE/12-cdp-gui-driver.mjs")"
-test "$(printf '%s\n' "$picker_request_body" | /usr/bin/grep -Fc 'type: "mousePressed"')" -eq 1
-test "$(printf '%s\n' "$picker_request_body" | /usr/bin/grep -Fc 'type: "mouseReleased"')" -eq 1
+trusted_accelerator_body="$(/usr/bin/sed -n \
+  '/BEGIN_TRUSTED_RENDERER_ACCELERATOR/,/END_TRUSTED_RENDERER_ACCELERATOR/p' \
+  "$HERE/12-cdp-gui-driver.mjs")"
+test "$(printf '%s\n' "$trusted_accelerator_body" | /usr/bin/grep -Fc 'type: "rawKeyDown"')" -eq 1
+test "$(printf '%s\n' "$trusted_accelerator_body" | /usr/bin/grep -Fc 'type: "keyUp"')" -eq 1
+test "$(printf '%s\n' "$trusted_accelerator_body" | /usr/bin/grep -Fc 'modifiers: 4')" -eq 2
+test "$(printf '%s\n' "$trusted_accelerator_body" | /usr/bin/grep -Fc 'code: "KeyO"')" -eq 2
+test "$(printf '%s\n' "$trusted_accelerator_body" | /usr/bin/grep -Fc 'key: "o"')" -eq 2
+test "$(printf '%s\n' "$picker_request_body" | /usr/bin/grep -Fc 'await dispatchTrustedOpenFolderAccelerator()')" -eq 1
+choose_project_line="$(printf '%s\n' "$picker_request_body" | \
+  /usr/bin/grep -nF 'accessibleName: "Choose project"' | /usr/bin/awk -F: '{print $1}')"
+accelerator_line="$(printf '%s\n' "$picker_request_body" | \
+  /usr/bin/grep -nF 'await dispatchTrustedOpenFolderAccelerator()' | /usr/bin/awk -F: '{print $1}')"
+picker_requested_line="$(printf '%s\n' "$picker_request_body" | \
+  /usr/bin/grep -nF 'emit("native-project-picker-requested"' | /usr/bin/awk -F: '{print $1}')"
+test -n "$choose_project_line"
+test -n "$accelerator_line"
+test -n "$picker_requested_line"
+test "$choose_project_line" -lt "$accelerator_line"
+test "$accelerator_line" -lt "$picker_requested_line"
+/usr/bin/grep -Fq 'preconditionAccessibleName: "Choose project"' \
+  "$HERE/12-cdp-gui-driver.mjs"
+if printf '%s\n' "$picker_request_body" | /usr/bin/grep -Eq \
+  'exactText: "(New project|Use an existing folder)"|dispatchTrustedClick'; then
+  echo 'renderer project-picker request still depends on a feature-gated nested menu' >&2
+  exit 1
+fi
 if printf '%s\n' "$picker_request_body" | /usr/bin/grep -Eq 'sleep\(|setTimeout\('; then
   echo 'renderer project-picker request still relies on a fixed sleep' >&2
+  exit 1
+fi
+if printf '%s\n' "$picker_request_body" | /usr/bin/grep -Fq '.click('; then
+  echo 'renderer project-picker request uses an untrusted DOM click' >&2
   exit 1
 fi
 test "$(/usr/bin/grep -Fc '"$NATIVE_GUI_PROBE_BIN" "$@" \' \

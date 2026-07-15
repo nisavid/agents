@@ -50,17 +50,32 @@ PROBE_EXPECT=renderer-native-project \
   .scratch/chatgpt-airgap-unlock/research/08-run-prototype.sh
 ```
 
-The runner asks the renderer's unique visible `Choose project` control to open
-the native panel, resolves exactly one copied-app executable in the owned
-process group, invokes the helper, then requires a renderer transition from a
-nonmatching project to the per-run nonce project. After the renderer creates its
-first task, the runner waits for the authoritative database and required schema
-through a bounded, read-only readiness check. `research/14-project-state.py` then requires the authoritative
+The runner first requires one enabled, visible renderer control with the exact
+accessible name `Choose project`, proving that no project is selected. It then
+sends one trusted CDP `Meta+O` accelerator to the copied app. The bundled
+`Open Folder…` command routes directly through the local workspace bridge to
+`pickLocalWorkspaceRoots` and its parented `showOpenDialog`; it does not depend
+on the project-selector menu's feature-gated shape. The runner resolves exactly
+one copied-app executable in the owned process group, invokes the helper, then
+requires a renderer transition from a nonmatching project to the per-run nonce
+project. After the renderer creates its first task, the runner waits for the
+authoritative database and required schema through a bounded, read-only
+readiness check. `research/14-project-state.py` then requires the authoritative
 `state_5.sqlite.threads.cwd` record to transition from zero exact fixture rows
 to exactly one before recording the native project-picker gate as complete.
 The copied app's Seatbelt profile denies writes to the exact reviewed helper
 path, and the runner rechecks its inode, SHA-256, and signature immediately
 before execution.
+
+The first live attempt clicked `Choose project` and started the helper after
+that single renderer interaction. That control only opens the project-selector
+menu, so no native panel existed for the helper to inspect. Driving the menu is
+not deterministic: the empty-project menu can expose either a direct
+`New project` action or a submenu containing `Use an existing folder`, depending
+on a feature gate. The stable app-level `Open Folder…` accelerator bypasses both
+menu variants. The renderer driver uses bounded state polling for its
+precondition and contains no fixed delay between that assertion and the trusted
+accelerator.
 
 ## Permission boundary
 

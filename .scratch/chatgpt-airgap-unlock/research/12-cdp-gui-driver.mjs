@@ -465,10 +465,11 @@ async function reopenPersistedThread(state) {
 async function inspectSurfaces() {
   const main = await snapshot("surface-main");
   const rendererModelMetadataMatched =
-    main.text.includes("Local OptiQ smoke model") ||
-    main.text.includes("Qwen3.5-2B-OptiQ-4bit");
+    main.text.includes("Qwen3.5-2B-OptiQ-4bit (no-think)");
+  const rendererFallbackModelMetadataAbsent =
+    !main.controls.some((control) => control.text === "Custom Light");
   const modelSurfaceObserved = main.controls.some((control) =>
-    control.text === "Custom Light" ||
+    control.text?.includes("Qwen3.5-2B-OptiQ-4bit") ||
     /model/i.test(control.ariaLabel ?? "")
   );
 
@@ -520,6 +521,7 @@ async function inspectSurfaces() {
     localSkillVisible,
     modelSurfaceObserved,
     rendererModelMetadataMatched,
+    rendererFallbackModelMetadataAbsent,
   };
 }
 
@@ -552,7 +554,8 @@ try {
     emit("gui-summary", summary);
     const required = [summary.mainUi, summary.rendererPromptCompleted, summary.tasksSurfaceObserved,
       summary.settingsSurfaceObserved, summary.pluginSurfaceObserved,
-      summary.skillSurfaceObserved, summary.modelSurfaceObserved];
+      summary.skillSurfaceObserved, summary.modelSurfaceObserved,
+      summary.rendererModelMetadataMatched, summary.rendererFallbackModelMetadataAbsent];
     if (required.some((value) => value !== true)) process.exitCode = 1;
   } else if (phase === "second") {
     if (!resumeStatePath) throw new Error("second phase requires a resume-state path");

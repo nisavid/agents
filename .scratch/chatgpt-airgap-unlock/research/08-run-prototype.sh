@@ -22,6 +22,8 @@ OBSERVER="$HERE/08-proxy-observer.py"
 CDP_OBSERVER="$HERE/08-cdp-observer.mjs"
 GUI_DRIVER="$HERE/12-cdp-gui-driver.mjs"
 COLD_RESUME_STATE="$HERE/12-cold-resume-state.py"
+MODEL_CATALOG_BUILDER="$HERE/08-model-catalog.py"
+MODEL_CATALOG_TEST="$HERE/08-model-catalog-test.py"
 HOST_PROBE="$HERE/08-appserver-probe.py"
 HOST_RESTART_PROBE="$HERE/08-appserver-restart-probe.py"
 PROCESS_GROUP="$HERE/08-process-group.py"
@@ -84,6 +86,7 @@ require_positive_terminal_delta() {
 }
 
 run_cold_handoff_self_test() (
+  /usr/bin/python3 "$MODEL_CATALOG_TEST"
   /usr/bin/python3 "$COLD_RESUME_STATE" --self-test
   self_test_root="$(mktemp -d /private/tmp/chatgpt-cold-handoff-self-test.XXXXXX)"
   trap '/bin/rm -rf "$self_test_root"' EXIT INT TERM
@@ -176,7 +179,9 @@ CDP_OBSERVER_EXEC="$RUN_ROOT/cdp-observer.mjs"
 GUI_DRIVER_EXEC="$RUN_ROOT/gui-driver.mjs"
 NAMESPACE_PROBE_EXEC="$RUN_ROOT/namespace-probe.py"
 COLD_RESUME_STATE_EXEC="$RUN_ROOT/cold-resume-state.py"
+MODEL_CATALOG_BUILDER_EXEC="$RUN_ROOT/model-catalog.py"
 GUI_RESUME_STATE="$LOG_DIR/gui-resume-state.json"
+MODEL_CATALOG="$CODEX_DIR/model-catalog.json"
 
 case "$ROUTE_MODE" in
   direct)
@@ -239,8 +244,10 @@ chmod 700 "$HOME_DIR" "$CODEX_DIR" "$USER_DATA_DIR" "$TMP_DIR" "$LOG_DIR" "$WORK
 /bin/cp "$GUI_DRIVER" "$GUI_DRIVER_EXEC"
 /bin/cp "$NAMESPACE_PROBE" "$NAMESPACE_PROBE_EXEC"
 /bin/cp "$COLD_RESUME_STATE" "$COLD_RESUME_STATE_EXEC"
+/bin/cp "$MODEL_CATALOG_BUILDER" "$MODEL_CATALOG_BUILDER_EXEC"
 chmod 500 "$UPSTREAM_OBSERVER_EXEC" "$OBSERVER_EXEC" "$CDP_OBSERVER_EXEC" \
-  "$GUI_DRIVER_EXEC" "$NAMESPACE_PROBE_EXEC" "$COLD_RESUME_STATE_EXEC"
+  "$GUI_DRIVER_EXEC" "$NAMESPACE_PROBE_EXEC" "$COLD_RESUME_STATE_EXEC" \
+  "$MODEL_CATALOG_BUILDER_EXEC"
 test -x "$APP_EXEC"
 test ! -L "$APP"
 /usr/bin/codesign --verify --deep --strict "$APP"
@@ -281,9 +288,15 @@ if test "$ROUTE_MODE" = gateway; then
   /usr/bin/grep -Fq '"mixed_field_done_sentinel_rejected": true' "$LOG_DIR/namespace-probe.json"
 fi
 
+/usr/bin/python3 "$MODEL_CATALOG_BUILDER_EXEC" \
+  --codex-binary "$APP/Contents/Resources/codex" \
+  --model-dir "$MODEL_DIR" \
+  --output "$MODEL_CATALOG"
+
 cat >"$CODEX_DIR/config.toml" <<EOF
 model = "$MODEL_ID"
 model_provider = "local-optiq"
+model_catalog_json = "$MODEL_CATALOG"
 
 [model_providers.local-optiq]
 name = "Local OptiQ smoke model"
@@ -301,6 +314,24 @@ exclude = ["$CODEX_PROVIDER_TOKEN_ENV"]
 [features]
 shell_snapshot = false
 EOF
+HOME="$HOME_DIR" CODEX_HOME="$CODEX_DIR" \
+  "$APP/Contents/Resources/codex" debug models \
+  >"$LOG_DIR/model-catalog.json" 2>"$LOG_DIR/model-catalog.stderr"
+/usr/bin/python3 - "$LOG_DIR/model-catalog.json" "$MODEL_ID" <<'PY'
+import json
+import sys
+
+catalog = json.load(open(sys.argv[1]))
+assert len(catalog["models"]) == 1
+model = catalog["models"][0]
+assert model["slug"] == sys.argv[2]
+assert model["display_name"] == "Qwen3.5-2B-OptiQ-4bit (no-think)"
+assert model.get("default_reasoning_level") is None
+assert model["supported_reasoning_levels"] == []
+assert model["context_window"] == 262144
+assert model["max_context_window"] == 262144
+assert model["input_modalities"] == ["text"]
+PY
 if test "$GUI_WORKFLOW" = true; then
   cat >"$CODEX_DIR/AGENTS.md" <<'EOF'
 # Offline renderer smoke fixture
@@ -787,6 +818,7 @@ renderer_skills_observed=not-applicable
 renderer_local_skill_visible=not-applicable
 renderer_model_surface_observed=not-applicable
 renderer_model_metadata_matched=not-applicable
+renderer_fallback_model_metadata_absent=not-applicable
 native_project_picker_exercised=not-applicable
 native_permission_decision_exercised=not-applicable
 native_worktree_control_exercised=not-applicable
@@ -808,6 +840,7 @@ else
   renderer_local_skill_visible=false
   renderer_model_surface_observed=false
   renderer_model_metadata_matched=false
+  renderer_fallback_model_metadata_absent=false
   native_project_picker_exercised=false
   native_permission_decision_exercised=false
   native_worktree_control_exercised=false
@@ -823,6 +856,7 @@ else
   if /usr/bin/grep -Fq '"localSkillVisible":true' "$LOG_DIR/cdp.jsonl"; then renderer_local_skill_visible=true; fi
   if /usr/bin/grep -Fq '"modelSurfaceObserved":true' "$LOG_DIR/cdp.jsonl"; then renderer_model_surface_observed=true; fi
   if /usr/bin/grep -Fq '"rendererModelMetadataMatched":true' "$LOG_DIR/cdp.jsonl"; then renderer_model_metadata_matched=true; fi
+  if /usr/bin/grep -Fq '"rendererFallbackModelMetadataAbsent":true' "$LOG_DIR/cdp.jsonl"; then renderer_fallback_model_metadata_absent=true; fi
   if /usr/bin/grep -Fq '"rendererThreadReopened":true' "$LOG_DIR/cdp.jsonl"; then renderer_thread_reopened=true; fi
   if /usr/bin/grep -Fq '"rendererContinuationCompleted":true' "$LOG_DIR/cdp.jsonl"; then renderer_continuation_completed=true; fi
   if test -f "$GUI_RESUME_STATE" && /usr/bin/grep -Fq '"sameRolloutContinuationValidated": true' "$GUI_RESUME_STATE"; then renderer_same_rollout_continuation=true; fi
@@ -973,6 +1007,7 @@ done
   printf 'RENDERER_LOCAL_SKILL_VISIBLE=%s\n' "$renderer_local_skill_visible"
   printf 'RENDERER_MODEL_SURFACE_OBSERVED=%s\n' "$renderer_model_surface_observed"
   printf 'RENDERER_MODEL_METADATA_MATCHED=%s\n' "$renderer_model_metadata_matched"
+  printf 'RENDERER_FALLBACK_MODEL_METADATA_ABSENT=%s\n' "$renderer_fallback_model_metadata_absent"
   printf 'RENDERER_THREAD_REOPENED=%s\n' "$renderer_thread_reopened"
   printf 'RENDERER_CONTINUATION_COMPLETED=%s\n' "$renderer_continuation_completed"
   printf 'RENDERER_SAME_ROLLOUT_CONTINUATION=%s\n' "$renderer_same_rollout_continuation"
@@ -1028,6 +1063,8 @@ else
   test "$renderer_plugins_observed" = true
   test "$renderer_skills_observed" = true
   test "$renderer_model_surface_observed" = true
+  test "$renderer_model_metadata_matched" = true
+  test "$renderer_fallback_model_metadata_absent" = true
   if test "$GUI_COLD_RESUME" = true; then
     test "$copied_app_cold_stopped" = true
     test "$renderer_thread_reopened" = true

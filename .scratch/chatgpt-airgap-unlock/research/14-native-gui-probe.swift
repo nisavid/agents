@@ -1345,6 +1345,7 @@ func waitForUniquePathEntry<Element>(
     let addition = started.addingReportingOverflow(timeoutNanoseconds)
     let deadline = addition.overflow ? UInt64.max : addition.partialValue
     var pollCount = 0
+    var lastPendingState = "unpublished"
     while try nowNanoseconds() < deadline {
         try validateIdentity()
         let snapshot = try readSnapshot()
@@ -1355,13 +1356,26 @@ func waitForUniquePathEntry<Element>(
             return PathEntryToken(panel: baseline.panel, field: candidate.field,
                                   goButton: candidate.goButton, pollCount: pollCount)
         }
+        let baselineFields = identityDeduplicated(
+            baseline.textFields, sameElement: sameElement)
+        let currentFields = identityDeduplicated(
+            snapshot.textFields, sameElement: sameElement)
+        let newFieldCount = currentFields.filter { field in
+            !baselineFields.contains(where: { sameElement(field, $0) })
+        }.count
+        lastPendingState =
+            "new-fields=\(min(newFieldCount, 2)) " +
+            "go-buttons=\(min(snapshot.goButtons.count, 2)) " +
+            "extra-cancels=\(min(snapshot.additionalCancelCount, 2)) " +
+            "chooser-enabled=\(snapshot.chooserEnabled)"
         let current = try nowNanoseconds()
         guard current < deadline else { break }
         let remainingMicroseconds = (deadline - current + 999) / 1_000
         pause(useconds_t(min(UInt64(pollMicroseconds), remainingMicroseconds)))
     }
     throw ProbeError.unavailable(
-        "path-entry controls did not become ready after \(pollCount) polls")
+        "path-entry controls did not become ready after \(pollCount) polls; " +
+        "last pending state: \(lastPendingState)")
 }
 
 func waitForRestoredOpenPanel<Element>(
@@ -2769,7 +2783,10 @@ func runSelfTests() throws {
             sameElement: sameString,
             pause: { pathNow += UInt64($0) * 1_000 })
     } catch ProbeError.unavailable(let message) {
-        rejected = message == "path-entry controls did not become ready after 3 polls"
+        rejected = message ==
+            "path-entry controls did not become ready after 3 polls; " +
+            "last pending state: new-fields=0 go-buttons=0 extra-cancels=0 " +
+            "chooser-enabled=true"
     }
     try require(rejected && pathTimeoutReads == 3,
                 "path-entry timeout used the wrong monotonic poll bound")

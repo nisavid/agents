@@ -21,6 +21,50 @@ and is recorded in `08-validate-preferred-route.md`; the appended renderer
 reasoning-selection label remains open. Ticket 12 remains open for those
 separate surfaces.
 
+## Worktree acceptance harness
+
+The worktree slice is implemented but has not been run against the copied app.
+It is not runtime evidence yet. The runner creates a clean `main` fixture with
+no Git remotes, selects that project through the reviewed native helper, saves
+an exact isolated worktree root through the renderer's `Worktrees` settings,
+selects the unique `/worktree` → `New worktree` control, completes the first
+sentinel turn, cold-restarts only the copied app group, reopens the same thread,
+and completes the second sentinel turn.
+
+`12-worktree-state.py` fails closed unless all of these independent surfaces
+agree:
+
+- `git worktree list --porcelain -z` exposes exactly the clean fixture `main`
+  checkout and one clean linked worktree beneath the configured root, both at
+  the original local-only commit;
+- the linked worktree's regular `codex-thread.json` has schema version 1 and a
+  unique UUID owner matching the only `state_5.sqlite.threads` row for that
+  worktree cwd;
+- exactly one rollout has the same thread identity and exact worktree cwd in
+  `session_meta`; and
+- the renderer published exactly one first-phase worktree selection marker and
+  one cold-reopen marker, with both deterministic turns validated by the
+  existing completed-turn and renderer-output bindings.
+
+The intended run is:
+
+```sh
+ROUTE_MODE=gateway \
+GATEWAY_COMMIT=6307d37b76918c19f2e3bc0fd506434531aadeb2 \
+GUI_WORKFLOW=true \
+GUI_COLD_RESUME=true \
+GUI_WORKTREE=true \
+GUI_NATIVE_PROJECT_PICKER=true \
+NATIVE_GUI_PROBE_BIN=<reviewed-helper-path> \
+NATIVE_GUI_PROBE_SHA256=<reviewed-helper-sha256> \
+NATIVE_GUI_PROBE_KEY_FALLBACK=false \
+PROBE_EXPECT=renderer-worktree \
+  .scratch/chatgpt-airgap-unlock/research/08-run-prototype.sh
+```
+
+The worktree verdict remains false until baseline, first-phase, cold-phase,
+transport, integrity, process, listener, and copied-app cleanup gates all pass.
+
 The dedicated mode workflow is also green. Run-root suffix `iT8EEf` exercised
 both mode controls and completed one persisted Default turn and one persisted
 Plan turn. The renderer and persisted output hashes matched for both turns;

@@ -24,6 +24,7 @@ CDP_OBSERVER="$HERE/08-cdp-observer.mjs"
 GUI_DRIVER="$HERE/12-cdp-gui-driver.mjs"
 COLD_RESUME_STATE="$HERE/12-cold-resume-state.py"
 MODE_STATE="$HERE/12-mode-state.py"
+WORKTREE_STATE="$HERE/12-worktree-state.py"
 MODEL_CATALOG_BUILDER="$HERE/08-model-catalog.py"
 MODEL_CATALOG_TEST="$HERE/08-model-catalog-test.py"
 NATIVE_PROJECT_STATE="$HERE/14-project-state.py"
@@ -52,6 +53,7 @@ PROBE_EXPECT="${PROBE_EXPECT:-usable-ui}"
 GUI_WORKFLOW="${GUI_WORKFLOW:-false}"
 GUI_COLD_RESUME="${GUI_COLD_RESUME:-false}"
 GUI_MODES="${GUI_MODES:-false}"
+GUI_WORKTREE="${GUI_WORKTREE:-false}"
 GUI_NATIVE_PROJECT_PICKER="${GUI_NATIVE_PROJECT_PICKER:-false}"
 NATIVE_GUI_PROBE_BIN="${NATIVE_GUI_PROBE_BIN:-}"
 NATIVE_GUI_PROBE_SHA256="${NATIVE_GUI_PROBE_SHA256:-}"
@@ -108,6 +110,50 @@ validate_native_menu_inspection_config() {
   fi
 }
 
+validate_worktree_config() {
+  worktree_enabled="$1"
+  gui_workflow="$2"
+  cold_resume="$3"
+  gui_modes="$4"
+  native_picker="$5"
+  inspection_only="$6"
+  if test "$worktree_enabled" = true && \
+    { test "$gui_workflow" != true || test "$cold_resume" != true || \
+      test "$gui_modes" != false || test "$native_picker" != true || \
+      test "$inspection_only" != false; }; then
+    echo 'GUI_WORKTREE=true requires GUI_WORKFLOW=true, GUI_COLD_RESUME=true, GUI_MODES=false, GUI_NATIVE_PROJECT_PICKER=true, and NATIVE_GUI_PROBE_INSPECT_MENU_ONLY=false' >&2
+    return 64
+  fi
+}
+
+configure_gui_orchestration() {
+  configured_gui_workflow="$1"
+  configured_gui_modes="$2"
+  configured_gui_worktree="$3"
+  configured_worktree_root="$4"
+  configured_resume_state="$5"
+  worktree_baseline_action=""
+  worktree_first_action=""
+  worktree_cold_action=""
+  first_driver_phase=""
+  first_driver_argument=""
+  second_driver_phase="second"
+  second_driver_argument="$configured_resume_state"
+  if test "$configured_gui_workflow" != true; then return 0; fi
+  if test "$configured_gui_modes" = true; then
+    first_driver_phase="modes"
+  elif test "$configured_gui_worktree" = true; then
+    worktree_baseline_action="baseline"
+    first_driver_phase="worktree-first"
+    first_driver_argument="$configured_worktree_root"
+    worktree_first_action="first"
+    second_driver_phase="worktree-second"
+    worktree_cold_action="cold"
+  else
+    first_driver_phase="first"
+  fi
+}
+
 wait_for_native_project_database() {
   state_validator="$1"
   state_database="$2"
@@ -135,6 +181,7 @@ run_native_gui_probe() {
 run_cold_handoff_self_test() (
   /usr/bin/python3 "$COLD_RESUME_STATE" --self-test
   /usr/bin/python3 "$MODE_STATE" --self-test
+  /usr/bin/python3 "$WORKTREE_STATE" --self-test
   /usr/bin/python3 "$NATIVE_PROJECT_STATE" --self-test
   self_test_root="$(mktemp -d /private/tmp/chatgpt-cold-handoff-self-test.XXXXXX)"
   trap '/bin/rm -rf "$self_test_root"' EXIT INT TERM
@@ -170,6 +217,34 @@ run_cold_handoff_self_test() (
   test "$inspection_key_fallback_status" -eq 64
   test "$(/bin/cat "$self_test_root/inspection-key-fallback.stderr")" = \
     'menu inspection requires GUI_NATIVE_PROJECT_PICKER=true, GUI_WORKFLOW=false, and NATIVE_GUI_PROBE_KEY_FALLBACK=false'
+  validate_worktree_config true true true false true false
+  if validate_worktree_config true true false false true false \
+    2>"$self_test_root/worktree-config.stderr"; then
+    echo 'worktree config accepted GUI_COLD_RESUME=false' >&2
+    return 1
+  else
+    worktree_config_status=$?
+  fi
+  test "$worktree_config_status" -eq 64
+  test "$(/bin/cat "$self_test_root/worktree-config.stderr")" = \
+    'GUI_WORKTREE=true requires GUI_WORKFLOW=true, GUI_COLD_RESUME=true, GUI_MODES=false, GUI_NATIVE_PROJECT_PICKER=true, and NATIVE_GUI_PROBE_INSPECT_MENU_ONLY=false'
+  configure_gui_orchestration true false true \
+    "$self_test_root/worktree root" "$self_test_root/resume state.json"
+  test "$worktree_baseline_action" = baseline
+  test "$first_driver_phase" = worktree-first
+  test "$first_driver_argument" = "$self_test_root/worktree root"
+  test "$worktree_first_action" = first
+  test "$second_driver_phase" = worktree-second
+  test "$second_driver_argument" = "$self_test_root/resume state.json"
+  test "$worktree_cold_action" = cold
+  configure_gui_orchestration true false false unused resume.json
+  test -z "$worktree_baseline_action$worktree_first_action$worktree_cold_action"
+  test "$first_driver_phase" = first
+  test "$second_driver_phase" = second
+  configure_gui_orchestration true true false unused resume.json
+  test "$first_driver_phase" = modes
+  configure_gui_orchestration false false false unused resume.json
+  test -z "$first_driver_phase"
   for phase in terminal-delta-capture terminal-delta-check resume-state-python stop-app-group relaunch; do
     record_cold_handoff_phase "$phase" before
     record_cold_handoff_phase "$phase" after
@@ -277,6 +352,7 @@ if test "$GUI_NATIVE_PROJECT_PICKER" = true; then
   PROJECT_NONCE="$(/usr/bin/uuidgen | /usr/bin/tr '[:upper:]' '[:lower:]')"
   WORKSPACE_DIR="$RUN_ROOT/project-$PROJECT_NONCE"
 fi
+WORKTREE_ROOT="$RUN_ROOT/worktrees"
 HF_CACHE_DIR="$RUN_ROOT/hf-cache"
 GATEWAY_EXEC=""
 UPSTREAM_OBSERVER_EXEC="$RUN_ROOT/upstream-observer.py"
@@ -286,13 +362,17 @@ GUI_DRIVER_EXEC="$RUN_ROOT/gui-driver.mjs"
 NAMESPACE_PROBE_EXEC="$RUN_ROOT/namespace-probe.py"
 COLD_RESUME_STATE_EXEC="$RUN_ROOT/cold-resume-state.py"
 MODE_STATE_EXEC="$RUN_ROOT/mode-state.py"
+WORKTREE_STATE_EXEC="$RUN_ROOT/worktree-state.py"
 MODEL_CATALOG_BUILDER_EXEC="$RUN_ROOT/model-catalog.py"
 MODEL_CATALOG_TEST_EXEC="$RUN_ROOT/model-catalog-test.py"
 GUI_RESUME_STATE="$LOG_DIR/gui-resume-state.json"
+GUI_WORKTREE_STATE="$LOG_DIR/gui-worktree-state.json"
 MODEL_CATALOG="$CODEX_DIR/model-catalog.json"
 NATIVE_PROJECT_STATE_EXEC="$RUN_ROOT/native-project-state.py"
 NATIVE_PROJECT_BASELINE="$LOG_DIR/native-project-baseline.json"
 NATIVE_PROJECT_STATE_RESULT="$LOG_DIR/native-project-state.json"
+configure_gui_orchestration "$GUI_WORKFLOW" "$GUI_MODES" "$GUI_WORKTREE" \
+  "$WORKTREE_ROOT" "$GUI_RESUME_STATE"
 
 case "$ROUTE_MODE" in
   direct)
@@ -322,6 +402,10 @@ case "$GUI_MODES" in
   false|true) ;;
   *) echo "GUI_MODES must be true or false" >&2; exit 64 ;;
 esac
+case "$GUI_WORKTREE" in
+  false|true) ;;
+  *) echo "GUI_WORKTREE must be true or false" >&2; exit 64 ;;
+esac
 case "$GUI_NATIVE_PROJECT_PICKER" in
   false|true) ;;
   *) echo "GUI_NATIVE_PROJECT_PICKER must be true or false" >&2; exit 64 ;;
@@ -336,6 +420,8 @@ case "$NATIVE_GUI_PROBE_INSPECT_MENU_ONLY" in
 esac
 validate_native_menu_inspection_config "$NATIVE_GUI_PROBE_INSPECT_MENU_ONLY" \
   "$GUI_NATIVE_PROJECT_PICKER" "$GUI_WORKFLOW" "$NATIVE_GUI_PROBE_KEY_FALLBACK"
+validate_worktree_config "$GUI_WORKTREE" "$GUI_WORKFLOW" "$GUI_COLD_RESUME" \
+  "$GUI_MODES" "$GUI_NATIVE_PROJECT_PICKER" "$NATIVE_GUI_PROBE_INSPECT_MENU_ONLY"
 if test "$GUI_COLD_RESUME" = true; then
   test "$GUI_WORKFLOW" = true
   test "$ROUTE_MODE" = gateway
@@ -391,8 +477,8 @@ for port in "$CDP_PORT" "$PROXY_PORT" "$UPSTREAM_OBSERVER_PORT" "$OPTIQ_PORT" "$
   ! /usr/sbin/lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1
 done
 
-mkdir -p "$HOME_DIR" "$CODEX_DIR" "$USER_DATA_DIR" "$TMP_DIR" "$LOG_DIR" "$WORKSPACE_DIR" "$HF_CACHE_DIR"
-chmod 700 "$HOME_DIR" "$CODEX_DIR" "$USER_DATA_DIR" "$TMP_DIR" "$LOG_DIR" "$WORKSPACE_DIR" "$HF_CACHE_DIR"
+mkdir -p "$HOME_DIR" "$CODEX_DIR" "$USER_DATA_DIR" "$TMP_DIR" "$LOG_DIR" "$WORKSPACE_DIR" "$WORKTREE_ROOT" "$HF_CACHE_DIR"
+chmod 700 "$HOME_DIR" "$CODEX_DIR" "$USER_DATA_DIR" "$TMP_DIR" "$LOG_DIR" "$WORKSPACE_DIR" "$WORKTREE_ROOT" "$HF_CACHE_DIR"
 /usr/bin/ditto "$SOURCE_APP" "$APP"
 /bin/cp "$UPSTREAM_OBSERVER" "$UPSTREAM_OBSERVER_EXEC"
 /bin/cp "$OBSERVER" "$OBSERVER_EXEC"
@@ -401,12 +487,13 @@ chmod 700 "$HOME_DIR" "$CODEX_DIR" "$USER_DATA_DIR" "$TMP_DIR" "$LOG_DIR" "$WORK
 /bin/cp "$NAMESPACE_PROBE" "$NAMESPACE_PROBE_EXEC"
 /bin/cp "$COLD_RESUME_STATE" "$COLD_RESUME_STATE_EXEC"
 /bin/cp "$MODE_STATE" "$MODE_STATE_EXEC"
+/bin/cp "$WORKTREE_STATE" "$WORKTREE_STATE_EXEC"
 /bin/cp "$MODEL_CATALOG_BUILDER" "$MODEL_CATALOG_BUILDER_EXEC"
 /bin/cp "$MODEL_CATALOG_TEST" "$MODEL_CATALOG_TEST_EXEC"
 /bin/cp "$NATIVE_PROJECT_STATE" "$NATIVE_PROJECT_STATE_EXEC"
 chmod 500 "$UPSTREAM_OBSERVER_EXEC" "$OBSERVER_EXEC" "$CDP_OBSERVER_EXEC" \
   "$GUI_DRIVER_EXEC" "$NAMESPACE_PROBE_EXEC" "$COLD_RESUME_STATE_EXEC" \
-  "$MODE_STATE_EXEC" "$MODEL_CATALOG_BUILDER_EXEC" "$MODEL_CATALOG_TEST_EXEC" \
+  "$MODE_STATE_EXEC" "$WORKTREE_STATE_EXEC" "$MODEL_CATALOG_BUILDER_EXEC" "$MODEL_CATALOG_TEST_EXEC" \
   "$NATIVE_PROJECT_STATE_EXEC"
 test -x "$APP_EXEC"
 test ! -L "$APP"
@@ -503,11 +590,15 @@ description: Local file-only skill for the ticket 08 deterministic plumbing chec
 
 Do not use tools. Reply exactly `LOCAL_APP_OK` and nothing else.
 EOF
-/usr/bin/git -C "$WORKSPACE_DIR" init -q
+/usr/bin/git -C "$WORKSPACE_DIR" init -q -b main
 /usr/bin/git -C "$WORKSPACE_DIR" config user.name "Ivan D Vasin"
 /usr/bin/git -C "$WORKSPACE_DIR" config user.email "ivan@nisavid.io"
 /usr/bin/git -C "$WORKSPACE_DIR" add README.md .agents/skills/local-sentinel/SKILL.md
 /usr/bin/git -C "$WORKSPACE_DIR" commit -qm "test: create disposable fixture"
+test -z "$(/usr/bin/git -C "$WORKSPACE_DIR" remote)"
+test "$(/usr/bin/git -C "$WORKSPACE_DIR" branch --show-current)" = main
+test "$(/usr/bin/git -C "$WORKSPACE_DIR" worktree list --porcelain | /usr/bin/grep -c '^worktree ')" -eq 1
+test -z "$(/usr/bin/git -C "$WORKSPACE_DIR" status --porcelain=v2)"
 
 optiq_pid=""
 proxy_pid=""
@@ -597,6 +688,7 @@ printf '%s\n' "$RUN_ROOT" >"$LOG_DIR/run-root.txt"
   printf 'mlx=%s\n' "0.32.0"
   printf 'route_mode=%s\n' "$ROUTE_MODE"
   printf 'gui_modes=%s\n' "$GUI_MODES"
+  printf 'gui_worktree=%s\n' "$GUI_WORKTREE"
   if test "$ROUTE_MODE" = gateway; then
     printf 'gateway_upstream_timeout_seconds=%s\n' "$GATEWAY_UPSTREAM_TIMEOUT_SECONDS"
     printf 'gateway_sse_heartbeat_seconds=%s\n' "default"
@@ -938,12 +1030,17 @@ if test "$GUI_NATIVE_PROJECT_PICKER" = true; then
   /usr/bin/grep -Fq '"matched":true' "$LOG_DIR/cdp-native-confirm.jsonl"
   fi
 fi
+if test -n "$worktree_baseline_action"; then
+  /usr/bin/python3 "$WORKTREE_STATE_EXEC" "$worktree_baseline_action" \
+    "$(realpath "$WORKSPACE_DIR")" "$(realpath "$WORKTREE_ROOT")" \
+    "$GUI_WORKTREE_STATE"
+fi
 if test "$GUI_WORKFLOW" = true; then
   cdp_command="$GUI_DRIVER_EXEC"
-  if test "$GUI_MODES" = true; then
-    cdp_argument="modes"
-  else
-    cdp_argument="first"
+  cdp_argument="$first_driver_phase"
+  cdp_phase_argument="$first_driver_argument"
+  if test -n "$cdp_phase_argument"; then
+    cdp_phase_argument="$(realpath "$cdp_phase_argument")"
   fi
   cdp_timeout="120000"
 else
@@ -956,8 +1053,9 @@ if test "$GUI_WORKFLOW" = true && /usr/bin/env -i \
   HOME="$HOME_DIR" \
   TMPDIR="$TMP_DIR" \
   LANG="en_US.UTF-8" \
-  /usr/bin/sandbox-exec -f "$GATEWAY_PROFILE" -D "REAL_HOME=$REAL_HOME" \
+    /usr/bin/sandbox-exec -f "$GATEWAY_PROFILE" -D "REAL_HOME=$REAL_HOME" \
     "$NODE" "$cdp_command" "$CDP_PORT" "$cdp_argument" "$cdp_timeout" \
+      "$cdp_phase_argument" \
   >"$LOG_DIR/cdp.jsonl" 2>"$LOG_DIR/cdp.stderr"; then
   cdp_exit=0
 elif test "$GUI_WORKFLOW" = false && /usr/bin/env -i \
@@ -979,10 +1077,21 @@ if test "$GUI_MODES" = true && test "$cdp_exit" -eq 0; then
 fi
 
 if test "$GUI_NATIVE_PROJECT_PICKER" = true && \
+  test "$GUI_WORKTREE" = false && \
   test "$NATIVE_GUI_PROBE_INSPECT_MENU_ONLY" = false && test "$cdp_exit" -eq 0; then
   /usr/bin/python3 "$NATIVE_PROJECT_STATE_EXEC" validate \
     "$CODEX_DIR/state_5.sqlite" "$(realpath "$WORKSPACE_DIR")" \
     "$NATIVE_PROJECT_BASELINE" "$NATIVE_PROJECT_STATE_RESULT"
+fi
+
+worktree_cwd=""
+if test -n "$worktree_first_action" && test "$cdp_exit" -eq 0; then
+  /usr/bin/python3 "$WORKTREE_STATE_EXEC" "$worktree_first_action" \
+    "$(realpath "$WORKSPACE_DIR")" "$(realpath "$WORKTREE_ROOT")" \
+    "$CODEX_DIR/state_5.sqlite" "$CODEX_DIR" "$GUI_WORKTREE_STATE" \
+    "$LOG_DIR/cdp.jsonl"
+  worktree_cwd="$(/usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["worktreePath"])' "$GUI_WORKTREE_STATE")"
+  test -d "$worktree_cwd"
 fi
 
 if test "$GUI_COLD_RESUME" = true && test "$cdp_exit" -eq 0; then
@@ -1001,8 +1110,13 @@ if test "$GUI_COLD_RESUME" = true && test "$cdp_exit" -eq 0; then
   fi
   record_cold_handoff_phase terminal-delta-check after
   record_cold_handoff_phase resume-state-python before
-  /usr/bin/python3 "$COLD_RESUME_STATE_EXEC" capture \
-    "$CODEX_DIR" "$GUI_RESUME_STATE" "$LOG_DIR/cdp.jsonl"
+  if test "$GUI_WORKTREE" = true; then
+    /usr/bin/python3 "$COLD_RESUME_STATE_EXEC" capture \
+      "$CODEX_DIR" "$GUI_RESUME_STATE" "$LOG_DIR/cdp.jsonl" "$worktree_cwd"
+  else
+    /usr/bin/python3 "$COLD_RESUME_STATE_EXEC" capture \
+      "$CODEX_DIR" "$GUI_RESUME_STATE" "$LOG_DIR/cdp.jsonl"
+  fi
   record_cold_handoff_phase resume-state-python after
   record_cold_handoff_phase stop-app-group before
   stop_app_group
@@ -1023,15 +1137,25 @@ if test "$GUI_COLD_RESUME" = true && test "$cdp_exit" -eq 0; then
     TMPDIR="$TMP_DIR" \
     LANG="en_US.UTF-8" \
     /usr/bin/sandbox-exec -f "$GATEWAY_PROFILE" -D "REAL_HOME=$REAL_HOME" \
-      "$NODE" "$GUI_DRIVER_EXEC" "$CDP_PORT" second 120000 "$GUI_RESUME_STATE" \
+      "$NODE" "$GUI_DRIVER_EXEC" "$CDP_PORT" \
+        "$second_driver_phase" 120000 "$second_driver_argument" \
     >>"$LOG_DIR/cdp.jsonl" 2>>"$LOG_DIR/cdp.stderr"; then
     cdp_exit=0
   else
     cdp_exit=$?
   fi
   if test "$cdp_exit" -eq 0; then
-    /usr/bin/python3 "$COLD_RESUME_STATE_EXEC" validate \
-      "$GUI_RESUME_STATE" "$LOG_DIR/cdp.jsonl"
+    if test "$GUI_WORKTREE" = true; then
+      /usr/bin/python3 "$COLD_RESUME_STATE_EXEC" validate \
+        "$GUI_RESUME_STATE" "$LOG_DIR/cdp.jsonl" "$worktree_cwd"
+      /usr/bin/python3 "$WORKTREE_STATE_EXEC" "$worktree_cold_action" \
+        "$(realpath "$WORKSPACE_DIR")" "$(realpath "$WORKTREE_ROOT")" \
+        "$CODEX_DIR/state_5.sqlite" "$CODEX_DIR" "$GUI_WORKTREE_STATE" \
+        "$LOG_DIR/cdp.jsonl"
+    else
+      /usr/bin/python3 "$COLD_RESUME_STATE_EXEC" validate \
+        "$GUI_RESUME_STATE" "$LOG_DIR/cdp.jsonl"
+    fi
   fi
 fi
 
@@ -1101,7 +1225,22 @@ else
   native_project_picker_exercised=false
   native_permission_decision_exercised=false
   native_worktree_control_exercised=false
-  if test "$GUI_NATIVE_PROJECT_PICKER" = true && \
+  if test "$GUI_WORKTREE" = true && \
+    test -f "$GUI_WORKTREE_STATE" && \
+    /usr/bin/grep -Fq '"coldValidated": true' "$GUI_WORKTREE_STATE" && \
+    /usr/bin/grep -Fq '"kind":"worktree-mode-selected"' "$LOG_DIR/cdp.jsonl" && \
+    /usr/bin/grep -Fq '"selected":true' "$LOG_DIR/cdp.jsonl" && \
+    /usr/bin/grep -Fq '"kind":"worktree-thread-reopened"' "$LOG_DIR/cdp.jsonl" && \
+    /usr/bin/grep -Fq '"reopened":true' "$LOG_DIR/cdp.jsonl"; then
+    native_worktree_control_exercised=true
+  fi
+  if test "$GUI_WORKTREE" = true && \
+    test "$native_worktree_control_exercised" = true && \
+    /usr/bin/grep -Fq '"kind":"renderer-project-selection-confirmed"' \
+      "$LOG_DIR/cdp-native-confirm.jsonl" && \
+    /usr/bin/grep -Fq '"matched":true' "$LOG_DIR/cdp-native-confirm.jsonl"; then
+    native_project_picker_exercised=true
+  elif test "$GUI_NATIVE_PROJECT_PICKER" = true && \
     test -f "$NATIVE_PROJECT_STATE_RESULT" && \
     /usr/bin/grep -Fq '"transitionValidated": true' "$NATIVE_PROJECT_STATE_RESULT" && \
     /usr/bin/grep -Fq '"matched":true' "$LOG_DIR/cdp-native-confirm.jsonl"; then
@@ -1347,6 +1486,9 @@ elif test "$GUI_MODES" = false; then
   if test "$GUI_NATIVE_PROJECT_PICKER" = true; then
     test "$native_project_picker_exercised" = true
   fi
+  if test "$GUI_WORKTREE" = true; then
+    test "$native_worktree_control_exercised" = true
+  fi
 else
   test "$renderer_default_mode_observed" = true
   test "$renderer_plan_mode_observed" = true
@@ -1393,6 +1535,7 @@ case "$PROBE_EXPECT" in
   renderer-cold-resume) test "$GUI_COLD_RESUME" = true; test "$login_wall_observed" = false; test "$main_ui_observed" = true ;;
   renderer-modes) test "$GUI_MODES" = true; test "$login_wall_observed" = false; test "$main_ui_observed" = true ;;
   renderer-native-project) test "$GUI_NATIVE_PROJECT_PICKER" = true; test "$login_wall_observed" = false; test "$main_ui_observed" = true ;;
+  renderer-worktree) test "$GUI_WORKTREE" = true; test "$native_worktree_control_exercised" = true; test "$login_wall_observed" = false; test "$main_ui_observed" = true ;;
   native-menu-inspection) test "$NATIVE_GUI_PROBE_INSPECT_MENU_ONLY" = true; test "$native_menu_inspection_validated" = true; test "$login_wall_observed" = false; test "$main_ui_observed" = true ;;
   *) echo "unknown PROBE_EXPECT: $PROBE_EXPECT" >&2; exit 64 ;;
 esac

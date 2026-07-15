@@ -24,6 +24,13 @@ The ticket remains open for native project-picker, worktree, and permission
 interaction; project-local skill visibility; and reconciliation of the
 renderer's appended reasoning-selection label with the pinned catalog.
 
+The worktree slice now has a deterministic, no-remote acceptance harness. It
+sets the exact worktree root through the renderer, selects the unique local
+`New worktree` command, cold-reopens the resulting thread, and binds the UI
+markers to Git worktree porcelain, `state_5.sqlite`, per-worktree
+`codex-thread.json`, and rollout `session_meta.cwd`. Its self-tests pass; the
+exact copied-app GUI run remains unexecuted and this is not runtime evidence.
+
 Default and Plan mode behavior is complete. The copied-app probe observed both
 renderer controls, completed one turn in each mode, and bound each renderer
 output hash to a persisted completion with the exact corresponding

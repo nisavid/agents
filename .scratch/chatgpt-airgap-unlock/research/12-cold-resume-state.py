@@ -6,13 +6,14 @@ from __future__ import annotations
 import hashlib
 import json
 import pathlib
-import re
 import sys
 import tempfile
 
 
-FIRST_PROMPT = "What is 73 plus 19? Your final answer must include the decimal result."
-SECOND_PROMPT = "What is 46 plus 17? Your final answer must include the decimal result."
+FIRST_PROMPT = "Reply exactly COLD_PHASE_ONE_OK and nothing else. Do not use tools."
+FIRST_SENTINEL = "COLD_PHASE_ONE_OK"
+SECOND_PROMPT = "Reply exactly COLD_PHASE_TWO_OK and nothing else. Do not use tools."
+SECOND_SENTINEL = "COLD_PHASE_TWO_OK"
 
 
 class ContractError(RuntimeError):
@@ -27,10 +28,8 @@ def exact_sha256(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
-def arithmetic_output_matches(message: str, operands: tuple[int, int], expected_result: int) -> bool:
-    integers = [int(value) for value in re.findall(r"(?<![\w.])[+-]?\d+(?!\w|\.\d)", message)]
-    allowed = {*operands, expected_result}
-    return bool(integers) and all(value in allowed for value in integers) and integers[-1] == expected_result
+def sentinel_output_matches(message: str, expected_sentinel: str) -> bool:
+    return message.strip() == expected_sentinel
 
 
 def read_records(path: pathlib.Path) -> list[dict]:
@@ -49,9 +48,7 @@ def matching_user_messages(records: list[dict], prompt: str) -> list[dict]:
     return matches
 
 
-def completed_turn(
-    records: list[dict], prompt: str, operands: tuple[int, int], expected_result: int
-) -> tuple[str, str]:
+def completed_turn(records: list[dict], prompt: str, expected_sentinel: str) -> tuple[str, str]:
     users = matching_user_messages(records, prompt)
     if len(users) != 1:
         raise ContractError(f"expected one matching user prompt, found {len(users)}")
@@ -68,8 +65,10 @@ def completed_turn(
     if len(completions) != 1:
         raise ContractError(f"expected one task_complete for matching turn, found {len(completions)}")
     final_message = completions[0].get("last_agent_message", "")
-    if not isinstance(final_message, str) or not arithmetic_output_matches(final_message, operands, expected_result):
-        raise ContractError("completed turn final message failed the arithmetic contract")
+    if not isinstance(final_message, str) or not sentinel_output_matches(
+        final_message, expected_sentinel
+    ):
+        raise ContractError("completed turn final message failed the exact sentinel contract")
     return turn_id, final_message
 
 
@@ -84,22 +83,25 @@ def session_id(records: list[dict]) -> str:
     return identifiers[0]
 
 
-def renderer_oracle(cdp_path: pathlib.Path, phase: str, expected_result: int) -> dict:
-    matches = [
+def renderer_oracle(cdp_path: pathlib.Path, phase: str, expected_sentinel: str) -> dict:
+    phase_records = [
         record
         for record in read_records(cdp_path)
         if record.get("kind") == "assistant-output-oracle"
         and record.get("phase") == phase
-        and record.get("matched") is True
-        and record.get("expectedOccurrenceCount", 0) >= 1
-        and record.get("conflictingIntegers") == []
-        and record.get("finalInteger") == expected_result
-        and isinstance(record.get("textSha256"), str)
-        and re.fullmatch(r"[0-9a-f]{64}", record["textSha256"])
     ]
-    if len(matches) != 1:
-        raise ContractError(f"expected one {phase}-phase renderer output oracle, found {len(matches)}")
-    return matches[0]
+    if len(phase_records) != 1:
+        raise ContractError(
+            f"expected one {phase}-phase renderer output oracle, found {len(phase_records)}"
+        )
+    oracle = phase_records[0]
+    if (
+        oracle.get("matched") is not True
+        or oracle.get("exactMatch") is not True
+        or oracle.get("textSha256") != exact_sha256(expected_sentinel)
+    ):
+        raise ContractError(f"{phase}-phase renderer output oracle failed the sentinel contract")
+    return oracle
 
 
 def matching_rollout(codex_dir: pathlib.Path, prompt: str) -> tuple[pathlib.Path, list[dict]]:
@@ -116,14 +118,14 @@ def matching_rollout(codex_dir: pathlib.Path, prompt: str) -> tuple[pathlib.Path
 def capture(codex_dir: pathlib.Path, state_path: pathlib.Path, cdp_path: pathlib.Path) -> None:
     rollout, records = matching_rollout(codex_dir, FIRST_PROMPT)
     thread_id = session_id(records)
-    first_turn_id, first_final = completed_turn(records, FIRST_PROMPT, (73, 19), 92)
-    oracle = renderer_oracle(cdp_path, "first", 92)
+    first_turn_id, first_final = completed_turn(records, FIRST_PROMPT, FIRST_SENTINEL)
+    oracle = renderer_oracle(cdp_path, "first", FIRST_SENTINEL)
     state = {
         "threadId": thread_id,
         "rolloutPath": str(rollout),
         "firstTurnIdSha256": exact_sha256(first_turn_id),
         "firstPromptSha256": normalized_sha256(FIRST_PROMPT),
-        "firstResult": "92",
+        "firstSentinelSha256": exact_sha256(FIRST_SENTINEL),
         "firstPersistedOutputSha256": exact_sha256(first_final),
         "firstRendererOutputSha256": oracle["textSha256"],
         "firstOutputBinding": "completed-turn",
@@ -136,22 +138,25 @@ def validate(state_path: pathlib.Path, cdp_path: pathlib.Path) -> None:
     state = json.loads(state_path.read_text())
     if state.get("firstOutputBinding") != "completed-turn":
         raise ContractError("original output is not bound to a completed turn")
-    if state.get("firstPromptSha256") != normalized_sha256(FIRST_PROMPT) or state.get("firstResult") != "92":
+    if (
+        state.get("firstPromptSha256") != normalized_sha256(FIRST_PROMPT)
+        or state.get("firstSentinelSha256") != exact_sha256(FIRST_SENTINEL)
+    ):
         raise ContractError("original completed-turn contract changed across restart")
     rollout = pathlib.Path(state["rolloutPath"])
     records = read_records(rollout)
     if session_id(records) != state["threadId"]:
         raise ContractError("thread identity changed across restart")
-    first_turn_id, first_final = completed_turn(records, FIRST_PROMPT, (73, 19), 92)
+    first_turn_id, first_final = completed_turn(records, FIRST_PROMPT, FIRST_SENTINEL)
     if exact_sha256(first_turn_id) != state["firstTurnIdSha256"]:
         raise ContractError("original completed turn identity changed across restart")
     if exact_sha256(first_final) != state["firstPersistedOutputSha256"]:
         raise ContractError("original completed final output changed across restart")
-    _, second_final = completed_turn(records, SECOND_PROMPT, (46, 17), 63)
-    oracle = renderer_oracle(cdp_path, "second", 63)
+    _, second_final = completed_turn(records, SECOND_PROMPT, SECOND_SENTINEL)
+    oracle = renderer_oracle(cdp_path, "second", SECOND_SENTINEL)
     state.update(
         {
-            "secondResult": "63",
+            "secondSentinelSha256": exact_sha256(SECOND_SENTINEL),
             "secondPromptSha256": normalized_sha256(SECOND_PROMPT),
             "secondPersistedOutputSha256": exact_sha256(second_final),
             "secondRendererOutputSha256": oracle["textSha256"],
@@ -162,7 +167,7 @@ def validate(state_path: pathlib.Path, cdp_path: pathlib.Path) -> None:
     state_path.write_text(json.dumps(state, sort_keys=True) + "\n")
 
 
-def fixture_turn(prompt: str, turn_id: str, intermediates: list[str], final: str) -> list[dict]:
+def fixture_turn(prompt: str, turn_id: str, intermediates: list[dict], final: str) -> list[dict]:
     records = [
         {
             "type": "response_item",
@@ -174,10 +179,7 @@ def fixture_turn(prompt: str, turn_id: str, intermediates: list[str], final: str
             },
         }
     ]
-    records.extend(
-        {"type": "event_msg", "payload": {"type": "agent_message", "message": message}}
-        for message in intermediates
-    )
+    records.extend(intermediates)
     records.append(
         {
             "type": "event_msg",
@@ -187,15 +189,45 @@ def fixture_turn(prompt: str, turn_id: str, intermediates: list[str], final: str
     return records
 
 
-def fixture_oracle(phase: str, result: int) -> dict:
+def fixture_failed_tool_calls(count: int) -> list[dict]:
+    records = []
+    for index in range(count):
+        call_id = f"call-{index}"
+        records.extend(
+            [
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": call_id,
+                        "arguments": '{"cmd":"false"}',
+                    },
+                },
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": "Process exited with code 71",
+                    },
+                },
+            ]
+        )
+    return records
+
+
+def fixture_agent_message(message: str) -> dict:
+    return {"type": "event_msg", "payload": {"type": "agent_message", "message": message}}
+
+
+def fixture_oracle(phase: str, sentinel: str) -> dict:
     return {
         "kind": "assistant-output-oracle",
         "phase": phase,
         "matched": True,
-        "expectedOccurrenceCount": 1,
-        "conflictingIntegers": [],
-        "finalInteger": result,
-        "textSha256": hashlib.sha256(f"renderer-{phase}".encode()).hexdigest(),
+        "exactMatch": True,
+        "textSha256": exact_sha256(sentinel),
     }
 
 
@@ -223,27 +255,29 @@ def run_self_tests() -> None:
             *fixture_turn(
                 FIRST_PROMPT,
                 "turn-first",
-                ["73 plus 19 equals 92.", "73 + 19 = 92"],
-                "73 + 19 = 92",
+                [
+                    *fixture_failed_tool_calls(2),
+                    fixture_agent_message("still working"),
+                    fixture_agent_message(FIRST_SENTINEL),
+                ],
+                FIRST_SENTINEL,
             ),
         ]
         rollout.write_text("\n".join(json.dumps(record) for record in first_records) + "\n")
-        cdp_path.write_text(json.dumps(fixture_oracle("first", 92)) + "\n")
+        cdp_path.write_text(json.dumps(fixture_oracle("first", FIRST_SENTINEL)) + "\n")
         capture(codex_dir, state_path, cdp_path)
         state = json.loads(state_path.read_text())
         assert state["firstOutputBinding"] == "completed-turn"
-        assert state["firstPersistedOutputSha256"] == exact_sha256("73 + 19 = 92")
+        assert state["firstSentinelSha256"] == exact_sha256(FIRST_SENTINEL)
+        assert state["firstPersistedOutputSha256"] == exact_sha256(FIRST_SENTINEL)
 
         wrong_intermediate = [
             *first_records[:-1],
-            {
-                "type": "event_msg",
-                "payload": {"type": "agent_message", "message": "73 + 19 = 91"},
-            },
+            fixture_agent_message("COLD_PHASE_WRONG"),
             first_records[-1],
         ]
-        _, bound_final = completed_turn(wrong_intermediate, FIRST_PROMPT, (73, 19), 92)
-        assert bound_final == "73 + 19 = 92"
+        _, bound_final = completed_turn(wrong_intermediate, FIRST_PROMPT, FIRST_SENTINEL)
+        assert bound_final == FIRST_SENTINEL
 
         conflicting = [dict(record) for record in first_records]
         conflicting[-1] = {
@@ -251,40 +285,85 @@ def run_self_tests() -> None:
             "payload": {
                 "type": "task_complete",
                 "turn_id": "turn-first",
-                "last_agent_message": "73 + 19 = 91. Correction: 92",
+                "last_agent_message": f"{FIRST_SENTINEL}\n{FIRST_SENTINEL}",
             },
         }
         expect_contract_error(
-            lambda: completed_turn(conflicting, FIRST_PROMPT, (73, 19), 92), "final message"
+            lambda: completed_turn(conflicting, FIRST_PROMPT, FIRST_SENTINEL), "final message"
+        )
+        wrong_final = [*first_records[:-1]]
+        wrong_final.append(
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_complete",
+                    "turn_id": "turn-first",
+                    "last_agent_message": SECOND_SENTINEL,
+                },
+            }
+        )
+        expect_contract_error(
+            lambda: completed_turn(wrong_final, FIRST_PROMPT, FIRST_SENTINEL), "final message"
         )
         duplicate = [*first_records, first_records[-1]]
         expect_contract_error(
-            lambda: completed_turn(duplicate, FIRST_PROMPT, (73, 19), 92), "found 2"
+            lambda: completed_turn(duplicate, FIRST_PROMPT, FIRST_SENTINEL), "found 2"
         )
+        duplicate_prompt = [*first_records, first_records[1]]
+        expect_contract_error(
+            lambda: completed_turn(duplicate_prompt, FIRST_PROMPT, FIRST_SENTINEL), "found 2"
+        )
+
+        no_completion = [
+            first_records[0],
+            *fixture_turn(FIRST_PROMPT, "turn-loop", fixture_failed_tool_calls(105), FIRST_SENTINEL)[
+                :-1
+            ],
+        ]
+        expect_contract_error(
+            lambda: completed_turn(no_completion, FIRST_PROMPT, FIRST_SENTINEL), "found 0"
+        )
+
+        cdp_path.write_text(json.dumps(fixture_oracle("first", SECOND_SENTINEL)) + "\n")
+        expect_contract_error(
+            lambda: capture(codex_dir, state_path, cdp_path), "renderer output oracle"
+        )
+        cdp_path.write_text(
+            "\n".join(
+                json.dumps(fixture_oracle("first", FIRST_SENTINEL)) for _ in range(2)
+            )
+            + "\n"
+        )
+        expect_contract_error(lambda: capture(codex_dir, state_path, cdp_path), "found 2")
+        cdp_path.write_text(json.dumps(fixture_oracle("first", FIRST_SENTINEL)) + "\n")
 
         second_records = fixture_turn(
             SECOND_PROMPT,
             "turn-second",
-            ["46 plus 17 equals 63.", "46 + 17 = 63"],
-            "63",
+            [fixture_agent_message(SECOND_SENTINEL)],
+            SECOND_SENTINEL,
         )
         continued_records = [*first_records, *second_records]
         rollout.write_text("\n".join(json.dumps(record) for record in continued_records) + "\n")
         cdp_path.write_text(
             "\n".join(
                 json.dumps(record)
-                for record in (fixture_oracle("first", 92), fixture_oracle("second", 63))
+                for record in (
+                    fixture_oracle("first", FIRST_SENTINEL),
+                    fixture_oracle("second", SECOND_SENTINEL),
+                )
             )
             + "\n"
         )
         validate(state_path, cdp_path)
         state = json.loads(state_path.read_text())
         assert state["secondOutputBinding"] == "completed-turn"
-        assert state["secondPersistedOutputSha256"] == exact_sha256("63")
+        assert state["secondSentinelSha256"] == exact_sha256(SECOND_SENTINEL)
+        assert state["secondPersistedOutputSha256"] == exact_sha256(SECOND_SENTINEL)
 
         conflicting_second = [
             *first_records,
-            *fixture_turn(SECOND_PROMPT, "turn-second", [], "46 + 17 = 62. Correction: 63"),
+            *fixture_turn(SECOND_PROMPT, "turn-second", [], f"extra {SECOND_SENTINEL}"),
         ]
         rollout.write_text("\n".join(json.dumps(record) for record in conflicting_second) + "\n")
         expect_contract_error(lambda: validate(state_path, cdp_path), "final message")
@@ -300,7 +379,7 @@ def run_self_tests() -> None:
                 "payload": {
                     "type": "task_complete",
                     "turn_id": "turn-first",
-                    "last_agent_message": "73 + 19 = 92\n",
+                    "last_agent_message": f"{FIRST_SENTINEL}\n",
                 },
             }
         )

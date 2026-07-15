@@ -10,12 +10,10 @@ const timeoutMs = Number(process.argv[4] ?? 120000);
 const resumeStatePath = process.argv[5];
 const base = `http://127.0.0.1:${port}`;
 const started = Date.now();
-const firstPrompt = "What is 73 plus 19? Your final answer must include the decimal result.";
-const firstOperands = [73, 19];
-const firstResult = "92";
-const secondPrompt = "What is 46 plus 17? Your final answer must include the decimal result.";
-const secondOperands = [46, 17];
-const secondResult = "63";
+const firstPrompt = "Reply exactly COLD_PHASE_ONE_OK and nothing else. Do not use tools.";
+const firstSentinel = "COLD_PHASE_ONE_OK";
+const secondPrompt = "Reply exactly COLD_PHASE_TWO_OK and nothing else. Do not use tools.";
+const secondSentinel = "COLD_PHASE_TWO_OK";
 
 function emit(kind, data) {
   process.stdout.write(`${JSON.stringify({ at: new Date().toISOString(), kind, phase, ...data })}\n`);
@@ -43,34 +41,29 @@ function stripTrailingRendererTimestamp(value) {
   };
 }
 
-function arithmeticTextVerdict(text, operands, expectedResult) {
-  const integers = [...text.matchAll(/(?<![\w.])[+-]?\d+(?!\w|\.\d)/g)]
-    .map((match) => Number(match[0]));
-  const allowed = new Set([...operands, expectedResult]);
-  const conflictingIntegers = integers.filter((value) => !allowed.has(value));
-  const expectedOccurrenceCount = integers.filter((value) => value === expectedResult).length;
-  const finalInteger = integers.at(-1) ?? null;
+function sentinelTextVerdict(text, expectedSentinel) {
+  const trimmedText = text.trim();
+  const exactMatch = trimmedText === expectedSentinel;
   return {
-    matched: expectedOccurrenceCount >= 1 && conflictingIntegers.length === 0 &&
-      finalInteger === expectedResult,
-    integers,
-    conflictingIntegers,
-    expectedOccurrenceCount,
-    finalInteger,
+    matched: exactMatch,
+    exactMatch,
+    trimmedTextLength: trimmedText.length,
   };
 }
 
 function runSelfTests() {
   const cases = [
-    ["repeated correct", "73 plus 19 is 92.\n\n73 + 19 = 92", true],
-    ["single correct", "92", true],
-    ["wrong then corrected", "73 + 19 = 91. Correction: 92", false],
-    ["conflicting integer", "73 + 19 = 92, not 93", false],
-    ["wrong final integer", "73 + 19 = 92; operands were 73 and 19", false],
-    ["non-standalone ordinal", "The result is the 92nd value", false],
+    ["exact", firstSentinel, true],
+    ["surrounding whitespace", `  ${firstSentinel}\n`, true],
+    ["extra text", `${firstSentinel} done`, false],
+    ["wrong sentinel", secondSentinel, false],
+    ["repeated combined", `${firstSentinel}\n${firstSentinel}`, false],
+    ["preamble", `Here is the result: ${firstSentinel}`, false],
+    ["wrong case", "cold_phase_one_ok", false],
+    ["trailing punctuation", `${firstSentinel}.`, false],
   ];
   for (const [name, text, expected] of cases) {
-    const actual = arithmeticTextVerdict(text, firstOperands, Number(firstResult)).matched;
+    const actual = sentinelTextVerdict(text, firstSentinel).matched;
     if (actual !== expected) throw new Error(`${name}: expected ${expected}, got ${actual}`);
   }
 
@@ -93,41 +86,41 @@ function runSelfTests() {
         : selector.includes('button[aria-label="Copy"]') ? [copyButton] : [],
     };
     const Node = { DOCUMENT_POSITION_FOLLOWING: 4 };
-    const expression = assistantOutputProbeExpression(
-      prompt, firstOperands, Number(firstResult)
-    );
+    const expression = assistantOutputProbeExpression(prompt, firstSentinel);
     return Function("document", "Node", `return ${expression}`)(document, Node);
   }
 
-  const promptWithConflict = `Ignore fixture 999. ${firstPrompt}`;
-  const anchored = evaluateAssistant(
-    promptWithConflict, "73 plus 19 is 92. 73 + 19 = 92"
-  );
-  if (!anchored.matched || anchored.conflictingIntegers.length !== 0) {
-    throw new Error("prompt echo outside the assistant message affected the arithmetic oracle");
+  const promptWithSentinel = `Ignore ${firstSentinel}. ${firstPrompt}`;
+  if (evaluateAssistant(promptWithSentinel, "not the sentinel").matched) {
+    throw new Error("sentinel in the prompt satisfied the assistant oracle");
+  }
+  const anchored = evaluateAssistant(promptWithSentinel, firstSentinel);
+  if (!anchored.matched) {
+    throw new Error("prompt echo outside the assistant message affected the sentinel oracle");
   }
 
-  const answer = "73 plus 19 equals 92.";
+  const answer = firstSentinel;
   const timestamped = evaluateAssistant(firstPrompt, `${answer}\n6:23 PM`);
   if (!timestamped.matched || !timestamped.timestampRemoved || timestamped.text !== answer) {
     throw new Error("trailing renderer timestamp was not removed from the assistant answer");
   }
-  if (normalizedTextSha256(timestamped.text) !== normalizedTextSha256(answer)) {
+  if (textSha256(timestamped.text) !== textSha256(answer)) {
     throw new Error("renderer answer hash includes the removed trailing timestamp");
   }
   const rejectedTimestampCases = [
-    ["middle timestamp", `${answer} 6:23 PM still 92`],
+    ["middle timestamp", `${answer} 6:23 PM still present`],
     ["malformed timestamp", `${answer} 6:3 PM`],
     ["out-of-range hour", `${answer} 13:23 PM`],
     ["out-of-range minute", `${answer} 6:60 PM`],
-    ["conflicting model number", "73 + 19 = 91. Correction: 92\n6:23 PM"],
+    ["extra text before timestamp", `${answer} done\n6:23 PM`],
+    ["repeated before timestamp", `${answer}\n${answer}\n6:23 PM`],
   ];
   for (const [name, text] of rejectedTimestampCases) {
     if (evaluateAssistant(firstPrompt, text).matched) {
       throw new Error(`${name}: renderer oracle should fail closed`);
     }
   }
-  process.stdout.write("arithmetic oracle self-test passed\n");
+  process.stdout.write("sentinel oracle self-test passed\n");
 }
 
 async function targets() {
@@ -289,35 +282,35 @@ async function reachMainUi() {
   return Boolean(mainUi);
 }
 
-function assistantOutputProbeExpression(prompt, operands, expectedResult) {
+function assistantOutputProbeExpression(prompt, expectedSentinel) {
   return `(() => {
     const userMessage = [...document.querySelectorAll('[aria-label="Edit user message"]')]
       .filter((element) => (element.innerText ?? "").trim() === ${JSON.stringify(prompt)})
       .at(-1);
-    if (!userMessage) return { matched: false, integers: [], conflictingIntegers: [] };
+    if (!userMessage) return { matched: false, exactMatch: false };
     const copyButton = [...document.querySelectorAll('button[aria-label="Copy"]')]
       .filter((element) => userMessage.compareDocumentPosition(element) & Node.DOCUMENT_POSITION_FOLLOWING)
       .at(-1);
-    if (!copyButton) return { matched: false, integers: [], conflictingIntegers: [] };
+    if (!copyButton) return { matched: false, exactMatch: false };
     let assistantMessage = copyButton.parentElement;
     while (assistantMessage && assistantMessage !== document.body) {
       const { text } = (${stripTrailingRendererTimestamp.toString()})(
         assistantMessage.innerText ?? ""
       );
-      const verdict = (${arithmeticTextVerdict.toString()})(
-        text, ${JSON.stringify(operands)}, ${JSON.stringify(expectedResult)}
+      const verdict = (${sentinelTextVerdict.toString()})(
+        text, ${JSON.stringify(expectedSentinel)}
       );
       if (!assistantMessage.contains(userMessage) && verdict.matched) break;
       assistantMessage = assistantMessage.parentElement;
     }
     if (!assistantMessage || assistantMessage === document.body) {
-      return { matched: false, integers: [], conflictingIntegers: [] };
+      return { matched: false, exactMatch: false };
     }
     const rawText = assistantMessage.innerText ?? "";
     const stripped = (${stripTrailingRendererTimestamp.toString()})(rawText);
-    const text = stripped.text.replace(/\\s+/g, " ").trim();
-    const verdict = (${arithmeticTextVerdict.toString()})(
-      text, ${JSON.stringify(operands)}, ${JSON.stringify(expectedResult)}
+    const text = stripped.text.trim();
+    const verdict = (${sentinelTextVerdict.toString()})(
+      text, ${JSON.stringify(expectedSentinel)}
     );
     return {
       ...verdict,
@@ -329,7 +322,7 @@ function assistantOutputProbeExpression(prompt, operands, expectedResult) {
   })()`;
 }
 
-async function submitPrompt(prompt, operands, expectedResult) {
+async function submitPrompt(prompt, expectedSentinel) {
   const focused = await evaluate(`(() => {
     const editor = document.querySelector('[contenteditable=true][data-codex-composer=true]');
     if (!editor) return false;
@@ -388,10 +381,10 @@ async function submitPrompt(prompt, operands, expectedResult) {
   }
   if (!sent) return false;
 
-  const assistantOutputProbe = assistantOutputProbeExpression(prompt, operands, expectedResult);
+  const assistantOutputProbe = assistantOutputProbeExpression(prompt, expectedSentinel);
   const completed = await waitFor(
     `${assistantOutputProbe}.matched`,
-    `conflict-free semantic renderer result ${expectedResult} in assistant output`,
+    `exact renderer sentinel ${expectedSentinel} in assistant output`,
     timeoutMs
   );
   const outputOracle = await evaluate(assistantOutputProbe);
@@ -405,7 +398,7 @@ async function submitPrompt(prompt, operands, expectedResult) {
   emit("assistant-output-oracle", {
     ...safeOutputOracle,
     textLength: text.length,
-    textSha256: normalizedTextSha256(text),
+    textSha256: textSha256(text),
     rawTextLength: rawText.length,
     rawTextSha256: textSha256(rawText),
     timestampRemoved,
@@ -446,9 +439,7 @@ async function reopenPersistedThread(state) {
     `persisted first prompt for ${state.threadId}`,
     15000
   );
-  const firstOutputProbe = assistantOutputProbeExpression(
-    firstPrompt, firstOperands, Number(state.firstResult)
-  );
+  const firstOutputProbe = assistantOutputProbeExpression(firstPrompt, firstSentinel);
   const firstOutputSemanticMatch = firstPromptVisible && await waitFor(
     `${firstOutputProbe}.matched`,
     `persisted first output for ${state.threadId}`,
@@ -458,7 +449,7 @@ async function reopenPersistedThread(state) {
     ? await evaluate(firstOutputProbe)
     : { text: "" };
   const firstOutputVisible = firstOutputSemanticMatch &&
-    normalizedTextSha256(reopenedOutput.text) === state.firstRendererOutputSha256;
+    textSha256(reopenedOutput.text) === state.firstRendererOutputSha256;
   emit("persisted-thread-oracle", {
     threadId: state.threadId,
     firstPromptVisible,
@@ -539,7 +530,7 @@ try {
   if (phase === "first") {
     const mainUi = await reachMainUi();
     const rendererPromptCompleted = mainUi &&
-      await submitPrompt(firstPrompt, firstOperands, Number(firstResult));
+      await submitPrompt(firstPrompt, firstSentinel);
     const tasks = rendererPromptCompleted
       ? await inspectTasks(firstPrompt)
       : { inspected: false };
@@ -570,7 +561,8 @@ try {
       throw new Error(`invalid persisted thread identity: ${state.threadId}`);
     }
     if (state.firstPromptSha256 !== normalizedTextSha256(firstPrompt) ||
-      state.firstResult !== firstResult || !state.firstPersistedOutputSha256 ||
+      state.firstSentinelSha256 !== textSha256(firstSentinel) ||
+      !state.firstPersistedOutputSha256 ||
       !state.firstRendererOutputSha256 || !state.firstTurnIdSha256 ||
       state.firstOutputBinding !== "completed-turn") {
       throw new Error("resume state does not bind the first deterministic turn");
@@ -580,7 +572,7 @@ try {
       ? await reopenPersistedThread(state)
       : { reopened: false, persistedOutputVisible: false };
     const rendererContinuationCompleted = reopened.reopened &&
-      await submitPrompt(secondPrompt, secondOperands, Number(secondResult));
+      await submitPrompt(secondPrompt, secondSentinel);
     const summary = {
       mainUi,
       persistedThreadId: state.threadId,

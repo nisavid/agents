@@ -36,8 +36,9 @@ UPSTREAM_OBSERVER_PORT="${UPSTREAM_OBSERVER_PORT:-18997}"
 ROUTE_MODE="${ROUTE_MODE:-direct}"
 REPO_ROOT="$(/usr/bin/git -C "$HERE" rev-parse --show-toplevel)"
 GATEWAY_COMMIT="${GATEWAY_COMMIT:-}"
-GATEWAY_REVIEWED_COMMIT="a69e710dbe6a43e513a6f12c118b1abce81241ea"
+GATEWAY_REVIEWED_COMMIT="6307d37b76918c19f2e3bc0fd506434531aadeb2"
 GATEWAY_FILE="tooling/codex-ns-proxy/codex-ns-proxy.py"
+GATEWAY_REVIEWED_BLOB="a368b8f8e919361425763e86ca1c80fcea81825f"
 GATEWAY_UPSTREAM_URL="http://127.0.0.1:$UPSTREAM_OBSERVER_PORT/v1"
 GATEWAY_UPSTREAM_TIMEOUT_SECONDS="300"
 GATEWAY_TERMINAL_PATTERN="[codex-ns-proxy] SSE terminal_completed=true"
@@ -249,6 +250,7 @@ if test "$ROUTE_MODE" = gateway; then
   resolved_gateway_commit="$(/usr/bin/git -C "$REPO_ROOT" rev-parse --verify "$GATEWAY_COMMIT^{commit}")"
   test "$resolved_gateway_commit" = "$GATEWAY_COMMIT"
   gateway_blob="$(/usr/bin/git -C "$REPO_ROOT" rev-parse "$GATEWAY_COMMIT:$GATEWAY_FILE")"
+  test "$gateway_blob" = "$GATEWAY_REVIEWED_BLOB"
   GATEWAY_EXEC="$RUN_ROOT/gateway.py"
   /usr/bin/git -C "$REPO_ROOT" show "$GATEWAY_COMMIT:$GATEWAY_FILE" >"$GATEWAY_EXEC"
   test "$(/usr/bin/git hash-object "$GATEWAY_EXEC")" = "$gateway_blob"
@@ -275,6 +277,8 @@ if test "$ROUTE_MODE" = gateway; then
   /usr/bin/grep -Fq '"second_call_reconstructed": true' "$LOG_DIR/namespace-probe.json"
   /usr/bin/grep -Fq '"upstream_timeout_seconds": 300.0' "$LOG_DIR/namespace-probe.json"
   /usr/bin/grep -Fq '"default_sse_heartbeat_seconds": 15.0' "$LOG_DIR/namespace-probe.json"
+  /usr/bin/grep -Fq '"data_only_done_sentinel_recognized": true' "$LOG_DIR/namespace-probe.json"
+  /usr/bin/grep -Fq '"mixed_field_done_sentinel_rejected": true' "$LOG_DIR/namespace-probe.json"
 fi
 
 cat >"$CODEX_DIR/config.toml" <<EOF
@@ -301,8 +305,8 @@ if test "$GUI_WORKFLOW" = true; then
   cat >"$CODEX_DIR/AGENTS.md" <<'EOF'
 # Offline renderer smoke fixture
 
-For the arithmetic renderer smoke prompt, do not use tools and do not send a
-preamble. Answer directly and include the requested decimal result.
+For the renderer smoke prompts, do not use tools and do not send a preamble.
+Return only the exact phase sentinel requested by the user.
 EOF
 fi
 cat >"$WORKSPACE_DIR/README.md" <<'EOF'
@@ -864,8 +868,10 @@ refresh_gateway_log_observations() {
   fi
   if /usr/bin/grep -Fq 'Reply with exactly LOCAL_APP_OK' "$LOG_DIR/gateway.stdout" "$LOG_DIR/gateway.stderr" || \
     /usr/bin/grep -Fq 'LOCAL_APP_OK' "$LOG_DIR/gateway.stdout" "$LOG_DIR/gateway.stderr" || \
-    /usr/bin/grep -Fq 'What is 73 plus 19?' "$LOG_DIR/gateway.stdout" "$LOG_DIR/gateway.stderr" || \
-    /usr/bin/grep -Fq 'What is 46 plus 17?' "$LOG_DIR/gateway.stdout" "$LOG_DIR/gateway.stderr" || \
+    /usr/bin/grep -Fq 'Reply exactly COLD_PHASE_ONE_OK' "$LOG_DIR/gateway.stdout" "$LOG_DIR/gateway.stderr" || \
+    /usr/bin/grep -Fq 'Reply exactly COLD_PHASE_TWO_OK' "$LOG_DIR/gateway.stdout" "$LOG_DIR/gateway.stderr" || \
+    /usr/bin/grep -Fq 'COLD_PHASE_ONE_OK' "$LOG_DIR/gateway.stdout" "$LOG_DIR/gateway.stderr" || \
+    /usr/bin/grep -Fq 'COLD_PHASE_TWO_OK' "$LOG_DIR/gateway.stdout" "$LOG_DIR/gateway.stderr" || \
     /usr/bin/grep -Fq 'MISSING_OR_WRONG_AUTH_BODY_CANARY' "$LOG_DIR/gateway.stdout" "$LOG_DIR/gateway.stderr"; then
     gateway_body_leak_observed=true
   fi

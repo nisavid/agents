@@ -83,6 +83,17 @@ def session_id(records: list[dict]) -> str:
     return identifiers[0]
 
 
+def session_cwd(records: list[dict]) -> str:
+    values = [
+        record.get("payload", {}).get("cwd")
+        for record in records
+        if record.get("type") == "session_meta"
+    ]
+    if len(values) != 1 or not isinstance(values[0], str) or not pathlib.Path(values[0]).is_absolute():
+        raise ContractError(f"expected one absolute session cwd, found {len(values)}")
+    return values[0]
+
+
 def renderer_oracle(cdp_path: pathlib.Path, phase: str, expected_sentinel: str) -> dict:
     phase_records = [
         record
@@ -115,9 +126,17 @@ def matching_rollout(codex_dir: pathlib.Path, prompt: str) -> tuple[pathlib.Path
     return matches[0]
 
 
-def capture(codex_dir: pathlib.Path, state_path: pathlib.Path, cdp_path: pathlib.Path) -> None:
+def capture(
+    codex_dir: pathlib.Path,
+    state_path: pathlib.Path,
+    cdp_path: pathlib.Path,
+    expected_cwd: pathlib.Path | None = None,
+) -> None:
     rollout, records = matching_rollout(codex_dir, FIRST_PROMPT)
     thread_id = session_id(records)
+    cwd = session_cwd(records)
+    if expected_cwd is not None and cwd != str(expected_cwd.resolve(strict=True)):
+        raise ContractError("persisted session cwd does not match the expected workspace")
     first_turn_id, first_final = completed_turn(records, FIRST_PROMPT, FIRST_SENTINEL)
     oracle = renderer_oracle(cdp_path, "first", FIRST_SENTINEL)
     state = {
@@ -129,12 +148,18 @@ def capture(codex_dir: pathlib.Path, state_path: pathlib.Path, cdp_path: pathlib
         "firstPersistedOutputSha256": exact_sha256(first_final),
         "firstRendererOutputSha256": oracle["textSha256"],
         "firstOutputBinding": "completed-turn",
+        "cwdSha256": exact_sha256(cwd),
+        "cwdBinding": "rollout-session-meta",
     }
     state_path.write_text(json.dumps(state, sort_keys=True) + "\n")
     state_path.chmod(0o600)
 
 
-def validate(state_path: pathlib.Path, cdp_path: pathlib.Path) -> None:
+def validate(
+    state_path: pathlib.Path,
+    cdp_path: pathlib.Path,
+    expected_cwd: pathlib.Path | None = None,
+) -> None:
     state = json.loads(state_path.read_text())
     if state.get("firstOutputBinding") != "completed-turn":
         raise ContractError("original output is not bound to a completed turn")
@@ -147,6 +172,11 @@ def validate(state_path: pathlib.Path, cdp_path: pathlib.Path) -> None:
     records = read_records(rollout)
     if session_id(records) != state["threadId"]:
         raise ContractError("thread identity changed across restart")
+    cwd = session_cwd(records)
+    if state.get("cwdBinding") != "rollout-session-meta" or exact_sha256(cwd) != state.get("cwdSha256"):
+        raise ContractError("session cwd changed across restart")
+    if expected_cwd is not None and cwd != str(expected_cwd.resolve(strict=True)):
+        raise ContractError("persisted session cwd does not match the expected workspace")
     first_turn_id, first_final = completed_turn(records, FIRST_PROMPT, FIRST_SENTINEL)
     if exact_sha256(first_turn_id) != state["firstTurnIdSha256"]:
         raise ContractError("original completed turn identity changed across restart")
@@ -249,9 +279,17 @@ def run_self_tests() -> None:
         rollout.parent.mkdir(parents=True)
         state_path = root / "state.json"
         cdp_path = root / "cdp.jsonl"
+        workspace = root / "workspace"
+        workspace.mkdir()
 
         first_records = [
-            {"type": "session_meta", "payload": {"id": "019f0000-0000-7000-8000-000000000001"}},
+            {
+                "type": "session_meta",
+                "payload": {
+                    "id": "019f0000-0000-7000-8000-000000000001",
+                    "cwd": str(workspace.resolve()),
+                },
+            },
             *fixture_turn(
                 FIRST_PROMPT,
                 "turn-first",
@@ -265,11 +303,13 @@ def run_self_tests() -> None:
         ]
         rollout.write_text("\n".join(json.dumps(record) for record in first_records) + "\n")
         cdp_path.write_text(json.dumps(fixture_oracle("first", FIRST_SENTINEL)) + "\n")
-        capture(codex_dir, state_path, cdp_path)
+        capture(codex_dir, state_path, cdp_path, workspace)
         state = json.loads(state_path.read_text())
         assert state["firstOutputBinding"] == "completed-turn"
         assert state["firstSentinelSha256"] == exact_sha256(FIRST_SENTINEL)
         assert state["firstPersistedOutputSha256"] == exact_sha256(FIRST_SENTINEL)
+        assert state["cwdBinding"] == "rollout-session-meta"
+        assert state["cwdSha256"] == exact_sha256(str(workspace.resolve()))
 
         wrong_intermediate = [
             *first_records[:-1],
@@ -355,7 +395,7 @@ def run_self_tests() -> None:
             )
             + "\n"
         )
-        validate(state_path, cdp_path)
+        validate(state_path, cdp_path, workspace)
         state = json.loads(state_path.read_text())
         assert state["secondOutputBinding"] == "completed-turn"
         assert state["secondSentinelSha256"] == exact_sha256(SECOND_SENTINEL)
@@ -388,20 +428,41 @@ def run_self_tests() -> None:
         )
         expect_contract_error(lambda: validate(state_path, cdp_path), "final output changed")
 
+        changed_cwd = [dict(record) for record in [*first_records, *second_records]]
+        changed_cwd[0] = {
+            "type": "session_meta",
+            "payload": {
+                "id": "019f0000-0000-7000-8000-000000000001",
+                "cwd": str(root.resolve()),
+            },
+        }
+        rollout.write_text("\n".join(json.dumps(record) for record in changed_cwd) + "\n")
+        expect_contract_error(lambda: validate(state_path, cdp_path), "session cwd changed")
+
     print("cold resume completed-turn self-test passed")
 
 
 def main() -> None:
     if sys.argv[1:] == ["--self-test"]:
         run_self_tests()
-    elif len(sys.argv) == 5 and sys.argv[1] == "capture":
-        capture(pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3]), pathlib.Path(sys.argv[4]))
-    elif len(sys.argv) == 4 and sys.argv[1] == "validate":
-        validate(pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3]))
+    elif len(sys.argv) in (5, 6) and sys.argv[1] == "capture":
+        capture(
+            pathlib.Path(sys.argv[2]),
+            pathlib.Path(sys.argv[3]),
+            pathlib.Path(sys.argv[4]),
+            pathlib.Path(sys.argv[5]) if len(sys.argv) == 6 else None,
+        )
+    elif len(sys.argv) in (4, 5) and sys.argv[1] == "validate":
+        validate(
+            pathlib.Path(sys.argv[2]),
+            pathlib.Path(sys.argv[3]),
+            pathlib.Path(sys.argv[4]) if len(sys.argv) == 5 else None,
+        )
     else:
         raise SystemExit(
             "usage: 12-cold-resume-state.py --self-test | "
-            "capture CODEX_DIR STATE CDP | validate STATE CDP"
+            "capture CODEX_DIR STATE CDP [EXPECTED_CWD] | "
+            "validate STATE CDP [EXPECTED_CWD]"
         )
 
 

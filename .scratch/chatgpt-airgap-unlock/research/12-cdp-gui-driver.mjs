@@ -87,6 +87,33 @@ function uniqueVisibleControlVerdict(candidates) {
   return { status: "ready", count: 1, ...candidate };
 }
 
+function matchingControlVerdict(candidates, acceptedText) {
+  const matches = candidates.filter((candidate) => acceptedText.includes(candidate.text));
+  if (matches.length === 0) return { status: "pending", reason: "missing", count: 0 };
+  if (matches.length !== 1) {
+    return { status: "duplicate", reason: "duplicate", count: matches.length };
+  }
+  const candidate = matches[0];
+  if (candidate.disabled) return { status: "disabled", reason: "disabled", count: 1 };
+  if (!candidate.visible) return { status: "pending", reason: "not-visible", count: 1 };
+  return { status: "ready", count: 1, ...candidate };
+}
+
+function worktreeCommandVerdict(candidates) {
+  return matchingControlVerdict(candidates, [
+    "New worktree",
+    "New worktree Run this chat in a new worktree",
+  ]);
+}
+
+function worktreeModeVerdict(candidates) {
+  return matchingControlVerdict(candidates, ["New worktree", "Worktree"]);
+}
+
+function matchingControlExpression(candidatesExpression, acceptedText) {
+  return `(${matchingControlVerdict.toString()})(${candidatesExpression}, ${JSON.stringify(acceptedText)})`;
+}
+
 function runSelfTests() {
   const cases = [
     ["exact", firstSentinel, true],
@@ -246,6 +273,43 @@ function runSelfTests() {
   }]);
   if (readyControl.status !== "ready" || readyControl.x !== 10 || readyControl.height !== 40) {
     throw new Error("unique visible renderer control coordinates were not retained");
+  }
+  if (worktreeCommandVerdict([{ text: "New worktree", disabled: false, visible: true }]).status !== "ready") {
+    throw new Error("exact worktree slash-command option was not accepted");
+  }
+  if (worktreeCommandVerdict([{
+    text: "New worktree Run this chat in a new worktree", disabled: false, visible: true,
+  }]).status !== "ready") {
+    throw new Error("described worktree slash-command option was not accepted");
+  }
+  if (worktreeCommandVerdict([{ text: "New remote worktree", disabled: false, visible: true }]).status !== "pending") {
+    throw new Error("remote worktree command was mistaken for the exact local command");
+  }
+  if (worktreeCommandVerdict([
+    { text: "New worktree", disabled: false, visible: true },
+    { text: "New worktree", disabled: false, visible: true },
+  ]).status !== "duplicate") {
+    throw new Error("duplicate worktree slash-command options were not rejected");
+  }
+  if (worktreeModeVerdict([{ text: "Worktree", disabled: false, visible: true }]).status !== "ready") {
+    throw new Error("selected worktree mode marker was not recognized");
+  }
+  if (worktreeModeVerdict([{ text: "Local", disabled: false, visible: true }]).status !== "pending") {
+    throw new Error("local mode was mistaken for selected worktree mode");
+  }
+  const serializedCommandVerdict = Function(`return ${matchingControlExpression(
+    '[{text: "New worktree", disabled: false, visible: true}]',
+    ["New worktree", "New worktree Run this chat in a new worktree"]
+  )}`)();
+  if (serializedCommandVerdict.status !== "ready") {
+    throw new Error("serialized worktree command verdict depends on outer scope");
+  }
+  const serializedModeVerdict = Function(`return ${matchingControlExpression(
+    '[{text: "Worktree", disabled: false, visible: true}]',
+    ["New worktree", "Worktree"]
+  )}`)();
+  if (serializedModeVerdict.status !== "ready") {
+    throw new Error("serialized worktree mode verdict depends on outer scope");
   }
 
   process.stdout.write("sentinel oracle self-test passed\n");
@@ -428,6 +492,142 @@ async function waitForUniqueVisibleControl(query, description, milliseconds = 10
   throw new Error(`${description} control did not become uniquely visible: ${JSON.stringify(lastResult)}`);
 }
 
+function visibleCandidateExpression(selector) {
+  return `[...document.querySelectorAll(${JSON.stringify(selector)})].map((element) => {
+    const rect = element.getBoundingClientRect();
+    const style = getComputedStyle(element);
+    return {
+      element,
+      text: (element.innerText ?? element.textContent ?? "").replace(/\\s+/g, " ").trim(),
+      disabled: Boolean(element.disabled) || element.getAttribute("aria-disabled") === "true",
+      visible: rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.right > 0 &&
+        rect.top < window.innerHeight && rect.left < window.innerWidth &&
+        style.display !== "none" && style.visibility === "visible" &&
+        style.opacity !== "0" && style.pointerEvents !== "none",
+    };
+  })`;
+}
+
+async function configureWorktreeRoot(expectedRoot) {
+  if (!expectedRoot?.startsWith("/")) {
+    throw new Error("worktree-first requires an absolute configured worktree root");
+  }
+  await waitForUniqueVisibleControl({
+    selector: 'button[aria-label="Open settings"]', accessibleName: "Open settings",
+  }, "Open settings");
+  if (!await clickMatching(
+    `[...document.querySelectorAll('button[aria-label="Open settings"]')].find((element) => !element.disabled)`,
+    "open settings for worktree root"
+  )) return false;
+  await waitForUniqueVisibleControl({
+    selector: 'button[aria-label="Worktrees"]', accessibleName: "Worktrees",
+  }, "Worktrees settings");
+  if (!await clickMatching(
+    `[...document.querySelectorAll('button[aria-label="Worktrees"]')].find((element) => !element.disabled)`,
+    "open Worktrees settings"
+  )) return false;
+  await waitForUniqueVisibleControl({
+    selector: 'input[aria-label="Worktree root"]', accessibleName: "Worktree root",
+  }, "Worktree root input");
+  const updated = await evaluate(`(() => {
+    const inputs = [...document.querySelectorAll('input[aria-label="Worktree root"]')]
+      .filter((element) => !element.disabled);
+    if (inputs.length !== 1) return { updated: false, count: inputs.length };
+    const input = inputs[0];
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+    if (!setter) return { updated: false, count: 1 };
+    input.focus();
+    setter.call(input, ${JSON.stringify(expectedRoot)});
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+    input.blur();
+    return { updated: input.value === ${JSON.stringify(expectedRoot)}, count: 1 };
+  })()`);
+  if (!updated?.updated || updated.count !== 1) {
+    throw new Error(`worktree root input update failed closed: ${JSON.stringify(updated)}`);
+  }
+  const saved = await waitFor(
+    `(document.body?.innerText ?? "").includes("Saved worktree root") &&
+      document.querySelector('input[aria-label="Worktree root"]')?.value === ${JSON.stringify(expectedRoot)}`,
+    "saved exact worktree root",
+    10000
+  );
+  emit("worktree-root-saved", {
+    saved,
+    rootSha256: textSha256(expectedRoot),
+  });
+  if (!saved) return false;
+  await waitForUniqueVisibleControl({
+    selector: '[role="link"]', exactText: "Back to app",
+  }, "Back to app");
+  if (!await clickMatching(
+    `[...document.querySelectorAll('[role="link"]')].find((element) =>
+      (element.innerText ?? element.textContent ?? "").trim() === "Back to app"
+    )`,
+    "return from Worktrees settings"
+  )) return false;
+  return await reachMainUi();
+}
+
+async function selectNewWorktreeMode() {
+  const focused = await evaluate(`(() => {
+    const editor = document.querySelector('[contenteditable=true][data-codex-composer=true]');
+    if (!editor || (editor.innerText ?? "").trim()) return false;
+    editor.focus();
+    return document.activeElement === editor;
+  })()`);
+  if (!focused) return false;
+  await send("Input.insertText", { text: "/worktree" });
+  const commandCandidates = visibleCandidateExpression(
+    '[role="option"], [role="menuitem"], button'
+  );
+  const commandVerdict = matchingControlExpression(commandCandidates, [
+    "New worktree",
+    "New worktree Run this chat in a new worktree",
+  ]);
+  const commandReady = await waitFor(
+    `${commandVerdict}.status === "ready"`,
+    "unique exact New worktree slash command",
+    10000
+  );
+  if (!commandReady) return false;
+  const selected = await evaluate(`(() => {
+    const candidates = ${commandCandidates};
+    const verdict = (${matchingControlVerdict.toString()})(candidates, [
+      "New worktree",
+      "New worktree Run this chat in a new worktree",
+    ]);
+    if (verdict.status !== "ready") return { selected: false, status: verdict.status };
+    const exact = candidates.filter((candidate) =>
+      candidate.text === "New worktree" ||
+      candidate.text === "New worktree Run this chat in a new worktree"
+    );
+    if (exact.length !== 1) return { selected: false, status: "duplicate" };
+    exact[0].element.click();
+    return { selected: true, status: "ready" };
+  })()`);
+  if (!selected?.selected) {
+    throw new Error(`exact New worktree command was not selected: ${JSON.stringify(selected)}`);
+  }
+  const modeCandidates = visibleCandidateExpression("button");
+  const modeVerdict = matchingControlExpression(
+    modeCandidates, ["New worktree", "Worktree"]
+  );
+  const markerReady = await waitFor(
+    `${modeVerdict}.status === "ready"`,
+    "unique selected worktree mode marker",
+    10000
+  );
+  const marker = markerReady
+    ? await evaluate(modeVerdict)
+    : { status: "pending", count: 0 };
+  emit("worktree-mode-selected", {
+    selected: markerReady && marker.status === "ready" && marker.count === 1,
+    uniqueControl: marker.count === 1,
+  });
+  return markerReady && marker.status === "ready" && marker.count === 1;
+}
+
 // BEGIN_NATIVE_PROJECT_PICKER_PRECONDITION
 async function assertNativeProjectPickerPrecondition(expectedFixtureRoot) {
   if (!expectedFixtureRoot?.startsWith("/")) {
@@ -579,7 +779,7 @@ function modeOutputProbeExpression(prompt) {
   })()`;
 }
 
-async function submitPrompt(prompt, expectedSentinel, expectedMode = null) {
+async function submitPrompt(prompt, expectedSentinel, expectedMode = null, outputPhase = phase) {
   const focused = await evaluate(`(() => {
     const editor = document.querySelector('[contenteditable=true][data-codex-composer=true]');
     if (!editor) return false;
@@ -657,6 +857,7 @@ async function submitPrompt(prompt, expectedSentinel, expectedMode = null) {
     ...safeOutputOracle
   } = outputOracle;
   emit("assistant-output-oracle", {
+    phase: outputPhase,
     ...safeOutputOracle,
     textLength: text.length,
     textSha256: textSha256(text),
@@ -872,7 +1073,42 @@ try {
       summary.skillSurfaceObserved, summary.modelSurfaceObserved,
       summary.rendererModelMetadataMatched, summary.rendererFallbackModelMetadataAbsent];
     if (required.some((value) => value !== true)) process.exitCode = 1;
-  } else if (phase === "second") {
+  } else if (phase === "worktree-first") {
+    const mainUi = await reachMainUi();
+    const worktreeRootSaved = mainUi && await configureWorktreeRoot(phaseArgument);
+    const worktreeModeSelected = worktreeRootSaved && await selectNewWorktreeMode();
+    const rendererPromptCompleted = worktreeModeSelected &&
+      await submitPrompt(firstPrompt, firstSentinel, null, "first");
+    const tasks = rendererPromptCompleted
+      ? await inspectTasks(firstPrompt)
+      : { inspected: false };
+    await clickMatching(
+      `[...document.querySelectorAll("button")].find((element) => element.innerText?.includes("New task"))`,
+      "return to new task before worktree surface inspection"
+    );
+    await sleep(500);
+    const surfaces = await inspectSurfaces();
+    const summary = {
+      mainUi,
+      worktreeRootSaved,
+      worktreeModeSelected,
+      rendererPromptCompleted,
+      tasksSurfaceObserved: tasks.inspected,
+      ...surfaces,
+      nativeProjectPickerExercised: true,
+      nativePermissionDecisionExercised: false,
+      nativeWorktreeControlExercised: worktreeModeSelected,
+    };
+    emit("worktree-first-summary", summary);
+    emit("gui-summary", summary);
+    const required = [summary.mainUi, summary.worktreeRootSaved,
+      summary.worktreeModeSelected, summary.rendererPromptCompleted,
+      summary.tasksSurfaceObserved, summary.settingsSurfaceObserved,
+      summary.pluginSurfaceObserved, summary.skillSurfaceObserved,
+      summary.modelSurfaceObserved, summary.rendererModelMetadataMatched,
+      summary.rendererFallbackModelMetadataAbsent];
+    if (required.some((value) => value !== true)) process.exitCode = 1;
+  } else if (phase === "second" || phase === "worktree-second") {
     const resumeStatePath = phaseArgument;
     if (!resumeStatePath) throw new Error("second phase requires a resume-state path");
     const state = JSON.parse(readFileSync(resumeStatePath, "utf8"));
@@ -883,7 +1119,8 @@ try {
       state.firstSentinelSha256 !== textSha256(firstSentinel) ||
       !state.firstPersistedOutputSha256 ||
       !state.firstRendererOutputSha256 || !state.firstTurnIdSha256 ||
-      state.firstOutputBinding !== "completed-turn") {
+      state.firstOutputBinding !== "completed-turn" ||
+      !state.cwdSha256 || state.cwdBinding !== "rollout-session-meta") {
       throw new Error("resume state does not bind the first deterministic turn");
     }
     const mainUi = await reachMainUi();
@@ -891,7 +1128,15 @@ try {
       ? await reopenPersistedThread(state)
       : { reopened: false, persistedOutputVisible: false };
     const rendererContinuationCompleted = reopened.reopened &&
-      await submitPrompt(secondPrompt, secondSentinel);
+      await submitPrompt(secondPrompt, secondSentinel, null,
+        phase === "worktree-second" ? "second" : phase);
+    if (phase === "worktree-second") {
+      emit("worktree-thread-reopened", {
+        reopened: reopened.reopened,
+        threadId: state.threadId,
+        cwdSha256: state.cwdSha256,
+      });
+    }
     const summary = {
       mainUi,
       persistedThreadId: state.threadId,
@@ -899,7 +1144,8 @@ try {
       persistedOutputVisible: reopened.persistedOutputVisible,
       rendererContinuationCompleted,
     };
-    emit("gui-resume-summary", summary);
+    emit(phase === "worktree-second" ? "worktree-second-summary" : "gui-resume-summary", summary);
+    if (phase === "worktree-second") emit("gui-resume-summary", summary);
     const required = [summary.mainUi, summary.rendererThreadReopened,
       summary.persistedOutputVisible, summary.rendererContinuationCompleted];
     if (required.some((value) => value !== true)) process.exitCode = 1;

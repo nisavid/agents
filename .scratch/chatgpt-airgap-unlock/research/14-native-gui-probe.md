@@ -165,16 +165,14 @@ Ivan; the helper never requests a prompt itself.
 ## No-permission verdict
 
 Green for the source, build, input-policy, selector-policy, and runner-seam
-slice. The temporary no-permission artifact for this revision is arm64 and ad-hoc signed,
+slice. The retained no-permission artifact for this revision is arm64 and ad-hoc signed,
 with SHA-256 `160d8a49d9730b48efa8e85120f352c3e21fb5fd43c6a0854e9b496462f7b4b1`
 and CDHash `d4fff90e19ef9fd245285e18cf2d122bbbf6efd6`. A clean build in a second
 disposable directory produced the same SHA-256. The helper self-test, forbidden
 API and sensitive-symbol allowlists, path-policy fixtures, renderer transition
 oracle, authoritative project-state fixtures, runner shell syntax, and
-cold-handoff self-test all passed. The canonical helper path still contains the
-earlier granted artifact with SHA-256
-`ad76e34b416fb5d8be9bc4baec09c09bba4073c66275acfd459c0b6d7068aa6c`;
-the reviewed revision has not yet replaced it.
+cold-handoff self-test all passed. The reviewed revision is installed at the
+canonical helper path recorded above and requires a fresh manual grant.
 
 ## First live invocation
 
@@ -192,6 +190,5 @@ helper now polls read-only for at most five monotonic seconds, validates the
 same process identity before and after every AX snapshot, retries only while no
 panel-shaped candidate exists, and fails immediately on malformed, duplicate,
 unauthorized, ambiguous, or drifted state. The wait contains no AX or input
-action. The live native project selection remains unexecuted with the reviewed
-revision and blocked on its canonical rebuild and fresh manual Accessibility
-grant.
+action. The live native project selection remains unexecuted with this retained
+artifact and blocked on its fresh manual Accessibility grant.

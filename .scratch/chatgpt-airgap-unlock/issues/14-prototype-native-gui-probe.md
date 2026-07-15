@@ -50,9 +50,10 @@ final reviewed helper artifact when it is ready to run.
 
 ## Permission gate
 
-The live native run is blocked until the exact reviewed helper artifact exists
-and Ivan manually grants that helper Accessibility access in System Settings.
-Rebuilding or re-signing the helper invalidates the grant until reverified.
+The exact reviewed helper artifact is installed at the canonical path. The live
+native run remains blocked until Ivan manually grants that helper Accessibility
+access in System Settings. Rebuilding or re-signing the helper invalidates the
+grant until reverified.
 
 ## Current prototype evidence
 
@@ -119,8 +120,6 @@ field-specific diagnostic, and a present value of the wrong CF type fails as
 malformed; case-normalized `O`/`o`, integral virtual key `31`, and integral
 modifiers `0` remain required. The inspection phase still authorizes no action.
 
-No new Accessibility request, TCC mutation, installed-app launch, or live AX
-action has occurred for this revision. The reviewed no-permission artifact is
-recorded in `research/14-native-gui-probe.md`; read-only menu inspection requires
-separate review and a manual grant for that exact artifact before the next live
-step.
+No live AX action has occurred for this revision. The reviewed retained artifact
+is recorded in `research/14-native-gui-probe.md`; read-only menu inspection
+requires a manual grant for that exact artifact before the next live step.

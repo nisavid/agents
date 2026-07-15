@@ -849,7 +849,7 @@ else
   if /usr/bin/grep -Fq '"localSkillVisible":true' "$LOG_DIR/cdp.jsonl"; then renderer_local_skill_visible=true; fi
   if /usr/bin/grep -Fq '"modelSurfaceObserved":true' "$LOG_DIR/cdp.jsonl"; then renderer_model_surface_observed=true; fi
   if /usr/bin/grep -Fq '"rendererModelMetadataMatched":true' "$LOG_DIR/cdp.jsonl"; then renderer_model_metadata_matched=true; fi
-  if /usr/bin/grep -Fq '"rendererFallbackModelMetadataAbsent":true' "$LOG_DIR/cdp.jsonl"; then renderer_fallback_model_metadata_absent=true; fi
+  if /usr/bin/grep -Eq '"rendererFallbackModelMetadataAbsent"[[:space:]]*:[[:space:]]*true' "$LOG_DIR/cdp.jsonl"; then renderer_fallback_model_metadata_absent=true; fi
   if /usr/bin/grep -Fq '"rendererThreadReopened":true' "$LOG_DIR/cdp.jsonl"; then renderer_thread_reopened=true; fi
   if /usr/bin/grep -Fq '"rendererContinuationCompleted":true' "$LOG_DIR/cdp.jsonl"; then renderer_continuation_completed=true; fi
   if test -f "$GUI_RESUME_STATE" && /usr/bin/grep -Fq '"sameRolloutContinuationValidated": true' "$GUI_RESUME_STATE"; then renderer_same_rollout_continuation=true; fi

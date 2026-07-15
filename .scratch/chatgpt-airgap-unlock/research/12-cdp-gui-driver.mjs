@@ -14,10 +14,8 @@ const firstPrompt = "Reply exactly COLD_PHASE_ONE_OK and nothing else. Do not us
 const firstSentinel = "COLD_PHASE_ONE_OK";
 const secondPrompt = "Reply exactly COLD_PHASE_TWO_OK and nothing else. Do not use tools.";
 const secondSentinel = "COLD_PHASE_TWO_OK";
-const defaultModePrompt = "Reply exactly MODE_DEFAULT_OK and nothing else. Do not use tools.";
-const defaultModeSentinel = "MODE_DEFAULT_OK";
-const planModePrompt = "Reply exactly MODE_PLAN_OK and nothing else. Do not use tools.";
-const planModeSentinel = "MODE_PLAN_OK";
+const defaultModePrompt = "Confirm Default mode in one short sentence. Do not use tools.";
+const planModePrompt = "Confirm Plan mode in one short sentence. Do not use tools.";
 
 function emit(kind, data) {
   process.stdout.write(`${JSON.stringify({ at: new Date().toISOString(), kind, phase, ...data })}\n`);
@@ -81,7 +79,7 @@ function runSelfTests() {
     if (actual !== expected) throw new Error(`${name}: expected ${expected}, got ${actual}`);
   }
 
-  function evaluateAssistant(prompt, assistantText) {
+  function evaluateProbe(prompt, assistantText, expression) {
     const body = { innerText: `${prompt}\n${assistantText}` };
     const userMessage = {
       innerText: prompt,
@@ -100,8 +98,15 @@ function runSelfTests() {
         : selector.includes('button[aria-label="Copy"]') ? [copyButton] : [],
     };
     const Node = { DOCUMENT_POSITION_FOLLOWING: 4 };
-    const expression = assistantOutputProbeExpression(prompt, firstSentinel);
     return Function("document", "Node", `return ${expression}`)(document, Node);
+  }
+
+  function evaluateAssistant(prompt, assistantText) {
+    return evaluateProbe(
+      prompt,
+      assistantText,
+      assistantOutputProbeExpression(prompt, firstSentinel)
+    );
   }
 
   const promptWithSentinel = `Ignore ${firstSentinel}. ${firstPrompt}`;
@@ -145,6 +150,22 @@ function runSelfTests() {
   }
   if (planModeIndicatorVerdict([{ ariaLabel: null, text: "Plan mode" }])) {
     throw new Error("slash command was mistaken for selected Plan mode");
+  }
+  const nonemptyModeOutput = evaluateProbe(
+    defaultModePrompt,
+    "Default mode is active.\n6:23 PM",
+    modeOutputProbeExpression(defaultModePrompt)
+  );
+  if (!nonemptyModeOutput.matched || nonemptyModeOutput.text !== "Default mode is active.") {
+    throw new Error("nonempty mode output was not isolated from its renderer timestamp");
+  }
+  const emptyModeOutput = evaluateProbe(
+    defaultModePrompt,
+    "",
+    modeOutputProbeExpression(defaultModePrompt)
+  );
+  if (emptyModeOutput.matched) {
+    throw new Error("empty mode output unexpectedly passed");
   }
   process.stdout.write("sentinel oracle self-test passed\n");
 }
@@ -348,7 +369,39 @@ function assistantOutputProbeExpression(prompt, expectedSentinel) {
   })()`;
 }
 
-async function submitPrompt(prompt, expectedSentinel) {
+function modeOutputProbeExpression(prompt) {
+  return `(() => {
+    const userMessage = [...document.querySelectorAll('[aria-label="Edit user message"]')]
+      .filter((element) => (element.innerText ?? "").trim() === ${JSON.stringify(prompt)})
+      .at(-1);
+    if (!userMessage) return { matched: false };
+    const copyButton = [...document.querySelectorAll('button[aria-label="Copy"]')]
+      .filter((element) => userMessage.compareDocumentPosition(element) & Node.DOCUMENT_POSITION_FOLLOWING)
+      .at(-1);
+    if (!copyButton) return { matched: false };
+    let assistantMessage = copyButton.parentElement;
+    while (assistantMessage && assistantMessage !== document.body) {
+      const stripped = (${stripTrailingRendererTimestamp.toString()})(
+        assistantMessage.innerText ?? ""
+      );
+      if (!assistantMessage.contains(userMessage) && stripped.text.trim()) break;
+      assistantMessage = assistantMessage.parentElement;
+    }
+    if (!assistantMessage || assistantMessage === document.body) return { matched: false };
+    const rawText = assistantMessage.innerText ?? "";
+    const stripped = (${stripTrailingRendererTimestamp.toString()})(rawText);
+    const text = stripped.text.trim();
+    return {
+      matched: text.length > 0,
+      text,
+      rawText,
+      timestampRemoved: stripped.timestampRemoved,
+      rendererTimestamp: stripped.timestamp,
+    };
+  })()`;
+}
+
+async function submitPrompt(prompt, expectedSentinel, expectedMode = null) {
   const focused = await evaluate(`(() => {
     const editor = document.querySelector('[contenteditable=true][data-codex-composer=true]');
     if (!editor) return false;
@@ -407,10 +460,14 @@ async function submitPrompt(prompt, expectedSentinel) {
   }
   if (!sent) return false;
 
-  const assistantOutputProbe = assistantOutputProbeExpression(prompt, expectedSentinel);
+  const assistantOutputProbe = expectedMode === null
+    ? assistantOutputProbeExpression(prompt, expectedSentinel)
+    : modeOutputProbeExpression(prompt);
   const completed = await waitFor(
     `${assistantOutputProbe}.matched`,
-    `exact renderer sentinel ${expectedSentinel} in assistant output`,
+    expectedMode === null
+      ? `exact renderer sentinel ${expectedSentinel} in assistant output`
+      : `nonempty renderer output for ${expectedMode} mode turn`,
     timeoutMs
   );
   const outputOracle = await evaluate(assistantOutputProbe);
@@ -432,6 +489,15 @@ async function submitPrompt(prompt, expectedSentinel) {
       ? textSha256(rendererTimestamp)
       : null,
   });
+  if (expectedMode !== null) {
+    emit("mode-turn-output", {
+      mode: expectedMode,
+      matched: Boolean(outputOracle.matched),
+      promptSha256: textSha256(prompt),
+      outputLength: text.length,
+      outputSha256: textSha256(text),
+    });
+  }
   await snapshot(completed ? "renderer-reply-completed" : "renderer-reply-missing");
   return completed;
 }
@@ -670,14 +736,14 @@ try {
           5000
         );
         defaultPromptCompleted = defaultModeControlObserved &&
-          await submitPrompt(defaultModePrompt, defaultModeSentinel);
+          await submitPrompt(defaultModePrompt, null, "default");
         const modeControlsAfterDefault = defaultPromptCompleted
           ? await observeDefaultAndEnablePlanMode()
           : { defaultObserved: false, planSelected: false };
         defaultModeControlObserved = defaultModeControlObserved && modeControlsAfterDefault.defaultObserved;
         planModeControlObserved = planModeControlObserved && modeControlsAfterDefault.planSelected;
         planPromptCompleted = planModeControlObserved &&
-          await submitPrompt(planModePrompt, planModeSentinel);
+          await submitPrompt(planModePrompt, null, "plan");
       }
     }
     const summary = {

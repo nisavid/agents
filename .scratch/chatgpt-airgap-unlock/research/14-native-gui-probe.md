@@ -143,6 +143,17 @@ The retry loop continues to validate process identity around every read and
 contains no AX mutation; inspection evidence continues to require
 `actionCount: 0`.
 
+The eighth inspection run reached the exact `Open Folder…` item after process
+validation and Accessibility trust, then failed the combined Command-O metadata
+check before any action. The prior check did not identify whether an optional
+attribute was absent or a published value was wrong. Missing or empty command
+character, missing virtual key, and missing modifiers now remain retryable
+within the same bounded read-only wait. Once present, a wrong character, key,
+or modifier value fails on that snapshot with a field-specific diagnostic; a
+present value of the wrong CF type fails as malformed. Case-normalized `O`/`o`,
+integral virtual key `31`, and integral modifiers `0` remain the only accepted
+command metadata.
+
 ## Permission boundary
 
 Do not run the live seam until Ivan has reviewed the final artifact hash and
@@ -155,8 +166,8 @@ Ivan; the helper never requests a prompt itself.
 
 Green for the source, build, input-policy, selector-policy, and runner-seam
 slice. The temporary no-permission artifact for this revision is arm64 and ad-hoc signed,
-with SHA-256 `ad76e34b416fb5d8be9bc4baec09c09bba4073c66275acfd459c0b6d7068aa6c`
-and CDHash `c3a03b2510a2ca6486daf0c18a2cf6cb67249335`. A clean build in a second
+with SHA-256 `160d8a49d9730b48efa8e85120f352c3e21fb5fd43c6a0854e9b496462f7b4b1`
+and CDHash `d4fff90e19ef9fd245285e18cf2d122bbbf6efd6`. A clean build in a second
 disposable directory produced the same SHA-256. The helper self-test, forbidden
 API and sensitive-symbol allowlists, path-policy fixtures, renderer transition
 oracle, authoritative project-state fixtures, runner shell syntax, and

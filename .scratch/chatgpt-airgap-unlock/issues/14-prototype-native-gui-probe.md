@@ -102,6 +102,15 @@ action, or Command-O metadata remain immediate failures. Identity validation
 still brackets every read, and the inspection phase remains mutation-free with
 `actionCount: 0`.
 
+The eighth inspection run reached the exact `Open Folder…` item but failed the
+combined Command-O metadata check before any action. That check could not
+distinguish missing publication from a present wrong value. Missing or empty
+command character, missing virtual key, and missing modifiers now retry within
+the existing deadline. Any present wrong value fails immediately with a
+field-specific diagnostic, and a present value of the wrong CF type fails as
+malformed; case-normalized `O`/`o`, integral virtual key `31`, and integral
+modifiers `0` remain required. The inspection phase still authorizes no action.
+
 No new Accessibility request, TCC mutation, installed-app launch, or live AX
 action has occurred for this revision. The reviewed no-permission artifact is
 recorded in `research/14-native-gui-probe.md`; read-only menu inspection requires

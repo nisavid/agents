@@ -354,6 +354,7 @@ async function clickMatching(expression, description) {
   return result;
 }
 
+// BEGIN_NATIVE_PROJECT_PICKER_REQUEST
 async function openNativeProjectPicker(expectedFixtureRoot) {
   if (!expectedFixtureRoot?.startsWith("/")) {
     throw new Error("open-project-picker requires an absolute nonce fixture root");
@@ -401,8 +402,8 @@ async function openNativeProjectPicker(expectedFixtureRoot) {
     preSelectionMatchedExpected: false,
     expectedFixtureSha256: textSha256(expectedFixtureRoot),
   });
-  await sleep(750);
 }
+// END_NATIVE_PROJECT_PICKER_REQUEST
 
 async function confirmNativeProjectSelection(expectedFixtureRoot) {
   if (!expectedFixtureRoot?.startsWith("/")) {

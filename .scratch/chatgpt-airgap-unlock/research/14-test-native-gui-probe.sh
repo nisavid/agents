@@ -89,6 +89,26 @@ fi
 /usr/bin/grep -Fq -- '-D "NATIVE_GUI_PROBE_BIN=$NATIVE_GUI_PROBE_PROTECTED_PATH"' \
   "$HERE/08-run-prototype.sh"
 
+readiness_body="$(/usr/bin/sed -n \
+  '/BEGIN_READ_ONLY_OPEN_PANEL_WAIT/,/END_READ_ONLY_OPEN_PANEL_WAIT/p' \
+  "$HERE/14-native-gui-probe.swift")"
+if printf '%s\n' "$readiness_body" | /usr/bin/grep -Eq \
+  'AXUIElementPerformAction|AXUIElementSetAttributeValue|CGEvent|postCommandShiftG|(^|[^[:alnum:]_])press\('; then
+  echo 'Open panel readiness wait contains an AX or input action' >&2
+  exit 1
+fi
+picker_request_body="$(/usr/bin/sed -n \
+  '/BEGIN_NATIVE_PROJECT_PICKER_REQUEST/,/END_NATIVE_PROJECT_PICKER_REQUEST/p' \
+  "$HERE/12-cdp-gui-driver.mjs")"
+test "$(printf '%s\n' "$picker_request_body" | /usr/bin/grep -Fc 'type: "mousePressed"')" -eq 1
+test "$(printf '%s\n' "$picker_request_body" | /usr/bin/grep -Fc 'type: "mouseReleased"')" -eq 1
+if printf '%s\n' "$picker_request_body" | /usr/bin/grep -Eq 'sleep\(|setTimeout\('; then
+  echo 'renderer project-picker request still relies on a fixed sleep' >&2
+  exit 1
+fi
+test "$(/usr/bin/grep -Fc '"$NATIVE_GUI_PROBE_BIN" "$@" \' \
+  "$HERE/08-run-prototype.sh")" -eq 1
+
 sensitive_symbols="$(/usr/bin/nm -u "$PROBE" | /usr/bin/awk '{print $NF}' | \
   /usr/bin/grep -E '(^_(AX|CGEvent|IOHID|NSAppleScript|LS(Open|Launch)|posix_spawn|exec|fork|system|kill|Sec(Code|StaticCode)|proc_))|NSTask|NSWorkspace' | \
   LC_ALL=C /usr/bin/sort || true)"

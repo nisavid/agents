@@ -175,6 +175,25 @@ enum PathPolicy {
 enum OpenPanelPolicy {
     static let chooserTitles: Set<String> = ["open", "choose", "select"]
 
+    static func panelShapedIndices(windows: [ElementDescription]) -> [Int] {
+        windows.indices.filter { index in
+            let window = windows[index]
+            guard (window.role == kAXWindowRole && window.subrole == kAXStandardWindowSubrole) ||
+                    window.role == kAXSheetRole else { return false }
+            let descendants = [window] + window.descendants
+            let hasCancel = descendants.contains {
+                $0.role == kAXButtonRole && $0.title?.lowercased() == "cancel"
+            }
+            let hasChooser = descendants.contains {
+                $0.role == kAXButtonRole && chooserTitles.contains($0.title?.lowercased() ?? "")
+            }
+            let hasFileBrowser = descendants.contains {
+                [kAXOutlineRole, kAXBrowserRole, kAXTableRole].contains($0.role)
+            }
+            return [hasCancel, hasChooser, hasFileBrowser].filter { $0 }.count >= 2
+        }
+    }
+
     static func uniqueElements(_ root: ElementDescription, where predicate: (ElementDescription) -> Bool)
         throws -> [ElementDescription] {
         let matches = ([root] + root.descendants).filter(predicate)
@@ -182,33 +201,29 @@ enum OpenPanelPolicy {
     }
 
     static func plan(windows: [ElementDescription], permitKeyFallback: Bool) throws -> SelectionPlan {
-        let candidates = windows.filter { window in
-            guard (window.role == kAXWindowRole && window.subrole == kAXStandardWindowSubrole) ||
-                    window.role == kAXSheetRole else { return false }
-            let descendants = [window] + window.descendants
-            let hasCancel = descendants.contains {
-                $0.role == kAXButtonRole && $0.title?.lowercased() == "cancel" &&
-                    $0.actions.contains(kAXPressAction)
-            }
-            let chooserCount = descendants.filter {
-                $0.role == kAXButtonRole && chooserTitles.contains($0.title?.lowercased() ?? "") &&
-                    $0.actions.contains(kAXPressAction)
-            }.count
-            let hasFileBrowser = descendants.contains {
-                [kAXOutlineRole, kAXBrowserRole, kAXTableRole].contains($0.role)
-            }
-            return hasCancel && chooserCount == 1 && hasFileBrowser
+        let shapedIndices = panelShapedIndices(windows: windows)
+        guard shapedIndices.count == 1, let candidateIndex = shapedIndices.first else {
+            throw ProbeError.validation(
+                "expected exactly one panel-shaped Open candidate; found \(shapedIndices.count)")
         }
-        guard candidates.count == 1, let panel = candidates.first else {
-            throw ProbeError.validation("expected exactly one standard Open panel; found \(candidates.count)")
-        }
+        let panel = windows[candidateIndex]
         let all = [panel] + panel.descendants
+        let cancels = all.filter {
+            $0.role == kAXButtonRole && $0.title?.lowercased() == "cancel" &&
+                $0.actions.contains(kAXPressAction)
+        }
         let choosers = all.filter {
             $0.role == kAXButtonRole && chooserTitles.contains($0.title?.lowercased() ?? "") &&
                 $0.actions.contains(kAXPressAction)
         }
-        guard choosers.count == 1, let chooser = choosers.first, let title = chooser.title else {
-            throw ProbeError.validation("Open panel chooser is missing or ambiguous")
+        let fileBrowsers = all.filter {
+            [kAXOutlineRole, kAXBrowserRole, kAXTableRole].contains($0.role)
+        }
+        guard cancels.count == 1, choosers.count == 1, !fileBrowsers.isEmpty,
+              let chooser = choosers.first, let title = chooser.title else {
+            throw ProbeError.validation(
+                "malformed Open panel controls: cancel=\(min(cancels.count, 2)) " +
+                "chooser=\(min(choosers.count, 2)) browser=\(min(fileBrowsers.count, 2))")
         }
         let directFields = all.filter {
             $0.role == kAXTextFieldRole &&
@@ -429,6 +444,83 @@ func matchingLiveElements(_ root: AXUIElement, _ predicate: (AXUIElement) -> Boo
     return ([root] + (try descendants(root, budget: &budget))).filter(predicate)
 }
 
+func monotonicNanoseconds() throws -> UInt64 {
+    var value = timespec()
+    guard clock_gettime(CLOCK_MONOTONIC, &value) == 0 else {
+        throw ProbeError.unavailable("monotonic clock unavailable")
+    }
+    return UInt64(value.tv_sec) * 1_000_000_000 + UInt64(value.tv_nsec)
+}
+
+struct OpenPanelReadiness<Element> {
+    let panel: Element
+    let plan: SelectionPlan
+    let initialElements: [Element]
+    let pollCount: Int
+}
+
+// BEGIN_READ_ONLY_OPEN_PANEL_WAIT
+func waitForUniqueOpenPanel<Element>(
+    timeoutNanoseconds: UInt64,
+    pollMicroseconds: useconds_t,
+    permitKeyFallback: Bool,
+    nowNanoseconds: () throws -> UInt64,
+    validateIdentity: () throws -> Void,
+    readWindows: () throws -> [(Element, ElementDescription)],
+    sameElement: (Element, Element) -> Bool,
+    pause: (useconds_t) -> Void
+) throws -> OpenPanelReadiness<Element> {
+    precondition(timeoutNanoseconds > 0 && pollMicroseconds > 0)
+    let started = try nowNanoseconds()
+    let addition = started.addingReportingOverflow(timeoutNanoseconds)
+    let deadline = addition.overflow ? UInt64.max : addition.partialValue
+    var pollCount = 0
+    while try nowNanoseconds() < deadline {
+        try validateIdentity()
+        let windows = try readWindows()
+        try validateIdentity()
+        pollCount += 1
+        let descriptions = windows.map(\.1)
+        let shapedIndices = OpenPanelPolicy.panelShapedIndices(windows: descriptions)
+        guard shapedIndices.count <= 1 else {
+            throw ProbeError.validation(
+                "expected exactly one panel-shaped Open candidate; found \(shapedIndices.count)")
+        }
+        if let selectedIndex = shapedIndices.first {
+            let plan = try OpenPanelPolicy.plan(
+                windows: [descriptions[selectedIndex]], permitKeyFallback: permitKeyFallback)
+            let selected = windows[selectedIndex].0
+            guard windows.filter({ sameElement($0.0, selected) }).count == 1 else {
+                throw ProbeError.validation("live Open panel identity is ambiguous")
+            }
+            return OpenPanelReadiness(panel: selected, plan: plan,
+                                      initialElements: windows.map(\.0), pollCount: pollCount)
+        }
+        let current = try nowNanoseconds()
+        guard current < deadline else { break }
+        let remainingMicroseconds = (deadline - current + 999) / 1_000
+        pause(useconds_t(min(UInt64(pollMicroseconds), remainingMicroseconds)))
+    }
+    throw ProbeError.unavailable("Open panel did not become ready after \(pollCount) polls")
+}
+
+func waitForValidatedOpenPanel(
+    application: AXUIElement,
+    identity: ProcessIdentity,
+    permitKeyFallback: Bool
+) throws -> OpenPanelReadiness<AXUIElement> {
+    try waitForUniqueOpenPanel(
+        timeoutNanoseconds: 5_000_000_000,
+        pollMicroseconds: 100_000,
+        permitKeyFallback: permitKeyFallback,
+        nowNanoseconds: monotonicNanoseconds,
+        validateIdentity: { try requireSameProcess(identity) },
+        readWindows: { try liveWindows(application) },
+        sameElement: sameAXElement,
+        pause: { _ = usleep($0) })
+}
+// END_READ_ONLY_OPEN_PANEL_WAIT
+
 func requireSameProcess(_ expected: ProcessIdentity) throws {
     guard try processIdentity(expected.pid) == expected else {
         throw ProbeError.validation("PID identity changed before AX mutation")
@@ -549,22 +641,6 @@ func chooseButton(in panel: AXUIElement, title: String) throws -> AXUIElement {
     return matches[0]
 }
 
-func validatedOpenPanel(
-    application: AXUIElement,
-    permitKeyFallback: Bool
-) throws -> (AXUIElement, SelectionPlan, [AXUIElement]) {
-    let windows = try liveWindows(application)
-    let plan = try OpenPanelPolicy.plan(windows: windows.map(\.1),
-                                        permitKeyFallback: permitKeyFallback)
-    let selected = windows.filter { pair in
-        (try? OpenPanelPolicy.plan(windows: [pair.1], permitKeyFallback: permitKeyFallback)) != nil
-    }
-    guard selected.count == 1, let panel = selected.first?.0 else {
-        throw ProbeError.validation("live Open panel identity is missing or ambiguous")
-    }
-    return (panel, plan, windows.map(\.0))
-}
-
 func revalidateOriginalOpenPanel(
     application: AXUIElement,
     originalPanel: AXUIElement,
@@ -596,9 +672,14 @@ func execute(options: Options, paths: ValidatedPaths, log: EventLog) throws {
         throw ProbeError.permission("Accessibility is not granted to this exact helper artifact")
     }
     let application = AXUIElementCreateApplication(options.pid)
-    let (panel, plan, initialWindows) = try validatedOpenPanel(
-        application: application, permitKeyFallback: options.permitKeyFallback)
+    let readiness = try waitForValidatedOpenPanel(
+        application: application, identity: identity,
+        permitKeyFallback: options.permitKeyFallback)
+    let panel = readiness.panel
+    let plan = readiness.plan
+    let initialWindows = readiness.initialElements
     try log.write("open-panel-validated", ["windowCount": initialWindows.count,
+                                            "pollCount": readiness.pollCount,
                                             "navigation": plan.navigation == .direct ? "direct" : "command-shift-g",
                                             "chooserTitle": plan.chooserTitle])
     if options.phase == .inspectProjectPicker { return }
@@ -656,6 +737,7 @@ func runSelfTests() throws {
     func require(_ condition: Bool, _ message: String) throws {
         if !condition { throw ProbeError.validation("self-test failed: \(message)") }
     }
+    func sameString(_ left: String, _ right: String) -> Bool { left == right }
     let cancel = testElement(role: kAXButtonRole, title: "Cancel", actions: [kAXPressAction])
     let choose = testElement(role: kAXButtonRole, title: "Open", actions: [kAXPressAction])
     let direct = testElement(role: kAXTextFieldRole, identifier: "path", actions: [])
@@ -701,6 +783,118 @@ func runSelfTests() throws {
     do { _ = try uniqueNewRelated(initial: [String](), candidates: ["one", "two"], equals: ==) }
     catch ProbeError.validation { rejected = true }
     try require(rejected, "duplicate new children passed")
+
+    let unrelatedWindow = testElement(role: kAXWindowRole,
+                                      subrole: kAXStandardWindowSubrole)
+    var delayedSnapshots: [[(String, ElementDescription)]] = [
+        [], [], [("unrelated", unrelatedWindow)], [("original", panel)],
+    ]
+    var fakeNow: UInt64 = 0
+    var identityChecks = 0
+    let delayedPanel = try waitForUniqueOpenPanel(
+        timeoutNanoseconds: 1_000_000_000,
+        pollMicroseconds: 100,
+        permitKeyFallback: false,
+        nowNanoseconds: { fakeNow },
+        validateIdentity: { identityChecks += 1 },
+        readWindows: { delayedSnapshots.removeFirst() },
+        sameElement: sameString,
+        pause: { fakeNow += UInt64($0) * 1_000 })
+    try require(delayedPanel.panel == "original", "delayed Open panel was not selected")
+    try require(identityChecks == 8, "PID identity was not checked around every AX snapshot")
+
+    var lookalikeReads = 0
+    var lookalikePauses = 0
+    rejected = false
+    do {
+        _ = try waitForUniqueOpenPanel(
+            timeoutNanoseconds: 1_000_000_000,
+            pollMicroseconds: 100,
+            permitKeyFallback: false,
+            nowNanoseconds: { 0 },
+            validateIdentity: {},
+            readWindows: {
+                lookalikeReads += 1
+                return [("lookalike", wrongSheet)]
+            },
+            sameElement: sameString,
+            pause: { _ in lookalikePauses += 1 })
+    } catch ProbeError.validation { rejected = true }
+    try require(rejected && lookalikeReads == 1 && lookalikePauses == 0,
+                "panel-shaped lookalike did not fail immediately")
+
+    fakeNow = 0
+    var timeoutReads = 0
+    rejected = false
+    do {
+        _ = try waitForUniqueOpenPanel(
+            timeoutNanoseconds: 300_000,
+            pollMicroseconds: 100,
+            permitKeyFallback: false,
+            nowNanoseconds: { fakeNow },
+            validateIdentity: {},
+            readWindows: {
+                timeoutReads += 1
+                return [] as [(String, ElementDescription)]
+            },
+            sameElement: sameString,
+            pause: { fakeNow += UInt64($0) * 1_000 })
+    } catch ProbeError.unavailable(let message) {
+        rejected = message == "Open panel did not become ready after 3 polls"
+    }
+    try require(rejected && timeoutReads == 3, "Open panel timeout used the wrong poll bound")
+
+    fakeNow = 0
+    var ambiguitySnapshots = [
+        [] as [(String, ElementDescription)],
+        [("one", panel), ("two", panel)],
+    ]
+    var ambiguityReads = 0
+    var ambiguityPauses = 0
+    rejected = false
+    do {
+        _ = try waitForUniqueOpenPanel(
+            timeoutNanoseconds: 1_000_000_000,
+            pollMicroseconds: 100,
+            permitKeyFallback: false,
+            nowNanoseconds: { fakeNow },
+            validateIdentity: {},
+            readWindows: {
+                ambiguityReads += 1
+                return ambiguitySnapshots.removeFirst()
+            },
+            sameElement: sameString,
+            pause: {
+                ambiguityPauses += 1
+                fakeNow += UInt64($0) * 1_000
+            })
+    } catch ProbeError.validation { rejected = true }
+    try require(rejected && ambiguityReads == 2 && ambiguityPauses == 1,
+                "absent-then-ambiguous Open panels did not fail immediately")
+
+    fakeNow = 0
+    var driftChecks = 0
+    var driftReads = 0
+    rejected = false
+    do {
+        _ = try waitForUniqueOpenPanel(
+            timeoutNanoseconds: 1_000_000_000,
+            pollMicroseconds: 100,
+            permitKeyFallback: false,
+            nowNanoseconds: { fakeNow },
+            validateIdentity: {
+                driftChecks += 1
+                if driftChecks == 3 { throw ProbeError.validation("test PID drift") }
+            },
+            readWindows: {
+                driftReads += 1
+                return [] as [(String, ElementDescription)]
+            },
+            sameElement: sameString,
+            pause: { fakeNow += UInt64($0) * 1_000 })
+    } catch ProbeError.validation { rejected = true }
+    try require(rejected && driftReads == 1, "PID drift did not stop before another AX read")
+
     try require(!PathPolicy.contains("/private/tmp/root", "/private/tmp/root2/file"), "prefix collision")
     try require(PathPolicy.contains("/private/tmp/root", "/private/tmp/root/file"), "contained path")
     try require(Phase(rawValue: "select-project") == .selectProject, "phase parsing")

@@ -30,7 +30,8 @@ The live runner seam is opt-in. It requires the exact artifact path and SHA-256,
 passes the copied app PID and canonical copied paths explicitly, and authorizes
 the PID-targeted Command-Shift-G fallback separately. The helper checks path,
 process-start, executable, running-bundle, static signature, and live signature
-identity before checking trust or reading AX state. It appends only structured,
+identity before checking trust or reading AX state, then rechecks process-start
+and executable identity immediately before every AX mutation. It appends only structured,
 path-hashed JSONL events beneath the disposable run root.
 
 After the exact artifact has been reviewed and manually granted, the seam is:
@@ -63,8 +64,8 @@ Ivan; the helper never requests a prompt itself.
 Green for the source, build, input-policy, selector-policy, and runner-seam
 slice. The final no-permission build produced the arm64 ad-hoc-signed artifact
 `/private/tmp/chatgpt-native-gui-probe-build/chatgpt-native-gui-probe` with
-SHA-256 `ede3a79ff51cf25822990570c9d93fcbe9fece5e9372a8facbb050b4bc3b8d36`
-and CDHash `ba4020dc8d090b12e97a2bbfdec13ee31028e636`. A clean build in a second
+SHA-256 `2844d245776daa8f67342ccb7c4bfd00106325158e68718b79f75e07a629c03a`
+and CDHash `0d92dd1132324babf912e63f68e343328acd2032`. A clean build in a second
 disposable directory produced the same SHA-256. The helper self-test, forbidden
 API scan, path-policy fixtures, renderer oracle self-test, runner shell syntax,
 and cold-handoff self-test all passed.

@@ -325,7 +325,15 @@ async function clickMatching(expression, description) {
 async function openNativeProjectPicker() {
   const target = await evaluate(`(() => {
     const matches = [...document.querySelectorAll('button[aria-label="Choose project"]')]
-      .filter((element) => !element.disabled);
+      .filter((element) => {
+        if (element.disabled) return false;
+        const rect = element.getBoundingClientRect();
+        const style = getComputedStyle(element);
+        return rect.width > 0 && rect.height > 0 &&
+          rect.bottom > 0 && rect.right > 0 &&
+          rect.top < window.innerHeight && rect.left < window.innerWidth &&
+          style.visibility === "visible" && style.pointerEvents !== "none";
+      });
     if (matches.length !== 1) return { count: matches.length };
     const rect = matches[0].getBoundingClientRect();
     return {

@@ -21,8 +21,17 @@ all passed. See
 [`research/12-validate-offline-gui-workflow.md`](../research/12-validate-offline-gui-workflow.md).
 
 The ticket remains open for native project-picker, worktree, and permission
-interaction; Default and Plan mode behavior; project-local skill visibility;
-and exact renderer-visible model metadata.
+interaction; a persisted Plan-mode turn and its renderer/persistence binding;
+project-local skill visibility; and exact renderer-visible model metadata.
+
+The dedicated mode slice now observes the Default `/plan` command and selected
+Plan indicator through renderer controls. Its first run persisted a completed
+Default turn with `collaboration_mode.mode=default`, then stopped before the
+Plan turn because the initial probe imposed an unrelated exact-answer oracle.
+The revised no-app probe compares nonempty renderer and persisted completion
+hashes while preserving exact prompt, turn, and mode binding. It remains live
+unvalidated. See
+[`research/12-validate-offline-gui-workflow.md`](../research/12-validate-offline-gui-workflow.md).
 
 ## Acceptance
 

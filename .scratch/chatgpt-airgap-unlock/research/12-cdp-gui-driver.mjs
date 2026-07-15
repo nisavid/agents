@@ -34,7 +34,7 @@ function textSha256(value) {
 }
 
 function stripTrailingRendererTimestamp(value) {
-  const match = value.match(/\s+((?:0?[1-9]|1[0-2]):[0-5]\d (?:AM|PM))\s*$/);
+  const match = value.match(/(?:^|\s+)((?:0?[1-9]|1[0-2]):[0-5]\d (?:AM|PM))\s*$/);
   if (!match) return { text: value, timestampRemoved: false, timestamp: null };
   return {
     text: value.slice(0, match.index).replace(/\s+$/g, ""),
@@ -79,7 +79,7 @@ function runSelfTests() {
     if (actual !== expected) throw new Error(`${name}: expected ${expected}, got ${actual}`);
   }
 
-  function evaluateProbe(prompt, assistantText, expression) {
+  function evaluateProbe(prompt, assistantText, expression, copyWrapperText = null) {
     const body = { innerText: `${prompt}\n${assistantText}` };
     const userMessage = {
       innerText: prompt,
@@ -90,7 +90,12 @@ function runSelfTests() {
       parentElement: body,
       contains: () => false,
     };
-    const copyButton = { parentElement: assistantMessage };
+    const copyWrapper = copyWrapperText === null ? assistantMessage : {
+      innerText: copyWrapperText,
+      parentElement: assistantMessage,
+      contains: () => false,
+    };
+    const copyButton = { parentElement: copyWrapper };
     const document = {
       body,
       querySelectorAll: (selector) => selector.includes("Edit user message")
@@ -158,6 +163,20 @@ function runSelfTests() {
   );
   if (!nonemptyModeOutput.matched || nonemptyModeOutput.text !== "Default mode is active.") {
     throw new Error("nonempty mode output was not isolated from its renderer timestamp");
+  }
+  const timestampOnly = stripTrailingRendererTimestamp("6:23 PM");
+  if (!timestampOnly.timestampRemoved || timestampOnly.text !== "") {
+    throw new Error("timestamp-only renderer wrapper was mistaken for assistant output");
+  }
+  const nestedTimestampModeOutput = evaluateProbe(
+    defaultModePrompt,
+    "Default mode is active.\n6:23 PM",
+    modeOutputProbeExpression(defaultModePrompt),
+    "6:23 PM"
+  );
+  if (!nestedTimestampModeOutput.matched ||
+      nestedTimestampModeOutput.text !== "Default mode is active.") {
+    throw new Error("mode oracle stopped at a timestamp-only Copy-button ancestor");
   }
   const emptyModeOutput = evaluateProbe(
     defaultModePrompt,

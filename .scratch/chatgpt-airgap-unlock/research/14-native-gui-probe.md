@@ -17,7 +17,7 @@ Build an ad-hoc-signed disposable artifact with:
 
 ```sh
 .scratch/chatgpt-airgap-unlock/research/14-build-native-gui-probe.sh \
-  /private/tmp/chatgpt-native-gui-probe-build
+  <absolute-output-directory>
 ```
 
 Run the deterministic no-permission checks with:
@@ -38,7 +38,7 @@ After the exact artifact has been reviewed and manually granted, the seam is:
 
 ```sh
 GUI_NATIVE_PROJECT_PICKER=true \
-NATIVE_GUI_PROBE_BIN=/private/tmp/chatgpt-native-gui-probe-build/chatgpt-native-gui-probe \
+NATIVE_GUI_PROBE_BIN=<reviewed-artifact-path> \
 NATIVE_GUI_PROBE_SHA256=<reviewed-sha256> \
 NATIVE_GUI_PROBE_KEY_FALLBACK=true \
 GUI_WORKFLOW=true \
@@ -69,9 +69,8 @@ Ivan; the helper never requests a prompt itself.
 ## No-permission verdict
 
 Green for the source, build, input-policy, selector-policy, and runner-seam
-slice. The final no-permission build produced the arm64 ad-hoc-signed artifact
-`/private/tmp/chatgpt-native-gui-probe-build/chatgpt-native-gui-probe` with
-SHA-256 `9a24fbe62ffe15ca77f3a220ecf8d8360b066121d45aa44fdee62437aafd9ea2`
+slice. The retained final no-permission artifact is arm64 and ad-hoc signed,
+with SHA-256 `9a24fbe62ffe15ca77f3a220ecf8d8360b066121d45aa44fdee62437aafd9ea2`
 and CDHash `0824e57d9672f5cd125fb87f45ce85630dd8ac6c`. A clean build in a second
 disposable directory produced the same SHA-256. The helper self-test, forbidden
 API and sensitive-symbol allowlists, path-policy fixtures, renderer transition

@@ -26,6 +26,7 @@ COLD_RESUME_STATE="$HERE/12-cold-resume-state.py"
 MODE_STATE="$HERE/12-mode-state.py"
 MODEL_CATALOG_BUILDER="$HERE/08-model-catalog.py"
 MODEL_CATALOG_TEST="$HERE/08-model-catalog-test.py"
+NATIVE_PROJECT_STATE="$HERE/14-project-state.py"
 HOST_PROBE="$HERE/08-appserver-probe.py"
 HOST_RESTART_PROBE="$HERE/08-appserver-restart-probe.py"
 PROCESS_GROUP="$HERE/08-process-group.py"
@@ -92,16 +93,10 @@ require_positive_terminal_delta() {
   fi
 }
 
-persisted_fixture_path_observed() {
-  expected_fixture_path="$1"
-  shift
-  find "$@" -type f -exec /usr/bin/grep -aFl -- "$expected_fixture_path" {} + 2>/dev/null |
-    /usr/bin/grep -q .
-}
-
 run_cold_handoff_self_test() (
   /usr/bin/python3 "$COLD_RESUME_STATE" --self-test
   /usr/bin/python3 "$MODE_STATE" --self-test
+  /usr/bin/python3 "$NATIVE_PROJECT_STATE" --self-test
   self_test_root="$(mktemp -d /private/tmp/chatgpt-cold-handoff-self-test.XXXXXX)"
   trap '/bin/rm -rf "$self_test_root"' EXIT INT TERM
   LOG_DIR="$self_test_root"
@@ -148,13 +143,6 @@ run_cold_handoff_self_test() (
   test "$signal_status" -eq 143
   test "$(/usr/bin/tail -n 1 "$LOG_DIR/cold-handoff.jsonl")" = \
     '{"kind":"signal","signal":"TERM","status":143}'
-  mkdir -p "$self_test_root/persisted"
-  printf 'fixture=%s\n' "$self_test_root/workspace" >"$self_test_root/persisted/state.bin"
-  persisted_fixture_path_observed "$self_test_root/workspace" "$self_test_root/persisted"
-  if persisted_fixture_path_observed "$self_test_root/wrong-workspace" "$self_test_root/persisted"; then
-    echo "wrong persisted fixture path unexpectedly passed" >&2
-    return 1
-  fi
   printf 'cold handoff self-test passed\n'
 )
 
@@ -195,7 +183,12 @@ CODEX_DIR="$RUN_ROOT/codex-home"
 USER_DATA_DIR="$RUN_ROOT/electron-user-data"
 TMP_DIR="$RUN_ROOT/tmp"
 LOG_DIR="$RUN_ROOT/logs"
+PROJECT_NONCE=""
 WORKSPACE_DIR="$RUN_ROOT/workspace"
+if test "$GUI_NATIVE_PROJECT_PICKER" = true; then
+  PROJECT_NONCE="$(/usr/bin/uuidgen | /usr/bin/tr '[:upper:]' '[:lower:]')"
+  WORKSPACE_DIR="$RUN_ROOT/project-$PROJECT_NONCE"
+fi
 HF_CACHE_DIR="$RUN_ROOT/hf-cache"
 GATEWAY_EXEC=""
 UPSTREAM_OBSERVER_EXEC="$RUN_ROOT/upstream-observer.py"
@@ -209,6 +202,9 @@ MODEL_CATALOG_BUILDER_EXEC="$RUN_ROOT/model-catalog.py"
 MODEL_CATALOG_TEST_EXEC="$RUN_ROOT/model-catalog-test.py"
 GUI_RESUME_STATE="$LOG_DIR/gui-resume-state.json"
 MODEL_CATALOG="$CODEX_DIR/model-catalog.json"
+NATIVE_PROJECT_STATE_EXEC="$RUN_ROOT/native-project-state.py"
+NATIVE_PROJECT_BASELINE="$LOG_DIR/native-project-baseline.json"
+NATIVE_PROJECT_STATE_RESULT="$LOG_DIR/native-project-state.json"
 
 case "$ROUTE_MODE" in
   direct)
@@ -310,9 +306,11 @@ chmod 700 "$HOME_DIR" "$CODEX_DIR" "$USER_DATA_DIR" "$TMP_DIR" "$LOG_DIR" "$WORK
 /bin/cp "$MODE_STATE" "$MODE_STATE_EXEC"
 /bin/cp "$MODEL_CATALOG_BUILDER" "$MODEL_CATALOG_BUILDER_EXEC"
 /bin/cp "$MODEL_CATALOG_TEST" "$MODEL_CATALOG_TEST_EXEC"
+/bin/cp "$NATIVE_PROJECT_STATE" "$NATIVE_PROJECT_STATE_EXEC"
 chmod 500 "$UPSTREAM_OBSERVER_EXEC" "$OBSERVER_EXEC" "$CDP_OBSERVER_EXEC" \
   "$GUI_DRIVER_EXEC" "$NAMESPACE_PROBE_EXEC" "$COLD_RESUME_STATE_EXEC" \
-  "$MODE_STATE_EXEC" "$MODEL_CATALOG_BUILDER_EXEC" "$MODEL_CATALOG_TEST_EXEC"
+  "$MODE_STATE_EXEC" "$MODEL_CATALOG_BUILDER_EXEC" "$MODEL_CATALOG_TEST_EXEC" \
+  "$NATIVE_PROJECT_STATE_EXEC"
 test -x "$APP_EXEC"
 test ! -L "$APP"
 /usr/bin/codesign --verify --deep --strict "$APP"
@@ -758,6 +756,9 @@ sleep 1
   done
 } >"$LOG_DIR/processes-01s.txt"
 if test "$GUI_NATIVE_PROJECT_PICKER" = true; then
+  test -f "$CODEX_DIR/state_5.sqlite"
+  /usr/bin/python3 "$NATIVE_PROJECT_STATE_EXEC" capture \
+    "$CODEX_DIR/state_5.sqlite" "$(realpath "$WORKSPACE_DIR")" "$NATIVE_PROJECT_BASELINE"
   /usr/bin/env -i \
     PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
     HOME="$HOME_DIR" \
@@ -765,8 +766,11 @@ if test "$GUI_NATIVE_PROJECT_PICKER" = true; then
     LANG="en_US.UTF-8" \
     /usr/bin/sandbox-exec -f "$GATEWAY_PROFILE" -D "REAL_HOME=$REAL_HOME" \
       "$NODE" "$GUI_DRIVER_EXEC" "$CDP_PORT" open-project-picker 30000 \
+      "$(realpath "$WORKSPACE_DIR")" \
     >"$LOG_DIR/cdp-native-open.jsonl" 2>"$LOG_DIR/cdp-native-open.stderr"
   /usr/bin/grep -Fq '"kind":"native-project-picker-requested"' \
+    "$LOG_DIR/cdp-native-open.jsonl"
+  /usr/bin/grep -Fq '"preSelectionMatchedExpected":false' \
     "$LOG_DIR/cdp-native-open.jsonl"
   copied_app_pid="$(/bin/ps -axo pid=,pgid=,command= | \
     /usr/bin/awk -v wanted_group="$app_pid" -v wanted_executable="$APP_EXEC" \
@@ -806,20 +810,6 @@ if test "$GUI_NATIVE_PROJECT_PICKER" = true; then
   /usr/bin/grep -Fq '"kind":"renderer-project-selection-confirmed"' \
     "$LOG_DIR/cdp-native-confirm.jsonl"
   /usr/bin/grep -Fq '"matched":true' "$LOG_DIR/cdp-native-confirm.jsonl"
-  i=0
-  while test "$i" -lt 50 && \
-    ! persisted_fixture_path_observed "$(realpath "$WORKSPACE_DIR")" "$CODEX_DIR" "$USER_DATA_DIR"; do
-    sleep 0.1
-    i=$((i + 1))
-  done
-  persisted_fixture_path_observed "$(realpath "$WORKSPACE_DIR")" "$CODEX_DIR" "$USER_DATA_DIR"
-  {
-    printf 'helper_selection_requested=true\n'
-    printf 'renderer_project_name_matched=true\n'
-    printf 'persisted_fixture_path_matched=true\n'
-    printf 'fixture_path_sha256=%s\n' \
-      "$(printf '%s' "$(realpath "$WORKSPACE_DIR")" | /usr/bin/shasum -a 256 | /usr/bin/awk '{print $1}')"
-  } >"$LOG_DIR/native-project-verdict.txt"
 fi
 if test "$GUI_WORKFLOW" = true; then
   cdp_command="$GUI_DRIVER_EXEC"
@@ -859,6 +849,12 @@ fi
 if test "$GUI_MODES" = true && test "$cdp_exit" -eq 0; then
   /usr/bin/python3 "$MODE_STATE_EXEC" "$CODEX_DIR" "$LOG_DIR/cdp.jsonl" \
     >"$LOG_DIR/gui-mode-state.json"
+fi
+
+if test "$GUI_NATIVE_PROJECT_PICKER" = true && test "$cdp_exit" -eq 0; then
+  /usr/bin/python3 "$NATIVE_PROJECT_STATE_EXEC" validate \
+    "$CODEX_DIR/state_5.sqlite" "$(realpath "$WORKSPACE_DIR")" \
+    "$NATIVE_PROJECT_BASELINE" "$NATIVE_PROJECT_STATE_RESULT"
 fi
 
 if test "$GUI_COLD_RESUME" = true && test "$cdp_exit" -eq 0; then
@@ -978,10 +974,9 @@ else
   native_permission_decision_exercised=false
   native_worktree_control_exercised=false
   if test "$GUI_NATIVE_PROJECT_PICKER" = true && \
-    test -f "$LOG_DIR/native-project-verdict.txt" && \
-    /usr/bin/grep -Fq 'helper_selection_requested=true' "$LOG_DIR/native-project-verdict.txt" && \
-    /usr/bin/grep -Fq 'renderer_project_name_matched=true' "$LOG_DIR/native-project-verdict.txt" && \
-    /usr/bin/grep -Fq 'persisted_fixture_path_matched=true' "$LOG_DIR/native-project-verdict.txt"; then
+    test -f "$NATIVE_PROJECT_STATE_RESULT" && \
+    /usr/bin/grep -Fq '"transitionValidated": true' "$NATIVE_PROJECT_STATE_RESULT" && \
+    /usr/bin/grep -Fq '"matched":true' "$LOG_DIR/cdp-native-confirm.jsonl"; then
     native_project_picker_exercised=true
   fi
   renderer_thread_reopened=false

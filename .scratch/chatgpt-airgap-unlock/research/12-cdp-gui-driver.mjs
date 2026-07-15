@@ -340,7 +340,10 @@ async function clickMatching(expression, description) {
   return result;
 }
 
-async function openNativeProjectPicker() {
+async function openNativeProjectPicker(expectedFixtureRoot) {
+  if (!expectedFixtureRoot?.startsWith("/")) {
+    throw new Error("open-project-picker requires an absolute nonce fixture root");
+  }
   const target = await evaluate(`(() => {
     const matches = [...document.querySelectorAll('button[aria-label="Choose project"]')]
       .filter((element) => {
@@ -360,10 +363,17 @@ async function openNativeProjectPicker() {
       y: rect.top + rect.height / 2,
       width: rect.width,
       height: rect.height,
+      text: (matches[0].innerText ?? "").trim(),
+      title: matches[0].getAttribute("title"),
+      ariaDescription: matches[0].getAttribute("aria-description"),
     };
   })()`);
   if (target.count !== 1 || target.width <= 0 || target.height <= 0) {
     throw new Error(`Choose project control is missing, duplicate, or not visible: ${JSON.stringify(target)}`);
+  }
+  const preSelection = projectSelectionVerdict(target, expectedFixtureRoot);
+  if (preSelection.matched) {
+    throw new Error("nonce fixture was already selected before the native action");
   }
   await send("Input.dispatchMouseEvent", {
     type: "mousePressed", x: target.x, y: target.y, button: "left", clickCount: 1,
@@ -374,6 +384,8 @@ async function openNativeProjectPicker() {
   emit("native-project-picker-requested", {
     uniqueControl: true,
     trustedRendererInput: true,
+    preSelectionMatchedExpected: false,
+    expectedFixtureSha256: textSha256(expectedFixtureRoot),
   });
   await sleep(750);
 }
@@ -767,7 +779,7 @@ try {
   if (phase === "open-project-picker") {
     const mainUi = await reachMainUi();
     if (!mainUi) throw new Error("main UI unavailable before native project picker request");
-    await openNativeProjectPicker();
+    await openNativeProjectPicker(phaseArgument);
   } else if (phase === "confirm-project-selection") {
     const mainUi = await reachMainUi();
     if (!mainUi) throw new Error("main UI unavailable after native project selection");

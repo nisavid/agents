@@ -194,7 +194,10 @@ enum OpenPanelPolicy {
                 $0.role == kAXButtonRole && chooserTitles.contains($0.title?.lowercased() ?? "") &&
                     $0.actions.contains(kAXPressAction)
             }.count
-            return hasCancel && chooserCount == 1
+            let hasFileBrowser = descendants.contains {
+                [kAXOutlineRole, kAXBrowserRole, kAXTableRole].contains($0.role)
+            }
+            return hasCancel && chooserCount == 1 && hasFileBrowser
         }
         guard candidates.count == 1, let panel = candidates.first else {
             throw ProbeError.validation("expected exactly one standard Open panel; found \(candidates.count)")
@@ -476,10 +479,40 @@ func pathEntry(in container: AXUIElement) throws -> (AXUIElement, AXUIElement)? 
     return fields.count == 1 && confirms.count == 1 ? (fields[0], confirms[0]) : nil
 }
 
+func uniqueOriginal<T>(
+    original: T,
+    candidates: [T],
+    equals: (T, T) -> Bool
+) throws -> T {
+    guard candidates.count == 1, let candidate = candidates.first,
+          equals(original, candidate) else {
+        throw ProbeError.validation("original Open panel was replaced or became ambiguous")
+    }
+    return original
+}
+
+func uniqueNewRelated<T>(
+    initial: [T],
+    candidates: [T],
+    equals: (T, T) -> Bool
+) throws -> T? {
+    var deduplicated: [T] = []
+    for candidate in candidates where !deduplicated.contains(where: { equals($0, candidate) }) {
+        deduplicated.append(candidate)
+    }
+    let newCandidates = deduplicated.filter { candidate in
+        !initial.contains(where: { equals($0, candidate) })
+    }
+    guard newCandidates.count <= 1 else {
+        throw ProbeError.validation("multiple new path-entry children appeared")
+    }
+    return newCandidates.first
+}
+
 func waitForUniquePathEntry(
     application: AXUIElement,
     openPanel: AXUIElement,
-    initialWindows: [AXUIElement]
+    initialElements: [AXUIElement]
 ) throws -> (AXUIElement, AXUIElement) {
     let deadline = Date().addingTimeInterval(3)
     while Date() < deadline {
@@ -487,16 +520,20 @@ func waitForUniquePathEntry(
             stringAttribute($0, kAXRoleAttribute as CFString) == kAXSheetRole
         }.filter { !sameAXElement($0, openPanel) }
         let currentWindows = try liveWindows(application).map(\.0)
-        let relatedNewWindows = currentWindows.filter { candidate in
-            guard !initialWindows.contains(where: { sameAXElement($0, candidate) }) else { return false }
+        let relatedWindows = currentWindows.filter { candidate in
             let parent = axElementAttribute(candidate, kAXParentAttribute as CFString)
             let topLevel = axElementAttribute(candidate, kAXTopLevelUIElementAttribute as CFString)
             return (parent.map { sameAXElement($0, openPanel) } ?? false) ||
                 (topLevel.map { sameAXElement($0, openPanel) } ?? false)
         }
-        let entries = try (panelSheets + relatedNewWindows).compactMap { try pathEntry(in: $0) }
-        if entries.count == 1 { return entries[0] }
-        if entries.count > 1 { throw ProbeError.validation("validated Open panel has ambiguous path-entry children") }
+        if let newChild = try uniqueNewRelated(initial: initialElements,
+                                               candidates: panelSheets + relatedWindows,
+                                               equals: sameAXElement) {
+            guard let entry = try pathEntry(in: newChild) else {
+                throw ProbeError.validation("new Open panel child is not the path-entry sheet")
+            }
+            return entry
+        }
         usleep(100_000)
     }
     throw ProbeError.unavailable("validated Open panel did not expose one related path-entry child")
@@ -525,6 +562,27 @@ func validatedOpenPanel(
         throw ProbeError.validation("live Open panel identity is missing or ambiguous")
     }
     return (panel, plan, windows.map(\.0))
+}
+
+func revalidateOriginalOpenPanel(
+    application: AXUIElement,
+    originalPanel: AXUIElement,
+    originalPlan: SelectionPlan,
+    permitKeyFallback: Bool
+) throws {
+    let windows = try liveWindows(application)
+    _ = try OpenPanelPolicy.plan(windows: windows.map(\.1), permitKeyFallback: permitKeyFallback)
+    let candidates = windows.filter { pair in
+        (try? OpenPanelPolicy.plan(windows: [pair.1], permitKeyFallback: permitKeyFallback)) != nil
+    }.map(\.0)
+    _ = try uniqueOriginal(original: originalPanel, candidates: candidates, equals: sameAXElement)
+    var budget = 500
+    let currentDescription = try describe(originalPanel, budget: &budget)
+    let currentPlan = try OpenPanelPolicy.plan(windows: [currentDescription],
+                                               permitKeyFallback: permitKeyFallback)
+    guard currentPlan == originalPlan else {
+        throw ProbeError.validation("original Open panel controls changed before final action")
+    }
 }
 
 func execute(options: Options, paths: ValidatedPaths, log: EventLog) throws {
@@ -560,9 +618,13 @@ func execute(options: Options, paths: ValidatedPaths, log: EventLog) throws {
             throw ProbeError.validation("direct path field is missing, ambiguous, or not writable")
         }
     case .commandShiftG:
+        let initialSheets = try matchingLiveElements(panel) {
+            stringAttribute($0, kAXRoleAttribute as CFString) == kAXSheetRole
+        }
         try postCommandShiftG(to: identity)
         let (pathField, confirmButton) = try waitForUniquePathEntry(
-            application: application, openPanel: panel, initialWindows: initialWindows)
+            application: application, openPanel: panel,
+            initialElements: initialWindows + initialSheets)
         try requireSameProcess(identity)
         guard AXUIElementSetAttributeValue(pathField, kAXValueAttribute as CFString,
                                            paths.fixture as CFString) == .success else {
@@ -571,12 +633,10 @@ func execute(options: Options, paths: ValidatedPaths, log: EventLog) throws {
         try press(confirmButton, purpose: "path-entry confirmation", process: identity)
         usleep(250_000)
     }
-    let (currentPanel, currentPlan, _) = try validatedOpenPanel(
-        application: application, permitKeyFallback: options.permitKeyFallback)
-    guard currentPlan.chooserTitle == plan.chooserTitle else {
-        throw ProbeError.validation("Open panel chooser identity changed before final action")
-    }
-    try press(try chooseButton(in: currentPanel, title: currentPlan.chooserTitle),
+    try revalidateOriginalOpenPanel(application: application, originalPanel: panel,
+                                    originalPlan: plan,
+                                    permitKeyFallback: options.permitKeyFallback)
+    try press(try chooseButton(in: panel, title: plan.chooserTitle),
               purpose: "Open panel chooser", process: identity)
     let finalIdentity = try processIdentity(options.pid)
     guard finalIdentity == identity else { throw ProbeError.validation("PID identity changed during AX action") }
@@ -598,11 +658,12 @@ func runSelfTests() throws {
     let cancel = testElement(role: kAXButtonRole, title: "Cancel", actions: [kAXPressAction])
     let choose = testElement(role: kAXButtonRole, title: "Open", actions: [kAXPressAction])
     let direct = testElement(role: kAXTextFieldRole, identifier: "path", actions: [])
+    let fileBrowser = testElement(role: kAXOutlineRole)
     let panel = testElement(role: kAXWindowRole, subrole: kAXStandardWindowSubrole,
-                            children: [cancel, choose, direct])
+                            children: [cancel, choose, direct, fileBrowser])
     try require(try OpenPanelPolicy.plan(windows: [panel], permitKeyFallback: false) ==
                 SelectionPlan(navigation: .direct, chooserTitle: "Open"), "direct plan")
-    let fallbackPanel = testElement(role: kAXSheetRole, children: [cancel, choose])
+    let fallbackPanel = testElement(role: kAXSheetRole, children: [cancel, choose, fileBrowser])
     try require(try OpenPanelPolicy.plan(windows: [fallbackPanel], permitKeyFallback: true).navigation ==
                 .commandShiftG, "explicit key fallback")
     var rejected = false
@@ -614,7 +675,7 @@ func runSelfTests() throws {
     catch ProbeError.validation { rejected = true }
     try require(rejected, "duplicate panels passed")
     let duplicateChooser = testElement(role: kAXWindowRole, subrole: kAXStandardWindowSubrole,
-                                       children: [cancel, choose, choose, direct])
+                                       children: [cancel, choose, choose, direct, fileBrowser])
     rejected = false
     do { _ = try OpenPanelPolicy.plan(windows: [duplicateChooser], permitKeyFallback: false) }
     catch ProbeError.validation { rejected = true }
@@ -624,13 +685,21 @@ func runSelfTests() throws {
     do { _ = try OpenPanelPolicy.plan(windows: [customWindow], permitKeyFallback: false) }
     catch ProbeError.validation { rejected = true }
     try require(rejected, "nonstandard custom window passed")
-    let wrongSheet = testElement(role: kAXSheetRole,
-                                 children: [cancel, testElement(role: kAXButtonRole,
-                                                               title: "Save", actions: [kAXPressAction])])
+    let wrongSheet = testElement(role: kAXSheetRole, children: [cancel, choose, direct])
     rejected = false
     do { _ = try OpenPanelPolicy.plan(windows: [wrongSheet], permitKeyFallback: true) }
     catch ProbeError.validation { rejected = true }
     try require(rejected, "wrong native dialog passed")
+    rejected = false
+    do { _ = try uniqueOriginal(original: "original", candidates: ["lookalike"], equals: ==) }
+    catch ProbeError.validation { rejected = true }
+    try require(rejected, "lookalike panel replaced original identity")
+    try require(try uniqueNewRelated(initial: ["stale"], candidates: ["stale"], equals: ==) == nil,
+                "stale child was treated as new")
+    rejected = false
+    do { _ = try uniqueNewRelated(initial: [String](), candidates: ["one", "two"], equals: ==) }
+    catch ProbeError.validation { rejected = true }
+    try require(rejected, "duplicate new children passed")
     try require(!PathPolicy.contains("/private/tmp/root", "/private/tmp/root2/file"), "prefix collision")
     try require(PathPolicy.contains("/private/tmp/root", "/private/tmp/root/file"), "contained path")
     try require(Phase(rawValue: "select-project") == .selectProject, "phase parsing")

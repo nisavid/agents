@@ -48,9 +48,11 @@ PROBE_EXPECT=renderer-native-project \
 
 The runner asks the renderer's unique visible `Choose project` control to open
 the native panel, resolves exactly one copied-app executable in the owned
-process group, invokes the helper, then requires the renderer to expose the
-fixture name and persisted desktop state to contain the exact canonical fixture
-path before recording the native project-picker gate as complete.
+process group, invokes the helper, then requires a renderer transition from a
+nonmatching project to the per-run nonce project. After the renderer creates its
+first task, `research/14-project-state.py` requires the authoritative
+`state_5.sqlite.threads.cwd` record to transition from zero exact fixture rows
+to exactly one before recording the native project-picker gate as complete.
 
 ## Permission boundary
 
@@ -65,11 +67,12 @@ Ivan; the helper never requests a prompt itself.
 Green for the source, build, input-policy, selector-policy, and runner-seam
 slice. The final no-permission build produced the arm64 ad-hoc-signed artifact
 `/private/tmp/chatgpt-native-gui-probe-build/chatgpt-native-gui-probe` with
-SHA-256 `b25b04f73a5c1570055c36f73e032eedf26361c67cdbc853b2f631f8ef50402a`
-and CDHash `61fa69bb91fe7b6953167176c316a6720be916cd`. A clean build in a second
+SHA-256 `d715854d64ab6ba2aafa84a7b5668a802d87a05811a6f90d67ebe2a103231f4f`
+and CDHash `22d299b0521b004ae3bb603fb40200f593dd6a5b`. A clean build in a second
 disposable directory produced the same SHA-256. The helper self-test, forbidden
-API scan, path-policy fixtures, renderer oracle self-test, runner shell syntax,
-and cold-handoff self-test all passed.
+API and sensitive-symbol allowlists, path-policy fixtures, renderer transition
+oracle, authoritative project-state fixtures, runner shell syntax, and
+cold-handoff self-test all passed.
 
 The live native project selection remains intentionally unexecuted and blocked
 on the manual Accessibility grant for this exact artifact.

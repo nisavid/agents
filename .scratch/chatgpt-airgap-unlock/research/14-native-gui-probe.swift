@@ -1111,6 +1111,7 @@ struct PathEntrySnapshot<Element> {
     let cancel: Element
     let chooser: Element
     let chooserEnabled: Bool
+    let additionalCancelCount: Int
     let browserAnchors: [Element]
     let textFields: [Element]
     let goButtons: [Element]
@@ -1179,6 +1180,20 @@ func exactAnchor<Element>(
 }
 
 enum PathEntryPolicy {
+    static func navigation(searchableFieldText: [String]) throws
+        -> SelectionPlan.Navigation {
+        let directCount = searchableFieldText.filter { text in
+            let lowered = text.lowercased()
+            return lowered.contains("path") || lowered.contains("location") ||
+                lowered.contains("folder")
+        }.count
+        if directCount == 1 { return .direct }
+        guard directCount == 0 else {
+            throw ProbeError.validation("Open panel path field is ambiguous")
+        }
+        return .commandShiftG
+    }
+
     static func isGoControl(
         role: String?,
         title: String?,
@@ -1196,6 +1211,7 @@ enum PathEntryPolicy {
 
     static func baseline<Element>(
         _ snapshot: PathEntrySnapshot<Element>,
+        expectedPlan: SelectionPlan,
         sameElement: (Element, Element) -> Bool
     ) throws -> PathEntrySnapshot<Element> {
         guard !snapshot.browserAnchors.isEmpty else {
@@ -1207,8 +1223,8 @@ enum PathEntryPolicy {
         guard snapshot.goButtons.isEmpty else {
             throw ProbeError.validation("Open panel exposed Go before the path-entry shortcut")
         }
-        guard snapshot.restoredPlan != nil else {
-            throw ProbeError.validation("Open panel baseline plan is not valid")
+        guard snapshot.restoredPlan == expectedPlan else {
+            throw ProbeError.validation("Open panel baseline plan changed before shortcut")
         }
         return snapshot
     }
@@ -1277,6 +1293,7 @@ enum PathEntryPolicy {
             throw ProbeError.validation("Open panel published ambiguous destination paths")
         }
         return fieldsMatch && current.goButtons.isEmpty && current.chooserEnabled &&
+            current.additionalCancelCount == 0 &&
             current.restoredPlan == baseline.restoredPlan &&
             destinations == [expectedDestination]
     }
@@ -1392,38 +1409,49 @@ func livePathEntrySnapshot(
     anchorBaseline: PathEntrySnapshot<AXUIElement>? = nil,
     readDestination: Bool = false
 ) throws -> PathEntrySnapshot<AXUIElement> {
-    let windows = try liveWindows(application)
-    let originalMatches = windows.indices.filter {
-        sameAXElement(windows[$0].0, openPanel)
+    guard let windows = attribute(
+        application, kAXWindowsAttribute as CFString) as? [AXUIElement] else {
+        throw ProbeError.validation("application exposes no AX windows")
     }
-    let shapedIndices = OpenPanelPolicy.panelShapedIndices(
-        windows: windows.map(\.1))
-    guard originalMatches.count == 1, originalMatches == shapedIndices,
-          let originalIndex = originalMatches.first else {
+    let originalMatches = windows.filter { sameAXElement($0, openPanel) }
+    guard originalMatches.count == 1 else {
         throw ProbeError.validation(
-            "original Open panel was replaced, missing, or accompanied by another panel")
+            "original Open panel was replaced, missing, or ambiguous")
     }
-    let currentPanel = windows[originalIndex].0
-    let currentDescription = windows[originalIndex].1
-    let panelElements = try matchingLiveElements(currentPanel) { _ in true }
-
-    let cancels = panelElements.filter {
-        stringAttribute($0, kAXRoleAttribute as CFString) == kAXButtonRole &&
-            stringAttribute($0, kAXTitleAttribute as CFString)?.lowercased() == "cancel" &&
-            actions($0).contains(kAXPressAction)
+    let currentPanel = originalMatches[0]
+    let newWindows = windows.filter { window in
+        !initialElements.contains(where: { sameAXElement(window, $0) })
     }
-    let choosers = panelElements.filter {
-        stringAttribute($0, kAXRoleAttribute as CFString) == kAXButtonRole &&
-            stringAttribute($0, kAXTitleAttribute as CFString)?.lowercased() ==
-                originalPlan.chooserTitle.lowercased() &&
-            actions($0).contains(kAXPressAction)
-    }
-    let browsers = panelElements.filter {
-        guard let role = stringAttribute($0, kAXRoleAttribute as CFString) else {
-            return false
+    for window in newWindows {
+        let parent = axElementAttribute(window, kAXParentAttribute as CFString)
+        let topLevel = axElementAttribute(window, kAXTopLevelUIElementAttribute as CFString)
+        guard (parent.map { sameAXElement($0, currentPanel) } ?? false) ||
+                (topLevel.map { sameAXElement($0, currentPanel) } ?? false) else {
+            throw ProbeError.validation("an unrelated AX window appeared during path entry")
         }
-        return [kAXOutlineRole, kAXBrowserRole, kAXTableRole].contains(role)
     }
+    guard newWindows.count <= 1 else {
+        throw ProbeError.validation("multiple new AX windows appeared during path entry")
+    }
+    let panelElements = try matchingLiveElements(currentPanel) { _ in true }
+    let panelMetadata = panelElements.map { element in
+        (element: element,
+         role: stringAttribute(element, kAXRoleAttribute as CFString),
+         title: stringAttribute(element, kAXTitleAttribute as CFString))
+    }
+    let cancels = panelMetadata.filter {
+        $0.role == kAXButtonRole && $0.title?.lowercased() == "cancel" &&
+            actions($0.element).contains(kAXPressAction)
+    }.map(\.element)
+    let choosers = panelMetadata.filter {
+        $0.role == kAXButtonRole && $0.title?.lowercased() ==
+                originalPlan.chooserTitle.lowercased() &&
+            actions($0.element).contains(kAXPressAction)
+    }.map(\.element)
+    let browsers = panelMetadata.filter {
+        guard let role = $0.role else { return false }
+        return [kAXOutlineRole, kAXBrowserRole, kAXTableRole].contains(role)
+    }.map(\.element)
     let cancel = try exactAnchor(
         expected: anchorBaseline?.cancel, candidates: cancels,
         allowAdditional: anchorBaseline != nil, sameElement: sameAXElement)
@@ -1434,11 +1462,10 @@ func livePathEntrySnapshot(
         throw ProbeError.validation("original Open panel has no file-browser anchor")
     }
 
-    let panelSheets = panelElements.filter {
-        stringAttribute($0, kAXRoleAttribute as CFString) == kAXSheetRole &&
-            !sameAXElement($0, currentPanel)
-    }
-    let relatedWindows = windows.map(\.0).filter { candidate in
+    let panelSheets = panelMetadata.filter {
+        $0.role == kAXSheetRole && !sameAXElement($0.element, currentPanel)
+    }.map(\.element)
+    let relatedWindows = windows.filter { candidate in
         guard !sameAXElement(candidate, currentPanel) else { return false }
         let parent = axElementAttribute(candidate, kAXParentAttribute as CFString)
         let topLevel = axElementAttribute(candidate, kAXTopLevelUIElementAttribute as CFString)
@@ -1449,28 +1476,62 @@ func livePathEntrySnapshot(
         initial: initialElements,
         candidates: panelSheets + relatedWindows,
         equals: sameAXElement)
-    var candidateRoots = [currentPanel]
-    if let newChild, !sameAXElement(newChild, currentPanel) {
-        candidateRoots.append(newChild)
+    var candidateMetadata = panelMetadata
+    if let newChild,
+       !panelElements.contains(where: { sameAXElement($0, newChild) }) {
+        for element in try matchingLiveElements(newChild, { _ in true })
+            where !candidateMetadata.contains(where: {
+                sameAXElement($0.element, element)
+            }) {
+            candidateMetadata.append(
+                (element: element,
+                 role: stringAttribute(element, kAXRoleAttribute as CFString),
+                 title: stringAttribute(element, kAXTitleAttribute as CFString)))
+        }
     }
-    let candidateElements = identityDeduplicated(
-        try candidateRoots.flatMap { root in
-            try matchingLiveElements(root) { _ in true }
-        },
-        sameElement: sameAXElement)
-    let fields = candidateElements.filter {
-        stringAttribute($0, kAXRoleAttribute as CFString) == kAXTextFieldRole
+    let fieldMetadata = candidateMetadata.filter { $0.role == kAXTextFieldRole }
+    let fields = fieldMetadata.map(\.element)
+    let searchableFieldText = fieldMetadata.map { metadata in
+        [metadata.title,
+         stringAttribute(metadata.element, kAXIdentifierAttribute as CFString),
+         stringAttribute(metadata.element, kAXHelpAttribute as CFString)]
+            .compactMap { $0?.lowercased() }.joined(separator: " ")
     }
+    let semanticPlan = SelectionPlan(
+        navigation: try PathEntryPolicy.navigation(
+            searchableFieldText: searchableFieldText),
+        chooserTitle: originalPlan.chooserTitle)
     var titledGoControls: [AXUIElement] = []
-    for element in candidateElements where try PathEntryPolicy.isGoControl(
-        role: stringAttribute(element, kAXRoleAttribute as CFString),
-        title: stringAttribute(element, kAXTitleAttribute as CFString),
-        enabled: boolAttribute(element, kAXEnabledAttribute as CFString),
-        actions: actions(element)) {
-        titledGoControls.append(element)
+    for metadata in candidateMetadata {
+        guard metadata.title?.lowercased() == "go" else { continue }
+        if try PathEntryPolicy.isGoControl(
+            role: metadata.role,
+            title: metadata.title,
+            enabled: boolAttribute(metadata.element, kAXEnabledAttribute as CFString),
+            actions: actions(metadata.element)) {
+            titledGoControls.append(metadata.element)
+        }
     }
-    let restoredPlan = try? OpenPanelPolicy.plan(
-        windows: [currentDescription], permitKeyFallback: true)
+    let currentFields = identityDeduplicated(fields, sameElement: sameAXElement)
+    let currentGoButtons = identityDeduplicated(
+        titledGoControls, sameElement: sameAXElement)
+    let currentBrowsers = identityDeduplicated(
+        browsers, sameElement: sameAXElement)
+    let additionalCancelCount = cancels.filter {
+        !sameAXElement($0, cancel)
+    }.count
+    let topologyRestored: Bool
+    if let anchorBaseline {
+        topologyRestored = sameIdentitySet(
+            anchorBaseline.textFields, currentFields, sameElement: sameAXElement) &&
+            sameIdentitySet(
+                anchorBaseline.browserAnchors, currentBrowsers,
+                sameElement: sameAXElement) &&
+            currentGoButtons.isEmpty && additionalCancelCount == 0
+    } else {
+        topologyRestored = true
+    }
+    let restoredPlan = topologyRestored ? semanticPlan : nil
     let destinationPaths: [String]
     if readDestination {
         destinationPaths = try [
@@ -1492,9 +1553,10 @@ func livePathEntrySnapshot(
         chooser: chooser,
         chooserEnabled: boolAttribute(
             chooser, kAXEnabledAttribute as CFString) == true,
-        browserAnchors: identityDeduplicated(browsers, sameElement: sameAXElement),
-        textFields: identityDeduplicated(fields, sameElement: sameAXElement),
-        goButtons: identityDeduplicated(titledGoControls, sameElement: sameAXElement),
+        additionalCancelCount: additionalCancelCount,
+        browserAnchors: currentBrowsers,
+        textFields: currentFields,
+        goButtons: currentGoButtons,
         restoredPlan: restoredPlan,
         destinationPaths: destinationPaths)
 }
@@ -1512,10 +1574,7 @@ func validatedPathEntryBaseline(
         originalPlan: originalPlan, initialElements: initialElements)
     try requireSameProcess(process)
     let baseline = try PathEntryPolicy.baseline(
-        snapshot, sameElement: sameAXElement)
-    guard baseline.restoredPlan == originalPlan else {
-        throw ProbeError.validation("Open panel baseline plan changed before shortcut")
-    }
+        snapshot, expectedPlan: originalPlan, sameElement: sameAXElement)
     return baseline
 }
 
@@ -2538,6 +2597,7 @@ func runSelfTests() throws {
         cancel: String = "cancel",
         chooser: String = "chooser",
         chooserEnabled: Bool = true,
+        additionalCancelCount: Int = 0,
         browsers: [String] = ["browser"],
         fields: [String] = ["search"],
         goButtons: [String] = [],
@@ -2547,6 +2607,7 @@ func runSelfTests() throws {
     ) -> PathEntrySnapshot<String> {
         PathEntrySnapshot(panel: panel, cancel: cancel, chooser: chooser,
                           chooserEnabled: chooserEnabled,
+                          additionalCancelCount: additionalCancelCount,
                           browserAnchors: browsers, textFields: fields,
                           goButtons: goButtons, restoredPlan: restoredPlan,
                           destinationPaths: destinationPaths)
@@ -2557,7 +2618,32 @@ func runSelfTests() throws {
         allowAdditional: true, sameElement: sameString) == "original-cancel",
         "transient overlay Cancel replaced the original Cancel anchor")
     let pathBaseline = try PathEntryPolicy.baseline(
-        pathSnapshot(), sameElement: sameString)
+        pathSnapshot(),
+        expectedPlan: SelectionPlan(navigation: .commandShiftG, chooserTitle: "Open"),
+        sameElement: sameString)
+    try require(try PathEntryPolicy.navigation(searchableFieldText: ["search"]) ==
+                    .commandShiftG,
+                "ordinary baseline field acquired direct-path semantics")
+    try require(try PathEntryPolicy.navigation(searchableFieldText: ["folder path"]) ==
+                    .direct,
+                "direct-path field semantics were missed")
+    rejected = false
+    do {
+        _ = try PathEntryPolicy.baseline(
+            pathSnapshot(restoredPlan: SelectionPlan(
+                navigation: .direct, chooserTitle: "Open")),
+            expectedPlan: SelectionPlan(
+                navigation: .commandShiftG, chooserTitle: "Open"),
+            sameElement: sameString)
+    } catch ProbeError.validation { rejected = true }
+    try require(rejected, "baseline field semantic drift preserved the old plan")
+    try require(!(try PathEntryPolicy.restored(
+        baseline: pathBaseline,
+        current: pathSnapshot(
+            restoredPlan: SelectionPlan(navigation: .direct, chooserTitle: "Open"),
+            destinationPaths: ["fixture"]),
+        expectedDestination: "fixture", sameElement: sameString)),
+        "restored field semantic drift preserved the old plan")
     try require(try PathEntryPolicy.isGoControl(
         role: kAXButtonRole, title: "Go", enabled: true,
         actions: [kAXPressAction]), "valid Go control was rejected")
@@ -2609,7 +2695,10 @@ func runSelfTests() throws {
     rejected = false
     do {
         _ = try PathEntryPolicy.baseline(
-            pathSnapshot(goButtons: ["preexisting-go"]), sameElement: sameString)
+            pathSnapshot(goButtons: ["preexisting-go"]),
+            expectedPlan: SelectionPlan(
+                navigation: .commandShiftG, chooserTitle: "Open"),
+            sameElement: sameString)
     } catch ProbeError.validation { rejected = true }
     try require(rejected, "preexisting Go control allowed the shortcut baseline")
     for ambiguous in [
@@ -2729,6 +2818,12 @@ func runSelfTests() throws {
         pause: { pathNow += UInt64($0) * 1_000 })
     try require(restored.pollCount == 2 && restored.chooser == "chooser",
                 "Open-panel restoration did not retain the exact chooser identity")
+    try require(!(try PathEntryPolicy.restored(
+        baseline: pathBaseline,
+        current: pathSnapshot(additionalCancelCount: 1,
+                              destinationPaths: ["fixture"]),
+        expectedDestination: "fixture", sameElement: sameString)),
+        "lingering overlay Cancel allowed Open-panel restoration")
 
     pathNow = 0
     var destinationlessReads = 0

@@ -107,13 +107,15 @@ fi
 process_validation_body="$(/usr/bin/sed -n \
   '/BEGIN_PROCESS_REGISTRATION_VALIDATION/,/END_PROCESS_REGISTRATION_VALIDATION/p' \
   "$HERE/14-native-gui-probe.swift")"
+process_validation_file="$BUILD_ROOT/process-validation-body.txt"
+printf '%s\n' "$process_validation_body" >"$process_validation_file"
 test "$(printf '%s\n' "$process_validation_body" | \
   /usr/bin/grep -Fc 'try validateIdentity()')" -eq 4
 for required_process_gate in SecStaticCodeCheckValidity SecCodeCopyGuestWithAttributes \
   SecCodeCheckValidity SecCodeCopyStaticCode 'staticIdentifier == dynamicIdentifier' \
   'staticUnique == dynamicUnique' 'timeoutNanoseconds: 5_000_000_000' \
   'pollMicroseconds: 100_000'; do
-  printf '%s\n' "$process_validation_body" | /usr/bin/grep -Fq "$required_process_gate"
+  /usr/bin/grep -Fq "$required_process_gate" "$process_validation_file"
 done
 if printf '%s\n' "$process_validation_body" | /usr/bin/grep -Eq \
   'AXUIElement|CGEvent|postToPid|pressOpenFolderMenuItem'; then

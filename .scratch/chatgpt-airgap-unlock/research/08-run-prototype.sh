@@ -14,6 +14,7 @@ OPTIQ_SITE_PACKAGES="/private/tmp/chatgpt-optiq-smoke/.venv/lib/python3.12/site-
 MODEL_DIR="${MODEL_DIR:-$REAL_HOME/.cache/huggingface/hub/models--mlx-community--Qwen3.5-2B-OptiQ-4bit/snapshots/adc8669eb431e3168aeb4e320bd7b757914350e2}"
 MODEL_REPO="${MODEL_DIR%/snapshots/*}"
 MODEL_ID="$MODEL_DIR:no-think"
+MODEL_DISPLAY_NAME="Qwen3.5-2B-OptiQ-4bit (no-think)"
 HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 PROFILE="$HERE/08-probe.sb"
 PROVIDER_PROFILE="$HERE/08-provider.sb"
@@ -86,7 +87,6 @@ require_positive_terminal_delta() {
 }
 
 run_cold_handoff_self_test() (
-  /usr/bin/python3 "$MODEL_CATALOG_TEST"
   /usr/bin/python3 "$COLD_RESUME_STATE" --self-test
   self_test_root="$(mktemp -d /private/tmp/chatgpt-cold-handoff-self-test.XXXXXX)"
   trap '/bin/rm -rf "$self_test_root"' EXIT INT TERM
@@ -141,6 +141,10 @@ if test "${1:-}" = --self-test; then
   run_cold_handoff_self_test
   exit 0
 fi
+if test "${1:-}" = --model-catalog-self-test; then
+  /usr/bin/python3 "$MODEL_CATALOG_TEST"
+  exit 0
+fi
 
 lock_acquired=false
 release_lock() {
@@ -180,6 +184,7 @@ GUI_DRIVER_EXEC="$RUN_ROOT/gui-driver.mjs"
 NAMESPACE_PROBE_EXEC="$RUN_ROOT/namespace-probe.py"
 COLD_RESUME_STATE_EXEC="$RUN_ROOT/cold-resume-state.py"
 MODEL_CATALOG_BUILDER_EXEC="$RUN_ROOT/model-catalog.py"
+MODEL_CATALOG_TEST_EXEC="$RUN_ROOT/model-catalog-test.py"
 GUI_RESUME_STATE="$LOG_DIR/gui-resume-state.json"
 MODEL_CATALOG="$CODEX_DIR/model-catalog.json"
 
@@ -245,9 +250,10 @@ chmod 700 "$HOME_DIR" "$CODEX_DIR" "$USER_DATA_DIR" "$TMP_DIR" "$LOG_DIR" "$WORK
 /bin/cp "$NAMESPACE_PROBE" "$NAMESPACE_PROBE_EXEC"
 /bin/cp "$COLD_RESUME_STATE" "$COLD_RESUME_STATE_EXEC"
 /bin/cp "$MODEL_CATALOG_BUILDER" "$MODEL_CATALOG_BUILDER_EXEC"
+/bin/cp "$MODEL_CATALOG_TEST" "$MODEL_CATALOG_TEST_EXEC"
 chmod 500 "$UPSTREAM_OBSERVER_EXEC" "$OBSERVER_EXEC" "$CDP_OBSERVER_EXEC" \
   "$GUI_DRIVER_EXEC" "$NAMESPACE_PROBE_EXEC" "$COLD_RESUME_STATE_EXEC" \
-  "$MODEL_CATALOG_BUILDER_EXEC"
+  "$MODEL_CATALOG_BUILDER_EXEC" "$MODEL_CATALOG_TEST_EXEC"
 test -x "$APP_EXEC"
 test ! -L "$APP"
 /usr/bin/codesign --verify --deep --strict "$APP"
@@ -317,21 +323,8 @@ EOF
 HOME="$HOME_DIR" CODEX_HOME="$CODEX_DIR" \
   "$APP/Contents/Resources/codex" debug models \
   >"$LOG_DIR/model-catalog.json" 2>"$LOG_DIR/model-catalog.stderr"
-/usr/bin/python3 - "$LOG_DIR/model-catalog.json" "$MODEL_ID" <<'PY'
-import json
-import sys
-
-catalog = json.load(open(sys.argv[1]))
-assert len(catalog["models"]) == 1
-model = catalog["models"][0]
-assert model["slug"] == sys.argv[2]
-assert model["display_name"] == "Qwen3.5-2B-OptiQ-4bit (no-think)"
-assert model.get("default_reasoning_level") is None
-assert model["supported_reasoning_levels"] == []
-assert model["context_window"] == 262144
-assert model["max_context_window"] == 262144
-assert model["input_modalities"] == ["text"]
-PY
+/usr/bin/python3 "$MODEL_CATALOG_TEST_EXEC" \
+  --catalog "$LOG_DIR/model-catalog.json" "$MODEL_ID" "$MODEL_DISPLAY_NAME"
 if test "$GUI_WORKFLOW" = true; then
   cat >"$CODEX_DIR/AGENTS.md" <<'EOF'
 # Offline renderer smoke fixture

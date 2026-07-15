@@ -464,12 +464,14 @@ async function reopenPersistedThread(state) {
 
 async function inspectSurfaces() {
   const main = await snapshot("surface-main");
-  const rendererModelMetadataMatched =
-    main.text.includes("Qwen3.5-2B-OptiQ-4bit (no-think)");
+  const modelControl = main.controls.find((control) =>
+    control.text?.includes("Qwen3.5-2B-OptiQ-4bit (no-think)")
+  );
+  const rendererModelMetadataMatched = modelControl != null;
   const rendererFallbackModelMetadataAbsent =
-    !main.controls.some((control) => control.text === "Custom Light");
+    !main.controls.some((control) => /^Custom(?:\s|$)/.test(control.text ?? ""));
   const modelSurfaceObserved = main.controls.some((control) =>
-    control.text?.includes("Qwen3.5-2B-OptiQ-4bit") ||
+    control === modelControl ||
     /model/i.test(control.ariaLabel ?? "")
   );
 

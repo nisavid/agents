@@ -7,16 +7,21 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import select
 import subprocess
 import sys
 import tempfile
+import time
 
 
 HERE = Path(__file__).resolve().parent
 BUILDER = HERE / "08-model-catalog.py"
 SOURCE_APP = Path(
-    "/private/tmp/ChatGPT-Codex-26.707.71524-5263-extracted/"
-    "ChatGPT-Codex-26.707.71524-5263.app"
+    os.environ.get(
+        "SOURCE_APP",
+        "/private/tmp/ChatGPT-Codex-26.707.71524-5263-extracted/"
+        "ChatGPT-Codex-26.707.71524-5263.app",
+    )
 )
 CODEX = SOURCE_APP / "Contents/Resources/codex"
 MODEL_DIR = Path(
@@ -37,13 +42,17 @@ FALLBACK_PROMPT_SHA256 = (
 )
 
 
-def assert_catalog(catalog: dict[str, object]) -> None:
+def assert_catalog(
+    catalog: dict[str, object],
+    expected_model_id: str = MODEL_ID,
+    expected_display_name: str = DISPLAY_NAME,
+) -> None:
     models = catalog["models"]
     assert isinstance(models, list) and len(models) == 1
     model = models[0]
     assert isinstance(model, dict)
-    assert model["slug"] == MODEL_ID
-    assert model["display_name"] == DISPLAY_NAME
+    assert model["slug"] == expected_model_id
+    assert model["display_name"] == expected_display_name
     assert model.get("default_reasoning_level") is None
     assert model["supported_reasoning_levels"] == []
     assert model["context_window"] == 262_144
@@ -57,7 +66,11 @@ def assert_catalog(catalog: dict[str, object]) -> None:
 
 
 def request(
-    process: subprocess.Popen[str], request_id: int, method: str, params: dict[str, object]
+    process: subprocess.Popen[str],
+    request_id: int,
+    method: str,
+    params: dict[str, object],
+    timeout: float = 10,
 ) -> dict[str, object]:
     assert process.stdin is not None
     assert process.stdout is not None
@@ -65,7 +78,17 @@ def request(
         json.dumps({"id": request_id, "method": method, "params": params}) + "\n"
     )
     process.stdin.flush()
-    while line := process.stdout.readline():
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(f"timed out waiting for {method}")
+        ready, _, _ = select.select([process.stdout], [], [], remaining)
+        if not ready:
+            raise TimeoutError(f"timed out waiting for {method}")
+        line = process.stdout.readline()
+        if not line:
+            break
         message = json.loads(line)
         if message.get("id") == request_id:
             if "error" in message:
@@ -74,7 +97,7 @@ def request(
     raise RuntimeError(f"app-server exited before replying to {method}")
 
 
-def main() -> int:
+def run_full_contract() -> None:
     with tempfile.TemporaryDirectory(prefix="chatgpt-model-catalog-test.") as raw_root:
         root = Path(raw_root)
         catalog_path = root / "model-catalog.json"
@@ -123,7 +146,7 @@ def main() -> int:
             },
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
             text=True,
         )
         try:
@@ -155,7 +178,27 @@ def main() -> int:
             assert items[0]["inputModalities"] == ["text"]
         finally:
             process.terminate()
-            process.wait(timeout=10)
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=10)
+
+
+def main() -> int:
+    if len(sys.argv) > 1:
+        if len(sys.argv) != 5 or sys.argv[1] != "--catalog":
+            raise SystemExit(
+                "usage: 08-model-catalog-test.py "
+                "[--catalog PATH EXPECTED_MODEL_ID EXPECTED_DISPLAY_NAME]"
+            )
+        assert_catalog(
+            json.loads(Path(sys.argv[2]).read_text()),
+            expected_model_id=sys.argv[3],
+            expected_display_name=sys.argv[4],
+        )
+    else:
+        run_full_contract()
 
     print("pinned local model catalog contract passed")
     return 0

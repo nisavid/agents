@@ -10,11 +10,11 @@ Does the exact copied app complete the minimum offline workflow through its rend
 
 ## Current evidence
 
-The scoped renderer slice passes. The exact copied app reached the main UI
-without OpenAI state, submitted a semantic turn through the renderer, received
-the expected assistant result, persisted a completed local thread, exposed that
-thread in local task navigation, and displayed Settings, Plugins, Skills,
-Tasks, and the model control. The request reached only the authenticated gateway
+The scoped renderer cold-restart slice passes. The exact copied app reached the
+main UI without OpenAI state, completed and persisted an exact sentinel turn,
+cold-stopped, relaunched, reopened the same local thread and rollout, and
+completed a second exact sentinel turn. It displayed Settings, Plugins, Skills,
+Tasks, and the model control. Requests reached only the authenticated gateway
 and pinned OptiQ upstream; gateway authentication, secret separation,
 namespaced tool continuation, listener isolation, integrity, and cleanup checks
 all passed. See
@@ -22,13 +22,13 @@ all passed. See
 
 The ticket remains open for native project-picker, worktree, and permission
 interaction; Default and Plan mode behavior; project-local skill visibility;
-exact renderer-visible model metadata; and cold GUI reopen and continuation.
+and exact renderer-visible model metadata.
 
 ## Acceptance
 
 - Launch only the separately named exact app copy with fresh isolated state and the pinned OptiQ profile; keep the installed app, normal profile, global Codex state, and unrelated model servers untouched.
 - Submit a deterministic text and tool turn from the renderer and verify the request reaches only the authenticated gateway and pinned OptiQ upstream.
-- Materialize a local thread from a user message, reopen it after a cold restart, and continue it from the renderer.
+- **Complete:** Materialize a local thread from a user message, reopen it after a cold restart, and continue it from the renderer.
 - Select or create a local project and Git worktree without remote Git and verify their state survives a cold restart.
 - Observe one allowed and one denied local operation by their effects, not merely by prompt visibility.
 - Exercise Default and Plan modes and verify their observable local turn settings.

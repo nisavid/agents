@@ -2,18 +2,79 @@
 
 ## Question
 
-Can the exact copied app submit a deterministic prompt from its renderer,
-persist the resulting task, and expose the local workflow surfaces through the
-reviewed authenticated gateway without automating native dialogs?
+Can the exact copied app submit a deterministic renderer turn, persist it,
+cold-stop and relaunch only the app process group, reopen the same local thread,
+complete a second turn through the reviewed authenticated gateway, and expose
+the local workflow surfaces without automating native dialogs?
 
 ## Verdict
 
-Red. The renderer-to-gateway path, task persistence, local surfaces, trust
-boundaries, integrity checks, and cleanup passed. The pinned 2B model did not
-return the requested exact sentinel, so the renderer completion oracle failed
-closed. Ticket 12 remains open.
+Green for the scoped renderer cold-restart continuation. Run-root suffix
+`OBXLwu` exited zero after completing both exact sentinel turns, cold-stopping
+the copied app, reopening the same persisted thread and rollout, and preserving
+the provider, gateway, observer, isolation, integrity, and cleanup contracts.
 
-The exact run used:
+The project-local skill, exact configured model metadata, native project
+picker, native permission decision, and native worktree controls remain red or
+unexercised. Ticket 12 remains open for those separate surfaces.
+
+The successful run used:
+
+```sh
+ROUTE_MODE=gateway \
+GATEWAY_COMMIT=6307d37b76918c19f2e3bc0fd506434531aadeb2 \
+GUI_WORKFLOW=true \
+GUI_COLD_RESUME=true \
+PROBE_EXPECT=renderer-cold-resume \
+  .scratch/chatgpt-airgap-unlock/research/08-run-prototype.sh
+```
+
+## Successful cold-restart evidence
+
+- The first renderer phase completed `COLD_PHASE_ONE_OK`, persisted its task,
+  and observed the Tasks, Settings, Plugins, Skills, and model-control surfaces.
+  The second phase relaunched the copied app, reopened the same thread with its
+  first output visible, and completed `COLD_PHASE_TWO_OK` in the same rollout.
+- The structured handoff recorded ordered before/after markers for terminal
+  capture and checks, resume-state capture, app-group stop, and relaunch. The
+  first app process group exited and its CDP listener closed before relaunch.
+- The gateway and upstream each recorded three terminal completions: two before
+  the cold stop and one continuation completion. Both first-phase deltas were
+  two, both continuation deltas were one, and continuation transport was
+  observed.
+- The exact gateway source was commit
+  `6307d37b76918c19f2e3bc0fd506434531aadeb2`, blob
+  `a368b8f8e919361425763e86ca1c80fcea81825f`, with a 300-second upstream
+  timeout and the default 15-second heartbeat. The namespace preflight retained
+  continuation reconstruction and exact data-only `[DONE]` checks.
+- The persisted thread was `019f6349-e2f2-7c52-b4d1-077c23194a85`. Its rollout
+  contained two exact smoke prompts, two user turn events, two assistant
+  messages, and two `task_complete` events, with no function calls. The rollout
+  SHA-256 was
+  `829696a486967d155d83c7cb608667213fa436c70cdcb4b547c33aa7246e63ee`.
+- The first turn-identity SHA-256 was
+  `34ba4ebb17fb767b8eb39c2958927a6ae35e172936c5ceaf3d18cd9afffb3cac`.
+  Its persisted, renderer, and sentinel output SHA-256 values were all
+  `6b3f8de7d7bc4217399ef704cf467ee931bef4171d6fe39c6b2e386fc632b6cc`.
+  The second persisted, renderer, and sentinel output SHA-256 values were all
+  `ee67dab48c757720854e0106fbf36eb4e278b68a0158291e5ae937423e3912e1`.
+- No request-body, credential, or remote-socket leak was observed. No
+  `auth.json` or shell snapshot appeared. Outbound attempts were blocked; every
+  captured socket was loopback. All owned processes were absent and all owned
+  listeners were closed after cleanup.
+- The copied app ASAR retained SHA-256
+  `d28f31b4bbb04c519be65c2af8277d8c5faf77b4239ee89b928f0a7423dacd84`;
+  the bundled Codex binary retained SHA-256
+  `28699add67540b93390329a740649a9eb9bdbc5538d92c1679c8c6b6fa2c623c`.
+  The copied bundle also retained its strict deep signature.
+
+The project-local skill was not visible, exact configured model metadata did
+not match, and the three native surfaces were not exercised. Those failures do
+not weaken the completed renderer cold-restart contract.
+
+## Historical initial red run
+
+The initial exact run used:
 
 ```sh
 ROUTE_MODE=gateway \
@@ -22,8 +83,6 @@ GUI_WORKFLOW=true \
 PROBE_EXPECT=renderer-workflow \
   .scratch/chatgpt-airgap-unlock/research/08-run-prototype.sh
 ```
-
-## Evidence
 
 - CDP inserted the prompt through the renderer's trusted input path and
   submitted it with a trusted Enter event.
@@ -120,8 +179,8 @@ the scoped renderer run.
 ## Cold-restart continuation prototype design
 
 The renderer workflow now has an opt-in, two-phase cold-restart path. It has
-not completed a cold restart and contributes no cold-restart runtime evidence
-to the verdict above.
+completed the full cold-restart contract in run `OBXLwu`; the successful
+evidence is summarized above.
 
 Phase one retains the validated renderer prompt, task, and surface assertions.
 It now asks the model to return exactly `COLD_PHASE_ONE_OK` and forbids tool
@@ -341,10 +400,10 @@ SSE frame contains exactly one data field with that payload and no other
 nonempty fields. This is the correct general Responses SSE behavior, but it is
 not an `OsZeWx` fix because that OptiQ path exposes `response.completed` and
 EOF, not `[DONE]`. The immutable namespace preflight retains tool-calling
-coverage and now asserts the exact data-only sentinel shape. No live GUI run
-has used this commit yet.
+coverage and now asserts the exact data-only sentinel shape. `OBXLwu` is the
+first live GUI run against this commit.
 
-Future cold-resume runs use exact nonnumeric phase sentinels instead of
-arithmetic. This keeps the 2B model's GUI smoke deterministic and prevents a
-tool-selection loop from masquerading as transport progress. Tool calling
+Current and future cold-resume runs use exact nonnumeric phase sentinels instead
+of arithmetic. This keeps the 2B model's GUI smoke deterministic and prevents
+a tool-selection loop from masquerading as transport progress. Tool calling
 remains validated separately by the namespace preflight.

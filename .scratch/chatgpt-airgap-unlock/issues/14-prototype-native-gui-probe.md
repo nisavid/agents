@@ -120,6 +120,20 @@ field-specific diagnostic, and a present value of the wrong CF type fails as
 malformed; case-normalized `O`/`o`, integral virtual key `31`, and integral
 modifiers `0` remain required. The inspection phase still authorizes no action.
 
+The next attempt was stopped before app launch because the outer harness sandbox
+denied the runner's nested `sandbox-exec`; running the unchanged inspection
+outside that outer sandbox cleared the harness-only restriction. The copied app
+then completed its local sentinel workflow, the helper validated the exact
+process and trust state, and all 41 menu polls remained read-only before timing
+out in an unpublished state. No menu press or project selection occurred. All
+owned processes and listeners closed, all isolated databases passed
+`quick_check`, and source/copy hashes remained exact.
+
+The timeout now records only the final member of a bounded pending-state enum,
+distinguishing the application menu bar, File item, direct menu, Open Folder
+item, and three Command-O attributes. It records no AX titles or history and
+does not change the immediate rejection or action policy.
+
 No live AX action has occurred for this revision. The reviewed retained artifact
 is recorded in `research/14-native-gui-probe.md`; read-only menu inspection
 requires a manual grant for that exact artifact before the next live step.

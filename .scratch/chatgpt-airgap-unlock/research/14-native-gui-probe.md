@@ -166,8 +166,8 @@ Ivan; the helper never requests a prompt itself.
 
 Green for the source, build, input-policy, selector-policy, and runner-seam
 slice. The retained no-permission artifact for this revision is arm64 and ad-hoc signed,
-with SHA-256 `160d8a49d9730b48efa8e85120f352c3e21fb5fd43c6a0854e9b496462f7b4b1`
-and CDHash `d4fff90e19ef9fd245285e18cf2d122bbbf6efd6`. A clean build in a second
+with SHA-256 `fd359b0ba1eb8abcb2fd60fbd632575c69f477d4594e286fb2fb5c2a9eccd083`
+and CDHash `2f30af041c6b3ccb8b9f566f9ad4fa0a8097f7b6`. A clean build in a second
 disposable directory produced the same SHA-256. The helper self-test, forbidden
 API and sensitive-symbol allowlists, path-policy fixtures, renderer transition
 oracle, authoritative project-state fixtures, runner shell syntax, and
@@ -192,3 +192,18 @@ panel-shaped candidate exists, and fails immediately on malformed, duplicate,
 unauthorized, ambiguous, or drifted state. The wait contains no AX or input
 action. The live native project selection remains unexecuted with this retained
 artifact and blocked on its fresh manual Accessibility grant.
+
+The first attempt with the prior revision ran inside the outer harness sandbox,
+where nested `sandbox-exec` failed before app launch. The unchanged inspection
+then ran outside that outer sandbox, validated the copied process and helper
+trust, and remained read-only for 41 menu polls. It timed out in a retryable
+unpublished state, emitted no menu-validation or project-selection event, and
+cleaned up every owned process and listener. All isolated databases passed
+`quick_check`, and source/copy app hashes remained exact.
+
+The helper now retains only the final bounded pending-state label across the
+read-only wait. Timeout evidence distinguishes an unpublished application menu
+bar, File item, direct menu, Open Folder item, command character, virtual key,
+or modifiers without recording menu contents or changing any immediate
+rejection or action gate. The retained artifact requires a fresh manual grant
+before repeating the mutation-free inspection.

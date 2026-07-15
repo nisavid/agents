@@ -775,6 +775,7 @@ if test "$GUI_WORKFLOW" = false; then
       "$LOG_DIR" \
       "$MODEL_ID" \
       "$PROXY_PORT" \
+      "$NATIVE_GUI_PROBE_PROTECTED_PATH" \
       >"$LOG_DIR/host-probe.stdout" 2>"$LOG_DIR/host-probe.stderr"
   THREAD_ID="$(/usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["thread_id"])' "$LOG_DIR/host-summary.json")"
   /usr/bin/env -i \
@@ -792,6 +793,7 @@ if test "$GUI_WORKFLOW" = false; then
       "$LOG_DIR" \
       "$THREAD_ID" \
       "$PROXY_PORT" \
+      "$NATIVE_GUI_PROBE_PROTECTED_PATH" \
       >"$LOG_DIR/host-restart-probe.stdout" 2>"$LOG_DIR/host-restart-probe.stderr"
 fi
 

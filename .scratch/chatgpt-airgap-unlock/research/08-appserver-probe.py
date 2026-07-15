@@ -13,7 +13,55 @@ import time
 from typing import Any
 
 
+def sandbox_command(
+    profile: pathlib.Path,
+    real_home: pathlib.Path,
+    codex: pathlib.Path,
+    protected_helper: pathlib.Path | None,
+) -> list[str]:
+    command = [
+        "/usr/bin/sandbox-exec",
+        "-f",
+        str(profile),
+        "-D",
+        f"REAL_HOME={real_home}",
+    ]
+    if protected_helper is not None:
+        command.extend(["-D", f"NATIVE_GUI_PROBE_BIN={protected_helper}"])
+    command.extend(
+        [
+            str(codex),
+            "-c",
+            "features.code_mode_host=true",
+            "app-server",
+            "--stdio",
+        ]
+    )
+    return command
+
+
+def run_self_test() -> None:
+    profile = pathlib.Path("/private/tmp/profile.sb")
+    real_home = pathlib.Path("/Users/operator")
+    codex = pathlib.Path("/private/tmp/Codex")
+    without_helper = sandbox_command(profile, real_home, codex, None)
+    assert not any(value.startswith("NATIVE_GUI_PROBE_BIN=") for value in without_helper)
+    helper = pathlib.Path("/private/tmp/reviewed-helper")
+    with_helper = sandbox_command(profile, real_home, codex, helper)
+    assert with_helper.count("-D") == 2
+    helper_define = f"NATIVE_GUI_PROBE_BIN={helper}"
+    helper_index = with_helper.index(helper_define)
+    assert with_helper[helper_index - 1] == "-D"
+    assert with_helper[helper_index + 1] == str(codex)
+    print("host app-server sandbox command self-test passed")
+
+
 def main() -> None:
+    if len(sys.argv) not in (8, 9):
+        raise SystemExit(
+            "usage: 08-appserver-probe.py CODEX WORKSPACE PROFILE REAL_HOME "
+            "LOG_DIR MODEL_ID PROXY_PORT [PROTECTED_HELPER]"
+        )
     codex = pathlib.Path(sys.argv[1]).resolve()
     workspace = pathlib.Path(sys.argv[2]).resolve()
     profile = pathlib.Path(sys.argv[3]).resolve()
@@ -21,6 +69,7 @@ def main() -> None:
     log_dir = pathlib.Path(sys.argv[5]).resolve()
     model_id = sys.argv[6]
     proxy_port = int(sys.argv[7])
+    protected_helper = pathlib.Path(sys.argv[8]).resolve() if len(sys.argv) == 9 else None
     token_env_name = os.environ["CODEX_PROVIDER_TOKEN_ENV"]
     skill_path = workspace / ".agents/skills/local-sentinel/SKILL.md"
 
@@ -56,18 +105,7 @@ def main() -> None:
 
     with stderr_path.open("w") as stderr, messages_path.open("w") as raw:
         process = subprocess.Popen(
-            [
-                "/usr/bin/sandbox-exec",
-                "-f",
-                str(profile),
-                "-D",
-                f"REAL_HOME={real_home}",
-                str(codex),
-                "-c",
-                "features.code_mode_host=true",
-                "app-server",
-                "--stdio",
-            ],
+            sandbox_command(profile, real_home, codex, protected_helper),
             cwd=workspace,
             env=environment,
             text=True,
@@ -292,4 +330,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:] == ["--self-test"]:
+        run_self_test()
+    else:
+        main()

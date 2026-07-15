@@ -29,6 +29,8 @@ test "$probe_sha256" = "$probe_second_sha256"
 /bin/sh -n "$HERE/14-build-native-gui-probe.sh"
 /bin/sh -n "$HERE/14-test-native-gui-probe.sh"
 "$HERE/08-run-prototype.sh" --self-test
+/usr/bin/python3 "$HERE/08-appserver-probe.py" --self-test
+/usr/bin/python3 "$HERE/08-appserver-restart-probe.py" --self-test
 "$NODE" "$HERE/12-cdp-gui-driver.mjs" --self-test
 
 if "$PROBE" 2>"$BUILD_ROOT/options.stderr"; then
@@ -88,6 +90,11 @@ if /usr/bin/grep -Fq 'NATIVE_GUI_PROBE_PROTECTED_PATH="/dev/null"' \
 fi
 /usr/bin/grep -Fq -- '-D "NATIVE_GUI_PROBE_BIN=$NATIVE_GUI_PROBE_PROTECTED_PATH"' \
   "$HERE/08-run-prototype.sh"
+host_probe_invocations="$(/usr/bin/sed -n \
+  '/if test "$GUI_WORKFLOW" = false; then/,/^fi$/p' \
+  "$HERE/08-run-prototype.sh")"
+test "$(printf '%s\n' "$host_probe_invocations" | \
+  /usr/bin/grep -Fc '"$NATIVE_GUI_PROBE_PROTECTED_PATH"')" -eq 2
 
 readiness_body="$(/usr/bin/sed -n \
   '/BEGIN_READ_ONLY_OPEN_PANEL_WAIT/,/END_READ_ONLY_OPEN_PANEL_WAIT/p' \

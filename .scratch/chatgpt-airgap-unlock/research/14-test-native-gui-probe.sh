@@ -279,7 +279,9 @@ done
 test "$(printf '%s\n' "$focus_body" | \
   /usr/bin/grep -Fc 'AXUIElementSetAttributeValue(')" -eq 3
 test "$(printf '%s\n' "$focus_body" | \
-  /usr/bin/grep -Fc 'try requireSettableAttribute(')" -eq 3
+  /usr/bin/grep -Fc 'try requireSettableAttribute(')" -eq 1
+test "$(printf '%s\n' "$focus_body" | \
+  /usr/bin/grep -Fc 'try strictAttributeSettable(')" -eq 3
 test "$(printf '%s\n' "$focus_body" | \
   /usr/bin/grep -Fc 'AXUIElementIsAttributeSettable(')" -eq 1
 test "$(printf '%s\n' "$focus_body" | \

@@ -169,13 +169,15 @@ focused window is the original panel, and that panel is focused. If those
 postconditions are absent, separate authorization permits only setting the
 exact application's `AXFrontmost` attribute and performing `AXRaise` on the
 exact panel, setting that application's focused window to the validated panel,
-and, only after a strict reread still reports false, setting that panel's focused
-attribute to true. Every boundary revalidates both PID and unique current panel
-identity. It then recaptures the path-entry baseline and checks focus inside the
-final keyboard-post boundary. Two reproducible builds matched SHA-256
-`e3b184ad22566a565a55068f7b7418fed862bcd4551a1705e1f9725d1b209b54`;
+or setting that panel's focused attribute to true. The helper preflights both
+exact selectors, prefers focused-window when writable, rereads panel focus, and
+otherwise uses panel-focused; neither being writable fails before mutation.
+Every boundary revalidates both PID and unique current panel identity. It then
+recaptures the path-entry baseline and checks focus inside the final keyboard-post
+boundary. Two reproducible builds matched SHA-256
+`9b264a696cc823d31d82c465a43edfeaf02d9c9e13abbafd0537a22f77e77696`;
 the canonical arm64 ad-hoc artifact has CDHash
-`331175d81b4da5876a74934563ec982547166a85` and awaits a fresh manual grant.
+`f907e3b737459ba86f10a43c487803caa37d281a` and awaits a fresh manual grant.
 
 The first focus-enabled run, suffix `XX7Egp`, reached the exact menu press and
 Open panel, then failed before focus mutation because the inactive exact app's
@@ -196,3 +198,11 @@ selectors, with a staged reread to avoid the latter write when the former is
 sufficient. Cleanup closed every owned process and listener; the isolated
 database passed `quick_check` with zero threads, and source/copy ASAR hashes
 matched.
+
+Run suffix `tsT8Zz` confirmed the application's focused-window attribute is
+read-only for this Open panel. Capability validation stopped before any focus
+mutation, keyboard input, or project-selection request. The retained plan now
+uses the exact panel-focused selector when focused-window is confirmed read-only
+and rejects before mutation only when neither exact selector is writable.
+Cleanup closed every owned process and listener; the isolated database passed
+`quick_check` with zero threads, and source/copy ASAR hashes matched.

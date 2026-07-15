@@ -72,13 +72,15 @@ current exact-PID window, strictly reads the application frontmost, focused
 window, and panel-focused attributes, and performs no focus action when they
 already prove readiness. Otherwise, separate authorization permits only setting
 that exact application's `AXFrontmost` attribute, raising that exact panel, and
-setting that application's focused window to the same validated panel. It then
-rereads panel focus and sets only that panel's focused attribute to true if the
-focused-window write did not establish it. Every boundary revalidates the PID
-and unique current panel identity; writability read failures remain distinct
-from confirmed read-only attributes. It waits two monotonic seconds for all
-three focus postconditions, recaptures the path-entry baseline, and rechecks
-exact focus immediately before the adjacent PID-targeted key events.
+using either exact writable focus selector: the application's focused-window
+attribute with the validated panel value, or that panel's focused attribute with
+the value true. It preflights both selectors, prefers focused-window when
+writable, rereads panel focus, and otherwise uses panel-focused; neither selector
+being writable fails before mutation. Every boundary revalidates the PID and
+unique current panel identity; writability read failures remain distinct from
+confirmed read-only attributes. It waits two monotonic seconds for all three
+focus postconditions, recaptures the path-entry baseline, and rechecks exact
+focus immediately before the adjacent PID-targeted key events.
 The runner requires that evidence order before accepting panel validation, then
 requires a renderer transition from a nonmatching project to the per-run nonce
 project. After the renderer creates its first task, the runner waits for the
@@ -179,8 +181,8 @@ Ivan; the helper never requests a prompt itself.
 
 Green for the source, build, input-policy, selector-policy, and runner-seam
 slice. The retained no-permission artifact for this revision is arm64 and ad-hoc signed,
-with SHA-256 `e3b184ad22566a565a55068f7b7418fed862bcd4551a1705e1f9725d1b209b54`
-and CDHash `331175d81b4da5876a74934563ec982547166a85`. A clean build in a second
+with SHA-256 `9b264a696cc823d31d82c465a43edfeaf02d9c9e13abbafd0537a22f77e77696`
+and CDHash `f907e3b737459ba86f10a43c487803caa37d281a`. A clean build in a second
 disposable directory produced the same SHA-256. The helper self-test, forbidden
 API and sensitive-symbol allowlists, path-policy fixtures, renderer transition
 oracle, authoritative project-state fixtures, runner shell syntax, and
@@ -225,6 +227,14 @@ therefore still emitted no keyboard input or project-selection request. The
 retained contract adds only the two exact AX focus selectors described above,
 with a staged reread to avoid a redundant panel-focus write. Cleanup again
 closed every owned listener and process; the isolated database passed
+`quick_check` with zero threads, and source/copy ASAR hashes matched.
+
+Run suffix `tsT8Zz` confirmed the application's focused-window attribute is
+read-only for this Open panel. The capability preflight failed before any focus
+mutation, keyboard input, or project-selection request. The retained plan now
+uses the exact panel-focused selector when focused-window is confirmed read-only
+and rejects before mutation only when neither exact selector is writable.
+Cleanup closed every owned listener and process; the isolated database passed
 `quick_check` with zero threads, and source/copy ASAR hashes matched.
 
 ## First live invocation

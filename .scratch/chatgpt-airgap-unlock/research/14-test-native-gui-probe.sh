@@ -24,10 +24,11 @@ probe_sha256="$(/usr/bin/shasum -a 256 "$PROBE" | /usr/bin/awk '{print $1}')"
 probe_second_sha256="$(/usr/bin/shasum -a 256 "$PROBE_SECOND" | /usr/bin/awk '{print $1}')"
 test "$probe_sha256" = "$probe_second_sha256"
 "$PROBE" --self-test
+/usr/bin/python3 "$HERE/14-project-state.py" --self-test
 /bin/sh -n "$HERE/08-run-prototype.sh"
 "$NODE" "$HERE/12-cdp-gui-driver.mjs" --self-test
 
-if /usr/bin/grep -Eq 'AXUIElementCreateSystemWide|AXIsProcessTrustedWithOptions|NSWorkspace|NSAppleScript|osascript|tccutil|System Events|CGEventPost\(|\.post\(|(^|[^[:alnum:]_])Process\(|posix_spawn|exec[lv]|system\(|(^|[^[:alnum:]_])kill\(|terminate\(' \
+if /usr/bin/grep -Eq 'AXUIElementCreateSystemWide|AXIsProcessTrustedWithOptions|NSWorkspace|NSTask|NSAppleScript|NSClassFromString|dlopen|dlsym|objc_msgSend|osascript|tccutil|System Events|CGEventPost\(|\.post\(|(^|[^[:alnum:]_])Process\(|posix_spawn|exec[lv]|system\(|(^|[^[:alnum:]_])kill\(|terminate\(' \
   "$HERE/14-native-gui-probe.swift"; then
   echo 'forbidden global-event, prompting, launching, termination, AppleScript, or TCC API present' >&2
   exit 1
@@ -40,9 +41,43 @@ if /usr/bin/grep -Eq 'AXUIElementCreateSystemWide|AXIsProcessTrustedWithOptions|
   echo 'forbidden installed-app, global-AX, AppleScript, prompting, or TCC shell seam present' >&2
   exit 1
 fi
+if /usr/bin/grep -Eq 'child_process|execFile|spawn\(|process\.binding|process\.mainModule|window\.require|Deno\.|Bun\.|IOHID|CGEvent|NSAppleScript|osascript|tccutil|System Events' \
+  "$HERE/12-cdp-gui-driver.mjs"; then
+  echo 'forbidden process, global-input, AppleScript, or TCC renderer path present' >&2
+  exit 1
+fi
+if /usr/bin/grep -Eq 'subprocess|os\.system|os\.kill|posix_spawn|exec[lv]|NSAppleScript|osascript|tccutil' \
+  "$HERE/14-project-state.py"; then
+  echo 'forbidden process or host-mutation project-state path present' >&2
+  exit 1
+fi
 /usr/bin/grep -Fq 'test "$(/usr/bin/stat -f '\''%d:%i'\'' "$NATIVE_GUI_PROBE_BIN")" = "$native_gui_probe_device_inode"' \
   "$HERE/08-run-prototype.sh"
-/usr/bin/grep -Fq 'persisted_fixture_path_matched=true' "$HERE/08-run-prototype.sh"
+/usr/bin/grep -Fq '"transitionValidated": true' "$HERE/08-run-prototype.sh"
+
+sensitive_symbols="$(/usr/bin/nm -u "$PROBE" | /usr/bin/awk '{print $NF}' | \
+  /usr/bin/grep -E '(^_(AX|CGEvent|IOHID|NSAppleScript|LS(Open|Launch)|posix_spawn|exec|fork|system|kill|Sec(Code|StaticCode)|proc_))|NSTask|NSWorkspace' | \
+  LC_ALL=C /usr/bin/sort || true)"
+expected_sensitive_symbols='_AXIsProcessTrusted
+_AXUIElementCopyActionNames
+_AXUIElementCopyAttributeValue
+_AXUIElementCreateApplication
+_AXUIElementGetTypeID
+_AXUIElementPerformAction
+_AXUIElementSetAttributeValue
+_CGEventCreateKeyboardEvent
+_CGEventPostToPid
+_CGEventSetFlags
+_CGEventSourceCreate
+_SecCodeCheckValidity
+_SecCodeCopyGuestWithAttributes
+_SecCodeCopySigningInformation
+_SecCodeCopyStaticCode
+_SecStaticCodeCheckValidity
+_SecStaticCodeCreateWithPath
+_proc_pidinfo
+_proc_pidpath'
+test "$sensitive_symbols" = "$expected_sensitive_symbols"
 
 RUN_ROOT="$(mktemp -d /private/tmp/chatgpt-route-prototype-08.test.XXXXXX)"
 mkdir -p "$RUN_ROOT/Probe.app/Contents/MacOS" "$RUN_ROOT/workspace/.git" "$RUN_ROOT/logs"

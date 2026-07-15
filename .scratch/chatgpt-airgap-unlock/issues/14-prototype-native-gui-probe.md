@@ -58,7 +58,10 @@ the Ticket 08/12 runner. The helper binds to the copied executable by PID,
 process start time, canonical running paths, and static/live code signatures;
 uses only PID-scoped AX state; refuses path, control, or process ambiguity; and
 requires a separate explicit flag before the audited PID-targeted
-Command-Shift-G fallback is available.
+Command-Shift-G fallback is available. The fallback accepts only one newly
+created child of the original validated panel, and the final press remains
+bound to that original panel's exact AX identity. Project adoption requires a
+nonce renderer transition plus an exact authoritative `threads.cwd` transition.
 
 No Accessibility request, TCC mutation, installed-app launch, or live AX action
 has occurred. The reviewed no-permission artifact is recorded in

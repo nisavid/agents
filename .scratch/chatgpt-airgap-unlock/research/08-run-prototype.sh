@@ -886,7 +886,7 @@ else
     /usr/bin/grep -Fq '"planPromptCompleted":true' "$LOG_DIR/cdp.jsonl"; then renderer_plan_mode_observed=true; fi
   if test -f "$LOG_DIR/gui-mode-state.json" && \
     /usr/bin/grep -Fq '"rendererAndPersistenceMatched": true' "$LOG_DIR/gui-mode-state.json"; then renderer_mode_persistence_matched=true; fi
-  if /usr/bin/grep -Fq '"rendererFallbackModelMetadataAbsent":true' "$LOG_DIR/cdp.jsonl"; then renderer_fallback_model_metadata_absent=true; fi
+  if /usr/bin/grep -Eq '"rendererFallbackModelMetadataAbsent"[[:space:]]*:[[:space:]]*true' "$LOG_DIR/cdp.jsonl"; then renderer_fallback_model_metadata_absent=true; fi
   if /usr/bin/grep -Fq '"rendererThreadReopened":true' "$LOG_DIR/cdp.jsonl"; then renderer_thread_reopened=true; fi
   if /usr/bin/grep -Fq '"rendererContinuationCompleted":true' "$LOG_DIR/cdp.jsonl"; then renderer_continuation_completed=true; fi
   if test -f "$GUI_RESUME_STATE" && /usr/bin/grep -Fq '"sameRolloutContinuationValidated": true' "$GUI_RESUME_STATE"; then renderer_same_rollout_continuation=true; fi

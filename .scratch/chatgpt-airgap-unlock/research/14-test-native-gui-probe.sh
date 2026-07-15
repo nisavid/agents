@@ -3,9 +3,18 @@
 set -eu
 
 HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-NODE="${NODE:-/opt/homebrew/bin/node}"
+NODE="${NODE:-$(command -v node || true)}"
+if test -z "$NODE" || test ! -x "$NODE"; then
+  echo 'node executable not found; set NODE or add node to PATH' >&2
+  exit 1
+fi
 BUILD_ROOT="$(mktemp -d /private/tmp/chatgpt-native-gui-probe-test.XXXXXX)"
-trap '/bin/rm -rf "$BUILD_ROOT"' EXIT INT TERM
+RUN_ROOT=""
+cleanup() {
+  /bin/rm -rf "$BUILD_ROOT"
+  if test -n "$RUN_ROOT"; then /bin/rm -rf "$RUN_ROOT"; fi
+}
+trap cleanup EXIT INT TERM
 
 "$HERE/14-build-native-gui-probe.sh" "$BUILD_ROOT/build"
 PROBE="$BUILD_ROOT/build/chatgpt-native-gui-probe"
@@ -13,7 +22,7 @@ PROBE="$BUILD_ROOT/build/chatgpt-native-gui-probe"
 /bin/sh -n "$HERE/08-run-prototype.sh"
 "$NODE" "$HERE/12-cdp-gui-driver.mjs" --self-test
 
-if /usr/bin/grep -Eq 'AXUIElementCreateSystemWide|AXIsProcessTrustedWithOptions|NSWorkspace.*open|tccutil|System Events' \
+if /usr/bin/grep -Eq 'AXUIElementCreateSystemWide|AXIsProcessTrustedWithOptions|NSWorkspace|tccutil|System Events' \
   "$HERE/14-native-gui-probe.swift"; then
   echo 'forbidden system-wide, prompting, launching, or TCC API present' >&2
   exit 1
@@ -62,5 +71,4 @@ if "$PROBE" \
 fi
 /usr/bin/grep -Fq 'not an owned ticket-08 disposable root' "$BUILD_ROOT/root.stderr"
 
-/bin/rm -rf "$RUN_ROOT"
 echo 'native GUI probe no-permission tests passed'

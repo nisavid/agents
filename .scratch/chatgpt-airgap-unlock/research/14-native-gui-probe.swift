@@ -313,6 +313,7 @@ enum OpenFolderMenuPolicy {
         let itemIndices = menu.children.indices.filter {
             menu.children[$0].title == itemTitle
         }
+        guard !itemIndices.isEmpty else { return nil }
         guard itemIndices.count == 1, let itemIndex = itemIndices.first else {
             throw ProbeError.validation(
                 "expected exactly one direct Open Folder menu item; found \(min(itemIndices.count, 2))")
@@ -1417,22 +1418,38 @@ func runSelfTests() throws {
                 role: kAXMenuBarItemRole, title: "File",
                 children: [testElement(role: kAXMenuRole)])]),
         items: [:])
+    let otherMenuChildrenSnapshot = OpenFolderMenuSnapshot<String>(
+        description: testElement(
+            role: kAXMenuBarRole,
+            children: [testElement(
+                role: kAXMenuBarItemRole, title: "File",
+                children: [testElement(
+                    role: kAXMenuRole,
+                    children: [testElement(
+                        role: kAXMenuItemRole, title: "New Window",
+                        actions: [kAXPressAction])])])]),
+        items: [:])
     var menuSnapshots: [OpenFolderMenuSnapshot<String>?] = [
         nil, wrongFileTitleSnapshot, missingFileTitleSnapshot,
-        missingDirectMenuSnapshot, emptyDirectMenuSnapshot, validMenuSnapshot,
+        missingDirectMenuSnapshot, emptyDirectMenuSnapshot,
+        otherMenuChildrenSnapshot, validMenuSnapshot,
     ]
     var menuNow: UInt64 = 0
     var menuIdentityChecks = 0
+    var menuPauses = 0
     let menuReadiness = try waitForReadyOpenFolderMenu(
         timeoutNanoseconds: 1_000_000_000,
         pollMicroseconds: 100,
         nowNanoseconds: { menuNow },
         validateIdentity: { menuIdentityChecks += 1 },
         readSnapshot: { menuSnapshots.removeFirst() },
-        pause: { menuNow += UInt64($0) * 1_000 })
-    try require(menuReadiness.item == "open-folder-item" && menuReadiness.pollCount == 6,
+        pause: {
+            menuPauses += 1
+            menuNow += UInt64($0) * 1_000
+        })
+    try require(menuReadiness.item == "open-folder-item" && menuReadiness.pollCount == 7,
                 "bounded menu readiness did not select the delayed menu")
-    try require(menuIdentityChecks == 12,
+    try require(menuIdentityChecks == 14 && menuPauses == 6,
                 "PID identity was not checked around every menu snapshot")
     var malformedMenuReads = 0
     var malformedMenuPauses = 0
@@ -1446,7 +1463,7 @@ func runSelfTests() throws {
             readSnapshot: {
                 malformedMenuReads += 1
                 return OpenFolderMenuSnapshot<String>(
-                    description: menuBar(itemTitle: "Open Folder..."), items: [:])
+                    description: menuBar(enabled: false), items: [:])
             },
             pause: { _ in malformedMenuPauses += 1 })
     } catch ProbeError.validation { rejected = true }
@@ -1454,6 +1471,7 @@ func runSelfTests() throws {
                 "malformed published menu did not fail immediately")
     menuNow = 0
     var menuTimeoutReads = 0
+    var menuTimeoutPauses = 0
     rejected = false
     do {
         _ = try waitForReadyOpenFolderMenu(
@@ -1463,17 +1481,38 @@ func runSelfTests() throws {
             validateIdentity: {},
             readSnapshot: {
                 menuTimeoutReads += 1
-                return nil as OpenFolderMenuSnapshot<String>?
+                return otherMenuChildrenSnapshot
             },
-            pause: { menuNow += UInt64($0) * 1_000 })
+            pause: {
+                menuTimeoutPauses += 1
+                menuNow += UInt64($0) * 1_000
+            })
     } catch ProbeError.unavailable(let message) {
         rejected = message == "Open Folder menu did not become ready after 3 polls"
     }
-    try require(rejected && menuTimeoutReads == 3,
+    try require(rejected && menuTimeoutReads == 3 && menuTimeoutPauses == 3,
                 "Open Folder menu timeout used the wrong poll bound")
+    var duplicateMenuReads = 0
+    var duplicateMenuPauses = 0
+    rejected = false
+    do {
+        _ = try waitForReadyOpenFolderMenu(
+            timeoutNanoseconds: 1_000_000_000,
+            pollMicroseconds: 100,
+            nowNanoseconds: { 0 },
+            validateIdentity: {},
+            readSnapshot: {
+                duplicateMenuReads += 1
+                return OpenFolderMenuSnapshot<String>(description: duplicateItems, items: [:])
+            },
+            pause: { _ in duplicateMenuPauses += 1 })
+    } catch ProbeError.validation { rejected = true }
+    try require(rejected && duplicateMenuReads == 1 && duplicateMenuPauses == 0,
+                "duplicate published menu items did not fail immediately")
     menuNow = 0
     var menuDriftChecks = 0
     var menuDriftReads = 0
+    var menuDriftPauses = 0
     rejected = false
     do {
         _ = try waitForReadyOpenFolderMenu(
@@ -1488,11 +1527,15 @@ func runSelfTests() throws {
             },
             readSnapshot: {
                 menuDriftReads += 1
-                return nil as OpenFolderMenuSnapshot<String>?
+                return otherMenuChildrenSnapshot
             },
-            pause: { menuNow += UInt64($0) * 1_000 })
+            pause: {
+                menuDriftPauses += 1
+                menuNow += UInt64($0) * 1_000
+            })
     } catch ProbeError.validation { rejected = true }
-    try require(rejected && menuDriftChecks == 3 && menuDriftReads == 1,
+    try require(rejected && menuDriftChecks == 3 && menuDriftReads == 1 &&
+                    menuDriftPauses == 1,
                 "menu PID drift did not stop before another AX read")
 
     let cancel = testElement(role: kAXButtonRole, title: "Cancel", actions: [kAXPressAction])

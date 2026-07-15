@@ -14,6 +14,10 @@ const firstPrompt = "Reply exactly COLD_PHASE_ONE_OK and nothing else. Do not us
 const firstSentinel = "COLD_PHASE_ONE_OK";
 const secondPrompt = "Reply exactly COLD_PHASE_TWO_OK and nothing else. Do not use tools.";
 const secondSentinel = "COLD_PHASE_TWO_OK";
+const defaultModePrompt = "Reply exactly MODE_DEFAULT_OK and nothing else. Do not use tools.";
+const defaultModeSentinel = "MODE_DEFAULT_OK";
+const planModePrompt = "Reply exactly MODE_PLAN_OK and nothing else. Do not use tools.";
+const planModeSentinel = "MODE_PLAN_OK";
 
 function emit(kind, data) {
   process.stdout.write(`${JSON.stringify({ at: new Date().toISOString(), kind, phase, ...data })}\n`);
@@ -49,6 +53,16 @@ function sentinelTextVerdict(text, expectedSentinel) {
     exactMatch,
     trimmedTextLength: trimmedText.length,
   };
+}
+
+function defaultModeMenuVerdict(text) {
+  return text.includes("Plan mode") && text.includes("Turn plan mode on");
+}
+
+function planModeIndicatorVerdict(controls) {
+  return controls.some((control) =>
+    control.ariaLabel === "Plan" && control.text.trim() === "Plan"
+  );
 }
 
 function runSelfTests() {
@@ -119,6 +133,18 @@ function runSelfTests() {
     if (evaluateAssistant(firstPrompt, text).matched) {
       throw new Error(`${name}: renderer oracle should fail closed`);
     }
+  }
+  if (!defaultModeMenuVerdict("Plan mode\nTurn plan mode on")) {
+    throw new Error("Default mode menu contract was not recognized");
+  }
+  if (defaultModeMenuVerdict("Plan mode\nTurn plan mode off")) {
+    throw new Error("selected Plan mode was mistaken for Default mode");
+  }
+  if (!planModeIndicatorVerdict([{ ariaLabel: "Plan", text: "Plan" }])) {
+    throw new Error("Plan mode indicator contract was not recognized");
+  }
+  if (planModeIndicatorVerdict([{ ariaLabel: null, text: "Plan mode" }])) {
+    throw new Error("slash command was mistaken for selected Plan mode");
   }
   process.stdout.write("sentinel oracle self-test passed\n");
 }
@@ -410,6 +436,41 @@ async function submitPrompt(prompt, expectedSentinel) {
   return completed;
 }
 
+async function observeDefaultAndEnablePlanMode() {
+  const editorFocused = await evaluate(`(() => {
+    const editor = document.querySelector('[contenteditable=true][data-codex-composer=true]');
+    if (!editor) return false;
+    editor.focus();
+    return document.activeElement === editor;
+  })()`);
+  if (!editorFocused) return { defaultObserved: false, planSelected: false };
+  await send("Input.insertText", { text: "/plan" });
+  const defaultObserved = await waitFor(
+    `(${defaultModeMenuVerdict.toString()})(document.body?.innerText ?? "")`,
+    "renderer-visible Default mode slash command",
+    10000
+  );
+  await snapshot(defaultObserved ? "default-mode-control" : "default-mode-control-missing");
+  const planSelected = defaultObserved && await clickMatching(
+    `[...document.querySelectorAll('button, [role=option], [role=menuitem]')].find((element) => {
+      const text = element.innerText ?? "";
+      return text.includes("Plan mode") && text.includes("Turn plan mode on");
+    })`,
+    "select renderer Plan mode"
+  );
+  const indicatorObserved = planSelected && await waitFor(
+    `(${planModeIndicatorVerdict.toString()})(
+      [...document.querySelectorAll('button')].map((element) => ({
+        ariaLabel: element.getAttribute('aria-label'), text: element.innerText ?? ""
+      }))
+    )`,
+    "renderer-visible Plan mode indicator",
+    10000
+  );
+  await snapshot(indicatorObserved ? "plan-mode-control" : "plan-mode-control-missing");
+  return { defaultObserved, planSelected: indicatorObserved };
+}
+
 async function inspectTasks(prompt) {
   const taskPrefix = prompt.slice(0, 32);
   const taskVisible = await waitFor(
@@ -584,6 +645,50 @@ try {
     const required = [summary.mainUi, summary.rendererThreadReopened,
       summary.persistedOutputVisible, summary.rendererContinuationCompleted];
     if (required.some((value) => value !== true)) process.exitCode = 1;
+  } else if (phase === "modes") {
+    const mainUi = await reachMainUi();
+    let defaultModeControlObserved = false;
+    let defaultPromptCompleted = false;
+    let planModeControlObserved = false;
+    let planPromptCompleted = false;
+    if (mainUi) {
+      const modeControls = await observeDefaultAndEnablePlanMode();
+      defaultModeControlObserved = modeControls.defaultObserved;
+      planModeControlObserved = modeControls.planSelected;
+      if (planModeControlObserved) {
+        await clickMatching(
+          `[...document.querySelectorAll('button')].find((element) =>
+            element.getAttribute('aria-label') === 'Plan' && element.innerText?.trim() === 'Plan'
+          )`,
+          "return renderer composer to Default mode"
+        );
+        defaultModeControlObserved = defaultModeControlObserved && await waitFor(
+          `![...document.querySelectorAll('button')].some((element) =>
+            element.getAttribute('aria-label') === 'Plan'
+          )`,
+          "renderer Plan indicator cleared for Default mode",
+          5000
+        );
+        defaultPromptCompleted = defaultModeControlObserved &&
+          await submitPrompt(defaultModePrompt, defaultModeSentinel);
+        const modeControlsAfterDefault = defaultPromptCompleted
+          ? await observeDefaultAndEnablePlanMode()
+          : { defaultObserved: false, planSelected: false };
+        defaultModeControlObserved = defaultModeControlObserved && modeControlsAfterDefault.defaultObserved;
+        planModeControlObserved = planModeControlObserved && modeControlsAfterDefault.planSelected;
+        planPromptCompleted = planModeControlObserved &&
+          await submitPrompt(planModePrompt, planModeSentinel);
+      }
+    }
+    const summary = {
+      mainUi,
+      defaultModeControlObserved,
+      defaultPromptCompleted,
+      planModeControlObserved,
+      planPromptCompleted,
+    };
+    emit("gui-modes-summary", summary);
+    if (Object.values(summary).some((value) => value !== true)) process.exitCode = 1;
   } else {
     throw new Error(`unknown driver phase: ${phase}`);
   }

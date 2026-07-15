@@ -425,7 +425,14 @@ func matchingLiveElements(_ root: AXUIElement, _ predicate: (AXUIElement) -> Boo
     return ([root] + (try descendants(root, budget: &budget))).filter(predicate)
 }
 
-func press(_ element: AXUIElement, purpose: String) throws {
+func requireSameProcess(_ expected: ProcessIdentity) throws {
+    guard try processIdentity(expected.pid) == expected else {
+        throw ProbeError.validation("PID identity changed before AX mutation")
+    }
+}
+
+func press(_ element: AXUIElement, purpose: String, process: ProcessIdentity) throws {
+    try requireSameProcess(process)
     guard actions(element).contains(kAXPressAction) else {
         throw ProbeError.validation("\(purpose) does not advertise AXPress")
     }
@@ -434,7 +441,8 @@ func press(_ element: AXUIElement, purpose: String) throws {
     }
 }
 
-func postCommandShiftG(to pid: pid_t) throws {
+func postCommandShiftG(to process: ProcessIdentity) throws {
+    try requireSameProcess(process)
     guard let source = CGEventSource(stateID: .privateState),
           let down = CGEvent(keyboardEventSource: source, virtualKey: 5, keyDown: true),
           let up = CGEvent(keyboardEventSource: source, virtualKey: 5, keyDown: false) else {
@@ -442,8 +450,8 @@ func postCommandShiftG(to pid: pid_t) throws {
     }
     down.flags = [.maskCommand, .maskShift]
     up.flags = [.maskCommand, .maskShift]
-    down.postToPid(pid)
-    up.postToPid(pid)
+    down.postToPid(process.pid)
+    up.postToPid(process.pid)
 }
 
 func waitForUniquePathEntry(application: AXUIElement) throws -> (AXUIElement, AXUIElement) {
@@ -511,22 +519,25 @@ func execute(options: Options, paths: ValidatedPaths, log: EventLog) throws {
                 .compactMap { $0?.lowercased() }.joined(separator: " ")
             return text.contains("path") || text.contains("location") || text.contains("folder")
         }
+        try requireSameProcess(identity)
         guard fields.count == 1,
               AXUIElementSetAttributeValue(fields[0], kAXValueAttribute as CFString,
                                            paths.fixture as CFString) == .success else {
             throw ProbeError.validation("direct path field is missing, ambiguous, or not writable")
         }
     case .commandShiftG:
-        try postCommandShiftG(to: options.pid)
+        try postCommandShiftG(to: identity)
         let (pathField, confirmButton) = try waitForUniquePathEntry(application: application)
+        try requireSameProcess(identity)
         guard AXUIElementSetAttributeValue(pathField, kAXValueAttribute as CFString,
                                            paths.fixture as CFString) == .success else {
             throw ProbeError.validation("path-entry field rejected fixture root")
         }
-        try press(confirmButton, purpose: "path-entry confirmation")
+        try press(confirmButton, purpose: "path-entry confirmation", process: identity)
         usleep(250_000)
     }
-    try press(try chooseButton(in: panel, title: plan.chooserTitle), purpose: "Open panel chooser")
+    try press(try chooseButton(in: panel, title: plan.chooserTitle),
+              purpose: "Open panel chooser", process: identity)
     let finalIdentity = try processIdentity(options.pid)
     guard finalIdentity == identity else { throw ProbeError.validation("PID identity changed during AX action") }
     try log.write("project-selection-issued", ["pid": Int(identity.pid),

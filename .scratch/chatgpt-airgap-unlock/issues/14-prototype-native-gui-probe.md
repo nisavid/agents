@@ -164,20 +164,20 @@ so the helper failed closed before any path mutation or chooser press. Project
 adoption remained zero and all isolation, integrity, database, process, and
 listener closeout gates passed.
 
-The helper now strictly proves the exact copied application is frontmost, its
-focused window is the original panel, and that panel is focused. If those
-postconditions are absent, separate authorization permits only setting the
-exact application's `AXFrontmost` attribute and performing `AXRaise` on the
-exact panel, setting that application's focused window to the validated panel,
-or setting that panel's focused attribute to true. The helper preflights both
-exact selectors, prefers focused-window when writable, rereads panel focus, and
-otherwise uses panel-focused; neither being writable fails before mutation.
-Every boundary revalidates both PID and unique current panel identity. It then
-recaptures the path-entry baseline and checks focus inside the final keyboard-post
-boundary. Two reproducible builds matched SHA-256
-`9b264a696cc823d31d82c465a43edfeaf02d9c9e13abbafd0537a22f77e77696`;
+The helper now activates only the already verified copied PID, revalidates its
+copied bundle and executable paths, and requires AppKit active plus AX frontmost
+state before pressing the exact menu item. After panel publication it strictly
+proves the exact copied application is frontmost, its focused window is the
+original panel, and its exact-PID focused UI element is that panel or has that
+panel as its top-level element. Window-level `AXFocused` is diagnostic only. If
+repair is needed, separate authorization permits only exact-app `AXFrontmost`,
+exact-panel `AXRaise`, and a focused-window write to the validated panel when
+that selector is writable. Every boundary revalidates PID and unique panel
+identity before the final keyboard-post boundary. Two reproducible builds
+matched SHA-256
+`b2de2bdd588344f01598b7dbe8d57dc73979c8c5edcc44c7521555384adf39f8`;
 the canonical arm64 ad-hoc artifact has CDHash
-`f907e3b737459ba86f10a43c487803caa37d281a` and awaits a fresh manual grant.
+`9f18c6a5cd19c7dca0383bb235a726364c95a721` and awaits a fresh manual grant.
 
 The first focus-enabled run, suffix `XX7Egp`, reached the exact menu press and
 Open panel, then failed before focus mutation because the inactive exact app's
@@ -193,16 +193,24 @@ The next focus-enabled run, suffix `MYh8h3`, successfully made the exact copied
 application frontmost and raised the exact panel. All 19 bounded focus polls
 still reported `frontmost=true focused-window-matches=false
 panel-focused=false`, so no keyboard input or project-selection request
-occurred. The retained contract adds only exact focused-window and panel-focused
-selectors, with a staged reread to avoid the latter write when the former is
-sufficient. Cleanup closed every owned process and listener; the isolated
+occurred. The result motivated runtime capability checks for both then-candidate
+AX selectors; later runs established both were read-only and corrected the
+window-level focus model. Cleanup closed every owned process and listener; the isolated
 database passed `quick_check` with zero threads, and source/copy ASAR hashes
 matched.
 
 Run suffix `tsT8Zz` confirmed the application's focused-window attribute is
 read-only for this Open panel. Capability validation stopped before any focus
 mutation, keyboard input, or project-selection request. The retained plan now
-uses the exact panel-focused selector when focused-window is confirmed read-only
-and rejects before mutation only when neither exact selector is writable.
+requires natural key-panel publication from exact-PID activation and rejects
+before mutation when focused-window repair would be required but is read-only.
 Cleanup closed every owned process and listener; the isolated database passed
 `quick_check` with zero threads, and source/copy ASAR hashes matched.
+
+Runs `LhoGIW` and `OWWn0g` reproduced the read-only focused-window result and
+confirmed the panel's own `AXFocused` attribute is read-only. Both failed closed
+before input, closed all five listeners, retained zero database threads after
+`quick_check`, and preserved matching source/copy ASAR hashes. The corrected
+contract treats window-level `AXFocused` as diagnostic, proves the exact focused
+UI element belongs to the original panel, and activates the verified PID before
+opening the panel so AppKit can publish it as key naturally.

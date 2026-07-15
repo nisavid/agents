@@ -65,22 +65,25 @@ checks that control only to prove the per-run nonce fixture is not already
 selected; it does not infer broader project state from the label or perform any
 input action. The runner resolves exactly one copied-app executable in the owned
 process group and invokes the helper with explicit Open Folder authorization.
-The helper presses the exact PID-scoped menu item, records exactly one
+The helper first resolves `NSRunningApplication` only by the already verified
+PID, revalidates its copied bundle and executable paths, requests activation
+without bundle-ID targeting or deprecated activation options, and requires both
+AppKit active state and AX frontmost state through a bounded monotonic poll. It
+then presses the exact PID-scoped menu item, records exactly one
 `open-folder-menu-item-pressed` event, and validates the native panel afterward.
 Before Command-Shift-G, it requires the original panel to remain the unique
-current exact-PID window, strictly reads the application frontmost, focused
-window, and panel-focused attributes, and performs no focus action when they
-already prove readiness. Otherwise, separate authorization permits only setting
-that exact application's `AXFrontmost` attribute, raising that exact panel, and
-using either exact writable focus selector: the application's focused-window
-attribute with the validated panel value, or that panel's focused attribute with
-the value true. It preflights both selectors, prefers focused-window when
-writable, rereads panel focus, and otherwise uses panel-focused; neither selector
-being writable fails before mutation. Every boundary revalidates the PID and
-unique current panel identity; writability read failures remain distinct from
-confirmed read-only attributes. It waits two monotonic seconds for all three
-focus postconditions, recaptures the path-entry baseline, and rechecks exact
-focus immediately before the adjacent PID-targeted key events.
+current exact-PID window and strictly proves the application is frontmost, its
+focused window is the original panel, and its focused UI element is either that
+panel or an exact-PID descendant whose top-level UI element is that panel.
+Window-level `AXFocused` is diagnostic only because non-focusable windows may
+publish it read-only. If readiness is absent, separate authorization permits
+only setting that exact application's `AXFrontmost` attribute, raising that
+exact panel, and setting the application's focused-window attribute to the
+validated panel when runtime capability inspection confirms it is writable.
+Every boundary revalidates the PID and unique current panel identity. It waits
+two monotonic seconds for all focus postconditions, recaptures the path-entry
+baseline, and rechecks exact focus immediately before the adjacent PID-targeted
+key events.
 The runner requires that evidence order before accepting panel validation, then
 requires a renderer transition from a nonmatching project to the per-run nonce
 project. After the renderer creates its first task, the runner waits for the
@@ -181,8 +184,8 @@ Ivan; the helper never requests a prompt itself.
 
 Green for the source, build, input-policy, selector-policy, and runner-seam
 slice. The retained no-permission artifact for this revision is arm64 and ad-hoc signed,
-with SHA-256 `9b264a696cc823d31d82c465a43edfeaf02d9c9e13abbafd0537a22f77e77696`
-and CDHash `f907e3b737459ba86f10a43c487803caa37d281a`. A clean build in a second
+with SHA-256 `b2de2bdd588344f01598b7dbe8d57dc73979c8c5edcc44c7521555384adf39f8`
+and CDHash `9f18c6a5cd19c7dca0383bb235a726364c95a721`. A clean build in a second
 disposable directory produced the same SHA-256. The helper self-test, forbidden
 API and sensitive-symbol allowlists, path-policy fixtures, renderer transition
 oracle, authoritative project-state fixtures, runner shell syntax, and
@@ -202,8 +205,10 @@ caused no accessibility-tree change; project adoption remained at zero exact
 fixture rows, and every owned process and listener still closed cleanly.
 
 The retained helper now treats focus as a proven precondition rather than an
-assumption. It introduces no system-wide AX element, AppKit activation API,
-bundle-ID target, or coordinate input. The deterministic suite produced two
+assumption. It introduces no system-wide AX element, bundle-ID target,
+deprecated activation option, or coordinate input. Its exact-PID AppKit
+activation is bounded by the previously validated process, copied paths, active
+state, and AX frontmost state. The deterministic suite produced two
 byte-identical arm64 ad-hoc builds, exercised staged focus convergence, timeout,
 PID drift, option and runner authorization, exact mutation ordering, forbidden
 API policy, and the sensitive-symbol allowlist, then passed the complete
@@ -224,18 +229,29 @@ The next focus-enabled run, suffix `MYh8h3`, performed exact-app frontmost and
 exact-panel raise successfully, but all 19 bounded polls retained
 `frontmost=true focused-window-matches=false panel-focused=false`. The helper
 therefore still emitted no keyboard input or project-selection request. The
-retained contract adds only the two exact AX focus selectors described above,
-with a staged reread to avoid a redundant panel-focus write. Cleanup again
+result motivated runtime capability checks for the two then-candidate AX
+selectors; later runs established both were read-only and corrected the
+window-level focus model. Cleanup again
 closed every owned listener and process; the isolated database passed
 `quick_check` with zero threads, and source/copy ASAR hashes matched.
 
 Run suffix `tsT8Zz` confirmed the application's focused-window attribute is
 read-only for this Open panel. The capability preflight failed before any focus
 mutation, keyboard input, or project-selection request. The retained plan now
-uses the exact panel-focused selector when focused-window is confirmed read-only
-and rejects before mutation only when neither exact selector is writable.
+requires natural key-panel publication from exact-PID activation and rejects
+before mutation when focused-window repair would be required but is read-only.
 Cleanup closed every owned listener and process; the isolated database passed
 `quick_check` with zero threads, and source/copy ASAR hashes matched.
+
+Runs `LhoGIW` and `OWWn0g` reproduced the same read-only focused-window result
+and confirmed the panel's own `AXFocused` attribute is also read-only. Both runs
+stopped before keyboard input or project selection, closed all five listeners,
+left zero threads in databases that passed `quick_check`, and retained matching
+source/copy ASAR hashes. The SDK contract explains that a non-focusable window
+may publish `AXFocused` read-only; readiness now proves the focused window plus
+the exact focused UI element's top-level panel instead. The next live probe uses
+exact-PID activation before opening the panel so AppKit can publish it as key
+naturally.
 
 ## First live invocation
 

@@ -163,19 +163,23 @@ open_folder_menu_body="$(/usr/bin/sed -n \
   '/BEGIN_PID_OPEN_FOLDER_MENU_PRESS/,/END_PID_OPEN_FOLDER_MENU_PRESS/p' \
   "$HERE/14-native-gui-probe.swift")"
 test "$(printf '%s\n' "$open_folder_menu_body" | \
-  /usr/bin/grep -Ec '^    try requireSameProcess\(process\)$')" -eq 2
-test "$(printf '%s\n' "$open_folder_menu_body" | \
-  /usr/bin/grep -Fc 'AXUIElementPerformAction(menuItem, kAXPressAction as CFString)')" -eq 1
-menu_identity_lines="$(printf '%s\n' "$open_folder_menu_body" | \
-  /usr/bin/grep -nE '^    try requireSameProcess\(process\)$' | \
-  /usr/bin/awk -F: '{print $1}')"
-menu_identity_before_line="$(printf '%s\n' "$menu_identity_lines" | /usr/bin/sed -n '1p')"
-menu_identity_after_line="$(printf '%s\n' "$menu_identity_lines" | /usr/bin/sed -n '$p')"
-menu_press_line="$(printf '%s\n' "$open_folder_menu_body" | \
-  /usr/bin/grep -nF 'AXUIElementPerformAction(menuItem, kAXPressAction as CFString)' | \
-  /usr/bin/awk -F: '{print $1}')"
-test $((menu_identity_before_line + 1)) -eq "$menu_press_line"
-test $((menu_press_line + 4)) -eq "$menu_identity_after_line"
+  /usr/bin/grep -Fc 'AXUIElementPerformAction(')" -eq 1
+/usr/bin/grep -Fq 'menuItem, kAXPressAction as CFString' <<EOF
+$open_folder_menu_body
+EOF
+menu_press_boundary="$(/usr/bin/sed -n \
+  '/^func performValidatedMenuPress(/,/^}/p' \
+  "$HERE/14-native-gui-probe.swift")"
+test "$(printf '%s\n' "$menu_press_boundary" | \
+  /usr/bin/grep -Fc 'try validateIdentity()')" -eq 3
+menu_active_line="$(printf '%s\n' "$menu_press_boundary" | \
+  /usr/bin/grep -nF 'try validateActive()' | /usr/bin/awk -F: '{print $1}')"
+menu_perform_line="$(printf '%s\n' "$menu_press_boundary" | \
+  /usr/bin/grep -nF 'try performPress()' | /usr/bin/awk -F: '{print $1}')"
+test "$menu_active_line" -lt "$menu_perform_line"
+/usr/bin/grep -Fq 'validateActive: validateActive' <<EOF
+$open_folder_menu_body
+EOF
 for required_contract in kAXMenuBarAttribute kAXMenuBarRole kAXMenuBarItemRole \
   kAXMenuRole kAXMenuItemRole kAXEnabledAttribute kAXPressAction \
   kAXMenuItemCmdCharAttribute kAXMenuItemCmdModifiersAttribute; do
@@ -272,16 +276,17 @@ focus_body="$(/usr/bin/sed -n \
 focus_body_file="$BUILD_ROOT/open-panel-focus-body.txt"
 printf '%s\n' "$focus_body" >"$focus_body_file"
 for required_focus_contract in kAXFrontmostAttribute kAXFocusedWindowAttribute \
-  kAXFocusedAttribute kAXRaiseAction AXUIElementIsAttributeSettable \
+  kAXFocusedUIElementAttribute kAXTopLevelUIElementAttribute AXUIElementGetPid \
+  kAXRaiseAction AXUIElementIsAttributeSettable \
   readOpenPanelFocusSnapshot waitForOpenPanelFocus; do
   /usr/bin/grep -Fq "$required_focus_contract" "$focus_body_file"
 done
 test "$(printf '%s\n' "$focus_body" | \
-  /usr/bin/grep -Fc 'AXUIElementSetAttributeValue(')" -eq 3
+  /usr/bin/grep -Fc 'AXUIElementSetAttributeValue(')" -eq 2
 test "$(printf '%s\n' "$focus_body" | \
   /usr/bin/grep -Fc 'try requireSettableAttribute(')" -eq 1
 test "$(printf '%s\n' "$focus_body" | \
-  /usr/bin/grep -Fc 'try strictAttributeSettable(')" -eq 3
+  /usr/bin/grep -Fc 'try strictAttributeSettable(')" -eq 2
 test "$(printf '%s\n' "$focus_body" | \
   /usr/bin/grep -Fc 'AXUIElementIsAttributeSettable(')" -eq 1
 test "$(printf '%s\n' "$focus_body" | \
@@ -289,24 +294,58 @@ test "$(printf '%s\n' "$focus_body" | \
 /usr/bin/grep -Fq 'panel, kAXRaiseAction as CFString' "$focus_body_file"
 /usr/bin/grep -Fq 'application, kAXFocusedWindowAttribute as CFString' \
   "$focus_body_file"
-/usr/bin/grep -Fq 'panel, kAXFocusedAttribute as CFString' "$focus_body_file"
 focused_window_setter_body="$(printf '%s\n' "$focus_body" | /usr/bin/sed -n \
-  '/^        setFocusedWindow: {$/,/^        },$/p')"
+  '/^        setFocusedWindow: {$/,/^        })$/p')"
 printf '%s\n' "$focused_window_setter_body" | \
   /usr/bin/grep -Fq 'application, kAXFocusedWindowAttribute as CFString'
 printf '%s\n' "$focused_window_setter_body" | \
   /usr/bin/grep -Fq 'panel) == .success'
-panel_focus_setter_body="$(printf '%s\n' "$focus_body" | /usr/bin/sed -n \
-  '/^        setPanelFocus: {$/,/^        })$/p')"
-printf '%s\n' "$panel_focus_setter_body" | \
-  /usr/bin/grep -Fq 'panel, kAXFocusedAttribute as CFString'
-printf '%s\n' "$panel_focus_setter_body" | \
-  /usr/bin/grep -Fq 'kCFBooleanTrue) == .success'
 if printf '%s\n' "$focus_body" | /usr/bin/grep -Eq \
   'NSWorkspace|NSRunningApplication|activateIgnoringOtherApps|AXUIElementCreateSystemWide|postToPid'; then
   echo 'Open panel focus contract contains a broader activation or input surface' >&2
   exit 1
 fi
+activation_body="$(/usr/bin/sed -n \
+  '/BEGIN_PID_EXACT_APP_ACTIVATION/,/END_PID_EXACT_APP_ACTIVATION/p' \
+  "$HERE/14-native-gui-probe.swift")"
+test "$(printf '%s\n' "$activation_body" | \
+  /usr/bin/grep -Fc 'requestActivation()')" -eq 1
+activation_live_body="$(/usr/bin/sed -n \
+  '/^func activateVerifiedApplication(/,/^}/p' \
+  "$HERE/14-native-gui-probe.swift")"
+for required_activation_contract in exactRunningApplication \
+  'running.activate(options: [])' running.isActive kAXFrontmostAttribute \
+  'try requireSameProcess(process)'; do
+  /usr/bin/grep -Fq "$required_activation_contract" <<EOF
+$activation_live_body
+EOF
+done
+if printf '%s\n' "$activation_live_body" | /usr/bin/grep -Eq \
+  'activateAllWindows|activateIgnoringOtherApps|NSWorkspace|runningApplicationsWithBundleIdentifier'; then
+  echo 'exact application activation uses a broader target or activation option' >&2
+  exit 1
+fi
+active_boundary_body="$(/usr/bin/sed -n \
+  '/^func requireVerifiedApplicationActive(/,/^}/p' \
+  "$HERE/14-native-gui-probe.swift")"
+for required_active_boundary in exactRunningApplication running.isActive \
+  kAXFrontmostAttribute 'try requireSameProcess(process)'; do
+  /usr/bin/grep -Fq "$required_active_boundary" <<EOF
+$active_boundary_body
+EOF
+done
+activation_line="$(printf '%s\n' "$execute_body" | \
+  /usr/bin/grep -nF 'let activationReadiness = try activateVerifiedApplication(' | \
+  /usr/bin/awk -F: '{print $1}')"
+menu_press_line="$(printf '%s\n' "$execute_body" | \
+  /usr/bin/grep -nF 'let menuReadiness = try pressOpenFolderMenuItem(' | \
+  /usr/bin/awk -F: '{print $1}')"
+test "$activation_line" -lt "$menu_press_line"
+focus_snapshot_body="$(/usr/bin/sed -n \
+  '/^func readOpenPanelFocusSnapshot(/,/^}/p' \
+  "$HERE/14-native-gui-probe.swift")"
+test "$(printf '%s\n' "$focus_snapshot_body" | \
+  /usr/bin/grep -Fc 'try requireExactOpenPanelCurrent(')" -eq 2
 command_focus_line="$(printf '%s\n' "$execute_body" | \
   /usr/bin/grep -nF 'let focusReadiness = try focusOpenPanel(' | \
   /usr/bin/awk -F: '{print $1}')"
@@ -361,6 +400,7 @@ expected_sensitive_symbols='_AXIsProcessTrusted
 _AXUIElementCopyActionNames
 _AXUIElementCopyAttributeValue
 _AXUIElementCreateApplication
+_AXUIElementGetPid
 _AXUIElementGetTypeID
 _AXUIElementIsAttributeSettable
 _AXUIElementPerformAction

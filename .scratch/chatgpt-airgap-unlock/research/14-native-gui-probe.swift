@@ -78,6 +78,11 @@ struct ProcessRegistrationReadiness: Equatable {
     let pollCount: Int
 }
 
+struct ApplicationActivationReadiness: Equatable {
+    let pollCount: Int
+    let actionCount: Int
+}
+
 struct ProcessVerification: Equatable {
     let identity: ProcessIdentity
     let registrationPollCount: Int
@@ -612,10 +617,9 @@ func verifyProcessRegistration(
         "AppKit process registration did not become ready after \(pollCount) polls")
 }
 
-func appKitRegistrationSample(pid: pid_t) throws -> AppKitRegistrationSample {
-    guard let running = NSRunningApplication(processIdentifier: pid) else {
-        return .unavailable
-    }
+func appKitRegistrationSample(
+    running: NSRunningApplication
+) throws -> AppKitRegistrationSample {
     let bundlePath = try running.bundleURL.map {
         try PathPolicy.canonicalExisting($0.path)
     }
@@ -624,6 +628,13 @@ func appKitRegistrationSample(pid: pid_t) throws -> AppKitRegistrationSample {
     }
     return .published(isTerminated: running.isTerminated,
                       bundlePath: bundlePath, executablePath: executablePath)
+}
+
+func appKitRegistrationSample(pid: pid_t) throws -> AppKitRegistrationSample {
+    guard let running = NSRunningApplication(processIdentifier: pid) else {
+        return .unavailable
+    }
+    return try appKitRegistrationSample(running: running)
 }
 
 func validateCodeIdentity(pid: pid_t, paths: ValidatedPaths) throws {
@@ -681,6 +692,119 @@ func verifyProcess(options: Options, paths: ValidatedPaths) throws -> ProcessVer
     return ProcessVerification(identity: before, registrationPollCount: readiness.pollCount)
 }
 // END_PROCESS_REGISTRATION_VALIDATION
+
+// BEGIN_PID_EXACT_APP_ACTIVATION
+func activateExactApplication(
+    timeoutNanoseconds: UInt64,
+    pollMicroseconds: useconds_t,
+    nowNanoseconds: () throws -> UInt64,
+    validateIdentity: () throws -> Void,
+    readReady: () throws -> Bool,
+    requestActivation: () throws -> Bool,
+    pause: (useconds_t) -> Void
+) throws -> ApplicationActivationReadiness {
+    precondition(timeoutNanoseconds > 0 && pollMicroseconds > 0)
+    let started = try nowNanoseconds()
+    let addition = started.addingReportingOverflow(timeoutNanoseconds)
+    let deadline = addition.overflow ? UInt64.max : addition.partialValue
+    var pollCount = 0
+    var actionCount = 0
+    while try nowNanoseconds() < deadline {
+        try validateIdentity()
+        let ready = try readReady()
+        pollCount += 1
+        try validateIdentity()
+        if ready {
+            return ApplicationActivationReadiness(
+                pollCount: pollCount, actionCount: actionCount)
+        }
+        if actionCount == 0 {
+            try validateIdentity()
+            guard try requestActivation() else {
+                throw ProbeError.unavailable(
+                    "exact application activation request was rejected")
+            }
+            try validateIdentity()
+            actionCount = 1
+            continue
+        }
+        let current = try nowNanoseconds()
+        guard current < deadline else { break }
+        let remainingMicroseconds = (deadline - current + 999) / 1_000
+        pause(useconds_t(min(UInt64(pollMicroseconds), remainingMicroseconds)))
+    }
+    throw ProbeError.unavailable(
+        "exact application activation did not become ready after \(pollCount) polls")
+}
+
+func exactRunningApplication(
+    process: ProcessIdentity,
+    paths: ValidatedPaths
+) throws -> NSRunningApplication {
+    try requireSameProcess(process)
+    guard let running = NSRunningApplication(processIdentifier: process.pid) else {
+        throw ProbeError.unavailable("exact application is absent from AppKit")
+    }
+    let sample = try appKitRegistrationSample(running: running)
+    guard try registrationIsReady(
+        sample, expectedBundle: paths.bundle,
+        expectedExecutable: paths.executable) else {
+        throw ProbeError.unavailable(
+            "exact application registration became incomplete")
+    }
+    try requireSameProcess(process)
+    return running
+}
+
+func activateVerifiedApplication(
+    application: AXUIElement,
+    process: ProcessIdentity,
+    paths: ValidatedPaths
+) throws -> ApplicationActivationReadiness {
+    try activateExactApplication(
+        timeoutNanoseconds: 2_000_000_000,
+        pollMicroseconds: 100_000,
+        nowNanoseconds: monotonicNanoseconds,
+        validateIdentity: { try requireSameProcess(process) },
+        readReady: {
+            let running = try exactRunningApplication(
+                process: process, paths: paths)
+            let isActive = running.isActive
+            let isFrontmost = try strictBoolAttribute(
+                application, kAXFrontmostAttribute as CFString,
+                purpose: "application frontmost state during activation")
+            try requireSameProcess(process)
+            return isActive && isFrontmost
+        },
+        requestActivation: {
+            let running = try exactRunningApplication(
+                process: process, paths: paths)
+            try requireSameProcess(process)
+            let accepted = running.activate(options: [])
+            try requireSameProcess(process)
+            return accepted
+        },
+        pause: { _ = usleep($0) })
+}
+
+func requireVerifiedApplicationActive(
+    application: AXUIElement,
+    process: ProcessIdentity,
+    paths: ValidatedPaths
+) throws {
+    let running = try exactRunningApplication(
+        process: process, paths: paths)
+    let isActive = running.isActive
+    let isFrontmost = try strictBoolAttribute(
+        application, kAXFrontmostAttribute as CFString,
+        purpose: "application frontmost state at menu press")
+    try requireSameProcess(process)
+    guard isActive && isFrontmost else {
+        throw ProbeError.validation(
+            "exact application lost active or frontmost state before menu press")
+    }
+}
+// END_PID_EXACT_APP_ACTIVATION
 
 func attribute(_ element: AXUIElement, _ name: CFString) -> CFTypeRef? {
     var value: CFTypeRef?
@@ -998,10 +1122,11 @@ func sameAXElement(_ left: AXUIElement, _ right: AXUIElement) -> Bool {
 struct OpenPanelFocusSnapshot: Equatable {
     let applicationFrontmost: Bool
     let focusedWindowMatchesPanel: Bool
-    let panelFocused: Bool
+    let focusedUIBelongsToPanel: Bool
 
     var ready: Bool {
-        applicationFrontmost && focusedWindowMatchesPanel && panelFocused
+        applicationFrontmost && focusedWindowMatchesPanel &&
+            focusedUIBelongsToPanel
     }
 }
 
@@ -1113,15 +1238,38 @@ func readOpenPanelFocusSnapshot(
     let focusedWindow = try strictElementAttribute(
         application, kAXFocusedWindowAttribute as CFString,
         purpose: "application focused window")
+    let focusedUI = try strictElementAttribute(
+        application, kAXFocusedUIElementAttribute as CFString,
+        purpose: "application focused UI element")
+    var focusedPid: pid_t = 0
+    guard AXUIElementGetPid(focusedUI, &focusedPid) == .success,
+          focusedPid == process.pid else {
+        throw ProbeError.validation(
+            "application focused UI element does not belong to the exact PID")
+    }
+    let focusedUIBelongsToPanel: Bool
+    if sameAXElement(focusedUI, panel) {
+        focusedUIBelongsToPanel = true
+    } else {
+        let topLevel = try strictElementAttribute(
+            focusedUI, kAXTopLevelUIElementAttribute as CFString,
+            purpose: "focused UI top-level element")
+        var topLevelPid: pid_t = 0
+        guard AXUIElementGetPid(topLevel, &topLevelPid) == .success,
+              topLevelPid == process.pid else {
+            throw ProbeError.validation(
+                "focused UI top-level element does not belong to the exact PID")
+        }
+        focusedUIBelongsToPanel = sameAXElement(topLevel, panel)
+    }
     let snapshot = OpenPanelFocusSnapshot(
         applicationFrontmost: try strictBoolAttribute(
             application, kAXFrontmostAttribute as CFString,
             purpose: "application frontmost state"),
         focusedWindowMatchesPanel: sameAXElement(focusedWindow, panel),
-        panelFocused: try strictBoolAttribute(
-            panel, kAXFocusedAttribute as CFString,
-            purpose: "Open panel focused state"))
-    try requireSameProcess(process)
+        focusedUIBelongsToPanel: focusedUIBelongsToPanel)
+    try requireExactOpenPanelCurrent(
+        application: application, panel: panel, process: process)
     return snapshot
 }
 
@@ -1156,7 +1304,7 @@ func waitForOpenPanelFocus(
     var pollCount = 0
     var last = OpenPanelFocusSnapshot(
         applicationFrontmost: false, focusedWindowMatchesPanel: false,
-        panelFocused: false)
+        focusedUIBelongsToPanel: false)
     while try nowNanoseconds() < deadline {
         try validateIdentity()
         last = try readSnapshot()
@@ -1174,7 +1322,7 @@ func waitForOpenPanelFocus(
         "Open panel focus did not become ready after \(pollCount) polls; " +
         "last state: frontmost=\(last.applicationFrontmost) " +
         "focused-window-matches=\(last.focusedWindowMatchesPanel) " +
-        "panel-focused=\(last.panelFocused)")
+        "focused-ui-in-panel=\(last.focusedUIBelongsToPanel)")
 }
 
 func performOpenPanelFocusActions(
@@ -1183,12 +1331,9 @@ func performOpenPanelFocusActions(
     preflightFrontmost: () throws -> Void,
     preflightRaise: () throws -> Void,
     preflightFocusedWindow: () throws -> Bool,
-    preflightPanelFocus: () throws -> Bool,
     setFrontmost: () throws -> Void,
     raisePanel: () throws -> Void,
-    setFocusedWindow: () throws -> Void,
-    readPanelFocused: () throws -> Bool,
-    setPanelFocus: () throws -> Void
+    setFocusedWindow: () throws -> Void
 ) throws -> Int {
     if initial.ready { return 0 }
 
@@ -1197,16 +1342,14 @@ func performOpenPanelFocusActions(
     try preflightRaise()
     let canSetFocusedWindow = !initial.focusedWindowMatchesPanel ?
         try preflightFocusedWindow() : false
-    let canSetPanelFocus = (!initial.panelFocused ||
-                            !initial.focusedWindowMatchesPanel) ?
-        try preflightPanelFocus() : false
-    if !initial.focusedWindowMatchesPanel &&
-        !canSetFocusedWindow && !canSetPanelFocus {
-        throw ProbeError.validation("no exact Open panel focus selector is writable")
+    if !initial.focusedWindowMatchesPanel && !canSetFocusedWindow {
+        throw ProbeError.validation(
+            "application focused window is not writable")
     }
     if initial.focusedWindowMatchesPanel &&
-        !initial.panelFocused && !canSetPanelFocus {
-        throw ProbeError.validation("Open panel focused state is not writable")
+        !initial.focusedUIBelongsToPanel {
+        throw ProbeError.validation(
+            "focused UI element does not belong to the exact Open panel")
     }
     try validateTarget()
 
@@ -1226,24 +1369,6 @@ func performOpenPanelFocusActions(
         try setFocusedWindow()
         try validateTarget()
         actionCount += 1
-    }
-    if !initial.panelFocused ||
-        (!initial.focusedWindowMatchesPanel && !canSetFocusedWindow) {
-        try validateTarget()
-        let panelFocused = try readPanelFocused()
-        try validateTarget()
-        let shouldSetPanelFocus = !panelFocused ||
-            (!initial.focusedWindowMatchesPanel && !canSetFocusedWindow)
-        if shouldSetPanelFocus {
-            guard canSetPanelFocus else {
-                throw ProbeError.validation(
-                    "Open panel remains unfocused and its focused state is not writable")
-            }
-            try validateTarget()
-            try setPanelFocus()
-            try validateTarget()
-            actionCount += 1
-        }
     }
     return actionCount
 }
@@ -1276,11 +1401,6 @@ func focusOpenPanel(
                 application, kAXFocusedWindowAttribute as CFString,
                 purpose: "application focused window")
         },
-        preflightPanelFocus: {
-            try strictAttributeSettable(
-                panel, kAXFocusedAttribute as CFString,
-                purpose: "Open panel focused state")
-        },
         setFrontmost: {
             guard AXUIElementSetAttributeValue(
                 application, kAXFrontmostAttribute as CFString,
@@ -1299,18 +1419,6 @@ func focusOpenPanel(
                 application, kAXFocusedWindowAttribute as CFString,
                 panel) == .success else {
                 throw ProbeError.unavailable("setting exact application focused window failed")
-            }
-        },
-        readPanelFocused: {
-            try strictBoolAttribute(
-                panel, kAXFocusedAttribute as CFString,
-                purpose: "Open panel focused state after focused-window write")
-        },
-        setPanelFocus: {
-            guard AXUIElementSetAttributeValue(
-                panel, kAXFocusedAttribute as CFString,
-                kCFBooleanTrue) == .success else {
-                throw ProbeError.unavailable("setting exact Open panel focused state failed")
             }
         })
 
@@ -1475,9 +1583,22 @@ func waitForValidatedOpenFolderMenu(
 }
 // END_READ_ONLY_OPEN_FOLDER_MENU_WAIT
 
+func performValidatedMenuPress(
+    validateIdentity: () throws -> Void,
+    validateActive: () throws -> Void,
+    performPress: () throws -> Void
+) throws {
+    try validateIdentity()
+    try validateActive()
+    try validateIdentity()
+    try performPress()
+    try validateIdentity()
+}
+
 func pressOpenFolderMenuItem(
     application: AXUIElement,
-    process: ProcessIdentity
+    process: ProcessIdentity,
+    validateActive: () throws -> Void
 ) throws -> OpenFolderMenuReadiness<AXUIElement> {
     let readiness = try waitForValidatedOpenFolderMenu(
         application: application, process: process)
@@ -1489,12 +1610,17 @@ func pressOpenFolderMenuItem(
           sameAXElement(menuItem, readiness.item) else {
         throw ProbeError.validation("Open Folder menu topology changed before AXPress")
     }
-    try requireSameProcess(process)
-    let pressStatus = AXUIElementPerformAction(menuItem, kAXPressAction as CFString)
-    guard pressStatus == .success else {
-        throw ProbeError.unavailable("AXPress failed for Open Folder menu item")
-    }
-    try requireSameProcess(process)
+    try performValidatedMenuPress(
+        validateIdentity: { try requireSameProcess(process) },
+        validateActive: validateActive,
+        performPress: {
+            let pressStatus = AXUIElementPerformAction(
+                menuItem, kAXPressAction as CFString)
+            guard pressStatus == .success else {
+                throw ProbeError.unavailable(
+                    "AXPress failed for Open Folder menu item")
+            }
+        })
     return readiness
 }
 // END_PID_OPEN_FOLDER_MENU_PRESS
@@ -2148,8 +2274,19 @@ func execute(options: Options, paths: ValidatedPaths, log: EventLog) throws {
     }
     // BEGIN_PID_OPEN_FOLDER_REQUEST
     if options.pressOpenFolderMenuItem {
+        let activationReadiness = try activateVerifiedApplication(
+            application: application, process: identity, paths: paths)
+        try log.write("application-activation-validated", [
+            "pid": Int(identity.pid),
+            "actionCount": activationReadiness.actionCount,
+            "pollCount": activationReadiness.pollCount,
+        ])
         let menuReadiness = try pressOpenFolderMenuItem(
-            application: application, process: identity)
+            application: application, process: identity,
+            validateActive: {
+                try requireVerifiedApplicationActive(
+                    application: application, process: identity, paths: paths)
+            })
         let menuPlan = menuReadiness.plan
         var menuFields: [String: Any] = [
             "pid": Int(identity.pid),
@@ -2450,6 +2587,61 @@ func runSelfTests() throws {
     }
     try require(rejected && registrationTimeoutReads == 3,
                 "AppKit registration timeout used the wrong poll bound")
+
+    var activationNow: UInt64 = 0
+    var activationTrace: [String] = []
+    var activationStates = [false, false, true]
+    let activationReadiness = try activateExactApplication(
+        timeoutNanoseconds: 1_000_000_000, pollMicroseconds: 100,
+        nowNanoseconds: { activationNow },
+        validateIdentity: { activationTrace.append("identity") },
+        readReady: {
+            activationTrace.append("ready")
+            return activationStates.removeFirst()
+        },
+        requestActivation: {
+            activationTrace.append("activate")
+            return true
+        },
+        pause: {
+            activationTrace.append("pause")
+            activationNow += UInt64($0) * 1_000
+        })
+    try require(activationReadiness.actionCount == 1 &&
+                    activationReadiness.pollCount == 3 &&
+                    activationTrace.filter({ $0 == "activate" }).count == 1,
+                "exact application activation was not single-shot and bounded")
+    activationNow = 0
+    activationTrace = []
+    let alreadyActiveReadiness = try activateExactApplication(
+        timeoutNanoseconds: 1_000_000_000, pollMicroseconds: 100,
+        nowNanoseconds: { activationNow },
+        validateIdentity: { activationTrace.append("identity") },
+        readReady: { activationTrace.append("ready"); return true },
+        requestActivation: { activationTrace.append("activate"); return true },
+        pause: { _ in activationTrace.append("pause") })
+    try require(alreadyActiveReadiness.actionCount == 0 &&
+                    alreadyActiveReadiness.pollCount == 1 &&
+                    !activationTrace.contains("activate") &&
+                    !activationTrace.contains("pause"),
+                "already-active exact application requested activation")
+    activationNow = 0
+    activationTrace = []
+    rejected = false
+    do {
+        _ = try activateExactApplication(
+            timeoutNanoseconds: 1_000_000_000, pollMicroseconds: 100,
+            nowNanoseconds: { activationNow },
+            validateIdentity: { activationTrace.append("identity") },
+            readReady: { activationTrace.append("ready"); return false },
+            requestActivation: { activationTrace.append("activate"); return false },
+            pause: { _ in activationTrace.append("pause") })
+    } catch ProbeError.unavailable(let message) {
+        rejected = message == "exact application activation request was rejected"
+    }
+    try require(rejected && activationTrace.filter({ $0 == "activate" }).count == 1 &&
+                    !activationTrace.contains("pause"),
+                "rejected exact activation request retried or paused")
 
     func requireRegistrationIdentityDrift(
         identities: [ProcessIdentity],
@@ -3421,10 +3613,10 @@ func runSelfTests() throws {
 
     let focusReady = OpenPanelFocusSnapshot(
         applicationFrontmost: true, focusedWindowMatchesPanel: true,
-        panelFocused: true)
+        focusedUIBelongsToPanel: true)
     let focusPending = OpenPanelFocusSnapshot(
         applicationFrontmost: true, focusedWindowMatchesPanel: false,
-        panelFocused: false)
+        focusedUIBelongsToPanel: false)
     var focusActionTrace: [String] = []
     let readyActionCount = try performOpenPanelFocusActions(
         initial: focusReady,
@@ -3435,24 +3627,15 @@ func runSelfTests() throws {
             focusActionTrace.append("preflight-focused-window")
             return true
         },
-        preflightPanelFocus: {
-            focusActionTrace.append("preflight-panel-focus")
-            return true
-        },
         setFrontmost: { focusActionTrace.append("frontmost") },
         raisePanel: { focusActionTrace.append("raise") },
-        setFocusedWindow: { focusActionTrace.append("focused-window") },
-        readPanelFocused: {
-            focusActionTrace.append("panel-focus-read")
-            return true
-        },
-        setPanelFocus: { focusActionTrace.append("panel-focus") })
+        setFocusedWindow: { focusActionTrace.append("focused-window") })
     try require(readyActionCount == 0 && focusActionTrace.isEmpty,
                 "already-focused Open panel performed an action")
     focusActionTrace = []
     let unfocused = OpenPanelFocusSnapshot(
         applicationFrontmost: false, focusedWindowMatchesPanel: false,
-        panelFocused: false)
+        focusedUIBelongsToPanel: false)
     let focusActionCount = try performOpenPanelFocusActions(
         initial: unfocused,
         validateTarget: { focusActionTrace.append("target") },
@@ -3462,52 +3645,15 @@ func runSelfTests() throws {
             focusActionTrace.append("preflight-focused-window")
             return true
         },
-        preflightPanelFocus: {
-            focusActionTrace.append("preflight-panel-focus")
-            return true
-        },
         setFrontmost: { focusActionTrace.append("frontmost") },
         raisePanel: { focusActionTrace.append("raise") },
-        setFocusedWindow: { focusActionTrace.append("focused-window") },
-        readPanelFocused: {
-            focusActionTrace.append("panel-focus-read")
-            return false
-        },
-        setPanelFocus: { focusActionTrace.append("panel-focus") })
-    try require(focusActionCount == 4 && focusActionTrace == [
+        setFocusedWindow: { focusActionTrace.append("focused-window") })
+    try require(focusActionCount == 3 && focusActionTrace == [
         "target", "preflight-frontmost", "preflight-raise",
-        "preflight-focused-window", "preflight-panel-focus", "target",
+        "preflight-focused-window", "target",
         "target", "frontmost", "target", "target", "raise", "target",
         "target", "focused-window", "target",
-        "target", "panel-focus-read", "target", "target", "panel-focus", "target",
     ], "Open panel focus actions violated preflight, order, or PID bracketing")
-    focusActionTrace = []
-    let pendingActionCount = try performOpenPanelFocusActions(
-        initial: focusPending,
-        validateTarget: { focusActionTrace.append("target") },
-        preflightFrontmost: { focusActionTrace.append("preflight-frontmost") },
-        preflightRaise: { focusActionTrace.append("preflight-raise") },
-        preflightFocusedWindow: {
-            focusActionTrace.append("preflight-focused-window")
-            return false
-        },
-        preflightPanelFocus: {
-            focusActionTrace.append("preflight-panel-focus")
-            return true
-        },
-        setFrontmost: { focusActionTrace.append("frontmost") },
-        raisePanel: { focusActionTrace.append("raise") },
-        setFocusedWindow: { focusActionTrace.append("focused-window") },
-        readPanelFocused: {
-            focusActionTrace.append("panel-focus-read")
-            return false
-        },
-        setPanelFocus: { focusActionTrace.append("panel-focus") })
-    try require(pendingActionCount == 2 && focusActionTrace == [
-        "target", "preflight-raise", "preflight-focused-window",
-        "preflight-panel-focus", "target", "target", "raise", "target",
-        "target", "panel-focus-read", "target", "target", "panel-focus", "target",
-    ], "read-only focused-window fallback skipped exact panel focus")
     focusActionTrace = []
     rejected = false
     do {
@@ -3520,32 +3666,22 @@ func runSelfTests() throws {
                 focusActionTrace.append("preflight-focused-window")
                 return false
             },
-            preflightPanelFocus: {
-                focusActionTrace.append("preflight-panel-focus")
-                return false
-            },
             setFrontmost: { focusActionTrace.append("frontmost") },
             raisePanel: { focusActionTrace.append("raise") },
-            setFocusedWindow: { focusActionTrace.append("focused-window") },
-            readPanelFocused: {
-                focusActionTrace.append("panel-focus-read")
-                return false
-            },
-            setPanelFocus: { focusActionTrace.append("panel-focus") })
+            setFocusedWindow: { focusActionTrace.append("focused-window") })
     } catch ProbeError.validation(let message) {
-        rejected = message == "no exact Open panel focus selector is writable"
+        rejected = message == "application focused window is not writable"
     }
     try require(rejected && !focusActionTrace.contains("raise") &&
-                    !focusActionTrace.contains("focused-window") &&
-                    !focusActionTrace.contains("panel-focus"),
-                "read-only exact focus selectors allowed a partial mutation")
+                    !focusActionTrace.contains("focused-window"),
+                "read-only exact focused-window selector allowed a partial mutation")
     for initiallyFrontmost in [true, false] {
         focusActionTrace = []
         rejected = false
         let matchedWindowUnfocusedPanel = OpenPanelFocusSnapshot(
             applicationFrontmost: initiallyFrontmost,
             focusedWindowMatchesPanel: true,
-            panelFocused: false)
+            focusedUIBelongsToPanel: false)
         do {
             _ = try performOpenPanelFocusActions(
                 initial: matchedWindowUnfocusedPanel,
@@ -3556,26 +3692,15 @@ func runSelfTests() throws {
                     focusActionTrace.append("preflight-focused-window")
                     return true
                 },
-                preflightPanelFocus: {
-                    focusActionTrace.append("preflight-panel-focus")
-                    return false
-                },
                 setFrontmost: { focusActionTrace.append("frontmost") },
                 raisePanel: { focusActionTrace.append("raise") },
-                setFocusedWindow: { focusActionTrace.append("focused-window") },
-                readPanelFocused: {
-                    focusActionTrace.append("panel-focus-read")
-                    return false
-                },
-                setPanelFocus: { focusActionTrace.append("panel-focus") })
+                setFocusedWindow: { focusActionTrace.append("focused-window") })
         } catch ProbeError.validation { rejected = true }
         try require(rejected &&
                         !focusActionTrace.contains("frontmost") &&
                         !focusActionTrace.contains("raise") &&
-                        !focusActionTrace.contains("focused-window") &&
-                        !focusActionTrace.contains("panel-focus-read") &&
-                        !focusActionTrace.contains("panel-focus"),
-                    "read-only panel focus allowed a partial mutation for matched window")
+                        !focusActionTrace.contains("focused-window"),
+                    "foreign focused UI allowed a partial mutation for matched window")
     }
     focusActionTrace = []
     rejected = false
@@ -3592,55 +3717,14 @@ func runSelfTests() throws {
                 focusActionTrace.append("preflight-focused-window")
                 return true
             },
-            preflightPanelFocus: {
-                focusActionTrace.append("preflight-panel-focus")
-                return true
-            },
             setFrontmost: { focusActionTrace.append("frontmost") },
             raisePanel: { focusActionTrace.append("raise") },
-            setFocusedWindow: { focusActionTrace.append("focused-window") },
-            readPanelFocused: {
-                focusActionTrace.append("panel-focus-read")
-                return false
-            },
-            setPanelFocus: { focusActionTrace.append("panel-focus") })
+            setFocusedWindow: { focusActionTrace.append("focused-window") })
     } catch ProbeError.validation { rejected = true }
     try require(rejected && !focusActionTrace.contains("frontmost") &&
                     !focusActionTrace.contains("raise") &&
-                    !focusActionTrace.contains("focused-window") &&
-                    !focusActionTrace.contains("panel-focus"),
+                    !focusActionTrace.contains("focused-window"),
                 "failed focus preflight allowed a partial mutation")
-    focusActionTrace = []
-    rejected = false
-    do {
-        _ = try performOpenPanelFocusActions(
-            initial: unfocused,
-            validateTarget: { focusActionTrace.append("target") },
-            preflightFrontmost: { focusActionTrace.append("preflight-frontmost") },
-            preflightRaise: { focusActionTrace.append("preflight-raise") },
-            preflightFocusedWindow: {
-                focusActionTrace.append("preflight-focused-window")
-                return true
-            },
-            preflightPanelFocus: {
-                focusActionTrace.append("preflight-panel-focus")
-                throw ProbeError.validation("test read-only panel focus")
-            },
-            setFrontmost: { focusActionTrace.append("frontmost") },
-            raisePanel: { focusActionTrace.append("raise") },
-            setFocusedWindow: { focusActionTrace.append("focused-window") },
-            readPanelFocused: {
-                focusActionTrace.append("panel-focus-read")
-                return false
-            },
-            setPanelFocus: { focusActionTrace.append("panel-focus") })
-    } catch ProbeError.validation { rejected = true }
-    try require(rejected && !focusActionTrace.contains("frontmost") &&
-                    !focusActionTrace.contains("raise") &&
-                    !focusActionTrace.contains("focused-window") &&
-                    focusActionTrace.contains("preflight-panel-focus") &&
-                    !focusActionTrace.contains("panel-focus"),
-                "panel-focus capability failure allowed a partial mutation")
     focusActionTrace = []
     rejected = false
     do {
@@ -3653,26 +3737,37 @@ func runSelfTests() throws {
                 focusActionTrace.append("preflight-focused-window")
                 return true
             },
-            preflightPanelFocus: {
-                focusActionTrace.append("preflight-panel-focus")
-                return true
-            },
             setFrontmost: { focusActionTrace.append("frontmost") },
             raisePanel: { focusActionTrace.append("raise") },
             setFocusedWindow: {
                 focusActionTrace.append("focused-window")
                 throw ProbeError.unavailable("test focused-window write failure")
-            },
-            readPanelFocused: {
-                focusActionTrace.append("panel-focus-read")
-                return false
-            },
-            setPanelFocus: { focusActionTrace.append("panel-focus") })
+            })
     } catch ProbeError.unavailable { rejected = true }
-    try require(rejected && focusActionTrace.contains("focused-window") &&
-                    !focusActionTrace.contains("panel-focus-read") &&
-                    !focusActionTrace.contains("panel-focus"),
-                "focused-window write failure allowed panel-focus fallback")
+    try require(rejected && focusActionTrace.contains("focused-window"),
+                "focused-window write failure was not propagated")
+
+    var menuPressTrace: [String] = []
+    try performValidatedMenuPress(
+        validateIdentity: { menuPressTrace.append("identity") },
+        validateActive: { menuPressTrace.append("active") },
+        performPress: { menuPressTrace.append("press") })
+    try require(menuPressTrace == [
+        "identity", "active", "identity", "press", "identity",
+    ], "menu press escaped its exact active-state boundary")
+    menuPressTrace = []
+    rejected = false
+    do {
+        try performValidatedMenuPress(
+            validateIdentity: { menuPressTrace.append("identity") },
+            validateActive: {
+                menuPressTrace.append("active")
+                throw ProbeError.validation("test activation drift")
+            },
+            performPress: { menuPressTrace.append("press") })
+    } catch ProbeError.validation { rejected = true }
+    try require(rejected && menuPressTrace == ["identity", "active"],
+                "activation drift allowed the menu press")
 
     var keyboardTrace: [String] = []
     try performValidatedKeyboardPost(
@@ -3729,7 +3824,8 @@ func runSelfTests() throws {
     } catch ProbeError.unavailable(let message) {
         rejected = message ==
             "Open panel focus did not become ready after 3 polls; " +
-            "last state: frontmost=true focused-window-matches=false panel-focused=false"
+            "last state: frontmost=true focused-window-matches=false " +
+            "focused-ui-in-panel=false"
     }
     try require(rejected && focusTimeoutReads == 3,
                 "Open panel focus timeout used the wrong monotonic poll bound")

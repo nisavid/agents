@@ -1094,9 +1094,6 @@ func readOpenPanelFocusSnapshot(
     let focusedWindow = try strictElementAttribute(
         application, kAXFocusedWindowAttribute as CFString,
         purpose: "application focused window")
-    guard windows.filter({ sameAXElement($0, focusedWindow) }).count == 1 else {
-        throw ProbeError.validation("application focused window is not a current exact-PID window")
-    }
     let snapshot = OpenPanelFocusSnapshot(
         applicationFrontmost: try strictBoolAttribute(
             application, kAXFrontmostAttribute as CFString,

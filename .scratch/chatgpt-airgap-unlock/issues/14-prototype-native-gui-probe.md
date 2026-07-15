@@ -171,6 +171,16 @@ exact application's `AXFrontmost` attribute and performing `AXRaise` on the
 exact panel, after both capabilities are preflighted and with process identity
 checks around each action. It then recaptures the path-entry baseline and checks
 focus inside the final keyboard-post boundary. Two reproducible builds matched
-SHA-256 `40d7b6426a41b5f860a88a869f9a60137de61f1ca484cd05790ac80b64b2ee0c`;
+SHA-256 `b797cca31ba50627b4bb7d17d870d67778e055fff5431094568a25bc9c00e085`;
 the canonical arm64 ad-hoc artifact has CDHash
-`8acdf587fae6521b42ae74d0af2e696f5e7f8389` and awaits a fresh manual grant.
+`c9f6321572d96e89e34d1cd919df5f3d6039df47` and awaits a fresh manual grant.
+
+The first focus-enabled run, suffix `XX7Egp`, reached the exact menu press and
+Open panel, then failed before focus mutation because the inactive exact app's
+strict focused-window reference was not in its current window enumeration. The
+helper never acts on that reference. It now retains the original panel's unique
+membership and strict typed focus reads while treating a different focused
+window as pending until the authorized exact-app frontmost and exact-panel raise
+actions establish equality. Cleanup closed every owned process and listener;
+the isolated database passed `quick_check` with zero threads, and source/copy
+ASAR hashes matched.

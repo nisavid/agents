@@ -176,8 +176,8 @@ Ivan; the helper never requests a prompt itself.
 
 Green for the source, build, input-policy, selector-policy, and runner-seam
 slice. The retained no-permission artifact for this revision is arm64 and ad-hoc signed,
-with SHA-256 `40d7b6426a41b5f860a88a869f9a60137de61f1ca484cd05790ac80b64b2ee0c`
-and CDHash `8acdf587fae6521b42ae74d0af2e696f5e7f8389`. A clean build in a second
+with SHA-256 `b797cca31ba50627b4bb7d17d870d67778e055fff5431094568a25bc9c00e085`
+and CDHash `c9f6321572d96e89e34d1cd919df5f3d6039df47`. A clean build in a second
 disposable directory produced the same SHA-256. The helper self-test, forbidden
 API and sensitive-symbol allowlists, path-policy fixtures, renderer transition
 oracle, authoritative project-state fixtures, runner shell syntax, and
@@ -204,6 +204,16 @@ PID drift, option and runner authorization, exact mutation ordering, forbidden
 API policy, and the sensitive-symbol allowlist, then passed the complete
 no-permission workflow. The canonical artifact above awaits a fresh manual
 Accessibility grant before the next live project-selection run.
+
+The first focus-enabled run, with suffix `XX7Egp`, reached the exact menu press
+and Open panel, then failed before any focus mutation because the inactive
+copied app's strict `AXFocusedWindow` value was not among its currently
+enumerated windows. That value is not used as an action target. The helper now
+keeps the original Open panel's unique membership requirement and strict focus
+typing but treats any other focused-window identity as pending until exact-app
+frontmost plus exact-panel raise establishes the required equality. The run
+cleaned up every owned listener and process, its isolated database passed
+`quick_check` with zero threads, and source/copy ASAR hashes matched.
 
 ## First live invocation
 

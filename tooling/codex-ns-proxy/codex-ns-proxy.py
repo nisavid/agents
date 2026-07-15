@@ -885,9 +885,9 @@ def _handler_for(config: ProxyConfig, namespace_state: _NamespaceState):
                 if config.debug:
                     _safe_log("SSE stream ended before upstream EOF")
             finally:
-                reader.close(wait_for_reader=not terminal_observed)
                 if config.debug:
                     _safe_log(f"SSE terminal_completed={str(terminal_observed).lower()}")
+                reader.close(wait_for_reader=not terminal_observed)
 
         def _copy_response_headers(self, response: http.client.HTTPResponse) -> None:
             response_headers = response.getheaders()

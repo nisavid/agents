@@ -536,14 +536,28 @@ class ProxyIntegrationTest(unittest.TestCase):
         FakeUpstreamHandler.hold_open = True
         FakeUpstreamHandler.observe_disconnect = True
         self.restart_gateway(
-            upstream_timeout_seconds=1,
+            upstream_timeout_seconds=5,
             sse_heartbeat_seconds=0.02,
             adapter="identity",
             debug=True,
         )
         result = []
         client_errors = []
-        stderr = io.StringIO()
+
+        class TerminalOrderingLog(io.StringIO):
+            upstream_disconnected_at_terminal = None
+
+            def write(log_self, value):
+                if (
+                    "SSE terminal_completed=true" in value
+                    and log_self.upstream_disconnected_at_terminal is None
+                ):
+                    log_self.upstream_disconnected_at_terminal = (
+                        FakeUpstreamHandler.upstream_disconnect_observed.is_set()
+                    )
+                return super().write(value)
+
+        stderr = TerminalOrderingLog()
 
         def consume():
             connection = socket.create_connection(
@@ -594,12 +608,18 @@ class ProxyIntegrationTest(unittest.TestCase):
         self.assertTrue(completed_before_release, evidence)
         self.assertTrue(disconnected_before_release, evidence)
         self.assertTrue(terminal_logged_before_release, evidence)
+        self.assertFalse(stderr.upstream_disconnected_at_terminal, evidence)
         self.assertFalse(client.is_alive())
         self.assertEqual(1, len(result))
         self.assertEqual([], client_errors)
         headers, raw = result[0].split(b"\r\n\r\n", 1)
         self.assertTrue(headers.startswith(b"HTTP/1.1 200"), headers)
         self.assertEqual(terminal, raw)
+        FakeUpstreamHandler.hold_open = False
+        FakeUpstreamHandler.response_headers = {"Content-Type": "application/json"}
+        FakeUpstreamHandler.response_body = b'{"object":"ok"}'
+        status, _, _ = self.request("GET", "/v1/models")
+        self.assertEqual(200, status)
 
     def test_sse_terminal_frame_materialized_at_eof_is_flushed_once(self):
         terminal = (

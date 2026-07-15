@@ -85,10 +85,12 @@ does not alter the relative order or bytes of upstream frames. Heartbeats keep
 the downstream transport active; they do not extend the configured upstream
 read timeout.
 
-A valid `response.completed` frame terminates the proxied SSE response after
-that frame is flushed; the gateway does not wait for the provider to close its
-stream. A terminal frame completed by upstream EOF is flushed with the same
-semantics.
+A valid `response.completed` frame marks semantic completion as soon as that
+frame is flushed. The gateway logs that state once and suppresses later
+heartbeats, while continuing to forward upstream frames unchanged. An exact
+`data: [DONE]` transport sentinel is forwarded and then ends the stream. If a
+provider omits the sentinel, EOF or the configured upstream read timeout ends
+the stream; the gateway never fabricates `[DONE]`.
 
 The configured `NS_PROXY_UPSTREAM` URL is the complete upstream allowlist. Its
 origin and base path are parsed once; fixed route suffixes are appended without

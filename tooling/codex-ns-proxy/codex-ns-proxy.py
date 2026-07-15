@@ -832,6 +832,8 @@ def _handler_for(config: ProxyConfig, namespace_state: _NamespaceState):
             self.send_header("Connection", "close")
             self.end_headers()
             terminal_observed = False
+            terminal_logged = False
+            transport_done_observed = False
             frame: list[bytes] = []
             reader = _SSELineReader(response, lifecycle)
             try:
@@ -849,30 +851,42 @@ def _handler_for(config: ProxyConfig, namespace_state: _NamespaceState):
                         break
                     if kind == "eof":
                         if frame:
+                            transport_done = _is_sse_done_frame(frame)
                             transformed_frame, is_terminal, response_ids = _transform_sse_frame(
                                 frame, reconstruction
                             )
                             for response_id in response_ids:
                                 namespace_state.remember(response_id, reconstruction)
-                            terminal_observed = terminal_observed or is_terminal
                             self.wfile.write(transformed_frame)
                             self.wfile.flush()
+                            if is_terminal:
+                                terminal_observed = True
+                                if config.debug and not terminal_logged:
+                                    _safe_log("SSE terminal_completed=true")
+                                    terminal_logged = True
+                            transport_done_observed = transport_done
                         break
                     line = value
                     if not isinstance(line, bytes):
                         break
                     frame.append(line)
                     if line in {b"\n", b"\r\n"}:
+                        transport_done = _is_sse_done_frame(frame)
                         transformed_frame, is_terminal, response_ids = _transform_sse_frame(
                             frame, reconstruction
                         )
                         for response_id in response_ids:
                             namespace_state.remember(response_id, reconstruction)
-                        terminal_observed = terminal_observed or is_terminal
                         self.wfile.write(transformed_frame)
                         self.wfile.flush()
-                        frame = []
                         if is_terminal:
+                            terminal_observed = True
+                            if config.debug and not terminal_logged:
+                                _safe_log("SSE terminal_completed=true")
+                                terminal_logged = True
+                        frame = []
+                        if transport_done:
+                            transport_done_observed = True
                             break
             except (
                 BrokenPipeError,
@@ -885,9 +899,9 @@ def _handler_for(config: ProxyConfig, namespace_state: _NamespaceState):
                 if config.debug:
                     _safe_log("SSE stream ended before upstream EOF")
             finally:
-                if config.debug:
+                if config.debug and not terminal_logged:
                     _safe_log(f"SSE terminal_completed={str(terminal_observed).lower()}")
-                reader.close(wait_for_reader=not terminal_observed)
+                reader.close(wait_for_reader=not transport_done_observed)
 
         def _copy_response_headers(self, response: http.client.HTTPResponse) -> None:
             response_headers = response.getheaders()
@@ -981,6 +995,24 @@ def _transform_sse_frame(
         if index not in data_indexes[1:]
     ]
     return b"".join(rebuilt), terminal, response_ids
+
+
+def _is_sse_done_frame(lines: list[bytes]) -> bool:
+    data_parts: list[bytes] = []
+    for line in lines:
+        content = (
+            line[:-2]
+            if line.endswith(b"\r\n")
+            else line[:-1]
+            if line.endswith(b"\n")
+            else line
+        )
+        if content.startswith(b"data:"):
+            payload = content[5:]
+            if payload.startswith(b" "):
+                payload = payload[1:]
+            data_parts.append(payload)
+    return data_parts == [b"[DONE]"]
 
 
 class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):

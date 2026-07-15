@@ -120,17 +120,21 @@ the scoped renderer run.
 ## Cold-restart continuation prototype design
 
 The renderer workflow now has an opt-in, two-phase cold-restart path. It has
-not been run yet and contributes no runtime evidence to the verdict above.
+not completed a cold restart and contributes no cold-restart runtime evidence
+to the verdict above.
 
 Phase one retains the validated renderer prompt, task, and surface assertions.
 After it completes, the runner reads the isolated Codex rollout and writes a
 mode-0600 state artifact binding the exact thread UUID and rollout path to
-SHA-256 digests of the first prompt, unique persisted assistant output, and
-unique normalized phase-one renderer text. The distinct source and rendered
-digests avoid conflating Markdown with its rendered form. The runner then stops
-only the copied app's process group, which includes its app-server, and requires
-both that process group and its CDP listener to disappear. The pinned OptiQ
-server, authenticated gateway, and observers remain alive.
+SHA-256 digests of the first prompt, exact completed turn, its
+`task_complete.last_agent_message`, and normalized phase-one renderer text.
+Repeated intermediate `agent_message` events may describe the same correct
+result, but only one `task_complete` for the prompt's exact turn can bind the
+persisted output. The distinct source and rendered digests avoid conflating
+Markdown with its rendered form. The runner then stops only the copied app's
+process group, which includes its app-server, and requires both that process
+group and its CDP listener to disappear. The pinned OptiQ server, authenticated
+gateway, and observers remain alive.
 
 Phase two relaunches the same copied bundle with the same isolated home, Codex
 home, Electron user-data directory, provider configuration, Seatbelt profile,
@@ -141,25 +145,26 @@ a different deterministic arithmetic prompt. Its assistant output must contain
 one or more standalone `63` tokens, every standalone integer must be one of
 `46`, `17`, or `63`, and the final standalone integer must be `63`.
 
-The runner finally requires that the second prompt and result were persisted
-exactly once in the original rollout with the original thread UUID, that the
-original persisted output digest is unchanged, and that phase two records one
-unique persisted-output digest plus one unique renderer-output digest. For the
-gateway route it records gateway and upstream terminal baselines immediately
-before the first renderer launch. It then requires at least one completion
-beyond baseline for phase one, at least one additional completion after the
-restart for phase two, and a total renderer delta of at least two. This keeps
-the two renderer transports distinct from pre-renderer namespace traffic. The
-new resume-state and assistant-oracle records retain only hashes, lengths, and
-semantic results; the gateway and upstream observers log neither credentials
-nor request bodies. Existing CDP snapshots continue to capture renderer text as
-the GUI evidence surface.
+The runner finally requires one matching second prompt and one
+`task_complete` for that exact turn in the original rollout with the original
+thread UUID, that the original completed-turn identity and final-output digest
+are unchanged, and that phase two records persisted and renderer-output
+digests. A duplicate completion or a final message containing any conflicting
+integer fails closed. For the gateway route it records gateway and upstream
+terminal baselines immediately before the first renderer launch. It then
+requires at least one completion beyond baseline for phase one, at least one
+additional completion after the restart for phase two, and a total renderer
+delta of at least two. This keeps the two renderer transports distinct from
+pre-renderer namespace traffic. The resume-state and assistant-oracle records
+retain only hashes, lengths, and semantic results; the gateway and upstream
+observers log neither credentials nor request bodies. Existing CDP snapshots
+continue to capture renderer text as the GUI evidence surface.
 
 The intended live command is:
 
 ```sh
 ROUTE_MODE=gateway \
-GATEWAY_COMMIT=8703dbe96841d591e77c1f274e22eb4b2aea9d64 \
+GATEWAY_COMMIT=a69e710dbe6a43e513a6f12c118b1abce81241ea \
 GUI_WORKFLOW=true \
 GUI_COLD_RESUME=true \
 PROBE_EXPECT=renderer-cold-resume \
@@ -267,7 +272,31 @@ loads the materialized gateway and asserts that it parses the upstream timeout
 as 300 seconds while retaining the 15-second default heartbeat.
 
 The failed run cleaned up all owned processes and listeners and left the copied
-app ASAR and bundled Codex binary unchanged. A later attempt passed phase one
-but ended before writing its resume-state or cold-stop artifacts. The next run's
-structured cold-handoff phases and top-level signal record will disambiguate
-that handoff without changing its cleanup behavior.
+app ASAR and bundled Codex binary unchanged.
+
+## Phase-one semantic success and handoff lifecycle correction
+
+Run-root suffix `syzpUh` used reviewed gateway commit
+`8703dbe96841d591e77c1f274e22eb4b2aea9d64`, blob
+`b5428c5f938ddf0c27fc3b8e8effe64006ca4382`, with the 300-second
+runner-selected upstream timeout. Phase one reached every required GUI surface
+and persisted one exact user prompt plus one matching `task_complete` whose
+`last_agent_message` was `73 + 19 = 92`.
+The rollout also contained two semantically correct intermediate
+`agent_message` events. This is phase-one semantic success.
+
+The run stopped before resume-state capture or the copied-app cold stop. Its
+structured handoff log ended with `terminal-delta-check` in `failed` state:
+the old gateway emitted its terminal record only during later cleanup. The
+gateway and upstream logs now contain three completed totals, but those
+post-cleanup totals are not the handoff counts captured by the runner and are
+not cold-restart evidence.
+
+The runner now pins reviewed gateway commit
+`a69e710dbe6a43e513a6f12c118b1abce81241ea`, blob
+`ae013796f62c760c7a9424c0c97d01ad155d6ed1`, whose terminal lifecycle fix is a
+descendant of `8703dbe96841d591e77c1f274e22eb4b2aea9d64`. No live GUI run has
+used this commit yet. The
+no-app completed-turn fixtures cover the `syzpUh` repeated-intermediate shape,
+a conflicting final, duplicate completion, continuation, and mutation of the
+original final across restart.

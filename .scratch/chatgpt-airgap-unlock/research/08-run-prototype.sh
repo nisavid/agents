@@ -21,6 +21,7 @@ GATEWAY_PROFILE="$HERE/08-gateway.sb"
 OBSERVER="$HERE/08-proxy-observer.py"
 CDP_OBSERVER="$HERE/08-cdp-observer.mjs"
 GUI_DRIVER="$HERE/12-cdp-gui-driver.mjs"
+COLD_RESUME_STATE="$HERE/12-cold-resume-state.py"
 HOST_PROBE="$HERE/08-appserver-probe.py"
 HOST_RESTART_PROBE="$HERE/08-appserver-restart-probe.py"
 PROCESS_GROUP="$HERE/08-process-group.py"
@@ -35,7 +36,7 @@ UPSTREAM_OBSERVER_PORT="${UPSTREAM_OBSERVER_PORT:-18997}"
 ROUTE_MODE="${ROUTE_MODE:-direct}"
 REPO_ROOT="$(/usr/bin/git -C "$HERE" rev-parse --show-toplevel)"
 GATEWAY_COMMIT="${GATEWAY_COMMIT:-}"
-GATEWAY_REVIEWED_COMMIT="8703dbe96841d591e77c1f274e22eb4b2aea9d64"
+GATEWAY_REVIEWED_COMMIT="a69e710dbe6a43e513a6f12c118b1abce81241ea"
 GATEWAY_FILE="tooling/codex-ns-proxy/codex-ns-proxy.py"
 GATEWAY_UPSTREAM_URL="http://127.0.0.1:$UPSTREAM_OBSERVER_PORT/v1"
 GATEWAY_UPSTREAM_TIMEOUT_SECONDS="300"
@@ -82,6 +83,7 @@ require_positive_terminal_delta() {
 }
 
 run_cold_handoff_self_test() (
+  /usr/bin/python3 "$COLD_RESUME_STATE" --self-test
   self_test_root="$(mktemp -d /private/tmp/chatgpt-cold-handoff-self-test.XXXXXX)"
   trap '/bin/rm -rf "$self_test_root"' EXIT INT TERM
   LOG_DIR="$self_test_root"
@@ -172,6 +174,7 @@ OBSERVER_EXEC="$RUN_ROOT/proxy-observer.py"
 CDP_OBSERVER_EXEC="$RUN_ROOT/cdp-observer.mjs"
 GUI_DRIVER_EXEC="$RUN_ROOT/gui-driver.mjs"
 NAMESPACE_PROBE_EXEC="$RUN_ROOT/namespace-probe.py"
+COLD_RESUME_STATE_EXEC="$RUN_ROOT/cold-resume-state.py"
 GUI_RESUME_STATE="$LOG_DIR/gui-resume-state.json"
 
 case "$ROUTE_MODE" in
@@ -234,7 +237,9 @@ chmod 700 "$HOME_DIR" "$CODEX_DIR" "$USER_DATA_DIR" "$TMP_DIR" "$LOG_DIR" "$WORK
 /bin/cp "$CDP_OBSERVER" "$CDP_OBSERVER_EXEC"
 /bin/cp "$GUI_DRIVER" "$GUI_DRIVER_EXEC"
 /bin/cp "$NAMESPACE_PROBE" "$NAMESPACE_PROBE_EXEC"
-chmod 500 "$UPSTREAM_OBSERVER_EXEC" "$OBSERVER_EXEC" "$CDP_OBSERVER_EXEC" "$GUI_DRIVER_EXEC" "$NAMESPACE_PROBE_EXEC"
+/bin/cp "$COLD_RESUME_STATE" "$COLD_RESUME_STATE_EXEC"
+chmod 500 "$UPSTREAM_OBSERVER_EXEC" "$OBSERVER_EXEC" "$CDP_OBSERVER_EXEC" \
+  "$GUI_DRIVER_EXEC" "$NAMESPACE_PROBE_EXEC" "$COLD_RESUME_STATE_EXEC"
 test -x "$APP_EXEC"
 test ! -L "$APP"
 /usr/bin/codesign --verify --deep --strict "$APP"
@@ -710,84 +715,8 @@ if test "$GUI_COLD_RESUME" = true && test "$cdp_exit" -eq 0; then
   fi
   record_cold_handoff_phase terminal-delta-check after
   record_cold_handoff_phase resume-state-python before
-  /usr/bin/python3 - "$CODEX_DIR" "$GUI_RESUME_STATE" "$LOG_DIR/cdp.jsonl" <<'PY'
-import json
-import hashlib
-import pathlib
-import re
-import sys
-
-codex_dir = pathlib.Path(sys.argv[1])
-state_path = pathlib.Path(sys.argv[2])
-cdp_path = pathlib.Path(sys.argv[3])
-first_prompt = "What is 73 plus 19? Your final answer must include the decimal result."
-def arithmetic_output_matches(message, operands, expected_result):
-    integers = [int(value) for value in re.findall(r"(?<![\w.])[+-]?\d+(?!\w|\.\d)", message)]
-    allowed = {*operands, expected_result}
-    return (
-        bool(integers)
-        and all(value in allowed for value in integers)
-        and integers[-1] == expected_result
-    )
-
-candidates = []
-for rollout in codex_dir.glob("sessions/*/*/*/rollout-*.jsonl"):
-    records = [json.loads(line) for line in rollout.read_text().splitlines() if line]
-    session_ids = [
-        record["payload"].get("id") or record["payload"].get("session_id")
-        for record in records
-        if record.get("type") == "session_meta"
-    ]
-    user_messages = [
-        item.get("text", "")
-        for record in records
-        if record.get("type") == "response_item"
-        and record.get("payload", {}).get("type") == "message"
-        and record["payload"].get("role") == "user"
-        for item in record["payload"].get("content", [])
-        if item.get("type") == "input_text"
-    ]
-    assistant_messages = [
-        record.get("payload", {}).get("message", "")
-        for record in records
-        if record.get("type") == "event_msg"
-        and record.get("payload", {}).get("type") == "agent_message"
-    ]
-    first_outputs = [
-        message for message in assistant_messages
-        if arithmetic_output_matches(message, (73, 19), 92)
-    ]
-    if len(session_ids) == 1 and sum(message.strip() == first_prompt for message in user_messages) == 1 and len(first_outputs) == 1:
-        candidates.append((session_ids[0], rollout, first_outputs[0]))
-if len(candidates) != 1:
-    raise SystemExit(f"expected one persisted renderer thread, found {len(candidates)}")
-thread_id, rollout, first_output = candidates[0]
-renderer_oracles = [
-    record for record in (json.loads(line) for line in cdp_path.read_text().splitlines() if line)
-    if record.get("kind") == "assistant-output-oracle"
-    and record.get("phase") == "first"
-    and record.get("matched") is True
-    and record.get("expectedOccurrenceCount", 0) >= 1
-    and record.get("conflictingIntegers") == []
-    and record.get("finalInteger") == 92
-    and isinstance(record.get("textSha256"), str)
-    and re.fullmatch(r"[0-9a-f]{64}", record["textSha256"])
-]
-if len(renderer_oracles) != 1:
-    raise SystemExit(f"expected one first-phase renderer output oracle, found {len(renderer_oracles)}")
-normalized_first_output = " ".join(first_output.split())
-state = {
-    "threadId": thread_id,
-    "rolloutPath": str(rollout),
-    "firstPromptSha256": hashlib.sha256(first_prompt.encode()).hexdigest(),
-    "firstResult": "92",
-    "firstPersistedOutputSha256": hashlib.sha256(normalized_first_output.encode()).hexdigest(),
-    "firstRendererOutputSha256": renderer_oracles[0]["textSha256"],
-    "firstOutputBinding": "unique-turn",
-}
-state_path.write_text(json.dumps(state, sort_keys=True) + "\n")
-state_path.chmod(0o600)
-PY
+  /usr/bin/python3 "$COLD_RESUME_STATE_EXEC" capture \
+    "$CODEX_DIR" "$GUI_RESUME_STATE" "$LOG_DIR/cdp.jsonl"
   record_cold_handoff_phase resume-state-python after
   record_cold_handoff_phase stop-app-group before
   stop_app_group
@@ -815,88 +744,8 @@ PY
     cdp_exit=$?
   fi
   if test "$cdp_exit" -eq 0; then
-    /usr/bin/python3 - "$GUI_RESUME_STATE" "$LOG_DIR/cdp.jsonl" <<'PY'
-import json
-import hashlib
-import pathlib
-import re
-import sys
-
-state_path = pathlib.Path(sys.argv[1])
-cdp_path = pathlib.Path(sys.argv[2])
-state = json.loads(state_path.read_text())
-rollout = pathlib.Path(state["rolloutPath"])
-records = [json.loads(line) for line in rollout.read_text().splitlines() if line]
-session_ids = [
-    record["payload"].get("id") or record["payload"].get("session_id")
-    for record in records
-    if record.get("type") == "session_meta"
-]
-if session_ids != [state["threadId"]]:
-    raise SystemExit(f"thread identity changed: {session_ids!r}")
-first_prompt = "What is 73 plus 19? Your final answer must include the decimal result."
-second_prompt = "What is 46 plus 17? Your final answer must include the decimal result."
-def arithmetic_output_matches(message, operands, expected_result):
-    integers = [int(value) for value in re.findall(r"(?<![\w.])[+-]?\d+(?!\w|\.\d)", message)]
-    allowed = {*operands, expected_result}
-    return (
-        bool(integers)
-        and all(value in allowed for value in integers)
-        and integers[-1] == expected_result
-    )
-
-user_messages = [
-    item.get("text", "")
-    for record in records
-    if record.get("type") == "response_item"
-    and record.get("payload", {}).get("type") == "message"
-    and record["payload"].get("role") == "user"
-    for item in record["payload"].get("content", [])
-    if item.get("type") == "input_text"
-]
-assistant_messages = [
-    record.get("payload", {}).get("message", "")
-    for record in records
-    if record.get("type") == "event_msg"
-    and record.get("payload", {}).get("type") == "agent_message"
-]
-first_outputs = [
-    message for message in assistant_messages
-    if arithmetic_output_matches(message, (73, 19), 92)
-]
-if sum(message.strip() == first_prompt for message in user_messages) != 1 or len(first_outputs) != 1:
-    raise SystemExit("original persisted assistant output is no longer unique")
-first_persisted_output_sha256 = hashlib.sha256(" ".join(first_outputs[0].split()).encode()).hexdigest()
-if first_persisted_output_sha256 != state["firstPersistedOutputSha256"]:
-    raise SystemExit("original persisted assistant output changed across restart")
-second_outputs = [
-    message for message in assistant_messages
-    if arithmetic_output_matches(message, (46, 17), 63)
-]
-if sum(message.strip() == second_prompt for message in user_messages) != 1 or len(second_outputs) != 1:
-    raise SystemExit("deterministic continuation was not persisted exactly once")
-second_oracles = [
-    record for record in (json.loads(line) for line in cdp_path.read_text().splitlines() if line)
-    if record.get("kind") == "assistant-output-oracle"
-    and record.get("phase") == "second"
-    and record.get("matched") is True
-    and record.get("expectedOccurrenceCount", 0) >= 1
-    and record.get("conflictingIntegers") == []
-    and record.get("finalInteger") == 63
-    and isinstance(record.get("textSha256"), str)
-    and re.fullmatch(r"[0-9a-f]{64}", record["textSha256"])
-]
-if len(second_oracles) != 1:
-    raise SystemExit(f"expected one second-phase renderer output oracle, found {len(second_oracles)}")
-second_output_sha256 = hashlib.sha256(" ".join(second_outputs[0].split()).encode()).hexdigest()
-state["secondResult"] = "63"
-state["secondPromptSha256"] = hashlib.sha256(second_prompt.encode()).hexdigest()
-state["secondPersistedOutputSha256"] = second_output_sha256
-state["secondRendererOutputSha256"] = second_oracles[0]["textSha256"]
-state["secondOutputBinding"] = "unique-turn"
-state["sameRolloutContinuationValidated"] = True
-state_path.write_text(json.dumps(state, sort_keys=True) + "\n")
-PY
+    /usr/bin/python3 "$COLD_RESUME_STATE_EXEC" validate \
+      "$GUI_RESUME_STATE" "$LOG_DIR/cdp.jsonl"
   fi
 fi
 

@@ -571,7 +571,8 @@ try {
     }
     if (state.firstPromptSha256 !== normalizedTextSha256(firstPrompt) ||
       state.firstResult !== firstResult || !state.firstPersistedOutputSha256 ||
-      !state.firstRendererOutputSha256 || state.firstOutputBinding !== "unique-turn") {
+      !state.firstRendererOutputSha256 || !state.firstTurnIdSha256 ||
+      state.firstOutputBinding !== "completed-turn") {
       throw new Error("resume state does not bind the first deterministic turn");
     }
     const mainUi = await reachMainUi();

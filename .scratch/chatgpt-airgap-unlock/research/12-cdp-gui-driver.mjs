@@ -7,7 +7,7 @@ import { createHash } from "node:crypto";
 const port = Number(process.argv[2]);
 const phase = process.argv[3] ?? "first";
 const timeoutMs = Number(process.argv[4] ?? 120000);
-const resumeStatePath = process.argv[5];
+const phaseArgument = process.argv[5];
 const base = `http://127.0.0.1:${port}`;
 const started = Date.now();
 const firstPrompt = "Reply exactly COLD_PHASE_ONE_OK and nothing else. Do not use tools.";
@@ -49,6 +49,15 @@ function sentinelTextVerdict(text, expectedSentinel) {
     exactMatch,
     trimmedTextLength: trimmedText.length,
   };
+}
+
+function projectSelectionVerdict(control, expectedFixtureRoot) {
+  const expectedName = expectedFixtureRoot.split("/").filter(Boolean).at(-1) ?? "";
+  const visibleText = [control?.text, control?.title, control?.ariaDescription]
+    .filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
+  const matched = Boolean(expectedName) && control?.count === 1 &&
+    visibleText.split(/[^A-Za-z0-9._-]+/).includes(expectedName);
+  return { matched, expectedName, visibleTextLength: visibleText.length };
 }
 
 function runSelfTests() {
@@ -119,6 +128,15 @@ function runSelfTests() {
     if (evaluateAssistant(firstPrompt, text).matched) {
       throw new Error(`${name}: renderer oracle should fail closed`);
     }
+  }
+  if (!projectSelectionVerdict({ count: 1, text: "workspace" }, "/tmp/run/workspace").matched) {
+    throw new Error("exact renderer project name was not accepted");
+  }
+  if (projectSelectionVerdict({ count: 1, text: "other-project" }, "/tmp/run/workspace").matched) {
+    throw new Error("wrong renderer project name was accepted");
+  }
+  if (projectSelectionVerdict({ count: 2, text: "workspace" }, "/tmp/run/workspace").matched) {
+    throw new Error("duplicate renderer project controls were accepted");
   }
   process.stdout.write("sentinel oracle self-test passed\n");
 }
@@ -292,6 +310,37 @@ async function openNativeProjectPicker() {
     trustedRendererInput: true,
   });
   await sleep(750);
+}
+
+async function confirmNativeProjectSelection(expectedFixtureRoot) {
+  if (!expectedFixtureRoot?.startsWith("/")) {
+    throw new Error("confirm-project-selection requires an absolute fixture root");
+  }
+  const control = await evaluate(`(() => {
+    const matches = [...document.querySelectorAll('button[aria-label="Choose project"]')]
+      .filter((element) => {
+        const rect = element.getBoundingClientRect();
+        const style = getComputedStyle(element);
+        return !element.disabled && rect.width > 0 && rect.height > 0 &&
+          style.visibility === "visible" && style.pointerEvents !== "none";
+      });
+    if (matches.length !== 1) return { count: matches.length };
+    return {
+      count: 1,
+      text: (matches[0].innerText ?? "").trim(),
+      title: matches[0].getAttribute("title"),
+      ariaDescription: matches[0].getAttribute("aria-description"),
+    };
+  })()`);
+  const verdict = projectSelectionVerdict(control, expectedFixtureRoot);
+  emit("renderer-project-selection-confirmed", {
+    matched: verdict.matched,
+    uniqueControl: control.count === 1,
+    expectedFixtureSha256: textSha256(expectedFixtureRoot),
+    visibleTextLength: verdict.visibleTextLength,
+  });
+  await snapshot("native-project-selection-confirmation");
+  if (!verdict.matched) throw new Error("renderer did not expose the selected fixture name");
 }
 
 async function reachMainUi() {
@@ -569,6 +618,10 @@ try {
     const mainUi = await reachMainUi();
     if (!mainUi) throw new Error("main UI unavailable before native project picker request");
     await openNativeProjectPicker();
+  } else if (phase === "confirm-project-selection") {
+    const mainUi = await reachMainUi();
+    if (!mainUi) throw new Error("main UI unavailable after native project selection");
+    await confirmNativeProjectSelection(phaseArgument);
   } else if (phase === "first") {
     const mainUi = await reachMainUi();
     const rendererPromptCompleted = mainUi &&
@@ -597,6 +650,7 @@ try {
       summary.skillSurfaceObserved, summary.modelSurfaceObserved];
     if (required.some((value) => value !== true)) process.exitCode = 1;
   } else if (phase === "second") {
+    const resumeStatePath = phaseArgument;
     if (!resumeStatePath) throw new Error("second phase requires a resume-state path");
     const state = JSON.parse(readFileSync(resumeStatePath, "utf8"));
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(state.threadId)) {

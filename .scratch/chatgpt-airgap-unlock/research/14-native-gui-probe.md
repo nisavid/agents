@@ -48,8 +48,9 @@ PROBE_EXPECT=renderer-native-project \
 
 The runner asks the renderer's unique visible `Choose project` control to open
 the native panel, resolves exactly one copied-app executable in the owned
-process group, invokes the helper, and resumes renderer automation only after
-the helper records `project-selection-issued`.
+process group, invokes the helper, then requires the renderer to expose the
+fixture name and persisted desktop state to contain the exact canonical fixture
+path before recording the native project-picker gate as complete.
 
 ## Permission boundary
 
@@ -64,8 +65,8 @@ Ivan; the helper never requests a prompt itself.
 Green for the source, build, input-policy, selector-policy, and runner-seam
 slice. The final no-permission build produced the arm64 ad-hoc-signed artifact
 `/private/tmp/chatgpt-native-gui-probe-build/chatgpt-native-gui-probe` with
-SHA-256 `2844d245776daa8f67342ccb7c4bfd00106325158e68718b79f75e07a629c03a`
-and CDHash `0d92dd1132324babf912e63f68e343328acd2032`. A clean build in a second
+SHA-256 `b25b04f73a5c1570055c36f73e032eedf26361c67cdbc853b2f631f8ef50402a`
+and CDHash `61fa69bb91fe7b6953167176c316a6720be916cd`. A clean build in a second
 disposable directory produced the same SHA-256. The helper self-test, forbidden
 API scan, path-policy fixtures, renderer oracle self-test, runner shell syntax,
 and cold-handoff self-test all passed.

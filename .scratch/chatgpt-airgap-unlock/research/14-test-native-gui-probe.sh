@@ -22,11 +22,19 @@ PROBE="$BUILD_ROOT/build/chatgpt-native-gui-probe"
 /bin/sh -n "$HERE/08-run-prototype.sh"
 "$NODE" "$HERE/12-cdp-gui-driver.mjs" --self-test
 
-if /usr/bin/grep -Eq 'AXUIElementCreateSystemWide|AXIsProcessTrustedWithOptions|NSWorkspace|tccutil|System Events' \
+if /usr/bin/grep -Eq 'AXUIElementCreateSystemWide|AXIsProcessTrustedWithOptions|NSWorkspace|NSAppleScript|osascript|tccutil|System Events|CGEventPost\(|\.post\(|(^|[^[:alnum:]_])Process\(|posix_spawn|exec[lv]|system\(|(^|[^[:alnum:]_])kill\(|terminate\(' \
   "$HERE/14-native-gui-probe.swift"; then
-  echo 'forbidden system-wide, prompting, launching, or TCC API present' >&2
+  echo 'forbidden global-event, prompting, launching, termination, AppleScript, or TCC API present' >&2
   exit 1
 fi
+if /usr/bin/grep -Eq 'AXUIElementCreateSystemWide|AXIsProcessTrustedWithOptions|NSAppleScript|osascript|tccutil|System Events|/Applications/ChatGPT\.app|/usr/bin/open|open -a' \
+  "$HERE/08-run-prototype.sh" "$HERE/14-build-native-gui-probe.sh"; then
+  echo 'forbidden installed-app, global-AX, AppleScript, prompting, or TCC shell seam present' >&2
+  exit 1
+fi
+/usr/bin/grep -Fq 'test "$(/usr/bin/stat -f '\''%d:%i'\'' "$NATIVE_GUI_PROBE_BIN")" = "$native_gui_probe_device_inode"' \
+  "$HERE/08-run-prototype.sh"
+/usr/bin/grep -Fq 'persisted_fixture_path_matched=true' "$HERE/08-run-prototype.sh"
 
 RUN_ROOT="$(mktemp -d /private/tmp/chatgpt-route-prototype-08.test.XXXXXX)"
 mkdir -p "$RUN_ROOT/Probe.app/Contents/MacOS" "$RUN_ROOT/workspace/.git" "$RUN_ROOT/logs"

@@ -18,6 +18,11 @@ trap cleanup EXIT INT TERM
 
 "$HERE/14-build-native-gui-probe.sh" "$BUILD_ROOT/build"
 PROBE="$BUILD_ROOT/build/chatgpt-native-gui-probe"
+"$HERE/14-build-native-gui-probe.sh" "$BUILD_ROOT/build-second"
+PROBE_SECOND="$BUILD_ROOT/build-second/chatgpt-native-gui-probe"
+probe_sha256="$(/usr/bin/shasum -a 256 "$PROBE" | /usr/bin/awk '{print $1}')"
+probe_second_sha256="$(/usr/bin/shasum -a 256 "$PROBE_SECOND" | /usr/bin/awk '{print $1}')"
+test "$probe_sha256" = "$probe_second_sha256"
 "$PROBE" --self-test
 /bin/sh -n "$HERE/08-run-prototype.sh"
 "$NODE" "$HERE/12-cdp-gui-driver.mjs" --self-test
@@ -27,6 +32,9 @@ if /usr/bin/grep -Eq 'AXUIElementCreateSystemWide|AXIsProcessTrustedWithOptions|
   echo 'forbidden global-event, prompting, launching, termination, AppleScript, or TCC API present' >&2
   exit 1
 fi
+test "$(/usr/bin/grep -Fc '/Applications/ChatGPT.app' "$HERE/14-native-gui-probe.swift")" -eq 1
+/usr/bin/grep -Fq 'static let installedApp = "/Applications/ChatGPT.app"' \
+  "$HERE/14-native-gui-probe.swift"
 if /usr/bin/grep -Eq 'AXUIElementCreateSystemWide|AXIsProcessTrustedWithOptions|NSAppleScript|osascript|tccutil|System Events|/Applications/ChatGPT\.app|/usr/bin/open|open -a' \
   "$HERE/08-run-prototype.sh" "$HERE/14-build-native-gui-probe.sh"; then
   echo 'forbidden installed-app, global-AX, AppleScript, prompting, or TCC shell seam present' >&2

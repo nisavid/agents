@@ -322,6 +322,36 @@ async function clickMatching(expression, description) {
   return result;
 }
 
+async function openNativeProjectPicker() {
+  const target = await evaluate(`(() => {
+    const matches = [...document.querySelectorAll('button[aria-label="Choose project"]')]
+      .filter((element) => !element.disabled);
+    if (matches.length !== 1) return { count: matches.length };
+    const rect = matches[0].getBoundingClientRect();
+    return {
+      count: 1,
+      x: rect.left + rect.width / 2,
+      y: rect.top + rect.height / 2,
+      width: rect.width,
+      height: rect.height,
+    };
+  })()`);
+  if (target.count !== 1 || target.width <= 0 || target.height <= 0) {
+    throw new Error(`Choose project control is missing, duplicate, or not visible: ${JSON.stringify(target)}`);
+  }
+  await send("Input.dispatchMouseEvent", {
+    type: "mousePressed", x: target.x, y: target.y, button: "left", clickCount: 1,
+  });
+  await send("Input.dispatchMouseEvent", {
+    type: "mouseReleased", x: target.x, y: target.y, button: "left", clickCount: 1,
+  });
+  emit("native-project-picker-requested", {
+    uniqueControl: true,
+    trustedRendererInput: true,
+  });
+  await sleep(750);
+}
+
 async function reachMainUi() {
   const deadline = Date.now() + 45000;
   let mainUi = false;
@@ -677,7 +707,11 @@ await send("Network.enable");
 await send("Runtime.enable");
 
 try {
-  if (phase === "first") {
+  if (phase === "open-project-picker") {
+    const mainUi = await reachMainUi();
+    if (!mainUi) throw new Error("main UI unavailable before native project picker request");
+    await openNativeProjectPicker();
+  } else if (phase === "first") {
     const mainUi = await reachMainUi();
     const rendererPromptCompleted = mainUi &&
       await submitPrompt(firstPrompt, firstSentinel);

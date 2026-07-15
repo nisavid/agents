@@ -49,3 +49,18 @@ final reviewed helper artifact when it is ready to run.
 The live native run is blocked until the exact reviewed helper artifact exists
 and Ivan manually grants that helper Accessibility access in System Settings.
 Rebuilding or re-signing the helper invalidates the grant until reverified.
+
+## Current prototype evidence
+
+The repo-owned Swift helper, deterministic no-permission checks, disposable
+build command, and opt-in runner seam are implemented in `research/14-*` and
+the Ticket 08/12 runner. The helper binds to the copied executable by PID,
+process start time, canonical running paths, and static/live code signatures;
+uses only PID-scoped AX state; refuses path, control, or process ambiguity; and
+requires a separate explicit flag before the audited PID-targeted
+Command-Shift-G fallback is available.
+
+No Accessibility request, TCC mutation, installed-app launch, or live AX action
+has occurred. The reviewed no-permission artifact is recorded in
+`research/14-native-gui-probe.md`; the manual permission gate above remains the
+next live step.

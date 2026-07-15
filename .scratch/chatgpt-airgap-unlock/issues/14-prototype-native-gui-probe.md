@@ -131,8 +131,18 @@ owned processes and listeners closed, all isolated databases passed
 
 The timeout now records only the final member of a bounded pending-state enum,
 distinguishing the application menu bar, File item, direct menu, Open Folder
-item, and three Command-O attributes. It records no AX titles or history and
-does not change the immediate rejection or action policy.
+item, command character, and modifiers. It records no AX titles or history and
+does not change the immediate rejection or action policy. The next mutation-free
+inspection isolated the persistent state to an unpublished command virtual key
+after 38 polls.
+
+Apple documents the command character as the primary shortcut key and the
+virtual key as physical-key evidence used when two keys can produce the same
+character. `O` is unambiguous, so absent virtual-key publication is accepted only
+for `attributeUnsupported` or `noValue`; a published key must remain integral
+`31`. All other AX read errors, wrong values, and malformed types fail
+immediately. Evidence records publication explicitly instead of fabricating a
+key value.
 
 No live AX action has occurred for this revision. The reviewed retained artifact
 is recorded in `research/14-native-gui-probe.md`; read-only menu inspection

@@ -166,8 +166,8 @@ Ivan; the helper never requests a prompt itself.
 
 Green for the source, build, input-policy, selector-policy, and runner-seam
 slice. The retained no-permission artifact for this revision is arm64 and ad-hoc signed,
-with SHA-256 `fd359b0ba1eb8abcb2fd60fbd632575c69f477d4594e286fb2fb5c2a9eccd083`
-and CDHash `2f30af041c6b3ccb8b9f566f9ad4fa0a8097f7b6`. A clean build in a second
+with SHA-256 `39dfa43ad8c1d84a4debbeb2d8726765428d08d9aafc72688f9830f4576c3180`
+and CDHash `3a27be8a5b3e8127722dc6d2a7db3842b602fde6`. A clean build in a second
 disposable directory produced the same SHA-256. The helper self-test, forbidden
 API and sensitive-symbol allowlists, path-policy fixtures, renderer transition
 oracle, authoritative project-state fixtures, runner shell syntax, and
@@ -203,7 +203,17 @@ cleaned up every owned process and listener. All isolated databases passed
 
 The helper now retains only the final bounded pending-state label across the
 read-only wait. Timeout evidence distinguishes an unpublished application menu
-bar, File item, direct menu, Open Folder item, command character, virtual key,
-or modifiers without recording menu contents or changing any immediate
-rejection or action gate. The retained artifact requires a fresh manual grant
-before repeating the mutation-free inspection.
+bar, File item, direct menu, Open Folder item, command character, or modifiers
+without recording menu contents or changing any immediate rejection or action
+gate. The next inspection identified the sole persistent state as an unpublished
+command virtual key after 38 read-only polls.
+
+Apple defines the [command character](https://developer.apple.com/documentation/applicationservices/kaxmenuitemcmdcharattribute)
+as the primary shortcut key and the [virtual key](https://developer.apple.com/documentation/applicationservices/kaxmenuitemcmdvirtualkeyattribute)
+as optional physical-key evidence for distinguishing keys that can produce the
+same character. `O` is unambiguous. The helper therefore accepts only
+`attributeUnsupported` or `noValue` as absent physical-key publication; an exact
+integral value must still be `31`, and every other AX read error, wrong value, or
+malformed type fails immediately. Evidence records whether the key was
+published and never fabricates it. The retained artifact requires a fresh manual
+grant before repeating the mutation-free inspection.

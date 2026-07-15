@@ -242,6 +242,32 @@ if printf '%s\n' "$menu_wait_body" | /usr/bin/grep -Eq \
   echo 'read-only menu readiness wait contains an action or fixed sleep' >&2
   exit 1
 fi
+path_entry_waits="$(/usr/bin/sed -n \
+  '/BEGIN_READ_ONLY_PATH_ENTRY_WAITS/,/END_READ_ONLY_PATH_ENTRY_WAITS/p' \
+  "$HERE/14-native-gui-probe.swift")"
+test "$(printf '%s\n' "$path_entry_waits" | \
+  /usr/bin/grep -Fc 'try validateIdentity()')" -eq 4
+if printf '%s\n' "$path_entry_waits" | /usr/bin/grep -Eq \
+  'AXUIElementPerformAction|AXUIElementSetAttributeValue|postToPid|Date\(|sleep\([0-9]'; then
+  echo 'path-entry readiness wait contains an action, wall clock, or fixed sleep' >&2
+  exit 1
+fi
+if /usr/bin/grep -Fq 'usleep(250_000)' "$HERE/14-native-gui-probe.swift"; then
+  echo 'path-entry restoration still relies on a fixed sleep' >&2
+  exit 1
+fi
+generic_press_body="$(/usr/bin/sed -n \
+  '/^func press(_ element:/,/^}/p' "$HERE/14-native-gui-probe.swift")"
+test "$(printf '%s\n' "$generic_press_body" | \
+  /usr/bin/grep -Fc 'try requireSameProcess(process)')" -eq 2
+test "$(printf '%s\n' "$generic_press_body" | \
+  /usr/bin/grep -Fc 'AXUIElementPerformAction(element, kAXPressAction as CFString)')" -eq 1
+for required_path_entry_gate in validatedPathEntryBaseline revalidatePathEntryToken \
+  'publishedPath == paths.fixture' waitForValidatedOpenPanelRestoration \
+  revalidateRestoredOpenPanelToken kAXDocumentAttribute kAXURLAttribute \
+  'destinations == [expectedDestination]'; do
+  /usr/bin/grep -Fq "$required_path_entry_gate" "$HERE/14-native-gui-probe.swift"
+done
 inspection_validated_line="$(/usr/bin/grep -nF \
   'native_menu_inspection_validated=true' "$HERE/08-run-prototype.sh" | \
   /usr/bin/awk -F: '{print $1}')"

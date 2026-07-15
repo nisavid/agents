@@ -724,6 +724,46 @@ func intAttributePublication(
     return attributePublication(status: status) { integralIntPublication(value) }
 }
 
+func fileURLPathPublication(_ value: CFTypeRef?) -> AttributePublication<String> {
+    let url: URL?
+    if let value, CFGetTypeID(value) == CFURLGetTypeID() {
+        url = unsafeBitCast(value, to: CFURL.self) as URL
+    } else if let publishedString = value as? String {
+        url = URL(string: publishedString)
+    } else {
+        return .malformed
+    }
+    guard let url, url.isFileURL,
+          let canonical = try? PathPolicy.canonicalExisting(
+            url.standardizedFileURL.path) else { return .malformed }
+    return .value(canonical)
+}
+
+func fileURLPathAttributePublication(
+    _ element: AXUIElement,
+    _ name: CFString
+) -> AttributePublication<String> {
+    var value: CFTypeRef?
+    let status = AXUIElementCopyAttributeValue(element, name, &value)
+    return attributePublication(status: status) { fileURLPathPublication(value) }
+}
+
+func publishedDestinationPath(
+    _ publication: AttributePublication<String>,
+    attributeName: String
+) throws -> String? {
+    switch publication {
+    case .missing: return nil
+    case .value(let path): return path
+    case .malformed:
+        throw ProbeError.validation(
+            "Open panel \(attributeName) destination is malformed")
+    case .readFailure(let status):
+        throw ProbeError.unavailable(
+            "Open panel \(attributeName) destination read failed: \(status)")
+    }
+}
+
 func actions(_ element: AXUIElement) -> Set<String> {
     var names: CFArray?
     guard AXUIElementCopyActionNames(element, &names) == .success,
@@ -874,6 +914,7 @@ func press(_ element: AXUIElement, purpose: String, process: ProcessIdentity) th
     guard AXUIElementPerformAction(element, kAXPressAction as CFString) == .success else {
         throw ProbeError.unavailable("AXPress failed for \(purpose)")
     }
+    try requireSameProcess(process)
 }
 
 // BEGIN_PID_PATH_ENTRY_SHORTCUT
@@ -1065,16 +1106,180 @@ func pressOpenFolderMenuItem(
 }
 // END_PID_OPEN_FOLDER_MENU_PRESS
 
-func pathEntry(in container: AXUIElement) throws -> (AXUIElement, AXUIElement)? {
-    let fields = try matchingLiveElements(container) {
-        stringAttribute($0, kAXRoleAttribute as CFString) == kAXTextFieldRole
+struct PathEntrySnapshot<Element> {
+    let panel: Element
+    let cancel: Element
+    let chooser: Element
+    let chooserEnabled: Bool
+    let browserAnchors: [Element]
+    let textFields: [Element]
+    let goButtons: [Element]
+    let restoredPlan: SelectionPlan?
+    let destinationPaths: [String]
+}
+
+struct PathEntryCandidate<Element> {
+    let field: Element
+    let goButton: Element
+}
+
+struct PathEntryToken<Element> {
+    let panel: Element
+    let field: Element
+    let goButton: Element
+    let pollCount: Int
+}
+
+struct RestoredOpenPanelToken<Element> {
+    let panel: Element
+    let chooser: Element
+    let pollCount: Int
+}
+
+func identityDeduplicated<Element>(
+    _ elements: [Element],
+    sameElement: (Element, Element) -> Bool
+) -> [Element] {
+    var result: [Element] = []
+    for element in elements where !result.contains(where: { sameElement($0, element) }) {
+        result.append(element)
     }
-    let confirms = try matchingLiveElements(container) {
-        stringAttribute($0, kAXRoleAttribute as CFString) == kAXButtonRole &&
-            actions($0).contains(kAXPressAction) &&
-            ["go", "open"].contains(stringAttribute($0, kAXTitleAttribute as CFString)?.lowercased() ?? "")
+    return result
+}
+
+func sameIdentitySet<Element>(
+    _ left: [Element],
+    _ right: [Element],
+    sameElement: (Element, Element) -> Bool
+) -> Bool {
+    let uniqueLeft = identityDeduplicated(left, sameElement: sameElement)
+    let uniqueRight = identityDeduplicated(right, sameElement: sameElement)
+    return uniqueLeft.count == uniqueRight.count && uniqueLeft.allSatisfy { element in
+        uniqueRight.contains(where: { sameElement(element, $0) })
     }
-    return fields.count == 1 && confirms.count == 1 ? (fields[0], confirms[0]) : nil
+}
+
+func exactAnchor<Element>(
+    expected: Element?,
+    candidates: [Element],
+    allowAdditional: Bool,
+    sameElement: (Element, Element) -> Bool
+) throws -> Element {
+    guard let expected else {
+        guard candidates.count == 1, let candidate = candidates.first else {
+            throw ProbeError.validation("Open-panel anchor is missing or ambiguous")
+        }
+        return candidate
+    }
+    let matches = candidates.filter { sameElement($0, expected) }
+    guard matches.count == 1, allowAdditional || candidates.count == 1 else {
+        throw ProbeError.validation("original Open-panel anchor identity changed")
+    }
+    return expected
+}
+
+enum PathEntryPolicy {
+    static func isGoControl(
+        role: String?,
+        title: String?,
+        enabled: Bool?,
+        actions: Set<String>
+    ) throws -> Bool {
+        guard title?.lowercased() == "go" else { return false }
+        guard role == kAXButtonRole, enabled == true,
+              actions.contains(kAXPressAction) else {
+            throw ProbeError.validation(
+                "path-entry Go control is not an enabled AXPress button")
+        }
+        return true
+    }
+
+    static func baseline<Element>(
+        _ snapshot: PathEntrySnapshot<Element>,
+        sameElement: (Element, Element) -> Bool
+    ) throws -> PathEntrySnapshot<Element> {
+        guard !snapshot.browserAnchors.isEmpty else {
+            throw ProbeError.validation("Open panel has no file-browser anchor")
+        }
+        guard snapshot.chooserEnabled else {
+            throw ProbeError.validation("Open panel chooser is not enabled at baseline")
+        }
+        guard snapshot.goButtons.isEmpty else {
+            throw ProbeError.validation("Open panel exposed Go before the path-entry shortcut")
+        }
+        guard snapshot.restoredPlan != nil else {
+            throw ProbeError.validation("Open panel baseline plan is not valid")
+        }
+        return snapshot
+    }
+
+    static func requireAnchors<Element>(
+        baseline: PathEntrySnapshot<Element>,
+        current: PathEntrySnapshot<Element>,
+        sameElement: (Element, Element) -> Bool
+    ) throws {
+        guard sameElement(baseline.panel, current.panel),
+              sameElement(baseline.cancel, current.cancel),
+              sameElement(baseline.chooser, current.chooser),
+              sameIdentitySet(baseline.browserAnchors, current.browserAnchors,
+                              sameElement: sameElement) else {
+            throw ProbeError.validation("original Open-panel identity or anchors changed")
+        }
+        let baselineFields = identityDeduplicated(
+            baseline.textFields, sameElement: sameElement)
+        let currentFields = identityDeduplicated(
+            current.textFields, sameElement: sameElement)
+        guard baselineFields.allSatisfy({ baselineField in
+            currentFields.contains(where: { sameElement(baselineField, $0) })
+        }) else {
+            throw ProbeError.validation("Open-panel baseline field identity changed")
+        }
+    }
+
+    static func candidate<Element>(
+        baseline: PathEntrySnapshot<Element>,
+        current: PathEntrySnapshot<Element>,
+        sameElement: (Element, Element) -> Bool
+    ) throws -> PathEntryCandidate<Element>? {
+        try requireAnchors(baseline: baseline, current: current,
+                           sameElement: sameElement)
+        let fields = identityDeduplicated(current.textFields, sameElement: sameElement)
+        let baselineFields = identityDeduplicated(
+            baseline.textFields, sameElement: sameElement)
+        let newFields = fields.filter { field in
+            !baselineFields.contains(where: { sameElement(field, $0) })
+        }
+        let goButtons = identityDeduplicated(current.goButtons, sameElement: sameElement)
+        guard newFields.count <= 1 else {
+            throw ProbeError.validation("multiple new path-entry fields appeared")
+        }
+        guard goButtons.count <= 1 else {
+            throw ProbeError.validation("multiple new path-entry Go buttons appeared")
+        }
+        guard let field = newFields.first, let goButton = goButtons.first else {
+            return nil
+        }
+        return PathEntryCandidate(field: field, goButton: goButton)
+    }
+
+    static func restored<Element>(
+        baseline: PathEntrySnapshot<Element>,
+        current: PathEntrySnapshot<Element>,
+        expectedDestination: String,
+        sameElement: (Element, Element) -> Bool
+    ) throws -> Bool {
+        try requireAnchors(baseline: baseline, current: current,
+                           sameElement: sameElement)
+        let fieldsMatch = sameIdentitySet(
+            baseline.textFields, current.textFields, sameElement: sameElement)
+        let destinations = Array(Set(current.destinationPaths))
+        guard destinations.count <= 1 else {
+            throw ProbeError.validation("Open panel published ambiguous destination paths")
+        }
+        return fieldsMatch && current.goButtons.isEmpty && current.chooserEnabled &&
+            current.restoredPlan == baseline.restoredPlan &&
+            destinations == [expectedDestination]
+    }
 }
 
 func uniqueOriginal<T>(
@@ -1107,34 +1312,307 @@ func uniqueNewRelated<T>(
     return newCandidates.first
 }
 
-func waitForUniquePathEntry(
+// BEGIN_READ_ONLY_PATH_ENTRY_WAITS
+func waitForUniquePathEntry<Element>(
+    timeoutNanoseconds: UInt64,
+    pollMicroseconds: useconds_t,
+    baseline: PathEntrySnapshot<Element>,
+    nowNanoseconds: () throws -> UInt64,
+    validateIdentity: () throws -> Void,
+    readSnapshot: () throws -> PathEntrySnapshot<Element>,
+    sameElement: (Element, Element) -> Bool,
+    pause: (useconds_t) -> Void
+) throws -> PathEntryToken<Element> {
+    precondition(timeoutNanoseconds > 0 && pollMicroseconds > 0)
+    let started = try nowNanoseconds()
+    let addition = started.addingReportingOverflow(timeoutNanoseconds)
+    let deadline = addition.overflow ? UInt64.max : addition.partialValue
+    var pollCount = 0
+    while try nowNanoseconds() < deadline {
+        try validateIdentity()
+        let snapshot = try readSnapshot()
+        try validateIdentity()
+        pollCount += 1
+        if let candidate = try PathEntryPolicy.candidate(
+            baseline: baseline, current: snapshot, sameElement: sameElement) {
+            return PathEntryToken(panel: baseline.panel, field: candidate.field,
+                                  goButton: candidate.goButton, pollCount: pollCount)
+        }
+        let current = try nowNanoseconds()
+        guard current < deadline else { break }
+        let remainingMicroseconds = (deadline - current + 999) / 1_000
+        pause(useconds_t(min(UInt64(pollMicroseconds), remainingMicroseconds)))
+    }
+    throw ProbeError.unavailable(
+        "path-entry controls did not become ready after \(pollCount) polls")
+}
+
+func waitForRestoredOpenPanel<Element>(
+    timeoutNanoseconds: UInt64,
+    pollMicroseconds: useconds_t,
+    baseline: PathEntrySnapshot<Element>,
+    expectedDestination: String,
+    nowNanoseconds: () throws -> UInt64,
+    validateIdentity: () throws -> Void,
+    readSnapshot: () throws -> PathEntrySnapshot<Element>,
+    sameElement: (Element, Element) -> Bool,
+    pause: (useconds_t) -> Void
+) throws -> RestoredOpenPanelToken<Element> {
+    precondition(timeoutNanoseconds > 0 && pollMicroseconds > 0)
+    let started = try nowNanoseconds()
+    let addition = started.addingReportingOverflow(timeoutNanoseconds)
+    let deadline = addition.overflow ? UInt64.max : addition.partialValue
+    var pollCount = 0
+    while try nowNanoseconds() < deadline {
+        try validateIdentity()
+        let snapshot = try readSnapshot()
+        try validateIdentity()
+        pollCount += 1
+        if try PathEntryPolicy.restored(
+            baseline: baseline, current: snapshot,
+            expectedDestination: expectedDestination, sameElement: sameElement) {
+            return RestoredOpenPanelToken(
+                panel: baseline.panel, chooser: baseline.chooser, pollCount: pollCount)
+        }
+        let current = try nowNanoseconds()
+        guard current < deadline else { break }
+        let remainingMicroseconds = (deadline - current + 999) / 1_000
+        pause(useconds_t(min(UInt64(pollMicroseconds), remainingMicroseconds)))
+    }
+    throw ProbeError.unavailable(
+        "Open panel did not restore after path entry in \(pollCount) polls")
+}
+// END_READ_ONLY_PATH_ENTRY_WAITS
+
+func livePathEntrySnapshot(
     application: AXUIElement,
     openPanel: AXUIElement,
-    initialElements: [AXUIElement]
-) throws -> (AXUIElement, AXUIElement) {
-    let deadline = Date().addingTimeInterval(3)
-    while Date() < deadline {
-        let panelSheets = try matchingLiveElements(openPanel) {
-            stringAttribute($0, kAXRoleAttribute as CFString) == kAXSheetRole
-        }.filter { !sameAXElement($0, openPanel) }
-        let currentWindows = try liveWindows(application).map(\.0)
-        let relatedWindows = currentWindows.filter { candidate in
-            let parent = axElementAttribute(candidate, kAXParentAttribute as CFString)
-            let topLevel = axElementAttribute(candidate, kAXTopLevelUIElementAttribute as CFString)
-            return (parent.map { sameAXElement($0, openPanel) } ?? false) ||
-                (topLevel.map { sameAXElement($0, openPanel) } ?? false)
-        }
-        if let newChild = try uniqueNewRelated(initial: initialElements,
-                                               candidates: panelSheets + relatedWindows,
-                                               equals: sameAXElement) {
-            guard let entry = try pathEntry(in: newChild) else {
-                throw ProbeError.validation("new Open panel child is not the path-entry sheet")
-            }
-            return entry
-        }
-        usleep(100_000)
+    originalPlan: SelectionPlan,
+    initialElements: [AXUIElement],
+    anchorBaseline: PathEntrySnapshot<AXUIElement>? = nil,
+    readDestination: Bool = false
+) throws -> PathEntrySnapshot<AXUIElement> {
+    let windows = try liveWindows(application)
+    let originalMatches = windows.indices.filter {
+        sameAXElement(windows[$0].0, openPanel)
     }
-    throw ProbeError.unavailable("validated Open panel did not expose one related path-entry child")
+    let shapedIndices = OpenPanelPolicy.panelShapedIndices(
+        windows: windows.map(\.1))
+    guard originalMatches.count == 1, originalMatches == shapedIndices,
+          let originalIndex = originalMatches.first else {
+        throw ProbeError.validation(
+            "original Open panel was replaced, missing, or accompanied by another panel")
+    }
+    let currentPanel = windows[originalIndex].0
+    let currentDescription = windows[originalIndex].1
+    let panelElements = try matchingLiveElements(currentPanel) { _ in true }
+
+    let cancels = panelElements.filter {
+        stringAttribute($0, kAXRoleAttribute as CFString) == kAXButtonRole &&
+            stringAttribute($0, kAXTitleAttribute as CFString)?.lowercased() == "cancel" &&
+            actions($0).contains(kAXPressAction)
+    }
+    let choosers = panelElements.filter {
+        stringAttribute($0, kAXRoleAttribute as CFString) == kAXButtonRole &&
+            stringAttribute($0, kAXTitleAttribute as CFString)?.lowercased() ==
+                originalPlan.chooserTitle.lowercased() &&
+            actions($0).contains(kAXPressAction)
+    }
+    let browsers = panelElements.filter {
+        guard let role = stringAttribute($0, kAXRoleAttribute as CFString) else {
+            return false
+        }
+        return [kAXOutlineRole, kAXBrowserRole, kAXTableRole].contains(role)
+    }
+    let cancel = try exactAnchor(
+        expected: anchorBaseline?.cancel, candidates: cancels,
+        allowAdditional: anchorBaseline != nil, sameElement: sameAXElement)
+    let chooser = try exactAnchor(
+        expected: anchorBaseline?.chooser, candidates: choosers,
+        allowAdditional: false, sameElement: sameAXElement)
+    guard !browsers.isEmpty else {
+        throw ProbeError.validation("original Open panel has no file-browser anchor")
+    }
+
+    let panelSheets = panelElements.filter {
+        stringAttribute($0, kAXRoleAttribute as CFString) == kAXSheetRole &&
+            !sameAXElement($0, currentPanel)
+    }
+    let relatedWindows = windows.map(\.0).filter { candidate in
+        guard !sameAXElement(candidate, currentPanel) else { return false }
+        let parent = axElementAttribute(candidate, kAXParentAttribute as CFString)
+        let topLevel = axElementAttribute(candidate, kAXTopLevelUIElementAttribute as CFString)
+        return (parent.map { sameAXElement($0, currentPanel) } ?? false) ||
+            (topLevel.map { sameAXElement($0, currentPanel) } ?? false)
+    }
+    let newChild = try uniqueNewRelated(
+        initial: initialElements,
+        candidates: panelSheets + relatedWindows,
+        equals: sameAXElement)
+    var candidateRoots = [currentPanel]
+    if let newChild, !sameAXElement(newChild, currentPanel) {
+        candidateRoots.append(newChild)
+    }
+    let candidateElements = identityDeduplicated(
+        try candidateRoots.flatMap { root in
+            try matchingLiveElements(root) { _ in true }
+        },
+        sameElement: sameAXElement)
+    let fields = candidateElements.filter {
+        stringAttribute($0, kAXRoleAttribute as CFString) == kAXTextFieldRole
+    }
+    var titledGoControls: [AXUIElement] = []
+    for element in candidateElements where try PathEntryPolicy.isGoControl(
+        role: stringAttribute(element, kAXRoleAttribute as CFString),
+        title: stringAttribute(element, kAXTitleAttribute as CFString),
+        enabled: boolAttribute(element, kAXEnabledAttribute as CFString),
+        actions: actions(element)) {
+        titledGoControls.append(element)
+    }
+    let restoredPlan = try? OpenPanelPolicy.plan(
+        windows: [currentDescription], permitKeyFallback: true)
+    let destinationPaths: [String]
+    if readDestination {
+        destinationPaths = try [
+            publishedDestinationPath(
+                fileURLPathAttributePublication(
+                    currentPanel, kAXDocumentAttribute as CFString),
+                attributeName: "AXDocument"),
+            publishedDestinationPath(
+                fileURLPathAttributePublication(
+                    currentPanel, kAXURLAttribute as CFString),
+                attributeName: "AXURL"),
+        ].compactMap { $0 }
+    } else {
+        destinationPaths = []
+    }
+    return PathEntrySnapshot(
+        panel: currentPanel,
+        cancel: cancel,
+        chooser: chooser,
+        chooserEnabled: boolAttribute(
+            chooser, kAXEnabledAttribute as CFString) == true,
+        browserAnchors: identityDeduplicated(browsers, sameElement: sameAXElement),
+        textFields: identityDeduplicated(fields, sameElement: sameAXElement),
+        goButtons: identityDeduplicated(titledGoControls, sameElement: sameAXElement),
+        restoredPlan: restoredPlan,
+        destinationPaths: destinationPaths)
+}
+
+func validatedPathEntryBaseline(
+    application: AXUIElement,
+    openPanel: AXUIElement,
+    originalPlan: SelectionPlan,
+    initialElements: [AXUIElement],
+    process: ProcessIdentity
+) throws -> PathEntrySnapshot<AXUIElement> {
+    try requireSameProcess(process)
+    let snapshot = try livePathEntrySnapshot(
+        application: application, openPanel: openPanel,
+        originalPlan: originalPlan, initialElements: initialElements)
+    try requireSameProcess(process)
+    let baseline = try PathEntryPolicy.baseline(
+        snapshot, sameElement: sameAXElement)
+    guard baseline.restoredPlan == originalPlan else {
+        throw ProbeError.validation("Open panel baseline plan changed before shortcut")
+    }
+    return baseline
+}
+
+func waitForValidatedPathEntry(
+    application: AXUIElement,
+    baseline: PathEntrySnapshot<AXUIElement>,
+    originalPlan: SelectionPlan,
+    initialElements: [AXUIElement],
+    process: ProcessIdentity
+) throws -> PathEntryToken<AXUIElement> {
+    try waitForUniquePathEntry(
+        timeoutNanoseconds: 3_000_000_000,
+        pollMicroseconds: 100_000,
+        baseline: baseline,
+        nowNanoseconds: monotonicNanoseconds,
+        validateIdentity: { try requireSameProcess(process) },
+        readSnapshot: {
+            try livePathEntrySnapshot(
+                application: application, openPanel: baseline.panel,
+                originalPlan: originalPlan, initialElements: initialElements,
+                anchorBaseline: baseline)
+        },
+        sameElement: sameAXElement,
+        pause: { _ = usleep($0) })
+}
+
+func revalidatePathEntryToken(
+    _ token: PathEntryToken<AXUIElement>,
+    application: AXUIElement,
+    baseline: PathEntrySnapshot<AXUIElement>,
+    originalPlan: SelectionPlan,
+    initialElements: [AXUIElement],
+    process: ProcessIdentity
+) throws -> PathEntryCandidate<AXUIElement> {
+    try requireSameProcess(process)
+    let snapshot = try livePathEntrySnapshot(
+        application: application, openPanel: baseline.panel,
+        originalPlan: originalPlan, initialElements: initialElements,
+        anchorBaseline: baseline)
+    try requireSameProcess(process)
+    guard let candidate = try PathEntryPolicy.candidate(
+        baseline: baseline, current: snapshot, sameElement: sameAXElement),
+          sameAXElement(candidate.field, token.field),
+          sameAXElement(candidate.goButton, token.goButton) else {
+        throw ProbeError.validation("path-entry control identities changed before mutation")
+    }
+    return candidate
+}
+
+func waitForValidatedOpenPanelRestoration(
+    application: AXUIElement,
+    baseline: PathEntrySnapshot<AXUIElement>,
+    originalPlan: SelectionPlan,
+    initialElements: [AXUIElement],
+    expectedDestination: String,
+    process: ProcessIdentity
+) throws -> RestoredOpenPanelToken<AXUIElement> {
+    try waitForRestoredOpenPanel(
+        timeoutNanoseconds: 3_000_000_000,
+        pollMicroseconds: 100_000,
+        baseline: baseline,
+        expectedDestination: expectedDestination,
+        nowNanoseconds: monotonicNanoseconds,
+        validateIdentity: { try requireSameProcess(process) },
+        readSnapshot: {
+            try livePathEntrySnapshot(
+                application: application, openPanel: baseline.panel,
+                originalPlan: originalPlan, initialElements: initialElements,
+                anchorBaseline: baseline, readDestination: true)
+        },
+        sameElement: sameAXElement,
+        pause: { _ = usleep($0) })
+}
+
+func revalidateRestoredOpenPanelToken(
+    _ token: RestoredOpenPanelToken<AXUIElement>,
+    application: AXUIElement,
+    baseline: PathEntrySnapshot<AXUIElement>,
+    originalPlan: SelectionPlan,
+    initialElements: [AXUIElement],
+    expectedDestination: String,
+    process: ProcessIdentity
+) throws -> RestoredOpenPanelToken<AXUIElement> {
+    try requireSameProcess(process)
+    let snapshot = try livePathEntrySnapshot(
+        application: application, openPanel: baseline.panel,
+        originalPlan: originalPlan, initialElements: initialElements,
+        anchorBaseline: baseline, readDestination: true)
+    try requireSameProcess(process)
+    guard try PathEntryPolicy.restored(
+        baseline: baseline, current: snapshot,
+        expectedDestination: expectedDestination, sameElement: sameAXElement),
+          sameAXElement(snapshot.panel, token.panel),
+          sameAXElement(snapshot.chooser, token.chooser) else {
+        throw ProbeError.validation("restored Open-panel identities changed before chooser press")
+    }
+    return token
 }
 
 func chooseButton(in panel: AXUIElement, title: String) throws -> AXUIElement {
@@ -1254,17 +1732,59 @@ func execute(options: Options, paths: ValidatedPaths, log: EventLog) throws {
         let initialSheets = try matchingLiveElements(panel) {
             stringAttribute($0, kAXRoleAttribute as CFString) == kAXSheetRole
         }
-        try postCommandShiftG(to: identity)
-        let (pathField, confirmButton) = try waitForUniquePathEntry(
+        let initialElements = identityDeduplicated(
+            initialWindows + initialSheets, sameElement: sameAXElement)
+        let baseline = try validatedPathEntryBaseline(
             application: application, openPanel: panel,
-            initialElements: initialWindows + initialSheets)
+            originalPlan: plan, initialElements: initialElements,
+            process: identity)
+        try postCommandShiftG(to: identity)
+        let token = try waitForValidatedPathEntry(
+            application: application, baseline: baseline,
+            originalPlan: plan, initialElements: initialElements,
+            process: identity)
+        var candidate = try revalidatePathEntryToken(
+            token, application: application, baseline: baseline,
+            originalPlan: plan, initialElements: initialElements,
+            process: identity)
         try requireSameProcess(identity)
-        guard AXUIElementSetAttributeValue(pathField, kAXValueAttribute as CFString,
+        guard AXUIElementSetAttributeValue(candidate.field, kAXValueAttribute as CFString,
                                            paths.fixture as CFString) == .success else {
             throw ProbeError.validation("path-entry field rejected fixture root")
         }
-        try press(confirmButton, purpose: "path-entry confirmation", process: identity)
-        usleep(250_000)
+        try requireSameProcess(identity)
+        candidate = try revalidatePathEntryToken(
+            token, application: application, baseline: baseline,
+            originalPlan: plan, initialElements: initialElements,
+            process: identity)
+        try requireSameProcess(identity)
+        let publishedPath = stringAttribute(candidate.field, kAXValueAttribute as CFString)
+        try requireSameProcess(identity)
+        guard publishedPath == paths.fixture else {
+            throw ProbeError.validation("path-entry field did not retain the exact fixture root")
+        }
+        try press(candidate.goButton, purpose: "path-entry confirmation", process: identity)
+        let restored = try waitForValidatedOpenPanelRestoration(
+            application: application, baseline: baseline,
+            originalPlan: plan, initialElements: initialElements,
+            expectedDestination: paths.fixture,
+            process: identity)
+        let revalidatedRestored = try revalidateRestoredOpenPanelToken(
+            restored, application: application, baseline: baseline,
+            originalPlan: plan, initialElements: initialElements,
+            expectedDestination: paths.fixture,
+            process: identity)
+        try press(revalidatedRestored.chooser, purpose: "Open panel chooser",
+                  process: identity)
+        let finalIdentity = try processIdentity(options.pid)
+        guard finalIdentity == identity else {
+            throw ProbeError.validation("PID identity changed during AX action")
+        }
+        try log.write("project-selection-requested", ["pid": Int(identity.pid),
+                                                       "fixtureSha256": sha256(paths.fixture),
+                                                       "pathEntryPollCount": token.pollCount,
+                                                       "restorePollCount": restored.pollCount])
+        return
     }
     try revalidateOriginalOpenPanel(application: application, originalPanel: panel,
                                     originalPlan: plan,
@@ -1329,6 +1849,15 @@ func runSelfTests() throws {
                 "string AX command value was coerced to an integer")
     try require(stringPublication(NSNumber(value: 31)) == .malformed,
                 "numeric AX command character was coerced to a string")
+    try require(fileURLPathPublication(
+        URL(fileURLWithPath: "/private/tmp") as CFURL) == .value("/private/tmp"),
+        "CFURL destination was not canonicalized to a file path")
+    try require(fileURLPathPublication(
+        "file:///private/tmp/" as CFString) == .value("/private/tmp"),
+        "string URL destination was not canonicalized to a file path")
+    try require(fileURLPathPublication(
+        "https://example.invalid/" as CFString) == .malformed,
+        "non-file destination URL passed")
     let unsupportedPublication: AttributePublication<Int> = attributePublication(
         status: .attributeUnsupported) { .value(31) }
     let noValuePublication: AttributePublication<Int> = attributePublication(
@@ -2003,6 +2532,253 @@ func runSelfTests() throws {
     do { _ = try uniqueNewRelated(initial: [String](), candidates: ["one", "two"], equals: ==) }
     catch ProbeError.validation { rejected = true }
     try require(rejected, "duplicate new children passed")
+
+    func pathSnapshot(
+        panel: String = "panel",
+        cancel: String = "cancel",
+        chooser: String = "chooser",
+        chooserEnabled: Bool = true,
+        browsers: [String] = ["browser"],
+        fields: [String] = ["search"],
+        goButtons: [String] = [],
+        restoredPlan: SelectionPlan? = SelectionPlan(
+            navigation: .commandShiftG, chooserTitle: "Open"),
+        destinationPaths: [String] = []
+    ) -> PathEntrySnapshot<String> {
+        PathEntrySnapshot(panel: panel, cancel: cancel, chooser: chooser,
+                          chooserEnabled: chooserEnabled,
+                          browserAnchors: browsers, textFields: fields,
+                          goButtons: goButtons, restoredPlan: restoredPlan,
+                          destinationPaths: destinationPaths)
+    }
+    try require(try exactAnchor(
+        expected: "original-cancel",
+        candidates: ["original-cancel", "overlay-cancel"],
+        allowAdditional: true, sameElement: sameString) == "original-cancel",
+        "transient overlay Cancel replaced the original Cancel anchor")
+    let pathBaseline = try PathEntryPolicy.baseline(
+        pathSnapshot(), sameElement: sameString)
+    try require(try PathEntryPolicy.isGoControl(
+        role: kAXButtonRole, title: "Go", enabled: true,
+        actions: [kAXPressAction]), "valid Go control was rejected")
+    for invalidGo in [
+        (kAXButtonRole as String?, "Go" as String?, false as Bool?, Set([kAXPressAction])),
+        (kAXButtonRole as String?, "Go" as String?, true as Bool?, Set<String>()),
+        (kAXTextFieldRole as String?, "Go" as String?, true as Bool?, Set([kAXPressAction])),
+    ] {
+        rejected = false
+        do {
+            _ = try PathEntryPolicy.isGoControl(
+                role: invalidGo.0, title: invalidGo.1,
+                enabled: invalidGo.2, actions: invalidGo.3)
+        } catch ProbeError.validation { rejected = true }
+        try require(rejected, "disabled, non-button, or non-pressable Go passed")
+    }
+    try require(try PathEntryPolicy.candidate(
+        baseline: pathBaseline,
+        current: pathSnapshot(fields: ["search", "path"], goButtons: ["go"],
+                              restoredPlan: nil),
+        sameElement: sameString)?.field == "path",
+        "same-panel path-entry identity delta was not accepted")
+    try require(try PathEntryPolicy.candidate(
+        baseline: pathBaseline,
+        current: pathSnapshot(chooserEnabled: false,
+                              fields: ["search", "path"], goButtons: ["go"],
+                              restoredPlan: nil),
+        sameElement: sameString)?.field == "path",
+        "temporarily disabled chooser blocked exact path-entry controls")
+    try require(try PathEntryPolicy.candidate(
+        baseline: pathBaseline,
+        current: pathSnapshot(fields: ["search", "path", "path"],
+                              goButtons: ["go", "go"], restoredPlan: nil),
+        sameElement: sameString)?.goButton == "go",
+        "same child-and-panel identities were not deduplicated")
+    try require(try PathEntryPolicy.candidate(
+        baseline: pathBaseline,
+        current: pathSnapshot(chooserEnabled: false,
+                              fields: ["search", "path"], goButtons: [],
+                              restoredPlan: nil),
+        sameElement: sameString) == nil,
+        "field-only staged publication or disabled chooser became ready")
+    try require(try PathEntryPolicy.candidate(
+        baseline: pathBaseline,
+        current: pathSnapshot(fields: ["search"], goButtons: ["go"],
+                              restoredPlan: nil),
+        sameElement: sameString) == nil,
+        "Go-only staged publication became ready")
+    rejected = false
+    do {
+        _ = try PathEntryPolicy.baseline(
+            pathSnapshot(goButtons: ["preexisting-go"]), sameElement: sameString)
+    } catch ProbeError.validation { rejected = true }
+    try require(rejected, "preexisting Go control allowed the shortcut baseline")
+    for ambiguous in [
+        pathSnapshot(fields: ["search", "path-one", "path-two"], goButtons: ["go"],
+                     restoredPlan: nil),
+        pathSnapshot(fields: ["search", "path"], goButtons: ["go-one", "go-two"],
+                     restoredPlan: nil),
+    ] {
+        rejected = false
+        do {
+            _ = try PathEntryPolicy.candidate(
+                baseline: pathBaseline, current: ambiguous, sameElement: sameString)
+        } catch ProbeError.validation { rejected = true }
+        try require(rejected, "ambiguous path-entry identity delta passed")
+    }
+    rejected = false
+    do {
+        _ = try PathEntryPolicy.candidate(
+            baseline: pathBaseline,
+            current: pathSnapshot(chooser: "replacement", fields: ["search", "path"],
+                                  goButtons: ["go"], restoredPlan: nil),
+            sameElement: sameString)
+    } catch ProbeError.validation { rejected = true }
+    try require(rejected, "replaced Open-panel anchor passed")
+    rejected = false
+    do {
+        _ = try PathEntryPolicy.candidate(
+            baseline: pathBaseline,
+            current: pathSnapshot(fields: ["replacement", "path"],
+                                  goButtons: ["go"], restoredPlan: nil),
+            sameElement: sameString)
+    } catch ProbeError.validation { rejected = true }
+    try require(rejected, "replaced baseline text field passed")
+
+    var pathNow: UInt64 = 0
+    var pathSnapshots = [
+        pathSnapshot(fields: ["search", "path"], restoredPlan: nil),
+        pathSnapshot(fields: ["search", "path"], goButtons: ["go"], restoredPlan: nil),
+    ]
+    var pathIdentityChecks = 0
+    let pathToken = try waitForUniquePathEntry(
+        timeoutNanoseconds: 1_000_000_000,
+        pollMicroseconds: 100,
+        baseline: pathBaseline,
+        nowNanoseconds: { pathNow },
+        validateIdentity: { pathIdentityChecks += 1 },
+        readSnapshot: { pathSnapshots.removeFirst() },
+        sameElement: sameString,
+        pause: { pathNow += UInt64($0) * 1_000 })
+    try require(pathToken.field == "path" && pathToken.goButton == "go" &&
+                    pathToken.pollCount == 2 && pathIdentityChecks == 4,
+                "staged path-entry wait did not preserve identity and poll bounds")
+
+    pathNow = 0
+    var pathTimeoutReads = 0
+    rejected = false
+    do {
+        _ = try waitForUniquePathEntry(
+            timeoutNanoseconds: 300_000,
+            pollMicroseconds: 100,
+            baseline: pathBaseline,
+            nowNanoseconds: { pathNow },
+            validateIdentity: {},
+            readSnapshot: {
+                pathTimeoutReads += 1
+                return pathSnapshot(restoredPlan: nil)
+            },
+            sameElement: sameString,
+            pause: { pathNow += UInt64($0) * 1_000 })
+    } catch ProbeError.unavailable(let message) {
+        rejected = message == "path-entry controls did not become ready after 3 polls"
+    }
+    try require(rejected && pathTimeoutReads == 3,
+                "path-entry timeout used the wrong monotonic poll bound")
+
+    pathNow = 0
+    var pathDriftChecks = 0
+    var pathDriftReads = 0
+    rejected = false
+    do {
+        _ = try waitForUniquePathEntry(
+            timeoutNanoseconds: 1_000_000_000,
+            pollMicroseconds: 100,
+            baseline: pathBaseline,
+            nowNanoseconds: { pathNow },
+            validateIdentity: {
+                pathDriftChecks += 1
+                if pathDriftChecks == 2 {
+                    throw ProbeError.validation("test path-entry PID drift")
+                }
+            },
+            readSnapshot: {
+                pathDriftReads += 1
+                return pathSnapshot(fields: ["search", "path"],
+                                    goButtons: ["go"], restoredPlan: nil)
+            },
+            sameElement: sameString,
+            pause: { pathNow += UInt64($0) * 1_000 })
+    } catch ProbeError.validation { rejected = true }
+    try require(rejected && pathDriftReads == 1,
+                "path-entry PID drift did not stop at the read boundary")
+
+    pathNow = 0
+    var restoreSnapshots = [
+        pathSnapshot(fields: ["search", "path"], goButtons: ["go"], restoredPlan: nil),
+        pathSnapshot(destinationPaths: ["fixture"]),
+    ]
+    let restored = try waitForRestoredOpenPanel(
+        timeoutNanoseconds: 1_000_000_000,
+        pollMicroseconds: 100,
+        baseline: pathBaseline,
+        expectedDestination: "fixture",
+        nowNanoseconds: { pathNow },
+        validateIdentity: {},
+        readSnapshot: { restoreSnapshots.removeFirst() },
+        sameElement: sameString,
+        pause: { pathNow += UInt64($0) * 1_000 })
+    try require(restored.pollCount == 2 && restored.chooser == "chooser",
+                "Open-panel restoration did not retain the exact chooser identity")
+
+    pathNow = 0
+    var destinationlessReads = 0
+    rejected = false
+    do {
+        _ = try waitForRestoredOpenPanel(
+            timeoutNanoseconds: 300_000,
+            pollMicroseconds: 100,
+            baseline: pathBaseline,
+            expectedDestination: "fixture",
+            nowNanoseconds: { pathNow },
+            validateIdentity: {},
+            readSnapshot: {
+                destinationlessReads += 1
+                return pathSnapshot()
+            },
+            sameElement: sameString,
+            pause: { pathNow += UInt64($0) * 1_000 })
+    } catch ProbeError.unavailable(let message) {
+        rejected = message == "Open panel did not restore after path entry in 3 polls"
+    }
+    try require(rejected && destinationlessReads == 3,
+                "restored controls without exact destination allowed chooser readiness")
+
+    pathNow = 0
+    var restoreDriftChecks = 0
+    var restoreDriftReads = 0
+    rejected = false
+    do {
+        _ = try waitForRestoredOpenPanel(
+            timeoutNanoseconds: 1_000_000_000,
+            pollMicroseconds: 100,
+            baseline: pathBaseline,
+            expectedDestination: "fixture",
+            nowNanoseconds: { pathNow },
+            validateIdentity: {
+                restoreDriftChecks += 1
+                if restoreDriftChecks == 2 {
+                    throw ProbeError.validation("test restoration PID drift")
+                }
+            },
+            readSnapshot: {
+                restoreDriftReads += 1
+                return pathSnapshot(destinationPaths: ["fixture"])
+            },
+            sameElement: sameString,
+            pause: { pathNow += UInt64($0) * 1_000 })
+    } catch ProbeError.validation { rejected = true }
+    try require(rejected && restoreDriftReads == 1,
+                "restoration PID drift did not stop at the read boundary")
 
     let unrelatedWindow = testElement(role: kAXWindowRole,
                                       subrole: kAXStandardWindowSubrole)

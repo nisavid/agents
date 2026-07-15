@@ -18,12 +18,10 @@ The project-local skill, exact configured model metadata, native project
 picker, native permission decision, and native worktree controls remain red or
 unexercised. Ticket 12 remains open for those separate surfaces.
 
-The first dedicated mode run was also intentionally red. It proved both mode
-controls and one persisted Default turn, then stopped before the Plan turn
-because the initial probe incorrectly treated an exact model phrase as part of
-the mode contract. The revised no-app probe binds nonempty renderer output to
-the persisted completion by hash instead; that revision has not received a
-second live run.
+The dedicated mode workflow is also green. Run-root suffix `iT8EEf` exercised
+both mode controls and completed one persisted Default turn and one persisted
+Plan turn. The renderer and persisted output hashes matched for both turns;
+provider, gateway, isolation, integrity, and cleanup gates remained green.
 
 The successful run used:
 
@@ -36,7 +34,35 @@ PROBE_EXPECT=renderer-cold-resume \
   .scratch/chatgpt-airgap-unlock/research/08-run-prototype.sh
 ```
 
-## Dedicated mode run and diagnosis
+## Successful dedicated mode evidence
+
+Run-root suffix `iT8EEf` executed the mode workflow from driver commit
+`7be6fdf03a8c5311131fd404a90822e436843116` with the same pinned app, OptiQ
+revision, and reviewed gateway commit used by the earlier mode diagnosis.
+
+- The renderer exposed `Plan mode` and `Turn plan mode on` in Default mode,
+  exposed the accessible `Plan` indicator after selection, and cleared that
+  indicator when returned to Default mode. Both control gates passed.
+- The Default and Plan prompts each completed with nonempty renderer output.
+  Their renderer output SHA-256 values were both
+  `3de89ef0f8216bcbfd88f1c76e3312d830f9b5aeb6c07b917767619b7b6f5072`.
+  Each renderer hash matched its own persisted `task_complete` output hash.
+- Persisted mode state bound the Default turn to turn-identity SHA-256
+  `ae3b13c80a8f5b5fce79ced447f77e2b1d2a98cccf24a31fdfa5863274cb66da`
+  and the Plan turn to
+  `2e43569053d36e7c33438cee3bbff0a2562b94a77c0ef0890f244d4502766be7`.
+  The single-rollout SHA-256 was
+  `41662f04943c7e322648e62921f11510d7f93a4768dc466248b91d9a03cd4077`.
+- The renderer timestamp was removed from each output wrapper before hashing.
+  The mode summary and persisted-state validator both passed, proving that the
+  timestamp-only wrapper correction did not weaken turn or mode identity.
+- The authenticated gateway and upstream each recorded three completed
+  terminal responses. Credential replacement, negative authentication,
+  namespace continuation, model-list isolation, copied-app integrity, and
+  strict signature checks passed. No credential, request-body, token, or remote
+  socket leak was observed. All owned processes and listeners exited.
+
+## Historical dedicated mode diagnosis
 
 Run-root suffix `jJuSa5` used the exact copied app, fresh isolated state, the
 pinned OptiQ revision, and reviewed gateway commit

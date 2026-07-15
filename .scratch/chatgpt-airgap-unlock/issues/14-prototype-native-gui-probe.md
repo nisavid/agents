@@ -39,7 +39,9 @@ final reviewed helper artifact when it is ready to run.
   termination, and untrusted Accessibility state.
 - Inspect and act on a unique standard Open panel through AX roles, identifiers,
   attributes, and advertised actions; allow only an audited PID-targeted
-  Command-Shift-G path-entry sequence when AX actions cannot navigate directly.
+  Command-Shift-G path-entry sequence when AX actions cannot navigate directly,
+  with separate authorization and exact application/panel focus proof before
+  posting it.
 - Prove project selection through renderer state and persisted desktop state,
   then exercise worktree and permission behavior through the renderer and verify
   their filesystem, Git, process, and app-server effects.
@@ -50,9 +52,10 @@ final reviewed helper artifact when it is ready to run.
 
 ## Permission gate
 
-The exact reviewed helper artifact is installed at the canonical path and has
-Accessibility access. Its mutation-free inspection is green. Rebuilding or
-re-signing the helper invalidates the grant until reverified.
+The exact reviewed helper artifact is installed at the canonical path. Its
+mutation-free inspection and no-permission focus contract are green. The latest
+rebuild invalidated the prior Accessibility grant until Ivan re-adds this exact
+artifact.
 
 ## Current prototype evidence
 
@@ -62,13 +65,14 @@ the Ticket 08/12 runner. The helper binds to the copied executable by PID,
 process start time, canonical running paths, and static/live code signatures;
 uses only PID-scoped AX state; refuses path, control, or process ambiguity; and
 requires a separate explicit flag before the audited PID-scoped Open Folder
-menu press and another flag before the Command-Shift-G fallback are available.
+menu press, another flag before the Command-Shift-G fallback, and explicit focus
+authorization before that fallback are available.
 The same binary provides a bounded read-only menu-inspection phase that records
 the exact validated topology and metadata with zero actions, then uses the
 runner's common audited teardown. The helper records the Open Folder action before validating the
-native panel. The fallback accepts only one newly created child of the original
-validated panel, and the final press remains bound to that original panel's
-exact AX identity. Project adoption requires a nonce renderer transition plus
+native panel. The fallback accepts only one exact path field and Go control
+introduced either within the original panel or one newly related child, and the
+final press remains bound to that original panel's exact AX identity. Project adoption requires a nonce renderer transition plus
 an exact authoritative `threads.cwd` transition.
 
 A manually granted first live invocation validated the exact copied-app process
@@ -148,8 +152,25 @@ File → Open Folder path after three polls. It recorded character `O`, modifier
 `0`, enabled `AXPress`, an explicitly unpublished virtual key, and
 `actionCount: 0`. The pinned model and host sentinel contracts passed, all owned
 processes and listeners closed, remote sockets and token leaks remained absent,
-and source/copy app hashes remained exact. The retained helper is ready for the
-separately authorized project-selection run.
+and source/copy app hashes remained exact.
 
-No live AX action has occurred for this revision. The reviewed retained artifact
-is recorded in `research/14-native-gui-probe.md`.
+The subsequent project-selection runs validated the exact menu press and Open
+panel. One run showed that a recursive AX snapshot consumed the readiness
+budget; bounded raw-window reads and one cached descendant traversal removed
+that observer cost. Run-root suffix `fWZ5kY` then completed four bounded polls
+with the final state `new-fields=0 go-buttons=0 extra-cancels=0
+chooser-enabled=true`. Command-Shift-G produced no accessibility-tree delta,
+so the helper failed closed before any path mutation or chooser press. Project
+adoption remained zero and all isolation, integrity, database, process, and
+listener closeout gates passed.
+
+The helper now strictly proves the exact copied application is frontmost, its
+focused window is the original panel, and that panel is focused. If those
+postconditions are absent, separate authorization permits only setting the
+exact application's `AXFrontmost` attribute and performing `AXRaise` on the
+exact panel, after both capabilities are preflighted and with process identity
+checks around each action. It then recaptures the path-entry baseline and checks
+focus inside the final keyboard-post boundary. Two reproducible builds matched
+SHA-256 `40d7b6426a41b5f860a88a869f9a60137de61f1ca484cd05790ac80b64b2ee0c`;
+the canonical arm64 ad-hoc artifact has CDHash
+`8acdf587fae6521b42ae74d0af2e696f5e7f8389` and awaits a fresh manual grant.

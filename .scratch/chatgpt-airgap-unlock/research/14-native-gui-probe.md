@@ -29,7 +29,7 @@ Run the deterministic no-permission checks with:
 The live runner seam is opt-in. It requires the exact artifact path and SHA-256,
 passes the copied app PID and canonical copied paths explicitly, requires
 `--press-open-folder-menu-item` for the selection phase, and authorizes the
-PID-targeted Command-Shift-G fallback separately. The helper checks path, process-start,
+PID-targeted Command-Shift-G fallback and its focus mutation separately. The helper checks path, process-start,
 executable, running-bundle, static signature, and live signature identity before
 checking trust or reading AX state. After trust, it waits up to five monotonic
 seconds for the exact source-backed `File` → `Open Folder…` menu path. The item
@@ -53,6 +53,7 @@ GUI_NATIVE_PROJECT_PICKER=true \
 NATIVE_GUI_PROBE_BIN=<reviewed-artifact-path> \
 NATIVE_GUI_PROBE_SHA256=<reviewed-sha256> \
 NATIVE_GUI_PROBE_KEY_FALLBACK=true \
+NATIVE_GUI_PROBE_FOCUS_OPEN_PANEL=true \
 GUI_WORKFLOW=true \
 PROBE_EXPECT=renderer-native-project \
   .scratch/chatgpt-airgap-unlock/research/08-run-prototype.sh
@@ -66,6 +67,15 @@ input action. The runner resolves exactly one copied-app executable in the owned
 process group and invokes the helper with explicit Open Folder authorization.
 The helper presses the exact PID-scoped menu item, records exactly one
 `open-folder-menu-item-pressed` event, and validates the native panel afterward.
+Before Command-Shift-G, it requires the original panel to remain the unique
+current exact-PID window, strictly reads the application frontmost, focused
+window, and panel-focused attributes, and performs no focus action when they
+already prove readiness. Otherwise, separate authorization permits only setting
+that exact application's `AXFrontmost` attribute and raising that exact panel.
+It preflights both capabilities before the first mutation, brackets each action
+with process-identity checks, waits two monotonic seconds for all three focus
+postconditions, recaptures the path-entry baseline, and rechecks exact focus
+immediately before the adjacent PID-targeted key events.
 The runner requires that evidence order before accepting panel validation, then
 requires a renderer transition from a nonmatching project to the per-run nonce
 project. After the renderer creates its first task, the runner waits for the
@@ -166,13 +176,34 @@ Ivan; the helper never requests a prompt itself.
 
 Green for the source, build, input-policy, selector-policy, and runner-seam
 slice. The retained no-permission artifact for this revision is arm64 and ad-hoc signed,
-with SHA-256 `39dfa43ad8c1d84a4debbeb2d8726765428d08d9aafc72688f9830f4576c3180`
-and CDHash `3a27be8a5b3e8127722dc6d2a7db3842b602fde6`. A clean build in a second
+with SHA-256 `40d7b6426a41b5f860a88a869f9a60137de61f1ca484cd05790ac80b64b2ee0c`
+and CDHash `8acdf587fae6521b42ae74d0af2e696f5e7f8389`. A clean build in a second
 disposable directory produced the same SHA-256. The helper self-test, forbidden
 API and sensitive-symbol allowlists, path-policy fixtures, renderer transition
 oracle, authoritative project-state fixtures, runner shell syntax, and
 cold-handoff self-test all passed. The reviewed revision is installed at the
 canonical helper path recorded above and requires a fresh manual grant.
+
+## Project-selection focus diagnosis
+
+The exact menu press and Open panel validation succeeded in the project-selection
+runs. The first Command-Shift-G attempt used a full recursive snapshot whose
+three-second traversal consumed the path-entry readiness budget. Bounded raw
+window reads and one cached descendant traversal removed that observer cost.
+The next run completed five bounded path-entry polls but found no candidate.
+Run-root suffix `fWZ5kY` then recorded the exact final pending state:
+`new-fields=0 go-buttons=0 extra-cancels=0 chooser-enabled=true`. The shortcut
+caused no accessibility-tree change; project adoption remained at zero exact
+fixture rows, and every owned process and listener still closed cleanly.
+
+The retained helper now treats focus as a proven precondition rather than an
+assumption. It introduces no system-wide AX element, AppKit activation API,
+bundle-ID target, or coordinate input. The deterministic suite produced two
+byte-identical arm64 ad-hoc builds, exercised staged focus convergence, timeout,
+PID drift, option and runner authorization, exact mutation ordering, forbidden
+API policy, and the sensitive-symbol allowlist, then passed the complete
+no-permission workflow. The canonical artifact above awaits a fresh manual
+Accessibility grant before the next live project-selection run.
 
 ## First live invocation
 

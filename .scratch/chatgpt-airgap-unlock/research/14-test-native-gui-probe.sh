@@ -210,6 +210,8 @@ test "$open_folder_event_line" -lt "$open_panel_wait_line"
 /usr/bin/grep -Fq '"actionCount": 1' "$HERE/14-native-gui-probe.swift"
 /usr/bin/grep -Fq -- '--press-open-folder-menu-item' "$HERE/14-native-gui-probe.swift"
 /usr/bin/grep -Fq -- '--press-open-folder-menu-item' "$HERE/08-run-prototype.sh"
+/usr/bin/grep -Fq -- '--focus-open-panel' "$HERE/14-native-gui-probe.swift"
+/usr/bin/grep -Fq -- '--focus-open-panel' "$HERE/08-run-prototype.sh"
 /usr/bin/grep -Fq '"kind":"native-project-picker-precondition-ready"' \
   "$HERE/08-run-prototype.sh"
 /usr/bin/grep -Fq '"kind":"open-folder-menu-item-pressed"' \
@@ -264,6 +266,49 @@ test "$(printf '%s\n' "$generic_press_body" | \
   /usr/bin/grep -Fc 'try requireSameProcess(process)')" -eq 2
 test "$(printf '%s\n' "$generic_press_body" | \
   /usr/bin/grep -Fc 'AXUIElementPerformAction(element, kAXPressAction as CFString)')" -eq 1
+focus_body="$(/usr/bin/sed -n \
+  '/BEGIN_PID_OPEN_PANEL_FOCUS/,/END_PID_OPEN_PANEL_FOCUS/p' \
+  "$HERE/14-native-gui-probe.swift")"
+focus_body_file="$BUILD_ROOT/open-panel-focus-body.txt"
+printf '%s\n' "$focus_body" >"$focus_body_file"
+for required_focus_contract in kAXFrontmostAttribute kAXFocusedWindowAttribute \
+  kAXFocusedAttribute kAXRaiseAction AXUIElementIsAttributeSettable \
+  readOpenPanelFocusSnapshot waitForOpenPanelFocus; do
+  /usr/bin/grep -Fq "$required_focus_contract" "$focus_body_file"
+done
+test "$(printf '%s\n' "$focus_body" | \
+  /usr/bin/grep -Fc 'AXUIElementSetAttributeValue(')" -eq 1
+test "$(printf '%s\n' "$focus_body" | \
+  /usr/bin/grep -Fc 'AXUIElementPerformAction(')" -eq 1
+/usr/bin/grep -Fq 'panel, kAXRaiseAction as CFString' "$focus_body_file"
+if printf '%s\n' "$focus_body" | /usr/bin/grep -Eq \
+  'NSWorkspace|NSRunningApplication|activateIgnoringOtherApps|AXUIElementCreateSystemWide|postToPid'; then
+  echo 'Open panel focus contract contains a broader activation or input surface' >&2
+  exit 1
+fi
+command_focus_line="$(printf '%s\n' "$execute_body" | \
+  /usr/bin/grep -nF 'let focusReadiness = try focusOpenPanel(' | \
+  /usr/bin/awk -F: '{print $1}')"
+command_baseline_line="$(printf '%s\n' "$execute_body" | \
+  /usr/bin/grep -nF 'let baseline = try validatedPathEntryBaseline(' | \
+  /usr/bin/awk -F: '{print $1}')"
+command_shortcut_line="$(printf '%s\n' "$execute_body" | \
+  /usr/bin/grep -nF 'try postCommandShiftG(' | \
+  /usr/bin/awk -F: '{print $1}')"
+test "$command_focus_line" -lt "$command_baseline_line"
+test "$command_baseline_line" -lt "$command_shortcut_line"
+keyboard_post_body="$(/usr/bin/sed -n \
+  '/^func performValidatedKeyboardPost(/,/^}/p' \
+  "$HERE/14-native-gui-probe.swift")"
+keyboard_focus_line="$(printf '%s\n' "$keyboard_post_body" | \
+  /usr/bin/grep -nF 'try validateFocus()' | /usr/bin/sed -n '1p' | \
+  /usr/bin/awk -F: '{print $1}')"
+keyboard_down_line="$(printf '%s\n' "$keyboard_post_body" | \
+  /usr/bin/grep -nF 'postKeyDown()' | /usr/bin/awk -F: '{print $1}')"
+keyboard_up_line="$(printf '%s\n' "$keyboard_post_body" | \
+  /usr/bin/grep -nF 'postKeyUp()' | /usr/bin/awk -F: '{print $1}')"
+test "$keyboard_focus_line" -lt "$keyboard_down_line"
+test $((keyboard_down_line + 1)) -eq "$keyboard_up_line"
 for required_path_entry_gate in validatedPathEntryBaseline revalidatePathEntryToken \
   'publishedPath == paths.fixture' waitForValidatedOpenPanelRestoration \
   revalidateRestoredOpenPanelToken kAXDocumentAttribute kAXURLAttribute \
@@ -289,6 +334,7 @@ _AXUIElementCopyActionNames
 _AXUIElementCopyAttributeValue
 _AXUIElementCreateApplication
 _AXUIElementGetTypeID
+_AXUIElementIsAttributeSettable
 _AXUIElementPerformAction
 _AXUIElementSetAttributeValue
 _CGEventCreateKeyboardEvent
@@ -354,6 +400,50 @@ fi
   --event-log "$RUN_ROOT/logs/native-gui-probe.jsonl" \
   --press-open-folder-menu-item \
   --validate-inputs-only
+if "$PROBE" \
+  --pid 2 \
+  --run-root "$RUN_ROOT" \
+  --expected-bundle "$RUN_ROOT/Probe.app" \
+  --expected-executable "$RUN_ROOT/Probe.app/Contents/MacOS/ChatGPT" \
+  --fixture-root "$RUN_ROOT/workspace" \
+  --phase select-project \
+  --event-log "$RUN_ROOT/logs/native-gui-probe.jsonl" \
+  --press-open-folder-menu-item \
+  --permit-key-fallback \
+  --validate-inputs-only 2>"$BUILD_ROOT/missing-focus.stderr"; then
+  echo 'key fallback without explicit Open panel focus authorization unexpectedly passed' >&2
+  exit 1
+fi
+/usr/bin/grep -Fq 'select-project with key fallback requires --focus-open-panel' \
+  "$BUILD_ROOT/missing-focus.stderr"
+"$PROBE" \
+  --pid 2 \
+  --run-root "$RUN_ROOT" \
+  --expected-bundle "$RUN_ROOT/Probe.app" \
+  --expected-executable "$RUN_ROOT/Probe.app/Contents/MacOS/ChatGPT" \
+  --fixture-root "$RUN_ROOT/workspace" \
+  --phase select-project \
+  --event-log "$RUN_ROOT/logs/native-gui-probe.jsonl" \
+  --press-open-folder-menu-item \
+  --permit-key-fallback \
+  --focus-open-panel \
+  --validate-inputs-only
+if "$PROBE" \
+  --pid 2 \
+  --run-root "$RUN_ROOT" \
+  --expected-bundle "$RUN_ROOT/Probe.app" \
+  --expected-executable "$RUN_ROOT/Probe.app/Contents/MacOS/ChatGPT" \
+  --fixture-root "$RUN_ROOT/workspace" \
+  --phase select-project \
+  --event-log "$RUN_ROOT/logs/native-gui-probe.jsonl" \
+  --press-open-folder-menu-item \
+  --focus-open-panel \
+  --validate-inputs-only 2>"$BUILD_ROOT/focus-without-fallback.stderr"; then
+  echo 'Open panel focus authorization without key fallback unexpectedly passed' >&2
+  exit 1
+fi
+/usr/bin/grep -Fq -- '--focus-open-panel requires --permit-key-fallback' \
+  "$BUILD_ROOT/focus-without-fallback.stderr"
 if "$PROBE" \
   --pid 2 \
   --run-root "$RUN_ROOT" \

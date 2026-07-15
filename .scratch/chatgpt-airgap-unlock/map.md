@@ -35,7 +35,7 @@ Produce an implementation-ready, empirically validated plan for running the exac
 - [Validate the preferred route](issues/08-validate-preferred-route.md) — Prove the configured pristine-bundle route against the local OptiQ fixture and grade every minimum-workflow and platform-isolation gate from artifact-bound evidence.
 - [Validate the offline GUI workflow](issues/12-validate-offline-gui-workflow.md) — Complete native project, worktree, permission, project-local skill, and reasoning-label acceptance against the pinned local route.
 - [Validate production isolation](issues/13-validate-production-isolation.md) — Preserve the vendor Chromium sandbox and signed code posture while a disconnected VM or true air gap makes hosted egress unavailable.
-- [Prototype the native GUI probe](issues/14-prototype-native-gui-probe.md) — The PID-bound, fail-closed Accessibility helper and authoritative project-adoption proof are independently reviewed and reproducible; the final mutation-free inspection validated the exact File → Open Folder path, Command-O metadata, optional physical-key state, stable process identity, and `actionCount: 0`, so the retained and granted artifact with SHA-256 `39dfa43ad8c1d84a4debbeb2d8726765428d08d9aafc72688f9830f4576c3180` is ready for the separately authorized project-selection run.
+- [Prototype the native GUI probe](issues/14-prototype-native-gui-probe.md) — The PID-bound helper now requires explicit exact-app/panel focus authorization and proof inside the final keyboard-post boundary; two reproducible builds matched SHA-256 `40d7b6426a41b5f860a88a869f9a60137de61f1ca484cd05790ac80b64b2ee0c`, and the canonical artifact awaits its fresh manual Accessibility grant before the next project-selection run.
 
 ## Not yet specified
 

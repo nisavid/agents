@@ -58,6 +58,7 @@ GUI_NATIVE_PROJECT_PICKER="${GUI_NATIVE_PROJECT_PICKER:-false}"
 NATIVE_GUI_PROBE_BIN="${NATIVE_GUI_PROBE_BIN:-}"
 NATIVE_GUI_PROBE_SHA256="${NATIVE_GUI_PROBE_SHA256:-}"
 NATIVE_GUI_PROBE_KEY_FALLBACK="${NATIVE_GUI_PROBE_KEY_FALLBACK:-false}"
+NATIVE_GUI_PROBE_FOCUS_OPEN_PANEL="${NATIVE_GUI_PROBE_FOCUS_OPEN_PANEL:-false}"
 NATIVE_GUI_PROBE_INSPECT_MENU_ONLY="${NATIVE_GUI_PROBE_INSPECT_MENU_ONLY:-false}"
 NATIVE_GUI_PROBE_PROTECTED_PATH=""
 RUN_LOCK="/private/tmp/chatgpt-route-prototype-08.lock"
@@ -102,10 +103,31 @@ validate_native_menu_inspection_config() {
   native_picker="$2"
   gui_workflow="$3"
   key_fallback="$4"
+  focus_open_panel="$5"
   if test "$inspection_only" = true && \
     { test "$native_picker" != true || test "$gui_workflow" != false || \
-      test "$key_fallback" != false; }; then
-    echo 'menu inspection requires GUI_NATIVE_PROJECT_PICKER=true, GUI_WORKFLOW=false, and NATIVE_GUI_PROBE_KEY_FALLBACK=false' >&2
+      test "$key_fallback" != false || test "$focus_open_panel" != false; }; then
+    echo 'menu inspection requires GUI_NATIVE_PROJECT_PICKER=true, GUI_WORKFLOW=false, NATIVE_GUI_PROBE_KEY_FALLBACK=false, and NATIVE_GUI_PROBE_FOCUS_OPEN_PANEL=false' >&2
+    return 64
+  fi
+}
+
+validate_native_focus_config() {
+  focus_open_panel="$1"
+  native_picker="$2"
+  gui_workflow="$3"
+  key_fallback="$4"
+  inspection_only="$5"
+  if test "$focus_open_panel" = true && \
+    { test "$native_picker" != true || test "$gui_workflow" != true || \
+      test "$key_fallback" != true || test "$inspection_only" != false; }; then
+    echo 'Open panel focus requires GUI_NATIVE_PROJECT_PICKER=true, GUI_WORKFLOW=true, NATIVE_GUI_PROBE_KEY_FALLBACK=true, and NATIVE_GUI_PROBE_INSPECT_MENU_ONLY=false' >&2
+    return 64
+  fi
+  if test "$native_picker" = true && test "$gui_workflow" = true && \
+    test "$inspection_only" = false && test "$key_fallback" = true && \
+    test "$focus_open_panel" != true; then
+    echo 'NATIVE_GUI_PROBE_KEY_FALLBACK=true requires NATIVE_GUI_PROBE_FOCUS_OPEN_PANEL=true' >&2
     return 64
   fi
 }
@@ -186,8 +208,8 @@ run_cold_handoff_self_test() (
   self_test_root="$(mktemp -d /private/tmp/chatgpt-cold-handoff-self-test.XXXXXX)"
   trap '/bin/rm -rf "$self_test_root"' EXIT INT TERM
   LOG_DIR="$self_test_root"
-  validate_native_menu_inspection_config true true false false
-  if validate_native_menu_inspection_config true true true false \
+  validate_native_menu_inspection_config true true false false false
+  if validate_native_menu_inspection_config true true true false false \
     2>"$self_test_root/inspection-config.stderr"; then
     echo 'menu inspection accepted GUI_WORKFLOW=true' >&2
     return 1
@@ -196,8 +218,8 @@ run_cold_handoff_self_test() (
   fi
   test "$inspection_config_status" -eq 64
   test "$(/bin/cat "$self_test_root/inspection-config.stderr")" = \
-    'menu inspection requires GUI_NATIVE_PROJECT_PICKER=true, GUI_WORKFLOW=false, and NATIVE_GUI_PROBE_KEY_FALLBACK=false'
-  if validate_native_menu_inspection_config true false false false \
+    'menu inspection requires GUI_NATIVE_PROJECT_PICKER=true, GUI_WORKFLOW=false, NATIVE_GUI_PROBE_KEY_FALLBACK=false, and NATIVE_GUI_PROBE_FOCUS_OPEN_PANEL=false'
+  if validate_native_menu_inspection_config true false false false false \
     2>"$self_test_root/inspection-native-picker.stderr"; then
     echo 'menu inspection accepted GUI_NATIVE_PROJECT_PICKER=false' >&2
     return 1
@@ -206,8 +228,8 @@ run_cold_handoff_self_test() (
   fi
   test "$inspection_native_picker_status" -eq 64
   test "$(/bin/cat "$self_test_root/inspection-native-picker.stderr")" = \
-    'menu inspection requires GUI_NATIVE_PROJECT_PICKER=true, GUI_WORKFLOW=false, and NATIVE_GUI_PROBE_KEY_FALLBACK=false'
-  if validate_native_menu_inspection_config true true false true \
+    'menu inspection requires GUI_NATIVE_PROJECT_PICKER=true, GUI_WORKFLOW=false, NATIVE_GUI_PROBE_KEY_FALLBACK=false, and NATIVE_GUI_PROBE_FOCUS_OPEN_PANEL=false'
+  if validate_native_menu_inspection_config true true false true false \
     2>"$self_test_root/inspection-key-fallback.stderr"; then
     echo 'menu inspection accepted NATIVE_GUI_PROBE_KEY_FALLBACK=true' >&2
     return 1
@@ -216,7 +238,38 @@ run_cold_handoff_self_test() (
   fi
   test "$inspection_key_fallback_status" -eq 64
   test "$(/bin/cat "$self_test_root/inspection-key-fallback.stderr")" = \
-    'menu inspection requires GUI_NATIVE_PROJECT_PICKER=true, GUI_WORKFLOW=false, and NATIVE_GUI_PROBE_KEY_FALLBACK=false'
+    'menu inspection requires GUI_NATIVE_PROJECT_PICKER=true, GUI_WORKFLOW=false, NATIVE_GUI_PROBE_KEY_FALLBACK=false, and NATIVE_GUI_PROBE_FOCUS_OPEN_PANEL=false'
+  if validate_native_menu_inspection_config true true false false true \
+    2>"$self_test_root/inspection-focus.stderr"; then
+    echo 'menu inspection accepted NATIVE_GUI_PROBE_FOCUS_OPEN_PANEL=true' >&2
+    return 1
+  else
+    inspection_focus_status=$?
+  fi
+  test "$inspection_focus_status" -eq 64
+  test "$(/bin/cat "$self_test_root/inspection-focus.stderr")" = \
+    'menu inspection requires GUI_NATIVE_PROJECT_PICKER=true, GUI_WORKFLOW=false, NATIVE_GUI_PROBE_KEY_FALLBACK=false, and NATIVE_GUI_PROBE_FOCUS_OPEN_PANEL=false'
+  validate_native_focus_config true true true true false
+  if validate_native_focus_config true true true false false \
+    2>"$self_test_root/focus-config.stderr"; then
+    echo 'Open panel focus accepted NATIVE_GUI_PROBE_KEY_FALLBACK=false' >&2
+    return 1
+  else
+    focus_config_status=$?
+  fi
+  test "$focus_config_status" -eq 64
+  test "$(/bin/cat "$self_test_root/focus-config.stderr")" = \
+    'Open panel focus requires GUI_NATIVE_PROJECT_PICKER=true, GUI_WORKFLOW=true, NATIVE_GUI_PROBE_KEY_FALLBACK=true, and NATIVE_GUI_PROBE_INSPECT_MENU_ONLY=false'
+  if validate_native_focus_config false true true true false \
+    2>"$self_test_root/key-fallback-focus-config.stderr"; then
+    echo 'key fallback accepted NATIVE_GUI_PROBE_FOCUS_OPEN_PANEL=false' >&2
+    return 1
+  else
+    key_fallback_focus_config_status=$?
+  fi
+  test "$key_fallback_focus_config_status" -eq 64
+  test "$(/bin/cat "$self_test_root/key-fallback-focus-config.stderr")" = \
+    'NATIVE_GUI_PROBE_KEY_FALLBACK=true requires NATIVE_GUI_PROBE_FOCUS_OPEN_PANEL=true'
   validate_worktree_config true true true false true false
   if validate_worktree_config true true false false true false \
     2>"$self_test_root/worktree-config.stderr"; then
@@ -414,12 +467,20 @@ case "$NATIVE_GUI_PROBE_KEY_FALLBACK" in
   false|true) ;;
   *) echo "NATIVE_GUI_PROBE_KEY_FALLBACK must be true or false" >&2; exit 64 ;;
 esac
+case "$NATIVE_GUI_PROBE_FOCUS_OPEN_PANEL" in
+  false|true) ;;
+  *) echo "NATIVE_GUI_PROBE_FOCUS_OPEN_PANEL must be true or false" >&2; exit 64 ;;
+esac
 case "$NATIVE_GUI_PROBE_INSPECT_MENU_ONLY" in
   false|true) ;;
   *) echo "NATIVE_GUI_PROBE_INSPECT_MENU_ONLY must be true or false" >&2; exit 64 ;;
 esac
 validate_native_menu_inspection_config "$NATIVE_GUI_PROBE_INSPECT_MENU_ONLY" \
-  "$GUI_NATIVE_PROJECT_PICKER" "$GUI_WORKFLOW" "$NATIVE_GUI_PROBE_KEY_FALLBACK"
+  "$GUI_NATIVE_PROJECT_PICKER" "$GUI_WORKFLOW" "$NATIVE_GUI_PROBE_KEY_FALLBACK" \
+  "$NATIVE_GUI_PROBE_FOCUS_OPEN_PANEL"
+validate_native_focus_config "$NATIVE_GUI_PROBE_FOCUS_OPEN_PANEL" \
+  "$GUI_NATIVE_PROJECT_PICKER" "$GUI_WORKFLOW" "$NATIVE_GUI_PROBE_KEY_FALLBACK" \
+  "$NATIVE_GUI_PROBE_INSPECT_MENU_ONLY"
 validate_worktree_config "$GUI_WORKTREE" "$GUI_WORKFLOW" "$GUI_COLD_RESUME" \
   "$GUI_MODES" "$GUI_NATIVE_PROJECT_PICKER" "$NATIVE_GUI_PROBE_INSPECT_MENU_ONLY"
 if test "$GUI_COLD_RESUME" = true; then
@@ -998,6 +1059,9 @@ if test "$GUI_NATIVE_PROJECT_PICKER" = true; then
     --press-open-folder-menu-item
   if test "$NATIVE_GUI_PROBE_KEY_FALLBACK" = true; then
     set -- "$@" --permit-key-fallback
+  fi
+  if test "$NATIVE_GUI_PROBE_FOCUS_OPEN_PANEL" = true; then
+    set -- "$@" --focus-open-panel
   fi
   run_native_gui_probe "$@" \
     >"$LOG_DIR/native-gui-probe.stdout" 2>"$LOG_DIR/native-gui-probe.stderr"

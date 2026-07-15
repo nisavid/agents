@@ -372,6 +372,7 @@ class _UpstreamLifecycle:
 
     def __init__(self, connection: http.client.HTTPConnection):
         self._connection = connection
+        self._transport: socket.socket | None = None
         self._response: http.client.HTTPResponse | None = None
         self._closing = False
         self._lock = threading.Lock()
@@ -384,21 +385,33 @@ class _UpstreamLifecycle:
         response.close()
         return False
 
-    def close(self) -> None:
+    def capture_transport(self) -> None:
+        """Retain the connected socket before HTTPResponse may detach it."""
+        with self._lock:
+            if not self._closing:
+                self._transport = self._connection.sock
+
+    def close(self, *, close_response: bool = True) -> None:
         with self._lock:
             if self._closing:
                 return
             self._closing = True
             response = self._response
-        # Close the transport first, then the file wrapper. Both are needed to
-        # interrupt a thread blocked in HTTPResponse.readline() on all supported
-        # Python/macOS combinations.
+            transport = self._transport or getattr(self._connection, "sock", None)
+        # Shut down the retained transport before closing its wrappers. A
+        # terminal SSE reader closes its own response wrapper when its blocked
+        # readline eventually returns; cross-thread response.close() can block.
+        if transport is not None:
+            try:
+                transport.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
         try:
             self._connection.close()
         except Exception:
             pass
         finally:
-            if response is not None:
+            if close_response and response is not None:
                 try:
                     response.close()
                 except Exception:
@@ -434,10 +447,11 @@ class _SSELineReader:
         except queue.Empty:
             return None
 
-    def close(self) -> None:
+    def close(self, *, wait_for_reader: bool = True) -> None:
         self._stopping.set()
-        self._lifecycle.close()
-        self._thread.join(timeout=1.0)
+        self._lifecycle.close(close_response=wait_for_reader)
+        if wait_for_reader:
+            self._thread.join(timeout=1.0)
 
     def _read(self) -> None:
         try:
@@ -450,6 +464,11 @@ class _SSELineReader:
                     return
         except Exception as error:
             self._put(("error", error))
+        finally:
+            try:
+                self._response.close()
+            except Exception:
+                pass
 
     def _put(self, item: tuple[str, bytes | Exception]) -> bool:
         while not self._stopping.is_set():
@@ -716,6 +735,7 @@ def _handler_for(config: ProxyConfig, namespace_state: _NamespaceState):
                     body=encoded,
                     headers=headers,
                 )
+                lifecycle.capture_transport()
                 response = connection.getresponse()
                 if not self.server.register_upstream_response(lifecycle, response):
                     self.close_connection = True
@@ -852,6 +872,8 @@ def _handler_for(config: ProxyConfig, namespace_state: _NamespaceState):
                         self.wfile.write(transformed_frame)
                         self.wfile.flush()
                         frame = []
+                        if is_terminal:
+                            break
             except (
                 BrokenPipeError,
                 ConnectionResetError,
@@ -863,7 +885,7 @@ def _handler_for(config: ProxyConfig, namespace_state: _NamespaceState):
                 if config.debug:
                     _safe_log("SSE stream ended before upstream EOF")
             finally:
-                reader.close()
+                reader.close(wait_for_reader=not terminal_observed)
                 if config.debug:
                     _safe_log(f"SSE terminal_completed={str(terminal_observed).lower()}")
 

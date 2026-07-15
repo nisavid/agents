@@ -526,7 +526,7 @@ class ProxyIntegrationTest(unittest.TestCase):
         self.assertEqual(body, raw)
         self.assertNotIn(b"codex-ns-proxy keep-alive", raw)
 
-    def test_sse_heartbeat_stops_after_terminal_frame(self):
+    def test_sse_terminal_frame_finishes_downstream_before_upstream_eof(self):
         terminal = (
             b"event: response.completed\n"
             b'data: {"type":"response.completed","response":{"id":"done","output":[]}}\n\n'
@@ -534,29 +534,89 @@ class ProxyIntegrationTest(unittest.TestCase):
         FakeUpstreamHandler.response_headers = {"Content-Type": "text/event-stream"}
         FakeUpstreamHandler.response_body = terminal
         FakeUpstreamHandler.hold_open = True
+        FakeUpstreamHandler.observe_disconnect = True
         self.restart_gateway(
             upstream_timeout_seconds=1,
             sse_heartbeat_seconds=0.02,
             adapter="identity",
+            debug=True,
         )
         result = []
+        client_errors = []
+        stderr = io.StringIO()
 
-        client = threading.Thread(
-            target=lambda: result.append(
-                self.request("POST", "/v1/responses", {"input": []})
+        def consume():
+            connection = socket.create_connection(
+                ("127.0.0.1", self.gateway.server_address[1]), timeout=1
             )
-        )
-        client.start()
-        self.assertTrue(FakeUpstreamHandler.read_started.wait(1))
-        time.sleep(0.08)
-        FakeUpstreamHandler.release_response.set()
-        client.join(2)
+            connection.settimeout(1)
+            body = b'{"input":[]}'
+            request = (
+                b"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                + f"Authorization: Bearer {INBOUND_TOKEN}\r\n".encode()
+                + f"Content-Length: {len(body)}\r\n\r\n".encode()
+                + body
+            )
+            try:
+                connection.sendall(request)
+                chunks = []
+                while True:
+                    chunk = connection.recv(65536)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                result.append(b"".join(chunks))
+            except OSError as error:
+                client_errors.append(type(error).__name__)
+            finally:
+                connection.close()
 
+        client = threading.Thread(target=consume)
+        try:
+            with contextlib.redirect_stderr(stderr):
+                client.start()
+                self.assertTrue(FakeUpstreamHandler.read_started.wait(0.5))
+                client.join(1.0)
+                completed_before_release = not client.is_alive()
+                disconnected_before_release = (
+                    FakeUpstreamHandler.upstream_disconnect_observed.wait(1.0)
+                )
+                terminal_logged_before_release = "SSE terminal_completed=true" in stderr.getvalue()
+        finally:
+            FakeUpstreamHandler.release_response.set()
+            client.join(2)
+
+        evidence = (
+            f"completed={completed_before_release} "
+            f"upstream_disconnected={disconnected_before_release} "
+            f"logs={stderr.getvalue()!r}"
+        )
+        self.assertTrue(completed_before_release, evidence)
+        self.assertTrue(disconnected_before_release, evidence)
+        self.assertTrue(terminal_logged_before_release, evidence)
         self.assertFalse(client.is_alive())
         self.assertEqual(1, len(result))
-        status, _, raw = result[0]
+        self.assertEqual([], client_errors)
+        headers, raw = result[0].split(b"\r\n\r\n", 1)
+        self.assertTrue(headers.startswith(b"HTTP/1.1 200"), headers)
+        self.assertEqual(terminal, raw)
+
+    def test_sse_terminal_frame_materialized_at_eof_is_flushed_once(self):
+        terminal = (
+            b"event: response.completed\n"
+            b'data: {"type":"response.completed","response":{"id":"eof","output":[]}}\n'
+        )
+        FakeUpstreamHandler.response_headers = {"Content-Type": "text/event-stream"}
+        FakeUpstreamHandler.stream_chunks = [(0, terminal)]
+        self.restart_gateway(adapter="identity", debug=True)
+        stderr = io.StringIO()
+
+        with contextlib.redirect_stderr(stderr):
+            status, _, raw = self.request("POST", "/v1/responses", {"input": []})
+
         self.assertEqual(200, status)
         self.assertEqual(terminal, raw)
+        self.assertEqual(1, stderr.getvalue().count("SSE terminal_completed=true"))
 
     def test_upstream_error_is_forwarded_without_dump_or_fabrication(self):
         FakeUpstreamHandler.response_status = 429

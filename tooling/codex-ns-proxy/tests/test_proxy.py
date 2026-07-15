@@ -526,13 +526,14 @@ class ProxyIntegrationTest(unittest.TestCase):
         self.assertEqual(body, raw)
         self.assertNotIn(b"codex-ns-proxy keep-alive", raw)
 
-    def test_sse_terminal_frame_finishes_downstream_before_upstream_eof(self):
+    def test_sse_completed_and_done_finish_downstream_before_upstream_eof(self):
         terminal = (
             b"event: response.completed\n"
             b'data: {"type":"response.completed","response":{"id":"done","output":[]}}\n\n'
         )
+        transport_done = b"data: [DONE]\n\n"
         FakeUpstreamHandler.response_headers = {"Content-Type": "text/event-stream"}
-        FakeUpstreamHandler.response_body = terminal
+        FakeUpstreamHandler.response_body = terminal + transport_done
         FakeUpstreamHandler.hold_open = True
         FakeUpstreamHandler.observe_disconnect = True
         self.restart_gateway(
@@ -614,12 +615,65 @@ class ProxyIntegrationTest(unittest.TestCase):
         self.assertEqual([], client_errors)
         headers, raw = result[0].split(b"\r\n\r\n", 1)
         self.assertTrue(headers.startswith(b"HTTP/1.1 200"), headers)
-        self.assertEqual(terminal, raw)
+        self.assertEqual(terminal + transport_done, raw)
         FakeUpstreamHandler.hold_open = False
         FakeUpstreamHandler.response_headers = {"Content-Type": "application/json"}
         FakeUpstreamHandler.response_body = b'{"object":"ok"}'
         status, _, _ = self.request("GET", "/v1/models")
         self.assertEqual(200, status)
+
+    def test_sse_completed_without_done_logs_immediately_and_uses_timeout_fallback(
+        self,
+    ):
+        terminal = (
+            b"event: response.completed\n"
+            b'data: {"type":"response.completed","response":{"id":"semantic","output":[]}}\n\n'
+        )
+        FakeUpstreamHandler.response_headers = {"Content-Type": "text/event-stream"}
+        FakeUpstreamHandler.response_body = terminal
+        FakeUpstreamHandler.hold_open = True
+        self.restart_gateway(
+            upstream_timeout_seconds=0.5,
+            sse_heartbeat_seconds=0.02,
+            adapter="identity",
+            debug=True,
+        )
+        result = []
+
+        class SemanticTerminalLog(io.StringIO):
+            terminal_logged = threading.Event()
+
+            def write(log_self, value):
+                if "SSE terminal_completed=true" in value:
+                    log_self.terminal_logged.set()
+                return super().write(value)
+
+        stderr = SemanticTerminalLog()
+        client = threading.Thread(
+            target=lambda: result.append(
+                self.request("POST", "/v1/responses", {"input": []})
+            )
+        )
+        try:
+            with contextlib.redirect_stderr(stderr):
+                client.start()
+                self.assertTrue(stderr.terminal_logged.wait(0.3))
+                client.join(0.05)
+                waiting_for_transport_fallback = client.is_alive()
+                client.join(1)
+        finally:
+            FakeUpstreamHandler.release_response.set()
+            client.join(2)
+
+        self.assertTrue(waiting_for_transport_fallback)
+        self.assertFalse(client.is_alive())
+        self.assertEqual(1, len(result))
+        status, _, raw = result[0]
+        self.assertEqual(200, status)
+        self.assertEqual(terminal, raw)
+        self.assertNotIn(b"[DONE]", raw)
+        self.assertNotIn(b"codex-ns-proxy keep-alive", raw)
+        self.assertEqual(1, stderr.getvalue().count("SSE terminal_completed=true"))
 
     def test_sse_terminal_frame_materialized_at_eof_is_flushed_once(self):
         terminal = (
@@ -1201,6 +1255,18 @@ class PureTransformAndConfigTest(unittest.TestCase):
             with self.subTest(frame=frame):
                 _, terminal, _ = proxy._transform_sse_frame(frame, {})
                 self.assertFalse(terminal)
+
+    def test_transport_done_requires_exact_single_data_payload(self):
+        self.assertTrue(proxy._is_sse_done_frame([b"data: [DONE]\n", b"\n"]))
+        self.assertTrue(proxy._is_sse_done_frame([b"data:[DONE]\r\n", b"\r\n"]))
+        for frame in [
+            [b"data: [DONE] \n", b"\n"],
+            [b"data: [done]\n", b"\n"],
+            [b"data: [DONE]\n", b"data: extra\n", b"\n"],
+            [b": [DONE]\n", b"\n"],
+        ]:
+            with self.subTest(frame=frame):
+                self.assertFalse(proxy._is_sse_done_frame(frame))
 
     def test_configuration_requires_explicit_upstream_and_fresh_token(self):
         with self.assertRaises(proxy.ConfigurationError):

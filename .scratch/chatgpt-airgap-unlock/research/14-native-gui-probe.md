@@ -31,7 +31,11 @@ passes the copied app PID and canonical copied paths explicitly, and authorizes
 the PID-targeted Command-Shift-G fallback separately. The helper checks path,
 process-start, executable, running-bundle, static signature, and live signature
 identity before checking trust or reading AX state, then rechecks process-start
-and executable identity immediately before every AX mutation. It appends only structured,
+and executable identity before and after every Open-panel readiness snapshot
+and immediately before every AX mutation. After trust, it waits up to five
+monotonic seconds at 100-millisecond intervals while no panel-shaped candidate
+exists. Any malformed, duplicate, or ambiguous candidate fails immediately;
+the readiness loop performs no AX or input action. It appends only structured,
 path-hashed JSONL events beneath the disposable run root.
 
 After the exact artifact has been reviewed and manually granted, the seam is:
@@ -70,8 +74,8 @@ Ivan; the helper never requests a prompt itself.
 
 Green for the source, build, input-policy, selector-policy, and runner-seam
 slice. The retained final no-permission artifact is arm64 and ad-hoc signed,
-with SHA-256 `9a24fbe62ffe15ca77f3a220ecf8d8360b066121d45aa44fdee62437aafd9ea2`
-and CDHash `0824e57d9672f5cd125fb87f45ce85630dd8ac6c`. A clean build in a second
+with SHA-256 `5394b55bddd330f4c6970bd66b5421193051070a6ce7f0fe344a6e34fae07372`
+and CDHash `03acdb9a7f766c2bca926324f8de9e3b280cab30`. A clean build in a second
 disposable directory produced the same SHA-256. The helper self-test, forbidden
 API and sensitive-symbol allowlists, path-policy fixtures, renderer transition
 oracle, authoritative project-state fixtures, runner shell syntax, and

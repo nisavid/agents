@@ -50,10 +50,9 @@ final reviewed helper artifact when it is ready to run.
 
 ## Permission gate
 
-The exact reviewed helper artifact is installed at the canonical path. The live
-native run remains blocked until Ivan manually grants that helper Accessibility
-access in System Settings. Rebuilding or re-signing the helper invalidates the
-grant until reverified.
+The exact reviewed helper artifact is installed at the canonical path and has
+Accessibility access. Its mutation-free inspection is green. Rebuilding or
+re-signing the helper invalidates the grant until reverified.
 
 ## Current prototype evidence
 
@@ -144,6 +143,13 @@ for `attributeUnsupported` or `noValue`; a published key must remain integral
 immediately. Evidence records publication explicitly instead of fabricating a
 key value.
 
+The final inspection run, with run-root suffix `CFu4Bp`, validated the direct
+File → Open Folder path after three polls. It recorded character `O`, modifiers
+`0`, enabled `AXPress`, an explicitly unpublished virtual key, and
+`actionCount: 0`. The pinned model and host sentinel contracts passed, all owned
+processes and listeners closed, remote sockets and token leaks remained absent,
+and source/copy app hashes remained exact. The retained helper is ready for the
+separately authorized project-selection run.
+
 No live AX action has occurred for this revision. The reviewed retained artifact
-is recorded in `research/14-native-gui-probe.md`; read-only menu inspection
-requires a manual grant for that exact artifact before the next live step.
+is recorded in `research/14-native-gui-probe.md`.

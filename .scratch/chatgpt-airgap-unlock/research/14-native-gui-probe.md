@@ -215,5 +215,13 @@ same character. `O` is unambiguous. The helper therefore accepts only
 `attributeUnsupported` or `noValue` as absent physical-key publication; an exact
 integral value must still be `31`, and every other AX read error, wrong value, or
 malformed type fails immediately. Evidence records whether the key was
-published and never fabricates it. The retained artifact requires a fresh manual
-grant before repeating the mutation-free inspection.
+published and never fabricates it. Any rebuild requires a fresh manual grant
+before another inspection.
+
+Run-root suffix `CFu4Bp` completed the final mutation-free inspection with the
+retained and granted artifact. The exact File → Open Folder path became ready
+after three polls and recorded character `O`, modifiers `0`, enabled `AXPress`,
+`commandVirtualKeyPublished: false`, and `actionCount: 0`. The local model,
+gateway, host sentinel, isolation, integrity, process cleanup, and listener
+cleanup gates all passed. The helper is ready for the separately authorized
+project-selection run; no live AX action has occurred with this revision.

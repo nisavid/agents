@@ -22,6 +22,7 @@ OBSERVER="$HERE/08-proxy-observer.py"
 CDP_OBSERVER="$HERE/08-cdp-observer.mjs"
 GUI_DRIVER="$HERE/12-cdp-gui-driver.mjs"
 COLD_RESUME_STATE="$HERE/12-cold-resume-state.py"
+MODE_STATE="$HERE/12-mode-state.py"
 HOST_PROBE="$HERE/08-appserver-probe.py"
 HOST_RESTART_PROBE="$HERE/08-appserver-restart-probe.py"
 PROCESS_GROUP="$HERE/08-process-group.py"
@@ -46,6 +47,7 @@ PROBE_DURATION_MS="${PROBE_DURATION_MS:-20000}"
 PROBE_EXPECT="${PROBE_EXPECT:-usable-ui}"
 GUI_WORKFLOW="${GUI_WORKFLOW:-false}"
 GUI_COLD_RESUME="${GUI_COLD_RESUME:-false}"
+GUI_MODES="${GUI_MODES:-false}"
 RUN_LOCK="/private/tmp/chatgpt-route-prototype-08.lock"
 
 record_cold_handoff_phase() {
@@ -85,6 +87,7 @@ require_positive_terminal_delta() {
 
 run_cold_handoff_self_test() (
   /usr/bin/python3 "$COLD_RESUME_STATE" --self-test
+  /usr/bin/python3 "$MODE_STATE" --self-test
   self_test_root="$(mktemp -d /private/tmp/chatgpt-cold-handoff-self-test.XXXXXX)"
   trap '/bin/rm -rf "$self_test_root"' EXIT INT TERM
   LOG_DIR="$self_test_root"
@@ -176,6 +179,7 @@ CDP_OBSERVER_EXEC="$RUN_ROOT/cdp-observer.mjs"
 GUI_DRIVER_EXEC="$RUN_ROOT/gui-driver.mjs"
 NAMESPACE_PROBE_EXEC="$RUN_ROOT/namespace-probe.py"
 COLD_RESUME_STATE_EXEC="$RUN_ROOT/cold-resume-state.py"
+MODE_STATE_EXEC="$RUN_ROOT/mode-state.py"
 GUI_RESUME_STATE="$LOG_DIR/gui-resume-state.json"
 
 case "$ROUTE_MODE" in
@@ -202,8 +206,17 @@ case "$GUI_COLD_RESUME" in
   false|true) ;;
   *) echo "GUI_COLD_RESUME must be true or false" >&2; exit 64 ;;
 esac
+case "$GUI_MODES" in
+  false|true) ;;
+  *) echo "GUI_MODES must be true or false" >&2; exit 64 ;;
+esac
 if test "$GUI_COLD_RESUME" = true; then
   test "$GUI_WORKFLOW" = true
+  test "$ROUTE_MODE" = gateway
+fi
+if test "$GUI_MODES" = true; then
+  test "$GUI_WORKFLOW" = true
+  test "$GUI_COLD_RESUME" = false
   test "$ROUTE_MODE" = gateway
 fi
 
@@ -239,8 +252,10 @@ chmod 700 "$HOME_DIR" "$CODEX_DIR" "$USER_DATA_DIR" "$TMP_DIR" "$LOG_DIR" "$WORK
 /bin/cp "$GUI_DRIVER" "$GUI_DRIVER_EXEC"
 /bin/cp "$NAMESPACE_PROBE" "$NAMESPACE_PROBE_EXEC"
 /bin/cp "$COLD_RESUME_STATE" "$COLD_RESUME_STATE_EXEC"
+/bin/cp "$MODE_STATE" "$MODE_STATE_EXEC"
 chmod 500 "$UPSTREAM_OBSERVER_EXEC" "$OBSERVER_EXEC" "$CDP_OBSERVER_EXEC" \
-  "$GUI_DRIVER_EXEC" "$NAMESPACE_PROBE_EXEC" "$COLD_RESUME_STATE_EXEC"
+  "$GUI_DRIVER_EXEC" "$NAMESPACE_PROBE_EXEC" "$COLD_RESUME_STATE_EXEC" \
+  "$MODE_STATE_EXEC"
 test -x "$APP_EXEC"
 test ! -L "$APP"
 /usr/bin/codesign --verify --deep --strict "$APP"
@@ -306,7 +321,7 @@ if test "$GUI_WORKFLOW" = true; then
 # Offline renderer smoke fixture
 
 For the renderer smoke prompts, do not use tools and do not send a preamble.
-Return only the exact phase sentinel requested by the user.
+Return only the exact phase or mode sentinel requested by the user.
 EOF
 fi
 cat >"$WORKSPACE_DIR/README.md" <<'EOF'
@@ -417,6 +432,7 @@ printf '%s\n' "$RUN_ROOT" >"$LOG_DIR/run-root.txt"
   printf 'mlx_lm_commit=%s\n' "$mlx_lm_commit"
   printf 'mlx=%s\n' "0.32.0"
   printf 'route_mode=%s\n' "$ROUTE_MODE"
+  printf 'gui_modes=%s\n' "$GUI_MODES"
   if test "$ROUTE_MODE" = gateway; then
     printf 'gateway_upstream_timeout_seconds=%s\n' "$GATEWAY_UPSTREAM_TIMEOUT_SECONDS"
     printf 'gateway_sse_heartbeat_seconds=%s\n' "default"
@@ -674,7 +690,11 @@ sleep 1
 } >"$LOG_DIR/processes-01s.txt"
 if test "$GUI_WORKFLOW" = true; then
   cdp_command="$GUI_DRIVER_EXEC"
-  cdp_argument="first"
+  if test "$GUI_MODES" = true; then
+    cdp_argument="modes"
+  else
+    cdp_argument="first"
+  fi
   cdp_timeout="120000"
 else
   cdp_command="$CDP_OBSERVER_EXEC"
@@ -701,6 +721,11 @@ elif test "$GUI_WORKFLOW" = false && /usr/bin/env -i \
   cdp_exit=0
 else
   cdp_exit=$?
+fi
+
+if test "$GUI_MODES" = true && test "$cdp_exit" -eq 0; then
+  /usr/bin/python3 "$MODE_STATE_EXEC" "$CODEX_DIR" "$LOG_DIR/cdp.jsonl" \
+    >"$LOG_DIR/gui-mode-state.json"
 fi
 
 if test "$GUI_COLD_RESUME" = true && test "$cdp_exit" -eq 0; then
@@ -787,6 +812,9 @@ renderer_skills_observed=not-applicable
 renderer_local_skill_visible=not-applicable
 renderer_model_surface_observed=not-applicable
 renderer_model_metadata_matched=not-applicable
+renderer_default_mode_observed=not-applicable
+renderer_plan_mode_observed=not-applicable
+renderer_mode_persistence_matched=not-applicable
 native_project_picker_exercised=not-applicable
 native_permission_decision_exercised=not-applicable
 native_worktree_control_exercised=not-applicable
@@ -808,6 +836,9 @@ else
   renderer_local_skill_visible=false
   renderer_model_surface_observed=false
   renderer_model_metadata_matched=false
+  renderer_default_mode_observed=false
+  renderer_plan_mode_observed=false
+  renderer_mode_persistence_matched=false
   native_project_picker_exercised=false
   native_permission_decision_exercised=false
   native_worktree_control_exercised=false
@@ -823,6 +854,12 @@ else
   if /usr/bin/grep -Fq '"localSkillVisible":true' "$LOG_DIR/cdp.jsonl"; then renderer_local_skill_visible=true; fi
   if /usr/bin/grep -Fq '"modelSurfaceObserved":true' "$LOG_DIR/cdp.jsonl"; then renderer_model_surface_observed=true; fi
   if /usr/bin/grep -Fq '"rendererModelMetadataMatched":true' "$LOG_DIR/cdp.jsonl"; then renderer_model_metadata_matched=true; fi
+  if /usr/bin/grep -Fq '"defaultModeControlObserved":true' "$LOG_DIR/cdp.jsonl" && \
+    /usr/bin/grep -Fq '"defaultPromptCompleted":true' "$LOG_DIR/cdp.jsonl"; then renderer_default_mode_observed=true; fi
+  if /usr/bin/grep -Fq '"planModeControlObserved":true' "$LOG_DIR/cdp.jsonl" && \
+    /usr/bin/grep -Fq '"planPromptCompleted":true' "$LOG_DIR/cdp.jsonl"; then renderer_plan_mode_observed=true; fi
+  if test -f "$LOG_DIR/gui-mode-state.json" && \
+    /usr/bin/grep -Fq '"rendererAndPersistenceMatched": true' "$LOG_DIR/gui-mode-state.json"; then renderer_mode_persistence_matched=true; fi
   if /usr/bin/grep -Fq '"rendererThreadReopened":true' "$LOG_DIR/cdp.jsonl"; then renderer_thread_reopened=true; fi
   if /usr/bin/grep -Fq '"rendererContinuationCompleted":true' "$LOG_DIR/cdp.jsonl"; then renderer_continuation_completed=true; fi
   if test -f "$GUI_RESUME_STATE" && /usr/bin/grep -Fq '"sameRolloutContinuationValidated": true' "$GUI_RESUME_STATE"; then renderer_same_rollout_continuation=true; fi
@@ -973,6 +1010,9 @@ done
   printf 'RENDERER_LOCAL_SKILL_VISIBLE=%s\n' "$renderer_local_skill_visible"
   printf 'RENDERER_MODEL_SURFACE_OBSERVED=%s\n' "$renderer_model_surface_observed"
   printf 'RENDERER_MODEL_METADATA_MATCHED=%s\n' "$renderer_model_metadata_matched"
+  printf 'RENDERER_DEFAULT_MODE_OBSERVED=%s\n' "$renderer_default_mode_observed"
+  printf 'RENDERER_PLAN_MODE_OBSERVED=%s\n' "$renderer_plan_mode_observed"
+  printf 'RENDERER_MODE_PERSISTENCE_MATCHED=%s\n' "$renderer_mode_persistence_matched"
   printf 'RENDERER_THREAD_REOPENED=%s\n' "$renderer_thread_reopened"
   printf 'RENDERER_CONTINUATION_COMPLETED=%s\n' "$renderer_continuation_completed"
   printf 'RENDERER_SAME_ROLLOUT_CONTINUATION=%s\n' "$renderer_same_rollout_continuation"
@@ -1021,7 +1061,7 @@ test "$cdp_observer_healthy" = true
 if test "$GUI_WORKFLOW" = false; then
   test "$host_sentinel_completed" = true
   test "$cold_host_resume_observed" = true
-else
+elif test "$GUI_MODES" = false; then
   test "$renderer_prompt_completed" = true
   test "$renderer_tasks_observed" = true
   test "$renderer_settings_observed" = true
@@ -1034,6 +1074,10 @@ else
     test "$renderer_continuation_completed" = true
     test "$renderer_same_rollout_continuation" = true
   fi
+else
+  test "$renderer_default_mode_observed" = true
+  test "$renderer_plan_mode_observed" = true
+  test "$renderer_mode_persistence_matched" = true
 fi
 test "$provider_request_observed" = true
 test "$auth_json_present" = false
@@ -1057,6 +1101,10 @@ if test "$ROUTE_MODE" = gateway; then
     test "$upstream_continuation_terminal_delta" -ge 1
     test "$renderer_continuation_transport_observed" = true
   fi
+  if test "$GUI_MODES" = true; then
+    test "$gateway_renderer_terminal_delta" -ge 2
+    test "$upstream_renderer_terminal_delta" -ge 2
+  fi
 fi
 test "$remote_socket_observed" = false
 test "$token_leak_observed" = false
@@ -1070,5 +1118,6 @@ case "$PROBE_EXPECT" in
   usable-ui) test "$login_wall_observed" = false; test "$main_ui_observed" = true ;;
   renderer-workflow) test "$GUI_WORKFLOW" = true; test "$login_wall_observed" = false; test "$main_ui_observed" = true ;;
   renderer-cold-resume) test "$GUI_COLD_RESUME" = true; test "$login_wall_observed" = false; test "$main_ui_observed" = true ;;
+  renderer-modes) test "$GUI_MODES" = true; test "$login_wall_observed" = false; test "$main_ui_observed" = true ;;
   *) echo "unknown PROBE_EXPECT: $PROBE_EXPECT" >&2; exit 64 ;;
 esac

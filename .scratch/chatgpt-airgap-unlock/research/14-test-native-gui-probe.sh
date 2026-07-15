@@ -98,42 +98,77 @@ if printf '%s\n' "$readiness_body" | /usr/bin/grep -Eq \
   exit 1
 fi
 picker_request_body="$(/usr/bin/sed -n \
-  '/BEGIN_NATIVE_PROJECT_PICKER_REQUEST/,/END_NATIVE_PROJECT_PICKER_REQUEST/p' \
+  '/BEGIN_NATIVE_PROJECT_PICKER_PRECONDITION/,/END_NATIVE_PROJECT_PICKER_PRECONDITION/p' \
   "$HERE/12-cdp-gui-driver.mjs")"
-trusted_accelerator_body="$(/usr/bin/sed -n \
-  '/BEGIN_TRUSTED_RENDERER_ACCELERATOR/,/END_TRUSTED_RENDERER_ACCELERATOR/p' \
-  "$HERE/12-cdp-gui-driver.mjs")"
-test "$(printf '%s\n' "$trusted_accelerator_body" | /usr/bin/grep -Fc 'type: "rawKeyDown"')" -eq 1
-test "$(printf '%s\n' "$trusted_accelerator_body" | /usr/bin/grep -Fc 'type: "keyUp"')" -eq 1
-test "$(printf '%s\n' "$trusted_accelerator_body" | /usr/bin/grep -Fc 'modifiers: 4')" -eq 2
-test "$(printf '%s\n' "$trusted_accelerator_body" | /usr/bin/grep -Fc 'code: "KeyO"')" -eq 2
-test "$(printf '%s\n' "$trusted_accelerator_body" | /usr/bin/grep -Fc 'key: "o"')" -eq 2
-test "$(printf '%s\n' "$picker_request_body" | /usr/bin/grep -Fc \
-  'await requestNativeProjectPickerFromPrecondition(expectedFixtureRoot, chooseProject);')" -eq 1
-choose_project_line="$(printf '%s\n' "$picker_request_body" | \
-  /usr/bin/grep -nF 'accessibleName: "Choose project"' | /usr/bin/awk -F: '{print $1}')"
-picker_request_line="$(printf '%s\n' "$picker_request_body" | \
-  /usr/bin/grep -nF \
-  'await requestNativeProjectPickerFromPrecondition(expectedFixtureRoot, chooseProject);' | \
-  /usr/bin/awk -F: '{print $1}')"
-test -n "$choose_project_line"
-test -n "$picker_request_line"
-test "$choose_project_line" -lt "$picker_request_line"
+/usr/bin/grep -Fq 'emit("native-project-picker-precondition-ready"' \
+  "$HERE/12-cdp-gui-driver.mjs"
 /usr/bin/grep -Fq 'preconditionAccessibleName: "Choose project"' \
   "$HERE/12-cdp-gui-driver.mjs"
 if printf '%s\n' "$picker_request_body" | /usr/bin/grep -Eq \
-  'exactText: "(New project|Use an existing folder)"|dispatchTrustedClick'; then
-  echo 'renderer project-picker request still depends on a feature-gated nested menu' >&2
+  'Input\.dispatch(Key|Mouse)Event|dispatchTrusted|send\(|\.click\('; then
+  echo 'renderer project-picker precondition still performs an input action' >&2
   exit 1
 fi
 if printf '%s\n' "$picker_request_body" | /usr/bin/grep -Eq 'sleep\(|setTimeout\('; then
-  echo 'renderer project-picker request still relies on a fixed sleep' >&2
+  echo 'renderer project-picker precondition still relies on a fixed sleep' >&2
   exit 1
 fi
-if printf '%s\n' "$picker_request_body" | /usr/bin/grep -Fq '.click('; then
-  echo 'renderer project-picker request uses an untrusted DOM click' >&2
+if /usr/bin/grep -Fq 'native-project-picker-requested' \
+  "$HERE/12-cdp-gui-driver.mjs"; then
+  echo 'renderer still claims that it requested the native project picker' >&2
   exit 1
 fi
+
+open_folder_shortcut_body="$(/usr/bin/sed -n \
+  '/BEGIN_PID_OPEN_FOLDER_SHORTCUT/,/END_PID_OPEN_FOLDER_SHORTCUT/p' \
+  "$HERE/14-native-gui-probe.swift")"
+test "$(printf '%s\n' "$open_folder_shortcut_body" | \
+  /usr/bin/grep -Fc 'try requireSameProcess(process)')" -eq 2
+test "$(printf '%s\n' "$open_folder_shortcut_body" | \
+  /usr/bin/grep -Fc '.postToPid(process.pid)')" -eq 2
+shortcut_identity_lines="$(printf '%s\n' "$open_folder_shortcut_body" | \
+  /usr/bin/grep -nF 'try requireSameProcess(process)' | /usr/bin/awk -F: '{print $1}')"
+shortcut_identity_before_line="$(printf '%s\n' "$shortcut_identity_lines" | /usr/bin/sed -n '1p')"
+shortcut_identity_after_line="$(printf '%s\n' "$shortcut_identity_lines" | /usr/bin/sed -n '$p')"
+shortcut_down_line="$(printf '%s\n' "$open_folder_shortcut_body" | \
+  /usr/bin/grep -nF 'down.postToPid(process.pid)' | /usr/bin/awk -F: '{print $1}')"
+shortcut_up_line="$(printf '%s\n' "$open_folder_shortcut_body" | \
+  /usr/bin/grep -nF 'up.postToPid(process.pid)' | /usr/bin/awk -F: '{print $1}')"
+test $((shortcut_identity_before_line + 1)) -eq "$shortcut_down_line"
+test "$shortcut_down_line" -lt "$shortcut_up_line"
+test $((shortcut_up_line + 1)) -eq "$shortcut_identity_after_line"
+/usr/bin/grep -Fq 'static let openFolder = KeyboardShortcut(virtualKey: 31, flags: [.maskCommand])' \
+  "$HERE/14-native-gui-probe.swift"
+open_folder_request_body="$(/usr/bin/sed -n \
+  '/BEGIN_PID_OPEN_FOLDER_REQUEST/,/END_PID_OPEN_FOLDER_REQUEST/p' \
+  "$HERE/14-native-gui-probe.swift")"
+test "$(printf '%s\n' "$open_folder_request_body" | \
+  /usr/bin/grep -Fc 'try postOpenFolder(to: identity)')" -eq 1
+open_folder_post_line="$(printf '%s\n' "$open_folder_request_body" | \
+  /usr/bin/grep -nF 'try postOpenFolder(to: identity)' | /usr/bin/awk -F: '{print $1}')"
+open_folder_event_line="$(printf '%s\n' "$open_folder_request_body" | \
+  /usr/bin/grep -nF 'try log.write("open-folder-accelerator-posted"' | \
+  /usr/bin/awk -F: '{print $1}')"
+open_panel_wait_line="$(printf '%s\n' "$open_folder_request_body" | \
+  /usr/bin/grep -nF 'let readiness = try waitForValidatedOpenPanel(' | \
+  /usr/bin/awk -F: '{print $1}')"
+test -n "$open_folder_post_line"
+test -n "$open_folder_event_line"
+test -n "$open_panel_wait_line"
+test "$open_folder_post_line" -lt "$open_folder_event_line"
+test "$open_folder_event_line" -lt "$open_panel_wait_line"
+/usr/bin/grep -Fq 'try log.write("open-folder-accelerator-posted"' \
+  "$HERE/14-native-gui-probe.swift"
+/usr/bin/grep -Fq '"actionCount": 1' "$HERE/14-native-gui-probe.swift"
+/usr/bin/grep -Fq '"eventCount": 2' "$HERE/14-native-gui-probe.swift"
+/usr/bin/grep -Fq -- '--invoke-open-folder' "$HERE/14-native-gui-probe.swift"
+/usr/bin/grep -Fq -- '--invoke-open-folder' "$HERE/08-run-prototype.sh"
+/usr/bin/grep -Fq '"kind":"native-project-picker-precondition-ready"' \
+  "$HERE/08-run-prototype.sh"
+/usr/bin/grep -Fq '"kind":"open-folder-accelerator-posted"' \
+  "$HERE/08-run-prototype.sh"
+/usr/bin/grep -Fq '"kind":"open-panel-validated"' \
+  "$HERE/08-run-prototype.sh"
 test "$(/usr/bin/grep -Fc '"$NATIVE_GUI_PROBE_BIN" "$@" \' \
   "$HERE/08-run-prototype.sh")" -eq 1
 
@@ -175,6 +210,46 @@ chmod 500 "$RUN_ROOT/Probe.app/Contents/MacOS/ChatGPT"
   --event-log "$RUN_ROOT/logs/native-gui-probe.jsonl" \
   --validate-inputs-only
 /usr/bin/grep -Fq '"kind":"inputs-validated"' "$RUN_ROOT/logs/native-gui-probe.jsonl"
+
+if "$PROBE" \
+  --pid 2 \
+  --run-root "$RUN_ROOT" \
+  --expected-bundle "$RUN_ROOT/Probe.app" \
+  --expected-executable "$RUN_ROOT/Probe.app/Contents/MacOS/ChatGPT" \
+  --fixture-root "$RUN_ROOT/workspace" \
+  --phase select-project \
+  --event-log "$RUN_ROOT/logs/native-gui-probe.jsonl" \
+  --validate-inputs-only 2>"$BUILD_ROOT/missing-open-folder.stderr"; then
+  echo 'select-project without explicit Open Folder authorization unexpectedly passed' >&2
+  exit 1
+fi
+/usr/bin/grep -Fq 'select-project requires --invoke-open-folder' \
+  "$BUILD_ROOT/missing-open-folder.stderr"
+"$PROBE" \
+  --pid 2 \
+  --run-root "$RUN_ROOT" \
+  --expected-bundle "$RUN_ROOT/Probe.app" \
+  --expected-executable "$RUN_ROOT/Probe.app/Contents/MacOS/ChatGPT" \
+  --fixture-root "$RUN_ROOT/workspace" \
+  --phase select-project \
+  --event-log "$RUN_ROOT/logs/native-gui-probe.jsonl" \
+  --invoke-open-folder \
+  --validate-inputs-only
+if "$PROBE" \
+  --pid 2 \
+  --run-root "$RUN_ROOT" \
+  --expected-bundle "$RUN_ROOT/Probe.app" \
+  --expected-executable "$RUN_ROOT/Probe.app/Contents/MacOS/ChatGPT" \
+  --fixture-root "$RUN_ROOT/workspace" \
+  --phase inspect-project-picker \
+  --event-log "$RUN_ROOT/logs/native-gui-probe.jsonl" \
+  --invoke-open-folder \
+  --validate-inputs-only 2>"$BUILD_ROOT/unexpected-open-folder.stderr"; then
+  echo 'inspect-project-picker with Open Folder authorization unexpectedly passed' >&2
+  exit 1
+fi
+/usr/bin/grep -Fq -- '--invoke-open-folder is only valid for select-project' \
+  "$BUILD_ROOT/unexpected-open-folder.stderr"
 
 if "$PROBE" \
   --pid 2 \

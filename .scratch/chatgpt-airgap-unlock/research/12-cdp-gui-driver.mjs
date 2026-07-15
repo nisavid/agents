@@ -67,8 +67,12 @@ function projectSelectionVerdict(control, expectedFixtureRoot) {
   const expectedName = expectedFixtureRoot.split("/").filter(Boolean).at(-1) ?? "";
   const visibleText = [control?.text, control?.title, control?.ariaDescription]
     .filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
+  const escapedName = expectedName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const boundedName = new RegExp(
+    `(^|[^\\p{L}\\p{N}._-])${escapedName}($|[^\\p{L}\\p{N}._-])`, "u"
+  );
   const matched = Boolean(expectedName) && control?.count === 1 &&
-    visibleText.split(/[^A-Za-z0-9._-]+/).includes(expectedName);
+    boundedName.test(visibleText);
   return { matched, expectedName, visibleTextLength: visibleText.length };
 }
 
@@ -203,6 +207,16 @@ function runSelfTests() {
   }
   if (projectSelectionVerdict({ count: 2, text: "workspace" }, "/tmp/run/workspace").matched) {
     throw new Error("duplicate renderer project controls were accepted");
+  }
+  if (!projectSelectionVerdict({ count: 1, text: "Selected: my workspace" },
+    "/tmp/run/my workspace").matched) {
+    throw new Error("space-containing renderer project name was not accepted");
+  }
+  if (!projectSelectionVerdict({ count: 1, text: "Selected 项目" }, "/tmp/run/项目").matched) {
+    throw new Error("non-ASCII renderer project name was not accepted");
+  }
+  if (projectSelectionVerdict({ count: 1, text: "workspace-old" }, "/tmp/run/workspace").matched) {
+    throw new Error("similarly prefixed renderer project name was accepted");
   }
   process.stdout.write("sentinel oracle self-test passed\n");
 }

@@ -25,6 +25,16 @@ def exact_threads(database: Path, fixture: str) -> list[str]:
     return [str(row[0]) for row in rows]
 
 
+def ready(database: Path) -> bool:
+    try:
+        uri = f"file:{database}?mode=ro"
+        with sqlite3.connect(uri, uri=True, timeout=1) as connection:
+            columns = connection.execute("PRAGMA table_info(threads)").fetchall()
+        return any(str(column[1]) == "cwd" for column in columns)
+    except sqlite3.Error:
+        return False
+
+
 def write_private(path: Path, value: dict[str, object]) -> None:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
@@ -122,6 +132,8 @@ def main(arguments: list[str]) -> None:
     if arguments == ["--self-test"]:
         self_test()
         return
+    if len(arguments) == 2 and arguments[0] == "ready":
+        raise SystemExit(0 if ready(Path(arguments[1])) else 1)
     if len(arguments) == 4 and arguments[0] == "capture":
         capture(Path(arguments[1]), arguments[2], Path(arguments[3]))
         return
@@ -130,7 +142,7 @@ def main(arguments: list[str]) -> None:
         return
     raise SystemExit(
         "usage: 14-project-state.py capture DB FIXTURE OUTPUT | "
-        "validate DB FIXTURE BASELINE OUTPUT | --self-test"
+        "validate DB FIXTURE BASELINE OUTPUT | ready DB | --self-test"
     )
 
 

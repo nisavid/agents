@@ -263,8 +263,9 @@ func parseOptions(_ arguments: [String]) throws -> Options {
     var permitKeyFallback = false
     var validateInputsOnly = false
     var index = 0
-    let valueOptions = Set(["--pid", "--run-root", "--expected-bundle", "--expected-executable",
-                            "--fixture-root", "--phase", "--event-log"])
+    let orderedValueOptions = ["--pid", "--run-root", "--expected-bundle", "--expected-executable",
+                               "--fixture-root", "--phase", "--event-log"]
+    let valueOptions = Set(orderedValueOptions)
     while index < arguments.count {
         let argument = arguments[index]
         if argument == "--permit-key-fallback" {
@@ -285,7 +286,7 @@ func parseOptions(_ arguments: [String]) throws -> Options {
             throw ProbeError.usage("unknown argument: \(argument)")
         }
     }
-    for option in valueOptions where values[option] == nil {
+    for option in orderedValueOptions where values[option] == nil {
         throw ProbeError.usage("missing required option: \(option)")
     }
     guard let rawPID = values["--pid"], let numericPID = Int32(rawPID), numericPID > 1 else {

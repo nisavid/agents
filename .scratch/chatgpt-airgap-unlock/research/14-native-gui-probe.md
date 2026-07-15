@@ -50,9 +50,13 @@ The runner asks the renderer's unique visible `Choose project` control to open
 the native panel, resolves exactly one copied-app executable in the owned
 process group, invokes the helper, then requires a renderer transition from a
 nonmatching project to the per-run nonce project. After the renderer creates its
-first task, `research/14-project-state.py` requires the authoritative
+first task, the runner waits for the authoritative database and required schema
+through a bounded, read-only readiness check. `research/14-project-state.py` then requires the authoritative
 `state_5.sqlite.threads.cwd` record to transition from zero exact fixture rows
 to exactly one before recording the native project-picker gate as complete.
+The copied app's Seatbelt profile denies writes to the exact reviewed helper
+path, and the runner rechecks its inode, SHA-256, and signature immediately
+before execution.
 
 ## Permission boundary
 
@@ -67,8 +71,8 @@ Ivan; the helper never requests a prompt itself.
 Green for the source, build, input-policy, selector-policy, and runner-seam
 slice. The final no-permission build produced the arm64 ad-hoc-signed artifact
 `/private/tmp/chatgpt-native-gui-probe-build/chatgpt-native-gui-probe` with
-SHA-256 `d715854d64ab6ba2aafa84a7b5668a802d87a05811a6f90d67ebe2a103231f4f`
-and CDHash `22d299b0521b004ae3bb603fb40200f593dd6a5b`. A clean build in a second
+SHA-256 `9a24fbe62ffe15ca77f3a220ecf8d8360b066121d45aa44fdee62437aafd9ea2`
+and CDHash `0824e57d9672f5cd125fb87f45ce85630dd8ac6c`. A clean build in a second
 disposable directory produced the same SHA-256. The helper self-test, forbidden
 API and sensitive-symbol allowlists, path-policy fixtures, renderer transition
 oracle, authoritative project-state fixtures, runner shell syntax, and

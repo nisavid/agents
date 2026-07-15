@@ -15,4 +15,5 @@
 (deny file-read* (subpath (param "REAL_HOME")))
 (deny file-write* (subpath (param "REAL_HOME")))
 (deny file-write* (subpath "/Applications/ChatGPT.app"))
+(deny file-write* (literal (param "NATIVE_GUI_PROBE_BIN")))
 (deny mach-lookup (regex #"^com\\.apple\\.securityd"))

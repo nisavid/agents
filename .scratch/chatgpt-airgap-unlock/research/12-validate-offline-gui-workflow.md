@@ -52,7 +52,7 @@ prerequisite for the task-list assertion. The settings, plugin, skill, provider,
 gateway, integrity, token, and cleanup assertions independently reported their
 observed results.
 
-## Discarded nested-sandbox attempt
+## Historical discarded nested-sandbox attempt
 
 The exact-copy run above and earlier direct development runs exposed brittle
 submission and result selectors. Synthetic DOM insertion did not prove
@@ -84,7 +84,7 @@ owned fixed-port listener remained. Native project selection, permission,
 worktree, exact model-metadata, cold reopen, and continuation gates remain red.
 Ticket 12 remains open.
 
-## Final valid semantic renderer run
+## Historical valid semantic renderer run
 
 Green for the scoped renderer workflow. The same locked gateway command ran
 outside the parent harness's nested sandbox while retaining the runner's own
@@ -124,34 +124,38 @@ not completed a cold restart and contributes no cold-restart runtime evidence
 to the verdict above.
 
 Phase one retains the validated renderer prompt, task, and surface assertions.
+It now asks the model to return exactly `COLD_PHASE_ONE_OK` and forbids tool
+use. The renderer accepts only that sentinel after trimming outer whitespace
+and removing one renderer-added terminal timestamp.
 After it completes, the runner reads the isolated Codex rollout and writes a
 mode-0600 state artifact binding the exact thread UUID and rollout path to
 SHA-256 digests of the first prompt, exact completed turn, its
-`task_complete.last_agent_message`, and normalized phase-one renderer text.
-Repeated intermediate `agent_message` events may describe the same correct
-result, but only one `task_complete` for the prompt's exact turn can bind the
-persisted output. The distinct source and rendered digests avoid conflating
-Markdown with its rendered form. The runner then stops only the copied app's
-process group, which includes its app-server, and requires both that process
-group and its CDP listener to disappear. The pinned OptiQ server, authenticated
-gateway, and observers remain alive.
+`task_complete.last_agent_message`, sentinel, and exact trimmed phase-one
+renderer text. Intermediate tool calls or `agent_message` events cannot bind
+the output; only one `task_complete` for the prompt's exact turn can do so, and
+its trimmed final message must equal the sentinel. The distinct persisted and
+rendered digests avoid conflating source text with its rendered form. The
+runner then stops only the copied app's process group, which includes its
+app-server, and requires both that process group and its CDP listener to
+disappear. The pinned OptiQ server, authenticated gateway, and observers remain
+alive.
 
 Phase two relaunches the same copied bundle with the same isolated home, Codex
 home, Electron user-data directory, provider configuration, Seatbelt profile,
 and loopback endpoints. The CDP driver selects the persisted local thread by
 its first-prompt task label, requires the bound first prompt and the same
-normalized full renderer text observed in phase one to be visible, then submits
-a different deterministic arithmetic prompt. Its assistant output must contain
-one or more standalone `63` tokens, every standalone integer must be one of
-`46`, `17`, or `63`, and the final standalone integer must be `63`.
+exact trimmed renderer text observed in phase one to be visible, then asks the
+model to return exactly `COLD_PHASE_TWO_OK` without tools. Extra text, a wrong
+phase sentinel, or repeated combined sentinels fail closed.
 
 The runner finally requires one matching second prompt and one
 `task_complete` for that exact turn in the original rollout with the original
-thread UUID, that the original completed-turn identity and final-output digest
-are unchanged, and that phase two records persisted and renderer-output
-digests. A duplicate completion or a final message containing any conflicting
-integer fails closed. For the gateway route it records gateway and upstream
-terminal baselines immediately before the first renderer launch. It then
+thread UUID, that the original completed-turn identity and exact-byte
+final-output digest are unchanged, and that phase two records sentinel,
+persisted-output, and renderer-output digests. A duplicate completion or any
+non-exact trimmed final message fails closed. For the gateway route it records
+gateway and upstream terminal baselines immediately before the first renderer
+launch. It then
 requires at least one completion beyond baseline for phase one, at least one
 additional completion after the restart for phase two, and a total renderer
 delta of at least two. This keeps the two renderer transports distinct from
@@ -164,7 +168,7 @@ The intended live command is:
 
 ```sh
 ROUTE_MODE=gateway \
-GATEWAY_COMMIT=a69e710dbe6a43e513a6f12c118b1abce81241ea \
+GATEWAY_COMMIT=6307d37b76918c19f2e3bc0fd506434531aadeb2 \
 GUI_WORKFLOW=true \
 GUI_COLD_RESUME=true \
 PROBE_EXPECT=renderer-cold-resume \
@@ -176,7 +180,7 @@ bundle and retains the existing outer Seatbelt plus `--no-sandbox` constraint.
 It does not modify the copied bundle identifier, signature, ASAR, native code,
 the installed app, or the operator's real profile and global state.
 
-## Repeated-result arithmetic oracle correction
+## Historical repeated-result arithmetic oracle correction
 
 A later live phase-one attempt produced the correct response:
 
@@ -214,7 +218,7 @@ node .scratch/chatgpt-airgap-unlock/research/12-cdp-gui-driver.mjs --self-test
 
 The cold-restart workflow has not been rerun after this correction.
 
-## Trailing renderer timestamp correction
+## Historical trailing renderer timestamp correction
 
 A second live phase-one attempt persisted the correct response, `73 plus 19
 equals 92.`, and completed its task, but the CDP arithmetic oracle returned no
@@ -292,11 +296,55 @@ gateway and upstream logs now contain three completed totals, but those
 post-cleanup totals are not the handoff counts captured by the runner and are
 not cold-restart evidence.
 
-The runner now pins reviewed gateway commit
+The next runner checkpoint pinned reviewed gateway commit
 `a69e710dbe6a43e513a6f12c118b1abce81241ea`, blob
 `ae013796f62c760c7a9424c0c97d01ad155d6ed1`, whose terminal lifecycle fix is a
-descendant of `8703dbe96841d591e77c1f274e22eb4b2aea9d64`. No live GUI run has
-used this commit yet. The
-no-app completed-turn fixtures cover the `syzpUh` repeated-intermediate shape,
-a conflicting final, duplicate completion, continuation, and mutation of the
+descendant of `8703dbe96841d591e77c1f274e22eb4b2aea9d64`. The no-app
+completed-turn fixtures cover the `syzpUh` repeated-intermediate shape, a
+conflicting final, duplicate completion, continuation, and mutation of the
 original final across restart.
+
+## Tool-call loop and corrected transport inference
+
+Run-root suffix `OsZeWx` used reviewed gateway commit
+`a69e710dbe6a43e513a6f12c118b1abce81241ea`, blob
+`ae013796f62c760c7a9424c0c97d01ad155d6ed1`. It never reached a valid renderer
+completion: the first renderer terminal deltas were zero, the assistant oracle
+matched no output, and the GUI reported `rendererPromptCompleted=false`.
+
+The persisted rollout contains 105 unique `function_call` records, 105 matching
+failed `function_call_output` records, and 105 token-count events, but no
+`agent_message` or `task_complete`. Every tool call failed with exit 71 because
+the nested `sandbox-exec` could not apply its profile. The gateway and upstream
+observers each recorded 106 completed Responses calls: one pre-renderer request
+plus 105 model/tool steps. A 107th request was incomplete at cleanup.
+
+The verdict assigned all 106 completions to the continuation delta and left the
+first-renderer delta at zero because the runner captures its after-first
+counters only after a successful CDP phase. No continuation phase actually
+ran. This was a model/tool loop, not 106 cold-resume continuations.
+
+The prior inference that a missing downstream `[DONE]` caused this loop was
+wrong. OptiQ consumes mlx-lm's Chat Completions `[DONE]` internally, translates
+it into a Responses `response.completed` event, and ends the upstream response
+without exposing `[DONE]` to the gateway. The run therefore provides no
+evidence that gateway commit `a69e710...` dropped an available sentinel. It
+never entered the cold-stop or persisted-thread reopen phases. Cleanup closed
+the owned processes and listeners, and both the copied app ASAR and bundled
+Codex binary retained their original hashes.
+
+The runner now pins reviewed gateway commit
+`6307d37b76918c19f2e3bc0fd506434531aadeb2`, blob
+`a368b8f8e919361425763e86ca1c80fcea81825f`, which is a descendant of
+`a69e710dbe6a43e513a6f12c118b1abce81241ea`. It forwards `[DONE]` only when an
+SSE frame contains exactly one data field with that payload and no other
+nonempty fields. This is the correct general Responses SSE behavior, but it is
+not an `OsZeWx` fix because that OptiQ path exposes `response.completed` and
+EOF, not `[DONE]`. The immutable namespace preflight retains tool-calling
+coverage and now asserts the exact data-only sentinel shape. No live GUI run
+has used this commit yet.
+
+Future cold-resume runs use exact nonnumeric phase sentinels instead of
+arithmetic. This keeps the 2B model's GUI smoke deterministic and prevents a
+tool-selection loop from masquerading as transport progress. Tool calling
+remains validated separately by the namespace preflight.

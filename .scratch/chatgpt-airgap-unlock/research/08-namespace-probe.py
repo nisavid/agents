@@ -32,6 +32,10 @@ def main() -> None:
     )
     assert config.upstream_timeout_seconds == expected_upstream_timeout_seconds
     assert config.sse_heartbeat_seconds == 15.0
+    assert gateway._is_sse_done_frame([b"data: [DONE]\n", b"\n"])
+    assert not gateway._is_sse_done_frame(
+        [b"event: response.completed\n", b"data: [DONE]\n", b"\n"]
+    )
     declaration = {
         "model": "fixture-model",
         "tools": [
@@ -126,6 +130,8 @@ def main() -> None:
                 "second_call_reconstructed": True,
                 "upstream_timeout_seconds": config.upstream_timeout_seconds,
                 "default_sse_heartbeat_seconds": config.sse_heartbeat_seconds,
+                "data_only_done_sentinel_recognized": True,
+                "mixed_field_done_sentinel_rejected": True,
             },
             sort_keys=True,
         )

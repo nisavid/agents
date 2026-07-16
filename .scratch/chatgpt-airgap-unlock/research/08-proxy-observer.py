@@ -34,10 +34,8 @@ class Handler(socketserver.StreamRequestHandler):
             json.dumps(
                 {
                     "at": datetime.now(timezone.utc).isoformat(),
-                    "client": self.client_address[0],
                     "method": method,
                     "host": headers.get("host"),
-                    "user_agent": headers.get("user-agent"),
                 },
                 sort_keys=True,
             ),

@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 
 HERE = Path(__file__).resolve().parent
@@ -119,6 +121,16 @@ class ManifestTests(unittest.TestCase):
             secret_bindings["api_token"] = "must-not-persist"
             with self.assertRaises(production_evidence.EvidenceError):
                 production_evidence.build_manifest(root, secret_bindings)
+
+            for sensitive_key in ("accessToken", "clientSecret"):
+                compound_bindings = bindings_for(
+                    "payload.bin", production_evidence.file_sha256(payload)
+                )
+                compound_bindings["artifacts"][0]["identity"][sensitive_key] = (
+                    "plain-value"
+                )
+                with self.assertRaises(production_evidence.EvidenceError):
+                    production_evidence.build_manifest(root, compound_bindings)
 
     def test_empty_artifact_bindings_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -446,6 +458,95 @@ class FinalizerTests(unittest.TestCase):
             self.assertFalse(verdict["process_snapshot_captured"])
             self.assertFalse(verdict["socket_snapshot_captured"])
             self.assertIn("process-baseline-failed", verdict["errors"])
+
+    def test_whitespace_credentials_are_redacted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            stage, manifest, state = self.make_run(temporary)
+            evidence = Path(temporary) / "evidence"
+
+            def execute(_command: list[str], environment: dict[str, str]) -> int:
+                completed_state(state, environment)
+                return 0
+
+            result = production_evidence.run_guarded(
+                stage,
+                manifest,
+                evidence,
+                state,
+                ["fixture-command"],
+                execute=execute,
+                collect_processes=lambda: (
+                    0,
+                    "4242 1 4242 S 00:01 process --token plain-value "
+                    "--api-key another-value\n",
+                ),
+                collect_sockets=lambda: (
+                    0,
+                    "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\n",
+                ),
+            )
+
+            self.assertEqual(production_evidence.EVIDENCE_FAILURE, result)
+            processes = (evidence / "processes-final.txt").read_text(encoding="utf-8")
+            self.assertNotIn("plain-value", processes)
+            self.assertNotIn("another-value", processes)
+            self.assertEqual(2, processes.count("[REDACTED]"))
+
+    def test_lifecycle_environment_is_allowlisted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            stage, manifest, state = self.make_run(temporary)
+            evidence = Path(temporary) / "evidence"
+            captured: dict[str, str] = {}
+
+            def execute(_command: list[str], environment: dict[str, str]) -> int:
+                captured.update(environment)
+                completed_state(state, environment)
+                return 0
+
+            inherited = {
+                "DYLD_INSERT_LIBRARIES": "/private/tmp/injected.dylib",
+                "HTTPS_PROXY": "http://127.0.0.1:9999",
+                "OPENAI_API_KEY": "not-forwarded",
+                "PYTHONPATH": "/private/tmp/imports",
+                production_evidence.RUN_NONCE_ENV: "stale-nonce",
+                production_evidence.STATE_PATH_ENV: "/private/tmp/stale-state",
+            }
+            with mock.patch.dict(os.environ, inherited, clear=False):
+                result = production_evidence.run_guarded(
+                    stage,
+                    manifest,
+                    evidence,
+                    state,
+                    ["fixture-command"],
+                    execute=execute,
+                    collect_processes=lambda: (
+                        0,
+                        "PID PPID PGID STARTED STATE ELAPSED COMMAND\n",
+                    ),
+                    collect_sockets=lambda: (
+                        0,
+                        "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\n",
+                    ),
+                )
+
+            self.assertEqual(0, result)
+            self.assertEqual(
+                {
+                    "PATH",
+                    "HOME",
+                    "TMPDIR",
+                    "LANG",
+                    "LC_ALL",
+                    production_evidence.RUN_NONCE_ENV,
+                    production_evidence.STATE_PATH_ENV,
+                },
+                set(captured),
+            )
+            self.assertNotEqual("stale-nonce", captured[production_evidence.RUN_NONCE_ENV])
+            self.assertNotEqual(
+                "/private/tmp/stale-state",
+                captured[production_evidence.STATE_PATH_ENV],
+            )
 
     def test_raised_collector_still_writes_all_terminal_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

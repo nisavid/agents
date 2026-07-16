@@ -273,12 +273,14 @@ def _load_owned_state(path: Path, expected_run_nonce: str | None) -> dict[str, A
     steps = state["cleanup_steps"]
     if (
         not isinstance(pids, list)
+        or not pids
         or any(type(pid) is not int or pid <= 1 for pid in pids)
         or len(pids) != len(set(pids))
     ):
         raise EvidenceError("owned PIDs must be unique integers greater than one")
     if (
         not isinstance(process_groups, list)
+        or not process_groups
         or any(type(pgid) is not int or pgid <= 1 for pgid in process_groups)
         or len(process_groups) != len(set(process_groups))
     ):
@@ -287,6 +289,7 @@ def _load_owned_state(path: Path, expected_run_nonce: str | None) -> dict[str, A
         )
     if (
         not isinstance(ports, list)
+        or not ports
         or any(type(port) is not int or not 1 <= port <= 65535 for port in ports)
         or len(ports) != len(set(ports))
     ):
@@ -328,14 +331,14 @@ def _standard_process_snapshot() -> tuple[int, str]:
     return collector.returncode, visible + stderr
 
 
-def _standard_socket_snapshot() -> tuple[int, str]:
+def _standard_socket_snapshot() -> tuple[int, str, str]:
     completed = subprocess.run(
         ["/usr/sbin/lsof", "-nP", "-iTCP", "-iUDP"],
         check=False,
         capture_output=True,
         text=True,
     )
-    return completed.returncode, completed.stdout + completed.stderr
+    return completed.returncode, completed.stdout, completed.stderr
 
 
 def _standard_execute(command: list[str], environment: dict[str, str]) -> int:
@@ -420,6 +423,28 @@ def _safe_collect(collector: Callable[[], tuple[int, str]]) -> tuple[int, str]:
         return 127, "snapshot collector raised an exception\n"
 
 
+def _safe_collect_socket(
+    collector: Callable[[], tuple[int, str] | tuple[int, str, str]]
+) -> tuple[int, str, str]:
+    try:
+        result = collector()
+        if not isinstance(result, tuple) or len(result) not in (2, 3):
+            return 127, "", "snapshot collector returned an invalid result\n"
+        code = result[0]
+        if type(code) is not int or not all(isinstance(value, str) for value in result[1:]):
+            return 127, "", "snapshot collector returned an invalid result\n"
+        if len(result) == 2:
+            return code, result[1], ""
+        return code, result[1], result[2]
+    except Exception:
+        return 127, "", "snapshot collector raised an exception\n"
+
+
+def _clean_empty_socket_snapshot(stdout: str) -> bool:
+    lines = [line.strip() for line in stdout.splitlines() if line.strip()]
+    return not lines or all(line.startswith("COMMAND ") for line in lines)
+
+
 def _finalize(
     evidence_dir: Path,
     state_path: Path,
@@ -434,7 +459,7 @@ def _finalize(
     baseline_processes: str,
     errors: list[str],
     collect_processes: Callable[[], tuple[int, str]],
-    collect_sockets: Callable[[], tuple[int, str]],
+    collect_sockets: Callable[[], tuple[int, str] | tuple[int, str, str]],
 ) -> bool:
     try:
         state = _load_owned_state(state_path, expected_run_nonce)
@@ -453,13 +478,18 @@ def _finalize(
         errors.append("owned-state-invalid")
 
     process_code, raw_processes = _safe_collect(collect_processes)
-    socket_code, raw_sockets = _safe_collect(collect_sockets)
+    socket_code, socket_stdout, socket_stderr = _safe_collect_socket(collect_sockets)
     processes, process_redacted = _redact(raw_processes)
-    sockets, socket_redacted = _redact(raw_sockets)
+    socket_output = socket_stdout + socket_stderr
+    sockets, socket_redacted = _redact(socket_output)
     sensitive_data_redacted = process_redacted or socket_redacted
     process_snapshot_captured = process_code == 0
     process_baseline_captured = command_started and baseline_process_code == 0
-    socket_snapshot_captured = socket_code in {0, 1}
+    socket_snapshot_captured = socket_code == 0 or (
+        socket_code == 1
+        and not socket_stderr.strip()
+        and _clean_empty_socket_snapshot(socket_stdout)
+    )
     if not process_snapshot_captured:
         errors.append("process-snapshot-failed")
     if not socket_snapshot_captured:
@@ -584,7 +614,7 @@ def run_guarded(
     *,
     execute: Callable[[list[str], dict[str, str]], int] = _standard_execute,
     collect_processes: Callable[[], tuple[int, str]] = _standard_process_snapshot,
-    collect_sockets: Callable[[], tuple[int, str]] = _standard_socket_snapshot,
+    collect_sockets: Callable[[], tuple[int, str] | tuple[int, str, str]] = _standard_socket_snapshot,
 ) -> int:
     for run_owned_path in (manifest_path, evidence_dir, state_path):
         _ensure_output_outside_stage(stage_root, run_owned_path)

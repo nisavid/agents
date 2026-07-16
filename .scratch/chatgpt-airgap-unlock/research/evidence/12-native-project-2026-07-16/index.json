@@ -36,7 +36,7 @@
     "projectState": {
       "baselineSourceSha256": "0f68dabb31621a5d0fd84e097e024d8b2b58cc3dc71f3a49ad36c2f63669ba0a",
       "stateSourceSha256": "4345ed474e46a178ba78418fafa5e3d3b28da04140f7582a23081abfaf7b6cb0",
-      "rule": "Retain the source schema-2 baseline and state unchanged."
+      "rule": "Retain the source schema-2 fields and values unchanged in compact JSON serialization."
     }
   }
 }

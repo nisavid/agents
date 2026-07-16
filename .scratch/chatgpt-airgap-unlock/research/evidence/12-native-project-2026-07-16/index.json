@@ -1,40 +1,42 @@
 {
-  "schema": 1,
-  "executedAt": "2026-07-16T17:19:17.116Z",
-  "application": {
-    "version": "26.707.71524",
-    "build": "5263",
-    "sourceAsarSha256": "d28f31b4bbb04c519be65c2af8277d8c5faf77b4239ee89b928f0a7423dacd84",
-    "sourceAsarHeaderSha256": "e3023f2d1c334ba8ba80bd22a97553d412a4616a86d75ca81e258e974061f3c7",
-    "patchedAsarSha256": "06c4fd5cbb3662911cc62c3569042bd5657f3476a99ef9edc47bd51d5380026f",
-    "patchedAsarHeaderSha256": "c069ef0e4e826ec2fd8db41a626f3e26f3edead477053a12703830ce7e047b75",
-    "patchedMainSha256": "a8082ef44bf3aa4e30e7c663472da502d15bed35073a4c125903f4b9291961cc"
-  },
-  "route": {
-    "probeExpectation": "renderer-native-project",
-    "gatewayCommit": "6307d37b76918c19f2e3bc0fd506434531aadeb2",
-    "nativeHelperSha256": "906c9af5c02e3ea3dcc520d0a5f86ba68b67ae0d1d493e08c8e3d0e71c978501",
-    "modelRevision": "adc8669eb431e3168aeb4e320bd7b757914350e2",
-    "modelSafetensorsBlob": "4a46dafdc0afb80deacc2dada482ff339405adabc87fcde51a43834827f0e0bf"
+  "schema": 2,
+  "cohort": {
+    "sourceRunRootSha256": "a87ceb601ca514c1c59fdf91135164366339aa3823aa7112d2b920152e1d9f0d",
+    "nativeHelperSha256": "a4365c91bbc160045f4cf31bfc679c5d46adfc19d4b6271a2c79bb354fd0dff5",
+    "application": {
+      "version": "26.707.71524",
+      "build": "5263",
+      "sourceAsarSha256": "d28f31b4bbb04c519be65c2af8277d8c5faf77b4239ee89b928f0a7423dacd84",
+      "patchedAsarSha256": "06c4fd5cbb3662911cc62c3569042bd5657f3476a99ef9edc47bd51d5380026f",
+      "patchedMainSha256": "a8082ef44bf3aa4e30e7c663472da502d15bed35073a4c125903f4b9291961cc"
+    }
   },
   "binding": {
-    "fixtureSha256": "0d80e8aa472b559e2da29aa0404dcfb3b4605dc46af714c9d316b474f18f94cc",
-    "runRootSha256": "4dc29d65f15cd6ccef44c68c113d0389729f645aa096a510d34805f52fd3b12f"
+    "fixtureSha256": "364b210da90c62e0442083b508d11bfc24eee3c2e7836243b6e23207b379a55c",
+    "databasePathSha256": "bf3025460687dda71cb46a9398af511bf54fb67fd487801b7ea1a744fc1eb30a",
+    "databaseFileIdentitySha256": "924759919b6153d8586b50c6472f821e3adab2768d4487ab7c88cee16a201a1e"
   },
   "outputs": {
-    "runtime-manifest.txt": "8767ef20122bba468c74b2c9bff8e66222b19b961ac6af100ae2940c501a7e41",
+    "native-project-baseline.json": "999888ebf0353261036e940cb87f2bad0aaabf899aebf58605afb27aa4a577db",
+    "native-project-state.json": "1dda46d99fb32dc2ad778802b4b6309083319202c8caf7ce0a563fef37f72a28",
+    "native-gui-probe.jsonl": "d926cddfaec4997c8958cee50a733578f2a7370f383992193adcaa5e486eb5f0",
     "probe-verdict.txt": "da941be5146b6ba414a68f013684fd6d35432087c18d0367c980bfc7e2290339",
-    "native-gui-probe.jsonl": "3d6733c7cdb462b42ad12fca81d914b51b447db9630ca0577d8c0e37d561b0f3",
-    "native-project-state.json": "8c92905959d82e5b200eff3ac109970621681e73e54e124422577c7f4c3c55d9",
-    "renderer-project-selection-confirmed.json": "4bcec2cd4c2610e23d93e943f755858ee8f0175411a40a7abb940b2a15a30750"
+    "renderer-project-selection-confirmed.json": "0307d7a5d014ca39c7c9c3ac2735c74915f224040399cf7b57db763ee3ee7372",
+    "runtime-manifest.txt": "8767ef20122bba468c74b2c9bff8e66222b19b961ac6af100ae2940c501a7e41"
   },
   "extraction": {
-    "sourceCdpNativeConfirmSha256": "e6995cfb85f7501b68281874757264171a33930b6d7bf30ed639e6e7c50b5884",
-    "rule": "Retain only kind, phase, matched, uniqueControl, and expectedFixtureSha256 from the unique renderer-project-selection-confirmed event."
-  },
-  "normalization": {
-    "sourceNativeProjectStateSha256": "0a646cea69524d509fae9e7aa4cbda4b7b90740e96beaf07fe50b3626d646ae7",
-    "databaseFileIdentitySha256": "8b5a48a94d22d59a5618b6e090b325df940e46d96f56c0d72d7693768ee4280e",
-    "rule": "Rename databaseSha256 to databasePathSha256 without changing its value; the digest binds the absolute database path string, not database contents. databaseFileIdentitySha256 is a post-run derivation from the surviving state_5.sqlite after verifying the retained authoritative thread, not a field emitted by the original live helper."
+    "nativeGuiProbe": {
+      "sourceSha256": "e3d7fcec44e803c84d382465415977abfe177f9549981769ac8b918b663345f3",
+      "rule": "Retain only the documented event allowlist; omit process IDs and start times."
+    },
+    "rendererConfirmation": {
+      "sourceSha256": "ebc4a1bcb8de607bcde66fed05c4b92ce17e50e01e6a02ac7e5bcb3c90f0143a",
+      "rule": "Retain only kind, phase, matched, uniqueControl, and expectedFixtureSha256 from the unique renderer-project-selection-confirmed event."
+    },
+    "projectState": {
+      "baselineSourceSha256": "0f68dabb31621a5d0fd84e097e024d8b2b58cc3dc71f3a49ad36c2f63669ba0a",
+      "stateSourceSha256": "4345ed474e46a178ba78418fafa5e3d3b28da04140f7582a23081abfaf7b6cb0",
+      "rule": "Retain the source schema-2 baseline and state unchanged."
+    }
   }
 }

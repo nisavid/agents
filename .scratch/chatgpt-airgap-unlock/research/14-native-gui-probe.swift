@@ -142,6 +142,22 @@ enum PathPolicy {
         return (parent as NSString).appendingPathComponent((path as NSString).lastPathComponent)
     }
 
+    static func nonSymlinkDirectoryIdentity(
+        _ path: String,
+        purpose: String
+    ) throws -> FileSystemIdentity {
+        var info = stat()
+        guard lstat(path, &info) == 0 else {
+            throw ProbeError.validation("\(purpose) filesystem identity is unavailable")
+        }
+        guard (info.st_mode & S_IFMT) != S_IFLNK,
+              (info.st_mode & S_IFMT) == S_IFDIR else {
+            throw ProbeError.validation("\(purpose) must be a non-symlink directory")
+        }
+        return FileSystemIdentity(
+            device: UInt64(info.st_dev), inode: UInt64(info.st_ino))
+    }
+
     static func contains(_ root: String, _ child: String) -> Bool {
         child != root && child.hasPrefix(root + "/")
     }
@@ -161,6 +177,11 @@ enum PathPolicy {
         let canonicalBundle = try canonicalExisting(bundle)
         let canonicalExecutable = try canonicalExisting(executable)
         let canonicalFixture = try canonicalExisting(fixture)
+        guard fixture == canonicalFixture else {
+            throw ProbeError.validation("fixture root must not resolve through a symlink")
+        }
+        let fixtureIdentity = try nonSymlinkDirectoryIdentity(
+            fixture, purpose: "fixture root")
         let canonicalEventLog = try canonicalLog(eventLog)
         guard canonicalBundle != installedApp,
               !canonicalBundle.hasPrefix(installedApp + "/") else {
@@ -178,11 +199,6 @@ enum PathPolicy {
         guard FileManager.default.isExecutableFile(atPath: canonicalExecutable) else {
             throw ProbeError.validation("expected executable is not executable")
         }
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: canonicalFixture, isDirectory: &isDirectory),
-              isDirectory.boolValue else {
-            throw ProbeError.validation("fixture root is not a directory")
-        }
         let gitMetadata = (canonicalFixture as NSString).appendingPathComponent(".git")
         var gitIsDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: gitMetadata, isDirectory: &gitIsDirectory),
@@ -197,11 +213,13 @@ enum PathPolicy {
         }
         let fixtureParent = try canonicalExisting(
             (canonicalFixture as NSString).deletingLastPathComponent)
+        let fixtureParentIdentity = try nonSymlinkDirectoryIdentity(
+            fixtureParent, purpose: "fixture parent")
         return ValidatedPaths(runRoot: root, bundle: canonicalBundle,
                               executable: canonicalExecutable, fixture: canonicalFixture,
-                              fixtureIdentity: try fileSystemIdentity(canonicalFixture),
+                              fixtureIdentity: fixtureIdentity,
                               fixtureParent: fixtureParent,
-                              fixtureParentIdentity: try fileSystemIdentity(fixtureParent),
+                              fixtureParentIdentity: fixtureParentIdentity,
                               eventLog: canonicalEventLog)
     }
 }
@@ -1537,14 +1555,17 @@ func waitForSelectedOpenPanelList<Element>(
 func performValidatedOpenPanelListSelectionSet<Element>(
     initial: OpenPanelListSelectionToken<Element>,
     sameElement: (Element, Element) -> Bool,
+    validateIdentity: () throws -> Void,
     revalidate: () throws -> (OpenPanelListSelectionToken<Element>,
                                OpenPanelListSelectionSnapshot<Element>),
     setSelection: (OpenPanelListSelectionToken<Element>) throws -> Void
 ) throws {
+    try validateIdentity()
     let (preflight, _) = try revalidate()
     try OpenPanelListSelectionPolicy.requireSameToken(
         initial, preflight, sameElement: sameElement)
     try setSelection(preflight)
+    try validateIdentity()
     let (published, publishedSnapshot) = try revalidate()
     try OpenPanelListSelectionPolicy.requireSameToken(
         preflight, published, sameElement: sameElement)
@@ -1555,10 +1576,12 @@ func performValidatedOpenPanelListSelectionSet<Element>(
 func performValidatedOpenPanelListChooserPress<Element>(
     initial: OpenPanelListSelectionToken<Element>,
     sameElement: (Element, Element) -> Bool,
+    validateIdentity: () throws -> Void,
     revalidate: () throws -> (OpenPanelListSelectionToken<Element>,
                                OpenPanelListSelectionSnapshot<Element>),
     pressChooser: (OpenPanelListSelectionToken<Element>) throws -> Void
 ) throws {
+    try validateIdentity()
     let (adjacent, snapshot) = try revalidate()
     try OpenPanelListSelectionPolicy.requireSameToken(
         initial, adjacent, sameElement: sameElement)
@@ -1568,6 +1591,7 @@ func performValidatedOpenPanelListChooserPress<Element>(
             "Open panel exact selection is not press-ready at mutation boundary")
     }
     try pressChooser(adjacent)
+    try validateIdentity()
 }
 
 func requireElementBelongsToProcess(
@@ -1582,18 +1606,11 @@ func requireElementBelongsToProcess(
     }
 }
 
-func fileSystemIdentity(_ path: String) throws -> FileSystemIdentity {
-    var info = stat()
-    guard stat(path, &info) == 0 else {
-        throw ProbeError.validation("filesystem identity is unavailable: \(path)")
-    }
-    return FileSystemIdentity(
-        device: UInt64(info.st_dev), inode: UInt64(info.st_ino))
-}
-
 func requireValidatedFixtureIdentity(_ paths: ValidatedPaths) throws {
-    guard try fileSystemIdentity(paths.fixture) == paths.fixtureIdentity,
-          try fileSystemIdentity(paths.fixtureParent) == paths.fixtureParentIdentity else {
+    guard try PathPolicy.nonSymlinkDirectoryIdentity(
+        paths.fixture, purpose: "fixture root") == paths.fixtureIdentity,
+          try PathPolicy.nonSymlinkDirectoryIdentity(
+            paths.fixtureParent, purpose: "fixture parent") == paths.fixtureParentIdentity else {
         throw ProbeError.validation(
             "fixture or chooser-root filesystem identity changed")
     }
@@ -1857,16 +1874,15 @@ func performValidatedOpenPanelListSelection(
     }
     try performValidatedOpenPanelListSelectionSet(
         initial: initial, sameElement: sameAXElement,
+        validateIdentity: requireCurrentMutationIdentity,
         revalidate: revalidate,
         setSelection: { token in
-            try performAtMutationBoundary(validateIdentity: requireCurrentMutationIdentity) {
-                let status = AXUIElementSetAttributeValue(
-                    token.list, kAXSelectedChildrenAttribute as CFString,
-                    [token.candidate] as CFArray)
-                guard status == .success else {
-                    throw ProbeError.unavailable(
-                        "setting exact Open panel candidate selection failed")
-                }
+            let status = AXUIElementSetAttributeValue(
+                token.list, kAXSelectedChildrenAttribute as CFString,
+                [token.candidate] as CFArray)
+            guard status == .success else {
+                throw ProbeError.unavailable(
+                    "setting exact Open panel candidate selection failed")
             }
             actionCount += 1
         })
@@ -1880,10 +1896,16 @@ func performValidatedOpenPanelListSelection(
         pause: { _ = usleep($0) })
     try performValidatedOpenPanelListChooserPress(
         initial: initial, sameElement: sameAXElement,
+        validateIdentity: requireCurrentMutationIdentity,
         revalidate: revalidate,
         pressChooser: { token in
-            try press(token.chooser, purpose: "Open panel exact OKButton",
-                      validateIdentity: requireCurrentMutationIdentity)
+            guard actions(token.chooser).contains(kAXPressAction) else {
+                throw ProbeError.validation("Open panel exact OKButton does not advertise AXPress")
+            }
+            guard AXUIElementPerformAction(
+                token.chooser, kAXPressAction as CFString) == .success else {
+                throw ProbeError.unavailable("AXPress failed for Open panel exact OKButton")
+            }
         })
     return (actionCount: actionCount, selectedPollCount: selectedPollCount)
 }
@@ -2130,6 +2152,48 @@ func runSelfTests() throws {
     catch ProbeError.validation { rejected = true }
     try require(rejected, "ambiguous Open panels were accepted")
 
+    let filesystemRoot = FileManager.default.temporaryDirectory.appendingPathComponent(
+        "chatgpt-native-gui-probe-self-test-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: filesystemRoot) }
+    let fixtureParentURL = filesystemRoot.appendingPathComponent("chooser", isDirectory: true)
+    let fixtureURL = fixtureParentURL.appendingPathComponent("project", isDirectory: true)
+    let fixtureReplacementURL = filesystemRoot.appendingPathComponent(
+        "replacement-project", isDirectory: true)
+    try FileManager.default.createDirectory(
+        at: fixtureURL, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(
+        at: fixtureReplacementURL, withIntermediateDirectories: true)
+    _ = try PathPolicy.nonSymlinkDirectoryIdentity(
+        fixtureURL.path, purpose: "fixture root")
+    try FileManager.default.removeItem(at: fixtureURL)
+    guard symlink(fixtureReplacementURL.path, fixtureURL.path) == 0 else {
+        throw ProbeError.unavailable("self-test could not replace fixture with symlink")
+    }
+    rejected = false
+    do {
+        _ = try PathPolicy.nonSymlinkDirectoryIdentity(
+            fixtureURL.path, purpose: "fixture root")
+    } catch ProbeError.validation { rejected = true }
+    try require(rejected, "symlink-replaced fixture passed identity validation")
+
+    try FileManager.default.removeItem(at: fixtureURL)
+    let parentReplacementURL = filesystemRoot.appendingPathComponent(
+        "replacement-parent", isDirectory: true)
+    try FileManager.default.createDirectory(
+        at: parentReplacementURL, withIntermediateDirectories: true)
+    _ = try PathPolicy.nonSymlinkDirectoryIdentity(
+        fixtureParentURL.path, purpose: "fixture parent")
+    try FileManager.default.removeItem(at: fixtureParentURL)
+    guard symlink(parentReplacementURL.path, fixtureParentURL.path) == 0 else {
+        throw ProbeError.unavailable("self-test could not replace fixture parent with symlink")
+    }
+    rejected = false
+    do {
+        _ = try PathPolicy.nonSymlinkDirectoryIdentity(
+            fixtureParentURL.path, purpose: "fixture parent")
+    } catch ProbeError.validation { rejected = true }
+    try require(rejected, "symlink-replaced fixture parent passed identity validation")
+
     var panelClock: UInt64 = 0
     var panelReads = 0
     let panelReadiness = try waitForUniqueOpenPanel(
@@ -2241,23 +2305,31 @@ func runSelfTests() throws {
     var selectionActions = 0
     var selectionPublished = false
     var selectionRevalidations = 0
+    var selectionMutationEvents: [String] = []
     try performValidatedOpenPanelListSelectionSet(
         initial: token, sameElement: ==,
+        validateIdentity: { selectionMutationEvents.append("identity") },
         revalidate: {
+            selectionMutationEvents.append("snapshot")
             selectionRevalidations += 1
             return (token, snapshot(
                 selected: selectionPublished ? ["candidate"] : []))
         },
         setSelection: { _ in
+            selectionMutationEvents.append("selection")
             selectionActions += 1
             selectionPublished = true
         })
     try require(
         selectionActions == 1 && selectionRevalidations == 2,
         "exact selection mutation was not published and reread once")
+    try require(
+        selectionMutationEvents == ["identity", "snapshot", "selection", "identity", "snapshot"],
+        "selection mutation did not use identity, fresh token, mutation, post-identity ordering")
     var preselectedActions = 0
     try performValidatedOpenPanelListSelectionSet(
         initial: token, sameElement: ==,
+        validateIdentity: {},
         revalidate: { (token, snapshot(selected: ["candidate"])) },
         setSelection: { _ in preselectedActions += 1 })
     try require(
@@ -2271,11 +2343,32 @@ func runSelfTests() throws {
         !isNestedApplicationBackReference(role: kAXWindowRole, depth: 1),
         "bounded AX traversal application back-reference policy failed")
     var chooserActions = 0
+    var chooserMutationEvents: [String] = []
     try performValidatedOpenPanelListChooserPress(
         initial: token, sameElement: ==,
-        revalidate: { (token, snapshot(selected: ["candidate"])) },
-        pressChooser: { _ in chooserActions += 1 })
+        validateIdentity: { chooserMutationEvents.append("identity") },
+        revalidate: {
+            chooserMutationEvents.append("snapshot")
+            return (token, snapshot(selected: ["candidate"]))
+        },
+        pressChooser: { _ in
+            chooserMutationEvents.append("chooser")
+            chooserActions += 1
+        })
     try require(chooserActions == 1, "exact chooser mutation did not run once")
+    try require(
+        chooserMutationEvents == ["identity", "snapshot", "chooser", "identity"],
+        "chooser mutation did not use identity, fresh token, mutation, post-identity ordering")
+    var staleTokenMutation = false
+    do {
+        try performValidatedOpenPanelListChooserPress(
+            initial: token, sameElement: ==, validateIdentity: {},
+            revalidate: { (try OpenPanelListSelectionPolicy.token(
+                snapshot(selected: ["candidate"], candidate: "replacement")),
+                snapshot(selected: ["candidate"], candidate: "replacement")) },
+            pressChooser: { _ in staleTokenMutation = true })
+    } catch ProbeError.validation {}
+    try require(!staleTokenMutation, "stale chooser token reached mutation")
 
     let arguments = [
         "--pid", "42", "--run-root", "/private/tmp/run",

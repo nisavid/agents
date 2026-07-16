@@ -30,7 +30,9 @@ Run the deterministic no-permission checks with:
 
 The live runner accepts only an exact helper path and SHA-256. The copied app's
 Seatbelt profile denies writes to that reviewed path, and the runner rechecks
-its inode, hash, and signature immediately before execution.
+its inode, hash, and signature immediately before execution. The deterministic
+test compares two fresh current builds; it does not pin them to a historical
+artifact hash.
 
 ## Verified project-selection contract
 
@@ -148,7 +150,7 @@ The exact copied artifacts are:
 | Source ASAR header | `e3023f2d1c334ba8ba80bd22a97553d412a4616a86d75ca81e258e974061f3c7` |
 | Patched ASAR header | `c069ef0e4e826ec2fd8db41a626f3e26f3edead477053a12703830ce7e047b75` |
 | Patched main file | `a8082ef44bf3aa4e30e7c663472da502d15bed35073a4c125903f4b9291961cc` |
-| Native helper | `906c9af5c02e3ea3dcc520d0a5f86ba68b67ae0d1d493e08c8e3d0e71c978501` |
+| Retained successful-run helper | `a4365c91bbc160045f4cf31bfc679c5d46adfc19d4b6271a2c79bb354fd0dff5` |
 
 The runner ad-hoc signs the copied outer bundle with identifier
 `com.openai.codex` and requires its deep signature and designated requirement
@@ -196,7 +198,7 @@ grant. The helper never requests a TCC prompt or edits TCC state.
 
 ## Verdict and cleanup
 
-Green for the exact helper identity, renderer authorization, bounded parented
+Green for the retained run's exact helper identity, renderer authorization, bounded parented
 sheet discovery, exact `AXSelectedChildren` selection, one chooser action, and
 renderer confirmation. The current route does not rely on activation repair,
 global focus, keyboard delivery, or coordinate input.
@@ -207,4 +209,8 @@ authenticated local `codex-ns-proxy`, OptiQ
 remote socket or token leak. Cleanup closed every owned app, host, proxy,
 gateway, observer, and model process and every reserved listener. Final
 integrity checks proved the copied ASAR matched the exact patched hash while the
-extracted source bundle and installed application remained unchanged.
+extracted source bundle and installed application remained unchanged. The
+secret-redacted evidence cohort in
+`evidence/12-native-project-2026-07-16/` is bound only to that surviving run,
+including its helper hash, schema-2 project baseline, and schema-2 project
+state; it is not a claim about a later rebuild.

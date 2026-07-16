@@ -21,6 +21,7 @@ The durable, secret-redacted run record is bound by
 [verdict](evidence/12-native-project-2026-07-16/probe-verdict.txt),
 [native event stream](evidence/12-native-project-2026-07-16/native-gui-probe.jsonl),
 [renderer confirmation](evidence/12-native-project-2026-07-16/renderer-project-selection-confirmed.json),
+[persistence baseline](evidence/12-native-project-2026-07-16/native-project-baseline.json),
 and [persistence transition](evidence/12-native-project-2026-07-16/native-project-state.json)
 substantiate the selection, gateway, integrity, isolation, and cleanup claims.
 

@@ -2,12 +2,15 @@
 
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { constants } from "node:fs";
 import {
+  link,
   lstat,
   mkdtemp,
   open,
   readFile,
   realpath,
+  rename,
   rm,
   symlink,
   writeFile,
@@ -146,14 +149,32 @@ function requirePayloadState(state, expectedSourceCount, expectedPatchedCount) {
   );
 }
 
+async function requireDescriptorMatchesTarget(handle, targetPath) {
+  const descriptorStat = await handle.stat();
+  assert.equal(descriptorStat.isFile(), true, "opened target must be a regular file");
+  assert.equal(descriptorStat.nlink, 1, "opened target must have exactly one link");
+  const targetStat = await lstat(targetPath);
+  assert.equal(targetStat.isSymbolicLink(), false, "target path must not be a symlink");
+  assert.equal(targetStat.isFile(), true, "target path must be a regular file");
+  assert.equal(targetStat.nlink, 1, "target path must have exactly one link");
+  assert.equal(targetStat.dev, descriptorStat.dev, "target path does not match opened descriptor device");
+  assert.equal(targetStat.ino, descriptorStat.ino, "target path does not match opened descriptor inode");
+  assert.equal(targetStat.size, descriptorStat.size, "target path does not match opened descriptor size");
+  return descriptorStat.size;
+}
+
 async function inspectTarget(targetPath, writable) {
-  const targetLstat = await lstat(targetPath);
-  assert.equal(targetLstat.isSymbolicLink(), false, "target must not be a symlink");
-  assert.equal(targetLstat.isFile(), true, "target must be a regular file");
   const canonicalPath = await realpath(targetPath);
   assert.equal(canonicalPath, targetPath, "target path must already be canonical");
-  const handle = await open(targetPath, writable ? "r+" : "r");
-  return { canonicalPath, fileSize: targetLstat.size, handle };
+  const flags = (writable ? constants.O_RDWR : constants.O_RDONLY) | constants.O_NOFOLLOW;
+  const handle = await open(targetPath, flags);
+  try {
+    const fileSize = await requireDescriptorMatchesTarget(handle, targetPath);
+    return { canonicalPath, fileSize, handle };
+  } catch (error) {
+    await handle.close();
+    throw error;
+  }
 }
 
 async function patchTarget(mode, targetPath) {
@@ -185,6 +206,7 @@ async function patchTarget(mode, targetPath) {
         "expected main-file hash exactly twice in ASAR header",
       );
       const patchOffset = before.mainFileOffset + before.sourceOffsets[0];
+      await requireDescriptorMatchesTarget(handle, targetPath);
       await writeExactly(handle, PATCHED, patchOffset, "main payload");
       for (const headerOffset of integrityOffsets) {
         await writeExactly(
@@ -195,6 +217,7 @@ async function patchTarget(mode, targetPath) {
         );
       }
       await handle.sync();
+      await requireDescriptorMatchesTarget(handle, targetPath);
       const after = await inspectAsar(handle, fileSize);
       requirePayloadState(after, 0, 1);
       assert.equal(after.mainFileOffset + after.patchedOffsets[0], patchOffset);
@@ -203,6 +226,7 @@ async function patchTarget(mode, targetPath) {
     }
 
     const finalState = await inspectAsar(handle, fileSize);
+    await requireDescriptorMatchesTarget(handle, targetPath);
     return {
       asarHeaderSha256: finalState.headerSha256,
       asarHeaderSize: finalState.headerSize,
@@ -334,7 +358,33 @@ async function selfTest() {
 
     const linked = join(root, "linked.asar");
     await symlink(target, linked);
-    await expectFailure(() => patchTarget("verify-patched", linked), /must not be a symlink/);
+    await expectFailure(
+      () => patchTarget("verify-patched", linked),
+      /ELOOP|symlink|already be canonical/,
+    );
+
+    const hardLinked = join(root, "hard-linked.asar");
+    await link(target, hardLinked);
+    await expectFailure(
+      () => patchTarget("verify-patched", target),
+      /exactly one link/,
+    );
+    await rm(hardLinked);
+
+    const raceTarget = join(root, "race-target.asar");
+    const raceReplacement = join(root, "race-replacement.asar");
+    await writeFile(raceTarget, original.bytes);
+    await writeFile(raceReplacement, original.bytes);
+    const raceHandle = await open(raceTarget, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      await rename(raceReplacement, raceTarget);
+      await expectFailure(
+        () => requireDescriptorMatchesTarget(raceHandle, raceTarget),
+        /exactly one link|does not match opened descriptor inode/,
+      );
+    } finally {
+      await raceHandle.close();
+    }
   } finally {
     await rm(root, { force: true, recursive: true });
   }

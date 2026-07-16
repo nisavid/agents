@@ -1034,6 +1034,10 @@ struct OpenPanelReadiness<Element> {
 }
 
 // BEGIN_READ_ONLY_OPEN_PANEL_WAIT
+// Covers the renderer's 20-second CDP target acquisition plus three 10-second
+// picker-control waits, with a bounded margin for the final request.
+let openPanelWaitTimeoutNanoseconds: UInt64 = 60_000_000_000
+
 func waitForUniqueOpenPanel<Element>(
     timeoutNanoseconds: UInt64,
     pollMicroseconds: useconds_t,
@@ -1092,7 +1096,7 @@ func waitForValidatedOpenPanel(
     identity: ProcessIdentity
 ) throws -> OpenPanelReadiness<AXUIElement> {
     try waitForUniqueOpenPanel(
-        timeoutNanoseconds: 5_000_000_000,
+        timeoutNanoseconds: openPanelWaitTimeoutNanoseconds,
         pollMicroseconds: 100_000,
         nowNanoseconds: monotonicNanoseconds,
         validateIdentity: { try requireSameProcess(identity) },
@@ -1110,15 +1114,28 @@ func requireSameProcess(_ expected: ProcessIdentity) throws {
     }
 }
 
-func press(_ element: AXUIElement, purpose: String, process: ProcessIdentity) throws {
-    try requireSameProcess(process)
-    guard actions(element).contains(kAXPressAction) else {
-        throw ProbeError.validation("\(purpose) does not advertise AXPress")
+func performAtMutationBoundary(
+    validateIdentity: () throws -> Void,
+    mutation: () throws -> Void
+) throws {
+    try validateIdentity()
+    try mutation()
+    try validateIdentity()
+}
+
+func press(
+    _ element: AXUIElement,
+    purpose: String,
+    validateIdentity: () throws -> Void
+) throws {
+    try performAtMutationBoundary(validateIdentity: validateIdentity) {
+        guard actions(element).contains(kAXPressAction) else {
+            throw ProbeError.validation("\(purpose) does not advertise AXPress")
+        }
+        guard AXUIElementPerformAction(element, kAXPressAction as CFString) == .success else {
+            throw ProbeError.unavailable("AXPress failed for \(purpose)")
+        }
     }
-    guard AXUIElementPerformAction(element, kAXPressAction as CFString) == .success else {
-        throw ProbeError.unavailable("AXPress failed for \(purpose)")
-    }
-    try requireSameProcess(process)
 }
 
 func sameAXElement(_ left: AXUIElement, _ right: AXUIElement) -> Bool {
@@ -1175,30 +1192,30 @@ func strictActions(_ element: AXUIElement, purpose: String) throws -> Set<String
     return Set(values)
 }
 
+func requireExactCurrentOpenPanel<Element>(
+    _ panel: Element,
+    nestedSheets: [Element],
+    sameElement: (Element, Element) -> Bool
+) throws {
+    guard nestedSheets.count == 1, sameElement(nestedSheets[0], panel) else {
+        throw ProbeError.validation(
+            "original Open panel is missing or ambiguous during selection")
+    }
+}
+
 func requireExactOpenPanelCurrent(
     application: AXUIElement,
     panel: AXUIElement,
     process: ProcessIdentity
 ) throws {
     try requireSameProcess(process)
-    let windows = try strictElementArrayAttribute(
-        application, kAXWindowsAttribute as CFString,
-        purpose: "application windows during Open panel selection")
-    guard windows.count <= 8 else {
-        throw ProbeError.validation(
-            "application exposes too many AX windows during Open panel selection")
-    }
     guard let nestedSheets = try liveBoundedNestedSheetsForOpenPanelReadiness(
         application) else {
         throw ProbeError.retryable(
             "Open panel sheet topology read was temporarily incomplete")
     }
-    let currentRoots = identityDeduplicated(
-        windows + nestedSheets.map(\.0), sameElement: sameAXElement)
-    guard currentRoots.filter({ sameAXElement($0, panel) }).count == 1 else {
-        throw ProbeError.validation(
-            "original Open panel is missing or ambiguous during selection")
-    }
+    try requireExactCurrentOpenPanel(
+        panel, nestedSheets: nestedSheets.map(\.0), sameElement: sameAXElement)
     try requireSameProcess(process)
 }
 
@@ -1582,6 +1599,16 @@ func requireValidatedFixtureIdentity(_ paths: ValidatedPaths) throws {
     }
 }
 
+func requireMutationIdentity(
+    process: ProcessIdentity,
+    paths: ValidatedPaths
+) throws {
+    try requireValidatedFixtureIdentity(paths)
+    try requireSameProcess(process)
+    try validateCodeIdentity(pid: process.pid, paths: paths)
+    try requireSameProcess(process)
+}
+
 func attributeSettablePublication(
     _ element: AXUIElement,
     _ name: CFString
@@ -1817,7 +1844,10 @@ func performValidatedOpenPanelListSelection(
     let requireFixtureIdentity = {
         try requireValidatedFixtureIdentity(paths)
     }
-    try requireFixtureIdentity()
+    let requireCurrentMutationIdentity = {
+        try requireMutationIdentity(process: process, paths: paths)
+    }
+    try requireCurrentMutationIdentity()
     var actionCount = 0
     let revalidate = {
         try requireFixtureIdentity()
@@ -1829,18 +1859,16 @@ func performValidatedOpenPanelListSelection(
         initial: initial, sameElement: sameAXElement,
         revalidate: revalidate,
         setSelection: { token in
-            try requireFixtureIdentity()
-            try requireSameProcess(process)
-            let status = AXUIElementSetAttributeValue(
-                token.list, kAXSelectedChildrenAttribute as CFString,
-                [token.candidate] as CFArray)
-            try requireSameProcess(process)
-            guard status == .success else {
-                throw ProbeError.unavailable(
-                    "setting exact Open panel candidate selection failed")
+            try performAtMutationBoundary(validateIdentity: requireCurrentMutationIdentity) {
+                let status = AXUIElementSetAttributeValue(
+                    token.list, kAXSelectedChildrenAttribute as CFString,
+                    [token.candidate] as CFArray)
+                guard status == .success else {
+                    throw ProbeError.unavailable(
+                        "setting exact Open panel candidate selection failed")
+                }
             }
             actionCount += 1
-            try requireFixtureIdentity()
         })
     let selectedPollCount = try waitForSelectedOpenPanelList(
         timeoutNanoseconds: 3_000_000_000,
@@ -1854,10 +1882,8 @@ func performValidatedOpenPanelListSelection(
         initial: initial, sameElement: sameAXElement,
         revalidate: revalidate,
         pressChooser: { token in
-            try requireFixtureIdentity()
             try press(token.chooser, purpose: "Open panel exact OKButton",
-                      process: process)
-            try requireFixtureIdentity()
+                      validateIdentity: requireCurrentMutationIdentity)
         })
     return (actionCount: actionCount, selectedPollCount: selectedPollCount)
 }
@@ -2123,6 +2149,49 @@ func runSelfTests() throws {
     try require(
         panelReadiness.pollCount == 2 && panelReads == 2,
         "transient panel AX read was not retried")
+    var delayedPanelClock: UInt64 = 0
+    let delayedPanelReadiness = try waitForUniqueOpenPanel(
+        timeoutNanoseconds: openPanelWaitTimeoutNanoseconds,
+        pollMicroseconds: 1_000_000,
+        nowNanoseconds: { delayedPanelClock },
+        validateIdentity: {},
+        readWindows: {
+            delayedPanelClock >= 50_000_000_000 ? [("panel", panel)] : []
+        },
+        sameElement: { (left: String, right: String) in left == right },
+        pause: { delayedPanelClock += UInt64($0) * 1_000 })
+    try require(
+        delayedPanelReadiness.pollCount == 51,
+        "60-second Open panel deadline did not cover delayed renderer restoration")
+    try requireExactCurrentOpenPanel(
+        "panel", nestedSheets: ["panel"], sameElement: ==)
+    rejected = false
+    do {
+        try requireExactCurrentOpenPanel(
+            "panel", nestedSheets: ["replacement"], sameElement: ==)
+    } catch ProbeError.validation { rejected = true }
+    try require(rejected, "replacement Open panel was accepted from a stale snapshot")
+    rejected = false
+    do {
+        try requireExactCurrentOpenPanel(
+            "panel", nestedSheets: ["panel", "replacement"], sameElement: ==)
+    } catch ProbeError.validation { rejected = true }
+    try require(rejected, "ambiguous current Open panel snapshot was accepted")
+
+    var mutationEvents: [String] = []
+    try performAtMutationBoundary(
+        validateIdentity: { mutationEvents.append("validate") },
+        mutation: { mutationEvents.append("mutate") })
+    try require(
+        mutationEvents == ["validate", "mutate", "validate"],
+        "mutation boundary did not validate before and after mutation")
+    var blockedMutation = false
+    do {
+        try performAtMutationBoundary(
+            validateIdentity: { throw ProbeError.validation("synthetic identity drift") },
+            mutation: { blockedMutation = true })
+    } catch ProbeError.validation {}
+    try require(!blockedMutation, "identity drift allowed an AX mutation")
 
     func snapshot(
         selected: [String], candidate: String = "candidate",

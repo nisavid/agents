@@ -170,6 +170,8 @@ if printf '%s\n' "$readiness_body" | /usr/bin/grep -Eq \
   echo 'Open panel readiness wait contains an input action' >&2
   exit 1
 fi
+printf '%s\n' "$readiness_body" | /usr/bin/grep -Fq \
+  'let openPanelWaitTimeoutNanoseconds: UInt64 = 60_000_000_000'
 test "$(/usr/bin/grep -Fc 'BEGIN_PID_OPEN_PANEL_LIST_SELECTION' \
   "$HERE/14-native-gui-probe.swift")" -eq 1
 test "$(/usr/bin/grep -Fc 'END_PID_OPEN_PANEL_LIST_SELECTION' \
@@ -186,7 +188,8 @@ test "$(printf '%s\n' "$list_selection_body" | \
 for contract in kAXBrowserRole ColumnView kAXListRole kAXGroupRole \
   kAXURLAttribute kAXSelectedChildrenAttribute fileSystemIdentity \
   revalidateOpenPanelListSelectionToken performValidatedOpenPanelListSelectionSet \
-  performValidatedOpenPanelListChooserPress; do
+  performValidatedOpenPanelListChooserPress requireMutationIdentity \
+  validateCodeIdentity performAtMutationBoundary; do
   printf '%s\n' "$list_selection_body" | /usr/bin/grep -Fq "$contract"
 done
 if printf '%s\n' "$list_selection_body" | /usr/bin/grep -Eq \

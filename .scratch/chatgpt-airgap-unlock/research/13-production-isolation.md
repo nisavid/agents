@@ -27,11 +27,18 @@ It exposes two small interfaces:
   links and special files, and binds explicitly named artifacts to their exact
   SHA-256 and review identity; and
 - a guarded runner establishes a fresh safe evidence directory, validates that
-  sealed tree before and after executing a guest lifecycle command, then writes
+  manifest-bound tree before and after executing a guest lifecycle command, then writes
   `cleanup-final.json`, `processes-final.txt`, `sockets-final.txt`, and
   `verdict.json` after success or a later manifest or command failure. Invalid
   output paths and a linked, non-directory, nonempty, or uncreatable evidence
   path return before this four-artifact guarantee begins.
+
+The helper detects pre-existing or persistent staging drift; pre/post hashes do
+not prove that a writable tree was never changed and restored during execution.
+Production acceptance therefore executes the manifest-bound artifacts from a
+separately mounted read-only artifact volume. State and terminal evidence live
+on a different writable guest volume. Ticket 13 remains open until the VM run
+verifies that mount boundary and the lifecycle cannot write the artifact volume.
 
 The bindings file is run-owned JSON with this shape:
 
@@ -114,6 +121,11 @@ record the red verdict. Run the deterministic synthetic cases with:
 python3 .scratch/chatgpt-airgap-unlock/research/13-test-production-evidence.py
 ```
 
+The guarded lifecycle receives only fixed `PATH`, `HOME`, `TMPDIR`, `LANG`, and
+`LC_ALL` values plus the fresh run nonce and owned-state path. It must consume
+those two capability values and remove them from its environment before
+launching the app, model, gateway, observers, or any tested child.
+
 ## Isolation boundary
 
 Use Apple's
@@ -145,11 +157,15 @@ graphics, keyboard, and pointing devices required to boot and operate macOS.
 Prepare the disposable guest before the acceptance boot:
 
 1. Copy the exact verified app, model snapshot, runtime, gateway source, test
-   fixture, and observers into the guest.
-2. Shut down the guest and detach every staging disk and shared resource.
-3. Clone or snapshot that sealed baseline.
+   fixture, and observers onto a dedicated artifact volume.
+2. Shut down the guest, detach every staging disk and shared resource, and attach
+   the artifact volume read-only to the acceptance VM.
+3. Keep run state and terminal evidence on a separate writable disposable guest
+   volume; clone or snapshot that baseline.
 4. Boot with the no-network, no-sharing configuration above.
-5. Assert the configured and live counts of network, socket, and directory-share
+5. Verify the artifact mount is read-only and a write canary fails before
+   launching any tested process.
+6. Assert the configured and live counts of network, socket, and directory-share
    devices are zero before launching any tested process.
 
 The guest disk is disposable evidence storage. It must contain no operator

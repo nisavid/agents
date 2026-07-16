@@ -30,7 +30,13 @@ SENSITIVE_TEXT_PATTERNS = (
     re.compile(r"\bBearer\s+\S+", re.IGNORECASE),
     re.compile(r"\bsk-[A-Za-z0-9][A-Za-z0-9_.-]{4,}"),
     re.compile(
-        r"\b(?:authorization|credential|password|secret|token|api[_-]?key)=\S+",
+        r"(?<!\S)(?:--?)?(?:authorization|credential|password|secret|token|"
+        r"api[-_]?key|access[-_]?token|client[-_]?secret)(?:=|[ \t]+)\S+",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:authorization|credential|password|secret|token|api[_-]?key|"
+        r"access[_-]?token|client[_-]?secret)=\S+",
         re.IGNORECASE,
     ),
 )
@@ -71,7 +77,8 @@ def _reject_sensitive_metadata(value: Any, location: str = "bindings") -> None:
         for key, child in value.items():
             if not isinstance(key, str):
                 raise EvidenceError(f"{location} keys must be strings")
-            if SENSITIVE_KEY_PATTERN.search(key):
+            normalized_key = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", key)
+            if SENSITIVE_KEY_PATTERN.search(normalized_key):
                 raise EvidenceError(f"{location} contains a forbidden sensitive key")
             _reject_sensitive_metadata(child, f"{location}.{key}")
     elif isinstance(value, list):
@@ -640,7 +647,13 @@ def run_guarded(
                 expected_run_nonce = None
                 errors.append("owned-state-initialize-failed")
             else:
-                environment = os.environ.copy()
+                environment = {
+                    "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+                    "HOME": "/var/empty",
+                    "TMPDIR": "/private/tmp",
+                    "LANG": "C",
+                    "LC_ALL": "C",
+                }
                 environment[RUN_NONCE_ENV] = expected_run_nonce
                 environment[STATE_PATH_ENV] = str(state_path.resolve())
                 baseline_process_code, baseline_processes = _safe_collect(

@@ -17,6 +17,9 @@ def sandbox_command(
     profile: pathlib.Path,
     real_home: pathlib.Path,
     codex: pathlib.Path,
+    proxy_port: int,
+    optiq_port: int,
+    gateway_port: int,
     protected_helper: pathlib.Path | None,
 ) -> list[str]:
     command = [
@@ -25,6 +28,12 @@ def sandbox_command(
         str(profile),
         "-D",
         f"REAL_HOME={real_home}",
+        "-D",
+        f"PROXY_PORT={proxy_port}",
+        "-D",
+        f"OPTIQ_PORT={optiq_port}",
+        "-D",
+        f"GATEWAY_PORT={gateway_port}",
     ]
     if protected_helper is not None:
         command.extend(["-D", f"NATIVE_GUI_PROBE_BIN={protected_helper}"])
@@ -44,11 +53,12 @@ def run_self_test() -> None:
     profile = pathlib.Path("/private/tmp/profile.sb")
     real_home = pathlib.Path("/Users/operator")
     codex = pathlib.Path("/private/tmp/Codex")
-    without_helper = sandbox_command(profile, real_home, codex, None)
+    without_helper = sandbox_command(profile, real_home, codex, 49309, 18998, 18999, None)
     assert not any(value.startswith("NATIVE_GUI_PROBE_BIN=") for value in without_helper)
+    assert without_helper.count("-D") == 4
     helper = pathlib.Path("/private/tmp/reviewed-helper")
-    with_helper = sandbox_command(profile, real_home, codex, helper)
-    assert with_helper.count("-D") == 2
+    with_helper = sandbox_command(profile, real_home, codex, 49309, 18998, 18999, helper)
+    assert with_helper.count("-D") == 5
     helper_define = f"NATIVE_GUI_PROBE_BIN={helper}"
     helper_index = with_helper.index(helper_define)
     assert with_helper[helper_index - 1] == "-D"
@@ -96,10 +106,10 @@ def receive_message(
 
 
 def main() -> None:
-    if len(sys.argv) not in (8, 9):
+    if len(sys.argv) not in (10, 11):
         raise SystemExit(
             "usage: 08-appserver-probe.py CODEX WORKSPACE PROFILE REAL_HOME "
-            "LOG_DIR MODEL_ID PROXY_PORT [PROTECTED_HELPER]"
+            "LOG_DIR MODEL_ID PROXY_PORT OPTIQ_PORT GATEWAY_PORT [PROTECTED_HELPER]"
         )
     codex = pathlib.Path(sys.argv[1]).resolve()
     workspace = pathlib.Path(sys.argv[2]).resolve()
@@ -108,7 +118,9 @@ def main() -> None:
     log_dir = pathlib.Path(sys.argv[5]).resolve()
     model_id = sys.argv[6]
     proxy_port = int(sys.argv[7])
-    protected_helper = pathlib.Path(sys.argv[8]).resolve() if len(sys.argv) == 9 else None
+    optiq_port = int(sys.argv[8])
+    gateway_port = int(sys.argv[9])
+    protected_helper = pathlib.Path(sys.argv[10]).resolve() if len(sys.argv) == 11 else None
     token_env_name = os.environ["CODEX_PROVIDER_TOKEN_ENV"]
     skill_path = workspace / ".agents/skills/local-sentinel/SKILL.md"
 
@@ -144,7 +156,9 @@ def main() -> None:
 
     with stderr_path.open("w") as stderr, messages_path.open("w") as raw:
         process = subprocess.Popen(
-            sandbox_command(profile, real_home, codex, protected_helper),
+            sandbox_command(
+                profile, real_home, codex, proxy_port, optiq_port, gateway_port, protected_helper
+            ),
             cwd=workspace,
             env=environment,
             stdin=subprocess.PIPE,

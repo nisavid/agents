@@ -32,6 +32,10 @@ def sandbox(profile: str, definitions: dict[str, str], *command: str) -> subproc
     return subprocess.run(arguments, text=True, capture_output=True, check=False)
 
 
+def unsandboxed(*command: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(command, text=True, capture_output=True, check=False)
+
+
 def assert_allowed(result: subprocess.CompletedProcess[str], subject: str) -> None:
     assert result.returncode == 0, (
         f"{subject} was denied: stdout={result.stdout!r} stderr={result.stderr!r}"
@@ -40,6 +44,13 @@ def assert_allowed(result: subprocess.CompletedProcess[str], subject: str) -> No
 
 def assert_denied(result: subprocess.CompletedProcess[str], subject: str) -> None:
     assert result.returncode != 0, f"{subject} unexpectedly succeeded"
+
+
+def assert_denied_after_control(
+    profile: str, definitions: dict[str, str], subject: str, *command: str
+) -> None:
+    assert_allowed(unsandboxed(*command), f"{subject} unsandboxed control")
+    assert_denied(sandbox(profile, definitions, *command), subject)
 
 
 def bind_code(port: int) -> str:
@@ -75,6 +86,8 @@ def listener(port: int):
 
 
 def assert_bind(profile: str, definitions: dict[str, str], port: int, allowed: bool) -> None:
+    if not allowed:
+        assert_allowed(unsandboxed(PYTHON, "-c", bind_code(port)), f"{profile} bind {port} control")
     result = sandbox(profile, definitions, PYTHON, "-c", bind_code(port))
     assertion = assert_allowed if allowed else assert_denied
     assertion(result, f"{profile} bind {port}")
@@ -82,6 +95,11 @@ def assert_bind(profile: str, definitions: dict[str, str], port: int, allowed: b
 
 def assert_connect(profile: str, definitions: dict[str, str], port: int, allowed: bool) -> None:
     with listener(port):
+        if not allowed:
+            assert_allowed(
+                unsandboxed(PYTHON, "-c", connect_code(port)),
+                f"{profile} connect {port} control",
+            )
         result = sandbox(profile, definitions, PYTHON, "-c", connect_code(port))
     assertion = assert_allowed if allowed else assert_denied
     assertion(result, f"{profile} connect {port}")
@@ -119,6 +137,26 @@ def test_ports() -> None:
         for port, allowed in connect_cases:
             assert_connect(profile, definitions, port, allowed)
 
+    non_default_ports = {
+        "CDP_PORT": "29408",
+        "PROXY_PORT": "29409",
+        "UPSTREAM_OBSERVER_PORT": "28997",
+        "OPTIQ_PORT": "28998",
+        "GATEWAY_PORT": "28999",
+    }
+    non_default_common = {**common, **non_default_ports}
+    assert_connect("08-host-direct.sb", non_default_common, 29409, True)
+    assert_connect("08-host-direct.sb", non_default_common, 28998, True)
+    assert_connect("08-host-direct.sb", non_default_common, 49309, False)
+    assert_connect("08-host-gateway.sb", non_default_common, 29409, True)
+    assert_connect("08-host-gateway.sb", non_default_common, 28999, True)
+    assert_connect("08-host-gateway.sb", non_default_common, 18999, False)
+    assert_bind("08-proxy.sb", non_default_common, 29409, True)
+    assert_bind("08-proxy.sb", non_default_common, 49309, False)
+    assert_bind("08-gateway.sb", non_default_common, 28999, True)
+    assert_connect("08-gateway.sb", non_default_common, 28997, True)
+    assert_bind("08-gateway.sb", non_default_common, 18999, False)
+
     provider_definitions = {
         "REAL_HOME": real_home,
         "MODEL_REPO": str(PINNED_MODEL.parent.parent),
@@ -134,6 +172,27 @@ def test_ports() -> None:
     assert_allowed(
         sandbox("08-provider.sb", provider_definitions, provider_python, "-P", "-c", bind_code(18998)),
         "08-provider.sb bind 18998",
+    )
+    non_default_provider = {**provider_definitions, **non_default_ports}
+    assert_allowed(
+        sandbox(
+            "08-provider.sb",
+            non_default_provider,
+            provider_python,
+            "-P",
+            "-c",
+            bind_code(28998),
+        ),
+        "08-provider.sb bind non-default OptiQ port",
+    )
+    assert_denied_after_control(
+        "08-provider.sb",
+        non_default_provider,
+        "08-provider.sb bind fixed default OptiQ port",
+        provider_python,
+        "-P",
+        "-c",
+        bind_code(18998),
     )
     with listener(49308):
         assert_denied(
@@ -210,30 +269,71 @@ def test_provider_files_and_exec() -> None:
             sandbox("08-provider.sb", definitions, provider_python, "-P", "-c", read, provider_python),
             "provider runtime read",
         )
-        assert_denied(
-            sandbox("08-provider.sb", definitions, provider_python, "-P", "-c", read, str(real_home / ".codex/memories/MEMORY.md")),
+        home_sentinel = real_home / ".codex/memories/MEMORY.md"
+        assert home_sentinel.is_file()
+        assert_denied_after_control(
+            "08-provider.sb",
+            definitions,
             "provider unrelated home read",
+            provider_python,
+            "-P",
+            "-c",
+            read,
+            str(home_sentinel),
         )
-        assert_denied(
-            sandbox("08-provider.sb", definitions, provider_python, "-P", "-c", read, str(run_root / "protected.txt")),
+        assert_denied_after_control(
+            "08-provider.sb",
+            definitions,
             "provider run-root read",
+            provider_python,
+            "-P",
+            "-c",
+            read,
+            str(run_root / "protected.txt"),
         )
         for directory in (provider_home, provider_tmp, hf_cache):
             assert_allowed(
                 sandbox("08-provider.sb", definitions, provider_python, "-P", "-c", write, str(directory / "allowed.txt")),
                 f"provider write {directory.name}",
             )
-        assert_denied(
-            sandbox("08-provider.sb", definitions, provider_python, "-P", "-c", write, str(run_root / "denied.txt")),
+        assert_denied_after_control(
+            "08-provider.sb",
+            definitions,
             "provider run-root write",
+            provider_python,
+            "-P",
+            "-c",
+            write,
+            str(run_root / "denied.txt"),
         )
         assert_allowed(
             sandbox("08-provider.sb", definitions, provider_python, "-P", "-c", "pass"),
             "provider pinned runtime execution",
         )
-        assert_denied(
-            sandbox("08-provider.sb", definitions, "/bin/echo", "denied"),
+        assert_denied_after_control(
+            "08-provider.sb",
+            definitions,
             "provider execution outside pinned runtime",
+            "/bin/echo",
+            "denied",
+        )
+
+
+def test_metadata_real_home_denial() -> None:
+    with tempfile.TemporaryDirectory(prefix="ticket08-metadata-") as temporary:
+        real_home = Path(temporary).resolve() / "real-home"
+        real_home.mkdir()
+        sentinel = real_home / "sentinel.txt"
+        sentinel.write_text("known existing sentinel\n")
+        denied_write = real_home / "denied-write.txt"
+        read = "import pathlib; pathlib.Path(__import__('sys').argv[1]).read_bytes()"
+        write = "import pathlib; pathlib.Path(__import__('sys').argv[1]).write_text('ok')"
+        definitions = {"REAL_HOME": str(real_home)}
+        assert_denied_after_control(
+            "08-metadata-probe.sb", definitions, "metadata real-home read", PYTHON, "-c", read, str(sentinel)
+        )
+        assert_denied_after_control(
+            "08-metadata-probe.sb", definitions, "metadata real-home write", PYTHON, "-c", write, str(denied_write)
         )
 
 
@@ -242,6 +342,7 @@ def main() -> int:
         raise SystemExit("08-seatbelt-test.py requires assertions")
     test_ports()
     test_provider_files_and_exec()
+    test_metadata_real_home_denial()
     print("ticket 08 Seatbelt role contracts passed")
     return 0
 

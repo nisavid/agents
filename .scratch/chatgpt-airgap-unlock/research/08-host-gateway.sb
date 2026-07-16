@@ -1,0 +1,13 @@
+(version 1)
+
+; THROWAWAY PROTOTYPE ONLY. The bundled host has no listener and may use only
+; the observer proxy and the authenticated local gateway.
+(allow default)
+(deny network-outbound (remote ip))
+(deny network-inbound (local ip))
+(allow network-outbound (remote ip "localhost:49309"))
+(allow network-outbound (remote ip "localhost:18999"))
+
+(deny file-read* (subpath (param "REAL_HOME")))
+(deny file-write* (subpath (param "REAL_HOME")))
+(deny file-write* (literal (param "NATIVE_GUI_PROBE_BIN")))

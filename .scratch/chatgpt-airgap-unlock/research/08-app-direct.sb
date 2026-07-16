@@ -1,14 +1,16 @@
 (version 1)
 
-; THROWAWAY PROTOTYPE ONLY. The bundled host has no listener and may use only
-; the observer proxy and the fixed direct or gateway provider route.
+; THROWAWAY PROTOTYPE ONLY. The copied app owns its CDP listener and may reach
+; only the observer proxy and the direct OptiQ provider.
 (allow default)
 (deny network-outbound (remote ip))
 (deny network-inbound (local ip))
 (allow network-outbound (remote ip "localhost:49309"))
 (allow network-outbound (remote ip "localhost:18998"))
-(allow network-outbound (remote ip "localhost:18999"))
+(allow network-inbound (local ip "localhost:49308"))
 
 (deny file-read* (subpath (param "REAL_HOME")))
 (deny file-write* (subpath (param "REAL_HOME")))
+(deny file-write* (subpath "/Applications/ChatGPT.app"))
 (deny file-write* (literal (param "NATIVE_GUI_PROBE_BIN")))
+(deny mach-lookup (regex #"^com\\.apple\\.securityd"))

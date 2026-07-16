@@ -1,11 +1,13 @@
 (version 1)
 
 ; THROWAWAY PROTOTYPE ONLY. The copied app owns its CDP listener and may reach
-; only the separately-owned loopback proxy.
+; only the observer proxy and the active fixed local provider route.
 (allow default)
 (deny network-outbound (remote ip))
 (deny network-inbound (local ip))
 (allow network-outbound (remote ip "localhost:49309"))
+(allow network-outbound (remote ip "localhost:18998"))
+(allow network-outbound (remote ip "localhost:18999"))
 (allow network-inbound (local ip "localhost:49308"))
 
 (deny file-read* (subpath (param "REAL_HOME")))

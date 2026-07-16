@@ -59,7 +59,7 @@ def capture(database: Path, fixture: str, output: Path) -> None:
         {
             "schema": 1,
             "fixtureSha256": digest(fixture),
-            "databaseSha256": digest(str(database.resolve(strict=True))),
+            "databasePathSha256": digest(str(database.resolve(strict=True))),
             "exactThreadCount": 0,
         },
     )
@@ -71,10 +71,10 @@ def validate(database: Path, fixture: str, baseline_path: Path, output: Path) ->
     if baseline != {
         "schema": 1,
         "fixtureSha256": digest(fixture),
-        "databaseSha256": digest(str(database.resolve(strict=True))),
+        "databasePathSha256": digest(str(database.resolve(strict=True))),
         "exactThreadCount": 0,
     }:
-        raise ValueError("project baseline does not bind the exact database and fixture")
+        raise ValueError("project baseline does not bind the exact database path and fixture")
     rows = exact_threads(database, fixture)
     if len(rows) != 1:
         raise ValueError(f"expected one authoritative fixture thread, found {len(rows)}")
@@ -83,7 +83,7 @@ def validate(database: Path, fixture: str, baseline_path: Path, output: Path) ->
         {
             "schema": 1,
             "fixtureSha256": digest(fixture),
-            "databaseSha256": digest(str(database.resolve(strict=True))),
+            "databasePathSha256": digest(str(database.resolve(strict=True))),
             "exactThreadCountBefore": 0,
             "exactThreadCountAfter": 1,
             "threadId": rows[0],

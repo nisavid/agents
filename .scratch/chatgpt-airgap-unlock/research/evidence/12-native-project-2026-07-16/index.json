@@ -25,11 +25,15 @@
     "runtime-manifest.txt": "8767ef20122bba468c74b2c9bff8e66222b19b961ac6af100ae2940c501a7e41",
     "probe-verdict.txt": "da941be5146b6ba414a68f013684fd6d35432087c18d0367c980bfc7e2290339",
     "native-gui-probe.jsonl": "3d6733c7cdb462b42ad12fca81d914b51b447db9630ca0577d8c0e37d561b0f3",
-    "native-project-state.json": "0a646cea69524d509fae9e7aa4cbda4b7b90740e96beaf07fe50b3626d646ae7",
+    "native-project-state.json": "1ce45966a45eeaec2f27cf94213f634b67a92358cbc1e62f74754e3c4af31cf9",
     "renderer-project-selection-confirmed.json": "4bcec2cd4c2610e23d93e943f755858ee8f0175411a40a7abb940b2a15a30750"
   },
   "extraction": {
     "sourceCdpNativeConfirmSha256": "e6995cfb85f7501b68281874757264171a33930b6d7bf30ed639e6e7c50b5884",
     "rule": "Retain only kind, phase, matched, uniqueControl, and expectedFixtureSha256 from the unique renderer-project-selection-confirmed event."
+  },
+  "normalization": {
+    "sourceNativeProjectStateSha256": "0a646cea69524d509fae9e7aa4cbda4b7b90740e96beaf07fe50b3626d646ae7",
+    "rule": "Rename databaseSha256 to databasePathSha256 without changing its value; the digest binds the absolute database path string, not database contents."
   }
 }

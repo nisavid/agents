@@ -22,6 +22,16 @@ function emit(kind, data) {
   process.stdout.write(`${JSON.stringify({ at: new Date().toISOString(), kind, phase, ...data })}\n`);
 }
 
+function requestUrlEvidence(value) {
+  if (typeof value !== "string") return { scheme: null, host: null };
+  try {
+    const parsed = new URL(value);
+    return { scheme: parsed.protocol.slice(0, -1), host: parsed.host || null };
+  } catch {
+    return { scheme: null, host: null };
+  }
+}
+
 function sleep(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
@@ -126,6 +136,31 @@ function matchingControlExpression(candidatesExpression, acceptedText) {
 }
 
 async function runSelfTests() {
+  const adversarialUrl = "https://user:credential@example.test/private?prompt=secret#fragment";
+  const requestEvidence = {
+    method: "GET",
+    resourceType: "Document",
+    ...requestUrlEvidence(adversarialUrl),
+  };
+  const serializedRequestEvidence = JSON.stringify(requestEvidence);
+  if (
+    requestEvidence.method !== "GET"
+    || requestEvidence.resourceType !== "Document"
+    || requestEvidence.scheme !== "https"
+    || requestEvidence.host !== "example.test"
+    || /credential|private|prompt|secret|fragment/.test(serializedRequestEvidence)
+  ) {
+    throw new Error("request URL evidence must retain only structural URL fields");
+  }
+  const invalidUrlEvidence = requestUrlEvidence("not a URL with prompt=secret");
+  if (
+    invalidUrlEvidence.scheme !== null
+    || invalidUrlEvidence.host !== null
+    || JSON.stringify(invalidUrlEvidence).includes("prompt")
+  ) {
+    throw new Error("invalid request URLs must not be persisted");
+  }
+
   const cases = [
     ["exact", firstSentinel, true],
     ["surrounding whitespace", `  ${firstSentinel}\n`, true],
@@ -465,7 +500,11 @@ ws.addEventListener("message", (event) => {
   const message = JSON.parse(event.data);
   if (message.method === "Network.requestWillBeSent") {
     const { request, type } = message.params;
-    emit("request", { method: request.method, resourceType: type, url: request.url });
+    emit("request", {
+      method: request.method,
+      resourceType: type,
+      ...requestUrlEvidence(request.url),
+    });
   } else if (message.method === "Network.loadingFailed") {
     emit("request-failed", {
       blockedReason: message.params.blockedReason,

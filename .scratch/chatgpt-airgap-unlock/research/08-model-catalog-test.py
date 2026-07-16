@@ -16,6 +16,7 @@ import time
 
 HERE = Path(__file__).resolve().parent
 BUILDER = HERE / "08-model-catalog.py"
+METADATA_PROFILE = HERE / "08-metadata-probe.sb"
 SOURCE_APP = Path(
     os.environ.get(
         "SOURCE_APP",
@@ -40,6 +41,26 @@ DISPLAY_NAME = "Qwen3.5-2B-OptiQ-4bit (no-think)"
 FALLBACK_PROMPT_SHA256 = (
     "ac8ae107a0d72fe3476b430afb161ea4e67da2e446d778aefc44828160559807"
 )
+
+
+def isolated_environment(home: Path, codex_home: Path, temporary: Path) -> dict[str, str]:
+    return {
+        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+        "HOME": str(home),
+        "CODEX_HOME": str(codex_home),
+        "TMPDIR": str(temporary),
+        "LANG": "en_US.UTF-8",
+    }
+
+
+def isolated_codex_command(*arguments: str) -> list[str]:
+    return [
+        "/usr/bin/sandbox-exec",
+        "-f",
+        str(METADATA_PROFILE),
+        str(CODEX),
+        *arguments,
+    ]
 
 
 def assert_catalog(
@@ -118,32 +139,38 @@ def run_full_contract() -> None:
 
         codex_home = root / "codex-home"
         home = root / "home"
+        temporary = root / "tmp"
         codex_home.mkdir()
         home.mkdir()
+        temporary.mkdir()
         (codex_home / "config.toml").write_text(
             f'model_catalog_json = "{catalog_path}"\n'
         )
+        child_environment = isolated_environment(home, codex_home, temporary)
+        assert set(child_environment) == {
+            "PATH",
+            "HOME",
+            "CODEX_HOME",
+            "TMPDIR",
+            "LANG",
+        }
         completed = subprocess.run(
-            [str(CODEX), "debug", "models"],
-            check=True,
+            isolated_codex_command("debug", "models"),
+            check=False,
             capture_output=True,
-            env=os.environ
-            | {
-                "CODEX_HOME": str(codex_home),
-                "HOME": str(home),
-            },
+            env=child_environment,
             text=True,
         )
+        if completed.returncode != 0:
+            raise RuntimeError(
+                "isolated codex debug models failed: " + completed.stderr.strip()
+            )
         assert_catalog(json.loads(completed.stdout))
 
         process = subprocess.Popen(
-            [str(CODEX), "app-server", "--stdio"],
+            isolated_codex_command("app-server", "--stdio"),
             cwd=root,
-            env=os.environ
-            | {
-                "CODEX_HOME": str(codex_home),
-                "HOME": str(home),
-            },
+            env=child_environment,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -186,6 +213,11 @@ def run_full_contract() -> None:
 
 
 def main() -> int:
+    if sys.flags.optimize:
+        raise SystemExit(
+            "08-model-catalog-test.py requires assertions; "
+            "rerun without -O or PYTHONOPTIMIZE"
+        )
     if len(sys.argv) > 1:
         if len(sys.argv) != 5 or sys.argv[1] != "--catalog":
             raise SystemExit(

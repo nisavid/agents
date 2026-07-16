@@ -17,6 +17,7 @@ MODEL_ID="$MODEL_DIR:no-think"
 MODEL_DISPLAY_NAME="Qwen3.5-2B-OptiQ-4bit (no-think)"
 HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 PROFILE="$HERE/08-probe.sb"
+METADATA_PROFILE="$HERE/08-metadata-probe.sb"
 PROVIDER_PROFILE="$HERE/08-provider.sb"
 GATEWAY_PROFILE="$HERE/08-gateway.sb"
 OBSERVER="$HERE/08-proxy-observer.py"
@@ -328,6 +329,7 @@ trap 'record_top_level_signal INT 130' INT
 trap 'record_top_level_signal TERM 143' TERM
 
 RUN_ROOT="$(mktemp -d /private/tmp/chatgpt-route-prototype-08.XXXXXX)"
+model_list_isolated=false
 NATIVE_GUI_PROBE_PROTECTED_PATH="$RUN_ROOT/.native-gui-probe-disabled"
 test ! -e "$NATIVE_GUI_PROBE_PROTECTED_PATH"
 INBOUND_TOKEN="sk-optiq-inbound-$(/usr/bin/uuidgen | /usr/bin/tr '[:upper:]' '[:lower:]')"
@@ -594,9 +596,16 @@ exclude = ["$CODEX_PROVIDER_TOKEN_ENV"]
 [features]
 shell_snapshot = false
 EOF
-HOME="$HOME_DIR" CODEX_HOME="$CODEX_DIR" \
-  "$APP/Contents/Resources/codex" debug models \
+/usr/bin/env -i \
+  PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+  HOME="$HOME_DIR" \
+  CODEX_HOME="$CODEX_DIR" \
+  TMPDIR="$TMP_DIR" \
+  LANG="en_US.UTF-8" \
+  /usr/bin/sandbox-exec -f "$METADATA_PROFILE" \
+    "$APP/Contents/Resources/codex" debug models \
   >"$LOG_DIR/model-catalog.json" 2>"$LOG_DIR/model-catalog.stderr"
+model_list_isolated=true
 /usr/bin/python3 "$MODEL_CATALOG_TEST_EXEC" \
   --catalog "$LOG_DIR/model-catalog.json" "$MODEL_ID" "$MODEL_DISPLAY_NAME"
 if test "$GUI_WORKFLOW" = true; then
@@ -761,6 +770,10 @@ printf '%s\n' "$RUN_ROOT" >"$LOG_DIR/run-root.txt"
     -D "REAL_HOME=$REAL_HOME" \
     -D "MODEL_REPO=$MODEL_REPO" \
     -D "OPTIQ_RUNTIME=$OPTIQ_RUNTIME" \
+    -D "RUN_ROOT=$RUN_ROOT" \
+    -D "PROVIDER_HOME=$HOME_DIR" \
+    -D "PROVIDER_TMP=$TMP_DIR" \
+    -D "HF_CACHE=$HF_CACHE_DIR" \
     "$OPTIQ_RUNTIME/bin/python3.12" "$OPTIQ" serve \
     --model "$MODEL_DIR" \
     --host 127.0.0.1 \
@@ -1561,7 +1574,7 @@ done
   printf 'GATEWAY_CONTINUATION_TERMINAL_DELTA=%s\n' "$gateway_continuation_terminal_delta"
   printf 'UPSTREAM_CONTINUATION_TERMINAL_DELTA=%s\n' "$upstream_continuation_terminal_delta"
   printf 'RENDERER_CONTINUATION_TRANSPORT_OBSERVED=%s\n' "$renderer_continuation_transport_observed"
-  printf 'MODEL_LIST_ISOLATED=true\n'
+  printf 'MODEL_LIST_ISOLATED=%s\n' "$model_list_isolated"
   printf 'REMOTE_SOCKET_OBSERVED=%s\n' "$remote_socket_observed"
   printf 'TOKEN_LEAK_OBSERVED=%s\n' "$token_leak_observed"
   printf 'OWNED_PROCESSES_EXITED=%s\n' "$owned_processes_exited"

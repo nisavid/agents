@@ -85,13 +85,14 @@ source is available.
 
 ### Production isolation boundary
 
-The semantic run uses an outer macOS Seatbelt profile to deny remote network
-and operator-home access. Electron is launched with Chromium `--no-sandbox`
-because Chromium's nested sandbox does not initialize inside this outer test
-profile. This validates the application behavior, local routing, and outer
-egress boundary; it is not the final production-isolation result. A disconnected
-VM or the air-gapped target should retain the vendor Chromium sandbox for that
-platform check.
+The semantic run uses outer macOS Seatbelt profiles to deny remote network and
+general operator-home access. The provider alone may read the exact pinned model
+repository and OptiQ runtime beneath `REAL_HOME`. Electron is launched with
+Chromium `--no-sandbox` because Chromium's nested sandbox does not initialize
+inside this outer test profile. This validates the application behavior, local
+routing, and outer egress boundary; it is not the final production-isolation
+result. A disconnected VM or the air-gapped target should retain the vendor
+Chromium sandbox for that platform check.
 
 ## Exact artifacts
 

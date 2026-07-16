@@ -1,0 +1,11 @@
+(version 1)
+
+; THROWAWAY PROTOTYPE ONLY. Bundled-Codex metadata probes receive a fresh
+; run-local HOME/CODEX_HOME environment and may use loopback but not remote
+; network.
+(allow default)
+(deny network-outbound (remote ip))
+(deny network-inbound (local ip))
+(allow network-outbound (remote ip "localhost:*"))
+(allow network-inbound (local ip "localhost:*"))
+(deny file-write* (subpath "/Applications/ChatGPT.app"))

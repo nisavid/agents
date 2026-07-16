@@ -102,8 +102,8 @@ def test_ports() -> None:
         **ports,
     }
     roles = (
-        ("08-app.sb", common, ((49308, True),), ((49309, True),)),
-        ("08-host.sb", common, ((49308, False),), ((49309, True),)),
+        ("08-app.sb", common, ((49308, True),), ((49309, True), (18998, True), (18999, True))),
+        ("08-host.sb", common, ((49308, False),), ((49309, True), (18998, True), (18999, True))),
         ("08-proxy.sb", common, ((49309, True),), ((49308, False),)),
         ("08-upstream-observer.sb", common, ((18997, True),), ((18998, True),)),
         ("08-gateway.sb", common, ((18999, True),), ((18997, True),)),

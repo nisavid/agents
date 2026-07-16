@@ -138,6 +138,12 @@ test "$(/usr/bin/grep -Fc -- '--use-mock-keychain' \
   "$HERE/08-run-prototype.sh"
 /usr/bin/grep -Fq 'native GUI helper exited after absence attestation' \
   "$HERE/08-run-prototype.sh"
+cleanup_body="$(/usr/bin/sed -n '/^cleanup() {$/,/^}$/p' \
+  "$HERE/08-run-prototype.sh")"
+test "$(printf '%s\n' "$cleanup_body" | \
+  /usr/bin/grep -Fc 'while test "$i" -lt 50')" -eq 1
+test "$(printf '%s\n' "$cleanup_body" | \
+  /usr/bin/grep -Fc '/bin/kill -KILL "$native_gui_probe_pid"')" -eq 1
 /usr/bin/grep -Fq 'NDP="$NATIVE_PICKER_DEFAULT_PATH"' \
   "$HERE/08-run-prototype.sh"
 /usr/bin/grep -Fq 'ElectronAsarIntegrity:Resources/app.asar:hash' \
@@ -195,10 +201,10 @@ picker_request_body="$(/usr/bin/sed -n \
 test "$(printf '%s\n' "$picker_request_body" | \
   /usr/bin/grep -Fc 'pressUniqueVisibleExactControl(')" -eq 3
 test "$(printf '%s\n' "$picker_request_body" | /usr/bin/grep -Fc '.click()')" -eq 0
-/usr/bin/grep -Fq 'selector: '\''[role="menuitem"]'\'', exactText: "New project"' \
-  "$HERE/12-cdp-gui-driver.mjs"
-/usr/bin/grep -Fq 'selector: '\''[role="menuitem"]'\'', exactText: "Use an existing folder"' \
-  "$HERE/12-cdp-gui-driver.mjs"
+printf '%s\n' "$picker_request_body" | /usr/bin/grep -Fq \
+  'selector: '\''[role="menuitem"]'\'', exactText: "New project"'
+printf '%s\n' "$picker_request_body" | /usr/bin/grep -Fq \
+  'selector: '\''[role="menuitem"]'\'', exactText: "Use an existing folder"'
 trusted_mouse_body="$(/usr/bin/sed -n \
   '/^async function pressUniqueVisibleExactControl(/,/^}/p' \
   "$HERE/12-cdp-gui-driver.mjs")"

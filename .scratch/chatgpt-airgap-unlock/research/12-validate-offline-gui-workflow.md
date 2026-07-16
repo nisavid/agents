@@ -15,6 +15,15 @@ for cold renderer continuation and Default/Plan mode persistence. Native
 permission decisions and native worktree controls remain separate acceptance
 surfaces.
 
+The durable, secret-redacted run record is bound by
+[the evidence index](evidence/12-native-project-2026-07-16/index.json). Its
+[runtime manifest](evidence/12-native-project-2026-07-16/runtime-manifest.txt),
+[verdict](evidence/12-native-project-2026-07-16/probe-verdict.txt),
+[native event stream](evidence/12-native-project-2026-07-16/native-gui-probe.jsonl),
+[renderer confirmation](evidence/12-native-project-2026-07-16/renderer-project-selection-confirmed.json),
+and [persistence transition](evidence/12-native-project-2026-07-16/native-project-state.json)
+substantiate the selection, gateway, integrity, isolation, and cleanup claims.
+
 The native-project run completed this trusted sequence:
 
 1. The renderer reached the local main UI and proved that the nonce fixture was

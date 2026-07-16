@@ -72,7 +72,7 @@ replacement patcher or production application build.
 
 The deterministic helper, patcher, and path-confinement suites pass. Two builds
 of the final helper are byte-identical at SHA-256
-`333973d30e29fbb2bba460a82d623a24adfc35d88d981fac5c7200fccc563e31`.
+`b461c021c0493e5c8998f028b3a59c1400dd8c91f1ce86e11c60c99103b8fc3b`.
 The full copied-app smoke test proves the ordered same-helper absence, request,
 native selection, renderer confirmation, local OptiQ turn, and namespace
 continuation contract. It also proves no remote socket or token leak, expected

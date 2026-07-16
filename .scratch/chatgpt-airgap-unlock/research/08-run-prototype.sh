@@ -702,6 +702,15 @@ stop_app_group() {
 cleanup() {
   if test -n "$native_gui_probe_pid"; then
     /bin/kill -TERM "$native_gui_probe_pid" 2>/dev/null || true
+    i=0
+    while test "$i" -lt 50 && \
+      /bin/kill -0 "$native_gui_probe_pid" 2>/dev/null; do
+      sleep 0.1
+      i=$((i + 1))
+    done
+    if /bin/kill -0 "$native_gui_probe_pid" 2>/dev/null; then
+      /bin/kill -KILL "$native_gui_probe_pid" 2>/dev/null || true
+    fi
     wait "$native_gui_probe_pid" 2>/dev/null || true
     native_gui_probe_pid=""
   fi

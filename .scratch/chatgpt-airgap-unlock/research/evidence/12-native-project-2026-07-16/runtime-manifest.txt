@@ -1,0 +1,12 @@
+model_revision=adc8669eb431e3168aeb4e320bd7b757914350e2
+model_safetensors_blob=4a46dafdc0afb80deacc2dada482ff339405adabc87fcde51a43834827f0e0bf
+python=3.12.13
+mlx_optiq=0.2.15
+mlx_lm=0.31.3
+mlx_lm_commit=ab1806e8f5d6aa035973af194a1b9198ab4754dc
+mlx=0.32.0
+route_mode=gateway
+gui_modes=false
+gui_worktree=false
+gateway_upstream_timeout_seconds=300
+gateway_sse_heartbeat_seconds=default

@@ -1,0 +1,35 @@
+{
+  "schema": 1,
+  "executedAt": "2026-07-16T16:54:32.314Z",
+  "application": {
+    "version": "26.707.71524",
+    "build": "5263",
+    "sourceAsarSha256": "d28f31b4bbb04c519be65c2af8277d8c5faf77b4239ee89b928f0a7423dacd84",
+    "sourceAsarHeaderSha256": "e3023f2d1c334ba8ba80bd22a97553d412a4616a86d75ca81e258e974061f3c7",
+    "patchedAsarSha256": "06c4fd5cbb3662911cc62c3569042bd5657f3476a99ef9edc47bd51d5380026f",
+    "patchedAsarHeaderSha256": "c069ef0e4e826ec2fd8db41a626f3e26f3edead477053a12703830ce7e047b75",
+    "patchedMainSha256": "a8082ef44bf3aa4e30e7c663472da502d15bed35073a4c125903f4b9291961cc"
+  },
+  "route": {
+    "probeExpectation": "renderer-native-project",
+    "gatewayCommit": "6307d37b76918c19f2e3bc0fd506434531aadeb2",
+    "nativeHelperSha256": "b461c021c0493e5c8998f028b3a59c1400dd8c91f1ce86e11c60c99103b8fc3b",
+    "modelRevision": "adc8669eb431e3168aeb4e320bd7b757914350e2",
+    "modelSafetensorsBlob": "4a46dafdc0afb80deacc2dada482ff339405adabc87fcde51a43834827f0e0bf"
+  },
+  "binding": {
+    "fixtureSha256": "00109e78d8a1442425b25a44d3ade0167f95fd2d2c0e287eac83538d798cd3c3",
+    "runRootSha256": "dea98a1a5cb66601a294db6b83d52f2535f72eaa37cf4de70b611f2e39690274"
+  },
+  "outputs": {
+    "runtime-manifest.txt": "37d65c852bca243d5e7adc1f18362a49d90982890dfc9493d6a33113203933c2",
+    "probe-verdict.txt": "da941be5146b6ba414a68f013684fd6d35432087c18d0367c980bfc7e2290339",
+    "native-gui-probe.jsonl": "22a30f3688cb04f75388a5dd749b5aaef0ec339d12b5b65dab0a4217d0a92d50",
+    "native-project-state.json": "187369df6da1580096a118483d71c49514b38c32ad28b669cbbd5e166d418a0e",
+    "renderer-project-selection-confirmed.json": "8d885fcd3419814cb9f80800c40052cf57a192fa0fba7bf15b047627398aadde"
+  },
+  "extraction": {
+    "sourceCdpNativeConfirmSha256": "6c58e4693caff51b98388cb03f55714eb0aabdbd76fbc76bb9c09da909f67eda",
+    "rule": "Retain only kind, phase, matched, uniqueControl, and expectedFixtureSha256 from the unique renderer-project-selection-confirmed event."
+  }
+}

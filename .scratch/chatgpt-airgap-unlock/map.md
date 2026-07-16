@@ -32,7 +32,7 @@ Produce an implementation-ready, empirically validated plan for running the exac
 
 ## Active work
 
-- [Validate the preferred route](issues/08-validate-preferred-route.md) — Complete worktree, permission, project-local skill, reasoning-label, production-isolation, and target-GLM acceptance against the pinned local route.
+- [Validate the preferred route](issues/08-validate-preferred-route.md) — Complete worktree, permission, project-local skill, reasoning-label, and production-isolation acceptance against the pinned local route; validate the explicit GLM profile separately when its target environment becomes available.
 - [Validate the offline GUI workflow](issues/12-validate-offline-gui-workflow.md) — Complete worktree, permission, project-local skill, and reasoning-label acceptance against the pinned local route.
 - [Validate production isolation](issues/13-validate-production-isolation.md) — Preserve the vendor Chromium sandbox and signed code posture while a disconnected VM or true air gap makes hosted egress unavailable.
 

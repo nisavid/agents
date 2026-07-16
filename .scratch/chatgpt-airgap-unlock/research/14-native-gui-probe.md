@@ -147,7 +147,7 @@ The exact copied artifacts are:
 | Source ASAR header | `e3023f2d1c334ba8ba80bd22a97553d412a4616a86d75ca81e258e974061f3c7` |
 | Patched ASAR header | `c069ef0e4e826ec2fd8db41a626f3e26f3edead477053a12703830ce7e047b75` |
 | Patched main file | `a8082ef44bf3aa4e30e7c663472da502d15bed35073a4c125903f4b9291961cc` |
-| Native helper | `333973d30e29fbb2bba460a82d623a24adfc35d88d981fac5c7200fccc563e31` |
+| Native helper | `b461c021c0493e5c8998f028b3a59c1400dd8c91f1ce86e11c60c99103b8fc3b` |
 
 The runner ad-hoc signs the copied outer bundle with identifier
 `com.openai.codex` and requires its deep signature and designated requirement

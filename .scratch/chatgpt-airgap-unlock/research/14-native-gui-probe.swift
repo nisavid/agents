@@ -1362,20 +1362,6 @@ enum OpenPanelListSelectionPolicy {
         }
     }
 
-    static func selectionMutationRequired<Element>(
-        _ snapshot: OpenPanelListSelectionSnapshot<Element>,
-        token: OpenPanelListSelectionToken<Element>,
-        sameElement: (Element, Element) -> Bool
-    ) throws -> Bool {
-        guard let selected = try selectedChildren(
-            snapshot, pendingAllowed: false) else {
-            throw ProbeError.validation("Open panel AXSelectedChildren is unpublished")
-        }
-        if selected.isEmpty { return true }
-        try requireSelected(snapshot, token: token, sameElement: sameElement)
-        return false
-    }
-
     static func pendingToken<Element>(
         _ snapshot: OpenPanelListSelectionSnapshot<Element>
     ) throws -> OpenPanelListSelectionToken<Element>? {
@@ -1534,13 +1520,15 @@ func performValidatedOpenPanelListSelectionSet<Element>(
                                OpenPanelListSelectionSnapshot<Element>),
     setSelection: (OpenPanelListSelectionToken<Element>) throws -> Void
 ) throws {
-    let (preflight, snapshot) = try revalidate()
+    let (preflight, _) = try revalidate()
     try OpenPanelListSelectionPolicy.requireSameToken(
         initial, preflight, sameElement: sameElement)
-    if try OpenPanelListSelectionPolicy.selectionMutationRequired(
-        snapshot, token: preflight, sameElement: sameElement) {
-        try setSelection(preflight)
-    }
+    try setSelection(preflight)
+    let (published, publishedSnapshot) = try revalidate()
+    try OpenPanelListSelectionPolicy.requireSameToken(
+        preflight, published, sameElement: sameElement)
+    try OpenPanelListSelectionPolicy.requireSelected(
+        publishedSnapshot, token: published, sameElement: sameElement)
 }
 
 func performValidatedOpenPanelListChooserPress<Element>(
@@ -2171,11 +2159,30 @@ func runSelfTests() throws {
         snapshotReadiness?.pollCount == 2 && snapshotReads == 2,
         "transient list-selection AX read was not retried")
     var selectionActions = 0
+    var selectionPublished = false
+    var selectionRevalidations = 0
     try performValidatedOpenPanelListSelectionSet(
         initial: token, sameElement: ==,
-        revalidate: { (token, snapshot(selected: [])) },
-        setSelection: { _ in selectionActions += 1 })
-    try require(selectionActions == 1, "exact selection mutation did not run once")
+        revalidate: {
+            selectionRevalidations += 1
+            return (token, snapshot(
+                selected: selectionPublished ? ["candidate"] : []))
+        },
+        setSelection: { _ in
+            selectionActions += 1
+            selectionPublished = true
+        })
+    try require(
+        selectionActions == 1 && selectionRevalidations == 2,
+        "exact selection mutation was not published and reread once")
+    var preselectedActions = 0
+    try performValidatedOpenPanelListSelectionSet(
+        initial: token, sameElement: ==,
+        revalidate: { (token, snapshot(selected: ["candidate"])) },
+        setSelection: { _ in preselectedActions += 1 })
+    try require(
+        preselectedActions == 1,
+        "preselected exact candidate skipped the required publication")
     var chooserActions = 0
     try performValidatedOpenPanelListChooserPress(
         initial: token, sameElement: ==,

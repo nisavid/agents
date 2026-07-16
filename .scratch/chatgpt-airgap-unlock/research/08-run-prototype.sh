@@ -43,6 +43,7 @@ NATIVE_PICKER_PATCH="$HERE/14-patch-native-picker-default.mjs"
 HOST_PROBE="$HERE/08-appserver-probe.py"
 HOST_RESTART_PROBE="$HERE/08-appserver-restart-probe.py"
 PROCESS_GROUP="$HERE/08-process-group.py"
+PROCESS_MARKER="$HERE/08-process-marker.py"
 UPSTREAM_OBSERVER="$HERE/08-upstream-observer.py"
 NAMESPACE_PROBE="$HERE/08-namespace-probe.py"
 NODE="${NODE:-/opt/homebrew/bin/node}"
@@ -196,6 +197,8 @@ run_native_gui_probe() {
 }
 
 run_cold_handoff_self_test() (
+  /usr/bin/python3 "$PROCESS_MARKER" --self-test
+  /usr/bin/python3 "$PROCESS_MARKER" --audit-runner "$0"
   /usr/bin/python3 "$COLD_RESUME_STATE" --self-test
   /usr/bin/python3 "$MODE_STATE" --self-test
   /usr/bin/python3 "$WORKTREE_STATE" --self-test
@@ -216,6 +219,49 @@ run_cold_handoff_self_test() (
   self_test_root="$(mktemp -d /private/tmp/chatgpt-cold-handoff-self-test.XXXXXX)"
   trap '/bin/rm -rf "$self_test_root"' EXIT INT TERM
   LOG_DIR="$self_test_root"
+  marker_probe="chatgpt-route-ownership-0123456789abcdef0123456789abcdef"
+  marker_probe_file="$self_test_root/process-marker.txt"
+  marker_probe_pid_file="$self_test_root/reparented-pid.txt"
+  printf '%s\n' "$marker_probe" >"$marker_probe_file"
+  CHATGPT_ROUTE_RUN_MARKER="$marker_probe" \
+    /usr/bin/python3 - "$marker_probe_pid_file" <<'PY' &
+import os
+import pathlib
+import sys
+import time
+
+first = os.fork()
+if first:
+    os.waitpid(first, 0)
+    raise SystemExit(0)
+os.setsid()
+second = os.fork()
+if second:
+    os._exit(0)
+os.setpgid(0, 0)
+pathlib.Path(sys.argv[1]).write_text(str(os.getpid()), encoding="utf-8")
+time.sleep(10)
+PY
+  marker_probe_launcher=$!
+  wait "$marker_probe_launcher"
+  i=0
+  while test "$i" -lt 50 && test ! -s "$marker_probe_pid_file"; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  test -s "$marker_probe_pid_file"
+  marker_probe_pid="$(/bin/cat "$marker_probe_pid_file")"
+  test "$(/bin/ps -p "$marker_probe_pid" -o ppid= | /usr/bin/tr -d ' ')" = 1
+  test "$(/bin/ps -p "$marker_probe_pid" -o pgid= | /usr/bin/tr -d ' ')" = \
+    "$marker_probe_pid"
+  marker_probe_matches="$(
+    /usr/bin/env -u CHATGPT_ROUTE_RUN_MARKER \
+      /bin/ps eww -axo pid=,command= | \
+      /usr/bin/env -i PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+        /usr/bin/python3 "$PROCESS_MARKER" filter "$marker_probe_file" "$$"
+  )"
+  /bin/kill -TERM "$marker_probe_pid" 2>/dev/null || true
+  test "$marker_probe_matches" = "$marker_probe_pid"
   validate_native_picker_default_path_seam true true true
   if validate_native_picker_default_path_seam true false true 2>"$self_test_root/default-path.stderr"; then
     echo "native picker default-path seam accepted GUI_NATIVE_PROJECT_PICKER=false" >&2
@@ -351,6 +397,11 @@ trap 'record_top_level_signal INT 130' INT
 trap 'record_top_level_signal TERM 143' TERM
 
 RUN_ROOT="$(mktemp -d /private/tmp/chatgpt-route-prototype-08.XXXXXX)"
+RUN_MARKER="chatgpt-route-ownership-$(/usr/bin/uuidgen | /usr/bin/tr -d '-' | /usr/bin/tr '[:upper:]' '[:lower:]')"
+RUN_MARKER_FILE="$RUN_ROOT/process-ownership-marker.txt"
+printf '%s\n' "$RUN_MARKER" >"$RUN_MARKER_FILE"
+chmod 400 "$RUN_MARKER_FILE"
+export CHATGPT_ROUTE_RUN_MARKER="$RUN_MARKER"
 model_list_isolated=false
 NATIVE_GUI_PROBE_PROTECTED_PATH="$RUN_ROOT/.native-gui-probe-disabled"
 test ! -e "$NATIVE_GUI_PROBE_PROTECTED_PATH"
@@ -383,6 +434,7 @@ MODE_STATE_EXEC="$RUN_ROOT/mode-state.py"
 WORKTREE_STATE_EXEC="$RUN_ROOT/worktree-state.py"
 MODEL_CATALOG_BUILDER_EXEC="$RUN_ROOT/model-catalog.py"
 MODEL_CATALOG_TEST_EXEC="$RUN_ROOT/model-catalog-test.py"
+PROCESS_MARKER_EXEC="$RUN_ROOT/process-marker.py"
 GUI_RESUME_STATE="$LOG_DIR/gui-resume-state.json"
 GUI_WORKTREE_STATE="$LOG_DIR/gui-worktree-state.json"
 MODEL_CATALOG="$CODEX_DIR/model-catalog.json"
@@ -533,11 +585,12 @@ fi
 /bin/cp "$WORKTREE_STATE" "$WORKTREE_STATE_EXEC"
 /bin/cp "$MODEL_CATALOG_BUILDER" "$MODEL_CATALOG_BUILDER_EXEC"
 /bin/cp "$MODEL_CATALOG_TEST" "$MODEL_CATALOG_TEST_EXEC"
+/bin/cp "$PROCESS_MARKER" "$PROCESS_MARKER_EXEC"
 /bin/cp "$NATIVE_PROJECT_STATE" "$NATIVE_PROJECT_STATE_EXEC"
 chmod 500 "$UPSTREAM_OBSERVER_EXEC" "$OBSERVER_EXEC" "$CDP_OBSERVER_EXEC" \
   "$GUI_DRIVER_EXEC" "$NAMESPACE_PROBE_EXEC" "$COLD_RESUME_STATE_EXEC" \
   "$MODE_STATE_EXEC" "$WORKTREE_STATE_EXEC" "$MODEL_CATALOG_BUILDER_EXEC" "$MODEL_CATALOG_TEST_EXEC" \
-  "$NATIVE_PROJECT_STATE_EXEC"
+  "$NATIVE_PROJECT_STATE_EXEC" "$PROCESS_MARKER_EXEC"
 test -x "$APP_EXEC"
 test ! -L "$APP"
 /usr/bin/codesign --verify --deep --strict "$APP"
@@ -603,6 +656,7 @@ if test "$ROUTE_MODE" = gateway; then
     printf 'sse_heartbeat_seconds=%s\n' "$GATEWAY_SSE_HEARTBEAT_SECONDS"
   } >"$LOG_DIR/gateway-source.txt"
   /usr/bin/env -i \
+    CHATGPT_ROUTE_RUN_MARKER="$RUN_MARKER" \
     PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
     HOME="$HOME_DIR" \
     TMPDIR="$TMP_DIR" \
@@ -648,6 +702,7 @@ EOF
 (
   cd "$RUN_ROOT"
   exec /usr/bin/env -i \
+    CHATGPT_ROUTE_RUN_MARKER="$RUN_MARKER" \
     PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
     HOME="$HOME_DIR" \
     CFFIXED_USER_HOME="$HOME_DIR" \
@@ -788,6 +843,13 @@ cleanup() {
   for pid in $(owned_pids); do wait "$pid" 2>/dev/null || true; done
   release_lock
 }
+
+marker_survivor_pids() {
+  /usr/bin/env -u CHATGPT_ROUTE_RUN_MARKER \
+    /bin/ps eww -axo pid=,command= | \
+    /usr/bin/env -i PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+      /usr/bin/python3 "$PROCESS_MARKER_EXEC" filter "$RUN_MARKER_FILE" "$$"
+}
 trap 'status=$?; trap - EXIT INT TERM; cleanup; exit "$status"' EXIT
 trap 'record_top_level_signal INT 130' INT
 trap 'record_top_level_signal TERM 143' TERM
@@ -815,6 +877,7 @@ printf '%s\n' "$RUN_ROOT" >"$LOG_DIR/run-root.txt"
 (
   cd "$HOME_DIR"
   exec /usr/bin/env -i \
+  CHATGPT_ROUTE_RUN_MARKER="$RUN_MARKER" \
   PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
   HOME="$HOME_DIR" \
   TMPDIR="$TMP_DIR" \
@@ -874,6 +937,7 @@ if actual != expected:
 PY
 
 /usr/bin/env -i \
+  CHATGPT_ROUTE_RUN_MARKER="$RUN_MARKER" \
   PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
   HOME="$HOME_DIR" \
   TMPDIR="$TMP_DIR" \
@@ -888,6 +952,7 @@ proxy_pid=$!
 if test "$ROUTE_MODE" = gateway; then
   : >"$LOG_DIR/upstream-auth.jsonl"
   /usr/bin/env -i \
+    CHATGPT_ROUTE_RUN_MARKER="$RUN_MARKER" \
     PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
     HOME="$HOME_DIR" \
     TMPDIR="$TMP_DIR" \
@@ -920,6 +985,7 @@ if test "$ROUTE_MODE" = gateway; then
   test "$ready" = true
 
   /usr/bin/env -i \
+    CHATGPT_ROUTE_RUN_MARKER="$RUN_MARKER" \
     PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
     HOME="$HOME_DIR" \
     TMPDIR="$TMP_DIR" \
@@ -983,6 +1049,7 @@ fi
 
 if test "$GUI_WORKFLOW" = false; then
   /usr/bin/env -i \
+    CHATGPT_ROUTE_RUN_MARKER="$RUN_MARKER" \
     PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
     HOME="$HOME_DIR" \
     CODEX_HOME="$CODEX_DIR" \
@@ -1003,6 +1070,7 @@ if test "$GUI_WORKFLOW" = false; then
       >"$LOG_DIR/host-probe.stdout" 2>"$LOG_DIR/host-probe.stderr"
   THREAD_ID="$(/usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["thread_id"])' "$LOG_DIR/host-summary.json")"
   /usr/bin/env -i \
+    CHATGPT_ROUTE_RUN_MARKER="$RUN_MARKER" \
     PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
     HOME="$HOME_DIR" \
     CODEX_HOME="$CODEX_DIR" \
@@ -1028,6 +1096,7 @@ launch_app() {
   (
   cd "$HOME_DIR"
   exec /usr/bin/env -i \
+    CHATGPT_ROUTE_RUN_MARKER="$RUN_MARKER" \
     PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
     HOME="$HOME_DIR" \
     CFFIXED_USER_HOME="$HOME_DIR" \
@@ -1117,6 +1186,7 @@ if test "$GUI_NATIVE_PROJECT_PICKER" = true; then
   printf '{"kind":"stage","stage":"native-project-baseline-captured"}\n' \
     >>"$LOG_DIR/native-picker-stages.jsonl"
   /usr/bin/env -i \
+    CHATGPT_ROUTE_RUN_MARKER="$RUN_MARKER" \
     PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
     HOME="$HOME_DIR" \
     TMPDIR="$TMP_DIR" \
@@ -1178,6 +1248,7 @@ if test "$GUI_NATIVE_PROJECT_PICKER" = true; then
     exit 1
   fi
   /usr/bin/env -i \
+    CHATGPT_ROUTE_RUN_MARKER="$RUN_MARKER" \
     PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
     HOME="$HOME_DIR" \
     TMPDIR="$TMP_DIR" \
@@ -1199,6 +1270,7 @@ if test "$GUI_NATIVE_PROJECT_PICKER" = true; then
   /usr/bin/grep -Fq '"kind":"project-selection-requested"' \
     "$LOG_DIR/native-gui-probe.jsonl"
   /usr/bin/env -i \
+    CHATGPT_ROUTE_RUN_MARKER="$RUN_MARKER" \
     PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
     HOME="$HOME_DIR" \
     TMPDIR="$TMP_DIR" \
@@ -1231,6 +1303,7 @@ else
   cdp_timeout=""
 fi
 if test "$GUI_WORKFLOW" = true && /usr/bin/env -i \
+  CHATGPT_ROUTE_RUN_MARKER="$RUN_MARKER" \
   PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
   HOME="$HOME_DIR" \
   TMPDIR="$TMP_DIR" \
@@ -1242,6 +1315,7 @@ if test "$GUI_WORKFLOW" = true && /usr/bin/env -i \
   >"$LOG_DIR/cdp.jsonl" 2>"$LOG_DIR/cdp.stderr"; then
   cdp_exit=0
 elif test "$GUI_WORKFLOW" = false && /usr/bin/env -i \
+  CHATGPT_ROUTE_RUN_MARKER="$RUN_MARKER" \
   PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
   HOME="$HOME_DIR" \
   TMPDIR="$TMP_DIR" \
@@ -1316,6 +1390,7 @@ if test "$GUI_COLD_RESUME" = true && test "$cdp_exit" -eq 0; then
   sleep 1
   record_cold_handoff_phase relaunch after
   if /usr/bin/env -i \
+    CHATGPT_ROUTE_RUN_MARKER="$RUN_MARKER" \
     PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
     HOME="$HOME_DIR" \
     TMPDIR="$TMP_DIR" \
@@ -1600,6 +1675,19 @@ for pid in $(owned_pids); do
     owned_processes_exited=false
   fi
 done
+surviving_marked_process_pids="$(marker_survivor_pids)"
+surviving_marked_process_pids_after_emergency=""
+if test -n "$surviving_marked_process_pids"; then
+  owned_processes_exited=false
+  for pid in $surviving_marked_process_pids; do
+    /bin/kill -TERM "$pid" 2>/dev/null || true
+  done
+  sleep 0.2
+  for pid in $surviving_marked_process_pids; do
+    /bin/kill -KILL "$pid" 2>/dev/null || true
+  done
+  surviving_marked_process_pids_after_emergency="$(marker_survivor_pids)"
+fi
 owned_listeners_closed=true
 for port in "$CDP_PORT" "$PROXY_PORT" "$UPSTREAM_OBSERVER_PORT" "$OPTIQ_PORT" "$GATEWAY_PORT"; do
   if /usr/sbin/lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
@@ -1661,6 +1749,10 @@ done
   printf 'REMOTE_SOCKET_OBSERVED=%s\n' "$remote_socket_observed"
   printf 'TOKEN_LEAK_OBSERVED=%s\n' "$token_leak_observed"
   printf 'OWNED_PROCESSES_EXITED=%s\n' "$owned_processes_exited"
+  printf 'SURVIVING_MARKED_PROCESS_PIDS=%s\n' \
+    "$(printf '%s' "$surviving_marked_process_pids" | /usr/bin/tr '\n' ' ')"
+  printf 'SURVIVING_MARKED_PROCESS_PIDS_AFTER_EMERGENCY=%s\n' \
+    "$(printf '%s' "$surviving_marked_process_pids_after_emergency" | /usr/bin/tr '\n' ' ')"
   printf 'OWNED_LISTENERS_CLOSED=%s\n' "$owned_listeners_closed"
   printf 'NATIVE_PICKER_DEFAULT_PATH_SEAM=%s\n' "$NATIVE_PICKER_DEFAULT_PATH_SEAM"
   printf 'NATIVE_PICKER_ASAR_HEADER_EXPECTED=%s\n' "$native_picker_asar_header_expected"
@@ -1735,6 +1827,7 @@ fi
 test "$remote_socket_observed" = false
 test "$token_leak_observed" = false
 test "$owned_processes_exited" = true
+test -z "$surviving_marked_process_pids_after_emergency"
 test "$owned_listeners_closed" = true
 test "$native_picker_asar_header_expected" = true
 test "$source_app_asar_unchanged" = true

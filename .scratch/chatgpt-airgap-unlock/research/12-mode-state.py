@@ -45,12 +45,19 @@ def bind_turn(rollout: list[dict], prompt: str, expected_mode: str) -> dict:
         if record.get("type") == "turn_context":
             active_context = record.get("payload", {})
             continue
-        if exact_input_text(record) != prompt:
+        input_text = exact_input_text(record)
+        if input_text is None:
             continue
-        if active_context is None:
+        context = active_context
+        active_context = None
+        if input_text != prompt:
+            continue
+        if context is None:
             raise ContractError(f"{expected_mode} prompt has no preceding turn context")
-        turn_id = active_context.get("turn_id")
-        mode = active_context.get("collaboration_mode", {}).get("mode")
+        turn_id = context.get("turn_id")
+        if not isinstance(turn_id, str) or not turn_id:
+            raise ContractError(f"{expected_mode} prompt has no valid turn identity")
+        mode = context.get("collaboration_mode", {}).get("mode")
         completions = [
             candidate.get("payload", {})
             for candidate in rollout
@@ -195,6 +202,28 @@ def self_test() -> None:
         result = validate(root / "codex-home", cdp_path)
         if not result["rendererAndPersistenceMatched"]:
             raise AssertionError("valid mode fixture did not pass")
+
+        stale_context = fixture_turn(
+            "unrelated-turn", "default", "Unrelated user message.", "Unrelated output."
+        )
+        stale_context.append(fixture_turn("target", "default", DEFAULT_PROMPT, "ok")[1])
+        try:
+            bind_turn(stale_context, DEFAULT_PROMPT, "default")
+        except ContractError as error:
+            if "default prompt has no preceding turn context" not in str(error):
+                raise
+        else:
+            raise AssertionError("unrelated user message did not consume turn context")
+
+        invalid_identity = fixture_turn("target", "default", DEFAULT_PROMPT, "ok")
+        invalid_identity[0]["payload"]["turn_id"] = ""
+        try:
+            bind_turn(invalid_identity, DEFAULT_PROMPT, "default")
+        except ContractError as error:
+            if "default prompt has no valid turn identity" not in str(error):
+                raise
+        else:
+            raise AssertionError("empty turn identity unexpectedly passed")
 
         fixture[3]["payload"]["collaboration_mode"]["mode"] = "default"
         rollout_path.write_text("".join(json.dumps(item) + "\n" for item in fixture))

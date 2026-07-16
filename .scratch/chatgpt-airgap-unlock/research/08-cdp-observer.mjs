@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // THROWAWAY PROTOTYPE ONLY: observe the disposable renderer over loopback CDP.
 
+import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
 
 const DISCOVERY_REQUEST_TIMEOUT_MS = 2000;
@@ -47,6 +48,78 @@ function emit(kind, data) {
   process.stdout.write(`${JSON.stringify({ at: new Date().toISOString(), kind, ...data })}\n`);
 }
 
+export function summarizeText(value) {
+  const text = typeof value === "string" ? value : JSON.stringify(value) ?? String(value);
+  return {
+    length: text.length,
+    sha256: createHash("sha256").update(text).digest("hex"),
+  };
+}
+
+function summarizeControls(controls) {
+  const values = Array.isArray(controls) ? controls : [];
+  return {
+    count: values.length,
+    disabledCount: values.filter((control) => control?.disabled === true).length,
+    sha256: summarizeText(values).sha256,
+  };
+}
+
+function redactRendererState(value) {
+  const state = value && typeof value === "object" ? value : {};
+  const readyState = ["loading", "interactive", "complete"].includes(state.readyState)
+    ? state.readyState
+    : "other";
+  return {
+    url: summarizeText(state.url),
+    title: summarizeText(state.title),
+    document: summarizeText(state.text),
+    readyState,
+    mainUi: state.mainUi === true,
+    loginWall: state.loginWall === true,
+    controls: summarizeControls(state.controls),
+    likelyBridgeGlobals: summarizeText(state.likelyBridgeGlobals),
+    electronBridgeShape: state.electronBridgeShape === null
+      ? null
+      : summarizeText(state.electronBridgeShape),
+  };
+}
+
+export function redactCdpMessage(message) {
+  if (message.method === "Network.requestWillBeSent") {
+    const { request = {}, type } = message.params ?? {};
+    return {
+      kind: "request",
+      data: { method: request.method, resourceType: type, url: summarizeText(request.url) },
+    };
+  }
+  if (message.method === "Network.loadingFailed") {
+    const params = message.params ?? {};
+    return {
+      kind: "request-failed",
+      data: {
+        blockedReason: params.blockedReason,
+        errorText: summarizeText(params.errorText),
+        type: params.type,
+      },
+    };
+  }
+  if (message.method === "Runtime.consoleAPICalled") {
+    const params = message.params ?? {};
+    return {
+      kind: "console",
+      data: {
+        level: params.type,
+        values: (params.args ?? []).map((arg) => summarizeText(arg.value ?? arg.description ?? arg.type)),
+      },
+    };
+  }
+  if (message.id && message.result?.result?.value) {
+    return { kind: "renderer-state", data: redactRendererState(message.result.result.value) };
+  }
+  return null;
+}
+
 async function main() {
   const port = Number(process.argv[2]);
   const durationMs = Number(process.argv[3] ?? 20000);
@@ -72,7 +145,11 @@ async function main() {
     process.exit(2);
   }
 
-  emit("target", { id: target.id, title: target.title, url: target.url });
+  emit("target", {
+    type: target.type,
+    title: summarizeText(target.title),
+    url: summarizeText(target.url),
+  });
   const ws = await openWebSocket(target.webSocketDebuggerUrl);
   let nextId = 1;
 
@@ -82,23 +159,8 @@ async function main() {
 
   ws.addEventListener("message", (event) => {
     const message = JSON.parse(event.data);
-    if (message.method === "Network.requestWillBeSent") {
-      const { request, type } = message.params;
-      emit("request", { method: request.method, resourceType: type, url: request.url });
-    } else if (message.method === "Network.loadingFailed") {
-      emit("request-failed", {
-        blockedReason: message.params.blockedReason,
-        errorText: message.params.errorText,
-        type: message.params.type,
-      });
-    } else if (message.method === "Runtime.consoleAPICalled") {
-      emit("console", {
-        level: message.params.type,
-        values: message.params.args.map((arg) => arg.value ?? arg.description ?? arg.type),
-      });
-    } else if (message.id && message.result?.result?.value) {
-      emit("renderer-state", message.result.result.value);
-    }
+    const evidence = redactCdpMessage(message);
+    if (evidence) emit(evidence.kind, evidence.data);
   });
 
   send("Network.enable");
@@ -108,6 +170,7 @@ async function main() {
     url: location.href,
     title: document.title,
     text: (document.body?.innerText ?? "").replace(/\\s+/g, " ").trim().slice(0, 4000),
+    loginWall: (document.body?.innerText ?? "").includes("Sign in to ChatGPT"),
     readyState: document.readyState,
     mainUi: Boolean(
       [...document.querySelectorAll("button")].some((element) => element.innerText?.includes("New task")) &&

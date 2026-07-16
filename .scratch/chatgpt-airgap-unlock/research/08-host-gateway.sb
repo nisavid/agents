@@ -5,8 +5,8 @@
 (allow default)
 (deny network-outbound (remote ip))
 (deny network-inbound (local ip))
-(allow network-outbound (remote ip "localhost:49309"))
-(allow network-outbound (remote ip "localhost:18999"))
+(allow network-outbound (remote ip (string-append "localhost:" (param "PROXY_PORT"))))
+(allow network-outbound (remote ip (string-append "localhost:" (param "GATEWAY_PORT"))))
 
 (deny file-read* (subpath (param "REAL_HOME")))
 (deny file-write* (subpath (param "REAL_HOME")))

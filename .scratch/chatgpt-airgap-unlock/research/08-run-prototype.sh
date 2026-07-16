@@ -506,6 +506,13 @@ require_reserved_port_free() {
   fi
 }
 for port in "$CDP_PORT" "$PROXY_PORT" "$UPSTREAM_OBSERVER_PORT" "$OPTIQ_PORT" "$GATEWAY_PORT"; do
+  case "$port" in
+    ''|*[!0-9]*) echo "reserved port must be numeric: $port" >&2; exit 65 ;;
+  esac
+  if test "$port" -lt 1024 || test "$port" -gt 65535; then
+    echo "reserved port is outside the unprivileged TCP range: $port" >&2
+    exit 65
+  fi
   require_reserved_port_free "$port"
 done
 
@@ -644,7 +651,7 @@ EOF
   CODEX_HOME="$CODEX_DIR" \
   TMPDIR="$TMP_DIR" \
   LANG="en_US.UTF-8" \
-  /usr/bin/sandbox-exec -f "$METADATA_PROFILE" \
+  /usr/bin/sandbox-exec -f "$METADATA_PROFILE" -D "REAL_HOME=$REAL_HOME" \
     "$APP/Contents/Resources/codex" debug models \
   >"$LOG_DIR/model-catalog.json" 2>"$LOG_DIR/model-catalog.stderr"
 model_list_isolated=true
@@ -821,6 +828,7 @@ printf '%s\n' "$RUN_ROOT" >"$LOG_DIR/run-root.txt"
     -D "PROVIDER_HOME=$HOME_DIR" \
     -D "PROVIDER_TMP=$TMP_DIR" \
     -D "HF_CACHE=$HF_CACHE_DIR" \
+    -D "OPTIQ_PORT=$OPTIQ_PORT" \
     "$OPTIQ_PYTHON" -P "$OPTIQ" serve \
     --model "$MODEL_DIR" \
     --host 127.0.0.1 \
@@ -865,7 +873,8 @@ PY
   TMPDIR="$TMP_DIR" \
   LANG="en_US.UTF-8" \
   /usr/bin/python3 "$PROCESS_GROUP" \
-    /usr/bin/sandbox-exec -f "$PROXY_PROFILE" -D "REAL_HOME=$REAL_HOME" \
+    /usr/bin/sandbox-exec -f "$PROXY_PROFILE" \
+      -D "REAL_HOME=$REAL_HOME" -D "PROXY_PORT=$PROXY_PORT" \
       /usr/bin/python3 "$OBSERVER_EXEC" "$PROXY_PORT" \
   >"$LOG_DIR/proxy.jsonl" 2>"$LOG_DIR/proxy.stderr" &
 proxy_pid=$!
@@ -916,7 +925,10 @@ if test "$ROUTE_MODE" = gateway; then
     NS_PROXY_UPSTREAM_TOKEN="$UPSTREAM_TOKEN" \
     NS_PROXY_DEBUG=true \
     /usr/bin/python3 "$PROCESS_GROUP" \
-    /usr/bin/sandbox-exec -f "$GATEWAY_PROFILE" -D "REAL_HOME=$REAL_HOME" \
+    /usr/bin/sandbox-exec -f "$GATEWAY_PROFILE" \
+      -D "REAL_HOME=$REAL_HOME" \
+      -D "UPSTREAM_OBSERVER_PORT=$UPSTREAM_OBSERVER_PORT" \
+      -D "GATEWAY_PORT=$GATEWAY_PORT" \
       /usr/bin/python3 "$GATEWAY_EXEC" \
       >"$LOG_DIR/gateway.stdout" 2>"$LOG_DIR/gateway.stderr" &
   gateway_pid=$!
@@ -976,6 +988,8 @@ if test "$GUI_WORKFLOW" = false; then
       "$LOG_DIR" \
       "$MODEL_ID" \
       "$PROXY_PORT" \
+      "$OPTIQ_PORT" \
+      "$GATEWAY_PORT" \
       "$NATIVE_GUI_PROBE_PROTECTED_PATH" \
       >"$LOG_DIR/host-probe.stdout" 2>"$LOG_DIR/host-probe.stderr"
   THREAD_ID="$(/usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["thread_id"])' "$LOG_DIR/host-summary.json")"
@@ -994,6 +1008,8 @@ if test "$GUI_WORKFLOW" = false; then
       "$LOG_DIR" \
       "$THREAD_ID" \
       "$PROXY_PORT" \
+      "$OPTIQ_PORT" \
+      "$GATEWAY_PORT" \
       "$NATIVE_GUI_PROBE_PROTECTED_PATH" \
       >"$LOG_DIR/host-restart-probe.stdout" 2>"$LOG_DIR/host-restart-probe.stderr"
 fi
@@ -1319,7 +1335,7 @@ for pid in $(owned_group_pids); do
 done
 
 login_wall_observed=false
-if /usr/bin/grep -Fq 'Sign in to ChatGPT' "$LOG_DIR/cdp.jsonl"; then login_wall_observed=true; fi
+if /usr/bin/grep -Fq '"loginWall":true' "$LOG_DIR/cdp.jsonl"; then login_wall_observed=true; fi
 account_read_observed=false
 if /usr/bin/grep -Fq 'method=account/read' "$LOG_DIR/app.stdout"; then account_read_observed=true; fi
 main_ui_observed=false

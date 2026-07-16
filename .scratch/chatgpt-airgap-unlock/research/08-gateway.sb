@@ -5,8 +5,8 @@
 (allow default)
 (deny network-outbound (remote ip))
 (deny network-inbound (local ip))
-(allow network-outbound (remote ip "localhost:18997"))
-(allow network-inbound (local ip "localhost:18999"))
+(allow network-outbound (remote ip (string-append "localhost:" (param "UPSTREAM_OBSERVER_PORT"))))
+(allow network-inbound (local ip (string-append "localhost:" (param "GATEWAY_PORT"))))
 
 ; The gateway is materialized under the disposable run root and needs no
 ; operator-home access.

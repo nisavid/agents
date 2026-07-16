@@ -25,6 +25,7 @@ SOURCE_APP = Path(
     )
 )
 CODEX = SOURCE_APP / "Contents/Resources/codex"
+REAL_HOME = Path.home()
 MODEL_DIR = Path(
     os.environ.get(
         "MODEL_DIR",
@@ -58,6 +59,8 @@ def isolated_codex_command(*arguments: str) -> list[str]:
         "/usr/bin/sandbox-exec",
         "-f",
         str(METADATA_PROFILE),
+        "-D",
+        f"REAL_HOME={REAL_HOME}",
         str(CODEX),
         *arguments,
     ]

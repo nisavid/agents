@@ -62,7 +62,20 @@ ls_specific_settings: {}
 # list of additional paths to ignore in this project.
 # Same syntax as gitignore, so you can use * and **.
 # Note: global ignored_paths from serena_config.yml are also applied additively.
-ignored_paths: []
+ignored_paths:
+- ".worktrees/**"
+- "worktrees/**"
+- "**/.venv/**"
+- "**/venv/**"
+- "**/node_modules/**"
+- "**/__pycache__/**"
+- "**/.pytest_cache/**"
+- "**/.mypy_cache/**"
+- "**/.ruff_cache/**"
+- "**/htmlcov/**"
+- "**/coverage/**"
+- "**/dist/**"
+- "**/build/**"
 
 # whether the project is in read-only mode
 # If set to true, all editing tools will be disabled and attempts to use them will result in an error

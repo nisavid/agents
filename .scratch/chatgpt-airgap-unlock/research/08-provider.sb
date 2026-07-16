@@ -1,23 +1,30 @@
 (version 1)
 
-; THROWAWAY PROTOTYPE ONLY. OptiQ may load the exact local snapshot and use
-; Metal, but may communicate only over loopback.
+; THROWAWAY PROTOTYPE ONLY. Seatbelt fixes the provider listener to this port.
+; The OptiQ argv separately fixes its host to 127.0.0.1.
 (allow default)
 (deny network-outbound (remote ip))
 (deny network-inbound (local ip))
-(allow network-outbound (remote ip "localhost:*"))
-(allow network-inbound (local ip "localhost:*"))
+(allow network-inbound (local ip "*:18998"))
 
-; The only operator-home read allowed to the provider is the exact pinned
-; Hugging Face model repository. It may not write anywhere under that home.
-(deny file-read* (subpath (param "REAL_HOME")))
-(deny file-write* (subpath (param "REAL_HOME")))
-(allow file-read* (subpath (param "MODEL_REPO")))
-(allow file-read* (subpath (param "OPTIQ_RUNTIME")))
-(deny process-exec)
-(allow process-exec (subpath (param "OPTIQ_RUNTIME")))
-(deny file-write* (subpath (param "RUN_ROOT")))
-(allow file-write* (subpath (param "PROVIDER_HOME")))
-(allow file-write* (subpath (param "PROVIDER_TMP")))
-(allow file-write* (subpath (param "HF_CACHE")))
-(deny file-write* (subpath "/Applications/ChatGPT.app"))
+; The provider is limited to its pinned runtime and model, plus its three
+; disposable writable directories. Other operator-home and run-root state is
+; explicitly unavailable. These non-overlapping rules leave the pinned model
+; and runtime readable while retaining macOS framework and Metal reads.
+(deny file-read-data
+  (require-all
+    (subpath (param "REAL_HOME"))
+    (require-not (subpath (param "MODEL_REPO")))
+    (require-not (subpath (param "OPTIQ_RUNTIME")))))
+(deny file-read-data
+  (require-all
+    (subpath (param "RUN_ROOT"))
+    (require-not (subpath (param "PROVIDER_HOME")))
+    (require-not (subpath (param "PROVIDER_TMP")))
+    (require-not (subpath (param "HF_CACHE")))))
+(deny file-write*
+  (require-all
+    (require-not (subpath (param "PROVIDER_HOME")))
+    (require-not (subpath (param "PROVIDER_TMP")))
+    (require-not (subpath (param "HF_CACHE")))))
+(deny process-exec (require-not (subpath (param "OPTIQ_RUNTIME"))))

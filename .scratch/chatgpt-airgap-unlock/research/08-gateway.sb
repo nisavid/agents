@@ -1,13 +1,12 @@
 (version 1)
 
-; THROWAWAY PROTOTYPE ONLY. The immutable gateway may accept and forward only
-; loopback traffic. Its own application-layer upstream allowlist remains a
-; separate required gate.
+; THROWAWAY PROTOTYPE ONLY. The immutable gateway accepts requests only on its
+; assigned loopback port and forwards only to the assigned upstream observer.
 (allow default)
 (deny network-outbound (remote ip))
 (deny network-inbound (local ip))
-(allow network-outbound (remote ip "localhost:*"))
-(allow network-inbound (local ip "localhost:*"))
+(allow network-outbound (remote ip "localhost:18997"))
+(allow network-inbound (local ip "localhost:18999"))
 
 ; The gateway is materialized under the disposable run root and needs no
 ; operator-home access.

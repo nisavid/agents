@@ -1,0 +1,11 @@
+(version 1)
+
+; THROWAWAY PROTOTYPE ONLY. CDP observers and drivers are clients of the copied
+; app's assigned loopback debugging endpoint; they do not listen themselves.
+(allow default)
+(deny network-outbound (remote ip))
+(deny network-inbound (local ip))
+(allow network-outbound (remote ip "localhost:49308"))
+
+(deny file-read* (subpath (param "REAL_HOME")))
+(deny file-write* (subpath (param "REAL_HOME")))

@@ -1,0 +1,12 @@
+(version 1)
+
+; THROWAWAY PROTOTYPE ONLY. The bundled host has no listener and may use only
+; the separately-owned loopback proxy.
+(allow default)
+(deny network-outbound (remote ip))
+(deny network-inbound (local ip))
+(allow network-outbound (remote ip "localhost:49309"))
+
+(deny file-read* (subpath (param "REAL_HOME")))
+(deny file-write* (subpath (param "REAL_HOME")))
+(deny file-write* (literal (param "NATIVE_GUI_PROBE_BIN")))

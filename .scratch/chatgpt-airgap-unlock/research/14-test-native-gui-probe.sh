@@ -294,10 +294,19 @@ for event in events:
 assert events[0]["fixtureSha256"] == baseline["fixtureSha256"]
 assert events[-1]["fixtureSha256"] == baseline["fixtureSha256"]
 
+sensitive_pattern = re.compile(
+    r"bearer\s+|authorization:|sk-[a-z0-9_-]{8,}|https?://", re.IGNORECASE)
+for sample in (
+    "Authorization: Bearer retained-secret",
+    "sk-proj-retained_secret",
+    "https://remote.example.invalid/v1",
+):
+    assert sensitive_pattern.search(sample), sample
+
 for path in root.iterdir():
     assert not path.is_symlink() and path.is_file()
     text = path.read_text(encoding="utf-8")
-    assert not re.search(r"(?i)bearer\\s+|authorization:|sk-[a-z0-9]{8,}|https?://", text)
+    assert not sensitive_pattern.search(text)
 PY
 
 printf 'native GUI probe deterministic tests passed\n'

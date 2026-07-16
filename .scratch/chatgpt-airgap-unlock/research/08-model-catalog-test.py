@@ -48,6 +48,10 @@ def isolated_environment(home: Path, codex_home: Path, temporary: Path) -> dict[
     return {
         "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
         "HOME": str(home),
+        "CFFIXED_USER_HOME": str(home),
+        "XDG_CONFIG_HOME": str(home / ".config"),
+        "XDG_CACHE_HOME": str(home / ".cache"),
+        "XDG_DATA_HOME": str(home / ".local/share"),
         "CODEX_HOME": str(codex_home),
         "TMPDIR": str(temporary),
         "LANG": "en_US.UTF-8",
@@ -153,6 +157,10 @@ def run_full_contract() -> None:
         assert set(child_environment) == {
             "PATH",
             "HOME",
+            "CFFIXED_USER_HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_CACHE_HOME",
+            "XDG_DATA_HOME",
             "CODEX_HOME",
             "TMPDIR",
             "LANG",
@@ -161,6 +169,7 @@ def run_full_contract() -> None:
             isolated_codex_command("debug", "models"),
             check=False,
             capture_output=True,
+            cwd=root,
             env=child_environment,
             text=True,
         )

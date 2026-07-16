@@ -645,15 +645,21 @@ exclude = ["$CODEX_PROVIDER_TOKEN_ENV"]
 [features]
 shell_snapshot = false
 EOF
-/usr/bin/env -i \
-  PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
-  HOME="$HOME_DIR" \
-  CODEX_HOME="$CODEX_DIR" \
-  TMPDIR="$TMP_DIR" \
-  LANG="en_US.UTF-8" \
-  /usr/bin/sandbox-exec -f "$METADATA_PROFILE" -D "REAL_HOME=$REAL_HOME" \
-    "$APP/Contents/Resources/codex" debug models \
-  >"$LOG_DIR/model-catalog.json" 2>"$LOG_DIR/model-catalog.stderr"
+(
+  cd "$RUN_ROOT"
+  exec /usr/bin/env -i \
+    PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+    HOME="$HOME_DIR" \
+    CFFIXED_USER_HOME="$HOME_DIR" \
+    XDG_CONFIG_HOME="$HOME_DIR/.config" \
+    XDG_CACHE_HOME="$HOME_DIR/.cache" \
+    XDG_DATA_HOME="$HOME_DIR/.local/share" \
+    CODEX_HOME="$CODEX_DIR" \
+    TMPDIR="$TMP_DIR" \
+    LANG="en_US.UTF-8" \
+    /usr/bin/sandbox-exec -f "$METADATA_PROFILE" -D "REAL_HOME=$REAL_HOME" \
+      "$APP/Contents/Resources/codex" debug models
+) >"$LOG_DIR/model-catalog.json" 2>"$LOG_DIR/model-catalog.stderr"
 model_list_isolated=true
 /usr/bin/python3 "$MODEL_CATALOG_TEST_EXEC" \
   --catalog "$LOG_DIR/model-catalog.json" "$MODEL_ID" "$MODEL_DISPLAY_NAME"
@@ -889,7 +895,10 @@ if test "$ROUTE_MODE" = gateway; then
     EXPECTED_UPSTREAM_TOKEN="$UPSTREAM_TOKEN" \
     FORBIDDEN_INBOUND_TOKEN="$INBOUND_TOKEN" \
     /usr/bin/python3 "$PROCESS_GROUP" \
-    /usr/bin/sandbox-exec -f "$UPSTREAM_OBSERVER_PROFILE" -D "REAL_HOME=$REAL_HOME" \
+    /usr/bin/sandbox-exec -f "$UPSTREAM_OBSERVER_PROFILE" \
+      -D "REAL_HOME=$REAL_HOME" \
+      -D "UPSTREAM_OBSERVER_PORT=$UPSTREAM_OBSERVER_PORT" \
+      -D "OPTIQ_PORT=$OPTIQ_PORT" \
       /usr/bin/python3 "$UPSTREAM_OBSERVER_EXEC" \
         "$UPSTREAM_OBSERVER_PORT" "$OPTIQ_PORT" "$LOG_DIR/upstream-auth.jsonl" \
     >"$LOG_DIR/upstream-observer.stdout" 2>"$LOG_DIR/upstream-observer.stderr" &
@@ -1045,7 +1054,12 @@ launch_app() {
     ELECTRON_ENABLE_LOGGING=1 \
     RUST_LOG=info \
     /usr/bin/python3 "$PROCESS_GROUP" \
-    /usr/bin/sandbox-exec -f "$APP_PROFILE" -D "REAL_HOME=$REAL_HOME" \
+    /usr/bin/sandbox-exec -f "$APP_PROFILE" \
+      -D "REAL_HOME=$REAL_HOME" \
+      -D "CDP_PORT=$CDP_PORT" \
+      -D "PROXY_PORT=$PROXY_PORT" \
+      -D "OPTIQ_PORT=$OPTIQ_PORT" \
+      -D "GATEWAY_PORT=$GATEWAY_PORT" \
       -D "NATIVE_GUI_PROBE_BIN=$NATIVE_GUI_PROBE_PROTECTED_PATH" "$APP_EXEC" \
       --no-sandbox \
       --use-mock-keychain \
@@ -1107,7 +1121,8 @@ if test "$GUI_NATIVE_PROJECT_PICKER" = true; then
     HOME="$HOME_DIR" \
     TMPDIR="$TMP_DIR" \
     LANG="en_US.UTF-8" \
-    /usr/bin/sandbox-exec -f "$CDP_CLIENT_PROFILE" -D "REAL_HOME=$REAL_HOME" \
+    /usr/bin/sandbox-exec -f "$CDP_CLIENT_PROFILE" \
+      -D "REAL_HOME=$REAL_HOME" -D "CDP_PORT=$CDP_PORT" \
       "$NODE" "$GUI_DRIVER_EXEC" "$CDP_PORT" prepare-project-picker 30000 \
       "$(realpath "$WORKSPACE_DIR")" \
     >"$LOG_DIR/cdp-native-prepare.jsonl" 2>"$LOG_DIR/cdp-native-prepare.stderr"
@@ -1167,7 +1182,8 @@ if test "$GUI_NATIVE_PROJECT_PICKER" = true; then
     HOME="$HOME_DIR" \
     TMPDIR="$TMP_DIR" \
     LANG="en_US.UTF-8" \
-    /usr/bin/sandbox-exec -f "$CDP_CLIENT_PROFILE" -D "REAL_HOME=$REAL_HOME" \
+    /usr/bin/sandbox-exec -f "$CDP_CLIENT_PROFILE" \
+      -D "REAL_HOME=$REAL_HOME" -D "CDP_PORT=$CDP_PORT" \
       "$NODE" "$GUI_DRIVER_EXEC" "$CDP_PORT" open-project-picker 30000 \
       "$(realpath "$WORKSPACE_DIR")" \
     >"$LOG_DIR/cdp-native-open.jsonl" 2>"$LOG_DIR/cdp-native-open.stderr"
@@ -1187,7 +1203,8 @@ if test "$GUI_NATIVE_PROJECT_PICKER" = true; then
     HOME="$HOME_DIR" \
     TMPDIR="$TMP_DIR" \
     LANG="en_US.UTF-8" \
-    /usr/bin/sandbox-exec -f "$CDP_CLIENT_PROFILE" -D "REAL_HOME=$REAL_HOME" \
+    /usr/bin/sandbox-exec -f "$CDP_CLIENT_PROFILE" \
+      -D "REAL_HOME=$REAL_HOME" -D "CDP_PORT=$CDP_PORT" \
       "$NODE" "$GUI_DRIVER_EXEC" "$CDP_PORT" confirm-project-selection 30000 \
       "$(realpath "$WORKSPACE_DIR")" \
     >"$LOG_DIR/cdp-native-confirm.jsonl" 2>"$LOG_DIR/cdp-native-confirm.stderr"
@@ -1218,7 +1235,8 @@ if test "$GUI_WORKFLOW" = true && /usr/bin/env -i \
   HOME="$HOME_DIR" \
   TMPDIR="$TMP_DIR" \
   LANG="en_US.UTF-8" \
-    /usr/bin/sandbox-exec -f "$CDP_CLIENT_PROFILE" -D "REAL_HOME=$REAL_HOME" \
+    /usr/bin/sandbox-exec -f "$CDP_CLIENT_PROFILE" \
+      -D "REAL_HOME=$REAL_HOME" -D "CDP_PORT=$CDP_PORT" \
     "$NODE" "$cdp_command" "$CDP_PORT" "$cdp_argument" "$cdp_timeout" \
       "$cdp_phase_argument" \
   >"$LOG_DIR/cdp.jsonl" 2>"$LOG_DIR/cdp.stderr"; then
@@ -1228,7 +1246,8 @@ elif test "$GUI_WORKFLOW" = false && /usr/bin/env -i \
   HOME="$HOME_DIR" \
   TMPDIR="$TMP_DIR" \
   LANG="en_US.UTF-8" \
-  /usr/bin/sandbox-exec -f "$CDP_CLIENT_PROFILE" -D "REAL_HOME=$REAL_HOME" \
+  /usr/bin/sandbox-exec -f "$CDP_CLIENT_PROFILE" \
+    -D "REAL_HOME=$REAL_HOME" -D "CDP_PORT=$CDP_PORT" \
     "$NODE" "$cdp_command" "$CDP_PORT" "$cdp_argument" \
   >"$LOG_DIR/cdp.jsonl" 2>"$LOG_DIR/cdp.stderr"; then
   cdp_exit=0
@@ -1301,7 +1320,8 @@ if test "$GUI_COLD_RESUME" = true && test "$cdp_exit" -eq 0; then
     HOME="$HOME_DIR" \
     TMPDIR="$TMP_DIR" \
     LANG="en_US.UTF-8" \
-    /usr/bin/sandbox-exec -f "$CDP_CLIENT_PROFILE" -D "REAL_HOME=$REAL_HOME" \
+    /usr/bin/sandbox-exec -f "$CDP_CLIENT_PROFILE" \
+      -D "REAL_HOME=$REAL_HOME" -D "CDP_PORT=$CDP_PORT" \
       "$NODE" "$GUI_DRIVER_EXEC" "$CDP_PORT" \
         "$second_driver_phase" 120000 "$second_driver_argument" \
     >>"$LOG_DIR/cdp.jsonl" 2>>"$LOG_DIR/cdp.stderr"; then

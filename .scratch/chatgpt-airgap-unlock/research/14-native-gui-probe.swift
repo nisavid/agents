@@ -911,12 +911,15 @@ func liveBoundedNestedSheetsForOpenPanelReadiness(
         let current = pending[nextIndex]
         nextIndex += 1
         visitedCount += 1
-        if try strictStringAttribute(
+        let role = try strictStringAttribute(
             current.element, kAXRoleAttribute as CFString,
-            purpose: "bounded AX sheet discovery role") == kAXSheetRole {
+            purpose: "bounded AX sheet discovery role")
+        if role == kAXSheetRole {
             sheets.append(current.element)
             continue
         }
+        guard !isNestedApplicationBackReference(
+            role: role, depth: current.depth) else { continue }
         var childrenValue: CFTypeRef?
         let childrenStatus = AXUIElementCopyAttributeValue(
             current.element, kAXChildrenAttribute as CFString, &childrenValue)
@@ -930,7 +933,8 @@ func liveBoundedNestedSheetsForOpenPanelReadiness(
             if current.depth == 8 {
                 guard publishedChildren.isEmpty else {
                     throw ProbeError.validation(
-                        "bounded AX sheet discovery exceeded depth limit")
+                        "bounded AX sheet discovery exceeded depth limit: " +
+                        "role=\(role) children=\(publishedChildren.count)")
                 }
             } else {
                 pending.append(contentsOf: publishedChildren.map {
@@ -1864,6 +1868,10 @@ struct OpenPanelAbsenceEvidence: Equatable {
     let visitedCount: Int
 }
 
+func isNestedApplicationBackReference(role: String, depth: Int) -> Bool {
+    role == kAXApplicationRole && depth > 0
+}
+
 func requireOpenPanelAbsent(
     application: AXUIElement,
     process: ProcessIdentity
@@ -1903,6 +1911,8 @@ func requireOpenPanelAbsent(
             throw ProbeError.validation(
                 "an AXSheet already exists before the final renderer picker request")
         }
+        guard !isNestedApplicationBackReference(
+            role: role, depth: current.depth) else { continue }
         var childrenValue: CFTypeRef?
         let childrenStatus = AXUIElementCopyAttributeValue(
             current.element, kAXChildrenAttribute as CFString, &childrenValue)
@@ -1918,7 +1928,8 @@ func requireOpenPanelAbsent(
             if current.depth == 8 {
                 guard children.isEmpty else {
                     throw ProbeError.validation(
-                        "pre-request AX traversal exceeded depth limit")
+                        "pre-request AX traversal exceeded depth limit: " +
+                        "role=\(role) children=\(children.count)")
                 }
             } else {
                 pending.append(contentsOf: children.map {
@@ -2183,6 +2194,13 @@ func runSelfTests() throws {
     try require(
         preselectedActions == 1,
         "preselected exact candidate skipped the required publication")
+    try require(
+        isNestedApplicationBackReference(
+            role: kAXApplicationRole, depth: 1) &&
+        !isNestedApplicationBackReference(
+            role: kAXApplicationRole, depth: 0) &&
+        !isNestedApplicationBackReference(role: kAXWindowRole, depth: 1),
+        "bounded AX traversal application back-reference policy failed")
     var chooserActions = 0
     try performValidatedOpenPanelListChooserPress(
         initial: token, sameElement: ==,

@@ -9,4 +9,4 @@ route_mode=gateway
 gui_modes=false
 gui_worktree=false
 gateway_upstream_timeout_seconds=300
-gateway_sse_heartbeat_seconds=default
+gateway_sse_heartbeat_seconds=15

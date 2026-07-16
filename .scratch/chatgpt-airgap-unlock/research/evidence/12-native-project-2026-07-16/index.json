@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "executedAt": "2026-07-16T16:54:32.314Z",
+  "executedAt": "2026-07-16T17:19:17.116Z",
   "application": {
     "version": "26.707.71524",
     "build": "5263",
@@ -13,23 +13,23 @@
   "route": {
     "probeExpectation": "renderer-native-project",
     "gatewayCommit": "6307d37b76918c19f2e3bc0fd506434531aadeb2",
-    "nativeHelperSha256": "b461c021c0493e5c8998f028b3a59c1400dd8c91f1ce86e11c60c99103b8fc3b",
+    "nativeHelperSha256": "906c9af5c02e3ea3dcc520d0a5f86ba68b67ae0d1d493e08c8e3d0e71c978501",
     "modelRevision": "adc8669eb431e3168aeb4e320bd7b757914350e2",
     "modelSafetensorsBlob": "4a46dafdc0afb80deacc2dada482ff339405adabc87fcde51a43834827f0e0bf"
   },
   "binding": {
-    "fixtureSha256": "00109e78d8a1442425b25a44d3ade0167f95fd2d2c0e287eac83538d798cd3c3",
-    "runRootSha256": "dea98a1a5cb66601a294db6b83d52f2535f72eaa37cf4de70b611f2e39690274"
+    "fixtureSha256": "0d80e8aa472b559e2da29aa0404dcfb3b4605dc46af714c9d316b474f18f94cc",
+    "runRootSha256": "4dc29d65f15cd6ccef44c68c113d0389729f645aa096a510d34805f52fd3b12f"
   },
   "outputs": {
-    "runtime-manifest.txt": "37d65c852bca243d5e7adc1f18362a49d90982890dfc9493d6a33113203933c2",
+    "runtime-manifest.txt": "8767ef20122bba468c74b2c9bff8e66222b19b961ac6af100ae2940c501a7e41",
     "probe-verdict.txt": "da941be5146b6ba414a68f013684fd6d35432087c18d0367c980bfc7e2290339",
-    "native-gui-probe.jsonl": "22a30f3688cb04f75388a5dd749b5aaef0ec339d12b5b65dab0a4217d0a92d50",
-    "native-project-state.json": "187369df6da1580096a118483d71c49514b38c32ad28b669cbbd5e166d418a0e",
-    "renderer-project-selection-confirmed.json": "8d885fcd3419814cb9f80800c40052cf57a192fa0fba7bf15b047627398aadde"
+    "native-gui-probe.jsonl": "3d6733c7cdb462b42ad12fca81d914b51b447db9630ca0577d8c0e37d561b0f3",
+    "native-project-state.json": "0a646cea69524d509fae9e7aa4cbda4b7b90740e96beaf07fe50b3626d646ae7",
+    "renderer-project-selection-confirmed.json": "4bcec2cd4c2610e23d93e943f755858ee8f0175411a40a7abb940b2a15a30750"
   },
   "extraction": {
-    "sourceCdpNativeConfirmSha256": "6c58e4693caff51b98388cb03f55714eb0aabdbd76fbc76bb9c09da909f67eda",
+    "sourceCdpNativeConfirmSha256": "e6995cfb85f7501b68281874757264171a33930b6d7bf30ed639e6e7c50b5884",
     "rule": "Retain only kind, phase, matched, uniqueControl, and expectedFixtureSha256 from the unique renderer-project-selection-confirmed event."
   }
 }

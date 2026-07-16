@@ -48,6 +48,7 @@ GATEWAY_FILE="tooling/codex-ns-proxy/codex-ns-proxy.py"
 GATEWAY_REVIEWED_BLOB="a368b8f8e919361425763e86ca1c80fcea81825f"
 GATEWAY_UPSTREAM_URL="http://127.0.0.1:$UPSTREAM_OBSERVER_PORT/v1"
 GATEWAY_UPSTREAM_TIMEOUT_SECONDS="300"
+GATEWAY_SSE_HEARTBEAT_SECONDS="15"
 GATEWAY_TERMINAL_PATTERN="[codex-ns-proxy] SSE terminal_completed=true"
 PROBE_DURATION_MS="${PROBE_DURATION_MS:-20000}"
 PROBE_EXPECT="${PROBE_EXPECT:-usable-ui}"
@@ -548,7 +549,7 @@ if test "$ROUTE_MODE" = gateway; then
     printf 'adapter=codex-namespace\n'
     printf 'upstream=%s\n' "$GATEWAY_UPSTREAM_URL"
     printf 'upstream_timeout_seconds=%s\n' "$GATEWAY_UPSTREAM_TIMEOUT_SECONDS"
-    printf 'sse_heartbeat_seconds=default\n'
+    printf 'sse_heartbeat_seconds=%s\n' "$GATEWAY_SSE_HEARTBEAT_SECONDS"
   } >"$LOG_DIR/gateway-source.txt"
   /usr/bin/env -i \
     PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
@@ -738,7 +739,7 @@ printf '%s\n' "$RUN_ROOT" >"$LOG_DIR/run-root.txt"
   printf 'gui_worktree=%s\n' "$GUI_WORKTREE"
   if test "$ROUTE_MODE" = gateway; then
     printf 'gateway_upstream_timeout_seconds=%s\n' "$GATEWAY_UPSTREAM_TIMEOUT_SECONDS"
-    printf 'gateway_sse_heartbeat_seconds=%s\n' "default"
+    printf 'gateway_sse_heartbeat_seconds=%s\n' "$GATEWAY_SSE_HEARTBEAT_SECONDS"
   else
     printf 'gateway_upstream_timeout_seconds=%s\n' "not-applicable"
     printf 'gateway_sse_heartbeat_seconds=%s\n' "not-applicable"
@@ -849,6 +850,7 @@ if test "$ROUTE_MODE" = gateway; then
     NS_PROXY_PORT="$GATEWAY_PORT" \
     NS_PROXY_UPSTREAM="$GATEWAY_UPSTREAM_URL" \
     NS_PROXY_UPSTREAM_TIMEOUT="$GATEWAY_UPSTREAM_TIMEOUT_SECONDS" \
+    NS_PROXY_SSE_HEARTBEAT="$GATEWAY_SSE_HEARTBEAT_SECONDS" \
     NS_PROXY_ADAPTER="codex-namespace" \
     NS_PROXY_INBOUND_TOKEN="$INBOUND_TOKEN" \
     NS_PROXY_UPSTREAM_TOKEN="$UPSTREAM_TOKEN" \

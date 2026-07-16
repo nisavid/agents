@@ -72,7 +72,7 @@ replacement patcher or production application build.
 
 The deterministic helper, patcher, and path-confinement suites pass. Two builds
 of the final helper are byte-identical at SHA-256
-`b461c021c0493e5c8998f028b3a59c1400dd8c91f1ce86e11c60c99103b8fc3b`.
+`906c9af5c02e3ea3dcc520d0a5f86ba68b67ae0d1d493e08c8e3d0e71c978501`.
 The full copied-app smoke test proves the ordered same-helper absence, request,
 native selection, renderer confirmation, local OptiQ turn, and namespace
 continuation contract. It also proves no remote socket or token leak, expected
@@ -82,5 +82,5 @@ artifact and run evidence is recorded in `research/14-native-gui-probe.md` and
 
 Tickets 08 and 12 retain worktree, permission, project-local skill, and
 reasoning-label acceptance. Ticket 08 also carries production-isolation and
-target-GLM acceptance, and ticket 13 retains the dedicated production-isolation
-work.
+explicit GLM-profile acceptance when its target environment becomes available,
+and ticket 13 retains the dedicated production-isolation work.

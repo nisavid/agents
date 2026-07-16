@@ -86,9 +86,10 @@ drift, or published identity mismatch fails closed.
 The verified route does not recursively traverse the Electron renderer tree.
 It reads the exact copied application's windows, follows bounded `AXChildren`
 edges, deduplicates the resulting sheets, and evaluates only the parented sheet
-candidates. This avoids both global targeting and unbounded descent into the
-web content accessibility tree. The pre-request absence traversal fails closed
-on incomplete reads or depth, node, and fanout limits.
+candidates. This avoids global targeting and unbounded descent into the web
+content accessibility tree. The pre-request absence traversal checks every
+bounded branch for a sheet, stops only nested `AXApplication` back-references,
+and fails closed on incomplete reads or depth, node, and fanout limits.
 
 Readiness uses monotonic deadlines, fixed polling intervals, per-window node
 limits, and explicit depth limits. No qualifying sheet is a retryable
@@ -147,7 +148,7 @@ The exact copied artifacts are:
 | Source ASAR header | `e3023f2d1c334ba8ba80bd22a97553d412a4616a86d75ca81e258e974061f3c7` |
 | Patched ASAR header | `c069ef0e4e826ec2fd8db41a626f3e26f3edead477053a12703830ce7e047b75` |
 | Patched main file | `a8082ef44bf3aa4e30e7c663472da502d15bed35073a4c125903f4b9291961cc` |
-| Native helper | `b461c021c0493e5c8998f028b3a59c1400dd8c91f1ce86e11c60c99103b8fc3b` |
+| Native helper | `906c9af5c02e3ea3dcc520d0a5f86ba68b67ae0d1d493e08c8e3d0e71c978501` |
 
 The runner ad-hoc signs the copied outer bundle with identifier
 `com.openai.codex` and requires its deep signature and designated requirement

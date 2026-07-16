@@ -17,6 +17,12 @@ the development machine cannot afford the VM's memory overhead.
 No production-isolation run has occurred. This document fixes its environment,
 oracles, and pass conditions; it does not satisfy them.
 
+For this ticket, the production artifact is an unmodified copy of the vendor
+build. Do not use Ticket 14's fixed-width `defaultPath` ASAR seam or its
+derived, ad-hoc-signed bundle. This ticket makes no native project-selection
+claim. Any future native-selection claim requires a separately validated path
+that keeps the vendor artifact unmodified and an explicit acceptance update.
+
 ## Sealed staging and terminal evidence
 
 `13-production-evidence.py` is the provider- and VM-neutral local preparation
@@ -193,10 +199,15 @@ The preferred-route prototype in
 application, provider, gateway, namespace, credential, persistence, and cleanup
 semantics. It does not prove production isolation.
 
-Its outer `08-probe.sb` profile starts with `(allow default)`, then denies remote
-IP connections, operator-home access, production-app writes, and login Keychain
-lookup. The app is launched with `--no-sandbox` because Chromium's nested
-sandbox does not initialize inside that outer profile.
+The semantic harness uses Ticket 08's role-specific Seatbelt profiles. The
+copied app and bundled host may reach only the observer proxy and their selected
+direct OptiQ or authenticated-gateway loopback route. Gateway, observer, and
+CDP profiles use separate fixed loopback permissions. The provider profile
+fixes port `18998`; OptiQ's explicit `--host 127.0.0.1` bind and runtime listener
+verification provide the loopback-only listener gate. `08-probe.sb` is obsolete
+and fails closed; no Ticket 08 caller uses it. The
+copied app is launched with `--no-sandbox` because Chromium's nested sandbox
+does not initialize inside this outer test confinement.
 
 Electron documents that Chromium normally isolates renderers and utility
 processes from the privileged main process. It also states that
@@ -207,10 +218,10 @@ The
 states that the flag disables the sandbox for all processes, including utility
 processes, and must never be used in production.
 
-The outer profile proves its own coarse network boundary. It does not restore
-Chromium's renderer-to-main privilege separation. Production acceptance must
-therefore run the unmodified vendor process tree without `--no-sandbox` and put
-egress denial outside that tree.
+Those role-specific outer profiles prove their own coarse network boundary.
+They do not restore Chromium's renderer-to-main privilege separation.
+Production acceptance must therefore run the unmodified vendor process tree
+without `--no-sandbox` and put egress denial outside that tree.
 
 ## Exact artifact baseline
 
@@ -316,8 +327,9 @@ bundled Codex, or fuse bytes.
 
 ### 3. Prove the vendor sandbox
 
-Launch the copied app directly with its isolated guest profile and the accepted
-local provider configuration. Do not add `--no-sandbox`, `--disable-sandbox`,
+Launch an unmodified copy of the vendor app directly with its isolated guest
+profile and the accepted local provider configuration. Do not add
+`--no-sandbox`, `--disable-sandbox`,
 DYLD variables, injected code, new entitlements, re-signing, or bundle changes.
 
 Capture the complete process tree and fail if any command line contains
@@ -373,7 +385,8 @@ these conditions together:
 
 - the VM has no external network or live host/guest communication device;
 - the vendor Chromium sandbox is positively observed;
-- the renderer completes the accepted local workflow through guest loopback;
+- the renderer completes the accepted unmodified-artifact local workflow
+  through guest loopback; this ticket makes no native project-selection claim;
 - hosted egress is structurally unavailable and every remote probe fails;
 - credentials remain separated and absent from evidence;
 - all owned processes and listeners terminate; and

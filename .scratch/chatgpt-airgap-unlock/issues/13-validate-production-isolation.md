@@ -33,6 +33,7 @@ fail-closed acceptance procedure are recorded in
 
 - Run on a disconnected VM or true air-gapped Apple-silicon macOS environment whose network boundary does not require modifying or interposing on the app bundle.
 - Keep Chromium's vendor sandbox enabled; reject `--no-sandbox`, DYLD injection, disabled library validation, new entitlements, re-signing, or ASAR and native-code changes.
+- Exclude Ticket 14's disposable fixed-width ASAR picker seam. Claim native project selection only if the unmodified vendor artifact reproduces it inside this boundary; otherwise this ticket makes no native-selection claim.
 - Verify strict deep signature, nested code, ASAR, bundled Codex, architecture, entitlements, and Electron fuses before and after the run.
 - Execute the manifest-bound app, model, gateway, runtime, and observers from a separately mounted read-only artifact volume; keep state and evidence on a different writable disposable volume and prove an artifact-volume write canary fails.
 - Make hosted egress unavailable outside the app process while retaining only the profile-required loopback provider and gateway path.

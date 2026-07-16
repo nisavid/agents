@@ -56,6 +56,45 @@ def run_self_test() -> None:
     print("host app-server sandbox command self-test passed")
 
 
+def stop_process(process: subprocess.Popen[bytes]) -> None:
+    """Close and stop a host process even when the probe fails."""
+    if process.stdin is not None:
+        try:
+            process.stdin.close()
+        except OSError:
+            pass
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=10)
+
+
+def receive_message(
+    stream: Any,
+    raw: Any,
+    messages: list[dict[str, Any]],
+    deadline: float,
+) -> dict[str, Any]:
+    """Read one JSONL message from a binary, select-polled stream."""
+    while time.monotonic() < deadline:
+        ready, _, _ = select.select([stream], [], [], max(0.0, deadline - time.monotonic()))
+        if not ready:
+            break
+        line = stream.readline()
+        if not line:
+            break
+        message = json.loads(line.decode("utf-8"))
+        messages.append(message)
+        raw.write(json.dumps(message, sort_keys=True) + "\n")
+        raw.flush()
+        return message
+    raise TimeoutError("timed out waiting for app-server message")
+
+
 def main() -> None:
     if len(sys.argv) not in (8, 9):
         raise SystemExit(
@@ -108,154 +147,141 @@ def main() -> None:
             sandbox_command(profile, real_home, codex, protected_helper),
             cwd=workspace,
             env=environment,
-            text=True,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=stderr,
+            bufsize=0,
         )
-        assert process.stdin is not None
-        assert process.stdout is not None
+        try:
+            assert process.stdin is not None
+            assert process.stdout is not None
 
-        def receive(deadline: float) -> dict[str, Any]:
-            while time.monotonic() < deadline:
-                ready, _, _ = select.select(
-                    [process.stdout], [], [], max(0.0, deadline - time.monotonic())
+            def receive(deadline: float) -> dict[str, Any]:
+                return receive_message(process.stdout, raw, messages, deadline)
+
+            def request(method: str, params: dict[str, Any], timeout: float = 15) -> dict[str, Any]:
+                nonlocal request_id
+                request_id += 1
+                wanted = request_id
+                process.stdin.write(
+                    (json.dumps({"id": wanted, "method": method, "params": params}) + "\n").encode(
+                        "utf-8"
+                    )
                 )
-                if not ready:
-                    break
-                line = process.stdout.readline()
-                if not line:
-                    break
-                message = json.loads(line)
-                messages.append(message)
-                raw.write(json.dumps(message, sort_keys=True) + "\n")
-                raw.flush()
-                return message
-            raise TimeoutError("timed out waiting for app-server message")
+                process.stdin.flush()
+                deadline = time.monotonic() + timeout
+                while True:
+                    message = receive(deadline)
+                    if message.get("id") == wanted:
+                        if "error" in message:
+                            raise RuntimeError(f"{method} failed: {message['error']}")
+                        return message
 
-        def request(method: str, params: dict[str, Any], timeout: float = 15) -> dict[str, Any]:
-            nonlocal request_id
-            request_id += 1
-            wanted = request_id
-            process.stdin.write(
-                json.dumps({"id": wanted, "method": method, "params": params}) + "\n"
-            )
-            process.stdin.flush()
-            deadline = time.monotonic() + timeout
-            while True:
-                message = receive(deadline)
-                if message.get("id") == wanted:
-                    if "error" in message:
-                        raise RuntimeError(f"{method} failed: {message['error']}")
-                    return message
-
-        initialize = request(
-            "initialize",
-            {
-                "clientInfo": {
-                    "name": "offline-route-prototype",
-                    "title": "Offline route prototype",
-                    "version": "1",
+            initialize = request(
+                "initialize",
+                {
+                    "clientInfo": {
+                        "name": "offline-route-prototype",
+                        "title": "Offline route prototype",
+                        "version": "1",
+                    },
+                    "capabilities": {"experimentalApi": True},
                 },
-                "capabilities": {"experimentalApi": True},
-            },
-        )
-        account = request("account/read", {"refreshToken": False})
-        config = request("config/read", {"cwd": str(workspace), "includeLayers": True})
-        permissions = request("permissionProfile/list", {"cwd": str(workspace)})
-        modes = request("collaborationMode/list", {})
-        skills = request(
-            "skills/list", {"cwds": [str(workspace)], "forceReload": True}
-        )
-        started = request(
-            "thread/start",
-            {
-                "model": model_id,
-                "modelProvider": None,
-                "allowProviderModelFallback": False,
-                "cwd": str(workspace),
-                "approvalPolicy": "never",
-                "sandbox": "read-only",
-                "runtimeWorkspaceRoots": [str(workspace)],
-                "baseInstructions": (
-                    "This is a deterministic local plumbing check. Never use tools. "
-                    "Reply exactly LOCAL_APP_OK and nothing else."
-                ),
-                "developerInstructions": (
-                    "Never use tools. Reply exactly LOCAL_APP_OK and nothing else."
-                ),
-                "ephemeral": False,
-                "experimentalRawEvents": False,
-                "threadSource": "user",
-                "dynamicTools": [],
-            },
-        )
-        thread = started["result"]["thread"]
-        thread_id = thread["id"]
-        turn = request(
-            "turn/start",
-            {
-                "threadId": thread_id,
-                "input": [
-                    {
-                        "type": "skill",
-                        "name": "local-sentinel",
-                        "path": str(skill_path),
-                    },
-                    {
-                        "type": "text",
-                        "text": "Reply with exactly LOCAL_APP_OK and nothing else.",
-                        "text_elements": [],
-                    },
-                ],
-                "cwd": str(workspace),
-                "approvalPolicy": "never",
-                "sandboxPolicy": {"type": "readOnly", "networkAccess": False},
-                "runtimeWorkspaceRoots": [str(workspace)],
-            },
-            timeout=30,
-        )
-        turn_id = turn["result"]["turn"]["id"]
-        completed: dict[str, Any] | None = None
-        agent_item_completed = False
-        thread_became_idle = False
-        deadline = time.monotonic() + 120
-        while time.monotonic() < deadline:
-            message = receive(deadline)
-            if message.get("method") == "turn/completed":
-                params = message.get("params", {})
-                if params.get("threadId") == thread_id:
-                    completed = message
+            )
+            account = request("account/read", {"refreshToken": False})
+            config = request("config/read", {"cwd": str(workspace), "includeLayers": True})
+            permissions = request("permissionProfile/list", {"cwd": str(workspace)})
+            modes = request("collaborationMode/list", {})
+            skills = request(
+                "skills/list", {"cwds": [str(workspace)], "forceReload": True}
+            )
+            started = request(
+                "thread/start",
+                {
+                    "model": model_id,
+                    "modelProvider": None,
+                    "allowProviderModelFallback": False,
+                    "cwd": str(workspace),
+                    "approvalPolicy": "never",
+                    "sandbox": "read-only",
+                    "runtimeWorkspaceRoots": [str(workspace)],
+                    "baseInstructions": (
+                        "This is a deterministic local plumbing check. Never use tools. "
+                        "Reply exactly LOCAL_APP_OK and nothing else."
+                    ),
+                    "developerInstructions": (
+                        "Never use tools. Reply exactly LOCAL_APP_OK and nothing else."
+                    ),
+                    "ephemeral": False,
+                    "experimentalRawEvents": False,
+                    "threadSource": "user",
+                    "dynamicTools": [],
+                },
+            )
+            thread = started["result"]["thread"]
+            thread_id = thread["id"]
+            turn = request(
+                "turn/start",
+                {
+                    "threadId": thread_id,
+                    "input": [
+                        {
+                            "type": "skill",
+                            "name": "local-sentinel",
+                            "path": str(skill_path),
+                        },
+                        {
+                            "type": "text",
+                            "text": "Reply with exactly LOCAL_APP_OK and nothing else.",
+                            "text_elements": [],
+                        },
+                    ],
+                    "cwd": str(workspace),
+                    "approvalPolicy": "never",
+                    "sandboxPolicy": {"type": "readOnly", "networkAccess": False},
+                    "runtimeWorkspaceRoots": [str(workspace)],
+                },
+                timeout=30,
+            )
+            turn_id = turn["result"]["turn"]["id"]
+            completed: dict[str, Any] | None = None
+            agent_item_completed = False
+            thread_became_idle = False
+            deadline = time.monotonic() + 120
+            while time.monotonic() < deadline:
+                message = receive(deadline)
+                if message.get("method") == "turn/completed":
+                    params = message.get("params", {})
+                    if params.get("threadId") == thread_id:
+                        completed = message
+                        break
+                if message.get("method") == "item/completed":
+                    item = message.get("params", {}).get("item", {})
+                    if (
+                        item.get("type") == "agentMessage"
+                        and item.get("text") == "LOCAL_APP_OK"
+                    ):
+                        agent_item_completed = True
+                if message.get("method") == "thread/status/changed":
+                    params = message.get("params", {})
+                    if (
+                        params.get("threadId") == thread_id
+                        and params.get("status", {}).get("type") == "idle"
+                    ):
+                        thread_became_idle = True
+                if agent_item_completed and thread_became_idle:
                     break
-            if message.get("method") == "item/completed":
-                item = message.get("params", {}).get("item", {})
-                if (
-                    item.get("type") == "agentMessage"
-                    and item.get("text") == "LOCAL_APP_OK"
-                ):
-                    agent_item_completed = True
-            if message.get("method") == "thread/status/changed":
-                params = message.get("params", {})
-                if (
-                    params.get("threadId") == thread_id
-                    and params.get("status", {}).get("type") == "idle"
-                ):
-                    thread_became_idle = True
-            if agent_item_completed and thread_became_idle:
-                break
-            if "id" in message and "method" in message:
-                raise RuntimeError(
-                    f"unexpected server request during no-tool sentinel: {message['method']}"
-                )
-        if completed is None and not (agent_item_completed and thread_became_idle):
-            raise TimeoutError("sentinel turn produced no terminal host state")
+                if "id" in message and "method" in message:
+                    raise RuntimeError(
+                        f"unexpected server request during no-tool sentinel: {message['method']}"
+                    )
+            if completed is None and not (agent_item_completed and thread_became_idle):
+                raise TimeoutError("sentinel turn produced no terminal host state")
 
-        listed = request("thread/list", {"cwd": str(workspace), "limit": 20})
-        read = request("thread/read", {"threadId": thread_id, "includeTurns": True})
-
-        process.stdin.close()
-        process.terminate()
-        process.wait(timeout=10)
+            listed = request("thread/list", {"cwd": str(workspace), "limit": 20})
+            read = request("thread/read", {"threadId": thread_id, "includeTurns": True})
+        finally:
+            stop_process(process)
 
     def agent_texts(value: Any) -> list[str]:
         texts: list[str] = []

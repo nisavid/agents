@@ -56,6 +56,43 @@ def run_self_test() -> None:
     print("cold host app-server sandbox command self-test passed")
 
 
+def stop_process(process: subprocess.Popen[bytes]) -> None:
+    """Close and stop a host process even when the probe fails."""
+    if process.stdin is not None:
+        try:
+            process.stdin.close()
+        except OSError:
+            pass
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=10)
+
+
+def receive_message(
+    stream: Any,
+    raw: Any,
+    messages: list[dict[str, Any]],
+    deadline: float,
+) -> dict[str, Any]:
+    """Read one JSONL message from a binary, select-polled stream."""
+    ready, _, _ = select.select([stream], [], [], max(0.0, deadline - time.monotonic()))
+    if not ready:
+        raise TimeoutError("cold host response timed out")
+    line = stream.readline()
+    if not line:
+        raise RuntimeError("cold host closed stdout")
+    message = json.loads(line.decode("utf-8"))
+    messages.append(message)
+    raw.write(json.dumps(message, sort_keys=True) + "\n")
+    raw.flush()
+    return message
+
+
 def agent_texts(value: Any) -> list[str]:
     texts: list[str] = []
     if isinstance(value, dict):
@@ -118,71 +155,61 @@ def main() -> None:
             sandbox_command(profile, real_home, codex, protected_helper),
             cwd=workspace,
             env=environment,
-            text=True,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=stderr,
+            bufsize=0,
         )
-        assert process.stdin is not None and process.stdout is not None
+        try:
+            assert process.stdin is not None and process.stdout is not None
 
-        def receive(deadline: float) -> dict[str, Any]:
-            ready, _, _ = select.select(
-                [process.stdout], [], [], max(0.0, deadline - time.monotonic())
-            )
-            if not ready:
-                raise TimeoutError("cold host response timed out")
-            line = process.stdout.readline()
-            if not line:
-                raise RuntimeError("cold host closed stdout")
-            message = json.loads(line)
-            messages.append(message)
-            raw.write(json.dumps(message, sort_keys=True) + "\n")
-            raw.flush()
-            return message
+            def receive(deadline: float) -> dict[str, Any]:
+                return receive_message(process.stdout, raw, messages, deadline)
 
-        def request(method: str, params: dict[str, Any]) -> dict[str, Any]:
-            nonlocal request_id
-            request_id += 1
-            wanted = request_id
-            process.stdin.write(
-                json.dumps({"id": wanted, "method": method, "params": params}) + "\n"
-            )
-            process.stdin.flush()
-            deadline = time.monotonic() + 20
-            while True:
-                message = receive(deadline)
-                if message.get("id") == wanted:
-                    if "error" in message:
-                        raise RuntimeError(f"{method} failed: {message['error']}")
-                    return message
+            def request(method: str, params: dict[str, Any]) -> dict[str, Any]:
+                nonlocal request_id
+                request_id += 1
+                wanted = request_id
+                process.stdin.write(
+                    (json.dumps({"id": wanted, "method": method, "params": params}) + "\n").encode(
+                        "utf-8"
+                    )
+                )
+                process.stdin.flush()
+                deadline = time.monotonic() + 20
+                while True:
+                    message = receive(deadline)
+                    if message.get("id") == wanted:
+                        if "error" in message:
+                            raise RuntimeError(f"{method} failed: {message['error']}")
+                        return message
 
-        request(
-            "initialize",
-            {
-                "clientInfo": {
-                    "name": "offline-route-restart-prototype",
-                    "title": "Offline route restart prototype",
-                    "version": "1",
+            request(
+                "initialize",
+                {
+                    "clientInfo": {
+                        "name": "offline-route-restart-prototype",
+                        "title": "Offline route restart prototype",
+                        "version": "1",
+                    },
+                    "capabilities": {"experimentalApi": True},
                 },
-                "capabilities": {"experimentalApi": True},
-            },
-        )
-        account = request("account/read", {"refreshToken": False})
-        listed = request("thread/list", {"cwd": str(workspace), "limit": 20})
-        read = request("thread/read", {"threadId": thread_id, "includeTurns": True})
-        resumed = request(
-            "thread/resume",
-            {
-                "threadId": thread_id,
-                "cwd": str(workspace),
-                "approvalPolicy": "never",
-                "sandbox": "read-only",
-                "runtimeWorkspaceRoots": [str(workspace)],
-            },
-        )
-        process.stdin.close()
-        process.terminate()
-        process.wait(timeout=10)
+            )
+            account = request("account/read", {"refreshToken": False})
+            listed = request("thread/list", {"cwd": str(workspace), "limit": 20})
+            read = request("thread/read", {"threadId": thread_id, "includeTurns": True})
+            resumed = request(
+                "thread/resume",
+                {
+                    "threadId": thread_id,
+                    "cwd": str(workspace),
+                    "approvalPolicy": "never",
+                    "sandbox": "read-only",
+                    "runtimeWorkspaceRoots": [str(workspace)],
+                },
+            )
+        finally:
+            stop_process(process)
 
     persisted = agent_texts(read)
     assertions = {

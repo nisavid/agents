@@ -27,12 +27,15 @@ class Handler(socketserver.StreamRequestHandler):
             line = "<read failed>"
             headers = {}
 
+        request_parts = line.split(" ", 2)
+        method = request_parts[0] if len(request_parts) == 3 else None
+
         print(
             json.dumps(
                 {
                     "at": datetime.now(timezone.utc).isoformat(),
                     "client": self.client_address[0],
-                    "request": line,
+                    "method": method,
                     "host": headers.get("host"),
                     "user_agent": headers.get("user-agent"),
                 },

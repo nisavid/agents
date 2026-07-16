@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import stat
 import sys
 import tempfile
 from pathlib import Path
@@ -14,6 +15,28 @@ from pathlib import Path
 
 def digest(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
+
+
+def database_binding(database: Path) -> dict[str, object]:
+    resolved = database.resolve(strict=True)
+    metadata = resolved.stat()
+    if not stat.S_ISREG(metadata.st_mode):
+        raise ValueError("authoritative database must be a regular file")
+    if metadata.st_nlink != 1:
+        raise ValueError("authoritative database must have exactly one link")
+    birthtime_nanoseconds = getattr(metadata, "st_birthtime_ns", None)
+    identity = {
+        "path": str(resolved),
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "birthtimeNanoseconds": birthtime_nanoseconds,
+    }
+    return {
+        "databasePathSha256": digest(str(resolved)),
+        "databaseFileIdentitySha256": digest(
+            json.dumps(identity, sort_keys=True, separators=(",", ":"))
+        ),
+    }
 
 
 def exact_threads(database: Path, fixture: str) -> list[str]:
@@ -51,15 +74,18 @@ def write_private(path: Path, value: dict[str, object]) -> None:
 
 def capture(database: Path, fixture: str, output: Path) -> None:
     fixture = str(Path(fixture).resolve(strict=True))
+    binding = database_binding(database)
     rows = exact_threads(database, fixture)
     if rows:
         raise ValueError("nonce fixture already has an authoritative thread record")
+    if database_binding(database) != binding:
+        raise ValueError("authoritative database file identity changed during capture")
     write_private(
         output,
         {
-            "schema": 1,
+            "schema": 2,
             "fixtureSha256": digest(fixture),
-            "databasePathSha256": digest(str(database.resolve(strict=True))),
+            **binding,
             "exactThreadCount": 0,
         },
     )
@@ -67,23 +93,26 @@ def capture(database: Path, fixture: str, output: Path) -> None:
 
 def validate(database: Path, fixture: str, baseline_path: Path, output: Path) -> None:
     fixture = str(Path(fixture).resolve(strict=True))
+    binding = database_binding(database)
     baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
     if baseline != {
-        "schema": 1,
+        "schema": 2,
         "fixtureSha256": digest(fixture),
-        "databasePathSha256": digest(str(database.resolve(strict=True))),
+        **binding,
         "exactThreadCount": 0,
     }:
-        raise ValueError("project baseline does not bind the exact database path and fixture")
+        raise ValueError("project baseline does not bind the exact database file and fixture")
     rows = exact_threads(database, fixture)
     if len(rows) != 1:
         raise ValueError(f"expected one authoritative fixture thread, found {len(rows)}")
+    if database_binding(database) != binding:
+        raise ValueError("authoritative database file identity changed during validation")
     write_private(
         output,
         {
-            "schema": 1,
+            "schema": 2,
             "fixtureSha256": digest(fixture),
-            "databasePathSha256": digest(str(database.resolve(strict=True))),
+            **binding,
             "exactThreadCountBefore": 0,
             "exactThreadCountAfter": 1,
             "threadId": rows[0],
@@ -101,6 +130,15 @@ def self_test() -> None:
         fixture_real = str(fixture.resolve())
         with sqlite3.connect(database) as connection:
             connection.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT NOT NULL)")
+        alias = root / "state-alias.sqlite"
+        os.link(database, alias)
+        try:
+            database_binding(database)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("linked authoritative database passed")
+        alias.unlink()
         baseline = root / "baseline.json"
         output = root / "result.json"
         capture(database, fixture_real, baseline)
@@ -117,6 +155,10 @@ def self_test() -> None:
         validate(database, fixture_real, baseline, output)
         result = json.loads(output.read_text())
         assert result["transitionValidated"] is True
+        assert result["databasePathSha256"] == digest(str(database.resolve()))
+        assert result["databaseFileIdentitySha256"] == database_binding(database)[
+            "databaseFileIdentitySha256"
+        ]
         with sqlite3.connect(database) as connection:
             connection.execute("INSERT INTO threads VALUES (?, ?)", ("duplicate", fixture_real))
         try:
@@ -125,6 +167,19 @@ def self_test() -> None:
             pass
         else:
             raise AssertionError("duplicate authoritative cwd passed")
+        replacement = root / "replacement.sqlite"
+        with sqlite3.connect(replacement) as connection:
+            connection.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, cwd TEXT NOT NULL)")
+            connection.execute("INSERT INTO threads VALUES (?, ?)", ("expected", fixture_real))
+        os.replace(replacement, database)
+        replacement_output = root / "replacement-result.json"
+        try:
+            validate(database, fixture_real, baseline, replacement_output)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("same-path database replacement passed")
+        assert not replacement_output.exists()
     print("native project state self-test passed")
 
 

@@ -197,6 +197,8 @@ run_cold_handoff_self_test() (
   /usr/bin/python3 "$WORKTREE_STATE" --self-test
   /usr/bin/python3 "$NATIVE_PROJECT_STATE" --self-test
   "$NODE" "$NATIVE_PICKER_PATCH" --self-test
+  test "$(/usr/bin/grep -Ec \
+    '^(runtime_versions|mlx_lm_commit)="\$\(PYTHONPATH=' "$0")" -eq 2
   self_test_root="$(mktemp -d /private/tmp/chatgpt-cold-handoff-self-test.XXXXXX)"
   trap '/bin/rm -rf "$self_test_root"' EXIT INT TERM
   LOG_DIR="$self_test_root"
@@ -466,9 +468,9 @@ test "$(/usr/bin/shasum -a 256 "$MODEL_DIR/config.json" | /usr/bin/awk '{print $
 test "$(/usr/bin/shasum -a 256 "$MODEL_DIR/model.safetensors.index.json" | /usr/bin/awk '{print $1}')" = "14c5afd88e0e856e05f005bbb5c300d65e268277949e7a25d3b3e8fcb056475b"
 test "$(/usr/bin/shasum -a 256 "$MODEL_DIR/optiq_metadata.json" | /usr/bin/awk '{print $1}')" = "fb54f8ba5ac1c14a8949b52d1d8a3d2b5c86a56afbd18996e8cf9772c9606310"
 test "$(/usr/bin/shasum -a 256 "$MODEL_DIR/tokenizer_config.json" | /usr/bin/awk '{print $1}')" = "b2bed5e033438f09f22b0ce9522115b4807d9bbcc3b82bf23372cb74d93ed081"
-runtime_versions="$($OPTIQ_PYTHON -c 'import importlib.metadata as m, platform; print("|".join((platform.python_version(), m.version("mlx-optiq"), m.version("mlx-lm"), m.version("mlx"))))')"
+runtime_versions="$(PYTHONPATH="$OPTIQ_SITE_PACKAGES" "$OPTIQ_PYTHON" -P -c 'import importlib.metadata as m, platform; print("|".join((platform.python_version(), m.version("mlx-optiq"), m.version("mlx-lm"), m.version("mlx"))))')"
 test "$runtime_versions" = "3.12.13|0.2.15|0.31.3|0.32.0"
-mlx_lm_commit="$($OPTIQ_PYTHON -c 'import importlib.metadata as m, json, pathlib; p=pathlib.Path(m.distribution("mlx-lm").locate_file("mlx_lm-0.31.3.dist-info/direct_url.json")); print(json.loads(p.read_text())["vcs_info"]["commit_id"])')"
+mlx_lm_commit="$(PYTHONPATH="$OPTIQ_SITE_PACKAGES" "$OPTIQ_PYTHON" -P -c 'import importlib.metadata as m, json, pathlib; p=pathlib.Path(m.distribution("mlx-lm").locate_file("mlx_lm-0.31.3.dist-info/direct_url.json")); print(json.loads(p.read_text())["vcs_info"]["commit_id"])')"
 test "$mlx_lm_commit" = "ab1806e8f5d6aa035973af194a1b9198ab4754dc"
 test "$(/usr/bin/shasum -a 256 "$SOURCE_APP/Contents/Resources/app.asar" | /usr/bin/awk '{print $1}')" = "$SOURCE_APP_ASAR_SHA256"
 test "$(/usr/bin/shasum -a 256 "$SOURCE_APP/Contents/Resources/codex" | /usr/bin/awk '{print $1}')" = "28699add67540b93390329a740649a9eb9bdbc5538d92c1679c8c6b6fa2c623c"

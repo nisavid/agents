@@ -97,13 +97,18 @@ python3 .scratch/chatgpt-airgap-unlock/research/13-production-evidence.py run \
   ./guest-lifecycle
 ```
 
-The runner never invokes a shell around the guarded command. It records complete
-process and TCP/UDP socket snapshots, checks the declared PIDs, process groups,
-descendants, and listener ports, and fails red if cleanup is incomplete, a
-collector fails, or secret-shaped text must be redacted. A nonzero guest lifecycle
-status is preserved. Once the evidence directory is established, a manifest or
-command preflight failure prevents command execution and the same four terminal
-artifacts record the red verdict. Run the deterministic synthetic cases with:
+The runner never invokes a shell around the guarded command. It records a
+pre-command process-identity baseline and complete final process and TCP/UDP
+socket snapshots. It checks the declared PIDs, process groups, descendants, and
+listener ports, and rejects every final process identity that was absent from the
+baseline. Cleanup therefore fails red even when a child reparents or changes
+process group before finalization. Each identity binds the PID, full process
+start timestamp, and a digest of the command; terminal evidence reports only the
+surviving PID. A collector failure, incomplete cleanup, or secret-shaped text
+that requires redaction also fails red. A nonzero guest lifecycle status is
+preserved. Once the evidence directory is established, a manifest or command
+preflight failure prevents command execution and the same four terminal artifacts
+record the red verdict. Run the deterministic synthetic cases with:
 
 ```sh
 python3 .scratch/chatgpt-airgap-unlock/research/13-test-production-evidence.py
@@ -337,8 +342,9 @@ inert guest-loopback service and never forward them.
 
 Stop owned components in reverse dependency order: app and host, observers,
 gateway, then provider. Signal only recorded root PIDs and process groups. Wait
-for each group, verify every reserved listener is closed, then rerun the full
-artifact and fuse checks.
+for each group, verify every reserved listener is closed, reject every process
+identity absent from the pre-command baseline, then rerun the full artifact and
+fuse checks.
 
 Preserve the disposable guest disk and VM configuration digest as evidence.
 Restore or delete the guest clone after review. Do not copy its profile into a

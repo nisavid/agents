@@ -304,13 +304,21 @@ def _load_owned_state(path: Path, expected_run_nonce: str | None) -> dict[str, A
 
 
 def _standard_process_snapshot() -> tuple[int, str]:
-    completed = subprocess.run(
-        ["/bin/ps", "-axo", "pid,ppid,pgid,state,etime,command"],
-        check=False,
-        capture_output=True,
+    collector = subprocess.Popen(
+        ["/bin/ps", "-axo", "pid,ppid,pgid,lstart,state,etime,command"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
     )
-    return completed.returncode, completed.stdout + completed.stderr
+    stdout, stderr = collector.communicate()
+    visible = "\n".join(
+        line
+        for line in stdout.splitlines()
+        if not line.lstrip().startswith(f"{collector.pid} ")
+    )
+    if stdout.endswith("\n"):
+        visible += "\n"
+    return collector.returncode, visible + stderr
 
 
 def _standard_socket_snapshot() -> tuple[int, str]:
@@ -337,12 +345,22 @@ def _redact(value: str) -> tuple[str, bool]:
     return redacted, changed
 
 
-def _snapshot_processes(snapshot: str) -> dict[int, tuple[int, int]]:
-    result: dict[int, tuple[int, int]] = {}
+def _snapshot_processes(snapshot: str) -> dict[int, tuple[int, int, str]]:
+    result: dict[int, tuple[int, int, str]] = {}
     for line in snapshot.splitlines():
-        fields = line.split(maxsplit=3)
+        fields = line.split(maxsplit=10)
         if len(fields) >= 3 and all(field.isdigit() for field in fields[:3]):
-            result[int(fields[0])] = (int(fields[1]), int(fields[2]))
+            pid = int(fields[0])
+            if len(fields) >= 11:
+                started = " ".join(fields[3:8])
+                command = fields[10]
+            else:
+                started = "legacy-snapshot"
+                command = " ".join(fields[3:])
+            identity = hashlib.sha256(
+                f"{pid}\0{started}\0{command}".encode("utf-8")
+            ).hexdigest()
+            result[pid] = (int(fields[1]), int(fields[2]), identity)
     return result
 
 
@@ -354,19 +372,31 @@ def _surviving_owned_processes(
     owned_process_groups = set(state["owned_process_groups"])
     surviving_owned_pids = sorted(owned_pids & processes.keys())
     surviving_group_pids = sorted(
-        pid for pid, (_ppid, pgid) in processes.items() if pgid in owned_process_groups
+        pid
+        for pid, (_ppid, pgid, _identity) in processes.items()
+        if pgid in owned_process_groups
     )
     descendants: set[int] = set()
     while True:
         discovered = {
             pid
-            for pid, (ppid, _pgid) in processes.items()
+            for pid, (ppid, _pgid, _identity) in processes.items()
             if ppid in owned_pids or ppid in descendants
         }
         if discovered <= descendants:
             break
         descendants.update(discovered)
     return surviving_owned_pids, surviving_group_pids, sorted(descendants)
+
+
+def _surviving_run_created_pids(baseline: str, final: str) -> list[int]:
+    baseline_processes = _snapshot_processes(baseline)
+    final_processes = _snapshot_processes(final)
+    return sorted(
+        pid
+        for pid, (_ppid, _pgid, identity) in final_processes.items()
+        if pid not in baseline_processes or baseline_processes[pid][2] != identity
+    )
 
 
 def _listening_ports(snapshot: str) -> set[int]:
@@ -393,6 +423,8 @@ def _finalize(
     expected_run_nonce: str | None,
     command_started: bool,
     command_exit_code: int,
+    baseline_process_code: int,
+    baseline_processes: str,
     errors: list[str],
     collect_processes: Callable[[], tuple[int, str]],
     collect_sockets: Callable[[], tuple[int, str]],
@@ -419,6 +451,7 @@ def _finalize(
     sockets, socket_redacted = _redact(raw_sockets)
     sensitive_data_redacted = process_redacted or socket_redacted
     process_snapshot_captured = process_code == 0
+    process_baseline_captured = command_started and baseline_process_code == 0
     socket_snapshot_captured = socket_code in {0, 1}
     if not process_snapshot_captured:
         errors.append("process-snapshot-failed")
@@ -430,20 +463,32 @@ def _finalize(
     observed_ports = _listening_ports(sockets) if socket_snapshot_captured else set()
     if process_snapshot_captured:
         surviving_pids, surviving_group_pids, surviving_descendant_pids = (
-            _surviving_owned_processes(processes, state)
+            _surviving_owned_processes(raw_processes, state)
         )
     else:
         surviving_pids, surviving_group_pids, surviving_descendant_pids = [], [], []
+    if process_baseline_captured and process_snapshot_captured:
+        surviving_run_created_pids = _surviving_run_created_pids(
+            baseline_processes, raw_processes
+        )
+    else:
+        surviving_run_created_pids = []
     surviving_ports = sorted(set(state["reserved_tcp_ports"]) & observed_ports)
     owned_process_groups_exited = process_snapshot_captured and not surviving_group_pids
     owned_descendants_exited = (
         process_snapshot_captured and not surviving_descendant_pids
+    )
+    run_created_processes_exited = (
+        process_baseline_captured
+        and process_snapshot_captured
+        and not surviving_run_created_pids
     )
     owned_processes_exited = (
         process_snapshot_captured
         and not surviving_pids
         and owned_process_groups_exited
         and owned_descendants_exited
+        and run_created_processes_exited
     )
     owned_listeners_closed = socket_snapshot_captured and not surviving_ports
     cleanup_steps_complete = state_valid and all(
@@ -463,10 +508,13 @@ def _finalize(
         "surviving_owned_pids": surviving_pids,
         "surviving_owned_process_group_pids": surviving_group_pids,
         "surviving_owned_descendant_pids": surviving_descendant_pids,
+        "surviving_run_created_pids": surviving_run_created_pids,
         "surviving_reserved_tcp_ports": surviving_ports,
+        "process_baseline_captured": process_baseline_captured,
         "owned_processes_exited": owned_processes_exited,
         "owned_process_groups_exited": owned_process_groups_exited,
         "owned_descendants_exited": owned_descendants_exited,
+        "run_created_processes_exited": run_created_processes_exited,
         "owned_listeners_closed": owned_listeners_closed,
     }
     passed = all(
@@ -477,11 +525,13 @@ def _finalize(
             command_exit_code == 0,
             state_valid,
             cleanup_steps_complete,
+            process_baseline_captured,
             process_snapshot_captured,
             socket_snapshot_captured,
             owned_processes_exited,
             owned_process_groups_exited,
             owned_descendants_exited,
+            run_created_processes_exited,
             owned_listeners_closed,
             not sensitive_data_redacted,
             not errors,
@@ -499,11 +549,13 @@ def _finalize(
         "command_exit_code": command_exit_code,
         "cleanup_state_valid": state_valid,
         "cleanup_steps_complete": cleanup_steps_complete,
+        "process_baseline_captured": process_baseline_captured,
         "process_snapshot_captured": process_snapshot_captured,
         "socket_snapshot_captured": socket_snapshot_captured,
         "owned_processes_exited": owned_processes_exited,
         "owned_process_groups_exited": owned_process_groups_exited,
         "owned_descendants_exited": owned_descendants_exited,
+        "run_created_processes_exited": run_created_processes_exited,
         "owned_listeners_closed": owned_listeners_closed,
         "sensitive_data_redacted": sensitive_data_redacted,
         "errors": sorted(set(errors)),
@@ -553,6 +605,8 @@ def run_guarded(
     expected_run_nonce: str | None = None
     command_started = False
     command_exit_code = PREFLIGHT_FAILURE
+    baseline_process_code = 127
+    baseline_processes = ""
     errors: list[str] = []
     try:
         manifest = _load_json(manifest_path)
@@ -589,6 +643,11 @@ def run_guarded(
                 environment = os.environ.copy()
                 environment[RUN_NONCE_ENV] = expected_run_nonce
                 environment[STATE_PATH_ENV] = str(state_path.resolve())
+                baseline_process_code, baseline_processes = _safe_collect(
+                    collect_processes
+                )
+                if baseline_process_code != 0:
+                    errors.append("process-baseline-failed")
                 command_started = True
                 try:
                     command_exit_code = execute(list(command), environment)
@@ -614,6 +673,8 @@ def run_guarded(
         expected_run_nonce=expected_run_nonce,
         command_started=command_started,
         command_exit_code=command_exit_code,
+        baseline_process_code=baseline_process_code,
+        baseline_processes=baseline_processes,
         errors=errors,
         collect_processes=collect_processes,
         collect_sockets=collect_sockets,

@@ -368,6 +368,52 @@ class FinalizerTests(unittest.TestCase):
             self.assertEqual([5001], cleanup["surviving_owned_process_group_pids"])
             self.assertFalse(cleanup["owned_process_groups_exited"])
 
+    def test_reparented_child_in_unrecorded_group_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            stage, manifest, state = self.make_run(temporary)
+            evidence = Path(temporary) / "evidence"
+            process_snapshots = iter(
+                (
+                    (0, "PID PPID PGID STARTED STATE ELAPSED COMMAND\n"),
+                    (
+                        0,
+                        "5001 1 5001 Thu Jul 16 13:57:00 2026 S 00:01 "
+                        "detached-child\n",
+                    ),
+                )
+            )
+
+            def execute(_command: list[str], environment: dict[str, str]) -> int:
+                completed_state(
+                    state,
+                    environment,
+                    owned_pids=[4242],
+                    owned_process_groups=[4242],
+                )
+                return 0
+
+            result = production_evidence.run_guarded(
+                stage,
+                manifest,
+                evidence,
+                state,
+                ["fixture-command"],
+                execute=execute,
+                collect_processes=lambda: next(process_snapshots),
+                collect_sockets=lambda: (
+                    0,
+                    "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\n",
+                ),
+            )
+
+            self.assertEqual(production_evidence.EVIDENCE_FAILURE, result)
+            cleanup = json.loads(
+                (evidence / "cleanup-final.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual([5001], cleanup["surviving_run_created_pids"])
+            self.assertFalse(cleanup["run_created_processes_exited"])
+            self.assertFalse(cleanup["owned_processes_exited"])
+
     def test_collector_failure_and_secret_redaction_are_terminal_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             stage, manifest, state = self.make_run(temporary)
@@ -396,8 +442,10 @@ class FinalizerTests(unittest.TestCase):
                 (evidence / "verdict.json").read_text(encoding="utf-8")
             )
             self.assertTrue(verdict["sensitive_data_redacted"])
+            self.assertFalse(verdict["process_baseline_captured"])
             self.assertFalse(verdict["process_snapshot_captured"])
             self.assertFalse(verdict["socket_snapshot_captured"])
+            self.assertIn("process-baseline-failed", verdict["errors"])
 
     def test_raised_collector_still_writes_all_terminal_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

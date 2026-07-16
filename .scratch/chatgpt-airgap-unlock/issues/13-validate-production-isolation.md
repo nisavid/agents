@@ -36,4 +36,4 @@ fail-closed acceptance procedure are recorded in
 - Verify strict deep signature, nested code, ASAR, bundled Codex, architecture, entitlements, and Electron fuses before and after the run.
 - Make hosted egress unavailable outside the app process while retaining only the profile-required loopback provider and gateway path.
 - Prove a renderer-originated local turn completes and every observed non-loopback connection fails without receiving a disposable or provider credential.
-- Record the isolation boundary, process and socket inventory, workflow result, integrity result, and complete reverse-order cleanup in red-capable evidence.
+- Record the isolation boundary, pre-command process-identity baseline, final process and socket inventory, workflow result, integrity result, and complete reverse-order cleanup in red-capable evidence; fail if any run-created process survives outside declared ancestry or process groups.

@@ -53,9 +53,13 @@ def completed_state(
                 "schema": 1,
                 "run_nonce": environment["PRODUCTION_EVIDENCE_RUN_NONCE"],
                 "transition": "completed",
-                "owned_pids": owned_pids or [],
-                "owned_process_groups": owned_process_groups or [],
-                "reserved_tcp_ports": reserved_tcp_ports or [],
+                "owned_pids": [4242] if owned_pids is None else owned_pids,
+                "owned_process_groups": [4242]
+                if owned_process_groups is None
+                else owned_process_groups,
+                "reserved_tcp_ports": [18999]
+                if reserved_tcp_ports is None
+                else reserved_tcp_ports,
                 "cleanup_steps": [{"name": "fixture-cleanup", "completed": True}],
             }
         ),
@@ -578,6 +582,85 @@ class FinalizerTests(unittest.TestCase):
             )
             self.assertIn("process-snapshot-failed", verdict["errors"])
             self.assertIn("socket-snapshot-failed", verdict["errors"])
+
+    def test_status_one_socket_diagnostics_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            stage, manifest, state = self.make_run(temporary)
+            evidence = Path(temporary) / "evidence"
+
+            def execute(_command: list[str], environment: dict[str, str]) -> int:
+                completed_state(state, environment)
+                return 0
+
+            result = production_evidence.run_guarded(
+                stage,
+                manifest,
+                evidence,
+                state,
+                ["fixture-command"],
+                execute=execute,
+                collect_processes=lambda: (0, "PID PPID PGID STATE ELAPSED COMMAND\n"),
+                collect_sockets=lambda: (1, "COMMAND PID USER FD TYPE DEVICE NODE NAME\n", "lsof: permission denied\n"),
+            )
+
+            self.assertEqual(production_evidence.EVIDENCE_FAILURE, result)
+            verdict = json.loads((evidence / "verdict.json").read_text(encoding="utf-8"))
+            self.assertFalse(verdict["socket_snapshot_captured"])
+            self.assertIn("socket-snapshot-failed", verdict["errors"])
+
+    def test_status_one_clean_empty_socket_snapshot_passes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            stage, manifest, state = self.make_run(temporary)
+            evidence = Path(temporary) / "evidence"
+
+            def execute(_command: list[str], environment: dict[str, str]) -> int:
+                completed_state(state, environment)
+                return 0
+
+            result = production_evidence.run_guarded(
+                stage,
+                manifest,
+                evidence,
+                state,
+                ["fixture-command"],
+                execute=execute,
+                collect_processes=lambda: (0, "PID PPID PGID STATE ELAPSED COMMAND\n"),
+                collect_sockets=lambda: (1, "COMMAND PID USER FD TYPE DEVICE NODE NAME\n", ""),
+            )
+
+            self.assertEqual(0, result)
+            verdict = json.loads((evidence / "verdict.json").read_text(encoding="utf-8"))
+            self.assertTrue(verdict["socket_snapshot_captured"])
+
+    def test_empty_owned_inventories_fail_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            stage, manifest, state = self.make_run(temporary)
+            evidence = Path(temporary) / "evidence"
+
+            def execute(_command: list[str], environment: dict[str, str]) -> int:
+                completed_state(
+                    state,
+                    environment,
+                    owned_pids=[],
+                    owned_process_groups=[],
+                    reserved_tcp_ports=[],
+                )
+                return 0
+
+            result = production_evidence.run_guarded(
+                stage,
+                manifest,
+                evidence,
+                state,
+                ["fixture-command"],
+                execute=execute,
+                collect_processes=lambda: (0, "PID PPID PGID STATE ELAPSED COMMAND\n"),
+                collect_sockets=lambda: (0, "COMMAND PID USER FD TYPE DEVICE NODE NAME\n"),
+            )
+
+            self.assertEqual(production_evidence.EVIDENCE_FAILURE, result)
+            verdict = json.loads((evidence / "verdict.json").read_text(encoding="utf-8"))
+            self.assertIn("owned-state-invalid", verdict["errors"])
 
     def test_empty_command_is_preflight_failure_with_terminal_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

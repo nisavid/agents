@@ -15,6 +15,8 @@ from typing import Any
 
 
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+FIRST_PROMPT = "Reply exactly COLD_PHASE_ONE_OK and nothing else. Do not use tools."
+SECOND_PROMPT = "Reply exactly COLD_PHASE_TWO_OK and nothing else. Do not use tools."
 
 
 class ContractError(RuntimeError):
@@ -151,6 +153,13 @@ def read_rollouts(codex_home: pathlib.Path) -> list[tuple[pathlib.Path, list[dic
     return values
 
 
+def read_rollout_records(path: pathlib.Path) -> list[dict[str, Any]]:
+    try:
+        return [json.loads(line) for line in path.read_text().splitlines() if line]
+    except json.JSONDecodeError as error:
+        raise ContractError(f"invalid rollout JSON at {path}") from error
+
+
 def matching_rollout(codex_home: pathlib.Path, thread_id: str, cwd: pathlib.Path) -> pathlib.Path:
     matches = []
     for path, records in read_rollouts(codex_home):
@@ -160,6 +169,113 @@ def matching_rollout(codex_home: pathlib.Path, thread_id: str, cwd: pathlib.Path
     if len(matches) != 1:
         raise ContractError(f"expected one rollout session_meta for worktree thread, found {len(matches)}")
     return matches[0]
+
+
+def exact_input_text(record: dict[str, Any]) -> str | None:
+    payload = record.get("payload", {})
+    if (
+        record.get("type") != "response_item"
+        or payload.get("type") != "message"
+        or payload.get("role") != "user"
+    ):
+        return None
+    content = payload.get("content", [])
+    if (
+        len(content) != 1
+        or content[0].get("type") != "input_text"
+        or not isinstance(content[0].get("text"), str)
+    ):
+        return None
+    return content[0]["text"].strip()
+
+
+def completed_persisted_turn(
+    records: list[dict[str, Any]], prompt: str, phase: str
+) -> tuple[str, str]:
+    matches: list[tuple[str, str]] = []
+    active_context: dict[str, Any] | None = None
+    for record in records:
+        if record.get("type") == "turn_context":
+            active_context = record.get("payload", {})
+            continue
+        input_text = exact_input_text(record)
+        if input_text is None:
+            continue
+        context = active_context
+        active_context = None
+        if input_text != prompt:
+            continue
+        payload = record["payload"]
+        context_turn_id = context.get("turn_id") if context else None
+        metadata = payload.get("internal_chat_message_metadata_passthrough", {})
+        metadata_turn_id = metadata.get("turn_id") if isinstance(metadata, dict) else None
+        turn_id = context_turn_id or metadata_turn_id
+        if not isinstance(turn_id, str) or not turn_id:
+            raise ContractError(f"{phase} prompt has no valid turn identity")
+        if context_turn_id and metadata_turn_id and context_turn_id != metadata_turn_id:
+            raise ContractError(f"{phase} prompt turn identities disagree")
+        completions = [
+            record.get("payload", {})
+            for record in records
+            if record.get("type") == "event_msg"
+            and record.get("payload", {}).get("type") == "task_complete"
+            and record.get("payload", {}).get("turn_id") == turn_id
+        ]
+        if len(completions) != 1:
+            raise ContractError(
+                f"{phase} prompt expected one task_complete, found {len(completions)}"
+            )
+        final = completions[0].get("last_agent_message", "")
+        if not isinstance(final, str) or not final.strip():
+            raise ContractError(f"{phase} completed output is empty")
+        matches.append((turn_id, final.strip()))
+    if len(matches) != 1:
+        raise ContractError(f"{phase} prompt expected once, found {len(matches)}")
+    return matches[0]
+
+
+def renderer_output(records: list[dict[str, Any]], phase: str) -> str:
+    matches = [
+        record
+        for record in records
+        if record.get("kind") == "assistant-output-oracle"
+        and record.get("phase") == phase
+    ]
+    if len(matches) != 1:
+        raise ContractError(f"expected one {phase}-phase renderer output oracle, found {len(matches)}")
+    oracle = matches[0]
+    if oracle.get("matched") is not True or oracle.get("exactMatch") is not True:
+        raise ContractError(f"{phase}-phase renderer output oracle failed")
+    output_sha256 = oracle.get("textSha256")
+    if not isinstance(output_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", output_sha256):
+        raise ContractError(f"{phase}-phase renderer output hash is invalid")
+    return output_sha256
+
+
+def rollout_sha256(path: pathlib.Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def bind_phase(
+    rollout_path: pathlib.Path,
+    cdp: list[dict[str, Any]],
+    prompt: str,
+    phase: str,
+    renderer_phase: str,
+) -> dict[str, str]:
+    turn_id, final = completed_persisted_turn(
+        read_rollout_records(rollout_path), prompt, phase
+    )
+    persisted_output_sha256 = sha256(final)
+    renderer_output_sha256 = renderer_output(cdp, renderer_phase)
+    if renderer_output_sha256 != persisted_output_sha256:
+        raise ContractError(f"{phase}-phase renderer output does not match persisted completion")
+    return {
+        "turnIdSha256": sha256(turn_id),
+        "promptSha256": sha256(prompt),
+        "persistedOutputSha256": persisted_output_sha256,
+        "rendererOutputSha256": renderer_output_sha256,
+    }
 
 
 def linked_worktree(repo: pathlib.Path, worktree_root: pathlib.Path, expected_head: str) -> pathlib.Path:
@@ -258,13 +374,21 @@ def validate_first(
         worktreeModeSelected=True,
         rendererPromptCompleted=True,
         tasksSurfaceObserved=True,
+        nativeProjectPickerExercised=False,
     )
+    first_binding = bind_phase(rollout, cdp, FIRST_PROMPT, "worktree-first", "first")
     state.update({
         "threadId": thread_id,
         "worktreePath": str(worktree),
         "worktreePathSha256": sha256(str(worktree)),
         "codexThreadPathSha256": sha256(str(config_path)),
         "rolloutPathSha256": sha256(str(rollout)),
+        "rolloutContentSha256": rollout_sha256(rollout),
+        "firstPromptSha256": first_binding["promptSha256"],
+        "firstTurnIdSha256": first_binding["turnIdSha256"],
+        "firstPersistedOutputSha256": first_binding["persistedOutputSha256"],
+        "firstRendererOutputSha256": first_binding["rendererOutputSha256"],
+        "firstOutputBinding": "completed-turn",
         "firstValidated": True,
     })
     write_state(state_path, state)
@@ -298,6 +422,8 @@ def validate_cold(
     rollout = matching_rollout(codex_home, thread_id, worktree)
     if sha256(str(rollout)) != state.get("rolloutPathSha256"):
         raise ContractError("worktree rollout identity changed across cold restart")
+    if rollout_sha256(rollout) != state.get("rolloutContentSha256"):
+        raise ContractError("worktree rollout contents changed across cold restart")
     cdp = read_cdp(resolved(cdp_path))
     exact_marker(
         cdp, "worktree-mode-selected", phase="worktree-first", selected=True, uniqueControl=True
@@ -310,7 +436,20 @@ def validate_cold(
         worktreeModeSelected=True,
         rendererPromptCompleted=True,
         tasksSurfaceObserved=True,
+        nativeProjectPickerExercised=False,
     )
+    first_binding = bind_phase(rollout, cdp, FIRST_PROMPT, "worktree-first", "first")
+    if state.get("firstOutputBinding") != "completed-turn":
+        raise ContractError("first worktree output is not bound to a completed turn")
+    first_binding_keys = {
+        "firstPromptSha256": "promptSha256",
+        "firstTurnIdSha256": "turnIdSha256",
+        "firstPersistedOutputSha256": "persistedOutputSha256",
+        "firstRendererOutputSha256": "rendererOutputSha256",
+    }
+    for key, binding_key in first_binding_keys.items():
+        if state.get(key) != first_binding[binding_key]:
+            raise ContractError(f"first worktree binding changed across cold restart: {key}")
     exact_marker(
         cdp,
         "worktree-thread-reopened",
@@ -327,7 +466,15 @@ def validate_cold(
         persistedOutputVisible=True,
         rendererContinuationCompleted=True,
     )
-    state["coldValidated"] = True
+    second_binding = bind_phase(rollout, cdp, SECOND_PROMPT, "worktree-second", "second")
+    state.update({
+        "secondPromptSha256": second_binding["promptSha256"],
+        "secondTurnIdSha256": second_binding["turnIdSha256"],
+        "secondPersistedOutputSha256": second_binding["persistedOutputSha256"],
+        "secondRendererOutputSha256": second_binding["rendererOutputSha256"],
+        "secondOutputBinding": "completed-turn",
+        "coldValidated": True,
+    })
     write_state(state_path, state)
 
 
@@ -376,10 +523,49 @@ def run_self_tests() -> None:
             connection.execute("INSERT INTO threads (id, cwd) VALUES (?, ?)", (thread_id, str(linked.resolve())))
         rollout = codex_home / "sessions/2026/07/15/rollout-fixture.jsonl"
         rollout.parent.mkdir(parents=True)
-        rollout.write_text(json.dumps({
-            "type": "session_meta",
-            "payload": {"id": thread_id, "cwd": str(linked.resolve())},
-        }) + "\n")
+        first_output = "COLD_PHASE_ONE_OK"
+        second_output = "COLD_PHASE_TWO_OK"
+        rollout_records = [
+            {
+                "type": "session_meta",
+                "payload": {"id": thread_id, "cwd": str(linked.resolve())},
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": FIRST_PROMPT + "\n"}],
+                    "internal_chat_message_metadata_passthrough": {"turn_id": "first-turn"},
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_complete",
+                    "turn_id": "first-turn",
+                    "last_agent_message": first_output,
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": SECOND_PROMPT + "\n"}],
+                    "internal_chat_message_metadata_passthrough": {"turn_id": "second-turn"},
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_complete",
+                    "turn_id": "second-turn",
+                    "last_agent_message": second_output,
+                },
+            },
+        ]
+        rollout.write_text("\n".join(json.dumps(record) for record in rollout_records) + "\n")
         first_records = [
             {
                 "kind": "worktree-mode-selected",
@@ -394,8 +580,34 @@ def run_self_tests() -> None:
                 "worktreeModeSelected": True,
                 "rendererPromptCompleted": True,
                 "tasksSurfaceObserved": True,
+                "nativeProjectPickerExercised": False,
+            },
+            {
+                "kind": "assistant-output-oracle",
+                "phase": "first",
+                "matched": True,
+                "exactMatch": True,
+                "textSha256": sha256(first_output),
             },
         ]
+        cdp_path.write_text("\n".join(json.dumps(record) for record in first_records) + "\n")
+        rollout.write_text(json.dumps(rollout_records[0]) + "\n")
+        expect_error(
+            lambda: validate_first(repo, worktree_root, database, codex_home, state_path, cdp_path),
+            "worktree-first prompt expected once",
+        )
+        rollout.write_text("\n".join(json.dumps(record) for record in rollout_records) + "\n")
+        mismatched_first_records = [
+            *first_records[:-1],
+            {**first_records[-1], "textSha256": sha256("wrong renderer output")},
+        ]
+        cdp_path.write_text(
+            "\n".join(json.dumps(record) for record in mismatched_first_records) + "\n"
+        )
+        expect_error(
+            lambda: validate_first(repo, worktree_root, database, codex_home, state_path, cdp_path),
+            "renderer output does not match persisted completion",
+        )
         cdp_path.write_text("\n".join(json.dumps(record) for record in first_records) + "\n")
         validate_first(repo, worktree_root, database, codex_home, state_path, cdp_path)
         first_state = json.loads(state_path.read_text())
@@ -417,6 +629,13 @@ def run_self_tests() -> None:
                 "rendererThreadReopened": True,
                 "persistedOutputVisible": True,
                 "rendererContinuationCompleted": True,
+            },
+            {
+                "kind": "assistant-output-oracle",
+                "phase": "second",
+                "matched": True,
+                "exactMatch": True,
+                "textSha256": sha256(second_output),
             },
         ]
         cdp_path.write_text("\n".join(json.dumps(record) for record in cold_records) + "\n")
@@ -440,7 +659,7 @@ def run_self_tests() -> None:
             "expected exactly one worktree-mode-selected marker",
         )
         contradictory_summary = {
-            **cold_records[-1],
+            **cold_records[-2],
             "rendererContinuationCompleted": False,
         }
         cdp_path.write_text(

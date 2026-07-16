@@ -16,6 +16,7 @@ const secondPrompt = "Reply exactly COLD_PHASE_TWO_OK and nothing else. Do not u
 const secondSentinel = "COLD_PHASE_TWO_OK";
 const defaultModePrompt = "Confirm Default mode in one short sentence. Do not use tools.";
 const planModePrompt = "Confirm Plan mode in one short sentence. Do not use tools.";
+const cdpCommandTimeoutMs = Math.max(1000, Math.min(timeoutMs, 15000));
 
 function emit(kind, data) {
   process.stdout.write(`${JSON.stringify({ at: new Date().toISOString(), kind, phase, ...data })}\n`);
@@ -369,6 +370,21 @@ emit("target", { id: target.id, title: target.title, url: target.url });
 const ws = new WebSocket(target.webSocketDebuggerUrl);
 let nextId = 1;
 const pending = new Map();
+let socketFailed = false;
+
+function rejectPending(error) {
+  for (const [id, entry] of pending) {
+    clearTimeout(entry.timer);
+    pending.delete(id);
+    entry.reject(error);
+  }
+}
+
+function failSocket(error) {
+  if (socketFailed) return;
+  socketFailed = true;
+  rejectPending(error);
+}
 
 ws.addEventListener("message", (event) => {
   const message = JSON.parse(event.data);
@@ -390,12 +406,15 @@ ws.addEventListener("message", (event) => {
     });
   }
   if (message.id && pending.has(message.id)) {
-    const { resolve, reject } = pending.get(message.id);
+    const { resolve, reject, timer } = pending.get(message.id);
+    clearTimeout(timer);
     pending.delete(message.id);
     if (message.error) reject(new Error(JSON.stringify(message.error)));
     else resolve(message.result);
   }
 });
+ws.addEventListener("error", () => failSocket(new Error("CDP WebSocket error")));
+ws.addEventListener("close", () => failSocket(new Error("CDP WebSocket closed")));
 
 await new Promise((resolve, reject) => {
   ws.addEventListener("open", resolve, { once: true });
@@ -404,9 +423,24 @@ await new Promise((resolve, reject) => {
 
 function send(method, params = {}) {
   return new Promise((resolve, reject) => {
+    if (socketFailed) {
+      reject(new Error("CDP WebSocket is unavailable"));
+      return;
+    }
     const id = nextId++;
-    pending.set(id, { resolve, reject });
-    ws.send(JSON.stringify({ id, method, params }));
+    const timer = setTimeout(() => {
+      if (!pending.has(id)) return;
+      pending.delete(id);
+      reject(new Error(`CDP command timed out: ${method}`));
+    }, cdpCommandTimeoutMs);
+    pending.set(id, { resolve, reject, timer });
+    try {
+      ws.send(JSON.stringify({ id, method, params }));
+    } catch (error) {
+      clearTimeout(timer);
+      pending.delete(id);
+      reject(error);
+    }
   });
 }
 
@@ -1219,7 +1253,7 @@ try {
       rendererPromptCompleted,
       tasksSurfaceObserved: tasks.inspected,
       ...surfaces,
-      nativeProjectPickerExercised: true,
+      nativeProjectPickerExercised: false,
       nativePermissionDecisionExercised: false,
       nativeWorktreeControlExercised: worktreeModeSelected,
     };

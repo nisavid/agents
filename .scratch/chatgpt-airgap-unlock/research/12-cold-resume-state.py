@@ -42,8 +42,13 @@ def matching_user_messages(records: list[dict], prompt: str) -> list[dict]:
         payload = record.get("payload", {})
         if record.get("type") != "response_item" or payload.get("type") != "message" or payload.get("role") != "user":
             continue
-        texts = [item.get("text", "") for item in payload.get("content", []) if item.get("type") == "input_text"]
-        if any(text.strip() == prompt for text in texts):
+        content = payload.get("content", [])
+        if (
+            len(content) == 1
+            and content[0].get("type") == "input_text"
+            and isinstance(content[0].get("text"), str)
+            and content[0]["text"].strip() == prompt
+        ):
             matches.append(payload)
     return matches
 
@@ -352,6 +357,15 @@ def run_self_tests() -> None:
         duplicate_prompt = [*first_records, first_records[1]]
         expect_contract_error(
             lambda: completed_turn(duplicate_prompt, FIRST_PROMPT, FIRST_SENTINEL), "found 2"
+        )
+        composite_prompt = fixture_turn(
+            FIRST_PROMPT, "turn-composite", [], FIRST_SENTINEL
+        )
+        composite_prompt[0]["payload"]["content"].append(
+            {"type": "input_text", "text": "untrusted suffix"}
+        )
+        expect_contract_error(
+            lambda: completed_turn(composite_prompt, FIRST_PROMPT, FIRST_SENTINEL), "found 0"
         )
 
         no_completion = [

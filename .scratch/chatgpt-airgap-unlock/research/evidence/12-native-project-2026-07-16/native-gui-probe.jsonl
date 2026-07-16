@@ -1,0 +1,5 @@
+{"bundleSha256":"4f7d3fff9aa0a002c77daf2105fdc8905b3daccc06bf4f1e1fd8edef08ca2cc3","fixtureSha256":"0d80e8aa472b559e2da29aa0404dcfb3b4605dc46af714c9d316b474f18f94cc","kind":"inputs-validated","phase":"select-project","rendererProjectPickerRequestAuthorized":true,"runRootSha256":"4dc29d65f15cd6ccef44c68c113d0389729f645aa096a510d34805f52fd3b12f","schema":1}
+{"appKitRegistrationPollCount":1,"executableSha256":"db4aab5f8ddf80034341d149bc639a6d24966aa2f7c4de4417023997181a47ee","kind":"process-validated","pid":61472,"schema":1,"startSeconds":1784222261}
+{"fixtureSha256":"0d80e8aa472b559e2da29aa0404dcfb3b4605dc46af714c9d316b474f18f94cc","kind":"open-panel-absence-validated","pid":61472,"schema":1,"startSeconds":1784222261,"visitedCount":11,"windowCount":1}
+{"chooserTitle":"Open","kind":"open-panel-validated","navigation":"selected-children","pollCount":4,"schema":1,"windowCount":1}
+{"fixtureSha256":"0d80e8aa472b559e2da29aa0404dcfb3b4605dc46af714c9d316b474f18f94cc","kind":"project-selection-requested","navigation":"selected-children","pid":61472,"readinessPollCount":1,"schema":1,"selectedPollCount":1,"selectionActionCount":1}

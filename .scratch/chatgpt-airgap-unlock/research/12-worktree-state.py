@@ -198,7 +198,7 @@ def completed_persisted_turn(
 ) -> tuple[str, str]:
     matches: list[tuple[str, str]] = []
     active_context: dict[str, Any] | None = None
-    for record in records:
+    for index, record in enumerate(records):
         if record.get("type") == "turn_context":
             active_context = record.get("payload", {})
             continue
@@ -220,7 +220,7 @@ def completed_persisted_turn(
             raise ContractError(f"{phase} prompt turn identities disagree")
         completions = [
             record.get("payload", {})
-            for record in records
+            for record in records[index + 1 :]
             if record.get("type") == "event_msg"
             and record.get("payload", {}).get("type") == "task_complete"
             and record.get("payload", {}).get("turn_id") == turn_id
@@ -626,6 +626,15 @@ def run_self_tests() -> None:
             "worktree-first prompt expected once",
         )
         rollout.write_text("\n".join(json.dumps(record) for record in first_rollout_records) + "\n")
+        out_of_order = [
+            first_rollout_records[0],
+            first_rollout_records[2],
+            first_rollout_records[1],
+        ]
+        expect_error(
+            lambda: completed_persisted_turn(out_of_order, FIRST_PROMPT, "worktree-first"),
+            "found 0",
+        )
         mismatched_first_records = [
             *first_records[:-1],
             {**first_records[-1], "textSha256": sha256("wrong renderer output")},

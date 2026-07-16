@@ -26,6 +26,16 @@ function sleep(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
+async function expectRejected(action, expectedMessage) {
+  try {
+    await action();
+  } catch (error) {
+    if (error instanceof Error && error.message.includes(expectedMessage)) return;
+    throw error;
+  }
+  throw new Error(`expected rejection containing ${expectedMessage}`);
+}
+
 function normalizedTextSha256(value) {
   return createHash("sha256").update(value.replace(/\s+/g, " ").trim()).digest("hex");
 }
@@ -337,13 +347,78 @@ async function runSelfTests() {
     throw new Error("retained final picker control unexpectedly restored renderer path");
   }
 
+  await expectRejected(
+    () => targets({
+      fetchImpl: (_url, { signal }) => new Promise((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+      }),
+      deadlineMs: 5,
+    }),
+    "CDP target discovery timed out"
+  );
+  const stalledSocket = {
+    addEventListener() {},
+    removeEventListener() {},
+  };
+  await expectRejected(
+    () => waitForSocketOpen(stalledSocket, 5),
+    "CDP WebSocket open timed out"
+  );
+  const closingSocket = {
+    addEventListener(kind, listener) {
+      if (kind === "close") setTimeout(listener, 0);
+    },
+    removeEventListener() {},
+  };
+  await expectRejected(
+    () => waitForSocketOpen(closingSocket, 50),
+    "CDP WebSocket closed before open"
+  );
+
   process.stdout.write("sentinel oracle self-test passed\n");
 }
 
-async function targets() {
-  const response = await fetch(`${base}/json/list`);
-  if (!response.ok) throw new Error(`CDP target list returned ${response.status}`);
-  return response.json();
+async function targets({ fetchImpl = fetch, deadlineMs = cdpCommandTimeoutMs } = {}) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), deadlineMs);
+  try {
+    const response = await fetchImpl(`${base}/json/list`, { signal: controller.signal });
+    if (!response.ok) throw new Error(`CDP target list returned ${response.status}`);
+    return await response.json();
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new Error(`CDP target discovery timed out after ${deadlineMs}ms`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function waitForSocketOpen(socket, deadlineMs = cdpCommandTimeoutMs) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timer;
+    const finish = (action, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.removeEventListener("open", onOpen);
+      socket.removeEventListener("error", onError);
+      socket.removeEventListener("close", onClose);
+      action(value);
+    };
+    const onOpen = () => finish(resolve, socket);
+    const onError = () => finish(reject, new Error("CDP WebSocket error before open"));
+    const onClose = () => finish(reject, new Error("CDP WebSocket closed before open"));
+    timer = setTimeout(
+      () => finish(reject, new Error(`CDP WebSocket open timed out after ${deadlineMs}ms`)),
+      deadlineMs
+    );
+    socket.addEventListener("open", onOpen, { once: true });
+    socket.addEventListener("error", onError, { once: true });
+    socket.addEventListener("close", onClose, { once: true });
+  });
 }
 
 if (process.argv[2] === "--self-test") {
@@ -416,10 +491,7 @@ ws.addEventListener("message", (event) => {
 ws.addEventListener("error", () => failSocket(new Error("CDP WebSocket error")));
 ws.addEventListener("close", () => failSocket(new Error("CDP WebSocket closed")));
 
-await new Promise((resolve, reject) => {
-  ws.addEventListener("open", resolve, { once: true });
-  ws.addEventListener("error", reject, { once: true });
-});
+await waitForSocketOpen(ws);
 
 function send(method, params = {}) {
   return new Promise((resolve, reject) => {

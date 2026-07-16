@@ -36,6 +36,10 @@ Produce an implementation-ready, empirically validated plan for running the exac
 - [Validate the offline GUI workflow](issues/12-validate-offline-gui-workflow.md) — Complete worktree, permission, project-local skill, and reasoning-label acceptance against the pinned local route.
 - [Validate production isolation](issues/13-validate-production-isolation.md) — Preserve the vendor Chromium sandbox and signed code posture while a disconnected VM or true air gap makes hosted egress unavailable.
 
+## Deferred work
+
+- [Lock the implementation plan](issues/09-lock-implementation-plan.md) — Blocked until Ticket 08 closes; then convert the accepted evidence and remaining boundaries into the implementation-ready plan.
+
 ## Not yet specified
 
 - Real GLM 5.2 compatibility with bundled Codex's exact Responses streaming and tool-call dialect remains environment-dependent because that air-gapped endpoint is not locally available.

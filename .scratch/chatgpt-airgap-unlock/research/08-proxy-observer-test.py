@@ -51,6 +51,7 @@ def main() -> None:
         process.terminate()
         process.wait(timeout=5)
     encoded = json.dumps(record, sort_keys=True)
+    assert set(record) == {"at", "method", "host"}
     assert record["method"] == "GET"
     assert record["host"] == "example.invalid:443"
     assert "request" not in record

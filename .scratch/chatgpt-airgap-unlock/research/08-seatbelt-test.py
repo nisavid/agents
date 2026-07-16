@@ -156,6 +156,19 @@ def test_ports() -> None:
     assert_bind("08-gateway.sb", non_default_common, 28999, True)
     assert_connect("08-gateway.sb", non_default_common, 28997, True)
     assert_bind("08-gateway.sb", non_default_common, 18999, False)
+    assert_bind("08-app-direct.sb", non_default_common, 29408, True)
+    assert_connect("08-app-direct.sb", non_default_common, 29409, True)
+    assert_connect("08-app-direct.sb", non_default_common, 28998, True)
+    assert_bind("08-app-direct.sb", non_default_common, 49308, False)
+    assert_bind("08-app-gateway.sb", non_default_common, 29408, True)
+    assert_connect("08-app-gateway.sb", non_default_common, 29409, True)
+    assert_connect("08-app-gateway.sb", non_default_common, 28999, True)
+    assert_connect("08-app-gateway.sb", non_default_common, 18999, False)
+    assert_bind("08-upstream-observer.sb", non_default_common, 28997, True)
+    assert_connect("08-upstream-observer.sb", non_default_common, 28998, True)
+    assert_bind("08-upstream-observer.sb", non_default_common, 18997, False)
+    assert_connect("08-cdp-client.sb", non_default_common, 29408, True)
+    assert_connect("08-cdp-client.sb", non_default_common, 49308, False)
 
     provider_definitions = {
         "REAL_HOME": real_home,

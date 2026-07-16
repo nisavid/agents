@@ -1603,10 +1603,10 @@ func requireMutationIdentity(
     process: ProcessIdentity,
     paths: ValidatedPaths
 ) throws {
-    try requireValidatedFixtureIdentity(paths)
     try requireSameProcess(process)
     try validateCodeIdentity(pid: process.pid, paths: paths)
     try requireSameProcess(process)
+    try requireValidatedFixtureIdentity(paths)
 }
 
 func attributeSettablePublication(

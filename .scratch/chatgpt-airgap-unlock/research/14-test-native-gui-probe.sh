@@ -192,6 +192,15 @@ for contract in kAXBrowserRole ColumnView kAXListRole kAXGroupRole \
   validateCodeIdentity performAtMutationBoundary; do
   printf '%s\n' "$list_selection_body" | /usr/bin/grep -Fq "$contract"
 done
+mutation_identity_body="$(/usr/bin/sed -n \
+  '/^func requireMutationIdentity(/,/^}/p' \
+  "$HERE/14-native-gui-probe.swift")"
+printf '%s\n' "$mutation_identity_body" | /usr/bin/awk '
+  /try requireSameProcess\(process\)/ { pid += 1; if (pid == 1) first_pid = NR; else second_pid = NR }
+  /try validateCodeIdentity\(pid: process.pid, paths: paths\)/ { code_identity = NR }
+  /try requireValidatedFixtureIdentity\(paths\)/ { fixture_identity = NR }
+  END { exit !(pid == 2 && first_pid < code_identity && code_identity < second_pid && second_pid < fixture_identity) }
+'
 if printf '%s\n' "$list_selection_body" | /usr/bin/grep -Eq \
   'CGEvent|postToPid|kAXFocused(Window|UIElement)Attribute|NSWorkspace'; then
   echo 'Open panel selection contains keyboard, focus, or broad app targeting' >&2

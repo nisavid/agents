@@ -14,12 +14,14 @@ import Security
 enum ProbeError: Error, CustomStringConvertible {
     case usage(String)
     case validation(String)
+    case retryable(String)
     case unavailable(String)
     case permission(String)
 
     var description: String {
         switch self {
-        case .usage(let message), .validation(let message), .unavailable(let message),
+        case .usage(let message), .validation(let message), .retryable(let message),
+             .unavailable(let message),
              .permission(let message): return message
         }
     }
@@ -28,15 +30,13 @@ enum ProbeError: Error, CustomStringConvertible {
         switch self {
         case .usage: return 64
         case .validation: return 65
-        case .unavailable: return 69
+        case .retryable, .unavailable: return 69
         case .permission: return 77
         }
     }
 }
 
 enum Phase: String, CaseIterable {
-    case inspectOpenFolderMenu = "inspect-open-folder-menu"
-    case inspectProjectPicker = "inspect-project-picker"
     case selectProject = "select-project"
 }
 
@@ -48,9 +48,7 @@ struct Options {
     let fixtureRoot: String
     let phase: Phase
     let eventLog: String
-    let permitKeyFallback: Bool
-    let pressOpenFolderMenuItem: Bool
-    let focusOpenPanel: Bool
+    let acceptRendererProjectPickerRequest: Bool
     let validateInputsOnly: Bool
 }
 
@@ -59,6 +57,9 @@ struct ValidatedPaths {
     let bundle: String
     let executable: String
     let fixture: String
+    let fixtureIdentity: FileSystemIdentity
+    let fixtureParent: String
+    let fixtureParentIdentity: FileSystemIdentity
     let eventLog: String
 }
 
@@ -69,6 +70,11 @@ struct ProcessIdentity: Equatable {
     let executable: String
 }
 
+struct FileSystemIdentity: Equatable {
+    let device: UInt64
+    let inode: UInt64
+}
+
 enum AppKitRegistrationSample: Equatable {
     case unavailable
     case published(isTerminated: Bool, bundlePath: String?, executablePath: String?)
@@ -76,11 +82,6 @@ enum AppKitRegistrationSample: Equatable {
 
 struct ProcessRegistrationReadiness: Equatable {
     let pollCount: Int
-}
-
-struct ApplicationActivationReadiness: Equatable {
-    let pollCount: Int
-    let actionCount: Int
 }
 
 struct ProcessVerification: Equatable {
@@ -102,9 +103,6 @@ struct ElementDescription: Equatable {
     let title: String?
     let help: String?
     let enabled: Bool?
-    let menuCommandCharacter: AttributePublication<String>
-    let menuCommandVirtualKey: AttributePublication<Int>
-    let menuCommandModifiers: AttributePublication<Int>
     let actions: Set<String>
     let children: [ElementDescription]
 
@@ -117,18 +115,7 @@ struct ElementDescription: Equatable {
     }
 }
 
-struct OpenFolderMenuPlan: Equatable, Hashable {
-    let menuBarItemIndex: Int
-    let menuIndex: Int
-    let menuItemIndex: Int
-    let parentTitle: String
-    let itemTitle: String
-    let commandVirtualKey: Int?
-}
-
 struct SelectionPlan: Equatable {
-    enum Navigation: Equatable { case direct, commandShiftG }
-    let navigation: Navigation
     let chooserTitle: String
 }
 
@@ -208,8 +195,13 @@ enum PathPolicy {
               (canonicalEventLog as NSString).lastPathComponent == "native-gui-probe.jsonl" else {
             throw ProbeError.validation("event log must be logs/native-gui-probe.jsonl")
         }
+        let fixtureParent = try canonicalExisting(
+            (canonicalFixture as NSString).deletingLastPathComponent)
         return ValidatedPaths(runRoot: root, bundle: canonicalBundle,
                               executable: canonicalExecutable, fixture: canonicalFixture,
+                              fixtureIdentity: try fileSystemIdentity(canonicalFixture),
+                              fixtureParent: fixtureParent,
+                              fixtureParentIdentity: try fileSystemIdentity(fixtureParent),
                               eventLog: canonicalEventLog)
     }
 }
@@ -242,7 +234,7 @@ enum OpenPanelPolicy {
         return matches
     }
 
-    static func plan(windows: [ElementDescription], permitKeyFallback: Bool) throws -> SelectionPlan {
+    static func plan(windows: [ElementDescription]) throws -> SelectionPlan {
         let shapedIndices = panelShapedIndices(windows: windows)
         guard shapedIndices.count == 1, let candidateIndex = shapedIndices.first else {
             throw ProbeError.validation(
@@ -267,155 +259,17 @@ enum OpenPanelPolicy {
                 "malformed Open panel controls: cancel=\(min(cancels.count, 2)) " +
                 "chooser=\(min(choosers.count, 2)) browser=\(min(fileBrowsers.count, 2))")
         }
-        let directFields = all.filter {
-            $0.role == kAXTextFieldRole &&
-                ($0.searchableText.contains("path") || $0.searchableText.contains("location") ||
-                 $0.searchableText.contains("folder"))
+        let columnViews = all.filter {
+            $0.role == kAXBrowserRole && $0.identifier == "ColumnView"
         }
-        if directFields.count == 1 {
-            return SelectionPlan(navigation: .direct, chooserTitle: title)
-        }
-        guard directFields.isEmpty else {
-            throw ProbeError.validation("Open panel path field is ambiguous")
-        }
-        guard permitKeyFallback else {
-            throw ProbeError.validation("direct AX navigation unavailable and key fallback was not authorized")
-        }
-        return SelectionPlan(navigation: .commandShiftG, chooserTitle: title)
-    }
-}
-
-enum OpenFolderMenuPolicy {
-    enum PendingState: String, Equatable {
-        case applicationMenuBar = "application menu bar is unpublished"
-        case fileMenuItem = "File menu item is unpublished"
-        case fileAXMenu = "File AX menu is unpublished"
-        case openFolderMenuItem = "Open Folder menu item is unpublished"
-        case commandCharacter = "command character is unpublished"
-        case emptyCommandCharacter = "command character is empty"
-        case commandModifiers = "command modifiers are unpublished"
-    }
-
-    enum Readiness: Equatable {
-        case pending(PendingState)
-        case ready(OpenFolderMenuPlan)
-    }
-
-    static let parentTitle = "File"
-    static let itemTitle = "Open Folder…"
-    static let commandVirtualKey = 31
-    static let commandModifiers = 0 // Command is implicit when AXNoCommand is absent.
-
-    static func plan(menuBar: ElementDescription) throws -> OpenFolderMenuPlan {
-        guard let plan = try readinessPlan(menuBar: menuBar) else {
-            throw ProbeError.validation("direct File to Open Folder menu path is absent")
-        }
-        return plan
-    }
-
-    static func readinessPlan(menuBar: ElementDescription) throws -> OpenFolderMenuPlan? {
-        switch try readiness(menuBar: menuBar) {
-        case .pending: return nil
-        case .ready(let plan): return plan
-        }
-    }
-
-    static func readiness(menuBar: ElementDescription) throws -> Readiness {
-        guard menuBar.role == kAXMenuBarRole else {
-            throw ProbeError.validation("application AX menu bar has the wrong role")
-        }
-        let parentIndices = menuBar.children.indices.filter {
-            menuBar.children[$0].title == parentTitle
-        }
-        guard !parentIndices.isEmpty else { return .pending(.fileMenuItem) }
-        guard parentIndices.count == 1, let parentIndex = parentIndices.first else {
+        guard columnViews.count == 1 else {
             throw ProbeError.validation(
-                "expected exactly one direct File menu path; found \(min(parentIndices.count, 2))")
+                "expected exactly one Open panel ColumnView browser; found \(min(columnViews.count, 2))")
         }
-        let parent = menuBar.children[parentIndex]
-        guard parent.role == kAXMenuBarItemRole else {
-            throw ProbeError.validation("Open Folder parent has the wrong AX role")
+        guard chooser.identifier == nil || chooser.identifier == "OKButton" else {
+            throw ProbeError.validation("Open panel chooser is not the exact OKButton")
         }
-        guard !parent.children.isEmpty else { return .pending(.fileAXMenu) }
-        let menuIndices = parent.children.indices.filter {
-            parent.children[$0].role == kAXMenuRole
-        }
-        guard parent.children.count == 1, menuIndices.count == 1,
-              let menuIndex = menuIndices.first else {
-            throw ProbeError.validation("Open Folder parent does not expose exactly one direct AX menu")
-        }
-        let menu = parent.children[menuIndex]
-        guard !menu.children.isEmpty else { return .pending(.openFolderMenuItem) }
-        let itemIndices = menu.children.indices.filter {
-            menu.children[$0].title == itemTitle
-        }
-        guard !itemIndices.isEmpty else { return .pending(.openFolderMenuItem) }
-        guard itemIndices.count == 1, let itemIndex = itemIndices.first else {
-            throw ProbeError.validation(
-                "expected exactly one direct Open Folder menu item; found \(min(itemIndices.count, 2))")
-        }
-        let item = menu.children[itemIndex]
-        guard item.role == kAXMenuItemRole else {
-            throw ProbeError.validation("Open Folder has the wrong AX role")
-        }
-        guard item.enabled == true else {
-            throw ProbeError.validation("Open Folder menu item is not enabled")
-        }
-        guard item.actions.contains(kAXPressAction) else {
-            throw ProbeError.validation("Open Folder menu item does not advertise AXPress")
-        }
-        let commandCharacter: String
-        switch item.menuCommandCharacter {
-        case .missing: return .pending(.commandCharacter)
-        case .malformed:
-            throw ProbeError.validation(
-                "Open Folder menu item has malformed command character type")
-        case .readFailure(let status):
-            throw ProbeError.unavailable(
-                "Open Folder menu item command character read failed: \(status)")
-        case .value(let value):
-            guard !value.isEmpty else { return .pending(.emptyCommandCharacter) }
-            commandCharacter = value
-        }
-        let menuCommandVirtualKey: Int?
-        switch item.menuCommandVirtualKey {
-        case .missing: menuCommandVirtualKey = nil
-        case .malformed:
-            throw ProbeError.validation(
-                "Open Folder menu item has malformed command virtual key type")
-        case .readFailure(let status):
-            throw ProbeError.unavailable(
-                "Open Folder menu item command virtual key read failed: \(status)")
-        case .value(let value):
-            guard value == commandVirtualKey else {
-                throw ProbeError.validation(
-                    "Open Folder menu item has unexpected command virtual key: \(value)")
-            }
-            menuCommandVirtualKey = value
-        }
-        let menuCommandModifiers: Int
-        switch item.menuCommandModifiers {
-        case .missing: return .pending(.commandModifiers)
-        case .malformed:
-            throw ProbeError.validation(
-                "Open Folder menu item has malformed command modifiers type")
-        case .readFailure(let status):
-            throw ProbeError.unavailable(
-                "Open Folder menu item command modifiers read failed: \(status)")
-        case .value(let value): menuCommandModifiers = value
-        }
-        guard commandCharacter.lowercased() == "o" else {
-            throw ProbeError.validation(
-                "Open Folder menu item has unexpected command character: \(commandCharacter)")
-        }
-        guard menuCommandModifiers == commandModifiers else {
-            throw ProbeError.validation(
-                "Open Folder menu item has unexpected command modifiers: \(menuCommandModifiers)")
-        }
-        return .ready(OpenFolderMenuPlan(
-            menuBarItemIndex: parentIndex, menuIndex: menuIndex,
-            menuItemIndex: itemIndex, parentTitle: parent.title!, itemTitle: itemTitle,
-            commandVirtualKey: menuCommandVirtualKey))
+        return SelectionPlan(chooserTitle: title)
     }
 }
 
@@ -451,9 +305,7 @@ func sha256(_ value: String) -> String {
 
 func parseOptions(_ arguments: [String]) throws -> Options {
     var values: [String: String] = [:]
-    var permitKeyFallback = false
-    var pressOpenFolderMenuItem = false
-    var focusOpenPanel = false
+    var acceptRendererProjectPickerRequest = false
     var validateInputsOnly = false
     var index = 0
     let orderedValueOptions = ["--pid", "--run-root", "--expected-bundle", "--expected-executable",
@@ -461,21 +313,12 @@ func parseOptions(_ arguments: [String]) throws -> Options {
     let valueOptions = Set(orderedValueOptions)
     while index < arguments.count {
         let argument = arguments[index]
-        if argument == "--permit-key-fallback" {
-            guard !permitKeyFallback else { throw ProbeError.usage("duplicate --permit-key-fallback") }
-            permitKeyFallback = true
-            index += 1
-        } else if argument == "--press-open-folder-menu-item" {
-            guard !pressOpenFolderMenuItem else {
-                throw ProbeError.usage("duplicate --press-open-folder-menu-item")
+        if argument == "--accept-renderer-project-picker-request" {
+            guard !acceptRendererProjectPickerRequest else {
+                throw ProbeError.usage(
+                    "duplicate --accept-renderer-project-picker-request")
             }
-            pressOpenFolderMenuItem = true
-            index += 1
-        } else if argument == "--focus-open-panel" {
-            guard !focusOpenPanel else {
-                throw ProbeError.usage("duplicate --focus-open-panel")
-            }
-            focusOpenPanel = true
+            acceptRendererProjectPickerRequest = true
             index += 1
         } else if argument == "--validate-inputs-only" {
             guard !validateInputsOnly else { throw ProbeError.usage("duplicate --validate-inputs-only") }
@@ -499,31 +342,18 @@ func parseOptions(_ arguments: [String]) throws -> Options {
     }
     guard let rawPhase = values["--phase"], let phase = Phase(rawValue: rawPhase) else {
         throw ProbeError.usage(
-            "--phase must be inspect-open-folder-menu, inspect-project-picker, or select-project")
+            "--phase must be select-project")
     }
-    if phase == .selectProject && !pressOpenFolderMenuItem {
-        throw ProbeError.usage("select-project requires --press-open-folder-menu-item")
-    }
-    if phase != .selectProject && pressOpenFolderMenuItem {
-        throw ProbeError.usage("--press-open-folder-menu-item is only valid for select-project")
-    }
-    if focusOpenPanel && !permitKeyFallback {
-        throw ProbeError.usage("--focus-open-panel requires --permit-key-fallback")
-    }
-    if permitKeyFallback && phase == .selectProject && !focusOpenPanel {
+    if phase == .selectProject && !acceptRendererProjectPickerRequest {
         throw ProbeError.usage(
-            "select-project with key fallback requires --focus-open-panel")
-    }
-    if focusOpenPanel && phase != .selectProject {
-        throw ProbeError.usage("--focus-open-panel is only valid for select-project")
+            "select-project requires --accept-renderer-project-picker-request")
     }
     return Options(pid: numericPID, runRoot: values["--run-root"]!,
                    expectedBundle: values["--expected-bundle"]!,
                    expectedExecutable: values["--expected-executable"]!,
                    fixtureRoot: values["--fixture-root"]!, phase: phase,
-                   eventLog: values["--event-log"]!, permitKeyFallback: permitKeyFallback,
-                   pressOpenFolderMenuItem: pressOpenFolderMenuItem,
-                   focusOpenPanel: focusOpenPanel,
+                   eventLog: values["--event-log"]!,
+                   acceptRendererProjectPickerRequest: acceptRendererProjectPickerRequest,
                    validateInputsOnly: validateInputsOnly)
 }
 
@@ -693,119 +523,6 @@ func verifyProcess(options: Options, paths: ValidatedPaths) throws -> ProcessVer
 }
 // END_PROCESS_REGISTRATION_VALIDATION
 
-// BEGIN_PID_EXACT_APP_ACTIVATION
-func activateExactApplication(
-    timeoutNanoseconds: UInt64,
-    pollMicroseconds: useconds_t,
-    nowNanoseconds: () throws -> UInt64,
-    validateIdentity: () throws -> Void,
-    readReady: () throws -> Bool,
-    requestActivation: () throws -> Bool,
-    pause: (useconds_t) -> Void
-) throws -> ApplicationActivationReadiness {
-    precondition(timeoutNanoseconds > 0 && pollMicroseconds > 0)
-    let started = try nowNanoseconds()
-    let addition = started.addingReportingOverflow(timeoutNanoseconds)
-    let deadline = addition.overflow ? UInt64.max : addition.partialValue
-    var pollCount = 0
-    var actionCount = 0
-    while try nowNanoseconds() < deadline {
-        try validateIdentity()
-        let ready = try readReady()
-        pollCount += 1
-        try validateIdentity()
-        if ready {
-            return ApplicationActivationReadiness(
-                pollCount: pollCount, actionCount: actionCount)
-        }
-        if actionCount == 0 {
-            try validateIdentity()
-            guard try requestActivation() else {
-                throw ProbeError.unavailable(
-                    "exact application activation request was rejected")
-            }
-            try validateIdentity()
-            actionCount = 1
-            continue
-        }
-        let current = try nowNanoseconds()
-        guard current < deadline else { break }
-        let remainingMicroseconds = (deadline - current + 999) / 1_000
-        pause(useconds_t(min(UInt64(pollMicroseconds), remainingMicroseconds)))
-    }
-    throw ProbeError.unavailable(
-        "exact application activation did not become ready after \(pollCount) polls")
-}
-
-func exactRunningApplication(
-    process: ProcessIdentity,
-    paths: ValidatedPaths
-) throws -> NSRunningApplication {
-    try requireSameProcess(process)
-    guard let running = NSRunningApplication(processIdentifier: process.pid) else {
-        throw ProbeError.unavailable("exact application is absent from AppKit")
-    }
-    let sample = try appKitRegistrationSample(running: running)
-    guard try registrationIsReady(
-        sample, expectedBundle: paths.bundle,
-        expectedExecutable: paths.executable) else {
-        throw ProbeError.unavailable(
-            "exact application registration became incomplete")
-    }
-    try requireSameProcess(process)
-    return running
-}
-
-func activateVerifiedApplication(
-    application: AXUIElement,
-    process: ProcessIdentity,
-    paths: ValidatedPaths
-) throws -> ApplicationActivationReadiness {
-    try activateExactApplication(
-        timeoutNanoseconds: 2_000_000_000,
-        pollMicroseconds: 100_000,
-        nowNanoseconds: monotonicNanoseconds,
-        validateIdentity: { try requireSameProcess(process) },
-        readReady: {
-            let running = try exactRunningApplication(
-                process: process, paths: paths)
-            let isActive = running.isActive
-            let isFrontmost = try strictBoolAttribute(
-                application, kAXFrontmostAttribute as CFString,
-                purpose: "application frontmost state during activation")
-            try requireSameProcess(process)
-            return isActive && isFrontmost
-        },
-        requestActivation: {
-            let running = try exactRunningApplication(
-                process: process, paths: paths)
-            try requireSameProcess(process)
-            let accepted = running.activate(options: [])
-            try requireSameProcess(process)
-            return accepted
-        },
-        pause: { _ = usleep($0) })
-}
-
-func requireVerifiedApplicationActive(
-    application: AXUIElement,
-    process: ProcessIdentity,
-    paths: ValidatedPaths
-) throws {
-    let running = try exactRunningApplication(
-        process: process, paths: paths)
-    let isActive = running.isActive
-    let isFrontmost = try strictBoolAttribute(
-        application, kAXFrontmostAttribute as CFString,
-        purpose: "application frontmost state at menu press")
-    try requireSameProcess(process)
-    guard isActive && isFrontmost else {
-        throw ProbeError.validation(
-            "exact application lost active or frontmost state before menu press")
-    }
-}
-// END_PID_EXACT_APP_ACTIVATION
-
 func attribute(_ element: AXUIElement, _ name: CFString) -> CFTypeRef? {
     var value: CFTypeRef?
     guard AXUIElementCopyAttributeValue(element, name, &value) == .success else { return nil }
@@ -818,6 +535,71 @@ func stringAttribute(_ element: AXUIElement, _ name: CFString) -> String? {
 
 func boolAttribute(_ element: AXUIElement, _ name: CFString) -> Bool? {
     attribute(element, name) as? Bool
+}
+
+func strictStringAttribute(
+    _ element: AXUIElement,
+    _ name: CFString,
+    purpose: String
+) throws -> String {
+    var value: CFTypeRef?
+    let status = AXUIElementCopyAttributeValue(element, name, &value)
+    if status == .cannotComplete {
+        throw ProbeError.retryable(
+            "\(purpose) read was temporarily incomplete")
+    }
+    guard status == .success else {
+        throw ProbeError.unavailable(
+            "\(purpose) read failed: \(status.rawValue)")
+    }
+    guard let published = value as? String else {
+        throw ProbeError.validation("\(purpose) is malformed")
+    }
+    return published
+}
+
+func strictOptionalStringAttribute(
+    _ element: AXUIElement,
+    _ name: CFString,
+    purpose: String
+) throws -> String? {
+    var value: CFTypeRef?
+    let status = AXUIElementCopyAttributeValue(element, name, &value)
+    if status == .attributeUnsupported || status == .noValue { return nil }
+    if status == .cannotComplete {
+        throw ProbeError.retryable(
+            "\(purpose) read was temporarily incomplete")
+    }
+    guard status == .success else {
+        throw ProbeError.unavailable(
+            "\(purpose) read failed: \(status.rawValue)")
+    }
+    guard let published = value as? String else {
+        throw ProbeError.validation("\(purpose) is malformed")
+    }
+    return published
+}
+
+func strictOptionalBoolAttribute(
+    _ element: AXUIElement,
+    _ name: CFString,
+    purpose: String
+) throws -> Bool? {
+    var value: CFTypeRef?
+    let status = AXUIElementCopyAttributeValue(element, name, &value)
+    if status == .attributeUnsupported || status == .noValue { return nil }
+    if status == .cannotComplete {
+        throw ProbeError.retryable(
+            "\(purpose) read was temporarily incomplete")
+    }
+    guard status == .success else {
+        throw ProbeError.unavailable(
+            "\(purpose) read failed: \(status.rawValue)")
+    }
+    guard let published = value as? Bool else {
+        throw ProbeError.validation("\(purpose) is malformed")
+    }
+    return published
 }
 
 func intAttribute(_ element: AXUIElement, _ name: CFString) -> Int? {
@@ -867,28 +649,73 @@ func intAttributePublication(
     return attributePublication(status: status) { integralIntPublication(value) }
 }
 
-func fileURLPathPublication(_ value: CFTypeRef?) -> AttributePublication<String> {
-    let url: URL?
-    if let value, CFGetTypeID(value) == CFURLGetTypeID() {
-        url = unsafeBitCast(value, to: CFURL.self) as URL
-    } else if let publishedString = value as? String {
-        url = URL(string: publishedString)
-    } else {
-        return .malformed
+func lexicalLocalFileURLPath(_ url: URL) -> String? {
+    guard url.isFileURL,
+          url.user == nil, url.password == nil,
+          url.query == nil, url.fragment == nil,
+          url.host == nil || url.host == "" || url.host == "localhost" else {
+        return nil
     }
-    guard let url, url.isFileURL,
-          let canonical = try? PathPolicy.canonicalExisting(
-            url.standardizedFileURL.path) else { return .malformed }
-    return .value(canonical)
+    let publishedPath = url.path
+    guard publishedPath.hasPrefix("/"), !publishedPath.isEmpty,
+          !publishedPath.unicodeScalars.contains(where: {
+            $0.value == 0 || $0.value < 0x20 ||
+                (0x7f...0x9f).contains($0.value)
+          }) else { return nil }
+    var components: [Substring] = []
+    for component in publishedPath.split(separator: "/", omittingEmptySubsequences: false) {
+        if component.isEmpty || component == "." { continue }
+        if component == ".." {
+            guard !components.isEmpty else { return nil }
+            components.removeLast()
+        } else {
+            components.append(component)
+        }
+    }
+    return "/" + components.joined(separator: "/")
 }
 
-func fileURLPathAttributePublication(
+func documentURLPathPublication(
+    _ value: CFTypeRef?
+) -> AttributePublication<String> {
+    guard let publishedString = value as? String else { return .malformed }
+    guard !publishedString.isEmpty else { return .missing }
+    guard let url = URL(string: publishedString),
+          let path = lexicalLocalFileURLPath(url) else { return .malformed }
+    return .value(path)
+}
+
+func accessibilityURLPathPublication(
+    _ value: CFTypeRef?
+) -> AttributePublication<String> {
+    guard let value, CFGetTypeID(value) == CFURLGetTypeID() else {
+        return .malformed
+    }
+    let url = unsafeBitCast(value, to: CFURL.self) as URL
+    guard let path = lexicalLocalFileURLPath(url) else { return .malformed }
+    return .value(path)
+}
+
+func documentURLPathAttributePublication(
     _ element: AXUIElement,
     _ name: CFString
 ) -> AttributePublication<String> {
     var value: CFTypeRef?
     let status = AXUIElementCopyAttributeValue(element, name, &value)
-    return attributePublication(status: status) { fileURLPathPublication(value) }
+    return attributePublication(status: status) {
+        documentURLPathPublication(value)
+    }
+}
+
+func accessibilityURLPathAttributePublication(
+    _ element: AXUIElement,
+    _ name: CFString
+) -> AttributePublication<String> {
+    var value: CFTypeRef?
+    let status = AXUIElementCopyAttributeValue(element, name, &value)
+    return attributePublication(status: status) {
+        accessibilityURLPathPublication(value)
+    }
 }
 
 func publishedDestinationPath(
@@ -902,9 +729,16 @@ func publishedDestinationPath(
         throw ProbeError.validation(
             "Open panel \(attributeName) destination is malformed")
     case .readFailure(let status):
-        throw ProbeError.unavailable(
-            "Open panel \(attributeName) destination read failed: \(status)")
+        throw axPublicationReadError(
+            status, purpose: "Open panel \(attributeName) destination")
     }
+}
+
+func axPublicationReadError(_ status: Int32, purpose: String) -> ProbeError {
+    if status == AXError.cannotComplete.rawValue {
+        return .retryable("\(purpose) read was temporarily incomplete")
+    }
+    return .unavailable("\(purpose) read failed: \(status)")
 }
 
 func actions(_ element: AXUIElement) -> Set<String> {
@@ -918,51 +752,265 @@ func childElements(_ element: AXUIElement) -> [AXUIElement] {
     attribute(element, kAXChildrenAttribute as CFString) as? [AXUIElement] ?? []
 }
 
+func consumeTraversalNode(depth: Int, remainingNodes: inout Int) throws {
+    guard depth <= 16 else {
+        throw ProbeError.validation("AX tree exceeded depth limit")
+    }
+    guard remainingNodes > 0 else {
+        throw ProbeError.validation("AX tree exceeded node limit")
+    }
+    remainingNodes -= 1
+}
+
 func describe(_ element: AXUIElement, depth: Int = 0, budget: inout Int) throws -> ElementDescription {
-    guard depth <= 16, budget > 0 else { throw ProbeError.validation("AX tree exceeded traversal limit") }
-    budget -= 1
-    let children = try childElements(element).map { try describe($0, depth: depth + 1, budget: &budget) }
-    return describeShallow(element, children: children)
+    try consumeTraversalNode(depth: depth, remainingNodes: &budget)
+    let children = try strictChildElementsForEvidence(
+        element, purpose: "Open panel topology").map {
+            try describe($0, depth: depth + 1, budget: &budget)
+        }
+    return try describeShallow(element, children: children)
 }
 
 func describeShallow(
     _ element: AXUIElement,
     children: [ElementDescription] = []
-) -> ElementDescription {
-    ElementDescription(role: stringAttribute(element, kAXRoleAttribute as CFString) ?? "",
-                       subrole: stringAttribute(element, kAXSubroleAttribute as CFString),
-                       identifier: stringAttribute(element, kAXIdentifierAttribute as CFString),
-                       title: stringAttribute(element, kAXTitleAttribute as CFString),
-                       help: stringAttribute(element, kAXHelpAttribute as CFString),
-                       enabled: boolAttribute(element, kAXEnabledAttribute as CFString),
-                       menuCommandCharacter: stringAttributePublication(
-                        element, kAXMenuItemCmdCharAttribute as CFString),
-                       menuCommandVirtualKey: intAttributePublication(
-                        element, kAXMenuItemCmdVirtualKeyAttribute as CFString),
-                       menuCommandModifiers: intAttributePublication(
-                        element, kAXMenuItemCmdModifiersAttribute as CFString),
-                       actions: actions(element), children: children)
+) throws -> ElementDescription {
+    let role = try strictStringAttribute(
+        element, kAXRoleAttribute as CFString,
+        purpose: "Open panel topology role")
+    let publishedActions = role == kAXButtonRole ?
+        try strictActions(element, purpose: "Open panel topology button") : []
+    return ElementDescription(
+        role: role,
+        subrole: try strictOptionalStringAttribute(
+            element, kAXSubroleAttribute as CFString,
+            purpose: "Open panel topology subrole"),
+        identifier: try strictOptionalStringAttribute(
+            element, kAXIdentifierAttribute as CFString,
+            purpose: "Open panel topology identifier"),
+        title: try strictOptionalStringAttribute(
+            element, kAXTitleAttribute as CFString,
+            purpose: "Open panel topology title"),
+        help: try strictOptionalStringAttribute(
+            element, kAXHelpAttribute as CFString,
+            purpose: "Open panel topology help"),
+        enabled: try strictOptionalBoolAttribute(
+            element, kAXEnabledAttribute as CFString,
+            purpose: "Open panel topology enabled state"),
+        actions: publishedActions,
+        children: children)
+}
+
+func describedWindows(
+    _ windows: [AXUIElement],
+    perWindowNodeLimit: Int
+) throws -> [(AXUIElement, ElementDescription)] {
+    precondition(perWindowNodeLimit > 0)
+    return try windows.map { window in
+        var budget = perWindowNodeLimit
+        return (window, try describe(window, budget: &budget))
+    }
 }
 
 func liveWindows(_ application: AXUIElement) throws -> [(AXUIElement, ElementDescription)] {
     guard let windows = attribute(application, kAXWindowsAttribute as CFString) as? [AXUIElement] else {
         throw ProbeError.validation("application exposes no AX windows")
     }
-    return try windows.map { window in
-        var budget = 500
-        return (window, try describe(window, budget: &budget))
+    return try describedWindows(windows, perWindowNodeLimit: 500)
+}
+
+enum AXWindowReadDisposition: Equatable {
+    case published
+    case pending
+    case unsupported
+    case malformed
+    case failed
+}
+
+enum AXChildrenReadDisposition: Equatable {
+    case published
+    case leaf
+    case malformed
+    case failed
+}
+
+func classifyAXChildrenRead(
+    status: AXError,
+    valueIsElementArray: Bool
+) -> AXChildrenReadDisposition {
+    if status == .success {
+        return valueIsElementArray ? .published : .malformed
     }
+    if status == .attributeUnsupported || status == .noValue { return .leaf }
+    return .failed
+}
+
+func classifyAXWindowRead(
+    status: AXError,
+    valueIsElementArray: Bool
+) -> AXWindowReadDisposition {
+    if status == .success {
+        return valueIsElementArray ? .published : .malformed
+    }
+    if status == .noValue || status == .cannotComplete { return .pending }
+    if status == .attributeUnsupported { return .unsupported }
+    return .failed
+}
+
+func liveWindowsForOpenPanelReadiness(
+    _ application: AXUIElement
+) throws -> [(AXUIElement, ElementDescription)]? {
+    var value: CFTypeRef?
+    let status = AXUIElementCopyAttributeValue(
+        application, kAXWindowsAttribute as CFString, &value)
+    let windows = value as? [AXUIElement]
+    switch classifyAXWindowRead(
+        status: status, valueIsElementArray: windows != nil) {
+    case .pending:
+        return nil
+    case .unsupported:
+        throw ProbeError.validation("application AX windows are unsupported")
+    case .failed:
+        throw ProbeError.unavailable(
+            "application AX windows read failed: \(status.rawValue)")
+    case .malformed:
+        throw ProbeError.validation("application AX windows are malformed")
+    case .published:
+        break
+    }
+    guard let windows else { preconditionFailure("published AX windows require an element array") }
+    return try describedWindows(windows, perWindowNodeLimit: 5_000)
+}
+
+func liveBoundedNestedSheetsForOpenPanelReadiness(
+    _ application: AXUIElement
+) throws -> [(AXUIElement, ElementDescription)]? {
+    var windowsValue: CFTypeRef?
+    let windowsStatus = AXUIElementCopyAttributeValue(
+        application, kAXWindowsAttribute as CFString, &windowsValue)
+    guard windowsStatus == .success,
+          let windows = windowsValue as? [AXUIElement] else {
+        if windowsStatus == .noValue || windowsStatus == .cannotComplete {
+            return nil
+        }
+        throw ProbeError.unavailable(
+            "application AX windows read failed before parented sheet lookup: \(windowsStatus.rawValue)")
+    }
+    guard windows.count <= 8 else {
+        throw ProbeError.validation("application exposes too many AX windows")
+    }
+    var pending = windows.map { (element: $0, depth: 0) }
+    var nextIndex = 0
+    var visitedCount = 0
+    var incompleteRead = false
+    var sheets: [AXUIElement] = []
+    while nextIndex < pending.count {
+        guard visitedCount < 1_000 else {
+            throw ProbeError.validation("bounded AX sheet discovery exceeded node limit")
+        }
+        let current = pending[nextIndex]
+        nextIndex += 1
+        visitedCount += 1
+        if try strictStringAttribute(
+            current.element, kAXRoleAttribute as CFString,
+            purpose: "bounded AX sheet discovery role") == kAXSheetRole {
+            sheets.append(current.element)
+            continue
+        }
+        var childrenValue: CFTypeRef?
+        let childrenStatus = AXUIElementCopyAttributeValue(
+            current.element, kAXChildrenAttribute as CFString, &childrenValue)
+        if childrenStatus == .success {
+            guard let publishedChildren = childrenValue as? [AXUIElement] else {
+                throw ProbeError.validation("bounded AX sheet discovery children are malformed")
+            }
+            guard publishedChildren.count <= 128 else {
+                throw ProbeError.validation("bounded AX sheet discovery child fanout is excessive")
+            }
+            if current.depth == 8 {
+                guard publishedChildren.isEmpty else {
+                    throw ProbeError.validation(
+                        "bounded AX sheet discovery exceeded depth limit")
+                }
+            } else {
+                pending.append(contentsOf: publishedChildren.map {
+                    (element: $0, depth: current.depth + 1)
+                })
+            }
+        } else if childrenStatus == .cannotComplete {
+            incompleteRead = true
+        } else if childrenStatus != .noValue && childrenStatus != .attributeUnsupported {
+            throw ProbeError.unavailable(
+                "bounded AX sheet discovery child read failed: \(childrenStatus.rawValue)")
+        }
+    }
+    if incompleteRead { return nil }
+    let uniqueSheets = identityDeduplicated(sheets, sameElement: sameAXElement)
+    guard uniqueSheets.count <= 1 else {
+        throw ProbeError.validation("multiple bounded AXSheets appeared")
+    }
+    guard let sheet = uniqueSheets.first else { return nil }
+    return try describedWindows([sheet], perWindowNodeLimit: 5_000)
 }
 
 func descendants(_ element: AXUIElement, depth: Int = 0, budget: inout Int) throws -> [AXUIElement] {
-    guard depth <= 16, budget > 0 else { throw ProbeError.validation("AX tree exceeded traversal limit") }
-    budget -= 1
-    let children = childElements(element)
+    try consumeTraversalNode(depth: depth, remainingNodes: &budget)
+    let children = try strictChildElementsForEvidence(
+        element, purpose: "Open panel live topology")
     return children + (try children.flatMap { try descendants($0, depth: depth + 1, budget: &budget) })
 }
 
-func matchingLiveElements(_ root: AXUIElement, _ predicate: (AXUIElement) -> Bool) throws -> [AXUIElement] {
-    var budget = 500
+func strictChildElementsForEvidence(
+    _ element: AXUIElement,
+    purpose: String
+) throws -> [AXUIElement] {
+    var value: CFTypeRef?
+    let status = AXUIElementCopyAttributeValue(
+        element, kAXChildrenAttribute as CFString, &value)
+    let children = value as? [AXUIElement]
+    switch classifyAXChildrenRead(
+        status: status, valueIsElementArray: children != nil) {
+    case .published:
+        guard let children else {
+            throw ProbeError.validation("\(purpose) AXChildren are malformed")
+        }
+        return children
+    case .leaf:
+        return []
+    case .malformed:
+        throw ProbeError.validation("\(purpose) AXChildren are malformed")
+    case .failed:
+        if status == .cannotComplete {
+            throw ProbeError.retryable(
+                "\(purpose) AXChildren read was temporarily incomplete")
+        }
+        throw ProbeError.unavailable(
+            "\(purpose) AXChildren read failed: \(status.rawValue)")
+    }
+}
+
+func strictEvidenceDescendants(
+    _ element: AXUIElement,
+    depth: Int = 0,
+    budget: inout Int,
+    purpose: String = "Open panel row evidence"
+) throws -> [AXUIElement] {
+    try consumeTraversalNode(depth: depth, remainingNodes: &budget)
+    let children = try strictChildElementsForEvidence(
+        element, purpose: purpose)
+    return children + (try children.flatMap {
+        try strictEvidenceDescendants(
+            $0, depth: depth + 1, budget: &budget, purpose: purpose)
+    })
+}
+
+func matchingLiveElements(
+    _ root: AXUIElement,
+    nodeLimit: Int,
+    _ predicate: (AXUIElement) -> Bool
+) throws -> [AXUIElement] {
+    precondition(nodeLimit > 0)
+    var budget = nodeLimit
     return ([root] + (try descendants(root, budget: &budget))).filter(predicate)
 }
 
@@ -985,10 +1033,9 @@ struct OpenPanelReadiness<Element> {
 func waitForUniqueOpenPanel<Element>(
     timeoutNanoseconds: UInt64,
     pollMicroseconds: useconds_t,
-    permitKeyFallback: Bool,
     nowNanoseconds: () throws -> UInt64,
     validateIdentity: () throws -> Void,
-    readWindows: () throws -> [(Element, ElementDescription)],
+    readWindows: () throws -> [(Element, ElementDescription)]?,
     sameElement: (Element, Element) -> Bool,
     pause: (useconds_t) -> Void
 ) throws -> OpenPanelReadiness<Element> {
@@ -999,24 +1046,34 @@ func waitForUniqueOpenPanel<Element>(
     var pollCount = 0
     while try nowNanoseconds() < deadline {
         try validateIdentity()
-        let windows = try readWindows()
-        try validateIdentity()
-        pollCount += 1
-        let descriptions = windows.map(\.1)
-        let shapedIndices = OpenPanelPolicy.panelShapedIndices(windows: descriptions)
-        guard shapedIndices.count <= 1 else {
-            throw ProbeError.validation(
-                "expected exactly one panel-shaped Open candidate; found \(shapedIndices.count)")
+        let readResult: Result<[(Element, ElementDescription)]?, Error>
+        do {
+            readResult = .success(try readWindows())
+        } catch ProbeError.retryable {
+            readResult = .success(nil)
+        } catch {
+            readResult = .failure(error)
         }
-        if let selectedIndex = shapedIndices.first {
-            let plan = try OpenPanelPolicy.plan(
-                windows: [descriptions[selectedIndex]], permitKeyFallback: permitKeyFallback)
-            let selected = windows[selectedIndex].0
-            guard windows.filter({ sameElement($0.0, selected) }).count == 1 else {
-                throw ProbeError.validation("live Open panel identity is ambiguous")
+        try validateIdentity()
+        let windows = try readResult.get()
+        pollCount += 1
+        if let windows {
+            let descriptions = windows.map(\.1)
+            let shapedIndices = OpenPanelPolicy.panelShapedIndices(windows: descriptions)
+            guard shapedIndices.count <= 1 else {
+                throw ProbeError.validation(
+                    "expected exactly one panel-shaped Open candidate; found \(shapedIndices.count)")
             }
-            return OpenPanelReadiness(panel: selected, plan: plan,
-                                      initialElements: windows.map(\.0), pollCount: pollCount)
+            if let selectedIndex = shapedIndices.first {
+                let plan = try OpenPanelPolicy.plan(
+                    windows: [descriptions[selectedIndex]])
+                let selected = windows[selectedIndex].0
+                guard windows.filter({ sameElement($0.0, selected) }).count == 1 else {
+                    throw ProbeError.validation("live Open panel identity is ambiguous")
+                }
+                return OpenPanelReadiness(panel: selected, plan: plan,
+                                          initialElements: windows.map(\.0), pollCount: pollCount)
+            }
         }
         let current = try nowNanoseconds()
         guard current < deadline else { break }
@@ -1028,16 +1085,16 @@ func waitForUniqueOpenPanel<Element>(
 
 func waitForValidatedOpenPanel(
     application: AXUIElement,
-    identity: ProcessIdentity,
-    permitKeyFallback: Bool
+    identity: ProcessIdentity
 ) throws -> OpenPanelReadiness<AXUIElement> {
     try waitForUniqueOpenPanel(
         timeoutNanoseconds: 5_000_000_000,
         pollMicroseconds: 100_000,
-        permitKeyFallback: permitKeyFallback,
         nowNanoseconds: monotonicNanoseconds,
         validateIdentity: { try requireSameProcess(identity) },
-        readWindows: { try liveWindows(application) },
+        readWindows: {
+            try liveBoundedNestedSheetsForOpenPanelReadiness(application)
+        },
         sameElement: sameAXElement,
         pause: { _ = usleep($0) })
 }
@@ -1060,600 +1117,8 @@ func press(_ element: AXUIElement, purpose: String, process: ProcessIdentity) th
     try requireSameProcess(process)
 }
 
-// BEGIN_PID_PATH_ENTRY_SHORTCUT
-struct KeyboardShortcut: Equatable {
-    let virtualKey: CGKeyCode
-    let flags: CGEventFlags
-
-    static let pathEntry = KeyboardShortcut(virtualKey: 5, flags: [.maskCommand, .maskShift])
-}
-
-func performValidatedKeyboardPost(
-    validateIdentity: () throws -> Void,
-    validateFocus: () throws -> Void,
-    postKeyDown: () -> Void,
-    postKeyUp: () -> Void
-) throws {
-    try validateIdentity()
-    try validateFocus()
-    postKeyDown()
-    postKeyUp()
-    try validateIdentity()
-}
-
-func postKeyboardShortcut(
-    _ shortcut: KeyboardShortcut,
-    to process: ProcessIdentity,
-    validateFocus: () throws -> Void
-) throws {
-    guard let source = CGEventSource(stateID: .privateState),
-          let down = CGEvent(keyboardEventSource: source, virtualKey: shortcut.virtualKey,
-                             keyDown: true),
-          let up = CGEvent(keyboardEventSource: source, virtualKey: shortcut.virtualKey,
-                           keyDown: false) else {
-        throw ProbeError.unavailable("cannot create audited PID-targeted keyboard events")
-    }
-    down.flags = shortcut.flags
-    up.flags = shortcut.flags
-    try performValidatedKeyboardPost(
-        validateIdentity: { try requireSameProcess(process) },
-        validateFocus: validateFocus,
-        postKeyDown: { down.postToPid(process.pid) },
-        postKeyUp: { up.postToPid(process.pid) })
-}
-
-func postCommandShiftG(
-    application: AXUIElement,
-    panel: AXUIElement,
-    to process: ProcessIdentity
-) throws {
-    try postKeyboardShortcut(.pathEntry, to: process) {
-        try requireOpenPanelFocusReady(
-            application: application, panel: panel, process: process)
-    }
-}
-// END_PID_PATH_ENTRY_SHORTCUT
-
 func sameAXElement(_ left: AXUIElement, _ right: AXUIElement) -> Bool {
     CFEqual(left, right)
-}
-
-// BEGIN_PID_OPEN_PANEL_FOCUS
-struct OpenPanelFocusSnapshot: Equatable {
-    let applicationFrontmost: Bool
-    let focusedWindowMatchesPanel: Bool
-    let focusedUIBelongsToPanel: Bool
-
-    var ready: Bool {
-        applicationFrontmost && focusedWindowMatchesPanel &&
-            focusedUIBelongsToPanel
-    }
-}
-
-struct OpenPanelFocusReadiness: Equatable {
-    let pollCount: Int
-    let actionCount: Int
-}
-
-func strictBoolAttribute(
-    _ element: AXUIElement,
-    _ name: CFString,
-    purpose: String
-) throws -> Bool {
-    var value: CFTypeRef?
-    let status = AXUIElementCopyAttributeValue(element, name, &value)
-    guard status == .success else {
-        if status == .attributeUnsupported || status == .noValue {
-            throw ProbeError.validation("\(purpose) is not published")
-        }
-        throw ProbeError.unavailable("\(purpose) read failed: \(status.rawValue)")
-    }
-    guard let published = value as? Bool else {
-        throw ProbeError.validation("\(purpose) is malformed")
-    }
-    return published
-}
-
-func strictElementAttribute(
-    _ element: AXUIElement,
-    _ name: CFString,
-    purpose: String
-) throws -> AXUIElement {
-    var value: CFTypeRef?
-    let status = AXUIElementCopyAttributeValue(element, name, &value)
-    guard status == .success else {
-        if status == .attributeUnsupported || status == .noValue {
-            throw ProbeError.validation("\(purpose) is not published")
-        }
-        throw ProbeError.unavailable("\(purpose) read failed: \(status.rawValue)")
-    }
-    guard let value, CFGetTypeID(value) == AXUIElementGetTypeID() else {
-        throw ProbeError.validation("\(purpose) is malformed")
-    }
-    return unsafeBitCast(value, to: AXUIElement.self)
-}
-
-func strictElementArrayAttribute(
-    _ element: AXUIElement,
-    _ name: CFString,
-    purpose: String
-) throws -> [AXUIElement] {
-    var value: CFTypeRef?
-    let status = AXUIElementCopyAttributeValue(element, name, &value)
-    guard status == .success else {
-        if status == .attributeUnsupported || status == .noValue {
-            throw ProbeError.validation("\(purpose) is not published")
-        }
-        throw ProbeError.unavailable("\(purpose) read failed: \(status.rawValue)")
-    }
-    guard let values = value as? [AXUIElement] else {
-        throw ProbeError.validation("\(purpose) is malformed")
-    }
-    return values
-}
-
-func strictActions(_ element: AXUIElement, purpose: String) throws -> Set<String> {
-    var names: CFArray?
-    let status = AXUIElementCopyActionNames(element, &names)
-    guard status == .success else {
-        throw ProbeError.unavailable("\(purpose) action read failed: \(status.rawValue)")
-    }
-    guard let values = names as? [String] else {
-        throw ProbeError.validation("\(purpose) actions are malformed")
-    }
-    return Set(values)
-}
-
-func strictAttributeSettable(
-    _ element: AXUIElement,
-    _ name: CFString,
-    purpose: String
-) throws -> Bool {
-    var settable = DarwinBoolean(false)
-    let status = AXUIElementIsAttributeSettable(element, name, &settable)
-    guard status == .success else {
-        throw ProbeError.unavailable(
-            "\(purpose) writability read failed: \(status.rawValue)")
-    }
-    return settable.boolValue
-}
-
-func requireSettableAttribute(
-    _ element: AXUIElement,
-    _ name: CFString,
-    purpose: String
-) throws {
-    guard try strictAttributeSettable(element, name, purpose: purpose) else {
-        throw ProbeError.validation("\(purpose) is not writable")
-    }
-}
-
-func readOpenPanelFocusSnapshot(
-    application: AXUIElement,
-    panel: AXUIElement,
-    process: ProcessIdentity
-) throws -> OpenPanelFocusSnapshot {
-    try requireExactOpenPanelCurrent(
-        application: application, panel: panel, process: process)
-    let focusedWindow = try strictElementAttribute(
-        application, kAXFocusedWindowAttribute as CFString,
-        purpose: "application focused window")
-    let focusedUI = try strictElementAttribute(
-        application, kAXFocusedUIElementAttribute as CFString,
-        purpose: "application focused UI element")
-    var focusedPid: pid_t = 0
-    guard AXUIElementGetPid(focusedUI, &focusedPid) == .success,
-          focusedPid == process.pid else {
-        throw ProbeError.validation(
-            "application focused UI element does not belong to the exact PID")
-    }
-    let focusedUIBelongsToPanel: Bool
-    if sameAXElement(focusedUI, panel) {
-        focusedUIBelongsToPanel = true
-    } else {
-        let topLevel = try strictElementAttribute(
-            focusedUI, kAXTopLevelUIElementAttribute as CFString,
-            purpose: "focused UI top-level element")
-        var topLevelPid: pid_t = 0
-        guard AXUIElementGetPid(topLevel, &topLevelPid) == .success,
-              topLevelPid == process.pid else {
-            throw ProbeError.validation(
-                "focused UI top-level element does not belong to the exact PID")
-        }
-        focusedUIBelongsToPanel = sameAXElement(topLevel, panel)
-    }
-    let snapshot = OpenPanelFocusSnapshot(
-        applicationFrontmost: try strictBoolAttribute(
-            application, kAXFrontmostAttribute as CFString,
-            purpose: "application frontmost state"),
-        focusedWindowMatchesPanel: sameAXElement(focusedWindow, panel),
-        focusedUIBelongsToPanel: focusedUIBelongsToPanel)
-    try requireExactOpenPanelCurrent(
-        application: application, panel: panel, process: process)
-    return snapshot
-}
-
-func requireExactOpenPanelCurrent(
-    application: AXUIElement,
-    panel: AXUIElement,
-    process: ProcessIdentity
-) throws {
-    try requireSameProcess(process)
-    let windows = try strictElementArrayAttribute(
-        application, kAXWindowsAttribute as CFString,
-        purpose: "application windows during Open panel focus")
-    guard windows.filter({ sameAXElement($0, panel) }).count == 1 else {
-        throw ProbeError.validation("original Open panel is missing or ambiguous during focus")
-    }
-    try requireSameProcess(process)
-}
-
-func waitForOpenPanelFocus(
-    timeoutNanoseconds: UInt64,
-    pollMicroseconds: UInt32,
-    actionCount: Int,
-    nowNanoseconds: () throws -> UInt64,
-    validateIdentity: () throws -> Void,
-    readSnapshot: () throws -> OpenPanelFocusSnapshot,
-    pause: (UInt32) -> Void
-) throws -> OpenPanelFocusReadiness {
-    let start = try nowNanoseconds()
-    let deadlineResult = start.addingReportingOverflow(timeoutNanoseconds)
-    guard !deadlineResult.overflow else { throw ProbeError.unavailable("focus deadline overflow") }
-    let deadline = deadlineResult.partialValue
-    var pollCount = 0
-    var last = OpenPanelFocusSnapshot(
-        applicationFrontmost: false, focusedWindowMatchesPanel: false,
-        focusedUIBelongsToPanel: false)
-    while try nowNanoseconds() < deadline {
-        try validateIdentity()
-        last = try readSnapshot()
-        pollCount += 1
-        try validateIdentity()
-        if last.ready {
-            return OpenPanelFocusReadiness(pollCount: pollCount, actionCount: actionCount)
-        }
-        let current = try nowNanoseconds()
-        guard current < deadline else { break }
-        let remainingMicroseconds = (deadline - current + 999) / 1_000
-        pause(UInt32(min(UInt64(pollMicroseconds), remainingMicroseconds)))
-    }
-    throw ProbeError.unavailable(
-        "Open panel focus did not become ready after \(pollCount) polls; " +
-        "last state: frontmost=\(last.applicationFrontmost) " +
-        "focused-window-matches=\(last.focusedWindowMatchesPanel) " +
-        "focused-ui-in-panel=\(last.focusedUIBelongsToPanel)")
-}
-
-func performOpenPanelFocusActions(
-    initial: OpenPanelFocusSnapshot,
-    validateTarget: () throws -> Void,
-    preflightFrontmost: () throws -> Void,
-    preflightRaise: () throws -> Void,
-    preflightFocusedWindow: () throws -> Bool,
-    setFrontmost: () throws -> Void,
-    raisePanel: () throws -> Void,
-    setFocusedWindow: () throws -> Void
-) throws -> Int {
-    if initial.ready { return 0 }
-
-    try validateTarget()
-    if !initial.applicationFrontmost { try preflightFrontmost() }
-    try preflightRaise()
-    let canSetFocusedWindow = !initial.focusedWindowMatchesPanel ?
-        try preflightFocusedWindow() : false
-    if !initial.focusedWindowMatchesPanel && !canSetFocusedWindow {
-        throw ProbeError.validation(
-            "application focused window is not writable")
-    }
-    if initial.focusedWindowMatchesPanel &&
-        !initial.focusedUIBelongsToPanel {
-        throw ProbeError.validation(
-            "focused UI element does not belong to the exact Open panel")
-    }
-    try validateTarget()
-
-    var actionCount = 0
-    if !initial.applicationFrontmost {
-        try validateTarget()
-        try setFrontmost()
-        try validateTarget()
-        actionCount += 1
-    }
-    try validateTarget()
-    try raisePanel()
-    try validateTarget()
-    actionCount += 1
-    if !initial.focusedWindowMatchesPanel && canSetFocusedWindow {
-        try validateTarget()
-        try setFocusedWindow()
-        try validateTarget()
-        actionCount += 1
-    }
-    return actionCount
-}
-
-func focusOpenPanel(
-    application: AXUIElement,
-    panel: AXUIElement,
-    process: ProcessIdentity
-) throws -> OpenPanelFocusReadiness {
-    let initial = try readOpenPanelFocusSnapshot(
-        application: application, panel: panel, process: process)
-    let actionCount = try performOpenPanelFocusActions(
-        initial: initial,
-        validateTarget: {
-            try requireExactOpenPanelCurrent(
-                application: application, panel: panel, process: process)
-        },
-        preflightFrontmost: {
-            try requireSettableAttribute(
-                application, kAXFrontmostAttribute as CFString,
-                purpose: "application frontmost state")
-        },
-        preflightRaise: {
-            guard try strictActions(panel, purpose: "Open panel").contains(kAXRaiseAction) else {
-                throw ProbeError.validation("Open panel does not advertise AXRaise")
-            }
-        },
-        preflightFocusedWindow: {
-            try strictAttributeSettable(
-                application, kAXFocusedWindowAttribute as CFString,
-                purpose: "application focused window")
-        },
-        setFrontmost: {
-            guard AXUIElementSetAttributeValue(
-                application, kAXFrontmostAttribute as CFString,
-                kCFBooleanTrue) == .success else {
-                throw ProbeError.unavailable("setting exact application frontmost state failed")
-            }
-        },
-        raisePanel: {
-            guard AXUIElementPerformAction(
-                panel, kAXRaiseAction as CFString) == .success else {
-                throw ProbeError.unavailable("AXRaise failed for exact Open panel")
-            }
-        },
-        setFocusedWindow: {
-            guard AXUIElementSetAttributeValue(
-                application, kAXFocusedWindowAttribute as CFString,
-                panel) == .success else {
-                throw ProbeError.unavailable("setting exact application focused window failed")
-            }
-        })
-
-    if actionCount == 0 {
-        return OpenPanelFocusReadiness(pollCount: 1, actionCount: 0)
-    }
-
-    return try waitForOpenPanelFocus(
-        timeoutNanoseconds: 2_000_000_000,
-        pollMicroseconds: 100_000,
-        actionCount: actionCount,
-        nowNanoseconds: monotonicNanoseconds,
-        validateIdentity: { try requireSameProcess(process) },
-        readSnapshot: {
-            try readOpenPanelFocusSnapshot(
-                application: application, panel: panel, process: process)
-        },
-        pause: { _ = usleep($0) })
-}
-
-func requireOpenPanelFocusReady(
-    application: AXUIElement,
-    panel: AXUIElement,
-    process: ProcessIdentity
-) throws {
-    guard try readOpenPanelFocusSnapshot(
-        application: application, panel: panel, process: process).ready else {
-        throw ProbeError.validation("Open panel lost exact focus before keyboard input")
-    }
-}
-// END_PID_OPEN_PANEL_FOCUS
-
-func axElementAttribute(_ element: AXUIElement, _ name: CFString) -> AXUIElement? {
-    guard let value = attribute(element, name),
-          CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
-    return unsafeBitCast(value, to: AXUIElement.self)
-}
-
-// BEGIN_PID_OPEN_FOLDER_MENU_PRESS
-struct OpenFolderMenuSnapshot<Element> {
-    let description: ElementDescription
-    let items: [OpenFolderMenuPlan: Element]
-}
-
-struct OpenFolderMenuReadiness<Element> {
-    let plan: OpenFolderMenuPlan
-    let item: Element
-    let pollCount: Int
-}
-
-func openFolderMenuSnapshot(application: AXUIElement) throws
-    -> OpenFolderMenuSnapshot<AXUIElement>? {
-    guard let menuBar = axElementAttribute(application, kAXMenuBarAttribute as CFString) else {
-        return nil
-    }
-    let menuBarItems = childElements(menuBar)
-    guard menuBarItems.count <= 64 else {
-        throw ProbeError.validation("application AX menu bar exceeds the 64-item bound")
-    }
-    var liveItems: [OpenFolderMenuPlan: AXUIElement] = [:]
-    let parentDescriptions = try menuBarItems.enumerated().map { parentIndex, parent in
-        let parentTitle = stringAttribute(parent, kAXTitleAttribute as CFString)
-        guard parentTitle == OpenFolderMenuPolicy.parentTitle else {
-            return describeShallow(parent)
-        }
-        let menus = childElements(parent)
-        guard menus.count <= 4 else {
-            throw ProbeError.validation("Open Folder parent exceeds the four-menu bound")
-        }
-        let menuDescriptions = try menus.enumerated().map { menuIndex, menu in
-            let menuItems = childElements(menu)
-            guard menuItems.count <= 128 else {
-                throw ProbeError.validation("Open Folder menu exceeds the 128-item bound")
-            }
-            let itemDescriptions = menuItems.enumerated().map { itemIndex, item in
-                let description = describeShallow(item)
-                if description.title == OpenFolderMenuPolicy.itemTitle,
-                   let parentTitle {
-                    let commandVirtualKey: Int?
-                    switch description.menuCommandVirtualKey {
-                    case .value(let value): commandVirtualKey = value
-                    case .missing, .malformed, .readFailure: commandVirtualKey = nil
-                    }
-                    let path = OpenFolderMenuPlan(
-                        menuBarItemIndex: parentIndex, menuIndex: menuIndex,
-                        menuItemIndex: itemIndex, parentTitle: parentTitle,
-                        itemTitle: OpenFolderMenuPolicy.itemTitle,
-                        commandVirtualKey: commandVirtualKey)
-                    liveItems[path] = item
-                }
-                return description
-            }
-            return describeShallow(menu, children: itemDescriptions)
-        }
-        return describeShallow(parent, children: menuDescriptions)
-    }
-    return OpenFolderMenuSnapshot<AXUIElement>(
-        description: describeShallow(menuBar, children: parentDescriptions),
-        items: liveItems)
-}
-
-// BEGIN_READ_ONLY_OPEN_FOLDER_MENU_WAIT
-func waitForReadyOpenFolderMenu<Element>(
-    timeoutNanoseconds: UInt64,
-    pollMicroseconds: useconds_t,
-    nowNanoseconds: () throws -> UInt64,
-    validateIdentity: () throws -> Void,
-    readSnapshot: () throws -> OpenFolderMenuSnapshot<Element>?,
-    pause: (useconds_t) -> Void
-) throws -> OpenFolderMenuReadiness<Element> {
-    precondition(timeoutNanoseconds > 0 && pollMicroseconds > 0)
-    let started = try nowNanoseconds()
-    let addition = started.addingReportingOverflow(timeoutNanoseconds)
-    let deadline = addition.overflow ? UInt64.max : addition.partialValue
-    var pollCount = 0
-    var lastPendingState: OpenFolderMenuPolicy.PendingState?
-    while try nowNanoseconds() < deadline {
-        try validateIdentity()
-        let snapshot = try readSnapshot()
-        try validateIdentity()
-        pollCount += 1
-        guard let snapshot else {
-            lastPendingState = .applicationMenuBar
-            let current = try nowNanoseconds()
-            guard current < deadline else { break }
-            let remainingMicroseconds = (deadline - current + 999) / 1_000
-            pause(useconds_t(min(UInt64(pollMicroseconds), remainingMicroseconds)))
-            continue
-        }
-        switch try OpenFolderMenuPolicy.readiness(menuBar: snapshot.description) {
-        case .pending(let state): lastPendingState = state
-        case .ready(let plan):
-            guard let item = snapshot.items[plan] else {
-                throw ProbeError.validation(
-                    "validated Open Folder path has no unique live AX identity")
-            }
-            return OpenFolderMenuReadiness(plan: plan, item: item, pollCount: pollCount)
-        }
-        let current = try nowNanoseconds()
-        guard current < deadline else { break }
-        let remainingMicroseconds = (deadline - current + 999) / 1_000
-        pause(useconds_t(min(UInt64(pollMicroseconds), remainingMicroseconds)))
-    }
-    let pendingSuffix = lastPendingState.map {
-        "; last pending state: \($0.rawValue)"
-    } ?? ""
-    throw ProbeError.unavailable(
-        "Open Folder menu did not become ready after \(pollCount) polls\(pendingSuffix)")
-}
-
-func waitForValidatedOpenFolderMenu(
-    application: AXUIElement,
-    process: ProcessIdentity
-) throws -> OpenFolderMenuReadiness<AXUIElement> {
-    try waitForReadyOpenFolderMenu(
-        timeoutNanoseconds: 5_000_000_000,
-        pollMicroseconds: 100_000,
-        nowNanoseconds: monotonicNanoseconds,
-        validateIdentity: { try requireSameProcess(process) },
-        readSnapshot: { try openFolderMenuSnapshot(application: application) },
-        pause: { _ = usleep($0) })
-}
-// END_READ_ONLY_OPEN_FOLDER_MENU_WAIT
-
-func performValidatedMenuPress(
-    validateIdentity: () throws -> Void,
-    validateActive: () throws -> Void,
-    performPress: () throws -> Void
-) throws {
-    try validateIdentity()
-    try validateActive()
-    try validateIdentity()
-    try performPress()
-    try validateIdentity()
-}
-
-func pressOpenFolderMenuItem(
-    application: AXUIElement,
-    process: ProcessIdentity,
-    validateActive: () throws -> Void
-) throws -> OpenFolderMenuReadiness<AXUIElement> {
-    let readiness = try waitForValidatedOpenFolderMenu(
-        application: application, process: process)
-    guard let snapshot = try openFolderMenuSnapshot(application: application),
-          let revalidatedPlan = try OpenFolderMenuPolicy.readinessPlan(
-            menuBar: snapshot.description),
-          let menuItem = snapshot.items[revalidatedPlan],
-          revalidatedPlan == readiness.plan,
-          sameAXElement(menuItem, readiness.item) else {
-        throw ProbeError.validation("Open Folder menu topology changed before AXPress")
-    }
-    try performValidatedMenuPress(
-        validateIdentity: { try requireSameProcess(process) },
-        validateActive: validateActive,
-        performPress: {
-            let pressStatus = AXUIElementPerformAction(
-                menuItem, kAXPressAction as CFString)
-            guard pressStatus == .success else {
-                throw ProbeError.unavailable(
-                    "AXPress failed for Open Folder menu item")
-            }
-        })
-    return readiness
-}
-// END_PID_OPEN_FOLDER_MENU_PRESS
-
-struct PathEntrySnapshot<Element> {
-    let panel: Element
-    let cancel: Element
-    let chooser: Element
-    let chooserEnabled: Bool
-    let additionalCancelCount: Int
-    let browserAnchors: [Element]
-    let textFields: [Element]
-    let goButtons: [Element]
-    let restoredPlan: SelectionPlan?
-    let destinationPaths: [String]
-}
-
-struct PathEntryCandidate<Element> {
-    let field: Element
-    let goButton: Element
-}
-
-struct PathEntryToken<Element> {
-    let panel: Element
-    let field: Element
-    let goButton: Element
-    let pollCount: Int
-}
-
-struct RestoredOpenPanelToken<Element> {
-    let panel: Element
-    let chooser: Element
-    let pollCount: Int
 }
 
 func identityDeduplicated<Element>(
@@ -1667,262 +1132,391 @@ func identityDeduplicated<Element>(
     return result
 }
 
-func sameIdentitySet<Element>(
-    _ left: [Element],
-    _ right: [Element],
-    sameElement: (Element, Element) -> Bool
-) -> Bool {
-    let uniqueLeft = identityDeduplicated(left, sameElement: sameElement)
-    let uniqueRight = identityDeduplicated(right, sameElement: sameElement)
-    return uniqueLeft.count == uniqueRight.count && uniqueLeft.allSatisfy { element in
-        uniqueRight.contains(where: { sameElement(element, $0) })
+func strictElementArrayAttribute(
+    _ element: AXUIElement,
+    _ name: CFString,
+    purpose: String
+) throws -> [AXUIElement] {
+    var value: CFTypeRef?
+    let status = AXUIElementCopyAttributeValue(element, name, &value)
+    guard status == .success else {
+        if status == .attributeUnsupported || status == .noValue {
+            throw ProbeError.validation("\(purpose) is not published")
+        }
+        if status == .cannotComplete {
+            throw ProbeError.retryable(
+                "\(purpose) read was temporarily incomplete")
+        }
+        throw ProbeError.unavailable("\(purpose) read failed: \(status.rawValue)")
     }
+    guard let values = value as? [AXUIElement] else {
+        throw ProbeError.validation("\(purpose) is malformed")
+    }
+    return values
 }
 
-func exactAnchor<Element>(
-    expected: Element?,
-    candidates: [Element],
-    allowAdditional: Bool,
-    sameElement: (Element, Element) -> Bool
-) throws -> Element {
-    guard let expected else {
-        guard candidates.count == 1, let candidate = candidates.first else {
-            throw ProbeError.validation("Open-panel anchor is missing or ambiguous")
-        }
-        return candidate
+func strictActions(_ element: AXUIElement, purpose: String) throws -> Set<String> {
+    var names: CFArray?
+    let status = AXUIElementCopyActionNames(element, &names)
+    if status == .cannotComplete {
+        throw ProbeError.retryable(
+            "\(purpose) action read was temporarily incomplete")
     }
-    let matches = candidates.filter { sameElement($0, expected) }
-    guard matches.count == 1, allowAdditional || candidates.count == 1 else {
-        throw ProbeError.validation("original Open-panel anchor identity changed")
+    guard status == .success else {
+        throw ProbeError.unavailable("\(purpose) action read failed: \(status.rawValue)")
     }
-    return expected
+    guard let values = names as? [String] else {
+        throw ProbeError.validation("\(purpose) actions are malformed")
+    }
+    return Set(values)
 }
 
-enum PathEntryPolicy {
-    static func navigation(searchableFieldText: [String]) throws
-        -> SelectionPlan.Navigation {
-        let directCount = searchableFieldText.filter { text in
-            let lowered = text.lowercased()
-            return lowered.contains("path") || lowered.contains("location") ||
-                lowered.contains("folder")
-        }.count
-        if directCount == 1 { return .direct }
-        guard directCount == 0 else {
-            throw ProbeError.validation("Open panel path field is ambiguous")
-        }
-        return .commandShiftG
+func requireExactOpenPanelCurrent(
+    application: AXUIElement,
+    panel: AXUIElement,
+    process: ProcessIdentity
+) throws {
+    try requireSameProcess(process)
+    let windows = try strictElementArrayAttribute(
+        application, kAXWindowsAttribute as CFString,
+        purpose: "application windows during Open panel selection")
+    guard windows.count <= 8 else {
+        throw ProbeError.validation(
+            "application exposes too many AX windows during Open panel selection")
     }
+    guard let nestedSheets = try liveBoundedNestedSheetsForOpenPanelReadiness(
+        application) else {
+        throw ProbeError.retryable(
+            "Open panel sheet topology read was temporarily incomplete")
+    }
+    let currentRoots = identityDeduplicated(
+        windows + nestedSheets.map(\.0), sameElement: sameAXElement)
+    guard currentRoots.filter({ sameAXElement($0, panel) }).count == 1 else {
+        throw ProbeError.validation(
+            "original Open panel is missing or ambiguous during selection")
+    }
+    try requireSameProcess(process)
+}
 
-    static func isGoControl(
-        role: String?,
-        title: String?,
-        enabled: Bool?,
-        actions: Set<String>
+// BEGIN_PID_OPEN_PANEL_LIST_SELECTION
+struct OpenPanelListSelectionToken<Element> {
+    let panel: Element
+    let browser: Element
+    let list: Element
+    let candidate: Element
+    let chooser: Element
+}
+
+struct OpenPanelListSelectionSnapshot<Element> {
+    let panels: [Element]
+    let browsers: [Element]
+    let lists: [Element]
+    let candidates: [Element]
+    let choosers: [Element]
+    let selectedChildrenSettable: AttributePublication<Bool>
+    let selectedChildren: ElementArrayPublication<Element>
+    let chooserEnabled: Bool
+    let chooserActions: Set<String>
+    let listChildCount: Int
+    let descendantListCount: Int
+    let groupChildCount: Int
+    let rowEvidenceElementCount: Int
+    let urlPublisherCount: Int
+    let publishedURLPathHashes: [String]
+    let panelDestinationPathHashes: [String]
+}
+
+struct OpenPanelListSelectionReadiness<Element> {
+    let token: OpenPanelListSelectionToken<Element>
+    let pollCount: Int
+}
+
+enum ElementArrayPublication<Element> {
+    case missing
+    case malformed
+    case readFailure(Int32)
+    case value([Element])
+}
+
+enum OpenPanelListSelectionPolicy {
+    static func rowMatchesExactFixture(
+        role: String,
+        pathPublications: [AttributePublication<String>],
+        fixture: String
     ) throws -> Bool {
-        guard title?.lowercased() == "go" else { return false }
-        guard role == kAXButtonRole, enabled == true,
-              actions.contains(kAXPressAction) else {
+        var publishedPaths = Set<String>()
+        for publication in pathPublications {
+            switch publication {
+            case .missing:
+                continue
+            case .malformed:
+                throw ProbeError.validation(
+                    "Open panel row descendant AXURL is malformed")
+            case .readFailure(let status):
+                throw axPublicationReadError(
+                    status, purpose: "Open panel row descendant AXURL")
+            case .value(let path):
+                publishedPaths.insert(path)
+            }
+        }
+        guard publishedPaths.contains(fixture) else { return false }
+        guard role == kAXGroupRole else {
             throw ProbeError.validation(
-                "path-entry Go control is not an enabled AXPress button")
+                "Open panel exact fixture row is not AXGroup")
+        }
+        guard publishedPaths == Set([fixture]) else {
+            throw ProbeError.validation(
+                "Open panel exact fixture row publishes ambiguous paths")
         }
         return true
     }
 
-    static func baseline<Element>(
-        _ snapshot: PathEntrySnapshot<Element>,
-        expectedPlan: SelectionPlan,
-        sameElement: (Element, Element) -> Bool
-    ) throws -> PathEntrySnapshot<Element> {
-        guard !snapshot.browserAnchors.isEmpty else {
-            throw ProbeError.validation("Open panel has no file-browser anchor")
+    static func settable<Element>(
+        _ snapshot: OpenPanelListSelectionSnapshot<Element>,
+        pendingAllowed: Bool
+    ) throws -> Bool? {
+        switch snapshot.selectedChildrenSettable {
+        case .missing:
+            if pendingAllowed { return nil }
+            throw ProbeError.validation("Open panel AXSelectedChildren writability is unpublished")
+        case .malformed:
+            throw ProbeError.validation("Open panel AXSelectedChildren writability is malformed")
+        case .readFailure(let status):
+            throw axPublicationReadError(
+                status, purpose: "Open panel AXSelectedChildren writability")
+        case .value(let value):
+            return value
         }
-        guard snapshot.chooserEnabled else {
-            throw ProbeError.validation("Open panel chooser is not enabled at baseline")
-        }
-        guard snapshot.goButtons.isEmpty else {
-            throw ProbeError.validation("Open panel exposed Go before the path-entry shortcut")
-        }
-        guard snapshot.restoredPlan == expectedPlan else {
-            throw ProbeError.validation("Open panel baseline plan changed before shortcut")
-        }
-        return snapshot
     }
 
-    static func requireAnchors<Element>(
-        baseline: PathEntrySnapshot<Element>,
-        current: PathEntrySnapshot<Element>,
+    static func selectedChildren<Element>(
+        _ snapshot: OpenPanelListSelectionSnapshot<Element>,
+        pendingAllowed: Bool
+    ) throws -> [Element]? {
+        switch snapshot.selectedChildren {
+        case .missing:
+            if pendingAllowed { return nil }
+            throw ProbeError.validation("Open panel AXSelectedChildren is unpublished")
+        case .malformed:
+            throw ProbeError.validation("Open panel AXSelectedChildren is malformed")
+        case .readFailure(let status):
+            throw axPublicationReadError(
+                status, purpose: "Open panel AXSelectedChildren")
+        case .value(let children):
+            return children
+        }
+    }
+
+    static func token<Element>(
+        _ snapshot: OpenPanelListSelectionSnapshot<Element>
+    ) throws -> OpenPanelListSelectionToken<Element> {
+        guard snapshot.panels.count == 1,
+              snapshot.browsers.count == 1,
+              snapshot.lists.count == 1,
+              snapshot.candidates.count == 1,
+              snapshot.choosers.count == 1 else {
+            throw ProbeError.validation(
+                "Open panel list selection is missing or ambiguous: " +
+                "panel=\(min(snapshot.panels.count, 2)) " +
+                "browser=\(min(snapshot.browsers.count, 2)) " +
+                "list=\(min(snapshot.lists.count, 2)) " +
+                "candidate=\(min(snapshot.candidates.count, 2)) " +
+                "chooser=\(min(snapshot.choosers.count, 2))")
+        }
+        guard try settable(snapshot, pendingAllowed: false) == true else {
+            throw ProbeError.validation("Open panel AXSelectedChildren is not writable")
+        }
+        _ = try selectedChildren(snapshot, pendingAllowed: false)
+        return OpenPanelListSelectionToken(
+            panel: snapshot.panels[0], browser: snapshot.browsers[0],
+            list: snapshot.lists[0], candidate: snapshot.candidates[0],
+            chooser: snapshot.choosers[0])
+    }
+
+    static func requireSameToken<Element>(
+        _ expected: OpenPanelListSelectionToken<Element>,
+        _ actual: OpenPanelListSelectionToken<Element>,
         sameElement: (Element, Element) -> Bool
     ) throws {
-        guard sameElement(baseline.panel, current.panel),
-              sameElement(baseline.cancel, current.cancel),
-              sameElement(baseline.chooser, current.chooser),
-              sameIdentitySet(baseline.browserAnchors, current.browserAnchors,
-                              sameElement: sameElement) else {
-            throw ProbeError.validation("original Open-panel identity or anchors changed")
-        }
-        let baselineFields = identityDeduplicated(
-            baseline.textFields, sameElement: sameElement)
-        let currentFields = identityDeduplicated(
-            current.textFields, sameElement: sameElement)
-        guard baselineFields.allSatisfy({ baselineField in
-            currentFields.contains(where: { sameElement(baselineField, $0) })
-        }) else {
-            throw ProbeError.validation("Open-panel baseline field identity changed")
+        guard sameElement(expected.panel, actual.panel),
+              sameElement(expected.browser, actual.browser),
+              sameElement(expected.list, actual.list),
+              sameElement(expected.candidate, actual.candidate),
+              sameElement(expected.chooser, actual.chooser) else {
+            throw ProbeError.validation(
+                "Open panel list-selection identities changed before mutation")
         }
     }
 
-    static func candidate<Element>(
-        baseline: PathEntrySnapshot<Element>,
-        current: PathEntrySnapshot<Element>,
+    static func requireSelected<Element>(
+        _ snapshot: OpenPanelListSelectionSnapshot<Element>,
+        token: OpenPanelListSelectionToken<Element>,
         sameElement: (Element, Element) -> Bool
-    ) throws -> PathEntryCandidate<Element>? {
-        try requireAnchors(baseline: baseline, current: current,
-                           sameElement: sameElement)
-        let fields = identityDeduplicated(current.textFields, sameElement: sameElement)
-        let baselineFields = identityDeduplicated(
-            baseline.textFields, sameElement: sameElement)
-        let newFields = fields.filter { field in
-            !baselineFields.contains(where: { sameElement(field, $0) })
+    ) throws {
+        guard let selected = try selectedChildren(
+            snapshot, pendingAllowed: false),
+              selected.count == 1,
+              sameElement(selected[0], token.candidate) else {
+            throw ProbeError.validation(
+                "Open panel did not retain the exact selected candidate")
         }
-        let goButtons = identityDeduplicated(current.goButtons, sameElement: sameElement)
-        guard newFields.count <= 1 else {
-            throw ProbeError.validation("multiple new path-entry fields appeared")
-        }
-        guard goButtons.count <= 1 else {
-            throw ProbeError.validation("multiple new path-entry Go buttons appeared")
-        }
-        guard let field = newFields.first, let goButton = goButtons.first else {
-            return nil
-        }
-        return PathEntryCandidate(field: field, goButton: goButton)
     }
 
-    static func restored<Element>(
-        baseline: PathEntrySnapshot<Element>,
-        current: PathEntrySnapshot<Element>,
-        expectedDestination: String,
+    static func selectionMutationRequired<Element>(
+        _ snapshot: OpenPanelListSelectionSnapshot<Element>,
+        token: OpenPanelListSelectionToken<Element>,
         sameElement: (Element, Element) -> Bool
     ) throws -> Bool {
-        try requireAnchors(baseline: baseline, current: current,
-                           sameElement: sameElement)
-        let fieldsMatch = sameIdentitySet(
-            baseline.textFields, current.textFields, sameElement: sameElement)
-        let destinations = Array(Set(current.destinationPaths))
-        guard destinations.count <= 1 else {
-            throw ProbeError.validation("Open panel published ambiguous destination paths")
+        guard let selected = try selectedChildren(
+            snapshot, pendingAllowed: false) else {
+            throw ProbeError.validation("Open panel AXSelectedChildren is unpublished")
         }
-        return fieldsMatch && current.goButtons.isEmpty && current.chooserEnabled &&
-            current.additionalCancelCount == 0 &&
-            current.restoredPlan == baseline.restoredPlan &&
-            destinations == [expectedDestination]
+        if selected.isEmpty { return true }
+        try requireSelected(snapshot, token: token, sameElement: sameElement)
+        return false
+    }
+
+    static func pendingToken<Element>(
+        _ snapshot: OpenPanelListSelectionSnapshot<Element>
+    ) throws -> OpenPanelListSelectionToken<Element>? {
+        guard snapshot.panels.count == 1 else {
+            throw ProbeError.validation(
+                "Open panel identity is missing or ambiguous during list selection")
+        }
+        guard snapshot.browsers.count <= 1,
+              snapshot.lists.count <= 1,
+              snapshot.choosers.count <= 1 else {
+            throw ProbeError.validation(
+                "Open panel list-selection anchors are ambiguous")
+        }
+        guard snapshot.candidates.count <= 1 else {
+            throw ProbeError.validation("Open panel exact fixture candidate is ambiguous")
+        }
+        guard snapshot.browsers.count == 1,
+              snapshot.lists.count == 1,
+              snapshot.choosers.count == 1,
+              snapshot.candidates.count == 1 else {
+            return nil
+        }
+        guard try settable(snapshot, pendingAllowed: true) == true,
+              try selectedChildren(snapshot, pendingAllowed: true) != nil else {
+            return nil
+        }
+        return try token(snapshot)
+    }
+
+    static func pressReady<Element>(
+        _ snapshot: OpenPanelListSelectionSnapshot<Element>,
+        token: OpenPanelListSelectionToken<Element>,
+        sameElement: (Element, Element) -> Bool
+    ) throws -> Bool {
+        guard let selected = try selectedChildren(
+            snapshot, pendingAllowed: false) else {
+            return false
+        }
+        if selected.isEmpty || !snapshot.chooserEnabled ||
+            !snapshot.chooserActions.contains(kAXPressAction) {
+            return false
+        }
+        try requireSelected(snapshot, token: token, sameElement: sameElement)
+        return true
     }
 }
 
-func uniqueOriginal<T>(
-    original: T,
-    candidates: [T],
-    equals: (T, T) -> Bool
-) throws -> T {
-    guard candidates.count == 1, let candidate = candidates.first,
-          equals(original, candidate) else {
-        throw ProbeError.validation("original Open panel was replaced or became ambiguous")
+func boolPublicationKind(_ publication: AttributePublication<Bool>) -> String {
+    switch publication {
+    case .missing: return "missing"
+    case .malformed: return "malformed"
+    case .readFailure: return "read-failure"
+    case .value(true): return "true"
+    case .value(false): return "false"
     }
-    return original
 }
 
-func uniqueNewRelated<T>(
-    initial: [T],
-    candidates: [T],
-    equals: (T, T) -> Bool
-) throws -> T? {
-    var deduplicated: [T] = []
-    for candidate in candidates where !deduplicated.contains(where: { equals($0, candidate) }) {
-        deduplicated.append(candidate)
+func elementArrayPublicationKind<Element>(
+    _ publication: ElementArrayPublication<Element>
+) -> String {
+    switch publication {
+    case .missing: return "missing"
+    case .malformed: return "malformed"
+    case .readFailure: return "read-failure"
+    case .value: return "value"
     }
-    let newCandidates = deduplicated.filter { candidate in
-        !initial.contains(where: { equals($0, candidate) })
-    }
-    guard newCandidates.count <= 1 else {
-        throw ProbeError.validation("multiple new path-entry children appeared")
-    }
-    return newCandidates.first
 }
 
-// BEGIN_READ_ONLY_PATH_ENTRY_WAITS
-func waitForUniquePathEntry<Element>(
+func waitForReadyOpenPanelListSelection<Element>(
     timeoutNanoseconds: UInt64,
     pollMicroseconds: useconds_t,
-    baseline: PathEntrySnapshot<Element>,
     nowNanoseconds: () throws -> UInt64,
     validateIdentity: () throws -> Void,
-    readSnapshot: () throws -> PathEntrySnapshot<Element>,
-    sameElement: (Element, Element) -> Bool,
+    readSnapshot: () throws -> OpenPanelListSelectionSnapshot<Element>,
     pause: (useconds_t) -> Void
-) throws -> PathEntryToken<Element> {
-    precondition(timeoutNanoseconds > 0 && pollMicroseconds > 0)
-    let started = try nowNanoseconds()
-    let addition = started.addingReportingOverflow(timeoutNanoseconds)
-    let deadline = addition.overflow ? UInt64.max : addition.partialValue
-    var pollCount = 0
-    var lastPendingState = "unpublished"
-    while try nowNanoseconds() < deadline {
-        try validateIdentity()
-        let snapshot = try readSnapshot()
-        try validateIdentity()
-        pollCount += 1
-        if let candidate = try PathEntryPolicy.candidate(
-            baseline: baseline, current: snapshot, sameElement: sameElement) {
-            return PathEntryToken(panel: baseline.panel, field: candidate.field,
-                                  goButton: candidate.goButton, pollCount: pollCount)
-        }
-        let baselineFields = identityDeduplicated(
-            baseline.textFields, sameElement: sameElement)
-        let currentFields = identityDeduplicated(
-            snapshot.textFields, sameElement: sameElement)
-        let newFieldCount = currentFields.filter { field in
-            !baselineFields.contains(where: { sameElement(field, $0) })
-        }.count
-        lastPendingState =
-            "new-fields=\(min(newFieldCount, 2)) " +
-            "go-buttons=\(min(snapshot.goButtons.count, 2)) " +
-            "extra-cancels=\(min(snapshot.additionalCancelCount, 2)) " +
-            "chooser-enabled=\(snapshot.chooserEnabled)"
-        let current = try nowNanoseconds()
-        guard current < deadline else { break }
-        let remainingMicroseconds = (deadline - current + 999) / 1_000
-        pause(useconds_t(min(UInt64(pollMicroseconds), remainingMicroseconds)))
-    }
-    throw ProbeError.unavailable(
-        "path-entry controls did not become ready after \(pollCount) polls; " +
-        "last pending state: \(lastPendingState)")
-}
-
-func waitForRestoredOpenPanel<Element>(
-    timeoutNanoseconds: UInt64,
-    pollMicroseconds: useconds_t,
-    baseline: PathEntrySnapshot<Element>,
-    expectedDestination: String,
-    nowNanoseconds: () throws -> UInt64,
-    validateIdentity: () throws -> Void,
-    readSnapshot: () throws -> PathEntrySnapshot<Element>,
-    sameElement: (Element, Element) -> Bool,
-    pause: (useconds_t) -> Void
-) throws -> RestoredOpenPanelToken<Element> {
-    precondition(timeoutNanoseconds > 0 && pollMicroseconds > 0)
+) throws -> OpenPanelListSelectionReadiness<Element>? {
     let started = try nowNanoseconds()
     let addition = started.addingReportingOverflow(timeoutNanoseconds)
     let deadline = addition.overflow ? UInt64.max : addition.partialValue
     var pollCount = 0
     while try nowNanoseconds() < deadline {
         try validateIdentity()
-        let snapshot = try readSnapshot()
+        let snapshot: OpenPanelListSelectionSnapshot<Element>
+        do {
+            snapshot = try readSnapshot()
+        } catch ProbeError.retryable {
+            try validateIdentity()
+            pollCount += 1
+            let current = try nowNanoseconds()
+            guard current < deadline else { break }
+            let remainingMicroseconds = (deadline - current + 999) / 1_000
+            pause(useconds_t(min(UInt64(pollMicroseconds), remainingMicroseconds)))
+            continue
+        }
         try validateIdentity()
         pollCount += 1
-        if try PathEntryPolicy.restored(
-            baseline: baseline, current: snapshot,
-            expectedDestination: expectedDestination, sameElement: sameElement) {
-            return RestoredOpenPanelToken(
-                panel: baseline.panel, chooser: baseline.chooser, pollCount: pollCount)
+        if let token = try OpenPanelListSelectionPolicy.pendingToken(snapshot) {
+            return OpenPanelListSelectionReadiness(
+                token: token, pollCount: pollCount)
+        }
+        let current = try nowNanoseconds()
+        guard current < deadline else { break }
+        let remainingMicroseconds = (deadline - current + 999) / 1_000
+        pause(useconds_t(min(UInt64(pollMicroseconds), remainingMicroseconds)))
+    }
+    return nil
+}
+
+func waitForSelectedOpenPanelList<Element>(
+    timeoutNanoseconds: UInt64,
+    pollMicroseconds: useconds_t,
+    expected: OpenPanelListSelectionToken<Element>,
+    nowNanoseconds: () throws -> UInt64,
+    revalidate: () throws -> (OpenPanelListSelectionToken<Element>,
+                               OpenPanelListSelectionSnapshot<Element>),
+    sameElement: (Element, Element) -> Bool,
+    pause: (useconds_t) -> Void
+) throws -> Int {
+    let started = try nowNanoseconds()
+    let addition = started.addingReportingOverflow(timeoutNanoseconds)
+    let deadline = addition.overflow ? UInt64.max : addition.partialValue
+    var pollCount = 0
+    while try nowNanoseconds() < deadline {
+        let actual: OpenPanelListSelectionToken<Element>
+        let snapshot: OpenPanelListSelectionSnapshot<Element>
+        do {
+            (actual, snapshot) = try revalidate()
+        } catch ProbeError.retryable {
+            pollCount += 1
+            let current = try nowNanoseconds()
+            guard current < deadline else { break }
+            let remainingMicroseconds = (deadline - current + 999) / 1_000
+            pause(useconds_t(min(UInt64(pollMicroseconds), remainingMicroseconds)))
+            continue
+        }
+        try OpenPanelListSelectionPolicy.requireSameToken(
+            expected, actual, sameElement: sameElement)
+        pollCount += 1
+        if try OpenPanelListSelectionPolicy.pressReady(
+            snapshot, token: actual, sameElement: sameElement) {
+            return pollCount
         }
         let current = try nowNanoseconds()
         guard current < deadline else { break }
@@ -1930,491 +1524,513 @@ func waitForRestoredOpenPanel<Element>(
         pause(useconds_t(min(UInt64(pollMicroseconds), remainingMicroseconds)))
     }
     throw ProbeError.unavailable(
-        "Open panel did not restore after path entry in \(pollCount) polls")
-}
-// END_READ_ONLY_PATH_ENTRY_WAITS
-
-func livePathEntrySnapshot(
-    application: AXUIElement,
-    openPanel: AXUIElement,
-    originalPlan: SelectionPlan,
-    initialElements: [AXUIElement],
-    anchorBaseline: PathEntrySnapshot<AXUIElement>? = nil,
-    readDestination: Bool = false
-) throws -> PathEntrySnapshot<AXUIElement> {
-    guard let windows = attribute(
-        application, kAXWindowsAttribute as CFString) as? [AXUIElement] else {
-        throw ProbeError.validation("application exposes no AX windows")
-    }
-    let originalMatches = windows.filter { sameAXElement($0, openPanel) }
-    guard originalMatches.count == 1 else {
-        throw ProbeError.validation(
-            "original Open panel was replaced, missing, or ambiguous")
-    }
-    let currentPanel = originalMatches[0]
-    let newWindows = windows.filter { window in
-        !initialElements.contains(where: { sameAXElement(window, $0) })
-    }
-    for window in newWindows {
-        let parent = axElementAttribute(window, kAXParentAttribute as CFString)
-        let topLevel = axElementAttribute(window, kAXTopLevelUIElementAttribute as CFString)
-        guard (parent.map { sameAXElement($0, currentPanel) } ?? false) ||
-                (topLevel.map { sameAXElement($0, currentPanel) } ?? false) else {
-            throw ProbeError.validation("an unrelated AX window appeared during path entry")
-        }
-    }
-    guard newWindows.count <= 1 else {
-        throw ProbeError.validation("multiple new AX windows appeared during path entry")
-    }
-    let panelElements = try matchingLiveElements(currentPanel) { _ in true }
-    let panelMetadata = panelElements.map { element in
-        (element: element,
-         role: stringAttribute(element, kAXRoleAttribute as CFString),
-         title: stringAttribute(element, kAXTitleAttribute as CFString))
-    }
-    let cancels = panelMetadata.filter {
-        $0.role == kAXButtonRole && $0.title?.lowercased() == "cancel" &&
-            actions($0.element).contains(kAXPressAction)
-    }.map(\.element)
-    let choosers = panelMetadata.filter {
-        $0.role == kAXButtonRole && $0.title?.lowercased() ==
-                originalPlan.chooserTitle.lowercased() &&
-            actions($0.element).contains(kAXPressAction)
-    }.map(\.element)
-    let browsers = panelMetadata.filter {
-        guard let role = $0.role else { return false }
-        return [kAXOutlineRole, kAXBrowserRole, kAXTableRole].contains(role)
-    }.map(\.element)
-    let cancel = try exactAnchor(
-        expected: anchorBaseline?.cancel, candidates: cancels,
-        allowAdditional: anchorBaseline != nil, sameElement: sameAXElement)
-    let chooser = try exactAnchor(
-        expected: anchorBaseline?.chooser, candidates: choosers,
-        allowAdditional: false, sameElement: sameAXElement)
-    guard !browsers.isEmpty else {
-        throw ProbeError.validation("original Open panel has no file-browser anchor")
-    }
-
-    let panelSheets = panelMetadata.filter {
-        $0.role == kAXSheetRole && !sameAXElement($0.element, currentPanel)
-    }.map(\.element)
-    let relatedWindows = windows.filter { candidate in
-        guard !sameAXElement(candidate, currentPanel) else { return false }
-        let parent = axElementAttribute(candidate, kAXParentAttribute as CFString)
-        let topLevel = axElementAttribute(candidate, kAXTopLevelUIElementAttribute as CFString)
-        return (parent.map { sameAXElement($0, currentPanel) } ?? false) ||
-            (topLevel.map { sameAXElement($0, currentPanel) } ?? false)
-    }
-    let newChild = try uniqueNewRelated(
-        initial: initialElements,
-        candidates: panelSheets + relatedWindows,
-        equals: sameAXElement)
-    var candidateMetadata = panelMetadata
-    if let newChild,
-       !panelElements.contains(where: { sameAXElement($0, newChild) }) {
-        for element in try matchingLiveElements(newChild, { _ in true })
-            where !candidateMetadata.contains(where: {
-                sameAXElement($0.element, element)
-            }) {
-            candidateMetadata.append(
-                (element: element,
-                 role: stringAttribute(element, kAXRoleAttribute as CFString),
-                 title: stringAttribute(element, kAXTitleAttribute as CFString)))
-        }
-    }
-    let fieldMetadata = candidateMetadata.filter { $0.role == kAXTextFieldRole }
-    let fields = fieldMetadata.map(\.element)
-    let searchableFieldText = fieldMetadata.map { metadata in
-        [metadata.title,
-         stringAttribute(metadata.element, kAXIdentifierAttribute as CFString),
-         stringAttribute(metadata.element, kAXHelpAttribute as CFString)]
-            .compactMap { $0?.lowercased() }.joined(separator: " ")
-    }
-    let semanticPlan = SelectionPlan(
-        navigation: try PathEntryPolicy.navigation(
-            searchableFieldText: searchableFieldText),
-        chooserTitle: originalPlan.chooserTitle)
-    var titledGoControls: [AXUIElement] = []
-    for metadata in candidateMetadata {
-        guard metadata.title?.lowercased() == "go" else { continue }
-        if try PathEntryPolicy.isGoControl(
-            role: metadata.role,
-            title: metadata.title,
-            enabled: boolAttribute(metadata.element, kAXEnabledAttribute as CFString),
-            actions: actions(metadata.element)) {
-            titledGoControls.append(metadata.element)
-        }
-    }
-    let currentFields = identityDeduplicated(fields, sameElement: sameAXElement)
-    let currentGoButtons = identityDeduplicated(
-        titledGoControls, sameElement: sameAXElement)
-    let currentBrowsers = identityDeduplicated(
-        browsers, sameElement: sameAXElement)
-    let additionalCancelCount = cancels.filter {
-        !sameAXElement($0, cancel)
-    }.count
-    let topologyRestored: Bool
-    if let anchorBaseline {
-        topologyRestored = sameIdentitySet(
-            anchorBaseline.textFields, currentFields, sameElement: sameAXElement) &&
-            sameIdentitySet(
-                anchorBaseline.browserAnchors, currentBrowsers,
-                sameElement: sameAXElement) &&
-            currentGoButtons.isEmpty && additionalCancelCount == 0
-    } else {
-        topologyRestored = true
-    }
-    let restoredPlan = topologyRestored ? semanticPlan : nil
-    let destinationPaths: [String]
-    if readDestination {
-        destinationPaths = try [
-            publishedDestinationPath(
-                fileURLPathAttributePublication(
-                    currentPanel, kAXDocumentAttribute as CFString),
-                attributeName: "AXDocument"),
-            publishedDestinationPath(
-                fileURLPathAttributePublication(
-                    currentPanel, kAXURLAttribute as CFString),
-                attributeName: "AXURL"),
-        ].compactMap { $0 }
-    } else {
-        destinationPaths = []
-    }
-    return PathEntrySnapshot(
-        panel: currentPanel,
-        cancel: cancel,
-        chooser: chooser,
-        chooserEnabled: boolAttribute(
-            chooser, kAXEnabledAttribute as CFString) == true,
-        additionalCancelCount: additionalCancelCount,
-        browserAnchors: currentBrowsers,
-        textFields: currentFields,
-        goButtons: currentGoButtons,
-        restoredPlan: restoredPlan,
-        destinationPaths: destinationPaths)
+        "Open panel exact selection did not become press-ready after \(pollCount) polls")
 }
 
-func validatedPathEntryBaseline(
-    application: AXUIElement,
-    openPanel: AXUIElement,
-    originalPlan: SelectionPlan,
-    initialElements: [AXUIElement],
-    process: ProcessIdentity
-) throws -> PathEntrySnapshot<AXUIElement> {
-    try requireSameProcess(process)
-    let snapshot = try livePathEntrySnapshot(
-        application: application, openPanel: openPanel,
-        originalPlan: originalPlan, initialElements: initialElements)
-    try requireSameProcess(process)
-    let baseline = try PathEntryPolicy.baseline(
-        snapshot, expectedPlan: originalPlan, sameElement: sameAXElement)
-    return baseline
-}
-
-func waitForValidatedPathEntry(
-    application: AXUIElement,
-    baseline: PathEntrySnapshot<AXUIElement>,
-    originalPlan: SelectionPlan,
-    initialElements: [AXUIElement],
-    process: ProcessIdentity
-) throws -> PathEntryToken<AXUIElement> {
-    try waitForUniquePathEntry(
-        timeoutNanoseconds: 3_000_000_000,
-        pollMicroseconds: 100_000,
-        baseline: baseline,
-        nowNanoseconds: monotonicNanoseconds,
-        validateIdentity: { try requireSameProcess(process) },
-        readSnapshot: {
-            try livePathEntrySnapshot(
-                application: application, openPanel: baseline.panel,
-                originalPlan: originalPlan, initialElements: initialElements,
-                anchorBaseline: baseline)
-        },
-        sameElement: sameAXElement,
-        pause: { _ = usleep($0) })
-}
-
-func revalidatePathEntryToken(
-    _ token: PathEntryToken<AXUIElement>,
-    application: AXUIElement,
-    baseline: PathEntrySnapshot<AXUIElement>,
-    originalPlan: SelectionPlan,
-    initialElements: [AXUIElement],
-    process: ProcessIdentity
-) throws -> PathEntryCandidate<AXUIElement> {
-    try requireSameProcess(process)
-    let snapshot = try livePathEntrySnapshot(
-        application: application, openPanel: baseline.panel,
-        originalPlan: originalPlan, initialElements: initialElements,
-        anchorBaseline: baseline)
-    try requireSameProcess(process)
-    guard let candidate = try PathEntryPolicy.candidate(
-        baseline: baseline, current: snapshot, sameElement: sameAXElement),
-          sameAXElement(candidate.field, token.field),
-          sameAXElement(candidate.goButton, token.goButton) else {
-        throw ProbeError.validation("path-entry control identities changed before mutation")
-    }
-    return candidate
-}
-
-func waitForValidatedOpenPanelRestoration(
-    application: AXUIElement,
-    baseline: PathEntrySnapshot<AXUIElement>,
-    originalPlan: SelectionPlan,
-    initialElements: [AXUIElement],
-    expectedDestination: String,
-    process: ProcessIdentity
-) throws -> RestoredOpenPanelToken<AXUIElement> {
-    try waitForRestoredOpenPanel(
-        timeoutNanoseconds: 3_000_000_000,
-        pollMicroseconds: 100_000,
-        baseline: baseline,
-        expectedDestination: expectedDestination,
-        nowNanoseconds: monotonicNanoseconds,
-        validateIdentity: { try requireSameProcess(process) },
-        readSnapshot: {
-            try livePathEntrySnapshot(
-                application: application, openPanel: baseline.panel,
-                originalPlan: originalPlan, initialElements: initialElements,
-                anchorBaseline: baseline, readDestination: true)
-        },
-        sameElement: sameAXElement,
-        pause: { _ = usleep($0) })
-}
-
-func revalidateRestoredOpenPanelToken(
-    _ token: RestoredOpenPanelToken<AXUIElement>,
-    application: AXUIElement,
-    baseline: PathEntrySnapshot<AXUIElement>,
-    originalPlan: SelectionPlan,
-    initialElements: [AXUIElement],
-    expectedDestination: String,
-    process: ProcessIdentity
-) throws -> RestoredOpenPanelToken<AXUIElement> {
-    try requireSameProcess(process)
-    let snapshot = try livePathEntrySnapshot(
-        application: application, openPanel: baseline.panel,
-        originalPlan: originalPlan, initialElements: initialElements,
-        anchorBaseline: baseline, readDestination: true)
-    try requireSameProcess(process)
-    guard try PathEntryPolicy.restored(
-        baseline: baseline, current: snapshot,
-        expectedDestination: expectedDestination, sameElement: sameAXElement),
-          sameAXElement(snapshot.panel, token.panel),
-          sameAXElement(snapshot.chooser, token.chooser) else {
-        throw ProbeError.validation("restored Open-panel identities changed before chooser press")
-    }
-    return token
-}
-
-func chooseButton(in panel: AXUIElement, title: String) throws -> AXUIElement {
-    let matches = try matchingLiveElements(panel) {
-        stringAttribute($0, kAXRoleAttribute as CFString) == kAXButtonRole &&
-            stringAttribute($0, kAXTitleAttribute as CFString)?.lowercased() == title.lowercased()
-    }
-    guard matches.count == 1 else { throw ProbeError.validation("chooser button is missing or ambiguous") }
-    return matches[0]
-}
-
-func revalidateOriginalOpenPanel(
-    application: AXUIElement,
-    originalPanel: AXUIElement,
-    originalPlan: SelectionPlan,
-    permitKeyFallback: Bool
+func performValidatedOpenPanelListSelectionSet<Element>(
+    initial: OpenPanelListSelectionToken<Element>,
+    sameElement: (Element, Element) -> Bool,
+    revalidate: () throws -> (OpenPanelListSelectionToken<Element>,
+                               OpenPanelListSelectionSnapshot<Element>),
+    setSelection: (OpenPanelListSelectionToken<Element>) throws -> Void
 ) throws {
-    let windows = try liveWindows(application)
-    _ = try OpenPanelPolicy.plan(windows: windows.map(\.1), permitKeyFallback: permitKeyFallback)
-    let candidates = windows.filter { pair in
-        (try? OpenPanelPolicy.plan(windows: [pair.1], permitKeyFallback: permitKeyFallback)) != nil
-    }.map(\.0)
-    _ = try uniqueOriginal(original: originalPanel, candidates: candidates, equals: sameAXElement)
-    var budget = 500
-    let currentDescription = try describe(originalPanel, budget: &budget)
-    let currentPlan = try OpenPanelPolicy.plan(windows: [currentDescription],
-                                               permitKeyFallback: permitKeyFallback)
-    guard currentPlan == originalPlan else {
-        throw ProbeError.validation("original Open panel controls changed before final action")
+    let (preflight, snapshot) = try revalidate()
+    try OpenPanelListSelectionPolicy.requireSameToken(
+        initial, preflight, sameElement: sameElement)
+    if try OpenPanelListSelectionPolicy.selectionMutationRequired(
+        snapshot, token: preflight, sameElement: sameElement) {
+        try setSelection(preflight)
     }
+}
+
+func performValidatedOpenPanelListChooserPress<Element>(
+    initial: OpenPanelListSelectionToken<Element>,
+    sameElement: (Element, Element) -> Bool,
+    revalidate: () throws -> (OpenPanelListSelectionToken<Element>,
+                               OpenPanelListSelectionSnapshot<Element>),
+    pressChooser: (OpenPanelListSelectionToken<Element>) throws -> Void
+) throws {
+    let (adjacent, snapshot) = try revalidate()
+    try OpenPanelListSelectionPolicy.requireSameToken(
+        initial, adjacent, sameElement: sameElement)
+    guard try OpenPanelListSelectionPolicy.pressReady(
+        snapshot, token: adjacent, sameElement: sameElement) else {
+        throw ProbeError.validation(
+            "Open panel exact selection is not press-ready at mutation boundary")
+    }
+    try pressChooser(adjacent)
+}
+
+func requireElementBelongsToProcess(
+    _ element: AXUIElement,
+    process: ProcessIdentity,
+    purpose: String
+) throws {
+    var pid: pid_t = 0
+    guard AXUIElementGetPid(element, &pid) == .success,
+          pid == process.pid else {
+        throw ProbeError.validation("\(purpose) does not belong to the exact PID")
+    }
+}
+
+func fileSystemIdentity(_ path: String) throws -> FileSystemIdentity {
+    var info = stat()
+    guard stat(path, &info) == 0 else {
+        throw ProbeError.validation("filesystem identity is unavailable: \(path)")
+    }
+    return FileSystemIdentity(
+        device: UInt64(info.st_dev), inode: UInt64(info.st_ino))
+}
+
+func requireValidatedFixtureIdentity(_ paths: ValidatedPaths) throws {
+    guard try fileSystemIdentity(paths.fixture) == paths.fixtureIdentity,
+          try fileSystemIdentity(paths.fixtureParent) == paths.fixtureParentIdentity else {
+        throw ProbeError.validation(
+            "fixture or chooser-root filesystem identity changed")
+    }
+}
+
+func attributeSettablePublication(
+    _ element: AXUIElement,
+    _ name: CFString
+) -> AttributePublication<Bool> {
+    var settable = DarwinBoolean(false)
+    let status = AXUIElementIsAttributeSettable(element, name, &settable)
+    if status == .success { return .value(settable.boolValue) }
+    if status == .attributeUnsupported || status == .noValue { return .missing }
+    return .readFailure(status.rawValue)
+}
+
+func elementArrayAttributePublication(
+    _ element: AXUIElement,
+    _ name: CFString
+) -> ElementArrayPublication<AXUIElement> {
+    var value: CFTypeRef?
+    let status = AXUIElementCopyAttributeValue(element, name, &value)
+    if status == .attributeUnsupported || status == .noValue { return .missing }
+    guard status == .success else { return .readFailure(status.rawValue) }
+    guard let elements = value as? [AXUIElement] else { return .malformed }
+    return .value(elements)
+}
+
+func liveOpenPanelListSelectionSnapshot(
+    application: AXUIElement,
+    panel: AXUIElement,
+    chooserTitle: String,
+    fixture: String,
+    process: ProcessIdentity
+) throws -> OpenPanelListSelectionSnapshot<AXUIElement> {
+    try requireExactOpenPanelCurrent(
+        application: application, panel: panel, process: process)
+    let panelElements = try matchingLiveElements(
+        panel, nodeLimit: 5_000) { _ in true }
+    let browsers = try panelElements.filter {
+        try strictStringAttribute(
+            $0, kAXRoleAttribute as CFString,
+            purpose: "Open panel element role") == kAXBrowserRole &&
+            strictOptionalStringAttribute(
+                $0, kAXIdentifierAttribute as CFString,
+                purpose: "Open panel element identifier") == "ColumnView"
+    }
+    let descendantLists: [AXUIElement]
+    if browsers.count == 1 {
+        var browserBudget = 5_000
+        descendantLists = try strictEvidenceDescendants(
+            browsers[0], budget: &browserBudget).filter {
+                try strictStringAttribute(
+                    $0, kAXRoleAttribute as CFString,
+                    purpose: "ColumnView descendant role") == kAXListRole
+            }
+    } else {
+        descendantLists = []
+    }
+    var lists: [AXUIElement] = []
+    var candidates: [AXUIElement] = []
+    var publishedURLPathHashes = Set<String>()
+    var listChildCount = 0
+    var groupChildCount = 0
+    var rowEvidenceElementCount = 0
+    var urlPublisherCount = 0
+    var rowEvidenceBudget = 5_000
+    for list in descendantLists {
+        let listChildren = try strictChildElementsForEvidence(
+            list, purpose: "ColumnView list evidence")
+        listChildCount += listChildren.count
+        groupChildCount += try listChildren.filter {
+            try strictStringAttribute(
+                $0, kAXRoleAttribute as CFString,
+                purpose: "ColumnView child role") == kAXGroupRole
+        }.count
+        var listMatches = 0
+        for child in listChildren {
+            let role = try strictStringAttribute(
+                child, kAXRoleAttribute as CFString,
+                purpose: "Open panel row role")
+            let rowElements = [child] + (try strictEvidenceDescendants(
+                child, budget: &rowEvidenceBudget))
+            rowEvidenceElementCount += rowElements.count
+            var pathPublications: [AttributePublication<String>] = []
+            for rowElement in rowElements {
+                try requireElementBelongsToProcess(
+                    rowElement, process: process,
+                    purpose: "Open panel row evidence element")
+                let publication = accessibilityURLPathAttributePublication(
+                    rowElement, kAXURLAttribute as CFString)
+                pathPublications.append(publication)
+                if case .value(let path) = publication {
+                    urlPublisherCount += 1
+                    publishedURLPathHashes.insert(sha256(path))
+                }
+            }
+            if try OpenPanelListSelectionPolicy.rowMatchesExactFixture(
+                role: role, pathPublications: pathPublications,
+                fixture: fixture) {
+                candidates.append(child)
+                listMatches += 1
+            }
+        }
+        if listMatches > 0 { lists.append(list) }
+    }
+    lists = identityDeduplicated(lists, sameElement: sameAXElement)
+    candidates = identityDeduplicated(candidates, sameElement: sameAXElement)
+    let choosers = try panelElements.filter {
+        try strictStringAttribute(
+            $0, kAXRoleAttribute as CFString,
+            purpose: "Open panel element role") == kAXButtonRole &&
+            strictOptionalStringAttribute(
+                $0, kAXIdentifierAttribute as CFString,
+                purpose: "Open panel button identifier") == "OKButton" &&
+            strictOptionalStringAttribute(
+                $0, kAXTitleAttribute as CFString,
+                purpose: "Open panel button title")?.lowercased() ==
+                    chooserTitle.lowercased()
+    }
+    for (element, purpose) in
+        [(panel, "Open panel"),
+         (browsers.first, "ColumnView browser"),
+         (lists.first, "ColumnView list"),
+         (candidates.first, "fixture candidate"),
+         (choosers.first, "Open panel OKButton")]
+        .compactMap({ element, purpose in element.map { ($0, purpose) } }) {
+        try requireElementBelongsToProcess(
+            element, process: process, purpose: purpose)
+    }
+    let selectedChildrenSettable: AttributePublication<Bool> = lists.count == 1 ?
+        attributeSettablePublication(
+            lists[0], kAXSelectedChildrenAttribute as CFString) : .missing
+    let selectedChildren: ElementArrayPublication<AXUIElement> = lists.count == 1 ?
+        elementArrayAttributePublication(
+            lists[0], kAXSelectedChildrenAttribute as CFString) : .missing
+    let panelDestinationPublications: [(String, AttributePublication<String>)] = [
+        ("AXDocument", documentURLPathAttributePublication(
+            panel, kAXDocumentAttribute as CFString)),
+        ("AXURL", accessibilityURLPathAttributePublication(
+            panel, kAXURLAttribute as CFString)),
+    ]
+    var panelDestinations: [String] = []
+    for (name, publication) in panelDestinationPublications {
+        if let path = try publishedDestinationPath(
+            publication, attributeName: name) {
+            panelDestinations.append(path)
+        }
+    }
+    let expectedParent = (fixture as NSString).deletingLastPathComponent
+    guard panelDestinations.allSatisfy({ $0 == expectedParent }) else {
+        throw ProbeError.validation(
+            "Open panel published a destination outside the exact fixture parent")
+    }
+    let panelDestinationPathHashes = panelDestinations.map(sha256).sorted()
+    let chooserEnabled: Bool
+    if choosers.count == 1 {
+        chooserEnabled = try strictOptionalBoolAttribute(
+            choosers[0], kAXEnabledAttribute as CFString,
+            purpose: "Open panel OKButton enabled state") == true
+    } else {
+        chooserEnabled = false
+    }
+    let snapshot = OpenPanelListSelectionSnapshot(
+        panels: [panel], browsers: browsers, lists: lists,
+        candidates: candidates, choosers: choosers,
+        selectedChildrenSettable: selectedChildrenSettable,
+        selectedChildren: selectedChildren,
+        chooserEnabled: chooserEnabled,
+        chooserActions: choosers.count == 1 ?
+            try strictActions(choosers[0], purpose: "Open panel OKButton") : [],
+        listChildCount: listChildCount,
+        descendantListCount: descendantLists.count,
+        groupChildCount: groupChildCount,
+        rowEvidenceElementCount: rowEvidenceElementCount,
+        urlPublisherCount: urlPublisherCount,
+        publishedURLPathHashes: publishedURLPathHashes.sorted(),
+        panelDestinationPathHashes: panelDestinationPathHashes.sorted())
+    try requireExactOpenPanelCurrent(
+        application: application, panel: panel, process: process)
+    return snapshot
+}
+
+func waitForValidatedOpenPanelListSelection(
+    application: AXUIElement,
+    panel: AXUIElement,
+    chooserTitle: String,
+    paths: ValidatedPaths,
+    process: ProcessIdentity
+) throws -> OpenPanelListSelectionReadiness<AXUIElement>? {
+    try waitForReadyOpenPanelListSelection(
+        timeoutNanoseconds: 3_000_000_000,
+        pollMicroseconds: 100_000,
+        nowNanoseconds: monotonicNanoseconds,
+        validateIdentity: {
+            try requireSameProcess(process)
+            try requireValidatedFixtureIdentity(paths)
+        },
+        readSnapshot: {
+            try liveOpenPanelListSelectionSnapshot(
+                application: application, panel: panel,
+                chooserTitle: chooserTitle, fixture: paths.fixture,
+                process: process)
+        },
+        pause: { _ = usleep($0) })
+}
+
+func revalidateOpenPanelListSelectionToken(
+    _ expected: OpenPanelListSelectionToken<AXUIElement>?,
+    application: AXUIElement,
+    panel: AXUIElement,
+    chooserTitle: String,
+    fixture: String,
+    process: ProcessIdentity
+) throws -> (OpenPanelListSelectionToken<AXUIElement>,
+             OpenPanelListSelectionSnapshot<AXUIElement>) {
+    try requireSameProcess(process)
+    let snapshot = try liveOpenPanelListSelectionSnapshot(
+        application: application, panel: panel, chooserTitle: chooserTitle,
+        fixture: fixture, process: process)
+    let token = try OpenPanelListSelectionPolicy.token(snapshot)
+    if let expected {
+        try OpenPanelListSelectionPolicy.requireSameToken(
+            expected, token, sameElement: sameAXElement)
+    }
+    try requireSameProcess(process)
+    return (token, snapshot)
+}
+
+func performValidatedOpenPanelListSelection(
+    initial: OpenPanelListSelectionToken<AXUIElement>,
+    application: AXUIElement,
+    panel: AXUIElement,
+    chooserTitle: String,
+    paths: ValidatedPaths,
+    process: ProcessIdentity
+) throws -> (actionCount: Int, selectedPollCount: Int) {
+    let requireFixtureIdentity = {
+        try requireValidatedFixtureIdentity(paths)
+    }
+    try requireFixtureIdentity()
+    var actionCount = 0
+    let revalidate = {
+        try requireFixtureIdentity()
+        return try revalidateOpenPanelListSelectionToken(
+            initial, application: application, panel: panel,
+            chooserTitle: chooserTitle, fixture: paths.fixture, process: process)
+    }
+    try performValidatedOpenPanelListSelectionSet(
+        initial: initial, sameElement: sameAXElement,
+        revalidate: revalidate,
+        setSelection: { token in
+            try requireFixtureIdentity()
+            try requireSameProcess(process)
+            let status = AXUIElementSetAttributeValue(
+                token.list, kAXSelectedChildrenAttribute as CFString,
+                [token.candidate] as CFArray)
+            try requireSameProcess(process)
+            guard status == .success else {
+                throw ProbeError.unavailable(
+                    "setting exact Open panel candidate selection failed")
+            }
+            actionCount += 1
+            try requireFixtureIdentity()
+        })
+    let selectedPollCount = try waitForSelectedOpenPanelList(
+        timeoutNanoseconds: 3_000_000_000,
+        pollMicroseconds: 100_000,
+        expected: initial,
+        nowNanoseconds: monotonicNanoseconds,
+        revalidate: revalidate,
+        sameElement: sameAXElement,
+        pause: { _ = usleep($0) })
+    try performValidatedOpenPanelListChooserPress(
+        initial: initial, sameElement: sameAXElement,
+        revalidate: revalidate,
+        pressChooser: { token in
+            try requireFixtureIdentity()
+            try press(token.chooser, purpose: "Open panel exact OKButton",
+                      process: process)
+            try requireFixtureIdentity()
+        })
+    return (actionCount: actionCount, selectedPollCount: selectedPollCount)
+}
+// END_PID_OPEN_PANEL_LIST_SELECTION
+
+struct OpenPanelAbsenceEvidence: Equatable {
+    let windowCount: Int
+    let visitedCount: Int
+}
+
+func requireOpenPanelAbsent(
+    application: AXUIElement,
+    process: ProcessIdentity
+) throws -> OpenPanelAbsenceEvidence {
+    try requireSameProcess(process)
+    var windowsValue: CFTypeRef?
+    let windowsStatus = AXUIElementCopyAttributeValue(
+        application, kAXWindowsAttribute as CFString, &windowsValue)
+    guard windowsStatus == .success,
+          let windows = windowsValue as? [AXUIElement] else {
+        throw ProbeError.unavailable(
+            "application AX windows are incomplete before picker request: " +
+            "\(windowsStatus.rawValue)")
+    }
+    guard windows.count <= 8 else {
+        throw ProbeError.validation(
+            "application exposes too many AX windows before picker request")
+    }
+    var pending = windows.map { (element: $0, depth: 0) }
+    var nextIndex = 0
+    var visitedCount = 0
+    while nextIndex < pending.count {
+        guard visitedCount < 1_000 else {
+            throw ProbeError.validation(
+                "pre-request AX traversal exceeded node limit")
+        }
+        let current = pending[nextIndex]
+        nextIndex += 1
+        visitedCount += 1
+        try requireElementBelongsToProcess(
+            current.element, process: process,
+            purpose: "pre-request AX evidence element")
+        let role = try strictStringAttribute(
+            current.element, kAXRoleAttribute as CFString,
+            purpose: "pre-request AX evidence role")
+        guard role != kAXSheetRole else {
+            throw ProbeError.validation(
+                "an AXSheet already exists before the final renderer picker request")
+        }
+        var childrenValue: CFTypeRef?
+        let childrenStatus = AXUIElementCopyAttributeValue(
+            current.element, kAXChildrenAttribute as CFString, &childrenValue)
+        if childrenStatus == .success {
+            guard let children = childrenValue as? [AXUIElement] else {
+                throw ProbeError.validation(
+                    "pre-request AX children are malformed")
+            }
+            guard children.count <= 128 else {
+                throw ProbeError.validation(
+                    "pre-request AX child fanout is excessive")
+            }
+            if current.depth == 8 {
+                guard children.isEmpty else {
+                    throw ProbeError.validation(
+                        "pre-request AX traversal exceeded depth limit")
+                }
+            } else {
+                pending.append(contentsOf: children.map {
+                    (element: $0, depth: current.depth + 1)
+                })
+            }
+        } else if childrenStatus != .noValue &&
+                    childrenStatus != .attributeUnsupported {
+            throw ProbeError.unavailable(
+                "pre-request AX child read is incomplete: " +
+                "\(childrenStatus.rawValue)")
+        }
+    }
+    try requireSameProcess(process)
+    return OpenPanelAbsenceEvidence(
+        windowCount: windows.count, visitedCount: visitedCount)
 }
 
 func execute(options: Options, paths: ValidatedPaths, log: EventLog) throws {
     let verification = try verifyProcess(options: options, paths: paths)
     let identity = verification.identity
-    try log.write("process-validated", ["pid": Int(identity.pid),
-                                         "startSeconds": identity.startSeconds,
-                                         "executableSha256": sha256(identity.executable),
-                                         "appKitRegistrationPollCount":
-                                            verification.registrationPollCount])
+    try log.write("process-validated", [
+        "pid": Int(identity.pid),
+        "startSeconds": identity.startSeconds,
+        "executableSha256": sha256(identity.executable),
+        "appKitRegistrationPollCount": verification.registrationPollCount,
+    ])
     guard AXIsProcessTrusted() else {
         try log.write("accessibility-not-trusted", ["pid": Int(identity.pid)])
-        throw ProbeError.permission("Accessibility is not granted to this exact helper artifact")
+        throw ProbeError.permission(
+            "Accessibility is not granted to this exact helper artifact")
     }
     let application = AXUIElementCreateApplication(options.pid)
-    if options.phase == .inspectOpenFolderMenu {
-        let menuReadiness = try waitForValidatedOpenFolderMenu(
-            application: application, process: identity)
-        let menuPlan = menuReadiness.plan
-        var menuFields: [String: Any] = [
-            "pid": Int(identity.pid),
-            "parentTitle": menuPlan.parentTitle,
-            "itemTitle": menuPlan.itemTitle,
-            "commandCharacter": "O",
-            "commandVirtualKeyPublished": menuPlan.commandVirtualKey != nil,
-            "commandModifiers": OpenFolderMenuPolicy.commandModifiers,
-            "enabled": true,
-            "action": kAXPressAction,
-            "actionCount": 0,
-            "pollCount": menuReadiness.pollCount,
-        ]
-        if let commandVirtualKey = menuPlan.commandVirtualKey {
-            menuFields["commandVirtualKey"] = commandVirtualKey
-        }
-        try log.write("open-folder-menu-validated", menuFields)
-        return
-    }
-    // BEGIN_PID_OPEN_FOLDER_REQUEST
-    if options.pressOpenFolderMenuItem {
-        let activationReadiness = try activateVerifiedApplication(
-            application: application, process: identity, paths: paths)
-        try log.write("application-activation-validated", [
-            "pid": Int(identity.pid),
-            "actionCount": activationReadiness.actionCount,
-            "pollCount": activationReadiness.pollCount,
-        ])
-        let menuReadiness = try pressOpenFolderMenuItem(
-            application: application, process: identity,
-            validateActive: {
-                try requireVerifiedApplicationActive(
-                    application: application, process: identity, paths: paths)
-            })
-        let menuPlan = menuReadiness.plan
-        var menuFields: [String: Any] = [
-            "pid": Int(identity.pid),
-            "parentTitle": menuPlan.parentTitle,
-            "itemTitle": menuPlan.itemTitle,
-            "commandCharacter": "O",
-            "commandVirtualKeyPublished": menuPlan.commandVirtualKey != nil,
-            "commandModifiers": OpenFolderMenuPolicy.commandModifiers,
-            "actionCount": 1,
-            "pollCount": menuReadiness.pollCount,
-        ]
-        if let commandVirtualKey = menuPlan.commandVirtualKey {
-            menuFields["commandVirtualKey"] = commandVirtualKey
-        }
-        try log.write("open-folder-menu-item-pressed", menuFields)
-    }
+    let absenceEvidence = try requireOpenPanelAbsent(
+        application: application, process: identity)
+    try log.write("open-panel-absence-validated", [
+        "pid": Int(identity.pid),
+        "startSeconds": identity.startSeconds,
+        "fixtureSha256": sha256(paths.fixture),
+        "windowCount": absenceEvidence.windowCount,
+        "visitedCount": absenceEvidence.visitedCount,
+    ])
     let readiness = try waitForValidatedOpenPanel(
-        application: application, identity: identity,
-        permitKeyFallback: options.permitKeyFallback)
-    // END_PID_OPEN_FOLDER_REQUEST
+        application: application, identity: identity)
     let panel = readiness.panel
     let plan = readiness.plan
-    try log.write("open-panel-validated", ["windowCount": readiness.initialElements.count,
-                                            "pollCount": readiness.pollCount,
-                                            "navigation": plan.navigation == .direct ? "direct" : "command-shift-g",
-                                            "chooserTitle": plan.chooserTitle])
-    if options.phase == .inspectProjectPicker { return }
-    switch plan.navigation {
-    case .direct:
-        let fields = try matchingLiveElements(panel) {
-            guard stringAttribute($0, kAXRoleAttribute as CFString) == kAXTextFieldRole else { return false }
-            let text = [stringAttribute($0, kAXIdentifierAttribute as CFString),
-                        stringAttribute($0, kAXTitleAttribute as CFString),
-                        stringAttribute($0, kAXHelpAttribute as CFString)]
-                .compactMap { $0?.lowercased() }.joined(separator: " ")
-            return text.contains("path") || text.contains("location") || text.contains("folder")
-        }
-        try requireSameProcess(identity)
-        guard fields.count == 1,
-              AXUIElementSetAttributeValue(fields[0], kAXValueAttribute as CFString,
-                                           paths.fixture as CFString) == .success else {
-            throw ProbeError.validation("direct path field is missing, ambiguous, or not writable")
-        }
-    case .commandShiftG:
-        guard options.focusOpenPanel else {
-            throw ProbeError.validation(
-                "command-shift-g navigation requires --focus-open-panel")
-        }
-        let focusReadiness = try focusOpenPanel(
-            application: application, panel: panel, process: identity)
-        try log.write("open-panel-focus-validated", [
-            "pid": Int(identity.pid),
-            "authorized": true,
-            "actionCount": focusReadiness.actionCount,
-            "pollCount": focusReadiness.pollCount,
+    guard let listSelectionReadiness =
+        try waitForValidatedOpenPanelListSelection(
+            application: application, panel: panel,
+            chooserTitle: plan.chooserTitle, paths: paths,
+            process: identity) else {
+        let diagnostic = try liveOpenPanelListSelectionSnapshot(
+            application: application, panel: panel,
+            chooserTitle: plan.chooserTitle, fixture: paths.fixture,
+            process: identity)
+        try log.write("open-panel-list-selection-unavailable", [
+            "browserCount": diagnostic.browsers.count,
+            "listCount": diagnostic.lists.count,
+            "descendantListCount": diagnostic.descendantListCount,
+            "listChildCount": diagnostic.listChildCount,
+            "groupChildCount": diagnostic.groupChildCount,
+            "rowEvidenceElementCount": diagnostic.rowEvidenceElementCount,
+            "urlPublisherCount": diagnostic.urlPublisherCount,
+            "candidateCount": diagnostic.candidates.count,
+            "chooserCount": diagnostic.choosers.count,
+            "chooserEnabled": diagnostic.chooserEnabled,
+            "chooserPressPublished":
+                diagnostic.chooserActions.contains(kAXPressAction),
+            "selectedChildrenSettable":
+                boolPublicationKind(diagnostic.selectedChildrenSettable),
+            "selectedChildrenPublication":
+                elementArrayPublicationKind(diagnostic.selectedChildren),
+            "publishedURLPathHashes": diagnostic.publishedURLPathHashes,
+            "panelDestinationPathHashes": diagnostic.panelDestinationPathHashes,
+            "fixturePathHash": sha256(paths.fixture),
         ])
-        try requireSameProcess(identity)
-        let refreshedWindows = try strictElementArrayAttribute(
-            application, kAXWindowsAttribute as CFString,
-            purpose: "application windows after Open panel focus")
-        try requireSameProcess(identity)
-        let initialSheets = try matchingLiveElements(panel) {
-            stringAttribute($0, kAXRoleAttribute as CFString) == kAXSheetRole
-        }
-        let initialElements = identityDeduplicated(
-            refreshedWindows + initialSheets, sameElement: sameAXElement)
-        let baseline = try validatedPathEntryBaseline(
-            application: application, openPanel: panel,
-            originalPlan: plan, initialElements: initialElements,
-            process: identity)
-        try postCommandShiftG(
-            application: application, panel: panel, to: identity)
-        let token = try waitForValidatedPathEntry(
-            application: application, baseline: baseline,
-            originalPlan: plan, initialElements: initialElements,
-            process: identity)
-        var candidate = try revalidatePathEntryToken(
-            token, application: application, baseline: baseline,
-            originalPlan: plan, initialElements: initialElements,
-            process: identity)
-        try requireSameProcess(identity)
-        guard AXUIElementSetAttributeValue(candidate.field, kAXValueAttribute as CFString,
-                                           paths.fixture as CFString) == .success else {
-            throw ProbeError.validation("path-entry field rejected fixture root")
-        }
-        try requireSameProcess(identity)
-        candidate = try revalidatePathEntryToken(
-            token, application: application, baseline: baseline,
-            originalPlan: plan, initialElements: initialElements,
-            process: identity)
-        try requireSameProcess(identity)
-        let publishedPath = stringAttribute(candidate.field, kAXValueAttribute as CFString)
-        try requireSameProcess(identity)
-        guard publishedPath == paths.fixture else {
-            throw ProbeError.validation("path-entry field did not retain the exact fixture root")
-        }
-        try press(candidate.goButton, purpose: "path-entry confirmation", process: identity)
-        let restored = try waitForValidatedOpenPanelRestoration(
-            application: application, baseline: baseline,
-            originalPlan: plan, initialElements: initialElements,
-            expectedDestination: paths.fixture,
-            process: identity)
-        let revalidatedRestored = try revalidateRestoredOpenPanelToken(
-            restored, application: application, baseline: baseline,
-            originalPlan: plan, initialElements: initialElements,
-            expectedDestination: paths.fixture,
-            process: identity)
-        try press(revalidatedRestored.chooser, purpose: "Open panel chooser",
-                  process: identity)
-        let finalIdentity = try processIdentity(options.pid)
-        guard finalIdentity == identity else {
-            throw ProbeError.validation("PID identity changed during AX action")
-        }
-        try log.write("project-selection-requested", ["pid": Int(identity.pid),
-                                                       "fixtureSha256": sha256(paths.fixture),
-                                                       "pathEntryPollCount": token.pollCount,
-                                                       "restorePollCount": restored.pollCount])
-        return
+        throw ProbeError.unavailable(
+            "Open panel exact list selection did not become ready")
     }
-    try revalidateOriginalOpenPanel(application: application, originalPanel: panel,
-                                    originalPlan: plan,
-                                    permitKeyFallback: options.permitKeyFallback)
-    try press(try chooseButton(in: panel, title: plan.chooserTitle),
-              purpose: "Open panel chooser", process: identity)
-    let finalIdentity = try processIdentity(options.pid)
-    guard finalIdentity == identity else { throw ProbeError.validation("PID identity changed during AX action") }
-    try log.write("project-selection-requested", ["pid": Int(identity.pid),
-                                                   "fixtureSha256": sha256(paths.fixture)])
+    try log.write("open-panel-validated", [
+        "windowCount": readiness.initialElements.count,
+        "pollCount": readiness.pollCount,
+        "navigation": "selected-children",
+        "chooserTitle": plan.chooserTitle,
+    ])
+    let result = try performValidatedOpenPanelListSelection(
+        initial: listSelectionReadiness.token,
+        application: application, panel: panel,
+        chooserTitle: plan.chooserTitle, paths: paths,
+        process: identity)
+    try requireSameProcess(identity)
+    try requireValidatedFixtureIdentity(paths)
+    try log.write("project-selection-requested", [
+        "pid": Int(identity.pid),
+        "fixtureSha256": sha256(paths.fixture),
+        "navigation": "selected-children",
+        "readinessPollCount": listSelectionReadiness.pollCount,
+        "selectionActionCount": result.actionCount,
+        "selectedPollCount": result.selectedPollCount,
+    ])
 }
 
 func testPublication<Value: Equatable>(
@@ -2429,1503 +2045,159 @@ func testPublication<Value: Equatable>(
 
 func testElement(role: String, title: String? = nil, identifier: String? = nil,
                  subrole: String? = nil, enabled: Bool? = nil,
-                 menuCommandCharacter: String? = nil,
-                 menuCommandCharacterMalformed: Bool = false,
-                 menuCommandCharacterReadFailure: Int32? = nil,
-                 menuCommandVirtualKey: Int? = nil,
-                 menuCommandVirtualKeyMalformed: Bool = false,
-                 menuCommandVirtualKeyReadFailure: Int32? = nil,
-                 menuCommandModifiers: Int? = nil,
-                 menuCommandModifiersMalformed: Bool = false,
-                 menuCommandModifiersReadFailure: Int32? = nil,
                  actions: Set<String> = [],
                  children: [ElementDescription] = []) -> ElementDescription {
     ElementDescription(role: role, subrole: subrole, identifier: identifier, title: title,
-                       help: nil, enabled: enabled,
-                       menuCommandCharacter: testPublication(
-                        menuCommandCharacter, malformed: menuCommandCharacterMalformed,
-                        readFailure: menuCommandCharacterReadFailure),
-                       menuCommandVirtualKey: testPublication(
-                        menuCommandVirtualKey, malformed: menuCommandVirtualKeyMalformed,
-                        readFailure: menuCommandVirtualKeyReadFailure),
-                       menuCommandModifiers: testPublication(
-                        menuCommandModifiers, malformed: menuCommandModifiersMalformed,
-                        readFailure: menuCommandModifiersReadFailure),
-                       actions: actions, children: children)
+                       help: nil, enabled: enabled, actions: actions,
+                       children: children)
 }
 
 func runSelfTests() throws {
     func require(_ condition: Bool, _ message: String) throws {
         if !condition { throw ProbeError.validation("self-test failed: \(message)") }
     }
-    func sameString(_ left: String, _ right: String) -> Bool { left == right }
-    try require(integralIntPublication(NSNumber(value: 31)) == .value(31),
-                "integral AX command value was not preserved")
-    try require(integralIntPublication(NSNumber(value: 31.5)) == .malformed,
-                "fractional AX command value was coerced to an integer")
-    try require(integralIntPublication(kCFBooleanTrue) == .malformed,
-                "boolean AX command value was coerced to an integer")
-    try require(integralIntPublication("31" as CFString) == .malformed,
-                "string AX command value was coerced to an integer")
-    try require(stringPublication(NSNumber(value: 31)) == .malformed,
-                "numeric AX command character was coerced to a string")
-    try require(fileURLPathPublication(
-        URL(fileURLWithPath: "/private/tmp") as CFURL) == .value("/private/tmp"),
-        "CFURL destination was not canonicalized to a file path")
-    try require(fileURLPathPublication(
-        "file:///private/tmp/" as CFString) == .value("/private/tmp"),
-        "string URL destination was not canonicalized to a file path")
-    try require(fileURLPathPublication(
-        "https://example.invalid/" as CFString) == .malformed,
-        "non-file destination URL passed")
-    let unsupportedPublication: AttributePublication<Int> = attributePublication(
-        status: .attributeUnsupported) { .value(31) }
-    let noValuePublication: AttributePublication<Int> = attributePublication(
-        status: .noValue) { .value(31) }
-    try require(unsupportedPublication == .missing && noValuePublication == .missing,
-                "unsupported or valueless AX attribute was not classified as unpublished")
-    let successfulPublication: AttributePublication<Int> = attributePublication(
-        status: .success) { .value(31) }
-    try require(successfulPublication == .value(31),
-                "successful AX attribute read discarded its published value")
-    let hardReadFailures: [AXError] = [
-        .failure, .invalidUIElement, .cannotComplete, .notImplemented, .apiDisabled,
-    ]
-    for status in hardReadFailures {
-        let publication: AttributePublication<Int> = attributePublication(status: status) {
-            .value(31)
-        }
-        try require(publication == .readFailure(status.rawValue),
-                    "hard AX read failure was classified as unpublished")
-    }
-    let expectedProcess = ProcessIdentity(pid: 42, startSeconds: 10,
-                                          startMicroseconds: 20,
-                                          executable: "/private/tmp/copied/ChatGPT")
-    let exactRegistration = AppKitRegistrationSample.published(
-        isTerminated: false, bundlePath: "/private/tmp/copied/ChatGPT.app",
-        executablePath: expectedProcess.executable)
-    var registrationSamples: [AppKitRegistrationSample] = [.unavailable, exactRegistration]
-    var registrationNow: UInt64 = 0
-    var registrationIdentityChecks = 0
-    var registrationFinalChecks = 0
-    let delayedRegistration = try verifyProcessRegistration(
-        timeoutNanoseconds: 1_000_000_000, pollMicroseconds: 100,
-        expectedBundle: "/private/tmp/copied/ChatGPT.app",
-        expectedExecutable: expectedProcess.executable,
-        nowNanoseconds: { registrationNow },
-        validateIdentity: { registrationIdentityChecks += 1 },
-        readSample: { registrationSamples.removeFirst() },
-        validateFinal: { registrationFinalChecks += 1 },
-        pause: { registrationNow += UInt64($0) * 1_000 })
-    try require(delayedRegistration.pollCount == 2 &&
-                registrationIdentityChecks == 6 && registrationFinalChecks == 1,
-                "missing AppKit registration did not retry before final validation")
-
-    registrationSamples = [
-        .published(isTerminated: false, bundlePath: nil,
-                   executablePath: expectedProcess.executable),
-        .published(isTerminated: false, bundlePath: "/private/tmp/copied/ChatGPT.app",
-                   executablePath: nil),
-        exactRegistration,
-    ]
-    registrationNow = 0
-    let nilURLRegistration = try verifyProcessRegistration(
-        timeoutNanoseconds: 1_000_000_000, pollMicroseconds: 100,
-        expectedBundle: "/private/tmp/copied/ChatGPT.app",
-        expectedExecutable: expectedProcess.executable,
-        nowNanoseconds: { registrationNow }, validateIdentity: {},
-        readSample: { registrationSamples.removeFirst() }, validateFinal: {},
-        pause: { registrationNow += UInt64($0) * 1_000 })
-    try require(nilURLRegistration.pollCount == 3,
-                "missing AppKit bundle or executable URL did not retry")
-
-    func requireImmediateRegistrationRejection(
-        _ sample: AppKitRegistrationSample,
-        _ message: String
-    ) throws {
-        var reads = 0
-        var pauses = 0
-        var finals = 0
-        var rejected = false
-        do {
-            _ = try verifyProcessRegistration(
-                timeoutNanoseconds: 1_000_000_000, pollMicroseconds: 100,
-                expectedBundle: "/private/tmp/copied/ChatGPT.app",
-                expectedExecutable: expectedProcess.executable,
-                nowNanoseconds: { 0 }, validateIdentity: {},
-                readSample: { reads += 1; return sample },
-                validateFinal: { finals += 1 }, pause: { _ in pauses += 1 })
-        } catch ProbeError.validation { rejected = true }
-        try require(rejected && reads == 1 && pauses == 0 && finals == 0, message)
-    }
-    try requireImmediateRegistrationRejection(
-        .published(isTerminated: false, bundlePath: "/private/tmp/wrong.app",
-                   executablePath: expectedProcess.executable),
-        "published AppKit bundle mismatch did not fail immediately")
-    try requireImmediateRegistrationRejection(
-        .published(isTerminated: false, bundlePath: "/private/tmp/copied/ChatGPT.app",
-                   executablePath: "/private/tmp/wrong/ChatGPT"),
-        "published AppKit executable mismatch did not fail immediately")
-    try requireImmediateRegistrationRejection(
-        .published(isTerminated: true, bundlePath: nil, executablePath: nil),
-        "terminated AppKit registration did not fail immediately")
-
-    registrationNow = 0
-    var registrationTimeoutReads = 0
+    try require(
+        classifyAXChildrenRead(status: .success, valueIsElementArray: true) ==
+            .published,
+        "published AXChildren were rejected")
+    try require(
+        classifyAXChildrenRead(status: .cannotComplete, valueIsElementArray: false) ==
+            .failed,
+        "incomplete AXChildren read became a leaf")
+    try require(
+        accessibilityURLPathPublication(
+            URL(fileURLWithPath: "/private/tmp") as CFURL) ==
+            .value("/private/tmp"),
+        "AXURL file path was not preserved")
+    try require(
+        try OpenPanelListSelectionPolicy.rowMatchesExactFixture(
+            role: kAXGroupRole,
+            pathPublications: [.value("/private/tmp/project")],
+            fixture: "/private/tmp/project"),
+        "exact fixture row was rejected")
     var rejected = false
     do {
-        _ = try verifyProcessRegistration(
-            timeoutNanoseconds: 300_000, pollMicroseconds: 100,
-            expectedBundle: "/private/tmp/copied/ChatGPT.app",
-            expectedExecutable: expectedProcess.executable,
-            nowNanoseconds: { registrationNow }, validateIdentity: {},
-            readSample: { registrationTimeoutReads += 1; return .unavailable },
-            validateFinal: {},
-            pause: { registrationNow += UInt64($0) * 1_000 })
-    } catch ProbeError.unavailable(let message) {
-        rejected = message == "AppKit process registration did not become ready after 3 polls"
-    }
-    try require(rejected && registrationTimeoutReads == 3,
-                "AppKit registration timeout used the wrong poll bound")
+        _ = try OpenPanelListSelectionPolicy.rowMatchesExactFixture(
+            role: kAXGroupRole,
+            pathPublications: [.value("/private/tmp/project"),
+                               .value("/private/tmp/other")],
+            fixture: "/private/tmp/project")
+    } catch ProbeError.validation { rejected = true }
+    try require(rejected, "ambiguous row paths were accepted")
 
-    var activationNow: UInt64 = 0
-    var activationTrace: [String] = []
-    var activationStates = [false, false, true]
-    let activationReadiness = try activateExactApplication(
-        timeoutNanoseconds: 1_000_000_000, pollMicroseconds: 100,
-        nowNanoseconds: { activationNow },
-        validateIdentity: { activationTrace.append("identity") },
-        readReady: {
-            activationTrace.append("ready")
-            return activationStates.removeFirst()
-        },
-        requestActivation: {
-            activationTrace.append("activate")
-            return true
-        },
-        pause: {
-            activationTrace.append("pause")
-            activationNow += UInt64($0) * 1_000
-        })
-    try require(activationReadiness.actionCount == 1 &&
-                    activationReadiness.pollCount == 3 &&
-                    activationTrace.filter({ $0 == "activate" }).count == 1,
-                "exact application activation was not single-shot and bounded")
-    activationNow = 0
-    activationTrace = []
-    let alreadyActiveReadiness = try activateExactApplication(
-        timeoutNanoseconds: 1_000_000_000, pollMicroseconds: 100,
-        nowNanoseconds: { activationNow },
-        validateIdentity: { activationTrace.append("identity") },
-        readReady: { activationTrace.append("ready"); return true },
-        requestActivation: { activationTrace.append("activate"); return true },
-        pause: { _ in activationTrace.append("pause") })
-    try require(alreadyActiveReadiness.actionCount == 0 &&
-                    alreadyActiveReadiness.pollCount == 1 &&
-                    !activationTrace.contains("activate") &&
-                    !activationTrace.contains("pause"),
-                "already-active exact application requested activation")
-    activationNow = 0
-    activationTrace = []
+    let chooser = testElement(
+        role: kAXButtonRole, title: "Open", identifier: "OKButton",
+        enabled: true, actions: [kAXPressAction])
+    let panel = testElement(
+        role: kAXSheetRole,
+        children: [
+            testElement(
+                role: kAXButtonRole, title: "Cancel",
+                actions: [kAXPressAction]),
+            chooser,
+            testElement(role: kAXBrowserRole, identifier: "ColumnView"),
+        ])
+    try require(
+        try OpenPanelPolicy.plan(windows: [panel]).chooserTitle == "Open",
+        "exact Open panel contract was rejected")
     rejected = false
-    do {
-        _ = try activateExactApplication(
-            timeoutNanoseconds: 1_000_000_000, pollMicroseconds: 100,
-            nowNanoseconds: { activationNow },
-            validateIdentity: { activationTrace.append("identity") },
-            readReady: { activationTrace.append("ready"); return false },
-            requestActivation: { activationTrace.append("activate"); return false },
-            pause: { _ in activationTrace.append("pause") })
-    } catch ProbeError.unavailable(let message) {
-        rejected = message == "exact application activation request was rejected"
-    }
-    try require(rejected && activationTrace.filter({ $0 == "activate" }).count == 1 &&
-                    !activationTrace.contains("pause"),
-                "rejected exact activation request retried or paused")
+    do { _ = try OpenPanelPolicy.plan(windows: [panel, panel]) }
+    catch ProbeError.validation { rejected = true }
+    try require(rejected, "ambiguous Open panels were accepted")
 
-    func requireRegistrationIdentityDrift(
-        identities: [ProcessIdentity],
-        samples: [AppKitRegistrationSample],
-        expectedReads: Int,
-        expectedFinals: Int,
-        _ message: String
-    ) throws {
-        var remainingIdentities = identities
-        var remainingSamples = samples
-        var reads = 0
-        var finals = 0
-        var now: UInt64 = 0
-        var driftRejected = false
-        do {
-            _ = try verifyProcessRegistration(
-                timeoutNanoseconds: 1_000_000_000, pollMicroseconds: 100,
-                expectedBundle: "/private/tmp/copied/ChatGPT.app",
-                expectedExecutable: expectedProcess.executable,
-                nowNanoseconds: { now },
-                validateIdentity: {
-                    let actual = remainingIdentities.removeFirst()
-                    try requireProcessIdentity(actual, matches: expectedProcess)
-                },
-                readSample: { reads += 1; return remainingSamples.removeFirst() },
-                validateFinal: { finals += 1 },
-                pause: { now += UInt64($0) * 1_000 })
-        } catch ProbeError.validation { driftRejected = true }
-        try require(driftRejected && reads == expectedReads && finals == expectedFinals,
-                    message)
-    }
-    let pidDrift = ProcessIdentity(pid: 43, startSeconds: 10, startMicroseconds: 20,
-                                   executable: expectedProcess.executable)
-    let startDrift = ProcessIdentity(pid: 42, startSeconds: 11, startMicroseconds: 20,
-                                     executable: expectedProcess.executable)
-    let pathDrift = ProcessIdentity(pid: 42, startSeconds: 10, startMicroseconds: 20,
-                                    executable: "/private/tmp/wrong/ChatGPT")
-    let identityDrifts = [
-        ("PID", pidDrift),
-        ("process start", startDrift),
-        ("kernel executable", pathDrift),
-    ]
-    for (label, drift) in identityDrifts {
-        try requireRegistrationIdentityDrift(
-            identities: [drift], samples: [exactRegistration],
-            expectedReads: 0, expectedFinals: 0,
-            "\(label) drift before AppKit sampling was not rejected")
-        try requireRegistrationIdentityDrift(
-            identities: [expectedProcess, drift], samples: [exactRegistration],
-            expectedReads: 1, expectedFinals: 0,
-            "\(label) drift after AppKit sampling was not rejected")
-        try requireRegistrationIdentityDrift(
-            identities: [expectedProcess, expectedProcess, drift],
-            samples: [.unavailable, exactRegistration], expectedReads: 1,
-            expectedFinals: 0,
-            "\(label) drift before the next AppKit sample was not rejected")
-        try requireRegistrationIdentityDrift(
-            identities: [expectedProcess, expectedProcess, drift],
-            samples: [exactRegistration], expectedReads: 1, expectedFinals: 0,
-            "\(label) drift before final validation was not rejected")
-        try requireRegistrationIdentityDrift(
-            identities: [expectedProcess, expectedProcess, expectedProcess, drift],
-            samples: [exactRegistration], expectedReads: 1, expectedFinals: 1,
-            "\(label) drift after final validation was not rejected")
-    }
-
-    func menuBar(menuBarRole: String = kAXMenuBarRole,
-                 parentTitle: String? = "File", parentRole: String = kAXMenuBarItemRole,
-                 menuRole: String = kAXMenuRole, itemTitle: String = "Open Folder…",
-                 itemRole: String = kAXMenuItemRole, enabled: Bool? = true,
-                 actions: Set<String> = [kAXPressAction], commandCharacter: String? = "O",
-                 commandCharacterMalformed: Bool = false,
-                 commandCharacterReadFailure: Int32? = nil,
-                 commandVirtualKey: Int? = 31,
-                 commandVirtualKeyMalformed: Bool = false,
-                 commandVirtualKeyReadFailure: Int32? = nil,
-                 commandModifiers: Int? = 0,
-                 commandModifiersMalformed: Bool = false,
-                 commandModifiersReadFailure: Int32? = nil)
-        -> ElementDescription {
-        let item = testElement(role: itemRole, title: itemTitle, enabled: enabled,
-                               menuCommandCharacter: commandCharacter,
-                               menuCommandCharacterMalformed: commandCharacterMalformed,
-                               menuCommandCharacterReadFailure: commandCharacterReadFailure,
-                               menuCommandVirtualKey: commandVirtualKey,
-                               menuCommandVirtualKeyMalformed: commandVirtualKeyMalformed,
-                               menuCommandVirtualKeyReadFailure: commandVirtualKeyReadFailure,
-                               menuCommandModifiers: commandModifiers,
-                               menuCommandModifiersMalformed: commandModifiersMalformed,
-                               menuCommandModifiersReadFailure: commandModifiersReadFailure,
-                               actions: actions)
-        let menu = testElement(role: menuRole, children: [item])
-        let parent = testElement(role: parentRole, title: parentTitle,
-                                 children: [menu])
-        return testElement(role: menuBarRole, children: [parent])
-    }
-    func requireRejectedMenu(_ candidate: ElementDescription, _ message: String) throws {
-        var wasRejected = false
-        do { _ = try OpenFolderMenuPolicy.plan(menuBar: candidate) }
-        catch ProbeError.validation { wasRejected = true }
-        try require(wasRejected, message)
-    }
-    let validMenuPlan = try OpenFolderMenuPolicy.plan(menuBar: menuBar())
-    try require(validMenuPlan.parentTitle == "File" &&
-                validMenuPlan.itemTitle == "Open Folder…" &&
-                validMenuPlan.commandVirtualKey == 31, "valid Open Folder menu plan")
-    let unpublishedVirtualKeyPlan = try OpenFolderMenuPolicy.plan(
-        menuBar: menuBar(commandVirtualKey: nil))
-    try require(unpublishedVirtualKeyPlan.menuBarItemIndex == validMenuPlan.menuBarItemIndex &&
-                unpublishedVirtualKeyPlan.menuIndex == validMenuPlan.menuIndex &&
-                unpublishedVirtualKeyPlan.menuItemIndex == validMenuPlan.menuItemIndex &&
-                unpublishedVirtualKeyPlan.commandVirtualKey == nil,
-                "unpublished optional virtual key did not preserve the exact menu path")
-    let lowercaseCommandPlan = try OpenFolderMenuPolicy.plan(
-        menuBar: menuBar(commandCharacter: "o"))
-    try require(lowercaseCommandPlan == validMenuPlan,
-                "lowercase AX command character did not normalize to Command-O")
-    try requireRejectedMenu(menuBar(menuBarRole: kAXWindowRole),
-                            "wrong menu-bar role passed")
-    try requireRejectedMenu(menuBar(menuBarRole: ""),
-                            "missing menu-bar role passed")
-    try requireRejectedMenu(menuBar(parentTitle: "Workspace"),
-                            "wrong File parent title passed")
-    try requireRejectedMenu(menuBar(parentTitle: nil),
-                            "missing File parent title passed")
-    try requireRejectedMenu(menuBar(parentRole: kAXButtonRole),
-                            "wrong File parent role passed")
-    try requireRejectedMenu(menuBar(parentRole: ""),
-                            "missing File parent role passed")
-    try requireRejectedMenu(menuBar(menuRole: kAXGroupRole),
-                            "wrong direct menu role passed")
-    try requireRejectedMenu(menuBar(menuRole: ""),
-                            "missing direct menu role passed")
-    try requireRejectedMenu(menuBar(commandVirtualKey: 35),
-                            "wrong Open Folder command virtual key passed")
-    try requireRejectedMenu(menuBar(commandModifiers: 1),
-                            "wrong Open Folder command modifiers passed")
-    try requireRejectedMenu(menuBar(commandModifiers: nil),
-                            "missing Open Folder command modifiers passed")
-    try requireRejectedMenu(menuBar(commandCharacter: nil),
-                            "missing Open Folder command character passed")
-    try requireRejectedMenu(menuBar(enabled: nil),
-                            "missing Open Folder enabled state passed")
-    rejected = false
-    let ambiguousMenuBar = testElement(
-        role: kAXMenuBarRole,
-        children: menuBar(parentTitle: "File").children +
-            menuBar(parentTitle: "File").children)
-    do { _ = try OpenFolderMenuPolicy.plan(menuBar: ambiguousMenuBar) }
-    catch ProbeError.validation { rejected = true }
-    try require(rejected, "duplicate File menu paths passed")
-    rejected = false
-    do { _ = try OpenFolderMenuPolicy.plan(menuBar: menuBar(enabled: false)) }
-    catch ProbeError.validation { rejected = true }
-    try require(rejected, "disabled Open Folder menu item passed")
-    rejected = false
-    do { _ = try OpenFolderMenuPolicy.plan(menuBar: menuBar(itemTitle: "Open Folder...")) }
-    catch ProbeError.validation { rejected = true }
-    try require(rejected, "wrong Open Folder title passed")
-    rejected = false
-    do { _ = try OpenFolderMenuPolicy.plan(menuBar: menuBar(actions: [])) }
-    catch ProbeError.validation { rejected = true }
-    try require(rejected, "Open Folder item without AXPress passed")
-    rejected = false
-    do { _ = try OpenFolderMenuPolicy.plan(menuBar: menuBar(itemRole: kAXButtonRole)) }
-    catch ProbeError.validation { rejected = true }
-    try require(rejected, "Open Folder item with wrong role passed")
-    rejected = false
-    do { _ = try OpenFolderMenuPolicy.plan(menuBar: menuBar(commandCharacter: "P")) }
-    catch ProbeError.validation { rejected = true }
-    try require(rejected, "Open Folder item with wrong command metadata passed")
-    rejected = false
-    let duplicateItems = testElement(
-        role: kAXMenuBarRole,
-        children: [testElement(
-            role: kAXMenuBarItemRole, title: "File",
-            children: [testElement(
-                role: kAXMenuRole,
-                children: menuBar().children[0].children[0].children +
-                    menuBar().children[0].children[0].children)])])
-    do { _ = try OpenFolderMenuPolicy.plan(menuBar: duplicateItems) }
-    catch ProbeError.validation { rejected = true }
-    try require(rejected, "duplicate Open Folder menu items passed")
-    let validMenuSnapshot = OpenFolderMenuSnapshot<String>(
-        description: menuBar(), items: [validMenuPlan: "open-folder-item"])
-    let unpublishedCommandMetadataCases: [(String, ElementDescription)] = [
-        ("missing character", menuBar(commandCharacter: nil)),
-        ("empty character", menuBar(commandCharacter: "")),
-        ("missing modifiers", menuBar(commandModifiers: nil)),
-    ]
-    for (label, description) in unpublishedCommandMetadataCases {
-        var snapshots: [OpenFolderMenuSnapshot<String>?] = [
-            OpenFolderMenuSnapshot<String>(description: description, items: [:]),
-            validMenuSnapshot,
-        ]
-        var now: UInt64 = 0
-        var reads = 0
-        var pauses = 0
-        let readiness = try waitForReadyOpenFolderMenu(
-            timeoutNanoseconds: 1_000_000_000,
-            pollMicroseconds: 100,
-            nowNanoseconds: { now },
-            validateIdentity: {},
-            readSnapshot: { reads += 1; return snapshots.removeFirst() },
-            pause: { pauses += 1; now += UInt64($0) * 1_000 })
-        try require(readiness.item == "open-folder-item" &&
-                        readiness.pollCount == 2 && reads == 2 && pauses == 1,
-                    "\(label) did not retry until exact command metadata")
-    }
-    var missingMetadataNow: UInt64 = 0
-    var missingMetadataReads = 0
-    var missingMetadataPauses = 0
-    rejected = false
-    do {
-        _ = try waitForReadyOpenFolderMenu(
-            timeoutNanoseconds: 300_000,
-            pollMicroseconds: 100,
-            nowNanoseconds: { missingMetadataNow },
-            validateIdentity: {},
-            readSnapshot: {
-                missingMetadataReads += 1
-                return OpenFolderMenuSnapshot<String>(
-                    description: menuBar(commandModifiers: nil), items: [:])
-            },
-            pause: {
-                missingMetadataPauses += 1
-                missingMetadataNow += UInt64($0) * 1_000
-            })
-    } catch ProbeError.unavailable(let message) {
-        rejected = message == "Open Folder menu did not become ready after 3 polls; " +
-            "last pending state: command modifiers are unpublished"
-    }
-    try require(rejected && missingMetadataReads == 3 && missingMetadataPauses == 3,
-                "persistent missing command metadata did not use the exact timeout")
-    func requireImmediateCommandMetadataRejection(
-        _ description: ElementDescription,
-        expectedMessage: String,
-        _ message: String
-    ) throws {
-        var reads = 0
-        var pauses = 0
-        var exactError = false
-        do {
-            _ = try waitForReadyOpenFolderMenu(
-                timeoutNanoseconds: 1_000_000_000,
-                pollMicroseconds: 100,
-                nowNanoseconds: { 0 },
-                validateIdentity: {},
-                readSnapshot: {
-                    reads += 1
-                    return OpenFolderMenuSnapshot<String>(description: description, items: [:])
-                },
-                pause: { _ in pauses += 1 })
-        } catch ProbeError.validation(let actualMessage) {
-            exactError = actualMessage == expectedMessage
-        }
-        try require(exactError && reads == 1 && pauses == 0, message)
-    }
-    try requireImmediateCommandMetadataRejection(
-        menuBar(commandCharacter: "P"),
-        expectedMessage: "Open Folder menu item has unexpected command character: P",
-        "published wrong command character did not fail immediately")
-    try requireImmediateCommandMetadataRejection(
-        menuBar(commandVirtualKey: 35),
-        expectedMessage: "Open Folder menu item has unexpected command virtual key: 35",
-        "published wrong command virtual key did not fail immediately")
-    try requireImmediateCommandMetadataRejection(
-        menuBar(commandModifiers: 1),
-        expectedMessage: "Open Folder menu item has unexpected command modifiers: 1",
-        "published wrong command modifiers did not fail immediately")
-    try requireImmediateCommandMetadataRejection(
-        menuBar(commandCharacterMalformed: true),
-        expectedMessage: "Open Folder menu item has malformed command character type",
-        "published malformed command character did not fail immediately")
-    try requireImmediateCommandMetadataRejection(
-        menuBar(commandVirtualKeyMalformed: true),
-        expectedMessage: "Open Folder menu item has malformed command virtual key type",
-        "published malformed command virtual key did not fail immediately")
-    try requireImmediateCommandMetadataRejection(
-        menuBar(commandModifiersMalformed: true),
-        expectedMessage: "Open Folder menu item has malformed command modifiers type",
-        "published malformed command modifiers did not fail immediately")
-    func requireImmediateCommandMetadataReadFailure(
-        _ description: ElementDescription,
-        expectedMessage: String,
-        _ message: String
-    ) throws {
-        var reads = 0
-        var pauses = 0
-        var exactError = false
-        do {
-            _ = try waitForReadyOpenFolderMenu(
-                timeoutNanoseconds: 1_000_000_000,
-                pollMicroseconds: 100,
-                nowNanoseconds: { 0 },
-                validateIdentity: {},
-                readSnapshot: {
-                    reads += 1
-                    return OpenFolderMenuSnapshot<String>(description: description, items: [:])
-                },
-                pause: { _ in pauses += 1 })
-        } catch ProbeError.unavailable(let actualMessage) {
-            exactError = actualMessage == expectedMessage
-        }
-        try require(exactError && reads == 1 && pauses == 0, message)
-    }
-    try requireImmediateCommandMetadataReadFailure(
-        menuBar(commandCharacterReadFailure: -25204),
-        expectedMessage: "Open Folder menu item command character read failed: -25204",
-        "command character AX read failure did not fail immediately")
-    try requireImmediateCommandMetadataReadFailure(
-        menuBar(commandVirtualKeyReadFailure: -25204),
-        expectedMessage: "Open Folder menu item command virtual key read failed: -25204",
-        "optional virtual key AX read failure did not fail immediately")
-    try requireImmediateCommandMetadataReadFailure(
-        menuBar(commandModifiersReadFailure: -25204),
-        expectedMessage: "Open Folder menu item command modifiers read failed: -25204",
-        "command modifiers AX read failure did not fail immediately")
-    let wrongFileTitleSnapshot = OpenFolderMenuSnapshot<String>(
-        description: menuBar(parentTitle: "Workspace"), items: [:])
-    let missingFileTitleSnapshot = OpenFolderMenuSnapshot<String>(
-        description: menuBar(parentTitle: nil), items: [:])
-    let missingDirectMenuSnapshot = OpenFolderMenuSnapshot<String>(
-        description: testElement(
-            role: kAXMenuBarRole,
-            children: [testElement(role: kAXMenuBarItemRole, title: "File")]),
-        items: [:])
-    let emptyDirectMenuSnapshot = OpenFolderMenuSnapshot<String>(
-        description: testElement(
-            role: kAXMenuBarRole,
-            children: [testElement(
-                role: kAXMenuBarItemRole, title: "File",
-                children: [testElement(role: kAXMenuRole)])]),
-        items: [:])
-    let otherMenuChildrenSnapshot = OpenFolderMenuSnapshot<String>(
-        description: testElement(
-            role: kAXMenuBarRole,
-            children: [testElement(
-                role: kAXMenuBarItemRole, title: "File",
-                children: [testElement(
-                    role: kAXMenuRole,
-                    children: [testElement(
-                        role: kAXMenuItemRole, title: "New Window",
-                        actions: [kAXPressAction])])])]),
-        items: [:])
-    let pendingTimeoutCases: [(String, OpenFolderMenuSnapshot<String>?, String)] = [
-        ("application menu bar", nil, "application menu bar is unpublished"),
-        ("File menu item", wrongFileTitleSnapshot, "File menu item is unpublished"),
-        ("File AX menu", missingDirectMenuSnapshot, "File AX menu is unpublished"),
-        ("Open Folder item", otherMenuChildrenSnapshot,
-         "Open Folder menu item is unpublished"),
-        ("command character", OpenFolderMenuSnapshot<String>(
-            description: menuBar(commandCharacter: nil), items: [:]),
-         "command character is unpublished"),
-        ("empty command character", OpenFolderMenuSnapshot<String>(
-            description: menuBar(commandCharacter: ""), items: [:]),
-         "command character is empty"),
-        ("command modifiers", OpenFolderMenuSnapshot<String>(
-            description: menuBar(commandModifiers: nil), items: [:]),
-         "command modifiers are unpublished"),
-    ]
-    for (label, snapshot, pendingState) in pendingTimeoutCases {
-        var now: UInt64 = 0
-        var reads = 0
-        var pauses = 0
-        var exactTimeout = false
-        do {
-            _ = try waitForReadyOpenFolderMenu(
-                timeoutNanoseconds: 300_000,
-                pollMicroseconds: 100,
-                nowNanoseconds: { now },
-                validateIdentity: {},
-                readSnapshot: { reads += 1; return snapshot },
-                pause: { pauses += 1; now += UInt64($0) * 1_000 })
-        } catch ProbeError.unavailable(let message) {
-            exactTimeout = message ==
-                "Open Folder menu did not become ready after 3 polls; " +
-                "last pending state: \(pendingState)" && !message.contains("New Window")
-        }
-        try require(exactTimeout && reads == 3 && pauses == 3,
-                    "\(label) timeout did not report the bounded final pending state")
-    }
-    var changingPendingSnapshots: [OpenFolderMenuSnapshot<String>?] = [
-        nil,
-        OpenFolderMenuSnapshot<String>(
-            description: menuBar(commandCharacter: nil), items: [:]),
-        OpenFolderMenuSnapshot<String>(
-            description: menuBar(commandModifiers: nil), items: [:]),
-    ]
-    var changingPendingNow: UInt64 = 0
-    rejected = false
-    do {
-        _ = try waitForReadyOpenFolderMenu(
-            timeoutNanoseconds: 300_000,
-            pollMicroseconds: 100,
-            nowNanoseconds: { changingPendingNow },
-            validateIdentity: {},
-            readSnapshot: { changingPendingSnapshots.removeFirst() },
-            pause: { changingPendingNow += UInt64($0) * 1_000 })
-    } catch ProbeError.unavailable(let message) {
-        rejected = message == "Open Folder menu did not become ready after 3 polls; " +
-            "last pending state: command modifiers are unpublished"
-    }
-    try require(rejected, "menu timeout did not report the final observed pending state")
-    rejected = false
-    do { _ = try OpenFolderMenuPolicy.plan(menuBar: menuBar(commandCharacter: nil)) }
-    catch ProbeError.validation(let message) {
-        rejected = message == "direct File to Open Folder menu path is absent"
-    }
-    try require(rejected, "pending plan wrapper changed its validation contract")
-    var menuSnapshots: [OpenFolderMenuSnapshot<String>?] = [
-        nil, wrongFileTitleSnapshot, missingFileTitleSnapshot,
-        missingDirectMenuSnapshot, emptyDirectMenuSnapshot,
-        otherMenuChildrenSnapshot, validMenuSnapshot,
-    ]
-    var menuNow: UInt64 = 0
-    var menuIdentityChecks = 0
-    var menuPauses = 0
-    let menuReadiness = try waitForReadyOpenFolderMenu(
+    var panelClock: UInt64 = 0
+    var panelReads = 0
+    let panelReadiness = try waitForUniqueOpenPanel(
         timeoutNanoseconds: 1_000_000_000,
-        pollMicroseconds: 100,
-        nowNanoseconds: { menuNow },
-        validateIdentity: { menuIdentityChecks += 1 },
-        readSnapshot: { menuSnapshots.removeFirst() },
-        pause: {
-            menuPauses += 1
-            menuNow += UInt64($0) * 1_000
-        })
-    try require(menuReadiness.item == "open-folder-item" && menuReadiness.pollCount == 7,
-                "bounded menu readiness did not select the delayed menu")
-    try require(menuIdentityChecks == 14 && menuPauses == 6,
-                "PID identity was not checked around every menu snapshot")
-    var malformedMenuReads = 0
-    var malformedMenuPauses = 0
-    rejected = false
-    do {
-        _ = try waitForReadyOpenFolderMenu(
-            timeoutNanoseconds: 1_000_000_000,
-            pollMicroseconds: 100,
-            nowNanoseconds: { 0 },
-            validateIdentity: {},
-            readSnapshot: {
-                malformedMenuReads += 1
-                return OpenFolderMenuSnapshot<String>(
-                    description: menuBar(enabled: false), items: [:])
-            },
-            pause: { _ in malformedMenuPauses += 1 })
-    } catch ProbeError.validation { rejected = true }
-    try require(rejected && malformedMenuReads == 1 && malformedMenuPauses == 0,
-                "malformed published menu did not fail immediately")
-    menuNow = 0
-    var menuTimeoutReads = 0
-    var menuTimeoutPauses = 0
-    rejected = false
-    do {
-        _ = try waitForReadyOpenFolderMenu(
-            timeoutNanoseconds: 300_000,
-            pollMicroseconds: 100,
-            nowNanoseconds: { menuNow },
-            validateIdentity: {},
-            readSnapshot: {
-                menuTimeoutReads += 1
-                return otherMenuChildrenSnapshot
-            },
-            pause: {
-                menuTimeoutPauses += 1
-                menuNow += UInt64($0) * 1_000
-            })
-    } catch ProbeError.unavailable(let message) {
-        rejected = message == "Open Folder menu did not become ready after 3 polls; " +
-            "last pending state: Open Folder menu item is unpublished"
-    }
-    try require(rejected && menuTimeoutReads == 3 && menuTimeoutPauses == 3,
-                "Open Folder menu timeout used the wrong poll bound")
-    var duplicateMenuReads = 0
-    var duplicateMenuPauses = 0
-    rejected = false
-    do {
-        _ = try waitForReadyOpenFolderMenu(
-            timeoutNanoseconds: 1_000_000_000,
-            pollMicroseconds: 100,
-            nowNanoseconds: { 0 },
-            validateIdentity: {},
-            readSnapshot: {
-                duplicateMenuReads += 1
-                return OpenFolderMenuSnapshot<String>(description: duplicateItems, items: [:])
-            },
-            pause: { _ in duplicateMenuPauses += 1 })
-    } catch ProbeError.validation { rejected = true }
-    try require(rejected && duplicateMenuReads == 1 && duplicateMenuPauses == 0,
-                "duplicate published menu items did not fail immediately")
-    menuNow = 0
-    var menuDriftChecks = 0
-    var menuDriftReads = 0
-    var menuDriftPauses = 0
-    rejected = false
-    do {
-        _ = try waitForReadyOpenFolderMenu(
-            timeoutNanoseconds: 1_000_000_000,
-            pollMicroseconds: 100,
-            nowNanoseconds: { menuNow },
-            validateIdentity: {
-                menuDriftChecks += 1
-                if menuDriftChecks == 3 {
-                    throw ProbeError.validation("test menu PID drift")
-                }
-            },
-            readSnapshot: {
-                menuDriftReads += 1
-                return otherMenuChildrenSnapshot
-            },
-            pause: {
-                menuDriftPauses += 1
-                menuNow += UInt64($0) * 1_000
-            })
-    } catch ProbeError.validation { rejected = true }
-    try require(rejected && menuDriftChecks == 3 && menuDriftReads == 1 &&
-                    menuDriftPauses == 1,
-                "menu PID drift did not stop before another AX read")
-
-    let cancel = testElement(role: kAXButtonRole, title: "Cancel", actions: [kAXPressAction])
-    let choose = testElement(role: kAXButtonRole, title: "Open", actions: [kAXPressAction])
-    let direct = testElement(role: kAXTextFieldRole, identifier: "path", actions: [])
-    let fileBrowser = testElement(role: kAXOutlineRole)
-    let panel = testElement(role: kAXWindowRole, subrole: kAXStandardWindowSubrole,
-                            children: [cancel, choose, direct, fileBrowser])
-    try require(try OpenPanelPolicy.plan(windows: [panel], permitKeyFallback: false) ==
-                SelectionPlan(navigation: .direct, chooserTitle: "Open"), "direct plan")
-    let fallbackPanel = testElement(role: kAXSheetRole, children: [cancel, choose, fileBrowser])
-    try require(try OpenPanelPolicy.plan(windows: [fallbackPanel], permitKeyFallback: true).navigation ==
-                .commandShiftG, "explicit key fallback")
-    rejected = false
-    do { _ = try OpenPanelPolicy.plan(windows: [fallbackPanel], permitKeyFallback: false) }
-    catch ProbeError.validation { rejected = true }
-    try require(rejected, "unauthorized fallback passed")
-    rejected = false
-    do { _ = try OpenPanelPolicy.plan(windows: [panel, panel], permitKeyFallback: false) }
-    catch ProbeError.validation { rejected = true }
-    try require(rejected, "duplicate panels passed")
-    let duplicateChooser = testElement(role: kAXWindowRole, subrole: kAXStandardWindowSubrole,
-                                       children: [cancel, choose, choose, direct, fileBrowser])
-    rejected = false
-    do { _ = try OpenPanelPolicy.plan(windows: [duplicateChooser], permitKeyFallback: false) }
-    catch ProbeError.validation { rejected = true }
-    try require(rejected, "duplicate chooser passed")
-    let customWindow = testElement(role: kAXWindowRole, children: [cancel, choose, direct])
-    rejected = false
-    do { _ = try OpenPanelPolicy.plan(windows: [customWindow], permitKeyFallback: false) }
-    catch ProbeError.validation { rejected = true }
-    try require(rejected, "nonstandard custom window passed")
-    let wrongSheet = testElement(role: kAXSheetRole, children: [cancel, choose, direct])
-    rejected = false
-    do { _ = try OpenPanelPolicy.plan(windows: [wrongSheet], permitKeyFallback: true) }
-    catch ProbeError.validation { rejected = true }
-    try require(rejected, "wrong native dialog passed")
-    rejected = false
-    do { _ = try uniqueOriginal(original: "original", candidates: ["lookalike"], equals: ==) }
-    catch ProbeError.validation { rejected = true }
-    try require(rejected, "lookalike panel replaced original identity")
-    try require(try uniqueNewRelated(initial: ["stale"], candidates: ["stale"], equals: ==) == nil,
-                "stale child was treated as new")
-    rejected = false
-    do { _ = try uniqueNewRelated(initial: [String](), candidates: ["one", "two"], equals: ==) }
-    catch ProbeError.validation { rejected = true }
-    try require(rejected, "duplicate new children passed")
-
-    func pathSnapshot(
-        panel: String = "panel",
-        cancel: String = "cancel",
-        chooser: String = "chooser",
-        chooserEnabled: Bool = true,
-        additionalCancelCount: Int = 0,
-        browsers: [String] = ["browser"],
-        fields: [String] = ["search"],
-        goButtons: [String] = [],
-        restoredPlan: SelectionPlan? = SelectionPlan(
-            navigation: .commandShiftG, chooserTitle: "Open"),
-        destinationPaths: [String] = []
-    ) -> PathEntrySnapshot<String> {
-        PathEntrySnapshot(panel: panel, cancel: cancel, chooser: chooser,
-                          chooserEnabled: chooserEnabled,
-                          additionalCancelCount: additionalCancelCount,
-                          browserAnchors: browsers, textFields: fields,
-                          goButtons: goButtons, restoredPlan: restoredPlan,
-                          destinationPaths: destinationPaths)
-    }
-    try require(try exactAnchor(
-        expected: "original-cancel",
-        candidates: ["original-cancel", "overlay-cancel"],
-        allowAdditional: true, sameElement: sameString) == "original-cancel",
-        "transient overlay Cancel replaced the original Cancel anchor")
-    let pathBaseline = try PathEntryPolicy.baseline(
-        pathSnapshot(),
-        expectedPlan: SelectionPlan(navigation: .commandShiftG, chooserTitle: "Open"),
-        sameElement: sameString)
-    try require(try PathEntryPolicy.navigation(searchableFieldText: ["search"]) ==
-                    .commandShiftG,
-                "ordinary baseline field acquired direct-path semantics")
-    try require(try PathEntryPolicy.navigation(searchableFieldText: ["folder path"]) ==
-                    .direct,
-                "direct-path field semantics were missed")
-    rejected = false
-    do {
-        _ = try PathEntryPolicy.baseline(
-            pathSnapshot(restoredPlan: SelectionPlan(
-                navigation: .direct, chooserTitle: "Open")),
-            expectedPlan: SelectionPlan(
-                navigation: .commandShiftG, chooserTitle: "Open"),
-            sameElement: sameString)
-    } catch ProbeError.validation { rejected = true }
-    try require(rejected, "baseline field semantic drift preserved the old plan")
-    try require(!(try PathEntryPolicy.restored(
-        baseline: pathBaseline,
-        current: pathSnapshot(
-            restoredPlan: SelectionPlan(navigation: .direct, chooserTitle: "Open"),
-            destinationPaths: ["fixture"]),
-        expectedDestination: "fixture", sameElement: sameString)),
-        "restored field semantic drift preserved the old plan")
-    try require(try PathEntryPolicy.isGoControl(
-        role: kAXButtonRole, title: "Go", enabled: true,
-        actions: [kAXPressAction]), "valid Go control was rejected")
-    for invalidGo in [
-        (kAXButtonRole as String?, "Go" as String?, false as Bool?, Set([kAXPressAction])),
-        (kAXButtonRole as String?, "Go" as String?, true as Bool?, Set<String>()),
-        (kAXTextFieldRole as String?, "Go" as String?, true as Bool?, Set([kAXPressAction])),
-    ] {
-        rejected = false
-        do {
-            _ = try PathEntryPolicy.isGoControl(
-                role: invalidGo.0, title: invalidGo.1,
-                enabled: invalidGo.2, actions: invalidGo.3)
-        } catch ProbeError.validation { rejected = true }
-        try require(rejected, "disabled, non-button, or non-pressable Go passed")
-    }
-    try require(try PathEntryPolicy.candidate(
-        baseline: pathBaseline,
-        current: pathSnapshot(fields: ["search", "path"], goButtons: ["go"],
-                              restoredPlan: nil),
-        sameElement: sameString)?.field == "path",
-        "same-panel path-entry identity delta was not accepted")
-    try require(try PathEntryPolicy.candidate(
-        baseline: pathBaseline,
-        current: pathSnapshot(chooserEnabled: false,
-                              fields: ["search", "path"], goButtons: ["go"],
-                              restoredPlan: nil),
-        sameElement: sameString)?.field == "path",
-        "temporarily disabled chooser blocked exact path-entry controls")
-    try require(try PathEntryPolicy.candidate(
-        baseline: pathBaseline,
-        current: pathSnapshot(fields: ["search", "path", "path"],
-                              goButtons: ["go", "go"], restoredPlan: nil),
-        sameElement: sameString)?.goButton == "go",
-        "same child-and-panel identities were not deduplicated")
-    try require(try PathEntryPolicy.candidate(
-        baseline: pathBaseline,
-        current: pathSnapshot(chooserEnabled: false,
-                              fields: ["search", "path"], goButtons: [],
-                              restoredPlan: nil),
-        sameElement: sameString) == nil,
-        "field-only staged publication or disabled chooser became ready")
-    try require(try PathEntryPolicy.candidate(
-        baseline: pathBaseline,
-        current: pathSnapshot(fields: ["search"], goButtons: ["go"],
-                              restoredPlan: nil),
-        sameElement: sameString) == nil,
-        "Go-only staged publication became ready")
-    rejected = false
-    do {
-        _ = try PathEntryPolicy.baseline(
-            pathSnapshot(goButtons: ["preexisting-go"]),
-            expectedPlan: SelectionPlan(
-                navigation: .commandShiftG, chooserTitle: "Open"),
-            sameElement: sameString)
-    } catch ProbeError.validation { rejected = true }
-    try require(rejected, "preexisting Go control allowed the shortcut baseline")
-    for ambiguous in [
-        pathSnapshot(fields: ["search", "path-one", "path-two"], goButtons: ["go"],
-                     restoredPlan: nil),
-        pathSnapshot(fields: ["search", "path"], goButtons: ["go-one", "go-two"],
-                     restoredPlan: nil),
-    ] {
-        rejected = false
-        do {
-            _ = try PathEntryPolicy.candidate(
-                baseline: pathBaseline, current: ambiguous, sameElement: sameString)
-        } catch ProbeError.validation { rejected = true }
-        try require(rejected, "ambiguous path-entry identity delta passed")
-    }
-    rejected = false
-    do {
-        _ = try PathEntryPolicy.candidate(
-            baseline: pathBaseline,
-            current: pathSnapshot(chooser: "replacement", fields: ["search", "path"],
-                                  goButtons: ["go"], restoredPlan: nil),
-            sameElement: sameString)
-    } catch ProbeError.validation { rejected = true }
-    try require(rejected, "replaced Open-panel anchor passed")
-    rejected = false
-    do {
-        _ = try PathEntryPolicy.candidate(
-            baseline: pathBaseline,
-            current: pathSnapshot(fields: ["replacement", "path"],
-                                  goButtons: ["go"], restoredPlan: nil),
-            sameElement: sameString)
-    } catch ProbeError.validation { rejected = true }
-    try require(rejected, "replaced baseline text field passed")
-
-    var pathNow: UInt64 = 0
-    var pathSnapshots = [
-        pathSnapshot(fields: ["search", "path"], restoredPlan: nil),
-        pathSnapshot(fields: ["search", "path"], goButtons: ["go"], restoredPlan: nil),
-    ]
-    var pathIdentityChecks = 0
-    let pathToken = try waitForUniquePathEntry(
-        timeoutNanoseconds: 1_000_000_000,
-        pollMicroseconds: 100,
-        baseline: pathBaseline,
-        nowNanoseconds: { pathNow },
-        validateIdentity: { pathIdentityChecks += 1 },
-        readSnapshot: { pathSnapshots.removeFirst() },
-        sameElement: sameString,
-        pause: { pathNow += UInt64($0) * 1_000 })
-    try require(pathToken.field == "path" && pathToken.goButton == "go" &&
-                    pathToken.pollCount == 2 && pathIdentityChecks == 4,
-                "staged path-entry wait did not preserve identity and poll bounds")
-
-    pathNow = 0
-    var pathTimeoutReads = 0
-    rejected = false
-    do {
-        _ = try waitForUniquePathEntry(
-            timeoutNanoseconds: 300_000,
-            pollMicroseconds: 100,
-            baseline: pathBaseline,
-            nowNanoseconds: { pathNow },
-            validateIdentity: {},
-            readSnapshot: {
-                pathTimeoutReads += 1
-                return pathSnapshot(restoredPlan: nil)
-            },
-            sameElement: sameString,
-            pause: { pathNow += UInt64($0) * 1_000 })
-    } catch ProbeError.unavailable(let message) {
-        rejected = message ==
-            "path-entry controls did not become ready after 3 polls; " +
-            "last pending state: new-fields=0 go-buttons=0 extra-cancels=0 " +
-            "chooser-enabled=true"
-    }
-    try require(rejected && pathTimeoutReads == 3,
-                "path-entry timeout used the wrong monotonic poll bound")
-
-    pathNow = 0
-    var pathDriftChecks = 0
-    var pathDriftReads = 0
-    rejected = false
-    do {
-        _ = try waitForUniquePathEntry(
-            timeoutNanoseconds: 1_000_000_000,
-            pollMicroseconds: 100,
-            baseline: pathBaseline,
-            nowNanoseconds: { pathNow },
-            validateIdentity: {
-                pathDriftChecks += 1
-                if pathDriftChecks == 2 {
-                    throw ProbeError.validation("test path-entry PID drift")
-                }
-            },
-            readSnapshot: {
-                pathDriftReads += 1
-                return pathSnapshot(fields: ["search", "path"],
-                                    goButtons: ["go"], restoredPlan: nil)
-            },
-            sameElement: sameString,
-            pause: { pathNow += UInt64($0) * 1_000 })
-    } catch ProbeError.validation { rejected = true }
-    try require(rejected && pathDriftReads == 1,
-                "path-entry PID drift did not stop at the read boundary")
-
-    pathNow = 0
-    var restoreSnapshots = [
-        pathSnapshot(fields: ["search", "path"], goButtons: ["go"], restoredPlan: nil),
-        pathSnapshot(destinationPaths: ["fixture"]),
-    ]
-    let restored = try waitForRestoredOpenPanel(
-        timeoutNanoseconds: 1_000_000_000,
-        pollMicroseconds: 100,
-        baseline: pathBaseline,
-        expectedDestination: "fixture",
-        nowNanoseconds: { pathNow },
+        pollMicroseconds: 100_000,
+        nowNanoseconds: { panelClock },
         validateIdentity: {},
-        readSnapshot: { restoreSnapshots.removeFirst() },
-        sameElement: sameString,
-        pause: { pathNow += UInt64($0) * 1_000 })
-    try require(restored.pollCount == 2 && restored.chooser == "chooser",
-                "Open-panel restoration did not retain the exact chooser identity")
-    try require(!(try PathEntryPolicy.restored(
-        baseline: pathBaseline,
-        current: pathSnapshot(additionalCancelCount: 1,
-                              destinationPaths: ["fixture"]),
-        expectedDestination: "fixture", sameElement: sameString)),
-        "lingering overlay Cancel allowed Open-panel restoration")
-
-    pathNow = 0
-    var destinationlessReads = 0
-    rejected = false
-    do {
-        _ = try waitForRestoredOpenPanel(
-            timeoutNanoseconds: 300_000,
-            pollMicroseconds: 100,
-            baseline: pathBaseline,
-            expectedDestination: "fixture",
-            nowNanoseconds: { pathNow },
-            validateIdentity: {},
-            readSnapshot: {
-                destinationlessReads += 1
-                return pathSnapshot()
-            },
-            sameElement: sameString,
-            pause: { pathNow += UInt64($0) * 1_000 })
-    } catch ProbeError.unavailable(let message) {
-        rejected = message == "Open panel did not restore after path entry in 3 polls"
-    }
-    try require(rejected && destinationlessReads == 3,
-                "restored controls without exact destination allowed chooser readiness")
-
-    pathNow = 0
-    var restoreDriftChecks = 0
-    var restoreDriftReads = 0
-    rejected = false
-    do {
-        _ = try waitForRestoredOpenPanel(
-            timeoutNanoseconds: 1_000_000_000,
-            pollMicroseconds: 100,
-            baseline: pathBaseline,
-            expectedDestination: "fixture",
-            nowNanoseconds: { pathNow },
-            validateIdentity: {
-                restoreDriftChecks += 1
-                if restoreDriftChecks == 2 {
-                    throw ProbeError.validation("test restoration PID drift")
-                }
-            },
-            readSnapshot: {
-                restoreDriftReads += 1
-                return pathSnapshot(destinationPaths: ["fixture"])
-            },
-            sameElement: sameString,
-            pause: { pathNow += UInt64($0) * 1_000 })
-    } catch ProbeError.validation { rejected = true }
-    try require(rejected && restoreDriftReads == 1,
-                "restoration PID drift did not stop at the read boundary")
-
-    let unrelatedWindow = testElement(role: kAXWindowRole,
-                                      subrole: kAXStandardWindowSubrole)
-    var delayedSnapshots: [[(String, ElementDescription)]] = [
-        [], [], [("unrelated", unrelatedWindow)], [("original", panel)],
-    ]
-    var fakeNow: UInt64 = 0
-    var identityChecks = 0
-    let delayedPanel = try waitForUniqueOpenPanel(
-        timeoutNanoseconds: 1_000_000_000,
-        pollMicroseconds: 100,
-        permitKeyFallback: false,
-        nowNanoseconds: { fakeNow },
-        validateIdentity: { identityChecks += 1 },
-        readWindows: { delayedSnapshots.removeFirst() },
-        sameElement: sameString,
-        pause: { fakeNow += UInt64($0) * 1_000 })
-    try require(delayedPanel.panel == "original", "delayed Open panel was not selected")
-    try require(identityChecks == 8, "PID identity was not checked around every AX snapshot")
-
-    var lookalikeReads = 0
-    var lookalikePauses = 0
-    rejected = false
-    do {
-        _ = try waitForUniqueOpenPanel(
-            timeoutNanoseconds: 1_000_000_000,
-            pollMicroseconds: 100,
-            permitKeyFallback: false,
-            nowNanoseconds: { 0 },
-            validateIdentity: {},
-            readWindows: {
-                lookalikeReads += 1
-                return [("lookalike", wrongSheet)]
-            },
-            sameElement: sameString,
-            pause: { _ in lookalikePauses += 1 })
-    } catch ProbeError.validation { rejected = true }
-    try require(rejected && lookalikeReads == 1 && lookalikePauses == 0,
-                "panel-shaped lookalike did not fail immediately")
-
-    fakeNow = 0
-    var timeoutReads = 0
-    rejected = false
-    do {
-        _ = try waitForUniqueOpenPanel(
-            timeoutNanoseconds: 300_000,
-            pollMicroseconds: 100,
-            permitKeyFallback: false,
-            nowNanoseconds: { fakeNow },
-            validateIdentity: {},
-            readWindows: {
-                timeoutReads += 1
-                return [] as [(String, ElementDescription)]
-            },
-            sameElement: sameString,
-            pause: { fakeNow += UInt64($0) * 1_000 })
-    } catch ProbeError.unavailable(let message) {
-        rejected = message == "Open panel did not become ready after 3 polls"
-    }
-    try require(rejected && timeoutReads == 3, "Open panel timeout used the wrong poll bound")
-
-    fakeNow = 0
-    var ambiguitySnapshots = [
-        [] as [(String, ElementDescription)],
-        [("one", panel), ("two", panel)],
-    ]
-    var ambiguityReads = 0
-    var ambiguityPauses = 0
-    rejected = false
-    do {
-        _ = try waitForUniqueOpenPanel(
-            timeoutNanoseconds: 1_000_000_000,
-            pollMicroseconds: 100,
-            permitKeyFallback: false,
-            nowNanoseconds: { fakeNow },
-            validateIdentity: {},
-            readWindows: {
-                ambiguityReads += 1
-                return ambiguitySnapshots.removeFirst()
-            },
-            sameElement: sameString,
-            pause: {
-                ambiguityPauses += 1
-                fakeNow += UInt64($0) * 1_000
-            })
-    } catch ProbeError.validation { rejected = true }
-    try require(rejected && ambiguityReads == 2 && ambiguityPauses == 1,
-                "absent-then-ambiguous Open panels did not fail immediately")
-
-    fakeNow = 0
-    var driftChecks = 0
-    var driftReads = 0
-    rejected = false
-    do {
-        _ = try waitForUniqueOpenPanel(
-            timeoutNanoseconds: 1_000_000_000,
-            pollMicroseconds: 100,
-            permitKeyFallback: false,
-            nowNanoseconds: { fakeNow },
-            validateIdentity: {
-                driftChecks += 1
-                if driftChecks == 3 { throw ProbeError.validation("test PID drift") }
-            },
-            readWindows: {
-                driftReads += 1
-                return [] as [(String, ElementDescription)]
-            },
-            sameElement: sameString,
-            pause: { fakeNow += UInt64($0) * 1_000 })
-    } catch ProbeError.validation { rejected = true }
-    try require(rejected && driftReads == 1, "PID drift did not stop before another AX read")
-
-    try require(!PathPolicy.contains("/private/tmp/root", "/private/tmp/root2/file"), "prefix collision")
-    try require(PathPolicy.contains("/private/tmp/root", "/private/tmp/root/file"), "contained path")
-    try require(Phase(rawValue: "select-project") == .selectProject, "phase parsing")
-    try require(KeyboardShortcut.pathEntry.virtualKey == 5 &&
-                KeyboardShortcut.pathEntry.flags == [.maskCommand, .maskShift], "path-entry shortcut")
-
-    let focusReady = OpenPanelFocusSnapshot(
-        applicationFrontmost: true, focusedWindowMatchesPanel: true,
-        focusedUIBelongsToPanel: true)
-    let focusPending = OpenPanelFocusSnapshot(
-        applicationFrontmost: true, focusedWindowMatchesPanel: false,
-        focusedUIBelongsToPanel: false)
-    var focusActionTrace: [String] = []
-    let readyActionCount = try performOpenPanelFocusActions(
-        initial: focusReady,
-        validateTarget: { focusActionTrace.append("target") },
-        preflightFrontmost: { focusActionTrace.append("preflight-frontmost") },
-        preflightRaise: { focusActionTrace.append("preflight-raise") },
-        preflightFocusedWindow: {
-            focusActionTrace.append("preflight-focused-window")
-            return true
+        readWindows: {
+            panelReads += 1
+            if panelReads == 1 {
+                throw ProbeError.retryable("synthetic incomplete AX read")
+            }
+            return [("panel", panel)]
         },
-        setFrontmost: { focusActionTrace.append("frontmost") },
-        raisePanel: { focusActionTrace.append("raise") },
-        setFocusedWindow: { focusActionTrace.append("focused-window") })
-    try require(readyActionCount == 0 && focusActionTrace.isEmpty,
-                "already-focused Open panel performed an action")
-    focusActionTrace = []
-    let unfocused = OpenPanelFocusSnapshot(
-        applicationFrontmost: false, focusedWindowMatchesPanel: false,
-        focusedUIBelongsToPanel: false)
-    let focusActionCount = try performOpenPanelFocusActions(
-        initial: unfocused,
-        validateTarget: { focusActionTrace.append("target") },
-        preflightFrontmost: { focusActionTrace.append("preflight-frontmost") },
-        preflightRaise: { focusActionTrace.append("preflight-raise") },
-        preflightFocusedWindow: {
-            focusActionTrace.append("preflight-focused-window")
-            return true
-        },
-        setFrontmost: { focusActionTrace.append("frontmost") },
-        raisePanel: { focusActionTrace.append("raise") },
-        setFocusedWindow: { focusActionTrace.append("focused-window") })
-    try require(focusActionCount == 3 && focusActionTrace == [
-        "target", "preflight-frontmost", "preflight-raise",
-        "preflight-focused-window", "target",
-        "target", "frontmost", "target", "target", "raise", "target",
-        "target", "focused-window", "target",
-    ], "Open panel focus actions violated preflight, order, or PID bracketing")
-    focusActionTrace = []
-    rejected = false
-    do {
-        _ = try performOpenPanelFocusActions(
-            initial: focusPending,
-            validateTarget: { focusActionTrace.append("target") },
-            preflightFrontmost: { focusActionTrace.append("preflight-frontmost") },
-            preflightRaise: { focusActionTrace.append("preflight-raise") },
-            preflightFocusedWindow: {
-                focusActionTrace.append("preflight-focused-window")
-                return false
-            },
-            setFrontmost: { focusActionTrace.append("frontmost") },
-            raisePanel: { focusActionTrace.append("raise") },
-            setFocusedWindow: { focusActionTrace.append("focused-window") })
-    } catch ProbeError.validation(let message) {
-        rejected = message == "application focused window is not writable"
+        sameElement: { (left: String, right: String) in left == right },
+        pause: { panelClock += UInt64($0) * 1_000 })
+    try require(
+        panelReadiness.pollCount == 2 && panelReads == 2,
+        "transient panel AX read was not retried")
+
+    func snapshot(
+        selected: [String], candidate: String = "candidate",
+        selectedPublication: ElementArrayPublication<String>? = nil
+    ) -> OpenPanelListSelectionSnapshot<String> {
+        OpenPanelListSelectionSnapshot(
+            panels: ["panel"], browsers: ["browser"], lists: ["list"],
+            candidates: [candidate], choosers: ["chooser"],
+            selectedChildrenSettable: .value(true),
+            selectedChildren: selectedPublication ?? .value(selected),
+            chooserEnabled: true,
+            chooserActions: [kAXPressAction], listChildCount: 1,
+            descendantListCount: 1, groupChildCount: 1,
+            rowEvidenceElementCount: 1, urlPublisherCount: 1,
+            publishedURLPathHashes: [], panelDestinationPathHashes: [])
     }
-    try require(rejected && !focusActionTrace.contains("raise") &&
-                    !focusActionTrace.contains("focused-window"),
-                "read-only exact focused-window selector allowed a partial mutation")
-    for initiallyFrontmost in [true, false] {
-        focusActionTrace = []
-        rejected = false
-        let matchedWindowUnfocusedPanel = OpenPanelFocusSnapshot(
-            applicationFrontmost: initiallyFrontmost,
-            focusedWindowMatchesPanel: true,
-            focusedUIBelongsToPanel: false)
-        do {
-            _ = try performOpenPanelFocusActions(
-                initial: matchedWindowUnfocusedPanel,
-                validateTarget: { focusActionTrace.append("target") },
-                preflightFrontmost: { focusActionTrace.append("preflight-frontmost") },
-                preflightRaise: { focusActionTrace.append("preflight-raise") },
-                preflightFocusedWindow: {
-                    focusActionTrace.append("preflight-focused-window")
-                    return true
-                },
-                setFrontmost: { focusActionTrace.append("frontmost") },
-                raisePanel: { focusActionTrace.append("raise") },
-                setFocusedWindow: { focusActionTrace.append("focused-window") })
-        } catch ProbeError.validation { rejected = true }
-        try require(rejected &&
-                        !focusActionTrace.contains("frontmost") &&
-                        !focusActionTrace.contains("raise") &&
-                        !focusActionTrace.contains("focused-window"),
-                    "foreign focused UI allowed a partial mutation for matched window")
+    let token = try OpenPanelListSelectionPolicy.token(snapshot(selected: []))
+    var retryableReadPreserved = false
+    do {
+        _ = try OpenPanelListSelectionPolicy.pendingToken(snapshot(
+            selected: [], selectedPublication:
+                .readFailure(AXError.cannotComplete.rawValue)))
+    } catch ProbeError.retryable {
+        retryableReadPreserved = true
     }
-    focusActionTrace = []
-    rejected = false
-    do {
-        _ = try performOpenPanelFocusActions(
-            initial: unfocused,
-            validateTarget: { focusActionTrace.append("target") },
-            preflightFrontmost: { focusActionTrace.append("preflight-frontmost") },
-            preflightRaise: {
-                focusActionTrace.append("preflight-raise")
-                throw ProbeError.validation("test missing AXRaise")
-            },
-            preflightFocusedWindow: {
-                focusActionTrace.append("preflight-focused-window")
-                return true
-            },
-            setFrontmost: { focusActionTrace.append("frontmost") },
-            raisePanel: { focusActionTrace.append("raise") },
-            setFocusedWindow: { focusActionTrace.append("focused-window") })
-    } catch ProbeError.validation { rejected = true }
-    try require(rejected && !focusActionTrace.contains("frontmost") &&
-                    !focusActionTrace.contains("raise") &&
-                    !focusActionTrace.contains("focused-window"),
-                "failed focus preflight allowed a partial mutation")
-    focusActionTrace = []
-    rejected = false
-    do {
-        _ = try performOpenPanelFocusActions(
-            initial: focusPending,
-            validateTarget: { focusActionTrace.append("target") },
-            preflightFrontmost: { focusActionTrace.append("preflight-frontmost") },
-            preflightRaise: { focusActionTrace.append("preflight-raise") },
-            preflightFocusedWindow: {
-                focusActionTrace.append("preflight-focused-window")
-                return true
-            },
-            setFrontmost: { focusActionTrace.append("frontmost") },
-            raisePanel: { focusActionTrace.append("raise") },
-            setFocusedWindow: {
-                focusActionTrace.append("focused-window")
-                throw ProbeError.unavailable("test focused-window write failure")
-            })
-    } catch ProbeError.unavailable { rejected = true }
-    try require(rejected && focusActionTrace.contains("focused-window"),
-                "focused-window write failure was not propagated")
-
-    var menuPressTrace: [String] = []
-    try performValidatedMenuPress(
-        validateIdentity: { menuPressTrace.append("identity") },
-        validateActive: { menuPressTrace.append("active") },
-        performPress: { menuPressTrace.append("press") })
-    try require(menuPressTrace == [
-        "identity", "active", "identity", "press", "identity",
-    ], "menu press escaped its exact active-state boundary")
-    menuPressTrace = []
-    rejected = false
-    do {
-        try performValidatedMenuPress(
-            validateIdentity: { menuPressTrace.append("identity") },
-            validateActive: {
-                menuPressTrace.append("active")
-                throw ProbeError.validation("test activation drift")
-            },
-            performPress: { menuPressTrace.append("press") })
-    } catch ProbeError.validation { rejected = true }
-    try require(rejected && menuPressTrace == ["identity", "active"],
-                "activation drift allowed the menu press")
-
-    var keyboardTrace: [String] = []
-    try performValidatedKeyboardPost(
-        validateIdentity: { keyboardTrace.append("identity") },
-        validateFocus: { keyboardTrace.append("focus") },
-        postKeyDown: { keyboardTrace.append("down") },
-        postKeyUp: { keyboardTrace.append("up") })
-    try require(keyboardTrace == ["identity", "focus", "down", "up", "identity"],
-                "keyboard post escaped its exact focus boundary")
-    keyboardTrace = []
-    rejected = false
-    do {
-        try performValidatedKeyboardPost(
-            validateIdentity: { keyboardTrace.append("identity") },
-            validateFocus: {
-                keyboardTrace.append("focus")
-                throw ProbeError.validation("test focus loss")
-            },
-            postKeyDown: { keyboardTrace.append("down") },
-            postKeyUp: { keyboardTrace.append("up") })
-    } catch ProbeError.validation { rejected = true }
-    try require(rejected && keyboardTrace == ["identity", "focus"],
-                "failed exact focus validation allowed keyboard input")
-
-    var focusNow: UInt64 = 0
-    var focusSnapshots = [focusPending, focusReady]
-    var focusIdentityChecks = 0
-    let focusReadiness = try waitForOpenPanelFocus(
+    try require(
+        retryableReadPreserved,
+        "AX cannotComplete publication was not preserved as retryable")
+    var snapshotClock: UInt64 = 0
+    var snapshotReads = 0
+    let snapshotReadiness = try waitForReadyOpenPanelListSelection(
         timeoutNanoseconds: 1_000_000_000,
-        pollMicroseconds: 100,
-        actionCount: 2,
-        nowNanoseconds: { focusNow },
-        validateIdentity: { focusIdentityChecks += 1 },
-        readSnapshot: { focusSnapshots.removeFirst() },
-        pause: { focusNow += UInt64($0) * 1_000 })
-    try require(focusReadiness == OpenPanelFocusReadiness(pollCount: 2, actionCount: 2) &&
-                    focusIdentityChecks == 4,
-                "Open panel focus wait did not preserve action, poll, and identity bounds")
-    focusNow = 0
-    var focusTimeoutReads = 0
-    rejected = false
-    do {
-        _ = try waitForOpenPanelFocus(
-            timeoutNanoseconds: 300_000,
-            pollMicroseconds: 100,
-            actionCount: 2,
-            nowNanoseconds: { focusNow },
-            validateIdentity: {},
-            readSnapshot: {
-                focusTimeoutReads += 1
-                return focusPending
-            },
-            pause: { focusNow += UInt64($0) * 1_000 })
-    } catch ProbeError.unavailable(let message) {
-        rejected = message ==
-            "Open panel focus did not become ready after 3 polls; " +
-            "last state: frontmost=true focused-window-matches=false " +
-            "focused-ui-in-panel=false"
-    }
-    try require(rejected && focusTimeoutReads == 3,
-                "Open panel focus timeout used the wrong monotonic poll bound")
-    focusNow = 0
-    var focusDriftChecks = 0
-    var focusDriftReads = 0
-    rejected = false
-    do {
-        _ = try waitForOpenPanelFocus(
-            timeoutNanoseconds: 1_000_000_000,
-            pollMicroseconds: 100,
-            actionCount: 2,
-            nowNanoseconds: { focusNow },
-            validateIdentity: {
-                focusDriftChecks += 1
-                if focusDriftChecks == 2 {
-                    throw ProbeError.validation("test focus PID drift")
-                }
-            },
-            readSnapshot: {
-                focusDriftReads += 1
-                return focusReady
-            },
-            pause: { focusNow += UInt64($0) * 1_000 })
-    } catch ProbeError.validation { rejected = true }
-    try require(rejected && focusDriftReads == 1,
-                "Open panel focus PID drift did not stop at the read boundary")
+        pollMicroseconds: 100_000,
+        nowNanoseconds: { snapshotClock },
+        validateIdentity: {},
+        readSnapshot: {
+            snapshotReads += 1
+            if snapshotReads == 1 {
+                throw ProbeError.retryable("synthetic incomplete snapshot")
+            }
+            return snapshot(selected: [])
+        },
+        pause: { snapshotClock += UInt64($0) * 1_000 })
+    try require(
+        snapshotReadiness?.pollCount == 2 && snapshotReads == 2,
+        "transient list-selection AX read was not retried")
+    var selectionActions = 0
+    try performValidatedOpenPanelListSelectionSet(
+        initial: token, sameElement: ==,
+        revalidate: { (token, snapshot(selected: [])) },
+        setSelection: { _ in selectionActions += 1 })
+    try require(selectionActions == 1, "exact selection mutation did not run once")
+    var chooserActions = 0
+    try performValidatedOpenPanelListChooserPress(
+        initial: token, sameElement: ==,
+        revalidate: { (token, snapshot(selected: ["candidate"])) },
+        pressChooser: { _ in chooserActions += 1 })
+    try require(chooserActions == 1, "exact chooser mutation did not run once")
 
-    let optionArguments = [
-        "--pid", "2",
-        "--run-root", "/private/tmp/chatgpt-route-prototype-08.options",
-        "--expected-bundle", "/private/tmp/chatgpt-route-prototype-08.options/Probe.app",
-        "--expected-executable",
-        "/private/tmp/chatgpt-route-prototype-08.options/Probe.app/Contents/MacOS/ChatGPT",
-        "--fixture-root", "/private/tmp/chatgpt-route-prototype-08.options/workspace",
-        "--phase", "select-project",
-        "--event-log", "/private/tmp/chatgpt-route-prototype-08.options/logs/native-gui-probe.jsonl",
+    let arguments = [
+        "--pid", "42", "--run-root", "/private/tmp/run",
+        "--expected-bundle", "/private/tmp/run/ChatGPT.app",
+        "--expected-executable", "/private/tmp/run/ChatGPT.app/Contents/MacOS/ChatGPT",
+        "--fixture-root", "/private/tmp/run/project", "--phase", "select-project",
+        "--event-log", "/private/tmp/run/logs/native-gui-probe.jsonl",
+        "--accept-renderer-project-picker-request",
     ]
+    let options = try parseOptions(arguments)
+    try require(options.acceptRendererProjectPickerRequest,
+                "renderer picker authority was not retained")
     rejected = false
-    do { _ = try parseOptions(optionArguments) }
-    catch ProbeError.usage(let message) {
-        rejected = message == "select-project requires --press-open-folder-menu-item"
-    }
-    try require(rejected, "select-project omitted explicit Open Folder authorization")
-    let authorizedOptions = try parseOptions(optionArguments + ["--press-open-folder-menu-item"])
-    try require(authorizedOptions.pressOpenFolderMenuItem,
-                "Open Folder menu authorization was not retained")
-    rejected = false
-    do {
-        _ = try parseOptions(optionArguments + ["--press-open-folder-menu-item",
-                                                "--permit-key-fallback"])
-    } catch ProbeError.usage(let message) {
-        rejected = message ==
-            "select-project with key fallback requires --focus-open-panel"
-    }
-    try require(rejected, "key fallback omitted explicit Open panel focus authorization")
-    let focusedOptions = try parseOptions(
-        optionArguments + ["--press-open-folder-menu-item", "--permit-key-fallback",
-                           "--focus-open-panel"])
-    try require(focusedOptions.focusOpenPanel && focusedOptions.permitKeyFallback,
-                "Open panel focus authorization was not retained")
-    rejected = false
-    do {
-        _ = try parseOptions(optionArguments + ["--press-open-folder-menu-item",
-                                                "--focus-open-panel"])
-    } catch ProbeError.usage(let message) {
-        rejected = message == "--focus-open-panel requires --permit-key-fallback"
-    }
-    try require(rejected, "Open panel focus authorization passed without key fallback")
-    rejected = false
-    do {
-        _ = try parseOptions(
-            optionArguments + ["--press-open-folder-menu-item", "--permit-key-fallback",
-                               "--focus-open-panel", "--focus-open-panel"])
-    } catch ProbeError.usage(let message) {
-        rejected = message == "duplicate --focus-open-panel"
-    }
-    try require(rejected, "duplicate Open panel focus authorization passed")
-    let inspectArguments = optionArguments.map { $0 == "select-project" ? "inspect-project-picker" : $0 }
-    rejected = false
-    do { _ = try parseOptions(inspectArguments + ["--press-open-folder-menu-item"]) }
-    catch ProbeError.usage(let message) {
-        rejected = message == "--press-open-folder-menu-item is only valid for select-project"
-    }
-    try require(rejected, "inspect-project-picker accepted Open Folder authorization")
-    rejected = false
-    do {
-        _ = try parseOptions(optionArguments + ["--press-open-folder-menu-item",
-                                                 "--press-open-folder-menu-item"])
-    } catch ProbeError.usage(let message) {
-        rejected = message == "duplicate --press-open-folder-menu-item"
-    }
-    try require(rejected, "duplicate Open Folder authorization passed")
-    let menuInspectArguments = optionArguments.map {
-        $0 == "select-project" ? "inspect-open-folder-menu" : $0
-    }
-    let menuInspectOptions = try parseOptions(menuInspectArguments)
-    try require(menuInspectOptions.phase == .inspectOpenFolderMenu &&
-                !menuInspectOptions.pressOpenFolderMenuItem,
-                "read-only Open Folder menu inspection options")
+    do { _ = try parseOptions(Array(arguments.dropLast())) }
+    catch ProbeError.usage { rejected = true }
+    try require(rejected, "missing renderer picker authority was accepted")
     print("native GUI probe self-test passed")
 }
 
@@ -3943,10 +2215,8 @@ do {
                                         "runRootSha256": sha256(paths.runRoot),
                                         "bundleSha256": sha256(paths.bundle),
                                         "fixtureSha256": sha256(paths.fixture),
-                                        "keyFallbackAuthorized": options.permitKeyFallback,
-                                        "openPanelFocusAuthorized": options.focusOpenPanel,
-                                        "openFolderMenuPressAuthorized":
-                                            options.pressOpenFolderMenuItem])
+                                        "rendererProjectPickerRequestAuthorized":
+                                            options.acceptRendererProjectPickerRequest])
     if !options.validateInputsOnly {
         try execute(options: options, paths: paths, log: log)
     }

@@ -28,6 +28,7 @@ WORKTREE_STATE="$HERE/12-worktree-state.py"
 MODEL_CATALOG_BUILDER="$HERE/08-model-catalog.py"
 MODEL_CATALOG_TEST="$HERE/08-model-catalog-test.py"
 NATIVE_PROJECT_STATE="$HERE/14-project-state.py"
+NATIVE_PICKER_PATCH="$HERE/14-patch-native-picker-default.mjs"
 HOST_PROBE="$HERE/08-appserver-probe.py"
 HOST_RESTART_PROBE="$HERE/08-appserver-restart-probe.py"
 PROCESS_GROUP="$HERE/08-process-group.py"
@@ -57,10 +58,12 @@ GUI_WORKTREE="${GUI_WORKTREE:-false}"
 GUI_NATIVE_PROJECT_PICKER="${GUI_NATIVE_PROJECT_PICKER:-false}"
 NATIVE_GUI_PROBE_BIN="${NATIVE_GUI_PROBE_BIN:-}"
 NATIVE_GUI_PROBE_SHA256="${NATIVE_GUI_PROBE_SHA256:-}"
-NATIVE_GUI_PROBE_KEY_FALLBACK="${NATIVE_GUI_PROBE_KEY_FALLBACK:-false}"
-NATIVE_GUI_PROBE_FOCUS_OPEN_PANEL="${NATIVE_GUI_PROBE_FOCUS_OPEN_PANEL:-false}"
-NATIVE_GUI_PROBE_INSPECT_MENU_ONLY="${NATIVE_GUI_PROBE_INSPECT_MENU_ONLY:-false}"
+NATIVE_PICKER_DEFAULT_PATH_SEAM="${NATIVE_PICKER_DEFAULT_PATH_SEAM:-false}"
 NATIVE_GUI_PROBE_PROTECTED_PATH=""
+SOURCE_APP_ASAR_SHA256="d28f31b4bbb04c519be65c2af8277d8c5faf77b4239ee89b928f0a7423dacd84"
+PATCHED_APP_ASAR_SHA256="06c4fd5cbb3662911cc62c3569042bd5657f3476a99ef9edc47bd51d5380026f"
+SOURCE_APP_ASAR_HEADER_SHA256="e3023f2d1c334ba8ba80bd22a97553d412a4616a86d75ca81e258e974061f3c7"
+PATCHED_APP_ASAR_HEADER_SHA256="c069ef0e4e826ec2fd8db41a626f3e26f3edead477053a12703830ce7e047b75"
 RUN_LOCK="/private/tmp/chatgpt-route-prototype-08.lock"
 
 record_cold_handoff_phase() {
@@ -98,36 +101,18 @@ require_positive_terminal_delta() {
   fi
 }
 
-validate_native_menu_inspection_config() {
-  inspection_only="$1"
+validate_native_picker_default_path_seam() {
+  seam_enabled="$1"
   native_picker="$2"
   gui_workflow="$3"
-  key_fallback="$4"
-  focus_open_panel="$5"
-  if test "$inspection_only" = true && \
-    { test "$native_picker" != true || test "$gui_workflow" != false || \
-      test "$key_fallback" != false || test "$focus_open_panel" != false; }; then
-    echo 'menu inspection requires GUI_NATIVE_PROJECT_PICKER=true, GUI_WORKFLOW=false, NATIVE_GUI_PROBE_KEY_FALLBACK=false, and NATIVE_GUI_PROBE_FOCUS_OPEN_PANEL=false' >&2
-    return 64
-  fi
-}
-
-validate_native_focus_config() {
-  focus_open_panel="$1"
-  native_picker="$2"
-  gui_workflow="$3"
-  key_fallback="$4"
-  inspection_only="$5"
-  if test "$focus_open_panel" = true && \
-    { test "$native_picker" != true || test "$gui_workflow" != true || \
-      test "$key_fallback" != true || test "$inspection_only" != false; }; then
-    echo 'Open panel focus requires GUI_NATIVE_PROJECT_PICKER=true, GUI_WORKFLOW=true, NATIVE_GUI_PROBE_KEY_FALLBACK=true, and NATIVE_GUI_PROBE_INSPECT_MENU_ONLY=false' >&2
+  if test "$seam_enabled" = true && \
+    { test "$native_picker" != true || test "$gui_workflow" != true; }; then
+    echo 'native picker default-path seam requires GUI_NATIVE_PROJECT_PICKER=true and GUI_WORKFLOW=true' >&2
     return 64
   fi
   if test "$native_picker" = true && test "$gui_workflow" = true && \
-    test "$inspection_only" = false && test "$key_fallback" = true && \
-    test "$focus_open_panel" != true; then
-    echo 'NATIVE_GUI_PROBE_KEY_FALLBACK=true requires NATIVE_GUI_PROBE_FOCUS_OPEN_PANEL=true' >&2
+    test "$seam_enabled" != true; then
+    echo 'native project-picker workflow requires NATIVE_PICKER_DEFAULT_PATH_SEAM=true' >&2
     return 64
   fi
 }
@@ -138,12 +123,10 @@ validate_worktree_config() {
   cold_resume="$3"
   gui_modes="$4"
   native_picker="$5"
-  inspection_only="$6"
   if test "$worktree_enabled" = true && \
     { test "$gui_workflow" != true || test "$cold_resume" != true || \
-      test "$gui_modes" != false || test "$native_picker" != true || \
-      test "$inspection_only" != false; }; then
-    echo 'GUI_WORKTREE=true requires GUI_WORKFLOW=true, GUI_COLD_RESUME=true, GUI_MODES=false, GUI_NATIVE_PROJECT_PICKER=true, and NATIVE_GUI_PROBE_INSPECT_MENU_ONLY=false' >&2
+      test "$gui_modes" != false || test "$native_picker" != true; }; then
+    echo 'GUI_WORKTREE=true requires GUI_WORKFLOW=true, GUI_COLD_RESUME=true, GUI_MODES=false, and GUI_NATIVE_PROJECT_PICKER=true' >&2
     return 64
   fi
 }
@@ -197,7 +180,7 @@ run_native_gui_probe() {
   test "$(/usr/bin/shasum -a 256 "$NATIVE_GUI_PROBE_BIN" | /usr/bin/awk '{print $1}')" = \
     "$NATIVE_GUI_PROBE_SHA256"
   /usr/bin/codesign --verify --strict "$NATIVE_GUI_PROBE_BIN"
-  "$NATIVE_GUI_PROBE_BIN" "$@"
+  exec "$NATIVE_GUI_PROBE_BIN" "$@"
 }
 
 run_cold_handoff_self_test() (
@@ -205,82 +188,39 @@ run_cold_handoff_self_test() (
   /usr/bin/python3 "$MODE_STATE" --self-test
   /usr/bin/python3 "$WORKTREE_STATE" --self-test
   /usr/bin/python3 "$NATIVE_PROJECT_STATE" --self-test
+  "$NODE" "$NATIVE_PICKER_PATCH" --self-test
   self_test_root="$(mktemp -d /private/tmp/chatgpt-cold-handoff-self-test.XXXXXX)"
   trap '/bin/rm -rf "$self_test_root"' EXIT INT TERM
   LOG_DIR="$self_test_root"
-  validate_native_menu_inspection_config true true false false false
-  if validate_native_menu_inspection_config true true true false false \
-    2>"$self_test_root/inspection-config.stderr"; then
-    echo 'menu inspection accepted GUI_WORKFLOW=true' >&2
+  validate_native_picker_default_path_seam true true true
+  if validate_native_picker_default_path_seam true false true 2>"$self_test_root/default-path.stderr"; then
+    echo "native picker default-path seam accepted GUI_NATIVE_PROJECT_PICKER=false" >&2
     return 1
   else
-    inspection_config_status=$?
+    default_path_status=$?
   fi
-  test "$inspection_config_status" -eq 64
-  test "$(/bin/cat "$self_test_root/inspection-config.stderr")" = \
-    'menu inspection requires GUI_NATIVE_PROJECT_PICKER=true, GUI_WORKFLOW=false, NATIVE_GUI_PROBE_KEY_FALLBACK=false, and NATIVE_GUI_PROBE_FOCUS_OPEN_PANEL=false'
-  if validate_native_menu_inspection_config true false false false false \
-    2>"$self_test_root/inspection-native-picker.stderr"; then
-    echo 'menu inspection accepted GUI_NATIVE_PROJECT_PICKER=false' >&2
+  test "$default_path_status" -eq 64
+  test "$(/bin/cat "$self_test_root/default-path.stderr")" = \
+    "native picker default-path seam requires GUI_NATIVE_PROJECT_PICKER=true and GUI_WORKFLOW=true"
+  if validate_native_picker_default_path_seam true true false 2>"$self_test_root/default-path.stderr"; then
+    echo "native picker default-path seam accepted GUI_WORKFLOW=false" >&2
     return 1
   else
-    inspection_native_picker_status=$?
+    default_path_status=$?
   fi
-  test "$inspection_native_picker_status" -eq 64
-  test "$(/bin/cat "$self_test_root/inspection-native-picker.stderr")" = \
-    'menu inspection requires GUI_NATIVE_PROJECT_PICKER=true, GUI_WORKFLOW=false, NATIVE_GUI_PROBE_KEY_FALLBACK=false, and NATIVE_GUI_PROBE_FOCUS_OPEN_PANEL=false'
-  if validate_native_menu_inspection_config true true false true false \
-    2>"$self_test_root/inspection-key-fallback.stderr"; then
-    echo 'menu inspection accepted NATIVE_GUI_PROBE_KEY_FALLBACK=true' >&2
+  test "$default_path_status" -eq 64
+  test "$(/bin/cat "$self_test_root/default-path.stderr")" = \
+    "native picker default-path seam requires GUI_NATIVE_PROJECT_PICKER=true and GUI_WORKFLOW=true"
+  if validate_native_picker_default_path_seam false true true 2>"$self_test_root/default-path.stderr"; then
+    echo "native project-picker workflow accepted a disabled seam" >&2
     return 1
   else
-    inspection_key_fallback_status=$?
+    default_path_status=$?
   fi
-  test "$inspection_key_fallback_status" -eq 64
-  test "$(/bin/cat "$self_test_root/inspection-key-fallback.stderr")" = \
-    'menu inspection requires GUI_NATIVE_PROJECT_PICKER=true, GUI_WORKFLOW=false, NATIVE_GUI_PROBE_KEY_FALLBACK=false, and NATIVE_GUI_PROBE_FOCUS_OPEN_PANEL=false'
-  if validate_native_menu_inspection_config true true false false true \
-    2>"$self_test_root/inspection-focus.stderr"; then
-    echo 'menu inspection accepted NATIVE_GUI_PROBE_FOCUS_OPEN_PANEL=true' >&2
-    return 1
-  else
-    inspection_focus_status=$?
-  fi
-  test "$inspection_focus_status" -eq 64
-  test "$(/bin/cat "$self_test_root/inspection-focus.stderr")" = \
-    'menu inspection requires GUI_NATIVE_PROJECT_PICKER=true, GUI_WORKFLOW=false, NATIVE_GUI_PROBE_KEY_FALLBACK=false, and NATIVE_GUI_PROBE_FOCUS_OPEN_PANEL=false'
-  validate_native_focus_config true true true true false
-  if validate_native_focus_config true true true false false \
-    2>"$self_test_root/focus-config.stderr"; then
-    echo 'Open panel focus accepted NATIVE_GUI_PROBE_KEY_FALLBACK=false' >&2
-    return 1
-  else
-    focus_config_status=$?
-  fi
-  test "$focus_config_status" -eq 64
-  test "$(/bin/cat "$self_test_root/focus-config.stderr")" = \
-    'Open panel focus requires GUI_NATIVE_PROJECT_PICKER=true, GUI_WORKFLOW=true, NATIVE_GUI_PROBE_KEY_FALLBACK=true, and NATIVE_GUI_PROBE_INSPECT_MENU_ONLY=false'
-  if validate_native_focus_config false true true true false \
-    2>"$self_test_root/key-fallback-focus-config.stderr"; then
-    echo 'key fallback accepted NATIVE_GUI_PROBE_FOCUS_OPEN_PANEL=false' >&2
-    return 1
-  else
-    key_fallback_focus_config_status=$?
-  fi
-  test "$key_fallback_focus_config_status" -eq 64
-  test "$(/bin/cat "$self_test_root/key-fallback-focus-config.stderr")" = \
-    'NATIVE_GUI_PROBE_KEY_FALLBACK=true requires NATIVE_GUI_PROBE_FOCUS_OPEN_PANEL=true'
-  validate_worktree_config true true true false true false
-  if validate_worktree_config true true false false true false \
-    2>"$self_test_root/worktree-config.stderr"; then
-    echo 'worktree config accepted GUI_COLD_RESUME=false' >&2
-    return 1
-  else
-    worktree_config_status=$?
-  fi
-  test "$worktree_config_status" -eq 64
-  test "$(/bin/cat "$self_test_root/worktree-config.stderr")" = \
-    'GUI_WORKTREE=true requires GUI_WORKFLOW=true, GUI_COLD_RESUME=true, GUI_MODES=false, GUI_NATIVE_PROJECT_PICKER=true, and NATIVE_GUI_PROBE_INSPECT_MENU_ONLY=false'
+  test "$default_path_status" -eq 64
+  test "$(/bin/cat "$self_test_root/default-path.stderr")" = \
+    "native project-picker workflow requires NATIVE_PICKER_DEFAULT_PATH_SEAM=true"
+  validate_worktree_config true true true false true
   configure_gui_orchestration true false true \
     "$self_test_root/worktree root" "$self_test_root/resume state.json"
   test "$worktree_baseline_action" = baseline
@@ -403,7 +343,7 @@ PROJECT_NONCE=""
 WORKSPACE_DIR="$RUN_ROOT/workspace"
 if test "$GUI_NATIVE_PROJECT_PICKER" = true; then
   PROJECT_NONCE="$(/usr/bin/uuidgen | /usr/bin/tr '[:upper:]' '[:lower:]')"
-  WORKSPACE_DIR="$RUN_ROOT/project-$PROJECT_NONCE"
+  WORKSPACE_DIR="$HOME_DIR/project-$PROJECT_NONCE"
 fi
 WORKTREE_ROOT="$RUN_ROOT/worktrees"
 HF_CACHE_DIR="$RUN_ROOT/hf-cache"
@@ -463,26 +403,14 @@ case "$GUI_NATIVE_PROJECT_PICKER" in
   false|true) ;;
   *) echo "GUI_NATIVE_PROJECT_PICKER must be true or false" >&2; exit 64 ;;
 esac
-case "$NATIVE_GUI_PROBE_KEY_FALLBACK" in
+case "$NATIVE_PICKER_DEFAULT_PATH_SEAM" in
   false|true) ;;
-  *) echo "NATIVE_GUI_PROBE_KEY_FALLBACK must be true or false" >&2; exit 64 ;;
+  *) echo "NATIVE_PICKER_DEFAULT_PATH_SEAM must be true or false" >&2; exit 64 ;;
 esac
-case "$NATIVE_GUI_PROBE_FOCUS_OPEN_PANEL" in
-  false|true) ;;
-  *) echo "NATIVE_GUI_PROBE_FOCUS_OPEN_PANEL must be true or false" >&2; exit 64 ;;
-esac
-case "$NATIVE_GUI_PROBE_INSPECT_MENU_ONLY" in
-  false|true) ;;
-  *) echo "NATIVE_GUI_PROBE_INSPECT_MENU_ONLY must be true or false" >&2; exit 64 ;;
-esac
-validate_native_menu_inspection_config "$NATIVE_GUI_PROBE_INSPECT_MENU_ONLY" \
-  "$GUI_NATIVE_PROJECT_PICKER" "$GUI_WORKFLOW" "$NATIVE_GUI_PROBE_KEY_FALLBACK" \
-  "$NATIVE_GUI_PROBE_FOCUS_OPEN_PANEL"
-validate_native_focus_config "$NATIVE_GUI_PROBE_FOCUS_OPEN_PANEL" \
-  "$GUI_NATIVE_PROJECT_PICKER" "$GUI_WORKFLOW" "$NATIVE_GUI_PROBE_KEY_FALLBACK" \
-  "$NATIVE_GUI_PROBE_INSPECT_MENU_ONLY"
+validate_native_picker_default_path_seam "$NATIVE_PICKER_DEFAULT_PATH_SEAM" \
+  "$GUI_NATIVE_PROJECT_PICKER" "$GUI_WORKFLOW"
 validate_worktree_config "$GUI_WORKTREE" "$GUI_WORKFLOW" "$GUI_COLD_RESUME" \
-  "$GUI_MODES" "$GUI_NATIVE_PROJECT_PICKER" "$NATIVE_GUI_PROBE_INSPECT_MENU_ONLY"
+  "$GUI_MODES" "$GUI_NATIVE_PROJECT_PICKER"
 if test "$GUI_COLD_RESUME" = true; then
   test "$GUI_WORKFLOW" = true
   test "$ROUTE_MODE" = gateway
@@ -493,9 +421,7 @@ if test "$GUI_MODES" = true; then
   test "$ROUTE_MODE" = gateway
 fi
 if test "$GUI_NATIVE_PROJECT_PICKER" = true; then
-  if test "$NATIVE_GUI_PROBE_INSPECT_MENU_ONLY" = false; then
-    test "$GUI_WORKFLOW" = true
-  fi
+  test "$GUI_WORKFLOW" = true
   test -n "$NATIVE_GUI_PROBE_BIN"
   test -n "$NATIVE_GUI_PROBE_SHA256"
   test "${NATIVE_GUI_PROBE_BIN#/}" != "$NATIVE_GUI_PROBE_BIN"
@@ -532,7 +458,7 @@ runtime_versions="$($OPTIQ_PYTHON -c 'import importlib.metadata as m, platform; 
 test "$runtime_versions" = "3.12.13|0.2.15|0.31.3|0.32.0"
 mlx_lm_commit="$($OPTIQ_PYTHON -c 'import importlib.metadata as m, json, pathlib; p=pathlib.Path(m.distribution("mlx-lm").locate_file("mlx_lm-0.31.3.dist-info/direct_url.json")); print(json.loads(p.read_text())["vcs_info"]["commit_id"])')"
 test "$mlx_lm_commit" = "ab1806e8f5d6aa035973af194a1b9198ab4754dc"
-test "$(/usr/bin/shasum -a 256 "$SOURCE_APP/Contents/Resources/app.asar" | /usr/bin/awk '{print $1}')" = "d28f31b4bbb04c519be65c2af8277d8c5faf77b4239ee89b928f0a7423dacd84"
+test "$(/usr/bin/shasum -a 256 "$SOURCE_APP/Contents/Resources/app.asar" | /usr/bin/awk '{print $1}')" = "$SOURCE_APP_ASAR_SHA256"
 test "$(/usr/bin/shasum -a 256 "$SOURCE_APP/Contents/Resources/codex" | /usr/bin/awk '{print $1}')" = "28699add67540b93390329a740649a9eb9bdbc5538d92c1679c8c6b6fa2c623c"
 for port in "$CDP_PORT" "$PROXY_PORT" "$UPSTREAM_OBSERVER_PORT" "$OPTIQ_PORT" "$GATEWAY_PORT"; do
   ! /usr/sbin/lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1
@@ -540,6 +466,10 @@ done
 
 mkdir -p "$HOME_DIR" "$CODEX_DIR" "$USER_DATA_DIR" "$TMP_DIR" "$LOG_DIR" "$WORKSPACE_DIR" "$WORKTREE_ROOT" "$HF_CACHE_DIR"
 chmod 700 "$HOME_DIR" "$CODEX_DIR" "$USER_DATA_DIR" "$TMP_DIR" "$LOG_DIR" "$WORKSPACE_DIR" "$WORKTREE_ROOT" "$HF_CACHE_DIR"
+NATIVE_PICKER_DEFAULT_PATH=""
+if test "$NATIVE_PICKER_DEFAULT_PATH_SEAM" = true; then
+  NATIVE_PICKER_DEFAULT_PATH="$(realpath "$(dirname "$WORKSPACE_DIR")")"
+fi
 /usr/bin/ditto "$SOURCE_APP" "$APP"
 /bin/cp "$UPSTREAM_OBSERVER" "$UPSTREAM_OBSERVER_EXEC"
 /bin/cp "$OBSERVER" "$OBSERVER_EXEC"
@@ -559,6 +489,47 @@ chmod 500 "$UPSTREAM_OBSERVER_EXEC" "$OBSERVER_EXEC" "$CDP_OBSERVER_EXEC" \
 test -x "$APP_EXEC"
 test ! -L "$APP"
 /usr/bin/codesign --verify --deep --strict "$APP"
+if test "$NATIVE_PICKER_DEFAULT_PATH_SEAM" = true; then
+  "$NODE" "$NATIVE_PICKER_PATCH" apply "$APP/Contents/Resources/app.asar" \
+    >"$LOG_DIR/native-picker-asar-patch.json"
+  /usr/bin/grep -Fq "\"asarHeaderSha256\":\"$PATCHED_APP_ASAR_HEADER_SHA256\"" \
+    "$LOG_DIR/native-picker-asar-patch.json"
+  test "$(/usr/bin/shasum -a 256 "$APP/Contents/Resources/app.asar" | /usr/bin/awk '{print $1}')" = \
+    "$PATCHED_APP_ASAR_SHA256"
+  /usr/libexec/PlistBuddy -c \
+    "Set :ElectronAsarIntegrity:Resources/app.asar:hash $PATCHED_APP_ASAR_HEADER_SHA256" \
+    "$APP/Contents/Info.plist"
+  test "$(/usr/libexec/PlistBuddy -c \
+    'Print :ElectronAsarIntegrity:Resources/app.asar:hash' "$APP/Contents/Info.plist")" = \
+    "$PATCHED_APP_ASAR_HEADER_SHA256"
+  /usr/bin/codesign --force --sign - --identifier com.openai.codex "$APP"
+fi
+/usr/bin/codesign --verify --deep --strict --verbose=4 "$APP" \
+  2>"$LOG_DIR/copied-app-signature-verification.stderr"
+/usr/bin/grep -Fq 'satisfies its Designated Requirement' \
+  "$LOG_DIR/copied-app-signature-verification.stderr"
+/usr/bin/codesign -d --entitlements :- "$SOURCE_APP" \
+  >"$LOG_DIR/source-app-entitlements.plist" 2>"$LOG_DIR/source-app-entitlements.stderr"
+/usr/bin/codesign -d --entitlements :- "$APP" \
+  >"$LOG_DIR/copied-app-entitlements.plist" 2>"$LOG_DIR/copied-app-entitlements.stderr"
+test -s "$LOG_DIR/source-app-entitlements.plist"
+if test "$NATIVE_PICKER_DEFAULT_PATH_SEAM" = true; then
+  test ! -s "$LOG_DIR/copied-app-entitlements.plist"
+else
+  /usr/bin/cmp -s "$LOG_DIR/source-app-entitlements.plist" \
+    "$LOG_DIR/copied-app-entitlements.plist"
+fi
+/usr/bin/codesign -dvvv "$APP" >"$LOG_DIR/copied-app-signature.stdout" \
+  2>"$LOG_DIR/copied-app-signature.stderr"
+if test "$NATIVE_PICKER_DEFAULT_PATH_SEAM" = true; then
+  /usr/bin/grep -Fq 'Signature=adhoc' "$LOG_DIR/copied-app-signature.stderr"
+else
+  if /usr/bin/grep -Fq 'Signature=adhoc' \
+    "$LOG_DIR/copied-app-signature.stderr"; then
+    echo 'unpatched copied app unexpectedly has an ad-hoc outer signature' >&2
+    exit 1
+  fi
+fi
 cd "$RUN_ROOT"
 
 if test "$ROUTE_MODE" = gateway; then
@@ -666,6 +637,7 @@ proxy_pid=""
 upstream_observer_pid=""
 gateway_pid=""
 app_pid=""
+native_gui_probe_pid=""
 owned_processes_exited=false
 owned_listeners_closed=false
 
@@ -728,6 +700,11 @@ stop_app_group() {
 }
 
 cleanup() {
+  if test -n "$native_gui_probe_pid"; then
+    /bin/kill -TERM "$native_gui_probe_pid" 2>/dev/null || true
+    wait "$native_gui_probe_pid" 2>/dev/null || true
+    native_gui_probe_pid=""
+  fi
   for pid in $(owned_pids); do signal_owned TERM "$pid"; done
   sleep 1
   for pid in $(owned_pids); do signal_owned KILL "$pid"; done
@@ -952,7 +929,9 @@ fi
 
 launch_app() {
   log_stem="$1"
-  /usr/bin/env -i \
+  (
+  cd "$HOME_DIR"
+  exec /usr/bin/env -i \
     PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
     HOME="$HOME_DIR" \
     CFFIXED_USER_HOME="$HOME_DIR" \
@@ -966,6 +945,7 @@ launch_app() {
     LOGNAME="offline-probe" \
     SHELL="/bin/sh" \
     LANG="en_US.UTF-8" \
+    NDP="$NATIVE_PICKER_DEFAULT_PATH" \
     "$CODEX_PROVIDER_TOKEN_ENV=$CODEX_PROVIDER_TOKEN" \
     HTTP_PROXY="http://127.0.0.1:$PROXY_PORT" \
     HTTPS_PROXY="http://127.0.0.1:$PROXY_PORT" \
@@ -981,11 +961,12 @@ launch_app() {
     /usr/bin/sandbox-exec -f "$PROFILE" -D "REAL_HOME=$REAL_HOME" \
       -D "NATIVE_GUI_PROBE_BIN=$NATIVE_GUI_PROBE_PROTECTED_PATH" "$APP_EXEC" \
       --no-sandbox \
+      --use-mock-keychain \
       --user-data-dir="$USER_DATA_DIR" \
       --remote-debugging-port="$CDP_PORT" \
       --enable-logging=stderr \
-      --v=1 \
-      >"$LOG_DIR/$log_stem.stdout" 2>"$LOG_DIR/$log_stem.stderr" &
+      --v=1
+  ) >"$LOG_DIR/$log_stem.stdout" 2>"$LOG_DIR/$log_stem.stderr" &
   app_pid=$!
 }
 
@@ -1005,36 +986,95 @@ sleep 1
 {
   /bin/ps -axo pid,ppid,pgid,state,etime,command | /usr/bin/head -n 1
   for pid in $(owned_group_pids); do
-    /bin/ps -p "$pid" -o pid=,ppid=,pgid=,state=,etime=,command=
+    /bin/ps -p "$pid" -o pid=,ppid=,pgid=,state=,etime=,command= || true
   done
 } >"$LOG_DIR/processes-01s.txt"
-native_menu_inspection_validated=false
 if test "$GUI_NATIVE_PROJECT_PICKER" = true; then
   copied_app_pid="$(/bin/ps -axo pid=,pgid=,command= | \
     /usr/bin/awk -v wanted_group="$app_pid" -v wanted_executable="$APP_EXEC" \
       '$2 == wanted_group && $3 == wanted_executable {print $1}')"
-  test -n "$copied_app_pid"
-  test "$(printf '%s\n' "$copied_app_pid" | /usr/bin/wc -l | /usr/bin/tr -d ' ')" -eq 1
-  if test "$NATIVE_GUI_PROBE_INSPECT_MENU_ONLY" = true; then
-    run_native_gui_probe \
-      --pid "$copied_app_pid" \
-      --run-root "$RUN_ROOT" \
-      --expected-bundle "$APP" \
-      --expected-executable "$APP_EXEC" \
-      --fixture-root "$WORKSPACE_DIR" \
-      --phase inspect-open-folder-menu \
-      --event-log "$LOG_DIR/native-gui-probe.jsonl" \
-      >"$LOG_DIR/native-gui-probe.stdout" 2>"$LOG_DIR/native-gui-probe.stderr"
-    test "$(/usr/bin/grep -Fc '"kind":"open-folder-menu-validated"' \
-      "$LOG_DIR/native-gui-probe.jsonl")" -eq 1
-    test "$(/usr/bin/grep -Ec '"kind":"(open-folder-menu-item-pressed|open-panel-validated|project-selection-requested)"' \
-      "$LOG_DIR/native-gui-probe.jsonl" || true)" -eq 0
-    native_menu_inspection_validated=true
-  else
+  if test -z "$copied_app_pid"; then
+    echo 'copied app main process was not found in its owned process group' >&2
+    exit 69
+  fi
+  copied_app_pid_count="$(printf '%s\n' "$copied_app_pid" | \
+    /usr/bin/wc -l | /usr/bin/tr -d ' ')"
+  if test "$copied_app_pid_count" -ne 1; then
+    echo "copied app main process is ambiguous: $copied_app_pid_count matches" >&2
+    exit 69
+  fi
+  printf '{"kind":"stage","stage":"copied-app-process-validated"}\n' \
+    >"$LOG_DIR/native-picker-stages.jsonl"
+  printf '{"kind":"stage","stage":"native-project-database-wait-started"}\n' \
+    >>"$LOG_DIR/native-picker-stages.jsonl"
   wait_for_native_project_database "$NATIVE_PROJECT_STATE_EXEC" \
-    "$CODEX_DIR/state_5.sqlite" 200
+    "$CODEX_DIR/state_5.sqlite" 600
+  printf '{"kind":"stage","stage":"native-project-database-ready"}\n' \
+    >>"$LOG_DIR/native-picker-stages.jsonl"
   /usr/bin/python3 "$NATIVE_PROJECT_STATE_EXEC" capture \
     "$CODEX_DIR/state_5.sqlite" "$(realpath "$WORKSPACE_DIR")" "$NATIVE_PROJECT_BASELINE"
+  printf '{"kind":"stage","stage":"native-project-baseline-captured"}\n' \
+    >>"$LOG_DIR/native-picker-stages.jsonl"
+  /usr/bin/env -i \
+    PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+    HOME="$HOME_DIR" \
+    TMPDIR="$TMP_DIR" \
+    LANG="en_US.UTF-8" \
+    /usr/bin/sandbox-exec -f "$GATEWAY_PROFILE" -D "REAL_HOME=$REAL_HOME" \
+      "$NODE" "$GUI_DRIVER_EXEC" "$CDP_PORT" prepare-project-picker 30000 \
+      "$(realpath "$WORKSPACE_DIR")" \
+    >"$LOG_DIR/cdp-native-prepare.jsonl" 2>"$LOG_DIR/cdp-native-prepare.stderr"
+  /usr/bin/grep -Fq '"kind":"native-project-picker-precondition-ready"' \
+    "$LOG_DIR/cdp-native-prepare.jsonl"
+  /usr/bin/grep -Fq '"kind":"native-project-picker-control-clicked"' \
+    "$LOG_DIR/cdp-native-prepare.jsonl"
+  /usr/bin/grep -Fq '"kind":"renderer-project-menu-observed"' \
+    "$LOG_DIR/cdp-native-prepare.jsonl"
+  /usr/bin/grep -Fq '"kind":"native-project-picker-final-control-ready"' \
+    "$LOG_DIR/cdp-native-prepare.jsonl"
+  if /usr/bin/grep -Fq '"kind":"native-project-picker-requested"' \
+    "$LOG_DIR/cdp-native-prepare.jsonl"; then
+    echo 'picker preparation phase pressed the final renderer control' >&2
+    exit 1
+  fi
+  /usr/bin/grep -Fq '"preSelectionMatchedExpected":false' \
+    "$LOG_DIR/cdp-native-prepare.jsonl"
+  set -- \
+    --pid "$copied_app_pid" \
+    --run-root "$RUN_ROOT" \
+    --expected-bundle "$APP" \
+    --expected-executable "$APP_EXEC" \
+    --fixture-root "$WORKSPACE_DIR" \
+    --phase select-project \
+    --event-log "$LOG_DIR/native-gui-probe.jsonl" \
+    --accept-renderer-project-picker-request
+  : >"$LOG_DIR/native-gui-probe.jsonl"
+  run_native_gui_probe "$@" \
+    >"$LOG_DIR/native-gui-probe.stdout" \
+    2>"$LOG_DIR/native-gui-probe.stderr" &
+  native_gui_probe_pid=$!
+  i=0
+  while test "$i" -lt 100 && \
+    ! /usr/bin/grep -Fq '"kind":"open-panel-absence-validated"' \
+      "$LOG_DIR/native-gui-probe.jsonl"; do
+    if ! /bin/kill -0 "$native_gui_probe_pid" 2>/dev/null; then
+      if wait "$native_gui_probe_pid"; then helper_status=0; else helper_status=$?; fi
+      native_gui_probe_pid=""
+      echo "native GUI helper exited before absence attestation: $helper_status" >&2
+      exit 1
+    fi
+    sleep 0.1
+    i=$((i + 1))
+  done
+  test "$i" -lt 100
+  test "$(/usr/bin/grep -Fc '"kind":"open-panel-absence-validated"' \
+    "$LOG_DIR/native-gui-probe.jsonl")" -eq 1
+  if ! /bin/kill -0 "$native_gui_probe_pid" 2>/dev/null; then
+    if wait "$native_gui_probe_pid"; then helper_status=0; else helper_status=$?; fi
+    native_gui_probe_pid=""
+    echo "native GUI helper exited after absence attestation: $helper_status" >&2
+    exit 1
+  fi
   /usr/bin/env -i \
     PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
     HOME="$HOME_DIR" \
@@ -1044,40 +1084,15 @@ if test "$GUI_NATIVE_PROJECT_PICKER" = true; then
       "$NODE" "$GUI_DRIVER_EXEC" "$CDP_PORT" open-project-picker 30000 \
       "$(realpath "$WORKSPACE_DIR")" \
     >"$LOG_DIR/cdp-native-open.jsonl" 2>"$LOG_DIR/cdp-native-open.stderr"
-  /usr/bin/grep -Fq '"kind":"native-project-picker-precondition-ready"' \
+  /usr/bin/grep -Fq '"kind":"native-project-picker-requested"' \
     "$LOG_DIR/cdp-native-open.jsonl"
-  /usr/bin/grep -Fq '"preSelectionMatchedExpected":false' \
-    "$LOG_DIR/cdp-native-open.jsonl"
-  set -- \
-    --pid "$copied_app_pid" \
-    --run-root "$RUN_ROOT" \
-    --expected-bundle "$APP" \
-    --expected-executable "$APP_EXEC" \
-    --fixture-root "$WORKSPACE_DIR" \
-    --phase select-project \
-    --event-log "$LOG_DIR/native-gui-probe.jsonl" \
-    --press-open-folder-menu-item
-  if test "$NATIVE_GUI_PROBE_KEY_FALLBACK" = true; then
-    set -- "$@" --permit-key-fallback
-  fi
-  if test "$NATIVE_GUI_PROBE_FOCUS_OPEN_PANEL" = true; then
-    set -- "$@" --focus-open-panel
-  fi
-  run_native_gui_probe "$@" \
-    >"$LOG_DIR/native-gui-probe.stdout" 2>"$LOG_DIR/native-gui-probe.stderr"
-  test "$(/usr/bin/grep -Fc '"kind":"open-folder-menu-item-pressed"' \
-    "$LOG_DIR/native-gui-probe.jsonl")" -eq 1
+  if wait "$native_gui_probe_pid"; then helper_status=0; else helper_status=$?; fi
+  native_gui_probe_pid=""
+  test "$helper_status" -eq 0
+  /usr/bin/grep -Fq '"rendererProjectPickerRequestAuthorized":true' \
+    "$LOG_DIR/native-gui-probe.jsonl"
   test "$(/usr/bin/grep -Fc '"kind":"open-panel-validated"' \
     "$LOG_DIR/native-gui-probe.jsonl")" -eq 1
-  open_folder_menu_press_line="$(/usr/bin/grep -nF \
-    '"kind":"open-folder-menu-item-pressed"' \
-    "$LOG_DIR/native-gui-probe.jsonl" | /usr/bin/awk -F: '{print $1}')"
-  open_panel_validated_line="$(/usr/bin/grep -nF \
-    '"kind":"open-panel-validated"' \
-    "$LOG_DIR/native-gui-probe.jsonl" | /usr/bin/awk -F: '{print $1}')"
-  test -n "$open_folder_menu_press_line"
-  test -n "$open_panel_validated_line"
-  test "$open_folder_menu_press_line" -lt "$open_panel_validated_line"
   /usr/bin/grep -Fq '"kind":"project-selection-requested"' \
     "$LOG_DIR/native-gui-probe.jsonl"
   /usr/bin/env -i \
@@ -1092,7 +1107,6 @@ if test "$GUI_NATIVE_PROJECT_PICKER" = true; then
   /usr/bin/grep -Fq '"kind":"renderer-project-selection-confirmed"' \
     "$LOG_DIR/cdp-native-confirm.jsonl"
   /usr/bin/grep -Fq '"matched":true' "$LOG_DIR/cdp-native-confirm.jsonl"
-  fi
 fi
 if test -n "$worktree_baseline_action"; then
   /usr/bin/python3 "$WORKTREE_STATE_EXEC" "$worktree_baseline_action" \
@@ -1142,7 +1156,7 @@ fi
 
 if test "$GUI_NATIVE_PROJECT_PICKER" = true && \
   test "$GUI_WORKTREE" = false && \
-  test "$NATIVE_GUI_PROBE_INSPECT_MENU_ONLY" = false && test "$cdp_exit" -eq 0; then
+  test "$cdp_exit" -eq 0; then
   /usr/bin/python3 "$NATIVE_PROJECT_STATE_EXEC" validate \
     "$CODEX_DIR/state_5.sqlite" "$(realpath "$WORKSPACE_DIR")" \
     "$NATIVE_PROJECT_BASELINE" "$NATIVE_PROJECT_STATE_RESULT"
@@ -1436,7 +1450,30 @@ if test -s "$LOG_DIR/lsof-final.txt" && /usr/bin/awk '$8 == "TCP" || $8 == "UDP"
 token_leak_observed=false
 
 app_asar_after="$(/usr/bin/shasum -a 256 "$APP/Contents/Resources/app.asar" | /usr/bin/awk '{print $1}')"
+source_app_asar_after="$(/usr/bin/shasum -a 256 "$SOURCE_APP/Contents/Resources/app.asar" | /usr/bin/awk '{print $1}')"
 codex_after="$(/usr/bin/shasum -a 256 "$APP/Contents/Resources/codex" | /usr/bin/awk '{print $1}')"
+expected_app_asar_sha256="$SOURCE_APP_ASAR_SHA256"
+expected_app_asar_header_sha256="$SOURCE_APP_ASAR_HEADER_SHA256"
+native_picker_asar_inspection_mode="verify-source"
+if test "$NATIVE_PICKER_DEFAULT_PATH_SEAM" = true; then
+  expected_app_asar_sha256="$PATCHED_APP_ASAR_SHA256"
+  expected_app_asar_header_sha256="$PATCHED_APP_ASAR_HEADER_SHA256"
+  native_picker_asar_inspection_mode="verify-patched"
+fi
+"$NODE" "$NATIVE_PICKER_PATCH" "$native_picker_asar_inspection_mode" \
+  "$APP/Contents/Resources/app.asar" >"$LOG_DIR/native-picker-asar-final.json"
+native_picker_asar_header_expected=false
+if /usr/bin/grep -Fq "\"asarHeaderSha256\":\"$expected_app_asar_header_sha256\"" \
+  "$LOG_DIR/native-picker-asar-final.json"; then
+  native_picker_asar_header_expected=true
+fi
+test "$(/usr/libexec/PlistBuddy -c \
+  'Print :ElectronAsarIntegrity:Resources/app.asar:hash' "$APP/Contents/Info.plist")" = \
+  "$expected_app_asar_header_sha256"
+app_asar_expected=false
+if test "$app_asar_after" = "$expected_app_asar_sha256"; then app_asar_expected=true; fi
+source_app_asar_unchanged=false
+if test "$source_app_asar_after" = "$SOURCE_APP_ASAR_SHA256"; then source_app_asar_unchanged=true; fi
 /usr/bin/codesign --verify --deep --strict "$APP"
 
 cleanup
@@ -1488,7 +1525,6 @@ done
   printf 'RENDERER_SAME_ROLLOUT_CONTINUATION=%s\n' "$renderer_same_rollout_continuation"
   printf 'COPIED_APP_COLD_STOPPED=%s\n' "$copied_app_cold_stopped"
   printf 'NATIVE_PROJECT_PICKER_EXERCISED=%s\n' "$native_project_picker_exercised"
-  printf 'NATIVE_MENU_INSPECTION_VALIDATED=%s\n' "$native_menu_inspection_validated"
   printf 'NATIVE_PERMISSION_DECISION_EXERCISED=%s\n' "$native_permission_decision_exercised"
   printf 'NATIVE_WORKTREE_CONTROL_EXERCISED=%s\n' "$native_worktree_control_exercised"
   printf 'PROVIDER_REQUEST_OBSERVED=%s\n' "$provider_request_observed"
@@ -1519,7 +1555,11 @@ done
   printf 'TOKEN_LEAK_OBSERVED=%s\n' "$token_leak_observed"
   printf 'OWNED_PROCESSES_EXITED=%s\n' "$owned_processes_exited"
   printf 'OWNED_LISTENERS_CLOSED=%s\n' "$owned_listeners_closed"
-  printf 'APP_ASAR_UNCHANGED=%s\n' "$(test "$app_asar_after" = d28f31b4bbb04c519be65c2af8277d8c5faf77b4239ee89b928f0a7423dacd84 && echo true || echo false)"
+  printf 'NATIVE_PICKER_DEFAULT_PATH_SEAM=%s\n' "$NATIVE_PICKER_DEFAULT_PATH_SEAM"
+  printf 'NATIVE_PICKER_ASAR_HEADER_EXPECTED=%s\n' "$native_picker_asar_header_expected"
+  printf 'SOURCE_APP_ASAR_UNCHANGED=%s\n' "$source_app_asar_unchanged"
+  printf 'APP_ASAR_EXPECTED=%s\n' "$app_asar_expected"
+  printf 'APP_ASAR_UNCHANGED=%s\n' "$(test "$app_asar_after" = "$SOURCE_APP_ASAR_SHA256" && echo true || echo false)"
   printf 'CODEX_UNCHANGED=%s\n' "$(test "$codex_after" = 28699add67540b93390329a740649a9eb9bdbc5538d92c1679c8c6b6fa2c623c && echo true || echo false)"
 } >"$LOG_DIR/probe-verdict.txt"
 
@@ -1589,7 +1629,9 @@ test "$remote_socket_observed" = false
 test "$token_leak_observed" = false
 test "$owned_processes_exited" = true
 test "$owned_listeners_closed" = true
-test "$app_asar_after" = d28f31b4bbb04c519be65c2af8277d8c5faf77b4239ee89b928f0a7423dacd84
+test "$native_picker_asar_header_expected" = true
+test "$source_app_asar_unchanged" = true
+test "$app_asar_expected" = true
 test "$codex_after" = 28699add67540b93390329a740649a9eb9bdbc5538d92c1679c8c6b6fa2c623c
 case "$PROBE_EXPECT" in
   capture) ;;
@@ -1600,6 +1642,5 @@ case "$PROBE_EXPECT" in
   renderer-modes) test "$GUI_MODES" = true; test "$login_wall_observed" = false; test "$main_ui_observed" = true ;;
   renderer-native-project) test "$GUI_NATIVE_PROJECT_PICKER" = true; test "$login_wall_observed" = false; test "$main_ui_observed" = true ;;
   renderer-worktree) test "$GUI_WORKTREE" = true; test "$native_worktree_control_exercised" = true; test "$login_wall_observed" = false; test "$main_ui_observed" = true ;;
-  native-menu-inspection) test "$NATIVE_GUI_PROBE_INSPECT_MENU_ONLY" = true; test "$native_menu_inspection_validated" = true; test "$login_wall_observed" = false; test "$main_ui_observed" = true ;;
   *) echo "unknown PROBE_EXPECT: $PROBE_EXPECT" >&2; exit 64 ;;
 esac

@@ -1,76 +1,131 @@
-# Validate the renderer-only offline GUI slice
+# Validate the offline GUI workflow
 
 ## Question
 
-Can the exact copied app submit a deterministic renderer turn, persist it,
-cold-stop and relaunch only the app process group, reopen the same local thread,
-complete a second turn through the reviewed authenticated gateway, and expose
-the local workflow surfaces without automating native dialogs?
+Can the exact disposable copied app select a local project through its real
+renderer and native Open panel, confirm that project in the renderer, submit a
+deterministic local turn, and retain the gateway, namespace, isolation,
+integrity, and cleanup contracts?
 
 ## Verdict
 
-Green for the scoped renderer cold-restart continuation. Run-root suffix
-`OBXLwu` exited zero after completing both exact sentinel turns, cold-stopping
-the copied app, reopening the same persisted thread and rollout, and preserving
-the provider, gateway, observer, isolation, integrity, and cleanup contracts.
+Green for the native-project renderer workflow on ChatGPT/Codex
+`26.707.71524` (`5263`). The same harness also retains green dedicated results
+for cold renderer continuation and Default/Plan mode persistence. Native
+permission decisions and native worktree controls remain separate acceptance
+surfaces.
 
-The project-local skill, native project picker, native permission decision, and
-native worktree controls remain red or unexercised. A later single-run metadata
-slice replaced the generic model identity with the pinned OptiQ display name
-and is recorded in `08-validate-preferred-route.md`; the appended renderer
-reasoning-selection label remains open. Ticket 12 remains open for those
-separate surfaces.
+The native-project run completed this trusted sequence:
 
-## Worktree acceptance harness
+1. The renderer reached the local main UI and proved that the nonce fixture was
+   not already selected.
+2. It clicked exactly one visible, enabled `Choose project` control.
+3. It selected exactly one `New project` menu item and exactly one
+   `Use an existing folder` menu item.
+4. The copied app opened a native directory chooser at the disposable
+   fixture's parent directory.
+5. The PID-bound helper found the unique chooser as a sheet of the validated
+   copied-app window, found the exact fixture row, wrote only that row to
+   `AXSelectedChildren`, reread the selection, and pressed the enabled chooser
+   action once.
+6. The renderer independently exposed the exact nonce project name before it
+   submitted the prompt.
+7. The local turn completed through the reviewed authenticated gateway and
+   OptiQ model. The renderer displayed the pinned model identity and no
+   fallback model metadata.
 
-The worktree slice is implemented but has not been run against the copied app.
-It is not runtime evidence yet. The runner creates a clean `main` fixture with
-no Git remotes, selects that project through the reviewed native helper, saves
-an exact isolated worktree root through the renderer's `Worktrees` settings,
-selects the unique `/worktree` → `New worktree` control, completes the first
-sentinel turn, cold-restarts only the copied app group, reopens the same thread,
-and completes the second sentinel turn.
+The native helper does not drive the renderer. The renderer driver does not
+drive the native panel. Their evidence is joined only by the generated fixture
+identity and the runner's ordered stage gates.
 
-`12-worktree-state.py` fails closed unless all of these independent surfaces
-agree:
+## Native project-picker acceptance harness
 
-- `git worktree list --porcelain -z` exposes exactly the clean fixture `main`
-  checkout and one clean linked worktree beneath the configured root, both at
-  the original local-only commit;
-- the linked worktree's regular `codex-thread.json` has schema version 1 and a
-  unique UUID owner matching the only `state_5.sqlite.threads` row for that
-  worktree cwd;
-- exactly one rollout has the same thread identity and exact worktree cwd in
-  `session_meta`; and
-- the renderer published exactly one first-phase worktree selection marker and
-  one cold-reopen marker, with both deterministic turns validated by the
-  existing completed-turn and renderer-output bindings.
+The runner creates a fresh local-only Git fixture, copies the verified source
+application to a separately named disposable bundle, and applies the exact
+default-path seam described in `08-validate-preferred-route.md`. The seam points
+the native dialog at the fixture parent, not at the fixture itself, so the
+helper must identify and select the exact row.
 
-The intended run is:
+The renderer driver fails closed unless each control in the sequence is unique,
+visible, enabled, and has the exact accessible name or text. Its preparation
+phase emits `native-project-picker-precondition-ready`,
+`native-project-picker-control-clicked`, `renderer-project-menu-observed`,
+`renderer-new-project-menu-opened`, and
+`native-project-picker-final-control-ready` without pressing the final item.
+The runner then obtains `open-panel-absence-validated` from the exact PID-bound
+helper before a fresh driver invocation revalidates `Use an existing folder`.
+If the renderer popover closed with the first CDP session, that fresh invocation
+reopens only the same exact `Choose project` and `New project` controls, then
+presses the exact final item and emits `native-project-picker-requested`. No
+keyboard accelerator, fixed coordinate, blind timing assumption, or broad text
+match is part of this route.
+
+The native helper binds to the already validated copied-app PID. It validates
+the process start, executable, bundle, and static and live signature identities
+before reading Accessibility state or performing its one selection mutation.
+Its sheet discovery and row search are bounded by monotonic deadlines and node
+limits. A missing, malformed, duplicate, disabled, nonwritable, or ambiguous
+candidate fails immediately or remains pending only where the contract permits
+unpublished intermediate state.
+
+After the native chooser closes, the renderer confirmation phase requires one
+control naming the exact nonce project. `14-project-state.py` separately binds
+that selection to exactly one authoritative `state_5.sqlite.threads.cwd` row
+for the fixture.
+
+The verified run is:
 
 ```sh
 ROUTE_MODE=gateway \
 GATEWAY_COMMIT=6307d37b76918c19f2e3bc0fd506434531aadeb2 \
-GUI_WORKFLOW=true \
-GUI_COLD_RESUME=true \
-GUI_WORKTREE=true \
 GUI_NATIVE_PROJECT_PICKER=true \
+NATIVE_PICKER_DEFAULT_PATH_SEAM=true \
 NATIVE_GUI_PROBE_BIN=<reviewed-helper-path> \
 NATIVE_GUI_PROBE_SHA256=<reviewed-helper-sha256> \
-NATIVE_GUI_PROBE_KEY_FALLBACK=false \
-PROBE_EXPECT=renderer-worktree \
+GUI_WORKFLOW=true \
+PROBE_EXPECT=renderer-native-project \
   .scratch/chatgpt-airgap-unlock/research/08-run-prototype.sh
 ```
 
-The worktree verdict remains false until baseline, first-phase, cold-phase,
-transport, integrity, process, listener, and copied-app cleanup gates all pass.
+The copied app is ad-hoc signed only after its ASAR payload, ASAR header
+integrity, and `Info.plist` integrity value are updated. It launches with
+`--use-mock-keychain` only inside the disposable run. The source archive and
+installed application are never rewritten or launched by this workflow.
 
-The dedicated mode workflow is also green. Run-root suffix `iT8EEf` exercised
-both mode controls and completed one persisted Default turn and one persisted
-Plan turn. The renderer and persisted output hashes matched for both turns;
-provider, gateway, isolation, integrity, and cleanup gates remained green.
+## Successful native-project evidence
 
-The successful run used:
+The renderer and native evidence agree on the exact fixture without sharing an
+input mechanism:
+
+- renderer: unique `Choose project` → `New project` →
+  `Use an existing folder`;
+- native helper: unique `Open` sheet, `navigation: selected-children`, one
+  `project-selection-requested` event, and `selectionActionCount: 1`;
+- renderer confirmation: `renderer-project-selection-confirmed` with
+  `matched: true` and `uniqueControl: true`;
+- persistence: exactly one authoritative thread CWD for the fixture; and
+- turn: a nonempty completed renderer response through the pinned local model.
+
+The gateway and upstream observer each recorded completed terminal responses.
+Inbound credentials were replaced before upstream, negative authentication
+checks remained closed, and the namespace probe reconstructed its second call
+using the continuation mapping established by the first response.
+
+No remote socket, credential, request-body, or token-canary leak was observed.
+The source ASAR remained exact, the copied ASAR and header matched the reviewed
+patched hashes, the bundled Codex binary remained exact, and every owned
+process and listener exited.
+
+## Cold-restart continuation
+
+The renderer workflow retains an opt-in two-phase cold-restart path. Phase one
+submits the deterministic `COLD_PHASE_ONE_OK` turn, binds the exact thread UUID,
+rollout, prompt, completed output, and task-complete message, then terminates
+only the copied app process group. Phase two relaunches the same disposable
+copy and isolated state, reopens the exact thread, submits
+`COLD_PHASE_TWO_OK`, and requires both turns to remain in the same rollout.
+
+Use:
 
 ```sh
 ROUTE_MODE=gateway \
@@ -81,39 +136,19 @@ PROBE_EXPECT=renderer-cold-resume \
   .scratch/chatgpt-airgap-unlock/research/08-run-prototype.sh
 ```
 
-## Successful dedicated mode evidence
+The handoff is accepted only when the first app group and its descendants are
+gone, shared provider processes remain alive, the second renderer reopens the
+same task, both completed output hashes match persisted state, and cleanup
+closes the remaining owned groups and listeners.
 
-Run-root suffix `iT8EEf` executed the mode workflow from driver commit
-`7be6fdf03a8c5311131fd404a90822e436843116` with the same pinned app, OptiQ
-revision, and reviewed gateway commit used by the earlier mode diagnosis.
+## Dedicated mode workflow
 
-- The renderer exposed `Plan mode` and `Turn plan mode on` in Default mode,
-  exposed the accessible `Plan` indicator after selection, and cleared that
-  indicator when returned to Default mode. Both control gates passed.
-- The Default and Plan prompts each completed with nonempty renderer output.
-  Their renderer output SHA-256 values were both
-  `3de89ef0f8216bcbfd88f1c76e3312d830f9b5aeb6c07b917767619b7b6f5072`.
-  Each renderer hash matched its own persisted `task_complete` output hash.
-- Persisted mode state bound the Default turn to turn-identity SHA-256
-  `ae3b13c80a8f5b5fce79ced447f77e2b1d2a98cccf24a31fdfa5863274cb66da`
-  and the Plan turn to
-  `2e43569053d36e7c33438cee3bbff0a2562b94a77c0ef0890f244d4502766be7`.
-  The single-rollout SHA-256 was
-  `41662f04943c7e322648e62921f11510d7f93a4768dc466248b91d9a03cd4077`.
-- The renderer timestamp was removed from each output wrapper before hashing.
-  The mode summary and persisted-state validator both passed, proving that the
-  timestamp-only wrapper correction did not weaken turn or mode identity.
-- The authenticated gateway and upstream each recorded three completed
-  terminal responses. Credential replacement, negative authentication,
-  namespace continuation, model-list isolation, copied-app integrity, and
-  strict signature checks passed. No credential, request-body, token, or remote
-  socket leak was observed. All owned processes and listeners exited.
+The dedicated mode path validates one persisted Default turn and one persisted
+Plan turn. It requires the exact renderer controls for entering and leaving
+Plan mode, a nonempty completion in each mode, matching renderer and persisted
+output hashes, exact collaboration-mode metadata, and one shared rollout.
 
-## Historical dedicated mode diagnosis
-
-Run-root suffix `jJuSa5` used the exact copied app, fresh isolated state, the
-pinned OptiQ revision, and reviewed gateway commit
-`6307d37b76918c19f2e3bc0fd506434531aadeb2`:
+Use:
 
 ```sh
 ROUTE_MODE=gateway \
@@ -124,411 +159,69 @@ PROBE_EXPECT=renderer-modes \
   .scratch/chatgpt-airgap-unlock/research/08-run-prototype.sh
 ```
 
-- In Default mode, entering `/plan` displayed `Plan mode` and `Turn plan mode
-  on`. Selecting that renderer control displayed a `Plan` button with the
-  accessible label `Plan`; selecting the button removed the indicator and
-  returned the composer to Default mode.
-- The Default turn completed and persisted with
-  `collaboration_mode.mode=default`. Its turn-identity SHA-256 was
-  `cdba4837fcbfe48b869d242679c22c5eca5bbb8977f5de44cbc0f131b3c68c3f`;
-  its completed-output SHA-256 was
-  `a1635fe337e61157be3c8f37976926bd00feecba358e15ecf0d02ca60aafedec`.
-- The initial driver required an unrelated exact answer. The local model
-  returned a different nonempty completion, so the driver failed closed before
-  selecting Plan for the second turn. The Plan control is proven; a persisted
-  Plan turn and cross-surface output binding remain unvalidated.
-- The gateway and upstream completed the renderer transport with authentication
-  replacement and namespace continuation intact. No credential, request-body,
-  or remote-socket leak was observed. All owned processes and listeners exited.
-- The copied ASAR and bundled Codex hashes remained
-  `d28f31b4bbb04c519be65c2af8277d8c5faf77b4239ee89b928f0a7423dacd84`
-  and `28699add67540b93390329a740649a9eb9bdbc5538d92c1679c8c6b6fa2c623c`.
-  The copied bundle retained its strict deep signature.
+## Worktree acceptance harness
 
-The revised driver accepts any nonempty mode-turn output, records only its
-length and SHA-256, and requires the persisted `task_complete` output to have
-the same SHA-256. The companion validator still requires exactly one Default
-prompt and one Plan prompt, each bound to exactly one matching turn context and
-completion in one rollout. Its self-test rejects a Plan prompt persisted as
-Default and rejects a renderer/persistence output-hash mismatch. This isolates
-the mode contract from small-model wording without weakening turn identity,
-mode identity, renderer visibility, or persistence evidence.
+The worktree slice remains a separate native surface. It creates a clean
+local-only `main` fixture, uses the verified native project-selection route,
+saves an isolated worktree root through renderer settings, selects the unique
+`/worktree` → `New worktree` control, completes a first turn, cold-restarts the
+copied app group, reopens the same thread, and completes a second turn.
 
-## Successful cold-restart evidence
+`12-worktree-state.py` accepts that slice only when:
 
-- The first renderer phase completed `COLD_PHASE_ONE_OK`, persisted its task,
-  and observed the Tasks, Settings, Plugins, Skills, and model-control surfaces.
-  The second phase relaunched the copied app, reopened the same thread with its
-  first output visible, and completed `COLD_PHASE_TWO_OK` in the same rollout.
-- The structured handoff recorded ordered before/after markers for terminal
-  capture and checks, resume-state capture, app-group stop, and relaunch. The
-  first app process group exited and its CDP listener closed before relaunch.
-- The gateway and upstream each recorded three terminal completions: two before
-  the cold stop and one continuation completion. Both first-phase deltas were
-  two, both continuation deltas were one, and continuation transport was
-  observed.
-- The exact gateway source was commit
-  `6307d37b76918c19f2e3bc0fd506434531aadeb2`, blob
-  `a368b8f8e919361425763e86ca1c80fcea81825f`, with a 300-second upstream
-  timeout and the default 15-second heartbeat. The namespace preflight retained
-  continuation reconstruction and exact data-only `[DONE]` checks.
-- The persisted thread was `019f6349-e2f2-7c52-b4d1-077c23194a85`. Its rollout
-  contained two exact smoke prompts, two user turn events, two assistant
-  messages, and two `task_complete` events, with no function calls. The rollout
-  SHA-256 was
-  `829696a486967d155d83c7cb608667213fa436c70cdcb4b547c33aa7246e63ee`.
-- The first turn-identity SHA-256 was
-  `34ba4ebb17fb767b8eb39c2958927a6ae35e172936c5ceaf3d18cd9afffb3cac`.
-  Its persisted, renderer, and sentinel output SHA-256 values were all
-  `6b3f8de7d7bc4217399ef704cf467ee931bef4171d6fe39c6b2e386fc632b6cc`.
-  The second persisted, renderer, and sentinel output SHA-256 values were all
-  `ee67dab48c757720854e0106fbf36eb4e278b68a0158291e5ae937423e3912e1`.
-- No request-body, credential, or remote-socket leak was observed. No
-  `auth.json` or shell snapshot appeared. Outbound attempts were blocked; every
-  captured socket was loopback. All owned processes were absent and all owned
-  listeners were closed after cleanup.
-- The copied app ASAR retained SHA-256
-  `d28f31b4bbb04c519be65c2af8277d8c5faf77b4239ee89b928f0a7423dacd84`;
-  the bundled Codex binary retained SHA-256
-  `28699add67540b93390329a740649a9eb9bdbc5538d92c1679c8c6b6fa2c623c`.
-  The copied bundle also retained its strict deep signature.
+- `git worktree list --porcelain -z` exposes exactly the fixture checkout and
+  one clean linked worktree at the original commit;
+- the linked worktree's `codex-thread.json` owner matches the only database
+  thread for that exact worktree CWD;
+- exactly one rollout carries the same thread identity and exact worktree CWD;
+  and
+- renderer selection, cold reopen, deterministic turns, and persisted output
+  bindings all agree.
 
-The project-local skill was not visible, exact configured model metadata did
-not match, and the three native surfaces were not exercised. Those failures do
-not weaken the completed renderer cold-restart contract.
-
-## Historical initial red run
-
-The initial exact run used:
-
-```sh
-ROUTE_MODE=gateway \
-GATEWAY_COMMIT=7c960b15267e82ef5d5a854bdd54bf53fb9e8135 \
-GUI_WORKFLOW=true \
-PROBE_EXPECT=renderer-workflow \
-  .scratch/chatgpt-airgap-unlock/research/08-run-prototype.sh
-```
-
-- CDP inserted the prompt through the renderer's trusted input path and
-  submitted it with a trusted Enter event.
-- The app created renderer thread
-  `019f6285-a06a-7290-a99f-bb1753ee15c3` and persisted a completed turn.
-- The persisted `task_complete` event recorded the exact assistant text
-  `I'll reply exactly with the requested token.` instead of the requested
-  `LOCAL_RENDERER_OK`.
-- The reviewed gateway emitted terminal completion, replaced the inbound
-  credential, preserved the namespace continuation probe, and did not log a
-  request body.
-- Settings, Plugins, Skills, Tasks, and the renderer model-control surface were
-  observed. The plugin catalog failed explicitly because remote catalog access
-  requires ChatGPT authentication; the local core remained usable.
-- The renderer did not expose the pinned OptiQ model ID or configured display
-  name. Model-metadata matching remains red.
-- The native project picker, permission decisions, worktree controls, cold GUI
-  reopen, and continuation were not exercised and remain red.
-- No `auth.json` or shell snapshot appeared. No remote socket or token leak was
-  observed. All owned processes and listeners exited, and the copied app ASAR,
-  bundled Codex binary, and strict signature remained unchanged.
-
-The raw run ended with `RENDERER_PROMPT_COMPLETED=false` and
-`RENDERER_TASKS_OBSERVED=false` because exact sentinel completion is a
-prerequisite for the task-list assertion. The settings, plugin, skill, provider,
-gateway, integrity, token, and cleanup assertions independently reported their
-observed results.
-
-## Historical discarded nested-sandbox attempt
-
-The exact-copy run above and earlier direct development runs exposed brittle
-submission and result selectors. Synthetic DOM insertion did not prove
-submission; trusted renderer input and Enter did, but the exact-sentinel result
-check missed non-exact model output. The then-current renderer oracle submits
-`What is 73 plus 19? Your final answer must include the decimal result.` and
-accepts only one standalone `92` occurrence in one assistant-message output
-line. It anchors the output to the assistant's `Copy` action and excludes the
-user message, prompt, sidebar, and unrelated DOM text.
-
-A first attempt to run that oracle from inside the parent harness's nested
-sandbox acquired the lock but exited with status 71 before starting the
-provider, gateway listener, copied app, or renderer. The reviewed gateway
-namespace preflight failed with:
-
-```text
-sandbox-exec: sandbox_apply: Operation not permitted
-```
-
-This infrastructure-only attempt produced no renderer thread or assistant
-result and is discarded as GUI runtime evidence. It does not replace or weaken
-the first run's transport, persistence, surface, gateway, integrity, or cleanup
-evidence.
-
-Before the preflight failure, the runner acquired the fixed-port lock, verified
-the pinned app, model, runtime, reviewed gateway commit and blob, copied the app,
-and verified its strict signature. After failure, the lock was released and no
-owned fixed-port listener remained. Native project selection, permission,
-worktree, exact model-metadata, cold reopen, and continuation gates remain red.
-Ticket 12 remains open.
-
-## Historical valid semantic renderer run
-
-Green for the scoped renderer workflow. The same locked gateway command ran
-outside the parent harness's nested sandbox while retaining the runner's own
-Seatbelt profiles. The copied app reached its main UI without a login wall,
-submitted the arithmetic prompt through trusted renderer input and Enter, and
-created thread `019f6297-5e11-7521-a781-a6dafc4a4d58`.
-
-The assistant output line was `73 plus 19 = 92`. The assistant-message oracle
-found exactly one standalone `92` in that line, the persisted rollout recorded
-the same assistant text and a completed task, and the task-navigation surface
-exposed the renderer-created thread by its exact prompt prefix.
-
-The valid run also established:
-
-- The provider request, provider listener, reviewed gateway listener, gateway
-  terminal event, upstream terminal event, credential replacement, negative
-  authentication checks, namespace continuation, and isolated model list all
-  passed.
-- The gateway did not log a request body. No remote socket, credential leak,
-  `auth.json`, or shell snapshot was observed.
-- Settings, Plugins, Skills, the exact renderer-created task entry, and the
-  model-control surface were observed. The project-local skill and exact
-  configured model metadata were not visible.
-- All owned processes and listeners exited. The copied app ASAR and bundled
-  Codex binary remained unchanged; the strict copied-app signature had already
-  been verified before launch.
-
-Ticket 12 remains open for real native project-picker, permission, and worktree
-interaction; project-local skill visibility and exact model metadata; and cold
-GUI reopen and continuation. Those gates were not exercised or did not pass in
-the scoped renderer run.
-
-## Cold-restart continuation prototype design
-
-The renderer workflow now has an opt-in, two-phase cold-restart path. It has
-completed the full cold-restart contract in run `OBXLwu`; the successful
-evidence is summarized above.
-
-Phase one retains the validated renderer prompt, task, and surface assertions.
-It now asks the model to return exactly `COLD_PHASE_ONE_OK` and forbids tool
-use. The renderer accepts only that sentinel after trimming outer whitespace
-and removing one renderer-added terminal timestamp.
-After it completes, the runner reads the isolated Codex rollout and writes a
-mode-0600 state artifact binding the exact thread UUID and rollout path to
-SHA-256 digests of the first prompt, exact completed turn, its
-`task_complete.last_agent_message`, sentinel, and exact trimmed phase-one
-renderer text. Intermediate tool calls or `agent_message` events cannot bind
-the output; only one `task_complete` for the prompt's exact turn can do so, and
-its trimmed final message must equal the sentinel. The distinct persisted and
-rendered digests avoid conflating source text with its rendered form. The
-runner then stops only the copied app's process group, which includes its
-app-server, and requires both that process group and its CDP listener to
-disappear. The pinned OptiQ server, authenticated gateway, and observers remain
-alive.
-
-Phase two relaunches the same copied bundle with the same isolated home, Codex
-home, Electron user-data directory, provider configuration, Seatbelt profile,
-and loopback endpoints. The CDP driver selects the persisted local thread by
-its first-prompt task label, requires the bound first prompt and the same
-exact trimmed renderer text observed in phase one to be visible, then asks the
-model to return exactly `COLD_PHASE_TWO_OK` without tools. Extra text, a wrong
-phase sentinel, or repeated combined sentinels fail closed.
-
-The runner finally requires one matching second prompt and one
-`task_complete` for that exact turn in the original rollout with the original
-thread UUID, that the original completed-turn identity and exact-byte
-final-output digest are unchanged, and that phase two records sentinel,
-persisted-output, and renderer-output digests. A duplicate completion or any
-non-exact trimmed final message fails closed. For the gateway route it records
-gateway and upstream terminal baselines immediately before the first renderer
-launch. It then
-requires at least one completion beyond baseline for phase one, at least one
-additional completion after the restart for phase two, and a total renderer
-delta of at least two. This keeps the two renderer transports distinct from
-pre-renderer namespace traffic. The resume-state and assistant-oracle records
-retain only hashes, lengths, and semantic results; the gateway and upstream
-observers log neither credentials nor request bodies. Existing CDP snapshots
-continue to capture renderer text as the GUI evidence surface.
-
-The intended live command is:
+The intended run is:
 
 ```sh
 ROUTE_MODE=gateway \
 GATEWAY_COMMIT=6307d37b76918c19f2e3bc0fd506434531aadeb2 \
 GUI_WORKFLOW=true \
 GUI_COLD_RESUME=true \
-PROBE_EXPECT=renderer-cold-resume \
+GUI_WORKTREE=true \
+GUI_NATIVE_PROJECT_PICKER=true \
+NATIVE_PICKER_DEFAULT_PATH_SEAM=true \
+NATIVE_GUI_PROBE_BIN=<reviewed-helper-path> \
+NATIVE_GUI_PROBE_SHA256=<reviewed-helper-sha256> \
+PROBE_EXPECT=renderer-worktree \
   .scratch/chatgpt-airgap-unlock/research/08-run-prototype.sh
 ```
 
-This remains a development-only semantic probe: it launches only the copied
-bundle and retains the existing outer Seatbelt plus `--no-sandbox` constraint.
-It does not modify the copied bundle identifier, signature, ASAR, native code,
-the installed app, or the operator's real profile and global state.
+Native worktree control remains false until its baseline, first phase, cold
+phase, transport, integrity, process, listener, and copied-app cleanup gates
+all pass in that dedicated mode.
 
-## Historical repeated-result arithmetic oracle correction
+## Local model and transport
 
-A later live phase-one attempt produced the correct response:
+All renderer workflows use the immutable model
+`mlx-community/Qwen3.5-2B-OptiQ-4bit:no-think` at revision
+`adc8669eb431e3168aeb4e320bd7b757914350e2`. The UI must display
+`Qwen3.5-2B-OptiQ-4bit (no-think)` and must not expose fallback model metadata.
 
-```text
-73 plus 19 is 92.
+Codex sends Responses requests only to the authenticated loopback
+`codex-ns-proxy`. The gateway commit and blob are pinned by
+`08-run-prototype.sh`; the gateway replaces the inbound bearer with a distinct
+upstream bearer, forwards only to the fixed loopback observer and OptiQ, emits
+sanitized terminal markers, and preserves namespace-call continuation.
 
-73 + 19 = 92
-```
+## Integrity, isolation, and cleanup
 
-The previous exact-one-occurrence oracle rejected that response solely because
-`92` appeared twice, so the run stopped before the cold restart. The renderer,
-persisted rollout, and completed task were present. First-turn transport was not
-attributed because the CDP failure stopped the later accounting; that attempt is
-not cold-restart evidence.
+The runner treats the modified copied ASAR as an expected disposable artifact,
+not as an unchanged vendor file. It requires the exact patched ASAR and header
+hashes, the matching `ElectronAsarIntegrity` value, a valid deep signature and
+designated requirement, and the unchanged copied Codex binary. It separately
+requires the source ASAR to retain its vendor hash.
 
-The arithmetic oracle now accepts one or more expected-result occurrences only
-when every standalone integer in the assistant message belongs to the two
-operands or expected result and the final standalone integer equals the expected
-result. Phase one therefore allows only `{73, 19, 92}` and must end in `92`;
-phase two allows only `{46, 17, 63}` and must end in `63`. A wrong intermediate
-integer, a correction from a wrong integer, an unrelated integer, or a wrong
-final integer fails closed. Persisted-rollout selection uses the same predicate.
-
-The driver includes a no-app self-test covering repeated-correct, single-result,
-wrong-then-corrected, conflicting, and wrong-final responses. It also builds a
-synthetic DOM where the exact user prompt contains out-of-set `999`; the oracle
-passes the valid assistant node because prompt text outside that anchored node
-is excluded.
-
-Run the static oracle cases with:
-
-```sh
-node .scratch/chatgpt-airgap-unlock/research/12-cdp-gui-driver.mjs --self-test
-```
-
-The cold-restart workflow has not been rerun after this correction.
-
-## Historical trailing renderer timestamp correction
-
-A second live phase-one attempt persisted the correct response, `73 plus 19
-equals 92.`, and completed its task, but the CDP arithmetic oracle returned no
-assistant output. The run stopped before the cold restart, so it is not
-cold-restart evidence.
-
-The earlier artifact proves that the assistant container can append a rendered
-timestamp: its 30-character model output became a 38-character DOM value after
-the renderer added `6:23 PM`. The second attempt is consistent with the same
-renderer behavior, but its exact appended timestamp was not captured.
-
-The renderer-only oracle now removes exactly one terminal 12-hour timestamp in
-uppercase `AM` or `PM` before applying the arithmetic predicate and hashing the
-rendered answer. It records whether a timestamp was removed, along with the raw
-container length and hashes of the raw container and removed timestamp. The
-structured `assistant-output-oracle` event does not emit the raw container body
-or timestamp value. Existing renderer-state snapshots continue to capture the
-visible GUI for workflow evidence. A timestamp in the middle, a malformed or
-out-of-range timestamp, or a conflicting model-produced integer still fails
-closed. Persisted-rollout selection is unchanged.
-
-The no-app self-test covers the terminal timestamp, verifies that the renderer
-answer hash excludes it, and rejects middle, malformed, and conflicting-number
-cases. The next workflow attempt is documented below; it stopped during phase
-one before exercising the cold restart.
-
-## Heartbeat gateway low-RAM timeout diagnosis
-
-The first cold-restart attempt against reviewed heartbeat gateway commit
-`8703dbe96841d591e77c1f274e22eb4b2aea9d64`, blob
-`b5428c5f938ddf0c27fc3b8e8effe64006ca4382`, stopped in phase one. The run-root
-suffix was `MbrNDI`; it contributes no cold-restart evidence.
-
-The renderer request reached OptiQ at 19:16:42. OptiQ began a 13,558-token
-prefill, and Codex issued the retry at 19:17:12, exactly 30 seconds later. Both
-attempts completed the full prefill and then raised `BrokenPipeError` while
-writing their first response frames. The gateway recorded two renderer streams
-with `terminal_completed=false`; its one completed stream was the separate
-namespaces-zero request. The upstream observer likewise recorded one completed
-stream and two incomplete renderer streams. The phase-one gateway and upstream
-terminal deltas were both zero, and the GUI reported `stream disconnected before
-completion: stream closed before response.completed`.
-
-The gateway's 15-second SSE heartbeat kept the downstream Codex connection
-alive during silent prefill, but it did not change the independent 30-second
-upstream socket timeout. That default closed the OptiQ connection before this
-low-RAM smoke workload could produce its first SSE frame.
-
-The disposable runner now sets `NS_PROXY_UPSTREAM_TIMEOUT=300`. This leaves the
-gateway's reviewed default unchanged, retains its default 15-second heartbeat,
-and prevents the gateway from becoming the first deadline; the renderer oracle
-still bounds each GUI phase to 120 seconds. The runtime manifest and immutable
-gateway-source record include the selected timeout. The namespace preflight
-loads the materialized gateway and asserts that it parses the upstream timeout
-as 300 seconds while retaining the 15-second default heartbeat.
-
-The failed run cleaned up all owned processes and listeners and left the copied
-app ASAR and bundled Codex binary unchanged.
-
-## Phase-one semantic success and handoff lifecycle correction
-
-Run-root suffix `syzpUh` used reviewed gateway commit
-`8703dbe96841d591e77c1f274e22eb4b2aea9d64`, blob
-`b5428c5f938ddf0c27fc3b8e8effe64006ca4382`, with the 300-second
-runner-selected upstream timeout. Phase one reached every required GUI surface
-and persisted one exact user prompt plus one matching `task_complete` whose
-`last_agent_message` was `73 + 19 = 92`.
-The rollout also contained two semantically correct intermediate
-`agent_message` events. This is phase-one semantic success.
-
-The run stopped before resume-state capture or the copied-app cold stop. Its
-structured handoff log ended with `terminal-delta-check` in `failed` state:
-the old gateway emitted its terminal record only during later cleanup. The
-gateway and upstream logs now contain three completed totals, but those
-post-cleanup totals are not the handoff counts captured by the runner and are
-not cold-restart evidence.
-
-The next runner checkpoint pinned reviewed gateway commit
-`a69e710dbe6a43e513a6f12c118b1abce81241ea`, blob
-`ae013796f62c760c7a9424c0c97d01ad155d6ed1`, whose terminal lifecycle fix is a
-descendant of `8703dbe96841d591e77c1f274e22eb4b2aea9d64`. The no-app
-completed-turn fixtures cover the `syzpUh` repeated-intermediate shape, a
-conflicting final, duplicate completion, continuation, and mutation of the
-original final across restart.
-
-## Tool-call loop and corrected transport inference
-
-Run-root suffix `OsZeWx` used reviewed gateway commit
-`a69e710dbe6a43e513a6f12c118b1abce81241ea`, blob
-`ae013796f62c760c7a9424c0c97d01ad155d6ed1`. It never reached a valid renderer
-completion: the first renderer terminal deltas were zero, the assistant oracle
-matched no output, and the GUI reported `rendererPromptCompleted=false`.
-
-The persisted rollout contains 105 unique `function_call` records, 105 matching
-failed `function_call_output` records, and 105 token-count events, but no
-`agent_message` or `task_complete`. Every tool call failed with exit 71 because
-the nested `sandbox-exec` could not apply its profile. The gateway and upstream
-observers each recorded 106 completed Responses calls: one pre-renderer request
-plus 105 model/tool steps. A 107th request was incomplete at cleanup.
-
-The verdict assigned all 106 completions to the continuation delta and left the
-first-renderer delta at zero because the runner captures its after-first
-counters only after a successful CDP phase. No continuation phase actually
-ran. This was a model/tool loop, not 106 cold-resume continuations.
-
-The prior inference that a missing downstream `[DONE]` caused this loop was
-wrong. OptiQ consumes mlx-lm's Chat Completions `[DONE]` internally, translates
-it into a Responses `response.completed` event, and ends the upstream response
-without exposing `[DONE]` to the gateway. The run therefore provides no
-evidence that gateway commit `a69e710...` dropped an available sentinel. It
-never entered the cold-stop or persisted-thread reopen phases. Cleanup closed
-the owned processes and listeners, and both the copied app ASAR and bundled
-Codex binary retained their original hashes.
-
-The runner now pins reviewed gateway commit
-`6307d37b76918c19f2e3bc0fd506434531aadeb2`, blob
-`a368b8f8e919361425763e86ca1c80fcea81825f`, which is a descendant of
-`a69e710dbe6a43e513a6f12c118b1abce81241ea`. It forwards `[DONE]` only when an
-SSE frame contains exactly one data field with that payload and no other
-nonempty fields. This is the correct general Responses SSE behavior, but it is
-not an `OsZeWx` fix because that OptiQ path exposes `response.completed` and
-EOF, not `[DONE]`. The immutable namespace preflight retains tool-calling
-coverage and now asserts the exact data-only sentinel shape. `OBXLwu` is the
-first live GUI run against this commit.
-
-Current and future cold-resume runs use exact nonnumeric phase sentinels instead
-of arithmetic. This keeps the 2B model's GUI smoke deterministic and prevents
-a tool-selection loop from masquerading as transport progress. Tool calling
-remains validated separately by the namespace preflight.
+Final cleanup owns the copied app, host, renderer, proxy, gateway, observer,
+and OptiQ process groups. The verdict stays red unless all groups are gone, all
+reserved listeners are closed, no remote socket remains, no generated token is
+present in regular disposable state, and all isolated databases pass their
+integrity checks. The run root and copied app remain as disposable local
+evidence until manually removed.

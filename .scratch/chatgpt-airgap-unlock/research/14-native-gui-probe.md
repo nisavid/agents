@@ -2,16 +2,18 @@
 
 ## Question
 
-Can one separately named helper bind to the exact already-running copied app by
-PID, fail closed on identity or AX ambiguity, and select only the disposable Git
-fixture through the copied app's standard Open panel?
+Can one separately named helper bind to the exact already-running disposable
+copied app by PID, fail closed on process or Accessibility ambiguity, and select
+only the generated Git fixture through the copied app's native directory
+chooser?
 
 ## Source and artifact
 
-The prototype source is `research/14-native-gui-probe.swift`. It uses
-`AXUIElementCreateApplication(pid)` and never performs a system-wide AX lookup,
-launches or terminates an app, prompts for Accessibility, mutates TCC, or targets
-an application by bundle identifier.
+The helper source is
+`.scratch/chatgpt-airgap-unlock/research/14-native-gui-probe.swift`. It uses
+`AXUIElementCreateApplication(pid)` and never performs a system-wide
+Accessibility lookup, launches or terminates an app, prompts for Accessibility,
+mutates TCC, or targets an application by bundle identifier.
 
 Build an ad-hoc-signed disposable artifact with:
 
@@ -26,281 +28,182 @@ Run the deterministic no-permission checks with:
 .scratch/chatgpt-airgap-unlock/research/14-test-native-gui-probe.sh
 ```
 
-The live runner seam is opt-in. It requires the exact artifact path and SHA-256,
-passes the copied app PID and canonical copied paths explicitly, requires
-`--press-open-folder-menu-item` for the selection phase, and authorizes the
-PID-targeted Command-Shift-G fallback and its focus mutation separately. The helper checks path, process-start,
-executable, running-bundle, static signature, and live signature identity before
-checking trust or reading AX state. After trust, it waits up to five monotonic
-seconds for the exact source-backed `File` → `Open Folder…` menu path. The item
-must be unique, direct, enabled, advertise `AXPress`, and expose Command-O
-character, virtual-key, and modifier metadata. Missing or unpublished menu state
-is retried; malformed, duplicate, disabled, or mismatched published state fails
-immediately. The helper revalidates the exact AX identity and process, performs
-one `AXPress`, rechecks the process immediately afterward, then records bounded
-evidence. It also rechecks process-start
-and executable identity before and after every Open-panel readiness snapshot and
-immediately before every AX mutation. The readiness wait is limited to five
-monotonic seconds at 100-millisecond intervals. Any malformed, duplicate, or
-ambiguous candidate fails immediately; the readiness loop performs no AX or
-input action. The helper appends only structured, path-hashed JSONL events
-beneath the disposable run root.
+The live runner accepts only an exact helper path and SHA-256. The copied app's
+Seatbelt profile denies writes to that reviewed path, and the runner rechecks
+its inode, hash, and signature immediately before execution.
 
-After the exact artifact has been reviewed and manually granted, the seam is:
+## Verified project-selection contract
+
+The native selection route is green for the disposable copy of ChatGPT/Codex
+`26.707.71524` (`5263`). It separates renderer authorization from native panel
+mutation:
+
+1. The renderer validates and clicks the unique visible, enabled
+   `Choose project` control.
+2. The renderer selects the unique `New project` item and validates the unique
+   `Use an existing folder` item without pressing it.
+3. One helper invocation binds to the copied app's PID and completes a bounded
+   Accessibility traversal proving that no `AXSheet` exists. It records that
+   attestation and remains alive.
+4. The runner confirms that exact helper process is still alive, then a fresh
+   renderer invocation revalidates the exact final item. If the renderer
+   popover did not survive the first CDP session, it reopens only the exact
+   `Choose project` and `New project` controls before pressing the final item.
+   No menu accelerator or keyboard fallback is authorized in this route.
+5. The same continuously running helper waits for the unique native chooser,
+   revalidates the same PID and identity boundary, selects the exact fixture
+   row through `AXSelectedChildren`, and presses the chooser action once.
+6. The renderer independently confirms the exact nonce project after the
+   chooser closes.
+
+The helper records structured, path-hashed JSONL beneath the disposable run
+root. A successful selection emits, in order:
+
+- `inputs-validated` before process inspection;
+- `process-validated` with the exact PID, derived process start time,
+  executable hash, and AppKit registration poll count after internal bundle
+  and code-signature validation;
+- `open-panel-absence-validated` before the final renderer request;
+- `open-panel-validated` with title `Open` and
+  `navigation: selected-children`; and
+- `project-selection-requested` with `selectionActionCount: 1`.
+
+## PID and process boundary
+
+The helper receives the copied app PID plus canonical expected bundle and
+executable paths explicitly. It derives and pins the kernel process start time,
+then validates the running paths and static/live code identities before
+Accessibility trust or AX reads. AppKit registration is polled only for that
+PID and must publish the same bundle and executable paths.
+
+The helper revalidates process start and executable identity around every
+Open-panel readiness snapshot and immediately before each AX mutation. A
+terminated process, PID reuse, changed executable, changed bundle, signature
+drift, or published identity mismatch fails closed.
+
+## Bounded native panel discovery
+
+The verified route does not recursively traverse the Electron renderer tree.
+It reads the exact copied application's windows, follows bounded `AXChildren`
+edges, deduplicates the resulting sheets, and evaluates only the parented sheet
+candidates. This avoids both global targeting and unbounded descent into the
+web content accessibility tree. The pre-request absence traversal fails closed
+on incomplete reads or depth, node, and fanout limits.
+
+Readiness uses monotonic deadlines, fixed polling intervals, per-window node
+limits, and explicit depth limits. No qualifying sheet is a retryable
+unpublished state within the bound. A malformed, duplicate, unauthorized,
+ambiguous, or drifted candidate fails immediately. The readiness loop contains
+no AX mutation.
+
+The accepted chooser must be one unique visible sheet with the expected Open
+panel structure, one enabled chooser action, and a list exposing one exact
+fixture row. Any published panel destination must equal the canonical fixture
+parent. The exact row must publish only the canonical fixture path; the helper
+rejects lookalike, ancestor, descendant, symlinked, remote, non-file,
+malformed, or duplicate evidence.
+
+## Exact fixture selection
+
+The copied dialog starts at the canonical parent of the generated fixture. The
+helper therefore selects the fixture by native list identity rather than
+typing or navigating a path:
+
+- find exactly one list and exactly one row whose canonical URL resolves to the
+  expected fixture;
+- require `AXSelectedChildren` to be writable on that exact list;
+- write a single-element selection containing only that row;
+- reread `AXSelectedChildren` and require exact identity with that row;
+- revalidate the app, panel, list, row, destination, and enabled chooser
+  action; and
+- invoke the chooser action once.
+
+The helper never sends Command-Shift-G, Command-O, coordinates, pasteboard
+data, or system-wide input in this route. It never presses the chooser action
+when selection publication or destination validation is incomplete.
+
+## Disposable default-path seam
+
+The native dialog's deterministic starting directory is supplied only to the
+copied app. The patcher
+`.scratch/chatgpt-airgap-unlock/research/14-patch-native-picker-default.mjs`
+replaces one exact 164-byte call site in the copied `app.asar` with an
+equal-length payload that adds `defaultPath: process.env.NDP` to the existing
+`Select Project Root` dialog options.
+
+Before writing, the patcher validates the ASAR topology, the main entry's
+integrity, one source payload, no patched payload, and two exact copies of the
+old main-file hash in the header. After writing, it validates the patched main
+file, both updated header hashes, the unchanged archive size, and one patched
+payload. The runner also updates the copied bundle's
+`ElectronAsarIntegrity:Resources/app.asar:hash` value.
+
+The exact copied artifacts are:
+
+| Item | SHA-256 |
+| --- | --- |
+| Source ASAR | `d28f31b4bbb04c519be65c2af8277d8c5faf77b4239ee89b928f0a7423dacd84` |
+| Patched copied ASAR | `06c4fd5cbb3662911cc62c3569042bd5657f3476a99ef9edc47bd51d5380026f` |
+| Source ASAR header | `e3023f2d1c334ba8ba80bd22a97553d412a4616a86d75ca81e258e974061f3c7` |
+| Patched ASAR header | `c069ef0e4e826ec2fd8db41a626f3e26f3edead477053a12703830ce7e047b75` |
+| Patched main file | `a8082ef44bf3aa4e30e7c663472da502d15bed35073a4c125903f4b9291961cc` |
+| Native helper | `333973d30e29fbb2bba460a82d623a24adfc35d88d981fac5c7200fccc563e31` |
+
+The runner ad-hoc signs the copied outer bundle with identifier
+`com.openai.codex` and requires its deep signature and designated requirement
+to validate before launch. This signing step is confined to the disposable
+copy. The source archive and installed application remain untouched.
+
+## Keychain boundary
+
+The copied app launches with Chromium `--use-mock-keychain`. That switch is
+confined to the isolated copied-app command and does not change how the
+installed application is launched. The successful reviewed run produced no
+Keychain alert. The harness never resets or modifies the user's real keychain.
+
+If macOS displays a TCC, SecurityAgent, or keychain dialog despite this
+contract, stop the live run and leave the dialog to Ivan. Do not select
+`Reset To Defaults` as part of automation.
+
+## Live invocation
+
+After Ivan has reviewed the final helper hash and manually granted that exact
+artifact Accessibility access, run:
 
 ```sh
+ROUTE_MODE=gateway \
+GATEWAY_COMMIT=6307d37b76918c19f2e3bc0fd506434531aadeb2 \
 GUI_NATIVE_PROJECT_PICKER=true \
-NATIVE_GUI_PROBE_BIN=<reviewed-artifact-path> \
-NATIVE_GUI_PROBE_SHA256=<reviewed-sha256> \
-NATIVE_GUI_PROBE_KEY_FALLBACK=true \
-NATIVE_GUI_PROBE_FOCUS_OPEN_PANEL=true \
+NATIVE_PICKER_DEFAULT_PATH_SEAM=true \
+NATIVE_GUI_PROBE_BIN=<reviewed-helper-path> \
+NATIVE_GUI_PROBE_SHA256=<reviewed-helper-sha256> \
 GUI_WORKFLOW=true \
 PROBE_EXPECT=renderer-native-project \
   .scratch/chatgpt-airgap-unlock/research/08-run-prototype.sh
 ```
 
-The runner first requires one enabled, visible renderer control with the exact
-accessible name `Choose project` as the expected selector precondition. It
-checks that control only to prove the per-run nonce fixture is not already
-selected; it does not infer broader project state from the label or perform any
-input action. The runner resolves exactly one copied-app executable in the owned
-process group and invokes the helper with explicit Open Folder authorization.
-The helper first resolves `NSRunningApplication` only by the already verified
-PID, revalidates its copied bundle and executable paths, requests activation
-without bundle-ID targeting or deprecated activation options, and requires both
-AppKit active state and AX frontmost state through a bounded monotonic poll. It
-then presses the exact PID-scoped menu item, records exactly one
-`open-folder-menu-item-pressed` event, and validates the native panel afterward.
-Before Command-Shift-G, it requires the original panel to remain the unique
-current exact-PID window and strictly proves the application is frontmost, its
-focused window is the original panel, and its focused UI element is either that
-panel or an exact-PID descendant whose top-level UI element is that panel.
-Window-level `AXFocused` is diagnostic only because non-focusable windows may
-publish it read-only. If readiness is absent, separate authorization permits
-only setting that exact application's `AXFrontmost` attribute, raising that
-exact panel, and setting the application's focused-window attribute to the
-validated panel when runtime capability inspection confirms it is writable.
-Every boundary revalidates the PID and unique current panel identity. It waits
-two monotonic seconds for all focus postconditions, recaptures the path-entry
-baseline, and rechecks exact focus immediately before the adjacent PID-targeted
-key events.
-The runner requires that evidence order before accepting panel validation, then
-requires a renderer transition from a nonmatching project to the per-run nonce
-project. After the renderer creates its first task, the runner waits for the
-authoritative database and required schema through a bounded, read-only
-readiness check. `research/14-project-state.py` then requires the authoritative
-`state_5.sqlite.threads.cwd` record to transition from zero exact fixture rows
-to exactly one before recording the native project-picker gate as complete.
-The copied app's Seatbelt profile denies writes to the exact reviewed helper
-path, and the runner rechecks its inode, SHA-256, and signature immediately
-before execution.
-
-Before the first mutation, the same granted artifact can run a read-only menu
-inspection through the runner:
-
-```sh
-GUI_NATIVE_PROJECT_PICKER=true \
-NATIVE_GUI_PROBE_INSPECT_MENU_ONLY=true \
-NATIVE_GUI_PROBE_BIN=<reviewed-artifact-path> \
-NATIVE_GUI_PROBE_SHA256=<reviewed-sha256> \
-GUI_WORKFLOW=false \
-PROBE_EXPECT=native-menu-inspection \
-  .scratch/chatgpt-airgap-unlock/research/08-run-prototype.sh
-```
-
-That mode validates the same bounded topology and metadata, emits one
-`open-folder-menu-validated` event with `actionCount: 0`, performs no panel wait
-or input action, and continues through the common process, listener, signature,
-and copied-app integrity closeout before reporting success. Key fallback must be
-disabled.
-
-The first live attempt clicked `Choose project` and started the helper after
-that single renderer interaction. That control only opens the project-selector
-menu, so no native panel existed for the helper to inspect. Driving the menu is
-not deterministic: the empty-project menu can expose either a direct
-`New project` action or a submenu containing `Use an existing folder`, depending
-on a feature gate. A later third live run sent the stable `Meta+O` accelerator
-through CDP, but it did not reach AppKit; the helper observed no native panel and
-timed out after 45 readiness polls. The renderer is therefore limited to the
-precondition. A fourth run proved that the exact trusted helper posted one
-Command-O action to the focused copied PID, but AppKit still exposed no native
-panel. PID-targeted keyboard delivery is therefore not a sufficient menu-command
-contract. Extracted build 26.707.71524 (5263) source confirms the command is a
-direct `File` → `Open Folder…` item; the PID-bound helper now invokes that exact
-item through AX and owns the subsequent native-panel evidence.
-
-A fifth inspection-only run stopped before launching either the copied app or
-the helper. The host app-server sandbox rejected the shared profile because its
-`NATIVE_GUI_PROBE_BIN` path parameter had no value, then the host probe timed
-out. This was runner plumbing, not native-menu evidence. The runner now passes
-the exact protected helper path as a sandbox profile definition to both the
-initial and cold-restart host app-server commands; the helper path is not added
-to either isolated child environment.
-
-The sixth inspection run reached the exact granted helper and confirmed the
-kernel PID executable path matched the copied executable, but failed before AX
-inspection because AppKit had not registered an `NSRunningApplication` yet. A
-separate non-AX diagnostic sampled registration every 100 milliseconds: samples
-0–5 were unavailable, sample 6 onward exposed the exact copied bundle and
-executable, and `finishedLaunching` remained false until sample 13. The helper
-now waits up to five monotonic seconds for a nonterminated AppKit registration
-with those exact canonical paths. Missing registration or either missing URL is
-retryable; termination or any published mismatch fails immediately. The helper
-revalidates PID, process start, and kernel executable before and after every
-sample and around the unchanged static/dynamic signature validation. Launch
-completion is diagnostic only and is not part of this identity gate.
-
-The seventh inspection run passed process validation after seven AppKit polls
-and passed the existing Accessibility trust gate. Its first menu snapshot
-published the direct File menu and other children but no exact `Open Folder…`
-item, so the helper failed before any action. Zero matching items is now treated
-as an unpublished intermediate and retried within the existing five-second
-monotonic bound. A published duplicate or a matching item with the wrong role,
-enabled state, action, or Command-O metadata still fails on its first snapshot.
-The retry loop continues to validate process identity around every read and
-contains no AX mutation; inspection evidence continues to require
-`actionCount: 0`.
-
-The eighth inspection run reached the exact `Open Folder…` item after process
-validation and Accessibility trust, then failed the combined Command-O metadata
-check before any action. The prior check did not identify whether an optional
-attribute was absent or a published value was wrong. Missing or empty command
-character, missing virtual key, and missing modifiers now remain retryable
-within the same bounded read-only wait. Once present, a wrong character, key,
-or modifier value fails on that snapshot with a field-specific diagnostic; a
-present value of the wrong CF type fails as malformed. Case-normalized `O`/`o`,
-integral virtual key `31`, and integral modifiers `0` remain the only accepted
-command metadata.
+`NATIVE_PICKER_DEFAULT_PATH_SEAM=true` is required for this native-project
+workflow. The discarded menu, go-to-folder, focus, and keyboard options no
+longer exist.
 
 ## Permission boundary
 
-Do not run the live seam until Ivan has reviewed the final artifact hash and
+Do not run the live seam until Ivan has reviewed the final helper hash and
 manually granted that exact helper Accessibility access in System Settings.
 Rebuilding or re-signing produces a new artifact and requires a new review and
-grant. If macOS displays a TCC or SecurityAgent dialog, stop and hand control to
-Ivan; the helper never requests a prompt itself.
+grant. The helper never requests a TCC prompt or edits TCC state.
 
-## No-permission verdict
+## Verdict and cleanup
 
-Green for the source, build, input-policy, selector-policy, and runner-seam
-slice. The retained no-permission artifact for this revision is arm64 and ad-hoc signed,
-with SHA-256 `b2de2bdd588344f01598b7dbe8d57dc73979c8c5edcc44c7521555384adf39f8`
-and CDHash `9f18c6a5cd19c7dca0383bb235a726364c95a721`. A clean build in a second
-disposable directory produced the same SHA-256. The helper self-test, forbidden
-API and sensitive-symbol allowlists, path-policy fixtures, renderer transition
-oracle, authoritative project-state fixtures, runner shell syntax, and
-cold-handoff self-test all passed. The reviewed revision is installed at the
-canonical helper path recorded above and requires a fresh manual grant.
+Green for the exact helper identity, renderer authorization, bounded parented
+sheet discovery, exact `AXSelectedChildren` selection, one chooser action, and
+renderer confirmation. The current route does not rely on activation repair,
+global focus, keyboard delivery, or coordinate input.
 
-## Project-selection focus diagnosis
-
-The exact menu press and Open panel validation succeeded in the project-selection
-runs. The first Command-Shift-G attempt used a full recursive snapshot whose
-three-second traversal consumed the path-entry readiness budget. Bounded raw
-window reads and one cached descendant traversal removed that observer cost.
-The next run completed five bounded path-entry polls but found no candidate.
-Run-root suffix `fWZ5kY` then recorded the exact final pending state:
-`new-fields=0 go-buttons=0 extra-cancels=0 chooser-enabled=true`. The shortcut
-caused no accessibility-tree change; project adoption remained at zero exact
-fixture rows, and every owned process and listener still closed cleanly.
-
-The retained helper now treats focus as a proven precondition rather than an
-assumption. It introduces no system-wide AX element, bundle-ID target,
-deprecated activation option, or coordinate input. Its exact-PID AppKit
-activation is bounded by the previously validated process, copied paths, active
-state, and AX frontmost state. The deterministic suite produced two
-byte-identical arm64 ad-hoc builds, exercised staged focus convergence, timeout,
-PID drift, option and runner authorization, exact mutation ordering, forbidden
-API policy, and the sensitive-symbol allowlist, then passed the complete
-no-permission workflow. The canonical artifact above awaits a fresh manual
-Accessibility grant before the next live project-selection run.
-
-The first focus-enabled run, with suffix `XX7Egp`, reached the exact menu press
-and Open panel, then failed before any focus mutation because the inactive
-copied app's strict `AXFocusedWindow` value was not among its currently
-enumerated windows. That value is not used as an action target. The helper now
-keeps the original Open panel's unique membership requirement and strict focus
-typing but treats any other focused-window identity as pending until exact-app
-frontmost plus exact-panel raise establishes the required equality. The run
-cleaned up every owned listener and process, its isolated database passed
-`quick_check` with zero threads, and source/copy ASAR hashes matched.
-
-The next focus-enabled run, suffix `MYh8h3`, performed exact-app frontmost and
-exact-panel raise successfully, but all 19 bounded polls retained
-`frontmost=true focused-window-matches=false panel-focused=false`. The helper
-therefore still emitted no keyboard input or project-selection request. The
-result motivated runtime capability checks for the two then-candidate AX
-selectors; later runs established both were read-only and corrected the
-window-level focus model. Cleanup again
-closed every owned listener and process; the isolated database passed
-`quick_check` with zero threads, and source/copy ASAR hashes matched.
-
-Run suffix `tsT8Zz` confirmed the application's focused-window attribute is
-read-only for this Open panel. The capability preflight failed before any focus
-mutation, keyboard input, or project-selection request. The retained plan now
-requires natural key-panel publication from exact-PID activation and rejects
-before mutation when focused-window repair would be required but is read-only.
-Cleanup closed every owned listener and process; the isolated database passed
-`quick_check` with zero threads, and source/copy ASAR hashes matched.
-
-Runs `LhoGIW` and `OWWn0g` reproduced the same read-only focused-window result
-and confirmed the panel's own `AXFocused` attribute is also read-only. Both runs
-stopped before keyboard input or project selection, closed all five listeners,
-left zero threads in databases that passed `quick_check`, and retained matching
-source/copy ASAR hashes. The SDK contract explains that a non-focusable window
-may publish `AXFocused` read-only; readiness now proves the focused window plus
-the exact focused UI element's top-level panel instead. The next live probe uses
-exact-PID activation before opening the panel so AppKit can publish it as key
-naturally.
-
-## First live invocation
-
-The manually granted first invocation proved the exact helper was trusted and
-bound to the copied app's validated PID, paths, and live/static signatures. The
-renderer issued one trusted click on the unique project control, but the helper
-performed its first AX enumeration before the native Open panel was published
-and failed closed with zero qualifying panels. It emitted no panel-validated or
-project-selection event, and authoritative project state remained at zero exact
-fixture rows. All owned processes and listeners closed; route isolation and
-source/copied app integrity remained intact.
-
-The runner no longer relies on a fixed delay after the renderer click. The
-helper now polls read-only for at most five monotonic seconds, validates the
-same process identity before and after every AX snapshot, retries only while no
-panel-shaped candidate exists, and fails immediately on malformed, duplicate,
-unauthorized, ambiguous, or drifted state. The wait contains no AX or input
-action. The live native project selection remains unexecuted with this retained
-artifact and blocked on its fresh manual Accessibility grant.
-
-The first attempt with the prior revision ran inside the outer harness sandbox,
-where nested `sandbox-exec` failed before app launch. The unchanged inspection
-then ran outside that outer sandbox, validated the copied process and helper
-trust, and remained read-only for 41 menu polls. It timed out in a retryable
-unpublished state, emitted no menu-validation or project-selection event, and
-cleaned up every owned process and listener. All isolated databases passed
-`quick_check`, and source/copy app hashes remained exact.
-
-The helper now retains only the final bounded pending-state label across the
-read-only wait. Timeout evidence distinguishes an unpublished application menu
-bar, File item, direct menu, Open Folder item, command character, or modifiers
-without recording menu contents or changing any immediate rejection or action
-gate. The next inspection identified the sole persistent state as an unpublished
-command virtual key after 38 read-only polls.
-
-Apple defines the [command character](https://developer.apple.com/documentation/applicationservices/kaxmenuitemcmdcharattribute)
-as the primary shortcut key and the [virtual key](https://developer.apple.com/documentation/applicationservices/kaxmenuitemcmdvirtualkeyattribute)
-as optional physical-key evidence for distinguishing keys that can produce the
-same character. `O` is unambiguous. The helper therefore accepts only
-`attributeUnsupported` or `noValue` as absent physical-key publication; an exact
-integral value must still be `31`, and every other AX read error, wrong value, or
-malformed type fails immediately. Evidence records whether the key was
-published and never fabricates it. Any rebuild requires a fresh manual grant
-before another inspection.
-
-Run-root suffix `CFu4Bp` completed the final mutation-free inspection with the
-retained and granted artifact. The exact File → Open Folder path became ready
-after three polls and recorded character `O`, modifiers `0`, enabled `AXPress`,
-`commandVirtualKeyPublished: false`, and `actionCount: 0`. The local model,
-gateway, host sentinel, isolation, integrity, process cleanup, and listener
-cleanup gates all passed. The helper is ready for the separately authorized
-project-selection run; no live AX action has occurred with this revision.
+The successful full smoke test continued from project selection through the
+authenticated local `codex-ns-proxy`, OptiQ
+`Qwen3.5-2B-OptiQ-4bit:no-think`, and namespace continuation. It observed no
+remote socket or token leak. Cleanup closed every owned app, host, proxy,
+gateway, observer, and model process and every reserved listener. Final
+integrity checks proved the copied ASAR matched the exact patched hash while the
+extracted source bundle and installed application remained unchanged.

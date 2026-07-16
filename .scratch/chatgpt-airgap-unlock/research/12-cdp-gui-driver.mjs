@@ -114,7 +114,7 @@ function matchingControlExpression(candidatesExpression, acceptedText) {
   return `(${matchingControlVerdict.toString()})(${candidatesExpression}, ${JSON.stringify(acceptedText)})`;
 }
 
-function runSelfTests() {
+async function runSelfTests() {
   const cases = [
     ["exact", firstSentinel, true],
     ["surrounding whitespace", `  ${firstSentinel}\n`, true],
@@ -312,6 +312,30 @@ function runSelfTests() {
     throw new Error("serialized worktree mode verdict depends on outer scope");
   }
 
+  let restorationPrepareCount = 0;
+  const restorationEvents = [];
+  const restoration = await ensureNativeProjectPickerFinalControl("/tmp/run/project", {
+    probe: async () => ({ status: "pending", reason: "missing", count: 0 }),
+    prepare: async () => { restorationPrepareCount += 1; },
+    record: (kind, fields) => restorationEvents.push({ kind, fields }),
+    pause: async () => {},
+  });
+  if (!restoration.restored || restorationPrepareCount !== 1 ||
+      restorationEvents.length !== 1 ||
+      restorationEvents[0].kind !== "native-project-picker-renderer-path-restored") {
+    throw new Error("missing final picker control did not exercise exact renderer restoration");
+  }
+  let unexpectedPrepareCount = 0;
+  const retained = await ensureNativeProjectPickerFinalControl("/tmp/run/project", {
+    probe: async () => ({ status: "ready", count: 1 }),
+    prepare: async () => { unexpectedPrepareCount += 1; },
+    record: () => {},
+    pause: async () => {},
+  });
+  if (retained.restored || unexpectedPrepareCount !== 0) {
+    throw new Error("retained final picker control unexpectedly restored renderer path");
+  }
+
   process.stdout.write("sentinel oracle self-test passed\n");
 }
 
@@ -322,7 +346,7 @@ async function targets() {
 }
 
 if (process.argv[2] === "--self-test") {
-  runSelfTests();
+  await runSelfTests();
   process.exit(0);
 }
 
@@ -406,7 +430,10 @@ async function snapshot(label) {
     text: (document.body?.innerText ?? "").replace(/\\s+/g, " ").trim().slice(0, 12000),
     mainUi: Boolean(
       [...document.querySelectorAll("button")].some((element) => element.innerText?.includes("New task")) &&
-      [...document.querySelectorAll("button")].some((element) => element.getAttribute("aria-label") === "Choose project") &&
+      [...document.querySelectorAll("button")].some((element) => {
+        const label = element.getAttribute("aria-label") ?? "";
+        return label === "Choose project" || label.startsWith("Change project: ");
+      }) &&
       [...document.querySelectorAll("button")].some((element) => element.getAttribute("aria-label") === "Open settings") &&
       document.querySelector('[contenteditable=true][data-codex-composer=true]')
     ),
@@ -490,6 +517,22 @@ async function waitForUniqueVisibleControl(query, description, milliseconds = 10
     await sleep(100);
   }
   throw new Error(`${description} control did not become uniquely visible: ${JSON.stringify(lastResult)}`);
+}
+
+async function pressUniqueVisibleExactControl(query, description) {
+  const readiness = await evaluate(visibleExactControlProbeExpression(query));
+  if (readiness?.status !== "ready" || readiness.count !== 1 ||
+      !Number.isFinite(readiness.x) || !Number.isFinite(readiness.y)) {
+    throw new Error(`${description} control was not press-ready: ${JSON.stringify(readiness)}`);
+  }
+  await send("Input.dispatchMouseEvent", {
+    type: "mousePressed", x: readiness.x, y: readiness.y,
+    button: "left", buttons: 1, clickCount: 1,
+  });
+  await send("Input.dispatchMouseEvent", {
+    type: "mouseReleased", x: readiness.x, y: readiness.y,
+    button: "left", buttons: 0, clickCount: 1,
+  });
 }
 
 function visibleCandidateExpression(selector) {
@@ -628,10 +671,10 @@ async function selectNewWorktreeMode() {
   return markerReady && marker.status === "ready" && marker.count === 1;
 }
 
-// BEGIN_NATIVE_PROJECT_PICKER_PRECONDITION
-async function assertNativeProjectPickerPrecondition(expectedFixtureRoot) {
+// BEGIN_NATIVE_PROJECT_PICKER_REQUEST
+async function prepareNativeProjectPicker(expectedFixtureRoot) {
   if (!expectedFixtureRoot?.startsWith("/")) {
-    throw new Error("open-project-picker requires an absolute nonce fixture root");
+    throw new Error("prepare-project-picker requires an absolute nonce fixture root");
   }
   const chooseProject = await waitForUniqueVisibleControl({
     selector: 'button[aria-label="Choose project"]',
@@ -647,29 +690,107 @@ async function assertNativeProjectPickerPrecondition(expectedFixtureRoot) {
     preSelectionMatchedExpected: false,
     expectedFixtureSha256: textSha256(expectedFixtureRoot),
   });
+  await pressUniqueVisibleExactControl({
+    selector: 'button[aria-label="Choose project"]',
+    accessibleName: "Choose project",
+  }, "Choose project");
+  emit("native-project-picker-control-clicked", {
+    uniqueControl: true,
+    accessibleName: "Choose project",
+    expectedFixtureSha256: textSha256(expectedFixtureRoot),
+  });
+  await waitForUniqueVisibleControl({
+    selector: '[role="menuitem"]', exactText: "New project",
+  }, "New project");
+  emit("renderer-project-menu-observed", {
+    published: true,
+    uniqueControl: true,
+    exactText: "New project",
+  });
+  await pressUniqueVisibleExactControl({
+    selector: '[role="menuitem"]', exactText: "New project",
+  }, "New project");
+  emit("renderer-new-project-menu-opened", {
+    uniqueControl: true,
+    exactText: "New project",
+  });
+  await waitForUniqueVisibleControl({
+    selector: '[role="menuitem"]', exactText: "Use an existing folder",
+  }, "Use an existing folder");
+  emit("native-project-picker-final-control-ready", {
+    uniqueControl: true,
+    exactText: "Use an existing folder",
+    expectedFixtureSha256: textSha256(expectedFixtureRoot),
+  });
 }
-// END_NATIVE_PROJECT_PICKER_PRECONDITION
+
+async function ensureNativeProjectPickerFinalControl(expectedFixtureRoot, {
+  probe = async () => evaluate(visibleExactControlProbeExpression({
+    selector: '[role="menuitem"]', exactText: "Use an existing folder",
+  })),
+  prepare = prepareNativeProjectPicker,
+  record = emit,
+  pause = sleep,
+} = {}) {
+  const finalControlQuery = {
+    selector: '[role="menuitem"]', exactText: "Use an existing folder",
+  };
+  let finalReadiness = { status: "pending", reason: "not-probed", count: 0 };
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    finalReadiness = await probe(finalControlQuery);
+    if (finalReadiness.status === "ready") break;
+    if (finalReadiness.status === "duplicate" || finalReadiness.status === "disabled") {
+      throw new Error(
+        `Use an existing folder control is ${finalReadiness.reason}: ` +
+        JSON.stringify(finalReadiness)
+      );
+    }
+    await pause(100);
+  }
+  let restored = false;
+  if (finalReadiness.status !== "ready") {
+    await prepare(expectedFixtureRoot);
+    record("native-project-picker-renderer-path-restored", {
+      uniqueControl: true,
+      exactPath: ["Choose project", "New project", "Use an existing folder"],
+      expectedFixtureSha256: textSha256(expectedFixtureRoot),
+    });
+    restored = true;
+  }
+  return { finalControlQuery, restored };
+}
+
+async function requestNativeProjectPicker(expectedFixtureRoot) {
+  if (!expectedFixtureRoot?.startsWith("/")) {
+    throw new Error("open-project-picker requires an absolute nonce fixture root");
+  }
+  const { finalControlQuery } =
+    await ensureNativeProjectPickerFinalControl(expectedFixtureRoot);
+  await waitForUniqueVisibleControl({
+    ...finalControlQuery,
+  }, "Use an existing folder");
+  await pressUniqueVisibleExactControl({
+    ...finalControlQuery,
+  }, "Use an existing folder");
+  emit("native-project-picker-requested", {
+    uniqueControl: true,
+    exactText: "Use an existing folder",
+    expectedFixtureSha256: textSha256(expectedFixtureRoot),
+  });
+  await snapshot("after-existing-folder-press");
+}
+// END_NATIVE_PROJECT_PICKER_REQUEST
 
 async function confirmNativeProjectSelection(expectedFixtureRoot) {
   if (!expectedFixtureRoot?.startsWith("/")) {
     throw new Error("confirm-project-selection requires an absolute fixture root");
   }
-  const control = await evaluate(`(() => {
-    const matches = [...document.querySelectorAll('button[aria-label="Choose project"]')]
-      .filter((element) => {
-        const rect = element.getBoundingClientRect();
-        const style = getComputedStyle(element);
-        return !element.disabled && rect.width > 0 && rect.height > 0 &&
-          style.visibility === "visible" && style.pointerEvents !== "none";
-      });
-    if (matches.length !== 1) return { count: matches.length };
-    return {
-      count: 1,
-      text: (matches[0].innerText ?? "").trim(),
-      title: matches[0].getAttribute("title"),
-      ariaDescription: matches[0].getAttribute("aria-description"),
-    };
-  })()`);
+  const expectedName = expectedFixtureRoot.split("/").filter(Boolean).at(-1) ?? "";
+  if (!expectedName) throw new Error("fixture root has no project name");
+  const control = await waitForUniqueVisibleControl({
+    selector: 'button[aria-label^="Change project: "]',
+    accessibleName: `Change project: ${expectedName}`,
+  }, "selected project", 45000);
   const verdict = projectSelectionVerdict(control, expectedFixtureRoot);
   emit("renderer-project-selection-confirmed", {
     matched: verdict.matched,
@@ -695,7 +816,10 @@ async function reachMainUi() {
     );
     mainUi = await evaluate(`
       [...document.querySelectorAll("button")].some((element) => element.innerText?.includes("New task")) &&
-      [...document.querySelectorAll("button")].some((element) => element.getAttribute("aria-label") === "Choose project") &&
+      [...document.querySelectorAll("button")].some((element) => {
+        const label = element.getAttribute("aria-label") ?? "";
+        return label === "Choose project" || label.startsWith("Change project: ");
+      }) &&
       [...document.querySelectorAll("button")].some((element) => element.getAttribute("aria-label") === "Open settings") &&
       Boolean(document.querySelector('[contenteditable=true][data-codex-composer=true]')) &&
       !(document.body?.innerText ?? "").includes("What type of work do you do?")
@@ -1037,13 +1161,13 @@ await send("Network.enable");
 await send("Runtime.enable");
 
 try {
-  if (phase === "open-project-picker") {
+  if (phase === "prepare-project-picker") {
     const mainUi = await reachMainUi();
-    if (!mainUi) throw new Error("main UI unavailable before native project picker request");
-    await assertNativeProjectPickerPrecondition(phaseArgument);
+    if (!mainUi) throw new Error("main UI unavailable before native project picker preparation");
+    await prepareNativeProjectPicker(phaseArgument);
+  } else if (phase === "open-project-picker") {
+    await requestNativeProjectPicker(phaseArgument);
   } else if (phase === "confirm-project-selection") {
-    const mainUi = await reachMainUi();
-    if (!mainUi) throw new Error("main UI unavailable after native project selection");
     await confirmNativeProjectSelection(phaseArgument);
   } else if (phase === "first") {
     const mainUi = await reachMainUi();

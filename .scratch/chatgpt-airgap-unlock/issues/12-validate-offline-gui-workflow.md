@@ -20,9 +20,10 @@ namespaced tool continuation, listener isolation, integrity, and cleanup checks
 all passed. See
 [`research/12-validate-offline-gui-workflow.md`](../research/12-validate-offline-gui-workflow.md).
 
-The ticket remains open for native project-picker, worktree, and permission
-interaction; project-local skill visibility; and reconciliation of the
-renderer's appended reasoning-selection label with the pinned catalog.
+The ticket remains open for worktree and permission interaction, project-local
+skill visibility, and reconciliation of the renderer's appended
+reasoning-selection label with the pinned catalog. Native project selection is
+complete through the real renderer and native chooser.
 
 The worktree slice now has a deterministic, no-remote acceptance harness. It
 sets the exact worktree root through the renderer, selects the unique local
@@ -44,7 +45,8 @@ display the fallback `Custom Light` label. See
 - Launch only the separately named exact app copy with fresh isolated state and the pinned OptiQ profile; keep the installed app, normal profile, global Codex state, and unrelated model servers untouched.
 - Submit a deterministic text and tool turn from the renderer and verify the request reaches only the authenticated gateway and pinned OptiQ upstream.
 - **Complete:** Materialize a local thread from a user message, reopen it after a cold restart, and continue it from the renderer.
-- Select or create a local project and Git worktree without remote Git and verify their state survives a cold restart.
+- **Complete:** Select a local project through the native chooser and bind it to renderer and persisted thread state.
+- Create a Git worktree without remote Git and verify its state survives a cold restart.
 - Observe one allowed and one denied local operation by their effects, not merely by prompt visibility.
 - **Complete:** Exercise Default and Plan modes and verify their observable local turn settings.
 - Exercise bundled and preseeded local skill or plugin paths and verify network-dependent extensions fail explicitly without blocking the local core.

@@ -22,31 +22,30 @@ Produce an implementation-ready, empirically validated plan for running the exac
 - [Map the rewritten app auth architecture](issues/02-map-rewritten-app-auth-architecture.md) — The bundled app-server supplies `account/read`; the renderer routes to login only when no auth method exists and OpenAI auth remains required.
 - [Trace pristine offline startup](issues/03-trace-pristine-offline-startup.md) — A fresh isolated profile returns no account with OpenAI auth required and deterministically reaches the login wall; only changing the semantic host policy, not hiding UI, enables no-auth startup.
 - [Trace the GLM provider path](issues/04-trace-glm-provider-path.md) — A cold file-configured custom provider naturally disables the OpenAI-auth requirement and reaches a loopback Responses endpoint; UI provisioning and arbitrary model metadata remain absent.
-- [Classify the minimum offline workflow](issues/05-classify-minimum-offline-workflow.md) — The minimum workflow is predominantly local; only bounded provider compatibility, metadata, secret delivery, and extension dependencies remain, so no account shim or bundle mutation is justified.
+- [Classify the minimum offline workflow](issues/05-classify-minimum-offline-workflow.md) — The minimum workflow is predominantly local and needs no account shim; the exact-build-bound `defaultPath` seam is confined to disposable native-picker validation.
 - [Assess integrity, signing, and security](issues/06-assess-integrity-signing-and-security.md) — Prefer a pristine-bundle configuration or loopback-service route; any derived bundle must use exact-artifact binding, complete least-privilege signing, strict fail-closed verification, and whole-copy rollback.
 - [Select a local smoke-test model](issues/10-select-local-smoke-model.md) — Use Qwen3.5-2B-OptiQ-4bit at immutable revision `adc8669eb431e3168aeb4e320bd7b757914350e2` through an isolated OptiQ runner; it is the smallest compared candidate with a credible tool-calling margin and passed deterministic Responses text, function-call, and function-output checks.
-- [Choose the preferred architecture](issues/07-choose-bypass-architecture.md) — Use a closed profile-driven runner around the pristine vendor bundle, backed by one private typed lifecycle module and internal seams only for proven variation; OptiQ is the local development profile, GLM is explicit with no fallback, and bundle mutation is rejected absent new exact-build evidence.
+- [Choose the preferred architecture](issues/07-choose-bypass-architecture.md) — Use the closed profile-driven runner around a separately named verified copy; keep the source and installed app immutable, permit only the exact fixed-width disposable native-picker seam, use OptiQ locally, and keep GLM explicit with no fallback.
 - [Harden the Responses gateway](issues/11-harden-responses-gateway.md) — `codex-ns-proxy` is now an authenticated, allowlisted, secret-separating loopback boundary with bounded slow-prefill liveness, exact semantic and transport terminal handling, deterministic coverage, and an end-to-end OptiQ validation through the preferred route.
 - [Stabilize local Responses stream liveness](issues/15-stabilize-local-responses-stream-liveness.md) — Emit downstream SSE heartbeats during silent prefill, configure a longer low-memory upstream bound explicitly, log semantic completion immediately, and preserve the exact data-only `[DONE]` transport sentinel; the final gateway and cold-resume workflow pass together.
-- [Validate the offline GUI workflow](issues/12-validate-offline-gui-workflow.md) — The renderer now completes and resumes persisted turns, binds Default and Plan outputs to exact persisted modes, exposes the pinned local model identity instead of fallback metadata, and preserves every gateway, credential, integrity, and cleanup boundary; native project, worktree, permission, project-local skill, and reasoning-label gates remain.
+- [Prototype the native GUI probe](issues/14-prototype-native-gui-probe.md) — One PID-bound helper proves zero native sheets, remains alive across the renderer's exact final picker request, and selects only the canonical fixture through `AXSelectedChildren`; deterministic starting location uses an exact-build-bound seam confined to the disposable copy.
 
 ## Active work
 
-- [Validate the preferred route](issues/08-validate-preferred-route.md) — Prove the configured pristine-bundle route against the local OptiQ fixture and grade every minimum-workflow and platform-isolation gate from artifact-bound evidence.
-- [Validate the offline GUI workflow](issues/12-validate-offline-gui-workflow.md) — Complete native project, worktree, permission, project-local skill, and reasoning-label acceptance against the pinned local route.
+- [Validate the preferred route](issues/08-validate-preferred-route.md) — Complete worktree, permission, project-local skill, reasoning-label, production-isolation, and target-GLM acceptance against the pinned local route.
+- [Validate the offline GUI workflow](issues/12-validate-offline-gui-workflow.md) — Complete worktree, permission, project-local skill, and reasoning-label acceptance against the pinned local route.
 - [Validate production isolation](issues/13-validate-production-isolation.md) — Preserve the vendor Chromium sandbox and signed code posture while a disconnected VM or true air gap makes hosted egress unavailable.
-- [Prototype the native GUI probe](issues/14-prototype-native-gui-probe.md) — The helper now activates only the verified copied PID before the native panel, proves the exact focused window and focused UI ancestry inside the final keyboard-post boundary, and produced two reproducible builds at SHA-256 `b2de2bdd588344f01598b7dbe8d57dc73979c8c5edcc44c7521555384adf39f8`; the canonical artifact awaits its fresh manual Accessibility grant.
 
 ## Not yet specified
 
 - Real GLM 5.2 compatibility with bundled Codex's exact Responses streaming and tool-call dialect remains environment-dependent because that air-gapped endpoint is not locally available.
-- The configured renderer route still needs GUI-level validation for projects and worktrees, permission decisions, project-local skills, and reconciliation of the appended reasoning-selection label with the pinned catalog.
+- The configured renderer route still needs GUI-level validation for worktrees, permission decisions, project-local skills, and reconciliation of the appended reasoning-selection label with the pinned catalog.
 - Local semantic validation currently requires reconciling outer network confinement with Chromium's nested sandbox. Production acceptance must preserve the vendor Chromium sandbox on a disconnected VM or true air-gapped machine.
 - Cross-version discovery and migration remain deferred until a second exact app build is explicitly brought into scope.
 
 ## Out of scope
 
-- Implementing, distributing, or publishing the replacement patcher in this effort.
+- Publishing a redistributable replacement patcher or derived application build; the exact-build-bound disposable validation seam is prototype evidence only.
 - Enabling OpenAI-hosted features, paid entitlements, or remote services that are unavailable in the air-gapped environment.
 - Bypassing model-provider authorization; locally supplied GLM credentials remain required.
 - Supporting operating systems, CPU architectures, or app builds other than the exact baseline before the baseline route is established.

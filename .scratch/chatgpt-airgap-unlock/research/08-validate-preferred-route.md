@@ -2,155 +2,96 @@
 
 ## Question
 
-Can exact ChatGPT/Codex build `26.707.71524` (`5263`) cold-start from fresh,
-isolated state with no OpenAI account, reach its usable local UI, complete a
-deterministic Responses turn against the selected local OptiQ model, preserve
-the thread across a cold host restart, deny hosted egress, and leave the signed
-vendor artifact unchanged?
-
-The prototype answers this in two layers:
-
-1. a direct OptiQ baseline that isolates the app/provider semantics; and
-2. an authenticated loopback-gateway run that validates the preferred
-   architecture's actual trust boundary.
-
-Both layers are complete. The gateway result is bound to one reviewed commit
-and verified Git blob; it is not inferred from the direct result.
-
-This is a bounded route and trust-seam result. Ticket 08 remains partial
-because the broader minimum local workflow still includes GUI-driven behavior
-that this prototype did not exercise.
+Can ChatGPT/Codex build `26.707.71524` (`5263`) run a complete local GUI
+workflow with no OpenAI account: select an exact Git fixture through the native
+project picker, complete a renderer turn through the reviewed local gateway and
+OptiQ model, preserve namespace-call continuation, deny hosted egress, and
+leave the source archive and installed application untouched?
 
 ## Verdict
 
-### Direct application semantics: pass
+Green for the bounded local workflow. The verified route uses only a fresh,
+separately named copy of ChatGPT/Codex `26.707.71524`. It never launches,
+modifies, signs, or replaces the installed application.
 
-The exact packaged host and GUI operate without OpenAI state when cold-started
-with the supported custom-provider configuration:
+The run proved all of the following in one disposable environment:
 
-- `account/read` ran and the GUI did not show the ChatGPT login wall;
-- no `auth.json` was created;
-- the renderer passed local onboarding and reached the main `New task`,
-  `Choose project`, and `Open settings` surface;
-- the bundled Codex `0.144.2` host resolved the configured provider without
-  model fallback and sent `POST /v1/responses` to loopback OptiQ;
-- OptiQ returned HTTP 200 and the host streamed the exact agent message
-  `LOCAL_APP_OK`;
-- the exact turn persisted with status `completed` and no error;
-- a new host process listed, read, and resumed the same thread and exact agent
-  output after cold restart;
-- the local Git fixture was the thread CWD and runtime workspace root;
-- the host discovered and attached a repo-local file-only skill;
-- permission profiles and both Default and Plan collaboration modes were
-  listed locally;
-- failed hosted requests did not prevent the main UI or local host workflow;
-- the app and OptiQ listeners were loopback-only, no remote socket survived,
-  and the per-run token was absent from every regular disposable state file;
-- `app.asar`, the bundled `codex` binary, and the strict bundle signature were
-  unchanged after the run.
+- the copied app reached its usable local renderer without an OpenAI account;
+- the renderer selected the unique `Choose project` control, then the unique
+  `New project` and `Use an existing folder` menu items;
+- immediately before the final menu-item press, a PID-bound, fail-closed
+  bounded Accessibility traversal proved that no native sheet existed;
+- the copied app opened its native directory chooser at the fixture parent;
+- the reviewed PID-bound helper found the chooser only through the copied
+  app's bounded `AXSheet` topology, selected the exact fixture row through
+  writable `AXSelectedChildren`, and pressed the enabled chooser action once;
+- the renderer independently confirmed the exact nonce project before the
+  prompt was submitted;
+- the renderer turn completed through `codex-ns-proxy` and local OptiQ using
+  `mlx-community/Qwen3.5-2B-OptiQ-4bit:no-think`;
+- the namespace adapter reconstructed both calls and reused the response-ID
+  mapping for the continuation;
+- missing and incorrect gateway credentials were rejected before upstream;
+- no remote socket or token leak was observed; and
+- all owned processes and loopback listeners were closed during cleanup.
 
-This is a plumbing result for the selected 2B smoke model, not a claim that the
-model is a production-quality coding agent.
+This is a smoke-test result for the selected 2B model and exact desktop build,
+not a claim that the model is a production-quality coding agent or that the
+disposable patch is a redistributable application build.
 
-### Preferred authenticated gateway: pass
+### Disposable native-picker seam
 
-The preferred route passed against reviewed gateway commit
-`7c960b15267e82ef5d5a854bdd54bf53fb9e8135`, file
+The vendor app does not expose a deterministic fixture-start location for this
+test. The harness therefore copies the verified source bundle and applies one
+fixed-width, 164-byte replacement to the copied `app.asar` main process. The
+replacement adds `defaultPath: process.env.NDP` to the existing
+`Select Project Root` dialog options while preserving the dialog properties,
+title, parent-window overload, and payload length.
+
+The patcher fails closed unless it finds exactly one source payload, validates
+the ASAR topology and existing file integrity, and finds the old main-file hash
+exactly twice in the ASAR header. It writes the equal-length payload, updates
+both header hash occurrences, rereads the archive, and verifies the single
+patched payload and computed integrity. The runner then updates
+`ElectronAsarIntegrity:Resources/app.asar:hash` in the copied bundle's
+`Info.plist`.
+
+The copied outer bundle is ad-hoc signed with identifier `com.openai.codex` and
+must satisfy its new designated requirement before launch. Nested vendor
+artifacts remain part of the copied tree. The launch adds
+`--use-mock-keychain` only to this disposable copy. The successful reviewed run
+produced no Keychain alert, and the harness never resets or modifies the user's
+real keychain.
+
+### Preferred authenticated gateway
+
+The route is bound to gateway commit
+`6307d37b76918c19f2e3bc0fd506434531aadeb2`, file
 `tooling/codex-ns-proxy/codex-ns-proxy.py`, and Git blob
-`3401400af5da1a9b95e343c324661f90fa986deb`. The run proved:
+`a368b8f8e919361425763e86ca1c80fcea81825f`. The runner materializes only that
+committed blob, verifies its Git identity, and starts it on loopback with the
+`codex-namespace` adapter.
 
-- authenticated app/host-to-gateway access with a generated per-run token;
-- a distinct generated upstream token acceptable to OptiQ;
-- the exact immutable model ID with provider fallback disabled;
-- an explicit upstream authority allowlist and loopback-only listener;
-- namespace-tool request and response transformations without changing the
-  ordinary text turn;
-- transparent `response.completed` handling with the exact sanitized stderr
-  line `[codex-ns-proxy] SSE terminal_completed=true`;
-- redacted logs and disabled secret-bearing request dumps; and
-- the same host-turn, cold-resume, usable-UI, integrity, egress, token-canary,
-  and exact process-group cleanup assertions as the direct baseline.
-
-Missing and wrong inbound credentials both returned HTTP 401 without reaching
-the upstream observer. The observer then saw the authorized request with the
-exact upstream bearer and confirmed that the inbound bearer was not reused.
-It recorded booleans only; it did not persist credentials or message bodies.
-
-A separate deterministic probe loaded the immutable gateway module, flattened
-a namespace function, reconstructed the first call, preserved its
-`function_call_output`, reused the response-ID mapping for a continuation, and
-reconstructed the second call. The ordinary model sentinel remained a separate
-packaged-host turn through the live gateway.
-
-Gateway mode is fail-closed before materialization. It accepts only the exact
-reviewed 40-character commit. The gateway file, loopback validation-upstream
-URL, environment names, namespace adapter, debug setting, and terminal oracle
-are fixed in the harness. It resolves the commit, materializes only that
-committed blob into the disposable run root, and verifies its Git blob ID
-before execution. A moving worktree file cannot be selected implicitly.
-
-The authenticated-gateway reproduction is:
-
-```sh
-ROUTE_MODE=gateway \
-GATEWAY_COMMIT=7c960b15267e82ef5d5a854bdd54bf53fb9e8135 \
-PROBE_DURATION_MS=15000 \
-  .scratch/chatgpt-airgap-unlock/research/08-run-prototype.sh
-```
-
-Gateway mode generates two distinct values beginning with `sk-optiq-` for
-every run. The Codex process receives only the inbound value under its
-configured `env_key`. The gateway receives both values; it validates the
-inbound bearer and applies only the upstream bearer. The isolated validation
-observer also receives both strictly as expected and forbidden comparison
-values, records booleans only, and forwards only to fixed loopback OptiQ.
-OptiQ receives no inbound value, and Codex receives no upstream value. Neither
-value appears on the process command line or in committed configuration.
-
-The exact gateway environment contract remains bound to its reviewed commit:
-`NS_PROXY_UPSTREAM`, `NS_PROXY_INBOUND_TOKEN`, the distinct
-`NS_PROXY_UPSTREAM_TOKEN`, `NS_PROXY_HOST`, `NS_PROXY_PORT`,
-`NS_PROXY_ADAPTER=codex-namespace`, and `NS_PROXY_DEBUG=true`. The listener is
-loopback-only, and the explicit upstream URL is its sole forwarding authority.
-The gateway, validation upstream, and OptiQ run as separate processes under
-loopback-only Seatbelt profiles.
+Every run generates distinct inbound and upstream bearer values. Codex sees
+only the inbound value; the gateway validates it and sends only the upstream
+value to the fixed loopback observer and OptiQ authority. The observer records
+booleans rather than credentials or request bodies. Gateway logs are redacted,
+secret-bearing dumps are disabled, and terminal evidence is the sanitized line
+`[codex-ns-proxy] SSE terminal_completed=true`.
 
 The gateway must not invent token usage. Model metadata and usage remain a
-separate local metadata contract unless the gateway has an authoritative
-tokenizer-backed source.
+separate local metadata contract unless an authoritative tokenizer-backed
+source is available.
 
-OptiQ permits headerless loopback requests for local development; upstream
-authentication is not an OptiQ prerequisite. Gateway validation deliberately
-uses a separate generated upstream bearer to exercise credential replacement
-and prove that Codex's inbound gateway token never reaches OptiQ.
+### Production isolation boundary
 
-### Direct versus gateway comparison
-
-| Property | Direct baseline | Gateway run |
-| --- | --- | --- |
-| Codex endpoint | OptiQ loopback listener | authenticated gateway loopback listener |
-| Codex credential | generated OptiQ-compatible local bearer | generated inbound gateway bearer only |
-| OptiQ credential | same direct bearer | distinct generated upstream bearer only |
-| Namespace adapter | absent | explicitly `codex-namespace` |
-| Upstream authority | fixed OptiQ loopback URL in Codex config | fixed validation-observer URL; observer fixed to OptiQ loopback |
-| Immutable gateway source | not applicable | required commit, file, and verified Git blob |
-| Terminal evidence | host item, idle state, persisted completed turn | same plus sanitized gateway terminal marker |
-| Leak oracle | generated token absent from disposable state | all tokens absent from state; bodies absent from gateway logs |
-| Current grade | pass for bounded semantics | pass for bounded semantics and trust seams |
-
-### Production isolation: blocked
-
-The semantic runs use an outer macOS Seatbelt profile to deny remote network
-and operator-home access. Electron must be launched with Chromium
-`--no-sandbox`: Chromium's nested sandbox fails when the signed Electron tree
-is already wrapped by the outer profile.
-
-That is sufficient evidence for application behavior, RPCs, isolated state,
-provider routing, and outer-boundary egress denial. It is not a production
-isolation pass. The preferred architecture requires the vendor Chromium
-sandbox to remain enabled. A disconnected VM or true air-gapped target can
-provide the later artifact-red platform check without weakening Chromium or
-mutating global packet-filter state.
+The semantic run uses an outer macOS Seatbelt profile to deny remote network
+and operator-home access. Electron is launched with Chromium `--no-sandbox`
+because Chromium's nested sandbox does not initialize inside this outer test
+profile. This validates the application behavior, local routing, and outer
+egress boundary; it is not the final production-isolation result. A disconnected
+VM or the air-gapped target should retain the vendor Chromium sandbox for that
+platform check.
 
 ## Exact artifacts
 
@@ -158,330 +99,101 @@ mutating global packet-filter state.
 | --- | --- |
 | App version/build | `26.707.71524` (`5263`) |
 | Official archive SHA-256 | `8981d832cfd061ff8fe80295cd675d5c283fd53ed2ea8c80cc9d1856e47cfe74` |
-| `Contents/Resources/app.asar` SHA-256 | `d28f31b4bbb04c519be65c2af8277d8c5faf77b4239ee89b928f0a7423dacd84` |
+| Source `Contents/Resources/app.asar` SHA-256 | `d28f31b4bbb04c519be65c2af8277d8c5faf77b4239ee89b928f0a7423dacd84` |
+| Patched copied `app.asar` SHA-256 | `06c4fd5cbb3662911cc62c3569042bd5657f3476a99ef9edc47bd51d5380026f` |
+| Source ASAR header SHA-256 | `e3023f2d1c334ba8ba80bd22a97553d412a4616a86d75ca81e258e974061f3c7` |
+| Patched ASAR header SHA-256 | `c069ef0e4e826ec2fd8db41a626f3e26f3edead477053a12703830ce7e047b75` |
+| Patched main-file SHA-256 | `a8082ef44bf3aa4e30e7c663472da502d15bed35073a4c125903f4b9291961cc` |
+| Native helper SHA-256 | `333973d30e29fbb2bba460a82d623a24adfc35d88d981fac5c7200fccc563e31` |
 | `Contents/Resources/codex` SHA-256 | `28699add67540b93390329a740649a9eb9bdbc5538d92c1679c8c6b6fa2c623c` |
 | Bundled host | `codex-cli 0.144.2` |
-| Model | `mlx-community/Qwen3.5-2B-OptiQ-4bit` |
+| Model | `mlx-community/Qwen3.5-2B-OptiQ-4bit:no-think` |
 | Model revision | `adc8669eb431e3168aeb4e320bd7b757914350e2` |
-| Variant | `:no-think` |
 | OptiQ | `mlx-optiq 0.2.15` |
 | Python | `3.12.13` |
 | MLX | `0.32.0` |
 | MLX-LM | `0.31.3` at `ab1806e8f5d6aa035973af194a1b9198ab4754dc` |
-| Gateway commit | `7c960b15267e82ef5d5a854bdd54bf53fb9e8135` |
-| Gateway Git blob | `3401400af5da1a9b95e343c324661f90fa986deb` |
-
-The prototype copies the verified source to a separately named bundle inside a
-fresh disposable run root. It refuses to use the installed application.
-
-## One-command direct reproduction
-
-The primary-source prototype is intentionally throwaway:
-
-```sh
-PROBE_DURATION_MS=15000 \
-  .scratch/chatgpt-airgap-unlock/research/08-run-prototype.sh
-```
-
-The successful direct run returned:
-
-```text
-LOGIN_WALL_OBSERVED=false
-ACCOUNT_READ_OBSERVED=true
-MAIN_UI_OBSERVED=true
-CDP_OBSERVER_HEALTHY=true
-HOST_SENTINEL_COMPLETED=true
-COLD_HOST_RESUME_OBSERVED=true
-PROVIDER_REQUEST_OBSERVED=true
-AUTH_JSON_PRESENT=false
-SHELL_SNAPSHOT_ABSENT=true
-PROVIDER_LISTENER_OBSERVED=true
-MODEL_LIST_ISOLATED=true
-REMOTE_SOCKET_OBSERVED=false
-TOKEN_LEAK_OBSERVED=false
-OWNED_PROCESSES_EXITED=true
-OWNED_LISTENERS_CLOSED=true
-APP_ASAR_UNCHANGED=true
-CODEX_UNCHANGED=true
-```
-
-After the command exited, every reserved listener was closed. Local raw
-logs stay under the disposable run root and are not committed.
-
-## One-command authenticated-gateway reproduction
-
-```sh
-ROUTE_MODE=gateway \
-GATEWAY_COMMIT=7c960b15267e82ef5d5a854bdd54bf53fb9e8135 \
-PROBE_DURATION_MS=15000 \
-  .scratch/chatgpt-airgap-unlock/research/08-run-prototype.sh
-```
-
-The successful gateway run returned:
-
-```text
-LOGIN_WALL_OBSERVED=false
-ACCOUNT_READ_OBSERVED=true
-MAIN_UI_OBSERVED=true
-CDP_OBSERVER_HEALTHY=true
-HOST_SENTINEL_COMPLETED=true
-COLD_HOST_RESUME_OBSERVED=true
-PROVIDER_REQUEST_OBSERVED=true
-AUTH_JSON_PRESENT=false
-SHELL_SNAPSHOT_ABSENT=true
-PROVIDER_LISTENER_OBSERVED=true
-GATEWAY_LISTENER_OBSERVED=true
-GATEWAY_TERMINAL_OBSERVED=true
-GATEWAY_BODY_LEAK_OBSERVED=false
-GATEWAY_MISSING_AUTH_REJECTED=true
-GATEWAY_WRONG_AUTH_REJECTED=true
-UPSTREAM_TOKEN_REPLACED=true
-UPSTREAM_TERMINAL_COMPLETED=true
-NAMESPACE_TOOL_CONTINUATION=true
-MODEL_LIST_ISOLATED=true
-REMOTE_SOCKET_OBSERVED=false
-TOKEN_LEAK_OBSERVED=false
-OWNED_PROCESSES_EXITED=true
-OWNED_LISTENERS_CLOSED=true
-APP_ASAR_UNCHANGED=true
-CODEX_UNCHANGED=true
-```
-
-## Direct route evidence
-
-### Cold account and UI
-
-The app received `account/read` under the prelaunch provider config. CDP first
-observed the local role-onboarding prompt, clicked its local `Skip` action, and
-then observed one renderer state containing all of:
-
-- `New task`;
-- `Choose project`;
-- `Open settings`; and
-- no role-onboarding prompt and no ChatGPT login wall.
-
-The main-UI oracle requires that combined post-onboarding state. An earlier
-broad string heuristic was discarded because it could mark the role screen as
-the main UI.
-
-Hosted startup intent still reached the inert loopback proxy for ChatGPT,
-GitHub, API GitHub, and feature-flag endpoints. The proxy never forwarded, the
-outer Seatbelt profile denied direct remote connections, and those failures did
-not prevent the local main UI.
-
-### Exact host turn
-
-The bundled host used a proxy-facing-free direct model ID for this baseline,
-`allowProviderModelFallback: false`, the local Git fixture as `cwd`, read-only
-sandboxing, approval policy `never`, and the attached `local-sentinel` skill.
-The local skill says only to avoid tools and return the sentinel.
-
-OptiQ recorded one successful Responses request. The host emitted an
-`item/completed` agent message whose exact text was `LOCAL_APP_OK`, then changed
-the thread to idle. `thread/read` returned the same turn ID with status
-`completed`, no error, and the same exact agent message.
-
-The app-server did not emit its public `turn/completed` notification for that
-successful turn even though its rollout recorded internal `task_complete`, the
-thread became idle, and the persisted turn was complete. OptiQ's installed
-Responses shim explicitly emits `response.completed`. This is recorded as an
-app-server notification discrepancy, not a proven Responses-dialect failure.
-
-### Cold persistence
-
-The first app-server process exited before persistence validation. A separate
-process against the same isolated `CODEX_HOME` then:
-
-- returned `requiresOpenaiAuth: false`;
-- listed the exact thread under the fixture CWD;
-- read the completed turn and exact `LOCAL_APP_OK` agent message; and
-- resumed the exact thread successfully.
-
-The GUI process used the same isolated state, but its task list did not expose
-the app-server-created `vscode`-source thread. GUI rendering and reopening of a
-completed thread therefore remain unproven rather than being inferred from the
-host RPC pass.
-
-### Local capability evidence
-
-| Capability | Evidence | Grade |
-| --- | --- | --- |
-| No-account startup | `account/read`, no login wall, no `auth.json` | Pass |
-| Main local UI | Combined post-onboarding renderer state | Pass |
-| Project backing | Git fixture as host CWD and runtime workspace root | Pass at host seam |
-| Thread persistence | Separate cold host list/read/resume | Pass at host seam |
-| Local skill | Repo-local skill discovered and attached to the turn | Pass |
-| Permission profiles | Read-only, workspace, and danger-full-access listed | Discovery pass |
-| Collaboration modes | Default and Plan listed | Discovery pass |
-| Hosted failure behavior | Hosted intent denied; local UI and host turn continue | Pass for observed paths |
-| Renderer-originated model turn | No CDP-driven composer submission | Red/unproven |
-| GUI thread reopen | Host-created source not shown in GUI task list | Red/unproven |
-| Project picker/worktree UI | Native picker and worktree controls not driven | Red/unproven |
-| Mode selection | Modes listed but no turn run in each mode | Partial |
-| Permission enforcement/approval | Profiles listed; no denial and approval scenario run | Red/unproven |
-| Plugin install/settings UI | Local capability exists in prior research; not exercised here | Red/unproven |
+| Gateway commit | `6307d37b76918c19f2e3bc0fd506434531aadeb2` |
+| Gateway Git blob | `a368b8f8e919361425763e86ca1c80fcea81825f` |
 
 ## Pinned model metadata
 
-The supported Codex startup seam is `model_catalog_json`. The runner now builds
-a catalog under isolated `CODEX_HOME` instead of changing the copied app or its
-bundled Codex binary. The catalog keeps three concepts separate:
+The generated `model_catalog_json` and `codex debug models` gate bind the local
+profile to `Qwen3.5-2B-OptiQ-4bit (no-think)`. The catalog publishes no default
+reasoning level, an empty supported-reasoning set, text-only input, context and
+maximum context windows of `262144`, and an effective-window percentage of
+`95`.
 
-| Concept | Pinned value | Evidence |
-| --- | --- | --- |
-| Semantic model identity | Exact snapshot path plus `:no-think` | Matches the identifiers served by OptiQ `/v1/models` |
-| Renderer display metadata | `Qwen3.5-2B-OptiQ-4bit (no-think)` | App-server `model/list` and copied-app model control |
-| Capability metadata | No reasoning levels, default `none`, text input, `262144` model context | Pinned model config, model card, and conservative unsupported-feature values |
+The renderer independently displayed the exact pinned model name and no
+fallback `Custom Light` metadata. It also appended its own `Medium` selection
+label. Model identity therefore passes, while reconciliation of that independent
+reasoning label with the catalog remains an open ticket 08/12 gate.
 
-`08-model-catalog.py` also preserves the exact fallback instructions embedded
-in the pinned Codex 0.144.2 binary, verified by SHA-256, so supplying display
-metadata does not silently replace the agent instructions. The no-app contract
-in `08-model-catalog-test.py` passes through both `codex debug models` and the
-stdio app-server `model/list` interface. The app-server result contains one
-exact model, the pinned display name, `defaultReasoningEffort: none`, no
-supported reasoning efforts, and text-only input.
+## Authenticated-gateway reproduction
 
-The single copied-app proof retained under run-root
-`$TMPDIR/chatgpt-route-prototype-08.PUfaZS` passed the scoped renderer gates:
+Build and review the native helper first. Replace both angle-bracketed values
+below with that reviewed artifact's absolute path and SHA-256 before running
+the command:
+
+```sh
+ROUTE_MODE=gateway \
+GATEWAY_COMMIT=6307d37b76918c19f2e3bc0fd506434531aadeb2 \
+GUI_NATIVE_PROJECT_PICKER=true \
+NATIVE_PICKER_DEFAULT_PATH_SEAM=true \
+NATIVE_GUI_PROBE_BIN=<reviewed-helper-path> \
+NATIVE_GUI_PROBE_SHA256=<reviewed-helper-sha256> \
+GUI_WORKFLOW=true \
+PROBE_EXPECT=renderer-native-project \
+  .scratch/chatgpt-airgap-unlock/research/08-run-prototype.sh
+```
+
+The successful verdict includes:
 
 ```text
-RENDERER_MODEL_SURFACE_OBSERVED=true
-RENDERER_MODEL_METADATA_MATCHED=true
-RENDERER_FALLBACK_MODEL_METADATA_ABSENT=true
-LOGIN_WALL_OBSERVED=false
-ACCOUNT_READ_OBSERVED=true
 MAIN_UI_OBSERVED=true
+RENDERER_PROMPT_COMPLETED=true
+RENDERER_MODEL_METADATA_MATCHED=true
+NATIVE_PROJECT_PICKER_EXERCISED=true
 PROVIDER_REQUEST_OBSERVED=true
-PROVIDER_LISTENER_OBSERVED=true
 GATEWAY_LISTENER_OBSERVED=true
 GATEWAY_TERMINAL_OBSERVED=true
-GATEWAY_BODY_LEAK_OBSERVED=false
-GATEWAY_MISSING_AUTH_REJECTED=true
-GATEWAY_WRONG_AUTH_REJECTED=true
-UPSTREAM_TOKEN_REPLACED=true
-UPSTREAM_TERMINAL_COMPLETED=true
 NAMESPACE_TOOL_CONTINUATION=true
 MODEL_LIST_ISOLATED=true
 REMOTE_SOCKET_OBSERVED=false
 TOKEN_LEAK_OBSERVED=false
 OWNED_PROCESSES_EXITED=true
 OWNED_LISTENERS_CLOSED=true
-APP_ASAR_UNCHANGED=true
+NATIVE_PICKER_DEFAULT_PATH_SEAM=true
+NATIVE_PICKER_ASAR_HEADER_EXPECTED=true
+SOURCE_APP_ASAR_UNCHANGED=true
+APP_ASAR_EXPECTED=true
 CODEX_UNCHANGED=true
 ```
 
-The visible control read `Qwen3.5-2B-OptiQ-4bit (no-think) Medium`. The model
-identity is now exact and the generic `Custom Light` fallback is absent.
-`Medium` is renderer composer-selection state, not a catalog capability claim:
-the app-server catalog still reports default `none` with no selectable
-reasoning efforts. Reconciling that appended selection label remains part of
-the full renderer-visible capability contract.
-
-The overall prototype command exited red without a rerun on these unrelated
-workflow gates:
-
-```text
-CDP_OBSERVER_HEALTHY=false
-RENDERER_PROMPT_COMPLETED=false
-RENDERER_TASKS_OBSERVED=false
-RENDERER_LOCAL_SKILL_VISIBLE=false
-```
-
-The renderer turn did not complete, so Tasks and the project-local skill were
-not observed and the CDP observer inherited the driver failure. Settings,
-Plugins, Skills, the model surface, provider routing, isolation, integrity, and
-cleanup checks completed. This red does not weaken the independently asserted
-metadata slice and is not presented as a full workflow pass.
-
-Input-token usage accounting remains degraded: OptiQ reports `input_tokens: 0`
-even when its log shows prompt processing. Usage normalization belongs only at
-a seam with authoritative tokenizer-backed counts. Compaction behavior at the
-pinned model limit also remains unexercised.
-
-## Failed-probe history
-
-The red-capable loop found and corrected nine harness or contract defects:
-
-1. Isolating OptiQ's `HOME` moved Hugging Face cache discovery. The runner now
-   passes the absolute pinned snapshot directly, gives OptiQ an empty per-run
-   cache, and sets both Hugging Face and Transformers offline modes. The app
-   remains unable to read the operator home.
-2. OptiQ rejects a present bearer token unless it starts with `sk-optiq-`.
-   The first host attempt made six HTTP 401 requests. The fixed harness creates
-   a new local-only compatible value per run and proves it is absent from logs.
-   This is a runner protocol constraint, not a real external credential.
-3. The initial assertion matched `LOCAL_APP_OK` in the user prompt and matched
-   `completed` in the method name even though the turn had status `failed`.
-   The fixed oracle accepts only an exact agent message and the persisted exact
-   turn ID with status `completed` and no error.
-4. `request_max_retries` and `stream_max_retries` at the top level appeared in
-   the user layer but did not populate the effective provider values. They now
-   live inside `[model_providers.local-optiq]`, and the host probe requires both
-   effective values to equal one.
-5. Denying the operator home initially blocked the venv interpreter symlink,
-   whose target is a versioned uv-managed CPython tree. The fixed runner grants
-   read and process-exec only to that exact runtime tree, invokes its resolved
-   interpreter with only the pinned venv site-packages path, and grants model
-   reads only to the selected Hugging Face model repository.
-6. Pointing OptiQ at the ordinary Hugging Face cache made `/v1/models` expose
-   thirteen unrelated cached models. The fixed runner supplies an empty
-   per-run cache and requires exactly the loaded base model plus its four
-   declared variants.
-7. The first expanded token-canary scan found the provider bearer in Codex's
-   shell snapshot. The bundled snapshotter captures the raw launch environment
-   separately from `shell_environment_policy`. The fixed configuration keeps
-   the provider variable excluded from spawned shells and disables the shell
-   snapshot feature; the runner requires no snapshot files and no generated
-   bearer bytes in any regular disposable state file.
-8. The first authenticated-gateway attempt buffered short SSE responses in the
-   validation upstream until EOF or 64 KiB. The gateway correctly timed out and
-   Codex retried once. The fixed observer forwards SSE one line at a time with
-   immediate flush and records structural booleans only.
-9. The next gateway attempt completed the host turn, but the harness evaluated
-   the sanitized terminal line before controlled teardown while OptiQ kept the
-   HTTP connection alive. The fixed oracle evaluates final diagnostics after
-   exact process-group cleanup and records the upstream terminal event
-   immediately when observed.
-
-The successful direct run still exposes the missing public `turn/completed`
-notification described above. That discrepancy is not hidden by the stronger
-persisted-state oracle.
+`APP_ASAR_UNCHANGED=false` is expected in this mode: the disposable copy must
+contain the exact reviewed patch. `APP_ASAR_EXPECTED=true` is the relevant
+copy-integrity gate, while `SOURCE_APP_ASAR_UNCHANGED=true` proves the source
+artifact was not changed.
 
 ## Integrity, isolation, and cleanup
 
-The harness verifies strict code signing before and after launch and binds both
-critical resource hashes. It verifies the model revision, selected manifest
-hashes, safetensors blob link, Python, OptiQ, MLX-LM, MLX, and the MLX-LM source
-commit before launch. It creates fresh `HOME`, `CODEX_HOME`, Electron user data,
-Hugging Face cache, temporary, log, and Git fixture roots before first launch.
-Every child environment is rebuilt from an explicit allowlist. Credential
-values are present only in the processes that require their side of the seam.
+The runner verifies the extracted source bundle's exact ASAR and bundled Codex
+hashes before copying, verifies the exact source and patched ASAR states
+independently, and validates the copied bundle's deep signature and designated
+requirement. The official archive hash above is provenance evidence, not a
+runner gate. The runner refuses the installed application as an input or
+destination.
 
-The app process tree, observers, gateway, validation upstream, and OptiQ run
-under Seatbelt profiles that deny remote network and allow loopback. Wildcard
-listeners count as remote. The app, observers, and gateway deny the operator
-home; OptiQ receives only the exact model and runtime exceptions. Every profile
-explicitly denies writes to the installed production ChatGPT bundle. The app
-profile also denies login Keychain services. An inert HTTP proxy records external
-destination intent and never forwards it.
-
-Each long-lived process starts in a separately owned process group. Cleanup
-signals only those groups and root PIDs, waits for them, verifies every PID and
-group is gone, and verifies every reserved listener is closed. The verified
-model cache remains in place for the next prototype. The installed ChatGPT
-application, ordinary profiles, Keychain, machine-wide configuration, and
-global packet filter are outside the harness and remain untouched.
+All app, host, gateway, observer, proxy, and OptiQ processes belong to the
+disposable run. Cleanup terminates those process groups, verifies that every
+reserved loopback listener is closed, and scans final sockets and regular
+disposable state files for remote authorities and generated token canaries.
 
 ## Decision
 
-The supported custom-provider path is sufficient for the no-account local
-application semantics. No renderer, main-process, ASAR, native, entitlement,
-fuse, updater, or account-shim mutation is justified.
-
-The bounded application, provider, gateway, namespace, credential, and cleanup
-semantics pass. Ticket 08 remains open/partial until the renderer submits a
-model turn, the GUI reopens its completed thread, project/worktree controls are
-driven, permission denial and approval are exercised, and plugin/settings UI
-is validated. Production isolation also stays blocked until the same artifact
-is tested with the vendor Chromium sandbox enabled under a real air-gap or
-equivalent noninvasive egress boundary.
+Use the authenticated `codex-ns-proxy` to OptiQ route as the local development
+and smoke-test path for this exact desktop build. Keep the fixed-width ASAR
+seam, ad-hoc outer signing, mock keychain, and native helper confined to the
+disposable copied application. The official archive remains immutable
+provenance evidence; the extracted source bundle and installed application
+remain untouched.

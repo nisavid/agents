@@ -27,6 +27,10 @@ def sha256(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
 
 
+def sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
 def resolved(path: pathlib.Path | str) -> pathlib.Path:
     return pathlib.Path(path).resolve(strict=True)
 
@@ -252,8 +256,21 @@ def renderer_output(records: list[dict[str, Any]], phase: str) -> str:
     return output_sha256
 
 
-def rollout_sha256(path: pathlib.Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+def rollout_prefix_through_turn(path: pathlib.Path, turn_id: str) -> bytes:
+    prefix = bytearray()
+    for line in path.read_bytes().splitlines(keepends=True):
+        prefix.extend(line)
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise ContractError(f"invalid rollout JSON at {path}") from error
+        if (
+            record.get("type") == "event_msg"
+            and record.get("payload", {}).get("type") == "task_complete"
+            and record.get("payload", {}).get("turn_id") == turn_id
+        ):
+            return bytes(prefix)
+    raise ContractError("phase-one completion is missing from rollout")
 
 
 def bind_phase(
@@ -271,6 +288,7 @@ def bind_phase(
     if renderer_output_sha256 != persisted_output_sha256:
         raise ContractError(f"{phase}-phase renderer output does not match persisted completion")
     return {
+        "turnId": turn_id,
         "turnIdSha256": sha256(turn_id),
         "promptSha256": sha256(prompt),
         "persistedOutputSha256": persisted_output_sha256,
@@ -377,13 +395,15 @@ def validate_first(
         nativeProjectPickerExercised=False,
     )
     first_binding = bind_phase(rollout, cdp, FIRST_PROMPT, "worktree-first", "first")
+    first_prefix = rollout_prefix_through_turn(rollout, first_binding["turnId"])
     state.update({
         "threadId": thread_id,
         "worktreePath": str(worktree),
         "worktreePathSha256": sha256(str(worktree)),
         "codexThreadPathSha256": sha256(str(config_path)),
         "rolloutPathSha256": sha256(str(rollout)),
-        "rolloutContentSha256": rollout_sha256(rollout),
+        "rolloutPrefixBytes": len(first_prefix),
+        "rolloutPrefixSha256": sha256_bytes(first_prefix),
         "firstPromptSha256": first_binding["promptSha256"],
         "firstTurnIdSha256": first_binding["turnIdSha256"],
         "firstPersistedOutputSha256": first_binding["persistedOutputSha256"],
@@ -422,8 +442,6 @@ def validate_cold(
     rollout = matching_rollout(codex_home, thread_id, worktree)
     if sha256(str(rollout)) != state.get("rolloutPathSha256"):
         raise ContractError("worktree rollout identity changed across cold restart")
-    if rollout_sha256(rollout) != state.get("rolloutContentSha256"):
-        raise ContractError("worktree rollout contents changed across cold restart")
     cdp = read_cdp(resolved(cdp_path))
     exact_marker(
         cdp, "worktree-mode-selected", phase="worktree-first", selected=True, uniqueControl=True
@@ -450,6 +468,15 @@ def validate_cold(
     for key, binding_key in first_binding_keys.items():
         if state.get(key) != first_binding[binding_key]:
             raise ContractError(f"first worktree binding changed across cold restart: {key}")
+    first_prefix = rollout_prefix_through_turn(rollout, first_binding["turnId"])
+    prefix_bytes = state.get("rolloutPrefixBytes")
+    if (
+        type(prefix_bytes) is not int
+        or prefix_bytes <= 0
+        or len(first_prefix) != prefix_bytes
+        or sha256_bytes(first_prefix) != state.get("rolloutPrefixSha256")
+    ):
+        raise ContractError("phase-one rollout prefix changed across cold restart")
     exact_marker(
         cdp,
         "worktree-thread-reopened",
@@ -565,7 +592,9 @@ def run_self_tests() -> None:
                 },
             },
         ]
-        rollout.write_text("\n".join(json.dumps(record) for record in rollout_records) + "\n")
+        first_rollout_records = rollout_records[:3]
+        second_rollout_records = rollout_records[3:]
+        rollout.write_text("\n".join(json.dumps(record) for record in first_rollout_records) + "\n")
         first_records = [
             {
                 "kind": "worktree-mode-selected",
@@ -591,12 +620,12 @@ def run_self_tests() -> None:
             },
         ]
         cdp_path.write_text("\n".join(json.dumps(record) for record in first_records) + "\n")
-        rollout.write_text(json.dumps(rollout_records[0]) + "\n")
+        rollout.write_text(json.dumps(first_rollout_records[0]) + "\n")
         expect_error(
             lambda: validate_first(repo, worktree_root, database, codex_home, state_path, cdp_path),
             "worktree-first prompt expected once",
         )
-        rollout.write_text("\n".join(json.dumps(record) for record in rollout_records) + "\n")
+        rollout.write_text("\n".join(json.dumps(record) for record in first_rollout_records) + "\n")
         mismatched_first_records = [
             *first_records[:-1],
             {**first_records[-1], "textSha256": sha256("wrong renderer output")},
@@ -613,6 +642,10 @@ def run_self_tests() -> None:
         first_state = json.loads(state_path.read_text())
         assert first_state["threadId"] == thread_id
         assert first_state["firstValidated"] is True
+        assert first_state["rolloutPrefixBytes"] == len(rollout.read_bytes())
+        with rollout.open("a", encoding="utf-8") as stream:
+            stream.write("\n".join(json.dumps(record) for record in second_rollout_records) + "\n")
+        assert first_state["rolloutPrefixBytes"] < len(rollout.read_bytes())
 
         cold_records = [
             *first_records,

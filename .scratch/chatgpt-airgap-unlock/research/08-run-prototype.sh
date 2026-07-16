@@ -17,8 +17,12 @@ MODEL_REPO="${MODEL_DIR%/snapshots/*}"
 MODEL_ID="$MODEL_DIR:no-think"
 MODEL_DISPLAY_NAME="Qwen3.5-2B-OptiQ-4bit (no-think)"
 HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-APP_PROFILE="$HERE/08-app.sb"
-HOST_PROFILE="$HERE/08-host.sb"
+APP_DIRECT_PROFILE="$HERE/08-app-direct.sb"
+APP_GATEWAY_PROFILE="$HERE/08-app-gateway.sb"
+HOST_DIRECT_PROFILE="$HERE/08-host-direct.sb"
+HOST_GATEWAY_PROFILE="$HERE/08-host-gateway.sb"
+APP_PROFILE=""
+HOST_PROFILE=""
 METADATA_PROFILE="$HERE/08-metadata-probe.sb"
 PROVIDER_PROFILE="$HERE/08-provider.sb"
 PROXY_PROFILE="$HERE/08-proxy.sb"
@@ -197,6 +201,16 @@ run_cold_handoff_self_test() (
   /usr/bin/python3 "$WORKTREE_STATE" --self-test
   /usr/bin/python3 "$NATIVE_PROJECT_STATE" --self-test
   "$NODE" "$NATIVE_PICKER_PATCH" --self-test
+  for profile in "$APP_DIRECT_PROFILE" "$APP_GATEWAY_PROFILE" \
+    "$HOST_DIRECT_PROFILE" "$HOST_GATEWAY_PROFILE"; do
+    test -f "$profile"
+  done
+  test ! -e "$HERE/08-app.sb"
+  test ! -e "$HERE/08-host.sb"
+  /usr/bin/grep -Fq 'APP_PROFILE="$APP_DIRECT_PROFILE"' "$0"
+  /usr/bin/grep -Fq 'APP_PROFILE="$APP_GATEWAY_PROFILE"' "$0"
+  /usr/bin/grep -Fq 'HOST_PROFILE="$HOST_DIRECT_PROFILE"' "$0"
+  /usr/bin/grep -Fq 'HOST_PROFILE="$HOST_GATEWAY_PROFILE"' "$0"
   test "$(/usr/bin/grep -Ec \
     '^(runtime_versions|mlx_lm_commit)="\$\(PYTHONPATH=' "$0")" -eq 2
   self_test_root="$(mktemp -d /private/tmp/chatgpt-cold-handoff-self-test.XXXXXX)"
@@ -380,11 +394,15 @@ configure_gui_orchestration "$GUI_WORKFLOW" "$GUI_MODES" "$GUI_WORKTREE" \
 
 case "$ROUTE_MODE" in
   direct)
+    APP_PROFILE="$APP_DIRECT_PROFILE"
+    HOST_PROFILE="$HOST_DIRECT_PROFILE"
     CODEX_PROVIDER_TOKEN_ENV="LOCAL_OPTIQ_API_KEY"
     CODEX_PROVIDER_TOKEN="$UPSTREAM_TOKEN"
     PROVIDER_BASE_URL="http://127.0.0.1:$OPTIQ_PORT/v1"
     ;;
   gateway)
+    APP_PROFILE="$APP_GATEWAY_PROFILE"
+    HOST_PROFILE="$HOST_GATEWAY_PROFILE"
     test -n "$GATEWAY_COMMIT"
     printf '%s\n' "$GATEWAY_COMMIT" | /usr/bin/grep -Eq '^[0-9a-f]{40}$'
     test "$GATEWAY_COMMIT" = "$GATEWAY_REVIEWED_COMMIT"

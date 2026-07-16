@@ -241,6 +241,70 @@ def atomic_write_text(path: Path, value: str) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _atomic_write_at(directory_fd: int, filename: str, content: bytes) -> None:
+    temporary_name = f".{filename}.{secrets.token_hex(16)}"
+    descriptor = os.open(
+        temporary_name,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        0o600,
+        dir_fd=directory_fd,
+    )
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(
+            temporary_name,
+            filename,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+    finally:
+        try:
+            os.unlink(temporary_name, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+
+
+def atomic_write_json_at(directory_fd: int, filename: str, value: Any) -> None:
+    _atomic_write_at(
+        directory_fd,
+        filename,
+        json.dumps(value, indent=2, sort_keys=True, ensure_ascii=True).encode("utf-8")
+        + b"\n",
+    )
+
+
+def atomic_write_text_at(directory_fd: int, filename: str, value: str) -> None:
+    text = value if not value or value.endswith("\n") else value + "\n"
+    _atomic_write_at(directory_fd, filename, text.encode("utf-8"))
+
+
+def _open_evidence_directory(path: Path) -> int:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as error:
+        raise EvidenceError("terminal evidence directory cannot be opened safely") from error
+    if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+        os.close(descriptor)
+        raise EvidenceError("terminal evidence path is not a directory")
+    return descriptor
+
+
+def _evidence_directory_identity_matches(path: Path, descriptor: int) -> bool:
+    try:
+        path_status = os.lstat(path)
+        descriptor_status = os.fstat(descriptor)
+    except OSError:
+        return False
+    return (
+        stat.S_ISDIR(path_status.st_mode)
+        and path_status.st_dev == descriptor_status.st_dev
+        and path_status.st_ino == descriptor_status.st_ino
+    )
+
+
 def _load_json(path: Path) -> Any:
     try:
         with path.open(encoding="utf-8") as stream:
@@ -267,6 +331,7 @@ def _load_owned_state(path: Path, expected_run_nonce: str | None) -> dict[str, A
         raise EvidenceError("owned state schema is unsupported")
     if state["run_nonce"] != expected_run_nonce or state["transition"] != "completed":
         raise EvidenceError("owned state does not complete this invocation")
+    _reject_sensitive_metadata(state, "owned state")
     pids = state["owned_pids"]
     process_groups = state["owned_process_groups"]
     ports = state["reserved_tcp_ports"]
@@ -446,7 +511,7 @@ def _clean_empty_socket_snapshot(stdout: str) -> bool:
 
 
 def _finalize(
-    evidence_dir: Path,
+    evidence_directory_fd: int,
     state_path: Path,
     *,
     manifest_preflight_valid: bool,
@@ -597,11 +662,10 @@ def _finalize(
         "sensitive_data_redacted": sensitive_data_redacted,
         "errors": sorted(set(errors)),
     }
-    evidence_dir.mkdir(parents=True, exist_ok=True)
-    atomic_write_json(evidence_dir / "cleanup-final.json", cleanup)
-    atomic_write_text(evidence_dir / "processes-final.txt", processes)
-    atomic_write_text(evidence_dir / "sockets-final.txt", sockets)
-    atomic_write_json(evidence_dir / "verdict.json", verdict)
+    atomic_write_json_at(evidence_directory_fd, "cleanup-final.json", cleanup)
+    atomic_write_text_at(evidence_directory_fd, "processes-final.txt", processes)
+    atomic_write_text_at(evidence_directory_fd, "sockets-final.txt", sockets)
+    atomic_write_json_at(evidence_directory_fd, "verdict.json", verdict)
     return passed
 
 
@@ -634,6 +698,7 @@ def run_guarded(
         evidence_dir.mkdir(parents=True, exist_ok=True)
     except OSError as error:
         raise EvidenceError("terminal evidence directory cannot be created") from error
+    evidence_directory_fd = _open_evidence_directory(evidence_dir)
 
     manifest: Any = None
     manifest_preflight_valid = False
@@ -707,21 +772,26 @@ def run_guarded(
         except Exception:
             errors.append("staging-manifest-postflight-invalid")
 
-    passed = _finalize(
-        evidence_dir,
-        state_path,
-        manifest_preflight_valid=manifest_preflight_valid,
-        manifest_postflight_valid=manifest_postflight_valid,
-        manifest_tree_sha256=manifest_tree_sha256,
-        expected_run_nonce=expected_run_nonce,
-        command_started=command_started,
-        command_exit_code=command_exit_code,
-        baseline_process_code=baseline_process_code,
-        baseline_processes=baseline_processes,
-        errors=errors,
-        collect_processes=collect_processes,
-        collect_sockets=collect_sockets,
-    )
+    try:
+        if not _evidence_directory_identity_matches(evidence_dir, evidence_directory_fd):
+            raise EvidenceError("terminal evidence directory changed during guarded run")
+        passed = _finalize(
+            evidence_directory_fd,
+            state_path,
+            manifest_preflight_valid=manifest_preflight_valid,
+            manifest_postflight_valid=manifest_postflight_valid,
+            manifest_tree_sha256=manifest_tree_sha256,
+            expected_run_nonce=expected_run_nonce,
+            command_started=command_started,
+            command_exit_code=command_exit_code,
+            baseline_process_code=baseline_process_code,
+            baseline_processes=baseline_processes,
+            errors=errors,
+            collect_processes=collect_processes,
+            collect_sockets=collect_sockets,
+        )
+    finally:
+        os.close(evidence_directory_fd)
     if command_exit_code != 0:
         return command_exit_code
     return 0 if passed else EVIDENCE_FAILURE

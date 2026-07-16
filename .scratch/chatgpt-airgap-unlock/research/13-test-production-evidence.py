@@ -45,6 +45,7 @@ def completed_state(
     owned_pids: list[int] | None = None,
     owned_process_groups: list[int] | None = None,
     reserved_tcp_ports: list[int] | None = None,
+    cleanup_steps: list[dict[str, object]] | None = None,
 ) -> None:
     state = json.loads(path.read_text(encoding="utf-8"))
     path.write_text(
@@ -60,7 +61,11 @@ def completed_state(
                 "reserved_tcp_ports": [18999]
                 if reserved_tcp_ports is None
                 else reserved_tcp_ports,
-                "cleanup_steps": [{"name": "fixture-cleanup", "completed": True}],
+                "cleanup_steps": (
+                    [{"name": "fixture-cleanup", "completed": True}]
+                    if cleanup_steps is None
+                    else cleanup_steps
+                ),
             }
         ),
         encoding="utf-8",
@@ -496,6 +501,39 @@ class FinalizerTests(unittest.TestCase):
             self.assertNotIn("another-value", processes)
             self.assertEqual(2, processes.count("[REDACTED]"))
 
+    def test_owned_state_secrets_are_not_written_to_terminal_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            stage, manifest, state = self.make_run(temporary)
+            evidence = Path(temporary) / "evidence"
+            secret = "--token fixture-owned-state-secret"
+
+            def execute(_command: list[str], environment: dict[str, str]) -> int:
+                completed_state(
+                    state,
+                    environment,
+                    cleanup_steps=[{"name": secret, "completed": True}],
+                )
+                return 0
+
+            result = production_evidence.run_guarded(
+                stage,
+                manifest,
+                evidence,
+                state,
+                ["fixture-command"],
+                execute=execute,
+                collect_processes=lambda: (0, "PID PPID PGID STATE ELAPSED COMMAND\n"),
+                collect_sockets=lambda: (
+                    0,
+                    "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\n",
+                ),
+            )
+
+            self.assertEqual(production_evidence.EVIDENCE_FAILURE, result)
+            for artifact in evidence.iterdir():
+                self.assertNotIn(secret, artifact.read_text(encoding="utf-8"))
+
+
     def test_lifecycle_environment_is_allowlisted(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             stage, manifest, state = self.make_run(temporary)
@@ -789,6 +827,35 @@ class FinalizerTests(unittest.TestCase):
                     evidence,
                     state,
                     ["must-not-run"],
+                )
+            self.assertEqual([], list(target.iterdir()))
+
+    def test_replaced_evidence_path_fails_without_writing_the_link_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            stage, manifest, state = self.make_run(temporary)
+            target = Path(temporary) / "evidence-target"
+            target.mkdir()
+            evidence = Path(temporary) / "evidence"
+
+            def execute(_command: list[str], environment: dict[str, str]) -> int:
+                completed_state(state, environment)
+                evidence.rmdir()
+                evidence.symlink_to(target, target_is_directory=True)
+                return 0
+
+            with self.assertRaises(production_evidence.EvidenceError):
+                production_evidence.run_guarded(
+                    stage,
+                    manifest,
+                    evidence,
+                    state,
+                    ["fixture-command"],
+                    execute=execute,
+                    collect_processes=lambda: (0, "PID PPID PGID STATE ELAPSED COMMAND\n"),
+                    collect_sockets=lambda: (
+                        0,
+                        "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\n",
+                    ),
                 )
             self.assertEqual([], list(target.iterdir()))
 

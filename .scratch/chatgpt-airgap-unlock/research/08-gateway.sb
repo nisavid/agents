@@ -1,0 +1,16 @@
+(version 1)
+
+; THROWAWAY PROTOTYPE ONLY. The immutable gateway may accept and forward only
+; loopback traffic. Its own application-layer upstream allowlist remains a
+; separate required gate.
+(allow default)
+(deny network-outbound (remote ip))
+(deny network-inbound (local ip))
+(allow network-outbound (remote ip "localhost:*"))
+(allow network-inbound (local ip "localhost:*"))
+
+; The gateway is materialized under the disposable run root and needs no
+; operator-home access.
+(deny file-read* (subpath (param "REAL_HOME")))
+(deny file-write* (subpath (param "REAL_HOME")))
+(deny file-write* (subpath "/Applications/ChatGPT.app"))

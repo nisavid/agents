@@ -41,7 +41,7 @@ def exact_input_text(record: dict) -> str | None:
 def bind_turn(rollout: list[dict], prompt: str, expected_mode: str) -> dict:
     matches: list[dict] = []
     active_context: dict | None = None
-    for record in rollout:
+    for index, record in enumerate(rollout):
         if record.get("type") == "turn_context":
             active_context = record.get("payload", {})
             continue
@@ -60,7 +60,7 @@ def bind_turn(rollout: list[dict], prompt: str, expected_mode: str) -> dict:
         mode = context.get("collaboration_mode", {}).get("mode")
         completions = [
             candidate.get("payload", {})
-            for candidate in rollout
+            for candidate in rollout[index + 1 :]
             if candidate.get("type") == "event_msg"
             and candidate.get("payload", {}).get("type") == "task_complete"
             and candidate.get("payload", {}).get("turn_id") == turn_id
@@ -224,6 +224,15 @@ def self_test() -> None:
                 raise
         else:
             raise AssertionError("empty turn identity unexpectedly passed")
+
+        out_of_order = [fixture[2], fixture[0], fixture[1]]
+        try:
+            bind_turn(out_of_order, DEFAULT_PROMPT, "default")
+        except ContractError as error:
+            if "turn expected one completion, found 0" not in str(error):
+                raise
+        else:
+            raise AssertionError("completion before its prompt unexpectedly passed")
 
         fixture[3]["payload"]["collaboration_mode"]["mode"] = "default"
         rollout_path.write_text("".join(json.dumps(item) + "\n" for item in fixture))

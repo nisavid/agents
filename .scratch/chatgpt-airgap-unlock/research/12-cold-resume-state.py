@@ -36,9 +36,9 @@ def read_records(path: pathlib.Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text().splitlines() if line]
 
 
-def matching_user_messages(records: list[dict], prompt: str) -> list[dict]:
+def matching_user_messages(records: list[dict], prompt: str) -> list[tuple[int, dict]]:
     matches = []
-    for record in records:
+    for index, record in enumerate(records):
         payload = record.get("payload", {})
         if record.get("type") != "response_item" or payload.get("type") != "message" or payload.get("role") != "user":
             continue
@@ -49,7 +49,7 @@ def matching_user_messages(records: list[dict], prompt: str) -> list[dict]:
             and isinstance(content[0].get("text"), str)
             and content[0]["text"].strip() == prompt
         ):
-            matches.append(payload)
+            matches.append((index, payload))
     return matches
 
 
@@ -57,12 +57,13 @@ def completed_turn(records: list[dict], prompt: str, expected_sentinel: str) -> 
     users = matching_user_messages(records, prompt)
     if len(users) != 1:
         raise ContractError(f"expected one matching user prompt, found {len(users)}")
-    turn_id = users[0].get("internal_chat_message_metadata_passthrough", {}).get("turn_id")
+    prompt_index, user = users[0]
+    turn_id = user.get("internal_chat_message_metadata_passthrough", {}).get("turn_id")
     if not isinstance(turn_id, str) or not turn_id:
         raise ContractError("matching user prompt has no turn identity")
     completions = [
         record.get("payload", {})
-        for record in records
+        for record in records[prompt_index + 1 :]
         if record.get("type") == "event_msg"
         and record.get("payload", {}).get("type") == "task_complete"
         and record.get("payload", {}).get("turn_id") == turn_id
@@ -323,6 +324,11 @@ def run_self_tests() -> None:
         ]
         _, bound_final = completed_turn(wrong_intermediate, FIRST_PROMPT, FIRST_SENTINEL)
         assert bound_final == FIRST_SENTINEL
+
+        out_of_order = [first_records[0], first_records[-1], *first_records[1:-1]]
+        expect_contract_error(
+            lambda: completed_turn(out_of_order, FIRST_PROMPT, FIRST_SENTINEL), "found 0"
+        )
 
         conflicting = [dict(record) for record in first_records]
         conflicting[-1] = {

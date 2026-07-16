@@ -70,9 +70,11 @@ replacement patcher or production application build.
 
 ## Resolution
 
-The deterministic helper, patcher, and path-confinement suites pass. Two builds
-of the final helper are byte-identical at SHA-256
-`906c9af5c02e3ea3dcc520d0a5f86ba68b67ae0d1d493e08c8e3d0e71c978501`.
+The deterministic helper, patcher, and path-confinement suites pass. Two fresh
+current builds of the helper are byte-identical; the deterministic test does not
+pin a rebuilt artifact to a historical SHA-256. The retained successful run is
+bound to helper SHA-256
+`a4365c91bbc160045f4cf31bfc679c5d46adfc19d4b6271a2c79bb354fd0dff5`.
 The full copied-app smoke test proves the ordered same-helper absence, request,
 native selection, renderer confirmation, local OptiQ turn, and namespace
 continuation contract. It also proves no remote socket or token leak, expected

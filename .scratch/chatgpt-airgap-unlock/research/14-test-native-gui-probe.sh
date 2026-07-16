@@ -186,10 +186,10 @@ test "$(printf '%s\n' "$list_selection_body" | \
 test "$(printf '%s\n' "$list_selection_body" | \
   /usr/bin/grep -Fc 'try requireSameProcess(process)')" -ge 4
 for contract in kAXBrowserRole ColumnView kAXListRole kAXGroupRole \
-  kAXURLAttribute kAXSelectedChildrenAttribute fileSystemIdentity \
+  kAXURLAttribute kAXSelectedChildrenAttribute nonSymlinkDirectoryIdentity \
   revalidateOpenPanelListSelectionToken performValidatedOpenPanelListSelectionSet \
   performValidatedOpenPanelListChooserPress requireMutationIdentity \
-  validateCodeIdentity performAtMutationBoundary; do
+  validateCodeIdentity; do
   printf '%s\n' "$list_selection_body" | /usr/bin/grep -Fq "$contract"
 done
 mutation_identity_body="$(/usr/bin/sed -n \
@@ -230,5 +230,74 @@ for removed in permit-go-to-folder-menu-fallback press-open-folder-menu-item \
     exit 1
   fi
 done
+
+/usr/bin/python3 - "$HERE/evidence/12-native-project-2026-07-16" <<'PY'
+import hashlib
+import json
+import re
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+index = json.loads((root / "index.json").read_text(encoding="utf-8"))
+expected_files = {
+    "native-project-baseline.json",
+    "native-project-state.json",
+    "native-gui-probe.jsonl",
+    "probe-verdict.txt",
+    "renderer-project-selection-confirmed.json",
+    "runtime-manifest.txt",
+}
+assert index["schema"] == 2
+assert set(index["outputs"]) == expected_files
+assert index["cohort"]["nativeHelperSha256"] == (
+    "a4365c91bbc160045f4cf31bfc679c5d46adfc19d4b6271a2c79bb354fd0dff5"
+)
+assert index["cohort"]["sourceRunRootSha256"] == hashlib.sha256(
+    b"/private/tmp/chatgpt-route-prototype-08.B9nPyv"
+).hexdigest()
+assert {path.name for path in root.iterdir()} == expected_files | {"index.json"}
+for name in expected_files:
+    value = (root / name).read_bytes()
+    assert index["outputs"][name] == hashlib.sha256(value).hexdigest()
+
+baseline = json.loads((root / "native-project-baseline.json").read_text())
+state = json.loads((root / "native-project-state.json").read_text())
+assert baseline["schema"] == state["schema"] == 2
+for key in ("fixtureSha256", "databasePathSha256", "databaseFileIdentitySha256"):
+    assert baseline[key] == state[key]
+assert baseline["exactThreadCount"] == 0
+assert state["exactThreadCountBefore"] == 0
+assert state["exactThreadCountAfter"] == 1
+assert state["transitionValidated"] is True
+
+confirmation = json.loads(
+    (root / "renderer-project-selection-confirmed.json").read_text())
+assert set(confirmation) == {
+    "expectedFixtureSha256", "kind", "matched", "phase", "uniqueControl"
+}
+assert confirmation["expectedFixtureSha256"] == baseline["fixtureSha256"]
+assert confirmation["matched"] is True and confirmation["uniqueControl"] is True
+
+allowed = {
+    "inputs-validated": {"bundleSha256", "fixtureSha256", "kind", "phase", "rendererProjectPickerRequestAuthorized", "runRootSha256", "schema"},
+    "process-validated": {"appKitRegistrationPollCount", "executableSha256", "kind", "schema"},
+    "open-panel-absence-validated": {"fixtureSha256", "kind", "schema", "visitedCount", "windowCount"},
+    "open-panel-validated": {"chooserTitle", "kind", "navigation", "pollCount", "schema", "windowCount"},
+    "project-selection-requested": {"fixtureSha256", "kind", "navigation", "readinessPollCount", "schema", "selectedPollCount", "selectionActionCount"},
+}
+events = [json.loads(line) for line in (root / "native-gui-probe.jsonl").read_text().splitlines()]
+assert [event["kind"] for event in events] == list(allowed)
+for event in events:
+    assert set(event) == allowed[event["kind"]]
+    assert event["schema"] == 1
+assert events[0]["fixtureSha256"] == baseline["fixtureSha256"]
+assert events[-1]["fixtureSha256"] == baseline["fixtureSha256"]
+
+for path in root.iterdir():
+    assert not path.is_symlink() and path.is_file()
+    text = path.read_text(encoding="utf-8")
+    assert not re.search(r"(?i)bearer\\s+|authorization:|sk-[a-z0-9]{8,}|https?://", text)
+PY
 
 printf 'native GUI probe deterministic tests passed\n'

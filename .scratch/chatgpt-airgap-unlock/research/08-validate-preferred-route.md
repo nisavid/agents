@@ -105,7 +105,7 @@ Chromium sandbox for that platform check.
 | Source ASAR header SHA-256 | `e3023f2d1c334ba8ba80bd22a97553d412a4616a86d75ca81e258e974061f3c7` |
 | Patched ASAR header SHA-256 | `c069ef0e4e826ec2fd8db41a626f3e26f3edead477053a12703830ce7e047b75` |
 | Patched main-file SHA-256 | `a8082ef44bf3aa4e30e7c663472da502d15bed35073a4c125903f4b9291961cc` |
-| Native helper SHA-256 | `906c9af5c02e3ea3dcc520d0a5f86ba68b67ae0d1d493e08c8e3d0e71c978501` |
+| Retained successful-run helper SHA-256 | `a4365c91bbc160045f4cf31bfc679c5d46adfc19d4b6271a2c79bb354fd0dff5` |
 | `Contents/Resources/codex` SHA-256 | `28699add67540b93390329a740649a9eb9bdbc5538d92c1679c8c6b6fa2c623c` |
 | Bundled host | `codex-cli 0.144.2` |
 | Model | `mlx-community/Qwen3.5-2B-OptiQ-4bit:no-think` |

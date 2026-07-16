@@ -1,19 +1,6 @@
 (version 1)
 
-; THROWAWAY PROTOTYPE ONLY. The target is a separately named app copy in /private/tmp.
-(allow default)
-
-; The provider, proxy observer, and CDP observer are loopback-only. Deny every
-; connection to a remote IP while permitting those three local seams.
-(deny network-outbound (remote ip))
-(deny network-inbound (local ip))
-(allow network-outbound (remote ip "localhost:*"))
-(allow network-inbound (local ip "localhost:*"))
-
-; Do not let the disposable process tree consult the operator's home or login
-; keychain services.
-(deny file-read* (subpath (param "REAL_HOME")))
-(deny file-write* (subpath (param "REAL_HOME")))
-(deny file-write* (subpath "/Applications/ChatGPT.app"))
-(deny file-write* (literal (param "NATIVE_GUI_PROBE_BIN")))
-(deny mach-lookup (regex #"^com\\.apple\\.securityd"))
+; Obsolete after ticket 08 split the shared profile into role-specific files.
+; Retained only for the ticket 13 evidence reference; no ticket 08 caller may
+; use it, and any accidental use fails closed.
+(deny default)

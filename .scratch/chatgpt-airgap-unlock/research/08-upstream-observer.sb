@@ -1,0 +1,12 @@
+(version 1)
+
+; THROWAWAY PROTOTYPE ONLY. The upstream observer accepts gateway traffic on
+; its assigned port and forwards only to the OptiQ provider port.
+(allow default)
+(deny network-outbound (remote ip))
+(deny network-inbound (local ip))
+(allow network-inbound (local ip "localhost:18997"))
+(allow network-outbound (remote ip "localhost:18998"))
+
+(deny file-read* (subpath (param "REAL_HOME")))
+(deny file-write* (subpath (param "REAL_HOME")))

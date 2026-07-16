@@ -1,0 +1,11 @@
+(version 1)
+
+; THROWAWAY PROTOTYPE ONLY. The observation proxy accepts connections only on
+; its assigned loopback port and never initiates a connection.
+(allow default)
+(deny network-outbound (remote ip))
+(deny network-inbound (local ip))
+(allow network-inbound (local ip "localhost:49309"))
+
+(deny file-read* (subpath (param "REAL_HOME")))
+(deny file-write* (subpath (param "REAL_HOME")))

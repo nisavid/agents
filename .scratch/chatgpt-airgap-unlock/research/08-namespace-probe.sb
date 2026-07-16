@@ -1,0 +1,7 @@
+(version 1)
+
+; THROWAWAY PROTOTYPE ONLY. This is an in-process transformation probe. It has
+; no network role.
+(allow default)
+(deny network-outbound)
+(deny network-inbound)

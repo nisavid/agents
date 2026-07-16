@@ -11,15 +11,21 @@ OPTIQ="/private/tmp/chatgpt-optiq-smoke/.venv/bin/optiq"
 OPTIQ_PYTHON="/private/tmp/chatgpt-optiq-smoke/.venv/bin/python"
 OPTIQ_RUNTIME="$REAL_HOME/.local/share/uv/python/cpython-3.12.13-macos-aarch64-none"
 OPTIQ_SITE_PACKAGES="/private/tmp/chatgpt-optiq-smoke/.venv/lib/python3.12/site-packages"
+OPTIQ_PYTHON="$(realpath "$OPTIQ_PYTHON")"
 MODEL_DIR="${MODEL_DIR:-$REAL_HOME/.cache/huggingface/hub/models--mlx-community--Qwen3.5-2B-OptiQ-4bit/snapshots/adc8669eb431e3168aeb4e320bd7b757914350e2}"
 MODEL_REPO="${MODEL_DIR%/snapshots/*}"
 MODEL_ID="$MODEL_DIR:no-think"
 MODEL_DISPLAY_NAME="Qwen3.5-2B-OptiQ-4bit (no-think)"
 HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-PROFILE="$HERE/08-probe.sb"
+APP_PROFILE="$HERE/08-app.sb"
+HOST_PROFILE="$HERE/08-host.sb"
 METADATA_PROFILE="$HERE/08-metadata-probe.sb"
 PROVIDER_PROFILE="$HERE/08-provider.sb"
+PROXY_PROFILE="$HERE/08-proxy.sb"
+UPSTREAM_OBSERVER_PROFILE="$HERE/08-upstream-observer.sb"
 GATEWAY_PROFILE="$HERE/08-gateway.sb"
+CDP_CLIENT_PROFILE="$HERE/08-cdp-client.sb"
+NAMESPACE_PROFILE="$HERE/08-namespace-probe.sb"
 OBSERVER="$HERE/08-proxy-observer.py"
 CDP_OBSERVER="$HERE/08-cdp-observer.mjs"
 GUI_DRIVER="$HERE/12-cdp-gui-driver.mjs"
@@ -448,7 +454,10 @@ test -d "$SOURCE_APP"
 test -x "$OPTIQ"
 test -x "$OPTIQ_PYTHON"
 test -d "$OPTIQ_SITE_PACKAGES"
-test "$(dirname "$(dirname "$(realpath "$OPTIQ_PYTHON")")")" = "$OPTIQ_RUNTIME"
+case "$OPTIQ_PYTHON" in
+  "$OPTIQ_RUNTIME"/*) ;;
+  *) echo "OptiQ Python is outside the pinned runtime: $OPTIQ_PYTHON" >&2; exit 65 ;;
+esac
 test -x "$NODE"
 test -d "$MODEL_DIR"
 test "$MODEL_DIR" = "$MODEL_REPO/snapshots/adc8669eb431e3168aeb4e320bd7b757914350e2"
@@ -463,8 +472,21 @@ mlx_lm_commit="$($OPTIQ_PYTHON -c 'import importlib.metadata as m, json, pathlib
 test "$mlx_lm_commit" = "ab1806e8f5d6aa035973af194a1b9198ab4754dc"
 test "$(/usr/bin/shasum -a 256 "$SOURCE_APP/Contents/Resources/app.asar" | /usr/bin/awk '{print $1}')" = "$SOURCE_APP_ASAR_SHA256"
 test "$(/usr/bin/shasum -a 256 "$SOURCE_APP/Contents/Resources/codex" | /usr/bin/awk '{print $1}')" = "28699add67540b93390329a740649a9eb9bdbc5538d92c1679c8c6b6fa2c623c"
+require_reserved_port_free() {
+  checked_port="$1"
+  if /usr/sbin/lsof -nP -iTCP:"$checked_port" -sTCP:LISTEN >/dev/null 2>&1; then
+    echo "reserved port $checked_port is occupied" >&2
+    exit 69
+  else
+    lsof_status=$?
+  fi
+  if test "$lsof_status" -ne 1; then
+    echo "could not inspect reserved port $checked_port: lsof exited $lsof_status" >&2
+    exit 70
+  fi
+}
 for port in "$CDP_PORT" "$PROXY_PORT" "$UPSTREAM_OBSERVER_PORT" "$OPTIQ_PORT" "$GATEWAY_PORT"; do
-  ! /usr/sbin/lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1
+  require_reserved_port_free "$port"
 done
 
 mkdir -p "$HOME_DIR" "$CODEX_DIR" "$USER_DATA_DIR" "$TMP_DIR" "$LOG_DIR" "$WORKSPACE_DIR" "$WORKTREE_ROOT" "$HF_CACHE_DIR"
@@ -558,7 +580,7 @@ if test "$ROUTE_MODE" = gateway; then
     HOME="$HOME_DIR" \
     TMPDIR="$TMP_DIR" \
     LANG="en_US.UTF-8" \
-    /usr/bin/sandbox-exec -f "$GATEWAY_PROFILE" -D "REAL_HOME=$REAL_HOME" \
+    /usr/bin/sandbox-exec -f "$NAMESPACE_PROFILE" \
       /usr/bin/python3 "$NAMESPACE_PROBE_EXEC" \
         "$GATEWAY_EXEC" "$GATEWAY_UPSTREAM_TIMEOUT_SECONDS" \
     >"$LOG_DIR/namespace-probe.json" 2>"$LOG_DIR/namespace-probe.stderr"
@@ -633,12 +655,15 @@ description: Local file-only skill for the ticket 08 deterministic plumbing chec
 Do not use tools. Reply exactly `LOCAL_APP_OK` and nothing else.
 EOF
 /usr/bin/git -C "$WORKSPACE_DIR" init -q -b main
-/usr/bin/git -C "$WORKSPACE_DIR" config user.name "Ivan D Vasin"
-/usr/bin/git -C "$WORKSPACE_DIR" config user.email "ivan@nisavid.io"
+/usr/bin/git -C "$WORKSPACE_DIR" config user.name "Disposable Fixture"
+/usr/bin/git -C "$WORKSPACE_DIR" config user.email "fixture@example.invalid"
 /usr/bin/git -C "$WORKSPACE_DIR" add README.md .agents/skills/local-sentinel/SKILL.md
 /usr/bin/git -C "$WORKSPACE_DIR" commit -qm "test: create disposable fixture"
 test -z "$(/usr/bin/git -C "$WORKSPACE_DIR" remote)"
 test "$(/usr/bin/git -C "$WORKSPACE_DIR" branch --show-current)" = main
+test "$(/usr/bin/git -C "$WORKSPACE_DIR" log -1 --format='%s|%an <%ae>|%cn <%ce>')" = \
+  'test: create disposable fixture|Disposable Fixture <fixture@example.invalid>|Disposable Fixture <fixture@example.invalid>'
+test "$(/usr/bin/git -C "$WORKSPACE_DIR" rev-list --count HEAD)" = 1
 test "$(/usr/bin/git -C "$WORKSPACE_DIR" worktree list --porcelain | /usr/bin/grep -c '^worktree ')" -eq 1
 test -z "$(/usr/bin/git -C "$WORKSPACE_DIR" status --porcelain=v2)"
 
@@ -754,7 +779,9 @@ printf '%s\n' "$RUN_ROOT" >"$LOG_DIR/run-root.txt"
     printf 'gateway_sse_heartbeat_seconds=%s\n' "not-applicable"
   fi
 } >"$LOG_DIR/runtime-manifest.txt"
-/usr/bin/env -i \
+(
+  cd "$HOME_DIR"
+  exec /usr/bin/env -i \
   PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
   HOME="$HOME_DIR" \
   TMPDIR="$TMP_DIR" \
@@ -774,15 +801,15 @@ printf '%s\n' "$RUN_ROOT" >"$LOG_DIR/run-root.txt"
     -D "PROVIDER_HOME=$HOME_DIR" \
     -D "PROVIDER_TMP=$TMP_DIR" \
     -D "HF_CACHE=$HF_CACHE_DIR" \
-    "$OPTIQ_RUNTIME/bin/python3.12" "$OPTIQ" serve \
+    "$OPTIQ_PYTHON" -P "$OPTIQ" serve \
     --model "$MODEL_DIR" \
     --host 127.0.0.1 \
     --port "$OPTIQ_PORT" \
     --kv-bits 4 \
     --max-concurrent 1 \
     --no-anthropic \
-    --responses \
-    >"$LOG_DIR/optiq.stdout" 2>"$LOG_DIR/optiq.stderr" &
+    --responses
+) >"$LOG_DIR/optiq.stdout" 2>"$LOG_DIR/optiq.stderr" &
 optiq_pid=$!
 
 ready=false
@@ -818,8 +845,8 @@ PY
   TMPDIR="$TMP_DIR" \
   LANG="en_US.UTF-8" \
   /usr/bin/python3 "$PROCESS_GROUP" \
-  /usr/bin/sandbox-exec -f "$GATEWAY_PROFILE" -D "REAL_HOME=$REAL_HOME" \
-    /usr/bin/python3 "$OBSERVER_EXEC" "$PROXY_PORT" \
+    /usr/bin/sandbox-exec -f "$PROXY_PROFILE" -D "REAL_HOME=$REAL_HOME" \
+      /usr/bin/python3 "$OBSERVER_EXEC" "$PROXY_PORT" \
   >"$LOG_DIR/proxy.jsonl" 2>"$LOG_DIR/proxy.stderr" &
 proxy_pid=$!
 
@@ -833,7 +860,7 @@ if test "$ROUTE_MODE" = gateway; then
     EXPECTED_UPSTREAM_TOKEN="$UPSTREAM_TOKEN" \
     FORBIDDEN_INBOUND_TOKEN="$INBOUND_TOKEN" \
     /usr/bin/python3 "$PROCESS_GROUP" \
-    /usr/bin/sandbox-exec -f "$GATEWAY_PROFILE" -D "REAL_HOME=$REAL_HOME" \
+    /usr/bin/sandbox-exec -f "$UPSTREAM_OBSERVER_PROFILE" -D "REAL_HOME=$REAL_HOME" \
       /usr/bin/python3 "$UPSTREAM_OBSERVER_EXEC" \
         "$UPSTREAM_OBSERVER_PORT" "$OPTIQ_PORT" "$LOG_DIR/upstream-auth.jsonl" \
     >"$LOG_DIR/upstream-observer.stdout" 2>"$LOG_DIR/upstream-observer.stderr" &
@@ -924,7 +951,7 @@ if test "$GUI_WORKFLOW" = false; then
     /usr/bin/python3 "$HOST_PROBE" \
       "$APP/Contents/Resources/codex" \
       "$WORKSPACE_DIR" \
-      "$PROFILE" \
+      "$HOST_PROFILE" \
       "$REAL_HOME" \
       "$LOG_DIR" \
       "$MODEL_ID" \
@@ -942,7 +969,7 @@ if test "$GUI_WORKFLOW" = false; then
     /usr/bin/python3 "$HOST_RESTART_PROBE" \
       "$APP/Contents/Resources/codex" \
       "$WORKSPACE_DIR" \
-      "$PROFILE" \
+      "$HOST_PROFILE" \
       "$REAL_HOME" \
       "$LOG_DIR" \
       "$THREAD_ID" \
@@ -982,7 +1009,7 @@ launch_app() {
     ELECTRON_ENABLE_LOGGING=1 \
     RUST_LOG=info \
     /usr/bin/python3 "$PROCESS_GROUP" \
-    /usr/bin/sandbox-exec -f "$PROFILE" -D "REAL_HOME=$REAL_HOME" \
+    /usr/bin/sandbox-exec -f "$APP_PROFILE" -D "REAL_HOME=$REAL_HOME" \
       -D "NATIVE_GUI_PROBE_BIN=$NATIVE_GUI_PROBE_PROTECTED_PATH" "$APP_EXEC" \
       --no-sandbox \
       --use-mock-keychain \
@@ -1044,7 +1071,7 @@ if test "$GUI_NATIVE_PROJECT_PICKER" = true; then
     HOME="$HOME_DIR" \
     TMPDIR="$TMP_DIR" \
     LANG="en_US.UTF-8" \
-    /usr/bin/sandbox-exec -f "$GATEWAY_PROFILE" -D "REAL_HOME=$REAL_HOME" \
+    /usr/bin/sandbox-exec -f "$CDP_CLIENT_PROFILE" -D "REAL_HOME=$REAL_HOME" \
       "$NODE" "$GUI_DRIVER_EXEC" "$CDP_PORT" prepare-project-picker 30000 \
       "$(realpath "$WORKSPACE_DIR")" \
     >"$LOG_DIR/cdp-native-prepare.jsonl" 2>"$LOG_DIR/cdp-native-prepare.stderr"
@@ -1104,7 +1131,7 @@ if test "$GUI_NATIVE_PROJECT_PICKER" = true; then
     HOME="$HOME_DIR" \
     TMPDIR="$TMP_DIR" \
     LANG="en_US.UTF-8" \
-    /usr/bin/sandbox-exec -f "$GATEWAY_PROFILE" -D "REAL_HOME=$REAL_HOME" \
+    /usr/bin/sandbox-exec -f "$CDP_CLIENT_PROFILE" -D "REAL_HOME=$REAL_HOME" \
       "$NODE" "$GUI_DRIVER_EXEC" "$CDP_PORT" open-project-picker 30000 \
       "$(realpath "$WORKSPACE_DIR")" \
     >"$LOG_DIR/cdp-native-open.jsonl" 2>"$LOG_DIR/cdp-native-open.stderr"
@@ -1124,7 +1151,7 @@ if test "$GUI_NATIVE_PROJECT_PICKER" = true; then
     HOME="$HOME_DIR" \
     TMPDIR="$TMP_DIR" \
     LANG="en_US.UTF-8" \
-    /usr/bin/sandbox-exec -f "$GATEWAY_PROFILE" -D "REAL_HOME=$REAL_HOME" \
+    /usr/bin/sandbox-exec -f "$CDP_CLIENT_PROFILE" -D "REAL_HOME=$REAL_HOME" \
       "$NODE" "$GUI_DRIVER_EXEC" "$CDP_PORT" confirm-project-selection 30000 \
       "$(realpath "$WORKSPACE_DIR")" \
     >"$LOG_DIR/cdp-native-confirm.jsonl" 2>"$LOG_DIR/cdp-native-confirm.stderr"
@@ -1155,7 +1182,7 @@ if test "$GUI_WORKFLOW" = true && /usr/bin/env -i \
   HOME="$HOME_DIR" \
   TMPDIR="$TMP_DIR" \
   LANG="en_US.UTF-8" \
-    /usr/bin/sandbox-exec -f "$GATEWAY_PROFILE" -D "REAL_HOME=$REAL_HOME" \
+    /usr/bin/sandbox-exec -f "$CDP_CLIENT_PROFILE" -D "REAL_HOME=$REAL_HOME" \
     "$NODE" "$cdp_command" "$CDP_PORT" "$cdp_argument" "$cdp_timeout" \
       "$cdp_phase_argument" \
   >"$LOG_DIR/cdp.jsonl" 2>"$LOG_DIR/cdp.stderr"; then
@@ -1165,7 +1192,7 @@ elif test "$GUI_WORKFLOW" = false && /usr/bin/env -i \
   HOME="$HOME_DIR" \
   TMPDIR="$TMP_DIR" \
   LANG="en_US.UTF-8" \
-  /usr/bin/sandbox-exec -f "$GATEWAY_PROFILE" -D "REAL_HOME=$REAL_HOME" \
+  /usr/bin/sandbox-exec -f "$CDP_CLIENT_PROFILE" -D "REAL_HOME=$REAL_HOME" \
     "$NODE" "$cdp_command" "$CDP_PORT" "$cdp_argument" \
   >"$LOG_DIR/cdp.jsonl" 2>"$LOG_DIR/cdp.stderr"; then
   cdp_exit=0
@@ -1238,7 +1265,7 @@ if test "$GUI_COLD_RESUME" = true && test "$cdp_exit" -eq 0; then
     HOME="$HOME_DIR" \
     TMPDIR="$TMP_DIR" \
     LANG="en_US.UTF-8" \
-    /usr/bin/sandbox-exec -f "$GATEWAY_PROFILE" -D "REAL_HOME=$REAL_HOME" \
+    /usr/bin/sandbox-exec -f "$CDP_CLIENT_PROFILE" -D "REAL_HOME=$REAL_HOME" \
       "$NODE" "$GUI_DRIVER_EXEC" "$CDP_PORT" \
         "$second_driver_phase" 120000 "$second_driver_argument" \
     >>"$LOG_DIR/cdp.jsonl" 2>>"$LOG_DIR/cdp.stderr"; then

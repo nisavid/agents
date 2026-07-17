@@ -368,6 +368,46 @@ class BrokerSocketTest(unittest.TestCase):
         self.assertEqual(len(admissions), 1)
         release.set()
 
+    def test_server_registers_submitted_connection_before_lock_observers_run(self):
+        admitted, peer = socket.socketpair()
+        self.addCleanup(peer.close)
+        observed = threading.Event()
+        observer_threads = []
+
+        class Listener:
+            def accept(_self):
+                return admitted, None
+
+        class Executor:
+            def submit(_self, operation, connection, slots):
+                del operation
+
+                def observe():
+                    with self.server._connection_futures_lock:
+                        observed.set()
+
+                observer = threading.Thread(target=observe)
+                observer.start()
+                observer_threads.append(observer)
+                self.assertFalse(observed.wait(0.05))
+                connection.close()
+                slots.release()
+                future = Future()
+                future.set_result(())
+                self.server._closing.set()
+                return future
+
+        slots = threading.BoundedSemaphore(1)
+        self.server._closing.clear()
+        self.server._serve(Listener(), Executor(), slots)
+        for observer in observer_threads:
+            observer.join(1)
+            self.assertFalse(observer.is_alive())
+        self.assertTrue(observed.is_set())
+        with self.server._connection_futures_lock:
+            self.assertEqual(self.server._connection_futures, set())
+        self.server._closing.clear()
+
     def test_server_times_out_an_admitted_idle_connection(self):
         self.stop()
         self.broker = Broker(
@@ -1524,6 +1564,17 @@ class DurableWorkTest(unittest.TestCase):
             threading.Event().wait(0.005)
         self.fail("timed out waiting for broker state transition")
 
+    def generation_lease_is_released(self):
+        descriptor = os.open(self.broker._generation_lease_path, os.O_RDWR)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            return True
+        except BlockingIOError:
+            return False
+        finally:
+            os.close(descriptor)
+
     @staticmethod
     def writes_drained(broker):
         with broker._lock:
@@ -2054,24 +2105,106 @@ class DurableWorkTest(unittest.TestCase):
             queued_ids, {queue_id, newer["payload"]["queue_id"]}
         )
 
-        def generation_lease_is_released():
-            descriptor = os.open(
-                self.broker._generation_lease_path, os.O_RDWR
-            )
-            try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                fcntl.flock(descriptor, fcntl.LOCK_UN)
-                return True
-            except BlockingIOError:
-                return False
-            finally:
-                os.close(descriptor)
-
         # The external write may still take effect after the local timeout, so
         # it retains the generation fence until the worker actually exits.
-        self.assertFalse(generation_lease_is_released())
+        self.assertFalse(self.generation_lease_is_released())
         release.set()
-        self.wait_until(generation_lease_is_released)
+        self.wait_until(self.generation_lease_is_released)
+
+    def test_hung_adapter_generation_lease_expires_and_fences_late_result(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        class HungWriteAdapter(FakeAdapter):
+            def retain_outcome(self, request):
+                release.wait()
+                return super().retain_outcome(request)
+
+        self._stop()
+        self.adapter = HungWriteAdapter(endpoint=ENDPOINT)
+        self._start()
+        self.broker.adapter_call_timeout_seconds = 0.01
+        self.broker._adapter_generation_lease_timeout_seconds = 0.05
+        capability = self.exchange()
+        with patch.object(self.broker, "_submit_write"):
+            response = self.broker.retain_outcome(
+                capability,
+                sequence=1,
+                action_id="expiring-generation-lease",
+                request={
+                    "document_id": "doc",
+                    "epoch": 1,
+                    "checkpoint": 1,
+                    "outcome": "done",
+                },
+            )
+        queue_id = response["payload"]["queue_id"]
+
+        disposition, _delay = self.broker._dispatch_queued_item(queue_id)
+
+        self.assertEqual(disposition, "retry")
+        self.assertFalse(self.generation_lease_is_released())
+        self.wait_until(self.generation_lease_is_released)
+        with self.broker._adapter_calls_lock:
+            future = self.broker._adapter_calls[queue_id][2]
+        self.assertTrue(future._hindsight_generation_lease_expired)
+
+        release.set()
+        self.wait_until(future.done)
+        queued = next(
+            item for item in self.work()["queue"]
+            if item["queue_id"] == queue_id
+        )
+        with self.assertRaises(TimeoutError):
+            self.broker._invoke_adapter_bounded(
+                queue_id,
+                "retain_outcome",
+                self.adapter.retain_outcome,
+                queued["adapter_request"],
+            )
+        with self.broker._adapter_calls_lock:
+            self.assertNotIn(queue_id, self.broker._adapter_calls)
+
+    def test_dispatch_interrupt_transfers_generation_lease_to_reserved_call(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        class HungWriteAdapter(FakeAdapter):
+            def retain_outcome(self, request):
+                release.wait()
+                return super().retain_outcome(request)
+
+        self._stop()
+        self.adapter = HungWriteAdapter(endpoint=ENDPOINT)
+        self._start()
+        capability = self.exchange()
+        with patch.object(self.broker, "_submit_write"):
+            response = self.broker.retain_outcome(
+                capability,
+                sequence=1,
+                action_id="interrupted-generation-lease",
+                request={
+                    "document_id": "doc",
+                    "epoch": 1,
+                    "checkpoint": 1,
+                    "outcome": "done",
+                },
+            )
+        queue_id = response["payload"]["queue_id"]
+
+        with (
+            patch.object(
+                self.broker,
+                "_invoke_adapter_bounded",
+                side_effect=KeyboardInterrupt("dispatch interrupted"),
+            ),
+            self.assertRaisesRegex(KeyboardInterrupt, "dispatch interrupted"),
+        ):
+            self.broker._dispatch_queued_item(queue_id)
+
+        self.assertFalse(self.generation_lease_is_released())
+        release.set()
+        self.wait_until(self.generation_lease_is_released)
 
     def test_distinct_hung_adapter_calls_have_a_global_bound(self):
         release = threading.Event()

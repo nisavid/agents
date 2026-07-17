@@ -22,7 +22,7 @@ contract without editing reusable implementation.
 | Surface | Required bindings | Optional bindings and defaults |
 | --- | --- | --- |
 | Runtime tools and state | `HINDSIGHT_EMBED_UVX`, `HINDSIGHT_EMBED_PYTHON`, `HINDSIGHT_EMBED_CONTROL_SERVER`, `HINDSIGHT_EMBED_STOP_HELPER`, `HINDSIGHT_MEMORY_CLI`, `HINDSIGHT_MEMORY_STATE_DIR`, `HINDSIGHT_MEMORY_BROKER_SOCKET`, `HINDSIGHT_EMBED_STATE_DIR` | `HINDSIGHT_EMBED_PROFILE_SLOT_DIR` defaults to `$HINDSIGHT_EMBED_STATE_DIR/profile-slots`; `HINDSIGHT_EMBED_DESIRED_STATE_DIR` defaults to `$HINDSIGHT_EMBED_STATE_DIR/desired` |
-| Control-plane access key | Exact out-of-band secret locator for a resolver that returns 32 through 4096 bytes. A string is UTF-8 encoded, but the transmitted and resolved bytes must represent only `[A-Za-z0-9._~+/=-]`. | CLI/API clients send those exact bytes only as `Authorization: Bearer <access-key>`; there is no inline value, reusable default, or browser-auth bootstrap. |
+| Control-plane access key | Pass an out-of-band `access_key_resolver` callable to `ControlServer`; it must return 32 through 4096 bytes for each authentication request. A returned string is UTF-8 encoded, and the resolved bytes must represent only `[A-Za-z0-9._~+/=-]`. | The resolver is the sole authoritative binding. No environment variable, file, inline value, reusable default, or browser bootstrap takes precedence or acts as a fallback. CLI/API clients send the exact resolved bytes only as `Authorization: Bearer <access-key>`. |
 | Fleet and profile | `HINDSIGHT_EMBED_PRIMARY_PROFILE`, `HINDSIGHT_EMBED_FLEET_PROFILES`, `HINDSIGHT_EMBED_AUTOSTART_DAEMON`, `HINDSIGHT_EMBED_AUTOSTART_UI` | `HINDSIGHT_EMBED_PROFILE` defaults to the primary profile |
 | Hosts and ports | `HINDSIGHT_EMBED_CONTROL_PORT`, `HINDSIGHT_EMBED_CONTROL_HOSTNAME`, `HINDSIGHT_EMBED_API_BASE_PORT`, `HINDSIGHT_EMBED_UI_BASE_PORT`, `HINDSIGHT_EMBED_UI_HOSTNAME` | `HINDSIGHT_EMBED_PROFILE_<NORMALIZED_PROFILE>_{API,UI}_PORT` overrides the allocated base-plus-slot port for that profile. `HINDSIGHT_EMBED_API_PORT` and `HINDSIGHT_EMBED_UI_PORT` are resolved outputs for the selected profile, not fleet-wide overrides. Hostnames must be literal loopback addresses. |
 | Wait policy | none | `HINDSIGHT_EMBED_CONTROL_WAIT_SECONDS=30`, `HINDSIGHT_EMBED_DAEMON_WAIT_SECONDS=120`, `HINDSIGHT_EMBED_SIDECAR_WAIT_SECONDS=120`, `HINDSIGHT_EMBED_UI_WAIT_SECONDS=60`, `HINDSIGHT_MEMORY_BROKER_WAIT_SECONDS=30`, `HINDSIGHT_EMBED_STOP_WAIT_SECONDS=30`, `HINDSIGHT_EMBED_START_COOLDOWN_SECONDS=20`, `HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS=30` |
@@ -71,8 +71,10 @@ Read-only migration discovery requires a server-backed opaque monotonic generati
 
 Generated plans, credentials, profile state, control tokens, logs, archives, and other runtime artifacts must not enter this repository.
 
-The consuming installation must provide an exact out-of-band secret locator
-for the machine-local control-plane access key. That key is independent of
+The consuming installation must pass the exact out-of-band resolver callable
+for the machine-local control-plane access key. The resolver is evaluated for
+each authentication request and has no ambient fallback or precedence chain.
+That key is independent of
 every profile bearer token and is resolved directly by the controller; it is
 never forwarded to a Hindsight backend, browser, harness, or child-process
 argument vector and must never be written to rendered files or logs.

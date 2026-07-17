@@ -618,10 +618,20 @@ def resolve_policy(
     default = _identifier(public_policy["machine_default"], "machine default")
     if default not in seen_banks:
         raise PolicyError("machine default must reference a declared bank")
-    default_kind = next(bank.kind for bank in banks if bank.id == default)
+    bank_by_id = {bank.id: bank for bank in banks}
+    default_bank = bank_by_id[default]
+    default_kind = default_bank.kind
     if not engineering_enabled and default_kind == "engineering":
         raise PolicyError(
             "engineering-disabled policy cannot use an engineering machine default"
+        )
+    if default_kind == "airlock":
+        raise PolicyError(
+            "ordinary machine default cannot select an isolated airlock"
+        )
+    if not default_bank.writable or default_bank.authority != "authoritative":
+        raise PolicyError(
+            "machine default must reference a writable authoritative bank"
         )
 
     raw_workspaces = public_policy["workspace_mappings"]
@@ -647,20 +657,23 @@ def resolve_policy(
         )
         if mapped_bank_id not in seen_banks:
             raise PolicyError("workspace mapping references an unknown bank")
+        mapped_bank = bank_by_id[mapped_bank_id]
         if (
-            next(bank.kind for bank in banks if bank.id == mapped_bank_id)
-            == "airlock"
+            mapped_bank.kind == "airlock"
         ):
             raise PolicyError(
                 "ordinary workspace routing cannot select an isolated airlock"
             )
         if (
             not engineering_enabled
-            and next(bank.kind for bank in banks if bank.id == mapped_bank_id)
-            == "engineering"
+            and mapped_bank.kind == "engineering"
         ):
             raise PolicyError(
                 "engineering-disabled policy cannot route to engineering banks"
+            )
+        if not mapped_bank.writable or mapped_bank.authority != "authoritative":
+            raise PolicyError(
+                "workspace mapping must reference a writable authoritative bank"
             )
         workspaces.append(
             WorkspaceMapping(selector, specificity, mapped_bank_id)

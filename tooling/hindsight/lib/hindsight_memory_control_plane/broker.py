@@ -66,6 +66,7 @@ MAX_HANDLE_GC_FILES = 256
 LOCK_STRIPES = 64
 MAX_IN_FLIGHT_ADAPTER_CALLS = 4
 MAX_IN_FLIGHT_READ_ADAPTER_CALLS = 16
+MAX_ADAPTER_GENERATION_LEASE_SECONDS = 30.0
 MAX_DURABLE_QUEUE_ENTRIES = 1024
 MAX_DURABLE_QUEUE_ENTRY_BYTES = 128 * 1024
 MAX_DURABLE_QUEUE_BYTES = 8 * 1024 * 1024
@@ -327,6 +328,9 @@ class Broker:
                 raise BrokerError("ADAPTER_INVALID")
         self.adapter_call_timeout_seconds = self._timeout(
             adapter_call_timeout_seconds
+        )
+        self._adapter_generation_lease_timeout_seconds = (
+            MAX_ADAPTER_GENERATION_LEASE_SECONDS
         )
         if (
             type(max_payload_bytes) is not int
@@ -1822,6 +1826,13 @@ class Broker:
                 if self._adapter_calls.get(queue_id, (None, None, None))[2] is future:
                     del self._adapter_calls[queue_id]
             raise
+        if getattr(future, "_hindsight_generation_lease_expired", False):
+            with self._adapter_calls_lock:
+                if self._adapter_calls.get(
+                    queue_id, (None, None, None)
+                )[2] is future:
+                    del self._adapter_calls[queue_id]
+            raise FutureTimeout()
         with self._adapter_calls_lock:
             if self._adapter_calls.get(queue_id, (None, None, None))[2] is future:
                 del self._adapter_calls[queue_id]
@@ -2494,6 +2505,19 @@ class Broker:
                     fcntl.flock(descriptor, fcntl.LOCK_UN)
                 os.close(descriptor)
             if generation_locked and generation_descriptor is not None:
+                with self._adapter_calls_lock:
+                    active = self._adapter_calls.get(queue_id)
+                    active_future = active[2] if active is not None else None
+                if (
+                    active_future is not None
+                    and not active_future.done()
+                    and self._defer_generation_lease_release(
+                        active_future, generation_descriptor
+                    )
+                ):
+                    generation_locked = False
+                    generation_descriptor = None
+            if generation_locked and generation_descriptor is not None:
                 fcntl.flock(generation_descriptor, fcntl.LOCK_UN)
             if generation_descriptor is not None:
                 os.close(generation_descriptor)
@@ -2507,13 +2531,34 @@ class Broker:
                 return False
             future._hindsight_generation_lease_held = True
 
-        def release(_completed: Future[Any]) -> None:
+        release_lock = threading.Lock()
+        released = False
+
+        def release(*, expired: bool) -> None:
+            nonlocal released
+            with release_lock:
+                if released:
+                    return
+                released = True
+                if expired:
+                    future._hindsight_generation_lease_expired = True
             try:
                 fcntl.flock(descriptor, fcntl.LOCK_UN)
             finally:
                 os.close(descriptor)
 
-        future.add_done_callback(release)
+        timer = threading.Timer(
+            self._adapter_generation_lease_timeout_seconds,
+            lambda: release(expired=True),
+        )
+        timer.daemon = True
+        timer.start()
+
+        def completed(_future: Future[Any]) -> None:
+            timer.cancel()
+            release(expired=False)
+
+        future.add_done_callback(completed)
         return True
 
     def _persist_dispatch_retry(

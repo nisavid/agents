@@ -224,6 +224,7 @@ run_with_cleanup_lock() (
   fi
   ( umask 077; : >> "$lock_file" ) || die "failed to prepare cleanup lifecycle lock"
   /bin/chmod 600 "$lock_file" || die "failed to secure cleanup lifecycle lock"
+  validate_no_acl "$lock_file" "cleanup lifecycle lock"
   [[ "$(/usr/bin/stat -f '%u:%Lp' "$lock_file")" == "${EUID}:600" ]] ||
     die "cleanup lifecycle lock must be private and owned by the current user"
   zmodload zsh/system || die "zsh/system is required for cleanup lifecycle locking"
@@ -376,6 +377,8 @@ cleanup_commit_receipt_valid() {
   receipt="$(cleanup_commit_receipt_path "$archive")" || return 1
   [[ -f "$receipt" && ! -L "$receipt" ]] || return 1
   [[ "$(/usr/bin/stat -f '%u:%Lp' "$receipt")" == "${EUID}:600" ]] || return 1
+  validate_no_acl "$receipt" "cleanup commit receipt"
+  validate_archive_parent "${receipt:h}"
   hindsight_cleanup_run_archive_command /usr/bin/python3 -I -c '
 import json
 import sys
@@ -405,6 +408,7 @@ validate_archive_parent() {
   [[ -d "$parent" && ! -L "$parent" ]] || die "archive parent must be a real directory: ${parent}"
 
   local owner mode ancestor ancestor_root
+  validate_no_acl "$parent" "archive parent"
   owner="$(/usr/bin/stat -f '%u' "$parent")" || die "could not inspect archive parent owner: ${parent}"
   mode="$(/usr/bin/stat -f '%Lp' "$parent")" || die "could not inspect archive parent mode: ${parent}"
   (( owner == EUID || owner == 0 )) || die "archive parent is not trusted: ${parent}"
@@ -413,6 +417,7 @@ validate_archive_parent() {
   for ancestor_root in "$parent" "${parent:A}"; do
     ancestor="$ancestor_root"
     while [[ "$ancestor" != / ]]; do
+      validate_no_acl "$ancestor" "archive ancestor"
       owner="$(/usr/bin/stat -f '%u' "$ancestor")" || die "could not inspect archive ancestor: ${ancestor}"
       mode="$(/usr/bin/stat -f '%Lp' "$ancestor")" || die "could not inspect archive ancestor mode: ${ancestor}"
       (( owner == EUID || owner == 0 )) || die "archive ancestor is not trusted: ${ancestor}"
@@ -1199,7 +1204,7 @@ managed_service_running() {
   # launchd being loaded does not prove that any managed component was active,
   # and an unloaded job can leave children behind. Snapshot live runtime state.
   hindsight_stack_control_running ||
-    hindsight_stack_broker_running ||
+    hindsight_stack_broker_status ||
     hindsight_stack_daemon_running ||
     hindsight_stack_ui_running
 }

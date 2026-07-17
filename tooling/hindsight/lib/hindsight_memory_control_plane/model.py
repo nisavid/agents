@@ -23,7 +23,12 @@ class FrozenDict(Mapping[str, Any]):
     def __init__(self, value: Mapping[str, Any] | None = None, /, **kwargs: Any) -> None:
         data = dict(value or {})
         data.update(kwargs)
-        object.__setattr__(self, "_FrozenDict__data", MappingProxyType(data))
+        if any(not isinstance(key, str) for key in data):
+            raise TypeError("mapping keys must be strings")
+        detached = {key: deep_freeze(item) for key, item in data.items()}
+        object.__setattr__(
+            self, "_FrozenDict__data", MappingProxyType(detached)
+        )
 
     def __setattr__(self, name: str, value: Any) -> None:
         raise AttributeError("FrozenDict is immutable")

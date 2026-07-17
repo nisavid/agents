@@ -528,7 +528,16 @@ def _curated_markdown_records(
             raise ImportValidationError("duplicate Markdown heading cannot form a stable source identity")
         identities.add(native_id)
         content = "\n".join(lines[line_start - 1 : line_end])
-        relationships = sorted(set(WIKI_RELATIONSHIP.findall(content)))
+        relationship_content = "\n".join(
+            line
+            for index, line in enumerate(
+                lines[line_start - 1 : line_end], line_start - 1
+            )
+            if structural[index]
+        )
+        relationships = sorted(
+            set(WIKI_RELATIONSHIP.findall(relationship_content))
+        )
         repository_scopes = tuple(
             value for value in relationships if value.startswith("repo:")
         )

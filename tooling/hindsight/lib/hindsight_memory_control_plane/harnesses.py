@@ -4,10 +4,11 @@ from dataclasses import dataclass, field
 import hmac
 from pathlib import Path
 import re
+from types import MappingProxyType
 from typing import Any, Callable, Mapping
 
 from .canonical import digest
-from .model import FrozenDict, deep_freeze, deep_thaw
+from .model import deep_freeze, deep_thaw
 
 
 SUPPORTED_HARNESSES = frozenset({"codex", "claude-code", "cursor"})
@@ -186,7 +187,7 @@ def render_harnesses(
     unsupported = set(bindings) - SUPPORTED_HARNESSES
     if unsupported:
         raise ValueError(f"unsupported harness: {sorted(unsupported)[0]}")
-    return FrozenDict(
+    return MappingProxyType(
         {
             harness_id: render_harness(
                 current_by_harness.get(harness_id, {}),
@@ -442,10 +443,15 @@ def apply_activation(
         return _outcome("refused", "prestate_changed", current, plan)
     if tuple(sorted(RETIRED_DIRECT_KEYS.intersection(current))) != plan.retired_keys:
         return _outcome("refused", "retired_keys_changed", current, plan)
-    if not callable(persist_rollback_prestate) or not callable(write_configuration):
+    if (
+        not callable(persist_rollback_prestate)
+        or not callable(write_configuration)
+    ):
         return _outcome("refused", "activation_writer_unavailable", current, plan)
     if not callable(read_configuration):
         return _outcome("refused", "activation_reader_unavailable", current, plan)
+    if not callable(postcheck):
+        return _outcome("refused", "activation_postcheck_unavailable", current, plan)
 
     activated = deep_thaw(deep_freeze(current))
     for key in plan.retired_keys:
@@ -536,8 +542,8 @@ def apply_activation(
     except Exception:
         return rollback_owned("activation_readback_failed", activated)
     if not hmac.compare_digest(
-        digest(_activation_surface(persisted, plan.retired_keys)),
-        digest(_activation_surface(activated, plan.retired_keys)),
+        digest(persisted),
+        digest(activated),
     ):
         return rollback_owned("activation_readback_mismatch", persisted)
     try:
@@ -591,8 +597,8 @@ def apply_activation(
                     raise ValueError("persisted destination configuration is invalid")
                 configuration = deep_thaw(deep_freeze(rollback_persisted))
                 rollback_succeeded = hmac.compare_digest(
-                    digest(_activation_surface(configuration, plan.retired_keys)),
-                    digest(_activation_surface(current, plan.retired_keys)),
+                    digest(configuration),
+                    digest(restored),
                 )
             except Exception:
                 configuration = deep_thaw(deep_freeze(persisted))

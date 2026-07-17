@@ -521,6 +521,21 @@ class HarnessActivationTest(unittest.TestCase):
         self.assertEqual(events[1][1], digest(self.current))
         self.assertIs(events[1][2]["active"], True)
 
+    def test_activation_requires_postcheck_before_persistence_or_write(self):
+        events = []
+        outcome = self.apply(
+            persist_rollback_prestate=lambda _prestate: events.append(
+                "prestate"
+            ),
+            write_configuration=lambda *_args: events.append("write"),
+            postcheck=None,
+        )
+        self.assertEqual(
+            (outcome.status, outcome.reason),
+            ("refused", "activation_postcheck_unavailable"),
+        )
+        self.assertEqual(events, [])
+
     def test_activation_write_exception_restores_and_verifies_prestate(self):
         destination = deep_thaw(self.current)
 
@@ -753,7 +768,7 @@ class HarnessActivationTest(unittest.TestCase):
         self.assertFalse(outcome.rollback_succeeded)
         self.assertIs(outcome.configuration["active"], True)
 
-    def test_postcheck_rollback_success_uses_only_activation_owned_surface(self):
+    def test_postcheck_rollback_requires_complete_persisted_target(self):
         destination = deep_thaw(self.current)
         writes = 0
 
@@ -772,8 +787,8 @@ class HarnessActivationTest(unittest.TestCase):
             postcheck=lambda *_evidence: False,
         )
 
-        self.assertEqual(outcome.status, "rolled_back")
-        self.assertTrue(outcome.rollback_succeeded)
+        self.assertEqual(outcome.status, "rollback_failed")
+        self.assertFalse(outcome.rollback_succeeded)
         self.assertEqual(
             outcome.configuration["concurrent-registration"],
             {"id": "preserve"},

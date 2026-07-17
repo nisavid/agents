@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import subprocess
+import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,6 +13,14 @@ SMOKE = ROOT / "tests" / "hindsight-memory-disposable-smoke.zsh"
 
 
 class DisposableSmokeSignalTests(unittest.TestCase):
+    @staticmethod
+    def _pg_cleanup_program() -> str:
+        source = SMOKE.read_text(encoding="utf-8")
+        marker = '"$HINDSIGHT_PYTHON" -c \'\n'
+        start = source.index(marker, source.index("for name in $PG_NAMES")) + len(marker)
+        end = source.index("\n' >/dev/null", start)
+        return source[start:end]
+
     @staticmethod
     def _signal_fragment() -> str:
         source = SMOKE.read_text(encoding="utf-8")
@@ -74,6 +84,45 @@ class DisposableSmokeSignalTests(unittest.TestCase):
                 events.read_text(encoding="utf-8").splitlines(),
                 ["start:1", "start:2", "start:3", "wait:8003:4321"],
             )
+
+    def test_pg_cleanup_accepts_only_an_artifact_free_failed_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            smoke_root = root / "hindsight-memory-smoke.test"
+            smoke_root.mkdir(mode=0o700)
+            home = root / "home"
+            home.mkdir(mode=0o700)
+            (root / "pg0.py").write_text("def list_instances(): return []\n", encoding="utf-8")
+            name = "hindsight-smoke-test-source-1"
+            data = smoke_root / "missing-data"
+            registration = home / ".pg0" / "instances" / name
+            env = {
+                **os.environ,
+                "PYTHONPATH": str(root),
+                "HOME": str(home),
+                "PG0_NAME": name,
+                "PG0_DATA_DIR": str(data),
+                "PG0_RUN_ID": "test",
+                "PG0_SMOKE_ROOT": str(smoke_root),
+                "PG0_REGISTRATION": str(registration),
+            }
+            absent = subprocess.run(
+                [sys.executable, "-c", self._pg_cleanup_program()],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(absent.returncode, 0, absent.stderr)
+            data.mkdir()
+            partial = subprocess.run(
+                [sys.executable, "-c", self._pg_cleanup_program()],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(partial.returncode, 3, partial.stderr)
 
     def test_api_termination_refuses_changed_process_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

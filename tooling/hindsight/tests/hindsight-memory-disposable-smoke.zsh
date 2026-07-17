@@ -279,9 +279,20 @@ except ValueError:
 data_path = Path(os.environ["PG0_DATA_DIR"])
 try:
     smoke_metadata = smoke_root.lstat()
-    data_metadata = data_path.lstat()
 except OSError:
-    raise SystemExit("run-owned PostgreSQL data path is unavailable")
+    raise SystemExit("run-owned smoke root is unavailable")
+try:
+    data_metadata = data_path.lstat()
+except FileNotFoundError:
+    data_metadata = None
+try:
+    registration_metadata = registration.lstat()
+except FileNotFoundError:
+    registration_metadata = None
+if data_metadata is None and registration_metadata is None:
+    raise SystemExit(0)
+if data_metadata is None or registration_metadata is None:
+    raise SystemExit(3)
 if (
     not stat.S_ISDIR(smoke_metadata.st_mode)
     or stat.S_ISLNK(smoke_metadata.st_mode)
@@ -294,7 +305,6 @@ if (
 ):
     raise SystemExit("refusing to drop a PostgreSQL instance through an untrusted data path")
 try:
-    registration_metadata = registration.lstat()
     manifest = registration / "instance.json"
     manifest_metadata = manifest.lstat()
 except OSError:

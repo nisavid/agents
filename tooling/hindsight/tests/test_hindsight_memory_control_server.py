@@ -329,6 +329,34 @@ class ControlServerTest(unittest.TestCase):
         self.assertIn(b'"error":"REQUEST_TOO_LARGE"', response)
         self.assertEqual(self.resolutions, before)
 
+    def test_raw_request_line_and_parser_errors_use_bounded_json(self):
+        requests = (
+            (
+                b"GET /" + b"x" * 2048 + b" HTTP/1.1\r\n\r\n",
+                b'"error":"REQUEST_TOO_LARGE"',
+            ),
+            (
+                b"GET /health HTTP/9.9\r\nHost: 127.0.0.1\r\n\r\n",
+                b'"error":"SCHEMA_INVALID"',
+            ),
+        )
+        for request, expected in requests:
+            with self.subTest(expected=expected):
+                connection = socket.create_connection(
+                    ("127.0.0.1", self.server.port), timeout=1
+                )
+                try:
+                    connection.sendall(request)
+                    response = bytearray()
+                    while chunk := connection.recv(4096):
+                        response.extend(chunk)
+                finally:
+                    connection.close()
+                self.assertIn(b"Content-Type: application/json", response)
+                self.assertIn(expected, response)
+                self.assertNotIn(b"<!DOCTYPE HTML", response)
+                self.assertLessEqual(len(response), 2048)
+
     def test_authentication_capacity_failures_are_reported_as_unavailable(self):
         self.server.close()
         self.server._callback_slots = threading.BoundedSemaphore(1)

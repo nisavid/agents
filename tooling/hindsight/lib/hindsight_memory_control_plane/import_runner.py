@@ -116,6 +116,10 @@ def run_import_inspection(
         _sha(item_digest, "resume item digest")
         if item_id not in item_by_id:
             raise DomainImportError("resume state references an unknown projection item")
+        if item_digest != import_item_digest(item_by_id[item_id]):
+            raise DomainImportError(
+                "resume state item digest does not match the projection"
+            )
     validated_incoming_state = {
         item.item_id: import_item_digest(item)
         for item in projection.items
@@ -134,6 +138,10 @@ def run_import_inspection(
         _sha(item_digest, "resume item digest")
         if item_id not in item_by_id:
             raise DomainImportError("resume state references an unknown projection item")
+        if item_digest != import_item_digest(item_by_id[item_id]):
+            raise DomainImportError(
+                "inspection checkpoint item digest does not match the projection"
+            )
     completed_state = {
         item.item_id: import_item_digest(item)
         for item in projection.items

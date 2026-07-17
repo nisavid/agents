@@ -618,11 +618,10 @@ def main(argv: list[str]) -> int:
         args = parse_args(argv)
         if args.mode == "stop-control":
             pid_path = Path.home() / ".hindsight" / "control.pid"
-            with control_pid_lifecycle_lock(pid_path) as locked:
-                if locked:
-                    manager = DaemonEmbedManager()
-                    targets = resolve_targets(manager, args)
-                    stop_targets(manager, targets)
+            with control_pid_lifecycle_lock(pid_path):
+                manager = DaemonEmbedManager()
+                targets = resolve_targets(manager, args)
+                stop_targets(manager, targets)
         else:
             manager = DaemonEmbedManager()
             targets = resolve_targets(manager, args)

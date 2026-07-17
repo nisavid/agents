@@ -31,9 +31,9 @@ validate_trusted_stack_lib() {
   local owner mode path acl_permissions acl_listing
   acl_listing="$(/bin/ls -lde "$STACK_LIB")" || die "could not inspect stack library ACL"
   acl_permissions="${acl_listing%% *}"
-  [[ "$acl_permissions" != *+* ]] &&
-    ! print -r -- "$acl_listing" | /usr/bin/grep -Eq '^[[:space:]]*[0-9]+:' ||
-    die "stack library must not have an ACL"
+  ! print -r -- "$acl_listing" |
+    /usr/bin/grep -Eq '^[[:space:]]*[0-9]+:.*[[:space:]]allow[[:space:]]' ||
+    die "stack library must not have permissive ACL entries"
   owner="$(/usr/bin/stat -f '%u' "$STACK_LIB")" || die "could not inspect stack library owner"
   mode="$(/usr/bin/stat -f '%Lp' "$STACK_LIB")" || die "could not inspect stack library mode"
   (( owner == EUID || owner == 0 )) || die "stack library must be owned by the current user or root"
@@ -43,9 +43,9 @@ validate_trusted_stack_lib() {
   while true; do
     acl_listing="$(/bin/ls -lde "$path")" || die "could not inspect stack library ancestor ACL: ${path}"
     acl_permissions="${acl_listing%% *}"
-    [[ "$acl_permissions" != *+* ]] &&
-      ! print -r -- "$acl_listing" | /usr/bin/grep -Eq '^[[:space:]]*[0-9]+:' ||
-      die "stack library ancestor must not have an ACL: ${path}"
+    ! print -r -- "$acl_listing" |
+      /usr/bin/grep -Eq '^[[:space:]]*[0-9]+:.*[[:space:]]allow[[:space:]]' ||
+      die "stack library ancestor must not have permissive ACL entries: ${path}"
     owner="$(/usr/bin/stat -f '%u' "$path")" || die "could not inspect stack library ancestor: ${path}"
     mode="$(/usr/bin/stat -f '%Lp' "$path")" || die "could not inspect stack library ancestor: ${path}"
     (( owner == EUID || owner == 0 )) || die "stack library ancestor is not trusted: ${path}"

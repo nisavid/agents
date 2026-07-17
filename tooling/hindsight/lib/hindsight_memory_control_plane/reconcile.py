@@ -692,16 +692,24 @@ def apply_plan(plan: Plan | MutationPlan, adapter: Adapter, approval_digest: str
     if plan.actions:
         try:
             bind_apply_plan(rollback)
-        except Exception:
-            return finish(_refused("apply_plan_binding_failed"))
+        except BaseException as failure:
+            if isinstance(failure, Exception):
+                return finish(_refused("apply_plan_binding_failed"))
+            if migration_gate_pin is not None:
+                migration_gate_pin.close()
+            raise
         preflight_action = getattr(adapter, "preflight_action", None)
         if not callable(preflight_action):
             return finish(_refused("mutation_preflight_unavailable"))
         try:
             for action in plan.actions:
                 preflight_action(action)
-        except Exception:
-            return finish(_refused("mutation_preflight_failed"))
+        except BaseException as failure:
+            if isinstance(failure, Exception):
+                return finish(_refused("mutation_preflight_failed"))
+            if migration_gate_pin is not None:
+                migration_gate_pin.close()
+            raise
 
     ledger: list[Mapping[str, str]] = []
     applied: list[str] = []

@@ -1024,12 +1024,8 @@ restart_service() {
   fi
   if ! staged_manifest="$(run_with_service_lifecycle_lock stage_validated_manifest \
     "$PLIST" "service manifest" "$STACK_LABEL" "$SUPERVISOR" current)"; then
-    if (( stack_was_loaded && stack_was_healthy )) &&
-      restore_loaded_stack_health "$stack_rollback_manifest"; then
-      /bin/rm -f "$stack_rollback_manifest"
-      die "failed to stage validated service manifest; restored previously healthy stack"
-    fi
-    die "failed to stage validated service manifest and could not restore prior health"
+    [[ -z "$stack_rollback_manifest" ]] || /bin/rm -f "$stack_rollback_manifest"
+    die "failed to stage validated service manifest; existing stack was not changed"
   fi
   bootout_if_loaded "$STACK_LABEL" || die "failed to unload ${STACK_LABEL}"
   if ! hindsight_stack_with_lifecycle_lock hindsight_stack_stop_all; then

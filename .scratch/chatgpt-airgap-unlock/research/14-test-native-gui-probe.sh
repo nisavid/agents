@@ -299,7 +299,7 @@ sensitive_patterns = (
     re.compile(r"\bsk-[a-z0-9_.-]{8,}", re.IGNORECASE),
     re.compile(
         r"(?<![a-z0-9])(?:--?)?(?:[a-z0-9]+[-_])*"
-        r"(?:authorization|credential|password|secret|token|api[-_]?key|"
+        r"(?:authorization|credential|password|secret|token|cookie|api[-_]?key|"
         r"access[-_]?token|client[-_]?secret)"
         r"(?:[\"']?\s*[:=]\s*|[ \t]+)[\"']?[^\s\"']+",
         re.IGNORECASE,
@@ -321,6 +321,8 @@ for sample in (
     "GH_TOKEN=retained-secret",
     "X-API-Key: retained-secret",
     "Proxy-Authorization: Basic retained-secret",
+    "Cookie: session=retained-secret",
+    "Set-Cookie: session=retained-secret",
 ):
     assert any(pattern.search(sample) for pattern in sensitive_patterns), sample
 

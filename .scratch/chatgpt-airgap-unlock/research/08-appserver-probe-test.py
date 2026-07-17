@@ -120,6 +120,7 @@ def test_owned_process_fd_survives_environment_scrub(module) -> None:
                     check=False,
                     capture_output=True,
                     text=True,
+                    timeout=1.0,
                 )
                 holders = {
                     int(value) for value in result.stdout.splitlines() if value.isdigit()

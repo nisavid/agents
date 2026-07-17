@@ -1534,6 +1534,18 @@ class HttpAdapterSecurityTest(unittest.TestCase):
             with self.assertRaisesRegex(AdapterError, "invalid JSON"):
                 adapter.read_config()
 
+    def test_http_request_json_rejects_non_finite_numbers(self):
+        adapter = HttpAdapter(
+            inventory=inventory_for(7979),
+            profile_id="core",
+            token_resolver=lambda: "token",
+        )
+        for value in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                AdapterError, "JSON request is invalid"
+            ):
+                adapter._encode({"value": value})
+
     def test_dedicated_tls_context_requires_certificate_and_hostname_validation(self):
         adapter = HttpAdapter(
             inventory=inventory_for(443, scheme="https", host="example.com", approved_tls=True),
@@ -4696,6 +4708,50 @@ class GuardedApplyTest(unittest.TestCase):
                     restore_evidence("5" * 64)
                 ),
                 actions=[wrong_profile],
+            )
+
+        endpoint_bound = mutation_action()
+        endpoint = base.target_endpoint.to_dict()
+        endpoint_bound["source_bank"] = {
+            **endpoint_bound["source_bank"],
+            "endpoint": endpoint,
+        }
+        endpoint_bound["target_bank"] = {
+            **endpoint_bound["target_bank"],
+            "endpoint": endpoint,
+        }
+        mutation = build_mutation_plan(
+            base,
+            migration_run_id="run-1",
+            migration_artifact_digest=MIGRATION_ARTIFACT_DIGEST,
+            rollback_archive_digest="5" * 64,
+            rollback_restore_evidence_digest=digest(
+                restore_evidence("5" * 64)
+            ),
+            actions=[endpoint_bound],
+        )
+        self.assertEqual(
+            mutation.actions[0].details["source_bank"]["endpoint"],
+            endpoint,
+        )
+
+        wrong_endpoint = {
+            **endpoint_bound,
+            "source_bank": {
+                **endpoint_bound["source_bank"],
+                "endpoint": {**endpoint, "port": endpoint["port"] + 1},
+            },
+        }
+        with self.assertRaisesRegex(ApplyError, "target endpoint"):
+            build_mutation_plan(
+                base,
+                migration_run_id="run-1",
+                migration_artifact_digest=MIGRATION_ARTIFACT_DIGEST,
+                rollback_archive_digest="5" * 64,
+                rollback_restore_evidence_digest=digest(
+                    restore_evidence("5" * 64)
+                ),
+                actions=[wrong_endpoint],
             )
 
         missing_evidence = mutation_action()

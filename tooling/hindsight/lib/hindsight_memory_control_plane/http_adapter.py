@@ -227,7 +227,12 @@ class HttpAdapter:
     def _encode(self, payload: Mapping[str, Any]) -> bytes:
         chunks: list[bytes] = []
         size = 0
-        encoder = json.JSONEncoder(sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        encoder = json.JSONEncoder(
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
         try:
             for chunk in encoder.iterencode(payload):
                 remaining = self.max_json_bytes - size

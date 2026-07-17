@@ -1,4 +1,5 @@
 import importlib.util
+import json
 from contextlib import redirect_stderr
 from io import StringIO
 from pathlib import Path
@@ -11,6 +12,21 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 HELPER = ROOT / "libexec/hindsight-embed-stop-profile-services.py"
+
+
+def write_control_pid(path: Path, pid: int, port: int = 7977) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "desired_state_dir": "/tmp/hindsight-desired",
+                "pid": pid,
+                "port": port,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        encoding="ascii",
+    )
 
 
 def load_helper():
@@ -84,6 +100,11 @@ class StopProfileServicesTest(unittest.TestCase):
             tempfile.TemporaryDirectory() as directory,
             patch.object(Path, "home", return_value=Path(directory)),
             patch.object(self.helper, "DaemonEmbedManager", return_value=manager),
+            patch.object(
+                self.helper,
+                "read_control_pid",
+                side_effect=AssertionError("unlocked path must not inspect PID state"),
+            ),
             patch.object(
                 manager, "_find_pid_on_port", wraps=manager._find_pid_on_port
             ) as find_pid,
@@ -305,7 +326,7 @@ class StopProfileServicesTest(unittest.TestCase):
         manager = Manager()
         with tempfile.TemporaryDirectory() as directory:
             cleanup_path = Path(directory) / "control.pid"
-            cleanup_path.write_text("1234\n", encoding="ascii")
+            write_control_pid(cleanup_path, 1234)
             target = self.helper.Target(
                 "control", 7977, 1234, "stable", cleanup_path
             )
@@ -334,7 +355,7 @@ class StopProfileServicesTest(unittest.TestCase):
         manager = Manager()
         with tempfile.TemporaryDirectory() as directory:
             cleanup_path = Path(directory) / "control.pid"
-            cleanup_path.write_text("1234\n", encoding="ascii")
+            write_control_pid(cleanup_path, 1234)
             target = self.helper.Target(
                 "control", 7977, 1234, "stable", cleanup_path
             )
@@ -357,7 +378,7 @@ class StopProfileServicesTest(unittest.TestCase):
         manager = Manager()
         with tempfile.TemporaryDirectory() as directory:
             cleanup_path = Path(directory) / "control.pid"
-            cleanup_path.write_text("5678\n", encoding="ascii")
+            write_control_pid(cleanup_path, 5678)
             target = self.helper.Target(
                 "control", 7977, 1234, "stable", cleanup_path
             )
@@ -371,13 +392,13 @@ class StopProfileServicesTest(unittest.TestCase):
             ):
                 self.helper.stop_targets(manager, [target])
             self.assertEqual(manager.killed, [])
-            self.assertEqual(cleanup_path.read_text(encoding="ascii"), "5678\n")
+            self.assertEqual(json.loads(cleanup_path.read_text())["pid"], 5678)
 
     def test_busy_port_after_kill_preserves_pid_cleanup_and_raises(self):
         manager = Manager(busy_ports={18777})
         with tempfile.TemporaryDirectory() as directory:
             cleanup_path = Path(directory) / "control.pid"
-            cleanup_path.write_text("1234\n", encoding="ascii")
+            write_control_pid(cleanup_path, 1234, 18777)
             target = self.helper.Target(
                 "control", 18777, 1234, "stable", cleanup_path
             )
@@ -411,7 +432,7 @@ class StopProfileServicesTest(unittest.TestCase):
             home = Path(directory)
             pid_path = home / ".hindsight" / "control.pid"
             pid_path.parent.mkdir()
-            pid_path.write_text("1234\n", encoding="ascii")
+            write_control_pid(pid_path, 1234)
             with (
                 patch.object(Path, "home", return_value=home),
                 patch.object(
@@ -435,7 +456,7 @@ class StopProfileServicesTest(unittest.TestCase):
             home = Path(directory)
             pid_path = home / ".hindsight" / "control.pid"
             pid_path.parent.mkdir()
-            pid_path.write_text("1234\n", encoding="ascii")
+            write_control_pid(pid_path, 1234)
             with (
                 patch.object(Path, "home", return_value=home),
                 patch.object(
@@ -461,7 +482,7 @@ class StopProfileServicesTest(unittest.TestCase):
             home = Path(directory)
             pid_path = home / ".hindsight" / "control.pid"
             pid_path.parent.mkdir()
-            pid_path.write_text("1234\n", encoding="ascii")
+            write_control_pid(pid_path, 1234)
             with (
                 patch.object(Path, "home", return_value=home),
                 patch.object(self.helper, "stable_process_identity", return_value=""),
@@ -517,7 +538,7 @@ class StopProfileServicesTest(unittest.TestCase):
             home = Path(directory)
             pid_path = home / ".hindsight" / "control.pid"
             pid_path.parent.mkdir()
-            pid_path.write_text("1234\n", encoding="ascii")
+            write_control_pid(pid_path, 1234)
             original_open = self.helper.os.open
 
             def fail_selected(path, *args, **kwargs):
@@ -560,7 +581,7 @@ class StopProfileServicesTest(unittest.TestCase):
             home = Path(directory)
             pid_path = home / ".hindsight" / "control.pid"
             pid_path.parent.mkdir()
-            pid_path.write_text("1234\n", encoding="ascii")
+            write_control_pid(pid_path, 1234)
             with (
                 patch.object(Path, "home", return_value=home),
                 patch.object(self.helper, "stable_process_identity", return_value=""),

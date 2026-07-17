@@ -32,6 +32,12 @@ contract without editing reusable implementation.
 | Canonical bank | `HINDSIGHT_BANK_ID` for the explicit single-bank cleanup/migration workflow | No reusable default; ordinary stack startup reads the bank binding from the selected Hindsight profile. |
 | Migration inventory | `migration.artifact_dir` and `migration.proposal_log`, each a nonempty absolute path | `artifact_path` and `proposal_path` are compatibility aliases; supplying a canonical key and its alias with different values fails validation. |
 
+The legacy launchd label and manifest are migration bindings, not evidence that
+a legacy installation exists. A fresh installation still supplies a distinct
+legacy label and the absolute path where that legacy manifest would exist; the
+path may be absent. `hindsight-embed-service install` validates, unloads, and
+archives the legacy manifest only when it is present.
+
 Explicit normalized per-profile port overrides have first precedence. Without an
 override, each port is its base port plus that profile's persisted slot; a
 nonzero persisted slot therefore never falls back to the bare base port.

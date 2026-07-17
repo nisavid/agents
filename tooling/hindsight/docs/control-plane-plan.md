@@ -57,7 +57,7 @@ configuration repositories.
 - [ ] Run the Python suite with Python 3.11 or newer and attach an immutable
   commit/check-run evidence link before checking this item:
 
-  `python3 -m unittest discover -s tooling/hindsight/tests -p 'test_hindsight_*.py' -v`
+  `uv run --python '>=3.11' python -m unittest discover -s tooling/hindsight/tests -p 'test_hindsight_*.py' -v`
 
   Run the standalone publication-disclosure validator with its private catalog,
   public PRD, repository root, and immutable publication base. The private
@@ -68,7 +68,7 @@ configuration repositories.
 
   `: "${PUBLICATION_BASE_SHA:?set the immutable publication base SHA}"`
 
-  `python3 tooling/hindsight/tests/hindsight_memory_control_plane_prd_validation.py "$HINDSIGHT_PRIVATE_CATALOG" tooling/hindsight/docs/PRD.md . "$PUBLICATION_BASE_SHA"`
+  `uv run --python '>=3.11' python tooling/hindsight/tests/hindsight_memory_control_plane_prd_validation.py "$HINDSIGHT_PRIVATE_CATALOG" tooling/hindsight/docs/PRD.md . "$PUBLICATION_BASE_SHA"`
 
 - [ ] Run reusable shell contracts and attach an immutable commit/check-run
   evidence link before checking this item:

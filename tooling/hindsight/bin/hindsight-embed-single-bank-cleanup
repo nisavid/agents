@@ -265,7 +265,13 @@ acquire_cleanup_maintenance_lease() {
   integer descriptor
   zsystem flock -f descriptor -t 30 "$lock_file" ||
     die "timed out acquiring cleanup maintenance lease"
+  integer proof_descriptor
+  exec {proof_descriptor}<"$lock_file" || {
+    zsystem flock -u "$descriptor" >/dev/null 2>&1 || true
+    die "failed to open cleanup maintenance lease proof descriptor"
+  }
   typeset -gi HINDSIGHT_CLEANUP_MAINTENANCE_DESCRIPTOR="$descriptor"
+  typeset -gi HINDSIGHT_CLEANUP_MAINTENANCE_PROOF_DESCRIPTOR="$proof_descriptor"
   typeset -gi HINDSIGHT_CLEANUP_MAINTENANCE_LEASE_HELD=1
 }
 
@@ -273,8 +279,12 @@ release_cleanup_maintenance_lease() {
   emulate -L zsh
   (( ${HINDSIGHT_CLEANUP_MAINTENANCE_LEASE_HELD:-0} )) || return 0
   zmodload zsh/system || return 1
-  zsystem flock -u "$HINDSIGHT_CLEANUP_MAINTENANCE_DESCRIPTOR" || return 1
+  integer result=0
+  zsystem flock -u "$HINDSIGHT_CLEANUP_MAINTENANCE_DESCRIPTOR" || result=1
+  integer proof_descriptor="$HINDSIGHT_CLEANUP_MAINTENANCE_PROOF_DESCRIPTOR"
+  exec {proof_descriptor}>&- || result=1
   typeset -gi HINDSIGHT_CLEANUP_MAINTENANCE_LEASE_HELD=0
+  return "$result"
 }
 
 cleanup_commit_receipt_path() {
@@ -1072,6 +1082,7 @@ stop_managed_and_legacy_services() {
   local service="${HINDSIGHT_EMBED_SERVICE_COMMAND:-}"
   validate_trusted_artifact "$service" "service command" executable allow-symlink
   HINDSIGHT_EMBED_MAINTENANCE_LEASE_HELD=1 \
+    HINDSIGHT_EMBED_MAINTENANCE_LEASE_DESCRIPTOR="$HINDSIGHT_CLEANUP_MAINTENANCE_PROOF_DESCRIPTOR" \
     hindsight_cleanup_run_lifecycle_command \
       "$service" stop --maintenance-lease-held >/dev/null 2>&1 ||
     die "failed to stop managed Hindsight service"

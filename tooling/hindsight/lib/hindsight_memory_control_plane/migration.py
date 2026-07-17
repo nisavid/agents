@@ -31,7 +31,10 @@ class MigrationError(ValueError):
 
 DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 TIMESTAMP = re.compile(r"[0-9]{8}T[0-9]{6}Z\Z")
-SEMANTIC_SCOPE = re.compile(r"(?:repo:[a-z0-9][a-z0-9-]*|scope:active)\Z")
+SEMANTIC_SCOPE = re.compile(
+    r"(?:global|personal|repo:[a-z0-9][a-z0-9-]*|"
+    r"workflow:[a-z0-9][a-z0-9._-]*)\Z"
+)
 CANONICAL_REPOSITORY_TAG = re.compile(r"repo:[a-z0-9][a-z0-9-]*\Z")
 REPOSITORY_ALIAS = re.compile(r"(?:[a-z][a-z0-9-]*:)?[a-z0-9][a-z0-9-]*\Z")
 SNAPSHOT_KEYS = {
@@ -862,10 +865,31 @@ def _coverage_scope(
         return "omit", "unknown-repository-scope", None
     if dropped_candidates:
         return "omit", "dropped-repository-scope", None
+    workflow_candidates = sorted(
+        value
+        for value in candidates
+        if isinstance(value, str) and value.startswith("workflow:")
+    )
+    if len(workflow_candidates) > 1:
+        raise MigrationError("migration item has conflicting workflow scopes")
+    bare_scopes = {value for value in candidates if value in {"global", "personal"}}
+    if len(bare_scopes) > 1:
+        raise MigrationError("migration item has conflicting semantic scopes")
+    if len(resolved) + len(workflow_candidates) + len(bare_scopes) > 1:
+        raise MigrationError("migration item has conflicting semantic scopes")
+    semantic_scope = (
+        next(iter(resolved))
+        if resolved
+        else workflow_candidates[0]
+        if workflow_candidates
+        else next(iter(bare_scopes))
+        if bare_scopes
+        else "global"
+    )
     return (
         "retain",
         "stable-live-document",
-        next(iter(resolved)) if resolved else "scope:active",
+        semantic_scope,
     )
 
 

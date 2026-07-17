@@ -114,6 +114,27 @@ fi
   exit 1
 }
 
+rollback_events="$tmp_dir/rollback-events"
+(
+  cleanup_failed_replacement() { print -r -- cleanup >>"$rollback_events" }
+  manifest_program_argument() { print -r -- /usr/bin/true }
+  validate_trusted_artifact() { return 0 }
+  stage_validated_manifest() {
+    print -r -- stage >>"$rollback_events"
+    print -r -- "$tmp_dir/staged-rollback.plist"
+  }
+  bootstrap_manifest() { print -r -- bootstrap >>"$rollback_events" }
+  is_loaded() { return 0 }
+  wait_for_manifest_stack_health() { print -r -- healthy >>"$rollback_events" }
+  persist_service_manifest_snapshot() { print -r -- persist >>"$rollback_events" }
+  restore_loaded_stack_health "$tmp_dir/rollback.plist"
+)
+[[ "$(paste -sd, - <"$rollback_events")" == cleanup,stage,bootstrap,healthy,persist ]] || {
+  /bin/cat "$rollback_events" >&2
+  print -ru2 -- "healthy rollback restore did not persist the durable last-known-good manifest"
+  exit 1
+}
+
 failed_replacement_events="$tmp_dir/failed-replacement-events"
 (
   bootout_if_loaded() { print -r -- bootout >> "$failed_replacement_events" }
@@ -140,21 +161,61 @@ stop_lock_events="$tmp_dir/stop-lock-events"
     print -r -- command >>"$stop_lock_events"
     "$@"
   }
+  validate_inherited_maintenance_lease() { print -r -- proof >>"$stop_lock_events" }
   stop_service() { print -r -- stop >>"$stop_lock_events" }
   run_stop_command external
   HINDSIGHT_EMBED_MAINTENANCE_LEASE_HELD=1 run_stop_command inherited
 )
 [[ "$(paste -sd, - <"$stop_lock_events")" == \
-  maintenance,command,stop,command,stop ]] || {
+  maintenance,command,stop,proof,command,stop ]] || {
   /bin/cat "$stop_lock_events" >&2
   print -ru2 -- "service stop did not serialize externally and avoid lease re-entry internally"
   exit 1
 }
 if (
-  unset HINDSIGHT_EMBED_MAINTENANCE_LEASE_HELD
+  HINDSIGHT_EMBED_MAINTENANCE_LEASE_HELD=1
+  unset HINDSIGHT_EMBED_MAINTENANCE_LEASE_DESCRIPTOR
   run_stop_command inherited
 ) >/dev/null 2>&1; then
-  print -ru2 -- "service accepted the internal stop path without a held-lease marker"
+  print -ru2 -- "service accepted the internal stop path without descriptor proof"
+  exit 1
+fi
+
+lease_state="$tmp_dir/lease-state"
+mkdir -m 700 "$lease_state"
+lease_file="$lease_state/.maintenance.lock"
+: >"$lease_file"
+chmod 600 "$lease_file"
+(
+  STATE_DIR="$lease_state"
+  lease_ready="$tmp_dir/lease-ready"
+  lease_release="$tmp_dir/lease-release"
+  (
+    zmodload zsh/system
+    integer held_descriptor
+    zsystem flock -f held_descriptor -t 1 "$lease_file"
+    touch "$lease_ready"
+    while [[ ! -e "$lease_release" ]]; do sleep 0.01; done
+    zsystem flock -u "$held_descriptor"
+  ) &
+  holder_pid=$!
+  for _ in {1..100}; do [[ -e "$lease_ready" ]] && break; sleep 0.01; done
+  [[ -e "$lease_ready" ]]
+  integer proof_descriptor
+  exec {proof_descriptor}<"$lease_file"
+  HINDSIGHT_EMBED_MAINTENANCE_LEASE_DESCRIPTOR="$proof_descriptor" \
+    validate_inherited_maintenance_lease
+  exec {proof_descriptor}>&-
+  touch "$lease_release"
+  wait "$holder_pid"
+)
+if (
+  STATE_DIR="$lease_state"
+  exec {unlocked_descriptor}<"$lease_file"
+  HINDSIGHT_EMBED_MAINTENANCE_LEASE_DESCRIPTOR="$unlocked_descriptor" \
+    validate_inherited_maintenance_lease
+) >/dev/null 2>&1; then
+  print -ru2 -- "service accepted an inherited descriptor without a held lease"
   exit 1
 fi
 

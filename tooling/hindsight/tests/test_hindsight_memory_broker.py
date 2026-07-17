@@ -27,6 +27,7 @@ from hindsight_memory_control_plane.broker import (
     append_record_once,
     Broker,
     BrokerError,
+    MAX_REQUEST_SEQUENCE,
     MAX_SESSION_ACTION_IDS,
     MAX_PAYLOAD_BYTES,
 )
@@ -1679,6 +1680,62 @@ class DurableWorkTest(unittest.TestCase):
         state = self.work()["sessions"]["session-1"]
         self.assertEqual(state["sequence"], MAX_SESSION_ACTION_IDS)
         self.assertNotIn("over-limit", state["action_ids"])
+
+    def test_request_and_persisted_sequences_have_the_runtime_numeric_bound(self):
+        capability = self.exchange()
+
+        with self.assertRaisesRegex(BrokerError, "SCHEMA_INVALID"):
+            self.client.recall(
+                capability,
+                sequence=MAX_REQUEST_SEQUENCE + 1,
+                action_id="oversized-sequence",
+                request={"query": "q"},
+            )
+
+        state = self.work()["sessions"]["session-1"]
+        self.assertEqual(state["sequence"], 0)
+        self.assertEqual(state["action_ids"], [])
+        invalid = self.work()
+        invalid["sessions"]["session-1"]["sequence"] = (
+            MAX_REQUEST_SEQUENCE + 1
+        )
+        with self.assertRaisesRegex(BrokerError, "STATE_INVALID"):
+            self.broker._validate_work(invalid)
+
+    def test_session_action_history_reserves_its_final_slot_for_close(self):
+        capability = self.exchange()
+
+        def fill_history(work):
+            state = work["sessions"]["session-1"]
+            state["sequence"] = MAX_SESSION_ACTION_IDS - 1
+            state["action_ids"] = [
+                f"prior-{index}"
+                for index in range(MAX_SESSION_ACTION_IDS - 1)
+            ]
+
+        self.broker._transaction(fill_history, runtime=True)
+        with self.assertRaisesRegex(BrokerError, "SESSION_ACTION_LIMIT"):
+            self.client.recall(
+                capability,
+                sequence=MAX_SESSION_ACTION_IDS,
+                action_id="consume-close-slot",
+                request={"query": "q"},
+            )
+
+        with patch.object(self.broker, "_submit_write"):
+            response = self.broker.session_close(
+                capability,
+                sequence=MAX_SESSION_ACTION_IDS,
+                action_id="reserved-close",
+                timeout_seconds=0,
+            )
+
+        self.assertEqual(response["disposition"], "closed")
+        state = self.work()["sessions"]["session-1"]
+        self.assertTrue(state["closed"])
+        self.assertEqual(state["sequence"], MAX_SESSION_ACTION_IDS)
+        self.assertEqual(len(state["action_ids"]), MAX_SESSION_ACTION_IDS)
+        self.assertEqual(state["action_ids"][-1], "reserved-close")
 
     def test_newer_checkpoint_coalesces_queued_state_before_entry_limit(self):
         capability = self.exchange()

@@ -399,8 +399,12 @@ def _validate_compatibility_fallbacks(
         fallback = providers.get(fallback_id)
         if fallback is None:
             raise PlanError("provider fallback target must exist")
+        if result["provider_role"] != "reranking":
+            raise PlanError("only reranking providers may declare fallbacks")
         if fallback["provider_role"] != "reranking":
             raise PlanError("provider fallback target must support reranking")
+        if fallback["provider_state"] != "fallback":
+            raise PlanError("provider fallback target must be in fallback state")
         fallbacks[provider_id] = fallback_id
 
     for provider_id in fallbacks:

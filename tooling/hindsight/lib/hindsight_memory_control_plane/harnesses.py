@@ -404,6 +404,7 @@ def apply_activation(
     profile_healthy: bool,
     adapter_self_test: bool,
     persist_rollback_prestate: Callable[[Mapping[str, Any]], None],
+    read_rollback_prestate: Callable[[], Mapping[str, Any]] | None = None,
     write_configuration: Callable[
         [str, Mapping[str, Any]], Mapping[str, Any] | None
     ],
@@ -450,6 +451,10 @@ def apply_activation(
         return _outcome("refused", "activation_writer_unavailable", current, plan)
     if not callable(read_configuration):
         return _outcome("refused", "activation_reader_unavailable", current, plan)
+    if not callable(read_rollback_prestate):
+        return _outcome(
+            "refused", "rollback_prestate_reader_unavailable", current, plan
+        )
     if not callable(postcheck):
         return _outcome("refused", "activation_postcheck_unavailable", current, plan)
 
@@ -508,6 +513,22 @@ def apply_activation(
         persist_rollback_prestate(deep_thaw(deep_freeze(current)))
     except Exception:
         return _outcome("refused", "rollback_prestate_persistence_failed", current, plan)
+    try:
+        persisted_rollback_prestate = read_rollback_prestate()
+    except Exception:
+        return _outcome(
+            "refused", "rollback_prestate_readback_failed", current, plan
+        )
+    if not isinstance(persisted_rollback_prestate, Mapping):
+        return _outcome(
+            "refused", "rollback_prestate_readback_failed", current, plan
+        )
+    if not hmac.compare_digest(
+        digest(persisted_rollback_prestate), plan.expected_prestate_digest
+    ):
+        return _outcome(
+            "refused", "rollback_prestate_readback_mismatch", current, plan
+        )
     try:
         persisted_prestate = read_configuration()
     except Exception:

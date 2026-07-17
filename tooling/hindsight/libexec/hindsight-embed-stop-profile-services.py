@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import fcntl
+import json
 import os
 import shlex
 import stat
@@ -17,6 +18,13 @@ from hindsight_embed.daemon_embed_manager import DaemonEmbedManager
 
 
 @dataclass(frozen=True)
+class ControlPidRecord:
+    pid: int
+    port: int
+    desired_state_dir: str
+
+
+@dataclass(frozen=True)
 class Target:
     kind: str
     port: int
@@ -24,6 +32,7 @@ class Target:
     process_identity: str
     cleanup_path: Path | None = None
     cleanup_identity: tuple[int, int] | None = None
+    cleanup_record: ControlPidRecord | None = None
 
 
 class StopError(RuntimeError):
@@ -106,7 +115,7 @@ def unlink_stale_pid(path: Path) -> None:
         raise StopError(f"failed to remove stale PID file: {path}") from error
 
 
-def read_control_pid(path: Path) -> tuple[int, tuple[int, int]]:
+def read_control_pid(path: Path) -> tuple[ControlPidRecord, tuple[int, int]]:
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     parent: int | None = None
     descriptor: int | None = None
@@ -129,20 +138,39 @@ def read_control_pid(path: Path) -> tuple[int, tuple[int, int]]:
             or metadata.st_uid != os.geteuid()
             or metadata.st_nlink != 1
             or stat.S_IMODE(metadata.st_mode) & 0o022
-            or metadata.st_size > 64
+            or metadata.st_size > 4096
         ):
             raise StopError(f"unsafe control PID file: {path}")
-        payload = os.read(descriptor, 65)
-        if len(payload) > 64:
+        payload = os.read(descriptor, 4097)
+        if len(payload) > 4096:
             raise StopError(f"unsafe control PID file: {path}")
         identity = (metadata.st_dev, metadata.st_ino)
         try:
-            pid = int(payload.decode("ascii").strip())
-        except (UnicodeError, ValueError) as error:
+            value = json.loads(payload.decode("ascii"))
+            if not isinstance(value, dict) or set(value) != {
+                "desired_state_dir", "pid", "port"
+            }:
+                raise ValueError("unexpected control PID fields")
+            pid = value["pid"]
+            port = value["port"]
+            desired_state_dir = value["desired_state_dir"]
+            desired_path = Path(desired_state_dir)
+            if (
+                not isinstance(pid, int)
+                or isinstance(pid, bool)
+                or pid <= 0
+                or not isinstance(port, int)
+                or isinstance(port, bool)
+                or not 1 <= port <= 65535
+                or not isinstance(desired_state_dir, str)
+                or not desired_path.is_absolute()
+                or ".." in desired_path.parts
+                or str(desired_path) != desired_state_dir
+            ):
+                raise ValueError("invalid control PID identity")
+        except (json.JSONDecodeError, UnicodeError, ValueError) as error:
             raise InvalidControlPid(path, identity) from error
-        if pid <= 0:
-            raise InvalidControlPid(path, identity)
-        return pid, identity
+        return ControlPidRecord(pid, port, desired_state_dir), identity
     finally:
         os.close(descriptor)
         if parent is not None:
@@ -199,7 +227,9 @@ def unlink_control_pid_identity(path: Path, identity: tuple[int, int]) -> None:
 
 
 def cleanup_control_pid(
-    target: Target, expected_identity: tuple[int, int] | None = None
+    target: Target,
+    expected_identity: tuple[int, int] | None = None,
+    expected_record: ControlPidRecord | None = None,
 ) -> None:
     if target.cleanup_path is None:
         return
@@ -208,12 +238,18 @@ def cleanup_control_pid(
         raise StopError(f"control PID file identity was not preflighted: {target.cleanup_path}")
     path = target.cleanup_path
     try:
-        recorded_pid, identity = read_control_pid(path)
+        record, identity = read_control_pid(path)
     except FileNotFoundError:
         # Once the verified process is stopped, another trusted cleanup path may
         # already have removed the marker. Absence is the only tolerated drift.
         return
-    if recorded_pid != target.pid or identity != expected_identity:
+    expected_record = expected_record or target.cleanup_record
+    if (
+        record.pid != target.pid
+        or record.port != target.port
+        or identity != expected_identity
+        or (expected_record is not None and record != expected_record)
+    ):
         raise StopError(f"control PID file changed before cleanup: {path}")
     unlink_control_pid_identity(path, identity)
 
@@ -349,7 +385,9 @@ def owns_hindsight_ui(pid: int, port: int, paths, api_url: str) -> bool:
     return process_has_open_file(pid, paths.ui_log)
 
 
-def owns_hindsight_control(pid: int, port: int) -> bool:
+def owns_hindsight_control(
+    pid: int, port: int, desired_state_dir: str | None = None
+) -> bool:
     argv = process_args(pid)
     if not argv:
         return False
@@ -372,6 +410,10 @@ def owns_hindsight_control(pid: int, port: int) -> bool:
         ]
         and managed_args[4] == "--desired-state-dir"
         and Path(managed_args[5]).is_absolute()
+        and (
+            desired_state_dir is None
+            or managed_args[5] == desired_state_dir
+        )
     )
     return upstream or managed
 
@@ -409,47 +451,67 @@ def find_owned_targets(manager: DaemonEmbedManager, paths, api_url: str, api_por
     return targets
 
 
-def find_control_target(manager: DaemonEmbedManager, port: int) -> list[Target]:
+def find_control_target(
+    manager: DaemonEmbedManager, port: int, *, inspect_pid_file: bool = True
+) -> list[Target]:
     pid_path = Path.home() / ".hindsight" / "control.pid"
     pid = manager._find_pid_on_port(port)
+    if not inspect_pid_file:
+        if pid is None:
+            return []
+        identity = verified_process_identity(
+            pid, lambda: owns_hindsight_control(pid, port)
+        )
+        if not identity:
+            fail_unverified("control", port, pid)
+        return [Target("control", port, pid, identity)]
     if pid is None:
         try:
-            recorded_pid, cleanup_identity = read_control_pid(pid_path)
+            record, cleanup_identity = read_control_pid(pid_path)
         except FileNotFoundError:
             return []
         except InvalidControlPid as error:
             unlink_control_pid_identity(pid_path, error.identity)
             return []
         identity = verified_process_identity(
-            recorded_pid,
-            lambda: owns_hindsight_control(recorded_pid, port),
+            record.pid,
+            lambda: record.port == port and owns_hindsight_control(
+                record.pid, port, record.desired_state_dir
+            ),
         )
         if identity:
-            return [Target("control", port, recorded_pid, identity, pid_path, cleanup_identity)]
-        if process_is_absent(recorded_pid):
+            return [Target(
+                "control", port, record.pid, identity, pid_path,
+                cleanup_identity, record,
+            )]
+        if process_is_absent(record.pid):
             cleanup_control_pid(
                 Target(
-                    "control", port, recorded_pid, "",
-                    pid_path, cleanup_identity,
+                    "control", port, record.pid, "",
+                    pid_path, cleanup_identity, record,
                 )
             )
             return []
-        fail_unverified("control", port, recorded_pid)
+        fail_unverified("control", port, record.pid)
     identity = verified_process_identity(
         pid, lambda: owns_hindsight_control(pid, port)
     )
     if not identity:
         fail_unverified("control", port, pid)
     try:
-        recorded_pid, cleanup_identity = read_control_pid(pid_path)
+        record, cleanup_identity = read_control_pid(pid_path)
     except FileNotFoundError:
         return [Target("control", port, pid, identity)]
     except InvalidControlPid as error:
         unlink_control_pid_identity(pid_path, error.identity)
         return [Target("control", port, pid, identity)]
-    if recorded_pid != pid:
+    if record.pid != pid or record.port != port:
         raise StopError(f"control PID file does not identify listener pid {pid}: {pid_path}")
-    return [Target("control", port, pid, identity, pid_path, cleanup_identity)]
+    if not owns_hindsight_control(pid, port, record.desired_state_dir):
+        raise StopError(f"control PID file identity does not match listener pid {pid}: {pid_path}")
+    return [Target(
+        "control", port, pid, identity, pid_path, cleanup_identity, record
+    )]
 
 
 def stop_targets(manager: DaemonEmbedManager, targets: list[Target]) -> None:
@@ -457,15 +519,17 @@ def stop_targets(manager: DaemonEmbedManager, targets: list[Target]) -> None:
     # Validate every target before the first mutation. A late replacement must
     # not leave a partially stopped profile.
     preflighted: set[int] = set()
-    cleanup_identities: dict[tuple[Path, int], tuple[int, int]] = {}
+    cleanup_records: dict[
+        tuple[Path, int], tuple[tuple[int, int], ControlPidRecord]
+    ] = {}
     for target in targets:
         if target.cleanup_path is not None:
             try:
-                recorded_pid, cleanup_identity = read_control_pid(target.cleanup_path)
+                record, cleanup_identity = read_control_pid(target.cleanup_path)
             except FileNotFoundError:
                 cleanup_identity = None
             if cleanup_identity is not None:
-                if recorded_pid != target.pid:
+                if record.pid != target.pid or record.port != target.port:
                     raise StopError(
                         f"control PID file changed before cleanup: {target.cleanup_path}"
                     )
@@ -476,7 +540,16 @@ def stop_targets(manager: DaemonEmbedManager, targets: list[Target]) -> None:
                     raise StopError(
                         f"control PID file changed before cleanup: {target.cleanup_path}"
                     )
-                cleanup_identities[(target.cleanup_path, target.pid)] = cleanup_identity
+                if (
+                    target.cleanup_record is not None
+                    and record != target.cleanup_record
+                ):
+                    raise StopError(
+                        f"control PID file changed before cleanup: {target.cleanup_path}"
+                    )
+                cleanup_records[(target.cleanup_path, target.pid)] = (
+                    cleanup_identity, record
+                )
         if target.pid in preflighted:
             continue
         if stable_process_identity(target.pid) != target.process_identity:
@@ -502,12 +575,12 @@ def stop_targets(manager: DaemonEmbedManager, targets: list[Target]) -> None:
         if not any(manager._is_port_in_use(port) for port in ports):
             for target in targets:
                 expected = (
-                    cleanup_identities.get((target.cleanup_path, target.pid))
+                    cleanup_records.get((target.cleanup_path, target.pid))
                     if target.cleanup_path is not None
                     else None
                 )
                 if expected is not None:
-                    cleanup_control_pid(target, expected)
+                    cleanup_control_pid(target, *expected)
             return
         time.sleep(0.1)
 
@@ -515,11 +588,18 @@ def stop_targets(manager: DaemonEmbedManager, targets: list[Target]) -> None:
     raise StopError("ports still listening after stop: " + ", ".join(busy))
 
 
-def resolve_targets(manager: DaemonEmbedManager, args: argparse.Namespace) -> list[Target]:
+def resolve_targets(
+    manager: DaemonEmbedManager,
+    args: argparse.Namespace,
+    *,
+    inspect_control_pid: bool = True,
+) -> list[Target]:
     if args.mode == "stop-control":
         if args.control_port is None:
             raise StopError("stop-control mode requires --control-port")
-        return find_control_target(manager, args.control_port)
+        return find_control_target(
+            manager, args.control_port, inspect_pid_file=inspect_control_pid
+        )
 
     profile_manager = manager._profile_manager
 
@@ -618,9 +698,11 @@ def main(argv: list[str]) -> int:
         args = parse_args(argv)
         if args.mode == "stop-control":
             pid_path = Path.home() / ".hindsight" / "control.pid"
-            with control_pid_lifecycle_lock(pid_path):
+            with control_pid_lifecycle_lock(pid_path) as locked:
                 manager = DaemonEmbedManager()
-                targets = resolve_targets(manager, args)
+                targets = resolve_targets(
+                    manager, args, inspect_control_pid=locked
+                )
                 stop_targets(manager, targets)
         else:
             manager = DaemonEmbedManager()

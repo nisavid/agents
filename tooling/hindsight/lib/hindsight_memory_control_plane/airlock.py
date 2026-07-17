@@ -186,6 +186,7 @@ def _validate_runner_attestation(value: Any) -> dict[str, Any]:
     if (
         not isinstance(value, Mapping)
         or set(value) != {"schema_version", "instance_id", "session_id"}
+        or type(value.get("schema_version")) is not int
         or value.get("schema_version") != 1
         or any(
             not isinstance(value.get(key), str)

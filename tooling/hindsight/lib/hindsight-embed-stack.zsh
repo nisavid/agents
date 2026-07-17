@@ -76,6 +76,11 @@ hindsight_stack_load_config() {
       return 1
     }
   done
+  if [[ "$HINDSIGHT_EMBED_AUTOSTART_DAEMON" == false &&
+    "$HINDSIGHT_EMBED_AUTOSTART_UI" == true ]]; then
+    print -ru2 -- "hindsight-embed-stack: UI autostart requires daemon autostart"
+    return 1
+  fi
 
   typeset -g HINDSIGHT_EMBED_PROFILE="${HINDSIGHT_EMBED_PROFILE:-$HINDSIGHT_EMBED_PRIMARY_PROFILE}"
   typeset -g HINDSIGHT_EMBED_API_PORT="${HINDSIGHT_EMBED_API_PORT:-$HINDSIGHT_EMBED_API_BASE_PORT}"
@@ -476,9 +481,24 @@ def terminate_process_group():
             signal.signal(signum, handler)
 
 try:
+    pass_fds = ()
+    inherited_descriptor = os.environ.get(
+        "HINDSIGHT_EMBED_MAINTENANCE_LEASE_DESCRIPTOR"
+    )
+    if inherited_descriptor is not None:
+        if (
+            not inherited_descriptor.isdecimal()
+            or str(int(inherited_descriptor)) != inherited_descriptor
+            or int(inherited_descriptor) < 3
+        ):
+            raise ValueError("invalid inherited maintenance lease descriptor")
+        descriptor = int(inherited_descriptor)
+        os.fstat(descriptor)
+        pass_fds = (descriptor,)
     process = subprocess.Popen(
         sys.argv[2:],
         start_new_session=True,
+        pass_fds=pass_fds,
         preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask),
     )
     signal.signal(signal.SIGINT, handle_signal)
@@ -1762,8 +1782,16 @@ hindsight_stack_broker_terminate_started() {
 hindsight_stack_broker_abort_launch() {
   emulate -L zsh
   unsetopt ERR_EXIT
-  kill -KILL %% >/dev/null 2>&1 || true
-  wait %% >/dev/null 2>&1 || true
+  local pid="$1" expected="${2:-}"
+  [[ "$pid" == <-> ]] || return 1
+  if [[ -n "$expected" ]]; then
+    hindsight_stack_broker_terminate_started "$pid" "$expected"
+    return $?
+  fi
+  # Before immutable identity capture, the unreaped direct child still owns
+  # this PID, so it cannot be reused until this shell waits for it.
+  /bin/kill -KILL "$pid" >/dev/null 2>&1 || true
+  wait "$pid" >/dev/null 2>&1 || true
 }
 
 hindsight_stack_broker_wait_launch_barrier() {
@@ -1848,37 +1876,37 @@ os.execv(executable, arguments)
 ' "$HINDSIGHT_MEMORY_CLI" "${arguments[@]}" >/dev/null 2>&1 &
   local pid=$! identity
   hindsight_stack_broker_wait_launch_barrier "$pid" || {
-    hindsight_stack_broker_abort_launch
+    hindsight_stack_broker_abort_launch "$pid"
     print -ru2 -- "hindsight-embed-stack: broker launch handshake failed"
     return 1
   }
   identity="$(hindsight_stack_broker_process_identity "$pid")" || {
-    hindsight_stack_broker_abort_launch
+    hindsight_stack_broker_abort_launch "$pid"
     print -ru2 -- "hindsight-embed-stack: could not capture immutable broker process identity"
     return 1
   }
   hindsight_stack_broker_write_process_record "$pid" "$identity" || {
-    hindsight_stack_broker_abort_launch
+    hindsight_stack_broker_abort_launch "$pid" "$identity"
     return 1
   }
   /bin/kill -CONT "$pid" >/dev/null 2>&1 || {
-    hindsight_stack_broker_abort_launch
+    hindsight_stack_broker_abort_launch "$pid" "$identity"
     hindsight_stack_broker_terminate_recorded || return 1
     return 1
   }
   if ! hindsight_stack_wait_broker; then
-    hindsight_stack_broker_abort_launch
+    hindsight_stack_broker_abort_launch "$pid" "$identity"
     hindsight_stack_broker_terminate_recorded || return 1
     hindsight_stack_broker_remove_stale_socket || true
     return 1
   fi
   hindsight_stack_broker_identity_matches || {
-    hindsight_stack_broker_abort_launch
+    hindsight_stack_broker_abort_launch "$pid" "$identity"
     hindsight_stack_broker_terminate_recorded || return 1
     return 1
   }
   disown %% >/dev/null 2>&1 || {
-    hindsight_stack_broker_abort_launch
+    hindsight_stack_broker_abort_launch "$pid" "$identity"
     hindsight_stack_broker_terminate_recorded || return 1
     return 1
   }

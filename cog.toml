@@ -1,0 +1,7 @@
+ignore_merge_commits = true
+
+[git_hooks.commit-msg]
+path = ".hooks/commit-msg.sh"
+
+[git_hooks.pre-push]
+path = ".hooks/pre-push.sh"

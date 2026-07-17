@@ -27,6 +27,7 @@ from hindsight_memory_control_plane.broker import (
     append_record_once,
     Broker,
     BrokerError,
+    MIN_PAYLOAD_BYTES,
     MAX_REQUEST_SEQUENCE,
     MAX_SESSION_ACTION_IDS,
     MAX_PAYLOAD_BYTES,
@@ -405,6 +406,54 @@ class BrokerSocketTest(unittest.TestCase):
             observer.join(1)
             self.assertFalse(observer.is_alive())
         self.assertTrue(observed.is_set())
+        with self.server._connection_futures_lock:
+            self.assertEqual(self.server._connection_futures, set())
+        self.server._closing.clear()
+
+    def test_completed_connection_callback_runs_outside_registration_lock(self):
+        admitted, peer = socket.socketpair()
+        self.addCleanup(peer.close)
+        callback_observed_unlocked = []
+        observer_threads = []
+
+        class Listener:
+            def accept(_self):
+                return admitted, None
+
+        class Executor:
+            def submit(_self, operation, connection, slots):
+                del operation
+                connection.close()
+                slots.release()
+                future = Future()
+                future.set_result(())
+                self.server._closing.set()
+                return future
+
+        def observe_registration_lock():
+            acquired = threading.Event()
+
+            def observe():
+                with self.server._connection_futures_lock:
+                    acquired.set()
+
+            observer = threading.Thread(target=observe)
+            observer.start()
+            observer_threads.append(observer)
+            callback_observed_unlocked.append(acquired.wait(0.2))
+
+        slots = threading.BoundedSemaphore(1)
+        self.server._closing.clear()
+        with patch.object(
+            self.server,
+            "_release_drained_executor",
+            side_effect=observe_registration_lock,
+        ):
+            self.server._serve(Listener(), Executor(), slots)
+        for observer in observer_threads:
+            observer.join(1)
+            self.assertFalse(observer.is_alive())
+        self.assertEqual(callback_observed_unlocked, [True])
         with self.server._connection_futures_lock:
             self.assertEqual(self.server._connection_futures, set())
         self.server._closing.clear()
@@ -1077,17 +1126,54 @@ class BrokerSocketTest(unittest.TestCase):
 
     def test_max_payload_bytes_is_a_bounded_integer(self):
         self.stop()
-        zero_bound = Broker(
-            state_dir=self.state,
+        identifier = "a" * 128
+        maximal_claims = claims(
+            session_id=identifier,
+            harness_id=identifier,
+            home_bank={"profile_id": identifier, "bank_id": identifier},
+            trust_class=identifier,
+            companion_id=identifier,
+            route=identifier,
+        )
+        minimum_bound = Broker(
+            state_dir=self.root / "minimum-payload",
             signing_key=b"k" * 32,
-            routes={"local-core": {"bank": BANK, "adapter": self.adapter}},
+            routes={
+                identifier: {
+                    "bank": maximal_claims["home_bank"],
+                    "adapter": FakeAdapter(
+                        endpoint={
+                            **ENDPOINT,
+                            "profile_id": identifier,
+                        }
+                    ),
+                }
+            },
             policy_digest=DIGEST_A,
             artifact_digest=DIGEST_B,
-            max_payload_bytes=0,
+            mint_authorizer=lambda control, requested, _ttl: (
+                requested if control == "control" else {}
+            ),
+            max_payload_bytes=MIN_PAYLOAD_BYTES,
         )
-        self.assertEqual(zero_bound.max_payload_bytes, 0)
-        zero_bound.shutdown()
-        for value in (False, -1, MAX_PAYLOAD_BYTES + 1):
+        try:
+            minted = minimum_bound.session_mint(
+                "control", maximal_claims
+            )
+            exchanged = minimum_bound.session_exchange(
+                minted["payload"]["handle"]
+            )
+        finally:
+            minimum_bound.shutdown()
+        self.assertEqual(minted["disposition"], "ok")
+        self.assertIsNotNone(minted["payload"].get("handle"))
+        self.assertEqual(exchanged["disposition"], "ok")
+        self.assertIsNotNone(exchanged["payload"].get("capability"))
+        for value in (
+            False,
+            MIN_PAYLOAD_BYTES - 1,
+            MAX_PAYLOAD_BYTES + 1,
+        ):
             with self.subTest(value=value), self.assertRaisesRegex(
                 BrokerError, "MAX_PAYLOAD_BYTES_INVALID"
             ):
@@ -2428,6 +2514,67 @@ class DurableWorkTest(unittest.TestCase):
         state = self.work()
         self.assertTrue(state["sessions"]["session-1"]["closed"])
         self.assertIn(state["sessions"]["session-1"]["revocation_digest"], state["revoked_nonces"])
+
+    def test_concurrent_identical_close_replays_inside_atomic_transaction(self):
+        capability = self.exchange()
+        barrier = threading.Barrier(2)
+        original_record = self.broker._session_close_ledger_record
+        responses = []
+        failures = []
+
+        def synchronize_close(claims_value, action_id):
+            barrier.wait(1)
+            return original_record(claims_value, action_id)
+
+        def close():
+            try:
+                responses.append(
+                    self.broker.session_close(
+                        capability,
+                        sequence=1,
+                        action_id="concurrent-close",
+                        timeout_seconds=0,
+                    )
+                )
+            except BrokerError as error:
+                failures.append(error.code)
+
+        threads = [threading.Thread(target=close) for _ in range(2)]
+        with (
+            patch.object(
+                self.broker,
+                "_session_close_ledger_record",
+                side_effect=synchronize_close,
+            ),
+            patch.object(self.broker, "_submit_write") as submit,
+        ):
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(2)
+                self.assertFalse(thread.is_alive())
+
+        self.assertEqual(failures, [])
+        self.assertEqual(len(responses), 2)
+        self.assertTrue(all(
+            response["disposition"] == "closed"
+            for response in responses
+        ))
+        state = self.work()
+        session = state["sessions"]["session-1"]
+        self.assertTrue(session["closed"])
+        self.assertEqual(session["action_ids"], ["concurrent-close"])
+        queued = [
+            item for item in state["queue"]
+            if item["session_id"] == "session-1"
+        ]
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(submit.call_count, 2)
+        self.assertTrue(all(
+            call.args == (queued[0]["queue_id"],)
+            and call.kwargs == {"runtime": True}
+            for call in submit.call_args_list
+        ))
 
     def test_close_is_retryable_before_atomic_commit_and_drainable_after_commit(self):
         capability = self.exchange()

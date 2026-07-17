@@ -907,7 +907,7 @@ def build_import_plan(
             "operation": "retain",
         }
         for item in projection.pending_items
-        if item.coverage_disposition not in {"omitted", "review_pending"}
+        if item.coverage_disposition == "proposed_novel"
     )
     body = {
         "schema_version": 1,
@@ -1003,12 +1003,12 @@ def reconcile_import(
     expected = {
         item.item_id: import_item_digest(item)
         for item in projection.pending_items
-        if item.coverage_disposition not in {"omitted", "review_pending"}
+        if item.coverage_disposition == "proposed_novel"
     }
     unresolved = {
         item.item_id
         for item in projection.pending_items
-        if item.coverage_disposition == "review_pending"
+        if item.coverage_disposition != "proposed_novel"
     }
     seen: dict[str, str] = {}
     for raw in receipts:

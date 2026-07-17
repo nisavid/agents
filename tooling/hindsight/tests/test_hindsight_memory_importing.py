@@ -478,6 +478,56 @@ class ImportProjectionTest(unittest.TestCase):
         ):
             self.assertNotIn(private, representation)
 
+    def test_only_reviewed_novel_items_become_retain_actions(self):
+        items = tuple(
+            replace(
+                inspect_items("codex", [record(disposition)])[0],
+                coverage_disposition=disposition,
+                coverage_reason=f"reviewed:{'e' * 64}",
+            )
+            for disposition in (
+                "proposed_novel",
+                "proposed_duplicate",
+                "proposed_conflict",
+            )
+        )
+        projection = project_import(items)
+        plan = build_import_plan(
+            projection,
+            controller_plan_digest="c" * 64,
+            target_bank=TARGET_BANK,
+        )
+        self.assertEqual(
+            [action["item_id"] for action in plan.actions],
+            [
+                item.item_id
+                for item in projection.items
+                if item.coverage_disposition == "proposed_novel"
+            ],
+        )
+        novel_action = plan.actions[0]
+        result = reconcile_import(
+            projection,
+            plan,
+            ({
+                "item_id": novel_action["item_id"],
+                "item_digest": novel_action["item_digest"],
+                "status": "imported",
+                "import_plan_digest": plan.plan_digest,
+                "target_bank": TARGET_BANK.to_dict(),
+            },),
+            approved_plan_digest=plan.plan_digest,
+        )
+        self.assertFalse(result.complete)
+        self.assertEqual(
+            set(result.missing_item_ids),
+            {
+                item.item_id
+                for item in projection.items
+                if item.coverage_disposition != "proposed_novel"
+            },
+        )
+
     def test_review_pending_items_keep_reconciliation_incomplete(self):
         item = inspect_items(
             "codex", [record(coverage_disposition="review_pending")]

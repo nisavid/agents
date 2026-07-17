@@ -261,30 +261,45 @@ acquire_cleanup_maintenance_lease() {
   /bin/chmod 600 "$lock_file" || die "failed to secure cleanup maintenance lease"
   [[ "$(/usr/bin/stat -f '%u:%Lp' "$lock_file")" == "${EUID}:600" ]] ||
     die "cleanup maintenance lease must be private and current-user-owned"
-  zmodload zsh/system || die "zsh/system is required for cleanup maintenance leasing"
   integer descriptor
-  zsystem flock -f descriptor -t 30 "$lock_file" ||
+  exec {descriptor}<>"$lock_file" || die "failed to open cleanup maintenance lease"
+  if ! /usr/bin/python3 -I - "$descriptor" <<'PY'
+import fcntl
+import os
+import sys
+import time
+
+descriptor = int(sys.argv[1])
+deadline = time.monotonic() + 30
+while True:
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        break
+    except BlockingIOError:
+        if time.monotonic() >= deadline:
+            raise SystemExit(1)
+        time.sleep(0.05)
+PY
+  then
+    exec {descriptor}>&- || true
     die "timed out acquiring cleanup maintenance lease"
-  integer proof_descriptor
-  exec {proof_descriptor}<"$lock_file" || {
-    zsystem flock -u "$descriptor" >/dev/null 2>&1 || true
-    die "failed to open cleanup maintenance lease proof descriptor"
-  }
+  fi
   typeset -gi HINDSIGHT_CLEANUP_MAINTENANCE_DESCRIPTOR="$descriptor"
-  typeset -gi HINDSIGHT_CLEANUP_MAINTENANCE_PROOF_DESCRIPTOR="$proof_descriptor"
   typeset -gi HINDSIGHT_CLEANUP_MAINTENANCE_LEASE_HELD=1
 }
 
 release_cleanup_maintenance_lease() {
   emulate -L zsh
   (( ${HINDSIGHT_CLEANUP_MAINTENANCE_LEASE_HELD:-0} )) || return 0
-  zmodload zsh/system || return 1
-  integer result=0
-  zsystem flock -u "$HINDSIGHT_CLEANUP_MAINTENANCE_DESCRIPTOR" || result=1
-  integer proof_descriptor="$HINDSIGHT_CLEANUP_MAINTENANCE_PROOF_DESCRIPTOR"
-  exec {proof_descriptor}>&- || result=1
+  integer descriptor="$HINDSIGHT_CLEANUP_MAINTENANCE_DESCRIPTOR"
+  /usr/bin/python3 -I - "$descriptor" <<'PY' || return 1
+import fcntl
+import sys
+
+fcntl.flock(int(sys.argv[1]), fcntl.LOCK_UN)
+PY
+  exec {descriptor}>&- || return 1
   typeset -gi HINDSIGHT_CLEANUP_MAINTENANCE_LEASE_HELD=0
-  return "$result"
 }
 
 cleanup_commit_receipt_path() {
@@ -1082,7 +1097,7 @@ stop_managed_and_legacy_services() {
   local service="${HINDSIGHT_EMBED_SERVICE_COMMAND:-}"
   validate_trusted_artifact "$service" "service command" executable allow-symlink
   HINDSIGHT_EMBED_MAINTENANCE_LEASE_HELD=1 \
-    HINDSIGHT_EMBED_MAINTENANCE_LEASE_DESCRIPTOR="$HINDSIGHT_CLEANUP_MAINTENANCE_PROOF_DESCRIPTOR" \
+    HINDSIGHT_EMBED_MAINTENANCE_LEASE_DESCRIPTOR="$HINDSIGHT_CLEANUP_MAINTENANCE_DESCRIPTOR" \
     hindsight_cleanup_run_lifecycle_command \
       "$service" stop --maintenance-lease-held >/dev/null 2>&1 ||
     die "failed to stop managed Hindsight service"

@@ -829,6 +829,16 @@ def _coverage_scope(
             for value in values
             if isinstance(value, str)
         )
+    malformed_semantic = sorted(
+        value
+        for value in candidates
+        if (
+            value.startswith(("repo:", "workflow:"))
+            and SEMANTIC_SCOPE.fullmatch(value) is None
+        )
+    )
+    if malformed_semantic:
+        return "omit", "unknown-semantic-scope", None
     canonical = set(repository_catalog["canonical"])
     aliases = repository_catalog["aliases"]
     dropped = set(repository_catalog["drop_aliases"])

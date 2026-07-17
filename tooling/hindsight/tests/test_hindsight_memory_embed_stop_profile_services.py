@@ -222,7 +222,9 @@ class StopProfileServicesTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
             wrapper = str(
-                home / ".local/libexec/hindsight-embed-control-server.py"
+                Path(self.helper.__file__).resolve().with_name(
+                    "hindsight-embed-control-server.py"
+                )
             )
             cases = (
                 (
@@ -282,7 +284,11 @@ class StopProfileServicesTest(unittest.TestCase):
     def test_control_ownership_rejects_embedded_or_duplicated_signatures(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
-            wrapper = str(home / ".local/libexec/hindsight-embed-control-server.py")
+            wrapper = str(
+                Path(self.helper.__file__).resolve().with_name(
+                    "hindsight-embed-control-server.py"
+                )
+            )
             cases = (
                 ["/usr/bin/python3", "-c", "noop", "hindsight_embed.control_center.server", "--port", "7878"],
                 ["/usr/bin/python3", "-m", "hindsight_embed.control_center.server", "--port", "7878", "--port", "7878"],

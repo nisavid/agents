@@ -25,8 +25,10 @@ class DisposableSmokeSignalTests(unittest.TestCase):
     def _signal_fragment() -> str:
         source = SMOKE.read_text(encoding="utf-8")
         start = source.index("typeset CLEANED_UP=0")
+        setup = source.index('mkdir -p "$SMOKE_HOME"', start)
+        cleanup = source.index("finish_cleanup()", setup)
         end = source.index("TRAPZERR()", start)
-        return source[start:end]
+        return source[start:setup] + source[cleanup:end]
 
     @staticmethod
     def _api_identity_fragment() -> str:

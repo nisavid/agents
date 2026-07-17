@@ -444,6 +444,8 @@ def process_group_exists():
         os.killpg(process.pid, 0)
     except ProcessLookupError:
         return False
+    except PermissionError:
+        return process.poll() is None
     return True
 
 def terminate_process_group():
@@ -471,8 +473,14 @@ def terminate_process_group():
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+        kill_deadline = time.monotonic() + 2
+        while process_group_exists() and time.monotonic() < kill_deadline:
+            time.sleep(0.05)
         if process.poll() is None:
-            process.wait()
+            try:
+                process.wait(timeout=max(0, kill_deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                pass
     finally:
         # Unblock while the signals are ignored so a second signal cannot
         # interrupt cleanup or recursively re-enter this function.
@@ -1239,6 +1247,8 @@ def process_group_exists():
         os.killpg(process.pid, 0)
     except ProcessLookupError:
         return False
+    except PermissionError:
+        return process.poll() is None
     return True
 
 def terminate_process_group():
@@ -1274,8 +1284,14 @@ def terminate_process_group():
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+        kill_deadline = time.monotonic() + 2
+        while process_group_exists() and time.monotonic() < kill_deadline:
+            time.sleep(0.05)
         if process.poll() is None:
-            process.wait()
+            try:
+                process.wait(timeout=max(0, kill_deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                pass
     finally:
         signal.pthread_sigmask(signal.SIG_SETMASK, termination_mask)
         for signum, handler in termination_handlers.items():
@@ -1848,8 +1864,14 @@ hindsight_stack_broker_remove_stale_socket() {
 
 hindsight_stack_broker_start() {
   emulate -L zsh
+  setopt LOCAL_TRAPS
   unsetopt BG_NICE
-  hindsight_stack_load_config || return 1
+  local broker_launch_owned=0 pid='' identity=''
+  trap 'if (( ${broker_launch_owned:-0} )); then broker_launch_owned=0; hindsight_stack_broker_abort_launch "${pid:-}" "${identity:-}" >/dev/null 2>&1 || true; fi' EXIT
+  trap 'if (( ${broker_launch_owned:-0} )); then broker_launch_owned=0; hindsight_stack_broker_abort_launch "${pid:-}" "${identity:-}" >/dev/null 2>&1 || true; fi; return 130' INT
+  trap 'if (( ${broker_launch_owned:-0} )); then broker_launch_owned=0; hindsight_stack_broker_abort_launch "${pid:-}" "${identity:-}" >/dev/null 2>&1 || true; fi; return 143' TERM
+  {
+    hindsight_stack_load_config || return 1
 
   local -a arguments
   arguments=(
@@ -1874,41 +1896,56 @@ arguments = sys.argv[1:]
 os.kill(os.getpid(), signal.SIGSTOP)
 os.execv(executable, arguments)
 ' "$HINDSIGHT_MEMORY_CLI" "${arguments[@]}" >/dev/null 2>&1 &
-  local pid=$! identity
+  pid=$!
+  broker_launch_owned=1
   hindsight_stack_broker_wait_launch_barrier "$pid" || {
+    broker_launch_owned=0
     hindsight_stack_broker_abort_launch "$pid"
     print -ru2 -- "hindsight-embed-stack: broker launch handshake failed"
     return 1
   }
   identity="$(hindsight_stack_broker_process_identity "$pid")" || {
+    broker_launch_owned=0
     hindsight_stack_broker_abort_launch "$pid"
     print -ru2 -- "hindsight-embed-stack: could not capture immutable broker process identity"
     return 1
   }
   hindsight_stack_broker_write_process_record "$pid" "$identity" || {
+    broker_launch_owned=0
     hindsight_stack_broker_abort_launch "$pid" "$identity"
     return 1
   }
   /bin/kill -CONT "$pid" >/dev/null 2>&1 || {
+    broker_launch_owned=0
     hindsight_stack_broker_abort_launch "$pid" "$identity"
     hindsight_stack_broker_terminate_recorded || return 1
     return 1
   }
   if ! hindsight_stack_wait_broker; then
+    broker_launch_owned=0
     hindsight_stack_broker_abort_launch "$pid" "$identity"
     hindsight_stack_broker_terminate_recorded || return 1
     hindsight_stack_broker_remove_stale_socket || true
     return 1
   fi
   hindsight_stack_broker_identity_matches || {
+    broker_launch_owned=0
     hindsight_stack_broker_abort_launch "$pid" "$identity"
     hindsight_stack_broker_terminate_recorded || return 1
     return 1
   }
   disown %% >/dev/null 2>&1 || {
+    broker_launch_owned=0
     hindsight_stack_broker_abort_launch "$pid" "$identity"
     hindsight_stack_broker_terminate_recorded || return 1
     return 1
+  }
+    broker_launch_owned=0
+  } always {
+    if (( broker_launch_owned )); then
+      broker_launch_owned=0
+      hindsight_stack_broker_abort_launch "$pid" "${identity:-}" >/dev/null 2>&1 || true
+    fi
   }
 }
 

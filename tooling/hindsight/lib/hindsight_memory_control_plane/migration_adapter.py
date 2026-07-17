@@ -1373,6 +1373,20 @@ class AdminMigrationAdapter:
                 (after.st_dev, after.st_ino),
             )
             os.fsync(directory)
+            destination = os.stat(
+                archive_path.name,
+                dir_fd=directory,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISREG(destination.st_mode)
+                or (destination.st_dev, destination.st_ino)
+                != (after.st_dev, after.st_ino)
+                or destination.st_nlink != 1
+            ):
+                raise MigrationAdapterError(
+                    "hindsight-admin archive destination changed"
+                )
             return True
         finally:
             if descriptor is not None:
@@ -1703,6 +1717,27 @@ class AdminMigrationAdapter:
                         )
                         os.fsync(parent_descriptor)
                         raise
+                    linked_recovery = os.stat(
+                        recovery_name,
+                        dir_fd=parent_descriptor,
+                        follow_symlinks=False,
+                    )
+                    linked_destination = os.stat(
+                        archive_path.name,
+                        dir_fd=parent_descriptor,
+                        follow_symlinks=False,
+                    )
+                    if (
+                        (linked_recovery.st_dev, linked_recovery.st_ino)
+                        != published_identity
+                        or (linked_destination.st_dev, linked_destination.st_ino)
+                        != published_identity
+                        or linked_recovery.st_nlink != 2
+                        or linked_destination.st_nlink != 2
+                    ):
+                        raise MigrationAdapterError(
+                            "hindsight-admin archive publication identity changed"
+                        )
                     try:
                         self._assert_archive_parent_identity(
                             archive_parent, parent_identity
@@ -1727,6 +1762,20 @@ class AdminMigrationAdapter:
                     published_identity,
                 )
                 os.fsync(parent_descriptor)
+                destination = os.stat(
+                    archive_path.name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISREG(destination.st_mode)
+                    or (destination.st_dev, destination.st_ino)
+                    != published_identity
+                    or destination.st_nlink != 1
+                ):
+                    raise MigrationAdapterError(
+                        "hindsight-admin archive destination changed"
+                    )
         except MigrationAdapterError:
             cleanup_recovery()
             raise

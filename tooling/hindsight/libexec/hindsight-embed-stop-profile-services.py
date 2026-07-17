@@ -257,7 +257,7 @@ def cleanup_control_pid(
 def process_command(pid: int) -> str:
     try:
         result = subprocess.run(
-            ["/bin/ps", "-p", str(pid), "-o", "command="],
+            ["/bin/ps", "-ww", "-p", str(pid), "-o", "command="],
             capture_output=True,
             text=True,
             timeout=5,
@@ -284,7 +284,7 @@ def stable_process_identity(pid: int) -> str:
     try:
         result = subprocess.run(
             [
-                "/bin/ps", "-p", str(pid),
+                "/bin/ps", "-ww", "-p", str(pid),
                 "-o", "lstart=", "-o", "command=",
             ],
             capture_output=True,
@@ -392,7 +392,7 @@ def owns_hindsight_control(
     if not argv:
         return False
     managed_wrapper = str(
-        Path.home() / ".local/libexec/hindsight-embed-control-server.py"
+        Path(__file__).resolve().with_name("hindsight-embed-control-server.py")
     )
     if Path(argv[0]).name.startswith("python"):
         upstream = argv[1:] == [

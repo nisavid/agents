@@ -27,6 +27,7 @@ cleanup_test_fixtures() {
       /bin/kill -KILL "$pid" >/dev/null 2>&1 || true
     wait "$pid" >/dev/null 2>&1 || true
   done
+  /usr/bin/chflags -R nouchg "$tmp_dir" >/dev/null 2>&1 || true
   /bin/chmod -R u+rwX "$tmp_dir" >/dev/null 2>&1 || true
   /bin/rm -rf -- "$tmp_dir"
 }

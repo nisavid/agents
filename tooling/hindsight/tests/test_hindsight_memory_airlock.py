@@ -194,6 +194,13 @@ class AirlockPlanTests(unittest.TestCase):
         self.assertEqual(plan.to_dict(), candidate)
         self.assertEqual(runner.calls, list(PREFLIGHT_PROBES))
         self.assertFalse(set(runner.calls) & set(CLOSEOUT_PROBES))
+        self.assertTrue(
+            {
+                "harness.setuid_escalation.denied",
+                "harness.network_admin.denied",
+                "harness.container_socket.denied",
+            }.issubset(runner.calls)
+        )
         candidate["machine"]["fresh"] = False
         self.assertTrue(plan.machine["fresh"])
         with self.assertRaises(TypeError):

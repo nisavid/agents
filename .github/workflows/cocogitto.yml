@@ -1,13 +1,17 @@
 on: [push]
 
+permissions:
+  contents: read
+
 jobs:
   cog_check_job:
     runs-on: ubuntu-latest
     name: check conventional commit compliance
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Conventional commit check
-        uses: cocogitto/cocogitto-action@v3
+        uses: cocogitto/cocogitto-action@c7a74f5406bab86da17da0f0e460a69f8219a68c # v3

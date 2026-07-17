@@ -23,6 +23,12 @@ The live local installations point at this repository as their source. The
 install-cache and refresh workflow lives in the maintenance notes of
 [plugins/thermos/README.md](plugins/thermos/README.md).
 
+## Development
+
+Commits use the Conventional Commits format enforced by Cocogitto. After
+cloning, run `cog install-hook --all` once to install the repository's
+`commit-msg` and `pre-push` hooks into `.git/hooks`.
+
 ## License
 
 The repository license is MIT. Individual plugins may carry their own upstream

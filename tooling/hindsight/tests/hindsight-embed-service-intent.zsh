@@ -89,6 +89,31 @@ restart_events="$tmp_dir/restart-events"
   exit 1
 }
 
+failed_stage_events="$tmp_dir/failed-stage-events"
+if (
+  STACK_LABEL=stack
+  LEGACY_LABEL=legacy
+  is_loaded() { [[ "$1" == "$STACK_LABEL" ]] }
+  preflight_launchd_service() { print -r -- preflight >>"$failed_stage_events" }
+  snapshot_service_manifest() {
+    print -r -- snapshot >>"$failed_stage_events"
+    print -r -- "$tmp_dir/rollback.plist"
+  }
+  wait_for_manifest_stack_health() { print -r -- healthy >>"$failed_stage_events" }
+  stage_validated_manifest() { print -r -- stage >>"$failed_stage_events"; return 1 }
+  restore_loaded_stack_health() { print -r -- restore >>"$failed_stage_events" }
+  bootout_if_loaded() { print -r -- bootout >>"$failed_stage_events" }
+  restart_service
+) >/dev/null 2>&1; then
+  print -ru2 -- "service restart accepted a failed manifest staging attempt"
+  exit 1
+fi
+[[ "$(paste -sd, - <"$failed_stage_events")" == preflight,snapshot,healthy,stage ]] || {
+  /bin/cat "$failed_stage_events" >&2
+  print -ru2 -- "service restart mutated a healthy stack after staging failed"
+  exit 1
+}
+
 failed_replacement_events="$tmp_dir/failed-replacement-events"
 (
   bootout_if_loaded() { print -r -- bootout >> "$failed_replacement_events" }

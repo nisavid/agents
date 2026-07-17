@@ -161,7 +161,7 @@ class UnixJsonRpcServer:
         self._connection_slots = threading.BoundedSemaphore(max_connections)
         self._executor: ThreadPoolExecutor | None = None
         self._connection_futures: set[Future[Any]] = set()
-        self._connection_futures_lock = threading.Lock()
+        self._connection_futures_lock = threading.RLock()
 
     def start(self) -> None:
         with SOCKET_LIFECYCLE_LOCK:
@@ -320,16 +320,16 @@ class UnixJsonRpcServer:
                 connection.close()
                 continue
             try:
-                future = executor.submit(
-                    self._connection, connection, connection_slots
-                )
                 with self._connection_futures_lock:
-                    self._connection_futures.add(future)
-                future.add_done_callback(
-                    lambda completed, admitted=connection: self._complete_connection(
-                        completed, admitted, connection_slots
+                    future = executor.submit(
+                        self._connection, connection, connection_slots
                     )
-                )
+                    self._connection_futures.add(future)
+                    future.add_done_callback(
+                        lambda completed, admitted=connection: self._complete_connection(
+                            completed, admitted, connection_slots
+                        )
+                    )
             except RuntimeError:
                 connection.close()
                 connection_slots.release()

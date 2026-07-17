@@ -1,5 +1,6 @@
 """Compatibility-gated subprocess seam for the narrow hindsight-admin surface."""
 
+from collections import OrderedDict
 from contextlib import contextmanager
 import fcntl
 import hashlib
@@ -162,10 +163,38 @@ RUNTIME_TOTAL_MAX_BYTES = 512 * 1024 * 1024
 ADMIN_OUTPUT_MAX_CHARS = 8 * 1024 * 1024
 ADVISORY_LOCK_TIMEOUT_SECONDS = 5.0
 ADVISORY_LOCK_POLL_SECONDS = 0.01
+MAX_VERIFIED_ROLLBACK_IDENTITIES = 1024
 
 
 class MigrationAdapterError(RuntimeError):
     pass
+
+
+def _copy_exact_descriptor(
+    source: int,
+    destination: int | None,
+    expected_size: int,
+    label: str,
+) -> str:
+    """Copy the attested byte count and reject truncation or one-byte growth."""
+    checksum = hashlib.sha256()
+    remaining_bytes = expected_size
+    while remaining_bytes:
+        chunk = os.read(source, min(1024 * 1024, remaining_bytes))
+        if not chunk:
+            raise FileEvidenceError(f"{label} size changed")
+        checksum.update(chunk)
+        remaining_bytes -= len(chunk)
+        if destination is not None:
+            remaining = memoryview(chunk)
+            while remaining:
+                written = os.write(destination, remaining)
+                if written <= 0:
+                    raise OSError("runtime snapshot write failed")
+                remaining = remaining[written:]
+    if os.read(source, 1):
+        raise FileEvidenceError(f"{label} size changed")
+    return checksum.hexdigest()
 
 
 def _acquire_advisory_lock(descriptor: int, unavailable_message: str) -> None:
@@ -768,7 +797,12 @@ class AdminMigrationAdapter:
                 process.kill()
             except ProcessLookupError:
                 pass
-            process.wait()
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                raise MigrationAdapterError(
+                    "hindsight-admin process did not terminate"
+                ) from None
 
     def _require_executable_identity(self) -> None:
         try:
@@ -829,7 +863,6 @@ class AdminMigrationAdapter:
             | getattr(os, "O_NONBLOCK", 0),
         )
         destination_descriptor: int | None = None
-        copied = hashlib.sha256()
         try:
             before = os.fstat(source_descriptor)
             if (
@@ -849,14 +882,12 @@ class AdminMigrationAdapter:
                 | getattr(os, "O_NOFOLLOW", 0),
                 0o400,
             )
-            while chunk := os.read(source_descriptor, 1024 * 1024):
-                copied.update(chunk)
-                remaining = memoryview(chunk)
-                while remaining:
-                    written = os.write(destination_descriptor, remaining)
-                    if written <= 0:
-                        raise OSError("runtime snapshot write failed")
-                    remaining = remaining[written:]
+            copied_digest = _copy_exact_descriptor(
+                source_descriptor,
+                destination_descriptor,
+                binding[3][6],
+                label,
+            )
             os.fchmod(destination_descriptor, 0o400)
             os.fsync(destination_descriptor)
             after = os.fstat(source_descriptor)
@@ -864,7 +895,7 @@ class AdminMigrationAdapter:
             if (
                 file_identity(before) != file_identity(after)
                 or file_identity(after) != file_identity(current)
-                or not hmac.compare_digest(copied.hexdigest(), binding[4])
+                or not hmac.compare_digest(copied_digest, binding[4])
             ):
                 raise FileEvidenceError(f"{label} identity changed")
         finally:
@@ -926,17 +957,18 @@ class AdminMigrationAdapter:
                         raise FileEvidenceError(
                             "hindsight-admin interpreter identity changed"
                         )
-                    copied_interpreter = hashlib.sha256()
                     if before.st_uid == 0 and os.geteuid() != 0:
                         # A root-owned, non-writable interpreter is already an
                         # immutable execution target for this unprivileged
                         # process. macOS platform binaries also cannot be
                         # relocated without invalidating their platform seal.
                         execution_target = self._interpreter_binding[2]
-                        while chunk := os.read(
-                            interpreter_descriptor, 1024 * 1024
-                        ):
-                            copied_interpreter.update(chunk)
+                        copied_interpreter_digest = _copy_exact_descriptor(
+                            interpreter_descriptor,
+                            None,
+                            self._interpreter_binding[3][6],
+                            "hindsight-admin interpreter",
+                        )
                     else:
                         destination_descriptor = os.open(
                             interpreter_destination,
@@ -947,20 +979,12 @@ class AdminMigrationAdapter:
                             | getattr(os, "O_NOFOLLOW", 0),
                             0o500,
                         )
-                        while chunk := os.read(
-                            interpreter_descriptor, 1024 * 1024
-                        ):
-                            copied_interpreter.update(chunk)
-                            remaining = memoryview(chunk)
-                            while remaining:
-                                written = os.write(
-                                    destination_descriptor, remaining
-                                )
-                                if written <= 0:
-                                    raise OSError(
-                                        "interpreter snapshot write failed"
-                                    )
-                                remaining = remaining[written:]
+                        copied_interpreter_digest = _copy_exact_descriptor(
+                            interpreter_descriptor,
+                            destination_descriptor,
+                            self._interpreter_binding[3][6],
+                            "hindsight-admin interpreter",
+                        )
                         os.fchmod(destination_descriptor, 0o500)
                         os.fsync(destination_descriptor)
                     after = os.fstat(interpreter_descriptor)
@@ -969,7 +993,7 @@ class AdminMigrationAdapter:
                         file_identity(before) != file_identity(after)
                         or file_identity(after) != file_identity(current)
                         or not hmac.compare_digest(
-                            copied_interpreter.hexdigest(),
+                            copied_interpreter_digest,
                             self._interpreter_binding[4],
                         )
                     ):
@@ -1003,22 +1027,19 @@ class AdminMigrationAdapter:
                             | getattr(os, "O_NOFOLLOW", 0),
                             0o400,
                         )
-                        copied = hashlib.sha256()
                         try:
-                            while chunk := os.read(source_descriptor, 1024 * 1024):
-                                copied.update(chunk)
-                                remaining = memoryview(chunk)
-                                while remaining:
-                                    written = os.write(destination_descriptor, remaining)
-                                    if written <= 0:
-                                        raise OSError("runtime snapshot write failed")
-                                    remaining = remaining[written:]
+                            copied_digest = _copy_exact_descriptor(
+                                source_descriptor,
+                                destination_descriptor,
+                                binding[3][6],
+                                "hindsight-api runtime file",
+                            )
                             os.fchmod(destination_descriptor, 0o400)
                             os.fsync(destination_descriptor)
                         finally:
                             os.close(source_descriptor)
                             os.close(destination_descriptor)
-                    if not hmac.compare_digest(copied.hexdigest(), binding[4]):
+                    if not hmac.compare_digest(copied_digest, binding[4]):
                         raise MigrationAdapterError(
                             "hindsight-admin runtime snapshot changed"
                         )
@@ -1790,8 +1811,26 @@ class MigrationApplyAdapter:
         )
         if not self.restore_lock_dir.is_absolute():
             raise MigrationAdapterError("rollback restore lock directory is invalid")
-        self._verified_rollback_identities: set[str] = set()
+        self._verified_rollback_identities: OrderedDict[str, None] = OrderedDict()
+        self._verified_rollback_identities_lock = threading.Lock()
         self._restore_lock = threading.Lock()
+
+    def _rollback_identity_is_verified(self, identity: str) -> bool:
+        with self._verified_rollback_identities_lock:
+            known = identity in self._verified_rollback_identities
+            if known:
+                self._verified_rollback_identities.move_to_end(identity)
+            return known
+
+    def _remember_verified_rollback_identity(self, identity: str) -> None:
+        with self._verified_rollback_identities_lock:
+            self._verified_rollback_identities[identity] = None
+            self._verified_rollback_identities.move_to_end(identity)
+            while (
+                len(self._verified_rollback_identities)
+                > MAX_VERIFIED_ROLLBACK_IDENTITIES
+            ):
+                self._verified_rollback_identities.popitem(last=False)
 
     def _restore_binding(self, rollback: Any) -> dict[str, Any]:
         binding = {
@@ -2171,12 +2210,10 @@ class MigrationApplyAdapter:
 
     def verify_rollback_bundle(self, rollback: Any) -> bool:
         try:
-            known = (
-                self._restore_identity(rollback)
-                in self._verified_rollback_identities
-            )
+            rollback_identity = self._restore_identity(rollback)
         except MigrationAdapterError:
             return False
+        known = self._rollback_identity_is_verified(rollback_identity)
         if not known:
             try:
                 if self._read_restore_receipt(rollback) is None:
@@ -2198,9 +2235,7 @@ class MigrationApplyAdapter:
             return False
         verified = self.data_plane.verify_rollback_bundle(rollback) is True
         if verified:
-            self._verified_rollback_identities.add(
-                self._restore_identity(rollback)
-            )
+            self._remember_verified_rollback_identity(rollback_identity)
         return verified
 
     def restore(self, rollback: Any) -> None:
@@ -2225,12 +2260,11 @@ class MigrationApplyAdapter:
                 "rollback archive snapshot verification failed"
             ) from None
         try:
-            known = (
-                self._restore_identity(rollback)
-                in self._verified_rollback_identities
-            )
+            rollback_identity = self._restore_identity(rollback)
         except MigrationAdapterError:
             known = False
+        else:
+            known = self._rollback_identity_is_verified(rollback_identity)
         if not known:
             try:
                 verified = receipt is not None and self.verify_rollback_bundle(

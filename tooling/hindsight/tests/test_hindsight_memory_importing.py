@@ -83,9 +83,13 @@ class ImportProjectionTest(unittest.TestCase):
         self.temporary.cleanup()
 
     def test_nested_frozen_dicts_are_recopied_and_action_identity_is_reserved(self):
-        nested = FrozenDict({"value": []})
+        source = {"value": []}
+        nested = FrozenDict(source)
+        source["value"].append("changed-at-source")
+        self.assertEqual(nested["value"], ())
+        with self.assertRaises(AttributeError):
+            nested["value"].append("changed-directly")
         frozen = deep_freeze(nested)
-        nested["value"].append("changed")
         self.assertEqual(frozen["value"], ())
         self.assertNotIsInstance(frozen, dict)
         with self.assertRaises(TypeError):
@@ -102,6 +106,8 @@ class ImportProjectionTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "action identity"):
             Action("real-id", "retain", {"id": "spoofed"})
+        with self.assertRaises(TypeError):
+            FrozenDict({"items": {"not", "json"}})
 
     def test_deep_freeze_rejects_non_json_values_and_mapping_keys(self):
         for value in (
@@ -168,6 +174,24 @@ class ImportProjectionTest(unittest.TestCase):
             edited = inspect_source("codex", codex, timestamp=timestamp)[0]
             self.assertEqual(first.item_id, edited.item_id)
             self.assertNotEqual(first.content_digest, edited.content_digest)
+
+    def test_curated_markdown_ignores_relationships_inside_fenced_code(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "MEMORY.md"
+            source.write_text(
+                "# Memory\n\n"
+                "## Durable section\n\n"
+                "[[repo:visible]]\n\n"
+                "```markdown\n"
+                "[[workflow:hidden]]\n"
+                "```\n",
+                encoding="utf-8",
+            )
+            records = parse_codex_memory(
+                source, timestamp="2026-01-01T00:00:00Z"
+            )
+        self.assertEqual(records[0]["relationships"], ["repo:visible"])
+        self.assertEqual(records[0]["intended_scope"], "repo:visible")
 
     def test_curated_adapters_use_embedded_dates_and_reject_ambiguous_headings(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -798,7 +822,6 @@ class ImportProjectionTest(unittest.TestCase):
             inspector=lambda item: resumed_calls.append(item.item_id),
             resume_state={
                 items[0].item_id: import_item_digest(items[0]),
-                items[1].item_id: "0" * 64,
             },
             max_items=1,
             requests_per_window=1,
@@ -863,12 +886,48 @@ class ImportProjectionTest(unittest.TestCase):
         )
         completed_id = first.completed_item_ids[0]
 
-        with self.assertRaisesRegex(ImportValidationError, "conflicts"):
+        with self.assertRaisesRegex(
+            ImportValidationError, "does not match|conflicts"
+        ):
             run_import_inspection(
                 projection,
                 inspector=lambda _item: None,
                 resume_state={completed_id: "0" * 64},
                 max_items=1,
+                rate_limit_state_path=state_path,
+            )
+
+    def test_checkpoint_and_resume_digests_must_match_projection_items(self):
+        projection = project_import(inspect_items("codex", [record("m1")]))
+        item = projection.items[0]
+        state_path = Path(self.temporary.name) / "digest-bound-rate-limit.json"
+        with self.assertRaisesRegex(ImportValidationError, "does not match"):
+            run_import_inspection(
+                projection,
+                inspector=lambda _item: self.fail("inspector must not run"),
+                resume_state={item.item_id: "0" * 64},
+                rate_limit_state_path=state_path,
+            )
+
+        checkpoint = state_path.with_name(
+            f"{state_path.name}.inspection-checkpoint."
+            f"{projection.projection_digest}"
+        )
+        checkpoint.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "projection_digest": projection.projection_digest,
+                    "completed": {item.item_id: "0" * 64},
+                }
+            ),
+            encoding="utf-8",
+        )
+        checkpoint.chmod(0o600)
+        with self.assertRaisesRegex(ImportValidationError, "does not match"):
+            run_import_inspection(
+                projection,
+                inspector=lambda _item: self.fail("inspector must not run"),
                 rate_limit_state_path=state_path,
             )
 

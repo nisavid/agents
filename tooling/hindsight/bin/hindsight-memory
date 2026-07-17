@@ -400,6 +400,8 @@ def apply_command(args: argparse.Namespace) -> int:
         not hmac.compare_digest(base_plan.inventory_digest, inventory.inventory_digest)
         or not hmac.compare_digest(base_plan.artifact_digest, inventory.artifact_digest)
         or base_plan.target_profile != args.profile
+        or base_plan.target_endpoint
+        != inventory_endpoint(inventory, base_plan.target_profile)
     ):
         raise ApplyError("plan does not match the selected inventory and profile")
     desired_artifacts: dict[str, Any] = {}

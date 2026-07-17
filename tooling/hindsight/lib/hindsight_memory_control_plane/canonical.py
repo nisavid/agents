@@ -88,13 +88,16 @@ def strict_json_loads(value: str | bytes | bytearray) -> Any:
             value = bytes(value).decode("utf-8", errors="strict")
         except UnicodeDecodeError as error:
             raise StrictJsonError("JSON bytes must be strict UTF-8") from error
-    parsed = json.loads(
-        value,
-        object_pairs_hook=_reject_duplicate_object_keys,
-        parse_constant=_reject_non_finite_constant,
-        parse_float=_parse_finite_float,
-        parse_int=_parse_safe_integer,
-    )
+    try:
+        parsed = json.loads(
+            value,
+            object_pairs_hook=_reject_duplicate_object_keys,
+            parse_constant=_reject_non_finite_constant,
+            parse_float=_parse_finite_float,
+            parse_int=_parse_safe_integer,
+        )
+    except json.JSONDecodeError as error:
+        raise StrictJsonError("invalid JSON") from error
     _validate_unicode_scalars(parsed)
     return parsed
 

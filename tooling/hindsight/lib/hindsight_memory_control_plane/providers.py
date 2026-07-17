@@ -828,23 +828,6 @@ def validate_provider_compatibility(
             "provider_id": fallback.provider_id,
             "visible_degradation": True,
         }
-    elif (
-        desired_reranker is not None
-        and desired_reranker.fallback_provider_id
-    ):
-        fallback = activatable_fallback(desired_reranker)
-        if fallback is not None:
-            reranking_disposition = {
-                "state": "fallback",
-                "provider_id": fallback.provider_id,
-                "visible_degradation": True,
-            }
-        else:
-            reranking_disposition = {
-                "state": "disabled",
-                "provider_id": None,
-                "visible_degradation": True,
-            }
     else:
         reranking_disposition = {
             "state": "disabled",

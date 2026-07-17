@@ -225,7 +225,14 @@ hindsight_stack_set_desired_state() {
       ;;
   esac
   hindsight_stack_prepare_desired_state_dir || return 1
-  local path
+  local path dependency_path
+  if [[ "$component" == ui && "$desired" == running ]]; then
+    dependency_path="$(hindsight_stack_desired_state_path daemon "$profile")" || return 1
+    hindsight_stack_write_private_state "$dependency_path" running || return 1
+  elif [[ "$component" == daemon && "$desired" == stopped ]]; then
+    dependency_path="$(hindsight_stack_desired_state_path ui "$profile")" || return 1
+    hindsight_stack_write_private_state "$dependency_path" stopped || return 1
+  fi
   path="$(hindsight_stack_desired_state_path "$component" "$profile")" || return 1
   hindsight_stack_write_private_state "$path" "$desired"
 }
@@ -1755,10 +1762,8 @@ hindsight_stack_broker_terminate_started() {
 hindsight_stack_broker_abort_launch() {
   emulate -L zsh
   unsetopt ERR_EXIT
-  local pid="$1"
-  [[ "$pid" == <-> ]] || return 1
-  /bin/kill -KILL "$pid" >/dev/null 2>&1 || true
-  wait "$pid" >/dev/null 2>&1 || true
+  kill -KILL %% >/dev/null 2>&1 || true
+  wait %% >/dev/null 2>&1 || true
 }
 
 hindsight_stack_broker_wait_launch_barrier() {
@@ -1766,7 +1771,11 @@ hindsight_stack_broker_wait_launch_barrier() {
   local pid="$1" attempt state
   [[ "$pid" == <-> ]] || return 1
   for attempt in {1..500}; do
-    state="$(/bin/ps -o state= -p "$pid" 2>/dev/null)" || return 1
+    state="$(/bin/ps -o state= -p "$pid" 2>/dev/null)" || {
+      kill -0 "$pid" >/dev/null 2>&1 || return 1
+      sleep 0.01
+      continue
+    }
     [[ "$state" == *T* ]] && return 0
     sleep 0.01
   done
@@ -1780,7 +1789,6 @@ hindsight_stack_broker_terminate_recorded() {
   local pid="$HINDSIGHT_STACK_BROKER_PID" expected="$HINDSIGHT_STACK_BROKER_IDENTITY"
   local current
   current="$(hindsight_stack_broker_process_identity "$pid")" || {
-    wait "$pid" >/dev/null 2>&1 || true
     hindsight_stack_broker_clear_process_record
     return 0
   }
@@ -1788,27 +1796,8 @@ hindsight_stack_broker_terminate_recorded() {
     print -ru2 -- "hindsight-embed-stack: refusing to signal broker with changed process identity: ${pid}"
     return 1
   }
-  /bin/kill -TERM "$pid" >/dev/null 2>&1 || true
-  local attempt
-  for attempt in {1..20}; do
-    current="$(hindsight_stack_broker_process_identity "$pid")" || break
-    [[ "$current" == "$expected" ]] || {
-      print -ru2 -- "hindsight-embed-stack: broker identity changed during termination: ${pid}"
-      return 1
-    }
-    sleep 0.1
-  done
-  if current="$(hindsight_stack_broker_process_identity "$pid")"; then
-    [[ "$current" == "$expected" ]] || return 1
-    /bin/kill -KILL "$pid" >/dev/null 2>&1 || true
-  fi
-  wait "$pid" >/dev/null 2>&1 || true
-  for attempt in {1..20}; do
-    hindsight_stack_broker_process_identity "$pid" >/dev/null 2>&1 || break
-    sleep 0.05
-  done
-  hindsight_stack_broker_process_identity "$pid" >/dev/null 2>&1 && return 1
-  hindsight_stack_broker_clear_process_record
+  print -ru2 -- "hindsight-embed-stack: refusing to signal live recorded broker process: ${pid}"
+  return 1
 }
 
 hindsight_stack_broker_remove_stale_socket() {
@@ -1859,35 +1848,38 @@ os.execv(executable, arguments)
 ' "$HINDSIGHT_MEMORY_CLI" "${arguments[@]}" >/dev/null 2>&1 &
   local pid=$! identity
   hindsight_stack_broker_wait_launch_barrier "$pid" || {
-    hindsight_stack_broker_abort_launch "$pid"
+    hindsight_stack_broker_abort_launch
     print -ru2 -- "hindsight-embed-stack: broker launch handshake failed"
     return 1
   }
   identity="$(hindsight_stack_broker_process_identity "$pid")" || {
-    hindsight_stack_broker_abort_launch "$pid"
+    hindsight_stack_broker_abort_launch
     print -ru2 -- "hindsight-embed-stack: could not capture immutable broker process identity"
     return 1
   }
   hindsight_stack_broker_write_process_record "$pid" "$identity" || {
-    hindsight_stack_broker_abort_launch "$pid"
+    hindsight_stack_broker_abort_launch
     return 1
   }
   /bin/kill -CONT "$pid" >/dev/null 2>&1 || {
-    hindsight_stack_broker_abort_launch "$pid"
-    hindsight_stack_broker_clear_process_record || true
+    hindsight_stack_broker_abort_launch
+    hindsight_stack_broker_terminate_recorded || return 1
     return 1
   }
   if ! hindsight_stack_wait_broker; then
-    hindsight_stack_broker_terminate_recorded || true
+    hindsight_stack_broker_abort_launch
+    hindsight_stack_broker_terminate_recorded || return 1
     hindsight_stack_broker_remove_stale_socket || true
     return 1
   fi
   hindsight_stack_broker_identity_matches || {
-    hindsight_stack_broker_terminate_recorded || true
+    hindsight_stack_broker_abort_launch
+    hindsight_stack_broker_terminate_recorded || return 1
     return 1
   }
   disown %% >/dev/null 2>&1 || {
-    hindsight_stack_broker_terminate_recorded || true
+    hindsight_stack_broker_abort_launch
+    hindsight_stack_broker_terminate_recorded || return 1
     return 1
   }
 }
@@ -2195,6 +2187,10 @@ hindsight_stack_reconcile_profile() {
   hindsight_stack_reconcile_sidecars || ok=1
   daemon_desired="$(hindsight_stack_desired_state daemon)" || return 1
   ui_desired="$(hindsight_stack_desired_state ui)" || return 1
+  if [[ "$daemon_desired" == stopped && "$ui_desired" == running ]]; then
+    hindsight_stack_log "refusing inconsistent desired state: UI requires daemon for ${HINDSIGHT_EMBED_PROFILE}"
+    return 1
+  fi
 
   # Enforce intentional stops in dependency order. A supervisor reconciliation
   # must not merely refrain from starting a component that is still running.
@@ -2248,6 +2244,11 @@ hindsight_stack_start_profile() {
   local ok=0 daemon_desired ui_desired
   hindsight_stack_reconcile_sidecars || ok=1
   daemon_desired="$(hindsight_stack_desired_state daemon)" || return 1
+  ui_desired="$(hindsight_stack_desired_state ui)" || return 1
+  if [[ "$daemon_desired" == stopped && "$ui_desired" == running ]]; then
+    hindsight_stack_log "refusing inconsistent desired state: UI requires daemon for ${HINDSIGHT_EMBED_PROFILE}"
+    return 1
+  fi
   if [[ "$daemon_desired" == stopped ]]; then
     :
   elif hindsight_stack_daemon_status; then
@@ -2257,7 +2258,6 @@ hindsight_stack_start_profile() {
   else
     ok=1
   fi
-  ui_desired="$(hindsight_stack_desired_state ui)" || return 1
   if [[ "$ui_desired" == stopped ]]; then
     :
   elif hindsight_stack_daemon_status; then
@@ -2306,22 +2306,19 @@ hindsight_stack_start_all() {
 
 hindsight_stack_wait_profile() {
   emulate -L zsh
-  local profile="$1" ok=0 desired
+  local profile="$1" ok=0 daemon_desired ui_desired
   print -r -- "waiting for sidecars for profile ${profile} (up to ${HINDSIGHT_EMBED_SIDECAR_WAIT_SECONDS}s)"
   hindsight_stack_wait_sidecars || ok=1
-  if hindsight_stack_enabled "$HINDSIGHT_EMBED_AUTOSTART_DAEMON"; then
-    desired="$(hindsight_stack_desired_state daemon)" || return 1
-    if [[ "$desired" == running ]]; then
-      print -r -- "waiting for daemon profile ${profile} on port ${HINDSIGHT_EMBED_API_PORT} (up to ${HINDSIGHT_EMBED_DAEMON_WAIT_SECONDS}s)"
-      hindsight_stack_wait_daemon || ok=1
-    fi
+  daemon_desired="$(hindsight_stack_desired_state daemon "$profile")" || return 1
+  ui_desired="$(hindsight_stack_desired_state ui "$profile")" || return 1
+  [[ "$daemon_desired" != stopped || "$ui_desired" != running ]] || return 1
+  if [[ "$daemon_desired" == running ]]; then
+    print -r -- "waiting for daemon profile ${profile} on port ${HINDSIGHT_EMBED_API_PORT} (up to ${HINDSIGHT_EMBED_DAEMON_WAIT_SECONDS}s)"
+    hindsight_stack_wait_daemon || ok=1
   fi
-  if hindsight_stack_enabled "$HINDSIGHT_EMBED_AUTOSTART_UI"; then
-    desired="$(hindsight_stack_desired_state ui)" || return 1
-    if [[ "$desired" == running ]]; then
-      print -r -- "waiting for UI profile ${profile} on port ${HINDSIGHT_EMBED_UI_PORT} (up to ${HINDSIGHT_EMBED_UI_WAIT_SECONDS}s)"
-      hindsight_stack_wait_ui || ok=1
-    fi
+  if [[ "$ui_desired" == running ]]; then
+    print -r -- "waiting for UI profile ${profile} on port ${HINDSIGHT_EMBED_UI_PORT} (up to ${HINDSIGHT_EMBED_UI_WAIT_SECONDS}s)"
+    hindsight_stack_wait_ui || ok=1
   fi
   return "$ok"
 }
@@ -2440,18 +2437,10 @@ hindsight_stack_status_profile() {
   emulate -L zsh
   local profile="$1" sidecar
   [[ -z "$requested" || "$requested" == "$profile" ]] || return 0
-  if hindsight_stack_enabled "$HINDSIGHT_EMBED_AUTOSTART_DAEMON"; then
-    daemon_health="$(hindsight_stack_status_word daemon)" || fleet_health=degraded
-    [[ "$daemon_health" == healthy || "$daemon_health" == stopped ]] || fleet_health=degraded
-  else
-    daemon_health=disabled
-  fi
-  if hindsight_stack_enabled "$HINDSIGHT_EMBED_AUTOSTART_UI"; then
-    ui_health="$(hindsight_stack_status_word ui)" || fleet_health=degraded
-    [[ "$ui_health" == healthy || "$ui_health" == stopped ]] || fleet_health=degraded
-  else
-    ui_health=disabled
-  fi
+  daemon_health="$(hindsight_stack_status_word daemon)" || fleet_health=degraded
+  [[ "$daemon_health" == healthy || "$daemon_health" == stopped ]] || fleet_health=degraded
+  ui_health="$(hindsight_stack_status_word ui)" || fleet_health=degraded
+  [[ "$ui_health" == healthy || "$ui_health" == stopped ]] || fleet_health=degraded
   sidecar_records=()
   local -a sidecars
   sidecars=("${(@f)$(hindsight_stack_sidecar_names)}") || {
@@ -2488,16 +2477,8 @@ hindsight_stack_status_report() {
   print -r -- "broker: $(hindsight_stack_status_word broker) (${HINDSIGHT_MEMORY_BROKER_SOCKET})"
   print -r -- "control: $(hindsight_stack_status_word control) ($(hindsight_stack_http_url "$HINDSIGHT_EMBED_CONTROL_HOSTNAME" "$HINDSIGHT_EMBED_CONTROL_PORT"))"
   local primary_daemon_health primary_ui_health
-  if hindsight_stack_enabled "$HINDSIGHT_EMBED_AUTOSTART_DAEMON"; then
-    primary_daemon_health="$(hindsight_stack_status_word daemon)"
-  else
-    primary_daemon_health=disabled
-  fi
-  if hindsight_stack_enabled "$HINDSIGHT_EMBED_AUTOSTART_UI"; then
-    primary_ui_health="$(hindsight_stack_status_word ui)"
-  else
-    primary_ui_health=disabled
-  fi
+  primary_daemon_health="$(hindsight_stack_status_word daemon)"
+  primary_ui_health="$(hindsight_stack_status_word ui)"
   print -r -- "daemon: ${primary_daemon_health} (${HINDSIGHT_EMBED_PROFILE}, $(hindsight_stack_http_url 127.0.0.1 "$HINDSIGHT_EMBED_API_PORT"))"
   print -r -- "ui: ${primary_ui_health} (${HINDSIGHT_EMBED_PROFILE}, $(hindsight_stack_ui_url))"
   hindsight_stack_pop_profile_state

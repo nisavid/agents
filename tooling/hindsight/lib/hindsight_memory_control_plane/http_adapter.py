@@ -1559,7 +1559,13 @@ class HttpAdapter:
         request = validate_runtime_request(method, request)
         key = request["idempotency_key"]
         request_digest = digest(request)
-        return self._runtime_write_cached(path, request, key, request_digest)
+        return self._runtime_write_cached(
+            path,
+            request,
+            key,
+            request_digest,
+            time.monotonic() + self.timeout,
+        )
 
     def _runtime_write_cached(
         self,
@@ -1567,6 +1573,7 @@ class HttpAdapter:
         request: Mapping[str, Any],
         key: str,
         request_digest: str,
+        deadline: float,
     ):
         now = self._runtime_result_now()
         with self._runtime_results_lock:
@@ -1595,7 +1602,9 @@ class HttpAdapter:
                 leader = False
 
         if not leader:
-            in_flight.event.wait()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not in_flight.event.wait(remaining):
+                raise AdapterError("runtime request timed out")
             if in_flight.error is not None:
                 raise in_flight.error
             return deepcopy(in_flight.result)

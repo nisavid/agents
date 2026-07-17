@@ -48,6 +48,7 @@ from hindsight_memory_control_plane.migration_adapter import (
 )
 import hindsight_memory_control_plane.migration_adapter as migration_adapter_module
 import hindsight_memory_control_plane.ledger as ledger_module
+import hindsight_memory_control_plane.reconcile as reconcile_module
 from hindsight_memory_control_plane.canonical import canonical_bytes, digest
 from hindsight_memory_control_plane.model import Action, BankRef, EndpointIdentity, Inventory, OperationSnapshot, Plan
 from hindsight_memory_control_plane.planning import PlanError, _compatibility
@@ -1168,6 +1169,42 @@ class HttpAdapterContractTest(AdapterContractMixin, unittest.TestCase):
         self.assertFalse(leader.is_alive())
         self.assertFalse(follower.is_alive())
         self.assertEqual(errors, [failure, failure])
+
+    def test_runtime_result_follower_wait_uses_its_absolute_deadline(self):
+        adapter = HttpAdapter(
+            inventory=inventory_for(self.server.server_port),
+            profile_id="core",
+            token_resolver=lambda: "contract-token",
+            timeout=0.1,
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        requests = []
+        self.addCleanup(release.set)
+
+        def request(method, path, _payload):
+            requests.append((method, path))
+            entered.set()
+            release.wait(CONCURRENCY_TIMEOUT_SECONDS)
+            return {"applied": True}
+
+        adapter._request = request
+        value = {
+            "document_id": "bounded", "epoch": 1, "checkpoint": 1,
+            "idempotency_key": "9" * 64,
+        }
+        leader = threading.Thread(
+            target=lambda: adapter.transcript_checkpoint(value), daemon=True
+        )
+        leader.start()
+        self.assertTrue(entered.wait(CONCURRENCY_TIMEOUT_SECONDS))
+        started = time.monotonic()
+        with self.assertRaisesRegex(AdapterError, "timed out"):
+            adapter.transcript_checkpoint(value)
+        self.assertLess(time.monotonic() - started, 0.5)
+        release.set()
+        leader.join(CONCURRENCY_TIMEOUT_SECONDS)
+        self.assertFalse(leader.is_alive())
         self.assertEqual(requests, [("PUT", "/v1/runtime/transcript-checkpoint")])
 
     @staticmethod
@@ -2196,6 +2233,73 @@ class AdminMigrationAdapterContractTest(unittest.TestCase):
     def private_archive(self, name="bank.zip"):
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         return str(root / name)
+
+    def test_exact_runtime_copy_rejects_truncation_and_one_byte_growth(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        source = root / "source"
+        destination = root / "destination"
+        source.write_bytes(b"runtime")
+        source_descriptor = os.open(source, os.O_RDONLY)
+        destination_descriptor = os.open(
+            destination, os.O_WRONLY | os.O_CREAT, 0o600
+        )
+        try:
+            with self.assertRaisesRegex(FileEvidenceError, "size changed"):
+                migration_adapter_module._copy_exact_descriptor(
+                    source_descriptor, destination_descriptor, 6, "runtime"
+                )
+        finally:
+            os.close(source_descriptor)
+            os.close(destination_descriptor)
+
+        source_descriptor = os.open(source, os.O_RDONLY)
+        try:
+            with self.assertRaisesRegex(FileEvidenceError, "size changed"):
+                migration_adapter_module._copy_exact_descriptor(
+                    source_descriptor, None, 8, "runtime"
+                )
+        finally:
+            os.close(source_descriptor)
+
+    def test_process_group_kill_has_a_bounded_final_wait(self):
+        class Process:
+            pid = 1234
+
+            def poll(self):
+                return None
+
+            def wait(self, timeout):
+                raise subprocess.TimeoutExpired("admin", timeout)
+
+            def kill(self):
+                return None
+
+        with (
+            patch.object(os, "killpg", return_value=None),
+            patch.object(time, "sleep", return_value=None),
+            patch.object(time, "monotonic", side_effect=(0.0, 2.0)),
+            self.assertRaisesRegex(MigrationAdapterError, "did not terminate"),
+        ):
+            AdminMigrationAdapter._terminate_process_group(Process())
+
+    def test_verified_rollback_identity_cache_is_lru_bounded(self):
+        adapter = object.__new__(MigrationApplyAdapter)
+        adapter._verified_rollback_identities = migration_adapter_module.OrderedDict()
+        adapter._verified_rollback_identities_lock = threading.Lock()
+        with patch.object(
+            migration_adapter_module,
+            "MAX_VERIFIED_ROLLBACK_IDENTITIES",
+            2,
+        ):
+            adapter._remember_verified_rollback_identity("first")
+            adapter._remember_verified_rollback_identity("second")
+            self.assertTrue(adapter._rollback_identity_is_verified("first"))
+            adapter._remember_verified_rollback_identity("third")
+
+        self.assertEqual(
+            tuple(adapter._verified_rollback_identities),
+            ("first", "third"),
+        )
 
     @staticmethod
     def bound_admin_args(argv):
@@ -4152,6 +4256,72 @@ class AdminMigrationAdapterContractTest(unittest.TestCase):
 
 
 class GuardedApplyTest(unittest.TestCase):
+    def test_migration_gate_pin_closes_for_bind_and_preflight_interruptions(self):
+        from hindsight_memory_control_plane.reconcile import build_mutation_plan
+
+        with tempfile.TemporaryDirectory() as temporary:
+            descriptor, _, _ = write_migration_gate(
+                Path(temporary), "run-1", MIGRATION_ARTIFACT_DIGEST
+            )
+            base = empty_plan_for({})
+            mutation = build_mutation_plan(
+                base,
+                migration_run_id="run-1",
+                migration_artifact_digest=MIGRATION_ARTIFACT_DIGEST,
+                rollback_archive_digest="5" * 64,
+                rollback_restore_evidence_digest=digest(
+                    restore_evidence("5" * 64)
+                ),
+                actions=[mutation_action()],
+            )
+            mutation = bind_migration_gate(mutation, descriptor)
+
+            for seam in ("bind", "preflight"):
+                with self.subTest(seam=seam):
+                    class Interrupted(FakeAdapter):
+                        def bind_apply_plan(self, rollback):
+                            super().bind_apply_plan(rollback)
+                            if seam == "bind":
+                                raise KeyboardInterrupt("bind interrupted")
+
+                        def preflight_action(self, action):
+                            if seam == "preflight":
+                                raise KeyboardInterrupt("preflight interrupted")
+                            return super().preflight_action(action)
+
+                    adapter = Interrupted(
+                        endpoint=base.target_endpoint.to_dict()
+                    )
+                    rollback = create_rollback_bundle(mutation, adapter)
+
+                    class Pin:
+                        closed = 0
+
+                        def close(self):
+                            self.closed += 1
+
+                    pin = Pin()
+                    with (
+                        patch.object(
+                            reconcile_module,
+                            "_pin_migration_gate",
+                            return_value=pin,
+                        ),
+                        self.assertRaisesRegex(
+                            KeyboardInterrupt, f"{seam} interrupted"
+                        ),
+                    ):
+                        apply_plan(
+                            mutation,
+                            adapter,
+                            mutation.plan_digest,
+                            {
+                                "rollback_bundle": rollback,
+                                "migration_gate": descriptor,
+                            },
+                        )
+                    self.assertEqual(pin.closed, 1)
+
     def test_apply_rejects_empty_planned_compatibility_evidence(self):
         base = plan_for({})
         body = base.body()

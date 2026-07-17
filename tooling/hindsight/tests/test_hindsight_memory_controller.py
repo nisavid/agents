@@ -692,6 +692,11 @@ class ControllerCliTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "duplicate JSON object key: value"):
             strict_json_loads('{"value":1,"value":2}')
 
+    def test_strict_json_wraps_malformed_input_in_domain_error(self):
+        for value in ('{"missing":', b"{not-json}"):
+            with self.subTest(value=value), self.assertRaises(StrictJsonError):
+                strict_json_loads(value)
+
     def test_strict_json_rejects_lone_surrogates_in_keys_and_values(self):
         for encoded in ('{"value":"\\ud800"}', '{"\\udfff":"value"}'):
             with self.subTest(encoded=encoded), self.assertRaisesRegex(
@@ -842,6 +847,21 @@ class ControllerCliTest(unittest.TestCase):
             self.assertIn("create_rollback_bundle", [call["method"] for call in adapter.calls])
             methods = [call["method"] for call in adapter.calls]
             self.assertLess(methods.index("create_rollback_bundle"), methods.index("create_bank"))
+            with (
+                patch.dict(os.environ, {"HINDSIGHT_TEST_TOKEN": "local-test-token"}),
+                patch.dict(
+                    module["apply_command"].__globals__,
+                    {
+                        "inventory_endpoint": lambda *_args: replace(
+                            plan.target_endpoint, port=7980
+                        ),
+                    },
+                ),
+                self.assertRaisesRegex(
+                    module["ApplyError"], "selected inventory and profile"
+                ),
+            ):
+                module["apply_command"](args)
 
     def test_apply_cli_rejects_mutation_base_actions_before_admin_backup(self):
         module = runpy.run_path(str(CLI))
@@ -3282,6 +3302,47 @@ class ControllerCliTest(unittest.TestCase):
 
             self.assertEqual(canonical_bytes(plan.to_dict()), before)
             verify_plan(plan)
+
+    def test_plan_uses_one_detached_live_state_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "inventory.json"
+            self.write_json(path, inventory())
+            desired = load_inventory(path)
+        state = {"banks": []}
+        live = {
+            "profile_id": "core",
+            "endpoint": {
+                "profile_id": "core",
+                "scheme": "http",
+                "host": "127.0.0.1",
+                "port": 7979,
+                "tenant": "default",
+            },
+            "state": state,
+            "compatibility": [],
+        }
+        expected_digest = digest(state)
+        from hindsight_memory_control_plane import planning as planning_module
+
+        real_derive = planning_module._derive_actions
+
+        def mutate_source_then_derive(*args):
+            state["banks"].append({"id": "concurrent"})
+            return real_derive(*args)
+
+        with patch.object(
+            planning_module,
+            "_derive_actions",
+            side_effect=mutate_source_then_derive,
+        ):
+            plan = build_plan(desired, live, {"idle": True, "active": []})
+        self.assertEqual(plan.live_state_digest, expected_digest)
+        self.assertFalse(
+            any(
+                "concurrent" in action.details.get("reason_code", "")
+                for action in plan.actions
+            )
+        )
 
     def test_plan_rejects_duplicate_active_operations_and_compatibility_contradictions(self):
         with tempfile.TemporaryDirectory() as directory:

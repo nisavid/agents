@@ -78,15 +78,15 @@ class StopProfileServicesTest(unittest.TestCase):
             self.assertTrue(self.helper.process_has_open_file(1234, path))
         self.assertEqual(run.call_args.args[0], ["/usr/sbin/lsof", "-Fn", "-p", "1234"])
 
-    def test_stop_control_missing_state_directory_is_a_no_op(self):
+    def test_stop_control_missing_state_directory_still_checks_control_port(self):
+        manager = Manager()
         with (
             tempfile.TemporaryDirectory() as directory,
             patch.object(Path, "home", return_value=Path(directory)),
+            patch.object(self.helper, "DaemonEmbedManager", return_value=manager),
             patch.object(
-                self.helper,
-                "DaemonEmbedManager",
-                side_effect=AssertionError("manager must not be constructed"),
-            ),
+                manager, "_find_pid_on_port", wraps=manager._find_pid_on_port
+            ) as find_pid,
         ):
             self.assertEqual(
                 self.helper.main(
@@ -94,6 +94,7 @@ class StopProfileServicesTest(unittest.TestCase):
                 ),
                 0,
             )
+        find_pid.assert_called_once_with(7977)
 
     def test_stop_control_parent_open_errors_are_stop_errors(self):
         with (

@@ -8,7 +8,15 @@ from .action_contracts import ACTION_SCHEMAS, DESTRUCTIVE_ACTION_KINDS
 from .canonical import digest
 from .endpoint_host import canonical_endpoint_host, is_bare_endpoint_host
 from .inventory import _resolved_artifact
-from .model import Action, EndpointIdentity, Inventory, OperationSnapshot, Plan
+from .model import (
+    Action,
+    EndpointIdentity,
+    Inventory,
+    OperationSnapshot,
+    Plan,
+    deep_freeze,
+    deep_thaw,
+)
 
 
 PLAN_KEYS = {
@@ -808,6 +816,10 @@ def build_plan(inventory: Inventory, live_state: Mapping[str, Any], operations: 
         raise PlanError("live state must explicitly include state")
     if not isinstance(state, Mapping):
         raise PlanError("live state state must be an object")
+    try:
+        state = deep_thaw(deep_freeze(state))
+    except TypeError as error:
+        raise PlanError("live state must contain canonical JSON values") from error
     actions = _derive_actions(
         inventory,
         target_profile,

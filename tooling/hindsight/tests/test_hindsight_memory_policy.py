@@ -447,6 +447,37 @@ class BankPolicyTest(unittest.TestCase):
         )
         self.assertEqual(resolved.machine_default, "personal")
 
+    def test_defaults_and_workspace_routes_require_write_authority(self):
+        for field, value in (("writable", False), ("authority", "replica")):
+            config = public_policy()
+            config["banks"][1][field] = value
+            config["machine_default"] = "personal"
+            with self.subTest(
+                surface="default", field=field
+            ), self.assertRaisesRegex(
+                PolicyError, "machine default.*writable authoritative"
+            ):
+                resolve_policy(
+                    config,
+                    self.catalog,
+                    digest(self.catalog),
+                    private_catalog_ciphertext_digest=CIPHERTEXT_DIGEST,
+                )
+
+            config = public_policy()
+            config["banks"][1][field] = value
+            with self.subTest(
+                surface="workspace", field=field
+            ), self.assertRaisesRegex(
+                PolicyError, "workspace mapping.*writable authoritative"
+            ):
+                resolve_policy(
+                    config,
+                    self.catalog,
+                    digest(self.catalog),
+                    private_catalog_ciphertext_digest=CIPHERTEXT_DIGEST,
+                )
+
     def test_policy_rejects_a_second_writable_engineering_bank(self):
         public = public_policy()
         public["banks"].append(
@@ -590,19 +621,14 @@ class BankPolicyTest(unittest.TestCase):
         for field, value in (("writable", False), ("authority", "replica")):
             config = public_policy()
             config["banks"][1][field] = value
-            policy = resolve_policy(
-                config,
-                self.catalog,
-                digest(self.catalog),
-                private_catalog_ciphertext_digest=CIPHERTEXT_DIGEST,
-            )
             with self.subTest(field=field), self.assertRaisesRegex(
                 PolicyError, "writable authoritative"
             ):
-                resolve_session_route(
-                    policy,
-                    explicit_home_bank="personal",
-                    personal_session=True,
+                resolve_policy(
+                    config,
+                    self.catalog,
+                    digest(self.catalog),
+                    private_catalog_ciphertext_digest=CIPHERTEXT_DIGEST,
                 )
 
     def test_home_and_context_selector_precedence(
@@ -806,6 +832,11 @@ class BankPolicyTest(unittest.TestCase):
         config = public_policy()
         config["banks"][1]["authority"] = "none"
         config["banks"][1]["writable"] = False
+        config["workspace_mappings"] = [
+            mapping
+            for mapping in config["workspace_mappings"]
+            if mapping["bank_id"] != "personal"
+        ]
         with self.assertRaisesRegex(PolicyError, "companions.*authority"):
             resolve_policy(
                 config,
@@ -1826,7 +1857,7 @@ class ProviderCompatibilityTest(unittest.TestCase):
             },
         )
 
-    def test_healthy_desired_fallback_is_used_even_when_candidate_is_activatable(self):
+    def test_desired_candidate_fallback_cannot_replace_current_chain(self):
         providers = [
             *self.providers,
             provider(
@@ -1860,8 +1891,8 @@ class ProviderCompatibilityTest(unittest.TestCase):
         self.assertEqual(
             report.reranking_disposition,
             {
-                "state": "fallback",
-                "provider_id": "alternate-reranker",
+                "state": "disabled",
+                "provider_id": None,
                 "visible_degradation": True,
             },
         )

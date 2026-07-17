@@ -457,15 +457,56 @@ class ControlServer:
                     owner.request_timeout_seconds, expire
                 )
                 timer.daemon = True
+                original = self.rfile
+                self.rfile = _CumulativeHeaderReader(
+                    original, owner.max_request_bytes
+                )
                 try:
                     timer.start()
-                    super().handle_one_request()
+                    try:
+                        super().handle_one_request()
+                    except _HeaderBudgetExceeded:
+                        self.close_connection = True
+                        self.requestline = ""
+                        self.request_version = "HTTP/1.1"
+                        owner._send(
+                            self,
+                            413,
+                            {"error": "REQUEST_TOO_LARGE"},
+                            validate=False,
+                        )
                 finally:
+                    self.rfile = original
                     with self._hindsight_deadline_lock:
                         if self._hindsight_deadline_token is token:
                             self._hindsight_deadline_token = None
                     timer.cancel()
                     self.connection.settimeout(owner.request_timeout_seconds)
+
+            def send_error(
+                self,
+                code: int,
+                message: str | None = None,
+                explain: str | None = None,
+            ) -> None:
+                del message, explain
+                self.close_connection = True
+                if not hasattr(self, "requestline"):
+                    self.requestline = ""
+                if self.request_version == self.default_request_version:
+                    self.request_version = "HTTP/1.1"
+                owner._send(
+                    self,
+                    code if 400 <= code <= 599 else 400,
+                    {
+                        "error": (
+                            "REQUEST_TOO_LARGE"
+                            if code in {413, 414, 431}
+                            else "SCHEMA_INVALID"
+                        )
+                    },
+                    validate=False,
+                )
 
             def parse_request(self) -> bool:
                 original = self.rfile
@@ -1123,5 +1164,5 @@ class ControlServer:
         if handler.close_connection:
             handler.send_header("Connection", "close")
         handler.end_headers()
-        if handler.command != "HEAD":
+        if getattr(handler, "command", None) != "HEAD":
             handler.wfile.write(body)

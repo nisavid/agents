@@ -99,12 +99,13 @@ if kill -0 "$exit_cleanup_pid" >/dev/null 2>&1; then
   print -ru2 -- "EXIT cleanup left a TERM-ignoring fixture running"
   exit 1
 fi
+untrack_fixture_pid "$exit_cleanup_pid"
 
 rendered_stack_lib="$repo_dir/lib/hindsight-embed-stack.zsh"
 
-rg -F -q 'plane is CLI-only:' "$repo_dir/docs/PRD.md" &&
-  rg -F -q 'server-side local-session bootstrap' "$repo_dir/docs/PRD.md" &&
-  rg -F -q 'there is no inline value, reusable default, or browser-auth bootstrap' "$repo_dir/README.md" || {
+rg -F -q 'access_key_resolver' "$repo_dir/README.md" &&
+  rg -F -q 'sole authoritative binding' "$repo_dir/README.md" &&
+  rg -F -q 'No environment variable, file, inline value, reusable default, or browser bootstrap' "$repo_dir/README.md" || {
   print -ru2 -- "control-plane documentation does not preserve the CLI-only browser-auth boundary"
   exit 1
 }
@@ -940,20 +941,24 @@ disabled_status="$tmp_dir/disabled-status.out"
   export HINDSIGHT_EMBED_AUTOSTART_DAEMON=false
   export HINDSIGHT_EMBED_AUTOSTART_UI=false
   source "$rendered_stack_lib"
+  hindsight_stack_set_desired_state daemon stopped present-profile
+  hindsight_stack_set_desired_state ui stopped present-profile
   hindsight_stack_broker_status() { return 0 }
   hindsight_stack_broker_identity_matches() { return 0 }
   hindsight_stack_control_status() { return 0 }
   hindsight_stack_daemon_status() { return 1 }
+  hindsight_stack_daemon_running() { return 1 }
   hindsight_stack_ui_status() { return 1 }
+  hindsight_stack_ui_running() { return 1 }
   hindsight_stack_sidecar_names() { return 0 }
   hindsight_stack_status_report > "$disabled_status"
 )
-rg -F -q 'daemon: disabled' "$disabled_status" || {
-  print -ru2 -- "status did not report an intentionally disabled daemon"
+rg -F -q 'daemon: stopped' "$disabled_status" || {
+  print -ru2 -- "status did not report stopped daemon intent"
   exit 1
 }
-rg -F -q 'ui: disabled' "$disabled_status" || {
-  print -ru2 -- "status did not report an intentionally disabled UI"
+rg -F -q 'ui: stopped' "$disabled_status" || {
+  print -ru2 -- "status did not report stopped UI intent"
   exit 1
 }
 rg -F -q 'fleet: healthy (1 enabled profile)' "$disabled_status" || {
@@ -1385,7 +1390,22 @@ broker_output="$tmp_dir/broker-output"
     done
     return 1
   }
-  hindsight_stack_broker_start >"$broker_output" 2>&1
+  hindsight_stack_broker_start >"$broker_output" 2>&1 || {
+    /bin/cat "$broker_output" >&2
+    exit 1
+  }
+  hindsight_stack_broker_read_process_record
+  started_broker_pid="$HINDSIGHT_STACK_BROKER_PID"
+  if hindsight_stack_broker_terminate_recorded >/dev/null 2>&1; then
+    print -ru2 -- "recorded broker termination signaled a live external PID"
+    exit 1
+  fi
+  /bin/kill -KILL "$started_broker_pid" >/dev/null 2>&1 || true
+  wait "$started_broker_pid" >/dev/null 2>&1 || true
+  for _ in {1..100}; do
+    /bin/kill -0 "$started_broker_pid" >/dev/null 2>&1 || break
+    sleep 0.01
+  done
   hindsight_stack_broker_terminate_recorded
 )
 rg -F -q -- '-I -c ' "$configured_python_calls" || {
@@ -1509,6 +1529,7 @@ if /bin/kill -0 "$failed_broker_process" >/dev/null 2>&1; then
   print -ru2 -- "broker start left its unhealthy child running"
   exit 1
 fi
+untrack_fixture_pid "$failed_broker_process"
 [[ ! -e "$tmp_dir/failed-broker-state/broker-process.identity" ]] || {
   print -ru2 -- "broker start retained an unhealthy process identity"
   exit 1
@@ -1577,6 +1598,18 @@ chmod -N "$acl_stack_dir"
   print -ru2 -- "supervisor sourced a stack library beneath an ACL-bearing ancestor"
   exit 1
 }
+chmod +a 'everyone deny write' "$acl_stack_lib"
+if ! HINDSIGHT_EMBED_STACK_LIB="$acl_stack_lib" \
+  zsh "$repo_dir/bin/hindsight-embed-supervisor" >/dev/null 2>&1; then
+  print -ru2 -- "supervisor rejected a non-permissive deny ACL"
+  exit 1
+fi
+chmod -N "$acl_stack_lib"
+[[ -e "$acl_stack_marker" ]] || {
+  print -ru2 -- "supervisor did not source a stack library with a deny ACL"
+  exit 1
+}
+/bin/rm -f "$acl_stack_marker"
 service_acl_dir="$tmp_dir/service-acl-dir"
 service_acl_file="$service_acl_dir/helper"
 mkdir "$service_acl_dir"
@@ -1594,6 +1627,12 @@ if ( source "$service_lib"; validate_trusted_artifact "$service_acl_file" "ACL a
   exit 1
 fi
 chmod -N "$service_acl_dir"
+chmod +a 'everyone deny write' "$service_acl_file"
+if ! ( source "$service_lib"; validate_trusted_artifact "$service_acl_file" "deny ACL helper" executable ) >/dev/null 2>&1; then
+  print -ru2 -- "service rejected a non-permissive deny ACL"
+  exit 1
+fi
+chmod -N "$service_acl_file"
 if USER=definitely-not-the-current-user \
   HINDSIGHT_EMBED_STACK_LIB="$rendered_stack_lib" \
   zsh "$repo_dir/bin/hindsight-embed-supervisor" >/dev/null 2>&1; then

@@ -120,6 +120,26 @@ def agent_texts(value: Any) -> list[str]:
     return texts
 
 
+def start_owned_process(
+    command: list[str],
+    *,
+    cwd: pathlib.Path,
+    environment: dict[str, str],
+    stderr: Any,
+    run_marker_fd: int,
+) -> subprocess.Popen[bytes]:
+    return subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=environment,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=stderr,
+        bufsize=0,
+        pass_fds=(run_marker_fd,),
+    )
+
+
 def main() -> None:
     if len(sys.argv) not in (10, 11):
         raise SystemExit(
@@ -137,6 +157,9 @@ def main() -> None:
     gateway_port = int(sys.argv[9])
     protected_helper = pathlib.Path(sys.argv[10]).resolve() if len(sys.argv) == 11 else None
     token_env_name = os.environ["CODEX_PROVIDER_TOKEN_ENV"]
+    run_marker = os.environ["CHATGPT_ROUTE_RUN_MARKER"]
+    run_marker_fd = int(os.environ["CHATGPT_ROUTE_RUN_MARKER_FD"])
+    os.fstat(run_marker_fd)
     environment = {
         "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
         "HOME": os.environ["HOME"],
@@ -156,6 +179,8 @@ def main() -> None:
         "all_proxy": f"http://127.0.0.1:{proxy_port}",
         "no_proxy": "127.0.0.1,localhost",
         "RUST_LOG": "info",
+        "CHATGPT_ROUTE_RUN_MARKER": run_marker,
+        "CHATGPT_ROUTE_RUN_MARKER_FD": str(run_marker_fd),
     }
     environment[token_env_name] = os.environ[token_env_name]
     messages: list[dict[str, Any]] = []
@@ -163,16 +188,14 @@ def main() -> None:
     with (log_dir / "host-restart.stderr").open("w") as stderr, (
         log_dir / "host-restart-messages.jsonl"
     ).open("w") as raw:
-        process = subprocess.Popen(
+        process = start_owned_process(
             sandbox_command(
                 profile, real_home, codex, proxy_port, optiq_port, gateway_port, protected_helper
             ),
             cwd=workspace,
-            env=environment,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
+            environment=environment,
             stderr=stderr,
-            bufsize=0,
+            run_marker_fd=run_marker_fd,
         )
         try:
             assert process.stdin is not None and process.stdout is not None

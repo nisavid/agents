@@ -230,8 +230,10 @@ designated requirement, and the unchanged copied Codex binary. It separately
 requires the source ASAR to retain its vendor hash.
 
 Final cleanup owns the copied app, host, renderer, proxy, gateway, observer,
-and OptiQ process groups. The verdict stays red unless all groups are gone, all
-reserved listeners are closed, no remote socket remains, no generated token is
-present in regular disposable state, and all isolated databases pass their
-integrity checks. The run root and copied app remain as disposable local
+and OptiQ process groups. Environment and open-file ownership witnesses keep
+reparented, re-sessioned, or environment-clearing descendants in the cleanup
+gate. The verdict stays red unless all groups and witnessed descendants are
+gone, all reserved listeners are closed, no remote socket remains, no generated
+token is present in regular disposable state, and all isolated databases pass
+their integrity checks. The run root and copied app remain as disposable local
 evidence until manually removed.

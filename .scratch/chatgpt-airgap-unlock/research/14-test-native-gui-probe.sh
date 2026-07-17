@@ -294,19 +294,40 @@ for event in events:
 assert events[0]["fixtureSha256"] == baseline["fixtureSha256"]
 assert events[-1]["fixtureSha256"] == baseline["fixtureSha256"]
 
-sensitive_pattern = re.compile(
-    r"bearer\s+|authorization:|sk-[a-z0-9_-]{8,}|https?://", re.IGNORECASE)
+sensitive_patterns = (
+    re.compile(r"\bbearer\s+\S+", re.IGNORECASE),
+    re.compile(r"\bsk-[a-z0-9_.-]{8,}", re.IGNORECASE),
+    re.compile(
+        r"(?<![a-z0-9])(?:--?)?(?:[a-z0-9]+[-_])*"
+        r"(?:authorization|credential|password|secret|token|api[-_]?key|"
+        r"access[-_]?token|client[-_]?secret)"
+        r"(?:[\"']?\s*[:=]\s*|[ \t]+)[\"']?[^\s\"']+",
+        re.IGNORECASE,
+    ),
+    re.compile(r"https?://", re.IGNORECASE),
+)
 for sample in (
     "Authorization: Bearer retained-secret",
     "sk-proj-retained_secret",
     "https://remote.example.invalid/v1",
+    "--token retained-secret",
+    "--api-key retained-secret",
+    "accessToken=retained-secret",
+    "clientSecret=retained-secret",
+    "Authorization: Basic retained-secret",
+    "token: retained-secret",
+    '{"token":"retained-secret"}',
+    "OPENAI_API_KEY=retained-secret",
+    "GH_TOKEN=retained-secret",
+    "X-API-Key: retained-secret",
+    "Proxy-Authorization: Basic retained-secret",
 ):
-    assert sensitive_pattern.search(sample), sample
+    assert any(pattern.search(sample) for pattern in sensitive_patterns), sample
 
 for path in root.iterdir():
     assert not path.is_symlink() and path.is_file()
     text = path.read_text(encoding="utf-8")
-    assert not sensitive_pattern.search(text)
+    assert not any(pattern.search(text) for pattern in sensitive_patterns)
 PY
 
 printf 'native GUI probe deterministic tests passed\n'

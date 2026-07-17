@@ -282,11 +282,14 @@ def test_provider_files_and_exec() -> None:
             sandbox("08-provider.sb", definitions, provider_python, "-P", "-c", read, provider_python),
             "provider runtime read",
         )
-        home_sentinel = real_home / ".codex/memories/MEMORY.md"
-        assert home_sentinel.is_file()
+        synthetic_real_home = root / "real-home"
+        synthetic_real_home.mkdir()
+        home_sentinel = synthetic_real_home / "sentinel.txt"
+        home_sentinel.write_text("known existing sentinel\n")
+        home_definitions = {**definitions, "REAL_HOME": str(synthetic_real_home)}
         assert_denied_after_control(
             "08-provider.sb",
-            definitions,
+            home_definitions,
             "provider unrelated home read",
             provider_python,
             "-P",

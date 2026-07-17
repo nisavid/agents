@@ -1,4 +1,10 @@
+name: Conventional commit compliance
+
 on: [push]
+
+concurrency:
+  group: conventional-commits-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read

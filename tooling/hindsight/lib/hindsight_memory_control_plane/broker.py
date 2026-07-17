@@ -84,6 +84,7 @@ MAX_DURABLE_SESSION_BYTES = 8 * 1024 * 1024
 MAX_DURABLE_EXCHANGE_BYTES = 8 * 1024 * 1024
 MAX_DURABLE_NONCE_BYTES = 2 * 1024 * 1024
 MAX_DURABLE_HANDLE_BYTES = 8 * 1024 * 1024
+MIN_PAYLOAD_BYTES = 4 * 1024
 MAX_PAYLOAD_BYTES = MAX_DURABLE_QUEUE_ENTRY_BYTES
 
 
@@ -335,7 +336,9 @@ class Broker:
         )
         if (
             type(max_payload_bytes) is not int
-            or not 0 <= max_payload_bytes <= MAX_PAYLOAD_BYTES
+            or not MIN_PAYLOAD_BYTES
+            <= max_payload_bytes
+            <= MAX_PAYLOAD_BYTES
         ):
             raise BrokerError("MAX_PAYLOAD_BYTES_INVALID")
         self._state_dir_fd = _open_state_directory(self.state_dir)
@@ -776,7 +779,9 @@ class Broker:
             "expires_at": result["expires_at"],
         })
 
-    def _read_work(self) -> dict[str, Any]:
+    def _read_work(
+        self, *, allow_ledger_unavailable: bool = False
+    ) -> dict[str, Any]:
         value, migrated = self._migrate_work(
             _read_json(
                 self._work_path,
@@ -784,7 +789,9 @@ class Broker:
                 directory_fd=self._state_dir_fd,
             )
         )
-        validated = self._validate_work(value)
+        validated = self._validate_work(
+            value, allow_ledger_unavailable=allow_ledger_unavailable
+        )
         if migrated:
             _atomic_json(
                 self._work_path,
@@ -793,7 +800,9 @@ class Broker:
             )
         return validated
 
-    def _validate_work(self, value: Any) -> dict[str, Any]:
+    def _validate_work(
+        self, value: Any, *, allow_ledger_unavailable: bool = False
+    ) -> dict[str, Any]:
         if not isinstance(value, dict) or set(value) != set(self._empty_work()):
             raise BrokerError("STATE_INVALID")
         if (
@@ -857,7 +866,11 @@ class Broker:
                 validate_record(entry["record"])
             except LedgerError:
                 raise BrokerError("STATE_INVALID") from None
-        if value["ledger_outbox"] and self.ledger_path is None:
+        if (
+            value["ledger_outbox"]
+            and self.ledger_path is None
+            and not allow_ledger_unavailable
+        ):
             raise BrokerError("LEDGER_UNAVAILABLE")
         for session_id, session in value["sessions"].items():
             if (
@@ -1191,13 +1204,16 @@ class Broker:
         mutation: Callable[[dict[str, Any]], Any],
         *,
         runtime: bool = False,
+        allow_ledger_unavailable: bool = False,
     ) -> Any:
         descriptor = self._lease_descriptor()
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX)
             if runtime:
                 self._ensure_runtime_open()
-            current = self._read_work()
+            current = self._read_work(
+                allow_ledger_unavailable=allow_ledger_unavailable
+            )
             if current.get("generation") != self._generation:
                 raise BrokerError("BROKER_RETIRED")
             value = deepcopy(current)
@@ -2636,32 +2652,6 @@ class Broker:
     def session_close(self, capability: str, *, sequence: int, action_id: str, timeout_seconds: float = 2) -> dict[str, Any]:
         timeout = self._timeout(timeout_seconds)
         claims, _, action_digest = self._authorize(capability, "session_close", sequence, action_id, commit=False)
-        with self._lock:
-            existing_state = self._work["sessions"].get(claims["session_id"])
-            already_closed = (
-                isinstance(existing_state, dict)
-                and existing_state.get("closed") is True
-                and action_id in existing_state.get("action_ids", [])
-                and existing_state.get("sequence") == sequence
-            )
-        if already_closed:
-            with self._lock:
-                existing_queue_ids = [
-                    item["queue_id"]
-                    for item in self._work["queue"]
-                    if item["session_id"] == claims["session_id"]
-                    and item["idempotency_key"] == action_digest
-                ]
-                for existing_queue_id in existing_queue_ids:
-                    self._submit_write(existing_queue_id, runtime=True)
-            pending = self._wait_for_session_barrier(
-                claims["session_id"], timeout
-            )
-            ledger_written = self._flush_ledger_outbox(action_digest)
-            return self._close_response(
-                action_id, action_digest, claims["session_id"], ledger_written,
-                pending=pending,
-            )
         final_document = f"final-{hashlib.sha256(claims['session_id'].encode()).hexdigest()[:32]}"
         final_request = {"document_id": final_document, "epoch": 0, "checkpoint": sequence}
         queue_id = secrets.token_hex(16)
@@ -2683,6 +2673,24 @@ class Broker:
         ledger_record = self._session_close_ledger_record(claims, action_id)
         with self._lock:
             def close(work):
+                existing_state = work["sessions"].get(
+                    claims["session_id"]
+                )
+                if (
+                    isinstance(existing_state, dict)
+                    and existing_state.get("closed") is True
+                    and action_id
+                    in existing_state.get("action_ids", [])
+                    and existing_state.get("sequence") == sequence
+                ):
+                    return [
+                        queued["queue_id"]
+                        for queued in work["queue"]
+                        if queued["session_id"] == claims["session_id"]
+                        and queued["idempotency_key"] == action_digest
+                    ]
+                if work["ledger_outbox"] and self.ledger_path is None:
+                    raise BrokerError("LEDGER_UNAVAILABLE")
                 self._append_queue_item(work, item)
                 self._commit_action(
                     work, claims, "session_close", sequence, action_id
@@ -2703,8 +2711,14 @@ class Broker:
                         raise BrokerError("QUEUE_FULL")
                 if not self._durable_aggregates_within_limits(work):
                     raise BrokerError("STATE_FULL")
-            self._transaction(close, runtime=True)
-            self._submit_write(queue_id, runtime=True)
+                return [queue_id]
+            close_queue_ids = self._transaction(
+                close,
+                runtime=True,
+                allow_ledger_unavailable=True,
+            )
+            for close_queue_id in close_queue_ids:
+                self._submit_write(close_queue_id, runtime=True)
         pending = self._wait_for_session_barrier(
             claims["session_id"], timeout
         )

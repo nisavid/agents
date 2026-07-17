@@ -984,7 +984,9 @@ class HttpAdapterContractTest(AdapterContractMixin, unittest.TestCase):
             return_value={"bank_id": "other", "config": {}, "overrides": {}},
         ), self.assertRaisesRegex(AdapterError, "identity drifted"):
             self.adapter._read_migration_bank(
-                "source", BankRef("core", "engineering")
+                "source",
+                BankRef("core", "engineering"),
+                deadline=time.monotonic() + 5,
             )
 
     def test_destructive_migration_actions_have_no_direct_http_route(self):
@@ -1279,6 +1281,37 @@ class HttpAdapterSecurityTest(unittest.TestCase):
                     profile_id="core",
                     token_resolver=lambda: "contract-token",
                 )
+
+    def test_migration_inventory_uses_one_aggregate_deadline(self):
+        adapter = HttpAdapter(
+            inventory=inventory_for(7979),
+            profile_id="core",
+            token_resolver=lambda: "token",
+        )
+        observed = []
+
+        def request(_method, _path, _payload=None, *, deadline=None):
+            observed.append(deadline)
+            return {}
+
+        def read_bank(_role, bank, *, deadline):
+            observed.append(deadline)
+            return ({"bank_ref": bank.to_dict()}, [], [], [])
+
+        with (
+            patch.object(adapter, "_request", side_effect=request),
+            patch.object(adapter, "_migration_versions", return_value={}),
+            patch.object(adapter, "_read_migration_bank", side_effect=read_bank),
+            patch.object(adapter, "_declared_provider_identity", return_value={}),
+            patch.object(adapter, "_validate_migration_inventory"),
+        ):
+            adapter.read_migration_inventory(
+                BankRef("core", "source"),
+                BankRef("core", "candidate"),
+            )
+        self.assertEqual(len(observed), 3)
+        self.assertIsNotNone(observed[0])
+        self.assertEqual(observed, [observed[0]] * len(observed))
 
     def test_bearer_token_rejects_header_injection_and_header_value_errors(self):
         injected = HttpAdapter(
@@ -4082,6 +4115,38 @@ class AdminMigrationAdapterContractTest(unittest.TestCase):
 
         self.assertFalse(target.exists())
         self.assertEqual(list(displaced.glob(".hindsight-archive-*")), [])
+
+    def test_output_publication_reattests_destination_after_link(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        target = root / "rollback.zip"
+        def write_archive(argv):
+            Path(argv[4]).write_bytes(self.ARCHIVE_PAYLOAD)
+            return {"returncode": 0, "stdout": "Complete"}
+
+        adapter, _ = self.make_admin(write_archive)
+        real_link = os.link
+
+        def replace_after_link(source, destination, **kwargs):
+            real_link(source, destination, **kwargs)
+            directory = kwargs["dst_dir_fd"]
+            os.unlink(destination, dir_fd=directory)
+            descriptor = os.open(
+                destination,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o400,
+                dir_fd=directory,
+            )
+            try:
+                os.write(descriptor, b"replacement")
+            finally:
+                os.close(descriptor)
+
+        with (
+            patch.object(os, "link", side_effect=replace_after_link),
+            self.assertRaisesRegex(MigrationAdapterError, "identity changed"),
+        ):
+            adapter.backup(str(target), self.ARCHIVE_DIGEST)
+        self.assertEqual(target.read_bytes(), b"replacement")
 
     def test_interrupted_publication_never_unlinks_replacement_recovery_name(self):
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))

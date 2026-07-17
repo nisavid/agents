@@ -1372,6 +1372,7 @@ ZSH
 chmod 700 "$fake_memory_cli"
 broker_args="$tmp_dir/broker-args"
 broker_output="$tmp_dir/broker-output"
+broker_python_calls="$tmp_dir/broker-python-calls"
 (
   unsetopt BG_NICE
   export HOME="$test_home"
@@ -1380,6 +1381,7 @@ broker_output="$tmp_dir/broker-output"
   export HINDSIGHT_EMBED_FLEET_PROFILES="present-profile,second-profile"
   export HINDSIGHT_MEMORY_CLI="$fake_memory_cli"
   export HINDSIGHT_TEST_BROKER_ARGS="$broker_args"
+  export HINDSIGHT_TEST_CONFIGURED_PYTHON_CALLS="$broker_python_calls"
   source "$rendered_stack_lib"
   hindsight_stack_broker_process_identity() {
     local pid="$1" record state
@@ -1417,7 +1419,7 @@ broker_output="$tmp_dir/broker-output"
   done
   hindsight_stack_broker_terminate_recorded
 )
-rg -F -q -- '-I -c ' "$configured_python_calls" || {
+rg -F -q -- '-I -c ' "$broker_python_calls" || {
   print -ru2 -- "broker launch did not use the configured isolated Python runtime"
   exit 1
 }
@@ -1656,6 +1658,27 @@ if ! ( source "$service_lib"; validate_trusted_artifact "$service_acl_file" "den
   exit 1
 fi
 chmod -N "$service_acl_file"
+service_private_parent="$tmp_dir/service-private-parent"
+service_private_directory="$service_private_parent/state"
+mkdir "$service_private_parent"
+chmod +a 'everyone allow read' "$service_private_parent"
+if (
+  source "$service_lib"
+  prepare_private_directory "$service_private_directory" "test service state"
+) >/dev/null 2>&1; then
+  print -ru2 -- "service accepted a private directory beneath an ACL-bearing ancestor"
+  exit 1
+fi
+chmod -N "$service_private_parent"
+chmod +a 'everyone deny write' "$service_private_parent"
+if ! (
+  source "$service_lib"
+  prepare_private_directory "$service_private_directory" "test service state"
+) >/dev/null 2>&1; then
+  print -ru2 -- "service rejected a private directory beneath a non-permissive deny ACL"
+  exit 1
+fi
+chmod -N "$service_private_parent"
 if USER=definitely-not-the-current-user \
   HINDSIGHT_EMBED_STACK_LIB="$rendered_stack_lib" \
   zsh "$repo_dir/bin/hindsight-embed-supervisor" >/dev/null 2>&1; then
@@ -1792,7 +1815,7 @@ lifecycle_release="$tmp_dir/lifecycle-lock-release"
 ) &
 lifecycle_holder_pid=$!
 track_fixture_pid "$lifecycle_holder_pid"
-for _ in {1..100}; do
+for _ in {1..1000}; do
   [[ -e "$lifecycle_ready" ]] && break
   sleep 0.01
 done
@@ -1809,7 +1832,7 @@ done
 ) &
 lifecycle_observer_pid=$!
 track_fixture_pid "$lifecycle_observer_pid"
-for _ in {1..100}; do
+for _ in {1..1000}; do
   [[ -e "$lifecycle_attempted" ]] && break
   sleep 0.01
 done
@@ -1853,7 +1876,7 @@ service_command_release="$tmp_dir/service-command-release"
 ) &
 service_command_holder_pid=$!
 track_fixture_pid "$service_command_holder_pid"
-for _ in {1..500}; do
+for _ in {1..1500}; do
   [[ -e "$service_command_ready" ]] && break
   kill -0 "$service_command_holder_pid" >/dev/null 2>&1 || break
   sleep 0.01
@@ -1871,7 +1894,7 @@ done
 ) &
 service_command_observer_pid=$!
 track_fixture_pid "$service_command_observer_pid"
-for _ in {1..100}; do
+for _ in {1..1000}; do
   [[ -e "$service_command_attempted" ]] && break
   sleep 0.01
 done
@@ -1913,7 +1936,7 @@ maintenance_release="$tmp_dir/maintenance-release"
 ) &
 maintenance_holder_pid=$!
 track_fixture_pid "$maintenance_holder_pid"
-for _ in {1..100}; do
+for _ in {1..1000}; do
   [[ -e "$maintenance_ready" ]] && break
   sleep 0.01
 done

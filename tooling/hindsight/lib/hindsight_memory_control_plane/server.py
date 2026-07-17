@@ -325,11 +325,11 @@ class UnixJsonRpcServer:
                         self._connection, connection, connection_slots
                     )
                     self._connection_futures.add(future)
-                    future.add_done_callback(
-                        lambda completed, admitted=connection: self._complete_connection(
-                            completed, admitted, connection_slots
-                        )
+                future.add_done_callback(
+                    lambda completed, admitted=connection: self._complete_connection(
+                        completed, admitted, connection_slots
                     )
+                )
             except RuntimeError:
                 connection.close()
                 connection_slots.release()

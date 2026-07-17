@@ -748,7 +748,11 @@ wait_for_api() {
   for attempt in {1..240}; do
     if "$CURL" --noproxy '*' --silent --show-error --fail --max-time 2 \
       "http://127.0.0.1:$port/health" >/dev/null 2>&1; then
-      return 0
+      if api_identity_matches "$pid" &&
+        /usr/sbin/lsof -nP -a -p "$pid" -iTCP:"$port" -sTCP:LISTEN 2>/dev/null |
+          /usr/bin/awk -v expected="$pid" 'NR > 1 && $2 == expected { found = 1 } END { exit !found }'; then
+        return 0
+      fi
     fi
     kill -0 "$pid" >/dev/null 2>&1 || {
       print -u2 -- "disposable Hindsight API exited before becoming healthy"

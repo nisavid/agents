@@ -764,6 +764,10 @@ def build_plan(inventory: Inventory, live_state: Mapping[str, Any], operations: 
     if not isinstance(inventory, Inventory):
         raise PlanError("validated inventory is required")
     raw_inventory = inventory.body()
+    if not hmac.compare_digest(
+        digest(raw_inventory), inventory.inventory_digest
+    ):
+        raise PlanError("inventory digest is not canonical")
     base_port = raw_inventory["machine"].get("base_port", 7979)
     engineering_enabled = raw_inventory["machine"].get(
         "engineering_memory_enabled", False

@@ -142,6 +142,7 @@ prepare_private_directory() {
     fi
     owner="$(/usr/bin/stat -f '%u' "$ancestor")" || die "failed to inspect ${label}: ${ancestor}"
     mode="$(/usr/bin/stat -f '%Lp' "$ancestor")" || die "failed to inspect ${label} mode: ${ancestor}"
+    validate_no_acl "$ancestor" "$label ancestor"
     (( owner == EUID || owner == 0 )) || die "${label} ancestor is not trusted: ${ancestor}"
     if (( (8#$mode & 8#0022) != 0 && !(owner == 0 && (8#$mode & 8#01000) != 0) )); then
       die "${label} ancestor is group or world writable: ${ancestor}"
@@ -152,6 +153,7 @@ prepare_private_directory() {
   mode="$(/usr/bin/stat -f '%Lp' "$directory")" || die "failed to inspect ${label} mode"
   (( owner == EUID && (8#$mode & 8#0077) == 0 )) ||
     die "${label} must be private and owned by the current user"
+  validate_no_acl "$directory" "$label"
   validate_trusted_directory_ancestry "$directory" "$label"
   validate_trusted_directory_ancestry "${directory:A}" "$label"
 }
@@ -170,6 +172,7 @@ validate_trusted_directory_ancestry() {
     fi
     owner="$(/usr/bin/stat -f '%u' "$ancestor")" || die "failed to inspect ${label}: ${ancestor}"
     mode="$(/usr/bin/stat -f '%Lp' "$ancestor")" || die "failed to inspect ${label} mode: ${ancestor}"
+    validate_no_acl "$ancestor" "$label ancestor"
     (( owner == EUID || owner == 0 )) || die "${label} ancestor is not trusted: ${ancestor}"
     if (( (8#$mode & 8#0022) != 0 && !(owner == 0 && (8#$mode & 8#01000) != 0) )); then
       die "${label} ancestor is group or world writable: ${ancestor}"

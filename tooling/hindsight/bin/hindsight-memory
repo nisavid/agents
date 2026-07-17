@@ -1442,11 +1442,17 @@ def broker_serve_command(args: argparse.Namespace) -> int:
                     if _process_running(existing_identity.pid):
                         raise BrokerError("BROKER_PID_IDENTITY_INVALID")
                 if _read_broker_pid_entry(directory, pid_path.name) == existing_identity:
+                    if _process_running(existing_identity.pid):
+                        if _process_identity_matches(existing_identity):
+                            raise BrokerError("BROKER_ALREADY_RUNNING")
+                        raise BrokerError("BROKER_PID_IDENTITY_INVALID")
                     os.unlink(pid_path.name, dir_fd=directory)
                     os.fsync(directory)
             if socket_path.exists() or socket_path.is_symlink():
                 if not _broker_state_directory_matches(state_dir, directory):
                     raise BrokerError("BROKER_PATH_INVALID")
+                if _broker_probe(socket_path):
+                    raise BrokerError("BROKER_ALREADY_RUNNING")
                 if _broker_probe(socket_path):
                     raise BrokerError("BROKER_ALREADY_RUNNING")
                 _remove_broker_socket_entry(directory, socket_path.name)
@@ -1563,6 +1569,8 @@ def broker_stop_command(args: argparse.Namespace) -> int:
         if identity is None:
             if _broker_probe(socket_path):
                 raise BrokerError("BROKER_PID_INVALID")
+            if _broker_probe(socket_path):
+                raise BrokerError("BROKER_PID_INVALID")
             _remove_broker_socket_entry(directory, socket_path.name)
             return 0
         if _process_running(identity.pid):
@@ -1593,6 +1601,8 @@ def broker_stop_command(args: argparse.Namespace) -> int:
                     continue
                 current_identity = _read_broker_pid_entry(directory, pid_path.name)
                 if current_identity == identity:
+                    if _broker_probe(socket_path, timeout=probe_timeout):
+                        raise BrokerError("BROKER_PID_INVALID")
                     _remove_broker_socket_entry(directory, socket_path.name)
                     os.unlink(pid_path.name, dir_fd=directory)
                     os.fsync(directory)

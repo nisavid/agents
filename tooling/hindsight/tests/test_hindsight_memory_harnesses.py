@@ -674,11 +674,12 @@ class HarnessActivationTest(unittest.TestCase):
 
         self.assertEqual(
             (outcome.status, outcome.reason),
-            ("rollback_failed", "postcheck_failed"),
+            ("rolled_back", "postcheck_failed"),
         )
-        self.assertEqual(len(writes), 1)
+        self.assertEqual(len(writes), 2)
         self.assertEqual(destination["concurrent"], "preserve")
         self.assertEqual(outcome.configuration, destination)
+        self.assertFalse(destination["active"])
 
     def test_invalid_unhashable_retired_keys_fail_closed(self):
         forged = replace(self.plan, retired_keys=([],))

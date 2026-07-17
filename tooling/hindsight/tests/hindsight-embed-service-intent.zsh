@@ -188,26 +188,17 @@ lease_file="$lease_state/.maintenance.lock"
 chmod 600 "$lease_file"
 (
   STATE_DIR="$lease_state"
-  lease_ready="$tmp_dir/lease-ready"
-  lease_release="$tmp_dir/lease-release"
-  (
-    zmodload zsh/system
-    integer held_descriptor
-    zsystem flock -f held_descriptor -t 1 "$lease_file"
-    touch "$lease_ready"
-    while [[ ! -e "$lease_release" ]]; do sleep 0.01; done
-    zsystem flock -u "$held_descriptor"
-  ) &
-  holder_pid=$!
-  for _ in {1..100}; do [[ -e "$lease_ready" ]] && break; sleep 0.01; done
-  [[ -e "$lease_ready" ]]
-  integer proof_descriptor
-  exec {proof_descriptor}<"$lease_file"
-  HINDSIGHT_EMBED_MAINTENANCE_LEASE_DESCRIPTOR="$proof_descriptor" \
+  integer lease_descriptor
+  exec {lease_descriptor}<>"$lease_file"
+  /usr/bin/python3 -I -c \
+    'import fcntl, sys; fcntl.flock(int(sys.argv[1]), fcntl.LOCK_EX)' \
+    "$lease_descriptor"
+  HINDSIGHT_EMBED_MAINTENANCE_LEASE_DESCRIPTOR="$lease_descriptor" \
     validate_inherited_maintenance_lease
-  exec {proof_descriptor}>&-
-  touch "$lease_release"
-  wait "$holder_pid"
+  /usr/bin/python3 -I -c \
+    'import fcntl, sys; fcntl.flock(int(sys.argv[1]), fcntl.LOCK_UN)' \
+    "$lease_descriptor"
+  exec {lease_descriptor}>&-
 )
 if (
   STATE_DIR="$lease_state"

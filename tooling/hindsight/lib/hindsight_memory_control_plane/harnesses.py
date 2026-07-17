@@ -580,12 +580,7 @@ def apply_activation(
             rollback_current = read_configuration()
         except Exception:
             rollback_current = None
-        if (
-            not isinstance(rollback_current, Mapping)
-            or not hmac.compare_digest(
-                digest(rollback_current), digest(persisted)
-            )
-        ):
+        if not isinstance(rollback_current, Mapping):
             configuration = (
                 deep_thaw(deep_freeze(rollback_current))
                 if isinstance(rollback_current, Mapping)

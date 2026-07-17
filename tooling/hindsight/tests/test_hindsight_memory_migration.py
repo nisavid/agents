@@ -404,6 +404,20 @@ class MigrationDiscoveryContractTest(unittest.TestCase):
                     },
                 )
 
+    def test_malformed_semantic_scope_is_omitted_before_global_fallback(self):
+        self.assertEqual(
+            migration_module._coverage_scope(
+                {"scopes": ["workflow:"], "tags": []},
+                {"tags": []},
+                {
+                    "canonical": ["repo:one"],
+                    "aliases": {},
+                    "drop_aliases": [],
+                },
+            ),
+            ("omit", "unknown-semantic-scope", None),
+        )
+
     def test_snapshot_rejects_duplicate_and_noncanonical_scope_digest(self):
         snapshot = migration_inventory()
         snapshot["banks"]["source"]["scopes"] = ["repo:dotfiles", "repo:dotfiles"]

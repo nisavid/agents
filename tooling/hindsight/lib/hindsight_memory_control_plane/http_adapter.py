@@ -247,7 +247,19 @@ class HttpAdapter:
             raise AdapterError("JSON request is invalid") from None
         return b"".join(chunks)
 
-    def _request(self, method: str, path: str, payload: Mapping[str, Any] | None = None) -> Any:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        payload: Mapping[str, Any] | None = None,
+        *,
+        deadline: float | None = None,
+    ) -> Any:
+        request_deadline = time.monotonic() + self.timeout
+        if deadline is not None:
+            request_deadline = min(request_deadline, deadline)
+        if request_deadline <= time.monotonic():
+            raise AdapterError("endpoint request timed out")
         try:
             token = self._token_resolver()
         except Exception:
@@ -278,12 +290,12 @@ class HttpAdapter:
                 overflow = len(self.recordings) - self._max_recordings
                 if overflow > 0:
                     del self.recordings[:overflow]
-        deadline = time.monotonic() + self.timeout
         try:
             with self._opener.open(
-                request, timeout=max(0.001, deadline - time.monotonic())
+                request,
+                timeout=max(0.001, request_deadline - time.monotonic()),
             ) as response:
-                remaining = deadline - time.monotonic()
+                remaining = request_deadline - time.monotonic()
                 if remaining <= 0:
                     raise AdapterError("endpoint request timed out")
                 response_socket = self._response_socket(response)
@@ -315,7 +327,7 @@ class HttpAdapter:
                 reader.start()
                 try:
                     raw = read_result.result(
-                        timeout=max(0.0, deadline - time.monotonic())
+                        timeout=max(0.0, request_deadline - time.monotonic())
                     )
                 except FutureTimeout:
                     if response_socket is not None:
@@ -328,7 +340,7 @@ class HttpAdapter:
                     except OSError:
                         pass
                     raise AdapterError("endpoint request timed out")
-                if time.monotonic() > deadline:
+                if time.monotonic() > request_deadline:
                     raise AdapterError("endpoint request timed out")
                 if len(raw) > self.max_json_bytes:
                     raise AdapterError("JSON response exceeds configured size limit")
@@ -717,15 +729,18 @@ class HttpAdapter:
             raise AdapterError("migration inventory requires explicit bank references")
         if source_bank.profile_id != self.endpoint.profile_id or candidate_bank.profile_id != self.endpoint.profile_id:
             raise AdapterError("migration banks must use the selected profile")
+        deadline = time.monotonic() + self.timeout
         versions = self._migration_versions(
-            self._request("GET", "/version")
+            self._request("GET", "/version", deadline=deadline)
         )
         banks: dict[str, Any] = {}
         hooks: list[dict[str, Any]] = []
         schedules: list[dict[str, Any]] = []
         active_operations: list[dict[str, Any]] = []
         for role, bank in (("source", source_bank), ("candidate", candidate_bank)):
-            bank_snapshot, bank_hooks, bank_schedules, bank_operations = self._read_migration_bank(role, bank)
+            bank_snapshot, bank_hooks, bank_schedules, bank_operations = self._read_migration_bank(
+                role, bank, deadline=deadline
+            )
             banks[role] = bank_snapshot
             hooks.extend(bank_hooks)
             schedules.extend(bank_schedules)
@@ -924,6 +939,7 @@ class HttpAdapter:
         collection: str = "items",
         total_required: bool = True,
         limit: int | None = None,
+        deadline: float | None = None,
     ) -> list[Any]:
         page_limit = self.PAGE_LIMIT if limit is None else limit
         if type(page_limit) is not int or not 1 <= page_limit <= self.PAGE_LIMIT:
@@ -940,7 +956,11 @@ class HttpAdapter:
                 raise AdapterError("paginated discovery response exceeds byte limit")
             separator = "&" if "?" in path else "?"
             page_path = f"{path}{separator}{urlencode({'limit': page_limit, 'offset': offset})}"
-            page = self._request("GET", page_path)
+            page = (
+                self._request("GET", page_path)
+                if deadline is None
+                else self._request("GET", page_path, deadline=deadline)
+            )
             pages += 1
             page_items = page.get(collection)
             if not isinstance(page_items, list):
@@ -1056,25 +1076,40 @@ class HttpAdapter:
             "content_digest": hashlib.sha256(content.encode("utf-8")).hexdigest(),
         }
 
-    def _read_migration_bank(self, role: str, bank: BankRef):
+    def _read_migration_bank(
+        self, role: str, bank: BankRef, *, deadline: float
+    ):
         base = self._bank_path(bank)
-        config = self._safe_config(self._request("GET", f"{base}/config"))
+        config = self._safe_config(
+            self._request("GET", f"{base}/config", deadline=deadline)
+        )
         if config["bank_id"] != bank.bank_id:
             raise AdapterError("bank configuration response identity drifted")
         stats = self._migration_stats(
-            self._request("GET", f"{base}/stats"),
+            self._request("GET", f"{base}/stats", deadline=deadline),
             expected_bank_id=bank.bank_id,
         )
         scopes, scopes_digest = self._migration_scopes(
-            self._request("GET", f"{base}/observations/scopes")
+            self._request(
+                "GET", f"{base}/observations/scopes", deadline=deadline
+            )
         )
-        tags = self._safe_migration_tags(self._read_items(f"{base}/tags"))
-        documents = [self._migration_document(item) for item in self._read_items(f"{base}/documents")]
+        tags = self._safe_migration_tags(
+            self._read_items(f"{base}/tags", deadline=deadline)
+        )
+        documents = [
+            self._migration_document(item)
+            for item in self._read_items(
+                f"{base}/documents", deadline=deadline
+            )
+        ]
         document_ids = [item["document_id"] for item in documents]
         if len(document_ids) != len(set(document_ids)):
             raise AdapterError("migration document response identity is duplicated")
         raw_models = self._read_items(
-            f"{base}/mental-models?detail=full", total_required=False
+            f"{base}/mental-models?detail=full",
+            total_required=False,
+            deadline=deadline,
         )
         models = self._closed_content_records(
             raw_models, collection="models", identity_label="model_id"
@@ -1083,14 +1118,19 @@ class HttpAdapter:
             self._read_items(
                 f"{base}/directives?active_only=false",
                 total_required=False,
+                deadline=deadline,
             ),
             collection="directives",
             identity_label="directive_id",
         )
-        webhooks_response = self._request("GET", f"{base}/webhooks")
+        webhooks_response = self._request(
+            "GET", f"{base}/webhooks", deadline=deadline
+        )
         invalidations = [
             self._migration_invalidation(item)
-            for item in self._read_items(f"{base}/memories/list?state=invalidated")
+            for item in self._read_items(
+                f"{base}/memories/list?state=invalidated", deadline=deadline
+            )
         ]
         invalidation_ids = [item["item_id"] for item in invalidations]
         if len(invalidation_ids) != len(set(invalidation_ids)):
@@ -1101,6 +1141,7 @@ class HttpAdapter:
                 f"{base}/operations?{urlencode({'status': status})}",
                 collection="operations",
                 limit=100,
+                deadline=deadline,
             ):
                 if not isinstance(operation, Mapping) or not isinstance(operation.get("id"), str):
                     raise AdapterError("migration operation response is invalid")

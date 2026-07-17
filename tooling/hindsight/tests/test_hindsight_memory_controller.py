@@ -1106,6 +1106,7 @@ class ControllerCliTest(unittest.TestCase):
                     args.migration_archive = [str(path) for path in candidates]
                     admin_calls = []
                     process_contexts = []
+                    admin_process_contexts = []
                     observed_import = {}
 
                     def run_admin(argv, **_kwargs):
@@ -1141,6 +1142,7 @@ class ControllerCliTest(unittest.TestCase):
                         )
                         admin_argv = argv[3:]
                         admin_calls.append(admin_argv)
+                        admin_process_contexts.append(_kwargs)
                         if admin_argv[0] == "backup":
                             self.assertEqual(pass_fds, (execution_fd,))
                             Path(admin_argv[1]).write_bytes(rollback_payload)
@@ -1211,7 +1213,7 @@ class ControllerCliTest(unittest.TestCase):
                     ))
                     self.assertTrue(all(
                         context["env"].get("HINDSIGHT_API_DATABASE_URL") == "postgresql://approved"
-                        for context in process_contexts
+                        for context in admin_process_contexts
                     ))
 
             evidence_path.write_bytes(b"\xff")
@@ -2223,7 +2225,7 @@ class ControllerCliTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertFalse(pid_path.exists())
 
-    def test_broker_stop_binds_outer_and_locked_probes_to_recorded_pid(self):
+    def test_broker_stop_binds_identity_probes_and_rechecks_generic_socket(self):
         module = runpy.run_path(str(CLI))
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory) / "state"
@@ -2252,13 +2254,58 @@ class ControllerCliTest(unittest.TestCase):
             ):
                 self.assertEqual(module["broker_stop_command"](args), 0)
 
-            self.assertEqual(probe.call_count, 2)
+            self.assertEqual(probe.call_count, 3)
             self.assertTrue(
                 all(
                     call.kwargs.get("expected_pid") == 12345
-                    for call in probe.call_args_list
+                    for call in probe.call_args_list[:2]
                 )
             )
+            self.assertNotIn("expected_pid", probe.call_args_list[2].kwargs)
+
+    def test_broker_stop_never_unlinks_a_new_responsive_generic_socket(self):
+        module = runpy.run_path(str(CLI))
+        broker_error = module["BrokerError"]
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            state.mkdir(mode=0o700)
+            pid_path = state / "broker.pid"
+            pid_path.write_text(
+                json.dumps({"pid": 12345, "start_time": "process-start"}),
+                encoding="ascii",
+            )
+            os.chmod(pid_path, 0o600)
+            args = module["argparse"].Namespace(
+                state_dir=str(state),
+                socket=str(state / "broker.sock"),
+                timeout=0.02,
+            )
+            identity_calls = 0
+
+            def identity_matches(_identity):
+                nonlocal identity_calls
+                identity_calls += 1
+                return identity_calls == 1
+
+            def probe(_socket, **kwargs):
+                return "expected_pid" not in kwargs
+
+            remove = Mock()
+            with (
+                patch.dict(
+                    module["broker_stop_command"].__globals__,
+                    {
+                        "_process_running": lambda _pid: True,
+                        "_process_identity_matches": identity_matches,
+                        "_terminate_broker_process": Mock(),
+                        "_broker_probe": probe,
+                        "_remove_broker_socket_entry": remove,
+                    },
+                ),
+                self.assertRaisesRegex(broker_error, "BROKER_PID_INVALID"),
+            ):
+                module["broker_stop_command"](args)
+            remove.assert_not_called()
 
     def test_broker_stop_fails_closed_when_shutdown_rpc_is_unavailable(self):
         module = runpy.run_path(str(CLI))
@@ -4581,6 +4628,32 @@ class ControllerCliTest(unittest.TestCase):
         forged = replace(desired, artifact_digest="0" * 64)
         with self.assertRaisesRegex(PlanError, "inventory artifact digest"):
             build_plan(forged, {}, {})
+
+    def test_planning_rejects_inventory_without_canonical_inventory_digest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "inventory.json"
+            self.write_json(path, inventory())
+            desired = load_inventory(path)
+        forged = replace(desired, inventory_digest="0" * 64)
+        with self.assertRaisesRegex(PlanError, "inventory digest"):
+            build_plan(forged, {}, {})
+
+    def test_scalar_and_list_role_bindings_have_one_resolved_shape(self):
+        scalar = inventory()
+        listed = copy.deepcopy(scalar)
+        listed["profiles"][0]["roles"] = {
+            role: [provider]
+            for role, provider in scalar["profiles"][0]["roles"].items()
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            loaded = []
+            for name, value in (("scalar", scalar), ("list", listed)):
+                path = root / f"{name}.json"
+                self.write_json(path, value)
+                loaded.append(load_inventory(path))
+        self.assertNotEqual(loaded[0].inventory_digest, loaded[1].inventory_digest)
+        self.assertEqual(loaded[0].artifact_digest, loaded[1].artifact_digest)
 
 
 if __name__ == "__main__":

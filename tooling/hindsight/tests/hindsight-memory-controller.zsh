@@ -211,6 +211,21 @@ supervisor_root_checks="$(rg -F -c '[[ "$path" == / ]] && break' "$repo_dir/bin/
 [[ "$supervisor_root_checks" == 1 ]] ||
   fail "supervisor ancestry validation does not terminate immediately after checking root exactly once"
 
+supervisor_acl_dir="$tmp_dir/supervisor-acl-dir"
+supervisor_acl_lib="$supervisor_acl_dir/stack.zsh"
+supervisor_acl_marker="$tmp_dir/supervisor-acl-sourced"
+mkdir "$supervisor_acl_dir"
+print -r -- "touch ${(q)supervisor_acl_marker}; exit 0" >"$supervisor_acl_lib"
+chmod 600 "$supervisor_acl_lib"
+chmod +a 'everyone allow read' "$supervisor_acl_dir"
+if HINDSIGHT_EMBED_STACK_LIB="$supervisor_acl_lib" \
+  zsh "$repo_dir/bin/hindsight-embed-supervisor" >/dev/null 2>&1; then
+  fail "supervisor accepted a stack library beneath an ACL-bearing ancestor"
+fi
+chmod -N "$supervisor_acl_dir"
+[[ ! -e "$supervisor_acl_marker" ]] ||
+  fail "supervisor sourced a stack library beneath an ACL-bearing ancestor"
+
 export HINDSIGHT_EMBED_UVX=/usr/bin/true
 export HINDSIGHT_EMBED_CONTROL_PORT=7878
 export HINDSIGHT_EMBED_CONTROL_HOSTNAME=127.0.0.1

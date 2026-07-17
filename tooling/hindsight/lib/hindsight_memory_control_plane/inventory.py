@@ -628,9 +628,11 @@ def _resolved_artifact(
             ),
             "tenant": profile.get("tenant", "default"),
             "roles": {
-                role: sorted(provider_ids)
-                if isinstance(provider_ids, list)
-                else provider_ids
+                role: sorted(
+                    provider_ids
+                    if isinstance(provider_ids, list)
+                    else [provider_ids]
+                )
                 for role, provider_ids in roles.items()
             },
             "data_classes": sorted(profile.get("data_classes", [])),

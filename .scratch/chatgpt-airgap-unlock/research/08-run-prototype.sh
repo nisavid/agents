@@ -223,12 +223,18 @@ run_cold_handoff_self_test() (
   marker_probe_file="$self_test_root/process-marker.txt"
   marker_probe_pid_file="$self_test_root/reparented-pid.txt"
   printf '%s\n' "$marker_probe" >"$marker_probe_file"
+  exec 9<"$marker_probe_file"
+  marker_probe_identity="$(/usr/sbin/lsof -nP -F Di -- "$marker_probe_file")"
+  marker_probe_device="$(printf '%s\n' "$marker_probe_identity" | /usr/bin/awk '/^D/ {print substr($0, 2)}')"
+  marker_probe_inode="$(printf '%s\n' "$marker_probe_identity" | /usr/bin/awk '/^i/ {print substr($0, 2)}')"
+  test -n "$marker_probe_device"
+  test -n "$marker_probe_inode"
   CHATGPT_ROUTE_RUN_MARKER="$marker_probe" \
+    CHATGPT_ROUTE_RUN_MARKER_FD=9 \
     /usr/bin/python3 - "$marker_probe_pid_file" <<'PY' &
 import os
 import pathlib
 import sys
-import time
 
 first = os.fork()
 if first:
@@ -240,7 +246,11 @@ if second:
     os._exit(0)
 os.setpgid(0, 0)
 pathlib.Path(sys.argv[1]).write_text(str(os.getpid()), encoding="utf-8")
-time.sleep(10)
+os.execve(
+    "/usr/bin/env",
+    ["/usr/bin/env", "-i", "PATH=/usr/bin:/bin", "/bin/sleep", "10"],
+    {},
+)
 PY
   marker_probe_launcher=$!
   wait "$marker_probe_launcher"
@@ -260,8 +270,25 @@ PY
       /usr/bin/env -i PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
         /usr/bin/python3 "$PROCESS_MARKER" filter "$marker_probe_file" "$$"
   )"
+  exec 9<&-
+  /bin/rm "$marker_probe_file"
+  printf '%s\n' replacement >"$marker_probe_file"
+  marker_fd_matches="$(
+    /usr/sbin/lsof -nP -d 9 -F pDi | /usr/bin/awk \
+      -v expected_device="$marker_probe_device" \
+      -v expected_inode="$marker_probe_inode" '
+        function emit() {
+          if (pid != "" && device == expected_device && inode == expected_inode) print pid
+        }
+        /^p/ { emit(); pid=substr($0, 2); device=""; inode=""; next }
+        /^D/ { device=substr($0, 2); next }
+        /^i/ { inode=substr($0, 2); next }
+        END { emit() }
+      '
+  )"
   /bin/kill -TERM "$marker_probe_pid" 2>/dev/null || true
-  test "$marker_probe_matches" = "$marker_probe_pid"
+  test -z "$marker_probe_matches"
+  test "$marker_fd_matches" = "$marker_probe_pid"
   validate_native_picker_default_path_seam true true true
   if validate_native_picker_default_path_seam true false true 2>"$self_test_root/default-path.stderr"; then
     echo "native picker default-path seam accepted GUI_NATIVE_PROJECT_PICKER=false" >&2
@@ -401,7 +428,120 @@ RUN_MARKER="chatgpt-route-ownership-$(/usr/bin/uuidgen | /usr/bin/tr -d '-' | /u
 RUN_MARKER_FILE="$RUN_ROOT/process-ownership-marker.txt"
 printf '%s\n' "$RUN_MARKER" >"$RUN_MARKER_FILE"
 chmod 400 "$RUN_MARKER_FILE"
+exec 9<"$RUN_MARKER_FILE"
 export CHATGPT_ROUTE_RUN_MARKER="$RUN_MARKER"
+export CHATGPT_ROUTE_RUN_MARKER_FD=9
+marker_fd_identity="$(/usr/sbin/lsof -nP -F Di -- "$RUN_MARKER_FILE")"
+RUN_MARKER_DEVICE="$(printf '%s\n' "$marker_fd_identity" | /usr/bin/awk '/^D/ {print substr($0, 2)}')"
+RUN_MARKER_INODE="$(printf '%s\n' "$marker_fd_identity" | /usr/bin/awk '/^i/ {print substr($0, 2)}')"
+test -n "$RUN_MARKER_DEVICE"
+test -n "$RUN_MARKER_INODE"
+unset marker_fd_identity
+ownership_witness_open=true
+
+marker_survivor_pids() {
+  marker_helper="$PROCESS_MARKER"
+  if test -f "${PROCESS_MARKER_EXEC:-}"; then marker_helper="$PROCESS_MARKER_EXEC"; fi
+  marker_ps_stderr="$RUN_ROOT/.ownership-ps.stderr"
+  if marker_ps_snapshot="$(
+    /usr/bin/env -u CHATGPT_ROUTE_RUN_MARKER \
+      /bin/ps eww -axo pid=,command= 2>"$marker_ps_stderr"
+  )" && test ! -s "$marker_ps_stderr"; then
+    /bin/rm -f "$marker_ps_stderr"
+  else
+    /bin/rm -f "$marker_ps_stderr"
+    return 70
+  fi
+  printf '%s\n' "$marker_ps_snapshot" | \
+    /usr/bin/env -i PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+      /usr/bin/python3 "$marker_helper" filter "$RUN_MARKER_FILE" "$$"
+}
+
+marker_fd_survivor_pids() {
+  marker_lsof_stderr="$RUN_ROOT/.ownership-lsof.stderr"
+  if marker_lsof_snapshot="$(
+    /usr/sbin/lsof -nP -d 9 -F pDi 2>"$marker_lsof_stderr"
+  )" && test ! -s "$marker_lsof_stderr"; then
+    /bin/rm -f "$marker_lsof_stderr"
+  else
+    /bin/rm -f "$marker_lsof_stderr"
+    return 70
+  fi
+  printf '%s\n' "$marker_lsof_snapshot" | /usr/bin/awk \
+    -v expected_device="$RUN_MARKER_DEVICE" \
+    -v expected_inode="$RUN_MARKER_INODE" \
+    -v excluded_pid="$$" '
+      function emit() {
+        if (pid != "" && pid != excluded_pid && device == expected_device && inode == expected_inode) print pid
+      }
+      /^p/ { emit(); pid=substr($0, 2); device=""; inode=""; next }
+      /^D/ { device=substr($0, 2); next }
+      /^i/ { inode=substr($0, 2); next }
+      END { emit() }
+    '
+}
+
+ownership_survivor_pids() {
+  environment_pids="$(marker_survivor_pids)" || return 70
+  descriptor_pids="$(marker_fd_survivor_pids)" || return 70
+  printf '%s\n%s\n' "$environment_pids" "$descriptor_pids" | \
+    /usr/bin/awk 'NF' | /usr/bin/sort -nu
+}
+
+close_ownership_witness() {
+  if test "${ownership_witness_open:-false}" = true; then
+    exec 9<&-
+    ownership_witness_open=false
+  fi
+}
+
+ownership_pid_is_current() {
+  checked_pid="$1"
+  checked_survivors="$(ownership_survivor_pids)" || return 70
+  for checked_survivor in $checked_survivors; do
+    if test "$checked_survivor" = "$checked_pid"; then return 0; fi
+  done
+  return 1
+}
+
+signal_current_ownership_pid() {
+  checked_signal="$1"
+  checked_pid="$2"
+  if ownership_pid_is_current "$checked_pid"; then
+    /bin/kill "-$checked_signal" "$checked_pid" 2>/dev/null || true
+  else
+    checked_status="$?"
+    if test "$checked_status" -ne 1; then return "$checked_status"; fi
+  fi
+}
+
+cleanup_witnessed_survivors() {
+  for cleanup_round in 1 2 3 4 5 6 7 8 9 10; do
+    cleanup_survivors="$(ownership_survivor_pids)" || return 70
+    if test -z "$cleanup_survivors"; then return 0; fi
+    for cleanup_pid in $cleanup_survivors; do
+      signal_current_ownership_pid TERM "$cleanup_pid" || return 70
+    done
+    sleep 0.1
+    cleanup_survivors="$(ownership_survivor_pids)" || return 70
+    for cleanup_pid in $cleanup_survivors; do
+      signal_current_ownership_pid KILL "$cleanup_pid" || return 70
+    done
+    sleep 0.1
+  done
+  final_cleanup_survivors="$(ownership_survivor_pids)" || return 70
+  test -z "$final_cleanup_survivors"
+}
+
+ownership_cleanup_on_exit() {
+  status="$?"
+  trap - EXIT INT TERM
+  close_ownership_witness
+  cleanup_witnessed_survivors || true
+  release_lock
+  exit "$status"
+}
+trap 'ownership_cleanup_on_exit' EXIT
 model_list_isolated=false
 NATIVE_GUI_PROBE_PROTECTED_PATH="$RUN_ROOT/.native-gui-probe-disabled"
 test ! -e "$NATIVE_GUI_PROBE_PROTECTED_PATH"
@@ -841,16 +981,18 @@ cleanup() {
   sleep 1
   for pid in $(owned_pids); do signal_owned KILL "$pid"; done
   for pid in $(owned_pids); do wait "$pid" 2>/dev/null || true; done
-  release_lock
 }
 
-marker_survivor_pids() {
-  /usr/bin/env -u CHATGPT_ROUTE_RUN_MARKER \
-    /bin/ps eww -axo pid=,command= | \
-    /usr/bin/env -i PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
-      /usr/bin/python3 "$PROCESS_MARKER_EXEC" filter "$RUN_MARKER_FILE" "$$"
+cleanup_on_exit() {
+  status="$?"
+  trap - EXIT INT TERM
+  cleanup
+  close_ownership_witness
+  cleanup_witnessed_survivors || true
+  release_lock
+  exit "$status"
 }
-trap 'status=$?; trap - EXIT INT TERM; cleanup; exit "$status"' EXIT
+trap 'cleanup_on_exit' EXIT
 trap 'record_top_level_signal INT 130' INT
 trap 'record_top_level_signal TERM 143' TERM
 
@@ -1050,6 +1192,7 @@ fi
 if test "$GUI_WORKFLOW" = false; then
   /usr/bin/env -i \
     CHATGPT_ROUTE_RUN_MARKER="$RUN_MARKER" \
+    CHATGPT_ROUTE_RUN_MARKER_FD="$CHATGPT_ROUTE_RUN_MARKER_FD" \
     PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
     HOME="$HOME_DIR" \
     CODEX_HOME="$CODEX_DIR" \
@@ -1071,6 +1214,7 @@ if test "$GUI_WORKFLOW" = false; then
   THREAD_ID="$(/usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["thread_id"])' "$LOG_DIR/host-summary.json")"
   /usr/bin/env -i \
     CHATGPT_ROUTE_RUN_MARKER="$RUN_MARKER" \
+    CHATGPT_ROUTE_RUN_MARKER_FD="$CHATGPT_ROUTE_RUN_MARKER_FD" \
     PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
     HOME="$HOME_DIR" \
     CODEX_HOME="$CODEX_DIR" \
@@ -1659,7 +1803,7 @@ if test "$source_app_asar_after" = "$SOURCE_APP_ASAR_SHA256"; then source_app_as
 /usr/bin/codesign --verify --deep --strict "$APP"
 
 cleanup
-trap - EXIT INT TERM
+close_ownership_witness
 if test "$ROUTE_MODE" = gateway; then
   refresh_gateway_log_observations
 fi
@@ -1675,19 +1819,34 @@ for pid in $(owned_pids); do
     owned_processes_exited=false
   fi
 done
-surviving_marked_process_pids="$(marker_survivor_pids)"
+ownership_detection_succeeded=true
+if surviving_marked_process_pids="$(ownership_survivor_pids)"; then
+  :
+else
+  ownership_detection_succeeded=false
+  owned_processes_exited=false
+  surviving_marked_process_pids=""
+fi
 surviving_marked_process_pids_after_emergency=""
 if test -n "$surviving_marked_process_pids"; then
   owned_processes_exited=false
-  for pid in $surviving_marked_process_pids; do
-    /bin/kill -TERM "$pid" 2>/dev/null || true
-  done
-  sleep 0.2
-  for pid in $surviving_marked_process_pids; do
-    /bin/kill -KILL "$pid" 2>/dev/null || true
-  done
-  surviving_marked_process_pids_after_emergency="$(marker_survivor_pids)"
+  if cleanup_witnessed_survivors; then
+    :
+  else
+    ownership_cleanup_status="$?"
+    if test "$ownership_cleanup_status" -eq 70; then
+      ownership_detection_succeeded=false
+    fi
+  fi
+  if surviving_marked_process_pids_after_emergency="$(ownership_survivor_pids)"; then
+    :
+  else
+    ownership_detection_succeeded=false
+    surviving_marked_process_pids_after_emergency=""
+  fi
 fi
+release_lock
+trap - EXIT INT TERM
 owned_listeners_closed=true
 for port in "$CDP_PORT" "$PROXY_PORT" "$UPSTREAM_OBSERVER_PORT" "$OPTIQ_PORT" "$GATEWAY_PORT"; do
   if /usr/sbin/lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
@@ -1749,6 +1908,7 @@ done
   printf 'REMOTE_SOCKET_OBSERVED=%s\n' "$remote_socket_observed"
   printf 'TOKEN_LEAK_OBSERVED=%s\n' "$token_leak_observed"
   printf 'OWNED_PROCESSES_EXITED=%s\n' "$owned_processes_exited"
+  printf 'OWNERSHIP_DETECTION_SUCCEEDED=%s\n' "$ownership_detection_succeeded"
   printf 'SURVIVING_MARKED_PROCESS_PIDS=%s\n' \
     "$(printf '%s' "$surviving_marked_process_pids" | /usr/bin/tr '\n' ' ')"
   printf 'SURVIVING_MARKED_PROCESS_PIDS_AFTER_EMERGENCY=%s\n' \
@@ -1827,6 +1987,7 @@ fi
 test "$remote_socket_observed" = false
 test "$token_leak_observed" = false
 test "$owned_processes_exited" = true
+test "$ownership_detection_succeeded" = true
 test -z "$surviving_marked_process_pids_after_emergency"
 test "$owned_listeners_closed" = true
 test "$native_picker_asar_header_expected" = true

@@ -186,9 +186,12 @@ runner gate. The runner refuses the installed application as an input or
 destination.
 
 All app, host, gateway, observer, proxy, and OptiQ processes belong to the
-disposable run. Cleanup terminates those process groups, verifies that every
-reserved loopback listener is closed, and scans final sockets and regular
-disposable state files for remote authorities and generated token canaries.
+disposable run. Cleanup terminates those process groups and checks both an
+inherited environment marker and an inherited open-file witness, so a child
+that reparents, creates a new session, and clears its environment still keeps
+the verdict red. It also verifies that every reserved loopback listener is
+closed and scans final sockets and regular disposable state files for remote
+authorities and generated token canaries.
 
 ## Decision
 

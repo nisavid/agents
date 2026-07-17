@@ -678,7 +678,7 @@ class ControllerCliTest(unittest.TestCase):
             ):
                 canonical_bytes({"value": value})
 
-    def test_canonical_json_uses_rfc8785_key_and_number_serialization(self):
+    def test_canonical_json_uses_rfc8785_rules_within_the_bounded_profile(self):
         self.assertEqual(
             canonical_bytes({"value": 1e-6, "tiny": 1e-7}),
             b'{"tiny":1e-7,"value":0.000001}',
@@ -1632,6 +1632,32 @@ class ControllerCliTest(unittest.TestCase):
             with patch.object(module["os"], "geteuid", return_value=actual_uid + 1):
                 with self.assertRaisesRegex(broker_error, "BROKER_PATH_INVALID"):
                     module["_private_broker_state"](state)
+
+    def test_broker_state_creation_tolerates_a_concurrent_creator(self):
+        module = runpy.run_path(str(CLI))
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state"
+            real_mkdir = module["os"].mkdir
+            raced = False
+
+            def racing_mkdir(path, mode=0o777, *, dir_fd=None):
+                nonlocal raced
+                if path == state.name and not raced:
+                    raced = True
+                    real_mkdir(path, mode, dir_fd=dir_fd)
+                    raise FileExistsError(path)
+                return real_mkdir(path, mode, dir_fd=dir_fd)
+
+            with patch.object(module["os"], "mkdir", side_effect=racing_mkdir):
+                descriptor = module["_open_broker_state_directory"](
+                    state, create=True
+                )
+            try:
+                self.assertTrue(raced)
+                self.assertTrue(state.is_dir())
+                self.assertEqual(stat.S_IMODE(os.fstat(descriptor).st_mode), 0o700)
+            finally:
+                os.close(descriptor)
 
     def test_broker_private_reads_reject_unsafe_or_symlinked_ancestors(self):
         module = runpy.run_path(str(CLI))

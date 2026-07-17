@@ -718,8 +718,12 @@ def _open_broker_state_directory(
                         os.close(descriptor)
                         return None
                     raise BrokerError("BROKER_PATH_INVALID") from None
-                os.mkdir(component, 0o700, dir_fd=descriptor)
-                os.fsync(descriptor)
+                try:
+                    os.mkdir(component, 0o700, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+                else:
+                    os.fsync(descriptor)
                 child = os.open(component, flags, dir_fd=descriptor)
             except OSError as error:
                 raise BrokerError("BROKER_PATH_INVALID") from error

@@ -17,6 +17,10 @@ MAX_GIT_OUTPUT_BYTES = 32 * 1024 * 1024
 MAX_GIT_OBJECT_BYTES = 16 * 1024 * 1024
 MAX_METADATA_OBJECT_BYTES = 1024 * 1024
 MAX_INPUT_FILE_BYTES = 16 * 1024 * 1024
+MAX_PUBLICATION_SCAN_BYTES = 256 * 1024 * 1024
+MAX_PUBLICATION_COMMITS = 10_000
+MAX_PUBLICATION_DIFF_RECORDS = 1_000_000
+MAX_WILDCARD_MATCH_WORK = 64 * 1024 * 1024
 CONFUSABLES = str.maketrans({
     "А": "a", "В": "b", "Е": "e", "К": "k", "М": "m", "Н": "h",
     "О": "o", "Р": "p", "С": "c", "Т": "t", "Х": "x", "У": "y",
@@ -50,6 +54,17 @@ class ValidationError(Exception):
 @dataclass(frozen=True)
 class ValidatedCatalog:
     forbidden_literals: tuple[str, ...]
+
+
+@dataclass
+class _WorkBudget:
+    remaining: int
+    rejection_code: str
+
+    def consume(self, amount: int) -> None:
+        if amount < 0 or amount > self.remaining:
+            reject(self.rejection_code)
+        self.remaining -= amount
 
 
 def reject(code: str) -> NoReturn:
@@ -474,6 +489,7 @@ def validate_synthetic_migration_cases() -> None:
 def git(
     repo_root: Path, *args: str, text: bool = True,
     max_bytes: int = MAX_GIT_OUTPUT_BYTES,
+    inspection_budget: _WorkBudget | None = None,
 ) -> str | bytes:
     process = None
     try:
@@ -490,6 +506,8 @@ def git(
             reject("git_inspection_limit")
         if process.wait() != 0:
             reject("git_inspection")
+        if inspection_budget is not None:
+            inspection_budget.consume(len(payload))
         return payload.decode("utf-8") if text else payload
     except (OSError, UnicodeDecodeError):
         if process is not None and process.poll() is None:
@@ -499,10 +517,20 @@ def git(
 
 
 def git_object(
-    repo_root: Path, object_type: str, object_id: str, *, max_bytes: int
+    repo_root: Path,
+    object_type: str,
+    object_id: str,
+    *,
+    max_bytes: int,
+    inspection_budget: _WorkBudget | None = None,
 ) -> bytes:
     rendered_size = git(
-        repo_root, "cat-file", "-s", object_id, max_bytes=64
+        repo_root,
+        "cat-file",
+        "-s",
+        object_id,
+        max_bytes=64,
+        inspection_budget=inspection_budget,
     ).strip()
     if not rendered_size.isascii() or not rendered_size.isdigit():
         reject("git_inspection")
@@ -510,7 +538,9 @@ def git_object(
         reject("git_inspection_limit")
     return git(
         repo_root, "cat-file", object_type, object_id,
-        text=False, max_bytes=max_bytes,
+        text=False,
+        max_bytes=max_bytes,
+        inspection_budget=inspection_budget,
     )
 
 
@@ -527,9 +557,18 @@ def bounded_file_bytes(path: Path, *, max_bytes: int = MAX_INPUT_FILE_BYTES) -> 
     return payload
 
 
-def contains_forbidden(payload: bytes | str, forbidden: tuple[str, ...]) -> bool:
+def contains_forbidden(
+    payload: bytes | str,
+    forbidden: tuple[str, ...],
+    *,
+    wildcard_budget: _WorkBudget | None = None,
+) -> bool:
     if not payload:
         return False
+    if wildcard_budget is None:
+        wildcard_budget = _WorkBudget(
+            MAX_WILDCARD_MATCH_WORK, "wildcard_match_limit"
+        )
 
     def disclosure_normalize(value: str) -> str:
         def strip_ignorable_characters(text: str) -> str:
@@ -551,31 +590,57 @@ def contains_forbidden(payload: bytes | str, forbidden: tuple[str, ...]) -> bool
             else character
             for character in compatibility
         )
-        return strip_ignorable_characters(separated).casefold()
+        stripped = strip_ignorable_characters(separated).casefold()
+        return re.sub(r"-+", "-", stripped)
 
     needles = tuple(
         disclosure_normalize(value) for value in forbidden
     )
 
-    def contains(text: str) -> bool:
+    def contains_with_markers(text: str, needle: str) -> bool:
+        if not needle or len(text) < len(needle):
+            return False
+        wildcard_budget.consume(len(text))
+        masks: dict[str, int] = {}
+        for index, character in enumerate(needle):
+            masks[character] = masks.get(character, 0) | (1 << index)
+        all_positions = (1 << len(needle)) - 1
+        terminal = 1 << (len(needle) - 1)
+        state = 0
+        unaudited = 0
+        unaudited_limit = max(1, len(needle) // 4)
+        for index, character in enumerate(text):
+            if character == UNAUDITED_SCRIPT_MARKER:
+                character_mask = all_positions
+                unaudited += 1
+            else:
+                character_mask = masks.get(character, 0)
+            if (
+                index >= len(needle)
+                and text[index - len(needle)] == UNAUDITED_SCRIPT_MARKER
+            ):
+                unaudited -= 1
+            state = ((state << 1) | 1) & character_mask
+            if (
+                index >= len(needle) - 1
+                and state & terminal
+                and 0 < unaudited <= unaudited_limit
+            ):
+                return True
+        return False
+
+    def contains(text: str, *, allow_wildcards: bool = True) -> bool:
         normalized = disclosure_normalize(text)
         for needle in needles:
             if needle in normalized:
                 return True
-            if UNAUDITED_SCRIPT_MARKER not in normalized:
+            if (
+                not allow_wildcards
+                or UNAUDITED_SCRIPT_MARKER not in normalized
+            ):
                 continue
-            for start in range(max(0, len(normalized) - len(needle) + 1)):
-                window = normalized[start : start + len(needle)]
-                unaudited = window.count(UNAUDITED_SCRIPT_MARKER)
-                if (
-                    0 < unaudited <= max(1, len(needle) // 4)
-                    and all(
-                    actual == expected
-                    or actual == UNAUDITED_SCRIPT_MARKER
-                    for actual, expected in zip(window, needle)
-                    )
-                ):
-                    return True
+            if contains_with_markers(normalized, needle):
+                return True
         return False
 
     if isinstance(payload, str):
@@ -599,7 +664,13 @@ def contains_forbidden(payload: bytes | str, forbidden: tuple[str, ...]) -> bool
                     strict_decode_succeeded = True
             except (UnicodeDecodeError, UnicodeError):
                 text = candidate.decode(encoding, errors="ignore")
-            if contains(text):
+            plausible_multibyte_text = (
+                encoding == "utf-8"
+                or candidate.count(b"\0") * 4 >= len(candidate)
+            )
+            if contains(
+                text, allow_wildcards=plausible_multibyte_text
+            ):
                 return True
     return not strict_decode_succeeded
 
@@ -626,6 +697,10 @@ def validate_encoding_adversaries() -> None:
         reject("unicode_unaudited_script_publication_disclosure_bypass")
     if not contains_forbidden("private\u2011control\uff0dplane-marker", forbidden):
         reject("unicode_separator_publication_disclosure_bypass")
+    if not contains_forbidden(
+        "private\u2011\u2003\uff0dcontrol-plane-marker", forbidden
+    ):
+        reject("unicode_separator_run_publication_disclosure_bypass")
     mark_obscured = "\u0301".join(forbidden[0])
     if not contains_forbidden(mark_obscured, forbidden):
         reject("unicode_mark_publication_disclosure_bypass")
@@ -636,16 +711,48 @@ def validate_encoding_adversaries() -> None:
         mixed = b"\xff" + forbidden[0].encode(encoding)
         if not contains_forbidden(mixed, forbidden):
             reject(f"mixed_invalid_prefix_{encoding}_publication_disclosure_bypass")
+    try:
+        contains_forbidden(
+            "privaтe-control-plane-marker",
+            forbidden,
+            wildcard_budget=_WorkBudget(1, "wildcard_match_limit"),
+        )
+    except ValidationError as error:
+        if error.code != "wildcard_match_limit":
+            reject("wildcard_match_wrong_rejection")
+    else:
+        reject("wildcard_match_limit_bypass")
 
 
 def validate_publication_range(
-    repo_root: Path, publication_base: str, forbidden: tuple[str, ...]
+    repo_root: Path,
+    publication_base: str,
+    forbidden: tuple[str, ...],
+    *,
+    inspection_budget: _WorkBudget | None = None,
+    wildcard_budget: _WorkBudget | None = None,
 ) -> None:
+    if inspection_budget is None:
+        inspection_budget = _WorkBudget(
+            MAX_PUBLICATION_SCAN_BYTES, "publication_scan_limit"
+        )
+    if wildcard_budget is None:
+        wildcard_budget = _WorkBudget(
+            MAX_WILDCARD_MATCH_WORK, "wildcard_match_limit"
+        )
     base_sha = git(
-        repo_root, "rev-parse", "--verify", f"{publication_base}^{{commit}}"
+        repo_root,
+        "rev-parse",
+        "--verify",
+        f"{publication_base}^{{commit}}",
+        inspection_budget=inspection_budget,
     ).strip()
     head_sha = git(
-        repo_root, "rev-parse", "--verify", "HEAD^{commit}"
+        repo_root,
+        "rev-parse",
+        "--verify",
+        "HEAD^{commit}",
+        inspection_budget=inspection_budget,
     ).strip()
     if base_sha == head_sha:
         reject("publication_base_equals_head")
@@ -663,45 +770,83 @@ def validate_publication_range(
         reject("publication_base_not_ancestor")
     if ancestry.returncode != 0:
         reject("git_inspection")
-    base_tree = git(repo_root, "ls-tree", "-r", "-z", base_sha, text=False)
-    base_blobs: set[tuple[str, bytes]] = set()
-    for record in base_tree.split(b"\0"):
-        if not record:
-            continue
-        metadata, raw_path = record.split(b"\t", 1)
-        _mode, object_type, object_id = metadata.decode("ascii").split()
-        if object_type == "blob":
-            base_blobs.add((object_id, raw_path))
     commits = git(
-        repo_root, "rev-list", "--reverse", f"{base_sha}..{head_sha}"
+        repo_root,
+        "rev-list",
+        "--reverse",
+        f"{base_sha}..{head_sha}",
+        inspection_budget=inspection_budget,
     ).splitlines()
-    scanned: set[tuple[str, bytes]] = set()
+    if len(commits) > MAX_PUBLICATION_COMMITS:
+        reject("publication_scan_limit")
+    scanned_blobs: set[str] = set()
+    diff_records = 0
     for commit in commits:
         commit_object = git_object(
-            repo_root, "commit", commit, max_bytes=MAX_METADATA_OBJECT_BYTES
+            repo_root,
+            "commit",
+            commit,
+            max_bytes=MAX_METADATA_OBJECT_BYTES,
+            inspection_budget=inspection_budget,
         )
-        if contains_forbidden(commit_object, forbidden):
+        if contains_forbidden(
+            commit_object, forbidden, wildcard_budget=wildcard_budget
+        ):
             reject("publication_range_disclosure")
-        tree = git(repo_root, "ls-tree", "-r", "-z", commit, text=False)
-        for record in tree.split(b"\0"):
-            if not record:
-                continue
-            metadata, raw_path = record.split(b"\t", 1)
-            _mode, object_type, object_id = metadata.decode("ascii").split()
-            if contains_forbidden(raw_path, forbidden):
-                reject("publication_range_disclosure")
-            key = (object_id, raw_path)
+        changed = git(
+            repo_root,
+            "diff-tree",
+            "--root",
+            "-r",
+            "-m",
+            "--no-commit-id",
+            "--raw",
+            "-z",
+            "--no-renames",
+            "--diff-filter=AMT",
+            commit,
+            text=False,
+            inspection_budget=inspection_budget,
+        ).split(b"\0")
+        if changed and changed[-1] == b"":
+            changed.pop()
+        if len(changed) % 2:
+            reject("git_inspection")
+        for index in range(0, len(changed), 2):
+            diff_records += 1
+            if diff_records > MAX_PUBLICATION_DIFF_RECORDS:
+                reject("publication_scan_limit")
+            metadata, raw_path = changed[index], changed[index + 1]
+            try:
+                old_mode, new_mode, _old_id, object_id, status = (
+                    metadata.decode("ascii").split()
+                )
+            except (UnicodeDecodeError, ValueError):
+                reject("git_inspection")
             if (
-                object_type != "blob"
-                or key in base_blobs
-                or key in scanned
+                not old_mode.startswith(":")
+                or status not in {"A", "M", "T"}
+                or new_mode not in {"100644", "100755", "120000", "160000"}
+                or re.fullmatch(r"[0-9a-f]{40,64}", object_id) is None
             ):
+                reject("git_inspection")
+            if contains_forbidden(
+                raw_path, forbidden, wildcard_budget=wildcard_budget
+            ):
+                reject("publication_range_disclosure")
+            if new_mode == "160000" or object_id in scanned_blobs:
                 continue
-            scanned.add(key)
+            scanned_blobs.add(object_id)
             blob = git_object(
-                repo_root, "blob", object_id, max_bytes=MAX_GIT_OBJECT_BYTES
+                repo_root,
+                "blob",
+                object_id,
+                max_bytes=MAX_GIT_OBJECT_BYTES,
+                inspection_budget=inspection_budget,
             )
-            if contains_forbidden(blob, forbidden):
+            if contains_forbidden(
+                blob, forbidden, wildcard_budget=wildcard_budget
+            ):
                 reject("publication_range_disclosure")
 
     staged_paths = set(
@@ -714,10 +859,18 @@ def validate_publication_range(
             "-z",
             head_sha,
             text=False,
+            inspection_budget=inspection_budget,
         ).split(b"\0")
     )
     staged_paths.discard(b"")
-    index = git(repo_root, "ls-files", "--stage", "-z", text=False)
+    index = git(
+        repo_root,
+        "ls-files",
+        "--stage",
+        "-z",
+        text=False,
+        inspection_budget=inspection_budget,
+    )
     for record in index.split(b"\0"):
         if not record:
             continue
@@ -727,13 +880,21 @@ def validate_publication_range(
             reject("working_tree_unmerged_index")
         if raw_path not in staged_paths:
             continue
-        if contains_forbidden(raw_path, forbidden):
+        if contains_forbidden(
+            raw_path, forbidden, wildcard_budget=wildcard_budget
+        ):
             reject("working_tree_disclosure")
         if mode != "160000":
             blob = git_object(
-                repo_root, "blob", object_id, max_bytes=MAX_GIT_OBJECT_BYTES
+                repo_root,
+                "blob",
+                object_id,
+                max_bytes=MAX_GIT_OBJECT_BYTES,
+                inspection_budget=inspection_budget,
             )
-            if contains_forbidden(blob, forbidden):
+            if contains_forbidden(
+                blob, forbidden, wildcard_budget=wildcard_budget
+            ):
                 reject("working_tree_disclosure")
 
     worktree_paths = set(
@@ -745,6 +906,7 @@ def validate_publication_range(
             "-z",
             head_sha,
             text=False,
+            inspection_budget=inspection_budget,
         ).split(b"\0")
     )
     worktree_paths.update(
@@ -755,21 +917,33 @@ def validate_publication_range(
             "--exclude-standard",
             "-z",
             text=False,
+            inspection_budget=inspection_budget,
         ).split(b"\0")
     )
     worktree_paths.discard(b"")
     for raw_path in worktree_paths:
-        if contains_forbidden(raw_path, forbidden):
+        if contains_forbidden(
+            raw_path, forbidden, wildcard_budget=wildcard_budget
+        ):
             reject("working_tree_disclosure")
         path = raw_path.decode(sys.getfilesystemencoding(), errors="surrogateescape")
         candidate = repo_root / path
         if candidate.is_symlink():
-            if contains_forbidden(str(candidate.readlink()), forbidden):
+            if contains_forbidden(
+                str(candidate.readlink()),
+                forbidden,
+                wildcard_budget=wildcard_budget,
+            ):
                 reject("working_tree_disclosure")
-        elif candidate.is_file() and contains_forbidden(
-            bounded_file_bytes(candidate), forbidden
-        ):
-            reject("working_tree_disclosure")
+        elif candidate.is_file():
+            payload = bounded_file_bytes(candidate)
+            inspection_budget.consume(len(payload))
+            if contains_forbidden(
+                payload,
+                forbidden,
+                wildcard_budget=wildcard_budget,
+            ):
+                reject("working_tree_disclosure")
 
 
 def initialize_adversary_repo(root: str) -> tuple[Path, str]:
@@ -1058,6 +1232,28 @@ def validate_empty_publication_range_adversary() -> None:
             reject("empty_publication_range_bypass")
 
 
+def validate_publication_scan_budget_adversary() -> None:
+    forbidden = ("synthetic-private-marker",)
+    with tempfile.TemporaryDirectory(
+        prefix="hindsight-scan-budget-adversary-"
+    ) as root:
+        repo, base = initialize_adversary_repo(root)
+        try:
+            validate_publication_range(
+                repo,
+                base,
+                forbidden,
+                inspection_budget=_WorkBudget(
+                    1, "publication_scan_limit"
+                ),
+            )
+        except ValidationError as error:
+            if error.code != "publication_scan_limit":
+                reject("publication_scan_budget_wrong_rejection")
+        else:
+            reject("publication_scan_budget_bypass")
+
+
 def validate_replace_object_adversary() -> None:
     forbidden = ("synthetic-private-marker",)
     with tempfile.TemporaryDirectory(
@@ -1119,6 +1315,7 @@ def main() -> int:
         validate_worktree_path_adversaries()
         validate_publication_ancestry_adversary()
         validate_empty_publication_range_adversary()
+        validate_publication_scan_budget_adversary()
         validate_replace_object_adversary()
         validate_encoding_adversaries()
     except ValidationError as error:
@@ -1138,12 +1335,20 @@ def main() -> int:
     try:
         catalog = tomllib.loads(bounded_file_bytes(catalog_path).decode("utf-8"))
         validated = validate_catalog(catalog)
+        wildcard_budget = _WorkBudget(
+            MAX_WILDCARD_MATCH_WORK, "wildcard_match_limit"
+        )
         if contains_forbidden(
-            bounded_file_bytes(prd_path), validated.forbidden_literals
+            bounded_file_bytes(prd_path),
+            validated.forbidden_literals,
+            wildcard_budget=wildcard_budget,
         ):
             reject("public_prd_disclosure")
         validate_publication_range(
-            repo_root, publication_base, validated.forbidden_literals
+            repo_root,
+            publication_base,
+            validated.forbidden_literals,
+            wildcard_budget=wildcard_budget,
         )
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
         print("private hindsight memory control plane PRD: catalog I/O failure", file=sys.stderr)

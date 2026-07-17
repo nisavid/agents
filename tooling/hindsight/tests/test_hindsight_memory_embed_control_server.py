@@ -1,4 +1,5 @@
 import importlib.util
+import json
 from dataclasses import dataclass
 from pathlib import Path
 import os
@@ -78,6 +79,30 @@ class ControlServerHooksTest(unittest.TestCase):
         self.module.os.close(descriptor)
         self.assertTrue(observed_flags)
         self.assertTrue(observed_flags[0] & self.module.os.O_NONBLOCK)
+
+    def test_control_pid_record_binds_process_port_and_desired_state(self):
+        pid_path = Path(self.temporary.name) / "control.pid"
+        desired = Path(self.temporary.name) / "desired-state"
+        self.module._write_private_pid(pid_path, 1234, 7878, desired)
+        self.assertEqual(
+            json.loads(pid_path.read_text(encoding="ascii")),
+            {
+                "desired_state_dir": str(desired),
+                "pid": 1234,
+                "port": 7878,
+            },
+        )
+
+    def test_rejects_group_writable_nonprivate_ancestor(self):
+        ancestor = Path(self.temporary.name) / "group-writable"
+        ancestor.mkdir(mode=0o700)
+        ancestor.chmod(0o770)
+        target = ancestor / "private-leaf"
+        with self.assertRaises(ValueError):
+            self.module._open_absolute_directory(
+                target, create=True, private=True, label="test directory"
+            )
+        self.assertFalse(target.exists())
 
     def desired(self, profile, component):
         return (

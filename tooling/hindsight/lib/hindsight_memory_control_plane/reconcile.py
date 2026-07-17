@@ -17,7 +17,13 @@ from .file_evidence import (
     verified_file_snapshot,
 )
 from .model import Action, EndpointIdentity, OperationSnapshot, Plan, deep_freeze, deep_thaw
-from .planning import PlanError, _compatibility, plan_from_dict, verify_plan
+from .planning import (
+    PlanError,
+    _compatibility,
+    _endpoint,
+    plan_from_dict,
+    verify_plan,
+)
 
 
 DIGEST = re.compile(r"[0-9a-f]{64}\Z")
@@ -84,7 +90,11 @@ class ApplyResult:
     recovery_action_ids: tuple[str, ...] = ()
 
 
-def _mutation_actions(values: Any, target_profile: str) -> tuple[Action, ...]:
+def _mutation_actions(
+    values: Any,
+    target_profile: str,
+    target_endpoint: EndpointIdentity,
+) -> tuple[Action, ...]:
     if not isinstance(values, (list, tuple)) or not values:
         raise ApplyError("mutation actions must be a non-empty array")
     result = []
@@ -108,21 +118,34 @@ def _mutation_actions(values: Any, target_profile: str) -> tuple[Action, ...]:
         if not all(bank_key in details for bank_key in ("source_bank", "target_bank")):
             raise ApplyError("mutation source and target bank references are required")
         for bank_key in ("source_bank", "target_bank"):
-            if bank_key in details and (not isinstance(details[bank_key], dict) or set(details[bank_key]) != {"profile_id", "bank_id"}):
-                raise ApplyError("mutation bank reference is closed")
+            bank = details[bank_key]
             if (
-                bank_key in details
-                and (
-                    not isinstance(details[bank_key]["profile_id"], str)
-                    or SAFE_IDENTIFIER.fullmatch(details[bank_key]["profile_id"])
-                    is None
-                    or not isinstance(details[bank_key]["bank_id"], str)
-                    or BANK_ID.fullmatch(details[bank_key]["bank_id"]) is None
+                not isinstance(bank, dict)
+                or set(bank) not in (
+                    {"profile_id", "bank_id"},
+                    {"profile_id", "bank_id", "endpoint"},
                 )
             ):
+                raise ApplyError("mutation bank reference is closed")
+            if (
+                not isinstance(bank["profile_id"], str)
+                    or SAFE_IDENTIFIER.fullmatch(bank["profile_id"])
+                    is None
+                    or not isinstance(bank["bank_id"], str)
+                    or BANK_ID.fullmatch(bank["bank_id"]) is None
+            ):
                 raise ApplyError("mutation bank reference is invalid")
-            if details[bank_key]["profile_id"] != target_profile:
+            if bank["profile_id"] != target_profile:
                 raise ApplyError("mutation bank reference must match the target profile")
+            if "endpoint" in bank:
+                try:
+                    endpoint = _endpoint(bank["endpoint"], target_profile)
+                except PlanError as error:
+                    raise ApplyError("mutation bank endpoint is invalid") from error
+                if endpoint != target_endpoint:
+                    raise ApplyError(
+                        "mutation bank endpoint must match the target endpoint"
+                    )
         if details["source_bank"] == details["target_bank"]:
             raise ApplyError("mutation source and target banks must be distinct")
         result.append(Action(identifier, kind, deep_freeze(details)))
@@ -160,7 +183,9 @@ def build_mutation_plan(base_plan: Plan, *, migration_run_id: str, migration_art
             "completion_marker_digest": migration_gate.completion_marker_digest,
             "proposal_log_digest": migration_gate.proposal_log_digest,
         })
-    normalized = _mutation_actions(actions, base_plan.target_profile)
+    normalized = _mutation_actions(
+        actions, base_plan.target_profile, base_plan.target_endpoint
+    )
     for action in normalized:
         if action.details["artifact_digest"] != migration_artifact_digest:
             raise ApplyError(

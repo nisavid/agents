@@ -385,6 +385,25 @@ class MigrationDiscoveryContractTest(unittest.TestCase):
                 },
             )
 
+    def test_mixed_semantic_scope_classes_are_rejected(self):
+        for scopes in (
+            ["repo:one", "workflow:release"],
+            ["repo:one", "personal"],
+            ["workflow:release", "global"],
+        ):
+            with self.subTest(scopes=scopes), self.assertRaisesRegex(
+                MigrationError, "conflicting semantic scopes"
+            ):
+                migration_module._coverage_scope(
+                    {"scopes": scopes, "tags": []},
+                    {"tags": []},
+                    {
+                        "canonical": ["repo:one"],
+                        "aliases": {},
+                        "drop_aliases": [],
+                    },
+                )
+
     def test_snapshot_rejects_duplicate_and_noncanonical_scope_digest(self):
         snapshot = migration_inventory()
         snapshot["banks"]["source"]["scopes"] = ["repo:dotfiles", "repo:dotfiles"]
@@ -887,7 +906,35 @@ class MigrationDiscoveryContractTest(unittest.TestCase):
             self.assertEqual(source[0]["item_id"], "source-1")
             self.assertEqual(source[0]["content_digest"], SHA_A)
             self.assertEqual(source[0]["disposition"], "retain")
-            self.assertEqual(source[0]["semantic_scope"], "scope:active")
+            self.assertEqual(source[0]["semantic_scope"], "global")
+
+    def test_shadow_plan_uses_the_import_semantic_scope_vocabulary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, result = self.discover(Path(directory))
+            for semantic_scope in (
+                "global",
+                "personal",
+                "workflow:git.publication",
+            ):
+                plan = copy.deepcopy(result.plan.to_dict())
+                plan["coverage"]["source"][0][
+                    "semantic_scope"
+                ] = semantic_scope
+                plan["bindings"]["source_coverage_digest"] = digest(
+                    plan["coverage"]["source"]
+                )
+                plan["plan_digest"] = digest(
+                    {
+                        key: value
+                        for key, value in plan.items()
+                        if key != "plan_digest"
+                    }
+                )
+                with self.subTest(semantic_scope=semantic_scope):
+                    verify_shadow_plan(
+                        plan,
+                        repository_catalog=repository_catalog(),
+                    )
 
     def test_malformed_bank_scope_and_tag_entries_block_before_coverage(self):
         for field in ("scopes", "tags"):

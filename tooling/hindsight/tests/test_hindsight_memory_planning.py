@@ -150,6 +150,25 @@ class PlanningValidationTest(unittest.TestCase):
                 [source, self.provider_compatibility("target", role="llm")],
                 "fallback target must support reranking",
             ),
+            (
+                [
+                    self.provider_compatibility(
+                        "source", role="llm", fallback_provider_id="target"
+                    ),
+                    target,
+                ],
+                "only reranking providers may declare fallbacks",
+            ),
+            (
+                [
+                    source,
+                    {
+                        **target,
+                        "provider_state": "current",
+                    },
+                ],
+                "fallback target must be in fallback state",
+            ),
         )
         for compatibility, message in cases:
             with self.subTest(message=message), self.assertRaisesRegex(

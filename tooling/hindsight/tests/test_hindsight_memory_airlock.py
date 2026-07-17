@@ -339,6 +339,16 @@ class AirlockPlanTests(unittest.TestCase):
             ):
                 validate_airlock_plan(valid_candidate(), runner)
 
+    def test_runner_attestation_requires_an_exact_integer_schema_version(self):
+        class BooleanVersionRunner(FakeOrbStackRunner):
+            def attest(self):
+                return {**super().attest(), "schema_version": True}
+
+        with self.assertRaisesRegex(
+            AirlockPlanError, "attestation is invalid"
+        ):
+            validate_airlock_plan(valid_candidate(), BooleanVersionRunner())
+
     def test_rejects_each_closed_airlock_boundary(self):
         cases = {
             "fresh machine": ("machine", "fresh", False),

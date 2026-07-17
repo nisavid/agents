@@ -5,6 +5,7 @@ import argparse
 import contextlib
 import fcntl
 import functools
+import json
 import os
 import re
 import stat
@@ -43,7 +44,11 @@ def _validate_directory(
     mode = stat.S_IMODE(metadata.st_mode)
     if not stat.S_ISDIR(metadata.st_mode):
         raise ValueError(f"refusing unsafe {label}")
-    if mode & 0o002 and not mode & stat.S_ISVTX:
+    if metadata.st_uid not in {0, os.geteuid()}:
+        raise ValueError(f"refusing unsafe {label}")
+    if mode & 0o022 and not (
+        metadata.st_uid == 0 and mode & stat.S_ISVTX
+    ):
         raise ValueError(f"refusing unsafe {label}")
     if private and (metadata.st_uid != os.geteuid() or mode & 0o077):
         raise ValueError(f"refusing unsafe {label}")
@@ -327,13 +332,26 @@ def _open_private_append(path: Path) -> int:
         os.close(parent)
 
 
-def _write_private_pid(path: Path, pid: int) -> None:
+def _write_private_pid(
+    path: Path, pid: int, port: int, desired_state_dir: Path
+) -> None:
     parent = _open_absolute_directory(
         path.parent, create=True, private=True, label="control PID directory"
     )
     try:
         _atomic_private_write(
-            parent, path.name, str(pid).encode("ascii"), "control PID file"
+            parent,
+            path.name,
+            json.dumps(
+                {
+                    "desired_state_dir": str(desired_state_dir),
+                    "pid": pid,
+                    "port": port,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("ascii"),
+            "control PID file",
         )
     finally:
         os.close(parent)
@@ -365,7 +383,9 @@ def _control_pid_lifecycle_lock(path: Path):
         os.close(parent)
 
 
-def _remove_private_pid_if_matches(path: Path, pid: int) -> None:
+def _remove_private_pid_if_matches(
+    path: Path, pid: int, port: int, desired_state_dir: Path
+) -> None:
     parent = _open_absolute_directory(
         path.parent, create=False, private=True, label="control PID directory"
     )
@@ -380,8 +400,17 @@ def _remove_private_pid_if_matches(path: Path, pid: int) -> None:
         )
         metadata = os.fstat(descriptor)
         _validate_private_file(metadata, "control PID file")
-        payload = os.read(descriptor, 65)
-        if len(payload) > 64 or payload.decode("ascii").strip() != str(pid):
+        payload = os.read(descriptor, 4097)
+        expected = json.dumps(
+            {
+                "desired_state_dir": str(desired_state_dir),
+                "pid": pid,
+                "port": port,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if len(payload) > 4096 or payload.decode("ascii").strip() != expected:
             return
         current = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
         if (current.st_dev, current.st_ino) != (metadata.st_dev, metadata.st_ino):
@@ -440,22 +469,30 @@ def start(port: int, desired_state_dir: Path) -> int:
             os.close(log_descriptor)
 
         try:
-            _write_private_pid(pid_path, process.pid)
+            _write_private_pid(
+                pid_path, process.pid, port, desired_state_dir
+            )
             deadline = time.monotonic() + 20
             while time.monotonic() < deadline:
                 if lifecycle.control_status(port).running:
                     return 0
                 if process.poll() is not None:
                     process.wait()
-                    _remove_private_pid_if_matches(pid_path, process.pid)
+                    _remove_private_pid_if_matches(
+                        pid_path, process.pid, port, desired_state_dir
+                    )
                     return 1
                 time.sleep(0.25)
             _terminate_and_reap(process)
-            _remove_private_pid_if_matches(pid_path, process.pid)
+            _remove_private_pid_if_matches(
+                pid_path, process.pid, port, desired_state_dir
+            )
             return 1
         except Exception:
             _terminate_and_reap(process)
-            _remove_private_pid_if_matches(pid_path, process.pid)
+            _remove_private_pid_if_matches(
+                pid_path, process.pid, port, desired_state_dir
+            )
             raise
 
 

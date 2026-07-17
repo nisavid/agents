@@ -75,6 +75,7 @@ MAX_COMPLETED_BYTES = 16 * 1024 * 1024
 MAX_LEDGER_OUTBOX_ENTRIES = 1024
 MAX_LEDGER_OUTBOX_BYTES = 8 * 1024 * 1024
 MAX_SESSION_ACTION_IDS = 1024
+MAX_REQUEST_SEQUENCE = 1_000_000
 MAX_DURABLE_SESSIONS = 4096
 MAX_DURABLE_EXCHANGES = 4096
 MAX_DURABLE_NONCES = 8192
@@ -874,6 +875,7 @@ class Broker:
                 or DIGEST.fullmatch(session["revocation_digest"]) is None
                 or type(session["sequence"]) is not int
                 or session["sequence"] < 0
+                or session["sequence"] > MAX_REQUEST_SEQUENCE
                 or not isinstance(session["action_ids"], list)
                 or not all(
                     isinstance(action_id, str)
@@ -1632,7 +1634,12 @@ class Broker:
             raise BrokerError("ROUTE_DENIED")
         if not isinstance(route.get("adapter"), Adapter):
             raise BrokerError("ADAPTER_INVALID")
-        if type(sequence) is not int or sequence < 1 or not isinstance(action_id, str) or not IDENTIFIER.fullmatch(action_id):
+        if (
+            type(sequence) is not int
+            or not 1 <= sequence <= MAX_REQUEST_SEQUENCE
+            or not isinstance(action_id, str)
+            or not IDENTIFIER.fullmatch(action_id)
+        ):
             raise BrokerError("SCHEMA_INVALID")
         nonce_digest = _sha256_text(claims["nonce"])
         action_digest = hashlib.sha256(canonical_bytes({
@@ -1643,11 +1650,20 @@ class Broker:
         if commit:
             with self._lock:
                 def authorize(work):
-                    self._commit_action(work, claims, sequence, action_id)
+                    self._commit_action(
+                        work, claims, method, sequence, action_id
+                    )
                 self._transaction(authorize, runtime=True)
         return claims, route, action_digest
 
-    def _commit_action(self, work: dict[str, Any], claims: Mapping[str, Any], sequence: int, action_id: str) -> None:
+    def _commit_action(
+        self,
+        work: dict[str, Any],
+        claims: Mapping[str, Any],
+        method: str,
+        sequence: int,
+        action_id: str,
+    ) -> None:
         state = work["sessions"].get(claims["session_id"])
         if not state or state.get("nonce_digest") != _sha256_text(claims["nonce"]):
             raise BrokerError("CAPABILITY_INVALID")
@@ -1657,7 +1673,12 @@ class Broker:
             raise BrokerError("ACTION_REPLAY")
         if sequence <= state["sequence"]:
             raise BrokerError("SEQUENCE_ROLLBACK")
-        if len(state["action_ids"]) >= MAX_SESSION_ACTION_IDS:
+        action_limit = (
+            MAX_SESSION_ACTION_IDS
+            if method == "session_close"
+            else MAX_SESSION_ACTION_IDS - 1
+        )
+        if len(state["action_ids"]) >= action_limit:
             raise BrokerError("SESSION_ACTION_LIMIT")
         state["sequence"] = sequence
         state["action_ids"].append(action_id)
@@ -2074,7 +2095,9 @@ class Broker:
                                 "queue_id": existing_queue_id,
                             }
                         if tuple(watermark) < tuple(latest["watermark"]):
-                            self._commit_action(work, claims, sequence, action_id)
+                            self._commit_action(
+                                work, claims, method, sequence, action_id
+                            )
                             return {"disposition": "stale", "payload": {"watermark": latest["watermark"]}, "queue_id": None}
                     item = {
                         "queue_id": secrets.token_hex(16), "session_id": claims["session_id"],
@@ -2091,7 +2114,9 @@ class Broker:
                     self._append_queue_item(
                         work, item, supersede_state_key=state_key
                     )
-                    self._commit_action(work, claims, sequence, action_id)
+                    self._commit_action(
+                        work, claims, method, sequence, action_id
+                    )
                     return {"disposition": "queued", "payload": {"watermark": watermark, "queue_id": item["queue_id"]}, "queue_id": item["queue_id"]}
                 result = self._transaction(enqueue, runtime=True)
                 if result["queue_id"]:
@@ -2167,7 +2192,9 @@ class Broker:
                     "in_flight": False,
                 }
                 self._append_queue_item(work, item)
-                self._commit_action(work, claims, sequence, action_id)
+                self._commit_action(
+                    work, claims, "reflect", sequence, action_id
+                )
                 return item["queue_id"]
             queue_id = self._transaction(enqueue, runtime=True)
             if queue_id:
@@ -2657,7 +2684,9 @@ class Broker:
         with self._lock:
             def close(work):
                 self._append_queue_item(work, item)
-                self._commit_action(work, claims, sequence, action_id)
+                self._commit_action(
+                    work, claims, "session_close", sequence, action_id
+                )
                 state = work["sessions"][claims["session_id"]]
                 state["closed"] = True
                 if state["revocation_digest"] not in work["revoked_nonces"]:

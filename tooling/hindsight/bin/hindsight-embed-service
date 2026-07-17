@@ -848,7 +848,14 @@ restore_loaded_stack_health() {
     rollback_restore_failed
     return 1
   }
-  wait_for_manifest_stack_health "$staged_rollback" && return 0
+  if wait_for_manifest_stack_health "$staged_rollback"; then
+    run_with_service_lifecycle_lock \
+      persist_service_manifest_snapshot "$staged_rollback" || {
+      rollback_restore_failed
+      return 1
+    }
+    return 0
+  fi
   rollback_restore_failed
   return 1
 }
@@ -1100,10 +1107,53 @@ run_stop_command() {
     inherited)
       [[ "${HINDSIGHT_EMBED_MAINTENANCE_LEASE_HELD:-}" == 1 ]] ||
         die "internal stop requires an inherited maintenance lease"
+      validate_inherited_maintenance_lease
       run_with_service_command_lock stop_service
       ;;
     *) die "invalid service stop lease mode: ${lease_mode}" ;;
   esac
+}
+
+validate_inherited_maintenance_lease() {
+  emulate -L zsh
+  local descriptor="${HINDSIGHT_EMBED_MAINTENANCE_LEASE_DESCRIPTOR:-}"
+  [[ "$descriptor" =~ '^[1-9][0-9]*$' ]] && (( descriptor >= 3 )) ||
+    die "internal stop requires an inherited maintenance lease descriptor"
+  local lock_file="${STATE_DIR}/.maintenance.lock"
+  [[ -f "$lock_file" && ! -L "$lock_file" ]] ||
+    die "inherited maintenance lease path is unsafe"
+  local expected actual
+  expected="$(/usr/bin/stat -f '%d:%i:%u:%Lp' "$lock_file")" ||
+    die "could not inspect inherited maintenance lease"
+  actual="$(/usr/bin/python3 -I -c '
+import os
+import stat
+import sys
+metadata = os.fstat(int(sys.argv[1]))
+print(f"{metadata.st_dev}:{metadata.st_ino}:{metadata.st_uid}:{stat.S_IMODE(metadata.st_mode):o}")
+' "$descriptor")" ||
+    die "inherited maintenance lease descriptor is not open"
+  [[ "$actual" == "$expected" && "$expected" == *":${EUID}:600" ]] ||
+    die "inherited maintenance lease descriptor does not match the trusted lease"
+  if ! /usr/bin/python3 -I - "$lock_file" <<'PY'
+import fcntl
+import os
+import sys
+
+descriptor = os.open(sys.argv[1], os.O_RDONLY)
+try:
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise SystemExit(0)
+    fcntl.flock(descriptor, fcntl.LOCK_UN)
+    raise SystemExit(1)
+finally:
+    os.close(descriptor)
+PY
+  then
+    die "inherited maintenance lease descriptor does not prove a held lease"
+  fi
 }
 
 show_status() {

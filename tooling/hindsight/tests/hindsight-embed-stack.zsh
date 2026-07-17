@@ -209,6 +209,15 @@ for invalid_autostart in 1 0 TRUE yes; do
     exit 1
   fi
 done
+if (
+  export HINDSIGHT_EMBED_AUTOSTART_DAEMON=false
+  export HINDSIGHT_EMBED_AUTOSTART_UI=true
+  source "$rendered_stack_lib"
+  hindsight_stack_load_config
+) >/dev/null 2>&1; then
+  print -ru2 -- "stack accepted UI autostart without daemon autostart"
+  exit 1
+fi
 
 if (
   cd "$tmp_dir"
@@ -270,7 +279,7 @@ if (
 fi
 if (
   source "$rendered_stack_lib"
-  HINDSIGHT_EMBED_AUTOSTART_DAEMON=false
+  HINDSIGHT_EMBED_AUTOSTART_DAEMON=true
   HINDSIGHT_EMBED_AUTOSTART_UI=true
   hindsight_stack_reconcile_sidecars() { return 0 }
   hindsight_stack_daemon_status() { return 0 }
@@ -1496,6 +1505,7 @@ broker_stop_command="$(<"$broker_stop_args")"
 
 failed_broker_cli="$tmp_dir/failed-broker-cli"
 failed_broker_pid="$tmp_dir/failed-broker.pid"
+unrelated_broker_job_pid="$tmp_dir/unrelated-broker-job.pid"
 cat >"$failed_broker_cli" <<'ZSH'
 #!/usr/bin/env zsh
 print -r -- "$$" >"$HINDSIGHT_TEST_FAILED_BROKER_PID"
@@ -1513,7 +1523,11 @@ if (
   hindsight_stack_wait_broker() {
     local attempt
     for attempt in {1..100}; do
-      [[ -e "$failed_broker_pid" ]] && return 1
+      if [[ -e "$failed_broker_pid" ]]; then
+        /bin/sleep 60 &
+        print -r -- "$!" >"$unrelated_broker_job_pid"
+        return 1
+      fi
       sleep 0.01
     done
     return 1
@@ -1523,6 +1537,15 @@ if (
   print -ru2 -- "broker start accepted a failed readiness check"
   exit 1
 fi
+track_fixture_pid_file "$unrelated_broker_job_pid"
+unrelated_broker_job="$(<"$unrelated_broker_job_pid")"
+if ! /bin/kill -0 "$unrelated_broker_job" >/dev/null 2>&1; then
+  print -ru2 -- "broker launch abort terminated an unrelated current job"
+  exit 1
+fi
+/bin/kill -TERM "$unrelated_broker_job" >/dev/null 2>&1 || true
+untrack_fixture_pid "$unrelated_broker_job"
+wait "$unrelated_broker_job" >/dev/null 2>&1 || true
 track_fixture_pid_file "$failed_broker_pid"
 failed_broker_process="$(<"$failed_broker_pid")"
 if /bin/kill -0 "$failed_broker_process" >/dev/null 2>&1; then

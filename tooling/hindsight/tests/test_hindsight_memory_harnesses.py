@@ -197,6 +197,7 @@ class HarnessActivationTest(unittest.TestCase):
             "profile_healthy": True,
             "adapter_self_test": True,
             "persist_rollback_prestate": lambda _prestate: None,
+            "read_rollback_prestate": lambda: selected_current,
             "write_configuration": write,
             "read_configuration": lambda: destination,
             "postcheck": lambda *_evidence: True,
@@ -536,6 +537,38 @@ class HarnessActivationTest(unittest.TestCase):
         )
         self.assertEqual(events, [])
 
+    def test_activation_requires_durable_rollback_prestate_readback(self):
+        writes = []
+        unavailable = self.apply(
+            read_rollback_prestate=None,
+            write_configuration=lambda *_args: writes.append("write"),
+        )
+        self.assertEqual(
+            (unavailable.status, unavailable.reason),
+            ("refused", "rollback_prestate_reader_unavailable"),
+        )
+
+        unreadable = self.apply(
+            read_rollback_prestate=lambda: (_ for _ in ()).throw(
+                OSError("durable receipt unavailable")
+            ),
+            write_configuration=lambda *_args: writes.append("write"),
+        )
+        self.assertEqual(
+            (unreadable.status, unreadable.reason),
+            ("refused", "rollback_prestate_readback_failed"),
+        )
+
+        mismatched = self.apply(
+            read_rollback_prestate=lambda: {**self.current, "active": True},
+            write_configuration=lambda *_args: writes.append("write"),
+        )
+        self.assertEqual(
+            (mismatched.status, mismatched.reason),
+            ("refused", "rollback_prestate_readback_mismatch"),
+        )
+        self.assertEqual(writes, [])
+
     def test_activation_write_exception_restores_and_verifies_prestate(self):
         destination = deep_thaw(self.current)
 
@@ -733,6 +766,7 @@ class HarnessActivationTest(unittest.TestCase):
             profile_healthy=True,
             adapter_self_test=True,
             persist_rollback_prestate=lambda _prestate: None,
+            read_rollback_prestate=lambda: original,
             write_configuration=write,
             read_configuration=lambda: destination,
             postcheck=lambda *_evidence: False,
@@ -850,6 +884,7 @@ class HarnessActivationTest(unittest.TestCase):
             profile_healthy=True,
             adapter_self_test=True,
             persist_rollback_prestate=lambda _prestate: None,
+            read_rollback_prestate=lambda: original,
             write_configuration=write,
             read_configuration=lambda: destination,
             postcheck=lambda *_evidence: True,

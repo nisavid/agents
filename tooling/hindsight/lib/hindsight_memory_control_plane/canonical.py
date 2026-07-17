@@ -153,7 +153,14 @@ def canonical_scalar(value: Any) -> str | bool | int | float | None:
 
 
 def canonical_bytes(value: Any) -> bytes:
-    """Encode a value with the RFC 8785 JSON Canonicalization Scheme."""
+    """Encode the bounded interoperable JSON profile used for control digests.
+
+    Key ordering and number formatting follow RFC 8785 within the accepted
+    safe-number subset.  The input contract deliberately rejects finite IEEE
+    754 values outside the interoperable safe-integer and exact-decimal
+    profile, so this is not an implementation of the RFC's full Appendix B
+    number domain.
+    """
 
     def utf16_key(item: str) -> bytes:
         return item.encode("utf-16-be", "surrogatepass")

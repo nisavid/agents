@@ -259,6 +259,7 @@ acquire_cleanup_maintenance_lease() {
   fi
   ( umask 077; : >>"$lock_file" ) || die "failed to prepare cleanup maintenance lease"
   /bin/chmod 600 "$lock_file" || die "failed to secure cleanup maintenance lease"
+  validate_no_acl "$lock_file" "cleanup maintenance lease"
   [[ "$(/usr/bin/stat -f '%u:%Lp' "$lock_file")" == "${EUID}:600" ]] ||
     die "cleanup maintenance lease must be private and current-user-owned"
   integer descriptor
@@ -1094,13 +1095,15 @@ stop_managed_and_legacy_services() {
   capture_service_topology
   typeset -g HINDSIGHT_CLEANUP_TOPOLOGY_CAPTURED=1
 
-  local service="${HINDSIGHT_EMBED_SERVICE_COMMAND:-}"
-  validate_trusted_artifact "$service" "service command" executable allow-symlink
-  HINDSIGHT_EMBED_MAINTENANCE_LEASE_HELD=1 \
-    HINDSIGHT_EMBED_MAINTENANCE_LEASE_DESCRIPTOR="$HINDSIGHT_CLEANUP_MAINTENANCE_DESCRIPTOR" \
-    hindsight_cleanup_run_lifecycle_command \
-      "$service" stop --maintenance-lease-held >/dev/null 2>&1 ||
-    die "failed to stop managed Hindsight service"
+  if (( HINDSIGHT_CLEANUP_MANAGED_WAS_RUNNING )); then
+    local service="${HINDSIGHT_EMBED_SERVICE_COMMAND:-}"
+    validate_trusted_artifact "$service" "service command" executable allow-symlink
+    HINDSIGHT_EMBED_MAINTENANCE_LEASE_HELD=1 \
+      HINDSIGHT_EMBED_MAINTENANCE_LEASE_DESCRIPTOR="$HINDSIGHT_CLEANUP_MAINTENANCE_DESCRIPTOR" \
+      hindsight_cleanup_run_lifecycle_command \
+        "$service" stop --maintenance-lease-held >/dev/null 2>&1 ||
+      die "failed to stop managed Hindsight service"
+  fi
   hindsight_stack_broker_stop || die "failed to stop Hindsight runtime broker"
 
   local legacy_profile stop_profile display_profile
@@ -1241,7 +1244,7 @@ restore_service_topology() {
   local result=0 profile component
   integer daemon_ready
   local -a reply
-  if (( ${HINDSIGHT_CLEANUP_MANAGED_WAS_LOADED:-0} || HINDSIGHT_CLEANUP_MANAGED_WAS_RUNNING )); then
+  if (( HINDSIGHT_CLEANUP_MANAGED_WAS_RUNNING )); then
     start_managed_stack >/dev/null 2>&1 || result=1
   fi
   for profile in "${(@s:,:)HINDSIGHT_CLEANUP_LEGACY_PROFILES}"; do
@@ -1528,7 +1531,7 @@ apply_cleanup_locked() {
         print -ru2 -- "hindsight-embed-single-bank-cleanup: service topology restore failed; restore the prior managed and legacy services manually"
     else
       print -ru2 -- "hindsight-embed-single-bank-cleanup: post-commit cleanup failed; attempting to restart managed stack"
-      if (( ${HINDSIGHT_CLEANUP_MANAGED_WAS_LOADED:-0} || HINDSIGHT_CLEANUP_MANAGED_WAS_RUNNING )); then
+      if (( HINDSIGHT_CLEANUP_MANAGED_WAS_RUNNING )); then
         start_managed_stack >/dev/null 2>&1 ||
           print -ru2 -- "hindsight-embed-single-bank-cleanup: restart attempt failed; run hindsight-embed-service start"
       fi
@@ -1628,7 +1631,7 @@ apply_cleanup_locked() {
   normalize_profile_config || die "failed to normalize profile config"
   HINDSIGHT_CLEANUP_TEMPORARY_DAEMON_STARTED=0
   release_cleanup_maintenance_lease || die "failed to release cleanup maintenance lease"
-  if (( ${HINDSIGHT_CLEANUP_MANAGED_WAS_LOADED:-0} || HINDSIGHT_CLEANUP_MANAGED_WAS_RUNNING )); then
+  if (( HINDSIGHT_CLEANUP_MANAGED_WAS_RUNNING )); then
     start_managed_stack || die "failed to restart managed stack"
   fi
   HINDSIGHT_CLEANUP_RECOVERY_NEEDED=0

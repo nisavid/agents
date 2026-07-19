@@ -28,8 +28,11 @@ typeset -r API_VERSION=$(
 typeset -r CLI_VERSION=$(
   "$HINDSIGHT_CLI" --version | awk '{print $2}'
 )
-[[ "$API_VERSION" == 0.8.4 && "$CLI_VERSION" == 0.8.4 ]] || {
-  print -u2 -- "disposable smoke requires Hindsight API and CLI 0.8.4"
+typeset -r ADMIN_VERSION=$(
+  "$HINDSIGHT_ADMIN" --version | awk '{print $2}'
+)
+[[ "$API_VERSION" == 0.8.4 && "$ADMIN_VERSION" == 0.8.4 && "$CLI_VERSION" == 0.8.4 ]] || {
+  print -u2 -- "disposable smoke requires Hindsight API, admin, and CLI 0.8.4"
   exit 1
 }
 
@@ -1154,6 +1157,7 @@ print(sum(instance.name in expected for instance in pg0.list_instances()))
 
 $JQ -n \
   --arg hindsight_api_version "$API_VERSION" \
+  --arg hindsight_admin_version "$ADMIN_VERSION" \
   --arg hindsight_cli_version "$CLI_VERSION" \
   --arg postgres_version "$POSTGRES_VERSION" \
   --arg invalidated_fingerprint "$SOURCE_FINGERPRINT" \
@@ -1165,6 +1169,7 @@ $JQ -n \
     authentication: {unauthorized_status: 401, authenticated_reads: 8},
     versions: {
       hindsight_api: $hindsight_api_version,
+      hindsight_admin: $hindsight_admin_version,
       hindsight_cli: $hindsight_cli_version,
       postgresql: $postgres_version
     },

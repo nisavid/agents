@@ -13,7 +13,7 @@ from pathlib import Path
 import stat
 import sys
 import tempfile
-from typing import Any, Iterator
+from typing import Any, BinaryIO, Iterator
 
 from .canonical import DIGEST
 
@@ -22,16 +22,24 @@ class FileEvidenceError(ValueError):
     pass
 
 
-class VerifiedFileSnapshot(str):
-    """A path-compatible handoff that owns the verified read descriptor."""
+class VerifiedFileSnapshot:
+    """A descriptor-backed binary stream for one verified file snapshot."""
 
-    def __new__(cls, path: str, descriptor: int):
-        value = super().__new__(cls, path)
-        value._descriptor = descriptor
-        return value
+    def __init__(self, stream: BinaryIO) -> None:
+        self._stream = stream
 
     def fileno(self) -> int:
-        return self._descriptor
+        return self._stream.fileno()
+
+    def read(self, size: int = -1) -> bytes:
+        return self._stream.read(size)
+
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        return self._stream.seek(offset, whence)
+
+    @property
+    def closed(self) -> bool:
+        return self._stream.closed
 
 
 @dataclass(frozen=True)
@@ -256,21 +264,21 @@ def verified_file_snapshot(
         validate_trusted_regular_file(before, label, descriptor=source_descriptor)
         if before.st_size > max_bytes:
             raise FileEvidenceError(f"{label} is too large")
-        suffix = ".zip" if source.suffix == ".zip" else ".archive"
         with tempfile.TemporaryDirectory(
             prefix="hindsight-memory-verified-archive-"
         ) as temporary:
             snapshot_directory = Path(temporary)
             snapshot_directory.chmod(0o700)
-            snapshot = snapshot_directory / f"archive{suffix}"
-            snapshot_flags = (
+            snapshot = snapshot_directory / "snapshot"
+            snapshot_descriptor = os.open(
+                snapshot,
                 os.O_WRONLY
                 | os.O_CREAT
                 | os.O_EXCL
                 | getattr(os, "O_CLOEXEC", 0)
-                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o400,
             )
-            snapshot_descriptor = os.open(snapshot, snapshot_flags, 0o400)
             artifact_hash = hashlib.sha256()
             size = 0
             try:
@@ -302,43 +310,53 @@ def verified_file_snapshot(
                 raise FileEvidenceError(f"{label} changed while being snapshotted")
             if not hmac.compare_digest(artifact_hash.hexdigest(), expected_digest):
                 raise FileEvidenceError(f"{label} digest does not match plan")
-            validate_trusted_regular_file(snapshot_metadata, label)
-            current_snapshot = snapshot.lstat()
-            if file_identity(snapshot_metadata) != file_identity(current_snapshot):
-                raise FileEvidenceError(f"{label} snapshot identity changed")
             verified_descriptor = os.open(
                 snapshot,
                 os.O_RDONLY
                 | getattr(os, "O_CLOEXEC", 0)
                 | getattr(os, "O_NOFOLLOW", 0),
             )
-            try:
-                verified_metadata = os.fstat(verified_descriptor)
-                if file_identity(snapshot_metadata) != file_identity(
-                    verified_metadata
-                ):
-                    raise FileEvidenceError(f"{label} snapshot identity changed")
+            verified_metadata = os.fstat(verified_descriptor)
+            validate_trusted_regular_file(
+                verified_metadata, label, descriptor=verified_descriptor
+            )
+            if file_identity(snapshot_metadata) != file_identity(
+                verified_metadata
+            ):
+                os.close(verified_descriptor)
+                raise FileEvidenceError(f"{label} snapshot identity changed")
+            snapshot.unlink()
+            pinned_metadata = os.fstat(verified_descriptor)
+            if (
+                not stat.S_ISREG(pinned_metadata.st_mode)
+                or pinned_metadata.st_uid != os.geteuid()
+                or stat.S_IMODE(pinned_metadata.st_mode) & 0o077
+                or pinned_metadata.st_nlink != 0
+                or (pinned_metadata.st_dev, pinned_metadata.st_ino)
+                != (snapshot_metadata.st_dev, snapshot_metadata.st_ino)
+            ):
+                os.close(verified_descriptor)
+                raise FileEvidenceError(f"{label} snapshot identity changed")
+            with os.fdopen(verified_descriptor, "rb", closefd=True) as stream:
+                verified = VerifiedFileSnapshot(stream)
                 yield_started = True
-                yield VerifiedFileSnapshot(str(snapshot), verified_descriptor)
+                yield verified
                 final_metadata = os.fstat(verified_descriptor)
-                final_path_metadata = snapshot.lstat()
                 final_hash = hashlib.sha256()
                 offset = 0
-                while chunk := os.pread(verified_descriptor, 1024 * 1024, offset):
+                while chunk := os.pread(
+                    verified_descriptor, 1024 * 1024, offset
+                ):
                     final_hash.update(chunk)
                     offset += len(chunk)
                 if (
-                    file_identity(verified_metadata)
+                    file_identity(pinned_metadata)
                     != file_identity(final_metadata)
-                    or file_identity(final_metadata)
-                    != file_identity(final_path_metadata)
                     or not hmac.compare_digest(
                         final_hash.hexdigest(), expected_digest
                     )
                 ):
                     raise FileEvidenceError(f"{label} snapshot changed")
-            finally:
-                os.close(verified_descriptor)
     except FileEvidenceError:
         raise
     except OSError:

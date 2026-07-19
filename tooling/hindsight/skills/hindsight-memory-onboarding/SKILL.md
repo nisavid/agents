@@ -30,12 +30,15 @@ questioning.
 ## Plan And Apply
 
 After every onboarding decision is complete and `next_decision()` returns
-`None`, build the desired-state proposal with `build_onboarding_plan`, binding
-it to the current controller plan digest. Never build from a partial session or
-reuse a controller plan digest after the controller plan changes.
+`None`, build the desired-state proposal with `build_onboarding_plan`, passing
+the exact current controller plan payload. The onboarding library derives and
+binds its digest internally. Never build from a partial session or reuse an
+onboarding plan after the controller plan changes.
 Show the redacted desired-state diff, operator actions, and exact plan digest.
 
 Stop before mutation. Apply only after the operator approves that exact digest, and use
-`apply_onboarding_plan` through the controller gate. Dependency installation,
-login, harness activation, imports, and live Hindsight changes remain separate
-operator-visible actions and retain their own approval and rollback gates.
+`apply_onboarding_plan` through the controller gate, passing the same exact
+controller plan payload so the library verifies the binding and dispatches that
+payload. Dependency installation, login, harness activation, imports, and live
+Hindsight changes remain separate operator-visible actions and retain their own
+approval and rollback gates.

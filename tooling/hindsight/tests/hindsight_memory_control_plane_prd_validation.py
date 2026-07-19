@@ -28,7 +28,7 @@ CONFUSABLES = str.maketrans({
     "с": "c", "ѕ": "s", "х": "x", "у": "y", "Α": "a", "Β": "b",
     "Ε": "e", "Ι": "i", "Κ": "k", "Μ": "m", "Ν": "n", "Ο": "o",
     "Ρ": "p", "Τ": "t", "Υ": "y", "Χ": "x", "α": "a", "ι": "i",
-    "κ": "k", "ν": "v", "ο": "o", "ρ": "p", "τ": "t", "υ": "y",
+    "κ": "k", "ν": "v", "ο": "o", "ρ": "p", "τ": "t", "υ": "u",
     "χ": "x",
 })
 UNAUDITED_SCRIPT_MARKER = "\x00"
@@ -330,6 +330,24 @@ def validate_synthetic_migration_cases() -> None:
         source_id="private-rünbook-v2", target_id="private-rünbook-v2"
     )
     non_ascii_cases.append((model_identifier, "private_guard_identifier"))
+
+    upsilon_identifier = synthetic_catalog()
+    upsilon_identifier["contextual_models"][0]["id"] = "private-rυnbook-v2"
+    upsilon_identifier["contextual_model_migrations"][0].update(
+        source_id="private-rυnbook-v2", target_id="private-rυnbook-v2"
+    )
+    non_ascii_cases.append((upsilon_identifier, "private_guard_identifier"))
+
+    uppercase_upsilon_identifier = synthetic_catalog()
+    uppercase_upsilon_identifier["contextual_models"][0]["id"] = (
+        "private-rΥnbook-v2"
+    )
+    uppercase_upsilon_identifier["contextual_model_migrations"][0].update(
+        source_id="private-rΥnbook-v2", target_id="private-rΥnbook-v2"
+    )
+    non_ascii_cases.append(
+        (uppercase_upsilon_identifier, "private_guard_identifier")
+    )
 
     migration_source = synthetic_catalog()
     migration_source["contextual_model_migrations"] = [

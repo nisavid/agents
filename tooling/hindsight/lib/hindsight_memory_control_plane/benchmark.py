@@ -1,16 +1,14 @@
 """Deterministic, disclosure-safe retrieval benchmark evaluation."""
 
 from dataclasses import dataclass
-import hashlib
 import hmac
-import json
 import math
 from pathlib import Path
 import random
 import re
 from typing import Any, Iterable, Mapping, Sequence
 
-from .canonical import strict_json_loads
+from .canonical import StrictJsonError, canonical_scalar, digest, strict_json_loads
 from .file_evidence import FileEvidenceError, read_file_evidence
 from .model import deep_freeze
 
@@ -92,7 +90,7 @@ class BenchmarkDataset:
         case_ids = [case["case_id"] for case in validated]
         if len(set(case_ids)) != len(case_ids):
             raise BenchmarkError("duplicate case_id in benchmark dataset")
-        actual_digest = hashlib.sha256(_canonical_bytes(validated)).hexdigest()
+        actual_digest = digest(validated)
         if self.dataset_digest != actual_digest:
             message = (
                 "dataset digest mismatch: expected "
@@ -104,16 +102,37 @@ class BenchmarkDataset:
         )
 
 
-def _canonical_bytes(value: Any) -> bytes:
-    return json.dumps(
-        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-    ).encode("utf-8")
-
-
 def _require_nonempty_string(value: Any, label: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise BenchmarkError(f"{label} must be a non-empty string")
     return value
+
+
+def _bounded_number(
+    value: Any,
+    label: str,
+    *,
+    maximum: float | None = None,
+) -> float:
+    rule = (
+        f"finite from 0 to {maximum:g}"
+        if maximum is not None
+        else "a finite non-negative number"
+    )
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise BenchmarkError(f"{label} must be {rule}")
+    try:
+        normalized = canonical_scalar(value)
+        number = float(normalized)
+    except (StrictJsonError, OverflowError) as error:
+        raise BenchmarkError(f"{label} must be {rule}") from error
+    if (
+        not math.isfinite(number)
+        or number < 0
+        or (maximum is not None and number > maximum)
+    ):
+        raise BenchmarkError(f"{label} must be {rule}")
+    return number
 
 
 def _validate_string_list(value: Any, label: str) -> list[str]:
@@ -217,7 +236,7 @@ def load_cases(path: str | Path, *, expected_digest: str) -> BenchmarkDataset:
             continue
         try:
             raw = strict_json_loads(line)
-        except (json.JSONDecodeError, ValueError) as error:
+        except ValueError as error:
             raise BenchmarkError(
                 f"benchmark line {line_number} is not valid JSON: "
                 f"{getattr(error, 'msg', str(error))}"
@@ -232,7 +251,7 @@ def load_cases(path: str | Path, *, expected_digest: str) -> BenchmarkDataset:
     case_ids = [case["case_id"] for case in cases]
     if len(set(case_ids)) != len(case_ids):
         raise BenchmarkError("duplicate case_id in benchmark dataset")
-    dataset_digest = hashlib.sha256(_canonical_bytes(cases)).hexdigest()
+    dataset_digest = digest(cases)
     if dataset_digest != expected_digest:
         message = (
             "dataset digest mismatch: expected "
@@ -249,17 +268,7 @@ def _validate_dimensions(raw: Any) -> dict[str, float | bool]:
         )
     dimensions: dict[str, float | bool] = {}
     for key in LOWER_IS_BETTER:
-        value = raw[key]
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not math.isfinite(value)
-            or value < 0
-        ):
-            raise BenchmarkError(
-                f"dimension {key} must be a finite non-negative number"
-            )
-        dimensions[key] = float(value)
+        dimensions[key] = _bounded_number(raw[key], f"dimension {key}")
     for key in ("provider_available", "compatible", "license_ready"):
         if type(raw[key]) is not bool:
             raise BenchmarkError(f"dimension {key} must be boolean")
@@ -589,16 +598,9 @@ def _validate_thresholds(raw: Mapping[str, Any]) -> dict[str, dict[str, float]]:
             raise BenchmarkError(message)
         normalized[group] = {}
         for key, value in values.items():
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, (int, float))
-                or not math.isfinite(value)
-                or value < 0
-            ):
-                raise BenchmarkError(
-                    f"promotion threshold {group}.{key} must be non-negative"
-                )
-            normalized[group][key] = float(value)
+            normalized[group][key] = _bounded_number(
+                value, f"promotion threshold {group}.{key}"
+            )
     return normalized
 
 
@@ -626,15 +628,7 @@ def _validate_promotion_report(
     if not isinstance(metrics, Mapping) or set(metrics) != set(HIGHER_IS_BETTER):
         raise BenchmarkError(f"{label} metric keys are closed")
     for metric, value in metrics.items():
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not math.isfinite(value)
-            or not 0 <= value <= 1
-        ):
-            raise BenchmarkError(
-                f"{label} metric {metric} must be finite from 0 to 1"
-            )
+        _bounded_number(value, f"{label} metric {metric}", maximum=1)
     case_metrics = raw["case_metrics"]
     if not isinstance(case_metrics, Mapping) or set(case_metrics) != (
         set(HIGHER_IS_BETTER) | {"case_ids"}
@@ -660,17 +654,14 @@ def _validate_promotion_report(
         if (
             not isinstance(values, list)
             or not values
-            or any(
-                isinstance(value, bool)
-                or not isinstance(value, (int, float))
-                or not math.isfinite(value)
-                or not 0 <= value <= 1
-                for value in values
-            )
         ):
             raise BenchmarkError(
                 f"{label} case metric {metric} must be a non-empty list "
                 "of finite values from 0 to 1"
+            )
+        for value in values:
+            _bounded_number(
+                value, f"{label} case metric {metric}", maximum=1
             )
         case_counts.add(len(values))
         if not math.isclose(
@@ -699,15 +690,19 @@ def _validate_promotion_report(
         if (
             not isinstance(interval, list)
             or len(interval) != 2
-            or any(
-                isinstance(value, bool)
-                or not isinstance(value, (int, float))
-                or not math.isfinite(value)
-                or not 0 <= value <= 1
-                for value in interval
-            )
-            or interval[0] > interval[1]
         ):
+            raise BenchmarkError(
+                f"{label} confidence interval {metric} is invalid"
+            )
+        normalized_interval = [
+            _bounded_number(
+                value,
+                f"{label} confidence interval {metric}",
+                maximum=1,
+            )
+            for value in interval
+        ]
+        if normalized_interval[0] > normalized_interval[1]:
             raise BenchmarkError(
                 f"{label} confidence interval {metric} is invalid"
             )
@@ -722,13 +717,10 @@ def _validate_promotion_report(
         raise BenchmarkError(f"{label} bootstrap seed must be an integer")
     if type(bootstrap["samples"]) is not int or not 1 <= bootstrap["samples"] <= 100_000:
         raise BenchmarkError(f"{label} bootstrap samples are invalid")
-    confidence = bootstrap["confidence"]
-    if (
-        isinstance(confidence, bool)
-        or not isinstance(confidence, (int, float))
-        or not math.isfinite(confidence)
-        or not 0 < confidence < 1
-    ):
+    confidence = _bounded_number(
+        bootstrap["confidence"], f"{label} bootstrap confidence", maximum=1
+    )
+    if not 0 < confidence < 1:
         raise BenchmarkError(f"{label} bootstrap confidence is invalid")
     gates = raw["gates"]
     if not isinstance(gates, Mapping) or set(gates) != {

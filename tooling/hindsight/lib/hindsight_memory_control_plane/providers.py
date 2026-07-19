@@ -750,8 +750,7 @@ def validate_provider_compatibility(
                 from_revision=from_revision,
                 to_artifact_id=model["artifact_id"],
                 to_revision=model["revision"],
-                require_blue_green=role == "embedding"
-                and storage_state["populated"],
+                require_blue_green=False,
             ):
                 blocked.append("revision_switch_not_approved")
         if role == "embedding" and storage_state["populated"]:

@@ -488,6 +488,34 @@ class FakeAdapterContractTest(AdapterContractMixin, unittest.TestCase):
         self.assertTrue(self.adapter.verify_postcondition(action))
         self.adapter.bind_apply_plan(bundle)
 
+    def test_fake_binding_detects_operation_drift_without_restoring_operations(self):
+        action = Action("action-1", "create_bank", {})
+        bundle = self.adapter.create_rollback_bundle(
+            "a" * 64, (action.id,)
+        )
+        self.assertTrue(self.adapter.verify_rollback_bundle(bundle))
+        self.adapter.operations = {
+            "idle": False,
+            "active": [
+                {"id": "external", "kind": "retain", "status": "running"}
+            ],
+        }
+        with self.assertRaisesRegex(AdapterError, "exact verified rollback"):
+            self.adapter.bind_apply_plan(bundle)
+
+        self.adapter.operations = {"idle": True, "active": []}
+        self.adapter.bind_apply_plan(bundle)
+        self.adapter.operations = {
+            "idle": False,
+            "active": [
+                {"id": "external", "kind": "retain", "status": "running"}
+            ],
+        }
+        with self.assertRaisesRegex(AdapterError, "approved plan state"):
+            self.adapter.preflight_action(action)
+        self.adapter.restore(bundle)
+        self.assertFalse(self.adapter.operations["idle"])
+
     def test_external_action_is_consumed_and_pending_before_callback(self):
         action = Action("action-1", "migrate_bank", {})
         bundle = self.adapter.create_rollback_bundle(
@@ -600,7 +628,7 @@ class HttpAdapterContractTest(AdapterContractMixin, unittest.TestCase):
             }],
             "api_token": "private-top-level-token",
             "nested": {"client_secret": "private-nested-secret"},
-            "tags": {"tags": ["repo:dotfiles", "token=private-snapshot"]},
+            "tags": {"tags": ["repo:dotfiles"]},
             "models": {"models": [{"id": "m0", "prompt": "private-model"}]},
             "directives": {"directives": [{"id": "r0", "mission": "private-directive"}]},
             "documents": {
@@ -707,6 +735,7 @@ class HttpAdapterContractTest(AdapterContractMixin, unittest.TestCase):
                 responses[("GET", f"{base}/operations?status={status}&limit=100&offset=0")] = {
                     "bank_id": bank_id, "operations": [], "total": 0, "limit": 100, "offset": 0,
                 }
+        self.responses = responses
 
         class Handler(BaseHTTPRequestHandler):
             def _serve(handler):
@@ -764,12 +793,21 @@ class HttpAdapterContractTest(AdapterContractMixin, unittest.TestCase):
                 "artifact_digest": "b" * 64,
                 "enable_auto_consolidation": True,
                 "memory_defense": "sensitive_data",
+                "unknown_fields_digest": digest({
+                    "private_bank_value": "private-bank-value",
+                }),
                 "models": [{
                     "id": "summary", "revision": "v1",
                     "artifact_digest": "c" * 64,
+                    "unknown_fields_digest": digest({
+                        "prompt": "private-bank-model",
+                    }),
                 }],
                 "directives": [{
                     "id": "privacy", "artifact_digest": "d" * 64,
+                    "unknown_fields_digest": digest({
+                        "mission": "private-bank-directive",
+                    }),
                 }],
             }],
         )
@@ -795,6 +833,18 @@ class HttpAdapterContractTest(AdapterContractMixin, unittest.TestCase):
         )
         self.assertNotIn("private", json.dumps(snapshot))
 
+    def test_snapshot_rejects_unsafe_tags_instead_of_omitting_them(self):
+        original_request = self.adapter._request
+
+        def request(method, path, payload=None, **kwargs):
+            if method == "GET" and path == "/v1/state":
+                return {"tags": {"tags": ["repo:dotfiles", "token=private"]}}
+            return original_request(method, path, payload, **kwargs)
+
+        with patch.object(self.adapter, "_request", side_effect=request):
+            with self.assertRaisesRegex(AdapterError, "tags response is invalid"):
+                self.adapter.snapshot()
+
     def test_read_migration_inventory_composes_documented_get_surfaces(self):
         before = len(self.seen)
         result = self.adapter.read_migration_inventory(
@@ -815,6 +865,7 @@ class HttpAdapterContractTest(AdapterContractMixin, unittest.TestCase):
             },
         )
         self.assertEqual(result["provider_identity"]["profile_id"], "core")
+
         self.assertEqual(result["banks"]["source"]["bank_ref"]["bank_id"], "engineering")
         self.assertEqual(result["banks"]["candidate"]["bank_ref"]["bank_id"], "historical-candidate")
         self.assertEqual(result["banks"]["source"]["config"]["config"]["recall_max_tokens"], 4096)
@@ -869,6 +920,43 @@ class HttpAdapterContractTest(AdapterContractMixin, unittest.TestCase):
         self.assertTrue(all(method == "GET" for method, _path, _auth, _body in calls))
         self.assertFalse(any(path.startswith("/v1/migrations/") for _method, path, _auth, _body in calls))
         self.assertTrue(all(auth == "Bearer contract-token" for _method, _path, auth, _body in calls))
+
+    def test_migration_inventory_rejects_duplicate_operation_ids_across_statuses(self):
+        base = "/v1/default/banks/engineering"
+        operation = {
+            "id": "operation-1",
+            "updated_at": "2026-07-13T12:00:00Z",
+        }
+        for status in ("pending", "processing"):
+            self.responses[(
+                "GET", f"{base}/operations?status={status}&limit=100&offset=0"
+            )] = {
+                "bank_id": "engineering",
+                "operations": [operation],
+                "total": 1,
+                "limit": 100,
+                "offset": 0,
+            }
+        with self.assertRaisesRegex(AdapterError, "operation response is invalid"):
+            self.adapter.read_migration_inventory(
+                BankRef("core", "engineering"),
+                BankRef("core", "historical-candidate"),
+            )
+
+    def test_migration_inventory_rejects_duplicate_webhook_ids(self):
+        path = "/v1/default/banks/engineering/webhooks"
+        item = {
+            "id": "hook-duplicate",
+            "target": {"url": "https://hooks.example"},
+            "activation": {"enabled": True},
+            "config": {"timeout": 5},
+        }
+        self.responses[("GET", path)] = {"items": [item, dict(item)]}
+        with self.assertRaisesRegex(AdapterError, "webhook response is invalid"):
+            self.adapter.read_migration_inventory(
+                BankRef("core", "engineering"),
+                BankRef("core", "historical-candidate"),
+            )
 
     def test_migration_inventory_closed_surfaces_fail_on_malformed_safe_fields(self):
         version_cases = (
@@ -1255,6 +1343,7 @@ class HttpAdapterSecurityTest(unittest.TestCase):
         adapter.snapshot = lambda: {
             "endpoint": adapter.endpoint.to_dict(),
             "state": state,
+            "operations": {"idle": True, "active": []},
         }
         with adapter._apply_binding_lock:
             adapter._verified_rollbacks[rollback.rollback_id] = rollback
@@ -1506,7 +1595,7 @@ class HttpAdapterSecurityTest(unittest.TestCase):
             os.environ,
             {"HTTP_PROXY": proxy_url, "http_proxy": proxy_url, "NO_PROXY": "", "no_proxy": ""},
             clear=False,
-        ):
+        ), patch("urllib.request.proxy_bypass", return_value=False):
             adapter = HttpAdapter(
                 inventory=inventory_for(direct.server_port), profile_id="core",
                 token_resolver=lambda: "token",
@@ -1650,6 +1739,7 @@ class HttpAdapterSecurityTest(unittest.TestCase):
             self.assertTrue(adapter._apply_binding_lock.locked())
             return {
                 "endpoint": adapter.endpoint.to_dict(), "state": state,
+                "operations": {"idle": True, "active": []},
             }
 
         adapter.snapshot = snapshot
@@ -1668,6 +1758,7 @@ class HttpAdapterSecurityTest(unittest.TestCase):
             adapter._apply_binding = None
         adapter.snapshot = lambda: {
             "endpoint": adapter.endpoint.to_dict(), "state": drifted_state,
+            "operations": {"idle": True, "active": []},
         }
         with self.assertRaisesRegex(AdapterError, "current rollback"):
             adapter.bind_apply_plan(rollback)
@@ -1862,6 +1953,34 @@ class HttpAdapterSecurityTest(unittest.TestCase):
             item["plan_digest"] == "a" * 64 for item in mutation_controls
         ))
 
+    def test_http_action_rejects_operation_drift_before_mutation(self):
+        action = Action("create", "create_bank", {"bank_id": "engineering"})
+        adapter = HttpAdapter(
+            inventory=inventory_for(7979), profile_id="core",
+            token_resolver=lambda: "token",
+        )
+        prestate = {}
+        rollback = RollbackBundle(
+            "rollback", "a" * 64, (action.id,), digest(prestate),
+            digest(adapter.endpoint.to_dict()), "d" * 64, "e" * 64,
+        )
+        self.bind_verified(adapter, rollback, prestate)
+        adapter.snapshot = lambda: {
+            "endpoint": adapter.endpoint.to_dict(),
+            "state": prestate,
+            "operations": {
+                "idle": False,
+                "active": [{"operation_id": "unexpected"}],
+            },
+        }
+
+        with (
+            patch.object(adapter, "_request") as request,
+            self.assertRaisesRegex(AdapterError, "operations drifted"),
+        ):
+            adapter.apply_action(action)
+        request.assert_not_called()
+
     def test_external_admin_action_is_attested_against_http_poststate(self):
         action = Action("migrate", "migrate_bank", {})
         adapter = HttpAdapter(
@@ -1878,7 +1997,8 @@ class HttpAdapterSecurityTest(unittest.TestCase):
         mutated = False
         adapter.snapshot = lambda: {
             "endpoint": adapter.endpoint.to_dict(),
-            "state": state if mutated else prestate
+            "state": state if mutated else prestate,
+            "operations": {"idle": True, "active": []},
         }
         with adapter._apply_binding_lock:
             adapter._verified_rollbacks[rollback.rollback_id] = rollback
@@ -1909,12 +2029,16 @@ class HttpAdapterSecurityTest(unittest.TestCase):
     def test_external_admin_action_is_terminally_reserved_before_mutation(self):
         action = Action("migrate", "migrate_bank", {})
         reservations = []
+        events = []
+
+        def reserve(control):
+            reservations.append(dict(control))
+            events.append("reserved")
+
         adapter = HttpAdapter(
             inventory=inventory_for(7979), profile_id="core",
             token_resolver=lambda: "token",
-            external_action_reserver=lambda control: reservations.append(
-                dict(control)
-            ),
+            external_action_reserver=reserve,
         )
         prestate = {"banks": [], "profile_artifact_digest": "f" * 64}
         rollback = RollbackBundle(
@@ -1923,6 +2047,7 @@ class HttpAdapterSecurityTest(unittest.TestCase):
         )
         adapter.snapshot = lambda: {
             "endpoint": adapter.endpoint.to_dict(), "state": prestate,
+            "operations": {"idle": True, "active": []},
         }
         with adapter._apply_binding_lock:
             adapter._verified_rollbacks[rollback.rollback_id] = rollback
@@ -1931,12 +2056,14 @@ class HttpAdapterSecurityTest(unittest.TestCase):
 
         def mutate():
             mutations.append("called")
+            events.append("mutated")
             adapter.snapshot = lambda: {"endpoint": adapter.endpoint.to_dict()}
 
         with self.assertRaisesRegex(AdapterError, "poststate is invalid"):
             adapter.attest_external_action(action, mutate)
         self.assertEqual(mutations, ["called"])
         self.assertEqual(len(reservations), 1)
+        self.assertEqual(events, ["reserved", "mutated"])
         with self.assertRaisesRegex(AdapterError, "approved plan sequence"):
             adapter.attest_external_action(action, mutate)
         self.assertEqual(mutations, ["called"])
@@ -2985,7 +3112,7 @@ class AdminMigrationAdapterContractTest(unittest.TestCase):
             {"completed": True},
         )
 
-    def test_input_archive_subprocess_cannot_consume_swapped_snapshot_path(self):
+    def test_input_archive_subprocess_consumes_read_only_snapshot_descriptor(self):
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         marker = root / "consumed"
         executable = root / "hindsight-admin"
@@ -3023,19 +3150,15 @@ class AdminMigrationAdapterContractTest(unittest.TestCase):
                 value, label, expected_digest, **kwargs
             ) as snapshot:
                 if label == "hindsight-admin input archive":
-                    snapshot_path = Path(snapshot)
-                    snapshot_path.rename(snapshot_path.with_name("approved-moved"))
-                    snapshot_path.write_bytes(b"attacker-controlled archive")
-                    snapshot_path.chmod(0o400)
+                    self.assertNotIsInstance(snapshot, (str, Path))
+                    with self.assertRaises(OSError):
+                        os.write(snapshot.fileno(), b"attacker-controlled archive")
                 yield snapshot
 
         with (
             patch(
                 "hindsight_memory_control_plane.migration_adapter.verified_file_snapshot",
                 swapped_snapshot,
-            ),
-            self.assertRaisesRegex(
-                MigrationAdapterError, "input archive verification"
             ),
         ):
             adapter.import_bank(
@@ -4800,6 +4923,23 @@ class GuardedApplyTest(unittest.TestCase):
             endpoint,
         )
 
+        logical_collision = mutation_action()
+        logical_collision["target_bank"] = {
+            **logical_collision["source_bank"],
+            "endpoint": endpoint,
+        }
+        with self.assertRaisesRegex(ApplyError, "must be distinct"):
+            build_mutation_plan(
+                base,
+                migration_run_id="run-1",
+                migration_artifact_digest=MIGRATION_ARTIFACT_DIGEST,
+                rollback_archive_digest="5" * 64,
+                rollback_restore_evidence_digest=digest(
+                    restore_evidence("5" * 64)
+                ),
+                actions=[logical_collision],
+            )
+
         wrong_endpoint = {
             **endpoint_bound,
             "source_bank": {
@@ -5385,7 +5525,7 @@ class GuardedApplyTest(unittest.TestCase):
             with self.assertRaisesRegex(ApplyError, "writable ancestor"):
                 capture_migration_gate(marker, proposal)
 
-    def test_verified_file_snapshot_binds_bytes_in_a_private_path(self):
+    def test_verified_file_snapshot_binds_bytes_to_descriptor_stream(self):
         with tempfile.TemporaryDirectory() as temporary:
             source = Path(temporary) / "approved-bank.zip"
             approved = b"approved migration archive"
@@ -5396,28 +5536,30 @@ class GuardedApplyTest(unittest.TestCase):
             with verified_file_snapshot(
                 source, "migration archive", expected,
             ) as snapshot_value:
-                snapshot = Path(snapshot_value)
                 self.assertEqual(
                     os.pread(snapshot_value.fileno(), len(approved), 0),
                     approved,
                 )
-                self.assertNotEqual(snapshot, source)
-                self.assertEqual(snapshot.read_bytes(), approved)
-                self.assertEqual(snapshot.stat().st_mode & 0o777, 0o400)
-                self.assertEqual(snapshot.parent.stat().st_mode & 0o777, 0o700)
+                self.assertNotIsInstance(snapshot_value, (str, Path))
+                self.assertEqual(
+                    os.fstat(snapshot_value.fileno()).st_mode & 0o777,
+                    0o400,
+                )
                 source.write_bytes(b"changed after verification")
-                self.assertEqual(snapshot.read_bytes(), approved)
+                self.assertEqual(
+                    os.pread(snapshot_value.fileno(), len(approved), 0),
+                    approved,
+                )
 
-            self.assertFalse(snapshot.exists())
+            self.assertTrue(snapshot_value.closed)
             source.write_bytes(approved)
             source.chmod(0o600)
             with self.assertRaisesRegex(OSError, "consumer failure"):
                 with verified_file_snapshot(
                     source, "migration archive", expected,
                 ) as failed_snapshot_value:
-                    failed_snapshot = Path(failed_snapshot_value)
                     raise OSError("consumer failure")
-            self.assertFalse(failed_snapshot.exists())
+            self.assertTrue(failed_snapshot_value.closed)
 
             with self.assertRaisesRegex(FileEvidenceError, "absolute"):
                 with verified_file_snapshot(

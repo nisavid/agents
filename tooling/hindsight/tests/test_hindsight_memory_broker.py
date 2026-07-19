@@ -176,6 +176,7 @@ class BrokerSocketTest(unittest.TestCase):
 
         for result in (minted, exchanged, recalled, status, closed):
             self.assertFalse(any("control" in str(arg) for arg in result.args))
+            self.assertFalse(any(handle in str(arg) for arg in result.args))
             self.assertFalse(any(capability in str(arg) for arg in result.args))
 
     def test_cli_clients_fail_closed_when_private_environment_is_missing(self):
@@ -374,6 +375,7 @@ class BrokerSocketTest(unittest.TestCase):
         admitted, peer = socket.socketpair()
         self.addCleanup(peer.close)
         observed = threading.Event()
+        attempted = threading.Event()
         observer_threads = []
 
         class Listener:
@@ -385,13 +387,15 @@ class BrokerSocketTest(unittest.TestCase):
                 del operation
 
                 def observe():
+                    attempted.set()
                     with self.server._connection_futures_lock:
                         observed.set()
 
                 observer = threading.Thread(target=observe)
                 observer.start()
                 observer_threads.append(observer)
-                self.assertFalse(observed.wait(0.05))
+                self.assertTrue(attempted.wait(1))
+                self.assertFalse(observed.is_set())
                 connection.close()
                 slots.release()
                 future = Future()
@@ -525,6 +529,33 @@ class BrokerSocketTest(unittest.TestCase):
         self.server.start()
         self.assertTrue(self.socket_path.is_socket())
 
+    def test_server_close_bounds_listener_join_and_reports_live_listener(self):
+        self.server.close()
+
+        class Listener:
+            def close(_self):
+                return None
+
+        class Thread:
+            def __init__(_self):
+                _self.join_timeout = None
+
+            def join(_self, timeout=None):
+                _self.join_timeout = timeout
+
+            def is_alive(_self):
+                return True
+
+        listener = Listener()
+        listener_thread = Thread()
+        self.server.close_timeout_seconds = 0.02
+        self.server._socket = listener
+        self.server._thread = listener_thread
+        with self.assertRaisesRegex(BrokerError, "SERVER_CLOSE_INCOMPLETE"):
+            self.server.close()
+        self.assertIsNotNone(listener_thread.join_timeout)
+        self.assertLessEqual(listener_thread.join_timeout, 0.02)
+
     def test_private_shutdown_rpc_invokes_only_the_configured_callback(self):
         self.server.close()
         requested = threading.Event()
@@ -647,12 +678,14 @@ class BrokerSocketTest(unittest.TestCase):
     def test_cancelled_connection_work_releases_admission_and_socket(self):
         admitted, peer = socket.socketpair()
         self.addCleanup(peer.close)
-        self.assertTrue(self.server._connection_slots.acquire(blocking=False))
+        slots = threading.BoundedSemaphore(1)
+        self.assertTrue(slots.acquire(blocking=False))
         future = Future()
         self.assertTrue(future.cancel())
-        self.server._cancel_admission(future, admitted)
-        self.assertTrue(self.server._connection_slots.acquire(blocking=False))
-        self.server._connection_slots.release()
+        self.server._cancel_admission(future, admitted, slots)
+        self.assertTrue(slots.acquire(blocking=False))
+        self.assertFalse(slots.acquire(blocking=False))
+        slots.release()
         peer.settimeout(0.2)
         self.assertEqual(peer.recv(1), b"")
 
@@ -3037,17 +3070,26 @@ class DurableWorkTest(unittest.TestCase):
         for thread in threads:
             thread.join(timeout=1)
             self.assertFalse(thread.is_alive())
-        records = list(self.work()["completed"].values()) + self.work()["queue"]
+        self.wait_until(lambda: self.writes_drained(self.broker))
+        state = self.work()
+        records = list(state["completed"].values()) + state["queue"]
         self.assertEqual(max(tuple(record["watermark"]) for record in records), (2, 1))
         self.assertFalse(any(tuple(record["watermark"]) > (2, 1) for record in records))
         newest = next(
             record for record in records if record["watermark"] == [2, 1]
         )
-        self.assertEqual(newest["adapter_request"]["outcome"], "newer")
+        newer_request = {
+            "document_id": "doc",
+            "epoch": 2,
+            "checkpoint": 1,
+            "outcome": "newer",
+        }
+        newer_digest = hashlib.sha256(canonical_bytes(newer_request)).hexdigest()
+        self.assertEqual(newest["request_digest"], newer_digest)
         self.assertFalse(
             any(
                 record["watermark"] == [2, 1]
-                and record["adapter_request"]["outcome"] != "newer"
+                and record["request_digest"] != newer_digest
                 for record in records
             )
         )
@@ -3157,6 +3199,82 @@ class DurableWorkTest(unittest.TestCase):
         self.assertEqual(self.broker._write_retry_deadlines, {})
         self.assertEqual(self.broker._write_retry_heap, [])
         self.assertEqual(shutdown["active_writes"], 0)
+
+    def test_drain_item_recovers_publication_errors_as_retry_success_or_retired(self):
+        capability = self.exchange()
+        with patch.object(self.broker, "_submit_write"):
+            queued = self.client.retain_outcome(
+                capability,
+                sequence=1,
+                action_id="publication-error",
+                request={
+                    "document_id": "publication-error",
+                    "epoch": 1,
+                    "checkpoint": 1,
+                    "outcome": "queued",
+                },
+            )
+        queue_id = queued["payload"]["queue_id"]
+
+        with (
+            patch.object(
+                self.broker,
+                "_dispatch_queued_item",
+                side_effect=OSError("before replace"),
+            ),
+            patch(
+                "hindsight_memory_control_plane.broker.secrets.randbelow",
+                side_effect=(0, 500),
+            ),
+            patch.object(self.broker, "_schedule_write_retry") as retry,
+        ):
+            self.broker._drain_item(queue_id)
+            self.broker._drain_item(queue_id)
+        self.assertEqual(
+            retry.call_args_list,
+            [call(queue_id, 0.25 * 0.75), call(queue_id, 0.5 * 1.25)],
+        )
+        retried = next(
+            item for item in self.work()["queue"]
+            if item["queue_id"] == queue_id
+        )
+        self.assertEqual(retried["attempts"], 2)
+        self.assertEqual(retried["last_error"], "ADAPTER_UNAVAILABLE")
+
+        def completed_then_failed(_queue_id):
+            self.broker._transaction(
+                lambda work: work.update(queue=[]), runtime=True
+            )
+            raise OSError("after replace")
+
+        with (
+            patch.object(
+                self.broker,
+                "_dispatch_queued_item",
+                side_effect=completed_then_failed,
+            ),
+            patch.object(self.broker, "_release_write_dependents") as release,
+        ):
+            self.broker._drain_item(queue_id)
+        release.assert_called_once_with(queue_id)
+
+        with (
+            patch.object(
+                self.broker,
+                "_dispatch_queued_item",
+                side_effect=OSError("retired"),
+            ),
+            patch.object(
+                self.broker,
+                "_recover_write_publication_error",
+                return_value=("retired", 0.0),
+            ),
+            patch.object(self.broker, "_schedule_write_retry") as retry,
+            patch.object(self.broker, "_release_write_dependents") as release,
+        ):
+            self.broker._drain_item(queue_id)
+        retry.assert_not_called()
+        release.assert_not_called()
 
     def test_exchange_recovers_same_capability_after_unlink_crash(self):
         mint = self.client.session_mint("control", claims(), ttl_seconds=30)

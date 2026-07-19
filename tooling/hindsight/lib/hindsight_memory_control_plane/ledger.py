@@ -420,6 +420,92 @@ def _write_index_file(index: int, name: str, value: bytes) -> None:
     os.fsync(index)
 
 
+def _index_anchor_name(index: int) -> str:
+    metadata = os.fstat(index)
+    return (
+        ".hindsight-ledger-root-anchor-"
+        f"{metadata.st_dev}-{metadata.st_ino}.json"
+    )
+
+
+def _index_parent(index: int) -> int:
+    descriptor = os.open(
+        "..", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=index
+    )
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        os.close(descriptor)
+        raise OSError("ledger identity index anchor parent is unsafe")
+    return descriptor
+
+
+def _index_anchor(index: int) -> dict[str, Any] | None:
+    parent = _index_parent(index)
+    try:
+        value = _read_index_file(parent, _index_anchor_name(index))
+    finally:
+        os.close(parent)
+    if value is None:
+        return None
+    try:
+        anchor = strict_json_loads(value)
+    except (UnicodeDecodeError, ValueError):
+        raise LedgerError(
+            "ledger identity index authentication anchor is invalid"
+        ) from None
+    if (
+        not isinstance(anchor, dict)
+        or set(anchor)
+        != {
+            "schema_version", "indexed_bytes", "ledger_chain_digest",
+            "index_root_key", "index_root_digest",
+        }
+        or anchor["schema_version"] != 1
+        or type(anchor["indexed_bytes"]) is not int
+        or anchor["indexed_bytes"] < 0
+        or not isinstance(anchor["ledger_chain_digest"], str)
+        or DIGEST.fullmatch(anchor["ledger_chain_digest"]) is None
+        or (anchor["index_root_key"] is None)
+        != (anchor["index_root_digest"] is None)
+        or any(
+            item is not None
+            and (not isinstance(item, str) or DIGEST.fullmatch(item) is None)
+            for item in (
+                anchor["index_root_key"], anchor["index_root_digest"]
+            )
+        )
+        or canonical_bytes(anchor) != value
+    ):
+        raise LedgerError(
+            "ledger identity index authentication anchor is invalid"
+        )
+    return anchor
+
+
+def _write_index_anchor(index: int, marker: Mapping[str, Any]) -> None:
+    parent = _index_parent(index)
+    try:
+        _write_index_file(
+            parent,
+            _index_anchor_name(index),
+            canonical_bytes(
+                {
+                    "schema_version": 1,
+                    "indexed_bytes": marker["indexed_bytes"],
+                    "ledger_chain_digest": marker["ledger_chain_digest"],
+                    "index_root_key": marker["index_root_key"],
+                    "index_root_digest": marker["index_root_digest"],
+                }
+            ),
+        )
+    finally:
+        os.close(parent)
+
+
 def _ledger_tail_digest(descriptor: int, indexed_bytes: int) -> str:
     length = min(indexed_bytes, TAIL_VALIDATION_BYTES)
     return hashlib.sha256(
@@ -559,6 +645,18 @@ def _index_marker(index: int) -> dict[str, Any] | None:
         )
     ):
         raise LedgerError("ledger identity index marker is invalid")
+    if schema_version == 6:
+        anchor = _index_anchor(index)
+        if anchor is None or any(
+            anchor[key] != marker[key]
+            for key in (
+                "indexed_bytes", "ledger_chain_digest", "index_root_key",
+                "index_root_digest",
+            )
+        ):
+            raise LedgerError(
+                "ledger identity index authentication anchor does not match marker"
+            )
     return marker
 
 
@@ -626,23 +724,19 @@ def _write_index_marker(
     )
     if identity != verified_identity:
         raise LedgerError("ledger changed while authenticating indexed prefix")
-    _write_index_file(
-        index,
-        "complete",
-        canonical_bytes(
-            {
-                "schema_version": 6,
-                "indexed_bytes": indexed_bytes,
-                "ledger_dev": str(metadata.st_dev),
-                "ledger_ino": str(metadata.st_ino),
-                "ledger_mtime_ns": str(metadata.st_mtime_ns),
-                "ledger_ctime_ns": str(metadata.st_ctime_ns),
-                "ledger_chain_digest": ledger_chain_digest,
-                "index_root_key": index_root_key,
-                "index_root_digest": index_root_digest,
-            }
-        ),
-    )
+    marker = {
+        "schema_version": 6,
+        "indexed_bytes": indexed_bytes,
+        "ledger_dev": str(metadata.st_dev),
+        "ledger_ino": str(metadata.st_ino),
+        "ledger_mtime_ns": str(metadata.st_mtime_ns),
+        "ledger_ctime_ns": str(metadata.st_ctime_ns),
+        "ledger_chain_digest": ledger_chain_digest,
+        "index_root_key": index_root_key,
+        "index_root_digest": index_root_digest,
+    }
+    _write_index_anchor(index, marker)
+    _write_index_file(index, "complete", canonical_bytes(marker))
 
 
 def _index_entry(
@@ -975,8 +1069,9 @@ def _append_record(
         index = _open_identity_index(directory, target.name)
         try:
             marker = _index_marker(index)
-            metadata_change_is_growth = marker is not None and (
-                observed_size > marker["indexed_bytes"]
+            metadata_change_is_authenticated = marker is not None and (
+                marker["schema_version"] == 6
+                or observed_size > marker["indexed_bytes"]
                 or file_size > marker["indexed_bytes"]
             )
             if idempotent:
@@ -984,7 +1079,7 @@ def _append_record(
                     index,
                     descriptor,
                     file_size,
-                    allow_metadata_change=metadata_change_is_growth,
+                    allow_metadata_change=metadata_change_is_authenticated,
                 )
                 current_marker = _index_marker(index)
                 if current_marker is None or current_marker["schema_version"] != 6:
@@ -1009,7 +1104,7 @@ def _append_record(
                     index,
                     descriptor,
                     file_size,
-                    allow_metadata_change=metadata_change_is_growth,
+                    allow_metadata_change=metadata_change_is_authenticated,
                 )
             elif file_size == 0:
                 _write_index_marker(index, descriptor, 0)

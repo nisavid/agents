@@ -15,6 +15,7 @@ if str(LIB) not in sys.path:
 
 from hindsight_memory_control_plane.canonical import digest
 from hindsight_memory_control_plane.policy import (
+    ModelPolicy,
     PolicyError,
     observation_scope,
     resolve_policy,
@@ -292,6 +293,25 @@ class BankPolicyTest(unittest.TestCase):
                 for model in self.policy.contextual_models
             )
         )
+
+    def test_direct_model_policy_construction_detaches_sequence_fields(self):
+        evidence = ["facts", "observations"]
+        tags = ["workflow:review"]
+        model = ModelPolicy(
+            id="model",
+            max_tokens=1024,
+            refresh_mode="delta",
+            source_evidence=evidence,
+            exclude_mental_models=True,
+            refresh_after_consolidation=False,
+            refresh_cron=None,
+            source_filter_tags=tags,
+        )
+
+        evidence.append("mutated")
+        tags.append("repo:mutated")
+        self.assertEqual(model.source_evidence, ("facts", "observations"))
+        self.assertEqual(model.source_filter_tags, ("workflow:review",))
 
     def test_defense_tracing_and_cross_bank_writes_are_fail_closed(self):
         for bank_id in ("engineering", "personal", "airlock"):
@@ -1645,6 +1665,32 @@ class ProviderCompatibilityTest(unittest.TestCase):
             "openai-embedding"
         )
         self.assertTrue(allowed.activatable)
+
+    def test_embedding_revision_approval_is_independent_of_blue_green_gate(self):
+        providers = list(self.providers)
+        providers[2] = provider(
+            "openai-embedding",
+            "embedding",
+            artifact_id="other-embedding",
+            placement="third-party-hosted",
+            revision="rev-2",
+            active_revision="rev-1",
+        )
+        switch = {
+            "provider_id": "openai-embedding",
+            "from_artifact_id": "text-embedding-3-small",
+            "from_revision": "rev-1",
+            "to_artifact_id": "other-embedding",
+            "to_revision": "rev-2",
+            "blue_green_rebuild": False,
+            "approved": True,
+        }
+
+        blocked = self.validate(
+            providers=providers, switches=(switch,)
+        ).result("openai-embedding")
+        self.assertNotIn("revision_switch_not_approved", blocked.blocked_by)
+        self.assertIn("embedding_identity_immutable", blocked.blocked_by)
 
     def test_embedding_switch_must_match_every_identity_field_and_real_drift(self):
         providers = list(self.providers)

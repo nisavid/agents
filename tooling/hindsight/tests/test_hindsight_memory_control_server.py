@@ -324,7 +324,9 @@ class ControlServerTest(unittest.TestCase):
         request = ["GET /health HTTP/1.1", "Host: 127.0.0.1"]
         request.extend(f"X-Pad-{index}: {'x' * 40}" for index in range(32))
         connection.sendall(("\r\n".join(request) + "\r\n\r\n").encode())
-        response = connection.recv(4096)
+        response = bytearray()
+        while chunk := connection.recv(4096):
+            response.extend(chunk)
         self.assertIn(b"413", response)
         self.assertIn(b'"error":"REQUEST_TOO_LARGE"', response)
         self.assertEqual(self.resolutions, before)
@@ -819,9 +821,9 @@ class ControlServerTest(unittest.TestCase):
         future.result(timeout=1)
         self.server.close()
 
-    def test_capacity_retains_completed_idempotency_outcomes_until_ttl(self):
+    def test_completed_outcomes_do_not_consume_active_mutation_capacity(self):
         self.server.request_timeout_seconds = 0.02
-        self.server._max_session_operations = 2
+        self.server._max_session_operations = 1
         release = threading.Event()
         self.addCleanup(release.set)
 
@@ -833,12 +835,12 @@ class ControlServerTest(unittest.TestCase):
         self.server.session_operator = operation
         self.assertEqual(self.request(
             "POST", "/v1/sessions/mint", headers=self.auth(),
-            body={"session_id": "pending"},
-        )[0], 202)
-        self.assertEqual(self.request(
-            "POST", "/v1/sessions/mint", headers=self.auth(),
             body={"session_id": "completed"},
         )[0], 200)
+        self.assertEqual(self.request(
+            "POST", "/v1/sessions/mint", headers=self.auth(),
+            body={"session_id": "pending"},
+        )[0], 202)
         rejected = self.request(
             "POST", "/v1/sessions/mint", headers=self.auth(),
             body={"session_id": "new"},
@@ -852,7 +854,7 @@ class ControlServerTest(unittest.TestCase):
         self.assertNotIn(("new", "mint"), self.server._session_operations)
 
     def test_completed_outcomes_are_bounded_without_evicting_idempotency_results(self):
-        self.server._max_session_operations = 64
+        self.server._max_retained_session_outcomes = 64
 
         for index in range(64):
             status, _, body = self.request(
@@ -1156,25 +1158,50 @@ class ControlServerTest(unittest.TestCase):
         self.server.forbidden_material_resolver = (
             lambda _context: (escaped_material,)
         )
-        original_dispatch = self.server._dispatch
-        try:
-            for response in (
-                {"safe": escaped_material},
-                {escaped_material: "safe"},
-                {"nested": [{"safe": escaped_material}]},
-            ):
-                with self.subTest(response=response):
-                    self.server._dispatch = (
-                        lambda handler, method, response=response: (200, response)
-                    )
+        for response in (
+            {"safe": escaped_material},
+            {escaped_material: "safe"},
+            {"nested": [{"safe": escaped_material}]},
+        ):
+            with self.subTest(response=response):
+                with patch.object(
+                    self.server,
+                    "_dispatch",
+                    side_effect=lambda _handler, _method, response=response: (
+                        200, response
+                    ),
+                ):
                     status, _, body = self.request(
                         "GET", "/health", headers=self.auth()
                     )
-                    self.assertEqual(status, 500)
-                    self.assertEqual(body, {"error": "RESPONSE_INVALID"})
-                    self.assertNotIn(escaped_material, json.dumps(body))
-        finally:
-            self.server._dispatch = original_dispatch
+                self.assertEqual(status, 500)
+                self.assertEqual(body, {"error": "RESPONSE_INVALID"})
+                self.assertNotIn(escaped_material, json.dumps(body))
+
+    def test_successful_overridden_dispatch_still_runs_secret_scanner(self):
+        secret = "private-overridden-dispatch-material"
+        self.server.forbidden_material_resolver = lambda _context: (secret,)
+        with patch.object(
+            self.server,
+            "_dispatch",
+            return_value=(200, {"schema_version": 1, "value": "safe"}),
+        ) as dispatch:
+            status, _, body = self.request(
+                "GET", "/health", headers=self.auth()
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"schema_version": 1, "value": "safe"})
+        dispatch.assert_called_once()
+
+        with patch.object(
+            self.server,
+            "_dispatch",
+            return_value=(200, {"schema_version": 1, "value": secret}),
+        ):
+            status, _, body = self.request(
+                "GET", "/health", headers=self.auth()
+            )
+        self.assertEqual((status, body), (500, {"error": "RESPONSE_INVALID"}))
 
     def test_session_input_schema_is_closed_before_operator_dispatch(self):
         invalid = [

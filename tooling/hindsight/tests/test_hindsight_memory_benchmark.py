@@ -123,6 +123,50 @@ def promotion_report(candidate_id="candidate", **overrides):
 
 
 class BenchmarkTest(unittest.TestCase):
+    def test_numeric_surfaces_reject_oversize_values_as_benchmark_errors(self):
+        huge = 10**1000
+        dataset = BenchmarkDataset(1, tuple(CASES), cases_digest(CASES))
+        with self.assertRaises(BenchmarkError):
+            evaluate_candidate(
+                dataset,
+                candidate(
+                    dimensions=dimensions(latency_ms_p95=huge)
+                ),
+                seed=1,
+                bootstrap_samples=1,
+            )
+
+        baseline = promotion_report("baseline")
+        candidate_report = promotion_report("candidate")
+        thresholds = {
+            "max_retrieval_regression": {
+                "recall_at_20": 0.01,
+                "ndcg_at_10": 0.01,
+            },
+            "meaningful_gain": {
+                "recall_at_20": 0.02,
+                "ndcg_at_10": 0.02,
+                "latency_ms_p95": huge,
+                "direct_cost_usd": 0.001,
+                "peak_memory_mb": 1.0,
+                "model_footprint_mb": 1.0,
+            },
+        }
+        with self.assertRaises(BenchmarkError):
+            promotion_eligibility(baseline, candidate_report, thresholds)
+
+        oversized_report = deepcopy(candidate_report)
+        oversized_report["metrics"]["recall_at_20"] = huge
+        oversized_report["case_metrics"]["recall_at_20"] = [huge]
+        with self.assertRaises(BenchmarkError):
+            promotion_eligibility(baseline, oversized_report, {
+                **thresholds,
+                "meaningful_gain": {
+                    **thresholds["meaningful_gain"],
+                    "latency_ms_p95": 1.0,
+                },
+            })
+
     def test_candidate_iteration_is_explicitly_bounded(self):
         dataset = BenchmarkDataset(1, tuple(CASES), cases_digest(CASES))
         with patch(
@@ -596,7 +640,7 @@ class BenchmarkTest(unittest.TestCase):
         ]
 
         with patch(
-            "hindsight_memory_control_plane.benchmark._canonical_bytes",
+            "hindsight_memory_control_plane.canonical.canonical_bytes",
             side_effect=AssertionError("candidate sorting serialized a report"),
         ):
             self.assertEqual(

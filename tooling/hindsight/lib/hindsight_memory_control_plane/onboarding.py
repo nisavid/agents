@@ -326,14 +326,24 @@ def _validate_complete_session(session: OnboardingSession) -> None:
     )
 
 
-def build_onboarding_plan(session: OnboardingSession, *, controller_plan_digest: str) -> OnboardingPlan:
+def _controller_plan_payload(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise OnboardingError("controller plan payload must be an object")
+    try:
+        payload = deep_thaw(deep_freeze(value))
+        digest(payload)
+        return payload
+    except (TypeError, ValueError) as error:
+        raise OnboardingError("controller plan payload is not canonical") from error
+
+
+def build_onboarding_plan(
+    session: OnboardingSession,
+    *,
+    controller_plan: Mapping[str, Any],
+) -> OnboardingPlan:
     _validate_complete_session(session)
-    if not isinstance(controller_plan_digest, str) or not re.fullmatch(
-        r"[0-9a-f]{64}", controller_plan_digest
-    ):
-        raise OnboardingError(
-            "controller plan digest must be a lowercase SHA-256 digest"
-        )
+    controller_plan_digest = digest(_controller_plan_payload(controller_plan))
     body = {
         "schema_version": 1,
         "desired_state": session.desired_state,
@@ -348,6 +358,7 @@ def apply_onboarding_plan(
     plan: OnboardingPlan,
     *,
     approved_plan_digest: str | None,
+    controller_plan: Mapping[str, Any],
     controller_apply: Callable[[dict[str, Any]], Any],
 ) -> str:
     if (
@@ -376,6 +387,11 @@ def apply_onboarding_plan(
         r"[0-9a-f]{64}", plan.controller_plan_digest
     ):
         raise OnboardingError("controller plan digest must be a lowercase SHA-256 digest")
+    controller_payload = _controller_plan_payload(controller_plan)
+    if not hmac.compare_digest(
+        digest(controller_payload), plan.controller_plan_digest
+    ):
+        raise OnboardingError("onboarding plan is not bound to this controller plan")
     if not isinstance(plan.plan_digest, str) or not re.fullmatch(
         r"[0-9a-f]{64}", plan.plan_digest
     ):
@@ -389,10 +405,5 @@ def apply_onboarding_plan(
         or not hmac.compare_digest(approved_plan_digest, computed_plan_digest)
     ):
         raise OnboardingError("exact digest-bound onboarding plan approval is required")
-    controller_apply(
-        {
-            **plan.to_dict(),
-            "desired_state": canonical_desired_state,
-        }
-    )
+    controller_apply(controller_payload)
     return computed_plan_digest

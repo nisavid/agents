@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+from dataclasses import replace
 import fcntl
 import functools
+import ipaddress
 import json
 import os
 import re
@@ -13,12 +15,83 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Mapping, NamedTuple
+from urllib.parse import urlsplit
 
 
 PROFILE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 COMPONENTS = frozenset({"daemon", "ui"})
 STATES = frozenset({"running", "stopped"})
 CONTROL_PID_LOCK_NAME = ".control-pid.lifecycle.lock"
+PROVIDER_PRESET_ENV = {
+    "id": "HINDSIGHT_EMBED_PROVIDER_PRESET_ID",
+    "label": "HINDSIGHT_EMBED_PROVIDER_PRESET_LABEL",
+    "runtime_provider": "HINDSIGHT_EMBED_PROVIDER_PRESET_RUNTIME_PROVIDER",
+    "base_url": "HINDSIGHT_EMBED_PROVIDER_PRESET_BASE_URL",
+    "model": "HINDSIGHT_EMBED_PROVIDER_PRESET_MODEL",
+}
+
+
+class ProviderPreset(NamedTuple):
+    id: str
+    label: str
+    runtime_provider: str
+    base_url: str
+    model: str
+
+
+def provider_preset_from_environment(
+    environ: Mapping[str, str] = os.environ,
+) -> ProviderPreset | None:
+    values = {
+        field: environ.get(variable, "").strip()
+        for field, variable in PROVIDER_PRESET_ENV.items()
+    }
+    configured = {field for field, value in values.items() if value}
+    if not configured:
+        return None
+    if configured != set(PROVIDER_PRESET_ENV):
+        missing = sorted(set(PROVIDER_PRESET_ENV) - configured)
+        variables = ", ".join(PROVIDER_PRESET_ENV[field] for field in missing)
+        raise ValueError(f"incomplete provider preset; missing {variables}")
+    if not PROFILE_PATTERN.fullmatch(values["id"]):
+        raise ValueError("invalid provider preset ID")
+    if not PROFILE_PATTERN.fullmatch(values["runtime_provider"]):
+        raise ValueError("invalid provider preset runtime provider")
+    if any(
+        len(values[field]) > limit
+        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in values[field])
+        for field, limit in (("label", 256), ("model", 512))
+    ):
+        raise ValueError("invalid provider preset display value")
+    if len(values["base_url"]) > 2048 or any(
+        character.isspace() for character in values["base_url"]
+    ):
+        raise ValueError("invalid provider preset base URL")
+    try:
+        endpoint = urlsplit(values["base_url"])
+        port = endpoint.port
+    except ValueError as error:
+        raise ValueError("invalid provider preset base URL") from error
+    try:
+        host_is_loopback = ipaddress.ip_address(
+            endpoint.hostname or ""
+        ).is_loopback
+    except ValueError:
+        host_is_loopback = False
+    if (
+        endpoint.scheme not in {"http", "https"}
+        or not endpoint.netloc
+        or endpoint.hostname is None
+        or endpoint.username is not None
+        or endpoint.password is not None
+        or endpoint.query
+        or endpoint.fragment
+        or (endpoint.scheme == "http" and not host_is_loopback)
+        or port == 0
+    ):
+        raise ValueError("invalid provider preset base URL")
+    return ProviderPreset(**values)
 
 
 def normalize_profile(profile: str) -> str:
@@ -274,8 +347,13 @@ def install_lifecycle_hooks(service, desired_state_dir: Path) -> None:
     )
 
 
-def install_provider_catalog(providers) -> None:
+def install_provider_catalog(
+    providers, preset: ProviderPreset | None = None
+) -> None:
     existing = {provider.id for provider in providers.PROVIDER_CATALOG}
+    reserved = existing | {"openai-codex", "claude-code"}
+    if preset is not None and preset.id in reserved:
+        raise ValueError(f"provider preset ID is reserved: {preset.id}")
     additions = []
     if "openai-codex" not in existing:
         additions.append(
@@ -289,12 +367,92 @@ def install_provider_catalog(providers) -> None:
                 "claude-code", "Claude Code (subscription)", False
             )
         )
+    if preset is not None:
+        additions.append(
+            providers.ProviderInfo(
+                preset.id, preset.label, False, preset.base_url
+            )
+        )
     providers.PROVIDER_CATALOG = (*providers.PROVIDER_CATALOG, *additions)
 
 
+def _matches_provider_preset(config, preset: ProviderPreset) -> bool:
+    return (
+        config.provider == preset.runtime_provider
+        and config.model == preset.model
+        and config.base_url == preset.base_url
+    )
+
+
+def install_provider_alias(service, preset: ProviderPreset) -> None:
+    original_get_profile_config = service.get_profile_config
+    original_list_profiles = service.list_profiles
+    original_save_llm_config = service.save_llm_config
+
+    def display_config(config):
+        if _matches_provider_preset(config, preset):
+            return replace(config, provider=preset.id)
+        return config
+
+    def get_profile_config(name: str):
+        return display_config(original_get_profile_config(name))
+
+    def list_profiles():
+        summaries = []
+        for summary in original_list_profiles():
+            config = get_profile_config(summary.name)
+            if config.provider == preset.id:
+                summary = replace(
+                    summary, provider=preset.id, model=preset.model
+                )
+            summaries.append(summary)
+        return summaries
+
+    def save_llm_config(
+        name: str,
+        provider: str,
+        api_key: str | None,
+        model: str | None,
+        base_url: str | None,
+        api_port: str | None = None,
+        ui_port: str | None = None,
+        api_version: str | None = None,
+        cp_version: str | None = None,
+    ):
+        current = original_get_profile_config(name)
+        if provider == preset.id:
+            provider = preset.runtime_provider
+            api_key = ""
+            model = preset.model
+            base_url = preset.base_url
+        elif base_url is None and _matches_provider_preset(current, preset):
+            base_url = ""
+
+        return display_config(
+            original_save_llm_config(
+                name=name,
+                provider=provider,
+                api_key=api_key,
+                model=model,
+                base_url=base_url,
+                api_port=api_port,
+                ui_port=ui_port,
+                api_version=api_version,
+                cp_version=cp_version,
+            )
+        )
+
+    service.get_profile_config = get_profile_config
+    service.list_profiles = list_profiles
+    service.save_llm_config = save_llm_config
+
+
 def install_hooks(service, providers, desired_state_dir: Path) -> None:
+    preset = provider_preset_from_environment()
+    install_provider_catalog(providers, preset)
     install_lifecycle_hooks(service, desired_state_dir)
-    install_provider_catalog(providers)
+    if preset is not None:
+        install_provider_alias(service, preset)
 
 
 def serve(port: int, desired_state_dir: Path) -> int:
@@ -425,6 +583,58 @@ def _remove_private_pid_if_matches(
         os.close(parent)
 
 
+def _read_private_pid(path: Path) -> dict[str, object] | None:
+    parent = _open_absolute_directory(
+        path.parent, create=False, private=True, label="control PID directory"
+    )
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            path.name,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent,
+        )
+        metadata = os.fstat(descriptor)
+        _validate_private_file(metadata, "control PID file")
+        payload = os.read(descriptor, 4097)
+        if len(payload) > 4096:
+            raise ValueError("control PID file is invalid")
+        value = json.loads(payload)
+        if (
+            not isinstance(value, dict)
+            or set(value) != {"desired_state_dir", "pid", "port"}
+            or type(value["pid"]) is not int
+            or value["pid"] <= 0
+            or type(value["port"]) is not int
+            or not 1 <= value["port"] <= 65535
+            or not isinstance(value["desired_state_dir"], str)
+            or not Path(value["desired_state_dir"]).is_absolute()
+        ):
+            raise ValueError("control PID file is invalid")
+        current = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != (metadata.st_dev, metadata.st_ino):
+            raise ValueError("control PID file changed")
+        return value
+    except FileNotFoundError:
+        return None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(parent)
+
+
+def _process_running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 def _terminate_and_reap(process: subprocess.Popen) -> None:
     if process.poll() is not None:
         process.wait()
@@ -445,6 +655,26 @@ def start(port: int, desired_state_dir: Path) -> int:
     with _control_pid_lifecycle_lock(pid_path):
         if lifecycle.control_status(port).running:
             return 0
+        try:
+            existing = _read_private_pid(pid_path)
+        except ValueError:
+            print(
+                "hindsight-embed-control-server: refusing invalid control PID file",
+                file=sys.stderr,
+            )
+            return 1
+        if existing is not None:
+            existing_pid = int(existing["pid"])
+            existing_port = int(existing["port"])
+            existing_state = Path(str(existing["desired_state_dir"]))
+            if _process_running(existing_pid):
+                # A live wrapper on another port owns the singleton PID file.
+                # Refuse replacement rather than orphaning or signaling a PID
+                # whose complete process identity is not available here.
+                return 1
+            _remove_private_pid_if_matches(
+                pid_path, existing_pid, existing_port, existing_state
+            )
 
         log_descriptor = _open_private_append(lifecycle.log_file())
         command = [

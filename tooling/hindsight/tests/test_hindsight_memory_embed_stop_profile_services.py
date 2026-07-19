@@ -427,10 +427,11 @@ class StopProfileServicesTest(unittest.TestCase):
             self.helper,
             "stable_process_identity",
             side_effect=("first", "replacement"),
-        ):
+        ) as stable_identity:
             self.assertEqual(
                 self.helper.verified_process_identity(1234, lambda: True), ""
             )
+        self.assertEqual(stable_identity.call_count, 2)
 
     def test_idle_control_port_still_targets_live_owned_recorded_process(self):
         manager = Manager()

@@ -762,34 +762,38 @@ class ImportProjectionTest(unittest.TestCase):
                 with self.assertRaisesRegex(ImportValidationError, "secret-like"):
                     inspect_items("codex", [record(content=content)])
 
-    def test_resume_skips_only_matching_identity_and_complete_item_digest(self):
+    def test_projection_never_treats_resume_evidence_as_import_completion(self):
         items = inspect_items("codex", [record(), record("m2", "Use current evidence.")])
-        resume = {items[0].item_id: import_item_digest(items[0]), items[1].item_id: "0" * 64}
-        projection = project_import(items, resume_state=resume)
-        self.assertEqual(projection.skipped_item_ids, (items[0].item_id,))
-        self.assertEqual(
-            dict(projection.skip_evidence[0]),
+        evidence_values = (
+            import_item_digest(items[0]),
             {
-                "item_id": items[0].item_id,
+                "phase": "inspection",
                 "item_digest": import_item_digest(items[0]),
             },
+            {
+                "phase": "import",
+                "operation": "retain",
+                "target_bank": {"profile_id": "other", "bank_id": "foreign"},
+                "receipt_digest": "f" * 64,
+            },
         )
-        self.assertEqual([item.item_id for item in projection.pending_items], [items[1].item_id])
-
-        legacy = project_import(
-            items,
-            resume_state={items[0].item_id: items[0].content_digest},
-        )
-        self.assertEqual(legacy.skipped_item_ids, ())
-        self.assertEqual(legacy.pending_items, legacy.items)
-
+        for evidence in evidence_values:
+            with self.subTest(evidence=evidence), self.assertRaisesRegex(
+                ImportValidationError,
+                "inspection resume state cannot suppress pending import work",
+            ):
+                project_import(
+                    items,
+                    resume_state={items[0].item_id: evidence},
+                )
         with self.assertRaisesRegex(
-            ImportValidationError, "unknown projection item identities"
+            ImportValidationError,
+            "inspection resume state cannot suppress pending import work",
         ):
-            project_import(
-                items,
-                resume_state={"f" * 64: import_item_digest(items[0])},
-            )
+            project_import(items, resume_state={})
+        projection = project_import(items)
+        self.assertEqual(projection.skipped_item_ids, ())
+        self.assertEqual(projection.pending_items, projection.items)
 
     def test_projection_rejects_unsubstantiated_skipped_items(self):
         item = inspect_items("codex", [record()])[0]
@@ -804,7 +808,7 @@ class ImportProjectionTest(unittest.TestCase):
         )
         forged = replace(forged, projection_digest=digest(forged.body()))
         with self.assertRaisesRegex(
-            ImportValidationError, "canonical item digest"
+            ImportValidationError, "explicit omission evidence"
         ):
             validate_projection(forged)
 
@@ -826,7 +830,7 @@ class ImportProjectionTest(unittest.TestCase):
         )
         forged = replace(forged, projection_digest=digest(forged.body()))
         with self.assertRaisesRegex(
-            ImportValidationError, "explicit omission reason"
+            ImportValidationError, "explicit omission evidence"
         ):
             validate_projection(forged)
 

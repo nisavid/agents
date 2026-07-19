@@ -293,7 +293,7 @@ class FakeAdapter:
         else:
             raise AdapterError(f"unsupported apply action: {action.kind}")
         self._apply_action_ids.pop(0)
-        self._apply_expected_state_digest = digest(self._rollback_state())
+        self._apply_expected_state_digest = digest(self._binding_snapshot())
         self._pending_action_id = action.id
 
     def preflight_action(self, action) -> None:
@@ -303,7 +303,8 @@ class FakeAdapter:
             or self._pending_action_id is not None
             or action.id not in self._apply_action_ids
             or digest(self.endpoint.to_dict()) != binding.endpoint_digest
-            or digest(self._rollback_state()) != self._apply_expected_state_digest
+            or digest(self._binding_snapshot())
+            != self._apply_expected_state_digest
         ):
             raise AdapterError("action is not bound to the approved plan state")
         if (
@@ -320,7 +321,8 @@ class FakeAdapter:
             or not self._apply_action_ids
             or self._apply_action_ids[0] != action.id
             or digest(self.endpoint.to_dict()) != binding.endpoint_digest
-            or digest(self._rollback_state()) != self._apply_expected_state_digest
+            or digest(self._binding_snapshot())
+            != self._apply_expected_state_digest
         ):
             raise AdapterError("action is not bound to the approved plan state")
 
@@ -331,7 +333,7 @@ class FakeAdapter:
         self._apply_action_ids.pop(0)
         self._pending_action_id = action.id
         mutation()
-        self._apply_expected_state_digest = digest(self._rollback_state())
+        self._apply_expected_state_digest = digest(self._binding_snapshot())
 
     def verify_postcondition(self, action) -> bool:
         if (
@@ -353,6 +355,12 @@ class FakeAdapter:
         prestate = deepcopy(self.state)
         prestate.pop("migration_generation", None)
         return prestate
+
+    def _binding_snapshot(self) -> dict[str, Any]:
+        return {
+            "state": self._rollback_state(),
+            "operations": deepcopy(self.operations),
+        }
 
     def create_rollback_bundle(
         self,
@@ -393,6 +401,7 @@ class FakeAdapter:
         )
         self._rollbacks[rollback_id] = {
             "bundle": bundle, "state": prestate,
+            "binding_digest": digest(self._binding_snapshot()),
             "verifiable": self.restore_proof_valid,
             "verified": False,
         }
@@ -418,6 +427,7 @@ class FakeAdapter:
             or record["bundle"] != rollback
             or record["verified"] is not True
             or rollback.prestate_digest != digest(self._rollback_state())
+            or record["binding_digest"] != digest(self._binding_snapshot())
             or rollback.endpoint_digest != digest(self.endpoint.to_dict())
         ):
             raise AdapterError("apply plan requires the exact verified rollback")
@@ -427,7 +437,7 @@ class FakeAdapter:
             raise AdapterError("an apply plan binding is already active")
         self._apply_binding = rollback
         self._apply_action_ids = list(rollback.action_ids)
-        self._apply_expected_state_digest = rollback.prestate_digest
+        self._apply_expected_state_digest = record["binding_digest"]
         self._pending_action_id = None
         self._verified_action_ids.clear()
         self._record("bind_apply_plan", {"action_count": len(rollback.action_ids)})

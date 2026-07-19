@@ -146,7 +146,13 @@ def _mutation_actions(
                     raise ApplyError(
                         "mutation bank endpoint must match the target endpoint"
                     )
-        if details["source_bank"] == details["target_bank"]:
+        source_identity = tuple(
+            details["source_bank"][key] for key in ("profile_id", "bank_id")
+        )
+        target_identity = tuple(
+            details["target_bank"][key] for key in ("profile_id", "bank_id")
+        )
+        if source_identity == target_identity:
             raise ApplyError("mutation source and target banks must be distinct")
         result.append(Action(identifier, kind, deep_freeze(details)))
         seen.add(identifier)

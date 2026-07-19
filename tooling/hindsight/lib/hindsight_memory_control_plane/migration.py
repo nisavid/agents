@@ -87,7 +87,7 @@ HOOK_REGISTRATION_KEYS = frozenset({
 })
 SCHEDULE_KEYS = frozenset({"bank_role", "model_id", "trigger_digest"})
 STATIC_MIGRATION_TAGS = AGENT_TAGS | SOURCE_TAGS | LIFECYCLE_TAGS | KIND_TAGS
-CATALOG_TAG = re.compile(r"(?:repo|workflow):[a-z0-9][a-z0-9-]*\Z")
+CATALOG_TAG = re.compile(r"(?:repo|workflow):[a-z0-9][a-z0-9._-]*\Z")
 PACKAGE_KEYS = {
     "schema_version",
     "approved_manifest_digest",
@@ -1701,10 +1701,18 @@ def discover_migration_state(
         try:
             _live_coverage(before, repository_catalog)
         except MigrationError as error:
-            if str(error) == "migration item has conflicting repository scopes":
-                blockers.append("coverage:conflicting_repository_scopes")
-            else:
+            conflict_blockers = {
+                "migration item has conflicting repository scopes":
+                    "coverage:conflicting_repository_scopes",
+                "migration item has conflicting workflow scopes":
+                    "coverage:conflicting_workflow_scopes",
+                "migration item has conflicting semantic scopes":
+                    "coverage:conflicting_semantic_scopes",
+            }
+            blocker = conflict_blockers.get(str(error))
+            if blocker is None:
                 raise
+            blockers.append(blocker)
     blockers = sorted(set(blockers))
     if blockers:
         return MigrationDiscovery(False, tuple(blockers))

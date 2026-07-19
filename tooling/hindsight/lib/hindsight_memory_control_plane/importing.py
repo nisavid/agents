@@ -768,41 +768,27 @@ def inspect_items(source_kind: str, records: Sequence[Mapping[str, Any]]) -> tup
     return tuple(sorted(result, key=lambda item: item.item_id))
 
 
-def project_import(items: Iterable[ImportItem], *, resume_state: Mapping[str, str] | None = None) -> ImportProjection:
+def project_import(items: Iterable[ImportItem], *, resume_state: Mapping[str, Any] | None = None) -> ImportProjection:
     supplied = tuple(items)
     for item in supplied:
         _validate_import_item(item)
     ordered = tuple(sorted(supplied, key=lambda item: (item.timestamp, item.item_id)))
     if len({item.item_id for item in ordered}) != len(ordered):
         raise ImportValidationError("projection item identities must be unique")
-    resume = dict(resume_state or {})
-    for item_id, item_digest in resume.items():
-        _sha(item_id, "resume item identity")
-        _sha(item_digest, "resume item digest")
-    known_item_ids = {item.item_id for item in ordered}
-    unknown_resume_ids = set(resume) - known_item_ids
-    if unknown_resume_ids:
+    if resume_state is not None:
         raise ImportValidationError(
-            "resume state references unknown projection item identities"
+            "inspection resume state cannot suppress pending import work"
         )
     skipped = tuple(
         item.item_id
         for item in ordered
         if item.coverage_disposition == "omitted"
-        or resume.get(item.item_id) == import_item_digest(item)
     )
     skip_evidence = tuple(
-        (
-            {
-                "item_id": item.item_id,
-                "reason": item.coverage_reason,
-            }
-            if item.coverage_disposition == "omitted"
-            else {
-                "item_id": item.item_id,
-                "item_digest": import_item_digest(item),
-            }
-        )
+        {
+            "item_id": item.item_id,
+            "reason": item.coverage_reason,
+        }
         for item in ordered
         if item.item_id in skipped
     )
@@ -859,28 +845,16 @@ def validate_projection(projection: ImportProjection) -> None:
             raise ImportValidationError(
                 "projection skipped items require exact skip evidence"
             )
-        if item.coverage_disposition == "omitted":
-            reason = evidence.get("reason")
-            if (
-                set(evidence) != {"item_id", "reason"}
-                or not isinstance(reason, str)
-                or not hmac.compare_digest(reason, item.coverage_reason)
-            ):
-                raise ImportValidationError(
-                    "non-importable projection items require their explicit omission reason"
-                )
-        else:
-            item_digest = evidence.get("item_digest")
-            if (
-                set(evidence) != {"item_id", "item_digest"}
-                or not isinstance(item_digest, str)
-                or not hmac.compare_digest(
-                    item_digest, import_item_digest(item)
-                )
-            ):
-                raise ImportValidationError(
-                    "resumed projection items require their canonical item digest"
-                )
+        reason = evidence.get("reason")
+        if (
+            item.coverage_disposition != "omitted"
+            or set(evidence) != {"item_id", "reason"}
+            or not isinstance(reason, str)
+            or not hmac.compare_digest(reason, item.coverage_reason)
+        ):
+            raise ImportValidationError(
+                "skipped projection items require explicit omission evidence"
+            )
     _sha(projection.projection_digest, "projection digest")
     if not hmac.compare_digest(digest(projection.body()), projection.projection_digest):
         raise ImportValidationError("projection digest does not match projection body")

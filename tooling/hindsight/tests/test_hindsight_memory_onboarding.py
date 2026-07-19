@@ -19,6 +19,9 @@ from hindsight_memory_control_plane.onboarding import (
 from hindsight_memory_control_plane.canonical import digest
 
 
+CONTROLLER_PLAN = {"schema_version": 1, "actions": []}
+
+
 def complete_session():
     session = OnboardingSession()
     while (decision := session.next_decision()) is not None:
@@ -105,19 +108,32 @@ class OnboardingTest(unittest.TestCase):
 
     def test_plan_and_apply_use_controller_digest_gate(self):
         session = complete_session()
-        plan = build_onboarding_plan(session, controller_plan_digest="c" * 64)
+        plan = build_onboarding_plan(
+            session, controller_plan=CONTROLLER_PLAN
+        )
         calls = []
         with self.assertRaises(OnboardingError):
-            apply_onboarding_plan(plan, approved_plan_digest=None, controller_apply=calls.append)
+            apply_onboarding_plan(
+                plan,
+                approved_plan_digest=None,
+                controller_plan=CONTROLLER_PLAN,
+                controller_apply=calls.append,
+            )
         with self.assertRaises(OnboardingError):
             apply_onboarding_plan(
                 plan,
                 approved_plan_digest="d" * 64,
+                controller_plan=CONTROLLER_PLAN,
                 controller_apply=calls.append,
             )
         self.assertEqual(calls, [])
-        apply_onboarding_plan(plan, approved_plan_digest=plan.plan_digest, controller_apply=calls.append)
-        self.assertEqual(calls, [plan.to_dict()])
+        apply_onboarding_plan(
+            plan,
+            approved_plan_digest=plan.plan_digest,
+            controller_plan=CONTROLLER_PLAN,
+            controller_apply=calls.append,
+        )
+        self.assertEqual(calls, [CONTROLLER_PLAN])
 
     def test_cross_topic_incompatibilities_fail_with_actionable_choices(self):
         def record_until(session, topic, choices):
@@ -231,31 +247,54 @@ class OnboardingTest(unittest.TestCase):
             self.assertEqual(session.desired_state[topic], choice)
 
 
-    def test_plan_rejects_non_string_controller_digest_as_onboarding_error(self):
-        for value in (None, 1, b"c" * 64):
+    def test_plan_rejects_non_mapping_controller_payload(self):
+        for value in (None, 1, b"payload"):
             with self.subTest(value=value), self.assertRaisesRegex(
-                OnboardingError, "controller plan digest"
+                OnboardingError, "controller plan payload"
             ):
                 build_onboarding_plan(
-                    complete_session(), controller_plan_digest=value
+                    complete_session(), controller_plan=value
                 )
+
+        with self.assertRaisesRegex(OnboardingError, "not canonical"):
+            build_onboarding_plan(
+                complete_session(),
+                controller_plan={"unsafe_number": 10**1000},
+            )
 
     def test_apply_recomputes_digest_before_mutation(self):
         session = complete_session()
-        plan = build_onboarding_plan(session, controller_plan_digest="c" * 64)
+        plan = build_onboarding_plan(
+            session, controller_plan=CONTROLLER_PLAN
+        )
         tampered = replace(plan, controller_plan_digest="d" * 64)
         calls = []
         with self.assertRaises(OnboardingError):
             apply_onboarding_plan(
                 tampered,
                 approved_plan_digest=plan.plan_digest,
+                controller_plan=CONTROLLER_PLAN,
+                controller_apply=calls.append,
+            )
+        self.assertEqual(calls, [])
+
+    def test_apply_rejects_a_different_controller_plan_payload(self):
+        plan = build_onboarding_plan(
+            complete_session(), controller_plan=CONTROLLER_PLAN
+        )
+        calls = []
+        with self.assertRaisesRegex(OnboardingError, "not bound"):
+            apply_onboarding_plan(
+                plan,
+                approved_plan_digest=plan.plan_digest,
+                controller_plan={"schema_version": 1, "actions": ["changed"]},
                 controller_apply=calls.append,
             )
         self.assertEqual(calls, [])
 
     def test_apply_rejects_boolean_schema_version_before_mutation(self):
         plan = build_onboarding_plan(
-            complete_session(), controller_plan_digest="c" * 64
+            complete_session(), controller_plan=CONTROLLER_PLAN
         )
         forged = replace(plan, schema_version=True)
         forged = replace(forged, plan_digest=digest(forged.body()))
@@ -264,13 +303,14 @@ class OnboardingTest(unittest.TestCase):
             apply_onboarding_plan(
                 forged,
                 approved_plan_digest=forged.plan_digest,
+                controller_plan=CONTROLLER_PLAN,
                 controller_apply=calls.append,
             )
         self.assertEqual(calls, [])
 
     def test_apply_revalidates_directly_constructed_plan_content(self):
         plan = build_onboarding_plan(
-            complete_session(), controller_plan_digest="c" * 64
+            complete_session(), controller_plan=CONTROLLER_PLAN
         )
         desired_state = dict(plan.desired_state)
         desired_state["profiles"] = "not-a-declared-choice"
@@ -281,13 +321,14 @@ class OnboardingTest(unittest.TestCase):
             apply_onboarding_plan(
                 forged,
                 approved_plan_digest=forged.plan_digest,
+                controller_plan=CONTROLLER_PLAN,
                 controller_apply=calls.append,
             )
         self.assertEqual(calls, [])
 
     def test_apply_reconstructs_canonical_desired_state_order(self):
         plan = build_onboarding_plan(
-            complete_session(), controller_plan_digest="c" * 64
+            complete_session(), controller_plan=CONTROLLER_PLAN
         )
         forged = replace(
             plan,
@@ -298,13 +339,14 @@ class OnboardingTest(unittest.TestCase):
         apply_onboarding_plan(
             forged,
             approved_plan_digest=forged.plan_digest,
+            controller_plan=CONTROLLER_PLAN,
             controller_apply=calls.append,
         )
-        self.assertEqual(tuple(calls[0]["desired_state"]), ONBOARDING_TOPICS)
+        self.assertEqual(calls, [CONTROLLER_PLAN])
 
     def test_apply_rejects_missing_or_extra_desired_state_topics(self):
         plan = build_onboarding_plan(
-            complete_session(), controller_plan_digest="c" * 64
+            complete_session(), controller_plan=CONTROLLER_PLAN
         )
         for desired_state in (
             {key: value for key, value in plan.desired_state.items() if key != "import"},
@@ -316,13 +358,14 @@ class OnboardingTest(unittest.TestCase):
                 apply_onboarding_plan(
                     forged,
                     approved_plan_digest=forged.plan_digest,
+                    controller_plan=CONTROLLER_PLAN,
                     controller_apply=lambda _plan: None,
                 )
 
     def test_plan_rejects_incomplete_or_forged_sessions(self):
         with self.assertRaisesRegex(OnboardingError, "every decision"):
             build_onboarding_plan(
-                OnboardingSession(), controller_plan_digest="c" * 64
+                OnboardingSession(), controller_plan=CONTROLLER_PLAN
             )
 
         complete = complete_session()
@@ -359,7 +402,7 @@ class OnboardingTest(unittest.TestCase):
         for session in forged_cases:
             with self.subTest(session=session), self.assertRaises(OnboardingError):
                 build_onboarding_plan(
-                    session, controller_plan_digest="c" * 64
+                    session, controller_plan=CONTROLLER_PLAN
                 )
 
 

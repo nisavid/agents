@@ -749,34 +749,21 @@ hindsight_stack_profile_slot() {
     print -ru2 -- "hindsight-embed-stack: profile slot directory must be absolute: ${HINDSIGHT_EMBED_PROFILE_SLOT_DIR}"
     return 1
   }
-  local trusted_parent="$HINDSIGHT_EMBED_PROFILE_SLOT_DIR"
-  while [[ ! -e "$trusted_parent" && "$trusted_parent" != / ]]; do
-    trusted_parent="${trusted_parent:h}"
+  local slot_parent="$HINDSIGHT_EMBED_PROFILE_SLOT_DIR"
+  while [[ ! -e "$slot_parent" && "$slot_parent" != / ]]; do
+    slot_parent="${slot_parent:h}"
   done
-  [[ -d "$trusted_parent" && ! -L "$trusted_parent" ]] || {
-    print -ru2 -- "hindsight-embed-stack: profile slot parent is not a real directory: ${trusted_parent}"
-    return 1
-  }
-  local parent_owner parent_mode
-  parent_owner="$(/usr/bin/stat -f '%u' "$trusted_parent")" || return 1
-  parent_mode="$(/usr/bin/stat -f '%Lp' "$trusted_parent")" || return 1
-  if [[ "$trusted_parent" == "$HINDSIGHT_EMBED_PROFILE_SLOT_DIR" ]]; then
-    (( parent_owner == EUID )) || {
-      print -ru2 -- "hindsight-embed-stack: profile slot directory must be current-user-owned: ${trusted_parent}"
-      return 1
-    }
-  else
-    (( parent_owner == EUID && (8#$parent_mode & 8#0077) == 0 )) || {
-      print -ru2 -- "hindsight-embed-stack: profile slot parent must be private and current-user-owned: ${trusted_parent}"
+  if [[ "$slot_parent" != "$HINDSIGHT_EMBED_PROFILE_SLOT_DIR" ]]; then
+    local slot_parent_owner slot_parent_mode
+    slot_parent_owner="$(/usr/bin/stat -f '%u' "$slot_parent")" || return 1
+    slot_parent_mode="$(/usr/bin/stat -f '%Lp' "$slot_parent")" || return 1
+    (( slot_parent_owner == EUID && (8#$slot_parent_mode & 8#0077) == 0 )) || {
+      print -ru2 -- "hindsight-embed-stack: profile slot parent must be private and current-user-owned: ${slot_parent}"
       return 1
     }
   fi
-  /bin/mkdir -p "$HINDSIGHT_EMBED_PROFILE_SLOT_DIR" || return 1
-  [[ -d "$HINDSIGHT_EMBED_PROFILE_SLOT_DIR" && ! -L "$HINDSIGHT_EMBED_PROFILE_SLOT_DIR" ]] || {
-    print -ru2 -- "hindsight-embed-stack: refusing unsafe profile slot directory: ${HINDSIGHT_EMBED_PROFILE_SLOT_DIR}"
-    return 1
-  }
-  /bin/chmod 700 "$HINDSIGHT_EMBED_PROFILE_SLOT_DIR" || return 1
+  hindsight_stack_prepare_private_state_directory \
+    "$HINDSIGHT_EMBED_PROFILE_SLOT_DIR" "profile slot directory" || return 1
 
   local slot_file="$HINDSIGHT_EMBED_PROFILE_SLOT_DIR/${profile}.slot"
   local lock_file="$HINDSIGHT_EMBED_PROFILE_SLOT_DIR/.allocation.lock"
@@ -1837,6 +1824,7 @@ hindsight_stack_broker_terminate_recorded() {
     return 0
   }
   [[ "$current" == "$expected" ]] || {
+    hindsight_stack_broker_clear_process_record || return 1
     print -ru2 -- "hindsight-embed-stack: refusing to signal broker with changed process identity: ${pid}"
     return 1
   }

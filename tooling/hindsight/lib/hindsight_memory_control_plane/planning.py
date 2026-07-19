@@ -213,6 +213,7 @@ def _operations(
         resolved.append(normalized)
     if record["idle"] != (len(resolved) == 0):
         raise PlanError("operations idle state disagrees with active operations")
+    resolved.sort(key=lambda operation: operation["id"])
     return OperationSnapshot(record["idle"], tuple(resolved))
 
 

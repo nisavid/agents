@@ -9,7 +9,7 @@ cleanup_test_fixtures() {
   unsetopt ERR_EXIT
   local pid attempt
   local -a pids=()
-  for pid in "${cleanup_lock_holder:-}" "${cleanup_lock_observer:-}"; do
+  for pid in "${cleanup_lock_holder:-}" "${cleanup_lock_observer:-}" "${fifo_copy_pid:-}"; do
     [[ "$pid" == <-> ]] || continue
     pids+=("$pid")
     /bin/kill -TERM "$pid" >/dev/null 2>&1 || true
@@ -41,6 +41,20 @@ source "$repo_dir/lib/hindsight-embed-stack.zsh"
 export HINDSIGHT_EMBED_PYTHON=/usr/bin/python3
 export HINDSIGHT_CLEANUP_ARCHIVE_TIMEOUT_SECONDS=3600
 export HINDSIGHT_CLEANUP_MIGRATION_TIMEOUT_SECONDS=3600
+
+maintenance_acl_state="$tmp_dir/maintenance-acl-state"
+mkdir -m 700 "$maintenance_acl_state"
+touch "$maintenance_acl_state/.maintenance.lock"
+chmod 600 "$maintenance_acl_state/.maintenance.lock"
+chmod +a 'everyone allow read' "$maintenance_acl_state/.maintenance.lock"
+if (
+  HINDSIGHT_EMBED_STATE_DIR="$maintenance_acl_state"
+  acquire_cleanup_maintenance_lease
+) >/dev/null 2>&1; then
+  print -ru2 -- "cleanup accepted an ACL-bearing maintenance lease"
+  exit 1
+fi
+chmod -N "$maintenance_acl_state/.maintenance.lock"
 
 acl_helper_dir="$tmp_dir/acl-helper-dir"
 acl_helper="$acl_helper_dir/helper"
@@ -137,6 +151,7 @@ if wait "$fifo_copy_pid"; then
   print -ru2 -- "cleanup accepted a FIFO archive source"
   exit 1
 fi
+fifo_copy_pid=""
 
 missing_source="$tmp_dir/missing-source"
 if (HINDSIGHT_CLEANUP_ARCHIVE_SOURCES="$missing_source" archive_sources "$tmp_dir/missing-archive") >/dev/null 2>&1; then
@@ -1239,19 +1254,48 @@ topology_rendered="$(paste -sd, - <"$topology_events")"
 }
 
 idle_loaded_topology="$tmp_dir/idle-loaded-topology"
+idle_running_topology="$tmp_dir/idle-running-topology"
 (
   typeset -g HINDSIGHT_CLEANUP_LEGACY_PROFILES=""
   managed_service_loaded() { return 0 }
   managed_service_running() { return 1 }
-  start_managed_stack() { touch "$idle_loaded_topology" }
+  load_managed_stack() { touch "$idle_loaded_topology" }
+  start_managed_stack() { touch "$idle_running_topology" }
   capture_service_topology
   (( HINDSIGHT_CLEANUP_MANAGED_WAS_LOADED == 1 ))
   (( HINDSIGHT_CLEANUP_MANAGED_WAS_RUNNING == 0 ))
   typeset -g HINDSIGHT_CLEANUP_TOPOLOGY_CAPTURED=1
   restore_service_topology
 )
-[[ -e "$idle_loaded_topology" ]] || {
-  print -ru2 -- "cleanup did not restore an idle loaded managed LaunchAgent"
+[[ ! -e "$idle_loaded_topology" ]] || {
+  print -ru2 -- "cleanup re-bootstrapped an idle loaded managed LaunchAgent"
+  exit 1
+}
+[[ ! -e "$idle_running_topology" ]] || {
+  print -ru2 -- "cleanup started a previously idle managed LaunchAgent"
+  exit 1
+}
+
+idle_loaded_stop="$tmp_dir/idle-loaded-stop"
+(
+  typeset -g HINDSIGHT_CLEANUP_LEGACY_PROFILES=""
+  hindsight_stack_load_config() { return 0 }
+  capture_service_topology() {
+    typeset -g HINDSIGHT_CLEANUP_MANAGED_WAS_LOADED=1
+    typeset -g HINDSIGHT_CLEANUP_MANAGED_WAS_RUNNING=0
+    typeset -gA HINDSIGHT_CLEANUP_LEGACY_DAEMON_WAS_RUNNING=()
+    typeset -gA HINDSIGHT_CLEANUP_LEGACY_UI_WAS_RUNNING=()
+  }
+  hindsight_cleanup_run_lifecycle_command() { touch "$idle_loaded_stop" }
+  hindsight_stack_broker_stop() { return 0 }
+  hindsight_stack_ui_running() { return 1 }
+  hindsight_stack_daemon_running() { return 1 }
+  hindsight_stack_broker_status() { return 1 }
+  hindsight_stack_control_running() { return 1 }
+  stop_managed_and_legacy_services
+)
+[[ ! -e "$idle_loaded_stop" ]] || {
+  print -ru2 -- "cleanup unloaded a previously idle managed LaunchAgent"
   exit 1
 }
 

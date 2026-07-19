@@ -57,14 +57,8 @@ DIRECT_ACTION_KINDS = frozenset(
 )
 
 ARTIFACT_ACTION_KINDS = frozenset(
-    {
-        "activate_model",
-        "configure_bank",
-        "configure_profile",
-        "install_model",
-        "upsert_directive",
-        "upsert_model",
-    }
+    kind for kind, schema in ACTION_SCHEMAS.items()
+    if "artifact_digest" in schema
 )
 
 EXECUTABLE_ACTION_KINDS = frozenset(ACTION_METHODS) | DIRECT_ACTION_KINDS

@@ -195,7 +195,12 @@ class UnixJsonRpcServer:
                 bound_identity = self._bind_listener(
                     listener, parent_descriptor
                 )
-                listener.settimeout(0.1)
+                # Closing the descriptor does not reliably unblock a Unix
+                # accept in another thread on every supported platform. Keep
+                # the poll bounded by the close budget without busy-polling.
+                listener.settimeout(
+                    min(0.1, max(0.01, self.close_timeout_seconds / 2))
+                )
                 thread = threading.Thread(
                     target=self._serve,
                     args=(listener, executor, connection_slots),
@@ -510,15 +515,25 @@ class UnixJsonRpcServer:
 
     def _close(self) -> None:
         with SOCKET_LIFECYCLE_LOCK:
+            deadline = time.monotonic() + self.close_timeout_seconds
             self._closing.set()
             executor = self._executor
             if self._socket is not None:
+                try:
+                    self._socket.shutdown(socket.SHUT_RDWR)
+                except (AttributeError, OSError):
+                    pass
                 self._socket.close()
-            if self._thread is not None:
-                self._thread.join(timeout=1)
+            listener_thread = self._thread
+            if listener_thread is not None:
+                listener_thread.join(
+                    timeout=max(0.0, deadline - time.monotonic())
+                )
+            listener_active = bool(
+                listener_thread is not None and listener_thread.is_alive()
+            )
             if executor is not None:
                 executor.shutdown(wait=False, cancel_futures=True)
-            deadline = time.monotonic() + self.close_timeout_seconds
             pending: set[Future[Any]] = set()
             while True:
                 with self._connection_futures_lock:
@@ -545,7 +560,7 @@ class UnixJsonRpcServer:
                 callbacks_drained = not self._connection_futures
             if not pending or callbacks_drained:
                 self._executor = None
-            if pending:
+            if pending or listener_active:
                 raise BrokerError("SERVER_CLOSE_INCOMPLETE")
 
     def _unlink_bound_path(self, identity: tuple[int, int] | None) -> None:

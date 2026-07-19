@@ -389,6 +389,9 @@ class ControlServer:
         ] = {}
         self._accepting_callbacks = False
         self._max_session_operations = max(64, max_connections * 4)
+        self._max_retained_session_outcomes = max(
+            4096, self._max_session_operations * 16
+        )
         self._session_operation_ttl_seconds = 300.0
         self._shutdown_timeout_seconds = 1.0
         self._accepting_mutations = False
@@ -886,7 +889,18 @@ class ControlServer:
                 # failures.  Retain it for the full TTL; admitting new work by
                 # evicting an outcome could repeat a mutation whose response
                 # was lost to the caller.
-                if len(self._session_operations) >= self._max_session_operations:
+                active_operations = sum(
+                    not stored_future.done()
+                    for stored_future, _started, _context
+                    in self._session_operations.values()
+                )
+                retained_outcomes = len(self._session_operations) - active_operations
+                if active_operations >= self._max_session_operations:
+                    raise ControlServerError("PROVIDER_UNAVAILABLE")
+                if (
+                    retained_outcomes
+                    >= self._max_retained_session_outcomes
+                ):
                     raise ControlServerError("PROVIDER_UNAVAILABLE")
                 if not self._mutation_slots.acquire(blocking=False):
                     raise ControlServerError("PROVIDER_UNAVAILABLE")

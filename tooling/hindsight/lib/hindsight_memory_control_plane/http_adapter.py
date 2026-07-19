@@ -420,12 +420,21 @@ class HttpAdapter:
             raise AdapterError("migration tags response is invalid")
         tags: set[str] = set()
         for item in value:
-            candidate = item.get("tag") if isinstance(item, Mapping) else item
+            if isinstance(item, Mapping):
+                if not set(item) <= {"tag", "count"}:
+                    raise AdapterError("migration tags response has unknown fields")
+                count = item.get("count")
+                if count is not None and (type(count) is not int or count < 0):
+                    raise AdapterError("migration tags response is invalid")
+                candidate = item.get("tag")
+            else:
+                candidate = item
             if (
-                isinstance(candidate, str)
-                and cls.SAFE_MIGRATION_TAG.fullmatch(candidate) is not None
+                not isinstance(candidate, str)
+                or cls.SAFE_MIGRATION_TAG.fullmatch(candidate) is None
             ):
-                tags.add(candidate)
+                raise AdapterError("migration tags response is invalid")
+            tags.add(candidate)
         return sorted(tags)
 
     @classmethod
@@ -517,6 +526,16 @@ class HttpAdapter:
         for item in value:
             if not isinstance(item, Mapping):
                 raise AdapterError("snapshot bank response is invalid")
+            allowed_bank_keys = {
+                "bank_id", "id", "profile_id", "profile", "artifact_digest",
+                "enable_auto_consolidation", "memory_defense", "models",
+                "directives",
+            }
+            unknown_bank_fields = {
+                str(key): value
+                for key, value in item.items()
+                if key not in allowed_bank_keys
+            }
             bank_id = item.get("bank_id", item.get("id"))
             profile_id = item.get("profile_id", item.get("profile"))
             if (
@@ -532,6 +551,8 @@ class HttpAdapter:
                 raise AdapterError("snapshot bank identity is invalid")
             identities.add((profile_id, bank_id))
             bank: dict[str, Any] = {"id": bank_id}
+            if unknown_bank_fields:
+                bank["unknown_fields_digest"] = digest(unknown_bank_fields)
             if profile_id is not None:
                 bank["profile_id"] = profile_id
             for key in ("artifact_digest",):
@@ -571,6 +592,16 @@ class HttpAdapter:
                         raise AdapterError(
                             f"snapshot bank {collection} response is invalid"
                         )
+                    allowed_entry_keys = {
+                        identity_label, "id", "artifact_digest"
+                    }
+                    if collection == "models":
+                        allowed_entry_keys.add("revision")
+                    unknown_entry_fields = {
+                        str(key): value
+                        for key, value in raw_entry.items()
+                        if key not in allowed_entry_keys
+                    }
                     identifier = raw_entry.get(identity_label, raw_entry.get("id"))
                     artifact = raw_entry.get("artifact_digest")
                     if (
@@ -588,6 +619,10 @@ class HttpAdapter:
                         "id": identifier,
                         "artifact_digest": artifact,
                     }
+                    if unknown_entry_fields:
+                        entry["unknown_fields_digest"] = digest(
+                            unknown_entry_fields
+                        )
                     if collection == "models" and "revision" in raw_entry:
                         revision = raw_entry["revision"]
                         if (
@@ -1136,6 +1171,7 @@ class HttpAdapter:
         if len(invalidation_ids) != len(set(invalidation_ids)):
             raise AdapterError("invalidated memory response identity is duplicated")
         active: list[dict[str, Any]] = []
+        operation_ids: set[str] = set()
         for status in ("pending", "processing"):
             for operation in self._read_items(
                 f"{base}/operations?{urlencode({'status': status})}",
@@ -1150,8 +1186,10 @@ class HttpAdapter:
                 if (
                     self.ROLLBACK_ID.fullmatch(operation_id) is None
                     or not self._aware_timestamp(updated_at)
+                    or operation_id in operation_ids
                 ):
                     raise AdapterError("migration operation response is invalid")
+                operation_ids.add(operation_id)
                 active.append(
                     {
                         "bank_role": role,
@@ -1163,14 +1201,17 @@ class HttpAdapter:
         if not isinstance(webhooks_response.get("items"), list):
             raise AdapterError("webhook response is invalid")
         hooks = []
+        hook_ids: set[str] = set()
         for item in webhooks_response["items"]:
             if (
                 not isinstance(item, Mapping)
                 or not isinstance(item.get("id"), str)
                 or self.ROLLBACK_ID.fullmatch(item["id"]) is None
+                or item["id"] in hook_ids
                 or not {"target", "activation", "config"} <= set(item)
             ):
                 raise AdapterError("webhook response is invalid")
+            hook_ids.add(item["id"])
             try:
                 representation = {
                     "target_digest": digest(item["target"]),
@@ -1274,9 +1315,14 @@ class HttpAdapter:
                 snapshot.get("state")
                 if isinstance(snapshot, Mapping) else None
             )
+            operations = (
+                snapshot.get("operations")
+                if isinstance(snapshot, Mapping) else None
+            )
             if (
                 not isinstance(endpoint, Mapping)
                 or not isinstance(state, Mapping)
+                or not isinstance(operations, Mapping)
                 or digest(endpoint) != rollback.endpoint_digest
                 or digest(state) != rollback.prestate_digest
             ):
@@ -1287,6 +1333,7 @@ class HttpAdapter:
                 "plan_digest": rollback.plan_digest,
                 "expected_state_digest": rollback.prestate_digest,
                 "expected_endpoint_digest": rollback.endpoint_digest,
+                "expected_operations_digest": digest(operations),
                 "rollback": rollback,
                 "action_ids": rollback.action_ids,
             }
@@ -1360,6 +1407,18 @@ class HttpAdapter:
                 or self._last_action_attestation is not None
             ):
                 raise AdapterError("action is not bound to the approved plan sequence")
+            snapshot = self.snapshot()
+            operations = (
+                snapshot.get("operations")
+                if isinstance(snapshot, Mapping) else None
+            )
+            if (
+                not isinstance(operations, Mapping)
+                or not hmac.compare_digest(
+                    digest(operations), binding["expected_operations_digest"]
+                )
+            ):
+                raise AdapterError("action operations drifted")
             control = self._action_control(
                 action,
                 binding["plan_digest"],
@@ -1418,10 +1477,18 @@ class HttpAdapter:
             snapshot = self.snapshot()
             state = snapshot.get("state") if isinstance(snapshot, Mapping) else None
             endpoint = snapshot.get("endpoint") if isinstance(snapshot, Mapping) else None
+            operations = (
+                snapshot.get("operations")
+                if isinstance(snapshot, Mapping) else None
+            )
             if (
                 not isinstance(state, Mapping)
                 or not hmac.compare_digest(digest(state), binding["expected_state_digest"])
                 or not hmac.compare_digest(digest(endpoint), binding["expected_endpoint_digest"])
+                or not isinstance(operations, Mapping)
+                or not hmac.compare_digest(
+                    digest(operations), binding["expected_operations_digest"]
+                )
             ):
                 raise AdapterError("external action prestate drifted")
             control = self._action_control(

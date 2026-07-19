@@ -259,8 +259,9 @@ raw Hindsight bank selection remains an implementation detail.
     that cross-bank and mutation decisions remain traceable without preserving
     memory payloads.
 76. As the operator, I want every Hindsight data-plane endpoint protected by a distinct
-    profile bearer token held only by the controller, so that a harness cannot
-    bypass bank policy by calling loopback directly.
+    profile bearer token available only to the controller and the matching profile
+    process, never to harnesses or their descendants, so that a harness cannot bypass
+    bank policy by calling loopback directly.
 77. As an agent user, I want each session to receive an expiring,
     replay-resistant controller capability, so that memory access remains bound
     to the approved home bank and trust mode.

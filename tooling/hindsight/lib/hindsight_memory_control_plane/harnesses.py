@@ -476,13 +476,28 @@ def apply_activation(
                 or not hmac.compare_digest(digest(observed), digest(cas_observed))
             ):
                 raise ValueError("destination changed before rollback")
-            target = _owned_rollback_target(observed, current, plan)
-            write_result = write_configuration(digest(observed), target)
-            if write_result is not None and (
-                not isinstance(write_result, Mapping)
-                or not hmac.compare_digest(digest(write_result), digest(target))
+            observed_surface = digest(
+                _activation_surface(observed, plan.retired_keys)
+            )
+            activated_surface = digest(
+                _activation_surface(activated, plan.retired_keys)
+            )
+            original_surface = digest(
+                _activation_surface(current, plan.retired_keys)
+            )
+            if not (
+                hmac.compare_digest(observed_surface, activated_surface)
+                or hmac.compare_digest(observed_surface, original_surface)
             ):
-                raise ValueError("rollback write result is invalid")
+                raise ValueError("activation-owned state changed before rollback")
+            target = _owned_rollback_target(observed, current, plan)
+            if not hmac.compare_digest(digest(observed), digest(target)):
+                write_result = write_configuration(digest(observed), target)
+                if write_result is not None and (
+                    not isinstance(write_result, Mapping)
+                    or not hmac.compare_digest(digest(write_result), digest(target))
+                ):
+                    raise ValueError("rollback write result is invalid")
             restored = read_configuration()
             if not isinstance(restored, Mapping):
                 raise ValueError("persisted destination configuration is invalid")
@@ -602,9 +617,9 @@ def apply_activation(
             prestate=current,
             destination_harness_id=destination_harness_id,
         )
-        configuration = deep_thaw(deep_freeze(persisted))
+        configuration = deep_thaw(deep_freeze(rollback_current))
         rollback_succeeded = False
-        if rolled_back.status == "rolled_back":
+        if rolled_back.status == "rollback_ready":
             try:
                 restored = deep_thaw(rolled_back.configuration)
                 write_configuration(digest(rollback_current), restored)
@@ -617,7 +632,12 @@ def apply_activation(
                     digest(restored),
                 )
             except Exception:
-                configuration = deep_thaw(deep_freeze(persisted))
+                try:
+                    observed = read_configuration()
+                    if isinstance(observed, Mapping):
+                        configuration = deep_thaw(deep_freeze(observed))
+                except Exception:
+                    pass
         return ActivationOutcome(
             "rolled_back" if rollback_succeeded else "rollback_failed",
             "postcheck_failed",
@@ -671,4 +691,11 @@ def rollback_activation(
             restored[key] = deep_thaw(prestate[key])
         else:
             restored.pop(key, None)
-    return _outcome("rolled_back", "ok", restored, plan, rollback_attempted=True, rollback_succeeded=True)
+    return _outcome(
+        "rollback_ready",
+        "ok",
+        restored,
+        plan,
+        rollback_attempted=False,
+        rollback_succeeded=False,
+    )

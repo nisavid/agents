@@ -3,8 +3,9 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 import os
+import sys
 import tempfile
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -39,6 +40,21 @@ class DaemonResult:
 @dataclass(frozen=True)
 class UiResult:
     running: bool
+
+
+@dataclass(frozen=True)
+class ProfileConfig:
+    name: str
+    provider: str
+    model: str | None
+    base_url: str | None
+
+
+@dataclass(frozen=True)
+class ProfileSummary:
+    name: str
+    provider: str
+    model: str | None
 
 
 class ControlServerHooksTest(unittest.TestCase):
@@ -93,6 +109,59 @@ class ControlServerHooksTest(unittest.TestCase):
             },
         )
 
+    def test_start_refuses_live_existing_control_server_on_different_port(self):
+        pid_path = Path(self.temporary.name) / "control.pid"
+        existing_state = Path(self.temporary.name) / "existing-state"
+        self.module._write_private_pid(
+            pid_path, os.getpid(), 7879, existing_state
+        )
+        lifecycle = SimpleNamespace(
+            pid_file=lambda: pid_path,
+            get_or_create_token=lambda: "token",
+            control_status=lambda _port: SimpleNamespace(running=False),
+        )
+        package = ModuleType("hindsight_embed")
+        control_center = ModuleType("hindsight_embed.control_center")
+        control_center.lifecycle = lifecycle
+        package.control_center = control_center
+        with patch.dict(
+            sys.modules,
+            {
+                "hindsight_embed": package,
+                "hindsight_embed.control_center": control_center,
+            },
+        ), patch.object(self.module.subprocess, "Popen") as popen:
+            self.assertEqual(self.module.start(7878, self.state_dir), 1)
+        popen.assert_not_called()
+        self.assertEqual(
+            json.loads(pid_path.read_text(encoding="ascii"))["port"],
+            7879,
+        )
+
+    def test_start_refuses_malformed_control_pid_without_replacing_it(self):
+        pid_path = Path(self.temporary.name) / "control.pid"
+        pid_path.write_text("{}", encoding="ascii")
+        pid_path.chmod(0o600)
+        lifecycle = SimpleNamespace(
+            pid_file=lambda: pid_path,
+            get_or_create_token=lambda: "token",
+            control_status=lambda _port: SimpleNamespace(running=False),
+        )
+        package = ModuleType("hindsight_embed")
+        control_center = ModuleType("hindsight_embed.control_center")
+        control_center.lifecycle = lifecycle
+        package.control_center = control_center
+        with patch.dict(
+            sys.modules,
+            {
+                "hindsight_embed": package,
+                "hindsight_embed.control_center": control_center,
+            },
+        ), patch.object(self.module.subprocess, "Popen") as popen:
+            self.assertEqual(self.module.start(7878, self.state_dir), 1)
+        popen.assert_not_called()
+        self.assertEqual(pid_path.read_text(encoding="ascii"), "{}")
+
     def test_rejects_group_writable_nonprivate_ancestor(self):
         ancestor = Path(self.temporary.name) / "group-writable"
         ancestor.mkdir(mode=0o700)
@@ -120,6 +189,141 @@ class ControlServerHooksTest(unittest.TestCase):
         )
         self.assertFalse(catalog["openai-codex"].needs_api_key)
         self.assertFalse(catalog["claude-code"].needs_api_key)
+
+    def test_provider_preset_catalog_and_alias_round_trip(self):
+        runtime = ProfileConfig(
+            "example-profile", "lmstudio", "example-model", "https://host/v1"
+        )
+        saved = []
+        service = SimpleNamespace(
+            get_profile_config=lambda _name: runtime,
+            list_profiles=lambda: [
+                ProfileSummary("example-profile", "lmstudio", "example-model")
+            ],
+            save_llm_config=lambda **kwargs: saved.append(kwargs) or runtime,
+        )
+        preset = self.module.ProviderPreset(
+            id="private-remote",
+            label="Private remote",
+            runtime_provider="lmstudio",
+            base_url="https://host/v1",
+            model="example-model",
+        )
+
+        self.module.install_provider_catalog(self.providers, preset)
+        self.module.install_provider_alias(service, preset)
+
+        self.assertEqual(
+            [item.id for item in self.providers.PROVIDER_CATALOG].count(
+                "private-remote"
+            ),
+            1,
+        )
+        self.assertEqual(service.get_profile_config("example-profile").provider, "private-remote")
+        self.assertEqual(service.list_profiles()[0].provider, "private-remote")
+        displayed = service.save_llm_config(
+            name="example-profile",
+            provider="private-remote",
+            api_key="ignored",
+            model="ignored",
+            base_url=None,
+        )
+        self.assertEqual(displayed.provider, "private-remote")
+        self.assertEqual(
+            saved[-1],
+            {
+                "name": "example-profile",
+                "provider": "lmstudio",
+                "api_key": "",
+                "model": "example-model",
+                "base_url": "https://host/v1",
+                "api_port": None,
+                "ui_port": None,
+                "api_version": None,
+                "cp_version": None,
+            },
+        )
+
+        service.save_llm_config(
+            name="example-profile",
+            provider="openai",
+            api_key="secret",
+            model="other-model",
+            base_url=None,
+        )
+        self.assertEqual(saved[-1]["base_url"], "")
+
+    def test_provider_preset_environment_is_all_or_none(self):
+        complete = {
+            "HINDSIGHT_EMBED_PROVIDER_PRESET_ID": "private-remote",
+            "HINDSIGHT_EMBED_PROVIDER_PRESET_LABEL": "Private remote",
+            "HINDSIGHT_EMBED_PROVIDER_PRESET_RUNTIME_PROVIDER": "lmstudio",
+            "HINDSIGHT_EMBED_PROVIDER_PRESET_BASE_URL": "https://host/v1",
+            "HINDSIGHT_EMBED_PROVIDER_PRESET_MODEL": "example-model",
+        }
+        self.assertEqual(
+            self.module.provider_preset_from_environment(complete),
+            self.module.ProviderPreset(
+                id="private-remote",
+                label="Private remote",
+                runtime_provider="lmstudio",
+                base_url="https://host/v1",
+                model="example-model",
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "incomplete provider preset"):
+            self.module.provider_preset_from_environment(
+                {"HINDSIGHT_EMBED_PROVIDER_PRESET_ID": "private-remote"}
+            )
+
+        for unsafe_url in (
+            "https://user:credential@host/v1",
+            "https://host/v1?api_key=credential",
+            "https://host/v1#credential",
+            "http://192.0.2.1/v1",
+            "http://127.0.0.1:0/v1",
+            "file:///private/provider",
+        ):
+            with self.subTest(unsafe_url=unsafe_url), self.assertRaisesRegex(
+                ValueError, "invalid provider preset base URL"
+            ):
+                self.module.provider_preset_from_environment(
+                    {
+                        **complete,
+                        "HINDSIGHT_EMBED_PROVIDER_PRESET_BASE_URL": unsafe_url,
+                    }
+                )
+
+        loopback = {
+            **complete,
+            "HINDSIGHT_EMBED_PROVIDER_PRESET_BASE_URL": "http://127.0.0.1:1234/v1",
+        }
+        self.assertEqual(
+            self.module.provider_preset_from_environment(loopback).base_url,
+            "http://127.0.0.1:1234/v1",
+        )
+
+    def test_provider_preset_rejects_reserved_and_existing_ids(self):
+        preset = self.module.ProviderPreset(
+            id="openai-codex",
+            label="Conflicting provider",
+            runtime_provider="lmstudio",
+            base_url="https://host/v1",
+            model="example-model",
+        )
+        original_ids = [
+            provider.id for provider in self.providers.PROVIDER_CATALOG
+        ]
+        with self.assertRaisesRegex(ValueError, "provider preset ID is reserved"):
+            self.module.install_provider_catalog(self.providers, preset)
+        self.assertEqual(
+            [provider.id for provider in self.providers.PROVIDER_CATALOG],
+            original_ids,
+        )
+
+        preset = preset._replace(id="openai")
+        with self.assertRaisesRegex(ValueError, "provider preset ID is reserved"):
+            self.module.install_provider_catalog(self.providers, preset)
 
     def test_lifecycle_hooks_preserve_intent_and_required_daemon(self):
         self.service.stop_daemon("example-profile")

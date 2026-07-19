@@ -266,6 +266,16 @@ class ModelPolicy:
     source_filter_tags: tuple[str, ...] = field(default=(), repr=False)
     public_ref: str | None = field(default=None, repr=False)
 
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "source_evidence", tuple(deep_freeze(self.source_evidence))
+        )
+        object.__setattr__(
+            self,
+            "source_filter_tags",
+            tuple(deep_freeze(self.source_filter_tags)),
+        )
+
     def to_dict(self, *, disclose_private: bool = False) -> dict[str, Any]:
         identifier = (
             self.id

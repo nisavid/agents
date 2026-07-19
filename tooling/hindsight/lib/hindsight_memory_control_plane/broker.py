@@ -1240,17 +1240,18 @@ class Broker:
             # so callers cannot replay a transition after a post-replace fsync
             # or permission failure.
             value = self._read_work()
-            self._work = value
-            self._used = set(value["used_nonces"])
-            self._revoked = set(value["revoked_nonces"])
+            self._adopt_work(value)
             raise
-        self._work = value
-        self._used = set(value["used_nonces"])
-        self._revoked = set(value["revoked_nonces"])
+        self._adopt_work(value)
         try:
             self._sync_digest_mirrors(value)
         except OSError:
             pass
+
+    def _adopt_work(self, value: dict[str, Any]) -> None:
+        self._work = value
+        self._used = set(value["used_nonces"])
+        self._revoked = set(value["revoked_nonces"])
 
     def _completed_reservation_bytes(self, item: Mapping[str, Any]) -> int:
         record = {
@@ -2252,6 +2253,21 @@ class Broker:
                 if error.code == "BROKER_RETIRED":
                     return
                 raise
+            except OSError:
+                # Publication failures leave either the durable queue item or
+                # its completed record authoritative. Re-read the adopted
+                # state before deciding whether this is a retry or success.
+                with self._lock:
+                    disposition, delay = (
+                        self._recover_write_publication_error(queue_id)
+                    )
+                if disposition == "retired":
+                    return
+                if disposition == "complete":
+                    self._release_write_dependents(queue_id)
+                    return
+                self._schedule_write_retry(queue_id, delay)
+                return
         if disposition in {"missing", "complete"}:
             self._release_write_dependents(queue_id)
         elif disposition == "predecessor":
@@ -2261,6 +2277,40 @@ class Broker:
             self._schedule_write_after_predecessor(queue_id)
         else:
             self._schedule_write_retry(queue_id, delay)
+
+    def _recover_write_publication_error(
+        self, queue_id: str
+    ) -> tuple[str, float]:
+        """Adopt durable state and persist bounded retry state after I/O failure."""
+        generation_descriptor = self._generation_lease_descriptor()
+        descriptor: int | None = None
+        generation_locked = False
+        state_locked = False
+        try:
+            fcntl.flock(generation_descriptor, fcntl.LOCK_SH)
+            generation_locked = True
+            descriptor = self._lease_descriptor()
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            state_locked = True
+            current = self._read_work()
+            self._adopt_work(current)
+            if current.get("generation") != self._generation:
+                return "retired", 0.0
+            if not any(
+                item["queue_id"] == queue_id for item in current["queue"]
+            ):
+                return "complete", 0.0
+            value = deepcopy(current)
+            delay = self._persist_dispatch_retry(value, queue_id)
+            return "retry", delay
+        finally:
+            if descriptor is not None:
+                if state_locked:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                os.close(descriptor)
+            if generation_locked:
+                fcntl.flock(generation_descriptor, fcntl.LOCK_UN)
+            os.close(generation_descriptor)
 
     def _schedule_write_retry(self, queue_id: str, delay: float) -> None:
         deadline = time.monotonic() + max(0.0, delay)

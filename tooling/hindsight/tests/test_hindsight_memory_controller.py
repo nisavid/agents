@@ -3475,7 +3475,10 @@ class ControllerCliTest(unittest.TestCase):
         malformed_action_plan = build_plan(
             desired, live, {"idle": True, "active": []}
         ).to_dict()
-        malformed_action_plan["actions"] = [{"id": "action", "kind": {}}]
+        malformed_action_plan["actions"][0]["kind"] = {}
+        malformed_body = dict(malformed_action_plan)
+        malformed_body.pop("plan_digest")
+        malformed_action_plan["plan_digest"] = digest(malformed_body)
         with self.assertRaises(PlanError):
             plan_from_dict(malformed_action_plan)
 
@@ -3937,6 +3940,59 @@ class ControllerCliTest(unittest.TestCase):
             (index / f'.auth-{marker["index_root_key"]}').write_bytes(b"{}")
             with self.assertRaisesRegex(LedgerError, "authentication path"):
                 append_record_once(ledger, base)
+
+    def test_ledger_identity_index_root_is_bound_by_external_anchor(self):
+        base = {
+            "schema_version": 1,
+            "action_id": "retain-anchored-root",
+            "correlation_id": "session-anchored-root",
+            "source_bank": {"profile_id": "core", "bank_id": "engineering", "endpoint": {"profile_id": "core", "scheme": "http", "host": "127.0.0.1", "port": 7979, "tenant": "default"}},
+            "target_bank": {"profile_id": "core", "bank_id": "personal", "endpoint": {"profile_id": "core", "scheme": "http", "host": "127.0.0.1", "port": 7979, "tenant": "default"}},
+            "policy_digest": "1" * 64,
+            "artifact_digest": "2" * 64,
+            "decision": "deny",
+            "reason_code": "INDEX_ANCHOR_TEST",
+            "timestamp": "2026-07-12T17:00:00Z",
+            "reversible_record_id": None,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = Path(directory) / "controller.jsonl"
+            append_record_once(ledger, base)
+            index = next(
+                path for path in Path(directory).glob(
+                    ".hindsight-ledger-index-*"
+                ) if path.is_dir()
+            )
+            marker_path = index / "complete"
+            marker = json.loads(marker_path.read_text())
+            marker["index_root_digest"] = "f" * 64
+            marker_path.write_bytes(canonical_bytes(marker))
+
+            with self.assertRaisesRegex(LedgerError, "anchor does not match"):
+                append_record_once(ledger, base)
+
+    def test_schema_six_recovers_metadata_after_truncating_partial_tail(self):
+        base = {
+            "schema_version": 1,
+            "action_id": "retain-metadata-recovery",
+            "correlation_id": "session-metadata-recovery",
+            "source_bank": {"profile_id": "core", "bank_id": "engineering", "endpoint": {"profile_id": "core", "scheme": "http", "host": "127.0.0.1", "port": 7979, "tenant": "default"}},
+            "target_bank": {"profile_id": "core", "bank_id": "personal", "endpoint": {"profile_id": "core", "scheme": "http", "host": "127.0.0.1", "port": 7979, "tenant": "default"}},
+            "policy_digest": "1" * 64,
+            "artifact_digest": "2" * 64,
+            "decision": "deny",
+            "reason_code": "METADATA_RECOVERY_TEST",
+            "timestamp": "2026-07-12T17:00:00Z",
+            "reversible_record_id": None,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = Path(directory) / "controller.jsonl"
+            self.assertTrue(append_record_once(ledger, base))
+            indexed_size = ledger.stat().st_size
+            with ledger.open("ab") as stream:
+                stream.write(b'{"schema_version":1')
+            self.assertFalse(append_record_once(ledger, base))
+            self.assertEqual(ledger.stat().st_size, indexed_size)
 
     def test_markerless_index_rebuild_recovers_authenticated_tree(self):
         base = {

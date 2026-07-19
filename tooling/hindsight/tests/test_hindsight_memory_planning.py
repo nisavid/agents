@@ -358,6 +358,14 @@ class PlanningValidationTest(unittest.TestCase):
         self.assertTrue(unsupported.isdisjoint(EXECUTABLE_ACTION_KINDS))
         self.assertIn("activate_model", ARTIFACT_ACTION_KINDS)
         self.assertIn("artifact_digest", ACTION_SCHEMAS["activate_model"])
+        self.assertEqual(
+            ARTIFACT_ACTION_KINDS,
+            {
+                kind
+                for kind, schema in ACTION_SCHEMAS.items()
+                if "artifact_digest" in schema
+            },
+        )
         migration_fields = {
             "artifact_digest",
             "archive_digest",
@@ -401,6 +409,22 @@ class PlanningValidationTest(unittest.TestCase):
                         ],
                     }
                 )
+
+    def test_active_operation_snapshot_is_canonical_by_operation_id(self):
+        operations = [
+            {"id": "operation-z", "kind": "retain", "status": "running"},
+            {"id": "operation-a", "kind": "reflect", "status": "pending"},
+        ]
+        first = _operations({"idle": False, "active": operations})
+        second = _operations(
+            {"idle": False, "active": list(reversed(operations))}
+        )
+
+        self.assertEqual(first, second)
+        self.assertEqual(
+            [operation["id"] for operation in first.active],
+            ["operation-a", "operation-z"],
+        )
 
     def test_embedded_live_bank_identity_matches_enclosing_identity(self):
         with self.assertRaisesRegex(

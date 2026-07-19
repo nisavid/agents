@@ -624,11 +624,10 @@ class HarnessActivationTest(unittest.TestCase):
         )
         self.assertEqual(
             (outcome.status, outcome.reason),
-            ("rolled_back", "activation_readback_mismatch"),
+            ("rollback_failed", "activation_readback_mismatch"),
         )
-        self.assertTrue(outcome.rollback_succeeded)
-        expected = deep_thaw(self.current)
-        expected["unknown"] = {"registration": "concurrent"}
+        self.assertFalse(outcome.rollback_succeeded)
+        expected = deep_thaw(destination)
         self.assertEqual(outcome.configuration, expected)
 
     def test_activation_cas_rechecks_persisted_prestate_before_writing(self):
@@ -846,7 +845,9 @@ class HarnessActivationTest(unittest.TestCase):
             prestate=original,
             destination_harness_id=plan.harness_id,
         )
-        self.assertEqual(outcome.status, "rolled_back")
+        self.assertEqual(outcome.status, "rollback_ready")
+        self.assertFalse(outcome.rollback_attempted)
+        self.assertFalse(outcome.rollback_succeeded)
         self.assertIsNone(outcome.configuration["schemaVersion"])
         self.assertNotIn("broker", outcome.configuration)
         self.assertNotIn("adapter", outcome.configuration)
@@ -973,7 +974,9 @@ class HarnessActivationTest(unittest.TestCase):
             prestate=original,
             destination_harness_id=plan.harness_id,
         )
-        self.assertEqual((outcome.status, outcome.reason), ("rolled_back", "ok"))
+        self.assertEqual((outcome.status, outcome.reason), ("rollback_ready", "ok"))
+        self.assertFalse(outcome.rollback_attempted)
+        self.assertFalse(outcome.rollback_succeeded)
         self.assertEqual(outcome.configuration["registrations"][0]["id"], "after")
         self.assertNotIn("configuration", outcome.to_dict())
         self.assertEqual(outcome.configuration["hindsightApiUrl"], "http://localhost:7979")

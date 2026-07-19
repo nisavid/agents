@@ -170,6 +170,10 @@ class MigrationAdapterError(RuntimeError):
     pass
 
 
+class _DescriptorBackedInput(Exception):
+    """Internal control flow for an already verified archive descriptor."""
+
+
 def _copy_exact_descriptor(
     source: int,
     destination: int | None,
@@ -257,11 +261,9 @@ def _runtime_file_snapshot(
         validate(before)
         if before.st_size > RUNTIME_FILE_MAX_BYTES:
             raise FileEvidenceError(f"{label} is too large")
-        payload = hashlib.sha256()
-        offset = 0
-        while chunk := os.pread(descriptor, 65536, offset):
-            payload.update(chunk)
-            offset += len(chunk)
+        payload_digest = _copy_exact_descriptor(
+            descriptor, None, before.st_size, label
+        )
         after = os.fstat(descriptor)
     finally:
         os.close(descriptor)
@@ -278,7 +280,7 @@ def _runtime_file_snapshot(
         file_identity(requested_metadata),
         str(path),
         file_identity(after),
-        payload.hexdigest(),
+        payload_digest,
     )
 
 
@@ -325,6 +327,7 @@ def _interpreter_prefix_bindings(
         )
         home_paths = tuple(Path(path) for path in homes)
         files: dict[tuple[int, str], tuple[str, tuple[int, ...], str, tuple[int, ...], str]] = {}
+        total_bytes = 0
         for raw_path in values[4:]:
             if not raw_path:
                 continue
@@ -344,27 +347,41 @@ def _interpreter_prefix_bindings(
                 destinations, key=lambda item: len(home_paths[item[0]].parts)
             )
             candidates = (
-                (candidate,) if candidate.is_file()
-                else tuple(path for path in candidate.rglob("*") if path.is_file())
+                (candidate,)
+                if candidate.is_file()
+                else (path for path in candidate.rglob("*") if path.is_file())
             )
             for path in candidates:
                 relative = relative_root / path.relative_to(candidate)
                 key = (index, str(relative))
-                files[key] = _runtime_file_snapshot(
+                previous = files.get(key)
+                if previous is None and len(files) >= RUNTIME_FILE_MAX_COUNT:
+                    raise ValueError
+                candidate_size = path.lstat().st_size
+                if (
+                    total_bytes
+                    - (previous[3][6] if previous is not None else 0)
+                    + candidate_size
+                    > RUNTIME_TOTAL_MAX_BYTES
+                ):
+                    raise ValueError
+                binding = _runtime_file_snapshot(
                     path, "hindsight-admin interpreter prefix file",
                     allow_hardlinks=True,
                 )
+                total_bytes += binding[3][6] - (
+                    previous[3][6] if previous is not None else 0
+                )
+                if total_bytes > RUNTIME_TOTAL_MAX_BYTES:
+                    raise ValueError
+                files[key] = binding
         if not files:
             raise ValueError
         bindings = tuple(
             (index, relative, binding)
             for (index, relative), binding in sorted(files.items())
         )
-        total = sum(binding[3][6] for _index, _relative, binding in bindings)
-        if (
-            len(bindings) > RUNTIME_FILE_MAX_COUNT
-            or total > RUNTIME_TOTAL_MAX_BYTES
-        ):
+        if len(bindings) > RUNTIME_FILE_MAX_COUNT:
             raise ValueError
         package_roots = tuple(
             str(path)
@@ -1417,7 +1434,7 @@ class AdminMigrationAdapter:
         ):
             raise MigrationAdapterError("disposable restore evidence digest does not match plan")
 
-    def _run(self, operation: str, archive: str, archive_digest: str,
+    def _run(self, operation: str, archive: str | VerifiedFileSnapshot, archive_digest: str,
              bank_id: str | None = None,
              expected_evidence_digest: str | None = None,
              evidence: Mapping[str, Any] | None = None) -> Mapping[str, Any]:
@@ -1426,7 +1443,15 @@ class AdminMigrationAdapter:
         verified_input = (
             archive if isinstance(archive, VerifiedFileSnapshot) else None
         )
-        archive_value = str(verified_input) if verified_input is not None else archive
+        if verified_input is not None and operation in {"export-bank", "backup"}:
+            raise MigrationAdapterError(
+                "descriptor-backed archives are input-only"
+            )
+        archive_value = (
+            archive
+            if verified_input is None
+            else f"/dev/fd/{verified_input.fileno()}"
+        )
         if not isinstance(archive_value, (str, Path)) or not Path(archive_value).is_absolute():
             raise MigrationAdapterError("archive path must be absolute")
         if not isinstance(archive_digest, str) or not DIGEST.fullmatch(archive_digest):
@@ -1451,6 +1476,8 @@ class AdminMigrationAdapter:
         parent_identity: tuple[int, int] | None = None
         output_lock_descriptor: int | None = None
         try:
+            if verified_input is not None:
+                raise _DescriptorBackedInput
             reject_symlink_components(
                 archive_path.parent,
                 "hindsight-admin archive parent",
@@ -1521,6 +1548,8 @@ class AdminMigrationAdapter:
                 validate_trusted_regular_file(
                     archive_path.lstat(), "hindsight-admin archive"
                 )
+        except _DescriptorBackedInput:
+            pass
         except (FileEvidenceError, OSError) as error:
             self._release_output_archive_lock(output_lock_descriptor)
             output_lock_descriptor = None
@@ -1587,9 +1616,15 @@ class AdminMigrationAdapter:
                 descriptor = verified_archive.fileno()
                 try:
                     metadata = os.fstat(descriptor)
-                    validate_trusted_regular_file(
-                        metadata, "hindsight-admin input archive"
-                    )
+                    if (
+                        not stat.S_ISREG(metadata.st_mode)
+                        or metadata.st_uid != os.geteuid()
+                        or stat.S_IMODE(metadata.st_mode) & 0o077
+                        or metadata.st_nlink != 0
+                    ):
+                        raise FileEvidenceError(
+                            "hindsight-admin input archive descriptor changed"
+                        )
                     actual_digest = self._descriptor_digest(descriptor).hex()
                 except (FileEvidenceError, OSError):
                     raise FileEvidenceError(

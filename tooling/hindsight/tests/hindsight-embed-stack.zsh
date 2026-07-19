@@ -6,8 +6,16 @@ repo_dir="${0:A:h:h}"
 tmp_dir="$(mktemp -d)"
 typeset -A fixture_pids=()
 
+fixture_process_identity() {
+  emulate -L zsh
+  /bin/ps -ww -p "$1" -o lstart= 2>/dev/null
+}
+
 track_fixture_pid() {
-  fixture_pids[$1]=1
+  local identity
+  identity="$(fixture_process_identity "$1")" || return 1
+  [[ -n "$identity" ]] || return 1
+  fixture_pids[$1]="$identity"
 }
 
 track_fixture_pid_file() {
@@ -15,7 +23,7 @@ track_fixture_pid_file() {
   [[ -s "$pid_file" ]] || return 0
   pid="$(<"$pid_file")"
   [[ "$pid" == <-> ]] || return 0
-  track_fixture_pid "$pid"
+  track_fixture_pid "$pid" || return 0
 }
 
 untrack_fixture_pid() {
@@ -28,7 +36,7 @@ cleanup_fixtures() {
   local pid attempt
   local -a pids=("${(@k)fixture_pids}")
   for pid in "${pids[@]}"; do
-    if kill -0 "$pid" >/dev/null 2>&1; then
+    if [[ "$(fixture_process_identity "$pid")" == "${fixture_pids[$pid]}" ]]; then
       kill -TERM "$pid" >/dev/null 2>&1 || true
     else
       untrack_fixture_pid "$pid"
@@ -39,7 +47,7 @@ cleanup_fixtures() {
     local any_running=0
     for pid in "${pids[@]}"; do
       [[ -n "${fixture_pids[$pid]:-}" ]] || continue
-      if kill -0 "$pid" >/dev/null 2>&1; then
+      if [[ "$(fixture_process_identity "$pid")" == "${fixture_pids[$pid]}" ]]; then
         any_running=1
       else
         untrack_fixture_pid "$pid"
@@ -51,7 +59,7 @@ cleanup_fixtures() {
   done
   for pid in "${pids[@]}"; do
     [[ -n "${fixture_pids[$pid]:-}" ]] || continue
-    if kill -0 "$pid" >/dev/null 2>&1; then
+    if [[ "$(fixture_process_identity "$pid")" == "${fixture_pids[$pid]}" ]]; then
       kill -KILL "$pid" >/dev/null 2>&1 || true
     else
       untrack_fixture_pid "$pid"
@@ -556,7 +564,7 @@ fi
   exit 1
 }
 sidecar_child_pid="$(<"$sidecar_child_pid_file")"
-track_fixture_pid "$sidecar_child_pid"
+track_fixture_pid "$sidecar_child_pid" || true
 for _ in {1..40}; do
   state="$(ps -o state= -p "$sidecar_child_pid" 2>/dev/null || true)"
   [[ -z "$state" || "$state" == Z* ]] && break
@@ -694,7 +702,7 @@ immediate_status=0
 pid=""
 if [[ -s "$immediate_hook_pid_file" ]]; then
   pid="$(<"$immediate_hook_pid_file")"
-  track_fixture_pid "$pid"
+  track_fixture_pid "$pid" || true
 fi
 [[ "$immediate_status" == 143 ]] || {
   print -ru2 -- "masked sidecar interruption returned ${immediate_status}, expected 143"
@@ -1362,6 +1370,37 @@ rg -F -q 'endpoint collision on port 7979' "$collision_output" || {
 }
 
 fake_memory_cli="$tmp_dir/fake-hindsight-memory"
+
+stale_broker_state="$tmp_dir/stale-broker-state"
+mkdir -m 700 "$stale_broker_state"
+/bin/sleep 60 &
+stale_broker_pid=$!
+track_fixture_pid "$stale_broker_pid"
+print -r -- "$stale_broker_pid" >"$stale_broker_state/broker-process.identity"
+print -r -- original-identity >>"$stale_broker_state/broker-process.identity"
+chmod 600 "$stale_broker_state/broker-process.identity"
+if (
+  export HINDSIGHT_EMBED_STATE_DIR="$stale_broker_state"
+  source "$rendered_stack_lib"
+  hindsight_stack_load_config() { return 0 }
+  hindsight_stack_broker_process_identity() { print -r -- replacement-identity }
+  hindsight_stack_broker_terminate_recorded
+) >/dev/null 2>&1; then
+  print -ru2 -- "broker accepted a changed recorded process identity"
+  exit 1
+fi
+[[ ! -e "$stale_broker_state/broker-process.identity" ]] || {
+  print -ru2 -- "broker retained a stale changed-identity process record"
+  exit 1
+}
+/bin/kill -0 "$stale_broker_pid" >/dev/null 2>&1 || {
+  print -ru2 -- "broker signaled a live process after rejecting changed identity"
+  exit 1
+}
+/bin/kill -TERM "$stale_broker_pid" >/dev/null 2>&1 || true
+untrack_fixture_pid "$stale_broker_pid"
+wait "$stale_broker_pid" >/dev/null 2>&1 || true
+
 cat > "$fake_memory_cli" <<'ZSH'
 #!/usr/bin/env zsh
 print -r -- "$@" > "$HINDSIGHT_TEST_BROKER_ARGS"

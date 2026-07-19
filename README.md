@@ -25,9 +25,10 @@ install-cache and refresh workflow lives in the maintenance notes of
 
 ## Development
 
-Commits use the Conventional Commits format enforced by Cocogitto. After
-cloning, run `cog install-hook --all` once to install the repository's
-`commit-msg` and `pre-push` hooks into `.git/hooks`.
+Commits use the Conventional Commits format enforced by Cocogitto. Install
+`cog` and ensure it is on `PATH`, then run `cog install-hook --all` once after
+cloning to install the repository's `commit-msg` and `pre-push` hooks into
+`.git/hooks`.
 
 ## License
 

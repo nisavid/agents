@@ -134,21 +134,6 @@ prepare_private_directory() {
   owner="$(/usr/bin/stat -f '%u' "$directory")" || die "failed to inspect ${label} owner"
   (( owner == EUID )) || die "${label} must be owned by the current user"
   /bin/chmod 700 "$directory" || die "failed to secure ${label}: ${directory}"
-  ancestor="$directory"
-  while [[ "$ancestor" != / ]]; do
-    if [[ -L "$ancestor" ]]; then
-      [[ "$(/usr/bin/stat -f '%u' "$ancestor")" == 0 ]] ||
-        die "${label} ancestor symlink is not root-owned: ${ancestor}"
-    fi
-    owner="$(/usr/bin/stat -f '%u' "$ancestor")" || die "failed to inspect ${label}: ${ancestor}"
-    mode="$(/usr/bin/stat -f '%Lp' "$ancestor")" || die "failed to inspect ${label} mode: ${ancestor}"
-    validate_no_acl "$ancestor" "$label ancestor"
-    (( owner == EUID || owner == 0 )) || die "${label} ancestor is not trusted: ${ancestor}"
-    if (( (8#$mode & 8#0022) != 0 && !(owner == 0 && (8#$mode & 8#01000) != 0) )); then
-      die "${label} ancestor is group or world writable: ${ancestor}"
-    fi
-    ancestor="${ancestor:h}"
-  done
   owner="$(/usr/bin/stat -f '%u' "$directory")" || die "failed to inspect ${label} owner"
   mode="$(/usr/bin/stat -f '%Lp' "$directory")" || die "failed to inspect ${label} mode"
   (( owner == EUID && (8#$mode & 8#0077) == 0 )) ||

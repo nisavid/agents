@@ -7,7 +7,7 @@ import sys
 import tempfile
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -492,8 +492,61 @@ class StopProfileServicesTest(unittest.TestCase):
             self.assertRaisesRegex(self.helper.StopError, "failed to stop API"),
         ):
             self.helper.stop_targets(manager, [target])
-        kill.assert_called_once_with(1234)
+        self.assertEqual(kill.call_args_list, [call(1234), call(1234)])
         self.assertEqual(sleep.call_count, 599)
+
+    def test_stop_retries_verified_graceful_signal_after_extended_wait(self):
+        manager = Manager()
+        target = self.helper.Target("API", 7979, 1234, "stable")
+        with (
+            patch.object(
+                self.helper, "stable_process_identity", return_value="stable"
+            ),
+            patch.object(
+                manager, "_kill_process", side_effect=(False, True)
+            ) as kill,
+            patch.object(
+                self.helper, "wait_for_verified_process_exit", return_value=False
+            ),
+        ):
+            self.helper.stop_targets(manager, [target])
+        self.assertEqual(kill.call_args_list, [call(1234), call(1234)])
+
+    def test_stop_refuses_second_signal_after_pid_reuse(self):
+        manager = Manager()
+        target = self.helper.Target("API", 7979, 1234, "stable")
+        with (
+            patch.object(
+                self.helper,
+                "stable_process_identity",
+                side_effect=("stable", "stable", "replacement"),
+            ),
+            patch.object(manager, "_kill_process", return_value=False) as kill,
+            patch.object(
+                self.helper, "wait_for_verified_process_exit", return_value=False
+            ),
+            self.assertRaisesRegex(self.helper.StopError, "replaced API"),
+        ):
+            self.helper.stop_targets(manager, [target])
+        kill.assert_called_once_with(1234)
+
+    def test_stop_accepts_disappearance_before_second_signal(self):
+        manager = Manager()
+        target = self.helper.Target("API", 7979, 1234, "stable")
+        with (
+            patch.object(
+                self.helper,
+                "stable_process_identity",
+                side_effect=("stable", "stable", ""),
+            ),
+            patch.object(manager, "_kill_process", return_value=False) as kill,
+            patch.object(
+                self.helper, "wait_for_verified_process_exit", return_value=False
+            ),
+            patch.object(self.helper, "process_is_absent", return_value=True),
+        ):
+            self.helper.stop_targets(manager, [target])
+        kill.assert_called_once_with(1234)
 
     def test_stop_allows_pid_marker_already_removed_after_verified_stop(self):
         manager = Manager()

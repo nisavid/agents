@@ -364,13 +364,17 @@ def wait_for_verified_process_exit(target: Target) -> bool:
             return True
         identity = stable_process_identity(target.pid)
         if identity and identity != target.process_identity:
-            raise StopError(
-                f"refusing to stop replaced {target.kind} process on port "
-                f"{target.port} (pid {target.pid})"
-            )
+            raise replaced_process_error(target)
         if attempt < 599:
             time.sleep(0.1)
     return False
+
+
+def replaced_process_error(target: Target) -> StopError:
+    return StopError(
+        f"refusing to stop replaced {target.kind} process on port "
+        f"{target.port} (pid {target.pid})"
+    )
 
 
 def has_arg_value(argv: list[str], name: str, value: str) -> bool:
@@ -623,22 +627,24 @@ def stop_targets(manager: DaemonEmbedManager, targets: list[Target]) -> None:
         if target.pid in preflighted:
             continue
         if stable_process_identity(target.pid) != target.process_identity:
-            raise StopError(
-                f"refusing to stop replaced {target.kind} process on port "
-                f"{target.port} (pid {target.pid})"
-            )
+            raise replaced_process_error(target)
         preflighted.add(target.pid)
     for target in targets:
         if target.pid in killed:
             continue
         if stable_process_identity(target.pid) != target.process_identity:
-            raise StopError(
-                f"refusing to stop replaced {target.kind} process on port "
-                f"{target.port} (pid {target.pid})"
-            )
+            raise replaced_process_error(target)
         stopped = manager._kill_process(target.pid)
         if not stopped:
             stopped = wait_for_verified_process_exit(target)
+        if not stopped:
+            identity = stable_process_identity(target.pid)
+            if not identity:
+                stopped = process_is_absent(target.pid)
+            elif identity != target.process_identity:
+                raise replaced_process_error(target)
+            else:
+                stopped = manager._kill_process(target.pid)
         if not stopped:
             raise StopError(f"failed to stop {target.kind} process on port {target.port} (pid {target.pid})")
         killed.add(target.pid)

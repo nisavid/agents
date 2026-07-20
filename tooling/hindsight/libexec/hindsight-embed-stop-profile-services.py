@@ -359,7 +359,7 @@ def process_is_absent(pid: int) -> bool:
 
 def wait_for_verified_process_exit(target: Target) -> bool:
     """Allow a verified process extra time to finish its graceful shutdown."""
-    for attempt in range(250):
+    for attempt in range(600):
         if process_is_absent(target.pid):
             return True
         identity = stable_process_identity(target.pid)
@@ -368,7 +368,7 @@ def wait_for_verified_process_exit(target: Target) -> bool:
                 f"refusing to stop replaced {target.kind} process on port "
                 f"{target.port} (pid {target.pid})"
             )
-        if attempt < 249:
+        if attempt < 599:
             time.sleep(0.1)
     return False
 
@@ -636,10 +636,10 @@ def stop_targets(manager: DaemonEmbedManager, targets: list[Target]) -> None:
                 f"refusing to stop replaced {target.kind} process on port "
                 f"{target.port} (pid {target.pid})"
             )
-        if (
-            not manager._kill_process(target.pid)
-            and not wait_for_verified_process_exit(target)
-        ):
+        stopped = manager._kill_process(target.pid)
+        if not stopped:
+            stopped = wait_for_verified_process_exit(target)
+        if not stopped:
             raise StopError(f"failed to stop {target.kind} process on port {target.port} (pid {target.pid})")
         killed.add(target.pid)
 

@@ -479,6 +479,22 @@ class StopProfileServicesTest(unittest.TestCase):
         kill.assert_called_once_with(1234)
         sleep.assert_not_called()
 
+    def test_stop_fails_closed_after_extended_grace_period(self):
+        manager = Manager()
+        target = self.helper.Target("API", 7979, 1234, "stable")
+        with (
+            patch.object(
+                self.helper, "stable_process_identity", return_value="stable"
+            ),
+            patch.object(manager, "_kill_process", return_value=False) as kill,
+            patch.object(self.helper, "process_is_absent", return_value=False),
+            patch.object(self.helper.time, "sleep") as sleep,
+            self.assertRaisesRegex(self.helper.StopError, "failed to stop API"),
+        ):
+            self.helper.stop_targets(manager, [target])
+        kill.assert_called_once_with(1234)
+        self.assertEqual(sleep.call_count, 599)
+
     def test_stop_allows_pid_marker_already_removed_after_verified_stop(self):
         manager = Manager()
         with tempfile.TemporaryDirectory() as directory:

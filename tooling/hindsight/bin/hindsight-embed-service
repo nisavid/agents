@@ -359,7 +359,7 @@ bootout_if_loaded() {
 bootstrap_manifest() {
   emulate -L zsh
   local manifest="$1" expected_label="$2" actual_label
-  actual_label="$(/usr/bin/plutil -extract Label raw -o - "$manifest" 2>/dev/null)" || {
+  actual_label="$(manifest_label "$manifest")" || {
     print -ru2 -- "hindsight-embed-service: manifest has no valid Label: ${manifest}"
     return 1
   }
@@ -367,7 +367,45 @@ bootstrap_manifest() {
     print -ru2 -- "hindsight-embed-service: manifest Label ${actual_label} does not match expected ${expected_label}"
     return 1
   }
-  /bin/launchctl bootstrap "$(domain)" "$manifest"
+  local bootstrap_status
+  integer attempt
+  if launchctl_bootstrap_manifest "$manifest"; then
+    return 0
+  else
+    bootstrap_status=$?
+  fi
+  (( bootstrap_status == 5 )) || return "$bootstrap_status"
+
+  for attempt in {2..120}; do
+    launchctl_bootstrap_retry_delay
+    if (( attempt == 120 )); then
+      launchctl_bootstrap_manifest "$manifest"
+      return $?
+    fi
+    if launchctl_bootstrap_manifest "$manifest" >/dev/null 2>&1; then
+      return 0
+    else
+      bootstrap_status=$?
+    fi
+    if (( bootstrap_status != 5 )); then
+      return "$bootstrap_status"
+    fi
+  done
+}
+
+manifest_label() {
+  emulate -L zsh
+  /usr/bin/plutil -extract Label raw -o - "$1" 2>/dev/null
+}
+
+launchctl_bootstrap_manifest() {
+  emulate -L zsh
+  /bin/launchctl bootstrap "$(domain)" "$1"
+}
+
+launchctl_bootstrap_retry_delay() {
+  emulate -L zsh
+  /bin/sleep 1
 }
 
 validate_manifest_contract() {

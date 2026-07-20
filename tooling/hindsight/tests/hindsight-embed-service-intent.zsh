@@ -1,5 +1,6 @@
 #!/usr/bin/env zsh
 set -euo pipefail
+unsetopt BG_NICE
 
 repo_dir="${0:A:h:h}"
 tmp_dir="$(mktemp -d)"
@@ -9,6 +10,76 @@ service_lib="$tmp_dir/hindsight-embed-service.zsh"
 /usr/bin/sed '/^main "\$@"$/d' \
   "$repo_dir/bin/hindsight-embed-service" >"$service_lib"
 source "$service_lib"
+
+bootstrap_retry_events="$tmp_dir/bootstrap-retry-events"
+if ! (
+  integer attempts=0
+  manifest_label() { print -r -- stack }
+  launchctl_bootstrap_manifest() {
+    print -r -- bootstrap >>"$bootstrap_retry_events"
+    (( ++attempts >= 3 )) && return 0
+    return 5
+  }
+  launchctl_bootstrap_retry_delay() {
+    print -r -- delay >>"$bootstrap_retry_events"
+  }
+  bootstrap_manifest "$tmp_dir/staged.plist" stack
+); then
+  print -ru2 -- "service bootstrap did not retry transient launchctl error 5"
+  exit 1
+fi
+[[ "$(paste -sd, - <"$bootstrap_retry_events")" == \
+  bootstrap,delay,bootstrap,delay,bootstrap ]] || {
+  /bin/cat "$bootstrap_retry_events" >&2
+  print -ru2 -- "service bootstrap retry sequence is not bounded and ordered"
+  exit 1
+}
+
+bootstrap_exhausted_events="$tmp_dir/bootstrap-exhausted-events"
+bootstrap_exhausted_result="$tmp_dir/bootstrap-exhausted-result"
+(
+  set +e
+  manifest_label() { print -r -- stack }
+  launchctl_bootstrap_manifest() {
+    print -r -- bootstrap >>"$bootstrap_exhausted_events"
+    return 5
+  }
+  launchctl_bootstrap_retry_delay() {
+    print -r -- delay >>"$bootstrap_exhausted_events"
+  }
+  bootstrap_manifest "$tmp_dir/staged.plist" stack
+  print -r -- "$?" >"$bootstrap_exhausted_result"
+) &
+bootstrap_exhausted_pid=$!
+integer bootstrap_watchdog_attempt
+for bootstrap_watchdog_attempt in {1..100}; do
+  /bin/kill -0 "$bootstrap_exhausted_pid" 2>/dev/null || break
+  /bin/sleep 0.01
+done
+if /bin/kill -0 "$bootstrap_exhausted_pid" 2>/dev/null; then
+  /bin/kill -TERM "$bootstrap_exhausted_pid" 2>/dev/null || true
+  wait "$bootstrap_exhausted_pid" 2>/dev/null || true
+  print -ru2 -- "service bootstrap retry exhaustion timed out"
+  exit 1
+fi
+wait "$bootstrap_exhausted_pid" 2>/dev/null || true
+if [[ ! -r "$bootstrap_exhausted_result" ]] ||
+  [[ "$(<"$bootstrap_exhausted_result")" == 0 ]]; then
+  print -ru2 -- "service bootstrap accepted exhausted transient retries"
+  exit 1
+fi
+bootstrap_exhausted_expected="$tmp_dir/bootstrap-exhausted-expected"
+integer bootstrap_expected_attempt
+for bootstrap_expected_attempt in {1..119}; do
+  print -r -- bootstrap >>"$bootstrap_exhausted_expected"
+  print -r -- delay >>"$bootstrap_exhausted_expected"
+done
+print -r -- bootstrap >>"$bootstrap_exhausted_expected"
+/usr/bin/cmp -s "$bootstrap_exhausted_expected" "$bootstrap_exhausted_events" || {
+  /bin/cat "$bootstrap_exhausted_events" >&2
+  print -ru2 -- "service bootstrap retries exceeded their bounded contract"
+  exit 1
+}
 
 run_with_service_lifecycle_lock() {
   local callback="$1"

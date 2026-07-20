@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import ctypes
 import fcntl
 import json
 import os
@@ -46,6 +47,53 @@ class InvalidControlPid(StopError):
 
 
 CONTROL_PID_LOCK_NAME = ".control-pid.lifecycle.lock"
+PROC_PIDTBSDINFO = 3
+
+
+class DarwinProcBsdInfo(ctypes.Structure):
+    _fields_ = [
+        ("flags", ctypes.c_uint32),
+        ("status", ctypes.c_uint32),
+        ("xstatus", ctypes.c_uint32),
+        ("pid", ctypes.c_uint32),
+        ("ppid", ctypes.c_uint32),
+        ("uid", ctypes.c_uint32),
+        ("gid", ctypes.c_uint32),
+        ("ruid", ctypes.c_uint32),
+        ("rgid", ctypes.c_uint32),
+        ("svuid", ctypes.c_uint32),
+        ("svgid", ctypes.c_uint32),
+        ("rfu", ctypes.c_uint32),
+        ("comm", ctypes.c_char * 16),
+        ("name", ctypes.c_char * 32),
+        ("nfiles", ctypes.c_uint32),
+        ("pgid", ctypes.c_uint32),
+        ("pjobc", ctypes.c_uint32),
+        ("tdev", ctypes.c_uint32),
+        ("tpgid", ctypes.c_uint32),
+        ("nice", ctypes.c_int32),
+        ("start_tvsec", ctypes.c_uint64),
+        ("start_tvusec", ctypes.c_uint64),
+    ]
+
+
+_darwin_proc_pidinfo: ctypes._CFuncPtr | None = None
+
+
+def _get_darwin_proc_pidinfo() -> ctypes._CFuncPtr:
+    global _darwin_proc_pidinfo
+    if _darwin_proc_pidinfo is None:
+        proc_pidinfo = ctypes.CDLL("/usr/lib/libproc.dylib").proc_pidinfo
+        proc_pidinfo.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint64,
+            ctypes.c_void_p,
+            ctypes.c_int,
+        ]
+        proc_pidinfo.restype = ctypes.c_int
+        _darwin_proc_pidinfo = proc_pidinfo
+    return _darwin_proc_pidinfo
 
 
 def _open_control_pid_parent(path: Path) -> int:
@@ -319,23 +367,41 @@ def find_pids_on_port(manager: DaemonEmbedManager, port: int) -> list[int]:
     return pids
 
 
-def stable_process_identity(pid: int) -> str:
+def darwin_process_start_identity(pid: int) -> str:
     try:
-        result = subprocess.run(
-            [
-                "/bin/ps", "-ww", "-p", str(pid),
-                "-o", "lstart=", "-o", "command=",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
+        proc_pidinfo = _get_darwin_proc_pidinfo()
+        info = DarwinProcBsdInfo()
+        size = ctypes.sizeof(info)
+        result = proc_pidinfo(
+            pid, PROC_PIDTBSDINFO, 0, ctypes.byref(info), size
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except (AttributeError, OSError, ValueError):
         return ""
-    if result.returncode != 0:
+    if result != size or info.pid != pid:
         return ""
-    return result.stdout.strip()
+    return f"darwin:{pid}:{info.start_tvsec}:{info.start_tvusec}"
+
+
+def linux_process_start_identity(pid: int) -> str:
+    try:
+        value = Path(f"/proc/{pid}/stat").read_bytes()
+    except OSError:
+        return ""
+    command_end = value.rfind(b")")
+    if command_end < 0:
+        return ""
+    fields = value[command_end + 1:].split()
+    if len(fields) <= 19 or not fields[19].isdigit():
+        return ""
+    return f"linux:{pid}:{fields[19].decode('ascii')}"
+
+
+def stable_process_identity(pid: int) -> str:
+    if sys.platform == "darwin":
+        return darwin_process_start_identity(pid)
+    if sys.platform.startswith("linux"):
+        return linux_process_start_identity(pid)
+    return ""
 
 
 def verified_process_identity(pid: int, owns_process) -> str:

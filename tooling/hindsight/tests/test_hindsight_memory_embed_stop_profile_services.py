@@ -120,6 +120,50 @@ class StopProfileServicesTest(unittest.TestCase):
         self.assertEqual(run.call_args_list[0].args[0][0], "/usr/sbin/lsof")
         self.assertEqual(run.call_args_list[1].args[0][0], "/usr/bin/lsof")
 
+    def test_darwin_identity_uses_microsecond_kernel_start_time(self):
+        helper = self.helper
+
+        class ProcPidInfo:
+            argtypes = None
+            restype = None
+
+            def __call__(self, pid, flavor, _arg, buffer, size) -> int:
+                self.pid = pid
+                self.flavor = flavor
+                info = helper.ctypes.cast(
+                    buffer, helper.ctypes.POINTER(helper.DarwinProcBsdInfo)
+                ).contents
+                info.pid = pid
+                info.start_tvsec = 100
+                info.start_tvusec = 234567
+                return size
+
+        proc_pidinfo = ProcPidInfo()
+        library = types.SimpleNamespace(proc_pidinfo=proc_pidinfo)
+        with (
+            patch.object(helper, "_darwin_proc_pidinfo", None),
+            patch.object(helper.ctypes, "CDLL", return_value=library),
+        ):
+            self.assertEqual(
+                helper.darwin_process_start_identity(1234),
+                "darwin:1234:100:234567",
+            )
+        self.assertEqual(proc_pidinfo.flavor, helper.PROC_PIDTBSDINFO)
+
+    def test_linux_identity_uses_proc_start_ticks(self):
+        fields = ["S", *map(str, range(4, 23))]
+        value = f"1234 (worker ÿ with ) characters) {' '.join(fields)}\n".encode(
+            "latin-1"
+        )
+        with patch.object(
+            self.helper.Path, "read_bytes", autospec=True, return_value=value
+        ) as read_bytes:
+            self.assertEqual(
+                self.helper.linux_process_start_identity(1234),
+                "linux:1234:22",
+            )
+        read_bytes.assert_called_once_with(self.helper.Path("/proc/1234/stat"))
+
     def test_process_cwd_uses_usr_bin_lsof_fallback(self):
         completed = types.SimpleNamespace(
             returncode=0,
@@ -613,11 +657,11 @@ class StopProfileServicesTest(unittest.TestCase):
             self.assertEqual(manager.killed, [1234])
             self.assertTrue(cleanup_path.exists())
 
-    def test_discovery_rejects_identity_change_during_ownership_check(self):
+    def test_discovery_rejects_same_second_pid_reuse(self):
         with patch.object(
             self.helper,
             "stable_process_identity",
-            side_effect=("first", "replacement"),
+            side_effect=("darwin:1234:100:1", "darwin:1234:100:2"),
         ) as stable_identity:
             self.assertEqual(
                 self.helper.verified_process_identity(1234, lambda: True), ""

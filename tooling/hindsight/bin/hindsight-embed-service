@@ -466,12 +466,17 @@ stage_validated_manifest() {
   validate_trusted_artifact "$source" "$label"
   /usr/bin/plutil -lint "$source" >/dev/null || return 1
   validate_manifest_contract "$source" "$expected_label" "$expected_program" "$binding_mode" || return 1
-  local stage_dir="${STATE_DIR}/staged-manifests" staged
+  local stage_dir="${STATE_DIR}/staged-manifests" staged temporary
   mkdir -p "$stage_dir" || return 1
   /bin/chmod 700 "$stage_dir" || return 1
-  staged="$(mktemp "${stage_dir}/manifest.plist.XXXXXX")" || return 1
-  /bin/cp "$source" "$staged" || {
-    /bin/rm -f "$staged"
+  temporary="$(mktemp "${stage_dir}/manifest.plist.XXXXXX")" || return 1
+  staged="${temporary}.plist"
+  /bin/cp "$source" "$temporary" || {
+    /bin/rm -f "$temporary"
+    return 1
+  }
+  /bin/mv "$temporary" "$staged" || {
+    /bin/rm -f "$temporary"
     return 1
   }
   /bin/chmod 400 "$staged" || {

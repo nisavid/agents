@@ -11,6 +11,39 @@ service_lib="$tmp_dir/hindsight-embed-service.zsh"
   "$repo_dir/bin/hindsight-embed-service" >"$service_lib"
 source "$service_lib"
 
+stage_suffix_source="$tmp_dir/stage-suffix-source.plist"
+stage_suffix_state="$tmp_dir/stage-suffix-state"
+/usr/bin/plutil -create xml1 "$stage_suffix_source"
+stage_suffix_path="$(
+  STATE_DIR="$stage_suffix_state"
+  validate_trusted_artifact() { return 0 }
+  validate_manifest_contract() { return 0 }
+  stage_validated_manifest \
+    "$stage_suffix_source" "test manifest" stack /usr/bin/true current
+)"
+stage_suffix_manifest_dir="$stage_suffix_state/staged-manifests"
+stage_suffix_parent="${stage_suffix_path%/*}"
+stage_suffix_name="${stage_suffix_path##*/}"
+stage_suffix_valid=0
+stage_suffix_safe=0
+[[ "$stage_suffix_parent" == "$stage_suffix_manifest_dir" &&
+  -f "$stage_suffix_path" &&
+  ! -L "$stage_suffix_path" ]] &&
+  stage_suffix_safe=1
+[[ "$stage_suffix_safe" -eq 1 &&
+  "$stage_suffix_name" == *.plist &&
+  "$stage_suffix_path" != "$stage_suffix_source" ]] &&
+  stage_suffix_valid=1
+if (( stage_suffix_safe )); then
+  /usr/bin/chflags nouchg "$stage_suffix_path"
+  /bin/chmod 600 "$stage_suffix_path"
+  /bin/rm -f "$stage_suffix_path"
+fi
+(( stage_suffix_valid )) || {
+  print -ru2 -- "staged launchd manifest path does not end in .plist"
+  exit 1
+}
+
 bootstrap_retry_events="$tmp_dir/bootstrap-retry-events"
 if ! (
   integer attempts=0

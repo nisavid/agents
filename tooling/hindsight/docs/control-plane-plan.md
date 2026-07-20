@@ -101,5 +101,7 @@ configuration repositories.
 This item remains intentionally incomplete. Do not run controller-directed live
 `apply`, retain, consolidate, refresh, import, config patch, template import,
 curation reapply, or delete operations. Do not create either completion-gate
-half. Track the missing
-server contract as reusable follow-up work in `nisavid/agents`.
+half. Track the missing server contract in
+[`nisavid/agents` issue #11](https://github.com/nisavid/agents/issues/11). See
+[Migration readiness](migration-readiness.md) for the
+current operator boundary and remaining executable work.

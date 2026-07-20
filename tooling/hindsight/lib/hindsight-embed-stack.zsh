@@ -88,14 +88,14 @@ hindsight_stack_load_config() {
   typeset -g HINDSIGHT_EMBED_PROFILE_SLOT_DIR="${HINDSIGHT_EMBED_PROFILE_SLOT_DIR:-$HINDSIGHT_EMBED_STATE_DIR/profile-slots}"
   typeset -g HINDSIGHT_EMBED_DESIRED_STATE_DIR="${HINDSIGHT_EMBED_DESIRED_STATE_DIR:-$HINDSIGHT_EMBED_STATE_DIR/desired}"
   typeset -g HINDSIGHT_EMBED_CONTROL_WAIT_SECONDS="${HINDSIGHT_EMBED_CONTROL_WAIT_SECONDS:-30}"
-  typeset -g HINDSIGHT_EMBED_DAEMON_WAIT_SECONDS="${HINDSIGHT_EMBED_DAEMON_WAIT_SECONDS:-120}"
+  typeset -g HINDSIGHT_EMBED_DAEMON_WAIT_SECONDS="${HINDSIGHT_EMBED_DAEMON_WAIT_SECONDS:-300}"
   typeset -g HINDSIGHT_EMBED_SIDECAR_WAIT_SECONDS="${HINDSIGHT_EMBED_SIDECAR_WAIT_SECONDS:-120}"
   typeset -g HINDSIGHT_EMBED_SIDECAR_COMMAND_TIMEOUT_SECONDS="${HINDSIGHT_EMBED_SIDECAR_COMMAND_TIMEOUT_SECONDS:-30}"
   typeset -g HINDSIGHT_EMBED_UI_WAIT_SECONDS="${HINDSIGHT_EMBED_UI_WAIT_SECONDS:-60}"
   typeset -g HINDSIGHT_MEMORY_BROKER_WAIT_SECONDS="${HINDSIGHT_MEMORY_BROKER_WAIT_SECONDS:-30}"
   typeset -g HINDSIGHT_EMBED_STOP_WAIT_SECONDS="${HINDSIGHT_EMBED_STOP_WAIT_SECONDS:-30}"
   typeset -g HINDSIGHT_EMBED_START_COOLDOWN_SECONDS="${HINDSIGHT_EMBED_START_COOLDOWN_SECONDS:-20}"
-  typeset -g HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS="${HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS:-30}"
+  typeset -g HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS="${HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS:-300}"
   local timeout_name timeout_value timeout_max
   for timeout_name timeout_max in \
     HINDSIGHT_EMBED_CONTROL_WAIT_SECONDS 3600 \
@@ -1942,8 +1942,16 @@ hindsight_stack_daemon_start() {
   hindsight_stack_load_config || return 1
 
   hindsight_stack_ensure_profile_ports || return 1
-  hindsight_stack_run_bounded "$HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS" \
-    "$HINDSIGHT_EMBED_UVX" hindsight-embed --profile "$HINDSIGHT_EMBED_PROFILE" daemon start >/dev/null 2>&1
+  if hindsight_stack_run_bounded "$HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS" \
+    "$HINDSIGHT_EMBED_UVX" hindsight-embed --profile "$HINDSIGHT_EMBED_PROFILE" daemon start >/dev/null 2>&1; then
+    return 0
+  fi
+
+  # The embedded launcher can reject a transient post-start stability probe
+  # while leaving the detached daemon to finish initialization. Keep the
+  # reusable lifecycle contract authoritative by accepting that handoff only
+  # when the daemon becomes healthy within our own bounded wait.
+  hindsight_stack_wait_daemon
 }
 
 hindsight_stack_ui_start() {

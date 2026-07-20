@@ -42,6 +42,23 @@ export HINDSIGHT_EMBED_PYTHON=/usr/bin/python3
 export HINDSIGHT_CLEANUP_ARCHIVE_TIMEOUT_SECONDS=3600
 export HINDSIGHT_CLEANUP_MIGRATION_TIMEOUT_SECONDS=3600
 
+default_daemon_wait="$tmp_dir/default-daemon-wait"
+(
+  unset HINDSIGHT_EMBED_DAEMON_WAIT_SECONDS
+  HINDSIGHT_EMBED_UVX=/usr/bin/true
+  hindsight_stack_run_bounded() {
+    print -r -- "$1" >"$default_daemon_wait"
+    return 0
+  }
+  wait_legacy_daemon_ready legacy-profile
+)
+default_daemon_wait_seconds="$(<"$default_daemon_wait")"
+[[ "$default_daemon_wait_seconds" == <-> ]] &&
+  (( default_daemon_wait_seconds >= 299 && default_daemon_wait_seconds <= 300 )) || {
+  print -ru2 -- "cleanup default daemon wait does not cover the 300-second startup contract"
+  exit 1
+}
+
 maintenance_acl_state="$tmp_dir/maintenance-acl-state"
 mkdir -m 700 "$maintenance_acl_state"
 touch "$maintenance_acl_state/.maintenance.lock"

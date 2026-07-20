@@ -1152,7 +1152,7 @@ legacy_component_running() {
 wait_legacy_daemon_ready() {
   emulate -L zsh
   local profile="$1"
-  local timeout="${HINDSIGHT_EMBED_DAEMON_WAIT_SECONDS:-120}"
+  local timeout="${HINDSIGHT_EMBED_DAEMON_WAIT_SECONDS:-300}"
   local -a reply
   integer deadline=$(( $(/bin/date +%s) + timeout ))
   integer remaining

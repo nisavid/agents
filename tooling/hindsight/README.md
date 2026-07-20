@@ -13,6 +13,18 @@ Reusable Hindsight control-plane code, local-stack tooling, agent skills, policy
 - `docs/` contains the durable architecture and migration contract.
 - `tests/` contains repository-owned contract and disposable-stack validation.
 
+## Documentation
+
+- [Adopt the control-plane architecture](docs/adoption.md) for a fresh or
+  existing installation. Adoption changes code ownership and service wiring; it
+  does not move Hindsight memory.
+- [Migration readiness](docs/migration-readiness.md) for the current migration
+  status, the read-only discovery gate, and the remaining cutover work.
+- [Control-plane plan](docs/control-plane-plan.md) for repository delivery and
+  validation status.
+- [Product requirements](docs/PRD.md) for the complete safety and migration
+  design.
+
 ## Installation contract
 
 Consumers install or link these files from a checkout of `nisavid/agents`.
@@ -26,7 +38,8 @@ contract without editing reusable implementation.
 | Fleet and profile | `HINDSIGHT_EMBED_PRIMARY_PROFILE`, `HINDSIGHT_EMBED_FLEET_PROFILES`, `HINDSIGHT_EMBED_AUTOSTART_DAEMON`, `HINDSIGHT_EMBED_AUTOSTART_UI` | `HINDSIGHT_EMBED_PROFILE` defaults to the primary profile |
 | Provider preset | When a consumer exposes one named provider preset, it supplies all of `HINDSIGHT_EMBED_PROVIDER_PRESET_ID`, `HINDSIGHT_EMBED_PROVIDER_PRESET_LABEL`, `HINDSIGHT_EMBED_PROVIDER_PRESET_RUNTIME_PROVIDER`, `HINDSIGHT_EMBED_PROVIDER_PRESET_BASE_URL`, and `HINDSIGHT_EMBED_PROVIDER_PRESET_MODEL`. | Omit all five bindings to expose no preset. Partial presets fail closed. The preset ID must not collide with a built-in or upstream provider. The base URL must use HTTPS, or HTTP with a literal loopback host, and must contain no userinfo, query, fragment, whitespace, credential material, or port zero. Concrete alias, endpoint, runtime, and model values remain consumer-owned. |
 | Hosts and ports | `HINDSIGHT_EMBED_CONTROL_PORT`, `HINDSIGHT_EMBED_CONTROL_HOSTNAME`, `HINDSIGHT_EMBED_API_BASE_PORT`, `HINDSIGHT_EMBED_UI_BASE_PORT`, `HINDSIGHT_EMBED_UI_HOSTNAME` | `HINDSIGHT_EMBED_PROFILE_<NORMALIZED_PROFILE>_{API,UI}_PORT` overrides the allocated base-plus-slot port for that profile. `HINDSIGHT_EMBED_API_PORT` and `HINDSIGHT_EMBED_UI_PORT` are resolved outputs for the selected profile, not fleet-wide overrides. Hostnames must be literal loopback addresses. |
-| Wait policy | none | `HINDSIGHT_EMBED_CONTROL_WAIT_SECONDS=30`, `HINDSIGHT_EMBED_DAEMON_WAIT_SECONDS=120`, `HINDSIGHT_EMBED_SIDECAR_WAIT_SECONDS=120`, `HINDSIGHT_EMBED_UI_WAIT_SECONDS=60`, `HINDSIGHT_MEMORY_BROKER_WAIT_SECONDS=30`, `HINDSIGHT_EMBED_STOP_WAIT_SECONDS=30`, `HINDSIGHT_EMBED_START_COOLDOWN_SECONDS=20`, `HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS=30` |
+| Managed-stack wait policy | none | `HINDSIGHT_EMBED_CONTROL_WAIT_SECONDS=30`, `HINDSIGHT_EMBED_DAEMON_WAIT_SECONDS=300`, `HINDSIGHT_EMBED_SIDECAR_WAIT_SECONDS=120`, `HINDSIGHT_EMBED_UI_WAIT_SECONDS=60`, `HINDSIGHT_MEMORY_BROKER_WAIT_SECONDS=30`, `HINDSIGHT_EMBED_STOP_WAIT_SECONDS=30`, `HINDSIGHT_EMBED_START_COOLDOWN_SECONDS=20`, `HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS=300` |
+| Single-bank cleanup wait policy | none | The cleanup wrapper uses `HINDSIGHT_EMBED_DAEMON_WAIT_SECONDS=300` and `HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS=300` when those values are unset; explicit consumer values still take precedence. |
 | Cleanup timeout policy | none | `HINDSIGHT_CLEANUP_ARCHIVE_TIMEOUT_SECONDS=3600`, `HINDSIGHT_CLEANUP_MIGRATION_TIMEOUT_SECONDS=3600` |
 | Supervisor | `HINDSIGHT_EMBED_STACK_LIB` | `HINDSIGHT_EMBED_POLL_SECONDS=10`, `HINDSIGHT_EMBED_MAX_CONSECUTIVE_FAILURES=3` |
 | Launch service | `HINDSIGHT_EMBED_STACK_LABEL`, `HINDSIGHT_EMBED_LEGACY_LABEL`, `HINDSIGHT_EMBED_SERVICE_MANIFEST`, `HINDSIGHT_EMBED_LEGACY_MANIFEST`, `HINDSIGHT_EMBED_SUPERVISOR`, `HINDSIGHT_EMBED_STACK_LIB`, `HINDSIGHT_EMBED_STATE_DIR`, `HINDSIGHT_EMBED_SERVICE_LOG` | none |
@@ -75,6 +88,12 @@ logic into machine configuration.
 ## Migration safety
 
 Read-only migration discovery requires a server-backed opaque monotonic generation captured before and after the complete discovery read. If that generation is unavailable or changes, discovery fails closed. Do not run live migration mutations or mark the live-discovery checklist complete without satisfying that exact gate.
+
+The current CLI can publish only an immutable, unapproved discovery shadow
+plan. It has no migration apply or cutover command. Follow the status and gates
+in [Migration readiness](docs/migration-readiness.md);
+the generic desired-state `apply` command does not authorize a migration
+shadow plan.
 
 Generated plans, credentials, profile state, control tokens, logs, archives, and other runtime artifacts must not enter this repository.
 

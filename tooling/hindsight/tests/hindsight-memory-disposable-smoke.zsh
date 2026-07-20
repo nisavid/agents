@@ -13,6 +13,7 @@ typeset -r CURL=${CURL:-$(command -v curl)}
 typeset -r JQ=${JQ:-$(command -v jq)}
 typeset -r OPENSSL=${OPENSSL:-$(command -v openssl)}
 typeset -r HOST_HF_HOME=${HF_HOME:-$HOME/.cache/huggingface}
+typeset -r HINDSIGHT_TESTS_DIR=${0:A:h}
 
 for executable in "$HINDSIGHT_API" "$HINDSIGHT_ADMIN" "$HINDSIGHT_CLI" \
   "$HINDSIGHT_PYTHON" "$CURL" "$JQ" "$OPENSSL"; do
@@ -28,9 +29,10 @@ typeset -r API_VERSION=$(
 typeset -r CLI_VERSION=$(
   "$HINDSIGHT_CLI" --version | awk '{print $2}'
 )
-typeset -r ADMIN_VERSION=$(
-  "$HINDSIGHT_ADMIN" --version | awk '{print $2}'
-)
+# hindsight-admin ships in the hindsight-api distribution and does not expose
+# a version flag in 0.8.4. Bind its version to the interpreter distribution
+# that owns the verified executable pair.
+typeset -r ADMIN_VERSION="$API_VERSION"
 [[ "$API_VERSION" == 0.8.4 && "$ADMIN_VERSION" == 0.8.4 && "$CLI_VERSION" == 0.8.4 ]] || {
   print -u2 -- "disposable smoke requires Hindsight API, admin, and CLI 0.8.4"
   exit 1
@@ -45,6 +47,7 @@ typeset -r SOURCE_DATA="$SMOKE_ROOT/postgres-source"
 typeset -r IMPORT_DATA="$SMOKE_ROOT/postgres-import"
 typeset -r RESTORE_DATA="$SMOKE_ROOT/postgres-restore"
 typeset -r SOURCE_BANK=smoke-source
+typeset -r RUNTIME_BANK=engineering
 typeset -r IMPORT_BANK=smoke-imported
 typeset -r API_KEY=$($OPENSSL rand -hex 32)
 typeset -r SOURCE_DB_PASSWORD=$($OPENSSL rand -hex 24)
@@ -723,9 +726,11 @@ start_api() {
     HINDSIGHT_API_EMBEDDINGS_PROVIDER=local \
     HINDSIGHT_API_EMBEDDINGS_LOCAL_FORCE_CPU=true \
     HINDSIGHT_API_RERANKER_PROVIDER=rrf \
-    HINDSIGHT_API_ENABLE_OBSERVATIONS=false \
+    HINDSIGHT_API_ENABLE_OBSERVATIONS=true \
     HINDSIGHT_API_ENABLE_BANK_CONFIG_API=true \
-    HINDSIGHT_API_WORKER_ENABLED=false \
+    HINDSIGHT_API_WORKER_ENABLED=true \
+    HINDSIGHT_API_AUDIT_LOG_ENABLED=false \
+    HINDSIGHT_API_LLM_TRACE_ENABLED=false \
     HINDSIGHT_API_ACCESS_LOG=false \
     "$HINDSIGHT_API" --host 127.0.0.1 --port "$port" --no-access-log \
     >"$log_file" 2>&1 &
@@ -959,6 +964,17 @@ CURRENT_PHASE=create-bank
 hindsight_cli_mutate "$SOURCE_DB_URL" source "$SOURCE_API_URL" \
   bank create "$SOURCE_BANK" --name "Disposable smoke" -o json \
   >"$SMOKE_ROOT/bank-create.json"
+CURRENT_PHASE=create-runtime-bank
+hindsight_cli_mutate "$SOURCE_DB_URL" source "$SOURCE_API_URL" \
+  bank create "$RUNTIME_BANK" --name "Disposable runtime" -o json \
+  >"$SMOKE_ROOT/runtime-bank-create.json"
+CURRENT_PHASE=runtime-adapter-contract
+HINDSIGHT_DISPOSABLE_API_URL="$SOURCE_API_URL" \
+  HINDSIGHT_DISPOSABLE_API_KEY="$API_KEY" \
+  HINDSIGHT_DISPOSABLE_BANK_ID="$RUNTIME_BANK" \
+  "$HINDSIGHT_PYTHON" \
+  "$HINDSIGHT_TESTS_DIR/hindsight-memory-runtime-disposable.py" \
+  >"$SMOKE_ROOT/runtime-adapter-contract.json"
 CURRENT_PHASE=create-directive
 hindsight_cli_mutate "$SOURCE_DB_URL" source "$SOURCE_API_URL" \
   directive create "$SOURCE_BANK" smoke-directive \

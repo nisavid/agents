@@ -78,6 +78,11 @@ from hindsight_memory_control_plane.file_evidence import (  # noqa: E402
     validate_trusted_regular_file,
 )
 from hindsight_memory_control_plane.server import JsonRpcClient, UnixJsonRpcServer  # noqa: E402
+from hindsight_memory_control_plane.runtime import (  # noqa: E402
+    RuntimeConfigurationError,
+    compile_runtime_configuration,
+    compile_runtime_status,
+)
 
 
 BROKER_REQUEST = b'{"id":"health","jsonrpc":"2.0","method":"session_status","params":{}}\n'
@@ -1403,13 +1408,140 @@ def _write_broker_pid_entry(
     return process_identity
 
 
+def _broker_environment_resolver(name: str, label: str):
+    if not isinstance(name, str) or ENVIRONMENT_NAME.fullmatch(name) is None:
+        raise BrokerError(f"BROKER_{label}_RESOLVER_INVALID")
+
+    def resolve() -> str:
+        value = os.environ.get(name)
+        if (
+            not isinstance(value, str)
+            or not value
+            or "\r" in value
+            or "\n" in value
+        ):
+            raise BrokerError(f"BROKER_{label}_UNAVAILABLE")
+        return value
+
+    return resolve
+
+
+def _broker_runtime_configuration(
+    args: argparse.Namespace, *, preflight_resolvers: bool = True
+):
+    try:
+        inventory = load_inventory(args.inventory)
+        token_resolver = _broker_environment_resolver(
+            args.data_plane_token_env, "DATA_PLANE_TOKEN"
+        )
+        mint_authority_resolver = _broker_environment_resolver(
+            args.mint_authority_env, "MINT_AUTHORITY"
+        )
+        # Fail closed before creating the socket or PID record. Resolvers remain
+        # lazy afterward so rotation does not require broker reconstruction.
+        if preflight_resolvers:
+            token_value = token_resolver()
+            mint_authority_value = mint_authority_resolver()
+            if hmac.compare_digest(
+                token_value.encode("utf-8"),
+                mint_authority_value.encode("utf-8"),
+            ):
+                raise BrokerError(
+                    "BROKER_RUNTIME_CREDENTIAL_SEPARATION_INVALID"
+                )
+        return compile_runtime_configuration(
+            inventory=inventory,
+            profiles=tuple(args.profile),
+            token_resolver=token_resolver,
+            mint_authority_resolver=mint_authority_resolver,
+            token_resolver_id=args.data_plane_token_env,
+            mint_authority_resolver_id=args.mint_authority_env,
+            verify_adapters=preflight_resolvers,
+        )
+    except (InventoryError, RuntimeConfigurationError, AdapterError) as error:
+        raise BrokerError("BROKER_RUNTIME_CONFIGURATION_INVALID") from error
+
+
+def _broker_binding_mode_error(
+    inactive: bool, bindings: tuple[Any, Any, Any]
+) -> str | None:
+    if inactive and any(bindings):
+        return "inactive-with-bindings"
+    if not inactive and not all(bindings):
+        return "active-missing-bindings"
+    return None
+
+
+def _broker_runtime_bindings(args: argparse.Namespace):
+    # Command functions are also a tested programmatic interface. Older
+    # callers construct a minimal Namespace without the parser's runtime
+    # fields; keep that explicit transitional shape inactive.
+    inactive = getattr(args, "inactive", True)
+    bindings = (
+        getattr(args, "inventory", None),
+        getattr(args, "data_plane_token_env", None),
+        getattr(args, "mint_authority_env", None),
+    )
+    binding_error = _broker_binding_mode_error(inactive, bindings)
+    if binding_error == "inactive-with-bindings":
+        raise BrokerError("BROKER_RUNTIME_CONFIGURATION_INVALID")
+    if inactive:
+        return None
+    if binding_error == "active-missing-bindings":
+        raise BrokerError("BROKER_RUNTIME_CONFIGURATION_REQUIRED")
+    return bindings
+
+
+def _broker_selected_runtime(
+    args: argparse.Namespace, *, preflight_resolvers: bool
+):
+    if _broker_runtime_bindings(args) is None:
+        return None
+    return _broker_runtime_configuration(
+        args, preflight_resolvers=preflight_resolvers
+    )
+
+
+def _broker_selected_runtime_status(args: argparse.Namespace):
+    if _broker_runtime_bindings(args) is None:
+        return None
+    try:
+        inventory = load_inventory(args.inventory)
+        return compile_runtime_status(
+            inventory=inventory,
+            profiles=tuple(args.profile),
+            token_resolver_id=args.data_plane_token_env,
+            mint_authority_resolver_id=args.mint_authority_env,
+        )
+    except (InventoryError, RuntimeConfigurationError) as error:
+        raise BrokerError("BROKER_RUNTIME_CONFIGURATION_INVALID") from error
+
+
+def _inactive_broker_policy_digest(profiles: list[str]) -> str:
+    return digest({
+        "mode": "inactive", "profiles": sorted(set(profiles)),
+    })
+
+
 def broker_serve_command(args: argparse.Namespace) -> int:
     shutdown_timeout = _bounded_broker_timeout(args.shutdown_timeout)
     state_dir, socket_path, pid_path = _broker_paths(args)
     _private_broker_state(state_dir)
     key: bytes | None = None
-    policy_digest = digest({"mode": "inactive", "profiles": sorted(set(args.profile))})
-    artifact_digest = digest({"broker_schema_version": 1, "routes": []})
+    runtime = _broker_selected_runtime(args, preflight_resolvers=True)
+    policy_digest = (
+        runtime.policy_digest
+        if runtime is not None
+        else _inactive_broker_policy_digest(args.profile)
+    )
+    artifact_digest = (
+        runtime.artifact_digest
+        if runtime is not None
+        else digest({"broker_schema_version": 1, "routes": []})
+    )
+    process_digest = (
+        runtime.profile_set_digest if runtime is not None else policy_digest
+    )
     stopped = threading.Event()
     shutdown_capability = secrets.token_urlsafe(32)
 
@@ -1460,10 +1592,14 @@ def broker_serve_command(args: argparse.Namespace) -> int:
             broker = Broker(
                 state_dir=state_dir,
                 signing_key=key,
-                routes={},
+                routes=runtime.routes if runtime is not None else {},
                 policy_digest=policy_digest,
                 artifact_digest=artifact_digest,
-                mint_authorizer=lambda _control, _claims, _ttl: {},
+                mint_authorizer=(
+                    runtime.mint_authorizer
+                    if runtime is not None
+                    else lambda _control, _claims, _ttl: {}
+                ),
             )
             server = UnixJsonRpcServer(
                 socket_path,
@@ -1478,9 +1614,17 @@ def broker_serve_command(args: argparse.Namespace) -> int:
                 server.close()
                 raise BrokerError("BROKER_PATH_INVALID")
             broker_identity = _write_broker_pid_entry(
-                directory, pid_path.name, shutdown_capability, policy_digest
+                directory, pid_path.name, shutdown_capability, process_digest
             )
-        print(json.dumps({"broker": "ready", "mode": "inactive", "profiles": sorted(set(args.profile))}, sort_keys=True), flush=True)
+        ready = (
+            {"broker": "ready", **dict(runtime.status)}
+            if runtime is not None
+            else {
+                "broker": "ready", "mode": "inactive",
+                "profiles": sorted(set(args.profile)),
+            }
+        )
+        print(json.dumps(ready, sort_keys=True), flush=True)
         while not stopped.wait(0.25):
             pass
     finally:
@@ -1535,8 +1679,11 @@ def broker_status_command(args: argparse.Namespace) -> int:
     state_dir, socket_path, pid_path = _broker_paths(args)
     if not _private_broker_state(state_dir, create=False):
         raise BrokerError("BROKER_UNAVAILABLE")
-    expected_profile_set_digest = digest(
-        {"mode": "inactive", "profiles": sorted(set(args.profile))}
+    runtime_status = _broker_selected_runtime_status(args)
+    expected_profile_set_digest = (
+        runtime_status["profile_set_digest"]
+        if runtime_status is not None
+        else _inactive_broker_policy_digest(args.profile)
     )
     identity = _read_broker_pid(pid_path)
     if identity is None:
@@ -1552,7 +1699,15 @@ def broker_status_command(args: argparse.Namespace) -> int:
         or not _process_identity_matches(identity)
     ):
         raise BrokerError("BROKER_UNAVAILABLE")
-    print(json.dumps({"broker": "healthy", "mode": "inactive", "socket": str(socket_path)}, sort_keys=True))
+    status = (
+        {
+            "broker": "healthy", "socket": str(socket_path),
+            **dict(runtime_status),
+        }
+        if runtime_status is not None
+        else {"broker": "healthy", "mode": "inactive", "socket": str(socket_path)}
+    )
+    print(json.dumps(status, sort_keys=True))
     return 0
 
 
@@ -1667,7 +1822,7 @@ def session_mint_command(args: argparse.Namespace) -> int:
             _required_environment(
                 args.control_capability_env, "CONTROL_CAPABILITY_UNAVAILABLE"
             ),
-            _request_object(args.claims, "CLAIMS"),
+            _request_object(args.request, "MINT_REQUEST"),
             ttl_seconds=args.ttl_seconds,
         )
     )
@@ -1811,11 +1966,19 @@ def parser() -> argparse.ArgumentParser:
     serve = broker_commands.add_parser("serve")
     serve.add_argument("--socket", required=True)
     serve.add_argument("--profile", action="append", required=True)
+    serve.add_argument("--inactive", action="store_true")
+    serve.add_argument("--inventory")
+    serve.add_argument("--data-plane-token-env")
+    serve.add_argument("--mint-authority-env")
     serve.add_argument("--shutdown-timeout", type=_argparse_timeout, default=5.0)
     serve.set_defaults(run=broker_serve_command)
     broker_status = broker_commands.add_parser("status")
     broker_status.add_argument("--socket", required=True)
     broker_status.add_argument("--profile", action="append", required=True)
+    broker_status.add_argument("--inactive", action="store_true")
+    broker_status.add_argument("--inventory")
+    broker_status.add_argument("--data-plane-token-env")
+    broker_status.add_argument("--mint-authority-env")
     broker_status.set_defaults(run=broker_status_command)
     broker_stop = broker_commands.add_parser("stop")
     broker_stop.add_argument("--socket", required=True)
@@ -1830,7 +1993,7 @@ def parser() -> argparse.ArgumentParser:
         "--control-capability-env",
         default="HINDSIGHT_MEMORY_CONTROL_CAPABILITY",
     )
-    mint.add_argument("--claims", required=True)
+    mint.add_argument("--request", required=True)
     mint.add_argument("--ttl-seconds", type=float, default=60.0)
     mint.set_defaults(run=session_mint_command)
     exchange = session_commands.add_parser("exchange")
@@ -1863,9 +2026,34 @@ def parser() -> argparse.ArgumentParser:
     return value
 
 
+def _validate_broker_binding_arguments(
+    argument_parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> None:
+    if (
+        getattr(args, "command", None) != "broker"
+        or getattr(args, "broker_command", None) not in {"serve", "status"}
+    ):
+        return
+    bindings = (
+        args.inventory, args.data_plane_token_env, args.mint_authority_env,
+    )
+    binding_error = _broker_binding_mode_error(args.inactive, bindings)
+    if binding_error == "inactive-with-bindings":
+        argument_parser.error(
+            "--inactive cannot be combined with runtime bindings"
+        )
+    if binding_error == "active-missing-bindings":
+        argument_parser.error(
+            "active broker mode requires --inventory, "
+            "--data-plane-token-env, and --mint-authority-env"
+        )
+
+
 def main() -> int:
     try:
-        args = parser().parse_args()
+        argument_parser = parser()
+        args = argument_parser.parse_args()
+        _validate_broker_binding_arguments(argument_parser, args)
         return args.run(args)
     except (
         AdapterError,

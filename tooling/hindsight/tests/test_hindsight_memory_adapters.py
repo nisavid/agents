@@ -31,7 +31,11 @@ if str(LIB) not in sys.path:
     sys.path.insert(0, str(LIB))
 
 from hindsight_memory_control_plane.adapters import AdapterError, AuthenticationError, FakeAdapter, RollbackBundle
-from hindsight_memory_control_plane.http_adapter import HttpAdapter
+from hindsight_memory_control_plane.http_adapter import (
+    EndpointNotFoundError,
+    HttpAdapter,
+    SUPPORTED_RUNTIME_VERSION,
+)
 from hindsight_memory_control_plane.inventory import _resolved_artifact
 from hindsight_memory_control_plane.file_evidence import (
     FileEvidenceError,
@@ -64,6 +68,14 @@ from hindsight_memory_control_plane.reconcile import (
 
 
 CONCURRENCY_TIMEOUT_SECONDS = 5
+RUNTIME_OPERATION_ID = "00000000-0000-4000-8000-000000000001"
+RUNTIME_OPERATION_ID_2 = "00000000-0000-4000-8000-000000000002"
+RUNTIME_VERSION_RESPONSE = {
+    "api_version": SUPPORTED_RUNTIME_VERSION,
+    "features": {
+        "worker": True, "audit_log": False, "llm_trace": False,
+    },
+}
 
 
 def plan_for(state, *actions):
@@ -135,13 +147,39 @@ def inventory_for(port, *, scheme="http", host="127.0.0.1", tenant="default", ap
     raw = {
         "schema_version": 1, "machine": {"base_port": port}, "archetype": {},
         "profiles": [{"id": "core", "slot": 0, "port": port, "scheme": scheme, "host": host, "tenant": tenant}],
-        "providers": [], "banks": [], "harnesses": [], "migration": {},
+        "providers": [],
+        "banks": [{
+            "id": "engineering",
+            "profile_id": "core",
+            "data_class": "engineering",
+            "authority": "authoritative",
+            "writable": True,
+        }],
+        "harnesses": [{
+            "id": "codex",
+            "profile_id": "core",
+            "home_bank": {"profile_id": "core", "bank_id": "engineering"},
+            "write_bank": {"profile_id": "core", "bank_id": "engineering"},
+        }],
+        "migration": {},
         "policy": {"approved_tls_endpoints": [endpoint] if approved_tls else []},
     }
     artifact = _resolved_artifact(
         raw, base_port=port, machine_engineering_enabled=False
     )
-    return Inventory(1, raw["machine"], raw["archetype"], tuple(raw["profiles"]), (), (), (), raw["migration"], raw["policy"], digest(raw), digest(artifact))
+    return Inventory(
+        1,
+        raw["machine"],
+        raw["archetype"],
+        tuple(raw["profiles"]),
+        (),
+        tuple(raw["banks"]),
+        tuple(raw["harnesses"]),
+        raw["migration"],
+        raw["policy"],
+        digest(raw),
+        digest(artifact),
+    )
 
 
 def write_migration_gate(root, run_id, artifact_digest):
@@ -276,14 +314,25 @@ class AdapterContractMixin:
         self.assert_operation("POST", "/v1/runtime/session-status")
 
     def test_runtime_memory_writes_are_idempotent(self):
-        checkpoint = {"document_id": "d", "epoch": 1, "checkpoint": 2, "idempotency_key": "a" * 64}
-        retain = {**checkpoint, "outcome": "done", "idempotency_key": "c" * 64}
-        reflection = {"reflection": "note", "idempotency_key": "b" * 64}
+        checkpoint = {
+            "session_id": "session-1", "document_id": "d",
+            "epoch": 1, "checkpoint": 2,
+            "content": "complete cleaned transcript",
+            "idempotency_key": "a" * 64,
+        }
+        retain = {
+            "session_id": "session-1",
+            "document_id": checkpoint["document_id"],
+            "epoch": checkpoint["epoch"],
+            "checkpoint": checkpoint["checkpoint"],
+            "outcome": "done", "idempotency_key": "c" * 64,
+        }
+        reflection = {"reflection": "note"}
         self.assertEqual(self.adapter.transcript_checkpoint(checkpoint), {"applied": True})
         self.assert_operation("PUT", "/v1/runtime/transcript-checkpoint")
         self.assertEqual(self.adapter.retain_outcome(retain), {"retained": True})
         self.assert_operation("PUT", "/v1/runtime/outcome")
-        self.assertEqual(self.adapter.reflect(reflection), {"accepted": True})
+        self.assertEqual(self.adapter.reflect(reflection), {"reflection": "note"})
         self.assert_operation("PUT", "/v1/runtime/reflection")
         before = len(getattr(self.adapter, "calls", getattr(self, "seen", [])))
         self.assertEqual(self.adapter.retain_outcome(retain), {"retained": True})
@@ -297,7 +346,8 @@ class AdapterContractMixin:
             self.adapter.recall({"query": "q", "endpoint": "http://forbidden"})
         with self.assertRaisesRegex(AdapterError, "schema"):
             self.adapter.retain_outcome({
-                "document_id": "d", "epoch": 1, "checkpoint": 1, "outcome": "done",
+                "session_id": "session-1", "document_id": "d",
+                "epoch": 1, "checkpoint": 1, "outcome": "done",
                 "idempotency_key": "a" * 64, "token": "forbidden",
             })
 
@@ -377,25 +427,24 @@ class FakeAdapterContractTest(AdapterContractMixin, unittest.TestCase):
             (
                 adapter.transcript_checkpoint,
                 {
+                    "session_id": "session-1",
                     "document_id": "document-1",
                     "epoch": 1,
                     "checkpoint": 1,
+                    "content": "complete cleaned transcript",
                     "idempotency_key": "a" * 64,
                 },
             ),
             (
                 adapter.retain_outcome,
                 {
+                    "session_id": "session-1",
                     "document_id": "document-1",
                     "epoch": 1,
                     "checkpoint": 1,
                     "outcome": "done",
                     "idempotency_key": "b" * 64,
                 },
-            ),
-            (
-                adapter.reflect,
-                {"reflection": "note", "idempotency_key": "c" * 64},
             ),
         )
         for mutate, request in runtime_writes:
@@ -406,6 +455,12 @@ class FakeAdapterContractTest(AdapterContractMixin, unittest.TestCase):
             self.assertEqual(
                 adapter.read_migration_generation(), committed_generation
             )
+
+        generation_before_reflect = adapter.read_migration_generation()
+        adapter.reflect({"reflection": "note"})
+        self.assertEqual(
+            adapter.read_migration_generation(), generation_before_reflect
+        )
 
         self.assertEqual(len(generations), len(set(generations)))
 
@@ -650,17 +705,68 @@ class HttpAdapterContractTest(AdapterContractMixin, unittest.TestCase):
             ("PUT", "/v1/models"): {"upserted": "m"}, ("PUT", "/v1/directives"): {"upserted": "r"},
             ("POST", "/v1/documents/transfer"): {"transferred": 2},
             ("POST", "/v1/memories/invalidated/reapply"): {"reapplied": 2}, ("DELETE", "/v1/banks"): {"deleted": True},
-            ("POST", "/v1/runtime/recall"): {"memories": [{"id": "m1"}]},
-            ("POST", "/v1/runtime/mental-model"): {"models": [{"id": "model1"}]},
-            ("POST", "/v1/runtime/session-status"): {"status": "ready"},
-            ("PUT", "/v1/runtime/transcript-checkpoint"): {"applied": True},
-            ("PUT", "/v1/runtime/outcome"): {"retained": True},
-            ("PUT", "/v1/runtime/reflection"): {"accepted": True},
+            ("POST", "/v1/default/banks/engineering/memories/recall"): {
+                "results": [{"id": "m1", "text": "remembered", "type": "world"}],
+                "trace": None,
+                "entities": {
+                    "entity": {
+                        "entity_id": "entity-1",
+                        "canonical_name": "Entity",
+                        "observations": [{"text": "observed"}],
+                    },
+                },
+                "chunks": {
+                    "chunk-1": {
+                        "id": "chunk-1", "text": "source chunk",
+                        "chunk_index": 0, "truncated": False,
+                    },
+                },
+                "source_facts": {
+                    "source-1": {
+                        "id": "source-1", "text": "source fact",
+                        "type": "experience",
+                    },
+                },
+            },
+            ("GET", "/v1/default/banks/engineering/mental-models/model1?detail=content"): {
+                "id": "model1", "bank_id": "engineering", "name": "Model",
+                "content": "model content", "tags": [],
+            },
+            ("GET", "/v1/default/banks/engineering/operations?status=pending&limit=1&offset=0"): {
+                "bank_id": "engineering", "operations": [], "total": 0,
+                "limit": 1, "offset": 0,
+            },
+            ("GET", "/v1/default/banks/engineering/operations?status=processing&limit=1&offset=0"): {
+                "bank_id": "engineering", "operations": [], "total": 0,
+                "limit": 1, "offset": 0,
+            },
+            ("GET", f"/v1/default/banks/engineering/operations/{RUNTIME_OPERATION_ID}"): {
+                "operation_id": RUNTIME_OPERATION_ID, "status": "completed",
+            },
+            ("POST", "/v1/default/banks/engineering/memories"): {
+                "success": True, "bank_id": "engineering", "items_count": 1,
+                "async": True, "operation_id": RUNTIME_OPERATION_ID,
+                "operation_ids": None, "usage": None,
+            },
+            ("POST", "/v1/default/banks/engineering/reflect"): {
+                "text": "reflected answer",
+                "based_on": {
+                    "memories": [{"id": "memory-1", "text": "private"}],
+                    "mental_models": [{"id": "model-1", "text": "private"}],
+                    "directives": [{
+                        "id": "directive-1", "name": "private",
+                        "content": "private",
+                    }],
+                },
+            },
         }
         responses[("GET", "/version")] = {
-            "api_version": "0.8.4",
+            "api_version": SUPPORTED_RUNTIME_VERSION,
             "features": {
                 "observations": True,
+                "worker": True,
+                "audit_log": False,
+                "llm_trace": False,
                 "private_feature": "private-feature-content",
             },
             "release_notes": "private-version-content",
@@ -777,6 +883,650 @@ class HttpAdapterContractTest(AdapterContractMixin, unittest.TestCase):
         self.endpoint = EndpointIdentity("core", "http", "127.0.0.1", self.server.server_port, "default")
         self.state = state
         self.adapter = HttpAdapter(inventory=inventory_for(self.server.server_port), profile_id="core", token_resolver=lambda: "contract-token")
+
+    def test_runtime_memory_reads(self):
+        self.assertEqual(
+            self.adapter.recall({"query": "q", "limit": 2}),
+            {
+                "memories": [{
+                    "id": "m1", "text": "remembered", "type": "world",
+                }],
+                "entities": [{
+                    "id": "entity-1", "name": "Entity",
+                    "observations": [{"text": "observed"}],
+                }],
+                "chunks": [{
+                    "id": "chunk-1", "text": "source chunk",
+                    "chunk_index": 0, "truncated": False,
+                }],
+                "source_facts": [{
+                    "id": "source-1", "text": "source fact",
+                    "type": "experience",
+                }],
+            },
+        )
+        self.assert_operation(
+            "POST", "/v1/default/banks/engineering/memories/recall"
+        )
+        self.assertEqual(self.seen[-1][3], {
+            "query": "q",
+            "types": ["world", "experience", "observation"],
+            "prefer_observations": True,
+            "budget": "mid",
+            "max_tokens": 10_000,
+            "include": {
+                "entities": {"max_tokens": 2_000},
+                "chunks": {"max_tokens": 4_000},
+                "source_facts": {
+                    "max_tokens": 4_000,
+                    "max_tokens_per_observation": 1_000,
+                },
+            },
+        })
+        self.assertEqual(
+            self.adapter.mental_model_fetch({"model_id": "model1"}),
+            {"models": [{
+                "id": "model1", "name": "Model",
+                "content": "model content", "tags": [],
+            }]},
+        )
+        self.assert_operation(
+            "GET",
+            "/v1/default/banks/engineering/mental-models/model1?detail=content",
+        )
+        self.assertEqual(
+            self.adapter.session_status({"session_id": "session-1"}),
+            {"status": "ready"},
+        )
+        self.assert_operation(
+            "GET",
+            "/v1/default/banks/engineering/operations?status=processing&limit=1&offset=0",
+        )
+        self.assertEqual(
+            self.adapter.operation_status({"operation_id": RUNTIME_OPERATION_ID}),
+            {"status": "completed"},
+        )
+        self.assert_operation(
+            "GET", f"/v1/default/banks/engineering/operations/{RUNTIME_OPERATION_ID}"
+        )
+
+    def test_runtime_session_status_rejects_a_misrouted_bank_response(self):
+        path = (
+            "/v1/default/banks/engineering/operations?"
+            "status=pending&limit=1&offset=0"
+        )
+        self.responses[("GET", path)] = {
+            "bank_id": "other", "operations": [], "total": 0,
+        }
+
+        with self.assertRaisesRegex(
+            AdapterError, "runtime operation status response is invalid"
+        ):
+            self.adapter.session_status({"session_id": "session-1"})
+
+    def test_runtime_deep_recall_uses_the_compiled_deep_policy(self):
+        self.adapter.recall({"query": "deep question", "depth": "deep"})
+
+        self.assertEqual(self.seen[-1][3], {
+            "query": "deep question",
+            "types": ["world", "experience", "observation"],
+            "prefer_observations": True,
+            "budget": "high",
+            "max_tokens": 20_000,
+            "include": {
+                "entities": {"max_tokens": 4_000},
+                "chunks": {"max_tokens": 8_000},
+                "source_facts": {
+                    "max_tokens": 8_000,
+                    "max_tokens_per_observation": 2_000,
+                },
+            },
+        })
+
+    def test_runtime_recall_rejects_malformed_primary_results(self):
+        path = ("POST", "/v1/default/banks/engineering/memories/recall")
+        for results in (
+            [None], [{}], [{"id": "memory-1"}],
+            [{"id": 1, "text": "memory"}],
+        ):
+            with self.subTest(results=results):
+                self.responses[path] = {"results": results}
+                with self.assertRaisesRegex(
+                    AdapterError, "runtime recall response is invalid"
+                ):
+                    self.adapter.recall({"query": "question"})
+        for depth in ([], {}):
+            with self.subTest(depth=depth), self.assertRaisesRegex(
+                AdapterError, "runtime request schema is invalid"
+            ):
+                self.adapter.recall({"query": "question", "depth": depth})
+
+    def test_runtime_reflect_rejects_malformed_or_oversized_provenance(self):
+        path = ("POST", "/v1/default/banks/engineering/reflect")
+        invalid = (
+            {"text": "answer", "based_on": []},
+            {
+                "text": "answer",
+                "based_on": {
+                    "memories": [{"id": "m"}] * 129,
+                    "mental_models": [], "directives": [],
+                },
+            },
+            {
+                "text": "answer",
+                "based_on": {
+                    "memories": [],
+                    "mental_models": [{"id": "\nunsafe"}],
+                    "directives": [],
+                },
+            },
+        )
+        for response in invalid:
+            with self.subTest(response=response):
+                self.responses[path] = response
+                adapter = HttpAdapter(
+                    inventory=inventory_for(self.server.server_port),
+                    profile_id="core", token_resolver=lambda: "contract-token",
+                )
+                with self.assertRaisesRegex(
+                    AdapterError, "runtime reflect response is invalid"
+                ):
+                    adapter.reflect({
+                        "reflection": "note",
+                    })
+
+    def test_runtime_compatibility_probe_attests_the_bound_bank(self):
+        calls = []
+        adapter = HttpAdapter(
+            inventory=inventory_for(self.server.server_port),
+            profile_id="core", token_resolver=lambda: "contract-token",
+        )
+
+        def request(method, path, body=None, **kwargs):
+            calls.append((method, path, body, kwargs))
+            if "_authorization_token" in kwargs:
+                raise AuthenticationError(
+                    "endpoint authentication failed (HTTP 401)"
+                )
+            if path == "/version":
+                return RUNTIME_VERSION_RESPONSE
+            return {"bank_id": "engineering", "total": 0}
+
+        adapter._request = request
+        adapter.verify_runtime_compatibility()
+        self.assertEqual(calls[1], (
+            "GET",
+            "/v1/default/banks/engineering/operations?"
+            "status=pending&limit=1&offset=0",
+            None,
+            {},
+        ))
+        self.assertIsNone(calls[2][3]["_authorization_token"])
+        self.assertNotEqual(
+            calls[3][3]["_authorization_token"], "contract-token"
+        )
+
+        adapter._request = lambda _method, path, _body=None: (
+            RUNTIME_VERSION_RESPONSE
+            if path == "/version"
+            else {"bank_id": "other", "total": 0}
+        )
+        with self.assertRaisesRegex(
+            AdapterError, "runtime bank probe response is invalid"
+        ):
+            adapter.verify_runtime_compatibility()
+
+        for error in (
+            EndpointNotFoundError("endpoint request failed (HTTP 404)"),
+            AuthenticationError("endpoint authentication failed"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                def rejected(_method, path, _body=None, selected=error):
+                    if path == "/version":
+                        return RUNTIME_VERSION_RESPONSE
+                    raise selected
+
+                adapter._request = rejected
+                with self.assertRaises(type(error)):
+                    adapter.verify_runtime_compatibility()
+
+    def test_runtime_compatibility_rejects_an_unprotected_bank_endpoint(self):
+        adapter = HttpAdapter(
+            inventory=inventory_for(self.server.server_port),
+            profile_id="core", token_resolver=lambda: "contract-token",
+        )
+
+        def unprotected(method, path, body=None, **_kwargs):
+            if path == "/version":
+                return RUNTIME_VERSION_RESPONSE
+            return {"bank_id": "engineering", "total": 0}
+
+        adapter._request = unprotected
+        with self.assertRaisesRegex(
+            AdapterError, "does not enforce authentication"
+        ):
+            adapter.verify_runtime_compatibility()
+
+    def test_runtime_compatibility_probes_real_transport_without_credentials(self):
+        adapter = HttpAdapter(
+            inventory=inventory_for(self.server.server_port),
+            profile_id="core", token_resolver=lambda: "contract-token",
+        )
+
+        with self.assertRaisesRegex(
+            AdapterError, "does not enforce authentication"
+        ):
+            adapter.verify_runtime_compatibility()
+        self.assertIsNone(self.seen[-1][2])
+
+    def test_runtime_adapter_fails_closed_on_unsupported_hindsight_version(self):
+        adapter = HttpAdapter(
+            inventory=inventory_for(self.server.server_port),
+            profile_id="core",
+            token_resolver=lambda: "contract-token",
+        )
+        adapter._request = lambda *_args: {"api_version": "0.8.5"}
+        with self.assertRaisesRegex(
+            AdapterError, "version, worker, or privacy features are unsupported"
+        ):
+            adapter.recall({"query": "q"})
+
+    def test_runtime_adapter_fails_closed_when_async_worker_is_disabled(self):
+        adapter = HttpAdapter(
+            inventory=inventory_for(self.server.server_port),
+            profile_id="core", token_resolver=lambda: "contract-token",
+            runtime_bank_id="engineering", runtime_harness_id="codex",
+        )
+        adapter._request = lambda *_args: {
+            "api_version": SUPPORTED_RUNTIME_VERSION,
+            "features": {
+                "worker": False, "audit_log": False, "llm_trace": False,
+            },
+        }
+
+        with self.assertRaisesRegex(
+            AdapterError, "version, worker, or privacy features are unsupported"
+        ):
+            adapter.verify_runtime_compatibility()
+
+    def test_runtime_adapter_fails_closed_when_native_content_logging_is_enabled(self):
+        adapter = HttpAdapter(
+            inventory=inventory_for(self.server.server_port),
+            profile_id="core", token_resolver=lambda: "contract-token",
+            runtime_bank_id="engineering", runtime_harness_id="codex",
+        )
+        for feature in ("audit_log", "llm_trace"):
+            with self.subTest(feature=feature):
+                adapter._request = lambda *_args, selected=feature: {
+                    "api_version": SUPPORTED_RUNTIME_VERSION,
+                    "features": {
+                        "worker": True,
+                        "audit_log": selected == "audit_log",
+                        "llm_trace": selected == "llm_trace",
+                    },
+                }
+                with self.assertRaisesRegex(
+                    AdapterError,
+                    "version, worker, or privacy features are unsupported",
+                ):
+                    adapter.verify_runtime_compatibility()
+
+    def test_runtime_adapter_requires_explicit_native_content_logging_flags(self):
+        adapter = HttpAdapter(
+            inventory=inventory_for(self.server.server_port),
+            profile_id="core", token_resolver=lambda: "contract-token",
+            runtime_bank_id="engineering", runtime_harness_id="codex",
+        )
+        adapter._request = lambda *_args: {
+            "api_version": SUPPORTED_RUNTIME_VERSION,
+            "features": {"worker": True},
+        }
+        with self.assertRaisesRegex(
+            AdapterError,
+            "version, worker, or privacy features are unsupported",
+        ):
+            adapter.verify_runtime_compatibility()
+
+    def test_runtime_adapter_revalidates_version_before_each_operation(self):
+        adapter = HttpAdapter(
+            inventory=inventory_for(self.server.server_port),
+            profile_id="core", token_resolver=lambda: "contract-token",
+            runtime_bank_id="engineering", runtime_harness_id="codex",
+        )
+        calls = []
+
+        def request(method, path, body=None):
+            calls.append((method, path, body))
+            if path == "/version":
+                version = SUPPORTED_RUNTIME_VERSION if sum(
+                    call[1] == "/version" for call in calls
+                ) == 1 else "0.8.5"
+                return {
+                    "api_version": version,
+                    "features": {
+                        "worker": True,
+                        "audit_log": False,
+                        "llm_trace": False,
+                    },
+                }
+            return {"results": []}
+
+        adapter._request = request
+        self.assertEqual(adapter.recall({"query": "first"}), {
+            "memories": [], "entities": [], "chunks": [],
+            "source_facts": [],
+        })
+        with self.assertRaisesRegex(
+            AdapterError, "version, worker, or privacy features are unsupported"
+        ):
+            adapter.recall({"query": "second"})
+
+    def test_operation_status_does_not_treat_version_404_as_not_found(self):
+        adapter = HttpAdapter(
+            inventory=inventory_for(self.server.server_port),
+            profile_id="core", token_resolver=lambda: "contract-token",
+            runtime_bank_id="engineering", runtime_harness_id="codex",
+        )
+        adapter._request = lambda *_args: (_ for _ in ()).throw(
+            EndpointNotFoundError("endpoint request failed (HTTP 404)")
+        )
+
+        with self.assertRaisesRegex(
+            AdapterError, r"endpoint request failed \(HTTP 404\)"
+        ):
+            adapter.operation_status({"operation_id": RUNTIME_OPERATION_ID})
+
+    def test_runtime_routes_use_the_inventory_tenant(self):
+        adapter = HttpAdapter(
+            inventory=inventory_for(self.server.server_port, tenant="team"),
+            profile_id="core", token_resolver=lambda: "contract-token",
+            runtime_bank_id="engineering", runtime_harness_id="codex",
+        )
+        paths = []
+
+        def request(_method, path, _body=None):
+            paths.append(path)
+            return (
+                RUNTIME_VERSION_RESPONSE
+                if path == "/version"
+                else {"results": []}
+            )
+
+        adapter._request = request
+        adapter.recall({"query": "tenant-bound"})
+        self.assertEqual(
+            paths[-1], "/v1/team/banks/engineering/memories/recall"
+        )
+
+    def test_runtime_responses_attest_bound_bank_and_operation(self):
+        adapter = HttpAdapter(
+            inventory=inventory_for(self.server.server_port),
+            profile_id="core", token_resolver=lambda: "contract-token",
+            runtime_bank_id="engineering", runtime_harness_id="codex",
+        )
+        adapter._request = lambda _method, path, _body=None: (
+            RUNTIME_VERSION_RESPONSE
+            if path == "/version"
+            else {
+                "id": "model1", "bank_id": "other",
+                "content": "cross-bank content",
+            }
+        )
+        with self.assertRaisesRegex(AdapterError, "mental model response"):
+            adapter.mental_model_fetch({"model_id": "model1"})
+
+        adapter._request = lambda _method, path, _body=None: (
+            RUNTIME_VERSION_RESPONSE
+            if path == "/version"
+            else {
+                "operation_id": RUNTIME_OPERATION_ID_2,
+                "status": "completed",
+            }
+        )
+        with self.assertRaisesRegex(AdapterError, "operation status response"):
+            adapter.operation_status({"operation_id": RUNTIME_OPERATION_ID})
+
+    def test_runtime_retain_requires_exact_async_bank_scoped_response(self):
+        request = {
+            "session_id": "session-1", "document_id": "session",
+            "epoch": 1, "checkpoint": 1,
+            "content": "clean transcript", "idempotency_key": "a" * 64,
+        }
+        valid = {
+            "success": True, "bank_id": "engineering", "items_count": 1,
+            "async": True, "operation_id": RUNTIME_OPERATION_ID,
+            "operation_ids": None, "usage": None,
+        }
+        for changed in (
+            {**valid, "bank_id": "other"},
+            {**valid, "async": False},
+            {**valid, "operation_id": "not-a-uuid"},
+            {**valid, "operation_ids": [RUNTIME_OPERATION_ID]},
+            {**valid, "usage": {}},
+            {**valid, "unexpected": True},
+        ):
+            with self.subTest(changed=changed):
+                adapter = HttpAdapter(
+                    inventory=inventory_for(self.server.server_port),
+                    profile_id="core", token_resolver=lambda: "contract-token",
+                    runtime_bank_id="engineering", runtime_harness_id="codex",
+                )
+                adapter._request = lambda _method, path, _body=None: (
+                    RUNTIME_VERSION_RESPONSE
+                    if path == "/version"
+                    else changed
+                )
+                with self.assertRaisesRegex(
+                    AdapterError, "runtime retain response is invalid"
+                ):
+                    adapter.transcript_checkpoint(request)
+
+    def test_failed_operation_evicts_cached_submission_for_safe_resubmit(self):
+        adapter = HttpAdapter(
+            inventory=inventory_for(self.server.server_port),
+            profile_id="core", token_resolver=lambda: "contract-token",
+            runtime_bank_id="engineering", runtime_harness_id="codex",
+        )
+        submissions = []
+
+        def mutate(_method, _request):
+            operation_id = (
+                RUNTIME_OPERATION_ID
+                if not submissions
+                else RUNTIME_OPERATION_ID_2
+            )
+            submissions.append(operation_id)
+            return {"operation_id": operation_id}
+
+        adapter._runtime_mutation = mutate
+        adapter._request = lambda _method, path, _body=None: (
+            RUNTIME_VERSION_RESPONSE
+            if path == "/version"
+            else {
+                "operation_id": RUNTIME_OPERATION_ID,
+                "status": "failed",
+            }
+        )
+        request = {
+            "session_id": "session-1", "document_id": "session",
+            "epoch": 1, "checkpoint": 1,
+            "content": "clean transcript", "idempotency_key": "a" * 64,
+        }
+        self.assertEqual(
+            adapter.transcript_checkpoint(request),
+            {"operation_id": RUNTIME_OPERATION_ID},
+        )
+        self.assertEqual(
+            adapter.operation_status({"operation_id": RUNTIME_OPERATION_ID}),
+            {"status": "failed"},
+        )
+        self.assertEqual(
+            adapter.transcript_checkpoint(request),
+            {"operation_id": RUNTIME_OPERATION_ID_2},
+        )
+
+    def test_missing_operation_is_terminal_and_evicts_cached_submission(self):
+        adapter = HttpAdapter(
+            inventory=inventory_for(self.server.server_port),
+            profile_id="core", token_resolver=lambda: "contract-token",
+            runtime_bank_id="engineering", runtime_harness_id="codex",
+        )
+        adapter._runtime_mutation = lambda *_args: {
+            "operation_id": RUNTIME_OPERATION_ID
+        }
+        request = {
+            "session_id": "session-1", "document_id": "session",
+            "epoch": 1, "checkpoint": 1,
+            "content": "clean transcript", "idempotency_key": "a" * 64,
+        }
+        adapter.transcript_checkpoint(request)
+        adapter._request = lambda _method, path, _body=None: (
+            RUNTIME_VERSION_RESPONSE
+            if path == "/version"
+            else (_ for _ in ()).throw(
+                EndpointNotFoundError("endpoint request failed (HTTP 404)")
+            )
+        )
+        self.assertEqual(
+            adapter.operation_status({"operation_id": RUNTIME_OPERATION_ID}),
+            {"status": "not_found"},
+        )
+        self.assertNotIn("a" * 64, adapter._runtime_results)
+
+    def test_runtime_mental_model_fetch_rejects_mismatched_or_malformed_models(self):
+        for response in (
+            {"id": "other", "content": "model content"},
+            {"id": "model1", "content": {"unsafe": True}},
+            {"id": "model1"},
+        ):
+            with self.subTest(response=response):
+                adapter = HttpAdapter(
+                    inventory=inventory_for(self.server.server_port),
+                    profile_id="core",
+                    token_resolver=lambda: "contract-token",
+                )
+                replies = iter((RUNTIME_VERSION_RESPONSE, response))
+                adapter._request = lambda *_args: next(replies)
+                with self.assertRaisesRegex(
+                    AdapterError, "mental model response is invalid"
+                ):
+                    adapter.mental_model_fetch({"model_id": "model1"})
+
+    def test_runtime_memory_writes_are_idempotent(self):
+        checkpoint = {
+            "session_id": "session-1", "document_id": "d",
+            "epoch": 1, "checkpoint": 2,
+            "content": "clean transcript",
+            "idempotency_key": "a" * 64,
+        }
+        retain = {
+            "session_id": "session-1", "document_id": "outcome-d",
+            "epoch": 1, "checkpoint": 2,
+            "outcome": "done", "idempotency_key": "c" * 64,
+        }
+        reflection = {"reflection": "note"}
+        self.assertEqual(
+            self.adapter.transcript_checkpoint(checkpoint),
+            {"operation_id": RUNTIME_OPERATION_ID},
+        )
+        self.assert_operation(
+            "POST", "/v1/default/banks/engineering/memories"
+        )
+        self.assertEqual(self.seen[-1][3], {
+            "items": [{
+                "content": "clean transcript",
+                "document_id": "hindsight-transcript-" + digest({
+                    "harness_id": "codex",
+                    "kind": "transcript",
+                    "logical_document_id": "d",
+                    "epoch": 1,
+                    "session_id": "session-1",
+                })[:48],
+                "update_mode": "replace",
+                "tags": [
+                    "agent:codex", "source:codex-hook", "scope:active",
+                ],
+                "observation_scopes": [["scope:active"]],
+                "metadata": {
+                    "kind": "transcript", "session_id": "session-1",
+                    "epoch": "1", "checkpoint": "2",
+                },
+            }],
+            "async": True,
+        })
+        transcript_document_id = self.seen[-1][3]["items"][0]["document_id"]
+        self.assertEqual(
+            self.adapter.retain_outcome(retain),
+            {"operation_id": RUNTIME_OPERATION_ID},
+        )
+        self.assert_operation(
+            "POST", "/v1/default/banks/engineering/memories"
+        )
+        outcome_document_id = self.seen[-1][3]["items"][0]["document_id"]
+        self.assertTrue(outcome_document_id.startswith("hindsight-outcome-"))
+        self.assertNotEqual(outcome_document_id, transcript_document_id)
+        self.assertEqual(
+            self.adapter.reflect(reflection),
+            {
+                "reflection": "reflected answer",
+                "based_on": {
+                    "memory_ids": ["memory-1"],
+                    "mental_model_ids": ["model-1"],
+                    "directive_ids": ["directive-1"],
+                    "source_resolution_required": True,
+                    "unresolved_memory_items": 0,
+                },
+            },
+        )
+        self.assert_operation(
+            "POST", "/v1/default/banks/engineering/reflect"
+        )
+        self.assertEqual(self.seen[-1][3], {
+            "query": "note", "budget": "mid", "max_tokens": 10_000,
+            "include": {"facts": {}},
+        })
+        before = len(self.seen)
+        self.assertEqual(
+            self.adapter.retain_outcome(retain),
+            {"operation_id": RUNTIME_OPERATION_ID},
+        )
+        self.assertEqual(len(self.seen), before)
+        with self.assertRaisesRegex(AdapterError, "digest drift"):
+            self.adapter.retain_outcome({**retain, "outcome": "changed"})
+
+    def test_runtime_retain_requires_an_exact_integer_item_count(self):
+        self.responses[(
+            "POST", "/v1/default/banks/engineering/memories"
+        )]["items_count"] = True
+        with self.assertRaisesRegex(
+            AdapterError, "runtime retain response is invalid"
+        ):
+            self.adapter.transcript_checkpoint({
+                "session_id": "session-1", "document_id": "d",
+                "epoch": 1, "checkpoint": 1,
+                "content": "clean transcript",
+                "idempotency_key": "e" * 64,
+            })
+
+    def test_runtime_retain_document_identity_is_session_scoped(self):
+        document_ids = []
+        for session_id, key in (
+            ("session-one", "1" * 64),
+            ("session-two", "2" * 64),
+        ):
+            self.adapter.transcript_checkpoint({
+                "session_id": session_id,
+                "document_id": "shared-document",
+                "epoch": 1,
+                "checkpoint": 1,
+                "content": f"content for {session_id}",
+                "idempotency_key": key,
+            })
+            document_ids.append(
+                self.seen[-1][3]["items"][0]["document_id"]
+            )
+
+        self.assertNotEqual(document_ids[0], document_ids[1])
 
     def test_snapshot(self):
         snapshot = self.adapter.snapshot()
@@ -1097,27 +1847,34 @@ class HttpAdapterContractTest(AdapterContractMixin, unittest.TestCase):
             runtime_clock=lambda: clock[0],
         )
         checkpoint = {
-            "document_id": "d", "epoch": 1, "checkpoint": 1,
+            "session_id": "session-1", "document_id": "d",
+            "epoch": 1, "checkpoint": 1,
+            "content": "complete cleaned transcript",
             "idempotency_key": "a" * 64,
         }
         retain = {
-            **checkpoint, "outcome": "done", "idempotency_key": "b" * 64,
+            "session_id": "session-1", "document_id": "d",
+            "epoch": 1, "checkpoint": 1,
+            "outcome": "done", "idempotency_key": "b" * 64,
         }
-        reflection = {"reflection": "note", "idempotency_key": "c" * 64}
+        reflection = {"reflection": "note"}
         first = adapter.transcript_checkpoint(checkpoint)
-        first["applied"] = False
-        self.assertEqual(adapter.transcript_checkpoint(checkpoint), {"applied": True})
+        first["operation_id"] = "changed"
+        self.assertEqual(
+            adapter.transcript_checkpoint(checkpoint),
+            {"operation_id": RUNTIME_OPERATION_ID},
+        )
         adapter.retain_outcome(retain)
         adapter.transcript_checkpoint(checkpoint)
         adapter.reflect(reflection)
-        self.assertEqual(tuple(adapter._runtime_results), ("a" * 64, "c" * 64))
+        self.assertEqual(tuple(adapter._runtime_results), ("b" * 64, "a" * 64))
         before = len(self.seen)
         adapter.retain_outcome(retain)
-        self.assertEqual(len(self.seen), before + 1)
+        self.assertEqual(len(self.seen), before)
         clock[0] += 6
         before = len(self.seen)
         adapter.retain_outcome(retain)
-        self.assertEqual(len(self.seen), before + 1)
+        self.assertEqual(len(self.seen), before + 2)
 
     def test_runtime_result_cache_enforces_total_byte_budget(self):
         adapter = HttpAdapter(
@@ -1127,20 +1884,24 @@ class HttpAdapterContractTest(AdapterContractMixin, unittest.TestCase):
             max_runtime_results=10,
             max_runtime_result_bytes=48,
         )
-        adapter._request = lambda _method, _path, request: {
+        adapter._runtime_mutation = lambda _method, request: {
             "value": request["idempotency_key"][:24]
         }
         for key in ("a" * 64, "b" * 64):
             adapter.transcript_checkpoint({
-                "document_id": key[0], "epoch": 1, "checkpoint": 1,
+                "session_id": "session-1", "document_id": key[0],
+                "epoch": 1, "checkpoint": 1,
+                "content": "complete cleaned transcript",
                 "idempotency_key": key,
             })
         self.assertLessEqual(adapter._runtime_result_bytes, 48)
         self.assertEqual(len(adapter._runtime_results), 1)
 
-        adapter._request = lambda *_args: {"value": "x" * 100}
+        adapter._runtime_mutation = lambda *_args: {"value": "x" * 100}
         adapter.transcript_checkpoint({
-            "document_id": "oversized", "epoch": 1, "checkpoint": 1,
+            "session_id": "session-1", "document_id": "oversized",
+            "epoch": 1, "checkpoint": 1,
+            "content": "complete cleaned transcript",
             "idempotency_key": "c" * 64,
         })
         self.assertNotIn("c" * 64, adapter._runtime_results)
@@ -1156,21 +1917,25 @@ class HttpAdapterContractTest(AdapterContractMixin, unittest.TestCase):
         release = threading.Event()
         calls = []
 
-        def request(_method, path, payload):
-            calls.append((path, payload["idempotency_key"]))
+        def request(method, payload):
+            calls.append((method, payload["idempotency_key"]))
             if payload["idempotency_key"] == "d" * 64:
                 entered.set()
                 if not release.wait(CONCURRENCY_TIMEOUT_SECONDS):
                     raise TimeoutError("test release was not signaled")
             return {"applied": True}
 
-        adapter._request = request
+        adapter._runtime_mutation = request
         first_request = {
-            "document_id": "d", "epoch": 1, "checkpoint": 1,
+            "session_id": "session-1", "document_id": "d",
+            "epoch": 1, "checkpoint": 1,
+            "content": "complete cleaned transcript",
             "idempotency_key": "d" * 64,
         }
         other_request = {
-            "document_id": "other", "epoch": 1, "checkpoint": 1,
+            "session_id": "session-1", "document_id": "other",
+            "epoch": 1, "checkpoint": 1,
+            "content": "complete cleaned transcript",
             "idempotency_key": "e" * 64,
         }
         results = []
@@ -1195,7 +1960,7 @@ class HttpAdapterContractTest(AdapterContractMixin, unittest.TestCase):
         self.assertFalse(first.is_alive())
         self.assertFalse(duplicate.is_alive())
         self.assertEqual(len(results), 2)
-        self.assertEqual(calls.count(("/v1/runtime/transcript-checkpoint", "d" * 64)), 1)
+        self.assertEqual(calls.count(("transcript_checkpoint", "d" * 64)), 1)
 
     def test_runtime_result_inflight_preserves_digest_drift_and_leader_error(self):
         adapter = HttpAdapter(
@@ -1209,16 +1974,18 @@ class HttpAdapterContractTest(AdapterContractMixin, unittest.TestCase):
         failure = AdapterError("leader failed")
         requests = []
 
-        def request(_method, _path, _payload):
-            requests.append((_method, _path))
+        def request(method, _payload):
+            requests.append(method)
             entered.set()
             if not release.wait(CONCURRENCY_TIMEOUT_SECONDS):
                 raise TimeoutError("test release was not signaled")
             raise failure
 
-        adapter._request = request
+        adapter._runtime_mutation = request
         base = {
-            "document_id": "d", "epoch": 1, "checkpoint": 1,
+            "session_id": "session-1", "document_id": "d",
+            "epoch": 1, "checkpoint": 1,
+            "content": "complete cleaned transcript",
             "idempotency_key": "f" * 64,
         }
         errors = []
@@ -1272,15 +2039,17 @@ class HttpAdapterContractTest(AdapterContractMixin, unittest.TestCase):
         requests = []
         self.addCleanup(release.set)
 
-        def request(method, path, _payload):
-            requests.append((method, path))
+        def request(method, _payload):
+            requests.append(method)
             entered.set()
             release.wait(CONCURRENCY_TIMEOUT_SECONDS)
             return {"applied": True}
 
-        adapter._request = request
+        adapter._runtime_mutation = request
         value = {
-            "document_id": "bounded", "epoch": 1, "checkpoint": 1,
+            "session_id": "session-1", "document_id": "bounded",
+            "epoch": 1, "checkpoint": 1,
+            "content": "complete cleaned transcript",
             "idempotency_key": "9" * 64,
         }
         leader = threading.Thread(
@@ -1295,7 +2064,7 @@ class HttpAdapterContractTest(AdapterContractMixin, unittest.TestCase):
         release.set()
         leader.join(CONCURRENCY_TIMEOUT_SECONDS)
         self.assertFalse(leader.is_alive())
-        self.assertEqual(requests, [("PUT", "/v1/runtime/transcript-checkpoint")])
+        self.assertEqual(requests, ["transcript_checkpoint"])
 
     @staticmethod
     def _capture_error(errors, operation):

@@ -30,6 +30,16 @@ hindsight_stack_validate_port() {
   }
 }
 
+hindsight_stack_runtime_active() {
+  local inventory="${HINDSIGHT_MEMORY_INVENTORY:-}"
+  [[
+    -n "$inventory" &&
+    "$inventory" == /* &&
+    "$inventory" != *$'\n'* &&
+    "$inventory" != *$'\r'*
+  ]]
+}
+
 hindsight_stack_load_config() {
   emulate -L zsh
   setopt no_unset
@@ -64,6 +74,56 @@ hindsight_stack_load_config() {
     print -ru2 -- "hindsight-embed-stack: HINDSIGHT_MEMORY_BROKER_SOCKET must be absolute"
     return 1
   }
+  local runtime_binding_count=0
+  [[ -n "${HINDSIGHT_MEMORY_INVENTORY:-}" ]] &&
+    (( runtime_binding_count += 1 ))
+  [[ -n "${HINDSIGHT_MEMORY_DATA_PLANE_TOKEN_ENV:-}" ]] &&
+    (( runtime_binding_count += 1 ))
+  [[ -n "${HINDSIGHT_MEMORY_MINT_AUTHORITY_ENV:-}" ]] &&
+    (( runtime_binding_count += 1 ))
+  [[ -n "${HINDSIGHT_MEMORY_UI_ACCESS_KEY_ENV:-}" ]] &&
+    (( runtime_binding_count += 1 ))
+  if (( runtime_binding_count != 0 && runtime_binding_count != 4 )); then
+    print -ru2 -- "hindsight-embed-stack: runtime inventory and resolver bindings must be all set or all unset"
+    return 1
+  fi
+  if (( runtime_binding_count == 4 )); then
+    hindsight_stack_runtime_active || {
+      print -ru2 -- "hindsight-embed-stack: HINDSIGHT_MEMORY_INVENTORY must be an absolute single-line path"
+      return 1
+    }
+    local resolver_name
+    for resolver_name in \
+      HINDSIGHT_MEMORY_DATA_PLANE_TOKEN_ENV \
+      HINDSIGHT_MEMORY_MINT_AUTHORITY_ENV \
+      HINDSIGHT_MEMORY_UI_ACCESS_KEY_ENV; do
+      [[ "${(P)resolver_name:-}" =~ '^[A-Z_][A-Z0-9_]{0,127}$' ]] || {
+        print -ru2 -- "hindsight-embed-stack: ${resolver_name} must name a valid environment variable"
+        return 1
+      }
+      case "${(P)resolver_name}" in
+        HINDSIGHT_MEMORY_INVENTORY|\
+        HINDSIGHT_MEMORY_DATA_PLANE_TOKEN_ENV|\
+        HINDSIGHT_MEMORY_MINT_AUTHORITY_ENV|\
+        HINDSIGHT_MEMORY_UI_ACCESS_KEY_ENV|\
+        HINDSIGHT_API_TENANT_API_KEY|\
+        HINDSIGHT_CP_DATAPLANE_API_KEY|\
+        HINDSIGHT_CP_ACCESS_KEY)
+          print -ru2 -- "hindsight-embed-stack: ${resolver_name} must not target a reserved runtime binding"
+          return 1
+          ;;
+      esac
+    done
+    if [[ "$HINDSIGHT_MEMORY_DATA_PLANE_TOKEN_ENV" == \
+        "$HINDSIGHT_MEMORY_MINT_AUTHORITY_ENV" || \
+      "$HINDSIGHT_MEMORY_DATA_PLANE_TOKEN_ENV" == \
+        "$HINDSIGHT_MEMORY_UI_ACCESS_KEY_ENV" || \
+      "$HINDSIGHT_MEMORY_MINT_AUTHORITY_ENV" == \
+        "$HINDSIGHT_MEMORY_UI_ACCESS_KEY_ENV" ]]; then
+      print -ru2 -- "hindsight-embed-stack: runtime credential resolver bindings must be distinct"
+      return 1
+    fi
+  fi
 
   hindsight_stack_validate_port "$HINDSIGHT_EMBED_CONTROL_PORT" HINDSIGHT_EMBED_CONTROL_PORT || return 1
   hindsight_stack_validate_port "$HINDSIGHT_EMBED_API_BASE_PORT" HINDSIGHT_EMBED_API_BASE_PORT || return 1
@@ -412,13 +472,112 @@ hindsight_stack_with_lifecycle_lock() {
   return "$result"
 }
 
-hindsight_stack_run_bounded() {
+hindsight_stack_run_with_credential_scope() {
   emulate -L zsh
-  local timeout="$1"
+  local scope="$1"
   shift
+  if [[ "$scope" != none && "$scope" != api && \
+    "$scope" != ui-proxy && "$scope" != broker && \
+    "$scope" != preflight ]]; then
+    print -ru2 -- "hindsight-embed-stack: invalid credential scope: ${scope}"
+    return 2
+  fi
+  (
+    local data_name="${HINDSIGHT_MEMORY_DATA_PLANE_TOKEN_ENV:-}"
+    local mint_name="${HINDSIGHT_MEMORY_MINT_AUTHORITY_ENV:-}"
+    local ui_name="${HINDSIGHT_MEMORY_UI_ACCESS_KEY_ENV:-}"
+    local data_credential=''
+    local ui_credential=''
+    local mapped_name
+    if hindsight_stack_runtime_active; then
+      if [[ "$scope" == api || "$scope" == ui-proxy ]]; then
+        data_credential="${(P)data_name:-}"
+        if [[ -z "$data_credential" || "$data_credential" == *$'\n'* || \
+          "$data_credential" == *$'\r'* ]]; then
+          print -ru2 -- "hindsight-embed-stack: data-plane credential resolver is unavailable"
+          return 1
+        fi
+      fi
+      if [[ "$scope" == ui-proxy ]]; then
+        ui_credential="${(P)ui_name:-}"
+        if [[ -z "$ui_credential" || "$ui_credential" == *$'\n'* || \
+          "$ui_credential" == *$'\r'* ]]; then
+          print -ru2 -- "hindsight-embed-stack: UI access-key resolver is unavailable"
+          return 1
+        fi
+      fi
+      if [[ "$scope" == broker ]]; then
+        unset "$ui_name"
+        for mapped_name in \
+          HINDSIGHT_API_TENANT_API_KEY \
+          HINDSIGHT_CP_DATAPLANE_API_KEY HINDSIGHT_CP_ACCESS_KEY; do
+          [[ "$mapped_name" == "$data_name" || \
+            "$mapped_name" == "$mint_name" ]] || \
+            unset "$mapped_name"
+        done
+      elif [[ "$scope" == preflight ]]; then
+        for mapped_name in \
+          HINDSIGHT_API_TENANT_API_KEY \
+          HINDSIGHT_CP_DATAPLANE_API_KEY HINDSIGHT_CP_ACCESS_KEY; do
+          [[ "$mapped_name" == "$data_name" || \
+            "$mapped_name" == "$mint_name" || \
+            "$mapped_name" == "$ui_name" ]] || unset "$mapped_name"
+        done
+      else
+        unset "$data_name" "$mint_name" "$ui_name"
+        unset HINDSIGHT_API_TENANT_API_KEY \
+          HINDSIGHT_CP_DATAPLANE_API_KEY HINDSIGHT_CP_ACCESS_KEY
+        if [[ "$scope" == api ]]; then
+          export HINDSIGHT_API_TENANT_API_KEY="$data_credential"
+        elif [[ "$scope" == ui-proxy ]]; then
+          export HINDSIGHT_CP_DATAPLANE_API_KEY="$data_credential"
+          export HINDSIGHT_CP_ACCESS_KEY="$ui_credential"
+        fi
+      fi
+    else
+      unset HINDSIGHT_API_TENANT_API_KEY \
+        HINDSIGHT_CP_DATAPLANE_API_KEY HINDSIGHT_CP_ACCESS_KEY
+    fi
+    "$@"
+  )
+}
+
+hindsight_stack_preflight_runtime_credentials() {
+  emulate -L zsh
+  hindsight_stack_runtime_active || return 0
+  hindsight_stack_validate_fleet_profile_credential_isolation || return 1
+  hindsight_stack_require_trusted_artifact \
+    "$HINDSIGHT_EMBED_PYTHON" "Hindsight embed Python" executable allow-symlink || return 1
+  hindsight_stack_run_with_credential_scope preflight \
+    "$HINDSIGHT_EMBED_PYTHON" -I - \
+    "$HINDSIGHT_MEMORY_DATA_PLANE_TOKEN_ENV" \
+    "$HINDSIGHT_MEMORY_MINT_AUTHORITY_ENV" \
+    "$HINDSIGHT_MEMORY_UI_ACCESS_KEY_ENV" <<'PY'
+import hmac
+import os
+import sys
+
+values = []
+for name in sys.argv[1:]:
+    value = os.environ.get(name)
+    if not value or "\n" in value or "\r" in value:
+        raise SystemExit(1)
+    values.append(value.encode("utf-8"))
+for index, value in enumerate(values):
+    for other in values[index + 1:]:
+        if hmac.compare_digest(value, other):
+            raise SystemExit(1)
+PY
+}
+
+hindsight_stack_run_bounded_with_credential_scope() {
+  emulate -L zsh
+  local scope="$1" timeout="$2"
+  shift 2
   hindsight_stack_validate_seconds "$timeout" "bounded command timeout" 7200 || return 1
   (( $# )) || return 2
-  "$HINDSIGHT_EMBED_PYTHON" -I - "$timeout" "$@" <<'PY'
+  hindsight_stack_run_with_credential_scope "$scope" \
+    "$HINDSIGHT_EMBED_PYTHON" -I - "$timeout" "$@" <<'PY'
 import os
 import signal
 import subprocess
@@ -526,6 +685,18 @@ except BaseException:
     terminate_process_group()
     raise
 PY
+}
+
+hindsight_stack_run_bounded() {
+  hindsight_stack_run_bounded_with_credential_scope none "$@"
+}
+
+hindsight_stack_run_bounded_api() {
+  hindsight_stack_run_bounded_with_credential_scope api "$@"
+}
+
+hindsight_stack_run_bounded_ui_proxy() {
+  hindsight_stack_run_bounded_with_credential_scope ui-proxy "$@"
 }
 
 hindsight_stack_timestamp() {
@@ -964,6 +1135,50 @@ hindsight_stack_profile_exists() {
   [[ -f "$HOME/.hindsight/profiles/${profile}.env" ]]
 }
 
+hindsight_stack_validate_profile_credential_isolation() {
+  emulate -L zsh
+  setopt extended_glob
+  local profile="$1"
+  hindsight_stack_valid_profile_name "$profile" || return 1
+  local path="$HOME/.hindsight/profiles/${profile}.env"
+  [[ -f "$path" && -r "$path" ]] || return 1
+
+  local line key
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line##[[:space:]]#}"
+    [[ -n "$line" && "$line" != \#* ]] || continue
+    if [[ "$line" == export[[:space:]]* ]]; then
+      line="${line#export}"
+      line="${line##[[:space:]]#}"
+    fi
+    [[ "$line" == *=* ]] || continue
+    key="${line%%=*}"
+    key="${key%%[[:space:]]#}"
+    case "$key" in
+      HINDSIGHT_MEMORY_INVENTORY|\
+      HINDSIGHT_MEMORY_DATA_PLANE_TOKEN_ENV|\
+      HINDSIGHT_MEMORY_MINT_AUTHORITY_ENV|\
+      HINDSIGHT_MEMORY_UI_ACCESS_KEY_ENV|\
+      HINDSIGHT_API_TENANT_API_KEY|\
+      HINDSIGHT_CP_DATAPLANE_API_KEY|\
+      HINDSIGHT_CP_ACCESS_KEY)
+        print -ru2 -- "hindsight-embed-stack: profile '${profile}' must not define controller-owned credential binding ${key}"
+        return 1
+        ;;
+    esac
+  done < "$path"
+}
+
+hindsight_stack_validate_fleet_profile_credential_isolation() {
+  emulate -L zsh
+  local profile
+  local -a profiles
+  profiles=("${(@f)$(hindsight_stack_enabled_profiles)}") || return 1
+  for profile in "${profiles[@]}"; do
+    hindsight_stack_validate_profile_credential_isolation "$profile" || return 1
+  done
+}
+
 hindsight_stack_require_profile() {
   emulate -L zsh
   hindsight_stack_load_config || return 1
@@ -1020,7 +1235,8 @@ hindsight_stack_http_ok() {
   local timeout="${2:-2}"
   hindsight_stack_validate_seconds "$timeout" "HTTP probe timeout" 3600 || return 1
 
-  /usr/bin/curl --noproxy '*' -fsS --max-time "$timeout" "$url" >/dev/null 2>&1
+  hindsight_stack_run_with_credential_scope none \
+    /usr/bin/curl --noproxy '*' -fsS --max-time "$timeout" "$url" >/dev/null 2>&1
 }
 
 hindsight_stack_url_host() {
@@ -1204,7 +1420,8 @@ hindsight_stack_sidecar_command() {
     HINDSIGHT_EMBED_PROFILE_SLOT="$HINDSIGHT_EMBED_PROFILE_SLOT" \
     HINDSIGHT_EMBED_SIDECAR_NAME="$sidecar" \
     HINDSIGHT_EMBED_SIDECAR_PORT="$port" \
-    "$HINDSIGHT_EMBED_PYTHON" -I - "$timeout" "$executable" <<'PY'
+    hindsight_stack_run_with_credential_scope none \
+      "$HINDSIGHT_EMBED_PYTHON" -I - "$timeout" "$executable" <<'PY'
 import os
 import signal
 import subprocess
@@ -1587,12 +1804,27 @@ hindsight_stack_broker_status() {
   profiles=("${(@f)$(hindsight_stack_enabled_profiles)}") || return 1
   arguments=(--state-dir "$HINDSIGHT_MEMORY_STATE_DIR" broker status \
     --socket "$HINDSIGHT_MEMORY_BROKER_SOCKET")
+  arguments+=("${(@f)$(hindsight_stack_broker_runtime_arguments)}")
   for profile in "${profiles[@]}"; do
     hindsight_stack_valid_profile_name "$profile" || return 1
     arguments+=(--profile "$profile")
   done
   hindsight_stack_run_bounded "$probe_timeout" \
     "$HINDSIGHT_MEMORY_CLI" "${arguments[@]}" >/dev/null 2>&1
+}
+
+hindsight_stack_broker_runtime_arguments() {
+  emulate -L zsh
+  if hindsight_stack_runtime_active; then
+    print -r -- --inventory
+    print -r -- "$HINDSIGHT_MEMORY_INVENTORY"
+    print -r -- --data-plane-token-env
+    print -r -- "$HINDSIGHT_MEMORY_DATA_PLANE_TOKEN_ENV"
+    print -r -- --mint-authority-env
+    print -r -- "$HINDSIGHT_MEMORY_MINT_AUTHORITY_ENV"
+  else
+    print -r -- --inactive
+  fi
 }
 
 hindsight_stack_broker_running() {
@@ -1636,9 +1868,123 @@ hindsight_stack_daemon_running() {
   hindsight_stack_port_listening "$HINDSIGHT_EMBED_API_PORT"
 }
 
-hindsight_stack_ui_status() {
+hindsight_stack_ui_auth_probe() {
+  emulate -L zsh
+  local probe_timeout="${1:-$HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS}"
+  hindsight_stack_validate_seconds "$probe_timeout" "UI authentication probe timeout" 3600 || return 1
+  hindsight_stack_require_trusted_artifact \
+    "$HINDSIGHT_EMBED_PYTHON" "Hindsight embed Python" executable allow-symlink || return 1
+
+  local probe_program
+  IFS= read -r -d '' probe_program <<'PY' || true
+import hashlib
+import http.cookiejar
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+base_url = sys.argv[1].rstrip("/")
+timeout = float(sys.argv[2])
+access_key = os.environ.get("HINDSIGHT_CP_ACCESS_KEY", "")
+data_plane_token = os.environ.get("HINDSIGHT_CP_DATAPLANE_API_KEY", "")
+if not access_key or not data_plane_token:
+    raise SystemExit(1)
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def opener_with_cookies():
+    jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        NoRedirect(),
+        urllib.request.HTTPCookieProcessor(jar),
+    )
+    return opener, jar
+
+
+def request(opener, path, *, body=None, expected_status):
+    encoded = None if body is None else json.dumps(body).encode("utf-8")
+    headers = {"Accept": "application/json"}
+    if encoded is not None:
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(
+        base_url + path,
+        data=encoded,
+        headers=headers,
+        method="POST" if encoded is not None else "GET",
+    )
+    try:
+        response = opener.open(req, timeout=timeout)
+        status = response.status
+        response_headers = response.headers
+        response_body = response.read(1024 * 1024 + 1)
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+        response_headers = exc.headers
+        response_body = exc.read(1024 * 1024 + 1)
+    if status != expected_status or len(response_body) > 1024 * 1024:
+        raise SystemExit(1)
+    exposed = str(response_headers).encode("utf-8", "replace") + response_body
+    for secret in (access_key, data_plane_token):
+        if secret.encode("utf-8") in exposed:
+            raise SystemExit(1)
+    return response_headers, response_body
+
+
+anonymous, _ = opener_with_cookies()
+_, version_body = request(anonymous, "/api/version", expected_status=200)
+try:
+    version = json.loads(version_body)
+except (json.JSONDecodeError, TypeError):
+    raise SystemExit(1)
+if version.get("features", {}).get("access_key_auth") is not True:
+    raise SystemExit(1)
+request(anonymous, "/api/banks", expected_status=401)
+
+missing, _ = opener_with_cookies()
+request(missing, "/api/auth/login", body={}, expected_status=401)
+
+wrong_key = hashlib.sha256(access_key.encode("utf-8")).hexdigest()
+if wrong_key == access_key:
+    wrong_key += "-invalid"
+wrong, _ = opener_with_cookies()
+request(wrong, "/api/auth/login", body={"key": wrong_key}, expected_status=401)
+
+authenticated, cookie_jar = opener_with_cookies()
+login_headers, _ = request(
+    authenticated,
+    "/api/auth/login",
+    body={"key": access_key},
+    expected_status=200,
+)
+set_cookie = login_headers.get("Set-Cookie", "")
+if "hindsight_cp_access=" not in set_cookie or "httponly" not in set_cookie.lower():
+    raise SystemExit(1)
+if not any(cookie.name == "hindsight_cp_access" for cookie in cookie_jar):
+    raise SystemExit(1)
+request(authenticated, "/api/banks", expected_status=200)
+PY
+  hindsight_stack_run_bounded_ui_proxy "$probe_timeout" \
+    "$HINDSIGHT_EMBED_PYTHON" -I -c "$probe_program" \
+    "$(hindsight_stack_ui_url)" "$probe_timeout"
+}
+
+hindsight_stack_ui_auth_status() {
   emulate -L zsh
   hindsight_stack_load_config || return 1
+  hindsight_stack_runtime_active || return 0
+  hindsight_stack_preflight_runtime_credentials || return 1
+  hindsight_stack_ui_auth_probe "$@"
+}
+
+hindsight_stack_ui_status_probe() {
+  emulate -L zsh
   local probe_timeout="${1:-$HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS}"
   integer probe_deadline=$(( $(/bin/date +%s) + probe_timeout ))
 
@@ -1647,7 +1993,20 @@ hindsight_stack_ui_status() {
     --port "$HINDSIGHT_EMBED_UI_PORT" >/dev/null 2>&1 || return 1
   probe_timeout=$(( probe_deadline - $(/bin/date +%s) ))
   (( probe_timeout > 0 )) || return 1
-  hindsight_stack_http_ok "$(hindsight_stack_ui_url)" "$probe_timeout"
+  if hindsight_stack_runtime_active; then
+    hindsight_stack_ui_auth_probe "$probe_timeout"
+  else
+    hindsight_stack_http_ok "$(hindsight_stack_ui_url)" "$probe_timeout"
+  fi
+}
+
+hindsight_stack_ui_status() {
+  emulate -L zsh
+  hindsight_stack_load_config || return 1
+  if hindsight_stack_runtime_active; then
+    hindsight_stack_preflight_runtime_credentials || return 1
+  fi
+  hindsight_stack_ui_status_probe "$@"
 }
 
 hindsight_stack_ui_running() {
@@ -1672,6 +2031,7 @@ hindsight_stack_ui_running() {
 hindsight_stack_control_start() {
   emulate -L zsh
   hindsight_stack_load_config || return 1
+  hindsight_stack_preflight_runtime_credentials || return 1
 
   hindsight_stack_run_bounded "$HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS" \
     "$HINDSIGHT_EMBED_UVX" hindsight-embed control start --no-open \
@@ -1688,7 +2048,8 @@ hindsight_stack_broker_process_identity() {
   emulate -L zsh
   local pid="$1"
   [[ "$pid" == <-> ]] || return 1
-  "$HINDSIGHT_EMBED_PYTHON" -I - "$pid" <<'PY'
+  hindsight_stack_run_with_credential_scope none \
+    "$HINDSIGHT_EMBED_PYTHON" -I - "$pid" <<'PY'
 import ctypes
 import sys
 
@@ -1860,12 +2221,14 @@ hindsight_stack_broker_start() {
   trap 'if (( ${broker_launch_owned:-0} )); then broker_launch_owned=0; hindsight_stack_broker_abort_launch "${pid:-}" "${identity:-}" >/dev/null 2>&1 || true; fi; return 143' TERM
   {
     hindsight_stack_load_config || return 1
+    hindsight_stack_preflight_runtime_credentials || return 1
 
   local -a arguments
   arguments=(
     --state-dir "$HINDSIGHT_MEMORY_STATE_DIR"
     broker serve --socket "$HINDSIGHT_MEMORY_BROKER_SOCKET"
   )
+  arguments+=("${(@f)$(hindsight_stack_broker_runtime_arguments)}")
   local profile
   local -a profiles
   profiles=("${(@f)$(hindsight_stack_enabled_profiles)}") || return 1
@@ -1874,7 +2237,8 @@ hindsight_stack_broker_start() {
   done
   hindsight_stack_broker_terminate_recorded || return 1
   hindsight_stack_broker_remove_stale_socket || return 1
-  "$HINDSIGHT_EMBED_PYTHON" -I -c '
+  hindsight_stack_run_with_credential_scope broker \
+    "$HINDSIGHT_EMBED_PYTHON" -I -c '
 import os
 import signal
 import sys
@@ -1940,9 +2304,10 @@ os.execv(executable, arguments)
 hindsight_stack_daemon_start() {
   emulate -L zsh
   hindsight_stack_load_config || return 1
+  hindsight_stack_preflight_runtime_credentials || return 1
 
   hindsight_stack_ensure_profile_ports || return 1
-  if hindsight_stack_run_bounded "$HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS" \
+  if hindsight_stack_run_bounded_api "$HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS" \
     "$HINDSIGHT_EMBED_UVX" hindsight-embed --profile "$HINDSIGHT_EMBED_PROFILE" daemon start >/dev/null 2>&1; then
     return 0
   fi
@@ -1957,14 +2322,21 @@ hindsight_stack_daemon_start() {
 hindsight_stack_ui_start() {
   emulate -L zsh
   hindsight_stack_load_config || return 1
+  hindsight_stack_preflight_runtime_credentials || return 1
 
   hindsight_stack_daemon_status || {
     print -ru2 -- "hindsight-embed-stack: refusing to start UI for ${HINDSIGHT_EMBED_PROFILE} without a healthy daemon"
     return 1
   }
 
+  if hindsight_stack_runtime_active && hindsight_stack_ui_running; then
+    hindsight_stack_ui_status && return 0
+    hindsight_stack_ui_stop || return 1
+    hindsight_stack_wait_stopped_for ui "$HINDSIGHT_EMBED_STOP_WAIT_SECONDS" || return 1
+  fi
+
   hindsight_stack_ensure_profile_ports || return 1
-  hindsight_stack_run_bounded "$HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS" \
+  hindsight_stack_run_bounded_ui_proxy "$HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS" \
     "$HINDSIGHT_EMBED_UVX" hindsight-embed --profile "$HINDSIGHT_EMBED_PROFILE" ui start \
     --port "$HINDSIGHT_EMBED_UI_PORT" \
     --hostname "$HINDSIGHT_EMBED_UI_HOSTNAME" >/dev/null 2>&1
@@ -2040,6 +2412,12 @@ hindsight_stack_wait_for() {
 
   local component="$1" timeout_value="$2"
   hindsight_stack_validate_seconds "$timeout_value" "wait timeout" 3600 || return 2
+  if [[ "$component" == ui ]]; then
+    hindsight_stack_load_config || return 1
+    if hindsight_stack_runtime_active; then
+      hindsight_stack_preflight_runtime_credentials || return 1
+    fi
+  fi
   integer timeout_seconds="$timeout_value"
   integer deadline
   deadline=$(( $(/bin/date +%s) + timeout_seconds ))
@@ -2060,7 +2438,7 @@ hindsight_stack_wait_for() {
         hindsight_stack_daemon_status "$probe_timeout" && return 0
         ;;
       ui)
-        hindsight_stack_ui_status "$probe_timeout" && return 0
+        hindsight_stack_ui_status_probe "$probe_timeout" && return 0
         ;;
       *)
         print -ru2 -- "hindsight-embed-stack: unknown component: ${component}"
@@ -2280,6 +2658,7 @@ hindsight_stack_reconcile_profile() {
 hindsight_stack_reconcile_once() {
   emulate -L zsh
   hindsight_stack_load_config || return 1
+  hindsight_stack_preflight_runtime_credentials || return 1
   hindsight_stack_require_current_user || return 1
   hindsight_stack_require_tools || return 1
   hindsight_stack_validate_fleet || return 1
@@ -2287,15 +2666,17 @@ hindsight_stack_reconcile_once() {
 
   local ok=0
 
-  if ! hindsight_stack_reconcile_broker; then
-    ok=1
+  if hindsight_stack_runtime_active; then
+    # An active broker verifies the selected Hindsight runtime before it opens
+    # its socket. Start the data plane first so that gate is meaningful.
+    hindsight_stack_reconcile_control || ok=1
+    hindsight_stack_for_each_profile hindsight_stack_reconcile_profile "" || ok=1
+    hindsight_stack_reconcile_broker || ok=1
+  else
+    hindsight_stack_reconcile_broker || ok=1
+    hindsight_stack_reconcile_control || ok=1
+    hindsight_stack_for_each_profile hindsight_stack_reconcile_profile "" || ok=1
   fi
-
-  if ! hindsight_stack_reconcile_control; then
-    ok=1
-  fi
-
-  hindsight_stack_for_each_profile hindsight_stack_reconcile_profile "" || ok=1
 
   return "$ok"
 }
@@ -2336,33 +2717,48 @@ hindsight_stack_start_profile() {
   return "$ok"
 }
 
+hindsight_stack_start_broker_dependency() {
+  emulate -L zsh
+  if hindsight_stack_broker_status; then
+    hindsight_stack_broker_identity_matches || {
+      print -ru2 -- "hindsight-embed-stack: refusing to replace a healthy broker with unmanaged process identity"
+      return 1
+    }
+    hindsight_stack_wait_broker
+  else
+    hindsight_stack_broker_start
+  fi
+}
+
+hindsight_stack_start_control_dependency() {
+  emulate -L zsh
+  if hindsight_stack_control_status; then
+    hindsight_stack_wait_control
+  else
+    hindsight_stack_control_start || return 1
+    hindsight_stack_wait_control
+  fi
+}
+
 hindsight_stack_start_all() {
   emulate -L zsh
   hindsight_stack_load_config || return 1
+  hindsight_stack_preflight_runtime_credentials || return 1
   hindsight_stack_require_current_user || return 1
   hindsight_stack_require_tools || return 1
   hindsight_stack_require_runtime_helpers || return 1
   hindsight_stack_validate_fleet || return 1
   hindsight_stack_initialize_desired_state || return 1
 
-  if hindsight_stack_broker_status; then
-    hindsight_stack_broker_identity_matches || {
-      print -ru2 -- "hindsight-embed-stack: refusing to replace a healthy broker with unmanaged process identity"
-      return 1
-    }
-    hindsight_stack_wait_broker || return 1
+  if hindsight_stack_runtime_active; then
+    hindsight_stack_start_control_dependency || return 1
+    hindsight_stack_for_each_profile hindsight_stack_start_profile "" || return 1
+    hindsight_stack_start_broker_dependency
   else
-    hindsight_stack_broker_start || return 1
+    hindsight_stack_start_broker_dependency || return 1
+    hindsight_stack_start_control_dependency || return 1
+    hindsight_stack_for_each_profile hindsight_stack_start_profile ""
   fi
-
-  if hindsight_stack_control_status; then
-    hindsight_stack_wait_control || return 1
-  else
-    hindsight_stack_control_start || return 1
-    hindsight_stack_wait_control || return 1
-  fi
-
-  hindsight_stack_for_each_profile hindsight_stack_start_profile ""
 }
 
 hindsight_stack_wait_profile() {

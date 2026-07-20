@@ -368,7 +368,7 @@ print -r -- '{"pid":999999999,"start_time":"stale-process"}' >"$broker_state/bro
 chmod 600 "$broker_state/broker.pid"
 python3 "$repo_dir/bin/hindsight-memory" \
   --state-dir "$broker_state" broker serve \
-  --socket "$broker_socket" --profile example >"$broker_log" 2>&1 &
+  --socket "$broker_socket" --profile example --inactive >"$broker_log" 2>&1 &
 broker_pid=$!
 track_child "$broker_pid" || fail "could not capture inactive broker child identity"
 for _ in {1..100}; do
@@ -387,7 +387,7 @@ identity_start="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1],
 [[ "$identity_pid" == "$broker_pid" ]] || fail "broker PID identity was not rewritten"
 [[ "$identity_start" != "stale-process" ]] || fail "broker start identity remained stale"
 python3 "$repo_dir/bin/hindsight-memory" \
-  --state-dir "$broker_state" broker status --socket "$broker_socket" --profile example >/dev/null
+  --state-dir "$broker_state" broker status --socket "$broker_socket" --profile example --inactive >/dev/null
 [[ "$(stat -f '%Lp' "$broker_socket")" == "600" ]] || fail "broker socket is not mode 0600"
 python3 "$repo_dir/bin/hindsight-memory" \
   --state-dir "$broker_state" broker stop --socket "$broker_socket" >/dev/null

@@ -193,6 +193,217 @@ for relative_binding in HINDSIGHT_MEMORY_STATE_DIR HINDSIGHT_MEMORY_BROKER_SOCKE
 done
 
 if (
+  export HINDSIGHT_MEMORY_INVENTORY=$'/absolute/inventory.json\n--inactive'
+  export HINDSIGHT_MEMORY_DATA_PLANE_TOKEN_ENV=TEST_DATA_TOKEN
+  export HINDSIGHT_MEMORY_MINT_AUTHORITY_ENV=TEST_MINT_AUTHORITY
+  export HINDSIGHT_MEMORY_UI_ACCESS_KEY_ENV=TEST_UI_ACCESS_KEY
+  export TEST_DATA_TOKEN=test-data-token
+  export TEST_MINT_AUTHORITY=test-mint-authority
+  export TEST_UI_ACCESS_KEY=test-ui-access-key
+  source "$rendered_stack_lib"
+  hindsight_stack_load_config
+) >/dev/null 2>&1; then
+  print -ru2 -- "stack accepted a multiline runtime inventory path"
+  exit 1
+fi
+
+if (
+  export HINDSIGHT_MEMORY_INVENTORY=/absolute/inventory.json
+  export HINDSIGHT_MEMORY_DATA_PLANE_TOKEN_ENV=TEST_SHARED_AUTHORITY
+  export HINDSIGHT_MEMORY_MINT_AUTHORITY_ENV=TEST_SHARED_AUTHORITY
+  export HINDSIGHT_MEMORY_UI_ACCESS_KEY_ENV=TEST_UI_ACCESS_KEY
+  source "$rendered_stack_lib"
+  hindsight_stack_load_config
+) >/dev/null 2>&1; then
+  print -ru2 -- "stack accepted a shared data-plane and mint-authority resolver binding"
+  exit 1
+fi
+
+for resolver_role in data mint ui; do
+  for reserved_resolver in \
+    HINDSIGHT_MEMORY_INVENTORY \
+    HINDSIGHT_MEMORY_DATA_PLANE_TOKEN_ENV \
+    HINDSIGHT_MEMORY_MINT_AUTHORITY_ENV \
+    HINDSIGHT_MEMORY_UI_ACCESS_KEY_ENV \
+    HINDSIGHT_API_TENANT_API_KEY \
+    HINDSIGHT_CP_DATAPLANE_API_KEY \
+    HINDSIGHT_CP_ACCESS_KEY; do
+    if (
+      export HINDSIGHT_MEMORY_INVENTORY=/absolute/inventory.json
+      export HINDSIGHT_MEMORY_DATA_PLANE_TOKEN_ENV=TEST_DATA_PLANE_TOKEN
+      export HINDSIGHT_MEMORY_MINT_AUTHORITY_ENV=TEST_MINT_AUTHORITY
+      export HINDSIGHT_MEMORY_UI_ACCESS_KEY_ENV=TEST_UI_ACCESS_KEY
+      case "$resolver_role" in
+        data) export HINDSIGHT_MEMORY_DATA_PLANE_TOKEN_ENV="$reserved_resolver" ;;
+        mint) export HINDSIGHT_MEMORY_MINT_AUTHORITY_ENV="$reserved_resolver" ;;
+        ui) export HINDSIGHT_MEMORY_UI_ACCESS_KEY_ENV="$reserved_resolver" ;;
+      esac
+      source "$rendered_stack_lib"
+      hindsight_stack_load_config
+    ) >/dev/null 2>&1; then
+      print -ru2 -- "stack accepted reserved ${reserved_resolver} as the ${resolver_role} credential resolver"
+      exit 1
+    fi
+  done
+done
+
+credential_scope_results="$tmp_dir/credential-scope-results"
+(
+  export HINDSIGHT_MEMORY_INVENTORY=/absolute/inventory.json
+  export HINDSIGHT_MEMORY_DATA_PLANE_TOKEN_ENV=TEST_DATA_PLANE_TOKEN
+  export HINDSIGHT_MEMORY_MINT_AUTHORITY_ENV=TEST_MINT_AUTHORITY
+  export HINDSIGHT_MEMORY_UI_ACCESS_KEY_ENV=TEST_UI_ACCESS_KEY
+  export TEST_DATA_PLANE_TOKEN=test-data-plane-token
+  export TEST_MINT_AUTHORITY=test-mint-authority
+  export TEST_UI_ACCESS_KEY=test-ui-access-key
+  source "$rendered_stack_lib"
+  for credential_scope in none api ui-proxy broker; do
+    print -rn -- "${credential_scope}:"
+    hindsight_stack_run_with_credential_scope "$credential_scope" \
+      /bin/zsh -c '
+        api_match=0
+        cp_match=0
+        access_match=0
+        [[ "${HINDSIGHT_API_TENANT_API_KEY:-}" == test-data-plane-token ]] && api_match=1
+        [[ "${HINDSIGHT_CP_DATAPLANE_API_KEY:-}" == test-data-plane-token ]] && cp_match=1
+        [[ "${HINDSIGHT_CP_ACCESS_KEY:-}" == test-ui-access-key ]] && access_match=1
+        print -r -- "${+TEST_DATA_PLANE_TOKEN}:${+TEST_MINT_AUTHORITY}:${+TEST_UI_ACCESS_KEY}:${+HINDSIGHT_API_TENANT_API_KEY}:${+HINDSIGHT_CP_DATAPLANE_API_KEY}:${+HINDSIGHT_CP_ACCESS_KEY}:${api_match}:${cp_match}:${access_match}"
+      '
+  done
+) > "$credential_scope_results"
+[[ "$(<"$credential_scope_results")" == \
+  $'none:0:0:0:0:0:0:0:0:0\napi:0:0:0:1:0:0:1:0:0\nui-proxy:0:0:0:0:1:1:0:1:1\nbroker:1:1:0:0:0:0:0:0:0' ]] || {
+  print -ru2 -- "managed child credential scopes exceeded their authority"
+  exit 1
+}
+
+component_credential_scopes="$tmp_dir/component-credential-scopes"
+(
+  export HINDSIGHT_MEMORY_INVENTORY=/absolute/inventory.json
+  export HINDSIGHT_MEMORY_DATA_PLANE_TOKEN_ENV=TEST_DATA_PLANE_TOKEN
+  export HINDSIGHT_MEMORY_MINT_AUTHORITY_ENV=TEST_MINT_AUTHORITY
+  export HINDSIGHT_MEMORY_UI_ACCESS_KEY_ENV=TEST_UI_ACCESS_KEY
+  export TEST_DATA_PLANE_TOKEN=test-data-plane-token
+  export TEST_MINT_AUTHORITY=test-mint-authority
+  export TEST_UI_ACCESS_KEY=test-ui-access-key
+  source "$rendered_stack_lib"
+  hindsight_stack_load_config() { return 0 }
+  hindsight_stack_ensure_profile_ports() { return 0 }
+  hindsight_stack_daemon_status() { return 0 }
+  hindsight_stack_ui_running() { return 1 }
+  hindsight_stack_run_bounded_with_credential_scope() {
+    print -r -- "$1" >> "$component_credential_scopes"
+  }
+  hindsight_stack_control_start
+  hindsight_stack_daemon_start
+  hindsight_stack_ui_start
+)
+[[ "$(<"$component_credential_scopes")" == $'none\napi\nui-proxy' ]] || {
+  print -ru2 -- "managed Hindsight components received incorrect credential scopes"
+  exit 1
+}
+
+for shared_credential_pair in data-mint data-ui mint-ui; do
+  if (
+    export HINDSIGHT_MEMORY_INVENTORY=/absolute/inventory.json
+    export HINDSIGHT_MEMORY_DATA_PLANE_TOKEN_ENV=TEST_DATA_PLANE_TOKEN
+    export HINDSIGHT_MEMORY_MINT_AUTHORITY_ENV=TEST_MINT_AUTHORITY
+    export HINDSIGHT_MEMORY_UI_ACCESS_KEY_ENV=TEST_UI_ACCESS_KEY
+    export TEST_DATA_PLANE_TOKEN=distinct-data-plane-token
+    export TEST_MINT_AUTHORITY=distinct-mint-authority
+    export TEST_UI_ACCESS_KEY=distinct-ui-access-key
+    case "$shared_credential_pair" in
+      data-mint) export TEST_MINT_AUTHORITY=distinct-data-plane-token ;;
+      data-ui) export TEST_UI_ACCESS_KEY=distinct-data-plane-token ;;
+      mint-ui) export TEST_UI_ACCESS_KEY=distinct-mint-authority ;;
+    esac
+    export HINDSIGHT_EMBED_PYTHON=/usr/bin/python3
+    source "$rendered_stack_lib"
+    hindsight_stack_load_config
+    hindsight_stack_preflight_runtime_credentials
+  ) >/dev/null 2>&1; then
+    print -ru2 -- "stack accepted shared ${shared_credential_pair} credential values"
+    exit 1
+  fi
+done
+
+if (
+  export HINDSIGHT_MEMORY_INVENTORY=/absolute/inventory.json
+  export HINDSIGHT_MEMORY_DATA_PLANE_TOKEN_ENV=TEST_DATA_PLANE_TOKEN
+  export HINDSIGHT_MEMORY_MINT_AUTHORITY_ENV=TEST_MINT_AUTHORITY
+  export HINDSIGHT_MEMORY_UI_ACCESS_KEY_ENV=TEST_UI_ACCESS_KEY
+  export TEST_DATA_PLANE_TOKEN=distinct-data-plane-token
+  export TEST_MINT_AUTHORITY=distinct-mint-authority
+  unset TEST_UI_ACCESS_KEY
+  export HINDSIGHT_EMBED_PYTHON=/usr/bin/python3
+  source "$rendered_stack_lib"
+  hindsight_stack_load_config
+  hindsight_stack_preflight_runtime_credentials
+) >/dev/null 2>&1; then
+  print -ru2 -- "stack accepted an unavailable UI access-key credential"
+  exit 1
+fi
+
+profile_isolation_home="$tmp_dir/profile-isolation-home"
+mkdir -p "$profile_isolation_home/.hindsight/profiles"
+for reserved_profile_key in \
+  HINDSIGHT_MEMORY_INVENTORY \
+  HINDSIGHT_MEMORY_DATA_PLANE_TOKEN_ENV \
+  HINDSIGHT_MEMORY_MINT_AUTHORITY_ENV \
+  HINDSIGHT_MEMORY_UI_ACCESS_KEY_ENV \
+  HINDSIGHT_API_TENANT_API_KEY \
+  HINDSIGHT_CP_DATAPLANE_API_KEY \
+  HINDSIGHT_CP_ACCESS_KEY; do
+  print -r -- "export ${reserved_profile_key}=profile-owned-value" > \
+    "$profile_isolation_home/.hindsight/profiles/present-profile.env"
+  if (
+    export HOME="$profile_isolation_home"
+    export HINDSIGHT_MEMORY_INVENTORY=/absolute/inventory.json
+    export HINDSIGHT_MEMORY_DATA_PLANE_TOKEN_ENV=TEST_DATA_PLANE_TOKEN
+    export HINDSIGHT_MEMORY_MINT_AUTHORITY_ENV=TEST_MINT_AUTHORITY
+    export HINDSIGHT_MEMORY_UI_ACCESS_KEY_ENV=TEST_UI_ACCESS_KEY
+    export TEST_DATA_PLANE_TOKEN=distinct-data-plane-token
+    export TEST_MINT_AUTHORITY=distinct-mint-authority
+    export TEST_UI_ACCESS_KEY=distinct-ui-access-key
+    export HINDSIGHT_EMBED_PYTHON=/usr/bin/python3
+    source "$rendered_stack_lib"
+    hindsight_stack_load_config
+    hindsight_stack_preflight_runtime_credentials
+  ) >/dev/null 2>&1; then
+    print -ru2 -- "stack accepted controller-owned credential binding ${reserved_profile_key} in an adopted profile"
+    exit 1
+  fi
+done
+print -r -- '# isolated profile' > \
+  "$profile_isolation_home/.hindsight/profiles/present-profile.env"
+
+for partial_runtime_binding in token-only mint-only inventory-token; do
+  if (
+    unset HINDSIGHT_MEMORY_INVENTORY
+    unset HINDSIGHT_MEMORY_DATA_PLANE_TOKEN_ENV
+    unset HINDSIGHT_MEMORY_MINT_AUTHORITY_ENV
+    unset HINDSIGHT_MEMORY_UI_ACCESS_KEY_ENV
+    case "$partial_runtime_binding" in
+      token-only)
+        export HINDSIGHT_MEMORY_DATA_PLANE_TOKEN_ENV=TEST_DATA_TOKEN
+        ;;
+      mint-only)
+        export HINDSIGHT_MEMORY_MINT_AUTHORITY_ENV=TEST_MINT_AUTHORITY
+        ;;
+      inventory-token)
+        export HINDSIGHT_MEMORY_INVENTORY=/absolute/inventory.json
+        export HINDSIGHT_MEMORY_DATA_PLANE_TOKEN_ENV=TEST_DATA_TOKEN
+        ;;
+    esac
+    source "$rendered_stack_lib"
+    hindsight_stack_load_config
+  ) >/dev/null 2>&1; then
+    print -ru2 -- "stack accepted partial ${partial_runtime_binding} runtime bindings"
+    exit 1
+  fi
+done
+
+if (
   export HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS=not-a-timeout
   source "$rendered_stack_lib"
   hindsight_stack_load_config
@@ -316,6 +527,7 @@ fi
 if (
   source "$rendered_stack_lib"
   hindsight_stack_load_config() { return 0 }
+  hindsight_stack_preflight_runtime_credentials() { return 0 }
   hindsight_stack_require_current_user() { return 0 }
   hindsight_stack_require_tools() { return 0 }
   hindsight_stack_require_runtime_helpers() { return 0 }
@@ -342,7 +554,7 @@ daemon_launcher_status=0
   source "$rendered_stack_lib"
   hindsight_stack_load_config() { return 0 }
   hindsight_stack_ensure_profile_ports() { return 0 }
-  hindsight_stack_run_bounded() {
+  hindsight_stack_run_bounded_api() {
     print -r -- launcher-failed >>"$daemon_launcher_handoff"
     return 1
   }
@@ -363,7 +575,7 @@ daemon_launcher_status=0
   source "$rendered_stack_lib"
   hindsight_stack_load_config() { return 0 }
   hindsight_stack_ensure_profile_ports() { return 0 }
-  hindsight_stack_run_bounded() {
+  hindsight_stack_run_bounded_api() {
     print -r -- launcher-failed >>"$daemon_launcher_handoff"
     return 1
   }
@@ -376,6 +588,30 @@ daemon_launcher_status=0
 (( daemon_launcher_status != 0 )) &&
   [[ "$(<"$daemon_launcher_handoff")" == $'launcher-failed\ndaemon-unhealthy' ]] || {
   print -ru2 -- "daemon start accepted a failed launcher without bounded readiness"
+  exit 1
+}
+
+hardened_ui_restart_events="$tmp_dir/hardened-ui-restart-events"
+(
+  source "$rendered_stack_lib"
+  hindsight_stack_load_config() { return 0 }
+  hindsight_stack_runtime_active() { return 0 }
+  hindsight_stack_preflight_runtime_credentials() { return 0 }
+  hindsight_stack_daemon_status() { return 0 }
+  hindsight_stack_ui_running() { return 0 }
+  hindsight_stack_ui_status() { return 1 }
+  hindsight_stack_ui_stop() { print -r -- stop >>"$hardened_ui_restart_events" }
+  hindsight_stack_wait_stopped_for() {
+    print -r -- "wait:$1" >>"$hardened_ui_restart_events"
+  }
+  hindsight_stack_ensure_profile_ports() { return 0 }
+  hindsight_stack_run_bounded_ui_proxy() {
+    print -r -- start >>"$hardened_ui_restart_events"
+  }
+  hindsight_stack_ui_start
+)
+[[ "$(<"$hardened_ui_restart_events")" == $'stop\nwait:ui\nstart' ]] || {
+  print -ru2 -- "active UI start did not replace a running unauthenticated control plane"
   exit 1
 }
 
@@ -429,6 +665,29 @@ start_all_events="$tmp_dir/start-all-events"
   exit 1
 }
 
+active_start_all_events="$tmp_dir/active-start-all-events"
+(
+  source "$rendered_stack_lib"
+  HINDSIGHT_MEMORY_INVENTORY="$tmp_dir/inventory.json"
+  hindsight_stack_load_config() { return 0 }
+  hindsight_stack_require_current_user() { return 0 }
+  hindsight_stack_require_tools() { return 0 }
+  hindsight_stack_require_runtime_helpers() { return 0 }
+  hindsight_stack_validate_fleet() { print -r -- validate >>"$active_start_all_events" }
+  hindsight_stack_initialize_desired_state() { print -r -- initialize >>"$active_start_all_events" }
+  hindsight_stack_broker_status() { return 0 }
+  hindsight_stack_broker_identity_matches() { return 0 }
+  hindsight_stack_wait_broker() { print -r -- broker >>"$active_start_all_events" }
+  hindsight_stack_control_status() { return 0 }
+  hindsight_stack_wait_control() { print -r -- control >>"$active_start_all_events" }
+  hindsight_stack_for_each_profile() { print -r -- profiles >>"$active_start_all_events" }
+  hindsight_stack_start_all
+)
+[[ "$(<"$active_start_all_events")" == $'validate\ninitialize\ncontrol\nprofiles\nbroker' ]] || {
+  print -ru2 -- "active stack start did not bring up the data plane before broker verification"
+  exit 1
+}
+
 probe_timeout_calls="$tmp_dir/probe-timeout-calls"
 (
   source "$rendered_stack_lib"
@@ -445,6 +704,34 @@ while IFS= read -r probe_call; do
     exit 1
   }
 done < "$probe_timeout_calls"
+
+ui_wait_calls="$tmp_dir/ui-wait-calls"
+(
+  source "$rendered_stack_lib"
+  hindsight_stack_load_config() { return 0 }
+  hindsight_stack_runtime_active() { return 0 }
+  hindsight_stack_preflight_runtime_credentials() {
+    print -r -- preflight >> "$ui_wait_calls"
+  }
+  integer ui_probe_count=0
+  hindsight_stack_ui_status_probe() {
+    print -r -- probe >> "$ui_wait_calls"
+    (( ++ui_probe_count >= 3 ))
+  }
+  sleep() { return 0 }
+  hindsight_stack_wait_for ui 3
+)
+ui_wait_events=("${(@f)$(<"$ui_wait_calls")}")
+ui_wait_preflights=("${(@M)ui_wait_events:#preflight}")
+ui_wait_probes=("${(@M)ui_wait_events:#probe}")
+(( ${#ui_wait_preflights} == 1 )) || {
+  print -ru2 -- "UI wait repeated runtime credential preflight"
+  exit 1
+}
+(( ${#ui_wait_probes} == 3 )) || {
+  print -ru2 -- "UI wait did not retain bounded repeated health probes"
+  exit 1
+}
 
 for top_level_operation in hindsight_stack_wait_all hindsight_stack_stop_all hindsight_stack_status_report; do
   if (
@@ -1375,6 +1662,34 @@ for expected in \
   }
 done
 
+active_reconcile_events="$tmp_dir/active-reconcile-events"
+(
+  export HOME="$test_home"
+  export HINDSIGHT_MEMORY_INVENTORY="$tmp_dir/inventory.json"
+  export HINDSIGHT_MEMORY_DATA_PLANE_TOKEN_ENV=TEST_DATA_PLANE_TOKEN
+  export HINDSIGHT_MEMORY_MINT_AUTHORITY_ENV=TEST_MINT_AUTHORITY
+  export HINDSIGHT_MEMORY_UI_ACCESS_KEY_ENV=TEST_UI_ACCESS_KEY
+  export TEST_DATA_PLANE_TOKEN=test-data-plane-token
+  export TEST_MINT_AUTHORITY=test-mint-authority
+  export TEST_UI_ACCESS_KEY=test-ui-access-key
+  export HINDSIGHT_EMBED_STATE_DIR="$fleet_state"
+  export HINDSIGHT_EMBED_PROFILE="present-profile"
+  export HINDSIGHT_EMBED_FLEET_PROFILES="present-profile"
+  export HINDSIGHT_EMBED_API_PORT=7979
+  export HINDSIGHT_EMBED_UI_PORT=17979
+  export HINDSIGHT_EMBED_AUTOSTART_DAEMON=true
+  export HINDSIGHT_EMBED_AUTOSTART_UI=true
+  source "$rendered_stack_lib"
+  hindsight_stack_reconcile_broker() { print -r -- broker >> "$active_reconcile_events" }
+  hindsight_stack_reconcile_control() { print -r -- control >> "$active_reconcile_events" }
+  hindsight_stack_reconcile_profile() { print -r -- profile >> "$active_reconcile_events" }
+  hindsight_stack_reconcile_once
+)
+[[ "$(<"$active_reconcile_events")" == $'control\nprofile\nbroker' ]] || {
+  print -ru2 -- "active reconcile did not bring up the data plane before broker verification"
+  exit 1
+}
+
 ui_dependency_marker="$tmp_dir/ui-started-without-daemon"
 (
   export HOME="$test_home"
@@ -2133,6 +2448,22 @@ if (
 fi
 [[ ! -e "$invalid_config_artifact_check" ]] || {
   print -ru2 -- "installed-file validation continued after a stack configuration error"
+  exit 1
+}
+
+credential_preflight_artifact_check="$tmp_dir/credential-preflight-artifact-check"
+if (
+  source "$service_lib"
+  hindsight_stack_load_config() { return 0 }
+  hindsight_stack_preflight_runtime_credentials() { return 1 }
+  validate_trusted_artifact() { touch "$credential_preflight_artifact_check" }
+  validate_installed_files
+) >/dev/null 2>&1; then
+  print -ru2 -- "installed-file validation accepted a runtime credential preflight failure"
+  exit 1
+fi
+[[ ! -e "$credential_preflight_artifact_check" ]] || {
+  print -ru2 -- "installed-file validation continued after a runtime credential preflight failure"
   exit 1
 }
 

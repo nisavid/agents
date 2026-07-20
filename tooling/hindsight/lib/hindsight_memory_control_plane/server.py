@@ -719,8 +719,8 @@ class JsonRpcClient:
             raise BrokerError("RESPONSE_INVALID")
         return decoded["result"]
 
-    def session_mint(self, control_capability: str, claims: Mapping[str, Any], *, ttl_seconds: float = 60):
-        return self._call("session_mint", {"control_capability": control_capability, "claims": dict(claims), "ttl_seconds": ttl_seconds})
+    def session_mint(self, control_capability: str, request: Mapping[str, Any], *, ttl_seconds: float = 60):
+        return self._call("session_mint", {"control_capability": control_capability, "request": dict(request), "ttl_seconds": ttl_seconds})
 
     def session_exchange(self, handle: str):
         return self._call("session_exchange", {"handle": handle})

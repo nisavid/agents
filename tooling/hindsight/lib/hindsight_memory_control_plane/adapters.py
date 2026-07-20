@@ -10,12 +10,13 @@ from .model import BankRef, EndpointIdentity, deep_thaw
 
 
 RUNTIME_SCHEMAS = {
-    "recall": ({"query"}, {"limit"}),
+    "recall": ({"query"}, {"limit", "depth"}),
     "mental_model_fetch": ({"model_id"}, set()),
     "session_status": ({"session_id"}, set()),
-    "transcript_checkpoint": ({"document_id", "epoch", "checkpoint", "idempotency_key"}, set()),
-    "retain_outcome": ({"document_id", "epoch", "checkpoint", "outcome", "idempotency_key"}, set()),
-    "reflect": ({"reflection", "idempotency_key"}, set()),
+    "operation_status": ({"operation_id"}, set()),
+    "transcript_checkpoint": ({"session_id", "document_id", "epoch", "checkpoint", "content", "idempotency_key"}, set()),
+    "retain_outcome": ({"session_id", "document_id", "epoch", "checkpoint", "outcome", "idempotency_key"}, set()),
+    "reflect": ({"reflection"}, set()),
 }
 
 
@@ -32,6 +33,9 @@ def validate_runtime_request(method: str, request: Mapping[str, Any]) -> dict[st
                 raise AdapterError("runtime request schema is invalid")
         elif key == "idempotency_key":
             if not isinstance(item, str) or len(item) != 64 or any(char not in "0123456789abcdef" for char in item):
+                raise AdapterError("runtime request schema is invalid")
+        elif key == "depth":
+            if not isinstance(item, str) or item not in {"routine", "deep"}:
                 raise AdapterError("runtime request schema is invalid")
         elif not isinstance(item, str) or not item or len(item.encode("utf-8")) > 65_536:
             raise AdapterError("runtime request schema is invalid")
@@ -126,6 +130,7 @@ class Adapter(Protocol):
     def retain_outcome(self, request: Mapping[str, Any]) -> Mapping[str, Any]: ...
     def reflect(self, request: Mapping[str, Any]) -> Mapping[str, Any]: ...
     def session_status(self, request: Mapping[str, Any]) -> Mapping[str, Any]: ...
+    def operation_status(self, request: Mapping[str, Any]) -> Mapping[str, Any]: ...
 
 
 class FakeAdapter:
@@ -481,6 +486,13 @@ class FakeAdapter:
         self._record("session_status", self._keys(request))
         return deepcopy(self.state.get("session_status", {"status": "ready"}))
 
+    def operation_status(self, request):
+        request = validate_runtime_request("operation_status", request)
+        self._record("operation_status", self._keys(request))
+        return deepcopy(
+            self.state.get("operation_status", {"status": "completed"})
+        )
+
     def _runtime_write(self, method: str, request: Mapping[str, Any], result: Mapping[str, Any]):
         request = validate_runtime_request(method, request)
         key = request["idempotency_key"]
@@ -502,4 +514,8 @@ class FakeAdapter:
         return self._runtime_write("retain_outcome", request, {"retained": True})
 
     def reflect(self, request):
-        return self._runtime_write("reflect", request, {"accepted": True})
+        value = validate_runtime_request("reflect", request)
+        self._record("reflect", self._keys(value))
+        return deepcopy(
+            self.state.get("reflect", {"reflection": value["reflection"]})
+        )

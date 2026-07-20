@@ -45,13 +45,7 @@ METHODS = ["recall", "mental_model_fetch", "transcript_checkpoint", "retain_outc
 RESPONSE_KEYS = {"schema_version", "action_id", "action_digest", "policy_digest", "artifact_digest", "disposition", "payload", "diagnostic"}
 
 
-def authorize_mint(control, requested, ttl):
-    if control != "control" or requested.get("harness_id") != "codex" or ttl > 60:
-        return {}
-    return requested
-
-
-def claims(**changes):
+def authority_claims(**changes):
     value = {
         "session_id": "session-1", "harness_id": "codex", "home_bank": BANK,
         "trust_class": "local", "companion_id": "gui-1",
@@ -60,6 +54,27 @@ def claims(**changes):
     }
     value.update(changes)
     return value
+
+
+def claims(**changes):
+    value = {
+        "session_id": "session-1",
+        "companion_id": "gui-1",
+        "route": "local-core",
+    }
+    value.update(changes)
+    return value
+
+
+def authorize_mint(control, requested, ttl):
+    if (
+        control != "control"
+        or requested.get("route") != "local-core"
+        or ttl > 60
+    ):
+        return {}
+    methods = ["recall"] if requested["session_id"] == "limited" else METHODS
+    return authority_claims(**requested, methods=methods)
 
 
 class BrokerSocketTest(unittest.TestCase):
@@ -133,7 +148,7 @@ class BrokerSocketTest(unittest.TestCase):
         )
 
     def test_stable_cli_clients_use_files_and_environment_for_private_inputs(self):
-        claims_path = self.root / "claims.json"
+        claims_path = self.root / "mint-request.json"
         request_path = self.root / "request.json"
         claims_path.write_text(json.dumps(claims()), encoding="utf-8")
         request_path.write_text(json.dumps({"query": "deployment", "limit": 3}), encoding="utf-8")
@@ -142,7 +157,7 @@ class BrokerSocketTest(unittest.TestCase):
 
         minted = self.run_cli(
             "session", "mint", "--socket", self.socket_path,
-            "--claims", claims_path, "--ttl-seconds", "30",
+            "--request", claims_path, "--ttl-seconds", "30",
             env={"HINDSIGHT_MEMORY_CONTROL_CAPABILITY": "control"},
         )
         self.assertEqual(minted.returncode, 0, minted.stderr)
@@ -180,11 +195,11 @@ class BrokerSocketTest(unittest.TestCase):
             self.assertFalse(any(capability in str(arg) for arg in result.args))
 
     def test_cli_clients_fail_closed_when_private_environment_is_missing(self):
-        claims_path = self.root / "claims.json"
+        claims_path = self.root / "mint-request.json"
         claims_path.write_text(json.dumps(claims()), encoding="utf-8")
         result = self.run_cli(
             "session", "mint", "--socket", self.socket_path,
-            "--claims", claims_path,
+            "--request", claims_path,
             env={"HINDSIGHT_MEMORY_CONTROL_CAPABILITY": ""},
         )
         self.assertNotEqual(result.returncode, 0)
@@ -691,10 +706,12 @@ class BrokerSocketTest(unittest.TestCase):
 
     def test_checkpoint_keys_are_unambiguous_and_locks_are_bounded(self):
         first = {
-            "home_bank": {"profile_id": "a/b", "bank_id": "c"}
+            "session_id": "session-1",
+            "home_bank": {"profile_id": "a/b", "bank_id": "c"},
         }
         second = {
-            "home_bank": {"profile_id": "a", "bank_id": "b/c"}
+            "session_id": "session-1",
+            "home_bank": {"profile_id": "a", "bank_id": "b/c"},
         }
         first_key = self.broker._checkpoint_state_key(
             "transcript_checkpoint", first, "d"
@@ -703,9 +720,17 @@ class BrokerSocketTest(unittest.TestCase):
             "transcript_checkpoint", second, "d"
         )
         self.assertNotEqual(first_key, second_key)
+        self.assertNotEqual(
+            self.broker._checkpoint_state_key(
+                "transcript_checkpoint", first, "d", epoch=1
+            ),
+            self.broker._checkpoint_state_key(
+                "transcript_checkpoint", first, "d", epoch=2
+            ),
+        )
         for index in range(10_000):
             self.broker._document_lock(
-                claims(), f"document/{index}"
+                authority_claims(), f"document/{index}"
             )
             self.broker._work_lock(f"state/{index}")
         self.assertEqual(len(self.broker._document_locks), 64)
@@ -716,11 +741,11 @@ class BrokerSocketTest(unittest.TestCase):
         results = []
         failures = []
 
-        def delayed_mint(*, control_capability, claims, ttl_seconds):
+        def delayed_mint(*, control_capability, request, ttl_seconds):
             self.assertEqual(control_capability, "control")
             self.assertEqual(ttl_seconds, 30)
             barrier.wait(timeout=1)
-            return {"session_id": claims["session_id"]}
+            return {"session_id": request["session_id"]}
 
         def invoke(session_id):
             try:
@@ -762,7 +787,13 @@ class BrokerSocketTest(unittest.TestCase):
         capability = self.exchange()
         recall = self.client.recall(capability, sequence=1, action_id="recall-1", request={"query": "q", "limit": 2})
         model = self.client.mental_model_fetch(capability, sequence=2, action_id="model-1", request={"model_id": "model1"})
-        checkpoint = self.client.transcript_checkpoint(capability, sequence=3, action_id="checkpoint-1", request={"document_id": "doc", "epoch": 1, "checkpoint": 1})
+        checkpoint = self.client.transcript_checkpoint(
+            capability, sequence=3, action_id="checkpoint-1",
+            request={
+                "document_id": "doc", "epoch": 1, "checkpoint": 1,
+                "content": "complete cleaned transcript",
+            },
+        )
         retain = self.client.retain_outcome(capability, sequence=4, action_id="retain-1", request={"document_id": "doc", "epoch": 1, "checkpoint": 1, "outcome": "done"})
         reflect = self.client.reflect(capability, sequence=5, action_id="reflect-1", request={"reflection": "note"})
         status = self.client.session_status(capability, sequence=6, action_id="status-1")
@@ -804,7 +835,7 @@ class BrokerSocketTest(unittest.TestCase):
         for ttl_seconds in (float("nan"), 0, -1):
             invalid_mint = self.raw_rpc("session_mint", {
                 "control_capability": "control",
-                "claims": claims(),
+                "request": claims(),
                 "ttl_seconds": ttl_seconds,
             })
             expected = (
@@ -823,12 +854,26 @@ class BrokerSocketTest(unittest.TestCase):
         valid = self.client.recall(capability, sequence=1, action_id="timeout-action", request={"query": "q"})
         self.assertEqual(valid["disposition"], "ok")
 
-    def test_mint_requires_control_capability_and_verifier_bound_claims(self):
-        for control, requested in (("wrong", claims()), ("control", claims(harness_id="other"))):
+    def test_mint_requires_control_capability_and_internal_authority(self):
+        denied = [("wrong", claims(), "MINT_DENIED")]
+        for key, value in (
+            ("home_bank", BANK),
+            ("methods", ["recall"]),
+            ("policy_digest", DIGEST_A),
+            ("artifact_digest", DIGEST_B),
+            ("harness_id", "codex"),
+            ("trust_class", "local"),
+        ):
+            denied.append(
+                ("control", {**claims(), key: value}, "SCHEMA_INVALID")
+            )
+        for control, requested, expected in denied:
             response = self.raw_rpc("session_mint", {
-                "control_capability": control, "claims": requested, "ttl_seconds": 30,
+                "control_capability": control,
+                "request": requested,
+                "ttl_seconds": 30,
             })
-            self.assertEqual(response["error"]["message"], "MINT_DENIED")
+            self.assertEqual(response["error"]["message"], expected)
 
     def test_json_rpc_ids_are_scalar_and_non_boolean(self):
         for identifier in (True, 1.5, [], {}):
@@ -848,7 +893,7 @@ class BrokerSocketTest(unittest.TestCase):
             self.client.recall(capability, sequence=2, action_id="once", request={"query": "q"})
         with self.assertRaisesRegex(BrokerError, "SEQUENCE_ROLLBACK"):
             self.client.recall(capability, sequence=1, action_id="older", request={"query": "q"})
-        limited = self.exchange(session_id="limited", methods=["recall"])
+        limited = self.exchange(session_id="limited")
         with self.assertRaisesRegex(BrokerError, "METHOD_DENIED"):
             self.client.reflect(limited, sequence=1, action_id="denied", request={"reflection": "x"})
         wrong = self.exchange(session_id="wrong")
@@ -966,14 +1011,20 @@ class BrokerSocketTest(unittest.TestCase):
         capability = self.broker.session_exchange(
             minted["payload"]["handle"]
         )["payload"]["capability"]
-        reflected = self.broker.reflect(
+        retained = self.broker.retain_outcome(
             capability,
             sequence=1,
-            action_id="expired-reflect",
-            request={"reflection": "note"},
-            timeout_seconds=1,
+            action_id="expired-retain",
+            request={
+                "document_id": "expired", "epoch": 1,
+                "checkpoint": 1, "outcome": "done",
+            },
         )
-        self.assertEqual(reflected["disposition"], "ok")
+        self.assertEqual(retained["disposition"], "queued")
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline and not self.broker._work["completed"]:
+            time.sleep(0.005)
+        self.assertTrue(self.broker._work["completed"])
         closed = self.broker.session_close(
             capability,
             sequence=2,
@@ -1029,8 +1080,109 @@ class BrokerSocketTest(unittest.TestCase):
             recovered["payload"]["capability"],
             first["payload"]["capability"],
         )
-        self.assertEqual(migrated["schema_version"], 4)
+        self.assertEqual(migrated["schema_version"], 9)
         self.assertIn("receipt", migrated["exchanges"][handle])
+
+    def test_legacy_reflect_content_is_scrubbed_during_migration(self):
+        self.exchange(session_id="legacy-reflect")
+        self.stop()
+        work_path = self.state / "durable_work.json"
+        work = json.loads(work_path.read_text())
+        work["schema_version"] = 4
+        state_key = "reflect:" + ("a" * 64)
+        work["completed"][state_key] = {
+            "watermark": [0, 1], "request_digest": "b" * 64,
+            "idempotency_key": "c" * 64,
+            "adapter_result": {"accepted": True},
+            "session_id": "legacy-reflect", "method": "reflect",
+            "operation_id": None,
+        }
+        work["expirations"]["completed"][state_key] = time.time() + 300
+        work_path.write_text(json.dumps(work), encoding="utf-8")
+
+        self.start(self.adapter)
+        migrated = json.loads(work_path.read_text())
+        self.assertEqual(migrated["schema_version"], 9)
+        self.assertNotIn(state_key, migrated["completed"])
+        self.assertNotIn(state_key, migrated["expirations"]["completed"])
+
+    def test_legacy_queued_write_requires_drain_before_upgrade(self):
+        capability = self.exchange(session_id="legacy-queued-write")
+        with patch.object(self.broker, "_submit_write"):
+            self.broker.transcript_checkpoint(
+                capability, sequence=1, action_id="legacy-checkpoint",
+                request={
+                    "document_id": "legacy", "epoch": 1,
+                    "checkpoint": 1, "content": "not legacy compatible",
+                },
+            )
+        legacy = json.loads(
+            (self.state / "durable_work.json").read_text()
+        )
+        legacy["schema_version"] = 4
+        legacy["queue"][0]["adapter_request"].pop("content")
+        legacy["queue"][0]["adapter_request"].pop("session_id")
+        legacy["queue"][0]["authorized_bank"] = dict(BANK)
+
+        with self.assertRaisesRegex(
+            BrokerError, "LEGACY_QUEUE_NOT_DRAINED"
+        ) as raised:
+            self.broker._migrate_work(legacy)
+        self.assertEqual(raised.exception.code, "LEGACY_QUEUE_NOT_DRAINED")
+        self.assertIn("prior broker version", str(raised.exception))
+
+    def test_complete_looking_legacy_outcome_still_requires_prior_drain(self):
+        capability = self.exchange(session_id="legacy-queued-outcome")
+        with patch.object(self.broker, "_submit_write"):
+            self.broker.retain_outcome(
+                capability,
+                sequence=1,
+                action_id="legacy-outcome",
+                request={
+                    "document_id": "legacy",
+                    "epoch": 1,
+                    "checkpoint": 1,
+                    "outcome": "possibly already accepted",
+                },
+            )
+        legacy = json.loads(
+            (self.state / "durable_work.json").read_text()
+        )
+        legacy["schema_version"] = 8
+
+        with self.assertRaisesRegex(
+            BrokerError, "LEGACY_QUEUE_NOT_DRAINED"
+        ):
+            self.broker._migrate_work(legacy)
+
+    def test_legacy_queued_reflect_is_scrubbed_during_migration(self):
+        capability = self.exchange(session_id="legacy-queued-reflect")
+        with patch.object(self.broker, "_submit_write"):
+            self.broker.transcript_checkpoint(
+                capability, sequence=1, action_id="legacy-reflect",
+                request={
+                    "document_id": "legacy", "epoch": 1,
+                    "checkpoint": 1, "content": "temporary",
+                },
+            )
+        legacy = json.loads(
+            (self.state / "durable_work.json").read_text()
+        )
+        legacy["schema_version"] = 4
+        item = legacy["queue"][0]
+        item["method"] = "reflect"
+        item["state_key"] = "reflect:" + ("a" * 64)
+        item["adapter_request"] = {
+            "reflection": "private legacy prompt",
+            "idempotency_key": item["idempotency_key"],
+        }
+
+        migrated, changed = self.broker._migrate_work(legacy)
+
+        self.assertTrue(changed)
+        self.assertEqual(migrated["schema_version"], 9)
+        self.assertEqual(migrated["queue"], [])
+        self.assertNotIn("private legacy prompt", json.dumps(migrated))
 
     def test_malformed_exchange_ledger_is_rejected(self):
         self.stop()
@@ -1160,7 +1312,7 @@ class BrokerSocketTest(unittest.TestCase):
     def test_max_payload_bytes_is_a_bounded_integer(self):
         self.stop()
         identifier = "a" * 128
-        maximal_claims = claims(
+        maximal_claims = authority_claims(
             session_id=identifier,
             harness_id=identifier,
             home_bank={"profile_id": identifier, "bank_id": identifier},
@@ -1185,13 +1337,18 @@ class BrokerSocketTest(unittest.TestCase):
             policy_digest=DIGEST_A,
             artifact_digest=DIGEST_B,
             mint_authorizer=lambda control, requested, _ttl: (
-                requested if control == "control" else {}
+                maximal_claims if control == "control" else {}
             ),
             max_payload_bytes=MIN_PAYLOAD_BYTES,
         )
         try:
             minted = minimum_bound.session_mint(
-                "control", maximal_claims
+                "control",
+                {
+                    "session_id": identifier,
+                    "companion_id": identifier,
+                    "route": identifier,
+                },
             )
             exchanged = minimum_bound.session_exchange(
                 minted["payload"]["handle"]
@@ -1417,31 +1574,49 @@ class BrokerSocketTest(unittest.TestCase):
         response = self.client.reflect(capability, sequence=1, action_id="reflect-timeout", request={"reflection": "note"}, timeout_seconds=0)
         self.assertEqual(response["disposition"], "unavailable")
         self.assertEqual(response["diagnostic"]["code"], "REFLECT_UNAVAILABLE")
-        pending = json.loads((self.state / "durable_work.json").read_text())
-        self.assertTrue(any(item["method"] == "reflect" for item in pending["queue"]))
-        deadline = time.monotonic() + 1
-        while time.monotonic() < deadline:
-            if not any(
-                item["method"] == "reflect"
-                for item in json.loads(
-                    (self.state / "durable_work.json").read_text()
-                )["queue"]
-            ):
-                break
-            time.sleep(0.005)
-        recovered = self.client.reflect(
-            capability,
-            sequence=1,
-            action_id="reflect-timeout",
-            request={"reflection": "note"},
-            timeout_seconds=1,
-        )
-        self.assertEqual(recovered["disposition"], "ok")
-        self.assertEqual(recovered["payload"], {"accepted": True})
+        durable = (self.state / "durable_work.json").read_text()
+        self.assertNotIn("note", durable)
+        self.assertFalse(any(
+            item["method"] == "reflect"
+            for item in json.loads(durable)["queue"]
+        ))
         reflect_calls = [
             call for call in self.adapter.calls if call["method"] == "reflect"
         ]
+        deadline = time.monotonic() + 1
+        while not reflect_calls and time.monotonic() < deadline:
+            time.sleep(0.005)
+            reflect_calls = [
+                call for call in self.adapter.calls
+                if call["method"] == "reflect"
+            ]
         self.assertEqual(len(reflect_calls), 1)
+
+    def test_reflect_preserves_bounded_provenance_for_source_resolution(self):
+        provenance = {
+            "memory_ids": ["memory-1"],
+            "mental_model_ids": ["model-1"],
+            "directive_ids": ["directive-1"],
+            "source_resolution_required": True,
+            "unresolved_memory_items": 0,
+        }
+        capability = self.exchange()
+        with patch.object(
+            self.adapter, "reflect",
+            return_value={"reflection": "answer", "based_on": provenance},
+        ):
+            response = self.client.reflect(
+                capability, sequence=1, action_id="reflect-provenance",
+                request={"reflection": "note"}, timeout_seconds=1,
+            )
+
+        self.assertEqual(response["disposition"], "ok")
+        self.assertEqual(response["payload"], {
+            "reflection": "answer", "based_on": provenance,
+        })
+        durable = (self.state / "durable_work.json").read_text()
+        self.assertNotIn("answer", durable)
+        self.assertNotIn("note", durable)
 
     def test_adapter_response_cannot_expose_routing_or_credentials(self):
         self.adapter.state["recall"] = {"memories": [{"token": "private"}]}
@@ -1654,10 +1829,21 @@ class DurableWorkTest(unittest.TestCase):
         self.broker = Broker(state_dir=self.state, signing_key=b"z" * 32,
             routes={"local-core": {"bank": BANK, "adapter": self.adapter}},
             policy_digest=DIGEST_A, artifact_digest=DIGEST_B,
-            mint_authorizer=authorize_mint, clock=clock)
+            mint_authorizer=self.authorize_mint, clock=clock)
         self.server = UnixJsonRpcServer(self.socket_path, self.broker)
         self.server.start()
         self.client = JsonRpcClient(self.socket_path)
+
+    def authorize_mint(self, control, requested, ttl):
+        route = self.broker.routes.get(requested.get("route"))
+        if control != "control" or route is None or ttl > 60:
+            return {}
+        methods = ["recall"] if requested["session_id"] == "limited" else METHODS
+        return authority_claims(
+            **requested,
+            methods=methods,
+            home_bank=deepcopy(route["bank"]),
+        )
 
     def _stop(self):
         self.server.close()
@@ -1694,6 +1880,320 @@ class DurableWorkTest(unittest.TestCase):
             return False
         finally:
             os.close(descriptor)
+
+    def test_async_retain_operation_survives_restart_until_terminal_success(self):
+        self._stop()
+
+        class AsyncRetainFake(FakeAdapter):
+            complete = False
+
+            def transcript_checkpoint(self, request):
+                super().transcript_checkpoint(request)
+                return {"operation_id": "operation-1"}
+
+            def operation_status(self, request):
+                super().operation_status(request)
+                return {"status": "completed" if self.complete else "pending"}
+
+        self.adapter = AsyncRetainFake(endpoint=ENDPOINT)
+        self._start()
+        capability = self.exchange(session_id="async-retain")
+        queued = self.client.transcript_checkpoint(
+            capability,
+            sequence=1,
+            action_id="checkpoint",
+            request={
+                "document_id": "session",
+                "epoch": 1,
+                "checkpoint": 1,
+                "content": "clean transcript",
+            },
+        )
+        self.assertEqual(queued["disposition"], "queued")
+        self.wait_until(
+            lambda: self.work()["queue"][0].get("operation_id")
+            == "operation-1"
+        )
+        self.assertEqual(self.work()["completed"], {})
+
+        self._stop()
+        self.adapter.complete = True
+        self._start()
+        self.wait_until(lambda: not self.work()["queue"])
+        self.assertTrue(self.work()["completed"])
+
+    def test_failed_async_retain_is_resubmitted_before_watermark_completion(self):
+        self._stop()
+
+        class RetryRetainFake(FakeAdapter):
+            submissions = 0
+
+            def transcript_checkpoint(self, request):
+                super().transcript_checkpoint(request)
+                self.submissions += 1
+                return {"operation_id": f"operation-{self.submissions}"}
+
+            def operation_status(self, request):
+                super().operation_status(request)
+                return {
+                    "status": (
+                        "failed"
+                        if request["operation_id"] == "operation-1"
+                        else "completed"
+                    )
+                }
+
+        self.adapter = RetryRetainFake(endpoint=ENDPOINT)
+        self._start()
+        capability = self.exchange(session_id="retry-retain")
+        self.client.transcript_checkpoint(
+            capability,
+            sequence=1,
+            action_id="checkpoint",
+            request={
+                "document_id": "session",
+                "epoch": 1,
+                "checkpoint": 1,
+                "content": "clean transcript",
+            },
+        )
+        self.wait_until(lambda: not self.work()["queue"], timeout=2)
+        self.assertEqual(self.adapter.submissions, 2)
+        self.assertTrue(self.work()["completed"])
+
+    def test_transient_operation_status_failure_never_resubmits_retain(self):
+        self._stop()
+
+        class TransientStatusFake(FakeAdapter):
+            submissions = 0
+            polls = 0
+
+            def transcript_checkpoint(self, request):
+                super().transcript_checkpoint(request)
+                self.submissions += 1
+                return {"operation_id": "operation-1"}
+
+            def operation_status(self, request):
+                super().operation_status(request)
+                self.polls += 1
+                if self.polls == 1:
+                    raise RuntimeError("transient status transport failure")
+                return {"status": "completed"}
+
+        self.adapter = TransientStatusFake(endpoint=ENDPOINT)
+        self._start()
+        capability = self.exchange(session_id="transient-status")
+        self.client.transcript_checkpoint(
+            capability, sequence=1, action_id="checkpoint",
+            request={
+                "document_id": "session", "epoch": 1, "checkpoint": 1,
+                "content": "clean transcript",
+            },
+        )
+        self.wait_until(lambda: not self.work()["queue"], timeout=2)
+        self.assertEqual(self.adapter.submissions, 1)
+        self.assertGreaterEqual(self.adapter.polls, 2)
+        self.assertTrue(self.work()["completed"])
+
+    def test_malformed_runtime_write_responses_retry_without_corrupting_state(self):
+        capability = self.exchange()
+        with patch.object(self.broker, "_submit_write"):
+            submitted = self.broker.transcript_checkpoint(
+                capability, sequence=1, action_id="malformed-submit",
+                request={
+                    "document_id": "session", "epoch": 1,
+                    "checkpoint": 1, "content": "clean transcript",
+                },
+            )
+        queue_id = submitted["payload"]["queue_id"]
+        with (
+            patch.object(
+                self.adapter, "transcript_checkpoint",
+                return_value={"operation_id": "invalid operation id"},
+            ),
+            self.assertLogs(
+                "hindsight_memory_control_plane.broker", level="WARNING"
+            ),
+        ):
+            disposition, _ = self.broker._dispatch_queued_item(queue_id)
+        item = self.work()["queue"][0]
+        self.assertEqual(disposition, "retry")
+        self.assertIsNone(item["operation_id"])
+        self.assertEqual(item["attempts"], 1)
+
+        self.broker._transaction(
+            lambda work: (
+                work["queue"][0].__setitem__("operation_id", "operation-1"),
+                work["queue"][0].__setitem__("next_retry", None),
+            ),
+            runtime=True,
+        )
+        with (
+            patch.object(
+                self.adapter, "operation_status",
+                return_value={"status": "unknown"},
+            ),
+            self.assertLogs(
+                "hindsight_memory_control_plane.broker", level="WARNING"
+            ),
+        ):
+            disposition, _ = self.broker._dispatch_queued_item(queue_id)
+        item = self.work()["queue"][0]
+        self.assertEqual(disposition, "retry")
+        self.assertEqual(item["operation_id"], "operation-1")
+        self.assertEqual(item["attempts"], 2)
+
+    def test_pending_operation_polling_uses_capped_exponential_backoff(self):
+        capability = self.exchange()
+        now = [100.0]
+        self.broker.clock = lambda: now[0]
+        with patch.object(self.broker, "_submit_write"):
+            submitted = self.broker.transcript_checkpoint(
+                capability, sequence=1, action_id="pending-backoff",
+                request={
+                    "document_id": "session", "epoch": 1,
+                    "checkpoint": 1, "content": "clean transcript",
+                },
+            )
+        queue_id = submitted["payload"]["queue_id"]
+        self.broker._transaction(
+            lambda work: work["queue"][0].__setitem__(
+                "operation_id", "operation-1"
+            ),
+            runtime=True,
+        )
+        with patch.object(
+            self.adapter, "operation_status",
+            return_value={"status": "pending"},
+        ), self.assertLogs(
+            "hindsight_memory_control_plane.broker", level="WARNING"
+        ) as logs:
+            delays = []
+            for _ in range(70):
+                disposition, delay = self.broker._dispatch_queued_item(queue_id)
+                self.assertEqual(disposition, "retry")
+                delays.append(delay)
+                now[0] += delay
+
+        self.assertEqual(delays[:4], [0.25, 0.5, 1.0, 2.0])
+        self.assertEqual(delays[-2:], [5.0, 5.0])
+        item = self.work()["queue"][0]
+        self.assertEqual(item["poll_attempts"], 70)
+        self.assertEqual(item["attempts"], 0)
+        self.assertIsNone(item["last_error"])
+        pending_warnings = [
+            message for message in logs.output
+            if "runtime operation remains pending" in message
+        ]
+        self.assertEqual(len(pending_warnings), 2)
+        self.assertIn("operation_id=operation-1", pending_warnings[0])
+        self.assertIn(f"queue_id={queue_id}", pending_warnings[0])
+
+    def test_session_status_persists_pending_and_completed_write_watermarks(self):
+        capability = self.exchange(session_id="status-watermarks")
+        with patch.object(self.broker, "_submit_write"):
+            submitted = self.client.transcript_checkpoint(
+                capability, sequence=1, action_id="status-checkpoint",
+                request={
+                    "document_id": "session", "epoch": 2,
+                    "checkpoint": 3, "content": "clean transcript",
+                },
+            )
+        queue_id = submitted["payload"]["queue_id"]
+        self.broker._transaction(
+            lambda work: (
+                work["queue"][0].__setitem__(
+                    "operation_id", "operation-1"
+                ),
+                work["queue"][0].__setitem__("poll_attempts", 7),
+            ),
+            runtime=True,
+        )
+
+        pending = self.client.session_status(
+            capability, sequence=2, action_id="pending-status"
+        )
+        self.assertEqual(pending["payload"]["writes"], {
+            "pending": [{
+                "queue_id": queue_id,
+                "method": "transcript_checkpoint",
+                "watermark": [2, 3],
+                "operation_id": "operation-1",
+                "status": "pending",
+                "poll_attempts": 7,
+            }],
+            "completed": [],
+            "omitted": {"pending": 0, "completed": 0},
+        })
+
+        with patch.object(
+            self.adapter, "operation_status",
+            return_value={"status": "completed"},
+        ):
+            disposition, _ = self.broker._dispatch_queued_item(queue_id)
+        self.assertEqual(disposition, "complete")
+        self._stop()
+        self._start()
+
+        completed = self.client.session_status(
+            capability, sequence=3, action_id="completed-status"
+        )
+        self.assertEqual(completed["payload"]["writes"], {
+            "pending": [],
+            "completed": [{
+                "method": "transcript_checkpoint",
+                "watermark": [2, 3],
+                "operation_id": "operation-1",
+                "status": "completed",
+            }],
+            "omitted": {"pending": 0, "completed": 0},
+        })
+
+    def test_session_status_reports_most_recently_completed_replacement(self):
+        capability = self.exchange(session_id="completion-order")
+
+        def complete(response):
+            disposition, _ = self.broker._dispatch_queued_item(
+                response["payload"]["queue_id"]
+            )
+            self.assertEqual(disposition, "complete")
+
+        with patch.object(self.broker, "_submit_write"):
+            complete(self.client.transcript_checkpoint(
+                capability, sequence=1, action_id="completion-first",
+                request={
+                    "document_id": "session", "epoch": 1,
+                    "checkpoint": 1, "content": "first",
+                },
+            ))
+            for sequence in range(2, 11):
+                complete(self.client.retain_outcome(
+                    capability, sequence=sequence,
+                    action_id=f"completion-outcome-{sequence}",
+                    request={
+                        "document_id": f"outcome-{sequence}", "epoch": 1,
+                        "checkpoint": 1, "outcome": "done",
+                    },
+                ))
+            complete(self.client.transcript_checkpoint(
+                capability, sequence=11, action_id="completion-latest",
+                request={
+                    "document_id": "session", "epoch": 1,
+                    "checkpoint": 2, "content": "latest",
+                },
+            ))
+
+        response = self.client.session_status(
+            capability, sequence=12, action_id="completion-status"
+        )
+        writes = response["payload"]["writes"]
+        self.assertIn({
+            "method": "transcript_checkpoint",
+            "watermark": [1, 2],
+            "operation_id": None,
+            "status": "completed",
+        }, writes["completed"])
+        self.assertEqual(writes["omitted"]["completed"], 2)
 
     @staticmethod
     def writes_drained(broker):
@@ -1865,7 +2365,7 @@ class DurableWorkTest(unittest.TestCase):
                 1,
             ),
         ):
-            first = self.broker.retain_outcome(
+            first = self.broker.transcript_checkpoint(
                 capability,
                 sequence=1,
                 action_id="bounded-first",
@@ -1873,22 +2373,22 @@ class DurableWorkTest(unittest.TestCase):
                     "document_id": "doc",
                     "epoch": 1,
                     "checkpoint": 1,
-                    "outcome": "first",
+                    "content": "first",
                 },
             )
-            newer = self.broker.retain_outcome(
+            newer = self.broker.transcript_checkpoint(
                 capability,
                 sequence=2,
                 action_id="bounded-newer",
                 request={
                     "document_id": "doc",
-                    "epoch": 2,
-                    "checkpoint": 1,
-                    "outcome": "newer",
+                    "epoch": 1,
+                    "checkpoint": 2,
+                    "content": "newer",
                 },
             )
             with self.assertRaisesRegex(BrokerError, "QUEUE_FULL"):
-                self.broker.retain_outcome(
+                self.broker.transcript_checkpoint(
                     capability,
                     sequence=3,
                     action_id="bounded-overflow",
@@ -1896,7 +2396,7 @@ class DurableWorkTest(unittest.TestCase):
                         "document_id": "other-doc",
                         "epoch": 1,
                         "checkpoint": 1,
-                        "outcome": "overflow",
+                        "content": "overflow",
                     },
                 )
 
@@ -1904,47 +2404,203 @@ class DurableWorkTest(unittest.TestCase):
         self.assertEqual(newer["disposition"], "queued")
         queue = self.work()["queue"]
         self.assertEqual(len(queue), 1)
-        self.assertEqual(queue[0]["watermark"], [2, 1])
-        self.assertEqual(queue[0]["adapter_request"]["outcome"], "newer")
+        self.assertEqual(queue[0]["watermark"], [1, 2])
+        self.assertEqual(queue[0]["adapter_request"]["content"], "newer")
         self.assertEqual(self.work()["sessions"]["session-1"]["sequence"], 2)
+
+    def test_new_epoch_preserves_queued_sealed_epoch_document(self):
+        capability = self.exchange()
+        with patch.object(self.broker, "_submit_write"):
+            first = self.broker.transcript_checkpoint(
+                capability, sequence=1, action_id="sealed-epoch",
+                request={
+                    "document_id": "doc", "epoch": 1, "checkpoint": 3,
+                    "content": "sealed epoch",
+                },
+            )
+            second = self.broker.transcript_checkpoint(
+                capability, sequence=2, action_id="new-epoch",
+                request={
+                    "document_id": "doc", "epoch": 2, "checkpoint": 1,
+                    "content": "new epoch",
+                },
+            )
+
+        self.assertEqual(first["disposition"], "queued")
+        self.assertEqual(second["disposition"], "queued")
+        queue = self.work()["queue"]
+        self.assertEqual(len(queue), 2)
+        self.assertEqual(
+            [entry["watermark"] for entry in queue], [[1, 3], [2, 1]]
+        )
+        self.assertNotEqual(queue[0]["state_key"], queue[1]["state_key"])
+
+    def test_same_logical_document_is_isolated_between_sessions(self):
+        first_capability = self.exchange(session_id="first-session")
+        second_capability = self.exchange(session_id="second-session")
+        with patch.object(self.broker, "_submit_write"):
+            self.broker.transcript_checkpoint(
+                first_capability, sequence=1, action_id="first-session-write",
+                request={
+                    "document_id": "shared", "epoch": 1,
+                    "checkpoint": 1, "content": "first",
+                },
+            )
+            self.broker.transcript_checkpoint(
+                second_capability, sequence=1,
+                action_id="second-session-write",
+                request={
+                    "document_id": "shared", "epoch": 1,
+                    "checkpoint": 1, "content": "second",
+                },
+            )
+
+        queue = self.work()["queue"]
+        self.assertEqual(len(queue), 2)
+        self.assertNotEqual(queue[0]["state_key"], queue[1]["state_key"])
+        self.assertEqual(
+            [entry["adapter_request"]["session_id"] for entry in queue],
+            ["first-session", "second-session"],
+        )
 
     def test_newest_checkpoint_coalesces_obsolete_waiters_behind_in_flight(self):
         capability = self.exchange()
         with patch.object(self.broker, "_submit_write"):
-            first = self.broker.retain_outcome(
+            first = self.broker.transcript_checkpoint(
                 capability, sequence=1, action_id="in-flight-first",
                 request={
                     "document_id": "doc", "epoch": 1, "checkpoint": 1,
-                    "outcome": "first",
+                    "content": "first",
                 },
             )
             self.broker._transaction(
                 lambda work: work["queue"][0].__setitem__("in_flight", True),
                 runtime=True,
             )
-            self.broker.retain_outcome(
+            self.broker.transcript_checkpoint(
                 capability, sequence=2, action_id="waiting-obsolete",
                 request={
                     "document_id": "doc", "epoch": 2, "checkpoint": 1,
-                    "outcome": "obsolete",
+                    "content": "obsolete",
                 },
             )
-            newest = self.broker.retain_outcome(
+            newest = self.broker.transcript_checkpoint(
                 capability, sequence=3, action_id="waiting-newest",
                 request={
                     "document_id": "doc", "epoch": 3, "checkpoint": 1,
-                    "outcome": "newest",
+                    "content": "newest",
                 },
             )
 
         self.assertEqual(first["disposition"], "queued")
         self.assertEqual(newest["disposition"], "queued")
         queue = self.work()["queue"]
-        self.assertEqual(len(queue), 2)
+        self.assertEqual(len(queue), 3)
         self.assertTrue(queue[0]["in_flight"])
         self.assertEqual(queue[0]["watermark"], [1, 1])
-        self.assertEqual(queue[1]["watermark"], [3, 1])
-        self.assertEqual(queue[1]["adapter_request"]["outcome"], "newest")
+        self.assertEqual(queue[1]["watermark"], [2, 1])
+        self.assertEqual(queue[2]["watermark"], [3, 1])
+        self.assertEqual(queue[2]["adapter_request"]["content"], "newest")
+
+    def test_distinct_outcome_checkpoints_remain_separate_queued_documents(self):
+        capability = self.exchange()
+        with patch.object(self.broker, "_submit_write"):
+            first = self.broker.retain_outcome(
+                capability, sequence=1, action_id="outcome-first",
+                request={
+                    "document_id": "doc", "epoch": 1, "checkpoint": 1,
+                    "outcome": "first",
+                },
+            )
+            second = self.broker.retain_outcome(
+                capability, sequence=2, action_id="outcome-second",
+                request={
+                    "document_id": "doc", "epoch": 1, "checkpoint": 2,
+                    "outcome": "second",
+                },
+            )
+
+        self.assertEqual(first["disposition"], "queued")
+        self.assertEqual(second["disposition"], "queued")
+        queue = self.work()["queue"]
+        self.assertEqual(len(queue), 2)
+        self.assertNotEqual(queue[0]["state_key"], queue[1]["state_key"])
+        self.assertEqual(
+            [entry["adapter_request"]["outcome"] for entry in queue],
+            ["first", "second"],
+        )
+
+    def test_newer_checkpoint_preserves_submitted_operation_until_terminal(self):
+        capability = self.exchange()
+        with patch.object(self.broker, "_submit_write"):
+            first = self.broker.transcript_checkpoint(
+                capability, sequence=1, action_id="submitted-first",
+                request={
+                    "document_id": "session", "epoch": 1,
+                    "checkpoint": 1, "content": "first transcript",
+                },
+            )
+            self.broker._transaction(
+                lambda work: work["queue"][0].__setitem__(
+                    "operation_id", "operation-1"
+                ),
+                runtime=True,
+            )
+            newer = self.broker.transcript_checkpoint(
+                capability, sequence=2, action_id="submitted-newer",
+                request={
+                    "document_id": "session", "epoch": 1,
+                    "checkpoint": 2, "content": "newer transcript",
+                },
+            )
+
+        queue = self.work()["queue"]
+        self.assertEqual(
+            [item["queue_id"] for item in queue],
+            [first["payload"]["queue_id"], newer["payload"]["queue_id"]],
+        )
+        self.assertEqual(queue[0]["operation_id"], "operation-1")
+
+    def test_older_checkpoint_replay_survives_newer_watermark_completion(self):
+        capability = self.exchange()
+        first_request = {
+            "document_id": "session", "epoch": 1, "checkpoint": 1,
+            "content": "first transcript",
+        }
+        with patch.object(self.broker, "_submit_write"):
+            first = self.broker.transcript_checkpoint(
+                capability, sequence=1, action_id="checkpoint-first",
+                request=first_request,
+            )
+            newer = self.broker.transcript_checkpoint(
+                capability, sequence=2, action_id="checkpoint-newer",
+                request={
+                    "document_id": "session", "epoch": 1,
+                    "checkpoint": 2, "content": "newer transcript",
+                },
+            )
+        self.assertNotEqual(
+            first["payload"]["queue_id"], newer["payload"]["queue_id"]
+        )
+        self.assertEqual(
+            self.broker._dispatch_queued_item(
+                newer["payload"]["queue_id"]
+            )[0],
+            "complete",
+        )
+
+        replay = self.broker.transcript_checkpoint(
+            capability, sequence=1, action_id="checkpoint-first",
+            request=first_request,
+        )
+        self.assertEqual(replay["disposition"], "idempotent")
+        self.assertEqual(replay["payload"], {"watermark": [1, 1]})
+
+        with self.assertRaisesRegex(BrokerError, "DIGEST_DRIFT"):
+            self.broker.transcript_checkpoint(
+                capability, sequence=1, action_id="checkpoint-first",
+                request={**first_request, "content": "changed transcript"},
+            )
 
     def test_completed_capacity_is_reserved_before_a_new_write(self):
         capability = self.exchange()
@@ -1978,29 +2634,125 @@ class DurableWorkTest(unittest.TestCase):
         self.assertEqual(len(self.work()["completed"]), 1)
         self.assertEqual(self.work()["sessions"]["session-1"]["sequence"], 1)
 
-    def test_reflect_reserves_maximum_completed_result_bytes_before_dispatch(self):
+    def test_admission_reserves_full_async_completion_after_rank_rebase(self):
+        capability = self.exchange()
+        with patch.object(self.broker, "_submit_write"):
+            first = self.broker.retain_outcome(
+                capability, sequence=1, action_id="completed-old-order",
+                request={
+                    "document_id": "old", "epoch": 1, "checkpoint": 1,
+                    "outcome": "first",
+                },
+            )
+            self.assertEqual(
+                self.broker._dispatch_queued_item(
+                    first["payload"]["queue_id"]
+                )[0],
+                "complete",
+            )
+
+            def inflate_order(work):
+                only_record = next(iter(work["completed"].values()))
+                only_record["completion_order"] = 10**11
+
+            self.broker._transaction(inflate_order)
+            normalized = self.work()
+            self.broker._normalize_completion_orders(normalized)
+            state_key = self.broker._checkpoint_state_key(
+                "retain_outcome",
+                authority_claims(),
+                "new",
+                epoch=1,
+                checkpoint=1,
+            )
+            reservation = self.broker._completed_reservation_bytes({
+                "state_key": state_key,
+                "watermark": [1, 1],
+                "request_digest": "d" * 64,
+                "idempotency_key": "e" * 64,
+                "session_id": "session-1",
+                "method": "retain_outcome",
+                "operation_id": None,
+            })
+            exact_limit = (
+                len(canonical_bytes(normalized["completed"])) + reservation
+            )
+            with (
+                patch(
+                    "hindsight_memory_control_plane.broker."
+                    "MAX_COMPLETED_BYTES",
+                    exact_limit,
+                ),
+                patch.object(
+                    self.adapter,
+                    "retain_outcome",
+                    return_value={"operation_id": "o" * 128},
+                ),
+            ):
+                second = self.broker.retain_outcome(
+                    capability,
+                    sequence=2,
+                    action_id="completed-new-order",
+                    request={
+                        "document_id": "new",
+                        "epoch": 1,
+                        "checkpoint": 1,
+                        "outcome": "second",
+                    },
+                )
+                self.assertEqual(
+                    self.broker._dispatch_queued_item(
+                        second["payload"]["queue_id"]
+                    )[0],
+                    "retry",
+                )
+
+                def make_poll_ready(work):
+                    queued = next(
+                        item for item in work["queue"]
+                        if item["queue_id"] == second["payload"]["queue_id"]
+                    )
+                    queued["next_retry"] = 0
+
+                self.broker._transaction(make_poll_ready)
+                self.assertEqual(
+                    self.broker._dispatch_queued_item(
+                        second["payload"]["queue_id"]
+                    )[0],
+                    "complete",
+                )
+
+        self.assertEqual(self.work()["queue"], [])
+        self.assertEqual(
+            sorted(
+                record["completion_order"]
+                for record in self.work()["completed"].values()
+            ),
+            [1, 2],
+        )
+
+    def test_reflect_does_not_reserve_or_consume_completed_storage(self):
         capability = self.exchange()
         self.broker.max_payload_bytes = 128
         with (
-            patch.object(self.broker, "_submit_write") as submit,
             patch(
                 "hindsight_memory_control_plane.broker.MAX_COMPLETED_BYTES",
                 64,
             ),
-            self.assertRaisesRegex(BrokerError, "QUEUE_FULL"),
         ):
-            self.broker.reflect(
+            response = self.broker.reflect(
                 capability,
                 sequence=1,
                 action_id="completed-byte-reservation",
                 request={"reflection": "bounded"},
-                timeout_seconds=0,
+                timeout_seconds=1,
             )
-        submit.assert_not_called()
+        self.assertEqual(response["disposition"], "ok")
         self.assertEqual(self.work()["queue"], [])
-        self.assertEqual(self.work()["sessions"]["session-1"]["sequence"], 0)
+        self.assertEqual(self.work()["completed"], {})
+        self.assertEqual(self.work()["sessions"]["session-1"]["sequence"], 1)
 
-    def test_close_checkpoint_cannot_overtake_prior_session_work(self):
+    def test_close_drains_prior_session_work_without_synthesizing_checkpoint(self):
         capability = self.exchange()
         with patch.object(self.broker, "_submit_write"):
             prior = self.broker.retain_outcome(
@@ -2019,27 +2771,23 @@ class DurableWorkTest(unittest.TestCase):
                 timeout_seconds=0,
             )
         queue = self.work()["queue"]
-        close_id = next(
-            item["queue_id"] for item in queue
-            if item["idempotency_key"] == closed["action_digest"]
-        )
-        self.assertEqual(
-            self.broker._dispatch_queued_item(close_id)[0], "predecessor"
-        )
+        self.assertEqual(len(queue), 1)
+        self.assertEqual(closed["payload"]["undrained"], 1)
+        self.assertFalse(any(
+            item["idempotency_key"] == closed["action_digest"]
+            for item in queue
+        ))
         self.assertEqual(
             self.broker._dispatch_queued_item(
                 prior["payload"]["queue_id"]
             )[0],
             "complete",
         )
-        self.assertEqual(
-            self.broker._dispatch_queued_item(close_id)[0], "complete"
-        )
 
     def test_predecessor_scheduler_state_is_updated_after_durable_lease_release(self):
         capability = self.exchange()
         with patch.object(self.broker, "_submit_write"):
-            self.broker.retain_outcome(
+            prior = self.broker.retain_outcome(
                 capability,
                 sequence=1,
                 action_id="prior-session-work",
@@ -2048,16 +2796,17 @@ class DurableWorkTest(unittest.TestCase):
                     "checkpoint": 1, "outcome": "done",
                 },
             )
-            closed = self.broker.session_close(
+            following = self.broker.transcript_checkpoint(
                 capability,
                 sequence=2,
-                action_id="ordered-close",
-                timeout_seconds=0,
+                action_id="following-checkpoint",
+                request={
+                    "document_id": "transcript", "epoch": 1,
+                    "checkpoint": 1,
+                    "content": "complete cleaned transcript",
+                },
             )
-        close_id = next(
-            item["queue_id"] for item in self.work()["queue"]
-            if item["idempotency_key"] == closed["action_digest"]
-        )
+        following_id = following["payload"]["queue_id"]
         original = self.broker._remember_write_predecessor
 
         def remember_after_lease(queue_id, predecessor_id):
@@ -2074,17 +2823,18 @@ class DurableWorkTest(unittest.TestCase):
             "_remember_write_predecessor",
             side_effect=remember_after_lease,
         ) as remember:
-            self.broker._drain_item(close_id)
+            self.broker._drain_item(following_id)
 
         remember.assert_called_once()
+        self.assertEqual(remember.call_args.args[1], prior["payload"]["queue_id"])
 
     def test_ledger_outbox_capacity_is_checked_before_close_commit(self):
-        capability = self.exchange()
         self.broker.ledger_path = self.root / "bounded-ledger.jsonl"
         self.broker.routes["local-core"]["bank"] = {
             **BANK,
             "endpoint": ENDPOINT,
         }
+        capability = self.exchange()
         for constant, limit in (
             ("MAX_LEDGER_OUTBOX_ENTRIES", 0),
             ("MAX_LEDGER_OUTBOX_BYTES", 2),
@@ -2105,8 +2855,9 @@ class DurableWorkTest(unittest.TestCase):
 
     def test_every_queueing_path_rejects_oversized_durable_entry(self):
         capability = self.exchange()
-        operations = (
-            lambda: self.broker.retain_outcome(
+
+        def operation():
+            return self.broker.retain_outcome(
                 capability,
                 sequence=1,
                 action_id="oversized-retain",
@@ -2116,30 +2867,14 @@ class DurableWorkTest(unittest.TestCase):
                     "checkpoint": 1,
                     "outcome": "done",
                 },
-            ),
-            lambda: self.broker.reflect(
-                capability,
-                sequence=1,
-                action_id="oversized-reflect",
-                request={"reflection": "note"},
-                timeout_seconds=0,
-            ),
-            lambda: self.broker.session_close(
-                capability,
-                sequence=1,
-                action_id="oversized-close",
-                timeout_seconds=0,
-            ),
-        )
+            )
 
         with patch(
             "hindsight_memory_control_plane.broker.MAX_DURABLE_QUEUE_ENTRY_BYTES",
             1,
         ):
-            for operation in operations:
-                with self.subTest(operation=operation):
-                    with self.assertRaisesRegex(BrokerError, "QUEUE_FULL"):
-                        operation()
+            with self.assertRaisesRegex(BrokerError, "QUEUE_FULL"):
+                operation()
 
         state = self.work()
         self.assertEqual(state["queue"], [])
@@ -2161,6 +2896,7 @@ class DurableWorkTest(unittest.TestCase):
                         "document_id": "doc",
                         "epoch": 1,
                         "checkpoint": 1,
+                        "content": "x" * 256,
                     },
                 )
 
@@ -2601,13 +3337,8 @@ class DurableWorkTest(unittest.TestCase):
             item for item in state["queue"]
             if item["session_id"] == "session-1"
         ]
-        self.assertEqual(len(queued), 1)
-        self.assertEqual(submit.call_count, 2)
-        self.assertTrue(all(
-            call.args == (queued[0]["queue_id"],)
-            and call.kwargs == {"runtime": True}
-            for call in submit.call_args_list
-        ))
+        self.assertEqual(queued, [])
+        submit.assert_not_called()
 
     def test_close_is_retryable_before_atomic_commit_and_drainable_after_commit(self):
         capability = self.exchange()
@@ -2626,18 +3357,24 @@ class DurableWorkTest(unittest.TestCase):
 
         mint = self.client.session_mint("control", claims(session_id="close-after"), ttl_seconds=30)
         other = self.client.session_exchange(mint["payload"]["handle"])["payload"]["capability"]
+        with patch.object(self.broker, "_submit_write"):
+            queued_response = self.broker.transcript_checkpoint(
+                other, sequence=1, action_id="close-after-checkpoint",
+                request={
+                    "document_id": "transcript", "epoch": 1,
+                    "checkpoint": 1,
+                    "content": "complete cleaned transcript",
+                },
+            )
         with patch.object(self.broker, "_submit_write", side_effect=OSError("after close commit")):
             with self.assertRaises(OSError):
-                self.broker.session_close(other, sequence=1, action_id="close-after", timeout_seconds=0)
+                self.broker.session_close(other, sequence=2, action_id="close-after", timeout_seconds=0)
         state = self.work()
         self.assertTrue(state["sessions"]["close-after"]["closed"])
-        queued = next(
-            item for item in state["queue"]
-            if item["session_id"] == "close-after"
-        )
+        queued = next(item for item in state["queue"] if item["queue_id"] == queued_response["payload"]["queue_id"])
         with patch.object(self.broker, "_submit_write") as submit:
             retry = self.broker.session_close(
-                other, sequence=1, action_id="close-after",
+                other, sequence=2, action_id="close-after",
                 timeout_seconds=0,
             )
         self.assertEqual(retry["disposition"], "closed")
@@ -2652,9 +3389,17 @@ class DurableWorkTest(unittest.TestCase):
     def test_close_retry_restores_its_durable_session_barrier_after_restart(self):
         capability = self.exchange()
         with patch.object(self.broker, "_submit_write"):
+            self.broker.transcript_checkpoint(
+                capability, sequence=1, action_id="restart-checkpoint",
+                request={
+                    "document_id": "transcript", "epoch": 1,
+                    "checkpoint": 1,
+                    "content": "complete cleaned transcript",
+                },
+            )
             first = self.broker.session_close(
                 capability,
-                sequence=1,
+                sequence=2,
                 action_id="restart-close",
                 timeout_seconds=0,
             )
@@ -2676,7 +3421,7 @@ class DurableWorkTest(unittest.TestCase):
         self.assertTrue(entered.wait(0.5))
         pending = self.broker.session_close(
             capability,
-            sequence=1,
+            sequence=2,
             action_id="restart-close",
             timeout_seconds=0,
         )
@@ -2685,12 +3430,13 @@ class DurableWorkTest(unittest.TestCase):
         self.wait_until(lambda: not self.work()["queue"])
         drained = self.broker.session_close(
             capability,
-            sequence=1,
+            sequence=2,
             action_id="restart-close",
             timeout_seconds=1,
         )
         self.assertEqual(drained["payload"]["undrained"], 0)
-        self.assertEqual(drained["payload"]["final_checkpoint"], "drained")
+        self.assertEqual(drained["payload"]["write_drain"], "drained")
+        self.assertNotIn("final_checkpoint", drained["payload"])
 
     def test_close_persists_and_retries_ledger_outbox_before_success(self):
         self._stop()
@@ -2700,7 +3446,7 @@ class DurableWorkTest(unittest.TestCase):
             state_dir=self.state, signing_key=b"z" * 32,
             routes={"local-core": {"bank": bank, "adapter": self.adapter}},
             policy_digest=DIGEST_A, artifact_digest=DIGEST_B,
-            mint_authorizer=authorize_mint, ledger_path=ledger,
+            mint_authorizer=self.authorize_mint, ledger_path=ledger,
         )
         self.server = UnixJsonRpcServer(self.socket_path, self.broker)
         self.server.start()
@@ -2826,7 +3572,7 @@ class DurableWorkTest(unittest.TestCase):
                 "adapter": self.adapter,
             }},
             policy_digest=DIGEST_A, artifact_digest=DIGEST_B,
-            mint_authorizer=authorize_mint, ledger_path=ledger,
+            mint_authorizer=self.authorize_mint, ledger_path=ledger,
         )
         self.server = UnixJsonRpcServer(self.socket_path, self.broker)
         self.server.start()
@@ -2867,7 +3613,7 @@ class DurableWorkTest(unittest.TestCase):
                 "adapter": self.adapter,
             }},
             policy_digest=DIGEST_A, artifact_digest=DIGEST_B,
-            mint_authorizer=authorize_mint, ledger_path=ledger,
+            mint_authorizer=self.authorize_mint, ledger_path=ledger,
         )
         self.server = UnixJsonRpcServer(self.socket_path, self.broker)
         self.server.start()
@@ -3059,8 +3805,13 @@ class DurableWorkTest(unittest.TestCase):
             client = JsonRpcClient(self.socket_path)
             barrier.wait()
             try:
-                outcomes.append(client.retain_outcome(capability, sequence=sequence, action_id=action,
-                    request={"document_id": "doc", "epoch": epoch, "checkpoint": 1, "outcome": action}))
+                outcomes.append(client.transcript_checkpoint(
+                    capability, sequence=sequence, action_id=action,
+                    request={
+                        "document_id": "doc", "epoch": epoch,
+                        "checkpoint": 1, "content": action,
+                    },
+                ))
             except BrokerError as error:
                 outcomes.append(error.code)
         threads = [threading.Thread(target=send, args=(1, "older", 1)), threading.Thread(target=send, args=(2, "newer", 2))]
@@ -3082,7 +3833,7 @@ class DurableWorkTest(unittest.TestCase):
             "document_id": "doc",
             "epoch": 2,
             "checkpoint": 1,
-            "outcome": "newer",
+            "content": "newer",
         }
         newer_digest = hashlib.sha256(canonical_bytes(newer_request)).hexdigest()
         self.assertEqual(newest["request_digest"], newer_digest)
@@ -3097,8 +3848,8 @@ class DurableWorkTest(unittest.TestCase):
     def test_same_watermark_retry_requires_matching_idempotency_identity(self):
         capability = self.exchange()
         with patch.object(self.broker, "_submit_write") as submit:
-            first = self.client.retain_outcome(capability, sequence=1, action_id="first", request={"document_id": "doc", "epoch": 2, "checkpoint": 1, "outcome": "new"})
-            retry = self.client.retain_outcome(capability, sequence=1, action_id="first", request={"document_id": "doc", "epoch": 2, "checkpoint": 1, "outcome": "new"})
+            first = self.client.transcript_checkpoint(capability, sequence=1, action_id="first", request={"document_id": "doc", "epoch": 2, "checkpoint": 1, "content": "new"})
+            retry = self.client.transcript_checkpoint(capability, sequence=1, action_id="first", request={"document_id": "doc", "epoch": 2, "checkpoint": 1, "content": "new"})
         self.assertEqual(retry["disposition"], "idempotent")
         self.assertEqual(retry["action_digest"], first["action_digest"])
         self.assertEqual(retry["payload"]["queue_id"], first["payload"]["queue_id"])
@@ -3106,30 +3857,33 @@ class DurableWorkTest(unittest.TestCase):
             [item.args[0] for item in submit.call_args_list],
             [first["payload"]["queue_id"], first["payload"]["queue_id"]],
         )
-        stale = self.client.retain_outcome(capability, sequence=2, action_id="stale", request={"document_id": "doc", "epoch": 1, "checkpoint": 1, "outcome": "old"})
+        stale = self.client.transcript_checkpoint(capability, sequence=2, action_id="stale", request={"document_id": "doc", "epoch": 1, "checkpoint": 1, "content": "old"})
         self.assertEqual(stale["disposition"], "stale")
         with self.assertRaisesRegex(BrokerError, "DIGEST_DRIFT"):
-            self.client.retain_outcome(capability, sequence=3, action_id="same", request={"document_id": "doc", "epoch": 2, "checkpoint": 1, "outcome": "new"})
+            self.client.transcript_checkpoint(capability, sequence=3, action_id="same", request={"document_id": "doc", "epoch": 2, "checkpoint": 1, "content": "new"})
 
-    def test_reflect_retry_resubmits_the_existing_durable_queue_item(self):
+    def test_reflect_timeout_is_not_replayed_or_persisted(self):
         capability = self.exchange()
-        with patch.object(self.broker, "_submit_write") as submit:
+        with patch.object(
+            self.adapter, "reflect",
+            side_effect=lambda _request: (
+                time.sleep(0.05) or {"reflection": "summary"}
+            ),
+        ):
             first = self.client.reflect(
                 capability, sequence=1, action_id="reflect-retry",
                 request={"reflection": "summary"}, timeout_seconds=0,
             )
-            queued_id = self.work()["queue"][0]["queue_id"]
-            retry = self.client.reflect(
-                capability, sequence=1, action_id="reflect-retry",
-                request={"reflection": "summary"}, timeout_seconds=0,
-            )
+            with self.assertRaisesRegex(BrokerError, "ACTION_REPLAY"):
+                self.client.reflect(
+                    capability, sequence=1, action_id="reflect-retry",
+                    request={"reflection": "summary"}, timeout_seconds=0,
+                )
 
         self.assertEqual(first["disposition"], "unavailable")
-        self.assertEqual(retry["disposition"], "unavailable")
-        self.assertEqual(
-            [item.args[0] for item in submit.call_args_list],
-            [queued_id, queued_id],
-        )
+        durable = (self.state / "durable_work.json").read_text()
+        self.assertNotIn("summary", durable)
+        self.assertEqual(self.work()["queue"], [])
 
     def test_reflect_replay_revalidates_live_session_authorization(self):
         def complete_reflect(session_id, action_id):
@@ -3321,7 +4075,10 @@ class DurableWorkTest(unittest.TestCase):
             ),
             lambda: self.broker.transcript_checkpoint(
                 capability, sequence=1, action_id="closed-write",
-                request={"document_id": "doc", "epoch": 1, "checkpoint": 1},
+                request={
+                    "document_id": "doc", "epoch": 1, "checkpoint": 1,
+                    "content": "complete cleaned transcript",
+                },
             ),
             lambda: self.broker.reflect(
                 capability, sequence=1, action_id="closed-reflect",
@@ -3420,15 +4177,24 @@ class DurableWorkTest(unittest.TestCase):
         self.assertEqual(queued[0]["last_error"], "ADAPTER_UNAVAILABLE")
         self.assertAlmostEqual(queued[0]["next_retry"], now[0] + delay)
 
-    def test_final_checkpoint_state_key_stays_in_private_broker_state(self):
+    def test_checkpoint_state_key_stays_in_private_broker_state(self):
         capability = self.exchange()
+        checkpoint = self.client.transcript_checkpoint(
+            capability, sequence=1, action_id="private-final-checkpoint",
+            request={
+                "document_id": "transcript", "epoch": 1,
+                "checkpoint": 1,
+                "content": "complete cleaned transcript",
+            },
+        )
         closed = self.client.session_close(
             capability,
-            sequence=1,
-            action_id="private-final-checkpoint",
+            sequence=2,
+            action_id="private-close",
             timeout_seconds=1,
         )
         self.assertNotIn("state_key", json.dumps(closed))
+        self.assertNotIn("state_key", json.dumps(checkpoint))
         final_calls = [
             entry for entry in self.adapter.calls
             if entry["method"] == "transcript_checkpoint"

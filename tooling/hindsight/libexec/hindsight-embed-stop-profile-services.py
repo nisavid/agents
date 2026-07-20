@@ -357,6 +357,22 @@ def process_is_absent(pid: int) -> bool:
     return False
 
 
+def wait_for_verified_process_exit(target: Target) -> bool:
+    """Allow a verified process extra time to finish its graceful shutdown."""
+    for attempt in range(250):
+        if process_is_absent(target.pid):
+            return True
+        identity = stable_process_identity(target.pid)
+        if identity and identity != target.process_identity:
+            raise StopError(
+                f"refusing to stop replaced {target.kind} process on port "
+                f"{target.port} (pid {target.pid})"
+            )
+        if attempt < 249:
+            time.sleep(0.1)
+    return False
+
+
 def has_arg_value(argv: list[str], name: str, value: str) -> bool:
     for index, arg in enumerate(argv):
         if arg == name and index + 1 < len(argv) and argv[index + 1] == value:
@@ -620,7 +636,10 @@ def stop_targets(manager: DaemonEmbedManager, targets: list[Target]) -> None:
                 f"refusing to stop replaced {target.kind} process on port "
                 f"{target.port} (pid {target.pid})"
             )
-        if not manager._kill_process(target.pid):
+        if (
+            not manager._kill_process(target.pid)
+            and not wait_for_verified_process_exit(target)
+        ):
             raise StopError(f"failed to stop {target.kind} process on port {target.port} (pid {target.pid})")
         killed.add(target.pid)
 

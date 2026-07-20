@@ -167,6 +167,20 @@ export HINDSIGHT_EMBED_SUPERVISOR=/usr/bin/true
 export HINDSIGHT_EMBED_STACK_LIB="$rendered_stack_lib"
 export HINDSIGHT_EMBED_SERVICE_LOG="$tmp_dir/supervisor.log"
 
+default_startup_timeouts="$tmp_dir/default-startup-timeouts"
+(
+  unset HINDSIGHT_EMBED_DAEMON_WAIT_SECONDS
+  unset HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS
+  source "$rendered_stack_lib"
+  hindsight_stack_load_config
+  print -r -- "daemon:$HINDSIGHT_EMBED_DAEMON_WAIT_SECONDS" >"$default_startup_timeouts"
+  print -r -- "command:$HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS" >>"$default_startup_timeouts"
+)
+[[ "$(<"$default_startup_timeouts")" == $'daemon:300\ncommand:300' ]] || {
+  print -ru2 -- "stack defaults do not cover the embedded daemon's bounded startup contract"
+  exit 1
+}
+
 for relative_binding in HINDSIGHT_MEMORY_STATE_DIR HINDSIGHT_MEMORY_BROKER_SOCKET; do
   if (
     export "$relative_binding"=relative/path
@@ -319,6 +333,49 @@ if (
 fi
 [[ ! -e "$sync_start_waits" ]] || {
   print -ru2 -- "stack waited after a synchronous component-start failure"
+  exit 1
+}
+
+daemon_launcher_handoff="$tmp_dir/daemon-launcher-handoff"
+daemon_launcher_status=0
+(
+  source "$rendered_stack_lib"
+  hindsight_stack_load_config() { return 0 }
+  hindsight_stack_ensure_profile_ports() { return 0 }
+  hindsight_stack_run_bounded() {
+    print -r -- launcher-failed >>"$daemon_launcher_handoff"
+    return 1
+  }
+  hindsight_stack_wait_daemon() {
+    print -r -- daemon-healthy >>"$daemon_launcher_handoff"
+    return 0
+  }
+  hindsight_stack_daemon_start
+) || daemon_launcher_status=$?
+(( daemon_launcher_status == 0 )) &&
+  [[ "$(<"$daemon_launcher_handoff")" == $'launcher-failed\ndaemon-healthy' ]] || {
+  print -ru2 -- "daemon start discarded a still-initializing child after its launcher returned nonzero"
+  exit 1
+}
+: >"$daemon_launcher_handoff"
+daemon_launcher_status=0
+(
+  source "$rendered_stack_lib"
+  hindsight_stack_load_config() { return 0 }
+  hindsight_stack_ensure_profile_ports() { return 0 }
+  hindsight_stack_run_bounded() {
+    print -r -- launcher-failed >>"$daemon_launcher_handoff"
+    return 1
+  }
+  hindsight_stack_wait_daemon() {
+    print -r -- daemon-unhealthy >>"$daemon_launcher_handoff"
+    return 1
+  }
+  hindsight_stack_daemon_start
+) || daemon_launcher_status=$?
+(( daemon_launcher_status != 0 )) &&
+  [[ "$(<"$daemon_launcher_handoff")" == $'launcher-failed\ndaemon-unhealthy' ]] || {
+  print -ru2 -- "daemon start accepted a failed launcher without bounded readiness"
   exit 1
 }
 

@@ -699,6 +699,8 @@ retire_legacy_plist() {
 validate_installed_files() {
   emulate -L zsh
   hindsight_stack_load_config || die "Hindsight stack configuration failed validation"
+  hindsight_stack_preflight_runtime_credentials ||
+    die "Hindsight runtime credential preflight failed"
 
   validate_trusted_artifact "$PLIST" "service manifest"
   validate_trusted_artifact "$SUPERVISOR" "supervisor" executable

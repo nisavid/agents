@@ -15,6 +15,7 @@ import ssl
 import threading
 import time
 from typing import Any, Callable, Mapping
+from uuid import UUID
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import (
@@ -36,6 +37,12 @@ from .planning import PlanError, _compatibility
 
 
 MAX_VERIFIED_ROLLBACKS = 1024
+SUPPORTED_RUNTIME_VERSION = "0.8.4"
+_RESOLVE_BEARER = object()
+
+
+class EndpointNotFoundError(AdapterError):
+    """The requested endpoint resource returned HTTP 404."""
 
 
 class _RejectRedirectHandler(HTTPRedirectHandler):
@@ -120,6 +127,8 @@ class HttpAdapter:
     })
 
     def __init__(self, *, inventory: Inventory, profile_id: str, token_resolver: Callable[[], str],
+                 runtime_bank_id: str | None = None,
+                 runtime_harness_id: str | None = None,
                  artifact_resolver: Callable[[Any], Mapping[str, Any]] | None = None,
                  external_action_reserver: Callable[[Mapping[str, Any]], None] | None = None,
                  timeout: float = 5.0, max_json_bytes: int = 1_048_576,
@@ -145,6 +154,29 @@ class HttpAdapter:
             raise AdapterError("validated inventory digests do not match")
         self.endpoint = inventory_endpoint(inventory, profile_id)
         self._inventory = inventory
+        runtime_harnesses = [
+            harness for harness in inventory.harnesses
+            if harness["profile_id"] == profile_id
+            and harness["home_bank"] == harness["write_bank"]
+        ]
+        if runtime_harness_id is None and len(runtime_harnesses) == 1:
+            runtime_harness_id = runtime_harnesses[0]["id"]
+        if runtime_bank_id is None and len(runtime_harnesses) == 1:
+            runtime_bank_id = runtime_harnesses[0]["home_bank"]["bank_id"]
+        matching_harness = next(
+            (
+                harness for harness in runtime_harnesses
+                if harness["id"] == runtime_harness_id
+                and harness["home_bank"]["bank_id"] == runtime_bank_id
+            ),
+            None,
+        )
+        if (runtime_bank_id is None) != (runtime_harness_id is None):
+            raise AdapterError("runtime bank and harness must be bound together")
+        if runtime_bank_id is not None and matching_harness is None:
+            raise AdapterError("runtime bank route is not declared by inventory")
+        self._runtime_bank_id = runtime_bank_id
+        self._runtime_harness_id = runtime_harness_id
         self._token_resolver = token_resolver
         self._artifact_resolver = artifact_resolver
         self._external_action_reserver = external_action_reserver
@@ -152,8 +184,8 @@ class HttpAdapter:
         self.max_json_bytes = min(max(int(max_json_bytes), 1), 8_388_608)
         if (
             type(runtime_result_ttl_seconds) not in (int, float)
-            or not math.isfinite(runtime_result_ttl_seconds)
             or not 0 < runtime_result_ttl_seconds <= 86_400
+            or not math.isfinite(runtime_result_ttl_seconds)
         ):
             raise AdapterError("runtime result TTL is invalid")
         if (
@@ -254,32 +286,42 @@ class HttpAdapter:
         payload: Mapping[str, Any] | None = None,
         *,
         deadline: float | None = None,
+        _authorization_token: str | None | object = _RESOLVE_BEARER,
     ) -> Any:
         request_deadline = time.monotonic() + self.timeout
         if deadline is not None:
             request_deadline = min(request_deadline, deadline)
         if request_deadline <= time.monotonic():
             raise AdapterError("endpoint request timed out")
-        try:
-            token = self._token_resolver()
-        except Exception:
-            raise AuthenticationError("bearer token resolution failed") from None
-        if (
+        token = _authorization_token
+        if token is _RESOLVE_BEARER:
+            try:
+                token = self._token_resolver()
+            except Exception:
+                raise AuthenticationError(
+                    "bearer token resolution failed"
+                ) from None
+        if token is not None and (
             not isinstance(token, str)
             or not token
             or "\r" in token
             or "\n" in token
         ):
-            raise AuthenticationError("bearer token resolver returned an invalid token")
+            raise AuthenticationError(
+                "bearer token resolver returned an invalid token"
+            )
         body = None if payload is None else self._encode(payload)
         host = self.endpoint.host.strip("[]")
         url_host = f"[{host}]" if ":" in host else host
         url = f"{self.endpoint.scheme}://{url_host}:{self.endpoint.port}{path}"
-        request = Request(url, data=body, method=method, headers={
-            "Accept": "application/json",
-            "Authorization": f"Bearer {token}",
-            **({"Content-Type": "application/json"} if body is not None else {}),
-        })
+        headers = {"Accept": "application/json"}
+        if token is not None:
+            headers["Authorization"] = f"Bearer {token}"
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+        request = Request(
+            url, data=body, method=method, headers=headers
+        )
         if self._max_recordings:
             with self._recordings_lock:
                 self.recordings.append({
@@ -350,6 +392,10 @@ class HttpAdapter:
                     raise AuthenticationError("endpoint authentication failed (HTTP 401)") from None
                 if 300 <= error.code < 400:
                     raise AdapterError("endpoint redirect is not permitted") from None
+                if error.code == 404:
+                    raise EndpointNotFoundError(
+                        "endpoint request failed (HTTP 404)"
+                    ) from None
                 raise AdapterError(f"endpoint request failed (HTTP {error.code})") from None
             finally:
                 error.close()
@@ -1659,21 +1705,359 @@ class HttpAdapter:
             raise AdapterError("activation disable was not attested")
         return {"activation_enabled": False}
 
-    def recall(self, request): return self._request("POST", "/v1/runtime/recall", validate_runtime_request("recall", request))
-    def mental_model_fetch(self, request): return self._request("POST", "/v1/runtime/mental-model", validate_runtime_request("mental_model_fetch", request))
-    def session_status(self, request): return self._request("POST", "/v1/runtime/session-status", validate_runtime_request("session_status", request))
+    def _runtime_bank_prefix(self) -> str:
+        if self._runtime_bank_id is None:
+            raise AdapterError("runtime bank route is unavailable")
+        return (
+            "/v1/" + quote(self.endpoint.tenant, safe="") + "/banks/"
+            + quote(self._runtime_bank_id, safe="")
+        )
 
-    def _runtime_write(self, path: str, request: Mapping[str, Any]):
-        method = {
-            "/v1/runtime/transcript-checkpoint": "transcript_checkpoint",
-            "/v1/runtime/outcome": "retain_outcome",
-            "/v1/runtime/reflection": "reflect",
-        }[path]
+    def _runtime_base(self) -> str:
+        self._require_runtime_version()
+        return self._runtime_bank_prefix()
+
+    def _require_runtime_version(self) -> None:
+        response = self._request("GET", "/version")
+        if (
+            not isinstance(response, Mapping)
+            or response.get("api_version") != SUPPORTED_RUNTIME_VERSION
+            or not isinstance(response.get("features"), Mapping)
+            or response["features"].get("worker") is not True
+            or response["features"].get("audit_log") is not False
+            or response["features"].get("llm_trace") is not False
+        ):
+            raise AdapterError(
+                "runtime Hindsight version, worker, or privacy features "
+                "are unsupported"
+            )
+
+    def verify_runtime_compatibility(self) -> None:
+        """Fail closed unless the bound server is the supported runtime."""
+
+        self._require_runtime_version()
+        if self._runtime_bank_id is None:
+            raise AdapterError("runtime bank route is unavailable")
+        bank_probe_path = (
+            self._runtime_bank_prefix()
+            + "/operations?status=pending&limit=1&offset=0"
+        )
+        response = self._runtime_object(
+            self._request(
+                "GET", bank_probe_path,
+            ),
+            "runtime bank probe",
+        )
+        if (
+            response.get("bank_id") != self._runtime_bank_id
+            or type(response.get("total")) is not int
+            or response["total"] < 0
+        ):
+            raise AdapterError("runtime bank probe response is invalid")
+        self._verify_runtime_authentication(bank_probe_path)
+
+    def _verify_runtime_authentication(self, bank_probe_path: str) -> None:
+        try:
+            valid_token = self._token_resolver()
+        except Exception:
+            raise AuthenticationError(
+                "bearer token resolution failed"
+            ) from None
+        if (
+            not isinstance(valid_token, str)
+            or not valid_token
+            or "\r" in valid_token
+            or "\n" in valid_token
+        ):
+            raise AuthenticationError(
+                "bearer token resolver returned an invalid token"
+            )
+        wrong_token = "hindsight-invalid-" + hashlib.sha256(
+            valid_token.encode("utf-8")
+        ).hexdigest()
+        while hmac.compare_digest(
+            wrong_token.encode("utf-8"), valid_token.encode("utf-8")
+        ):
+            wrong_token += "x"
+        for rejected_token in (None, wrong_token):
+            try:
+                self._request(
+                    "GET", bank_probe_path,
+                    _authorization_token=rejected_token,
+                )
+            except AuthenticationError:
+                continue
+            raise AdapterError(
+                "runtime bank endpoint does not enforce authentication"
+            )
+
+    @staticmethod
+    def _runtime_object(value: Any, label: str) -> dict[str, Any]:
+        if not isinstance(value, Mapping):
+            raise AdapterError(f"{label} response is invalid")
+        return dict(value)
+
+    def recall(self, request):
+        value = validate_runtime_request("recall", request)
+        limit = value.pop("limit", None)
+        depth = value.pop("depth", "routine")
+        recall_policy = {
+            "routine": {
+                "budget": "mid", "max_tokens": 10_000,
+                "entity_limit": 32, "chunk_limit": 16,
+                "source_fact_limit": 32,
+                "include": {
+                    "entities": {"max_tokens": 2_000},
+                    "chunks": {"max_tokens": 4_000},
+                    "source_facts": {
+                        "max_tokens": 4_000,
+                        "max_tokens_per_observation": 1_000,
+                    },
+                },
+            },
+            "deep": {
+                "budget": "high", "max_tokens": 20_000,
+                "entity_limit": 64, "chunk_limit": 32,
+                "source_fact_limit": 64,
+                "include": {
+                    "entities": {"max_tokens": 4_000},
+                    "chunks": {"max_tokens": 8_000},
+                    "source_facts": {
+                        "max_tokens": 8_000,
+                        "max_tokens_per_observation": 2_000,
+                    },
+                },
+            },
+        }[depth]
+        response = self._runtime_object(
+            self._request(
+                "POST",
+                f"{self._runtime_base()}/memories/recall",
+                {
+                    "query": value["query"],
+                    "types": ["world", "experience", "observation"],
+                    "prefer_observations": True,
+                    "budget": recall_policy["budget"],
+                    "max_tokens": recall_policy["max_tokens"],
+                    "include": recall_policy["include"],
+                },
+            ),
+            "runtime recall",
+        )
+        memories = response.get("results")
+        if not isinstance(memories, list):
+            raise AdapterError("runtime recall response is invalid")
+        safe_fields = {
+            "id", "text", "type", "context", "occurred_start", "occurred_end",
+            "mentioned_at", "document_id", "tags",
+        }
+        result = []
+        for item in memories:
+            if (
+                not isinstance(item, Mapping)
+                or not isinstance(item.get("id"), str)
+                or not item["id"]
+                or not isinstance(item.get("text"), str)
+                or not item["text"]
+            ):
+                raise AdapterError("runtime recall response is invalid")
+            result.append({
+                key: deepcopy(item[key])
+                for key in safe_fields if key in item
+            })
+        if limit is not None:
+            result = result[:limit]
+        entities = self._runtime_recall_entities(
+            response.get("entities"), recall_policy["entity_limit"]
+        )
+        chunks = self._runtime_recall_mapping_items(
+            response.get("chunks"), recall_policy["chunk_limit"],
+            {"id", "text", "chunk_index", "truncated"}, "chunks",
+        )
+        source_facts = self._runtime_recall_mapping_items(
+            response.get("source_facts"),
+            recall_policy["source_fact_limit"], safe_fields,
+            "source facts",
+        )
+        return {
+            "memories": result, "entities": entities, "chunks": chunks,
+            "source_facts": source_facts,
+        }
+
+    @staticmethod
+    def _runtime_recall_mapping_items(
+        value: Any, limit: int, safe_fields: set[str], label: str,
+    ) -> list[dict[str, Any]]:
+        if value is None:
+            return []
+        if not isinstance(value, Mapping):
+            raise AdapterError(f"runtime recall {label} response is invalid")
+        result = []
+        for key in sorted(value):
+            item = value[key]
+            if not isinstance(key, str) or not isinstance(item, Mapping):
+                raise AdapterError(
+                    f"runtime recall {label} response is invalid"
+                )
+            safe = {
+                field: deepcopy(item[field])
+                for field in safe_fields if field in item
+            }
+            if not isinstance(safe.get("id"), str) or not isinstance(
+                safe.get("text"), str
+            ):
+                raise AdapterError(
+                    f"runtime recall {label} response is invalid"
+                )
+            result.append(safe)
+            if len(result) == limit:
+                break
+        return result
+
+    @staticmethod
+    def _runtime_recall_entities(
+        value: Any, limit: int,
+    ) -> list[dict[str, Any]]:
+        if value is None:
+            return []
+        if not isinstance(value, Mapping):
+            raise AdapterError("runtime recall entities response is invalid")
+        result = []
+        for key in sorted(value):
+            item = value[key]
+            if not isinstance(key, str) or not isinstance(item, Mapping):
+                raise AdapterError(
+                    "runtime recall entities response is invalid"
+                )
+            entity_id = item.get("entity_id")
+            name = item.get("canonical_name")
+            observations = item.get("observations")
+            if (
+                not isinstance(entity_id, str) or not entity_id
+                or not isinstance(name, str) or not name
+                or not isinstance(observations, list)
+            ):
+                raise AdapterError(
+                    "runtime recall entities response is invalid"
+                )
+            safe_observations = []
+            for observation in observations:
+                if (
+                    not isinstance(observation, Mapping)
+                    or not isinstance(observation.get("text"), str)
+                    or not observation["text"]
+                ):
+                    raise AdapterError(
+                        "runtime recall entities response is invalid"
+                    )
+                safe_observations.append({
+                    field: deepcopy(observation[field])
+                    for field in ("text", "mentioned_at")
+                    if field in observation
+                })
+            result.append({
+                "id": entity_id, "name": name,
+                "observations": safe_observations,
+            })
+            if len(result) == limit:
+                break
+        return result
+
+    def mental_model_fetch(self, request):
+        value = validate_runtime_request("mental_model_fetch", request)
+        response = self._runtime_object(
+            self._request(
+                "GET",
+                f"{self._runtime_base()}/mental-models/"
+                f"{quote(value['model_id'], safe='')}?detail=content",
+            ),
+            "runtime mental model",
+        )
+        safe_fields = {
+            "id", "name", "source_query", "content", "tags", "max_tokens",
+            "last_refreshed_at", "created_at", "is_stale",
+        }
+        if (
+            response.get("id") != value["model_id"]
+            or response.get("bank_id") != self._runtime_bank_id
+            or not isinstance(response.get("content"), str)
+            or not response["content"]
+        ):
+            raise AdapterError("runtime mental model response is invalid")
+        return {"models": [{
+            key: deepcopy(response[key]) for key in safe_fields if key in response
+        }]}
+
+    def session_status(self, request):
+        validate_runtime_request("session_status", request)
+        base = self._runtime_base()
+        for status in ("pending", "processing"):
+            response = self._runtime_object(
+                self._request(
+                    "GET",
+                    f"{base}/operations?"
+                    f"{urlencode({'status': status, 'limit': 1, 'offset': 0})}",
+                ),
+                "runtime operation status",
+            )
+            total = response.get("total")
+            if (
+                response.get("bank_id") != self._runtime_bank_id
+                or type(total) is not int
+                or total < 0
+            ):
+                raise AdapterError("runtime operation status response is invalid")
+            if total:
+                return {"status": "busy"}
+        return {"status": "ready"}
+
+    def operation_status(self, request):
+        value = validate_runtime_request("operation_status", request)
+        base = self._runtime_base()
+        try:
+            response = self._runtime_object(
+                self._request(
+                    "GET",
+                    f"{base}/operations/"
+                    f"{quote(value['operation_id'], safe='')}",
+                ),
+                "runtime operation status",
+            )
+        except EndpointNotFoundError:
+            response = {"status": "not_found"}
+        status = response.get("status")
+        if status not in {
+            "pending", "processing", "completed", "failed", "cancelled",
+            "not_found",
+        }:
+            raise AdapterError("runtime operation status response is invalid")
+        if (
+            status != "not_found"
+            and response.get("operation_id") != value["operation_id"]
+        ):
+            raise AdapterError("runtime operation status response is invalid")
+        if status in {"failed", "cancelled", "not_found"}:
+            self._evict_runtime_operation_result(value["operation_id"])
+        return {"status": status}
+
+    def _evict_runtime_operation_result(self, operation_id: str) -> None:
+        with self._runtime_results_lock:
+            for key, (_digest, result, _expires_at, size) in tuple(
+                self._runtime_results.items()
+            ):
+                if (
+                    isinstance(result, Mapping)
+                    and result.get("operation_id") == operation_id
+                ):
+                    del self._runtime_results[key]
+                    self._runtime_result_bytes -= size
+
+    def _runtime_write(self, method: str, request: Mapping[str, Any]):
         request = validate_runtime_request(method, request)
         key = request["idempotency_key"]
         request_digest = digest(request)
         return self._runtime_write_cached(
-            path,
+            method,
             request,
             key,
             request_digest,
@@ -1682,7 +2066,7 @@ class HttpAdapter:
 
     def _runtime_write_cached(
         self,
-        path: str,
+        method: str,
         request: Mapping[str, Any],
         key: str,
         request_digest: str,
@@ -1723,7 +2107,7 @@ class HttpAdapter:
             return deepcopy(in_flight.result)
 
         try:
-            result = self._request("PUT", path, request)
+            result = self._runtime_mutation(method, request)
             completed_at = self._runtime_result_now()
             expires_at = completed_at + self._runtime_result_ttl_seconds
             stored = deepcopy(result)
@@ -1773,6 +2157,165 @@ class HttpAdapter:
                 del self._runtime_results[stored_key]
                 self._runtime_result_bytes -= size
 
-    def transcript_checkpoint(self, request): return self._runtime_write("/v1/runtime/transcript-checkpoint", request)
-    def retain_outcome(self, request): return self._runtime_write("/v1/runtime/outcome", request)
-    def reflect(self, request): return self._runtime_write("/v1/runtime/reflection", request)
+    def _runtime_retain(self, request: Mapping[str, Any], content: str, kind: str):
+        if not isinstance(content, str) or not content:
+            raise AdapterError("runtime retain content is invalid")
+        source_tag = {
+            "codex": "source:codex-hook",
+            "claude-code": "source:claude-plugin",
+            "cursor": "source:cursor-plugin",
+        }.get(self._runtime_harness_id)
+        if source_tag is None:
+            raise AdapterError("runtime harness source is unsupported")
+        document_identity = {
+            "harness_id": self._runtime_harness_id,
+            "kind": kind,
+            "logical_document_id": request["document_id"],
+            "epoch": request["epoch"],
+            "session_id": request["session_id"],
+        }
+        if kind == "outcome":
+            document_identity["checkpoint"] = request["checkpoint"]
+        physical_document_id = (
+            f"hindsight-{kind}-{digest(document_identity)[:48]}"
+        )
+        response = self._runtime_object(
+            self._request(
+                "POST",
+                f"{self._runtime_base()}/memories",
+                {
+                    "items": [{
+                        "content": content,
+                        "document_id": physical_document_id,
+                        "update_mode": "replace",
+                        "tags": [
+                            f"agent:{self._runtime_harness_id}",
+                            source_tag,
+                            "scope:active",
+                        ],
+                        "observation_scopes": [["scope:active"]],
+                        "metadata": {
+                            "kind": kind,
+                            "session_id": request["session_id"],
+                            "epoch": str(request["epoch"]),
+                            "checkpoint": str(request["checkpoint"]),
+                        },
+                    }],
+                    "async": True,
+                },
+            ),
+            "runtime retain",
+        )
+        operation_id = response.get("operation_id")
+        if (
+            set(response) != {
+                "success", "bank_id", "items_count", "async",
+                "operation_id", "operation_ids", "usage",
+            }
+            or response["success"] is not True
+            or response["bank_id"] != self._runtime_bank_id
+            or type(response["items_count"]) is not int
+            or response["items_count"] != 1
+            or response["async"] is not True
+            or response["operation_ids"] is not None
+            or response["usage"] is not None
+            or not isinstance(operation_id, str)
+            or not self._runtime_uuid(operation_id)
+        ):
+            raise AdapterError("runtime retain response is invalid")
+        return {"operation_id": operation_id}
+
+    @staticmethod
+    def _runtime_uuid(value: str) -> bool:
+        try:
+            return str(UUID(value)) == value
+        except (ValueError, AttributeError):
+            return False
+
+    def _runtime_mutation(self, method: str, request: Mapping[str, Any]):
+        if method == "transcript_checkpoint":
+            return self._runtime_retain(
+                request, request["content"], "transcript"
+            )
+        if method == "retain_outcome":
+            return self._runtime_retain(request, request["outcome"], "outcome")
+        if method == "reflect":
+            response = self._runtime_object(
+                self._request(
+                    "POST",
+                    f"{self._runtime_base()}/reflect",
+                    {
+                        "query": request["reflection"], "budget": "mid",
+                        "max_tokens": 10_000, "include": {"facts": {}},
+                    },
+                ),
+                "runtime reflect",
+            )
+            reflection = response.get("text")
+            based_on = response.get("based_on")
+            if (
+                not isinstance(reflection, str) or not reflection
+                or not isinstance(based_on, Mapping)
+                or set(based_on)
+                != {"memories", "mental_models", "directives"}
+            ):
+                raise AdapterError("runtime reflect response is invalid")
+            memory_ids, unresolved = self._runtime_reflect_ids(
+                based_on["memories"], 128, allow_missing=True
+            )
+            mental_model_ids, _ = self._runtime_reflect_ids(
+                based_on["mental_models"], 16
+            )
+            directive_ids, _ = self._runtime_reflect_ids(
+                based_on["directives"], 32
+            )
+            return {
+                "reflection": reflection,
+                "based_on": {
+                    "memory_ids": memory_ids,
+                    "mental_model_ids": mental_model_ids,
+                    "directive_ids": directive_ids,
+                    "source_resolution_required": bool(
+                        memory_ids or unresolved
+                    ),
+                    "unresolved_memory_items": unresolved,
+                },
+            }
+        raise AdapterError("runtime method is unsupported")
+
+    @staticmethod
+    def _runtime_reflect_ids(
+        value: Any, limit: int, *, allow_missing: bool = False,
+    ) -> tuple[list[str], int]:
+        if not isinstance(value, list) or len(value) > limit:
+            raise AdapterError("runtime reflect response is invalid")
+        identifiers = []
+        unresolved = 0
+        seen = set()
+        for item in value:
+            if not isinstance(item, Mapping):
+                raise AdapterError("runtime reflect response is invalid")
+            identifier = item.get("id")
+            if identifier is None and allow_missing:
+                unresolved += 1
+                continue
+            if (
+                not isinstance(identifier, str) or not identifier
+                or len(identifier.encode("utf-8")) > 256
+                or any(not character.isprintable() for character in identifier)
+            ):
+                raise AdapterError("runtime reflect response is invalid")
+            if identifier not in seen:
+                identifiers.append(identifier)
+                seen.add(identifier)
+        return identifiers, unresolved
+
+    def transcript_checkpoint(self, request):
+        return self._runtime_write("transcript_checkpoint", request)
+
+    def retain_outcome(self, request):
+        return self._runtime_write("retain_outcome", request)
+
+    def reflect(self, request):
+        value = validate_runtime_request("reflect", request)
+        return self._runtime_mutation("reflect", value)

@@ -84,6 +84,61 @@ class StopProfileServicesTest(unittest.TestCase):
     def setUpClass(cls):
         cls.helper = load_helper()
 
+    def test_listener_discovery_does_not_depend_on_caller_path(self):
+        manager = Manager()
+        completed = types.SimpleNamespace(returncode=0, stdout="1234\n")
+        with patch.object(
+            self.helper.subprocess, "run", return_value=completed
+        ) as run:
+            self.assertEqual(self.helper.find_pids_on_port(manager, 7878), [1234])
+        self.assertEqual(
+            run.call_args.args[0],
+            ["/usr/sbin/lsof", "-nP", "-tiTCP:7878", "-sTCP:LISTEN"],
+        )
+
+    def test_listener_discovery_collects_every_unique_pid(self):
+        manager = Manager()
+        completed = types.SimpleNamespace(
+            returncode=0, stdout="1234\n5678\n1234\n"
+        )
+        with patch.object(self.helper.subprocess, "run", return_value=completed):
+            self.assertEqual(
+                self.helper.find_pids_on_port(manager, 7878), [1234, 5678]
+            )
+
+    def test_lsof_runner_falls_back_to_usr_bin(self):
+        completed = types.SimpleNamespace(returncode=0, stdout="1234\n")
+        with patch.object(
+            self.helper.subprocess,
+            "run",
+            side_effect=[FileNotFoundError, completed],
+        ) as run:
+            self.assertIs(
+                self.helper.run_lsof("-nP", "-tiTCP:7878", "-sTCP:LISTEN"),
+                completed,
+            )
+        self.assertEqual(run.call_args_list[0].args[0][0], "/usr/sbin/lsof")
+        self.assertEqual(run.call_args_list[1].args[0][0], "/usr/bin/lsof")
+
+    def test_process_cwd_uses_usr_bin_lsof_fallback(self):
+        completed = types.SimpleNamespace(
+            returncode=0,
+            stdout="p1234\nfcwd\nn/tmp/hindsight-control-plane/standalone\n",
+        )
+        with patch.object(
+            self.helper.subprocess,
+            "run",
+            side_effect=[FileNotFoundError, completed],
+        ) as run:
+            self.assertEqual(
+                self.helper.process_cwd(1234),
+                Path("/tmp/hindsight-control-plane/standalone"),
+            )
+        self.assertEqual(
+            run.call_args_list[1].args[0],
+            ["/usr/bin/lsof", "-Ffn", "-p", "1234"],
+        )
+
     def test_open_file_identity_preserves_spaces_in_lsof_field_output(self):
         path = Path("/tmp/profile log with spaces.log")
         completed = types.SimpleNamespace(
@@ -106,8 +161,8 @@ class StopProfileServicesTest(unittest.TestCase):
                 side_effect=AssertionError("unlocked path must not inspect PID state"),
             ),
             patch.object(
-                manager, "_find_pid_on_port", wraps=manager._find_pid_on_port
-            ) as find_pid,
+                self.helper, "find_pids_on_port", return_value=[]
+            ) as find_pids,
         ):
             self.assertEqual(
                 self.helper.main(
@@ -115,7 +170,7 @@ class StopProfileServicesTest(unittest.TestCase):
                 ),
                 0,
             )
-        find_pid.assert_called_once_with(7977)
+        find_pids.assert_called_once_with(manager, 7977)
 
     def test_stop_control_parent_open_errors_are_stop_errors(self):
         with (
@@ -217,6 +272,38 @@ class StopProfileServicesTest(unittest.TestCase):
                 self.assertFalse(self.helper.owns_hindsight_ui(
                     1234, 9999, paths, "http://127.0.0.1:7979"
                 ))
+
+    def test_ui_ownership_after_next_server_title_requires_managed_cwd_and_log(self):
+        paths = types.SimpleNamespace(ui_log=Path("/tmp/profile-ui.log"))
+        managed_cwd = Path(
+            "/tmp/node_modules/@vectorize-io/hindsight-control-plane/standalone"
+        )
+        cases = (
+            (managed_cwd, True, True),
+            (managed_cwd, False, False),
+            (Path("/tmp/node_modules/unrelated/standalone"), True, False),
+            (Path("/tmp/node_modules/hindsight-control-plane/server"), True, False),
+            (None, True, False),
+        )
+        for cwd, has_log, expected in cases:
+            with (
+                self.subTest(cwd=cwd, has_log=has_log),
+                patch.object(
+                    self.helper,
+                    "process_command",
+                    return_value="next-server (v16.2.9)",
+                ),
+                patch.object(self.helper, "process_cwd", return_value=cwd),
+                patch.object(
+                    self.helper, "process_has_open_file", return_value=has_log
+                ),
+            ):
+                self.assertEqual(
+                    self.helper.owns_hindsight_ui(
+                        1234, 9999, paths, "http://127.0.0.1:7979"
+                    ),
+                    expected,
+                )
 
     def test_control_ownership_accepts_only_upstream_or_exact_managed_wrapper(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -521,7 +608,9 @@ class StopProfileServicesTest(unittest.TestCase):
             pid_path.write_text("not-a-pid\n", encoding="ascii")
             with (
                 patch.object(Path, "home", return_value=home),
-                patch.object(manager, "_find_pid_on_port", return_value=1234),
+                patch.object(
+                    self.helper, "find_pids_on_port", return_value=[1234]
+                ),
                 patch.object(
                     self.helper,
                     "stable_process_identity",
@@ -538,6 +627,24 @@ class StopProfileServicesTest(unittest.TestCase):
                 [self.helper.Target("control", 7977, 1234, "owned-control")],
             )
             self.assertFalse(pid_path.exists())
+
+    def test_multiple_control_listeners_fail_before_ownership_or_signal(self):
+        manager = Manager()
+        with (
+            patch.object(
+                self.helper, "find_pids_on_port", return_value=[1234, 5678]
+            ),
+            patch.object(
+                self.helper,
+                "owns_hindsight_control",
+                side_effect=AssertionError("must fail before ownership mutation"),
+            ),
+            self.assertRaisesRegex(
+                self.helper.StopError, "multiple control listeners"
+            ),
+        ):
+            self.helper.find_control_target(manager, 7977)
+        self.assertEqual(manager.killed, [])
 
     def test_idle_control_port_reports_unexpected_pid_read_errors(self):
         manager = Manager()
@@ -592,6 +699,7 @@ class StopProfileServicesTest(unittest.TestCase):
             with (
                 patch.object(Path, "home", return_value=home),
                 patch.object(self.helper, "stable_process_identity", return_value=""),
+                patch.object(self.helper, "process_is_absent", return_value=True),
                 patch.object(self.helper.os, "unlink", side_effect=OSError("denied")),
                 self.assertRaisesRegex(self.helper.StopError, "remove control PID file"),
             ):

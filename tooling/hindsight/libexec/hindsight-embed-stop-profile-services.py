@@ -280,6 +280,45 @@ def process_args(pid: int) -> list[str]:
         return []
 
 
+def run_lsof(*arguments: str):
+    for executable in ("/usr/sbin/lsof", "/usr/bin/lsof"):
+        try:
+            return subprocess.run(
+                [executable, *arguments],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+    return None
+
+
+def find_pids_on_port(manager: DaemonEmbedManager, port: int) -> list[int]:
+    result = run_lsof("-nP", f"-tiTCP:{port}", "-sTCP:LISTEN")
+    if result is None:
+        if os.name == "nt":
+            pid = manager._find_pid_on_port(port)
+            return [] if pid is None else [pid]
+        raise StopError(
+            "listener discovery requires lsof at /usr/sbin/lsof or /usr/bin/lsof"
+        )
+    if result.returncode != 0 or not result.stdout.strip():
+        return []
+    pids: list[int] = []
+    for value in result.stdout.split():
+        try:
+            pid = int(value)
+        except ValueError as error:
+            raise StopError("lsof returned an invalid listener PID") from error
+        if pid <= 0:
+            raise StopError("lsof returned an invalid listener PID")
+        if pid not in pids:
+            pids.append(pid)
+    return pids
+
+
 def stable_process_identity(pid: int) -> str:
     try:
         result = subprocess.run(
@@ -328,23 +367,25 @@ def has_arg_value(argv: list[str], name: str, value: str) -> bool:
 
 
 def process_has_open_file(pid: int, path: Path) -> bool:
-    try:
-        result = subprocess.run(
-            ["/usr/sbin/lsof", "-Fn", "-p", str(pid)],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    if result.returncode != 0:
+    result = run_lsof("-Fn", "-p", str(pid))
+    if result is None or result.returncode != 0:
         return False
     expected = str(path)
     for line in result.stdout.splitlines():
         if line.startswith("n") and line[1:] == expected:
             return True
     return False
+
+
+def process_cwd(pid: int) -> Path | None:
+    result = run_lsof("-Ffn", "-p", str(pid))
+    if result is None or result.returncode != 0:
+        return None
+    lines = result.stdout.splitlines()
+    for index, line in enumerate(lines[:-1]):
+        if line == "fcwd" and lines[index + 1].startswith("n"):
+            return Path(lines[index + 1][1:])
+    return None
 
 
 def has_hindsight_api_signature(argv: list[str]) -> bool:
@@ -376,13 +417,27 @@ def owns_hindsight_api(pid: int, paths) -> bool:
 
 def owns_hindsight_ui(pid: int, port: int, paths, api_url: str) -> bool:
     argv = process_args(pid)
-    if len(argv) != 6 or Path(argv[0]).name not in {"node", "nodejs"}:
-        return False
-    if "hindsight-control-plane" not in Path(argv[1]).parts:
-        return False
-    if argv[2:] != ["--port", str(port), "--api-url", api_url]:
-        return False
-    return process_has_open_file(pid, paths.ui_log)
+    exact_command = (
+        len(argv) == 6
+        and Path(argv[0]).name in {"node", "nodejs"}
+        and "hindsight-control-plane" in Path(argv[1]).parts
+        and argv[2:] == ["--port", str(port), "--api-url", api_url]
+    )
+    rewritten_title = (
+        len(argv) == 2
+        and argv[0] == "next-server"
+        and argv[1].startswith("(v")
+        and argv[1].endswith(")")
+    )
+    cwd = process_cwd(pid) if rewritten_title else None
+    managed_cwd = (
+        cwd is not None
+        and cwd.name == "standalone"
+        and "hindsight-control-plane" in cwd.parts
+    )
+    return (exact_command or managed_cwd) and process_has_open_file(
+        pid, paths.ui_log
+    )
 
 
 def owns_hindsight_control(
@@ -427,26 +482,22 @@ def fail_unverified(kind: str, port: int, pid: int) -> None:
 def find_owned_targets(manager: DaemonEmbedManager, paths, api_url: str, api_ports: set[int], ui_ports: set[int]) -> list[Target]:
     targets: list[Target] = []
     for port in sorted(ui_ports):
-        pid = manager._find_pid_on_port(port)
-        if pid is None:
-            continue
-        identity = verified_process_identity(
-            pid, lambda: owns_hindsight_ui(pid, port, paths, api_url)
-        )
-        if not identity:
-            fail_unverified("UI", port, pid)
-        targets.append(Target("UI", port, pid, identity))
+        for pid in find_pids_on_port(manager, port):
+            identity = verified_process_identity(
+                pid, lambda: owns_hindsight_ui(pid, port, paths, api_url)
+            )
+            if not identity:
+                fail_unverified("UI", port, pid)
+            targets.append(Target("UI", port, pid, identity))
 
     for port in sorted(api_ports):
-        pid = manager._find_pid_on_port(port)
-        if pid is None:
-            continue
-        identity = verified_process_identity(
-            pid, lambda: owns_hindsight_api(pid, paths)
-        )
-        if not identity:
-            fail_unverified("API", port, pid)
-        targets.append(Target("API", port, pid, identity))
+        for pid in find_pids_on_port(manager, port):
+            identity = verified_process_identity(
+                pid, lambda: owns_hindsight_api(pid, paths)
+            )
+            if not identity:
+                fail_unverified("API", port, pid)
+            targets.append(Target("API", port, pid, identity))
 
     return targets
 
@@ -455,7 +506,10 @@ def find_control_target(
     manager: DaemonEmbedManager, port: int, *, inspect_pid_file: bool = True
 ) -> list[Target]:
     pid_path = Path.home() / ".hindsight" / "control.pid"
-    pid = manager._find_pid_on_port(port)
+    pids = find_pids_on_port(manager, port)
+    if len(pids) > 1:
+        raise StopError(f"multiple control listeners found on port {port}")
+    pid = pids[0] if pids else None
     if not inspect_pid_file:
         if pid is None:
             return []
@@ -655,12 +709,14 @@ def resolve_targets(
     # Preflight the desired API/UI ports so Hindsight's own start path never
     # gets a chance to reclaim an unrelated service on the canonical ports.
     for kind, port in (("API", desired_api_port), ("UI", desired_ui_port)):
-        pid = manager._find_pid_on_port(port)
-        if pid is None:
-            continue
-        owned = owns_hindsight_api(pid, paths) if kind == "API" else owns_hindsight_ui(pid, port, paths, api_url)
-        if not owned:
-            fail_unverified(kind, port, pid)
+        for pid in find_pids_on_port(manager, port):
+            owned = (
+                owns_hindsight_api(pid, paths)
+                if kind == "API"
+                else owns_hindsight_ui(pid, port, paths, api_url)
+            )
+            if not owned:
+                fail_unverified(kind, port, pid)
 
     return targets
 

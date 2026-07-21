@@ -80,6 +80,29 @@ contract without editing reusable implementation.
 | Canonical bank | `HINDSIGHT_BANK_ID` for the explicit single-bank cleanup/migration workflow | No reusable default; ordinary stack startup reads the bank binding from the selected Hindsight profile. |
 | Migration inventory | `migration.artifact_dir` and `migration.proposal_log`, each a nonempty absolute path | `artifact_path` and `proposal_path` are compatibility aliases; supplying a canonical key and its alias with different values fails validation. |
 
+## Provider runtime policy
+
+`hindsight_memory_control_plane.provider_runtime` owns reusable LLM failover,
+quota cooldown, exact provider matching, per-member concurrency and priority,
+timeout, and retry mechanics. Consumers supply the closed policy shape shown in
+`examples/provider-runtime-policy.json` and a protected credential resolver.
+The policy contains OAuth-home locators, never resolved paths or credential
+values.
+
+For an OAuth-backed Codex member, the Hindsight provider credential field
+contains only `provider-policy:<member-id>`. At construction time the adapter
+resolves that member's `oauth-home:` locator, scopes `CODEX_HOME` while the
+Codex client initializes, and restores the prior environment. No resolved home
+is retained in the policy or logged. Other providers are matched by the exact
+provider, model, and normalized base URL declared by the consumer.
+
+Call `ProviderRuntimePolicy.load(...)`, then install
+`HindsightProviderAdapter` with the protected resolver during Hindsight process
+startup. Installation fails before changing Hindsight classes unless the
+installed `hindsight-api` version and the policy both name an adapter-supported
+version. The current adapter supports only `0.8.4`; supporting another release
+requires an explicit compatibility update and contract tests.
+
 The legacy launchd label and manifest are migration bindings, not evidence that
 a legacy installation exists. A fresh installation still supplies a distinct
 legacy label and the absolute path where that legacy manifest would exist; the

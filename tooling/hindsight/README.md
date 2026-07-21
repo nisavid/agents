@@ -110,9 +110,47 @@ or caller environment.
 
 ## Installation contract
 
-Consumers install or link these files from a checkout of `nisavid/agents`.
-Consuming configuration supplies machine values through this environment
-contract without editing reusable implementation.
+`hindsight-memory install`, `upgrade`, `verify`, `rollback`, and `uninstall`
+manage immutable releases on macOS LaunchAgents and Linux systemd-user. These
+commands take no global `--state-dir`; their closed consumer configuration owns
+every installed path and runtime binding, while `install` and `upgrade` receive
+the release source and version through `--release-root` and `--version`. See
+`examples/portable-consumer/` and the [adoption guide](docs/adoption.md).
+
+An installation configuration contains:
+
+- a schema version, consumer ID, platform, and `fresh` or `adopt` mode;
+- separate absolute install, state, data, service, inventory, Python, `uvx`, and
+  Zsh paths;
+- one absolute, executable, SHA-256-bound credential resolver;
+- nonempty managed services plus optional daily timers and health checks;
+- only non-secret environment values and protected credential locators.
+
+Services, timers, and health checks name `bin/...` release-relative
+entrypoints. A `release://` environment value resolves within the
+digest-verified active release. The example stack binds
+`HINDSIGHT_EMBED_UVX=release://bin/hindsight-embed-uvx`; this release-owned
+wrapper pins managed server commands to `hindsight-embed==0.8.4`.
+The installer requires a working Python 3.11 or newer and validates the
+configured absolute Python, `uvx`, and Zsh executables' ownership, mode,
+ancestry, and ACLs. The managed launcher binds those exact paths to release
+wrappers and entrypoints without consulting `PATH`.
+Credential resolution receives one bounded
+strict-JSON request and
+must return one bounded strict-JSON response containing exactly the requested
+environment names. Process-control names cannot be credential targets. The
+launcher inherits only a narrow locale and user environment, discards resolver
+stderr, and injects resolved values only into the authorized child process.
+
+Install and upgrade copy regular files into content-addressed read-only release
+directories, atomically switch the active pointer, render only declared unit
+files, and require managed health. Failed or interrupted transitions recover
+the last verified prestate. Explicit rollback uses a compare-and-swap digest.
+Uninstall removes only unchanged installer-owned files and always preserves the
+data root, consumer inputs, protected resolver, and external state root.
+
+The following environment contract configures the managed stack inside those
+services without editing reusable implementation.
 
 | Surface | Required bindings | Optional bindings and defaults |
 | --- | --- | --- |
@@ -125,7 +163,7 @@ contract without editing reusable implementation.
 | Single-bank cleanup wait policy | none | The cleanup wrapper uses `HINDSIGHT_EMBED_DAEMON_WAIT_SECONDS=300` and `HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS=300` when those values are unset; explicit consumer values still take precedence. |
 | Cleanup timeout policy | none | `HINDSIGHT_CLEANUP_ARCHIVE_TIMEOUT_SECONDS=3600`, `HINDSIGHT_CLEANUP_MIGRATION_TIMEOUT_SECONDS=3600` |
 | Supervisor | `HINDSIGHT_EMBED_STACK_LIB` | `HINDSIGHT_EMBED_POLL_SECONDS=10`, `HINDSIGHT_EMBED_MAX_CONSECUTIVE_FAILURES=3` |
-| Launch service | `HINDSIGHT_EMBED_STACK_LABEL`, `HINDSIGHT_EMBED_LEGACY_LABEL`, `HINDSIGHT_EMBED_SERVICE_MANIFEST`, `HINDSIGHT_EMBED_LEGACY_MANIFEST`, `HINDSIGHT_EMBED_SUPERVISOR`, `HINDSIGHT_EMBED_STACK_LIB`, `HINDSIGHT_EMBED_STATE_DIR`, `HINDSIGHT_EMBED_SERVICE_LOG` | none |
+| Standalone launchd helper (`hindsight-embed-service`) | `HINDSIGHT_EMBED_STACK_LABEL`, `HINDSIGHT_EMBED_LEGACY_LABEL`, `HINDSIGHT_EMBED_SERVICE_MANIFEST`, `HINDSIGHT_EMBED_LEGACY_MANIFEST`, `HINDSIGHT_EMBED_SUPERVISOR`, `HINDSIGHT_EMBED_STACK_LIB`, `HINDSIGHT_EMBED_SERVICE_LOG` | Do not set these helper-specific bindings for portable installations; the portable manager owns launchd and systemd-user manifests directly. Portable services must still supply `HINDSIGHT_EMBED_STATE_DIR` through the runtime-tools contract above. |
 | Canonical bank | `HINDSIGHT_BANK_ID` for the explicit single-bank cleanup/migration workflow | No reusable default; ordinary stack startup reads the bank binding from the selected Hindsight profile. |
 | Migration inventory | `migration.artifact_dir` and `migration.proposal_log`, each a nonempty absolute path | `artifact_path` and `proposal_path` are compatibility aliases; supplying a canonical key and its alias with different values fails validation. |
 

@@ -1,0 +1,30 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -lt 1 ] || [ "$1" != "hindsight-embed" ]; then
+  printf '%s\n' \
+    'hindsight-embed-uvx: expected hindsight-embed as the command' >&2
+  exit 64
+fi
+
+uvx_executable=${HINDSIGHT_EMBED_UVX_EXECUTABLE:-}
+if [ -z "$uvx_executable" ]; then
+  printf '%s\n' \
+    'hindsight-embed-uvx: HINDSIGHT_EMBED_UVX_EXECUTABLE is required' >&2
+  exit 69
+fi
+case "$uvx_executable" in
+  /*) ;;
+  *)
+    printf '%s\n' \
+      'hindsight-embed-uvx: HINDSIGHT_EMBED_UVX_EXECUTABLE must be absolute' >&2
+    exit 69
+    ;;
+esac
+if [ ! -f "$uvx_executable" ] || [ ! -x "$uvx_executable" ]; then
+  printf '%s\n' \
+    'hindsight-embed-uvx: configured uvx is unavailable or not executable' >&2
+  exit 69
+fi
+
+exec "$uvx_executable" --from 'hindsight-embed==0.8.4' "$@"

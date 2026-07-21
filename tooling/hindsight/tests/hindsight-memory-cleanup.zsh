@@ -493,7 +493,7 @@ with open(os.environ["HINDSIGHT_TEST_API_PORT"], "w", encoding="utf-8") as handl
 server.handle_request()
 PY
 api_server_pid=$!
-for _ in {1..100}; do
+for _ in {1..1000}; do
   [[ -s "$api_server_port" ]] && break
   sleep 0.01
 done
@@ -575,7 +575,7 @@ cleanup_lock_release="$tmp_dir/cleanup-lock-release"
   run_with_cleanup_lock hold_cleanup_lock
 ) &
 cleanup_lock_holder=$!
-for _ in {1..100}; do
+for _ in {1..1000}; do
   [[ -e "$cleanup_lock_ready" ]] && break
   sleep 0.01
 done

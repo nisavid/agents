@@ -1,0 +1,128 @@
+{
+  "consumer_id": "example-workstation",
+  "credential_resolver": {
+    "path": "/home/example/.local/libexec/resolve-hindsight-credential",
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "data_root": "/home/example/.pg0/instances/hindsight-embed-core",
+  "health_checks": [
+    {
+      "arguments": ["--health"],
+      "check_id": "fleet",
+      "credentials": [
+        {"environment": "HINDSIGHT_DATA_PLANE_TOKEN", "locator": "pass://hindsight/data-plane"},
+        {"environment": "HINDSIGHT_MINT_AUTHORITY", "locator": "pass://hindsight/mint-authority"},
+        {"environment": "HINDSIGHT_UI_ACCESS_KEY", "locator": "pass://hindsight/ui-access-key"}
+      ],
+      "entrypoint": "bin/hindsight-embed-supervisor",
+      "environment": {
+        "HINDSIGHT_EMBED_API_BASE_PORT": "7979",
+        "HINDSIGHT_EMBED_AUTOSTART_DAEMON": "true",
+        "HINDSIGHT_EMBED_AUTOSTART_UI": "true",
+        "HINDSIGHT_EMBED_CONTROL_HOSTNAME": "127.0.0.1",
+        "HINDSIGHT_EMBED_CONTROL_PORT": "7878",
+        "HINDSIGHT_EMBED_CONTROL_SERVER": "release://libexec/hindsight-embed-control-server.py",
+        "HINDSIGHT_EMBED_FLEET_PROFILES": "core",
+        "HINDSIGHT_EMBED_PRIMARY_PROFILE": "core",
+        "HINDSIGHT_EMBED_PROVIDER_PRESET_BASE_URL": "https://provider.example.test/v1",
+        "HINDSIGHT_EMBED_PROVIDER_PRESET_ID": "private-remote",
+        "HINDSIGHT_EMBED_PROVIDER_PRESET_LABEL": "Private remote",
+        "HINDSIGHT_EMBED_PROVIDER_PRESET_MODEL": "example-model",
+        "HINDSIGHT_EMBED_PROVIDER_PRESET_RUNTIME_PROVIDER": "lmstudio",
+        "HINDSIGHT_EMBED_PYTHON": "/home/example/.local/share/uv/tools/hindsight-embed/bin/python3",
+        "HINDSIGHT_EMBED_STACK_LIB": "release://lib/hindsight-embed-stack.zsh",
+        "HINDSIGHT_EMBED_STATE_DIR": "/home/example/.local/state/hindsight/embed",
+        "HINDSIGHT_EMBED_STOP_HELPER": "release://libexec/hindsight-embed-stop-profile-services.py",
+        "HINDSIGHT_EMBED_UI_BASE_PORT": "17979",
+        "HINDSIGHT_EMBED_UI_HOSTNAME": "127.0.0.1",
+        "HINDSIGHT_EMBED_UVX": "release://bin/hindsight-embed-uvx",
+        "HINDSIGHT_MEMORY_BROKER_SOCKET": "/home/example/.local/state/hindsight/memory/broker.sock",
+        "HINDSIGHT_MEMORY_CLI": "release://bin/hindsight-memory",
+        "HINDSIGHT_MEMORY_DATA_PLANE_TOKEN_ENV": "HINDSIGHT_DATA_PLANE_TOKEN",
+        "HINDSIGHT_MEMORY_INTEGRATION_UPGRADE_STATE": "/home/example/.local/state/hindsight",
+        "HINDSIGHT_MEMORY_INVENTORY": "/home/example/.config/hindsight-control-plane/inventory.json",
+        "HINDSIGHT_MEMORY_MINT_AUTHORITY_ENV": "HINDSIGHT_MINT_AUTHORITY",
+        "HINDSIGHT_MEMORY_STATE_DIR": "/home/example/.local/state/hindsight/memory",
+        "HINDSIGHT_MEMORY_UI_ACCESS_KEY_ENV": "HINDSIGHT_UI_ACCESS_KEY",
+        "HOME": "/home/example",
+        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"
+      },
+      "timeout_seconds": 30
+    }
+  ],
+  "install_root": "/home/example/.local/opt/hindsight-control-plane",
+  "installation_mode": "adopt",
+  "inventory_path": "/home/example/.config/hindsight-control-plane/inventory.json",
+  "platform": "systemd-user",
+  "python_executable": "/usr/bin/python3",
+  "uvx_executable": "/home/example/.local/bin/uvx",
+  "zsh_executable": "/absolute/path/to/zsh",
+  "schema_version": 1,
+  "service_root": "/home/example/.config/systemd/user",
+  "services": [
+    {
+      "arguments": [],
+      "credentials": [
+        {"environment": "HINDSIGHT_DATA_PLANE_TOKEN", "locator": "pass://hindsight/data-plane"},
+        {"environment": "HINDSIGHT_MINT_AUTHORITY", "locator": "pass://hindsight/mint-authority"},
+        {"environment": "HINDSIGHT_UI_ACCESS_KEY", "locator": "pass://hindsight/ui-access-key"}
+      ],
+      "entrypoint": "bin/hindsight-embed-supervisor",
+      "environment": {
+        "HINDSIGHT_EMBED_API_BASE_PORT": "7979",
+        "HINDSIGHT_EMBED_AUTOSTART_DAEMON": "true",
+        "HINDSIGHT_EMBED_AUTOSTART_UI": "true",
+        "HINDSIGHT_EMBED_CONTROL_HOSTNAME": "127.0.0.1",
+        "HINDSIGHT_EMBED_CONTROL_PORT": "7878",
+        "HINDSIGHT_EMBED_CONTROL_SERVER": "release://libexec/hindsight-embed-control-server.py",
+        "HINDSIGHT_EMBED_FLEET_PROFILES": "core",
+        "HINDSIGHT_EMBED_PRIMARY_PROFILE": "core",
+        "HINDSIGHT_EMBED_PROVIDER_PRESET_BASE_URL": "https://provider.example.test/v1",
+        "HINDSIGHT_EMBED_PROVIDER_PRESET_ID": "private-remote",
+        "HINDSIGHT_EMBED_PROVIDER_PRESET_LABEL": "Private remote",
+        "HINDSIGHT_EMBED_PROVIDER_PRESET_MODEL": "example-model",
+        "HINDSIGHT_EMBED_PROVIDER_PRESET_RUNTIME_PROVIDER": "lmstudio",
+        "HINDSIGHT_EMBED_PYTHON": "/home/example/.local/share/uv/tools/hindsight-embed/bin/python3",
+        "HINDSIGHT_EMBED_STACK_LIB": "release://lib/hindsight-embed-stack.zsh",
+        "HINDSIGHT_EMBED_STATE_DIR": "/home/example/.local/state/hindsight/embed",
+        "HINDSIGHT_EMBED_STOP_HELPER": "release://libexec/hindsight-embed-stop-profile-services.py",
+        "HINDSIGHT_EMBED_UI_BASE_PORT": "17979",
+        "HINDSIGHT_EMBED_UI_HOSTNAME": "127.0.0.1",
+        "HINDSIGHT_EMBED_UVX": "release://bin/hindsight-embed-uvx",
+        "HINDSIGHT_MEMORY_BROKER_SOCKET": "/home/example/.local/state/hindsight/memory/broker.sock",
+        "HINDSIGHT_MEMORY_CLI": "release://bin/hindsight-memory",
+        "HINDSIGHT_MEMORY_DATA_PLANE_TOKEN_ENV": "HINDSIGHT_DATA_PLANE_TOKEN",
+        "HINDSIGHT_MEMORY_INTEGRATION_UPGRADE_STATE": "/home/example/.local/state/hindsight",
+        "HINDSIGHT_MEMORY_INVENTORY": "/home/example/.config/hindsight-control-plane/inventory.json",
+        "HINDSIGHT_MEMORY_MINT_AUTHORITY_ENV": "HINDSIGHT_MINT_AUTHORITY",
+        "HINDSIGHT_MEMORY_STATE_DIR": "/home/example/.local/state/hindsight/memory",
+        "HINDSIGHT_MEMORY_UI_ACCESS_KEY_ENV": "HINDSIGHT_UI_ACCESS_KEY",
+        "HOME": "/home/example",
+        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"
+      },
+      "label": "io.nisavid.hindsight.example.stack",
+      "restart": "on-failure",
+      "service_id": "stack"
+    }
+  ],
+  "state_root": "/home/example/.local/state/hindsight",
+  "timers": [
+    {
+      "arguments": [
+        "--state-dir", "/home/example/.local/state/hindsight",
+        "integration-upgrade", "check",
+        "--catalog", "/home/example/.config/hindsight-control-plane/codex-catalog.json",
+        "--update-policy", "/home/example/.config/hindsight-control-plane/codex-update-policy.json",
+        "--source-verifier", "/home/example/.local/libexec/verify-hindsight-integration-source",
+        "--compatibility-runner", "/home/example/.local/libexec/test-hindsight-integration",
+        "--smoke-runner", "/home/example/.local/libexec/smoke-hindsight-integration"
+      ],
+      "credentials": [],
+      "daily_at": "03:15",
+      "entrypoint": "bin/hindsight-memory",
+      "environment": {"HOME": "/home/example", "PATH": "/usr/bin:/bin"},
+      "label": "io.nisavid.hindsight.example.integration-upgrades",
+      "timer_id": "codex-integration-upgrades"
+    }
+  ]
+}

@@ -1,168 +1,304 @@
 # Adopt the Hindsight Control-Plane Architecture
 
-Use this guide to bind a fresh or existing Hindsight installation to the
-reusable tooling in this repository. Adoption changes where implementation is
-owned and how the local services are managed. It does not copy, rename, merge,
-or delete Hindsight banks, profiles, documents, facts, or observations.
+Use this guide to install the reusable control plane on macOS with LaunchAgents
+or on Linux, including CachyOS, with systemd user units. The same lifecycle can
+create a fresh installation or adopt an existing Hindsight data root without
+changing its identity.
 
-## Platform status
+Adoption changes code ownership and managed service wiring. It does not copy,
+rename, merge, or delete Hindsight banks, profiles, documents, facts, or
+observations.
 
-| Environment | Status |
-| --- | --- |
-| macOS | The reusable contract is available, but the operator must provide its own consumer configuration, wrappers, and LaunchAgent manifest. |
-| Linux, including CachyOS | The controller modules can be consumed independently, but the managed service command is not portable: it currently uses launchd and macOS-specific trust checks. No systemd installation path is available. |
+## Install platform prerequisites
 
-The repository does not yet provide a versioned installer, upgrader, or
-uninstaller. A consumer configuration repository owns the installation steps
-below. Portable installation and a Linux service backend are tracked in
-[`nisavid/agents` issue #22](https://github.com/nisavid/agents/issues/22).
+Start from a current OS installation and a normal login for the account that
+will own Hindsight. Both platforms require:
 
-The [`nisavid/dotfiles` consumer runbook](https://github.com/nisavid/dotfiles/blob/main/docs/HINDSIGHT.md)
-is one machine-specific example; it owns that consumer's values, commands, and
-current migration boundary.
+- Git, Python 3.11 or newer, Zsh with `zsh/stat` and `zsh/system`, `curl`,
+  `lsof`, and `uv`/`uvx`;
+- an absolute Python 3.11-or-newer executable whose file and non-sticky
+  ancestors are not group or world writable, plus an immutable checkout or
+  release tree of this repository;
+- a working Hindsight Embed profile runtime;
+- a protected credential resolver backed by `pass`, macOS Keychain, or Secret
+  Service; and
+- a user service-manager session. Do not install the control plane as root.
 
-## Choose the installation identity
-
-Choose and record these values before rendering any files:
-
-- an immutable or explicitly versioned `nisavid/agents` checkout;
-- the Hindsight profile and canonical bank;
-- loopback API, UI, and control ports;
-- private runtime and state directories;
-- the control-plane access-key resolver;
-- managed and legacy service labels and manifest paths;
-- the enabled profile fleet and daemon/UI autostart policy.
-
-Keep these values in the consumer repository. Do not add machine inventory,
-credentials, private catalog data, runtime state, or generated migration
-artifacts here.
-
-## Bind the reusable sources
-
-Install regular consumer-owned launchers, or equivalent trusted wrappers, that
-delegate to the selected checkout:
-
-- `tooling/hindsight/bin/`
-- `tooling/hindsight/lib/`
-- `tooling/hindsight/libexec/`
-- `tooling/hindsight/skills/`
-
-Supply the complete environment contract in the
-[installation reference](../README.md#installation-contract). Partial provider
-presets, invalid booleans, non-loopback hosts, colliding profile names, unsafe
-paths, and missing service values fail during preflight.
-
-The access-key resolver is an out-of-band callable. Do not place its resolved
-secret in a rendered file, process argument, repository, log, or fallback
-environment variable.
-
-## Configure a fresh Hindsight profile
-
-Configure the selected upstream Hindsight profile interactively, then set its
-canonical bank explicitly. The consumer decides how to invoke and version
-`hindsight-embed`; for example:
+On a clean current macOS installation, install Apple's Command Line Tools and a
+current Python and `uv`. If `brew` is absent, install Homebrew using its
+[official macOS instructions](https://brew.sh/), then run:
 
 ```zsh
-uvx hindsight-embed configure --profile "$profile" --port "$api_port"
-uvx hindsight-embed profile set-env "$profile" HINDSIGHT_BANK_ID "$bank_id"
+xcode-select --install
+brew install git python uv pass gnupg
+uv python install '3.14'
+/usr/bin/zsh -fc 'zmodload zsh/stat && zmodload zsh/system'
+/bin/launchctl print "gui/$UID" >/dev/null
+managed_python="$(uv python find --managed-python --resolve-links '3.14')"
+"$managed_python" -I -c 'import sys; assert sys.version_info >= (3, 11)'
+uvx --from 'hindsight-embed==0.8.4' hindsight-embed --help >/dev/null
 ```
 
-Interactive configuration keeps provider credentials out of process arguments.
+Wait for the Command Line Tools installer to finish before running the remaining
+commands. Use `managed_python` as the consumer configuration's
+`python_executable`; Homebrew's group-writable Cellar ancestry does not satisfy
+the managed-runtime trust contract. A GUI login owns the LaunchAgent domain;
+remote-only sessions without that domain cannot perform native LaunchAgent
+acceptance.
 
-For an existing installation, do not run either command. Inspect the selected
-profile and the consumer's canonical-bank binding without printing provider
-credentials. Fail adoption on any identity mismatch. Changing the profile or
-bank is a separately approved data migration, not an installation repair.
-
-## Render and preflight the consumer configuration
-
-Render the wrappers and service manifest without starting services. Validate
-the inventory before planning or migration work:
+On a clean current CachyOS installation, update the system and install the
+distribution packages:
 
 ```zsh
-"$HINDSIGHT_MEMORY_CLI" --state-dir "$HINDSIGHT_MEMORY_STATE_DIR" validate \
+sudo pacman -Syu --needed git python zsh curl lsof uv pass gnupg
+uv python install '3.14'
+zsh -fc 'zmodload zsh/stat && zmodload zsh/system'
+python -c 'import sys; assert sys.version_info >= (3, 11)'
+systemctl --user show-environment >/dev/null
+managed_python="$(uv python find --managed-python --resolve-links '3.14')"
+"$managed_python" -I -c 'import sys; assert sys.version_info >= (3, 11)'
+uvx --from 'hindsight-embed==0.8.4' hindsight-embed --help >/dev/null
+```
+
+The account must have a real `systemd --user` manager and session bus. Enable
+linger with `loginctl enable-linger "$USER"` only when services must remain
+available after logout. A container PID 1 or a root system manager is not a
+substitute for the account's user manager.
+
+After installing and configuring the consumer, run the native gated lifecycle
+test on the target host. It creates isolated manifests and data, exercises the
+real user service manager, and removes its jobs and files:
+
+```zsh
+# macOS
+env HINDSIGHT_PORTABLE_PLATFORM_ACCEPTANCE=1 \
+  HINDSIGHT_PORTABLE_ACCEPTANCE_PLATFORM=launchd \
+  HINDSIGHT_PORTABLE_ACCEPTANCE_MANAGED_PYTHON="$managed_python" \
+  "$managed_python" -m unittest \
+  tooling.hindsight.tests.test_hindsight_memory_portable_platform_acceptance -v
+
+# CachyOS
+env HINDSIGHT_PORTABLE_PLATFORM_ACCEPTANCE=1 \
+  HINDSIGHT_PORTABLE_ACCEPTANCE_PLATFORM=systemd-user \
+  HINDSIGHT_PORTABLE_ACCEPTANCE_MANAGED_PYTHON="$managed_python" \
+  "$managed_python" -m unittest \
+  tooling.hindsight.tests.test_hindsight_memory_portable_platform_acceptance -v
+```
+
+The systemd user timer makes its first check two minutes after that account's
+user manager starts, then follows the configured daily calendar schedule.
+
+## Prepare the consumer configuration
+
+Start from `examples/portable-consumer/`. Copy the inventory and the matching
+platform installation file into a private consumer configuration repository.
+Replace every example path and choose:
+
+- one immutable release tree and version;
+- one Hindsight profile and its existing or intended canonical bank;
+- `fresh` for a new, empty data root or `adopt` for an existing data root;
+- private install, state, and data roots; for `systemd-user`, use the unit
+  directory under the user manager's `$XDG_CONFIG_HOME` (defaulting to
+  `~/.config/systemd/user`), while launchd may bootstrap owned plists from the
+  configured service root;
+- `bin/...` entrypoints for installer-managed executables and scripts, plus
+  `release://...` environment values for release-owned runtime dependencies;
+- a protected credential resolver and opaque credential locators;
+- integration catalogs, policies, and digest-bound compatibility runners.
+
+Keep machine inventory, locators, service values, runtime state, and generated
+artifacts in the consumer repository or protected local state. Keep resolved
+credentials out of configuration, arguments, logs, and source control.
+
+The installer validates a closed JSON schema. Use paths such as
+`bin/hindsight-memory`, never absolute paths or `release://` values, for
+release-owned entrypoints. Use `release://bin/hindsight-embed-uvx` for the
+`HINDSIGHT_EMBED_UVX` environment binding; that protected wrapper always runs
+`hindsight-embed==0.8.4`. `release://` environment values resolve only inside
+the verified active release. The credential resolver must match its declared
+SHA-256 digest and implement the request and response protocol in the portable
+consumer example.
+
+The installer queries the systemd user manager for its `XDG_CONFIG_HOME` and
+requires `service_root` to match that manager-visible unit directory before any
+filesystem or service mutation. A custom `SYSTEMD_UNIT_PATH` fails closed and
+requires an explicit installation plan because it can replace or reorder the
+normal search path.
+
+## Establish the Hindsight identity
+
+For a fresh installation, configure the selected upstream profile
+interactively, then bind its canonical bank explicitly. For example:
+
+```zsh
+profile='replace-with-profile-name'
+api_port=7979
+bank_id=engineering
+uvx_executable=/absolute/path/to/uvx
+
+HINDSIGHT_EMBED_UVX_EXECUTABLE="$uvx_executable" \
+  tooling/hindsight/bin/hindsight-embed-uvx hindsight-embed configure \
+  --profile "$profile" --port "$api_port"
+HINDSIGHT_EMBED_UVX_EXECUTABLE="$uvx_executable" \
+  tooling/hindsight/bin/hindsight-embed-uvx hindsight-embed profile set-env \
+  "$profile" HINDSIGHT_BANK_ID "$bank_id"
+```
+
+Interactive setup keeps provider credentials out of process arguments. The
+configured profile may exist outside the installer-managed data root, but the
+declared fresh data root must be empty.
+
+For adoption, do not run either command. Inspect the existing profile, bank,
+ports, and data root without printing provider credentials. Set
+`installation_mode` to `adopt` and point `data_root` at the existing database
+root. The installer records its filesystem identity, rechecks that digest
+immediately before first service activation, and refuses later lifecycle
+operations if the identity changes. This proves that the declared root was not
+replaced; it does not infer the Hindsight profile, bank, schema, or content
+identity. The operator must establish those semantic identities through the
+read-only preflight. A mismatch is a migration decision, not an installation
+repair.
+
+## Validate before installation
+
+Validate the inventory with a private controller state directory:
+
+```zsh
+tooling/hindsight/bin/hindsight-memory \
+  --state-dir /absolute/private/state \
+  validate \
   --inventory /absolute/path/to/inventory.json
 ```
 
-Inspect the rendered manifest and wrappers in a temporary destination. Applying
-consumer configuration must not activate harness memory, migrate data, or run a
-controller-directed mutation.
+Read the installation configuration through the CLI without supplying the
+global `--state-dir`; portable lifecycle commands obtain all paths from
+`--config`.
 
-## Stage broker-mediated harness integrations
+Check that no Hindsight or harness session is active before adopting an
+existing service. Snapshot the current service manifests, hook registrations,
+provider state, and authentication state. Do not disable a direct harness
+integration until the controller-owned adapters are staged, tested, and ready
+for an atomic activation with a rollback snapshot.
 
-Start the broker in active inventory-backed mode only after the consumer can
-resolve both the data-plane token and mint authority without rendering either
-secret. The active broker must report the expected inventory, profile-set,
-route, policy, and artifact digests before a harness session is minted.
+## Install and verify
 
-Render the Codex, Claude Code, and Cursor controller artifacts into one
-content-addressed staging generation. The rendered hooks call
-`hindsight-memory harness`; they contain no endpoint, bank, bearer token,
-signing material, envelope, or session capability. Keep the artifacts inactive
-while checking their native hook schemas and adapter self-tests.
-
-CLI consumers must start through `hindsight-memory harness <harness> launch`.
-The launcher mints the bounded session, transfers its one-use handle to the
-private bridge over an inherited descriptor, and gives the harness only the
-bridge locator. GUI consumers use `stage-gui`; it reserves the session identity
-before minting and writes a controller-only, user-private one-use envelope
-carrying the broker-issued expiry. The first hook atomically consumes that
-envelope, starts the bridge, and publishes a non-secret locator for later hooks.
-Replays fail, expired abandoned envelopes may be safely replaced, and final
-close removes the locator. The bridge exchanges its handle only when the first
-hook arrives. If startup or locator publication fails after consumption, the
-controller terminates any bridge, exchanges and closes the minted session, and
-publishes no locator. Recovery requires a fresh `stage-gui`; the consumed
-envelope is never restored or replayed.
-
-Activation requires an approved digest-bound plan, unchanged inventory,
-policy, artifact, and prestate digests, healthy broker and profile checks, and a
-passing adapter self-test. It merges only controller-owned hooks, settings, and
-tools. A failed readback or postcheck restores the recorded controller-owned
-prestate while preserving unrelated configuration.
-
-The native event coverage is intentionally harness-specific:
-
-- Codex uses prompt recall, synchronous stop-hook submission to the broker's
-  asynchronous write queue, and pre-compaction checkpoints. The controller
-  launcher closes CLI sessions because Codex does not currently expose a
-  session-end hook.
-- Claude Code adds its native session-end close hook and disables upstream
-  knowledge tools together with upstream automatic recall and retention. It
-  sets the upstream `enableKnowledgeTools=false` contract, which keeps the MCP
-  process healthy in its verified empty-server mode while advertising no
-  knowledge tools.
-- Cursor uses startup recall, stop and pre-compaction checkpoints, session-end
-  close, and wrapped explicit tools.
-
-All three artifacts expose controller-owned recall, reflect, mental-model,
-and status tools. At a clean stop checkpoint, the controller derives a bounded
-outcome only when the final structured transcript record is an assistant result
-and retains it separately; harness input cannot supply arbitrary outcome
-content, routing, scopes, or tags. Close always attempts revocation, even when a
-pending checkpoint cannot be reconciled, and reports that condition visibly.
-
-Do not disable the existing direct integration until all staged artifacts pass
-the activation gates and a rollback snapshot exists. Do not activate this
-section as part of ordinary consumer rendering.
-
-## Start and verify the macOS service
-
-For a launchd consumer, install the rendered service and verify every managed
-surface:
+Install an immutable release from that release's installer runtime:
 
 ```zsh
-hindsight-embed-service install
-hindsight-embed-service status
+candidate_cli=/absolute/path/to/release/tooling/hindsight/bin/hindsight-memory
+"$candidate_cli" install \
+  --config /absolute/path/to/installation.json \
+  --release-root /absolute/path/to/release/tooling/hindsight \
+  --version 1.0.0
+
+installed_cli=/absolute/install/root/bin/hindsight-memory
+
+"$installed_cli" verify \
+  --config /absolute/path/to/installation.json
 ```
 
-A successful adoption reports the launchd service as loaded and the broker,
-control service, configured profile APIs, configured UIs, and fleet as healthy.
-It also leaves the canonical and last-known-good manifests identical and no
-staged manifest behind.
+The installer copies regular release files into a content-addressed immutable
+directory, publishes an atomic active pointer, renders only installer-owned
+LaunchAgent or systemd-user files, starts the managed services and timers, and
+runs every declared health check. `verify` rechecks the release, configuration,
+inventory, service manifests, data identity, and managed health.
 
-If the installation contains legacy banks or profiles that must be combined or
-renamed, stop here. Architecture adoption preserves them in place. Continue
-only after the gates in
-[Migration readiness](migration-readiness.md) are
-satisfied.
+The managed supervisor health check covers the control service, broker,
+configured APIs and UIs, and the complete fleet. A launchd integration job runs
+once when loaded and at its configured daily time. A systemd-user timer runs two
+minutes after its user manager starts and at its configured daily time. Create
+one timer per enabled harness catalog when the catalogs differ.
+
+## Upgrade and roll back
+
+Upgrade from another immutable release tree:
+
+```zsh
+candidate_cli=/absolute/path/to/new-release/tooling/hindsight/bin/hindsight-memory
+"$candidate_cli" upgrade \
+  --config /absolute/path/to/installation.json \
+  --release-root /absolute/path/to/new-release/tooling/hindsight \
+  --version 1.1.0 \
+  --expected-current-binding-generation-digest \
+  "$current_binding_generation_digest"
+```
+
+Copy the current binding-generation digest from `verify`. This compare-and-swap
+guard admits an intentional configuration or inventory update while rejecting
+a stale plan before service-manager mutation. The installer records the prior
+verified release as last known good. It restores that generation automatically
+if rendering, service activation, or health verification fails. An interrupted
+transition is recovered before the next lifecycle command.
+Upgrade must run from the candidate release's CLI so its installer runtime,
+launcher payloads, and service rendering become authoritative in the same
+transaction. The installed CLI remains available for `install`, `verify`,
+`rollback`, and `uninstall` while an install, upgrade, or rollback transaction
+is pending; other commands fail closed until recovery completes.
+
+For an explicit compare-and-swap rollback, copy the current release digest from
+`verify` and run:
+
+```zsh
+"$installed_cli" rollback \
+  --config /absolute/path/to/installation.json \
+  --expected-current-release-digest "$current_release_digest"
+```
+
+Rollback fails if the active digest changed or no distinct last-known-good
+release exists.
+
+## Uninstall without deleting data
+
+```zsh
+"$installed_cli" uninstall \
+  --config /absolute/path/to/installation.json
+```
+
+Uninstall stops the managed units and removes only unchanged installer-owned
+service files and release state. It preserves the data root, consumer
+configuration, inventory, credential resolver, and external state root. Any
+unowned path or owned-file drift fails closed for operator review.
+
+An uninstall transaction renames the installation root before deleting it, so
+the installed CLI intentionally disappears during that narrow window. If the
+process is interrupted, rerun `uninstall` with the trusted CLI from the same
+pinned release tree used to install or upgrade:
+
+```zsh
+bootstrap_cli=/absolute/path/to/pinned/release/tooling/hindsight/bin/hindsight-memory
+"$bootstrap_cli" uninstall \
+  --config /absolute/path/to/installation.json
+```
+
+The external uninstall journal restores a prepared transaction or finishes a
+committed removal before reporting the installation absent.
+
+## Activate broker-mediated harnesses
+
+Start the broker only after the consumer can resolve both the data-plane token
+and mint authority through protected locators. Its status must report the
+expected inventory, profile-set, route, policy, artifact, and integration
+authority digests.
+
+Render Codex, Claude Code, and Cursor controller artifacts into a disabled,
+content-addressed staging generation. Validate native hook schemas and run the
+adapter self-tests. Activation requires an approved digest-bound plan, unchanged
+prestate and policy digests, healthy runtime checks, and a rollback snapshot.
+It changes only controller-owned hook fields and preserves unrelated plugin
+configuration.
+
+CLI consumers start through
+`hindsight-memory --state-dir /absolute/private/state harness <harness> launch`.
+GUI consumers use a staged one-use envelope consumed by the first hook. Hooks
+receive only a private bridge locator; endpoint, bank, bearer token, signing
+material, envelope, and session capability remain outside the harness.
+
+After activation, run fresh Codex, Claude Code, and Cursor smoke sessions and
+verify recall, checkpoints, explicit reflect, mental models, close and
+revocation, durable watermarks, and writes to the canonical `engineering` bank
+only.
+
+If the installation contains legacy banks or profiles that must be combined,
+renamed, or retired, stop here. Follow [Migration readiness](migration-readiness.md).
+No portable install, adoption, harness activation, or ordinary controller apply
+authorizes data migration.

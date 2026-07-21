@@ -746,7 +746,6 @@ class HttpAdapterContractTest(AdapterContractMixin, unittest.TestCase):
             ("POST", "/v1/default/banks/engineering/memories"): {
                 "success": True, "bank_id": "engineering", "items_count": 1,
                 "async": True, "operation_id": RUNTIME_OPERATION_ID,
-                "operation_ids": None, "usage": None,
             },
             ("POST", "/v1/default/banks/engineering/reflect"): {
                 "text": "reflected answer",
@@ -1295,7 +1294,6 @@ class HttpAdapterContractTest(AdapterContractMixin, unittest.TestCase):
         valid = {
             "success": True, "bank_id": "engineering", "items_count": 1,
             "async": True, "operation_id": RUNTIME_OPERATION_ID,
-            "operation_ids": None, "usage": None,
         }
         for changed in (
             {**valid, "bank_id": "other"},

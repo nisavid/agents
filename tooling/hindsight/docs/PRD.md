@@ -547,6 +547,38 @@ raw Hindsight bank selection remains an implementation detail.
   records the active revision locally, switches atomically, and retains the
   prior cached revision for rollback. Service restarts never update models.
 
+### Harness integration upgrade contract
+
+- Compatible harness integration packages may auto-stage and auto-activate
+  under a configured update policy only after source verification, disposable
+  contract and security checks, digest-bound activation, and post-activation
+  rollback tests pass.
+- The managed installation checks the catalog's bounded same-origin manifest
+  after startup and once per day. Rechecking the active artifact is a no-op;
+  incompatible candidates are quarantined and a failed post-activation smoke
+  test restores the certified last-known-good generation.
+- The reusable catalog owns source coordinates, publisher identity, verifier
+  identity, and allowed transport modes. A consumer owns only the catalog ID,
+  initial version, channel, allowed major, and update mode. Credentials and
+  resolved bank routes are absent from both shapes.
+- A selected direct-only package receives no memory authority. Controller-owned
+  parsing remains authoritative until a broker-transport package is certified.
+  Selected package, certified authority, last-known-good authority, quarantine,
+  and interrupted transaction state are separate and visible.
+- Certified integration authority is bound into route, policy, artifact, and
+  profile-set digests. Sessions pin that generation and fail closed after an
+  authority change. Harness packages cannot choose an endpoint, bank, token,
+  scope, tag, method, or route.
+- Status is read-only. Interrupted activation recovery is an explicit apply
+  operation. Activation and rollback use compare-and-swap and digest checks,
+  preserve the prior certified generation, and quarantine failed candidates.
+- Staged packages and their plans, reports, attestations, and artifact indexes
+  are pruned under the lifecycle lock. Current, last-known-good, pending, and a
+  policy-selected number of recent generations remain available.
+- Hindsight server, database, embedding, model, and provider upgrades remain
+  explicit-plan-only. Harness integration update policy does not authorize any
+  of those changes.
+
 ### Deployment-target contract
 
 - Each consuming configuration selects runtime profiles, provider-role

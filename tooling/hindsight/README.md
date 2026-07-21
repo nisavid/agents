@@ -55,9 +55,58 @@ Activation is a separate digest- and compare-and-swap-bound operation that
 preserves unrelated hooks and settings, disables upstream automatic recall and
 retention, and rolls back the controller-owned fields when a post-activation
 check fails. Claude's upstream knowledge tools are disabled with its verified
-empty-MCP-server mode when this path is activated. Upstream integration package
-installation and compatibility-gated
-updates remain separate work; direct-only packages receive no broker authority.
+empty-MCP-server mode when this path is activated.
+
+## Integration upgrades
+
+`hindsight-memory integration-upgrade` stages upstream harness integrations as
+immutable, content-addressed candidates. A closed reusable catalog pins the
+publisher, HTTPS origin, same-origin update-manifest URL, verifier identity,
+and allowed transport modes. The
+consumer policy contains only the catalog ID, initial version, channel, allowed
+major, `retained_generations`, and one of `pinned`, `manual`, or
+`automatic-compatible`.
+
+Planning invokes three absolute, digest-bound executables with a scrubbed
+environment: a source verifier, a disposable compatibility runner, and a
+post-activation smoke runner. The compatibility report must prove hook schema,
+transcript behavior, security isolation, and broker transport. A direct-only
+package may become the selected upstream package, but it cannot replace the
+controller-owned or previously certified memory authority. Broker-compatible
+packages receive authority only after their post-activation smoke test passes.
+The update policy sets bounded recent-generation retention; current, certified
+last-known-good, and pending generations are always retained.
+
+The lifecycle is:
+
+```text
+hindsight-memory --state-dir STATE integration-upgrade plan ...
+hindsight-memory --state-dir STATE integration-upgrade apply ...
+hindsight-memory --state-dir STATE integration-upgrade check ...
+hindsight-memory --state-dir STATE integration-upgrade status --harness codex
+hindsight-memory --state-dir STATE integration-upgrade rollback ...
+```
+
+`check` fetches a bounded strict-JSON manifest from the catalog, verifies and
+tests its exact artifact, and atomically activates it only under an
+`automatic-compatible` policy. Manual and pinned policies leave an approved
+plan staged; incompatible candidates are quarantined. Rechecking an already
+active artifact is a no-op. Consumers run `check` after managed startup and
+from their daily launchd or systemd-user timer.
+
+`status` is read-only and loads no executable. Interrupted writes remain
+visible until `apply --recover-pending --harness HARNESS` explicitly restores
+the recorded prestate. An active broker given `--integration-upgrade-state`
+derives a closed authority-set digest from certified per-harness status. It
+binds that generation into route, policy, artifact, and profile-set identity,
+so capabilities minted under another generation fail closed. No caller may
+supply an authority digest directly.
+
+See `examples/integration-catalog-codex.json` and
+`examples/integration-update-policy-codex.json` for the closed configuration
+shapes. Source, compatibility, and smoke runners exchange one JSON object on
+standard input/output. They receive no inherited credentials, home directory,
+or caller environment.
 
 ## Installation contract
 

@@ -23,6 +23,22 @@ from .planning import inventory_endpoint
 
 LOGGER = logging.getLogger(__name__)
 ENVIRONMENT_RESOLVER_ID = re.compile(r"[A-Z_][A-Z0-9_]{0,127}", re.ASCII)
+SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+CONTROLLER_INTEGRATION_AUTHORITY_DIGEST = digest(
+    {"mode": "controller-owned", "transport": "broker-v1"}
+)
+
+
+def _integration_authority_digest(value: Any) -> str:
+    if not isinstance(value, str) or SHA256.fullmatch(value) is None:
+        raise RuntimeConfigurationError("integration authority digest is invalid")
+    return value
+
+
+def _resolved_integration_authority_digest(value: Any | None) -> str:
+    return _integration_authority_digest(
+        CONTROLLER_INTEGRATION_AUTHORITY_DIGEST if value is None else value
+    )
 
 HARNESS_METHODS = {
     # The controller policy intentionally exposes the same bounded memory
@@ -44,6 +60,7 @@ class RuntimeConfiguration:
     artifact_digest: str
     route_digest: str
     profile_set_digest: str
+    integration_authority_digest: str
     methods: tuple[str, ...]
     mint_authorizer: Callable[[str, Mapping[str, Any], float], Mapping[str, Any]]
     status: Mapping[str, Any]
@@ -205,18 +222,30 @@ def _compile_digests(
     route_specs: list[dict[str, Any]],
     token_resolver_id: str,
     mint_authority_resolver_id: str,
+    integration_authority_digest: str,
 ) -> tuple[str, str, str, str]:
-    route_digest = digest({"routes": route_specs})
+    route_digest = digest(
+        {
+            "routes": route_specs,
+            "integration_authority_digest": integration_authority_digest,
+        }
+    )
     policy_digest = digest({
         "policy": deep_thaw(inventory.policy),
         "route_digest": route_digest,
     })
-    artifact_digest = inventory.artifact_digest
+    artifact_digest = digest(
+        {
+            "inventory_artifact_digest": inventory.artifact_digest,
+            "integration_authority_digest": integration_authority_digest,
+        }
+    )
     profile_set_digest = digest({
         "mode": "active",
         "profiles": list(selected_profiles),
         "inventory_digest": inventory.inventory_digest,
         "route_digest": route_digest,
+        "integration_authority_digest": integration_authority_digest,
         "resolver_locators": {
             "data_plane_token": token_resolver_id,
             "mint_authority": mint_authority_resolver_id,
@@ -231,7 +260,7 @@ def _runtime_status(
     selected_profiles: tuple[str, ...],
     route_specs: list[dict[str, Any]],
     *, policy_digest: str, artifact_digest: str, route_digest: str,
-    profile_set_digest: str,
+    profile_set_digest: str, integration_authority_digest: str,
 ) -> Mapping[str, Any]:
     return deep_freeze({
         "mode": "active",
@@ -241,6 +270,7 @@ def _runtime_status(
         "artifact_digest": artifact_digest,
         "route_digest": route_digest,
         "profile_set_digest": profile_set_digest,
+        "integration_authority_digest": integration_authority_digest,
     })
 
 
@@ -250,9 +280,13 @@ def compile_runtime_status(
     profiles: tuple[str, ...] | list[str],
     token_resolver_id: str,
     mint_authority_resolver_id: str,
+    integration_authority_digest: str | None = None,
 ) -> Mapping[str, Any]:
     """Compile active status and digests without constructing adapters."""
 
+    integration_authority_digest = _resolved_integration_authority_digest(
+        integration_authority_digest
+    )
     selected_profiles = _validate_runtime_inputs(
         inventory, profiles, token_resolver_id, mint_authority_resolver_id
     )
@@ -263,12 +297,13 @@ def compile_runtime_status(
         route_digest, policy_digest, artifact_digest, profile_set_digest,
     ) = _compile_digests(
         inventory, selected_profiles, route_specs, token_resolver_id,
-        mint_authority_resolver_id,
+        mint_authority_resolver_id, integration_authority_digest,
     )
     return _runtime_status(
         selected_profiles, route_specs,
         policy_digest=policy_digest, artifact_digest=artifact_digest,
         route_digest=route_digest, profile_set_digest=profile_set_digest,
+        integration_authority_digest=integration_authority_digest,
     )
 
 
@@ -280,6 +315,7 @@ def compile_runtime_configuration(
     mint_authority_resolver: Callable[[], str],
     token_resolver_id: str,
     mint_authority_resolver_id: str,
+    integration_authority_digest: str | None = None,
     adapter_factory: Callable[..., Any] = HttpAdapter,
     verify_adapters: bool = False,
 ) -> RuntimeConfiguration:
@@ -287,6 +323,9 @@ def compile_runtime_configuration(
 
     if not callable(token_resolver) or not callable(mint_authority_resolver):
         raise RuntimeConfigurationError("runtime resolvers must be callable")
+    integration_authority_digest = _resolved_integration_authority_digest(
+        integration_authority_digest
+    )
     selected_profiles = _validate_runtime_inputs(
         inventory, profiles, token_resolver_id, mint_authority_resolver_id
     )
@@ -301,7 +340,7 @@ def compile_runtime_configuration(
         route_digest, policy_digest, artifact_digest, profile_set_digest,
     ) = _compile_digests(
         inventory, selected_profiles, route_specs, token_resolver_id,
-        mint_authority_resolver_id,
+        mint_authority_resolver_id, integration_authority_digest,
     )
     route_by_id = {item["route"]: item for item in route_specs}
 
@@ -354,6 +393,7 @@ def compile_runtime_configuration(
         selected_profiles, route_specs,
         policy_digest=policy_digest, artifact_digest=artifact_digest,
         route_digest=route_digest, profile_set_digest=profile_set_digest,
+        integration_authority_digest=integration_authority_digest,
     )
     return RuntimeConfiguration(
         routes=MappingProxyType(dict(routes)),
@@ -361,6 +401,7 @@ def compile_runtime_configuration(
         artifact_digest=artifact_digest,
         route_digest=route_digest,
         profile_set_digest=profile_set_digest,
+        integration_authority_digest=integration_authority_digest,
         methods=methods,
         mint_authorizer=authorize_mint,
         status=status,

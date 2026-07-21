@@ -12,14 +12,15 @@ ROOT = Path(__file__).resolve().parents[1]
 LIB = ROOT / "lib"
 sys.path.insert(0, str(LIB))
 
-from hindsight_memory_control_plane.canonical import digest
-from hindsight_memory_control_plane.broker import (
+from hindsight_memory_control_plane.canonical import digest  # noqa: E402
+from hindsight_memory_control_plane.broker import (  # noqa: E402
     DEFAULT_SESSION_TTL_SECONDS,
     MAX_SESSION_TTL_SECONDS,
 )
-from hindsight_memory_control_plane.inventory import load_inventory
-from hindsight_memory_control_plane.model import deep_thaw
-from hindsight_memory_control_plane.runtime import (
+from hindsight_memory_control_plane.inventory import load_inventory  # noqa: E402
+from hindsight_memory_control_plane.model import deep_thaw  # noqa: E402
+from hindsight_memory_control_plane.runtime import (  # noqa: E402
+    CONTROLLER_INTEGRATION_AUTHORITY_DIGEST,
     RuntimeConfigurationError,
     compile_runtime_configuration,
     compile_runtime_status,
@@ -133,6 +134,84 @@ class RuntimeConfigurationTest(unittest.TestCase):
             "profile_set_digest",
         ):
             self.assertRegex(configuration.status[key], r"^[0-9a-f]{64}$")
+
+    def test_integration_authority_generation_is_bound_into_runtime_identity(self):
+        baseline = self.compile()
+        self.assertEqual(
+            baseline.integration_authority_digest,
+            CONTROLLER_INTEGRATION_AUTHORITY_DIGEST,
+        )
+        certified = compile_runtime_configuration(
+            inventory=self.inventory,
+            profiles=("core",),
+            token_resolver=lambda: "data-token",
+            mint_authority_resolver=lambda: "control-capability",
+            token_resolver_id="TEST_DATA_TOKEN",
+            mint_authority_resolver_id="TEST_MINT_AUTHORITY",
+            integration_authority_digest="a" * 64,
+            adapter_factory=RecordingAdapter,
+        )
+
+        self.assertEqual(certified.status["integration_authority_digest"], "a" * 64)
+        self.assertEqual(
+            compile_runtime_status(
+                inventory=self.inventory,
+                profiles=("core",),
+                token_resolver_id="TEST_DATA_TOKEN",
+                mint_authority_resolver_id="TEST_MINT_AUTHORITY",
+                integration_authority_digest="a" * 64,
+            ),
+            certified.status,
+        )
+        for name in (
+            "route_digest",
+            "policy_digest",
+            "artifact_digest",
+            "profile_set_digest",
+        ):
+            self.assertNotEqual(getattr(baseline, name), getattr(certified, name))
+        authorized = certified.mint_authorizer(
+            "control-capability",
+            {
+                "session_id": "session-1",
+                "companion_id": "bridge-1",
+                "route": "codex",
+            },
+            60,
+        )
+        self.assertEqual(authorized["artifact_digest"], certified.artifact_digest)
+
+        for invalid in (
+            1,
+            b"a" * 64,
+            "",
+            "a" * 63,
+            "A" * 64,
+            "a" * 64 + "\n",
+        ):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                RuntimeConfigurationError, "integration authority digest is invalid"
+            ):
+                compile_runtime_status(
+                    inventory=self.inventory,
+                    profiles=("core",),
+                    token_resolver_id="TEST_DATA_TOKEN",
+                    mint_authority_resolver_id="TEST_MINT_AUTHORITY",
+                    integration_authority_digest=invalid,
+                )
+            with self.subTest(invalid_configuration=invalid), self.assertRaisesRegex(
+                RuntimeConfigurationError, "integration authority digest is invalid"
+            ):
+                compile_runtime_configuration(
+                    inventory=self.inventory,
+                    profiles=("core",),
+                    token_resolver=lambda: "data-token",
+                    mint_authority_resolver=lambda: "control-capability",
+                    token_resolver_id="TEST_DATA_TOKEN",
+                    mint_authority_resolver_id="TEST_MINT_AUTHORITY",
+                    integration_authority_digest=invalid,
+                    adapter_factory=RecordingAdapter,
+                )
 
     def test_mint_authority_constructs_compiled_route_authority(self):
         configuration = self.compile()
@@ -569,6 +648,56 @@ class RuntimeConfigurationTest(unittest.TestCase):
             ):
                 module["_broker_runtime_configuration"](args)
 
+    def test_cli_derives_integration_authority_from_certified_state(self):
+        module = runpy.run_path(str(ROOT / "bin/hindsight-memory"))
+        path = Path(self.temporary.name) / "authority-inventory.json"
+        import json
+        path.write_text(
+            json.dumps(inventory_json(self.temporary.name)), encoding="utf-8"
+        )
+        args = argparse.Namespace(
+            inventory=str(path),
+            profile=["core"],
+            data_plane_token_env="TEST_HINDSIGHT_DATA_TOKEN",
+            mint_authority_env="TEST_HINDSIGHT_MINT_AUTHORITY",
+            integration_upgrade_state=str(
+                Path(self.temporary.name) / "integration-upgrades"
+            ),
+        )
+        compile_configuration = module["compile_runtime_configuration"]
+
+        def compile_without_network(**kwargs):
+            return compile_configuration(
+                **kwargs, adapter_factory=RecordingAdapter
+            )
+
+        authority_digest = "a" * 64
+        authority_reader = Mock(return_value=authority_digest)
+        with patch.dict(
+            module["_broker_runtime_configuration"].__globals__,
+            {
+                "compile_runtime_configuration": compile_without_network,
+                "read_integration_authority_set_digest": authority_reader,
+            },
+        ), patch.dict(
+            module["os"].environ,
+            {
+                "TEST_HINDSIGHT_DATA_TOKEN": "private-data-token",
+                "TEST_HINDSIGHT_MINT_AUTHORITY": "private-mint-authority",
+            },
+            clear=False,
+        ):
+            configuration = module["_broker_runtime_configuration"](args)
+
+        authority_reader.assert_called_once_with(
+            args.integration_upgrade_state,
+            ("claude-code", "codex", "cursor"),
+        )
+        self.assertEqual(
+            configuration.status["integration_authority_digest"],
+            authority_digest,
+        )
+
     def test_cli_parser_rejects_mixed_or_partial_runtime_bindings(self):
         module = runpy.run_path(str(ROOT / "bin/hindsight-memory"))
         argument_parser = module["parser"]()
@@ -593,6 +722,23 @@ class RuntimeConfigurationTest(unittest.TestCase):
         module["_validate_broker_binding_arguments"](
             argument_parser, valid
         )
+
+        with self.assertRaises(SystemExit):
+            argument_parser.parse_args(
+                [*common, "--integration-authority-digest", "a" * 64]
+            )
+        invalid_state = argument_parser.parse_args(
+            [
+                *common,
+                "--inactive",
+                "--integration-upgrade-state",
+                "a" * 64,
+            ]
+        )
+        with self.assertRaises(SystemExit):
+            module["_validate_broker_binding_arguments"](
+                argument_parser, invalid_state
+            )
 
 
 if __name__ == "__main__":

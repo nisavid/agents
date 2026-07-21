@@ -102,7 +102,7 @@ track_fixture_pid_file "$exit_cleanup_pid_file"
   exit 1
 }
 exit_cleanup_pid="$(<"$exit_cleanup_pid_file")"
-if kill -0 "$exit_cleanup_pid" >/dev/null 2>&1; then
+if [[ -n "$(fixture_process_identity "$exit_cleanup_pid")" ]]; then
   kill -KILL "$exit_cleanup_pid" >/dev/null 2>&1 || true
   print -ru2 -- "EXIT cleanup left a TERM-ignoring fixture running"
   exit 1
@@ -110,6 +110,50 @@ fi
 untrack_fixture_pid "$exit_cleanup_pid"
 
 rendered_stack_lib="$repo_dir/lib/hindsight-embed-stack.zsh"
+
+hostile_sleep_dir="$tmp_dir/hostile-sleep"
+hostile_sleep_marker="$tmp_dir/hostile-sleep-ran"
+mkdir "$hostile_sleep_dir"
+cat >"$hostile_sleep_dir/sleep" <<'ZSH'
+#!/bin/zsh
+print -r -- "${HINDSIGHT_DATA_PLANE_API_KEY:-}:${HINDSIGHT_MINT_AUTHORITY_KEY:-}:${HINDSIGHT_UI_ACCESS_KEY:-}" >"$HINDSIGHT_TEST_HOSTILE_SLEEP_MARKER"
+ZSH
+chmod 700 "$hostile_sleep_dir/sleep"
+(
+  source "$rendered_stack_lib"
+  export PATH="$hostile_sleep_dir:/usr/bin:/bin"
+  export HINDSIGHT_DATA_PLANE_API_KEY=data-canary
+  export HINDSIGHT_MINT_AUTHORITY_KEY=mint-canary
+  export HINDSIGHT_UI_ACCESS_KEY=ui-canary
+  export HINDSIGHT_TEST_HOSTILE_SLEEP_MARKER="$hostile_sleep_marker"
+  hindsight_stack_sleep 0.01
+)
+[[ ! -e "$hostile_sleep_marker" ]] || {
+  print -ru2 -- "stack sleep invoked a PATH-resolved child with runtime credentials"
+  exit 1
+}
+
+stat_target="$tmp_dir/stat-target"
+stat_link="$tmp_dir/stat-link"
+stat_dangling_link="$tmp_dir/stat-dangling-link"
+touch "$stat_target"
+chmod 600 "$stat_target"
+ln -s "$stat_target" "$stat_link"
+ln -s "$tmp_dir/stat-missing" "$stat_dangling_link"
+for stat_path in "$stat_link" "$stat_dangling_link"; do
+  stat_fields="$({
+    source "$rendered_stack_lib"
+    hindsight_stack_stat_fields "$stat_path"
+  })" || {
+    print -ru2 -- "stack stat helper did not report symlink metadata: ${stat_path}"
+    exit 1
+  }
+  stat_mode="${${stat_fields#*:}%%:*}"
+  [[ "$stat_mode" != 600 ]] || {
+    print -ru2 -- "stack stat helper followed a symlink instead of reporting it: ${stat_path}"
+    exit 1
+  }
+done
 
 rg -F -q 'access_key_resolver' "$repo_dir/README.md" &&
   rg -F -q 'sole authoritative binding' "$repo_dir/README.md" &&
@@ -133,6 +177,8 @@ hindsight_stack_reset_desired_state() { return 0 }
 
 test_home="$tmp_dir/home"
 mkdir -p "$test_home/.hindsight/profiles"
+touch "$test_home/.hindsight/profiles/present-profile.env"
+export HOME="$test_home"
 
 if (
   unset ${(M)${(k)parameters}:#HINDSIGHT_*}
@@ -300,6 +346,42 @@ credential_scope_results="$tmp_dir/credential-scope-results"
 [[ "$(<"$credential_scope_results")" == \
   $'none:0:0:0:0:0:0:0:0:0\napi:0:0:0:1:0:0:1:0:0\nui-proxy:0:0:0:0:1:1:0:1:1\nbroker:1:1:0:0:0:0:0:0:0' ]] || {
   print -ru2 -- "managed child credential scopes exceeded their authority"
+  exit 1
+}
+
+authorized_credential_scope_results="$tmp_dir/authorized-credential-scope-results"
+(
+  export HINDSIGHT_MEMORY_INVENTORY=/absolute/inventory.json
+  export HINDSIGHT_MEMORY_DATA_PLANE_TOKEN_ENV=TEST_DATA_PLANE_TOKEN
+  export HINDSIGHT_MEMORY_MINT_AUTHORITY_ENV=TEST_MINT_AUTHORITY
+  export HINDSIGHT_MEMORY_UI_ACCESS_KEY_ENV=TEST_UI_ACCESS_KEY
+  export TEST_DATA_PLANE_TOKEN=test-data-plane-token
+  export TEST_MINT_AUTHORITY=test-mint-authority
+  export TEST_UI_ACCESS_KEY=test-ui-access-key
+  export HINDSIGHT_API_KEY=ambient-api-key
+  export HINDSIGHT_DATA_PLANE_TOKEN=ambient-data-plane-token
+  export HINDSIGHT_MINT_AUTHORITY=ambient-mint-authority
+  export HINDSIGHT_UI_ACCESS_KEY=ambient-ui-access-key
+  source "$rendered_stack_lib"
+  for credential_scope in none api ui-proxy broker preflight; do
+    print -rn -- "${credential_scope}:"
+    hindsight_stack_run_with_credential_scope "$credential_scope" \
+      /bin/zsh -f -c '
+        for name in \
+          TEST_DATA_PLANE_TOKEN TEST_MINT_AUTHORITY TEST_UI_ACCESS_KEY \
+          HINDSIGHT_API_KEY HINDSIGHT_DATA_PLANE_TOKEN \
+          HINDSIGHT_MINT_AUTHORITY HINDSIGHT_UI_ACCESS_KEY \
+          HINDSIGHT_API_TENANT_API_KEY \
+          HINDSIGHT_CP_DATAPLANE_API_KEY HINDSIGHT_CP_ACCESS_KEY; do
+          print -rn -- "${+parameters[$name]}"
+        done
+        print
+      '
+  done
+) > "$authorized_credential_scope_results"
+[[ "$(<"$authorized_credential_scope_results")" == \
+  $'none:0000000000\napi:0000000100\nui-proxy:0000000011\nbroker:1100000000\npreflight:1110000000' ]] || {
+  print -ru2 -- "managed child scopes retained unauthorized credential destinations"
   exit 1
 }
 
@@ -735,6 +817,7 @@ done < "$probe_timeout_calls"
 ui_wait_calls="$tmp_dir/ui-wait-calls"
 (
   source "$rendered_stack_lib"
+  HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS=300
   hindsight_stack_load_config() { return 0 }
   hindsight_stack_runtime_active() { return 0 }
   hindsight_stack_preflight_runtime_credentials() {
@@ -745,7 +828,7 @@ ui_wait_calls="$tmp_dir/ui-wait-calls"
     print -r -- probe >> "$ui_wait_calls"
     (( ++ui_probe_count >= 3 ))
   }
-  sleep() { return 0 }
+  hindsight_stack_sleep() { return 0 }
   hindsight_stack_wait_for ui 3
 )
 ui_wait_events=("${(@f)$(<"$ui_wait_calls")}")
@@ -1248,6 +1331,20 @@ if (
   exit 1
 fi
 
+missing_lsof_error="$tmp_dir/missing-lsof.err"
+if (
+  source "$rendered_stack_lib"
+  hindsight_stack_lsof_path() { return 1 }
+  hindsight_stack_require_tools
+) >/dev/null 2>"$missing_lsof_error"; then
+  print -ru2 -- "runtime tool preflight accepted a missing lsof dependency"
+  exit 1
+fi
+if [[ "$(<"$missing_lsof_error")" != *"missing lsof at /usr/sbin/lsof or /usr/bin/lsof"* ]]; then
+  print -ru2 -- "missing lsof preflight did not report the expected diagnostic"
+  exit 1
+fi
+
 (
   export HOME="$test_home"
   export HINDSIGHT_EMBED_PROFILE=present-profile
@@ -1355,7 +1452,7 @@ rg -F -q 'fleet: healthy (1 enabled profile)' "$disabled_status" || {
 }
 
 unmanaged_broker_status="$tmp_dir/unmanaged-broker-status.out"
-(
+if (
   export HOME="$test_home"
   export HINDSIGHT_EMBED_STATE_DIR="$fleet_state"
   export HINDSIGHT_EMBED_FLEET_PROFILES="present-profile"
@@ -1367,7 +1464,10 @@ unmanaged_broker_status="$tmp_dir/unmanaged-broker-status.out"
   hindsight_stack_control_status() { return 0 }
   hindsight_stack_sidecar_names() { return 0 }
   hindsight_stack_status_report > "$unmanaged_broker_status"
-)
+); then
+  print -ru2 -- "fleet status succeeded for a responsive broker with unmanaged identity"
+  exit 1
+fi
 rg -F -q 'fleet: degraded (1 enabled profile)' "$unmanaged_broker_status" || {
   print -ru2 -- "fleet health accepted a responsive broker with unmanaged identity"
   exit 1
@@ -1800,26 +1900,63 @@ fi
 untrack_fixture_pid "$stale_broker_pid"
 wait "$stale_broker_pid" >/dev/null 2>&1 || true
 
-cat > "$fake_memory_cli" <<'ZSH'
-#!/usr/bin/env zsh
-print -r -- "$@" > "$HINDSIGHT_TEST_BROKER_ARGS"
-print -ru2 -- "broker output must be detached"
-trap 'exit 0' TERM
-while true; do sleep 1; done
-ZSH
+cat > "$fake_memory_cli" <<'PY'
+#!/usr/bin/env python3
+import os
+from pathlib import Path
+import signal
+import sys
+import time
+
+Path(os.environ["HINDSIGHT_TEST_BROKER_ARGS"]).write_text(
+    " ".join(sys.argv[1:]), encoding="utf-8"
+)
+arguments = sys.argv[1:]
+operation = ""
+for index, argument in enumerate(arguments[:-1]):
+    if argument == "broker":
+        operation = arguments[index + 1]
+        break
+if operation != "serve":
+    raise SystemExit(0 if operation in {"status", "stop"} else 2)
+print("broker output must be detached", file=sys.stderr)
+signal.signal(signal.SIGTERM, lambda _signal, _frame: sys.exit(0))
+while True:
+    time.sleep(1)
+PY
 chmod 700 "$fake_memory_cli"
 broker_args="$tmp_dir/broker-args"
 broker_output="$tmp_dir/broker-output"
 broker_python_calls="$tmp_dir/broker-python-calls"
+hostile_python_dir="$tmp_dir/hostile-python"
+hostile_python_marker="$tmp_dir/hostile-python-ran"
+hostile_sitecustomize_marker="$tmp_dir/hostile-sitecustomize-ran"
+mkdir "$hostile_python_dir"
+cat > "$hostile_python_dir/python3" <<'ZSH'
+#!/usr/bin/env zsh
+touch "$HINDSIGHT_TEST_HOSTILE_PYTHON_MARKER"
+exit 97
+ZSH
+cat > "$hostile_python_dir/sitecustomize.py" <<'PY'
+import os
+from pathlib import Path
+
+Path(os.environ["HINDSIGHT_TEST_HOSTILE_SITECUSTOMIZE_MARKER"]).touch()
+PY
+chmod 700 "$hostile_python_dir/python3"
 (
   unsetopt BG_NICE
   export HOME="$test_home"
+  export PATH="$hostile_python_dir:/usr/bin:/bin"
+  export PYTHONPATH="$hostile_python_dir"
   export HINDSIGHT_EMBED_STATE_DIR="$fleet_state"
   export HINDSIGHT_EMBED_PROFILE="present-profile"
   export HINDSIGHT_EMBED_FLEET_PROFILES="present-profile,second-profile"
   export HINDSIGHT_MEMORY_CLI="$fake_memory_cli"
   export HINDSIGHT_TEST_BROKER_ARGS="$broker_args"
   export HINDSIGHT_TEST_CONFIGURED_PYTHON_CALLS="$broker_python_calls"
+  export HINDSIGHT_TEST_HOSTILE_PYTHON_MARKER="$hostile_python_marker"
+  export HINDSIGHT_TEST_HOSTILE_SITECUSTOMIZE_MARKER="$hostile_sitecustomize_marker"
   source "$rendered_stack_lib"
   hindsight_stack_broker_process_identity() {
     local pid="$1" record state
@@ -1861,6 +1998,14 @@ rg -F -q -- '-I -c ' "$broker_python_calls" || {
   print -ru2 -- "broker launch did not use the configured isolated Python runtime"
   exit 1
 }
+rg -F -q -- "-I $fake_memory_cli" "$broker_python_calls" || {
+  print -ru2 -- "broker launch did not execute the controller script with the configured isolated Python runtime"
+  exit 1
+}
+[[ ! -e "$hostile_python_marker" && ! -e "$hostile_sitecustomize_marker" ]] || {
+  print -ru2 -- "broker launch executed caller-selected Python startup code"
+  exit 1
+}
 [[ ! -s "$broker_output" ]] || {
   print -ru2 -- "broker start inherited caller output descriptors"
   exit 1
@@ -1871,6 +2016,39 @@ broker_command="$(<"$broker_args")"
   print -ru2 -- "broker did not receive the complete enabled-profile fleet: ${broker_command}"
   exit 1
 }
+
+for broker_operation in status stop; do
+  hostile_operation_args="$tmp_dir/hostile-broker-${broker_operation}-args"
+  (
+    export PATH="$hostile_python_dir:/usr/bin:/bin"
+    export PYTHONPATH="$hostile_python_dir"
+    export HINDSIGHT_TEST_BROKER_ARGS="$hostile_operation_args"
+    export HINDSIGHT_TEST_CONFIGURED_PYTHON_CALLS="$broker_python_calls"
+    export HINDSIGHT_TEST_HOSTILE_PYTHON_MARKER="$hostile_python_marker"
+    export HINDSIGHT_TEST_HOSTILE_SITECUSTOMIZE_MARKER="$hostile_sitecustomize_marker"
+    export HINDSIGHT_MEMORY_CLI="$fake_memory_cli"
+    export HINDSIGHT_MEMORY_BROKER_SOCKET="$tmp_dir/absent-hostile-broker.sock"
+    source "$rendered_stack_lib"
+    hindsight_stack_load_config() { return 0 }
+    hindsight_stack_enabled_profiles() { print -r -- present-profile }
+    if [[ "$broker_operation" == status ]]; then
+      hindsight_stack_broker_status 2
+    else
+      HINDSIGHT_EMBED_STOP_WAIT_SECONDS=2
+      hindsight_stack_broker_terminate_recorded() { return 0 }
+      hindsight_stack_broker_remove_stale_socket() { return 0 }
+      hindsight_stack_broker_stop
+    fi
+  )
+  rg -F -q -- "broker $broker_operation" "$hostile_operation_args" || {
+    print -ru2 -- "broker ${broker_operation} did not reach the isolated controller script"
+    exit 1
+  }
+  [[ ! -e "$hostile_python_marker" && ! -e "$hostile_sitecustomize_marker" ]] || {
+    print -ru2 -- "broker ${broker_operation} executed caller-selected Python startup code"
+    exit 1
+  }
+done
 status_output="$tmp_dir/status.out"
 if HOME="$test_home" \
   HINDSIGHT_EMBED_STACK_LIB="$rendered_stack_lib" \
@@ -1938,20 +2116,44 @@ broker_stop_args="$tmp_dir/broker-stop-args"
   hindsight_stack_broker_stop
 )
 broker_stop_command="$(<"$broker_stop_args")"
-[[ "$broker_stop_command" == '12 '* && "$broker_stop_command" == *'--timeout 7' ]] || {
+[[ "$broker_stop_command" == "12 $configured_python -I $HINDSIGHT_MEMORY_CLI "* &&
+  "$broker_stop_command" == *'--timeout 7' ]] || {
   print -ru2 -- "broker stop outer deadline did not exceed its CLI timeout: ${broker_stop_command}"
+  exit 1
+}
+
+broker_status_args="$tmp_dir/broker-status-args"
+(
+  source "$rendered_stack_lib"
+  hindsight_stack_load_config() { return 0 }
+  hindsight_stack_enabled_profiles() { print -r -- present-profile }
+  hindsight_stack_run_bounded() { print -r -- "$@" >"$broker_status_args" }
+  hindsight_stack_broker_status 9
+)
+broker_status_command="$(<"$broker_status_args")"
+[[ "$broker_status_command" == "9 $configured_python -I $HINDSIGHT_MEMORY_CLI "* &&
+  "$broker_status_command" == *'broker status'* ]] || {
+  print -ru2 -- "broker status bypassed the configured isolated Python runtime: ${broker_status_command}"
   exit 1
 }
 
 failed_broker_cli="$tmp_dir/failed-broker-cli"
 failed_broker_pid="$tmp_dir/failed-broker.pid"
 unrelated_broker_job_pid="$tmp_dir/unrelated-broker-job.pid"
-cat >"$failed_broker_cli" <<'ZSH'
-#!/usr/bin/env zsh
-print -r -- "$$" >"$HINDSIGHT_TEST_FAILED_BROKER_PID"
-trap '' TERM
-while true; do sleep 1; done
-ZSH
+cat >"$failed_broker_cli" <<'PY'
+#!/usr/bin/env python3
+import os
+from pathlib import Path
+import signal
+import time
+
+Path(os.environ["HINDSIGHT_TEST_FAILED_BROKER_PID"]).write_text(
+    str(os.getpid()), encoding="utf-8"
+)
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+while True:
+    time.sleep(1)
+PY
 chmod 700 "$failed_broker_cli"
 if (
   unsetopt BG_NICE

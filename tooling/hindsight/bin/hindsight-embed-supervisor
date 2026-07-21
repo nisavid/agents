@@ -18,6 +18,25 @@ require_current_user_identity() {
     die "USER does not match current user id ${EUID}"
 }
 
+stat_fields() {
+  emulate -L zsh
+  local path="$1"
+  local -A metadata
+  zmodload zsh/stat || return 1
+  zstat -H metadata -- "$path" || return 1
+  printf '%s:%o\n' "$metadata[uid]" "$(( metadata[mode] & 8#7777 ))"
+}
+
+validate_darwin_acl() {
+  emulate -L zsh
+  local path="$1" label="$2" acl_listing
+  [[ "$OSTYPE" == darwin* ]] || return 0
+  acl_listing="$(/bin/ls -lde "$path")" || die "could not inspect ${label} ACL: ${path}"
+  ! print -r -- "$acl_listing" |
+    /usr/bin/grep -Eq '^[[:space:]]*[0-9]+:.*[[:space:]]allow[[:space:]]' ||
+    die "${label} must not have permissive ACL entries: ${path}"
+}
+
 validate_trusted_stack_lib() {
   emulate -L zsh
 
@@ -28,26 +47,22 @@ validate_trusted_stack_lib() {
   [[ -f "$STACK_LIB" && ! -L "$STACK_LIB" && -r "$STACK_LIB" ]] ||
     die "HINDSIGHT_EMBED_STACK_LIB must resolve to a readable regular file"
 
-  local owner mode path acl_permissions acl_listing
-  acl_listing="$(/bin/ls -lde "$STACK_LIB")" || die "could not inspect stack library ACL"
-  acl_permissions="${acl_listing%% *}"
-  ! print -r -- "$acl_listing" |
-    /usr/bin/grep -Eq '^[[:space:]]*[0-9]+:.*[[:space:]]allow[[:space:]]' ||
-    die "stack library must not have permissive ACL entries"
-  owner="$(/usr/bin/stat -f '%u' "$STACK_LIB")" || die "could not inspect stack library owner"
-  mode="$(/usr/bin/stat -f '%Lp' "$STACK_LIB")" || die "could not inspect stack library mode"
+  local owner mode path fields
+  validate_darwin_acl "$STACK_LIB" "stack library"
+  fields="$(stat_fields "$STACK_LIB")" ||
+    die "could not inspect trusted path: ${STACK_LIB}"
+  owner="${fields%%:*}"
+  mode="${fields#*:}"
   (( owner == EUID || owner == 0 )) || die "stack library must be owned by the current user or root"
   (( (8#$mode & 8#0022) == 0 )) || die "stack library must not be group or world writable"
 
   path="${STACK_LIB:h}"
   while true; do
-    acl_listing="$(/bin/ls -lde "$path")" || die "could not inspect stack library ancestor ACL: ${path}"
-    acl_permissions="${acl_listing%% *}"
-    ! print -r -- "$acl_listing" |
-      /usr/bin/grep -Eq '^[[:space:]]*[0-9]+:.*[[:space:]]allow[[:space:]]' ||
-      die "stack library ancestor must not have permissive ACL entries: ${path}"
-    owner="$(/usr/bin/stat -f '%u' "$path")" || die "could not inspect stack library ancestor: ${path}"
-    mode="$(/usr/bin/stat -f '%Lp' "$path")" || die "could not inspect stack library ancestor: ${path}"
+    validate_darwin_acl "$path" "stack library ancestor"
+    fields="$(stat_fields "$path")" ||
+      die "could not inspect trusted path: ${path}"
+    owner="${fields%%:*}"
+    mode="${fields#*:}"
     (( owner == EUID || owner == 0 )) || die "stack library ancestor is not trusted: ${path}"
     if (( (8#$mode & 8#0022) != 0 && !(owner == 0 && (8#$mode & 8#01000) != 0) )); then
       die "stack library ancestor is group or world writable: ${path}"
@@ -79,7 +94,9 @@ source_stack_lib() {
     hindsight_stack_require_current_user \
     hindsight_stack_require_runtime_helpers \
     hindsight_stack_require_tools \
+    hindsight_stack_sleep \
     hindsight_stack_stop_all \
+    hindsight_stack_status_report \
     hindsight_stack_with_lifecycle_lock \
     hindsight_stack_validate_fleet; do
     if (( ! ${+functions[$required_function]} )); then
@@ -147,6 +164,11 @@ main() {
   hindsight_stack_require_tools || fail "missing required tools"
   hindsight_stack_require_runtime_helpers || fail "missing required helper runtime"
   hindsight_stack_validate_fleet || fail "invalid fleet configuration"
+  if (( $# )); then
+    [[ $# == 1 && "$1" == --health ]] || fail "usage: hindsight-embed-supervisor [--health]"
+    hindsight_stack_status_report || return 1
+    return 0
+  fi
   hindsight_stack_initialize_desired_state || fail "could not initialize desired component state"
 
   trap shutdown EXIT
@@ -160,7 +182,7 @@ main() {
   while true; do
     if hindsight_stack_with_lifecycle_lock hindsight_stack_reconcile_once; then
       consecutive_failures=0
-      sleep "$poll_seconds"
+      hindsight_stack_sleep "$poll_seconds"
       continue
     fi
     (( consecutive_failures += 1 ))
@@ -170,7 +192,7 @@ main() {
     retry_seconds=$(( poll_seconds * (consecutive_failures + 1) ))
     (( retry_seconds >= cooldown_seconds )) || retry_seconds=$cooldown_seconds
     (( retry_seconds <= 3600 )) || retry_seconds=3600
-    sleep "$retry_seconds"
+    hindsight_stack_sleep "$retry_seconds"
   done
 }
 

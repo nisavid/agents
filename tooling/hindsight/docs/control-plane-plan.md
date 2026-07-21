@@ -50,6 +50,8 @@ configuration repositories.
 - [x] Read-only migration inventory and immutable unapproved shadow planning.
 - [x] Environment-driven broker, supervisor, profile fleet, sidecar, and service
   lifecycle support.
+- [x] Immutable portable install, upgrade, verification, rollback, and
+  data-preserving uninstall for macOS LaunchAgents and Linux systemd-user.
 - [x] Explicit-policy legacy single-bank cleanup and migration helpers.
 
 ## Validation and closeout
@@ -76,6 +78,17 @@ configuration repositories.
   `zsh tooling/hindsight/tests/hindsight-memory-controller.zsh`
 
   `zsh tooling/hindsight/tests/hindsight-embed-stack.zsh`
+
+  `zsh tooling/hindsight/tests/hindsight-embed-stack-linux.zsh`
+
+  Native macOS LaunchAgent acceptance:
+
+  `managed_python="$(uv python find --managed-python --resolve-links --no-python-downloads '>=3.11')" && env HINDSIGHT_PORTABLE_PLATFORM_ACCEPTANCE=1 HINDSIGHT_PORTABLE_ACCEPTANCE_PLATFORM=launchd HINDSIGHT_PORTABLE_ACCEPTANCE_MANAGED_PYTHON="$managed_python" "$managed_python" -m unittest tooling.hindsight.tests.test_hindsight_memory_portable_platform_acceptance -v`
+
+  - [ ] Native CachyOS systemd-user acceptance remains pending evidence from a
+    real non-root user manager and session bus:
+
+    `managed_python="$(uv python find --managed-python --resolve-links --no-python-downloads '>=3.11')" && env HINDSIGHT_PORTABLE_PLATFORM_ACCEPTANCE=1 HINDSIGHT_PORTABLE_ACCEPTANCE_PLATFORM=systemd-user HINDSIGHT_PORTABLE_ACCEPTANCE_MANAGED_PYTHON="$managed_python" "$managed_python" -m unittest tooling.hindsight.tests.test_hindsight_memory_portable_platform_acceptance -v`
 
   `zsh tooling/hindsight/tests/hindsight-memory-cleanup.zsh`
 

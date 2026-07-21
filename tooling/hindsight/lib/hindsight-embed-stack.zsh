@@ -4,6 +4,36 @@ if (( ! ${+HINDSIGHT_EMBED_LAST_START_EPOCH} )); then
   typeset -gA HINDSIGHT_EMBED_LAST_START_EPOCH
 fi
 
+hindsight_stack_stat_fields() {
+  emulate -L zsh
+  local path="$1"
+  local -A metadata
+  zmodload zsh/stat || return 1
+  zstat -L -H metadata -- "$path" || return 1
+  printf '%s:%o:%s:%s\n' \
+    "$metadata[uid]" \
+    "$(( metadata[mode] & 8#7777 ))" \
+    "$metadata[device]" \
+    "$metadata[inode]"
+}
+
+hindsight_stack_stat_owner() {
+  emulate -L zsh
+  local value
+  value="$(hindsight_stack_stat_fields "$1")" || return 1
+  print -r -- "${value%%:*}"
+}
+
+hindsight_stack_stat_owner_mode() {
+  emulate -L zsh
+  local value owner remainder mode
+  value="$(hindsight_stack_stat_fields "$1")" || return 1
+  owner="${value%%:*}"
+  remainder="${value#*:}"
+  mode="${remainder%%:*}"
+  print -r -- "${owner}:${mode}"
+}
+
 hindsight_stack_validate_seconds() {
   emulate -L zsh
   local value="$1" label="$2" maximum="$3" minimum="${4:-1}"
@@ -15,6 +45,23 @@ hindsight_stack_validate_seconds() {
     print -ru2 -- "hindsight-embed-stack: ${label} must be from ${minimum} to ${maximum} seconds"
     return 1
   }
+}
+
+hindsight_stack_sleep() {
+  emulate -L zsh
+  local duration="$1"
+  [[ "$duration" =~ '^(0|[1-9][0-9]*)(\.[0-9]+)?$' ]] || {
+    print -ru2 -- "hindsight-embed-stack: sleep duration must be a non-negative decimal"
+    return 2
+  }
+  zmodload zsh/mathfunc zsh/zselect || return 1
+  local -F duration_value="$duration"
+  integer centiseconds=$(( int(duration_value * 100 + 0.999999999) ))
+  (( centiseconds > 0 )) || return 0
+  zselect -t "$centiseconds"
+  local result=$?
+  (( result == 1 )) && return 0
+  return "$result"
 }
 
 hindsight_stack_validate_port() {
@@ -203,9 +250,10 @@ hindsight_stack_prepare_private_state_directory() {
     print -ru2 -- "hindsight-embed-stack: ${label} has an unsafe existing ancestor: ${existing}"
     return 1
   }
-  local owner mode
-  owner="$(/usr/bin/stat -f '%u' "$existing")" || return 1
-  mode="$(/usr/bin/stat -f '%Lp' "$existing")" || return 1
+  local owner mode owner_mode
+  owner_mode="$(hindsight_stack_stat_owner_mode "$existing")" || return 1
+  owner="${owner_mode%%:*}"
+  mode="${owner_mode#*:}"
   (( owner == EUID || owner == 0 )) || return 1
   if (( (8#$mode & 8#0022) != 0 && !(owner == 0 && (8#$mode & 8#01000) != 0) )); then
     print -ru2 -- "hindsight-embed-stack: ${label} ancestor is writable by another user: ${existing}"
@@ -216,8 +264,9 @@ hindsight_stack_prepare_private_state_directory() {
   local ancestor="$path"
   while true; do
     if [[ -L "$ancestor" ]]; then
-      owner="$(/usr/bin/stat -f '%u' "$ancestor")" || return 1
-      mode="$(/usr/bin/stat -f '%Lp' "$ancestor")" || return 1
+      owner_mode="$(hindsight_stack_stat_owner_mode "$ancestor")" || return 1
+      owner="${owner_mode%%:*}"
+      mode="${owner_mode#*:}"
       (( owner == 0 && (8#$mode & 8#0022) == 0 )) || {
         print -ru2 -- "hindsight-embed-stack: ${label} contains an untrusted symlink: ${ancestor}"
         return 1
@@ -230,8 +279,9 @@ hindsight_stack_prepare_private_state_directory() {
       print -ru2 -- "hindsight-embed-stack: ${label} contains a symlink or non-directory: ${ancestor}"
       return 1
     }
-    owner="$(/usr/bin/stat -f '%u' "$ancestor")" || return 1
-    mode="$(/usr/bin/stat -f '%Lp' "$ancestor")" || return 1
+    owner_mode="$(hindsight_stack_stat_owner_mode "$ancestor")" || return 1
+    owner="${owner_mode%%:*}"
+    mode="${owner_mode#*:}"
     (( owner == EUID || owner == 0 )) || return 1
     if (( (8#$mode & 8#0022) != 0 && !(owner == 0 && (8#$mode & 8#01000) != 0) )); then
       print -ru2 -- "hindsight-embed-stack: ${label} ancestry is writable by another user: ${ancestor}"
@@ -240,7 +290,7 @@ hindsight_stack_prepare_private_state_directory() {
     [[ "$ancestor" == / ]] && break
     ancestor="${ancestor:h}"
   done
-  owner="$(/usr/bin/stat -f '%u' "$path")" || return 1
+  owner="$(hindsight_stack_stat_owner "$path")" || return 1
   (( owner == EUID )) || {
     print -ru2 -- "hindsight-embed-stack: ${label} must be current-user-owned: ${path}"
     return 1
@@ -287,7 +337,7 @@ hindsight_stack_write_private_state() {
     return 1
   fi
   [[ -f "$path" && ! -L "$path" ]] || return 1
-  [[ "$(/usr/bin/stat -f '%u:%Lp' "$path")" == "${EUID}:600" ]]
+  [[ "$(hindsight_stack_stat_owner_mode "$path")" == "${EUID}:600" ]]
 }
 
 hindsight_stack_set_desired_state() {
@@ -316,7 +366,7 @@ hindsight_stack_set_desired_state() {
 hindsight_stack_desired_state() {
   emulate -L zsh
   hindsight_stack_load_config || return 1
-  local component="$1" profile="${2:-$HINDSIGHT_EMBED_PROFILE}" path desired owner mode
+  local component="$1" profile="${2:-$HINDSIGHT_EMBED_PROFILE}" path desired owner mode owner_mode
   path="$(hindsight_stack_desired_state_path "$component" "$profile")" || return 1
   if [[ ! -e "$path" ]]; then
     case "$component" in
@@ -330,8 +380,9 @@ hindsight_stack_desired_state() {
     return 0
   fi
   [[ -f "$path" && ! -L "$path" ]] || return 1
-  owner="$(/usr/bin/stat -f '%u' "$path")" || return 1
-  mode="$(/usr/bin/stat -f '%Lp' "$path")" || return 1
+  owner_mode="$(hindsight_stack_stat_owner_mode "$path")" || return 1
+  owner="${owner_mode%%:*}"
+  mode="${owner_mode#*:}"
   (( owner == EUID && (8#$mode & 8#0077) == 0 )) || return 1
   desired="$(<"$path")"
   case "$desired" in
@@ -357,18 +408,24 @@ hindsight_stack_reset_desired_state() {
 
 hindsight_stack_startup_id() {
   emulate -L zsh
-  local audit_session boot_time
-  audit_session="$(
-    /bin/launchctl print "gui/${EUID}" 2>/dev/null |
-      /usr/bin/awk '/^[[:space:]]*asid = / && !found { print $3; found=1 } END { if (!found) exit 1 }'
-  )" || audit_session=""
+  local audit_session boot_marker
+  if [[ -x /bin/launchctl ]]; then
+    audit_session="$(
+      /bin/launchctl print "gui/${EUID}" 2>/dev/null |
+        /usr/bin/awk '/^[[:space:]]*asid = / && !found { print $3; found=1 } END { if (!found) exit 1 }'
+    )" || audit_session=""
+  fi
   if [[ -n "$audit_session" ]]; then
     print -r -- "asid:${audit_session}"
     return 0
   fi
-  boot_time="$(/usr/sbin/sysctl -n kern.boottime 2>/dev/null)" || return 1
-  [[ -n "$boot_time" ]] || return 1
-  print -r -- "boot:${boot_time}"
+  if [[ -r /proc/sys/kernel/random/boot_id ]]; then
+    boot_marker="$(</proc/sys/kernel/random/boot_id)" || return 1
+  else
+    boot_marker="$(/usr/sbin/sysctl -n kern.boottime 2>/dev/null)" || return 1
+  fi
+  [[ -n "$boot_marker" ]] || return 1
+  print -r -- "boot:${boot_marker}"
 }
 
 hindsight_stack_initialize_desired_state() {
@@ -379,7 +436,7 @@ hindsight_stack_initialize_desired_state() {
   startup_file="$HINDSIGHT_EMBED_DESIRED_STATE_DIR/startup-id"
   if [[ -e "$startup_file" ]]; then
     [[ -f "$startup_file" && ! -L "$startup_file" ]] || return 1
-    [[ "$(/usr/bin/stat -f '%u:%Lp' "$startup_file")" == "${EUID}:600" ]] || return 1
+    [[ "$(hindsight_stack_stat_owner_mode "$startup_file")" == "${EUID}:600" ]] || return 1
     previous="$(<"$startup_file")"
   fi
   if [[ "$previous" != "$startup_id" ]]; then
@@ -400,10 +457,11 @@ hindsight_stack_prepare_lifecycle_lock() {
   ( umask 077; /bin/mkdir -p "$state_dir" ) || return 1
   [[ -d "$state_dir" && ! -L "$state_dir" ]] || return 1
   /bin/chmod 700 "$state_dir" || return 1
-  local owner mode ancestor="$state_dir"
+  local owner mode owner_mode ancestor="$state_dir"
   while [[ "$ancestor" != / ]]; do
-    owner="$(/usr/bin/stat -f '%u' "$ancestor")" || return 1
-    mode="$(/usr/bin/stat -f '%Lp' "$ancestor")" || return 1
+    owner_mode="$(hindsight_stack_stat_owner_mode "$ancestor")" || return 1
+    owner="${owner_mode%%:*}"
+    mode="${owner_mode#*:}"
     (( owner == EUID || owner == 0 )) || return 1
     if (( (8#$mode & 8#0022) != 0 && !(owner == 0 && (8#$mode & 8#01000) != 0) )); then
       print -ru2 -- "hindsight-embed-stack: lifecycle state ancestry is untrusted: ${ancestor}"
@@ -418,7 +476,7 @@ hindsight_stack_prepare_lifecycle_lock() {
   fi
   ( umask 077; : >>"$lock_file" ) || return 1
   /bin/chmod 600 "$lock_file" || return 1
-  [[ "$(/usr/bin/stat -f '%u:%Lp' "$lock_file")" == "${EUID}:600" ]] || {
+  [[ "$(hindsight_stack_stat_owner_mode "$lock_file")" == "${EUID}:600" ]] || {
     print -ru2 -- "hindsight-embed-stack: lifecycle lock must be private and current-user-owned"
     return 1
   }
@@ -427,7 +485,7 @@ hindsight_stack_prepare_lifecycle_lock() {
 
 hindsight_stack_validate_creation_ancestry() {
   emulate -L zsh
-  local requested="$1" label="$2" candidate ancestor owner mode
+  local requested="$1" label="$2" candidate ancestor owner mode owner_mode
   for candidate in "${requested:h}" "${requested:A:h}"; do
     ancestor="$candidate"
     while [[ ! -e "$ancestor" && ! -L "$ancestor" && "$ancestor" != / ]]; do
@@ -435,7 +493,7 @@ hindsight_stack_validate_creation_ancestry() {
     done
     while [[ "$ancestor" != / ]]; do
       if [[ -L "$ancestor" ]]; then
-        owner="$(/usr/bin/stat -f '%u' "$ancestor")" || return 1
+        owner="$(hindsight_stack_stat_owner "$ancestor")" || return 1
         (( owner == 0 )) || {
           print -ru2 -- "hindsight-embed-stack: ${label} has an unsafe symlink ancestor: ${ancestor}"
           return 1
@@ -447,8 +505,9 @@ hindsight_stack_validate_creation_ancestry() {
         print -ru2 -- "hindsight-embed-stack: ${label} has an unsafe existing ancestor: ${ancestor}"
         return 1
       }
-      owner="$(/usr/bin/stat -f '%u' "$ancestor")" || return 1
-      mode="$(/usr/bin/stat -f '%Lp' "$ancestor")" || return 1
+      owner_mode="$(hindsight_stack_stat_owner_mode "$ancestor")" || return 1
+      owner="${owner_mode%%:*}"
+      mode="${owner_mode#*:}"
       (( owner == EUID || owner == 0 )) || return 1
       if (( (8#$mode & 8#0022) != 0 && !(owner == 0 && (8#$mode & 8#01000) != 0) )); then
         print -ru2 -- "hindsight-embed-stack: ${label} ancestry is untrusted: ${ancestor}"
@@ -483,74 +542,98 @@ hindsight_stack_with_lifecycle_lock() {
   return "$result"
 }
 
-hindsight_stack_run_with_credential_scope() {
+hindsight_stack_apply_credential_scope() {
   emulate -L zsh
   local scope="$1"
-  shift
   if [[ "$scope" != none && "$scope" != api && \
     "$scope" != ui-proxy && "$scope" != broker && \
     "$scope" != preflight ]]; then
     print -ru2 -- "hindsight-embed-stack: invalid credential scope: ${scope}"
     return 2
   fi
-  (
-    local data_name="${HINDSIGHT_MEMORY_DATA_PLANE_TOKEN_ENV:-}"
-    local mint_name="${HINDSIGHT_MEMORY_MINT_AUTHORITY_ENV:-}"
-    local ui_name="${HINDSIGHT_MEMORY_UI_ACCESS_KEY_ENV:-}"
-    local data_credential=''
-    local ui_credential=''
-    local mapped_name
-    if hindsight_stack_runtime_active; then
-      if [[ "$scope" == api || "$scope" == ui-proxy ]]; then
-        data_credential="${(P)data_name:-}"
-        if [[ -z "$data_credential" || "$data_credential" == *$'\n'* || \
-          "$data_credential" == *$'\r'* ]]; then
-          print -ru2 -- "hindsight-embed-stack: data-plane credential resolver is unavailable"
-          return 1
-        fi
-      fi
-      if [[ "$scope" == ui-proxy ]]; then
-        ui_credential="${(P)ui_name:-}"
-        if [[ -z "$ui_credential" || "$ui_credential" == *$'\n'* || \
-          "$ui_credential" == *$'\r'* ]]; then
-          print -ru2 -- "hindsight-embed-stack: UI access-key resolver is unavailable"
-          return 1
-        fi
-      fi
-      if [[ "$scope" == broker ]]; then
-        unset "$ui_name"
-        for mapped_name in \
-          HINDSIGHT_API_TENANT_API_KEY \
-          HINDSIGHT_CP_DATAPLANE_API_KEY HINDSIGHT_CP_ACCESS_KEY; do
-          [[ "$mapped_name" == "$data_name" || \
-            "$mapped_name" == "$mint_name" ]] || \
-            unset "$mapped_name"
-        done
-      elif [[ "$scope" == preflight ]]; then
-        for mapped_name in \
-          HINDSIGHT_API_TENANT_API_KEY \
-          HINDSIGHT_CP_DATAPLANE_API_KEY HINDSIGHT_CP_ACCESS_KEY; do
-          [[ "$mapped_name" == "$data_name" || \
-            "$mapped_name" == "$mint_name" || \
-            "$mapped_name" == "$ui_name" ]] || unset "$mapped_name"
-        done
-      else
-        unset "$data_name" "$mint_name" "$ui_name"
-        unset HINDSIGHT_API_TENANT_API_KEY \
-          HINDSIGHT_CP_DATAPLANE_API_KEY HINDSIGHT_CP_ACCESS_KEY
-        if [[ "$scope" == api ]]; then
-          export HINDSIGHT_API_TENANT_API_KEY="$data_credential"
-        elif [[ "$scope" == ui-proxy ]]; then
-          export HINDSIGHT_CP_DATAPLANE_API_KEY="$data_credential"
-          export HINDSIGHT_CP_ACCESS_KEY="$ui_credential"
-        fi
-      fi
-    else
-      unset HINDSIGHT_API_TENANT_API_KEY \
-        HINDSIGHT_CP_DATAPLANE_API_KEY HINDSIGHT_CP_ACCESS_KEY
-    fi
-    "$@"
+  local data_name="${HINDSIGHT_MEMORY_DATA_PLANE_TOKEN_ENV:-}"
+  local mint_name="${HINDSIGHT_MEMORY_MINT_AUTHORITY_ENV:-}"
+  local ui_name="${HINDSIGHT_MEMORY_UI_ACCESS_KEY_ENV:-}"
+  local data_credential=''
+  local mint_credential=''
+  local ui_credential=''
+  if hindsight_stack_runtime_active; then
+    [[ -n "$data_name" ]] && data_credential="${(P)data_name:-}"
+    [[ -n "$mint_name" ]] && mint_credential="${(P)mint_name:-}"
+    [[ -n "$ui_name" ]] && ui_credential="${(P)ui_name:-}"
+  fi
+
+  # The portable schema admits each of these secret destinations. Remove the
+  # complete set, plus the configured resolver destinations, before restoring
+  # only the credentials granted to the selected child scope.
+  local -a credential_names=(
+    HINDSIGHT_API_KEY
+    HINDSIGHT_DATA_PLANE_TOKEN
+    HINDSIGHT_MINT_AUTHORITY
+    HINDSIGHT_UI_ACCESS_KEY
+    HINDSIGHT_API_TENANT_API_KEY
+    HINDSIGHT_CP_DATAPLANE_API_KEY
+    HINDSIGHT_CP_ACCESS_KEY
   )
+  local credential_name
+  for credential_name in "$data_name" "$mint_name" "$ui_name"; do
+    [[ -n "$credential_name" ]] && credential_names+=("$credential_name")
+  done
+  unset "${credential_names[@]}"
+
+  if hindsight_stack_runtime_active; then
+    if [[ "$scope" == api || "$scope" == ui-proxy ]]; then
+      if [[ -z "$data_credential" || "$data_credential" == *$'\n'* || \
+        "$data_credential" == *$'\r'* ]]; then
+        print -ru2 -- "hindsight-embed-stack: data-plane credential resolver is unavailable"
+        return 1
+      fi
+    fi
+    if [[ "$scope" == ui-proxy ]]; then
+      if [[ -z "$ui_credential" || "$ui_credential" == *$'\n'* || \
+        "$ui_credential" == *$'\r'* ]]; then
+        print -ru2 -- "hindsight-embed-stack: UI access-key resolver is unavailable"
+        return 1
+      fi
+    fi
+    if [[ "$scope" == broker ]]; then
+      # The broker may hold only its resolver-bound data-plane and mint inputs.
+      [[ -n "$data_name" ]] && typeset -gx "${data_name}=${data_credential}"
+      [[ -n "$mint_name" ]] && typeset -gx "${mint_name}=${mint_credential}"
+    elif [[ "$scope" == preflight ]]; then
+      # Preflight validates the three resolver inputs without mapping credentials.
+      [[ -n "$data_name" ]] && typeset -gx "${data_name}=${data_credential}"
+      [[ -n "$mint_name" ]] && typeset -gx "${mint_name}=${mint_credential}"
+      [[ -n "$ui_name" ]] && typeset -gx "${ui_name}=${ui_credential}"
+    else
+      # Child services receive only their mapped credential, never resolver inputs.
+      if [[ "$scope" == api ]]; then
+        export HINDSIGHT_API_TENANT_API_KEY="$data_credential"
+      elif [[ "$scope" == ui-proxy ]]; then
+        export HINDSIGHT_CP_DATAPLANE_API_KEY="$data_credential"
+        export HINDSIGHT_CP_ACCESS_KEY="$ui_credential"
+      fi
+    fi
+  fi
+  return 0
+}
+
+hindsight_stack_run_with_credential_scope() {
+  emulate -L zsh
+  local scope="$1"
+  shift
+  (
+    hindsight_stack_apply_credential_scope "$scope" || exit $?
+    exec "$@"
+  )
+}
+
+hindsight_stack_exec_with_credential_scope() {
+  emulate -L zsh
+  local scope="$1"
+  shift
+  hindsight_stack_apply_credential_scope "$scope" || return $?
+  exec "$@"
 }
 
 hindsight_stack_preflight_runtime_credentials() {
@@ -745,7 +828,7 @@ hindsight_stack_require_trusted_artifact() {
       return 1
     }
     local link_owner
-    link_owner="$(/usr/bin/stat -f '%u' "$path")" || return 1
+    link_owner="$(hindsight_stack_stat_owner "$path")" || return 1
     (( link_owner == EUID || link_owner == 0 )) || {
       print -ru2 -- "hindsight-embed-stack: ${label} symlink is not trusted: ${path}"
       return 1
@@ -769,9 +852,10 @@ hindsight_stack_require_trusted_artifact() {
     }
   fi
 
-  local owner mode ancestor ancestor_root
-  owner="$(/usr/bin/stat -f '%u' "$resolved")" || return 1
-  mode="$(/usr/bin/stat -f '%Lp' "$resolved")" || return 1
+  local owner mode owner_mode ancestor ancestor_root
+  owner_mode="$(hindsight_stack_stat_owner_mode "$resolved")" || return 1
+  owner="${owner_mode%%:*}"
+  mode="${owner_mode#*:}"
   (( owner == EUID || owner == 0 )) || {
     print -ru2 -- "hindsight-embed-stack: ${label} owner is not trusted: ${path}"
     return 1
@@ -784,8 +868,9 @@ hindsight_stack_require_trusted_artifact() {
   for ancestor_root in "${path:h}" "${resolved:h}"; do
     ancestor="$ancestor_root"
     while [[ "$ancestor" != / ]]; do
-      owner="$(/usr/bin/stat -f '%u' "$ancestor")" || return 1
-      mode="$(/usr/bin/stat -f '%Lp' "$ancestor")" || return 1
+      owner_mode="$(hindsight_stack_stat_owner_mode "$ancestor")" || return 1
+      owner="${owner_mode%%:*}"
+      mode="${owner_mode#*:}"
       (( owner == EUID || owner == 0 )) || return 1
       if (( (8#$mode & 8#0022) != 0 && !(owner == 0 && (8#$mode & 8#01000) != 0) )); then
         print -ru2 -- "hindsight-embed-stack: ${label} ancestor is group or world writable: ${ancestor}"
@@ -808,6 +893,13 @@ hindsight_stack_require_tools() {
     print -ru2 -- "hindsight-embed-stack: missing /usr/bin/curl"
     return 1
   fi
+  local lsof_executable
+  lsof_executable="$(hindsight_stack_lsof_path)" || {
+    print -ru2 -- "hindsight-embed-stack: missing lsof at /usr/sbin/lsof or /usr/bin/lsof"
+    return 1
+  }
+  hindsight_stack_require_trusted_artifact \
+    "$lsof_executable" lsof executable allow-symlink || return 1
   hindsight_stack_require_trusted_artifact \
     "$HINDSIGHT_MEMORY_CLI" "memory controller" executable allow-symlink || return 1
   hindsight_stack_require_loopback || return 1
@@ -936,9 +1028,10 @@ hindsight_stack_profile_slot() {
     slot_parent="${slot_parent:h}"
   done
   if [[ "$slot_parent" != "$HINDSIGHT_EMBED_PROFILE_SLOT_DIR" ]]; then
-    local slot_parent_owner slot_parent_mode
-    slot_parent_owner="$(/usr/bin/stat -f '%u' "$slot_parent")" || return 1
-    slot_parent_mode="$(/usr/bin/stat -f '%Lp' "$slot_parent")" || return 1
+    local slot_parent_owner slot_parent_mode slot_parent_owner_mode
+    slot_parent_owner_mode="$(hindsight_stack_stat_owner_mode "$slot_parent")" || return 1
+    slot_parent_owner="${slot_parent_owner_mode%%:*}"
+    slot_parent_mode="${slot_parent_owner_mode#*:}"
     (( slot_parent_owner == EUID && (8#$slot_parent_mode & 8#0077) == 0 )) || {
       print -ru2 -- "hindsight-embed-stack: profile slot parent must be private and current-user-owned: ${slot_parent}"
       return 1
@@ -1322,21 +1415,23 @@ hindsight_stack_validate_trusted_metadata_file() {
     print -ru2 -- "hindsight-embed-stack: ${label} must be a readable regular file: ${path}"
     return 1
   }
-  local resolved="${path:A}" owner mode ancestor ancestor_root
+  local resolved="${path:A}" owner mode owner_mode ancestor ancestor_root
   [[ -f "$resolved" && ! -L "$resolved" && -r "$resolved" ]] || return 1
-  owner="$(/usr/bin/stat -f '%u' "$resolved")" || return 1
-  mode="$(/usr/bin/stat -f '%Lp' "$resolved")" || return 1
+  owner_mode="$(hindsight_stack_stat_owner_mode "$resolved")" || return 1
+  owner="${owner_mode%%:*}"
+  mode="${owner_mode#*:}"
   (( owner == EUID || owner == 0 )) || return 1
   (( (8#$mode & 8#0022) == 0 )) || return 1
   for ancestor_root in "${path:h}" "${resolved:h}"; do
     ancestor="$ancestor_root"
     while [[ "$ancestor" != / ]]; do
       if [[ -L "$ancestor" ]]; then
-        owner="$(/usr/bin/stat -f '%u' "$ancestor")" || return 1
+        owner="$(hindsight_stack_stat_owner "$ancestor")" || return 1
         (( owner == 0 )) || return 1
       fi
-      owner="$(/usr/bin/stat -f '%u' "$ancestor")" || return 1
-      mode="$(/usr/bin/stat -f '%Lp' "$ancestor")" || return 1
+      owner_mode="$(hindsight_stack_stat_owner_mode "$ancestor")" || return 1
+      owner="${owner_mode%%:*}"
+      mode="${owner_mode#*:}"
       (( owner == EUID || owner == 0 )) || return 1
       if (( (8#$mode & 8#0022) != 0 && !(owner == 0 && (8#$mode & 8#01000) != 0) )); then
         return 1
@@ -1389,20 +1484,22 @@ hindsight_stack_validate_trusted_executable() {
   }
   local resolved="${executable:A}"
   [[ -f "$resolved" && ! -L "$resolved" && -x "$resolved" ]] || return 1
-  local owner mode ancestor ancestor_root
-  owner="$(/usr/bin/stat -f '%u' "$resolved")" || return 1
-  mode="$(/usr/bin/stat -f '%Lp' "$resolved")" || return 1
+  local owner mode owner_mode ancestor ancestor_root
+  owner_mode="$(hindsight_stack_stat_owner_mode "$resolved")" || return 1
+  owner="${owner_mode%%:*}"
+  mode="${owner_mode#*:}"
   (( owner == EUID || owner == 0 )) || return 1
   (( (8#$mode & 8#0022) == 0 )) || return 1
   for ancestor_root in "${executable:h}" "${resolved:h}"; do
     ancestor="$ancestor_root"
     while [[ "$ancestor" != / ]]; do
       if [[ -L "$ancestor" ]]; then
-        owner="$(/usr/bin/stat -f '%u' "$ancestor")" || return 1
+        owner="$(hindsight_stack_stat_owner "$ancestor")" || return 1
         (( owner == 0 )) || return 1
       fi
-      owner="$(/usr/bin/stat -f '%u' "$ancestor")" || return 1
-      mode="$(/usr/bin/stat -f '%Lp' "$ancestor")" || return 1
+      owner_mode="$(hindsight_stack_stat_owner_mode "$ancestor")" || return 1
+      owner="${owner_mode%%:*}"
+      mode="${owner_mode#*:}"
       (( owner == EUID || owner == 0 )) || return 1
       if (( (8#$mode & 8#0022) != 0 && !(owner == 0 && (8#$mode & 8#01000) != 0) )); then
         return 1
@@ -1607,7 +1704,7 @@ hindsight_stack_wait_sidecars() {
     sleep_seconds=$(( deadline - $(/bin/date +%s) ))
     (( sleep_seconds > 0 )) || break
     (( sleep_seconds <= 2 )) || sleep_seconds=2
-    sleep "$sleep_seconds"
+    hindsight_stack_sleep "$sleep_seconds"
   done
   return 1
 }
@@ -1632,7 +1729,7 @@ hindsight_stack_wait_sidecars_stopped() {
     sleep_seconds=$(( deadline - $(/bin/date +%s) ))
     (( sleep_seconds > 0 )) || break
     (( sleep_seconds <= 2 )) || sleep_seconds=2
-    sleep "$sleep_seconds"
+    hindsight_stack_sleep "$sleep_seconds"
   done
   return 1
 }
@@ -1777,8 +1874,20 @@ hindsight_stack_port_listening() {
   emulate -L zsh
   local port="$1"
 
-  [[ -x /usr/sbin/lsof ]] || return 1
-  /usr/sbin/lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1
+  local lsof_executable
+  lsof_executable="$(hindsight_stack_lsof_path)" || return 1
+  "$lsof_executable" -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1
+}
+
+hindsight_stack_lsof_path() {
+  emulate -L zsh
+  local candidate
+  for candidate in /usr/sbin/lsof /usr/bin/lsof; do
+    [[ -x "$candidate" ]] || continue
+    print -r -- "$candidate"
+    return 0
+  done
+  return 1
 }
 
 hindsight_stack_control_status() {
@@ -1822,7 +1931,8 @@ hindsight_stack_broker_status() {
     arguments+=(--profile "$profile")
   done
   hindsight_stack_run_bounded "$probe_timeout" \
-    "$HINDSIGHT_MEMORY_CLI" "${arguments[@]}" >/dev/null 2>&1
+    "$HINDSIGHT_EMBED_PYTHON" -I "$HINDSIGHT_MEMORY_CLI" \
+    "${arguments[@]}" >/dev/null 2>&1
 }
 
 hindsight_stack_broker_runtime_arguments() {
@@ -2114,6 +2224,34 @@ hindsight_stack_broker_process_identity() {
 import ctypes
 import sys
 
+pid = int(sys.argv[1])
+if sys.platform == "linux":
+    try:
+        with open("/proc/sys/kernel/random/boot_id", encoding="ascii") as handle:
+            boot_id = handle.read(128).strip()
+        with open(f"/proc/{pid}/stat", encoding="ascii") as handle:
+            process_stat = handle.read(4096)
+    except (OSError, UnicodeError):
+        raise SystemExit(1)
+    closing_parenthesis = process_stat.rfind(")")
+    # The fields after the command name begin at kernel field 3; index 19 is
+    # field 22, the process start time in clock ticks since this boot.
+    stat_fields = process_stat[closing_parenthesis + 1 :].split()
+    if (
+        not boot_id
+        or ":" in boot_id
+        or closing_parenthesis < 0
+        or len(stat_fields) <= 19
+        or not stat_fields[19].isascii()
+        or not stat_fields[19].isdigit()
+    ):
+        raise SystemExit(1)
+    print(f"{boot_id}:{stat_fields[19]}")
+    raise SystemExit(0)
+
+if sys.platform != "darwin":
+    raise SystemExit(1)
+
 class ProcBsdInfo(ctypes.Structure):
     _fields_ = [
         ("flags", ctypes.c_uint32), ("status", ctypes.c_uint32),
@@ -2129,7 +2267,6 @@ class ProcBsdInfo(ctypes.Structure):
         ("start_tvusec", ctypes.c_uint64),
     ]
 
-pid = int(sys.argv[1])
 libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
 info = ProcBsdInfo()
 size = libproc.proc_pidinfo(pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info))
@@ -2144,7 +2281,7 @@ hindsight_stack_broker_read_process_record() {
   local record
   record="$(hindsight_stack_broker_process_record)" || return 1
   [[ -f "$record" && ! -L "$record" ]] || return 1
-  [[ "$(/usr/bin/stat -f '%u:%Lp' "$record")" == "${EUID}:600" ]] || return 1
+  [[ "$(hindsight_stack_stat_owner_mode "$record")" == "${EUID}:600" ]] || return 1
   local -a lines=("${(@f)$(<"$record")}")
   (( ${#lines} == 2 )) || return 1
   [[ "$lines[1]" == <-> && -n "$lines[2]" ]] || return 1
@@ -2195,7 +2332,7 @@ hindsight_stack_broker_terminate_started() {
   for attempt in {1..20}; do
     current="$(hindsight_stack_broker_process_identity "$pid")" || return 0
     [[ "$current" == "$expected" ]] || return 1
-    sleep 0.1
+    hindsight_stack_sleep 0.1
   done
   current="$(hindsight_stack_broker_process_identity "$pid")" || return 0
   [[ "$current" == "$expected" ]] || return 1
@@ -2226,11 +2363,11 @@ hindsight_stack_broker_wait_launch_barrier() {
   for attempt in {1..500}; do
     state="$(/bin/ps -o state= -p "$pid" 2>/dev/null)" || {
       kill -0 "$pid" >/dev/null 2>&1 || return 1
-      sleep 0.01
+      hindsight_stack_sleep 0.01
       continue
     }
     [[ "$state" == *T* ]] && return 0
-    sleep 0.01
+    hindsight_stack_sleep 0.01
   done
   return 1
 }
@@ -2298,17 +2435,19 @@ hindsight_stack_broker_start() {
   done
   hindsight_stack_broker_terminate_recorded || return 1
   hindsight_stack_broker_remove_stale_socket || return 1
-  hindsight_stack_run_with_credential_scope broker \
+  hindsight_stack_exec_with_credential_scope broker \
     "$HINDSIGHT_EMBED_PYTHON" -I -c '
 import os
 import signal
 import sys
 
-executable = sys.argv[1]
-arguments = sys.argv[1:]
+python = sys.argv[1]
+controller = sys.argv[2]
+arguments = [python, "-I", controller, *sys.argv[3:]]
 os.kill(os.getpid(), signal.SIGSTOP)
-os.execv(executable, arguments)
-' "$HINDSIGHT_MEMORY_CLI" "${arguments[@]}" >/dev/null 2>&1 &
+os.execv(python, arguments)
+' "$HINDSIGHT_EMBED_PYTHON" "$HINDSIGHT_MEMORY_CLI" \
+    "${arguments[@]}" >/dev/null 2>&1 &
   pid=$!
   broker_launch_owned=1
   hindsight_stack_broker_wait_launch_barrier "$pid" || {
@@ -2419,7 +2558,8 @@ hindsight_stack_broker_stop() {
   local outer_timeout=$(( HINDSIGHT_EMBED_STOP_WAIT_SECONDS + 5 ))
   local command_result=0
   hindsight_stack_run_bounded "$outer_timeout" \
-    "$HINDSIGHT_MEMORY_CLI" --state-dir "$HINDSIGHT_MEMORY_STATE_DIR" \
+    "$HINDSIGHT_EMBED_PYTHON" -I "$HINDSIGHT_MEMORY_CLI" \
+    --state-dir "$HINDSIGHT_MEMORY_STATE_DIR" \
     broker stop --socket "$HINDSIGHT_MEMORY_BROKER_SOCKET" \
     --timeout "$HINDSIGHT_EMBED_STOP_WAIT_SECONDS" || command_result=$?
   hindsight_stack_broker_terminate_recorded || return 1
@@ -2510,7 +2650,7 @@ hindsight_stack_wait_for() {
     sleep_seconds=$(( deadline - now ))
     (( sleep_seconds > 0 )) || break
     (( sleep_seconds <= 2 )) || sleep_seconds=2
-    sleep "$sleep_seconds"
+    hindsight_stack_sleep "$sleep_seconds"
   done
 
   return 1
@@ -2577,7 +2717,7 @@ hindsight_stack_wait_stopped_for() {
     sleep_seconds=$(( deadline - now ))
     (( sleep_seconds > 0 )) || break
     (( sleep_seconds <= 2 )) || sleep_seconds=2
-    sleep "$sleep_seconds"
+    hindsight_stack_sleep "$sleep_seconds"
   done
 
   return 1
@@ -3021,4 +3161,5 @@ hindsight_stack_status_report() {
   hindsight_stack_for_each_profile hindsight_stack_status_profile "$requested" || fleet_health=degraded
   print -r -- "fleet: ${fleet_health} (${profile_count} enabled ${profile_label})"
   print -rl -- "${profile_records[@]}"
+  [[ "$fleet_health" == healthy ]]
 }

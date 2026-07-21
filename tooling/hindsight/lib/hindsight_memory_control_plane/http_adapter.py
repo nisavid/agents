@@ -2213,15 +2213,13 @@ class HttpAdapter:
         if (
             set(response) != {
                 "success", "bank_id", "items_count", "async",
-                "operation_id", "operation_ids", "usage",
+                "operation_id",
             }
             or response["success"] is not True
             or response["bank_id"] != self._runtime_bank_id
             or type(response["items_count"]) is not int
             or response["items_count"] != 1
             or response["async"] is not True
-            or response["operation_ids"] is not None
-            or response["usage"] is not None
             or not isinstance(operation_id, str)
             or not self._runtime_uuid(operation_id)
         ):

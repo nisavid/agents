@@ -1,0 +1,114 @@
+{
+  "archetype": {
+    "id": "trusted-workstation"
+  },
+  "banks": [
+    {
+      "authority": "authoritative",
+      "data_class": "engineering",
+      "enable_auto_consolidation": true,
+      "id": "engineering",
+      "profile_id": "core",
+      "writable": true
+    }
+  ],
+  "harnesses": [
+    {
+      "home_bank": {
+        "bank_id": "engineering",
+        "profile_id": "core"
+      },
+      "id": "codex",
+      "profile_id": "core",
+      "write_bank": {
+        "bank_id": "engineering",
+        "profile_id": "core"
+      }
+    },
+    {
+      "home_bank": {
+        "bank_id": "engineering",
+        "profile_id": "core"
+      },
+      "id": "claude-code",
+      "profile_id": "core",
+      "write_bank": {
+        "bank_id": "engineering",
+        "profile_id": "core"
+      }
+    },
+    {
+      "home_bank": {
+        "bank_id": "engineering",
+        "profile_id": "core"
+      },
+      "id": "cursor",
+      "profile_id": "core",
+      "write_bank": {
+        "bank_id": "engineering",
+        "profile_id": "core"
+      }
+    }
+  ],
+  "machine": {
+    "base_port": 7979,
+    "engineering_memory_enabled": true,
+    "id": "example-workstation"
+  },
+  "migration": {
+    "artifact_dir": "/absolute/path/to/hindsight-state/migration/artifacts",
+    "proposal_log": "/absolute/path/to/hindsight-state/migration/proposals.md"
+  },
+  "policy": {
+    "allowed_placements": {
+      "engineering": [
+        "local",
+        "private-remote"
+      ]
+    },
+    "engineering_memory_enabled": true
+  },
+  "profiles": [
+    {
+      "data_classes": [
+        "engineering"
+      ],
+      "enabled": true,
+      "host": "127.0.0.1",
+      "id": "core",
+      "roles": {
+        "embedding": "local-embedding",
+        "llm": "private-llm",
+        "reranking": "local-reranker"
+      },
+      "slot": 0
+    }
+  ],
+  "providers": [
+    {
+      "data_classes": [
+        "engineering"
+      ],
+      "id": "private-llm",
+      "placement": "private-remote",
+      "role": "llm"
+    },
+    {
+      "data_classes": [
+        "engineering"
+      ],
+      "id": "local-embedding",
+      "placement": "local",
+      "role": "embedding"
+    },
+    {
+      "data_classes": [
+        "engineering"
+      ],
+      "id": "local-reranker",
+      "placement": "local",
+      "role": "reranking"
+    }
+  ],
+  "schema_version": 1
+}

@@ -10,7 +10,11 @@ import re
 from types import MappingProxyType
 from typing import Any
 
-from .broker import CAPABILITY_METHODS, MINT_REQUEST_KEYS
+from .broker import (
+    CAPABILITY_METHODS,
+    MAX_SESSION_TTL_SECONDS,
+    MINT_REQUEST_KEYS,
+)
 from .canonical import digest
 from .http_adapter import HttpAdapter
 from .model import Inventory, deep_freeze, deep_thaw
@@ -322,7 +326,7 @@ def compile_runtime_configuration(
             or not control_capability.isascii()
             or not hmac.compare_digest(authority, control_capability)
             or type(ttl_seconds) not in (int, float)
-            or not 0 < ttl_seconds <= 300
+            or not 0 < ttl_seconds <= MAX_SESSION_TTL_SECONDS
             or not isinstance(requested, Mapping)
             or set(requested) != MINT_REQUEST_KEYS
             or any(

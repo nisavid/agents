@@ -27,9 +27,11 @@ from hindsight_memory_control_plane.broker import (
     append_record_once,
     Broker,
     BrokerError,
+    DEFAULT_SESSION_TTL_SECONDS,
     MIN_PAYLOAD_BYTES,
     MAX_REQUEST_SEQUENCE,
     MAX_SESSION_ACTION_IDS,
+    MAX_SESSION_TTL_SECONDS,
     MAX_PAYLOAD_BYTES,
 )
 from hindsight_memory_control_plane.canonical import canonical_bytes
@@ -70,7 +72,7 @@ def authorize_mint(control, requested, ttl):
     if (
         control != "control"
         or requested.get("route") != "local-core"
-        or ttl > 60
+        or ttl > MAX_SESSION_TTL_SECONDS
     ):
         return {}
     methods = ["recall"] if requested["session_id"] == "limited" else METHODS
@@ -107,6 +109,38 @@ class BrokerSocketTest(unittest.TestCase):
         self.server = UnixJsonRpcServer(self.socket_path, self.broker)
         self.server.start()
         self.client = JsonRpcClient(self.socket_path)
+
+    def test_session_mint_cli_uses_the_operational_session_ttl_default(self):
+        parser = runpy.run_path(str(ROOT / "bin/hindsight-memory"))["parser"]()
+        arguments = parser.parse_args(
+            [
+                "--state-dir",
+                str(self.state),
+                "session",
+                "mint",
+                "--socket",
+                str(self.socket_path),
+                "--request",
+                "{}",
+            ]
+        )
+        self.assertEqual(arguments.ttl_seconds, DEFAULT_SESSION_TTL_SECONDS)
+        for invalid in ("nan", "inf", "0", str(MAX_SESSION_TTL_SECONDS + 1)):
+            with self.subTest(invalid=invalid), self.assertRaises(SystemExit):
+                parser.parse_args(
+                    [
+                        "--state-dir",
+                        str(self.state),
+                        "session",
+                        "mint",
+                        "--socket",
+                        str(self.socket_path),
+                        "--request",
+                        "{}",
+                        "--ttl-seconds",
+                        invalid,
+                    ]
+                )
 
     def stop(self):
         self.server.close()
@@ -1062,6 +1096,55 @@ class BrokerSocketTest(unittest.TestCase):
             )
         self.assertEqual(tuple(handles.iterdir()), before)
 
+    def test_session_ttl_supports_a_bounded_full_workday(self):
+        original = self.broker._mint_authorizer
+        self.broker._mint_authorizer = lambda control, requested, _ttl: (
+            authority_claims(**requested) if control == "control" else {}
+        )
+        try:
+            issued_after = time.time()
+            minted = self.broker.session_mint(
+                "control",
+                claims(session_id="workday-session"),
+                ttl_seconds=DEFAULT_SESSION_TTL_SECONDS,
+            )
+            self.assertRegex(minted["payload"]["handle"], r"^[0-9a-f]{64}$")
+            self.assertGreaterEqual(
+                minted["payload"]["expires_at"],
+                issued_after + DEFAULT_SESSION_TTL_SECONDS,
+            )
+            maximum = self.broker.session_mint(
+                "control",
+                claims(session_id="maximum-session"),
+                ttl_seconds=MAX_SESSION_TTL_SECONDS,
+            )
+            self.assertRegex(maximum["payload"]["handle"], r"^[0-9a-f]{64}$")
+            with self.assertRaisesRegex(BrokerError, "SCHEMA_INVALID"):
+                self.broker.session_mint(
+                    "control",
+                    claims(session_id="unbounded-session"),
+                    ttl_seconds=MAX_SESSION_TTL_SECONDS + 1,
+                )
+        finally:
+            self.broker._mint_authorizer = original
+
+    def test_omitted_session_ttl_uses_the_twelve_hour_default(self):
+        observed = []
+        original = self.broker._mint_authorizer
+
+        def authorize(control, requested, ttl):
+            observed.append(ttl)
+            return authority_claims(**requested) if control == "control" else {}
+
+        self.broker._mint_authorizer = authorize
+        try:
+            self.broker.session_mint(
+                "control", claims(session_id="default-workday")
+            )
+        finally:
+            self.broker._mint_authorizer = original
+        self.assertEqual(observed, [DEFAULT_SESSION_TTL_SECONDS])
+
     def test_legacy_exchange_result_is_migrated_to_a_signed_receipt(self):
         minted = self.broker.session_mint("control", claims())
         handle = minted["payload"]["handle"]
@@ -1861,7 +1944,7 @@ class DurableWorkTest(unittest.TestCase):
 
     def authorize_mint(self, control, requested, ttl):
         route = self.broker.routes.get(requested.get("route"))
-        if control != "control" or route is None or ttl > 60:
+        if control != "control" or route is None or ttl > MAX_SESSION_TTL_SECONDS:
             return {}
         methods = ["recall"] if requested["session_id"] == "limited" else METHODS
         return authority_claims(

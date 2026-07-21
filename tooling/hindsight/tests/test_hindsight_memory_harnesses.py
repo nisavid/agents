@@ -1,7 +1,10 @@
 import json
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
+import os
+import stat
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -11,17 +14,23 @@ LIB = ROOT / "lib"
 if str(LIB) not in sys.path:
     sys.path.insert(0, str(LIB))
 
-from hindsight_memory_control_plane.harnesses import (
+from hindsight_memory_control_plane.harnesses import (  # noqa: E402
     ActivationCASMismatch,
+    NativeActivationPlan,
     OWNED_KEYS,
     apply_activation,
     activation_plan,
+    apply_native_activation,
+    native_activation_plan,
+    render_native_harness_artifact,
+    stage_native_harness_artifacts,
+    verify_native_harness_generation,
     render_harness,
     render_harnesses,
     rollback_activation,
 )
-from hindsight_memory_control_plane.canonical import digest
-from hindsight_memory_control_plane.model import deep_thaw
+from hindsight_memory_control_plane.canonical import digest  # noqa: E402
+from hindsight_memory_control_plane.model import deep_thaw  # noqa: E402
 
 
 DIGESTS = {
@@ -166,6 +175,123 @@ class HarnessRenderingTest(unittest.TestCase):
             self.assertNotIn(forbidden, json.dumps(serialized))
         self.assertNotIn("nested-secret", repr(outcome))
         self.assertNotIn("password-secret", repr(outcome))
+
+    def test_native_artifacts_use_only_controller_hooks_and_disable_upstream_authority(self):
+        artifacts = {
+            harness: render_native_harness_artifact(
+                harness,
+                executable="/opt/hindsight/bin/hindsight-memory",
+                state_dir="/var/lib/hindsight-controller",
+                locator_dir="/run/user/1000/hindsight-locators",
+            )
+            for harness in ("codex", "claude-code", "cursor")
+        }
+        for harness, artifact in artifacts.items():
+            with self.subTest(harness=harness):
+                rendered = deep_thaw(artifact.rendered)
+                serialized = json.dumps(rendered)
+                self.assertIn(f"harness {harness}", serialized)
+                self.assertNotIn("http://", serialized)
+                self.assertNotIn("https://", serialized)
+                self.assertNotIn("bankId", serialized)
+                self.assertNotIn("token", serialized.lower())
+                self.assertFalse(rendered["settings"]["autoRecall"])
+                self.assertFalse(rendered["settings"]["autoRetain"])
+                self.assertTrue(rendered["controllerOwned"])
+        self.assertFalse(
+            deep_thaw(artifacts["claude-code"].rendered)["settings"]["enableKnowledgeTools"]
+        )
+        codex_hooks = deep_thaw(artifacts["codex"].rendered)["hooks"]["hooks"]
+        self.assertIn("PreCompact", codex_hooks)
+        self.assertNotIn("SessionEnd", codex_hooks)
+        self.assertNotIn("async", codex_hooks["Stop"][0]["hooks"][0])
+        claude_hooks = deep_thaw(artifacts["claude-code"].rendered)["hooks"]["hooks"]
+        self.assertIn("SessionEnd", claude_hooks)
+        cursor = deep_thaw(artifacts["cursor"].rendered)
+        self.assertEqual(
+            set(cursor["tools"]),
+            {"recall", "reflect", "model", "status"},
+        )
+        self.assertIn("sessionStart", cursor["hooks"]["hooks"])
+        self.assertIn("preCompact", cursor["hooks"]["hooks"])
+        self.assertNotIn("UserPromptSubmit", cursor["hooks"]["hooks"])
+
+    def test_native_artifact_serialization_exposes_digests_not_commands_or_paths(self):
+        artifact = render_native_harness_artifact(
+            "codex",
+            executable="/private/controller/hindsight-memory",
+            state_dir="/private/controller/state",
+            locator_dir="/private/controller/locators",
+        )
+        serialized = artifact.to_dict()
+        self.assertEqual(
+            set(serialized),
+            {"schema_version", "harness_id", "artifact_digest", "hooks_digest", "settings_digest", "tools_digest"},
+        )
+        self.assertNotIn("/private/controller", json.dumps(serialized))
+
+    def test_native_artifacts_stage_as_one_immutable_content_addressed_tree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            os.chmod(root, 0o700)
+            artifacts = {
+                harness: render_native_harness_artifact(
+                    harness,
+                    executable="/opt/hindsight/bin/hindsight-memory",
+                    state_dir="/var/lib/hindsight-controller",
+                    locator_dir="/run/user/1000/hindsight-locators",
+                )
+                for harness in ("codex", "claude-code", "cursor")
+            }
+            staged = stage_native_harness_artifacts(root, artifacts)
+            self.assertRegex(staged.name, r"^[0-9a-f]{64}$")
+            self.assertEqual(stage_native_harness_artifacts(root, artifacts), staged)
+            for harness in artifacts:
+                for name in ("hooks.json", "settings.json", "tools.json", "artifact.json"):
+                    path = staged / harness / name
+                    self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            manifest = json.loads((staged / "manifest.json").read_text())
+            self.assertEqual(set(manifest["artifacts"]), set(artifacts))
+            serialized = json.dumps(manifest).lower()
+            self.assertNotIn("/opt/", serialized)
+            self.assertNotIn("bank", serialized)
+            self.assertNotIn("token", serialized)
+            verified = verify_native_harness_generation(staged)
+            self.assertEqual(set(verified), set(artifacts))
+
+            original_lstat = Path.lstat
+
+            def remove_during_verification(path):
+                if path == staged / "codex":
+                    raise FileNotFoundError(path)
+                return original_lstat(path)
+
+            with patch.object(Path, "lstat", remove_during_verification):
+                with self.assertRaisesRegex(
+                    ValueError, "staged harness directory is invalid"
+                ):
+                    verify_native_harness_generation(staged)
+
+            (staged / "codex" / "hooks.json").write_text("{}", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "digest|conflict"):
+                verify_native_harness_generation(staged)
+            with self.assertRaisesRegex(ValueError, "digest|conflict"):
+                stage_native_harness_artifacts(root, artifacts)
+
+    def test_native_artifacts_reject_a_symlinked_staging_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            actual = Path(directory) / "actual"
+            actual.mkdir(mode=0o700)
+            linked = Path(directory) / "linked"
+            linked.symlink_to(actual, target_is_directory=True)
+            artifact = render_native_harness_artifact(
+                "codex",
+                executable="/opt/hindsight/bin/hindsight-memory",
+                state_dir="/var/lib/hindsight-controller",
+                locator_dir="/run/user/1000/hindsight-locators",
+            )
+            with self.assertRaisesRegex(ValueError, "private current-user"):
+                stage_native_harness_artifacts(linked, {"codex": artifact})
 
 
 class HarnessActivationTest(unittest.TestCase):
@@ -981,6 +1107,458 @@ class HarnessActivationTest(unittest.TestCase):
         self.assertNotIn("configuration", outcome.to_dict())
         self.assertEqual(outcome.configuration["hindsightApiUrl"], "http://localhost:7979")
         self.assertIs(outcome.configuration["active"], False)
+
+
+class NativeHarnessActivationTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.staging_root = Path(self.temporary.name)
+        os.chmod(self.staging_root, 0o700)
+        self.artifact = render_native_harness_artifact(
+            "claude-code",
+            executable="/opt/hindsight/bin/hindsight-memory",
+            state_dir="/var/lib/hindsight-controller",
+            locator_dir="/run/user/1000/hindsight-locators",
+        )
+        self.current = {
+            "hooks": {
+                "hooks": {
+                    "SessionStart": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/session_start.py\" || python \"${CLAUDE_PLUGIN_ROOT}/scripts/session_start.py\"",
+                                    "timeout": 5,
+                                }
+                            ]
+                        }
+                    ],
+                    "UserPromptSubmit": [
+                        {"hooks": [{"type": "command", "command": "third-party recall", "timeout": 3}]},
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "python3 \"/tmp/hindsight-unrelated/scripts/retain.py\"",
+                                    "timeout": 4,
+                                }
+                            ]
+                        },
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/recall.py\" || python \"${CLAUDE_PLUGIN_ROOT}/scripts/recall.py\"",
+                                    "timeout": 12,
+                                }
+                            ]
+                        },
+                    ],
+                    "Stop": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/retain.py\" || python \"${CLAUDE_PLUGIN_ROOT}/scripts/retain.py\"",
+                                    "timeout": 15,
+                                    "async": True,
+                                }
+                            ]
+                        }
+                    ],
+                },
+                "thirdPartyManifest": True,
+            },
+            "settings": {
+                "theme": "warm",
+                "autoRecall": True,
+                "autoRetain": True,
+                "enableKnowledgeTools": True,
+            },
+            "tools": {"unrelated": {"command": "other-tool"}},
+            "registrations": [{"id": "unrelated"}],
+        }
+        self.staged_generation = stage_native_harness_artifacts(
+            self.staging_root, {"claude-code": self.artifact}
+        )
+        self.plan = native_activation_plan(
+            self.artifact,
+            self.current,
+            staged_generation=self.staged_generation,
+            **DIGESTS,
+        )
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def test_plan_semantically_merges_only_memory_owned_surfaces(self):
+        self.assertIsInstance(self.plan, NativeActivationPlan)
+        target = deep_thaw(self.plan.target)
+        self.assertEqual(target["settings"]["theme"], "warm")
+        self.assertFalse(target["settings"]["autoRecall"])
+        self.assertFalse(target["settings"]["autoRetain"])
+        self.assertFalse(target["settings"]["enableKnowledgeTools"])
+        self.assertEqual(target["registrations"], [{"id": "unrelated"}])
+        self.assertIn("unrelated", target["tools"])
+        prompt_hooks = target["hooks"]["hooks"]["UserPromptSubmit"]
+        self.assertEqual(prompt_hooks[0]["hooks"][0]["command"], "third-party recall")
+        self.assertEqual(len(prompt_hooks), 3)
+        self.assertIn("hindsight-unrelated", prompt_hooks[1]["hooks"][0]["command"])
+        self.assertIn("hindsight-memory", prompt_hooks[2]["hooks"][0]["command"])
+        serialized_hooks = json.dumps(target["hooks"])
+        self.assertNotIn("CLAUDE_PLUGIN_ROOT", serialized_hooks)
+        self.assertNotIn("SessionStart", target["hooks"]["hooks"])
+        self.assertFalse(target["settings"]["enableKnowledgeTools"])
+        self.assertNotEqual(self.plan.retired_direct_hooks_digest, digest({}))
+        self.assertEqual(
+            self.plan.staged_generation_digest,
+            self.staged_generation.name,
+        )
+        self.assertNotIn("/opt/hindsight", json.dumps(self.plan.to_dict()))
+
+    def test_plan_rejects_an_unverified_or_corrupt_staged_generation(self):
+        (self.staged_generation / "claude-code" / "tools.json").unlink()
+        with self.assertRaisesRegex(ValueError, "unavailable|unexpected|invalid"):
+            native_activation_plan(
+                self.artifact,
+                self.current,
+                staged_generation=self.staged_generation,
+                **DIGESTS,
+            )
+
+    def test_plan_retires_absolute_hooks_only_under_verified_integration_roots(self):
+        integration_root = self.staging_root / "upstream-integration"
+        scripts = integration_root / "scripts"
+        scripts.mkdir(parents=True, mode=0o700)
+        (scripts / "recall.py").write_text("# upstream\n", encoding="utf-8")
+        current = deep_thaw(self.current)
+        current["hooks"]["hooks"]["UserPromptSubmit"].append(
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": f'python3 "{scripts / "recall.py"}"',
+                        "timeout": 12,
+                    }
+                ]
+            }
+        )
+        plan = native_activation_plan(
+            self.artifact,
+            current,
+            staged_generation=self.staged_generation,
+            upstream_integration_roots=(integration_root,),
+            **DIGESTS,
+        )
+        self.assertNotIn(
+            str(integration_root),
+            json.dumps(deep_thaw(plan.target)["hooks"]),
+        )
+
+    def test_plan_rejects_degenerate_roots_and_preserves_substring_matches(self):
+        with self.assertRaisesRegex(ValueError, "unsafe|unavailable"):
+            native_activation_plan(
+                self.artifact,
+                self.current,
+                staged_generation=self.staged_generation,
+                upstream_integration_roots=(Path("/"),),
+                **DIGESTS,
+            )
+
+        integration_root = self.staging_root / "verified-upstream"
+        scripts = integration_root / "scripts"
+        scripts.mkdir(parents=True, mode=0o700)
+        script = scripts / "retain.py"
+        script.write_text("# upstream\n", encoding="utf-8")
+        current = deep_thaw(self.current)
+        malicious = {
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": f'python3 "{script}.old"',
+                    "timeout": 12,
+                }
+            ]
+        }
+        current["hooks"]["hooks"]["Stop"].append(malicious)
+        plan = native_activation_plan(
+            self.artifact,
+            current,
+            staged_generation=self.staged_generation,
+            upstream_integration_roots=(integration_root,),
+            **DIGESTS,
+        )
+        self.assertIn(malicious, deep_thaw(plan.target)["hooks"]["hooks"]["Stop"])
+
+    def test_apply_uses_cas_readback_and_postcheck(self):
+        persisted = deep_thaw(self.current)
+        rollback = []
+
+        def write(expected_digest, value):
+            nonlocal persisted
+            if digest(persisted) != expected_digest:
+                raise ActivationCASMismatch("changed")
+            persisted = deep_thaw(value)
+
+        outcome = apply_native_activation(
+            self.plan,
+            self.current,
+            staged_generation=self.staged_generation,
+            approved_plan_digest=self.plan.plan_digest,
+            inventory_digest=DIGESTS["inventory_digest"],
+            artifact_digest=DIGESTS["artifact_digest"],
+            policy_digest=DIGESTS["policy_digest"],
+            broker_healthy=True,
+            profile_healthy=True,
+            adapter_self_test=True,
+            persist_rollback=lambda value: rollback.append(deep_thaw(value)),
+            read_rollback=lambda: deep_thaw(rollback[-1]),
+            read_configuration=lambda: deep_thaw(persisted),
+            write_configuration=write,
+            postcheck=lambda plan_digest, target_digest, harness: (
+                plan_digest == self.plan.plan_digest
+                and target_digest == self.plan.target_digest
+                and harness == "claude-code"
+            ),
+        )
+        self.assertEqual((outcome.status, outcome.reason), ("activated", "ok"))
+        self.assertEqual(rollback, [self.current])
+        self.assertEqual(persisted, deep_thaw(self.plan.target))
+
+    def test_failed_postcheck_restores_exact_prestate(self):
+        persisted = deep_thaw(self.current)
+        rollback = []
+
+        def write(expected_digest, value):
+            nonlocal persisted
+            if digest(persisted) != expected_digest:
+                raise ActivationCASMismatch("changed")
+            persisted = deep_thaw(value)
+
+        outcome = apply_native_activation(
+            self.plan,
+            self.current,
+            staged_generation=self.staged_generation,
+            approved_plan_digest=self.plan.plan_digest,
+            inventory_digest=DIGESTS["inventory_digest"],
+            artifact_digest=DIGESTS["artifact_digest"],
+            policy_digest=DIGESTS["policy_digest"],
+            broker_healthy=True,
+            profile_healthy=True,
+            adapter_self_test=True,
+            persist_rollback=lambda value: rollback.append(deep_thaw(value)),
+            read_rollback=lambda: deep_thaw(rollback[-1]),
+            read_configuration=lambda: deep_thaw(persisted),
+            write_configuration=write,
+            postcheck=lambda *_: False,
+        )
+        self.assertEqual((outcome.status, outcome.reason), ("rolled_back", "postcheck_failed"))
+        self.assertTrue(outcome.rollback_attempted)
+        self.assertTrue(outcome.rollback_succeeded)
+        self.assertEqual(persisted, self.current)
+
+    def test_write_then_raise_rolls_back_the_possibly_persisted_target(self):
+        persisted = deep_thaw(self.current)
+        rollback = []
+        writes = 0
+
+        def write(expected_digest, value):
+            nonlocal persisted, writes
+            if digest(persisted) != expected_digest:
+                raise ActivationCASMismatch("changed")
+            persisted = deep_thaw(value)
+            writes += 1
+            if writes == 1:
+                raise OSError("interrupted after persistence")
+
+        outcome = apply_native_activation(
+            self.plan,
+            self.current,
+            staged_generation=self.staged_generation,
+            approved_plan_digest=self.plan.plan_digest,
+            inventory_digest=DIGESTS["inventory_digest"],
+            artifact_digest=DIGESTS["artifact_digest"],
+            policy_digest=DIGESTS["policy_digest"],
+            broker_healthy=True,
+            profile_healthy=True,
+            adapter_self_test=True,
+            persist_rollback=lambda value: rollback.append(deep_thaw(value)),
+            read_rollback=lambda: deep_thaw(rollback[-1]),
+            read_configuration=lambda: deep_thaw(persisted),
+            write_configuration=write,
+            postcheck=lambda *_: True,
+        )
+        self.assertEqual(
+            (outcome.status, outcome.reason),
+            ("rolled_back", "activation_write_failed"),
+        )
+        self.assertTrue(outcome.rollback_succeeded)
+        self.assertEqual(persisted, self.current)
+
+    def test_partial_surface_write_rolls_back_exact_hook_order(self):
+        persisted = deep_thaw(self.current)
+        rollback = []
+        writes = 0
+
+        def write(expected_digest, value):
+            nonlocal writes
+            if digest(persisted) != expected_digest:
+                raise ActivationCASMismatch("changed")
+            writes += 1
+            if writes == 1:
+                persisted["hooks"] = deep_thaw(value["hooks"])
+                raise OSError("interrupted after hooks")
+            persisted.clear()
+            persisted.update(deep_thaw(value))
+
+        outcome = apply_native_activation(
+            self.plan,
+            self.current,
+            staged_generation=self.staged_generation,
+            approved_plan_digest=self.plan.plan_digest,
+            inventory_digest=DIGESTS["inventory_digest"],
+            artifact_digest=DIGESTS["artifact_digest"],
+            policy_digest=DIGESTS["policy_digest"],
+            broker_healthy=True,
+            profile_healthy=True,
+            adapter_self_test=True,
+            persist_rollback=lambda value: rollback.append(deep_thaw(value)),
+            read_rollback=lambda: deep_thaw(rollback[-1]),
+            read_configuration=lambda: deep_thaw(persisted),
+            write_configuration=write,
+            postcheck=lambda *_: True,
+        )
+        self.assertEqual(outcome.status, "rolled_back")
+        self.assertEqual(persisted["hooks"], self.current["hooks"])
+
+    def test_partial_rollback_restores_duplicate_direct_hook_occurrences(self):
+        current = deep_thaw(self.current)
+        upstream = deep_thaw(current["hooks"]["hooks"]["Stop"][0])
+        current["hooks"]["hooks"]["Stop"].insert(0, deep_thaw(upstream))
+        plan = native_activation_plan(
+            self.artifact,
+            current,
+            staged_generation=self.staged_generation,
+            **DIGESTS,
+        )
+        persisted = deep_thaw(current)
+        rollback = []
+        writes = 0
+
+        def write(expected_digest, value):
+            nonlocal writes
+            if digest(persisted) != expected_digest:
+                raise ActivationCASMismatch("changed")
+            writes += 1
+            if writes == 1:
+                partial = deep_thaw(value)
+                partial["hooks"]["hooks"]["Stop"].insert(
+                    0, deep_thaw(upstream)
+                )
+                persisted.clear()
+                persisted.update(partial)
+                raise OSError("interrupted with one duplicate restored")
+            persisted.clear()
+            persisted.update(deep_thaw(value))
+
+        outcome = apply_native_activation(
+            plan,
+            current,
+            staged_generation=self.staged_generation,
+            approved_plan_digest=plan.plan_digest,
+            inventory_digest=DIGESTS["inventory_digest"],
+            artifact_digest=DIGESTS["artifact_digest"],
+            policy_digest=DIGESTS["policy_digest"],
+            broker_healthy=True,
+            profile_healthy=True,
+            adapter_self_test=True,
+            persist_rollback=lambda value: rollback.append(deep_thaw(value)),
+            read_rollback=lambda: deep_thaw(rollback[-1]),
+            read_configuration=lambda: deep_thaw(persisted),
+            write_configuration=write,
+            postcheck=lambda *_: True,
+        )
+        self.assertEqual(outcome.status, "rolled_back")
+        self.assertEqual(persisted["hooks"], current["hooks"])
+
+    def test_true_postcheck_requires_a_final_exact_readback(self):
+        persisted = deep_thaw(self.current)
+        rollback = []
+
+        def write(expected_digest, value):
+            nonlocal persisted
+            if digest(persisted) != expected_digest:
+                raise ActivationCASMismatch("changed")
+            persisted = deep_thaw(value)
+
+        def drifting_postcheck(*_):
+            persisted["settings"]["theme"] = "cool"
+            return True
+
+        outcome = apply_native_activation(
+            self.plan,
+            self.current,
+            staged_generation=self.staged_generation,
+            approved_plan_digest=self.plan.plan_digest,
+            inventory_digest=DIGESTS["inventory_digest"],
+            artifact_digest=DIGESTS["artifact_digest"],
+            policy_digest=DIGESTS["policy_digest"],
+            broker_healthy=True,
+            profile_healthy=True,
+            adapter_self_test=True,
+            persist_rollback=lambda value: rollback.append(deep_thaw(value)),
+            read_rollback=lambda: deep_thaw(rollback[-1]),
+            read_configuration=lambda: deep_thaw(persisted),
+            write_configuration=write,
+            postcheck=drifting_postcheck,
+        )
+        self.assertEqual(
+            (outcome.status, outcome.reason),
+            ("rolled_back", "postcheck_drift"),
+        )
+        self.assertEqual(persisted["settings"]["theme"], "cool")
+        self.assertTrue(persisted["settings"]["autoRecall"])
+
+    def test_postcheck_rollback_preserves_concurrent_unrelated_changes(self):
+        persisted = deep_thaw(self.current)
+        rollback = []
+
+        def write(expected_digest, value):
+            nonlocal persisted
+            if digest(persisted) != expected_digest:
+                raise ActivationCASMismatch("changed")
+            persisted = deep_thaw(value)
+
+        def postcheck(*_):
+            persisted["settings"]["theme"] = "cool"
+            persisted["registrations"].append({"id": "concurrent"})
+            return False
+
+        outcome = apply_native_activation(
+            self.plan,
+            self.current,
+            staged_generation=self.staged_generation,
+            approved_plan_digest=self.plan.plan_digest,
+            inventory_digest=DIGESTS["inventory_digest"],
+            artifact_digest=DIGESTS["artifact_digest"],
+            policy_digest=DIGESTS["policy_digest"],
+            broker_healthy=True,
+            profile_healthy=True,
+            adapter_self_test=True,
+            persist_rollback=lambda value: rollback.append(deep_thaw(value)),
+            read_rollback=lambda: deep_thaw(rollback[-1]),
+            read_configuration=lambda: deep_thaw(persisted),
+            write_configuration=write,
+            postcheck=postcheck,
+        )
+        self.assertEqual(outcome.status, "rolled_back")
+        self.assertEqual(persisted["settings"]["theme"], "cool")
+        self.assertTrue(persisted["settings"]["autoRecall"])
+        self.assertEqual(
+            persisted["registrations"],
+            [{"id": "unrelated"}, {"id": "concurrent"}],
+        )
 
 
 if __name__ == "__main__":

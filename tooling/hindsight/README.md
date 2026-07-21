@@ -25,6 +25,40 @@ Reusable Hindsight control-plane code, local-stack tooling, agent skills, policy
 - [Product requirements](docs/PRD.md) for the complete safety and migration
   design.
 
+## Harness authority
+
+The reusable harness path is:
+
+`harness hook → controller adapter → private session bridge → capability broker → authenticated Hindsight API`
+
+The broker resolves the endpoint and canonical bank from a validated inventory.
+Harness configuration and hook payloads cannot choose a URL, bank, route, token,
+scope, or tag. Each session bridge owns one exchanged capability, sequence, and
+idempotency history. CLI launches receive only the bridge locator in their
+environment; GUI launches resolve an equally non-secret, user-only locator on
+the first hook after atomically consuming a controller-only one-use envelope.
+Session authority defaults to 12 hours and is capped at 24
+hours; normal close revokes it earlier.
+
+`hindsight-memory harness` exposes native Codex, Claude Code, and Cursor hook
+adapters plus explicit recall, reflect, mental-model, and status tools. The
+controller derives and retains a bounded clean outcome only from a terminal
+assistant record observed by a clean stop checkpoint. Ambient
+recall and checkpoint failures are visible but do not terminate the harness.
+Transcript checkpoints retain the complete cleaned user and assistant epoch,
+replace stable bounded segment documents, reject overflow explicitly, and
+report final-checkpoint, pending-write, or undrained-write failures at close. Close/revocation
+is still attempted when the final checkpoint is unavailable.
+
+Rendered harness artifacts are inactive, content-addressed generations.
+Activation is a separate digest- and compare-and-swap-bound operation that
+preserves unrelated hooks and settings, disables upstream automatic recall and
+retention, and rolls back the controller-owned fields when a post-activation
+check fails. Claude's upstream knowledge tools are disabled with its verified
+empty-MCP-server mode when this path is activated. Upstream integration package
+installation and compatibility-gated
+updates remain separate work; direct-only packages receive no broker authority.
+
 ## Installation contract
 
 Consumers install or link these files from a checkout of `nisavid/agents`.

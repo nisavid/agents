@@ -17,7 +17,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, wait
 import errno
 from typing import Any, Callable, Mapping
 
-from .broker import Broker, BrokerError
+from .broker import Broker, BrokerError, DEFAULT_SESSION_TTL_SECONDS
 from .canonical import StrictJsonError, strict_json_loads
 from .file_evidence import open_trusted_parent
 
@@ -719,7 +719,13 @@ class JsonRpcClient:
             raise BrokerError("RESPONSE_INVALID")
         return decoded["result"]
 
-    def session_mint(self, control_capability: str, request: Mapping[str, Any], *, ttl_seconds: float = 60):
+    def session_mint(
+        self,
+        control_capability: str,
+        request: Mapping[str, Any],
+        *,
+        ttl_seconds: float = DEFAULT_SESSION_TTL_SECONDS,
+    ):
         return self._call("session_mint", {"control_capability": control_capability, "request": dict(request), "ttl_seconds": ttl_seconds})
 
     def session_exchange(self, handle: str):

@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "hindsight_version": "0.8.4",
+  "default_usage_limit_cooldown_seconds": 300,
+  "failover_order": [
+    "personal-codex",
+    "work-codex",
+    "private-fallback"
+  ],
+  "members": [
+    {
+      "id": "personal-codex",
+      "identity": {
+        "provider": "openai-codex",
+        "model": "codex-model",
+        "base_url": "",
+        "credential_marker": "provider-policy:personal-codex"
+      },
+      "credential": {
+        "mode": "oauth-home",
+        "locator": "oauth-home:personal"
+      },
+      "timeout_seconds": null,
+      "max_retries": null,
+      "max_concurrent": null,
+      "operation_priorities": {
+        "default": 0,
+        "reflect": 0,
+        "retain": 20,
+        "consolidation": 30
+      },
+      "quota_cooldown": true
+    },
+    {
+      "id": "work-codex",
+      "identity": {
+        "provider": "openai-codex",
+        "model": "codex-model",
+        "base_url": "",
+        "credential_marker": "provider-policy:work-codex"
+      },
+      "credential": {
+        "mode": "oauth-home",
+        "locator": "oauth-home:work"
+      },
+      "timeout_seconds": null,
+      "max_retries": null,
+      "max_concurrent": null,
+      "operation_priorities": {
+        "default": 0,
+        "reflect": 0,
+        "retain": 20,
+        "consolidation": 30
+      },
+      "quota_cooldown": true
+    },
+    {
+      "id": "private-fallback",
+      "identity": {
+        "provider": "lmstudio",
+        "model": "private-model",
+        "base_url": "https://inference.example.invalid/v1",
+        "credential_marker": null
+      },
+      "credential": {
+        "mode": "none",
+        "locator": null
+      },
+      "timeout_seconds": 300,
+      "max_retries": 1,
+      "max_concurrent": 1,
+      "operation_priorities": {
+        "default": 0,
+        "reflect": 0,
+        "retain": 20,
+        "consolidation": 30
+      },
+      "quota_cooldown": false
+    }
+  ]
+}

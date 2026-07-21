@@ -106,6 +106,17 @@ from hindsight_memory_control_plane.session_bridge import (  # noqa: E402
     write_bridge_locator,
     write_gui_envelope,
 )
+from hindsight_memory_control_plane.integration_upgrades import (  # noqa: E402
+    IntegrationCatalogEntry,
+    IntegrationUpgradeError,
+    IntegrationUpgradeManager,
+    IntegrationUpgradePlan,
+    IntegrationUpdatePolicy,
+    PackageManifest,
+    read_integration_authority_set_digest,
+    read_integration_upgrade_status,
+    recover_integration_upgrade,
+)
 
 
 BROKER_REQUEST = b'{"id":"health","jsonrpc":"2.0","method":"session_status","params":{}}\n'
@@ -127,6 +138,258 @@ class BrokerProcessIdentity(NamedTuple):
 
 def read_json(path: str | Path) -> Any:
     return strict_json_loads(Path(path).read_text(encoding="utf-8"))
+
+
+def _integration_runner(path: str, operation: str):
+    runner = Path(path)
+    runner_digest = _regular_file_digest(runner, f"{operation} runner")
+
+    def invoke(payload: Mapping[str, Any]) -> Mapping[str, Any]:
+        request = {"schema_version": 1, "operation": operation, **payload}
+        process: subprocess.Popen[bytes] | None = None
+        output = bytearray()
+        transport_error: list[str] = []
+        writer_error: list[str] = []
+        try:
+            process = subprocess.Popen(
+                [str(runner)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                # Runner-controlled diagnostics may contain package content or
+                # credentials. Failures stay generic and stderr is never retained.
+                stderr=subprocess.DEVNULL,
+                cwd="/",
+                env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"},
+                close_fds=True,
+            )
+            if process.stdin is None or process.stdout is None:
+                raise OSError("runner pipes unavailable")
+            descriptor = process.stdout.fileno()
+
+            def read_output() -> None:
+                while True:
+                    try:
+                        chunk = os.read(descriptor, 64 * 1024)
+                    except OSError:
+                        return
+                    if not chunk:
+                        return
+                    output.extend(chunk)
+                    if len(output) > 1024 * 1024:
+                        transport_error.append("output-limit")
+                        if process is not None and process.poll() is None:
+                            process.kill()
+                        return
+
+            def write_input() -> None:
+                try:
+                    assert process is not None and process.stdin is not None
+                    process.stdin.write(canonical_bytes(request))
+                except OSError:
+                    writer_error.append("write-failed")
+                finally:
+                    if process is not None and process.stdin is not None:
+                        try:
+                            process.stdin.close()
+                        except OSError:
+                            if not writer_error:
+                                writer_error.append("close-failed")
+
+            reader = threading.Thread(target=read_output, daemon=True)
+            writer = threading.Thread(target=write_input, daemon=True)
+            reader.start()
+            writer.start()
+            deadline = time.monotonic() + 300
+            while reader.is_alive() or writer.is_alive():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                slice_timeout = min(remaining, 0.25)
+                if reader.is_alive():
+                    reader.join(timeout=slice_timeout)
+                else:
+                    writer.join(timeout=slice_timeout)
+            if reader.is_alive() or writer.is_alive():
+                process.kill()
+                reader.join(timeout=5)
+                writer.join(timeout=5)
+                raise subprocess.TimeoutExpired(str(runner), 300)
+            process.wait(timeout=5)
+            if transport_error:
+                raise IntegrationUpgradeError(
+                    f"{operation} runner output exceeds limit"
+                )
+        except IntegrationUpgradeError:
+            raise
+        except subprocess.TimeoutExpired as error:
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+            raise IntegrationUpgradeError(
+                f"{operation} runner timed out"
+            ) from error
+        except (OSError, subprocess.SubprocessError) as error:
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
+            raise IntegrationUpgradeError(f"{operation} runner failed") from error
+        finally:
+            if process is not None and process.stdout is not None:
+                process.stdout.close()
+        if process is None or process.returncode != 0:
+            raise IntegrationUpgradeError(f"{operation} runner failed")
+        if writer_error:
+            raise IntegrationUpgradeError(f"{operation} runner failed")
+        try:
+            result = strict_json_loads(bytes(output))
+        except (StrictJsonError, UnicodeDecodeError) as error:
+            raise IntegrationUpgradeError(f"{operation} runner output is invalid") from error
+        if not isinstance(result, Mapping):
+            raise IntegrationUpgradeError(f"{operation} runner output is invalid")
+        return result
+
+    return invoke, runner_digest
+
+
+def _integration_manager(args: argparse.Namespace) -> IntegrationUpgradeManager:
+    catalog = IntegrationCatalogEntry.load(read_json(args.catalog))
+    policy = IntegrationUpdatePolicy.load(read_json(args.update_policy))
+    source, source_digest = _integration_runner(args.source_verifier, "verify-source")
+    compatibility, compatibility_digest = _integration_runner(
+        args.compatibility_runner, "test-compatibility"
+    )
+    smoke, smoke_digest = _integration_runner(args.smoke_runner, "smoke")
+
+    def source_verifier(manifest: PackageManifest) -> Mapping[str, Any]:
+        return source({"catalog": catalog.to_dict(), "manifest": manifest.to_dict()})
+
+    def compatibility_runner(
+        candidate: Path, manifest: PackageManifest
+    ) -> Mapping[str, Any]:
+        return compatibility(
+            {"candidate_path": str(candidate), "manifest": manifest.to_dict()}
+        )
+
+    def smoke_runner(candidate: Path, manifest: PackageManifest) -> bool:
+        result = smoke(
+            {"candidate_path": str(candidate), "manifest": manifest.to_dict()}
+        )
+        return result == {
+            "schema_version": 1,
+            "artifact_sha256": manifest.artifact_sha256,
+            "passed": True,
+        }
+
+    return IntegrationUpgradeManager(
+        args.state_dir,
+        catalog=catalog,
+        policy=policy,
+        source_verifier=source_verifier,
+        source_verifier_digest=source_digest,
+        compatibility_runner=compatibility_runner,
+        compatibility_runner_digest=compatibility_digest,
+        smoke_runner=smoke_runner,
+        smoke_runner_digest=smoke_digest,
+    )
+
+
+def integration_upgrade_plan_command(args: argparse.Namespace) -> int:
+    manager = _integration_manager(args)
+    manifest = PackageManifest.load(read_json(args.manifest))
+    if args.package:
+        package = Path(args.package).read_bytes()
+        plan = manager.plan(manifest, package=package)
+    else:
+        plan = manager.download_and_plan(manifest)
+    output = Path(args.output) if args.output else Path(args.state_dir) / "approved-plan.json"
+    write_private(output, plan.to_dict())
+    print(
+        json.dumps(
+            {
+                "plan": str(output),
+                "plan_digest": plan.plan_digest,
+                "disposition": plan.disposition,
+                "memory_authority": plan.memory_authority,
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def integration_upgrade_check_command(args: argparse.Namespace) -> int:
+    outcome = _integration_manager(args).check_for_update()
+    print(json.dumps(outcome, sort_keys=True))
+    return 0
+
+
+def integration_upgrade_apply_command(args: argparse.Namespace) -> int:
+    if args.recover_pending:
+        if not args.harness:
+            raise IntegrationUpgradeError(
+                "pending recovery requires --harness"
+            )
+        if args.plan or args.approval_digest or args.automatic:
+            raise IntegrationUpgradeError(
+                "pending recovery cannot be combined with an upgrade plan"
+            )
+        print(
+            json.dumps(
+                recover_integration_upgrade(args.state_dir, args.harness),
+                sort_keys=True,
+            )
+        )
+        return 0
+    if args.harness:
+        raise IntegrationUpgradeError(
+            "--harness is valid only with --recover-pending"
+        )
+    for name in (
+        "catalog",
+        "update_policy",
+        "source_verifier",
+        "compatibility_runner",
+        "smoke_runner",
+    ):
+        if not getattr(args, name, None):
+            raise IntegrationUpgradeError(
+                "upgrade apply requires verifier and runner bindings"
+            )
+    manager = _integration_manager(args)
+    if not args.plan or not args.approval_digest:
+        raise IntegrationUpgradeError(
+            "upgrade apply requires --plan and --approval-digest"
+        )
+    plan = IntegrationUpgradePlan.load(read_json(args.plan))
+    outcome = manager.apply(
+        plan,
+        approval_digest=args.approval_digest,
+        automatic=args.automatic,
+    )
+    print(json.dumps(outcome, sort_keys=True))
+    return 0
+
+
+def integration_upgrade_status_command(args: argparse.Namespace) -> int:
+    print(
+        json.dumps(
+            read_integration_upgrade_status(args.state_dir, args.harness),
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def integration_upgrade_rollback_command(args: argparse.Namespace) -> int:
+    manager = _integration_manager(args)
+    outcome = manager.rollback(
+        args.harness,
+        expected_current_artifact_sha256=(
+            args.expected_current_artifact_sha256
+        ),
+    )
+    print(json.dumps(outcome, sort_keys=True))
+    return 0
 
 
 def _regular_file_digest(value: str | Path, label: str) -> str:
@@ -1454,6 +1717,9 @@ def _broker_runtime_configuration(
 ):
     try:
         inventory = load_inventory(args.inventory)
+        integration_authority_digest = _broker_integration_authority_digest(
+            args, inventory
+        )
         token_resolver = _broker_environment_resolver(
             args.data_plane_token_env, "DATA_PLANE_TOKEN"
         )
@@ -1479,14 +1745,35 @@ def _broker_runtime_configuration(
             mint_authority_resolver=mint_authority_resolver,
             token_resolver_id=args.data_plane_token_env,
             mint_authority_resolver_id=args.mint_authority_env,
+            integration_authority_digest=integration_authority_digest,
             verify_adapters=preflight_resolvers,
         )
-    except (InventoryError, RuntimeConfigurationError, AdapterError) as error:
+    except (
+        InventoryError,
+        RuntimeConfigurationError,
+        AdapterError,
+        IntegrationUpgradeError,
+    ) as error:
         raise BrokerError("BROKER_RUNTIME_CONFIGURATION_INVALID") from error
 
 
+def _broker_integration_authority_digest(
+    args: argparse.Namespace, inventory: Any
+) -> str | None:
+    state_dir = getattr(args, "integration_upgrade_state", None)
+    if state_dir is None:
+        return None
+    selected_profiles = set(args.profile)
+    harness_ids = tuple(
+        harness["id"]
+        for harness in inventory.harnesses
+        if harness["profile_id"] in selected_profiles
+    )
+    return read_integration_authority_set_digest(state_dir, harness_ids)
+
+
 def _broker_binding_mode_error(
-    inactive: bool, bindings: tuple[Any, Any, Any]
+    inactive: bool, bindings: tuple[Any, ...]
 ) -> str | None:
     if inactive and any(bindings):
         return "inactive-with-bindings"
@@ -1505,6 +1792,8 @@ def _broker_runtime_bindings(args: argparse.Namespace):
         getattr(args, "data_plane_token_env", None),
         getattr(args, "mint_authority_env", None),
     )
+    if inactive and getattr(args, "integration_upgrade_state", None):
+        raise BrokerError("BROKER_RUNTIME_CONFIGURATION_INVALID")
     binding_error = _broker_binding_mode_error(inactive, bindings)
     if binding_error == "inactive-with-bindings":
         raise BrokerError("BROKER_RUNTIME_CONFIGURATION_INVALID")
@@ -1530,13 +1819,21 @@ def _broker_selected_runtime_status(args: argparse.Namespace):
         return None
     try:
         inventory = load_inventory(args.inventory)
+        integration_authority_digest = _broker_integration_authority_digest(
+            args, inventory
+        )
         return compile_runtime_status(
             inventory=inventory,
             profiles=tuple(args.profile),
             token_resolver_id=args.data_plane_token_env,
             mint_authority_resolver_id=args.mint_authority_env,
+            integration_authority_digest=integration_authority_digest,
         )
-    except (InventoryError, RuntimeConfigurationError) as error:
+    except (
+        InventoryError,
+        RuntimeConfigurationError,
+        IntegrationUpgradeError,
+    ) as error:
         raise BrokerError("BROKER_RUNTIME_CONFIGURATION_INVALID") from error
 
 
@@ -2424,6 +2721,52 @@ def parser() -> argparse.ArgumentParser:
     discover.add_argument("--timestamp", help=argparse.SUPPRESS)
     discover.set_defaults(run=migration_discover_command)
 
+    integration_upgrade = commands.add_parser("integration-upgrade")
+    integration_upgrade_commands = integration_upgrade.add_subparsers(
+        dest="integration_upgrade_command", required=True
+    )
+
+    def add_integration_runtime_arguments(
+        command_parser: argparse.ArgumentParser, *, required: bool = True
+    ) -> None:
+        command_parser.add_argument("--catalog", required=required)
+        command_parser.add_argument("--update-policy", required=required)
+        command_parser.add_argument("--source-verifier", required=required)
+        command_parser.add_argument("--compatibility-runner", required=required)
+        command_parser.add_argument("--smoke-runner", required=required)
+
+    integration_plan = integration_upgrade_commands.add_parser("plan")
+    add_integration_runtime_arguments(integration_plan)
+    integration_plan.add_argument("--manifest", required=True)
+    integration_plan.add_argument("--package")
+    integration_plan.add_argument("--output")
+    integration_plan.set_defaults(run=integration_upgrade_plan_command)
+
+    integration_check = integration_upgrade_commands.add_parser("check")
+    add_integration_runtime_arguments(integration_check)
+    integration_check.set_defaults(run=integration_upgrade_check_command)
+
+    integration_apply = integration_upgrade_commands.add_parser("apply")
+    add_integration_runtime_arguments(integration_apply, required=False)
+    integration_apply.add_argument("--harness")
+    integration_apply.add_argument("--plan")
+    integration_apply.add_argument("--approval-digest")
+    integration_apply.add_argument("--automatic", action="store_true")
+    integration_apply.add_argument("--recover-pending", action="store_true")
+    integration_apply.set_defaults(run=integration_upgrade_apply_command)
+
+    integration_status = integration_upgrade_commands.add_parser("status")
+    integration_status.add_argument("--harness", required=True)
+    integration_status.set_defaults(run=integration_upgrade_status_command)
+
+    integration_rollback = integration_upgrade_commands.add_parser("rollback")
+    add_integration_runtime_arguments(integration_rollback)
+    integration_rollback.add_argument("--harness", required=True)
+    integration_rollback.add_argument(
+        "--expected-current-artifact-sha256", required=True
+    )
+    integration_rollback.set_defaults(run=integration_upgrade_rollback_command)
+
     broker = commands.add_parser("broker")
     broker_commands = broker.add_subparsers(dest="broker_command", required=True)
     serve = broker_commands.add_parser("serve")
@@ -2433,6 +2776,7 @@ def parser() -> argparse.ArgumentParser:
     serve.add_argument("--inventory")
     serve.add_argument("--data-plane-token-env")
     serve.add_argument("--mint-authority-env")
+    serve.add_argument("--integration-upgrade-state")
     serve.add_argument("--shutdown-timeout", type=_argparse_timeout, default=5.0)
     serve.set_defaults(run=broker_serve_command)
     broker_status = broker_commands.add_parser("status")
@@ -2442,6 +2786,7 @@ def parser() -> argparse.ArgumentParser:
     broker_status.add_argument("--inventory")
     broker_status.add_argument("--data-plane-token-env")
     broker_status.add_argument("--mint-authority-env")
+    broker_status.add_argument("--integration-upgrade-state")
     broker_status.set_defaults(run=broker_status_command)
     broker_stop = broker_commands.add_parser("stop")
     broker_stop.add_argument("--socket", required=True)
@@ -2555,6 +2900,10 @@ def _validate_broker_binding_arguments(
     bindings = (
         args.inventory, args.data_plane_token_env, args.mint_authority_env,
     )
+    if args.inactive and args.integration_upgrade_state:
+        argument_parser.error(
+            "--inactive cannot be combined with runtime bindings"
+        )
     binding_error = _broker_binding_mode_error(args.inactive, bindings)
     if binding_error == "inactive-with-bindings":
         argument_parser.error(
@@ -2579,6 +2928,7 @@ def main() -> int:
         BridgeError,
         BrokerError,
         InventoryError,
+        IntegrationUpgradeError,
         MigrationAdapterError,
         MigrationError,
         PlanError,

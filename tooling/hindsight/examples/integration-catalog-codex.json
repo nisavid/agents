@@ -1,0 +1,13 @@
+{
+  "allowed_transport_modes": [
+    "broker-v1",
+    "direct-only"
+  ],
+  "catalog_id": "official-hindsight-integrations",
+  "harness_id": "codex",
+  "manifest_url": "https://releases.example.test/codex/stable.json",
+  "publisher": "upstream-hindsight",
+  "schema_version": 1,
+  "source_origin": "https://releases.example.test",
+  "verifier_identity": "sigstore-upstream-hindsight"
+}

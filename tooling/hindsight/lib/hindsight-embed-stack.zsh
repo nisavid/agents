@@ -74,6 +74,16 @@ hindsight_stack_load_config() {
     print -ru2 -- "hindsight-embed-stack: HINDSIGHT_MEMORY_BROKER_SOCKET must be absolute"
     return 1
   }
+  if [[ -n "${HINDSIGHT_MEMORY_INTEGRATION_UPGRADE_STATE:-}" ]]; then
+    [[
+      "$HINDSIGHT_MEMORY_INTEGRATION_UPGRADE_STATE" == /* &&
+      "$HINDSIGHT_MEMORY_INTEGRATION_UPGRADE_STATE" != *$'\n'* &&
+      "$HINDSIGHT_MEMORY_INTEGRATION_UPGRADE_STATE" != *$'\r'*
+    ]] || {
+      print -ru2 -- "hindsight-embed-stack: HINDSIGHT_MEMORY_INTEGRATION_UPGRADE_STATE must be an absolute single-line path"
+      return 1
+    }
+  fi
   local runtime_binding_count=0
   [[ -n "${HINDSIGHT_MEMORY_INVENTORY:-}" ]] &&
     (( runtime_binding_count += 1 ))
@@ -103,6 +113,7 @@ hindsight_stack_load_config() {
       }
       case "${(P)resolver_name}" in
         HINDSIGHT_MEMORY_INVENTORY|\
+        HINDSIGHT_MEMORY_INTEGRATION_UPGRADE_STATE|\
         HINDSIGHT_MEMORY_DATA_PLANE_TOKEN_ENV|\
         HINDSIGHT_MEMORY_MINT_AUTHORITY_ENV|\
         HINDSIGHT_MEMORY_UI_ACCESS_KEY_ENV|\
@@ -1156,6 +1167,7 @@ hindsight_stack_validate_profile_credential_isolation() {
     key="${key%%[[:space:]]#}"
     case "$key" in
       HINDSIGHT_MEMORY_INVENTORY|\
+      HINDSIGHT_MEMORY_INTEGRATION_UPGRADE_STATE|\
       HINDSIGHT_MEMORY_DATA_PLANE_TOKEN_ENV|\
       HINDSIGHT_MEMORY_MINT_AUTHORITY_ENV|\
       HINDSIGHT_MEMORY_UI_ACCESS_KEY_ENV|\
@@ -1822,6 +1834,10 @@ hindsight_stack_broker_runtime_arguments() {
     print -r -- "$HINDSIGHT_MEMORY_DATA_PLANE_TOKEN_ENV"
     print -r -- --mint-authority-env
     print -r -- "$HINDSIGHT_MEMORY_MINT_AUTHORITY_ENV"
+    if [[ -n "${HINDSIGHT_MEMORY_INTEGRATION_UPGRADE_STATE:-}" ]]; then
+      print -r -- --integration-upgrade-state
+      print -r -- "$HINDSIGHT_MEMORY_INTEGRATION_UPGRADE_STATE"
+    fi
   else
     print -r -- --inactive
   fi

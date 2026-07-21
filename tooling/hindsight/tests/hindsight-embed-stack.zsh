@@ -208,6 +208,31 @@ if (
 fi
 
 if (
+  export HINDSIGHT_MEMORY_INTEGRATION_UPGRADE_STATE=$'/absolute/upgrades\n--inactive'
+  source "$rendered_stack_lib"
+  hindsight_stack_load_config
+) >/dev/null 2>&1; then
+  print -ru2 -- "stack accepted a multiline integration-upgrade state path"
+  exit 1
+fi
+
+integration_upgrade_arguments="$tmp_dir/integration-upgrade-arguments"
+(
+  export HINDSIGHT_MEMORY_INVENTORY=/absolute/inventory.json
+  export HINDSIGHT_MEMORY_INTEGRATION_UPGRADE_STATE=/absolute/integration-upgrades
+  export HINDSIGHT_MEMORY_DATA_PLANE_TOKEN_ENV=TEST_DATA_TOKEN
+  export HINDSIGHT_MEMORY_MINT_AUTHORITY_ENV=TEST_MINT_AUTHORITY
+  export HINDSIGHT_MEMORY_UI_ACCESS_KEY_ENV=TEST_UI_ACCESS_KEY
+  source "$rendered_stack_lib"
+  hindsight_stack_broker_runtime_arguments
+) > "$integration_upgrade_arguments"
+[[ "$(<"$integration_upgrade_arguments")" == \
+  $'--inventory\n/absolute/inventory.json\n--data-plane-token-env\nTEST_DATA_TOKEN\n--mint-authority-env\nTEST_MINT_AUTHORITY\n--integration-upgrade-state\n/absolute/integration-upgrades' ]] || {
+  print -ru2 -- "stack omitted the certified integration-upgrade authority state"
+  exit 1
+}
+
+if (
   export HINDSIGHT_MEMORY_INVENTORY=/absolute/inventory.json
   export HINDSIGHT_MEMORY_DATA_PLANE_TOKEN_ENV=TEST_SHARED_AUTHORITY
   export HINDSIGHT_MEMORY_MINT_AUTHORITY_ENV=TEST_SHARED_AUTHORITY
@@ -222,6 +247,7 @@ fi
 for resolver_role in data mint ui; do
   for reserved_resolver in \
     HINDSIGHT_MEMORY_INVENTORY \
+    HINDSIGHT_MEMORY_INTEGRATION_UPGRADE_STATE \
     HINDSIGHT_MEMORY_DATA_PLANE_TOKEN_ENV \
     HINDSIGHT_MEMORY_MINT_AUTHORITY_ENV \
     HINDSIGHT_MEMORY_UI_ACCESS_KEY_ENV \

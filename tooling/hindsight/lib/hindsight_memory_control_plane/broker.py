@@ -92,6 +92,8 @@ MAX_DURABLE_NONCE_BYTES = 2 * 1024 * 1024
 MAX_DURABLE_HANDLE_BYTES = 8 * 1024 * 1024
 MIN_PAYLOAD_BYTES = 4 * 1024
 MAX_PAYLOAD_BYTES = MAX_DURABLE_QUEUE_ENTRY_BYTES
+DEFAULT_SESSION_TTL_SECONDS = 12 * 60 * 60
+MAX_SESSION_TTL_SECONDS = 24 * 60 * 60
 
 
 class BrokerError(ValueError):
@@ -1717,12 +1719,23 @@ class Broker:
         })).hexdigest()
         return self._response(action_id, action_digest, "ok", payload)
 
-    def session_mint(self, control_capability: str, request: Mapping[str, Any], *, ttl_seconds: float = 60) -> dict[str, Any]:
+    def session_mint(
+        self,
+        control_capability: str,
+        request: Mapping[str, Any],
+        *,
+        ttl_seconds: float = DEFAULT_SESSION_TTL_SECONDS,
+    ) -> dict[str, Any]:
         with self._lock:
             self._ensure_runtime_open()
         self._prune_handle_files()
         requested = self._validate_mint_request(request)
-        if type(ttl_seconds) not in (int, float) or not math.isfinite(ttl_seconds) or ttl_seconds <= 0 or ttl_seconds > 300:
+        if (
+            type(ttl_seconds) not in (int, float)
+            or not math.isfinite(ttl_seconds)
+            or ttl_seconds <= 0
+            or ttl_seconds > MAX_SESSION_TTL_SECONDS
+        ):
             raise BrokerError("SCHEMA_INVALID")
         if self._mint_authorizer is None or not isinstance(control_capability, str) or not control_capability:
             raise BrokerError("MINT_DENIED")
@@ -1783,7 +1796,12 @@ class Broker:
             finally:
                 fcntl.flock(descriptor, fcntl.LOCK_UN)
                 os.close(descriptor)
-        return self._bootstrap_response("session-mint", "session_mint", value["session_id"], {"handle": handle})
+        return self._bootstrap_response(
+            "session-mint",
+            "session_mint",
+            value["session_id"],
+            {"handle": handle, "expires_at": envelope["expires_at"]},
+        )
 
     def session_exchange(self, handle: str) -> dict[str, Any]:
         if not isinstance(handle, str) or not re.fullmatch(r"[0-9a-f]{64}", handle):

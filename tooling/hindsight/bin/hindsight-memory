@@ -65,7 +65,12 @@ from hindsight_memory_control_plane.reconcile import (  # noqa: E402
     create_rollback_bundle,
     mutation_plan_from_dict,
 )
-from hindsight_memory_control_plane.broker import Broker, BrokerError  # noqa: E402
+from hindsight_memory_control_plane.broker import (  # noqa: E402
+    Broker,
+    BrokerError,
+    DEFAULT_SESSION_TTL_SECONDS,
+    MAX_SESSION_TTL_SECONDS,
+)
 from hindsight_memory_control_plane.migration_adapter import (  # noqa: E402
     ADMIN_ENVIRONMENT_ALLOWLIST,
 )
@@ -82,6 +87,24 @@ from hindsight_memory_control_plane.runtime import (  # noqa: E402
     RuntimeConfigurationError,
     compile_runtime_configuration,
     compile_runtime_status,
+)
+from hindsight_memory_control_plane.session_bridge import (  # noqa: E402
+    BridgeError,
+    consume_gui_envelope,
+    JsonBridgeClient,
+    MAX_INPUT_BYTES as MAX_BRIDGE_INPUT_BYTES,
+    SessionBridge,
+    UnixBridgeServer,
+    allocate_bridge_socket,
+    read_bridge_locator,
+    release_gui_envelope_slot,
+    remove_bridge_locator,
+    reserve_gui_envelope_slot,
+    sanitized_harness_environment,
+    start_bridge_process,
+    wait_for_bridge,
+    write_bridge_locator,
+    write_gui_envelope,
 )
 
 
@@ -1877,6 +1900,434 @@ def broker_method_command(args: argparse.Namespace) -> int:
     return _print_result(result)
 
 
+def _read_bridge_handle(descriptor: int) -> str:
+    if type(descriptor) is not int or descriptor < 3:
+        raise BridgeError("HANDLE_FD_INVALID")
+    chunks = bytearray()
+    try:
+        while True:
+            chunk = os.read(descriptor, 65 - len(chunks))
+            if not chunk:
+                break
+            chunks.extend(chunk)
+            if len(chunks) > 64:
+                raise BridgeError("HANDLE_INVALID")
+    finally:
+        os.close(descriptor)
+    try:
+        handle = chunks.decode("ascii")
+    except UnicodeDecodeError as error:
+        raise BridgeError("HANDLE_INVALID") from error
+    if re.fullmatch(r"[0-9a-f]{64}", handle) is None:
+        raise BridgeError("HANDLE_INVALID")
+    return handle
+
+
+def bridge_serve_command(args: argparse.Namespace) -> int:
+    bridge = SessionBridge(
+        broker_client=JsonRpcClient(args.broker_socket),
+        handle=_read_bridge_handle(args.handle_fd),
+        session_id=args.session_id,
+        harness_id=args.harness,
+    )
+    server = UnixBridgeServer(
+        args.socket, bridge, lifetime_seconds=args.lifetime_seconds
+    )
+    server.start()
+    idle = threading.Event()
+    try:
+        while server.running:
+            idle.wait(0.05)
+    finally:
+        server.close()
+    return 0
+
+
+def _native_hook_payload() -> dict[str, Any]:
+    raw = sys.stdin.buffer.read(MAX_BRIDGE_INPUT_BYTES + 1)
+    if len(raw) > MAX_BRIDGE_INPUT_BYTES:
+        raise BridgeError("INPUT_INVALID")
+    try:
+        value = strict_json_loads(raw.decode("utf-8"))
+    except (StrictJsonError, UnicodeDecodeError) as error:
+        raise BridgeError("INPUT_INVALID") from error
+    if not isinstance(value, dict):
+        raise BridgeError("INPUT_INVALID")
+    return value
+
+
+def _native_session_id(harness_id: str, payload: Mapping[str, Any]) -> str:
+    if harness_id == "cursor":
+        conversation_id = payload.get("conversation_id")
+        native_session_id = payload.get("session_id")
+        if (
+            conversation_id is not None
+            and native_session_id is not None
+            and conversation_id != native_session_id
+        ):
+            raise BridgeError("SESSION_MISMATCH")
+        value = conversation_id or native_session_id
+    else:
+        value = payload.get("session_id")
+    if not isinstance(value, str):
+        raise BridgeError("SESSION_INVALID")
+    return value
+
+
+def _activate_gui_envelope(
+    args: argparse.Namespace, *, session_id: str
+) -> Path:
+    envelope = consume_gui_envelope(
+        args.locator_dir,
+        session_id=session_id,
+        harness_id=args.harness_id,
+    )
+    handle = envelope["handle"]
+    broker_socket = Path(envelope["broker_socket"])
+    process: subprocess.Popen[bytes] | None = None
+    try:
+        if envelope["expires_at"] <= time.time():
+            raise BridgeError("ENVELOPE_EXPIRED")
+        bridge_dir = Path(envelope["bridge_dir"])
+        socket_path = allocate_bridge_socket(
+            bridge_dir,
+            session_id=session_id,
+            harness_id=args.harness_id,
+        )
+        process = start_bridge_process(
+            executable=str(Path(__file__).resolve()),
+            state_dir=Path(envelope["state_dir"]),
+            bridge_socket=socket_path,
+            broker_socket=broker_socket,
+            handle=handle,
+            session_id=session_id,
+            harness_id=args.harness_id,
+            detached=True,
+            lifetime_seconds=envelope["expires_at"] - time.time(),
+            environment=sanitized_harness_environment(os.environ, socket_path),
+        )
+        wait_for_bridge(socket_path, process, timeout=args.timeout)
+        write_bridge_locator(
+            args.locator_dir,
+            session_id=session_id,
+            harness_id=args.harness_id,
+            socket_path=socket_path,
+        )
+        return socket_path
+    except Exception as activation_error:
+        if process is not None:
+            try:
+                _terminate_bridge_process(process)
+            except Exception:
+                pass
+        try:
+            _cancel_minted_session(
+                JsonRpcClient(broker_socket),
+                handle,
+                action_id="gui-envelope-cancel",
+            )
+        except Exception as cleanup_error:
+            raise BridgeError("MINT_CLEANUP_FAILED") from cleanup_error
+        raise activation_error
+
+
+def harness_command(args: argparse.Namespace) -> int:
+    if args.event in {"launch", "stage-gui"}:
+        return harness_launch_command(args)
+    failure_isolated = args.event in {
+        "recall",
+        "session-start",
+        "checkpoint",
+        "pre-compact",
+        "close",
+        "tool-recall",
+        "reflect",
+        "model",
+        "status",
+    }
+    try:
+        payload = _native_hook_payload()
+        if args.bridge is not None:
+            locator = Path(args.bridge)
+        else:
+            environment_locator = os.environ.get(args.bridge_env)
+            if environment_locator:
+                locator = Path(environment_locator)
+            elif args.locator_dir:
+                session_id = _native_session_id(args.harness_id, payload)
+                try:
+                    locator = read_bridge_locator(
+                        args.locator_dir,
+                        session_id=session_id,
+                        harness_id=args.harness_id,
+                    )
+                except BridgeError as error:
+                    if error.code != "LOCATOR_UNAVAILABLE":
+                        raise
+                    locator = _activate_gui_envelope(
+                        args, session_id=session_id
+                    )
+            else:
+                raise BridgeError("BRIDGE_UNAVAILABLE")
+        client = JsonBridgeClient(locator, timeout=args.timeout)
+        try:
+            result = client.call_native(args.harness_id, args.event, payload)
+        except BridgeError as error:
+            if (
+                error.code != "BRIDGE_UNAVAILABLE"
+                or not args.locator_dir
+                or args.bridge is not None
+            ):
+                raise
+            remove_bridge_locator(
+                args.locator_dir,
+                session_id=_native_session_id(args.harness_id, payload),
+                harness_id=args.harness_id,
+                expected_socket=locator,
+            )
+            locator = _activate_gui_envelope(
+                args,
+                session_id=_native_session_id(args.harness_id, payload),
+            )
+            result = JsonBridgeClient(
+                locator, timeout=args.timeout
+            ).call_native(args.harness_id, args.event, payload)
+    except BridgeError as error:
+        print(f"[Hindsight] {error.code}", file=sys.stderr)
+        return 0 if failure_isolated else 2
+    if args.event == "close":
+        _report_close_result(result)
+        if args.locator_dir:
+            try:
+                remove_bridge_locator(
+                    args.locator_dir,
+                    session_id=_native_session_id(args.harness_id, payload),
+                    harness_id=args.harness_id,
+                    expected_socket=locator,
+                )
+            except BridgeError as error:
+                print(f"[Hindsight] {error.code}", file=sys.stderr)
+    if result:
+        print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+    return 0
+
+
+def _cancel_minted_session(
+    broker_client: JsonRpcClient, handle: str, *, action_id: str
+) -> None:
+    exchanged = broker_client.session_exchange(handle)
+    exchange_payload = exchanged.get("payload")
+    capability = (
+        exchange_payload.get("capability")
+        if isinstance(exchange_payload, Mapping)
+        else None
+    )
+    if not isinstance(capability, str):
+        raise BridgeError("MINT_CLEANUP_FAILED")
+    broker_client.session_close(
+        capability,
+        sequence=1,
+        action_id=action_id,
+        timeout_seconds=2,
+    )
+
+
+def _mint_harness_session(
+    args: argparse.Namespace,
+) -> tuple[JsonRpcClient, str, float]:
+    if not all(
+        isinstance(value, str) and value
+        for value in (
+            args.broker_socket,
+            args.session_id,
+            args.companion_id,
+            args.route,
+            args.bridge_dir,
+        )
+    ):
+        raise BridgeError("LAUNCH_ARGUMENTS_INVALID")
+    control_capability = _required_environment(
+        args.control_capability_env, "CONTROL_CAPABILITY_UNAVAILABLE"
+    )
+    broker_client = JsonRpcClient(args.broker_socket)
+    response = broker_client.session_mint(
+        control_capability,
+        {
+            "session_id": args.session_id,
+            "companion_id": args.companion_id,
+            "route": args.route,
+        },
+        ttl_seconds=args.ttl_seconds,
+    )
+    payload = response.get("payload") if isinstance(response, Mapping) else None
+    handle = payload.get("handle") if isinstance(payload, Mapping) else None
+    expires_at = payload.get("expires_at") if isinstance(payload, Mapping) else None
+    if (
+        not isinstance(handle, str)
+        or type(expires_at) not in {int, float}
+        or expires_at <= time.time()
+    ):
+        raise BridgeError("MINT_FAILED")
+    return broker_client, handle, float(expires_at)
+
+
+def _start_harness_bridge(
+    args: argparse.Namespace, *, detached: bool
+) -> tuple[subprocess.Popen[bytes], Path, str]:
+    broker_client, handle, expires_at = _mint_harness_session(args)
+    process: subprocess.Popen[bytes] | None = None
+    try:
+        bridge_dir = Path(args.bridge_dir)
+        if not bridge_dir.exists():
+            bridge_dir.mkdir(mode=0o700)
+        socket_path = allocate_bridge_socket(
+            bridge_dir,
+            session_id=args.session_id,
+            harness_id=args.harness_id,
+        )
+        process = start_bridge_process(
+            executable=str(Path(__file__).resolve()),
+            state_dir=Path(args.state_dir).resolve(),
+            bridge_socket=socket_path,
+            broker_socket=Path(args.broker_socket).resolve(),
+            handle=handle,
+            session_id=args.session_id,
+            harness_id=args.harness_id,
+            detached=detached,
+            lifetime_seconds=expires_at - time.time(),
+            environment={
+                key: value
+                for key, value in os.environ.items()
+                if key != args.control_capability_env
+            },
+        )
+        wait_for_bridge(socket_path, process, timeout=args.timeout)
+    except Exception as start_error:
+        termination_error = None
+        if process is not None:
+            try:
+                _terminate_bridge_process(process)
+            except Exception as error:
+                termination_error = error
+        try:
+            _cancel_minted_session(
+                broker_client,
+                handle,
+                action_id="launcher-startup-cancel",
+            )
+        except Exception as cleanup_error:
+            raise BridgeError("MINT_CLEANUP_FAILED") from cleanup_error
+        if termination_error is not None:
+            raise BridgeError("BRIDGE_SHUTDOWN_FAILED") from termination_error
+        raise start_error
+    return process, socket_path, handle
+
+
+def _terminate_bridge_process(process: subprocess.Popen[bytes]) -> None:
+    """Stop a bridge with bounded escalation and a reaped child."""
+
+    process.terminate()
+    try:
+        process.wait(timeout=2)
+        return
+    except subprocess.TimeoutExpired:
+        process.kill()
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired as error:
+        raise BridgeError("BRIDGE_SHUTDOWN_FAILED") from error
+
+
+def _report_close_result(result: Mapping[str, Any]) -> None:
+    checkpoint = result.get("checkpoint")
+    if isinstance(checkpoint, Mapping):
+        diagnostic = checkpoint.get("diagnostic")
+        code = diagnostic.get("code") if isinstance(diagnostic, Mapping) else None
+        if isinstance(code, str):
+            print(f"[Hindsight] final checkpoint: {code}", file=sys.stderr)
+    close_payload = result.get("payload")
+    if isinstance(close_payload, Mapping):
+        undrained = close_payload.get("undrained")
+        write_drain = close_payload.get("write_drain")
+        if undrained != 0 or write_drain != "drained":
+            print(
+                "[Hindsight] bridge closed with undrained writes: "
+                f"count={undrained!r}, state={write_drain!r}",
+                file=sys.stderr,
+            )
+
+
+def harness_launch_command(args: argparse.Namespace) -> int:
+    detached = args.event == "stage-gui"
+    if detached and not args.locator_dir:
+        raise BridgeError("LAUNCH_ARGUMENTS_INVALID")
+    command = list(args.launch_command or [])
+    if command and command[0] == "--":
+        command.pop(0)
+    if not detached and (
+        not command
+        or any(not isinstance(item, str) or not item for item in command)
+    ):
+        raise BridgeError("LAUNCH_ARGUMENTS_INVALID")
+    if detached:
+        reservation = reserve_gui_envelope_slot(
+            args.locator_dir, session_id=args.session_id
+        )
+        try:
+            broker_client, handle, expires_at = _mint_harness_session(args)
+            try:
+                envelope = write_gui_envelope(
+                    args.locator_dir,
+                    session_id=args.session_id,
+                    harness_id=args.harness_id,
+                    handle=handle,
+                    state_dir=Path(args.state_dir).resolve(),
+                    broker_socket=Path(args.broker_socket).resolve(),
+                    bridge_dir=Path(args.bridge_dir).resolve(),
+                    expires_at=expires_at,
+                )
+            except Exception as publication_error:
+                try:
+                    _cancel_minted_session(
+                        broker_client,
+                        handle,
+                        action_id="launcher-publication-cancel",
+                    )
+                except Exception as cleanup_error:
+                    raise BridgeError("MINT_CLEANUP_FAILED") from cleanup_error
+                raise publication_error
+        finally:
+            release_gui_envelope_slot(reservation)
+        print(json.dumps({"status": "staged", "envelope": str(envelope)}))
+        return 0
+    process, socket_path, _handle = _start_harness_bridge(args, detached=False)
+    environment = sanitized_harness_environment(
+        {
+            key: value
+            for key, value in os.environ.items()
+            if key != args.control_capability_env
+        },
+        socket_path,
+    )
+    try:
+        completed = subprocess.run(command, env=environment, check=False)
+    finally:
+        try:
+            close_result = JsonBridgeClient(socket_path, timeout=2).call_native(
+                args.harness_id,
+                "close",
+                {"session_id": args.session_id},
+            )
+            _report_close_result(close_result)
+        except BridgeError as error:
+            print(f"[Hindsight] bridge close: {error.code}", file=sys.stderr)
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            _terminate_bridge_process(process)
+    return completed.returncode
+
+
 def _add_socket(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--socket", required=True)
     parser.add_argument("--timeout", type=_argparse_timeout, default=2.0)
@@ -1890,6 +2341,16 @@ def _argparse_timeout(value: str) -> float:
     if not math.isfinite(timeout) or not 0 <= timeout <= 30:
         raise argparse.ArgumentTypeError("BROKER_TIMEOUT_INVALID")
     return timeout
+
+
+def _argparse_session_ttl(value: str) -> float:
+    try:
+        ttl = float(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError("SESSION_TTL_INVALID") from None
+    if not math.isfinite(ttl) or not 0 < ttl <= MAX_SESSION_TTL_SECONDS:
+        raise argparse.ArgumentTypeError("SESSION_TTL_INVALID")
+    return ttl
 
 
 def _add_session_request(
@@ -1994,7 +2455,11 @@ def parser() -> argparse.ArgumentParser:
         default="HINDSIGHT_MEMORY_CONTROL_CAPABILITY",
     )
     mint.add_argument("--request", required=True)
-    mint.add_argument("--ttl-seconds", type=float, default=60.0)
+    mint.add_argument(
+        "--ttl-seconds",
+        type=_argparse_session_ttl,
+        default=DEFAULT_SESSION_TTL_SECONDS,
+    )
     mint.set_defaults(run=session_mint_command)
     exchange = session_commands.add_parser("exchange")
     _add_socket(exchange)
@@ -2023,6 +2488,57 @@ def parser() -> argparse.ArgumentParser:
         _add_session_request(
             method, rpc_method=rpc_method, request=needs_request
         )
+
+    bridge = commands.add_parser("bridge")
+    bridge_commands = bridge.add_subparsers(dest="bridge_command", required=True)
+    bridge_serve = bridge_commands.add_parser("serve")
+    bridge_serve.add_argument("--socket", required=True)
+    bridge_serve.add_argument("--broker-socket", required=True)
+    bridge_serve.add_argument("--handle-fd", type=int, required=True)
+    bridge_serve.add_argument("--session-id", required=True)
+    bridge_serve.add_argument(
+        "--harness", choices=("codex", "claude-code", "cursor"), required=True
+    )
+    bridge_serve.add_argument(
+        "--lifetime-seconds",
+        type=_argparse_session_ttl,
+        default=DEFAULT_SESSION_TTL_SECONDS,
+    )
+    bridge_serve.set_defaults(run=bridge_serve_command)
+
+    harness = commands.add_parser("harness")
+    harness.add_argument(
+        "harness_id", choices=("codex", "claude-code", "cursor")
+    )
+    harness.add_argument(
+        "event",
+        choices=(
+            "recall", "session-start", "checkpoint", "pre-compact", "close",
+            "reflect", "model", "status", "tool-recall",
+            "launch", "stage-gui",
+        ),
+    )
+    harness.add_argument("--bridge")
+    harness.add_argument(
+        "--bridge-env", default="HINDSIGHT_MEMORY_BRIDGE_LOCATOR"
+    )
+    harness.add_argument("--locator-dir")
+    harness.add_argument("--timeout", type=_argparse_timeout, default=5.0)
+    harness.add_argument("--broker-socket")
+    harness.add_argument(
+        "--control-capability-env", default="HINDSIGHT_MEMORY_CONTROL_CAPABILITY"
+    )
+    harness.add_argument("--session-id")
+    harness.add_argument("--companion-id")
+    harness.add_argument("--route")
+    harness.add_argument("--bridge-dir")
+    harness.add_argument(
+        "--ttl-seconds",
+        type=_argparse_session_ttl,
+        default=DEFAULT_SESSION_TTL_SECONDS,
+    )
+    harness.add_argument("--command", dest="launch_command", nargs=argparse.REMAINDER)
+    harness.set_defaults(run=harness_command)
     return value
 
 
@@ -2058,6 +2574,7 @@ def main() -> int:
     except (
         AdapterError,
         ApplyError,
+        BridgeError,
         BrokerError,
         InventoryError,
         MigrationAdapterError,

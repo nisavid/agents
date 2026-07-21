@@ -13,6 +13,10 @@ LIB = ROOT / "lib"
 sys.path.insert(0, str(LIB))
 
 from hindsight_memory_control_plane.canonical import digest
+from hindsight_memory_control_plane.broker import (
+    DEFAULT_SESSION_TTL_SECONDS,
+    MAX_SESSION_TTL_SECONDS,
+)
 from hindsight_memory_control_plane.inventory import load_inventory
 from hindsight_memory_control_plane.model import deep_thaw
 from hindsight_memory_control_plane.runtime import (
@@ -150,6 +154,24 @@ class RuntimeConfigurationTest(unittest.TestCase):
             "artifact_digest": configuration.artifact_digest,
             "methods": list(configuration.methods),
         })
+        self.assertEqual(
+            configuration.mint_authorizer(
+                "control-capability", requested, DEFAULT_SESSION_TTL_SECONDS
+            ),
+            authorized,
+        )
+        self.assertEqual(
+            configuration.mint_authorizer(
+                "control-capability", requested, MAX_SESSION_TTL_SECONDS
+            ),
+            authorized,
+        )
+        self.assertEqual(
+            configuration.mint_authorizer(
+                "control-capability", requested, MAX_SESSION_TTL_SECONDS + 1
+            ),
+            {},
+        )
         for changed in (
             {**requested, "route": "uncompiled"},
             {

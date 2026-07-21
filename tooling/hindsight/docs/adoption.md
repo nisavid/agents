@@ -88,6 +88,64 @@ Inspect the rendered manifest and wrappers in a temporary destination. Applying
 consumer configuration must not activate harness memory, migrate data, or run a
 controller-directed mutation.
 
+## Stage broker-mediated harness integrations
+
+Start the broker in active inventory-backed mode only after the consumer can
+resolve both the data-plane token and mint authority without rendering either
+secret. The active broker must report the expected inventory, profile-set,
+route, policy, and artifact digests before a harness session is minted.
+
+Render the Codex, Claude Code, and Cursor controller artifacts into one
+content-addressed staging generation. The rendered hooks call
+`hindsight-memory harness`; they contain no endpoint, bank, bearer token,
+signing material, envelope, or session capability. Keep the artifacts inactive
+while checking their native hook schemas and adapter self-tests.
+
+CLI consumers must start through `hindsight-memory harness <harness> launch`.
+The launcher mints the bounded session, transfers its one-use handle to the
+private bridge over an inherited descriptor, and gives the harness only the
+bridge locator. GUI consumers use `stage-gui`; it reserves the session identity
+before minting and writes a controller-only, user-private one-use envelope
+carrying the broker-issued expiry. The first hook atomically consumes that
+envelope, starts the bridge, and publishes a non-secret locator for later hooks.
+Replays fail, expired abandoned envelopes may be safely replaced, and final
+close removes the locator. The bridge exchanges its handle only when the first
+hook arrives. If startup or locator publication fails after consumption, the
+controller terminates any bridge, exchanges and closes the minted session, and
+publishes no locator. Recovery requires a fresh `stage-gui`; the consumed
+envelope is never restored or replayed.
+
+Activation requires an approved digest-bound plan, unchanged inventory,
+policy, artifact, and prestate digests, healthy broker and profile checks, and a
+passing adapter self-test. It merges only controller-owned hooks, settings, and
+tools. A failed readback or postcheck restores the recorded controller-owned
+prestate while preserving unrelated configuration.
+
+The native event coverage is intentionally harness-specific:
+
+- Codex uses prompt recall, synchronous stop-hook submission to the broker's
+  asynchronous write queue, and pre-compaction checkpoints. The controller
+  launcher closes CLI sessions because Codex does not currently expose a
+  session-end hook.
+- Claude Code adds its native session-end close hook and disables upstream
+  knowledge tools together with upstream automatic recall and retention. It
+  sets the upstream `enableKnowledgeTools=false` contract, which keeps the MCP
+  process healthy in its verified empty-server mode while advertising no
+  knowledge tools.
+- Cursor uses startup recall, stop and pre-compaction checkpoints, session-end
+  close, and wrapped explicit tools.
+
+All three artifacts expose controller-owned recall, reflect, mental-model,
+and status tools. At a clean stop checkpoint, the controller derives a bounded
+outcome only when the final structured transcript record is an assistant result
+and retains it separately; harness input cannot supply arbitrary outcome
+content, routing, scopes, or tags. Close always attempts revocation, even when a
+pending checkpoint cannot be reconciled, and reports that condition visibly.
+
+Do not disable the existing direct integration until all staged artifacts pass
+the activation gates and a rollback snapshot exists. Do not activate this
+section as part of ordinary consumer rendering.
+
 ## Start and verify the macOS service
 
 For a launchd consumer, install the rendered service and verify every managed

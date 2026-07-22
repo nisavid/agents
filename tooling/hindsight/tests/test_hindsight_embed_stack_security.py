@@ -198,21 +198,25 @@ class StackUiAuthenticationTest(unittest.TestCase):
         result = self.run_probe(protected=False)
 
         self.assertNotEqual(result.returncode, 0)
+        self.assertIn("ACCESS_KEY_AUTH_DISABLED", result.stderr)
 
     def test_rejects_browser_readable_session_cookie(self):
         result = self.run_probe(http_only=False)
 
         self.assertNotEqual(result.returncode, 0)
+        self.assertIn("COOKIE_NOT_HTTP_ONLY", result.stderr)
 
     def test_rejects_data_plane_token_in_browser_response(self):
         result = self.run_probe(leak=True)
 
         self.assertNotEqual(result.returncode, 0)
+        self.assertIn("SECRET_EXPOSED", result.stderr)
 
     def test_rejects_control_plane_accepting_missing_login(self):
         result = self.run_probe(accept_missing_login=True)
 
         self.assertNotEqual(result.returncode, 0)
+        self.assertIn("MISSING_LOGIN_ACCEPTED", result.stderr)
 
     def test_loopback_auth_probe_never_contacts_ambient_proxy(self):
         received = []
@@ -292,6 +296,10 @@ class StackCredentialBindingTest(unittest.TestCase):
                     env[role] = reserved_name
                     result = self.run_stack("hindsight_stack_load_config", env)
                     self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(
+                        f"{role} must not target a reserved runtime binding",
+                        result.stderr,
+                    )
 
     def test_rejects_controller_owned_keys_in_adopted_profile(self):
         for reserved_name in self.reserved_names:
@@ -305,6 +313,11 @@ class StackCredentialBindingTest(unittest.TestCase):
                     "hindsight_stack_preflight_runtime_credentials"
                 )
                 self.assertNotEqual(result.returncode, 0)
+                self.assertIn(
+                    "must not define controller-owned credential binding "
+                    f"{reserved_name}",
+                    result.stderr,
+                )
 
 
 class ManagedServiceCredentialPreflightTest(unittest.TestCase):

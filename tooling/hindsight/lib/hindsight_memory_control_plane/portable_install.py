@@ -1313,6 +1313,9 @@ def _copy_release(
         raise PortableInstallError("release publication failed") from error
 
 
+RUNTIME_LIBRARY_END = "# HINDSIGHT_RUNTIME_LIBRARY_END"
+
+
 WRAPPER = r"""import ctypes, hashlib, json, os, stat, sys
 from pathlib import Path
 
@@ -1354,6 +1357,7 @@ def protected(path, mode, directory=False):
     reject_acl(path)
     return metadata
 
+# HINDSIGHT_RUNTIME_LIBRARY_END
 root = Path(__file__).resolve().parent
 protected(root, 0o700, directory=True)
 protected(Path(__file__), 0o500)
@@ -1714,6 +1718,7 @@ def resolve_credentials(path, request, environment, timeout_seconds=30):
         if process.stdout is not None:
             process.stdout.close()
 
+# HINDSIGHT_RUNTIME_LIBRARY_END
 if len(sys.argv) != 5 or sys.argv[1] != "--config" or sys.argv[3] not in {"--service", "--timer", "--health"}:
     raise SystemExit("invalid launcher arguments")
 root = Path(__file__).resolve().parent

@@ -44,6 +44,14 @@ def file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def runtime_library(source: str) -> str:
+    marker = "\n" + portable_install_module.RUNTIME_LIBRARY_END + "\n"
+    prefix, separator, suffix = source.partition(marker)
+    if not separator or marker in suffix:
+        raise AssertionError("runtime source must contain one library-end marker")
+    return prefix
+
+
 def managed_python_for_tests() -> Path:
     override = os.environ.get("HINDSIGHT_PORTABLE_TEST_MANAGED_PYTHON")
     if override:
@@ -3451,13 +3459,11 @@ class PortableInstallationManagerTest(unittest.TestCase):
         fake_library.acl_to_text = FakeFunction()
         sources = (
             (
-                portable_install_module.WRAPPER.split("\nroot =", 1)[0],
+                runtime_library(portable_install_module.WRAPPER),
                 SystemExit,
             ),
             (
-                portable_install_module.SERVICE_LAUNCHER.split("\nif len(sys.argv)", 1)[
-                    0
-                ],
+                runtime_library(portable_install_module.SERVICE_LAUNCHER),
                 ValueError,
             ),
         )
@@ -3483,9 +3489,7 @@ class PortableInstallationManagerTest(unittest.TestCase):
             encoding="utf-8",
         )
         resolver.chmod(0o500)
-        source = portable_install_module.SERVICE_LAUNCHER.split(
-            "\nif len(sys.argv)", 1
-        )[0]
+        source = runtime_library(portable_install_module.SERVICE_LAUNCHER)
         namespace: dict[str, object] = {}
         exec(compile(source, "<resolver-runtime>", "exec"), namespace)
 

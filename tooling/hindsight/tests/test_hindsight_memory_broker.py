@@ -1995,6 +1995,49 @@ class DurableWorkTest(unittest.TestCase):
         self.assertGreaterEqual(self.adapter.polls, 2)
         self.assertTrue(self.work()["completed"])
 
+    def test_missing_operation_status_never_resubmits_accepted_retain(self):
+        self._stop()
+
+        class MissingStatusFake(FakeAdapter):
+            submissions = 0
+            polls = 0
+
+            def transcript_checkpoint(self, request):
+                super().transcript_checkpoint(request)
+                self.submissions += 1
+                return {"operation_id": "operation-1"}
+
+            def operation_status(self, request):
+                super().operation_status(request)
+                self.polls += 1
+                return {"status": "not_found"}
+
+        self.adapter = MissingStatusFake(endpoint=ENDPOINT)
+        self._start()
+        capability = self.exchange(session_id="missing-status")
+        self.client.transcript_checkpoint(
+            capability, sequence=1, action_id="checkpoint",
+            request={
+                "document_id": "session", "epoch": 1, "checkpoint": 1,
+                "content": "clean transcript",
+            },
+        )
+        self.wait_until(lambda: self.adapter.polls >= 2, timeout=2)
+        self.assertEqual(self.adapter.submissions, 1)
+
+        self._stop()
+        self._start()
+        self.wait_until(lambda: self.adapter.polls >= 3, timeout=2)
+        self.assertEqual(self.adapter.submissions, 1)
+        status = self.client.session_status(
+            capability, sequence=2, action_id="status"
+        )
+        self.assertEqual(
+            status["payload"]["writes"]["pending"][0]["operation_id"],
+            "operation-1",
+        )
+        self.assertEqual(status["payload"]["writes"]["completed"], [])
+
     def test_malformed_runtime_write_responses_retry_without_corrupting_state(self):
         capability = self.exchange()
         with patch.object(self.broker, "_submit_write"):

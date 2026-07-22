@@ -198,6 +198,27 @@ class RuntimeConfigurationTest(unittest.TestCase):
                 adapter_factory=RecordingAdapter,
             )
 
+    def test_runtime_rejects_non_environment_credential_resolver_locators(self):
+        for invalid in (
+            "lowercase",
+            "1STARTS_WITH_A_DIGIT",
+            "CONTAINS-DASH",
+            "UNICODE_É",
+            "A" * 129,
+        ):
+            with self.subTest(locator=invalid), self.assertRaisesRegex(
+                RuntimeConfigurationError, "resolver locator is invalid"
+            ):
+                compile_runtime_configuration(
+                    inventory=self.inventory,
+                    profiles=("core",),
+                    token_resolver=lambda: "data-token",
+                    mint_authority_resolver=lambda: "control-capability",
+                    token_resolver_id=invalid,
+                    mint_authority_resolver_id="TEST_MINT_AUTHORITY",
+                    adapter_factory=RecordingAdapter,
+                )
+
     def test_mint_authority_resolver_failure_is_logged_without_secret_text(self):
         def failed_resolver():
             raise RuntimeError("private-mint-authority")

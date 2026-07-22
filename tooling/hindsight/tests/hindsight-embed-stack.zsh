@@ -673,6 +673,7 @@ active_start_all_events="$tmp_dir/active-start-all-events"
   hindsight_stack_require_current_user() { return 0 }
   hindsight_stack_require_tools() { return 0 }
   hindsight_stack_require_runtime_helpers() { return 0 }
+  hindsight_stack_preflight_runtime_credentials() { return 0 }
   hindsight_stack_validate_fleet() { print -r -- validate >>"$active_start_all_events" }
   hindsight_stack_initialize_desired_state() { print -r -- initialize >>"$active_start_all_events" }
   hindsight_stack_broker_status() { return 0 }

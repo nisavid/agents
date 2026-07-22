@@ -2885,11 +2885,15 @@ class Broker:
                         raise AdapterContractError(
                             "runtime operation status response is invalid"
                         )
+                    # A missing status record is indeterminate: the runtime
+                    # may have pruned it after applying the accepted write.
+                    # Preserve the operation identity and poll fail-closed;
+                    # clearing it here would authorize a duplicate mutation.
                     operation_pending = adapter_result["status"] in {
-                        "pending", "processing",
+                        "pending", "processing", "not_found",
                     }
                     failed_dispatch = adapter_result["status"] in {
-                        "failed", "cancelled", "not_found",
+                        "failed", "cancelled",
                     }
                     adapter_result = None
                 else:

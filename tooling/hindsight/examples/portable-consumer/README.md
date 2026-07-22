@@ -3,6 +3,13 @@
 These files show the closed consumer shape for macOS LaunchAgents and
 CachyOS/systemd-user. They are templates, not runnable defaults.
 
+The `/absolute/path/to/...` values and all-zero resolver digest are deliberate
+unresolved sentinels. Do not replace them with paths or digests from the
+machine publishing this repository. A consumer must resolve them for its own
+host; portable install preflight rejects missing or unprotected executables and
+rejects a resolver whose bytes do not match the configured digest before any
+managed state or service is changed.
+
 The portable manager owns service manifests and lifecycle directly. Do not add
 the standalone `hindsight-embed-service` launchd bindings to these service
 environments, including the systemd-user template.

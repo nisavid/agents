@@ -1,7 +1,8 @@
 """Private per-session bridge and native harness payload adapters."""
 
 from collections import OrderedDict
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
 import hashlib
@@ -1518,6 +1519,49 @@ def _reservation_name(session_id: str) -> str:
     return _locator_name(session_id).removesuffix(".json") + ".reservation"
 
 
+def _gui_envelope_claims(
+    directory: Path, name: str
+) -> list[tuple[Path, int]]:
+    pattern = re.compile(
+        rf"\.{re.escape(name)}\.consuming\.([1-9][0-9]*)\.[0-9a-f]{{16}}\Z"
+    )
+    claims = []
+    for candidate in directory.iterdir():
+        match = pattern.fullmatch(candidate.name)
+        if match is not None:
+            claims.append((candidate, int(match.group(1))))
+    return sorted(claims, key=lambda item: item[0].name)
+
+
+def _process_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _claim_gui_envelope(directory: Path, name: str) -> Path:
+    claim = directory / (
+        f".{name}.consuming.{os.getpid()}.{os.urandom(8).hex()}"
+    )
+    try:
+        os.rename(directory / name, claim)
+    except FileNotFoundError:
+        existing = _gui_envelope_claims(directory, name)
+        if len(existing) != 1 or _process_exists(existing[0][1]):
+            raise BridgeError("ENVELOPE_UNAVAILABLE") from None
+        try:
+            os.rename(existing[0][0], claim)
+        except OSError as error:
+            raise BridgeError("ENVELOPE_UNAVAILABLE") from error
+    except OSError as error:
+        raise BridgeError("ENVELOPE_UNAVAILABLE") from error
+    return claim
+
+
 def reserve_gui_envelope_slot(
     locator_dir: str | Path, *, session_id: str
 ) -> Path:
@@ -1526,7 +1570,11 @@ def reserve_gui_envelope_slot(
     directory = Path(locator_dir)
     _private_directory(directory, "LOCATOR_DIRECTORY_UNSAFE")
     remove_expired_gui_envelope(directory, session_id=session_id)
-    if (directory / _envelope_name(session_id)).exists():
+    envelope_name = _envelope_name(session_id)
+    if (
+        (directory / envelope_name).exists()
+        or _gui_envelope_claims(directory, envelope_name)
+    ):
         raise BridgeError("ENVELOPE_EXISTS")
     reservation = directory / _reservation_name(session_id)
     for attempt in range(2):
@@ -1554,7 +1602,10 @@ def reserve_gui_envelope_slot(
             continue
         else:
             os.close(descriptor)
-            if (directory / _envelope_name(session_id)).exists():
+            if (
+                (directory / envelope_name).exists()
+                or _gui_envelope_claims(directory, envelope_name)
+            ):
                 reservation.unlink(missing_ok=True)
                 raise BridgeError("ENVELOPE_EXISTS")
             return reservation
@@ -1640,11 +1691,21 @@ def remove_expired_gui_envelope(
 
     directory = Path(locator_dir)
     _private_directory(directory, "LOCATOR_DIRECTORY_UNSAFE")
-    path = directory / _envelope_name(session_id)
+    name = _envelope_name(session_id)
+    path = directory / name
     try:
         descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     except FileNotFoundError:
-        return False
+        claims = _gui_envelope_claims(directory, name)
+        if len(claims) != 1 or _process_exists(claims[0][1]):
+            return False
+        path = claims[0][0]
+        try:
+            descriptor = os.open(
+                path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            )
+        except FileNotFoundError:
+            return False
     try:
         metadata = os.fstat(descriptor)
         if (
@@ -1684,19 +1745,16 @@ def remove_expired_gui_envelope(
     return True
 
 
+@contextmanager
 def consume_gui_envelope(
     locator_dir: str | Path, *, session_id: str, harness_id: str
-) -> dict[str, Any]:
-    """Atomically consume one staged GUI capability envelope."""
+) -> Iterator[dict[str, Any]]:
+    """Claim one envelope until activation succeeds or the consumer exits."""
 
     directory = Path(locator_dir)
     _private_directory(directory, "LOCATOR_DIRECTORY_UNSAFE")
     name = _envelope_name(session_id)
-    consuming = directory / f".{name}.consuming.{os.getpid()}.{os.urandom(8).hex()}"
-    try:
-        os.rename(directory / name, consuming)
-    except OSError as error:
-        raise BridgeError("ENVELOPE_UNAVAILABLE") from error
+    consuming = _claim_gui_envelope(directory, name)
     try:
         descriptor = os.open(
             consuming, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
@@ -1743,7 +1801,7 @@ def consume_gui_envelope(
             or type(record.get("expires_at")) not in {int, float}
         ):
             raise BridgeError("ENVELOPE_INVALID")
-        return record
+        yield record
     finally:
         consuming.unlink(missing_ok=True)
 

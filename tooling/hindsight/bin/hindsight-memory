@@ -1977,58 +1977,60 @@ def _native_session_id(harness_id: str, payload: Mapping[str, Any]) -> str:
 def _activate_gui_envelope(
     args: argparse.Namespace, *, session_id: str
 ) -> Path:
-    envelope = consume_gui_envelope(
+    with consume_gui_envelope(
         args.locator_dir,
         session_id=session_id,
         harness_id=args.harness_id,
-    )
-    handle = envelope["handle"]
-    broker_socket = Path(envelope["broker_socket"])
-    process: subprocess.Popen[bytes] | None = None
-    try:
-        if envelope["expires_at"] <= time.time():
-            raise BridgeError("ENVELOPE_EXPIRED")
-        bridge_dir = Path(envelope["bridge_dir"])
-        socket_path = allocate_bridge_socket(
-            bridge_dir,
-            session_id=session_id,
-            harness_id=args.harness_id,
-        )
-        process = start_bridge_process(
-            executable=str(Path(__file__).resolve()),
-            state_dir=Path(envelope["state_dir"]),
-            bridge_socket=socket_path,
-            broker_socket=broker_socket,
-            handle=handle,
-            session_id=session_id,
-            harness_id=args.harness_id,
-            detached=True,
-            lifetime_seconds=envelope["expires_at"] - time.time(),
-            environment=sanitized_harness_environment(os.environ, socket_path),
-        )
-        wait_for_bridge(socket_path, process, timeout=args.timeout)
-        write_bridge_locator(
-            args.locator_dir,
-            session_id=session_id,
-            harness_id=args.harness_id,
-            socket_path=socket_path,
-        )
-        return socket_path
-    except Exception as activation_error:
-        if process is not None:
-            try:
-                _terminate_bridge_process(process)
-            except Exception:
-                pass
+    ) as envelope:
+        handle = envelope["handle"]
+        broker_socket = Path(envelope["broker_socket"])
+        process: subprocess.Popen[bytes] | None = None
         try:
-            _cancel_minted_session(
-                JsonRpcClient(broker_socket),
-                handle,
-                action_id="gui-envelope-cancel",
+            if envelope["expires_at"] <= time.time():
+                raise BridgeError("ENVELOPE_EXPIRED")
+            bridge_dir = Path(envelope["bridge_dir"])
+            socket_path = allocate_bridge_socket(
+                bridge_dir,
+                session_id=session_id,
+                harness_id=args.harness_id,
             )
-        except Exception as cleanup_error:
-            raise BridgeError("MINT_CLEANUP_FAILED") from cleanup_error
-        raise activation_error
+            process = start_bridge_process(
+                executable=str(Path(__file__).resolve()),
+                state_dir=Path(envelope["state_dir"]),
+                bridge_socket=socket_path,
+                broker_socket=broker_socket,
+                handle=handle,
+                session_id=session_id,
+                harness_id=args.harness_id,
+                detached=True,
+                lifetime_seconds=envelope["expires_at"] - time.time(),
+                environment=sanitized_harness_environment(
+                    os.environ, socket_path
+                ),
+            )
+            wait_for_bridge(socket_path, process, timeout=args.timeout)
+            write_bridge_locator(
+                args.locator_dir,
+                session_id=session_id,
+                harness_id=args.harness_id,
+                socket_path=socket_path,
+            )
+            return socket_path
+        except Exception as activation_error:
+            if process is not None:
+                try:
+                    _terminate_bridge_process(process)
+                except Exception:
+                    pass
+            try:
+                _cancel_minted_session(
+                    JsonRpcClient(broker_socket),
+                    handle,
+                    action_id="gui-envelope-cancel",
+                )
+            except Exception as cleanup_error:
+                raise BridgeError("MINT_CLEANUP_FAILED") from cleanup_error
+            raise activation_error
 
 
 def harness_command(args: argparse.Namespace) -> int:

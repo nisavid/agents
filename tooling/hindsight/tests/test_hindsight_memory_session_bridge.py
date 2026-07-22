@@ -998,19 +998,71 @@ class UnixBridgeTransportTest(unittest.TestCase):
             expires_at=time.time() + 30,
         )
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
-        consumed = consume_gui_envelope(
+        with consume_gui_envelope(
             locator_dir,
             session_id="one-use",
             harness_id="cursor",
-        )
-        self.assertEqual(consumed["handle"], "a" * 64)
+        ) as consumed:
+            self.assertEqual(consumed["handle"], "a" * 64)
+            with self.assertRaisesRegex(BridgeError, "ENVELOPE_UNAVAILABLE"):
+                with consume_gui_envelope(
+                    locator_dir,
+                    session_id="one-use",
+                    harness_id="cursor",
+                ):
+                    pass
         self.assertFalse(path.exists())
         with self.assertRaisesRegex(BridgeError, "ENVELOPE_UNAVAILABLE"):
-            consume_gui_envelope(
+            with consume_gui_envelope(
                 locator_dir,
                 session_id="one-use",
                 harness_id="cursor",
-            )
+            ):
+                pass
+
+    def test_gui_envelope_claim_recovers_after_consumer_process_crash(self):
+        locator_dir = self.root / "crashed-envelope"
+        locator_dir.mkdir(mode=0o700)
+        path = write_gui_envelope(
+            locator_dir,
+            session_id="crashed-consumer",
+            harness_id="cursor",
+            handle="b" * 64,
+            state_dir=self.root,
+            broker_socket=self.root / "broker.sock",
+            bridge_dir=self.root,
+            expires_at=time.time() + 30,
+        )
+        script = """
+import os
+import sys
+from hindsight_memory_control_plane.session_bridge import consume_gui_envelope
+
+with consume_gui_envelope(
+    sys.argv[1], session_id="crashed-consumer", harness_id="cursor"
+):
+    os._exit(17)
+"""
+        crashed = subprocess.run(
+            [sys.executable, "-c", script, str(locator_dir)],
+            env={**os.environ, "PYTHONPATH": str(LIB)},
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        self.assertEqual(crashed.returncode, 17, crashed.stderr)
+        self.assertFalse(path.exists())
+        self.assertEqual(
+            len(list(locator_dir.glob(".*.consuming.*"))), 1
+        )
+
+        with consume_gui_envelope(
+            locator_dir,
+            session_id="crashed-consumer",
+            harness_id="cursor",
+        ) as recovered:
+            self.assertEqual(recovered["handle"], "b" * 64)
+        self.assertEqual(list(locator_dir.glob(".*.consuming.*")), [])
 
     def test_stable_harness_cli_translates_native_payload_without_private_inputs(self):
         result = subprocess.run(

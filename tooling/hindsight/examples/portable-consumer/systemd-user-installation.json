@@ -22,6 +22,7 @@
         "HINDSIGHT_EMBED_CONTROL_HOSTNAME": "127.0.0.1",
         "HINDSIGHT_EMBED_CONTROL_PORT": "7878",
         "HINDSIGHT_EMBED_CONTROL_SERVER": "release://libexec/hindsight-embed-control-server.py",
+        "HINDSIGHT_EMBED_DAEMON_STARTUP_TIMEOUT": "300",
         "HINDSIGHT_EMBED_FLEET_PROFILES": "core",
         "HINDSIGHT_EMBED_PRIMARY_PROFILE": "core",
         "HINDSIGHT_EMBED_PROVIDER_PRESET_BASE_URL": "https://provider.example.test/v1",
@@ -47,15 +48,16 @@
         "HOME": "/home/example",
         "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"
       },
-      "timeout_seconds": 30
+      "timeout_seconds": 300
     }
   ],
   "install_root": "/home/example/.local/opt/hindsight-control-plane",
   "installation_mode": "adopt",
   "inventory_path": "/home/example/.config/hindsight-control-plane/inventory.json",
+  "npx_executable": "/usr/bin/npx",
   "platform": "systemd-user",
   "python_executable": "/usr/bin/python3",
-  "uvx_executable": "/home/example/.local/bin/uvx",
+  "uvx_executable": "/usr/bin/uvx",
   "zsh_executable": "/absolute/path/to/zsh",
   "schema_version": 1,
   "service_root": "/home/example/.config/systemd/user",
@@ -75,6 +77,7 @@
         "HINDSIGHT_EMBED_CONTROL_HOSTNAME": "127.0.0.1",
         "HINDSIGHT_EMBED_CONTROL_PORT": "7878",
         "HINDSIGHT_EMBED_CONTROL_SERVER": "release://libexec/hindsight-embed-control-server.py",
+        "HINDSIGHT_EMBED_DAEMON_STARTUP_TIMEOUT": "300",
         "HINDSIGHT_EMBED_FLEET_PROFILES": "core",
         "HINDSIGHT_EMBED_PRIMARY_PROFILE": "core",
         "HINDSIGHT_EMBED_PROVIDER_PRESET_BASE_URL": "https://provider.example.test/v1",

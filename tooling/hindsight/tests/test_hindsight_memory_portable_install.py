@@ -248,6 +248,7 @@ class PortableInstallationManagerTest(unittest.TestCase):
             "service_root": str(self.service_root),
             "inventory_path": str(self.inventory),
             "python_executable": str(self.managed_python),
+            "npx_executable": "/usr/bin/true",
             "uvx_executable": "/usr/bin/true",
             "zsh_executable": str(ZSH_EXECUTABLE),
             "credential_resolver": {
@@ -503,6 +504,9 @@ class PortableInstallationManagerTest(unittest.TestCase):
         )
         self.assertEqual(
             managed_config["python_executable"], str(self.managed_python.resolve())
+        )
+        self.assertEqual(
+            managed_config["npx_executable"], str(Path("/usr/bin/true").resolve())
         )
         self.assertEqual(
             managed_config["uvx_executable"], str(Path("/usr/bin/true").resolve())
@@ -940,6 +944,37 @@ class PortableInstallationManagerTest(unittest.TestCase):
         self.assertIn(self.install_root / "releases", observed)
         self.assertIn(self.install_root.parent, observed)
         self.assertEqual(observed[-1], self.state_root)
+
+    def test_failed_fresh_systemd_install_reloads_after_manifest_restore(
+        self,
+    ) -> None:
+        manager = self.manager(
+            platform="systemd-user",
+            health_runner=lambda _check, _release: False,
+        )
+        events: list[str] = []
+        original_restore = manager._restore_manifests
+
+        def restore(preimage):
+            events.append("restore")
+            original_restore(preimage)
+
+        def runner(argv):
+            if argv == ("/usr/bin/systemctl", "--user", "daemon-reload"):
+                events.append("reload")
+            return self.runner(argv)
+
+        manager._restore_manifests = restore
+        manager._command_runner = runner
+
+        with self.assertRaisesRegex(
+            PortableInstallError, "health verification failed"
+        ):
+            manager.install(self.release("1.0.0"), version="1.0.0")
+
+        daemon_reload = ("/usr/bin/systemctl", "--user", "daemon-reload")
+        self.assertEqual(self.runner.calls.count(daemon_reload), 3)
+        self.assertEqual(events[-2:], ["restore", "reload"])
 
     def test_lifecycle_rejects_root_before_mutation(self) -> None:
         manager = self.manager(health_runner=lambda _check, _release: True)
@@ -1794,6 +1829,31 @@ class PortableInstallationManagerTest(unittest.TestCase):
         self.assertNotIn("SECRET_CANARY", environment)
         account_lookup.assert_called_once_with(os.geteuid())
 
+    def test_default_health_retries_until_the_managed_stack_is_ready(self) -> None:
+        installed = self.manager(health_runner=lambda _check, _release: True)
+        installed.install(self.release("1.0.0"), version="1.0.0")
+        manager = self.manager()
+        starting = mock.Mock()
+        starting.wait.return_value = 1
+        starting.pid = 12345
+        healthy = mock.Mock()
+        healthy.wait.return_value = 0
+        healthy.pid = 12346
+
+        with mock.patch(
+            "hindsight_memory_control_plane.portable_install.subprocess.Popen",
+            side_effect=(starting, healthy),
+        ) as popen, mock.patch(
+            "hindsight_memory_control_plane.portable_install.time.sleep"
+        ):
+            result = manager._default_health_runner(
+                manager.config.health_checks[0].to_dict(),
+                manager._load_state()["current"],
+            )
+
+        self.assertTrue(result)
+        self.assertEqual(popen.call_count, 2)
+
     def test_health_timeout_kills_the_credential_resolver_process_group(self) -> None:
         pid_path = self.root / "resolver.pid"
         self.resolver.chmod(0o700)
@@ -1934,6 +1994,21 @@ class PortableInstallationManagerTest(unittest.TestCase):
                 health_runner=lambda _check, _release: True,
             ).install(self.release("1.0.0"), version="1.0.0")
 
+    def test_install_rejects_an_unprotected_npx_executable(self) -> None:
+        npx = self.root / "consumer" / "npx"
+        npx.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        npx.chmod(0o722)
+        data = self.config_data()
+        data["npx_executable"] = str(npx)
+        self.config_path.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
+
+        with self.assertRaisesRegex(PortableInstallError, "npx executable"):
+            PortableInstallationManager(
+                InstallationConfig.load(data, source_path=self.config_path),
+                command_runner=self.runner,
+                health_runner=lambda _check, _release: True,
+            ).install(self.release("1.0.0"), version="1.0.0")
+
     def test_install_rejects_a_uvx_alias_in_unprotected_ancestry(self) -> None:
         unsafe = self.root / "unsafe"
         unsafe.mkdir(mode=0o777)
@@ -1951,14 +2026,34 @@ class PortableInstallationManagerTest(unittest.TestCase):
                 health_runner=lambda _check, _release: True,
             ).install(self.release("1.0.0"), version="1.0.0")
 
+    def test_install_rejects_a_npx_alias_in_unprotected_ancestry(self) -> None:
+        unsafe = self.root / "unsafe-npx"
+        unsafe.mkdir(mode=0o777)
+        unsafe.chmod(0o777)
+        npx = unsafe / "npx"
+        npx.symlink_to("/usr/bin/true")
+        data = self.config_data()
+        data["npx_executable"] = str(npx)
+        self.config_path.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
+
+        with self.assertRaisesRegex(PortableInstallError, "npx executable ancestry"):
+            PortableInstallationManager(
+                InstallationConfig.load(data, source_path=self.config_path),
+                command_runner=self.runner,
+                health_runner=lambda _check, _release: True,
+            ).install(self.release("1.0.0"), version="1.0.0")
+
     def test_install_persists_the_validated_executable_targets(self) -> None:
         aliases = self.inventory.parent.resolve() / "executables"
         aliases.mkdir()
+        npx = aliases / "npx"
         uvx = aliases / "uvx"
         zsh = aliases / "zsh"
+        npx.symlink_to("/usr/bin/true")
         uvx.symlink_to("/usr/bin/true")
         zsh.symlink_to(ZSH_EXECUTABLE)
         data = self.config_data()
+        data["npx_executable"] = str(npx)
         data["uvx_executable"] = str(uvx)
         data["zsh_executable"] = str(zsh)
         self.config_path.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
@@ -1971,8 +2066,72 @@ class PortableInstallationManagerTest(unittest.TestCase):
         manager.install(self.release("1.0.0"), version="1.0.0")
 
         installed = json.loads((self.install_root / "managed-config.json").read_text())
+        state = json.loads((self.install_root / "install-state.json").read_text())
+        self.assertEqual(state["npx_alias"], str(npx))
+        self.assertEqual(installed["npx_executable"], str(npx.resolve()))
         self.assertEqual(installed["uvx_executable"], str(uvx.resolve()))
         self.assertEqual(installed["zsh_executable"], str(zsh.resolve()))
+
+    def test_load_state_migrates_the_legacy_npx_binding(self) -> None:
+        manager = self.manager(health_runner=lambda _check, _release: True)
+        manager.install(self.release("1.0.0"), version="1.0.0")
+        state = manager._load_state()
+        assert state is not None
+        managed_config_path = self.install_root / "managed-config.json"
+        managed_config = json.loads(managed_config_path.read_text())
+        managed_config.pop("npx_executable")
+        legacy_config_bytes = portable_install_module.canonical_bytes(managed_config)
+        managed_config_path.chmod(0o700)
+        managed_config_path.write_bytes(legacy_config_bytes)
+        managed_config_path.chmod(0o500)
+        state.pop("npx_alias")
+        state["config_digest"] = portable_install_module.digest(managed_config)
+        state["config_file_digest"] = hashlib.sha256(
+            legacy_config_bytes
+        ).hexdigest()
+        state["owned_install_files"][str(managed_config_path)] = state[
+            "config_file_digest"
+        ]
+        state["binding_generation_digest"] = portable_install_module.digest(
+            {
+                "config_digest": state["config_digest"],
+                "config_file_digest": state["config_file_digest"],
+                "inventory_digest": state["inventory_digest"],
+            }
+        )
+        manager._write_state(state)
+
+        original_atomic_write = portable_install_module._atomic_write
+
+        def interrupt_after_config(path, content, mode, **kwargs):
+            if path == manager._state_path and manager._binding_migration_path.exists():
+                raise PortableInstallError("simulated binding migration interruption")
+            return original_atomic_write(path, content, mode, **kwargs)
+
+        with (
+            mock.patch.object(
+                portable_install_module,
+                "_atomic_write",
+                side_effect=interrupt_after_config,
+            ),
+            self.assertRaisesRegex(PortableInstallError, "simulated"),
+        ):
+            manager._load_state()
+        self.assertTrue(manager._binding_migration_path.is_file())
+
+        migrated = manager._load_state()
+
+        assert migrated is not None
+        self.assertEqual(migrated["npx_alias"], str(manager.config.npx_executable))
+        migrated_config = json.loads(managed_config_path.read_text())
+        self.assertEqual(
+            migrated_config["npx_executable"],
+            str(manager.config.npx_executable.resolve()),
+        )
+        self.assertFalse(manager._binding_migration_path.exists())
+        self.assertEqual(manager.verify()["status"], "verified")
+        persisted = json.loads((self.install_root / "install-state.json").read_text())
+        self.assertEqual(persisted, migrated)
 
     def test_install_rejects_an_unprotected_zsh_executable(self) -> None:
         zsh = self.root / "consumer" / "zsh"
@@ -2062,6 +2221,7 @@ class PortableInstallationManagerTest(unittest.TestCase):
             "inventory_path",
             "credential_resolver",
             "python_executable",
+            "npx_executable",
             "uvx_executable",
             "zsh_executable",
         ):
@@ -2640,7 +2800,7 @@ class PortableInstallationManagerTest(unittest.TestCase):
         child.write_text(
             "#!/usr/bin/env python3\n"
             "import json, os, pathlib, sys\n"
-            'pathlib.Path(sys.argv[1]).write_text(json.dumps({"secret": os.environ.get("HINDSIGHT_API_KEY"), "ambient": os.environ.get("UNRELATED_AMBIENT"), "release_path": os.environ.get("CAPTURE_RELEASE"), "inventory": os.environ.get("HINDSIGHT_MEMORY_INVENTORY"), "uvx": os.environ.get("HINDSIGHT_EMBED_UVX_EXECUTABLE"), "isolated": sys.flags.isolated}))\n',
+            'pathlib.Path(sys.argv[1]).write_text(json.dumps({"secret": os.environ.get("HINDSIGHT_API_KEY"), "ambient": os.environ.get("UNRELATED_AMBIENT"), "release_path": os.environ.get("CAPTURE_RELEASE"), "inventory": os.environ.get("HINDSIGHT_MEMORY_INVENTORY"), "uvx": os.environ.get("HINDSIGHT_EMBED_UVX_EXECUTABLE"), "path": os.environ.get("PATH"), "isolated": sys.flags.isolated}))\n',
             encoding="utf-8",
         )
         child.chmod(0o755)
@@ -2653,6 +2813,11 @@ class PortableInstallationManagerTest(unittest.TestCase):
         )
         self.resolver.chmod(0o500)
         data = self.config_data()
+        npx_directory = self.inventory.parent / "node-bin"
+        npx_directory.mkdir()
+        npx = npx_directory / "npx"
+        npx.symlink_to("/usr/bin/true")
+        data["npx_executable"] = str(npx)
         data["credential_resolver"]["sha256"] = file_sha256(self.resolver)
         data["services"][0]["entrypoint"] = "bin/capture"
         data["services"][0]["arguments"] = [str(capture)]
@@ -2702,6 +2867,7 @@ class PortableInstallationManagerTest(unittest.TestCase):
             str((self.install_root / "managed-inventory.json").resolve()),
         )
         self.assertEqual(captured["uvx"], "/usr/bin/true")
+        self.assertEqual(captured["path"], f"{npx_directory}:/usr/bin:/bin")
         self.assertEqual(captured["isolated"], 1)
         for path in self.service_root.glob("*"):
             self.assertNotIn("test-canary-secret", path.read_text())
@@ -2727,6 +2893,32 @@ class PortableInstallationManagerTest(unittest.TestCase):
         )
         self.assertNotEqual(rejected.returncode, 0)
         self.assertNotIn(b"test-canary-secret", rejected.stderr)
+
+        state_path = self.install_root / "install-state.json"
+        state = json.loads(state_path.read_text())
+        del state["npx_alias"]
+        state_path.write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
+        missing_npx_binding = subprocess.run(
+            [
+                sys.executable,
+                str(launcher),
+                "--config",
+                str(self.install_root / "managed-config.json"),
+                "--service",
+                "broker",
+            ],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environment,
+            timeout=10,
+        )
+        self.assertNotEqual(missing_npx_binding.returncode, 0)
+        self.assertEqual(
+            missing_npx_binding.stderr,
+            b"managed npx binding is not protected\n",
+        )
 
     def test_service_launcher_uses_the_owned_validated_config_snapshot(self) -> None:
         capture = self.root / "owned-config-capture"
@@ -4058,6 +4250,7 @@ class PortableInstallationManagerTest(unittest.TestCase):
             "service_root",
             "inventory_path",
             "python_executable",
+            "npx_executable",
             "uvx_executable",
             "zsh_executable",
         ):

@@ -247,6 +247,7 @@ class PortablePlatformAcceptanceTest(unittest.TestCase):
             "service_root": str(self.service_root),
             "inventory_path": str(self.inventory_path),
             "python_executable": str(self.managed_python),
+            "npx_executable": "/usr/bin/true",
             "uvx_executable": "/usr/bin/true",
             "zsh_executable": str(self.zsh_executable),
             "credential_resolver": {
@@ -471,7 +472,7 @@ class PortablePlatformAcceptanceTest(unittest.TestCase):
                             "/usr/bin/systemctl",
                             "--user",
                             "show",
-                            "--property=LastTriggerUSecRealtime",
+                            "--property=LastTriggerUSec",
                             "--value",
                             f"{self.timer_label}.timer",
                         ],

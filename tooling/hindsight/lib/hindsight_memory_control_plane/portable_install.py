@@ -121,6 +121,7 @@ class _ManagedServiceCommandError(PortableInstallError):
 class BindingSnapshot:
     config_bytes: bytes
     inventory_bytes: bytes
+    npx_alias: str
     config_file_digest: str
     config_digest: str
     inventory_digest: str
@@ -565,6 +566,7 @@ class InstallationConfig:
     service_root: Path
     inventory_path: Path
     python_executable: Path
+    npx_executable: Path
     uvx_executable: Path
     zsh_executable: Path
     credential_resolver: CredentialResolver
@@ -589,6 +591,7 @@ class InstallationConfig:
                 "service_root",
                 "inventory_path",
                 "python_executable",
+                "npx_executable",
                 "uvx_executable",
                 "zsh_executable",
                 "credential_resolver",
@@ -650,6 +653,7 @@ class InstallationConfig:
                     raise PortableInstallError("installation roots must not overlap")
         inventory_path = _absolute(value["inventory_path"], "inventory_path")
         python_executable = _absolute(value["python_executable"], "python_executable")
+        npx_executable = _absolute(value["npx_executable"], "npx_executable")
         uvx_executable = _absolute(value["uvx_executable"], "uvx_executable")
         zsh_executable = _absolute(value["zsh_executable"], "zsh_executable")
         credential_resolver = CredentialResolver.load(value["credential_resolver"])
@@ -659,6 +663,7 @@ class InstallationConfig:
             "inventory": inventory_path,
             "credential resolver": credential_resolver.path,
             "managed Python": python_executable,
+            "npx executable": npx_executable,
             "uvx executable": uvx_executable,
             "Zsh executable": zsh_executable,
         }
@@ -677,6 +682,7 @@ class InstallationConfig:
             service_root=roots["service_root"],
             inventory_path=inventory_path,
             python_executable=python_executable,
+            npx_executable=npx_executable,
             uvx_executable=uvx_executable,
             zsh_executable=zsh_executable,
             credential_resolver=credential_resolver,
@@ -711,6 +717,7 @@ class InstallationConfig:
             "service_root": str(self.service_root),
             "inventory_path": str(self.inventory_path),
             "python_executable": str(self.python_executable),
+            "npx_executable": str(self.npx_executable),
             "uvx_executable": str(self.uvx_executable),
             "zsh_executable": str(self.zsh_executable),
             "credential_resolver": self.credential_resolver.to_dict(),
@@ -1476,6 +1483,59 @@ def protected(path, mode, directory=False):
     reject_acl(path)
     return metadata
 
+def protected_ancestry(directory, *, allow_root_symlinks):
+    allowed_owners = {0, os.geteuid()}
+    current = Path(directory.anchor)
+    for part in directory.parts[1:]:
+        current /= part
+        metadata = current.lstat()
+        sticky_root = metadata.st_uid == 0 and metadata.st_mode & stat.S_ISVTX
+        if current.is_symlink():
+            if not allow_root_symlinks or metadata.st_uid != 0:
+                raise ValueError
+        elif not stat.S_ISDIR(metadata.st_mode):
+            raise ValueError
+        if metadata.st_uid not in allowed_owners or (
+            metadata.st_mode & 0o022 and not sticky_root
+        ):
+            raise ValueError
+        reject_acl(current)
+
+def protected_external_executable(alias, expected):
+    if not alias.is_absolute():
+        raise SystemExit("managed npx alias is invalid")
+    allowed_owners = {0, os.geteuid()}
+    try:
+        resolved = alias.resolve(strict=True)
+        if resolved != expected:
+            raise ValueError
+        for candidate in (alias.parent, resolved.parent):
+            protected_ancestry(candidate, allow_root_symlinks=True)
+        descriptor = os.open(
+            resolved,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            metadata = os.fstat(descriptor)
+            observed = resolved.lstat()
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or (metadata.st_dev, metadata.st_ino)
+                != (observed.st_dev, observed.st_ino)
+                or metadata.st_uid not in allowed_owners
+                or metadata.st_mode & 0o022
+                or not metadata.st_mode & 0o111
+            ):
+                raise ValueError
+            reject_acl(resolved)
+        finally:
+            os.close(descriptor)
+    except (OSError, ValueError):
+        raise SystemExit("managed npx binding is not protected") from None
+    return alias.parent
+
 def snapshot_json(path, mode):
     observed = path.lstat()
     descriptor = os.open(
@@ -1529,18 +1589,7 @@ def protected_resolver(path, expected_digest):
     if path.is_symlink():
         raise ValueError("unsafe resolver executable")
     path = path.resolve(strict=True)
-    current = Path(path.anchor)
-    for part in path.parts[1:-1]:
-        current /= part
-        metadata = current.lstat()
-        sticky_root = metadata.st_uid == 0 and metadata.st_mode & stat.S_ISVTX
-        if current.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
-            raise ValueError("unsafe resolver ancestry")
-        if metadata.st_uid not in allowed_owners or (
-            metadata.st_mode & 0o022 and not sticky_root
-        ):
-            raise ValueError("unsafe resolver ancestry")
-        reject_acl(current)
+    protected_ancestry(path.parent, allow_root_symlinks=False)
     descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     try:
         metadata = os.fstat(descriptor)
@@ -1877,6 +1926,18 @@ environment.update(values)
 environment.update(account_environment)
 environment["HINDSIGHT_MEMORY_INVENTORY"] = str(inventory_path)
 environment["HINDSIGHT_EMBED_UVX_EXECUTABLE"] = config["uvx_executable"]
+try:
+    npx_directory = str(
+        protected_external_executable(
+            Path(state["npx_alias"]), Path(config["npx_executable"])
+        )
+    )
+except (KeyError, TypeError):
+    raise SystemExit("managed npx binding is not protected") from None
+path_entries = environment.get("PATH", "/usr/bin:/bin").split(":")
+environment["PATH"] = ":".join(
+    [npx_directory, *(entry for entry in path_entries if entry != npx_directory)]
+)
 with target.open("rb") as handle:
     first_line = handle.readline(256).lower()
 shebang_words = first_line[2:].strip().split() if first_line.startswith(b"#!") else []
@@ -1992,6 +2053,10 @@ class PortableInstallationManager:
     @property
     def _uninstall_transaction_path(self) -> Path:
         return self.config.state_root / "portable-uninstall-transaction.json"
+
+    @property
+    def _binding_migration_path(self) -> Path:
+        return self.config.state_root / "portable-binding-migration.json"
 
     @property
     def _uninstall_tombstone_path(self) -> Path:
@@ -2370,7 +2435,6 @@ class PortableInstallationManager:
     def _default_health_runner(
         self, check: Mapping[str, Any], _release: Mapping[str, Any]
     ) -> bool:
-        process: subprocess.Popen[bytes] | None = None
         try:
             account = pwd.getpwuid(os.geteuid())
             environment = _bound_user_environment()
@@ -2381,18 +2445,28 @@ class PortableInstallationManager:
                     "LOGNAME": account.pw_name,
                 }
             )
-            process = subprocess.Popen(
-                tuple(self._launch_argv("health", str(check["check_id"]))),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                cwd="/",
-                env=environment,
-                start_new_session=True,
-            )
-            returncode = process.wait(timeout=float(check["timeout_seconds"]))
-        except subprocess.TimeoutExpired:
-            if process is not None:
+            argv = tuple(self._launch_argv("health", str(check["check_id"])))
+            deadline = time.monotonic() + float(check["timeout_seconds"])
+        except (KeyError, OSError, TypeError, ValueError):
+            return False
+
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            process: subprocess.Popen[bytes] | None = None
+            try:
+                process = subprocess.Popen(
+                    argv,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    cwd="/",
+                    env=environment,
+                    start_new_session=True,
+                )
+                returncode = process.wait(timeout=remaining)
+            except subprocess.TimeoutExpired:
                 try:
                     _signal_process_group(process.pid, signal.SIGTERM)
                 except OSError:
@@ -2412,10 +2486,15 @@ class PortableInstallationManager:
                     process.wait(timeout=5)
                 except subprocess.SubprocessError:
                     pass
-            return False
-        except (KeyError, OSError, subprocess.SubprocessError):
-            return False
-        return returncode == 0
+                return False
+            except (OSError, subprocess.SubprocessError):
+                return False
+            if returncode == 0:
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(0.5, remaining))
 
     def _validate_external_bindings(self) -> BindingSnapshot:
         inventory_snapshot = _snapshot_regular_file(
@@ -2424,6 +2503,9 @@ class PortableInstallationManager:
         self._validate_config_source()
 
         python_executable = _validated_python_runtime(self.config.python_executable)
+        npx_executable = _protected_executable_path(
+            self.config.npx_executable, "npx executable"
+        )
         uvx_executable = _protected_executable_path(
             self.config.uvx_executable, "uvx executable"
         )
@@ -2439,6 +2521,7 @@ class PortableInstallationManager:
         effective_config.update(
             {
                 "python_executable": str(python_executable),
+                "npx_executable": str(npx_executable),
                 "uvx_executable": str(uvx_executable),
                 "zsh_executable": str(zsh_executable),
             }
@@ -2450,6 +2533,7 @@ class PortableInstallationManager:
         return BindingSnapshot(
             config_bytes=config_snapshot,
             inventory_bytes=inventory_snapshot,
+            npx_alias=str(self.config.npx_executable),
             config_file_digest=config_file_digest,
             config_digest=config_digest,
             inventory_digest=inventory_digest,
@@ -2458,6 +2542,7 @@ class PortableInstallationManager:
                     "config_digest": config_digest,
                     "config_file_digest": config_file_digest,
                     "inventory_digest": inventory_digest,
+                    "npx_alias": str(self.config.npx_executable),
                 }
             ),
         )
@@ -2935,6 +3020,147 @@ class PortableInstallationManager:
             runner(check.to_dict(), release) for check in self.config.health_checks
         )
 
+    def _recover_binding_migration(self) -> None:
+        if not self._binding_migration_path.exists():
+            return
+        try:
+            journal = _read_json(
+                self._binding_migration_path, "binding migration transaction"
+            )
+            if set(journal) != {
+                "schema_version",
+                "consumer_id",
+                "legacy_config_digest",
+                "legacy_state_digest",
+                "desired_config",
+                "desired_state",
+            } or journal.get("schema_version") != 1 or journal.get(
+                "consumer_id"
+            ) != self.config.consumer_id:
+                raise ValueError
+            desired_config = base64.b64decode(
+                journal["desired_config"], validate=True
+            )
+            desired_state = base64.b64decode(journal["desired_state"], validate=True)
+            config_path = self.config.install_root / "managed-config.json"
+            current_config = _snapshot_regular_file(config_path, "managed config")
+            current_state = _snapshot_regular_file(
+                self._state_path, "installation state"
+            )
+            config_digests = {
+                journal["legacy_config_digest"],
+                hashlib.sha256(desired_config).hexdigest(),
+            }
+            state_digests = {
+                journal["legacy_state_digest"],
+                hashlib.sha256(desired_state).hexdigest(),
+            }
+            if (
+                hashlib.sha256(current_config).hexdigest() not in config_digests
+                or hashlib.sha256(current_state).hexdigest() not in state_digests
+            ):
+                raise ValueError
+            strict_json_loads(desired_config)
+            strict_json_loads(desired_state)
+        except (KeyError, OSError, PortableInstallError, ValueError) as error:
+            raise PortableInstallError(
+                "legacy npx binding migration is invalid; reinstall required"
+            ) from error
+        _atomic_write(config_path, desired_config, 0o500)
+        _atomic_write(self._state_path, desired_state, 0o600)
+        self._binding_migration_path.unlink()
+        _fsync_directory(self._binding_migration_path.parent)
+
+    def _migrate_legacy_npx_binding(
+        self, state: dict[str, Any]
+    ) -> dict[str, Any]:
+        legacy_generation_digest = digest(
+            {
+                "config_digest": state.get("config_digest"),
+                "config_file_digest": state.get("config_file_digest"),
+                "inventory_digest": state.get("inventory_digest"),
+            }
+        )
+        if state.get("binding_generation_digest") != legacy_generation_digest:
+            raise PortableInstallError("installation state identity is invalid")
+        npx_alias = str(self.config.npx_executable)
+        config_path = self.config.install_root / "managed-config.json"
+        try:
+            config_bytes = _snapshot_regular_file(config_path, "managed config")
+            config_value = strict_json_loads(config_bytes)
+            if not isinstance(config_value, Mapping):
+                raise ValueError
+        except (PortableInstallError, ValueError) as error:
+            raise PortableInstallError(
+                "legacy installation lacks a migratable npx binding; reinstall required"
+            ) from error
+
+        migrated = dict(state)
+        migrated["npx_alias"] = npx_alias
+        if "npx_executable" not in config_value:
+            try:
+                resolved_npx = _protected_executable_path(
+                    self.config.npx_executable, "npx executable"
+                )
+                migrated_config_value = dict(config_value)
+                migrated_config_value["npx_executable"] = str(resolved_npx)
+                migrated_config = InstallationConfig.load(
+                    migrated_config_value, source_path=self.config.source_path
+                )
+            except (PortableInstallError, ValueError) as error:
+                raise PortableInstallError(
+                    "legacy installation lacks a migratable npx binding; reinstall required"
+                ) from error
+            migrated_config_bytes = canonical_bytes(migrated_config_value)
+            migrated["config_digest"] = migrated_config.config_digest
+            migrated["config_file_digest"] = hashlib.sha256(
+                migrated_config_bytes
+            ).hexdigest()
+            owned = migrated.get("owned_install_files")
+            if (
+                not isinstance(owned, Mapping)
+                or owned.get(str(config_path))
+                != hashlib.sha256(config_bytes).hexdigest()
+            ):
+                raise PortableInstallError(
+                    "legacy installation lacks a migratable npx binding; reinstall required"
+                )
+            migrated["owned_install_files"] = {
+                **owned,
+                str(config_path): migrated["config_file_digest"],
+            }
+        else:
+            migrated_config_bytes = config_bytes
+        migrated["binding_generation_digest"] = digest(
+            {
+                "config_digest": migrated.get("config_digest"),
+                "config_file_digest": migrated.get("config_file_digest"),
+                "inventory_digest": migrated.get("inventory_digest"),
+                "npx_alias": npx_alias,
+            }
+        )
+        if migrated_config_bytes == config_bytes:
+            self._write_state(migrated)
+            return migrated
+
+        legacy_state_bytes = _snapshot_regular_file(
+            self._state_path, "installation state"
+        )
+        migrated_state_bytes = canonical_bytes(migrated) + b"\n"
+        _atomic_json(
+            self._binding_migration_path,
+            {
+                "schema_version": 1,
+                "consumer_id": self.config.consumer_id,
+                "legacy_config_digest": hashlib.sha256(config_bytes).hexdigest(),
+                "legacy_state_digest": hashlib.sha256(legacy_state_bytes).hexdigest(),
+                "desired_config": base64.b64encode(migrated_config_bytes).decode(),
+                "desired_state": base64.b64encode(migrated_state_bytes).decode(),
+            },
+        )
+        self._recover_binding_migration()
+        return migrated
+
     def _load_state(self) -> dict[str, Any] | None:
         if self.config.install_root.exists() or self.config.install_root.is_symlink():
             _safe_directory(
@@ -2945,11 +3171,19 @@ class PortableInstallationManager:
             )
         if not self._state_path.exists():
             return None
+        self._recover_binding_migration()
         state = _read_json(self._state_path, "installation state")
         if (
             type(state.get("schema_version")) is not int
             or state.get("schema_version") != 1
             or state.get("consumer_id") != self.config.consumer_id
+        ):
+            raise PortableInstallError("installation state identity is invalid")
+        if "npx_alias" not in state:
+            state = self._migrate_legacy_npx_binding(state)
+        if (
+            not isinstance(state.get("npx_alias"), str)
+            or not Path(state["npx_alias"]).is_absolute()
         ):
             raise PortableInstallError("installation state identity is invalid")
         return state
@@ -3370,6 +3604,8 @@ class PortableInstallationManager:
                 "interrupted installation could not stop candidate services"
             ) from error
         self._restore_manifests(preimage)
+        if self.config.platform == "systemd-user":
+            self._command_runner(("/usr/bin/systemctl", "--user", "daemon-reload"))
         self._restore_install_files(install_preimage)
         self._remove_release_staging(journal["release_staging_path"], candidate)
         if active_bytes is None:
@@ -3529,6 +3765,7 @@ class PortableInstallationManager:
                 "config_file_digest": external_bindings.config_file_digest,
                 "inventory_digest": external_bindings.inventory_digest,
                 "binding_generation_digest": external_bindings.generation_digest,
+                "npx_alias": external_bindings.npx_alias,
                 "data_identity_digest": data_identity,
                 "current": release,
                 "last_known_good": prior["current"] if prior else release,
@@ -3698,10 +3935,13 @@ class PortableInstallationManager:
                 "config_digest": installed_config.config_digest,
                 "config_file_digest": config_file_digest,
                 "inventory_digest": inventory_digest,
+                "npx_alias": state.get("npx_alias"),
             }
         )
         if (
-            state.get("config_digest") != installed_config.config_digest
+            not isinstance(state.get("npx_alias"), str)
+            or not Path(state["npx_alias"]).is_absolute()
+            or state.get("config_digest") != installed_config.config_digest
             or state.get("config_file_digest") != config_file_digest
             or state.get("inventory_digest") != inventory_digest
             or state.get("binding_generation_digest") != generation_digest
@@ -3728,6 +3968,7 @@ class PortableInstallationManager:
             "config_file_digest",
             "inventory_digest",
             "binding_generation_digest",
+            "npx_alias",
             "data_identity_digest",
             "current",
             "last_known_good",
@@ -3751,6 +3992,8 @@ class PortableInstallationManager:
             or state.get("schema_version") != 1
             or state.get("consumer_id") != self.config.consumer_id
             or state.get("transaction") is not None
+            or not isinstance(state.get("npx_alias"), str)
+            or not Path(state["npx_alias"]).is_absolute()
             or any(
                 not isinstance(state.get(field), str)
                 or SHA256.fullmatch(state[field]) is None

@@ -1340,7 +1340,7 @@ if (
   print -ru2 -- "runtime tool preflight accepted a missing lsof dependency"
   exit 1
 fi
-if [[ "$(<"$missing_lsof_error")" != *"missing lsof at /usr/sbin/lsof or /usr/bin/lsof"* ]]; then
+if [[ "$(<"$missing_lsof_error")" != *"missing lsof at /usr/bin/lsof or /usr/sbin/lsof"* ]]; then
   print -ru2 -- "missing lsof preflight did not report the expected diagnostic"
   exit 1
 fi

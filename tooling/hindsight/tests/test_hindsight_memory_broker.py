@@ -1080,8 +1080,33 @@ class BrokerSocketTest(unittest.TestCase):
             recovered["payload"]["capability"],
             first["payload"]["capability"],
         )
-        self.assertEqual(migrated["schema_version"], 9)
+        self.assertEqual(migrated["schema_version"], 10)
         self.assertIn("receipt", migrated["exchanges"][handle])
+
+    def test_version_nine_queue_adds_missing_operation_counter(self):
+        capability = self.exchange(session_id="version-nine")
+        with patch.object(self.broker, "_submit_write"):
+            self.broker.transcript_checkpoint(
+                capability,
+                sequence=1,
+                action_id="version-nine-checkpoint",
+                request={
+                    "document_id": "version-nine", "epoch": 1,
+                    "checkpoint": 1, "content": "clean transcript",
+                },
+            )
+        self.stop()
+        work_path = self.state / "durable_work.json"
+        work = json.loads(work_path.read_text())
+        work["schema_version"] = 9
+        work["queue"][0].pop("missing_operation_polls")
+        work_path.write_text(json.dumps(work), encoding="utf-8")
+
+        self.start(self.adapter)
+
+        migrated = json.loads(work_path.read_text())
+        self.assertEqual(migrated["schema_version"], 10)
+        self.assertEqual(migrated["queue"][0]["missing_operation_polls"], 0)
 
     def test_legacy_reflect_content_is_scrubbed_during_migration(self):
         self.exchange(session_id="legacy-reflect")
@@ -1102,7 +1127,7 @@ class BrokerSocketTest(unittest.TestCase):
 
         self.start(self.adapter)
         migrated = json.loads(work_path.read_text())
-        self.assertEqual(migrated["schema_version"], 9)
+        self.assertEqual(migrated["schema_version"], 10)
         self.assertNotIn(state_key, migrated["completed"])
         self.assertNotIn(state_key, migrated["expirations"]["completed"])
 
@@ -1180,7 +1205,7 @@ class BrokerSocketTest(unittest.TestCase):
         migrated, changed = self.broker._migrate_work(legacy)
 
         self.assertTrue(changed)
-        self.assertEqual(migrated["schema_version"], 9)
+        self.assertEqual(migrated["schema_version"], 10)
         self.assertEqual(migrated["queue"], [])
         self.assertNotIn("private legacy prompt", json.dumps(migrated))
 
@@ -1995,7 +2020,7 @@ class DurableWorkTest(unittest.TestCase):
         self.assertGreaterEqual(self.adapter.polls, 2)
         self.assertTrue(self.work()["completed"])
 
-    def test_missing_operation_status_never_resubmits_accepted_retain(self):
+    def test_missing_operation_status_terminalizes_without_resubmission(self):
         self._stop()
 
         class MissingStatusFake(FakeAdapter):
@@ -2013,30 +2038,57 @@ class DurableWorkTest(unittest.TestCase):
                 return {"status": "not_found"}
 
         self.adapter = MissingStatusFake(endpoint=ENDPOINT)
-        self._start()
-        capability = self.exchange(session_id="missing-status")
-        self.client.transcript_checkpoint(
-            capability, sequence=1, action_id="checkpoint",
-            request={
-                "document_id": "session", "epoch": 1, "checkpoint": 1,
-                "content": "clean transcript",
-            },
-        )
-        self.wait_until(lambda: self.adapter.polls >= 2, timeout=2)
-        self.assertEqual(self.adapter.submissions, 1)
+        with patch(
+            "hindsight_memory_control_plane.broker."
+            "MAX_MISSING_OPERATION_POLLS",
+            3,
+        ):
+            self._start()
+            capability = self.exchange(session_id="missing-status")
+            self.client.transcript_checkpoint(
+                capability, sequence=1, action_id="checkpoint",
+                request={
+                    "document_id": "session", "epoch": 1,
+                    "checkpoint": 1, "content": "clean transcript",
+                },
+            )
+            self.wait_until(lambda: self.adapter.polls >= 2, timeout=2)
+            self.assertEqual(self.adapter.submissions, 1)
 
-        self._stop()
-        self._start()
-        self.wait_until(lambda: self.adapter.polls >= 3, timeout=2)
-        self.assertEqual(self.adapter.submissions, 1)
-        status = self.client.session_status(
-            capability, sequence=2, action_id="status"
-        )
-        self.assertEqual(
-            status["payload"]["writes"]["pending"][0]["operation_id"],
-            "operation-1",
-        )
-        self.assertEqual(status["payload"]["writes"]["completed"], [])
+            self._stop()
+            self._start()
+            self.wait_until(lambda: not self.work()["queue"], timeout=3)
+            self.assertEqual(self.adapter.submissions, 1)
+            status = self.client.session_status(
+                capability, sequence=2, action_id="status"
+            )
+            completed = next(iter(self.work()["completed"].values()))
+            self.assertEqual(
+                completed["adapter_result"], {"status": "indeterminate"}
+            )
+            self.assertEqual(status["payload"]["writes"]["pending"], [])
+            self.assertEqual(
+                status["payload"]["writes"]["completed"],
+                [{
+                    "method": "transcript_checkpoint",
+                    "watermark": [1, 1],
+                    "operation_id": "operation-1",
+                    "status": "indeterminate",
+                }],
+            )
+            with patch(
+                "hindsight_memory_control_plane.broker."
+                "MAX_DURABLE_QUEUE_ENTRIES",
+                1,
+            ):
+                accepted = self.client.transcript_checkpoint(
+                    capability, sequence=3, action_id="next-checkpoint",
+                    request={
+                        "document_id": "next", "epoch": 1,
+                        "checkpoint": 1, "content": "next transcript",
+                    },
+                )
+            self.assertEqual(accepted["disposition"], "queued")
 
     def test_malformed_runtime_write_responses_retry_without_corrupting_state(self):
         capability = self.exchange()

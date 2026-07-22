@@ -1889,8 +1889,15 @@ base_url = sys.argv[1].rstrip("/")
 timeout = float(sys.argv[2])
 access_key = os.environ.get("HINDSIGHT_CP_ACCESS_KEY", "")
 data_plane_token = os.environ.get("HINDSIGHT_CP_DATAPLANE_API_KEY", "")
-if not access_key or not data_plane_token:
+
+
+def fail(code):
+    print(f"hindsight-ui-auth-probe: {code}", file=sys.stderr)
     raise SystemExit(1)
+
+
+if not access_key or not data_plane_token:
+    fail("CREDENTIALS_UNAVAILABLE")
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -1908,7 +1915,7 @@ def opener_with_cookies():
     return opener, jar
 
 
-def request(opener, path, *, body=None, expected_status):
+def request(opener, path, *, body=None, expected_status, failure_code):
     encoded = None if body is None else json.dumps(body).encode("utf-8")
     headers = {"Accept": "application/json"}
     if encoded is not None:
@@ -1929,32 +1936,54 @@ def request(opener, path, *, body=None, expected_status):
         response_headers = exc.headers
         response_body = exc.read(1024 * 1024 + 1)
     if status != expected_status or len(response_body) > 1024 * 1024:
-        raise SystemExit(1)
+        fail(failure_code)
     exposed = str(response_headers).encode("utf-8", "replace") + response_body
     for secret in (access_key, data_plane_token):
         if secret.encode("utf-8") in exposed:
-            raise SystemExit(1)
+            fail("SECRET_EXPOSED")
     return response_headers, response_body
 
 
 anonymous, _ = opener_with_cookies()
-_, version_body = request(anonymous, "/api/version", expected_status=200)
+_, version_body = request(
+    anonymous,
+    "/api/version",
+    expected_status=200,
+    failure_code="VERSION_UNAVAILABLE",
+)
 try:
     version = json.loads(version_body)
 except (json.JSONDecodeError, TypeError):
-    raise SystemExit(1)
+    fail("VERSION_RESPONSE_INVALID")
 if version.get("features", {}).get("access_key_auth") is not True:
-    raise SystemExit(1)
-request(anonymous, "/api/banks", expected_status=401)
+    fail("ACCESS_KEY_AUTH_DISABLED")
+request(
+    anonymous,
+    "/api/banks",
+    expected_status=401,
+    failure_code="ANONYMOUS_ACCESS_ACCEPTED",
+)
 
 missing, _ = opener_with_cookies()
-request(missing, "/api/auth/login", body={}, expected_status=401)
+request(
+    missing,
+    "/api/auth/login",
+    body={},
+    expected_status=401,
+    failure_code="MISSING_LOGIN_ACCEPTED",
+)
 
 wrong_key = hashlib.sha256(access_key.encode("utf-8")).hexdigest()
 if wrong_key == access_key:
     wrong_key += "-invalid"
 wrong, _ = opener_with_cookies()
-request(wrong, "/api/auth/login", body={"key": wrong_key}, expected_status=401)
+request(
+    wrong,
+    "/api/auth/login",
+    body={"key": wrong_key},
+    expected_status=401,
+    failure_code="WRONG_LOGIN_ACCEPTED",
+)
 
 authenticated, cookie_jar = opener_with_cookies()
 login_headers, _ = request(
@@ -1962,13 +1991,19 @@ login_headers, _ = request(
     "/api/auth/login",
     body={"key": access_key},
     expected_status=200,
+    failure_code="VALID_LOGIN_REJECTED",
 )
 set_cookie = login_headers.get("Set-Cookie", "")
 if "hindsight_cp_access=" not in set_cookie or "httponly" not in set_cookie.lower():
-    raise SystemExit(1)
+    fail("COOKIE_NOT_HTTP_ONLY")
 if not any(cookie.name == "hindsight_cp_access" for cookie in cookie_jar):
-    raise SystemExit(1)
-request(authenticated, "/api/banks", expected_status=200)
+    fail("COOKIE_NOT_STORED")
+request(
+    authenticated,
+    "/api/banks",
+    expected_status=200,
+    failure_code="AUTHENTICATED_ACCESS_REJECTED",
+)
 PY
   hindsight_stack_run_bounded_ui_proxy "$probe_timeout" \
     "$HINDSIGHT_EMBED_PYTHON" -I -c "$probe_program" \

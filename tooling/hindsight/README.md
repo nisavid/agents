@@ -176,6 +176,12 @@ timeout, and retry mechanics. Consumers supply the closed policy shape shown in
 The policy contains OAuth-home locators, never resolved paths or credential
 values.
 
+The repository policy is a schema example, not a deployable failover chain.
+Its `example.invalid` endpoint is deliberately non-routable. Consumers must
+replace every example member identity, endpoint, model, locator, and ordering
+entry with a deployed provider that is valid on that installation before
+installing the adapter.
+
 For an OAuth-backed Codex member, the Hindsight provider credential field
 contains only `provider-policy:<member-id>`. At construction time the adapter
 resolves that member's `oauth-home:` locator, scopes `CODEX_HOME` while the

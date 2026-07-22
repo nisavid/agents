@@ -15,7 +15,8 @@ Start from a current OS installation and a normal login for the account that
 will own Hindsight. Both platforms require:
 
 - Git, Python 3.11 or newer, Zsh with `zsh/stat` and `zsh/system`, `curl`,
-  `lsof`, and `uv`/`uvx`;
+  `lsof`, `uv`/`uvx`, and Node.js with `npm`/`npx`; the declared `npx`
+  executable and its ancestry must not be group or world writable;
 - an absolute Python 3.11-or-newer executable whose file and non-sticky
   ancestors are not group or world writable, plus an immutable checkout or
   release tree of this repository;
@@ -30,40 +31,69 @@ current Python and `uv`. If `brew` is absent, install Homebrew using its
 
 ```zsh
 xcode-select --install
-brew install git python uv pass gnupg
-uv python install '3.14'
+brew install git python pass gnupg
+curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR="$HOME/.local/bin" UV_NO_MODIFY_PATH=1 sh
+uv_executable="$HOME/.local/bin/uv"
+uvx_executable="$HOME/.local/bin/uvx"
+"$uv_executable" python install '3.14'
+"$uv_executable" tool install --force 'hindsight-embed==0.8.4'
 /usr/bin/zsh -fc 'zmodload zsh/stat && zmodload zsh/system'
 /bin/launchctl print "gui/$UID" >/dev/null
-managed_python="$(uv python find --managed-python --resolve-links '3.14')"
+managed_python="$("$uv_executable" python find --managed-python --resolve-links '3.14')"
+embed_python="$("$uv_executable" tool dir)/hindsight-embed/bin/python3"
 "$managed_python" -I -c 'import sys; assert sys.version_info >= (3, 11)'
-uvx --from 'hindsight-embed==0.8.4' hindsight-embed --help >/dev/null
+"$embed_python" -I -c 'import hindsight_embed'
+"$uvx_executable" 'hindsight-api@0.8.4' --help >/dev/null
 ```
 
 Wait for the Command Line Tools installer to finish before running the remaining
 commands. Use `managed_python` as the consumer configuration's
-`python_executable`; Homebrew's group-writable Cellar ancestry does not satisfy
-the managed-runtime trust contract. A GUI login owns the LaunchAgent domain;
+`python_executable` and `embed_python` as `HINDSIGHT_EMBED_PYTHON`; Homebrew's
+group-writable Cellar ancestry does not satisfy the managed-runtime trust
+contract. The API and UI commands stage the exact child runtimes before the
+first managed activation. A GUI login owns the LaunchAgent domain;
 remote-only sessions without that domain cannot perform native LaunchAgent
 acceptance.
+
+Install Node.js for macOS from a system-managed package that provides a
+protected `npx` executable, normally `/usr/local/bin/npx`. Do not add Homebrew
+or an interactive version-manager directory to the managed service `PATH`.
+Declare the protected executable as `npx_executable`; the launcher adds only its
+validated directory to the child process path.
+
+```zsh
+npx_executable=/usr/local/bin/npx
+"$npx_executable" -y '@vectorize-io/hindsight-control-plane@0.8.4' --help >/dev/null
+```
 
 On a clean current CachyOS installation, update the system and install the
 distribution packages:
 
 ```zsh
-sudo pacman -Syu --needed git python zsh curl lsof uv pass gnupg
+sudo pacman -Syu --needed git python zsh curl lsof uv nodejs npm pass gnupg
 uv python install '3.14'
+uv tool install --force 'hindsight-embed==0.8.4'
 zsh -fc 'zmodload zsh/stat && zmodload zsh/system'
 python -c 'import sys; assert sys.version_info >= (3, 11)'
 systemctl --user show-environment >/dev/null
 managed_python="$(uv python find --managed-python --resolve-links '3.14')"
+embed_python="$(uv tool dir)/hindsight-embed/bin/python3"
+uvx_executable=/usr/bin/uvx
 "$managed_python" -I -c 'import sys; assert sys.version_info >= (3, 11)'
-uvx --from 'hindsight-embed==0.8.4' hindsight-embed --help >/dev/null
+"$embed_python" -I -c 'import hindsight_embed'
+"$uvx_executable" 'hindsight-api@0.8.4' --help >/dev/null
+npx_executable=/usr/bin/npx
+"$npx_executable" -y '@vectorize-io/hindsight-control-plane@0.8.4' --help >/dev/null
 ```
 
 The account must have a real `systemd --user` manager and session bus. Enable
 linger with `loginctl enable-linger "$USER"` only when services must remain
 available after logout. A container PID 1 or a root system manager is not a
 substitute for the account's user manager.
+
+Keep the staged Embed, API, and UI versions aligned at `0.8.4`. Changing any of
+these versions is a separate server or integration upgrade and requires an
+explicit plan.
 
 After installing and configuring the consumer, run the native gated lifecycle
 test on the target host. It creates isolated manifests and data, exercises the
@@ -208,6 +238,9 @@ configured APIs and UIs, and the complete fleet. A launchd integration job runs
 once when loaded and at its configured daily time. A systemd-user timer runs two
 minutes after its user manager starts and at its configured daily time. Create
 one timer per enabled harness catalog when the catalogs differ.
+Set the stack health-check deadline long enough for asynchronous API, UI,
+control, and broker readiness. The portable manager retries the isolated check
+until that deadline and rolls back the generation if readiness never converges.
 
 ## Upgrade and roll back
 

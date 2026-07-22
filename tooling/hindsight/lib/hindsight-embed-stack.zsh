@@ -895,7 +895,7 @@ hindsight_stack_require_tools() {
   fi
   local lsof_executable
   lsof_executable="$(hindsight_stack_lsof_path)" || {
-    print -ru2 -- "hindsight-embed-stack: missing lsof at /usr/sbin/lsof or /usr/bin/lsof"
+    print -ru2 -- "hindsight-embed-stack: missing lsof at /usr/bin/lsof or /usr/sbin/lsof"
     return 1
   }
   hindsight_stack_require_trusted_artifact \
@@ -1882,7 +1882,7 @@ hindsight_stack_port_listening() {
 hindsight_stack_lsof_path() {
   emulate -L zsh
   local candidate
-  for candidate in /usr/sbin/lsof /usr/bin/lsof; do
+  for candidate in /usr/bin/lsof /usr/sbin/lsof; do
     [[ -x "$candidate" ]] || continue
     print -r -- "$candidate"
     return 0

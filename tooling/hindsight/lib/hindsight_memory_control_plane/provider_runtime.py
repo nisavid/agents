@@ -17,7 +17,7 @@ import threading
 import time
 from types import MappingProxyType
 from typing import Any, AsyncIterator, Callable, Iterator, Mapping
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 
 class ProviderRuntimeCompatibilityError(RuntimeError):
@@ -129,7 +129,15 @@ def _base_url(value: Any) -> str:
         raise ProviderRuntimeCompatibilityError("base_url port is invalid") from exc
     if port == 0:
         raise ProviderRuntimeCompatibilityError("base_url port cannot be zero")
-    return base_url.rstrip("/")
+    scheme = parsed.scheme.lower()
+    hostname = parsed.hostname.lower()
+    if ":" in hostname:
+        hostname = f"[{hostname}]"
+    default_port = (scheme == "http" and port == 80) or (
+        scheme == "https" and port == 443
+    )
+    netloc = hostname if port is None or default_port else f"{hostname}:{port}"
+    return urlunsplit((scheme, netloc, parsed.path.rstrip("/"), "", ""))
 
 
 def _bounded_int(value: Any, label: str, low: int, high: int) -> int:
@@ -175,7 +183,11 @@ class ProviderIdentity:
             return False
         if model != self.model:
             return False
-        if base_url.rstrip("/") != self.base_url.rstrip("/"):
+        try:
+            normalized_base_url = _base_url(base_url)
+        except ProviderRuntimeCompatibilityError:
+            return False
+        if normalized_base_url != self.base_url:
             return False
         return (
             self.credential_marker is None
@@ -589,15 +601,28 @@ class _PriorityGate:
         self._limit = limit
         self._active = 0
         self._sequence = 0
-        self._waiters: list[tuple[int, int, asyncio.Future[None]]] = []
+        self._lock = threading.Lock()
+        self._waiters: list[
+            tuple[
+                int,
+                int,
+                asyncio.AbstractEventLoop,
+                asyncio.Future[None],
+            ]
+        ] = []
 
     async def acquire(self, priority: int) -> None:
-        if self._active < self._limit and not self._waiters:
-            self._active += 1
-            return
-        waiter = asyncio.get_running_loop().create_future()
-        self._sequence += 1
-        heapq.heappush(self._waiters, (priority, self._sequence, waiter))
+        loop = asyncio.get_running_loop()
+        with self._lock:
+            if self._active < self._limit and not self._waiters:
+                self._active += 1
+                return
+            waiter = loop.create_future()
+            self._sequence += 1
+            heapq.heappush(
+                self._waiters,
+                (priority, self._sequence, loop, waiter),
+            )
         try:
             await waiter
         except BaseException:
@@ -607,14 +632,29 @@ class _PriorityGate:
                 waiter.cancel()
             raise
 
-    def release(self) -> None:
-        while self._waiters:
-            _priority, _sequence, waiter = heapq.heappop(self._waiters)
-            if waiter.cancelled():
-                continue
+    def _grant(self, waiter: asyncio.Future[None]) -> None:
+        if waiter.cancelled():
+            self.release()
+        elif not waiter.done():
             waiter.set_result(None)
+
+    def release(self) -> None:
+        while True:
+            with self._lock:
+                while self._waiters:
+                    _priority, _sequence, loop, waiter = heapq.heappop(
+                        self._waiters
+                    )
+                    if not waiter.cancelled():
+                        break
+                else:
+                    self._active -= 1
+                    return
+            try:
+                loop.call_soon_threadsafe(self._grant, waiter)
+            except RuntimeError:
+                continue
             return
-        self._active -= 1
 
     @asynccontextmanager
     async def slot(self, priority: int) -> AsyncIterator[None]:
@@ -683,7 +723,7 @@ class _ProviderRuntime:
         self._clock = clock
         self._cooldowns: dict[str, float] = {}
         self._cooldown_lock = threading.Lock()
-        self._gate_loop: asyncio.AbstractEventLoop | None = None
+        self._gate_lock = threading.Lock()
         self._gates: dict[str, _PriorityGate] = {}
         self._resolved_oauth_homes: dict[str, Path] = {}
         self._oauth_home_owners: dict[Path, str] = {}
@@ -768,15 +808,12 @@ class _ProviderRuntime:
     def _gate(self, member: ProviderMemberPolicy) -> _PriorityGate | None:
         if member.max_concurrent is None:
             return None
-        loop = asyncio.get_running_loop()
-        if self._gate_loop is not loop:
-            self._gate_loop = loop
-            self._gates = {}
-        gate = self._gates.get(member.id)
-        if gate is None:
-            gate = _PriorityGate(member.max_concurrent)
-            self._gates[member.id] = gate
-        return gate
+        with self._gate_lock:
+            gate = self._gates.get(member.id)
+            if gate is None:
+                gate = _PriorityGate(member.max_concurrent)
+                self._gates[member.id] = gate
+            return gate
 
     async def call(
         self,

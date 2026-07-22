@@ -429,6 +429,7 @@ hindsight_stack_require_current_user() { return 0 }
 hindsight_stack_require_runtime_helpers() { return 0 }
 hindsight_stack_require_tools() { return 0 }
 hindsight_stack_validate_fleet() { return 0 }
+hindsight_stack_sleep() { sleep "$1" }
 hindsight_stack_status_report() { print -r -- "fleet: healthy (2 enabled profiles)" }
 hindsight_stack_stop_all() { return 0 }
 hindsight_stack_with_lifecycle_lock() {

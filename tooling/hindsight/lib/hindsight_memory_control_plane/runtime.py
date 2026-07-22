@@ -6,6 +6,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 import hmac
 import logging
+import re
 from types import MappingProxyType
 from typing import Any
 
@@ -17,6 +18,7 @@ from .planning import inventory_endpoint
 
 
 LOGGER = logging.getLogger(__name__)
+ENVIRONMENT_RESOLVER_ID = re.compile(r"[A-Z_][A-Z0-9_]{0,127}", re.ASCII)
 
 HARNESS_METHODS = {
     # The controller policy intentionally exposes the same bounded memory
@@ -53,9 +55,7 @@ def _validate_runtime_inputs(
         raise RuntimeConfigurationError("validated inventory is required")
     if any(
         not isinstance(locator, str)
-        or not locator
-        or len(locator) > 128
-        or not locator.replace("_", "").isalnum()
+        or ENVIRONMENT_RESOLVER_ID.fullmatch(locator) is None
         for locator in (token_resolver_id, mint_authority_resolver_id)
     ):
         raise RuntimeConfigurationError("runtime resolver locator is invalid")

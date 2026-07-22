@@ -7,6 +7,7 @@ import logging
 import os
 from pathlib import Path
 import sys
+import threading
 import types
 import unittest
 from unittest import mock
@@ -151,6 +152,20 @@ class ProviderRuntimePolicyTest(unittest.TestCase):
         invalid = {**policy_data(), "secret": "must-not-be-accepted"}
         with self.assertRaisesRegex(ProviderRuntimeCompatibilityError, "keys are closed"):
             ProviderRuntimePolicy.load(invalid)
+
+    def test_matching_canonicalizes_host_case_and_default_port(self) -> None:
+        value = policy_data()
+        fallback = value["members"][2]
+        fallback["identity"]["base_url"] = "https://example.test/v1"
+        policy = ProviderRuntimePolicy.load(value)
+        runtime_member = types.SimpleNamespace(
+            provider="lmstudio",
+            model="private-fallback-model",
+            base_url="https://EXAMPLE.TEST:443/v1/",
+            api_key="",
+        )
+
+        self.assertEqual(policy.match(runtime_member).id, "fallback")
 
     def test_credential_markers_are_non_secret_member_references(self) -> None:
         invalid = policy_data()
@@ -696,6 +711,51 @@ class HindsightProviderAdapterTest(unittest.TestCase):
             return started
 
         self.assertEqual(asyncio.run(scenario()), ["first", "reflect", "bulk"])
+
+    def test_member_gate_serializes_calls_across_event_loops(self) -> None:
+        LLMProvider, _CodexLLM, _MultiLLMProvider = self.install()
+        fallback = LLMProvider(
+            provider="lmstudio",
+            api_key="",
+            base_url="http://inference.example.test:13305/v1",
+            model="private-fallback-model",
+        )
+        first_entered = threading.Event()
+        second_entered = threading.Event()
+        release_first = threading.Event()
+        errors: list[BaseException] = []
+
+        async def call(**kwargs):
+            if kwargs["label"] == "first":
+                first_entered.set()
+                release_first.wait(timeout=2)
+            else:
+                second_entered.set()
+            return kwargs
+
+        fallback.operation = call
+
+        def invoke(label: str) -> None:
+            try:
+                asyncio.run(fallback.call(label=label, scope="reflect"))
+            except BaseException as error:
+                errors.append(error)
+
+        first = threading.Thread(target=invoke, args=("first",), daemon=True)
+        second = threading.Thread(target=invoke, args=("second",), daemon=True)
+        first.start()
+        self.assertTrue(first_entered.wait(timeout=1))
+        second.start()
+        try:
+            self.assertFalse(second_entered.wait(timeout=0.2))
+        finally:
+            release_first.set()
+            first.join(timeout=2)
+            second.join(timeout=2)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(second_entered.is_set())
 
 
 if __name__ == "__main__":

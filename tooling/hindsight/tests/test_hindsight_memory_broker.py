@@ -36,7 +36,11 @@ from hindsight_memory_control_plane.broker import (
 )
 from hindsight_memory_control_plane.canonical import canonical_bytes
 from hindsight_memory_control_plane.ledger import LedgerError
-from hindsight_memory_control_plane.server import JsonRpcClient, UnixJsonRpcServer
+from hindsight_memory_control_plane.server import (
+    JsonRpcClient,
+    SOCKET_LIFECYCLE_LOCK,
+    UnixJsonRpcServer,
+)
 
 
 DIGEST_A = "a" * 64
@@ -511,6 +515,42 @@ class BrokerSocketTest(unittest.TestCase):
             self.assertEqual(self.server._connection_futures, set())
         self.server._closing.clear()
 
+    def test_listener_completion_defers_executor_release_to_close(self):
+        self.server.close()
+        executor = Mock()
+        self.server._executor = executor
+        self.server._closing.set()
+        lock_held = threading.Event()
+        release_lock = threading.Event()
+        completed = threading.Event()
+
+        def hold_lifecycle_lock() -> None:
+            with SOCKET_LIFECYCLE_LOCK:
+                lock_held.set()
+                release_lock.wait(1)
+
+        def listener_completion() -> None:
+            self.server._thread = threading.current_thread()
+            self.server._release_drained_executor()
+            completed.set()
+
+        lock_holder = threading.Thread(target=hold_lifecycle_lock)
+        listener = threading.Thread(target=listener_completion)
+        try:
+            lock_holder.start()
+            self.assertTrue(lock_held.wait(0.2))
+            listener.start()
+            self.assertTrue(completed.wait(0.2))
+        finally:
+            release_lock.set()
+            lock_holder.join(1)
+            listener.join(1)
+            self.server._thread = None
+            self.server._executor = None
+            self.server._closing.clear()
+
+        executor.shutdown.assert_not_called()
+
     def test_server_times_out_an_admitted_idle_connection(self):
         self.stop()
         self.broker = Broker(
@@ -577,6 +617,82 @@ class BrokerSocketTest(unittest.TestCase):
         self.assertIsNone(self.server._executor)
         self.server.start()
         self.assertTrue(self.socket_path.is_socket())
+
+    def test_server_close_accepts_callbacks_that_drain_after_the_wait_deadline(self):
+        self.server.close()
+        pending = Future()
+        executor = Mock()
+        self.server._executor = executor
+        self.server._connection_futures = {pending}
+        self.server.close_timeout_seconds = 0
+        deferred = threading.Event()
+        completion_thread = None
+
+        def drain_after_deadline(_identity) -> None:
+            nonlocal completion_thread
+            pending.set_result((deferred.set,))
+            completion_thread = threading.Thread(
+                target=self.server._complete_connection,
+                args=(pending, Mock(), threading.BoundedSemaphore(1)),
+            )
+            completion_thread.start()
+            deadline = time.monotonic() + 0.2
+            while time.monotonic() < deadline:
+                with self.server._connection_futures_lock:
+                    if not self.server._connection_futures:
+                        return
+                time.sleep(0.001)
+            self.fail("connection completion did not drain before close finalization")
+
+        with patch.object(
+            self.server, "_unlink_bound_path", side_effect=drain_after_deadline
+        ):
+            self.server.close()
+
+        self.assertIsNotNone(completion_thread)
+        completion_thread.join(1)
+        self.assertFalse(completion_thread.is_alive())
+        self.assertTrue(deferred.is_set())
+
+        executor.shutdown.assert_called_once_with(
+            wait=False, cancel_futures=True
+        )
+        self.assertIsNone(self.server._executor)
+
+    def test_server_close_tracks_deferred_callbacks_until_they_finish(self):
+        self.server.close()
+        entered = threading.Event()
+        release = threading.Event()
+
+        def block_shutdown_callback() -> None:
+            entered.set()
+            release.wait(1)
+
+        self.server = UnixJsonRpcServer(
+            self.socket_path,
+            self.broker,
+            close_timeout_seconds=0.02,
+            shutdown_callback=block_shutdown_callback,
+            shutdown_capability="s" * 32,
+        )
+        self.server.start()
+        self.client = JsonRpcClient(self.socket_path)
+        self.assertEqual(
+            self.client.broker_shutdown("s" * 32), {"stopping": True}
+        )
+        self.assertTrue(entered.wait(0.2))
+
+        try:
+            with self.assertRaisesRegex(BrokerError, "SERVER_CLOSE_INCOMPLETE"):
+                self.server.close()
+            self.assertIsNotNone(self.server._executor)
+        finally:
+            release.set()
+
+        deadline = time.monotonic() + 1
+        while self.server._executor is not None and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.assertIsNone(self.server._executor)
 
     def test_server_close_bounds_listener_join_and_reports_live_listener(self):
         self.server.close()

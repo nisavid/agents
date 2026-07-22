@@ -13,7 +13,7 @@ import socket
 import stat
 import threading
 import time
-from concurrent.futures import Future, ThreadPoolExecutor, wait
+from concurrent.futures import Future, ThreadPoolExecutor
 import errno
 from typing import Any, Callable, Mapping
 
@@ -162,11 +162,18 @@ class UnixJsonRpcServer:
         self._executor: ThreadPoolExecutor | None = None
         self._connection_futures: set[Future[Any]] = set()
         self._connection_futures_lock = threading.RLock()
+        self._connection_state_changed = threading.Condition(
+            self._connection_futures_lock
+        )
+        self._active_deferred_callbacks = 0
 
     def start(self) -> None:
         with SOCKET_LIFECYCLE_LOCK:
             with self._connection_futures_lock:
-                has_active_connections = bool(self._connection_futures)
+                has_active_connections = bool(
+                    self._connection_futures
+                    or self._active_deferred_callbacks
+                )
             if (
                 self._socket is not None
                 or self._thread is not None
@@ -359,26 +366,49 @@ class UnixJsonRpcServer:
         connection_slots: threading.BoundedSemaphore,
     ) -> None:
         self._cancel_admission(future, connection, connection_slots)
-        with self._connection_futures_lock:
+        callbacks: tuple[Callable[[], None], ...] = ()
+        failed = False
+        if not future.cancelled():
+            try:
+                callbacks = tuple(future.result() or ())
+            except BaseException:
+                failed = True
+        with self._connection_state_changed:
             self._connection_futures.discard(future)
-        self._release_drained_executor()
-        if future.cancelled():
+            if callbacks:
+                self._active_deferred_callbacks += 1
+            self._connection_state_changed.notify_all()
+        if future.cancelled() or failed:
+            self._release_drained_executor()
             return
         try:
-            callbacks = future.result()
-        except BaseException:
-            return
-        for callback in callbacks or ():
-            callback()
+            for callback in callbacks:
+                callback()
+        finally:
+            if callbacks:
+                with self._connection_state_changed:
+                    self._active_deferred_callbacks -= 1
+                    self._connection_state_changed.notify_all()
+            self._release_drained_executor()
 
     def _release_drained_executor(self) -> None:
         """Release shutdown executor state only after every callback drains."""
 
         if not self._closing.is_set():
             return
+        # A future that completes before add_done_callback() is registered runs
+        # this callback synchronously in the listener thread. close() joins that
+        # thread while holding the lifecycle lock and performs the same drained
+        # release itself, so attempting to reacquire the lock here deadlocks the
+        # listener until the close deadline.
+        if threading.current_thread() is self._thread:
+            return
         with SOCKET_LIFECYCLE_LOCK:
             with self._connection_futures_lock:
-                drained = not self._connection_futures
+                drained = not (
+                    self._connection_futures
+                    or self._active_deferred_callbacks
+                )
             if (
                 drained
                 and self._socket is None
@@ -534,33 +564,27 @@ class UnixJsonRpcServer:
             )
             if executor is not None:
                 executor.shutdown(wait=False, cancel_futures=True)
-            pending: set[Future[Any]] = set()
-            while True:
-                with self._connection_futures_lock:
-                    active = set(self._connection_futures)
-                if not active:
-                    pending = set()
-                    break
-                _done, pending = wait(
-                    active, timeout=max(0.0, deadline - time.monotonic())
-                )
-                with self._connection_futures_lock:
-                    current = set(self._connection_futures)
-                if not current:
-                    pending = set()
-                    break
-                if time.monotonic() >= deadline:
-                    pending = current
-                    break
+            with self._connection_state_changed:
+                while (
+                    self._connection_futures
+                    or self._active_deferred_callbacks
+                ):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    self._connection_state_changed.wait(timeout=remaining)
             self._unlink_bound_path(self._bound_identity)
             self._socket = None
             self._thread = None
             self._bound_identity = None
             with self._connection_futures_lock:
-                callbacks_drained = not self._connection_futures
-            if not pending or callbacks_drained:
+                connections_active = bool(
+                    self._connection_futures
+                    or self._active_deferred_callbacks
+                )
+            if not connections_active:
                 self._executor = None
-            if pending or listener_active:
+            if connections_active or listener_active:
                 raise BrokerError("SERVER_CLOSE_INCOMPLETE")
 
     def _unlink_bound_path(self, identity: tuple[int, int] | None) -> None:

@@ -1714,6 +1714,9 @@ class HttpAdapter:
         )
 
     def _runtime_base(self) -> str:
+        # Re-attest compatibility for every operation. A cached success could
+        # authorize a request after the runtime restarts or changes version or
+        # privacy features, so this probe intentionally has no TTL.
         self._require_runtime_version()
         return self._runtime_bank_prefix()
 

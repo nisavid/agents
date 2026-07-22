@@ -54,6 +54,8 @@ class ControlPlaneFixture(BaseHTTPRequestHandler):
     http_only = True
     leaked_value = None
     accept_missing_login = False
+    additional_cookie = None
+    additional_cookie_after = False
 
     def log_message(self, format, *args):  # noqa: A002
         return
@@ -62,8 +64,12 @@ class ControlPlaneFixture(BaseHTTPRequestHandler):
         body = json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
+        if self.additional_cookie is not None and not self.additional_cookie_after:
+            self.send_header("Set-Cookie", self.additional_cookie)
         if cookie is not None:
             self.send_header("Set-Cookie", cookie)
+        if self.additional_cookie is not None and self.additional_cookie_after:
+            self.send_header("Set-Cookie", self.additional_cookie)
         if self.leaked_value is not None:
             self.send_header("X-Test-Leak", self.leaked_value)
         self.send_header("Content-Length", str(len(body)))
@@ -140,6 +146,8 @@ class StackUiAuthenticationTest(unittest.TestCase):
         http_only=True,
         leak=False,
         accept_missing_login=False,
+        additional_cookie=None,
+        additional_cookie_after=False,
         proxy_url=None,
     ):
         data_token = "test-data-plane-token"
@@ -151,6 +159,8 @@ class StackUiAuthenticationTest(unittest.TestCase):
         Handler.http_only = http_only
         Handler.leaked_value = data_token if leak else None
         Handler.accept_missing_login = accept_missing_login
+        Handler.additional_cookie = additional_cookie
+        Handler.additional_cookie_after = additional_cookie_after
         server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -193,6 +203,30 @@ class StackUiAuthenticationTest(unittest.TestCase):
         result = self.run_probe()
 
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_accepts_session_cookie_after_unrelated_cookie(self):
+        result = self.run_probe(
+            additional_cookie="ui_preference=compact; Path=/; SameSite=Lax"
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_rejects_non_http_only_duplicate_session_cookie_first(self):
+        result = self.run_probe(
+            additional_cookie="hindsight_cp_access=shadow; Path=/"
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("COOKIE_NOT_HTTP_ONLY", result.stderr)
+
+    def test_rejects_non_http_only_duplicate_session_cookie_last(self):
+        result = self.run_probe(
+            additional_cookie="hindsight_cp_access=shadow; Path=/",
+            additional_cookie_after=True,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("COOKIE_NOT_HTTP_ONLY", result.stderr)
 
     def test_rejects_unprotected_control_plane(self):
         result = self.run_probe(protected=False)

@@ -69,6 +69,9 @@ MAX_IN_FLIGHT_ADAPTER_CALLS = 4
 MAX_IN_FLIGHT_READ_ADAPTER_CALLS = 16
 MAX_ADAPTER_GENERATION_LEASE_SECONDS = 30.0
 PENDING_OPERATION_WARNING_POLL = 32
+# At the saturated five-second poll interval, 32 consecutive missing receipts
+# terminalize in about 155 seconds plus adapter latency and worker scheduling.
+MAX_MISSING_OPERATION_POLLS = 32
 SESSION_STATUS_WRITE_LIMIT = 8
 MAX_DURABLE_QUEUE_ENTRIES = 1024
 MAX_DURABLE_QUEUE_ENTRY_BYTES = 128 * 1024
@@ -617,7 +620,7 @@ class Broker:
     @staticmethod
     def _empty_work() -> dict[str, Any]:
         return {
-            "schema_version": 9,
+            "schema_version": 10,
             "queue": [], "completed": {}, "sessions": {}, "used_nonces": [],
             "revoked_nonces": [], "exchanges": {}, "ledger_outbox": {},
             "expirations": {
@@ -852,6 +855,15 @@ class Broker:
                 record["completion_order"] = completion_order
             migrated["schema_version"] = 9
             changed = True
+        if migrated.get("schema_version") == 9 and isinstance(
+            migrated.get("queue"), list
+        ):
+            for item in migrated["queue"]:
+                if not isinstance(item, dict):
+                    return value, False
+                item["missing_operation_polls"] = 0
+            migrated["schema_version"] = 10
+            changed = True
         return migrated, changed
 
     def _legacy_exchange_receipt(
@@ -927,7 +939,7 @@ class Broker:
         if not isinstance(value, dict) or set(value) != set(self._empty_work()):
             raise BrokerError("STATE_INVALID")
         if (
-                value["schema_version"] != 9
+                value["schema_version"] != 10
             or not isinstance(value["exchanges"], dict)
             or not isinstance(value["sessions"], dict)
             or not isinstance(value["used_nonces"], list)
@@ -1066,6 +1078,7 @@ class Broker:
                     "watermark", "request_digest", "idempotency_key",
                     "adapter_request", "attempts", "last_error", "next_retry",
                     "in_flight", "operation_id", "poll_attempts",
+                    "missing_operation_polls",
                     "authorized_bank", "policy_digest",
                     "artifact_digest",
                 }
@@ -1104,6 +1117,10 @@ class Broker:
                 or type(item["poll_attempts"]) is not int
                 or item["poll_attempts"] < 0
                 or item["poll_attempts"] > 1_000_000
+                or type(item["missing_operation_polls"]) is not int
+                or item["missing_operation_polls"] < 0
+                or item["missing_operation_polls"]
+                > MAX_MISSING_OPERATION_POLLS
                 or type(item["in_flight"]) is not bool
                 or (
                     item["operation_id"] is not None
@@ -1176,7 +1193,9 @@ class Broker:
                         or IDENTIFIER.fullmatch(record["operation_id"]) is None
                     )
                 )
-                or record["adapter_result"] is not None
+                or record["adapter_result"] not in (
+                    None, {"status": "indeterminate"},
+                )
                 or type(record["completion_order"]) is not int
                 or record["completion_order"] < 0
             ):
@@ -1434,7 +1453,7 @@ class Broker:
             "watermark": item["watermark"],
             "request_digest": item["request_digest"],
             "idempotency_key": item["idempotency_key"],
-            "adapter_result": None,
+            "adapter_result": {"status": "indeterminate"},
             "session_id": item["session_id"],
             "method": item["method"],
             "operation_id": item["operation_id"] or ("x" * 128),
@@ -2539,7 +2558,7 @@ class Broker:
                         },
                         "attempts": 0, "last_error": None, "next_retry": None,
                         "in_flight": False, "operation_id": None,
-                        "poll_attempts": 0,
+                        "poll_attempts": 0, "missing_operation_polls": 0,
                     }
                     self._append_queue_item(
                         work, item, supersede_state_key=state_key
@@ -2863,6 +2882,7 @@ class Broker:
             os.close(descriptor)
             descriptor = None
             operation_pending = False
+            operation_missing = False
             submitted_operation_id = None
             failed_dispatch = False
             operation_poll_failed = False
@@ -2885,10 +2905,7 @@ class Broker:
                         raise AdapterContractError(
                             "runtime operation status response is invalid"
                         )
-                    # A missing status record is indeterminate: the runtime
-                    # may have pruned it after applying the accepted write.
-                    # Preserve the operation identity and poll fail-closed;
-                    # clearing it here would authorize a duplicate mutation.
+                    operation_missing = adapter_result["status"] == "not_found"
                     operation_pending = adapter_result["status"] in {
                         "pending", "processing", "not_found",
                     }
@@ -2995,35 +3012,55 @@ class Broker:
                     submitted_operation_id or item["operation_id"]
                 )
                 pending_item["in_flight"] = False
+                missing_terminal = False
+                pending_item["attempts"] = 0
                 pending_item["last_error"] = None
-                poll_delay = min(
-                    5.0,
-                    0.25 * (
-                        2 ** min(pending_item["poll_attempts"], 5)
-                    ),
-                )
-                # This is a saturated backoff exponent, not a retry ceiling.
-                # Only the server can declare an accepted durable operation
-                # terminal; abandoning a pending ID could duplicate or lose a
-                # write that completes after a broker restart.
-                next_poll_attempt = min(
-                    1_000_000, pending_item["poll_attempts"] + 1
-                )
-                if (
-                    next_poll_attempt != pending_item["poll_attempts"]
-                    and next_poll_attempt >= PENDING_OPERATION_WARNING_POLL
-                    and next_poll_attempt % PENDING_OPERATION_WARNING_POLL == 0
-                ):
-                    LOGGER.warning(
-                        "runtime operation remains pending after %d polls "
-                        "(operation_id=%s queue_id=%s)",
-                        next_poll_attempt, pending_item["operation_id"],
-                        queue_id,
+                if operation_missing:
+                    missing_polls = min(
+                        MAX_MISSING_OPERATION_POLLS,
+                        pending_item["missing_operation_polls"] + 1,
                     )
-                pending_item["poll_attempts"] = next_poll_attempt
-                pending_item["next_retry"] = self.clock() + poll_delay
-                self._persist_locked_work(value)
-                return "retry", poll_delay
+                    pending_item["missing_operation_polls"] = missing_polls
+                    missing_terminal = (
+                        missing_polls >= MAX_MISSING_OPERATION_POLLS
+                    )
+                else:
+                    pending_item["missing_operation_polls"] = 0
+                if missing_terminal:
+                    # Preserve the accepted operation identity and make its
+                    # unknowable outcome replay-safe. Resubmission could
+                    # duplicate a write that the runtime applied then pruned.
+                    adapter_result = {"status": "indeterminate"}
+                else:
+                    poll_delay = min(
+                        5.0,
+                        0.25 * (
+                            2 ** min(pending_item["poll_attempts"], 5)
+                        ),
+                    )
+                    # This is a saturated backoff exponent, not a retry ceiling.
+                    # Pending and processing operations remain server-owned. A
+                    # bounded run of missing receipts instead becomes a durable
+                    # indeterminate terminal result without resubmission.
+                    next_poll_attempt = min(
+                        1_000_000, pending_item["poll_attempts"] + 1
+                    )
+                    if (
+                        next_poll_attempt != pending_item["poll_attempts"]
+                        and next_poll_attempt >= PENDING_OPERATION_WARNING_POLL
+                        and next_poll_attempt
+                        % PENDING_OPERATION_WARNING_POLL == 0
+                    ):
+                        LOGGER.warning(
+                            "runtime operation remains pending after %d polls "
+                            "(operation_id=%s queue_id=%s)",
+                            next_poll_attempt, pending_item["operation_id"],
+                            queue_id,
+                        )
+                    pending_item["poll_attempts"] = next_poll_attempt
+                    pending_item["next_retry"] = self.clock() + poll_delay
+                    self._persist_locked_work(value)
+                    return "retry", poll_delay
             if failed_dispatch:
                 failed_item = next(
                     entry for entry in value["queue"]
@@ -3031,6 +3068,7 @@ class Broker:
                 )
                 failed_item["operation_id"] = None
                 failed_item["poll_attempts"] = 0
+                failed_item["missing_operation_polls"] = 0
                 with self._adapter_calls_lock:
                     active = self._adapter_calls.get(queue_id)
                     active_future = active[2] if active is not None else None
@@ -3203,7 +3241,12 @@ class Broker:
                     "method": record["method"],
                     "watermark": deepcopy(record["watermark"]),
                     "operation_id": record["operation_id"],
-                    "status": "completed",
+                    "status": (
+                        "indeterminate"
+                        if record["adapter_result"]
+                        == {"status": "indeterminate"}
+                        else "completed"
+                    ),
                 }
                 for _state_key, record in sorted(
                     self._work["completed"].items(),

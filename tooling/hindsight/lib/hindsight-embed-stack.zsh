@@ -1993,8 +1993,18 @@ login_headers, _ = request(
     expected_status=200,
     failure_code="VALID_LOGIN_REJECTED",
 )
-set_cookie = login_headers.get("Set-Cookie", "")
-if "hindsight_cp_access=" not in set_cookie or "httponly" not in set_cookie.lower():
+access_cookies = [
+    value
+    for value in login_headers.get_all("Set-Cookie", [])
+    if value.lstrip().startswith("hindsight_cp_access=")
+]
+if not access_cookies or any(
+    "httponly" not in {
+        attribute.strip().lower()
+        for attribute in value.split(";")[1:]
+    }
+    for value in access_cookies
+):
     fail("COOKIE_NOT_HTTP_ONLY")
 if not any(cookie.name == "hindsight_cp_access" for cookie in cookie_jar):
     fail("COOKIE_NOT_STORED")

@@ -347,6 +347,100 @@ prestate and policy digests, healthy runtime checks, and a rollback snapshot.
 It changes only controller-owned hook fields and preserves unrelated plugin
 configuration.
 
+Create one private destination object for each harness with this closed shape:
+
+```json
+{
+  "schema_version": 1,
+  "harness_id": "codex",
+  "hooks_path": "/absolute/path/to/native-hooks.json",
+  "settings_path": "/absolute/path/to/hindsight-user-settings.json",
+  "tools_path": "/absolute/path/to/controller-tools.json",
+  "rollback_root": "/absolute/private/state/harness-rollbacks"
+}
+```
+
+Codex and Cursor use their native hooks documents directly. For Claude Code,
+`hooks_path` names Claude's user `settings.json`, while `settings_path` names
+the separate stable Hindsight upstream settings document; the closed schema
+requires every path to be distinct, so these two paths cannot alias. The
+adapter owns only the `hooks` member within Claude's user settings and preserves
+all other Claude settings. Across harnesses it owns the controller hook entries,
+the upstream auto-recall/auto-retain switches, the direct Hindsight endpoint,
+bank, and credential keys it retires, and the controller tool entries. It
+preserves unrelated values in all three documents. Claude also enters the
+verified empty-MCP-server mode. The tools destination records the controller
+commands exposed through the installed Hindsight memory skill. Destination
+files must be current-user-owned regular files without group or world write
+access, and the rollback root must be mode `0700`.
+
+Use the production persistence commands to separate staging, review, apply,
+status, and rollback:
+
+```zsh
+controller=/absolute/install/root/bin/hindsight-memory
+state=/absolute/private/state
+destination=/absolute/path/to/codex-destination.json
+
+if ! stage="$($controller --state-dir "$state" harness-config stage \
+  --destination "$destination" \
+  --executable "$controller" \
+  --locator-dir "$state/bridge-locators" \
+  --staging-root "$state/harness-staging")"; then
+  print -u2 -- 'harness artifact staging failed'
+  return 1
+fi
+if ! generation="$(print -r -- "$stage" | \
+  jq -er '.generation | select(type == "string" and length > 0)')"; then
+  print -u2 -- 'harness artifact staging returned no valid generation'
+  return 1
+fi
+
+$controller --state-dir "$state" harness-config plan \
+  --destination "$destination" \
+  --executable "$controller" \
+  --locator-dir "$state/bridge-locators" \
+  --generation "$generation" \
+  --inventory /absolute/path/to/inventory.json \
+  --policy /absolute/path/to/provider-runtime-policy.json \
+  --output "$state/codex-activation-plan.json"
+
+# Supply the printed approval digest only after reviewing the destination-bound
+# activation record. The three health flags are emitted by the consumer's fresh
+# broker, profile, and adapter checks.
+$controller --state-dir "$state" harness-config apply \
+  --destination "$destination" \
+  --generation "$generation" \
+  --inventory /absolute/path/to/inventory.json \
+  --policy /absolute/path/to/provider-runtime-policy.json \
+  --plan "$state/codex-activation-plan.json" \
+  --approval-digest "$approved_activation_digest" \
+  --broker-healthy --profile-healthy --adapter-self-test
+
+$controller --state-dir "$state" harness-config status \
+  --destination "$destination" \
+  --plan "$state/codex-activation-plan.json"
+
+$controller --state-dir "$state" harness-config rollback \
+  --destination "$destination" \
+  --generation "$generation" \
+  --inventory /absolute/path/to/inventory.json \
+  --policy /absolute/path/to/provider-runtime-policy.json \
+  --plan "$state/codex-activation-plan.json" \
+  --approval-digest "$approved_activation_digest"
+```
+
+The activation record contains only digests and binds the plan to the exact
+destination paths. Apply reconstructs it from the current configuration;
+rollback reconstructs it from the private rollback snapshot. Direct endpoint,
+bank, and credential values never enter the record. The persistence adapter
+serializes concurrent activation with an owner-only lock,
+uses compare-and-swap on the complete projected configuration, and keeps a
+phase-marked recovery journal. A process interrupted before commit restores the
+exact prestate; one interrupted after commit finishes the target. Explicit
+rollback requires the same approved activation digest and removes only
+activation-owned changes while preserving later unrelated configuration.
+
 CLI consumers start through
 `hindsight-memory --state-dir /absolute/private/state harness <harness> launch`.
 GUI consumers use a staged one-use envelope consumed by the first hook. Hooks

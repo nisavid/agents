@@ -57,6 +57,15 @@ retention, and rolls back the controller-owned fields when a post-activation
 check fails. Claude's upstream knowledge tools are disabled with its verified
 empty-MCP-server mode when this path is activated.
 
+`hindsight-memory harness-config stage` and `plan` persist inactive artifacts
+and destination-bound activation records; `status` is read-only. Only `apply`
+and `rollback` mutate controller-owned fields in real native configuration
+files. The secret-free approved activation record binds the prestate and target
+digests to the exact destination paths. An owner-only transaction journal makes
+multi-file updates recoverable across interruption. The
+`hindsight-memory-runtime` skill exposes the explicit session tools without
+giving a harness direct endpoint, bank, or credential authority.
+
 ## Integration upgrades
 
 `hindsight-memory integration-upgrade` stages upstream harness integrations as

@@ -885,11 +885,17 @@ class HookAdapter:
                 and conversation_id != native_session_id
             ):
                 raise BridgeError("SESSION_MISMATCH")
-            session_id = _identifier(
-                conversation_id or native_session_id, "SESSION_INVALID"
+            supplied = (
+                conversation_id
+                if conversation_id is not None
+                else native_session_id
             )
         else:
-            session_id = _identifier(payload.get("session_id"), "SESSION_INVALID")
+            supplied = payload.get("session_id")
+        if supplied is None and self.session_id is not None:
+            session_id = self.session_id
+        else:
+            session_id = _identifier(supplied, "SESSION_INVALID")
         if self.session_id is not None and session_id != self.session_id:
             raise BridgeError("SESSION_MISMATCH")
         return session_id

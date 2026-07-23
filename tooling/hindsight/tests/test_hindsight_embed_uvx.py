@@ -103,6 +103,7 @@ class HindsightEmbedUvxTest(unittest.TestCase):
                 check["environment"]["HINDSIGHT_EMBED_UVX"]
                 for check in payload["health_checks"]
             ]
+            self.assertTrue(bindings, name)
             self.assertEqual(
                 bindings,
                 ["release://bin/hindsight-embed-uvx"] * len(bindings),

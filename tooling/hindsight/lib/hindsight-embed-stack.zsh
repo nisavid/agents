@@ -2413,7 +2413,7 @@ hindsight_stack_broker_start() {
   emulate -L zsh
   setopt LOCAL_TRAPS
   unsetopt BG_NICE
-  local broker_launch_owned=0 pid='' identity=''
+  local broker_launch_owned=0 pid='' broker_job='' identity=''
   trap 'if (( ${broker_launch_owned:-0} )); then broker_launch_owned=0; hindsight_stack_broker_abort_launch "${pid:-}" "${identity:-}" >/dev/null 2>&1 || true; fi' EXIT
   trap 'if (( ${broker_launch_owned:-0} )); then broker_launch_owned=0; hindsight_stack_broker_abort_launch "${pid:-}" "${identity:-}" >/dev/null 2>&1 || true; fi; return 130' INT
   trap 'if (( ${broker_launch_owned:-0} )); then broker_launch_owned=0; hindsight_stack_broker_abort_launch "${pid:-}" "${identity:-}" >/dev/null 2>&1 || true; fi; return 143' TERM
@@ -2450,6 +2450,13 @@ os.execv(python, arguments)
     "${arguments[@]}" >/dev/null 2>&1 &
   pid=$!
   broker_launch_owned=1
+  broker_job="${(k)jobstates[(r)*:${pid}=*]}"
+  [[ "$broker_job" == <-> ]] || {
+    broker_launch_owned=0
+    hindsight_stack_broker_abort_launch "$pid"
+    print -ru2 -- "hindsight-embed-stack: could not capture broker job ownership"
+    return 1
+  }
   hindsight_stack_broker_wait_launch_barrier "$pid" || {
     broker_launch_owned=0
     hindsight_stack_broker_abort_launch "$pid"
@@ -2486,7 +2493,7 @@ os.execv(python, arguments)
     hindsight_stack_broker_terminate_recorded || return 1
     return 1
   }
-  disown %% >/dev/null 2>&1 || {
+  disown "%${broker_job}" >/dev/null 2>&1 || {
     broker_launch_owned=0
     hindsight_stack_broker_abort_launch "$pid" "$identity"
     hindsight_stack_broker_terminate_recorded || return 1

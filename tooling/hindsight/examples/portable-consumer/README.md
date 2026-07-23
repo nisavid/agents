@@ -72,6 +72,16 @@ Credential bindings may target only `HINDSIGHT_API_KEY`,
 `HINDSIGHT_UI_ACCESS_KEY`. This positive contract prevents a resolved secret
 from becoming a language-runtime or dynamic-loader control value.
 
+Keep `HINDSIGHT_API_TENANT_EXTENSION` bound to
+`hindsight_api.extensions.builtin.tenant:ApiKeyTenantExtension` in both the
+service and health-check environments. The launcher maps the resolved data
+plane token to `HINDSIGHT_API_TENANT_API_KEY` only for the API child; the
+extension selector is non-secret and does not grant authority by itself.
+Keep upstream audit logging and LLM request tracing explicitly disabled, and
+replace the example worker ID with a stable consumer-and-profile identity.
+Keep the broker startup budget long enough for the first authenticated runtime
+probe and route compilation; the examples use five minutes.
+
 A launchd integration job checks one catalog when loaded and at its configured
 daily time. A systemd-user timer checks two minutes after its user manager
 starts and at its configured daily time. Create one timer per enabled harness

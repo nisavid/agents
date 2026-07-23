@@ -21,8 +21,8 @@ will own Hindsight. Both platforms require:
   ancestors are not group or world writable, plus an immutable checkout or
   release tree of this repository;
 - a working Hindsight Embed profile runtime;
-- a protected credential resolver backed by `pass`, macOS Keychain, or Secret
-  Service; and
+- the bundled native Keychain resolver on macOS, or a protected resolver backed
+  by `pass` or Secret Service on Linux; and
 - a user service-manager session. Do not install the control plane as root.
 
 On a clean current macOS installation, install Apple's Command Line Tools and a
@@ -54,6 +54,195 @@ contract. The API and UI commands stage the exact child runtimes before the
 first managed activation. A GUI login owns the LaunchAgent domain;
 remote-only sessions without that domain cannot perform native LaunchAgent
 acceptance.
+
+Install the macOS resolver at a stable path before rendering the consumer
+configuration. Verify the repository artifact, run its isolated ACL probe, and
+record the installed digest without printing a credential:
+
+```zsh
+set -euo pipefail
+
+checkout_root=/absolute/path/to/verified/agents-release
+resolver_source="$checkout_root/tooling/hindsight/bin/hindsight-keychain-resolver"
+resolver_directory="$HOME/.local/libexec"
+resolver_target="$resolver_directory/hindsight-keychain-resolver"
+expected_resolver_sha256=replace-with-approved-release-sha256
+
+user_id="$(/usr/bin/id -u)"
+validate_protected_directory() {
+  local ancestor="$1" ancestor_owner ancestor_mode acl_entry
+  local -a acl_listing
+  while true; do
+    [[ -d "$ancestor" && ! -L "$ancestor" ]]
+    ancestor_owner="$(/usr/bin/stat -f '%u' "$ancestor")"
+    [[ "$ancestor_owner" == "$user_id" || "$ancestor_owner" == 0 ]]
+    ancestor_mode="$(/usr/bin/stat -f '%Lp' "$ancestor")"
+    (( (8#$ancestor_mode & 8#022) == 0 ))
+    acl_listing=("${(@f)$(/bin/ls -lde "$ancestor")}")
+    for acl_entry in "${acl_listing[@]}"; do
+      [[ ! "$acl_entry" =~ \
+        '^[[:space:]]*[0-9]+:.*[[:space:]]allow[[:space:]]' ]]
+    done
+    [[ "$ancestor" == / ]] && break
+    ancestor="${ancestor:h}"
+  done
+}
+
+resolver_parent="${resolver_directory:h}"
+if [[ ! -e "$resolver_parent" && ! -L "$resolver_parent" ]]; then
+  resolver_parent_parent="${resolver_parent:h}"
+  [[ "$resolver_parent_parent" == "${resolver_parent_parent:A}" ]]
+  validate_protected_directory "$resolver_parent_parent"
+  /bin/mkdir -m 700 "$resolver_parent"
+fi
+[[ "$resolver_parent" == "${resolver_parent:A}" ]]
+validate_protected_directory "$resolver_parent"
+if [[ -e "$resolver_directory" || -L "$resolver_directory" ]]; then
+  [[ -d "$resolver_directory" && ! -L "$resolver_directory" ]]
+else
+  /bin/mkdir -m 700 "$resolver_directory"
+fi
+[[ "$resolver_directory" == "${resolver_directory:A}" ]]
+validate_protected_directory "$resolver_directory"
+[[ "$(/usr/bin/stat -f '%Lp' "$resolver_directory")" == 700 ]]
+[[ ! -e "$resolver_target" && ! -L "$resolver_target" ]] || {
+  print -u2 -- "resolver target already exists; use the rotation workflow"
+  exit 1
+}
+
+resolver_sha256="$(
+  set -euo pipefail
+  resolver_temporary="$(/usr/bin/mktemp \
+    "$resolver_directory/.hindsight-keychain-resolver.XXXXXX")"
+  candidate_identity=
+  cleanup_candidate() {
+    if [[ -n "$candidate_identity" \
+      && -f "$resolver_target" \
+      && ! -L "$resolver_target" \
+      && "$(/usr/bin/stat -f '%d:%i' "$resolver_target")" \
+        == "$candidate_identity" ]]; then
+      /bin/rm -f -- "$resolver_target" || true
+    fi
+    /bin/rm -f -- "$resolver_temporary" || true
+  }
+  trap cleanup_candidate EXIT
+
+  [[ "$expected_resolver_sha256" =~ '^[0-9a-f]{64}$' ]]
+  read -r source_sha256 _ < <(/usr/bin/shasum -a 256 "$resolver_source")
+  [[ "$source_sha256" == "$expected_resolver_sha256" ]]
+  /usr/bin/codesign --verify --strict "$resolver_source"
+  signature_metadata="$(
+    /usr/bin/codesign -d --verbose=4 "$resolver_source" 2>&1
+  )"
+  [[ "$signature_metadata" == *"Signature=adhoc"* ]]
+  [[ "$signature_metadata" == *"TeamIdentifier=not set"* ]]
+  resolver_architectures=" $(/usr/bin/lipo -archs "$resolver_source") "
+  [[ "$resolver_architectures" == *" arm64 "* ]]
+  [[ "$resolver_architectures" == *" x86_64 "* ]]
+  [[ -x /usr/bin/python3 ]]
+
+  /usr/bin/install -m 500 "$resolver_source" "$resolver_temporary"
+  candidate_identity="$(
+    /usr/bin/stat -f '%d:%i' "$resolver_temporary"
+  )"
+  /usr/bin/codesign --verify --strict "$resolver_temporary"
+  [[ "$user_id" == "$(/usr/bin/stat -f '%u' "$resolver_temporary")" ]]
+  [[ "$(/usr/bin/stat -f '%Lp' "$resolver_temporary")" == 500 ]]
+  "$resolver_temporary" --self-test-acl >/dev/null
+  read -r candidate_sha256 _ < <(
+    /usr/bin/shasum -a 256 "$resolver_temporary"
+  )
+  [[ "$candidate_sha256" == "$expected_resolver_sha256" ]]
+
+  /usr/bin/python3 -I -c '
+import ctypes
+import os
+import sys
+
+rename = ctypes.CDLL(None, use_errno=True).renameatx_np
+rename.argtypes = [
+    ctypes.c_int,
+    ctypes.c_char_p,
+    ctypes.c_int,
+    ctypes.c_char_p,
+    ctypes.c_uint,
+]
+rename.restype = ctypes.c_int
+if rename(-2, os.fsencode(sys.argv[1]), -2, os.fsencode(sys.argv[2]), 4):
+    error = ctypes.get_errno()
+    raise OSError(error, os.strerror(error))
+' "$resolver_temporary" "$resolver_target"
+
+  /usr/bin/codesign --verify --strict "$resolver_target"
+  [[ "$user_id" == "$(/usr/bin/stat -f '%u' "$resolver_target")" ]]
+  [[ "$(/usr/bin/stat -f '%Lp' "$resolver_target")" == 500 ]]
+  read -r published_sha256 _ < <(
+    /usr/bin/shasum -a 256 "$resolver_target"
+  )
+  [[ "$published_sha256" == "$candidate_sha256" ]]
+  "$resolver_target" --self-test-acl >/dev/null
+
+  trap - EXIT
+  print -r -- "$published_sha256"
+)"
+[[ "$resolver_sha256" == "$expected_resolver_sha256" ]]
+print -r -- "$resolver_sha256"
+```
+
+The resolver is intentionally ad-hoc signed. Strict signature verification and
+the expected `Signature=adhoc` metadata provide internal code-integrity evidence
+only; they do not authenticate a producer or establish provenance. The release
+approval process binds the expected SHA-256 to the trusted artifact because
+there is no Team ID.
+
+Set `credential_resolver.path` to `resolver_target` and
+`credential_resolver.sha256` to `resolver_sha256`. Only after the final path and
+digest are approved should the activation task create the three internal
+credentials:
+
+```zsh
+resolver_target="$HOME/.local/libexec/hindsight-keychain-resolver"
+"$resolver_target" --initialize
+"$resolver_target" --status
+```
+
+The Keychain ACL binds the exact installed executable. Do not replace that path
+as an ordinary release update. A resolver upgrade requires an explicit
+credential-rotation and rollback plan.
+
+### Rotate the macOS resolver
+
+Treat a resolver upgrade as a credential rotation, not an in-place release
+update:
+
+1. Stop new harness sessions, drain broker writes, and stop every managed
+   service that consumes the three credentials.
+2. Install the successor at a new immutable path. Verify its trusted-release
+   SHA-256, ad-hoc signature, `arm64` and `x86_64` slices, owner, mode, and ACL
+   self-test before changing any credential.
+3. Update and approve the consumer resolver path and digest, but do not start
+   services.
+4. Retire all three existing items with `"$prior_resolver" --retire`, then
+   require `"$prior_resolver" --retired-status` to succeed. Only then
+   recreate them under the successor's exact ACL with
+   `"$successor_resolver" --initialize`. Verify the successor with
+   `"$successor_resolver" --status`. Cleanup must finish before initialization;
+   never print or persist credential values outside Keychain.
+5. Start the managed services once and verify API, UI, broker, control, and
+   fleet health plus a credential-free resolver status.
+6. Retain the prior binary and consumer prestate until the rollback window
+   closes. Rollback performs another credential rotation; it does not restore
+   the retired values. Stop services, run
+   `"$successor_resolver" --retire`, then
+   require `"$successor_resolver" --retired-status` to succeed before running
+   `"$prior_resolver" --initialize` and `"$prior_resolver" --status`, restoring
+   the prior path and digest, and repeating the same health checks.
+
+Never overwrite either resolver path in place. A partial rotation is a failed
+activation. Keep services stopped; invoke `--retire` with both the prior and
+successor resolvers even if the first reports mixed ownership, then require
+`--retired-status` to succeed. Initialize all three credentials under one
+verified resolver and require its `--status` to succeed before retrying.
 
 Install Node.js for macOS from a system-managed package that provides a
 protected `npx` executable, normally `/usr/local/bin/npx`. Do not add Homebrew

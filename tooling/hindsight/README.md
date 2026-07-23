@@ -151,6 +151,33 @@ environment names. Process-control names cannot be credential targets. The
 launcher inherits only a narrow locale and user environment, discards resolver
 stderr, and injects resolved values only into the authorized child process.
 
+On macOS, `bin/hindsight-keychain-resolver` is the supplied universal native
+resolver. It stores the data-plane token, mint authority, and UI access key as
+generic-password items with an explicit Keychain ACL bound to the exact native
+executable. The trusted-application list names no shared shell or Python
+interpreter. Install the verified binary at its final stable path before running
+`--initialize`. Bind that path and its SHA-256 digest in an approved consumer
+configuration before creating any credential. `--status` reports presence
+only. `--retire` deletes only credentials whose exact ACL matches that resolver
+and never emits their values. `--retired-status` succeeds only when all three
+credential items are absent.
+`--self-test-acl` creates and deletes isolated canaries and verifies exact
+trusted-application and authorization ACLs while `/usr/bin/python3` cannot read
+the protected canary. The self-test requires the Command Line Tools
+`/usr/bin/python3`.
+
+The resolver is an executable capability for its owning account: any same-user
+process able to execute it can request the fixed credential set. It prevents
+ambient inheritance and direct interpreter access to Keychain; it is not a
+caller-authenticating IPC service.
+
+The ACL deliberately does not follow a replaced executable. Upgrading this
+resolver therefore requires a separate credential-rotation plan that installs
+and verifies the successor, coordinates all service consumers, rotates the
+three values, and retains the prior binary until rollback is no longer needed.
+Do not overwrite the stable path in place. Follow the ordered
+[resolver rotation runbook](docs/adoption.md#rotate-the-macos-resolver).
+
 Install and upgrade copy regular files into content-addressed read-only release
 directories, atomically switch the active pointer, render only declared unit
 files, and require managed health. Failed or interrupted transitions recover

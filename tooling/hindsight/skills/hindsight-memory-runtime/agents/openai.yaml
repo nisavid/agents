@@ -1,0 +1,4 @@
+interface:
+  display_name: "Hindsight Memory Runtime"
+  short_description: "Use broker-scoped Hindsight memory tools."
+  default_prompt: "Use the active session bridge to access Hindsight memory safely."

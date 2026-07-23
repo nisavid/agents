@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shlex
 import signal
 import socket
 import stat
@@ -122,6 +123,20 @@ from hindsight_memory_control_plane.portable_install import (  # noqa: E402
     InstallationConfig,
     PortableInstallError,
     PortableInstallationManager,
+)
+from hindsight_memory_control_plane.harness_persistence import (  # noqa: E402
+    HarnessPersistenceError,
+    NativeHarnessDestination,
+)
+from hindsight_memory_control_plane.harnesses import (  # noqa: E402
+    NativeActivationPlan,
+    apply_native_activation,
+    load_native_activation_receipt,
+    native_activation_plan,
+    native_rollback_target,
+    render_native_harness_artifact,
+    stage_native_harness_artifacts,
+    verify_native_harness_generation,
 )
 
 
@@ -2661,6 +2676,296 @@ def harness_launch_command(args: argparse.Namespace) -> int:
     return completed.returncode
 
 
+def _harness_destination(args: argparse.Namespace) -> NativeHarnessDestination:
+    try:
+        return NativeHarnessDestination.load(read_json(args.destination))
+    except (TypeError, ValueError) as error:
+        raise HarnessPersistenceError("harness destination is invalid") from error
+
+
+def _harness_artifact(args: argparse.Namespace, harness_id: str):
+    if not args.state_dir:
+        raise HarnessPersistenceError("harness activation requires --state-dir")
+    try:
+        return render_native_harness_artifact(
+            harness_id,
+            executable=args.executable,
+            state_dir=args.state_dir,
+            locator_dir=args.locator_dir,
+        )
+    except (TypeError, ValueError) as error:
+        raise HarnessPersistenceError("harness artifact binding is invalid") from error
+
+
+def _harness_activation_record(
+    destination: NativeHarnessDestination, receipt: Mapping[str, Any]
+) -> dict[str, Any]:
+    body = {
+        "schema_version": 1,
+        "destination": destination.to_record(),
+        "destination_digest": destination.destination_digest,
+        "plan": deep_thaw(receipt),
+    }
+    return {**body, "approval_digest": digest(body)}
+
+
+def _load_harness_activation_record(
+    path: str | Path,
+) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+    record = read_json(path)
+    if not isinstance(record, Mapping) or set(record) != {
+        "schema_version",
+        "destination",
+        "destination_digest",
+        "plan",
+        "approval_digest",
+    }:
+        raise HarnessPersistenceError("harness activation record is invalid")
+    body = {key: value for key, value in record.items() if key != "approval_digest"}
+    if (
+        type(record.get("schema_version")) is not int
+        or record["schema_version"] != 1
+        or not isinstance(record.get("destination"), Mapping)
+        or not isinstance(record.get("destination_digest"), str)
+        or not isinstance(record.get("plan"), Mapping)
+        or not isinstance(record.get("approval_digest"), str)
+        or digest(record["destination"]) != record["destination_digest"]
+        or not hmac.compare_digest(digest(body), record["approval_digest"])
+    ):
+        raise HarnessPersistenceError("harness activation record is invalid")
+    try:
+        receipt = load_native_activation_receipt(record["plan"])
+    except (TypeError, ValueError) as error:
+        raise HarnessPersistenceError("harness activation record is invalid") from error
+    return record, receipt
+
+
+def _reconstruct_harness_activation_plan(
+    args: argparse.Namespace,
+    receipt: Mapping[str, Any],
+    prestate: Mapping[str, Any],
+) -> NativeActivationPlan:
+    try:
+        staged = verify_native_harness_generation(args.generation)
+        artifact = staged.get(receipt["harness_id"])
+        if artifact is None:
+            raise ValueError("staged generation does not contain harness")
+        inventory = load_inventory(args.inventory)
+        policy_digest = digest(read_json(args.policy))
+        plan = native_activation_plan(
+            artifact,
+            prestate,
+            staged_generation=args.generation,
+            upstream_integration_roots=tuple(args.upstream_integration_root or ()),
+            inventory_digest=inventory.inventory_digest,
+            artifact_digest=inventory.artifact_digest,
+            policy_digest=policy_digest,
+        )
+    except (InventoryError, StrictJsonError, TypeError, ValueError) as error:
+        raise HarnessPersistenceError("harness activation plan cannot be reconstructed") from error
+    if plan.to_dict() != receipt:
+        raise HarnessPersistenceError("harness activation inputs changed")
+    return plan
+
+
+def _validate_activation_record(
+    destination: NativeHarnessDestination,
+    record: Mapping[str, Any],
+    receipt: Mapping[str, Any],
+    approval_digest: str,
+) -> None:
+    if (
+        receipt["harness_id"] != destination.harness_id
+        or record["destination"] != destination.to_record()
+        or record["destination_digest"] != destination.destination_digest
+    ):
+        raise HarnessPersistenceError("activation plan destination changed")
+    if not hmac.compare_digest(approval_digest, record["approval_digest"]):
+        raise HarnessPersistenceError("harness activation record is not approved")
+
+
+def harness_config_stage_command(args: argparse.Namespace) -> int:
+    destination = _harness_destination(args)
+    artifact = _harness_artifact(args, destination.harness_id)
+    try:
+        generation = stage_native_harness_artifacts(
+            args.staging_root, {destination.harness_id: artifact}
+        )
+    except (TypeError, ValueError) as error:
+        raise HarnessPersistenceError("harness artifact staging failed") from error
+    print(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "harness_id": destination.harness_id,
+                "generation": str(generation),
+                "generation_digest": generation.name,
+                "native_artifact_digest": artifact.artifact_digest,
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def harness_config_plan_command(args: argparse.Namespace) -> int:
+    destination = _harness_destination(args)
+    artifact = _harness_artifact(args, destination.harness_id)
+    try:
+        staged = verify_native_harness_generation(args.generation)
+    except (TypeError, ValueError) as error:
+        raise HarnessPersistenceError("staged harness generation is invalid") from error
+    if destination.harness_id not in staged:
+        raise HarnessPersistenceError("staged generation does not contain destination")
+    staged_artifact = staged[destination.harness_id]
+    if not hmac.compare_digest(
+        artifact.artifact_digest, staged_artifact.artifact_digest
+    ):
+        raise HarnessPersistenceError("staged harness artifact binding changed")
+    inventory = load_inventory(args.inventory)
+    policy_digest = digest(read_json(args.policy))
+    try:
+        plan = native_activation_plan(
+            staged_artifact,
+            destination.read_configuration(),
+            staged_generation=args.generation,
+            upstream_integration_roots=tuple(args.upstream_integration_root or ()),
+            inventory_digest=inventory.inventory_digest,
+            artifact_digest=inventory.artifact_digest,
+            policy_digest=policy_digest,
+        )
+    except (TypeError, ValueError) as error:
+        raise HarnessPersistenceError("harness activation plan is invalid") from error
+    receipt = plan.to_dict()
+    record = _harness_activation_record(destination, receipt)
+    write_private(args.output, record)
+    print(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "harness_id": destination.harness_id,
+                "plan": str(Path(args.output).resolve()),
+                "approval_digest": record["approval_digest"],
+                "destination_digest": destination.destination_digest,
+                "plan_digest": plan.plan_digest,
+                "target_digest": plan.target_digest,
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def harness_config_apply_command(args: argparse.Namespace) -> int:
+    destination = _harness_destination(args)
+    record, receipt = _load_harness_activation_record(args.plan)
+    _validate_activation_record(
+        destination, record, receipt, args.approval_digest
+    )
+    current = destination.read_configuration()
+    plan = _reconstruct_harness_activation_plan(args, receipt, current)
+    outcome = apply_native_activation(
+        plan,
+        current,
+        staged_generation=args.generation,
+        approved_plan_digest=plan.plan_digest,
+        inventory_digest=plan.inventory_digest,
+        artifact_digest=plan.artifact_digest,
+        policy_digest=plan.policy_digest,
+        broker_healthy=args.broker_healthy,
+        profile_healthy=args.profile_healthy,
+        adapter_self_test=args.adapter_self_test,
+        persist_rollback=destination.persist_rollback,
+        read_rollback=lambda: destination.read_rollback(
+            plan.expected_prestate_digest
+        ),
+        read_configuration=destination.read_configuration,
+        write_configuration=destination.write_configuration,
+        postcheck=lambda _plan, target, _harness: (
+            digest(destination.read_configuration()) == target
+        ),
+    )
+    print(json.dumps(outcome.to_dict(), sort_keys=True))
+    return 0 if outcome.status == "activated" else 2
+
+
+def _controller_hook_present(value: Any) -> bool:
+    if isinstance(value, Mapping):
+        command = value.get("command")
+        if isinstance(command, str):
+            try:
+                arguments = shlex.split(command, posix=True)
+            except ValueError:
+                arguments = []
+            if arguments and Path(arguments[0]).name == "hindsight-memory":
+                return True
+        return any(_controller_hook_present(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_controller_hook_present(item) for item in value)
+    return False
+
+
+def harness_config_status_command(args: argparse.Namespace) -> int:
+    destination = _harness_destination(args)
+    current = destination.read_configuration()
+    hooks = current.get("hooks", {})
+    settings = current.get("settings", {})
+    if not isinstance(hooks, Mapping) or not isinstance(settings, Mapping):
+        raise HarnessPersistenceError("native harness configuration is invalid")
+    result = {
+        "schema_version": 1,
+        "harness_id": destination.harness_id,
+        "configuration_digest": digest(current),
+        "controller_hooks_present": _controller_hook_present(hooks),
+        "auto_recall": settings.get("autoRecall"),
+        "auto_retain": settings.get("autoRetain"),
+    }
+    if args.plan:
+        record, receipt = _load_harness_activation_record(args.plan)
+        result["approval_digest"] = record["approval_digest"]
+        result["destination_matches"] = (
+            record["destination"] == destination.to_record()
+            and record["destination_digest"] == destination.destination_digest
+        )
+        result["plan_digest"] = receipt["plan_digest"]
+        result["target_matches"] = digest(current) == receipt["target_digest"]
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
+def harness_config_rollback_command(args: argparse.Namespace) -> int:
+    destination = _harness_destination(args)
+    record, receipt = _load_harness_activation_record(args.plan)
+    _validate_activation_record(
+        destination, record, receipt, args.approval_digest
+    )
+    prestate = destination.read_rollback(receipt["expected_prestate_digest"])
+    plan = _reconstruct_harness_activation_plan(args, receipt, prestate)
+    current = destination.read_configuration()
+    try:
+        target = native_rollback_target(
+            plan, current, approved_plan_digest=plan.plan_digest
+        )
+    except (TypeError, ValueError) as error:
+        raise HarnessPersistenceError("harness rollback target is invalid") from error
+    restored = destination.write_configuration(digest(current), target)
+    succeeded = digest(restored) == digest(target)
+    print(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "harness_id": destination.harness_id,
+                "approval_digest": record["approval_digest"],
+                "plan_digest": plan.plan_digest,
+                "status": "rolled_back" if succeeded else "rollback_failed",
+                "configuration_digest": digest(restored),
+            },
+            sort_keys=True,
+        )
+    )
+    return 0 if succeeded else 2
+
+
 def _add_socket(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--socket", required=True)
     parser.add_argument("--timeout", type=_argparse_timeout, default=2.0)
@@ -2886,6 +3191,58 @@ def parser() -> argparse.ArgumentParser:
     )
     integration_rollback.set_defaults(run=integration_upgrade_rollback_command)
 
+    harness_config = commands.add_parser("harness-config")
+    harness_config_commands = harness_config.add_subparsers(
+        dest="harness_config_command", required=True
+    )
+
+    def add_harness_artifact_arguments(command_parser: argparse.ArgumentParser) -> None:
+        command_parser.add_argument("--destination", required=True)
+        command_parser.add_argument("--executable", required=True)
+        command_parser.add_argument("--locator-dir", required=True)
+
+    harness_config_stage = harness_config_commands.add_parser("stage")
+    add_harness_artifact_arguments(harness_config_stage)
+    harness_config_stage.add_argument("--staging-root", required=True)
+    harness_config_stage.set_defaults(run=harness_config_stage_command)
+
+    harness_config_plan = harness_config_commands.add_parser("plan")
+    add_harness_artifact_arguments(harness_config_plan)
+    harness_config_plan.add_argument("--generation", required=True)
+    harness_config_plan.add_argument("--inventory", required=True)
+    harness_config_plan.add_argument("--policy", required=True)
+    harness_config_plan.add_argument("--upstream-integration-root", action="append")
+    harness_config_plan.add_argument("--output", required=True)
+    harness_config_plan.set_defaults(run=harness_config_plan_command)
+
+    harness_config_apply = harness_config_commands.add_parser("apply")
+    harness_config_apply.add_argument("--destination", required=True)
+    harness_config_apply.add_argument("--generation", required=True)
+    harness_config_apply.add_argument("--inventory", required=True)
+    harness_config_apply.add_argument("--policy", required=True)
+    harness_config_apply.add_argument("--upstream-integration-root", action="append")
+    harness_config_apply.add_argument("--plan", required=True)
+    harness_config_apply.add_argument("--approval-digest", required=True)
+    harness_config_apply.add_argument("--broker-healthy", action="store_true")
+    harness_config_apply.add_argument("--profile-healthy", action="store_true")
+    harness_config_apply.add_argument("--adapter-self-test", action="store_true")
+    harness_config_apply.set_defaults(run=harness_config_apply_command)
+
+    harness_config_status = harness_config_commands.add_parser("status")
+    harness_config_status.add_argument("--destination", required=True)
+    harness_config_status.add_argument("--plan")
+    harness_config_status.set_defaults(run=harness_config_status_command)
+
+    harness_config_rollback = harness_config_commands.add_parser("rollback")
+    harness_config_rollback.add_argument("--destination", required=True)
+    harness_config_rollback.add_argument("--generation", required=True)
+    harness_config_rollback.add_argument("--inventory", required=True)
+    harness_config_rollback.add_argument("--policy", required=True)
+    harness_config_rollback.add_argument("--upstream-integration-root", action="append")
+    harness_config_rollback.add_argument("--plan", required=True)
+    harness_config_rollback.add_argument("--approval-digest", required=True)
+    harness_config_rollback.set_defaults(run=harness_config_rollback_command)
+
     broker = commands.add_parser("broker")
     broker_commands = broker.add_subparsers(dest="broker_command", required=True)
     serve = broker_commands.add_parser("serve")
@@ -3065,6 +3422,7 @@ def main() -> int:
         BrokerError,
         InventoryError,
         IntegrationUpgradeError,
+        HarnessPersistenceError,
         MigrationAdapterError,
         MigrationError,
         PlanError,

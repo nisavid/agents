@@ -1296,6 +1296,20 @@ class HookAdapterTest(unittest.TestCase):
                 },
             )
 
+    def test_explicit_tools_can_rely_on_the_bridge_bound_session(self):
+        codex = HookAdapter("codex", self.bridge.dispatch)
+        cursor = HookAdapter("cursor", self.bridge.dispatch)
+
+        self.assertEqual(
+            codex.handle("tool-recall", {"query": "current task"})["disposition"],
+            "ok",
+        )
+        self.assertEqual(cursor.handle("status", {})["disposition"], "ok")
+        with self.assertRaisesRegex(BridgeError, "SESSION_INVALID"):
+            cursor.handle("status", {"conversation_id": ""})
+        with self.assertRaisesRegex(BridgeError, "SESSION_INVALID"):
+            HookAdapter("codex", lambda _request: {}).handle("status", {})
+
     def test_ambient_unavailable_diagnostic_is_visible_and_non_authoritative(self):
         class UnavailableBroker(FakeBrokerClient):
             def recall(self, _capability, **_arguments):

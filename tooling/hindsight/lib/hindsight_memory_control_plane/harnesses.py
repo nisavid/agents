@@ -19,7 +19,17 @@ from .model import deep_freeze, deep_thaw
 SUPPORTED_HARNESSES = frozenset({"codex", "claude-code", "cursor"})
 OWNED_KEYS = frozenset({"schemaVersion", "broker", "adapter", "active"})
 RETIRED_DIRECT_KEYS = frozenset(
-    {"hindsightApiUrl", "bankId", "tenantToken", "bearerToken", "apiKey", "signingKey"}
+    {
+        "hindsightApiUrl",
+        "hindsightApiToken",
+        "bankId",
+        "bankIdPrefix",
+        "dynamicBankId",
+        "tenantToken",
+        "bearerToken",
+        "apiKey",
+        "signingKey",
+    }
 )
 DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 ACTIVATION_REQUIREMENTS = ("broker_healthy", "profile_healthy", "adapter_self_test")
@@ -131,7 +141,6 @@ class NativeActivationPlan:
 
     def to_dict(self) -> dict[str, Any]:
         return {**self.body(), "plan_digest": self.plan_digest}
-
 
 @dataclass(frozen=True)
 class NativeActivationOutcome:
@@ -762,7 +771,17 @@ def _native_target(
     target["hooks"] = current_hooks
 
     settings = deep_thaw(target.get("settings", {}))
+    for key in RETIRED_DIRECT_KEYS:
+        settings.pop(key, None)
     settings.update(deep_thaw(rendered["settings"]))
+    if (
+        type(settings.get("schemaVersion")) is int
+        and settings["schemaVersion"] == 1
+        and isinstance(settings.get("broker"), Mapping)
+        and isinstance(settings.get("adapter"), str)
+        and settings.get("active") is False
+    ):
+        settings["active"] = True
     target["settings"] = settings
     tools = deep_thaw(target.get("tools", {}))
     tools.update(deep_thaw(rendered["tools"]))
@@ -896,6 +915,40 @@ def _valid_native_plan(plan: Any) -> bool:
         )
     except (TypeError, ValueError):
         return False
+
+
+def load_native_activation_receipt(value: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Load a secret-free digest receipt for a reconstructable native plan."""
+
+    expected = {
+        "schema_version",
+        "harness_id",
+        "inventory_digest",
+        "artifact_digest",
+        "policy_digest",
+        "native_artifact_digest",
+        "staged_generation_digest",
+        "upstream_integration_roots_digest",
+        "retired_direct_hooks_digest",
+        "expected_prestate_digest",
+        "target_digest",
+        "plan_digest",
+    }
+    if not isinstance(value, Mapping) or set(value) != expected:
+        raise ValueError("native activation receipt is invalid")
+    if type(value.get("schema_version")) is not int or value["schema_version"] != 1:
+        raise ValueError("native activation receipt is invalid")
+    if (
+        not isinstance(value.get("harness_id"), str)
+        or value["harness_id"] not in SUPPORTED_HARNESSES
+    ):
+        raise ValueError("native activation receipt is invalid")
+    for key in expected - {"schema_version", "harness_id"}:
+        _validate_digest(value[key], key.replace("_", " "))
+    body = {key: deep_thaw(value[key]) for key in expected - {"plan_digest"}}
+    if not hmac.compare_digest(digest(body), value["plan_digest"]):
+        raise ValueError("native activation receipt is invalid")
+    return deep_freeze(deep_thaw(value))
 
 
 def apply_native_activation(
@@ -1200,6 +1253,25 @@ def _native_rollback_target(
         else:
             observed_events.pop(event, None)
     return restored
+
+
+def native_rollback_target(
+    plan: NativeActivationPlan,
+    current: Mapping[str, Any],
+    *,
+    approved_plan_digest: str,
+) -> Mapping[str, Any]:
+    """Prepare an owned-field rollback while preserving later unrelated edits."""
+
+    if not _valid_native_plan(plan):
+        raise ValueError("native activation plan is invalid")
+    if not isinstance(approved_plan_digest, str) or not hmac.compare_digest(
+        approved_plan_digest, plan.plan_digest
+    ):
+        raise ValueError("native activation plan is not approved")
+    if not isinstance(current, Mapping):
+        raise ValueError("current native harness configuration must be an object")
+    return deep_freeze(_native_rollback_target(current, plan.prestate, plan.target))
 
 
 def _validate_digest(value: str, label: str) -> str:

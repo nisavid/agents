@@ -25,6 +25,7 @@ import time
 from typing import Any, Mapping, NamedTuple
 
 
+sys.dont_write_bytecode = True
 LIB = Path(__file__).resolve().parents[1] / "lib"
 sys.path.insert(0, str(LIB))
 

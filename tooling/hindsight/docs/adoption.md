@@ -140,6 +140,13 @@ Keep machine inventory, locators, service values, runtime state, and generated
 artifacts in the consumer repository or protected local state. Keep resolved
 credentials out of configuration, arguments, logs, and source control.
 
+Bind `HINDSIGHT_API_TENANT_EXTENSION` to
+`hindsight_api.extensions.builtin.tenant:ApiKeyTenantExtension` in both the
+managed service and its health check. The launcher supplies the resolved
+`HINDSIGHT_API_TENANT_API_KEY` only to the API child. Without the explicit
+extension selector, upstream Hindsight remains unauthenticated and the broker
+refuses activation.
+
 The installer validates a closed JSON schema. Use paths such as
 `bin/hindsight-memory`, never absolute paths or `release://` values, for
 release-owned entrypoints. Use `release://bin/hindsight-embed-uvx` for the
@@ -164,6 +171,7 @@ interactively, then bind its canonical bank explicitly. For example:
 profile='replace-with-profile-name'
 api_port=7979
 bank_id=engineering
+worker_id='replace-with-stable-consumer-and-profile-id'
 uvx_executable=/absolute/path/to/uvx
 
 HINDSIGHT_EMBED_UVX_EXECUTABLE="$uvx_executable" \
@@ -172,14 +180,33 @@ HINDSIGHT_EMBED_UVX_EXECUTABLE="$uvx_executable" \
 HINDSIGHT_EMBED_UVX_EXECUTABLE="$uvx_executable" \
   tooling/hindsight/bin/hindsight-embed-uvx hindsight-embed profile set-env \
   "$profile" HINDSIGHT_BANK_ID "$bank_id"
+HINDSIGHT_EMBED_UVX_EXECUTABLE="$uvx_executable" \
+  tooling/hindsight/bin/hindsight-embed-uvx hindsight-embed profile set-env \
+  "$profile" HINDSIGHT_API_AUDIT_LOG_ENABLED false
+HINDSIGHT_EMBED_UVX_EXECUTABLE="$uvx_executable" \
+  tooling/hindsight/bin/hindsight-embed-uvx hindsight-embed profile set-env \
+  "$profile" HINDSIGHT_API_LLM_TRACE_ENABLED false
+HINDSIGHT_EMBED_UVX_EXECUTABLE="$uvx_executable" \
+  tooling/hindsight/bin/hindsight-embed-uvx hindsight-embed profile set-env \
+  "$profile" HINDSIGHT_API_WORKER_ID "$worker_id"
 ```
 
 Interactive setup keeps provider credentials out of process arguments. The
 configured profile may exist outside the installer-managed data root, but the
-declared fresh data root must be empty.
+declared fresh data root must be empty. The broker requires the upstream worker
+feature while rejecting native audit logging and LLM request tracing; keep both
+privacy features explicitly disabled and give each managed profile a stable,
+consumer-scoped worker ID.
+The broker validates the selected runtime and compiles its routes before it
+publishes the socket. Give that first-start gate a bounded five-minute budget
+with `HINDSIGHT_MEMORY_BROKER_WAIT_SECONDS=300`; later health probes remain
+bounded independently.
 
-For adoption, do not run either command. Inspect the existing profile, bank,
-ports, and data root without printing provider credentials. Set
+For adoption, do not configure the profile or change its bank. Inspect the
+existing profile, bank, ports, worker ID, privacy flags, and data root without
+printing provider credentials. Broker activation requires audit logging and
+LLM request tracing to be explicitly disabled; include any required privacy or
+stable-worker correction in the approved activation plan. Set
 `installation_mode` to `adopt` and point `data_root` at the existing database
 root. The installer records its filesystem identity, rechecks that digest
 immediately before first service activation, and refuses later lifecycle

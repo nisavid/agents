@@ -405,6 +405,26 @@ class PortableInstallationManagerTest(unittest.TestCase):
         for config in (launchd, systemd):
             serialized = json.dumps(config.to_dict(), sort_keys=True)
             self.assertNotIn("resolved-at-runtime", serialized)
+            service_environment = dict(config.services[0].environment)
+            health_environment = dict(config.health_checks[0].environment)
+            for environment in (service_environment, health_environment):
+                self.assertEqual(
+                    environment["HINDSIGHT_API_AUDIT_LOG_ENABLED"], "false"
+                )
+                self.assertEqual(
+                    environment["HINDSIGHT_API_LLM_TRACE_ENABLED"], "false"
+                )
+                self.assertEqual(
+                    environment["HINDSIGHT_API_TENANT_EXTENSION"],
+                    "hindsight_api.extensions.builtin.tenant:ApiKeyTenantExtension",
+                )
+                self.assertEqual(
+                    environment["HINDSIGHT_API_WORKER_ID"],
+                    "example-workstation-core",
+                )
+                self.assertEqual(
+                    environment["HINDSIGHT_MEMORY_BROKER_WAIT_SECONDS"], "300"
+                )
             self.assertEqual(
                 config.timers[0].arguments[2:4],
                 ("integration-upgrade", "check"),
@@ -4446,6 +4466,27 @@ class PortableInstallationManagerTest(unittest.TestCase):
             version="2.0.0",
             expected_current_binding_generation_digest="b" * 64,
         )
+
+    def test_candidate_cli_does_not_mutate_release_with_bytecode(self) -> None:
+        release = self.root / "candidate-release"
+        shutil.copytree(
+            ROOT,
+            release,
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        )
+
+        completed = subprocess.run(
+            [sys.executable, "-I", str(release / "bin" / "hindsight-memory"), "--help"],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(list(release.rglob("__pycache__")), [])
+        self.assertEqual(list(release.rglob("*.pyc")), [])
 
 
 if __name__ == "__main__":

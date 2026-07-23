@@ -879,7 +879,7 @@ bounded_ready="$tmp_dir/bounded.ready"
 ) >/dev/null 2>&1 &
 bounded_call_pid=$!
 track_fixture_pid "$bounded_call_pid"
-for _ in {1..100}; do
+for _ in {1..250}; do
   [[ -e "$bounded_ready" && -s "$bounded_child_pid_file" && -s "$bounded_wrapper_pid_file" ]] && break
   sleep 0.02
 done
@@ -1005,7 +1005,7 @@ if (
   export HINDSIGHT_EMBED_PROFILE=present-profile
   export HINDSIGHT_EMBED_PROFILE_SLOT=0
   export HINDSIGHT_EMBED_PYTHON=/usr/bin/python3
-  export HINDSIGHT_EMBED_SIDECAR_COMMAND_TIMEOUT_SECONDS=1
+  export HINDSIGHT_EMBED_SIDECAR_COMMAND_TIMEOUT_SECONDS=2
   export HINDSIGHT_TEST_SIDECAR_CHILD_PID="$sidecar_child_pid_file"
   source "$rendered_stack_lib"
   hindsight_stack_sidecar_command reranker start
@@ -1928,6 +1928,8 @@ chmod 700 "$fake_memory_cli"
 broker_args="$tmp_dir/broker-args"
 broker_output="$tmp_dir/broker-output"
 broker_python_calls="$tmp_dir/broker-python-calls"
+broker_readiness_job_pid="$tmp_dir/broker-readiness-job.pid"
+broker_owned_jobs="$tmp_dir/broker-owned-jobs"
 hostile_python_dir="$tmp_dir/hostile-python"
 hostile_python_marker="$tmp_dir/hostile-python-ran"
 hostile_sitecustomize_marker="$tmp_dir/hostile-sitecustomize-ran"
@@ -1958,6 +1960,19 @@ chmod 700 "$hostile_python_dir/python3"
   export HINDSIGHT_TEST_HOSTILE_PYTHON_MARKER="$hostile_python_marker"
   export HINDSIGHT_TEST_HOSTILE_SITECUSTOMIZE_MARKER="$hostile_sitecustomize_marker"
   source "$rendered_stack_lib"
+  broker_readiness_job_cleaned=0
+  cleanup_broker_readiness_job() {
+    (( broker_readiness_job_cleaned )) && return 0
+    broker_readiness_job_cleaned=1
+    local cleanup_pid="${readiness_job_pid:-}"
+    if [[ -z "$cleanup_pid" && -s "$broker_readiness_job_pid" ]]; then
+      cleanup_pid="$(<"$broker_readiness_job_pid")"
+    fi
+    [[ "$cleanup_pid" == <-> ]] || return 0
+    /bin/kill -TERM "$cleanup_pid" >/dev/null 2>&1 || true
+    wait "$cleanup_pid" >/dev/null 2>&1 || true
+  }
+  trap cleanup_broker_readiness_job EXIT
   hindsight_stack_broker_process_identity() {
     local pid="$1" record state
     record="$(hindsight_stack_broker_process_record)" || return 1
@@ -1971,7 +1986,11 @@ chmod 700 "$hostile_python_dir/python3"
   hindsight_stack_wait_broker() {
     local attempt
     for attempt in {1..100}; do
-      [[ -e "$broker_args" ]] && return 0
+      if [[ -e "$broker_args" ]]; then
+        /bin/sleep 60 &
+        print -r -- "$!" >"$broker_readiness_job_pid"
+        return 0
+      fi
       sleep 0.01
     done
     return 1
@@ -1982,12 +2001,24 @@ chmod 700 "$hostile_python_dir/python3"
   }
   hindsight_stack_broker_read_process_record
   started_broker_pid="$HINDSIGHT_STACK_BROKER_PID"
+  readiness_job_pid="$(<"$broker_readiness_job_pid")"
+  jobs -l >"$broker_owned_jobs"
+  owned_jobs="$(<"$broker_owned_jobs")"
+  [[ "$owned_jobs" != *" ${started_broker_pid} "* ]] || {
+    print -ru2 -- "broker start retained its broker job after successful handoff"
+    exit 1
+  }
+  [[ "$owned_jobs" == *" ${readiness_job_pid} "* ]] || {
+    print -ru2 -- "broker start disowned an unrelated readiness job"
+    exit 1
+  }
   if hindsight_stack_broker_terminate_recorded >/dev/null 2>&1; then
     print -ru2 -- "recorded broker termination signaled a live external PID"
     exit 1
   fi
   /bin/kill -KILL "$started_broker_pid" >/dev/null 2>&1 || true
   wait "$started_broker_pid" >/dev/null 2>&1 || true
+  cleanup_broker_readiness_job
   for _ in {1..100}; do
     /bin/kill -0 "$started_broker_pid" >/dev/null 2>&1 || break
     sleep 0.01

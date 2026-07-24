@@ -1,0 +1,277 @@
+{
+  "schema_version": 1,
+  "evaluation_id": "control-plane-integrated-v1",
+  "repetitions": 3,
+  "conditions": ["no_skill", "incumbent", "candidate", "composed"],
+  "runtime_dependencies": {
+    "mergecraft:writing-reviewable-pr-descriptions": [
+      "plugins/mergecraft/skills/writing-reviewable-pr-descriptions/scripts"
+    ],
+    "mergecraft:publishing-reviewable-prs": [
+      "plugins/mergecraft/skills/writing-reviewable-pr-descriptions/scripts"
+    ],
+    "mergecraft:getting-prs-merged": [
+      "plugins/mergecraft/skills/getting-prs-merged/scripts/post_coderabbit_comment.py",
+      "plugins/mergecraft/skills/publishing-reviewable-prs/scripts/reviewable_pr_state.py"
+    ]
+  },
+  "invalidation_source_scenario_id": "cursor-grok-consequential-review",
+  "skills": [
+    {
+      "id": "rolecasting:choosing-agent-models",
+      "entrypoint": "plugins/rolecasting/skills/choosing-agent-models/SKILL.md",
+      "companions": [],
+      "scenario": {
+        "id": "cursor-grok-consequential-review",
+        "kind": "skill-evals",
+        "source": "plugins/rolecasting/skills/choosing-agent-models/evals/evals.json",
+        "selector": "cursor-grok-consequential-review"
+      }
+    },
+    {
+      "id": "rolecasting:delegating-cross-agent-work",
+      "entrypoint": "plugins/rolecasting/skills/delegating-cross-agent-work/SKILL.md",
+      "companions": ["rolecasting:choosing-agent-models"],
+      "scenario": {
+        "id": "insufficient-foreign-isolation-blocked",
+        "kind": "skill-evals",
+        "source": "plugins/rolecasting/skills/delegating-cross-agent-work/evals/evals.json",
+        "selector": "insufficient-foreign-isolation-blocked"
+      }
+    },
+    {
+      "id": "tricritical:review",
+      "entrypoint": "plugins/tricritical/skills/review/SKILL.md",
+      "companions": [
+        "tricritical:intent",
+        "tricritical:runtime",
+        "tricritical:structure"
+      ],
+      "scenario": {
+        "id": "critic-isolation",
+        "kind": "tricritical-corpus",
+        "source": "plugins/tricritical/evals/corpus.json",
+        "selector": "critic-isolation.md"
+      }
+    },
+    {
+      "id": "tricritical:intent",
+      "entrypoint": "plugins/tricritical/skills/intent/SKILL.md",
+      "companions": [],
+      "scenario": {
+        "id": "intent-no-spec",
+        "kind": "tricritical-corpus",
+        "source": "plugins/tricritical/evals/corpus.json",
+        "selector": "intent-no-spec.md"
+      }
+    },
+    {
+      "id": "tricritical:runtime",
+      "entrypoint": "plugins/tricritical/skills/runtime/SKILL.md",
+      "companions": [],
+      "scenario": {
+        "id": "runtime-green-test-false-positive",
+        "kind": "tricritical-corpus",
+        "source": "plugins/tricritical/evals/corpus.json",
+        "selector": "runtime-green-test-false-positive.md"
+      }
+    },
+    {
+      "id": "tricritical:structure",
+      "entrypoint": "plugins/tricritical/skills/structure/SKILL.md",
+      "companions": [],
+      "scenario": {
+        "id": "structure-smell-negative",
+        "kind": "tricritical-corpus",
+        "source": "plugins/tricritical/evals/corpus.json",
+        "selector": "structure-smell-negative.md"
+      }
+    },
+    {
+      "id": "tricritical:adjudicate",
+      "entrypoint": "plugins/tricritical/skills/adjudicate/SKILL.md",
+      "companions": [],
+      "scenario": {
+        "id": "severity-calibration",
+        "kind": "tricritical-corpus",
+        "source": "plugins/tricritical/evals/corpus.json",
+        "selector": "severity-calibration.md"
+      }
+    },
+    {
+      "id": "tricritical:revise",
+      "entrypoint": "plugins/tricritical/skills/revise/SKILL.md",
+      "companions": [],
+      "scenario": {
+        "id": "pre-edit-identity-mismatch",
+        "kind": "tricritical-corpus",
+        "source": "plugins/tricritical/evals/corpus.json",
+        "selector": "pre-edit-identity-mismatch.md"
+      }
+    },
+    {
+      "id": "tricritical:loop",
+      "entrypoint": "plugins/tricritical/skills/loop/SKILL.md",
+      "companions": [
+        "tricritical:review",
+        "tricritical:adjudicate",
+        "tricritical:revise"
+      ],
+      "scenario": {
+        "id": "loop-incomplete-successful-verification",
+        "kind": "tricritical-corpus",
+        "source": "plugins/tricritical/evals/corpus.json",
+        "selector": "loop-incomplete-successful-verification.md"
+      }
+    },
+    {
+      "id": "versionkeeping:checkpointing-and-publishing-git-work",
+      "entrypoint": "plugins/versionkeeping/skills/checkpointing-and-publishing-git-work/SKILL.md",
+      "companions": [],
+      "scenario": {
+        "id": "merged-remote-ref-cleanup",
+        "kind": "simple-corpus",
+        "source": "evals/versionkeeping/corpus.json",
+        "selector": "merged-remote-ref-cleanup"
+      }
+    },
+    {
+      "id": "versionkeeping:syncing-forks-with-upstream",
+      "entrypoint": "plugins/versionkeeping/skills/syncing-forks-with-upstream/SKILL.md",
+      "companions": ["versionkeeping:checkpointing-and-publishing-git-work"],
+      "scenario": {
+        "id": "non-default-fork-sync",
+        "kind": "simple-corpus",
+        "source": "evals/versionkeeping/corpus.json",
+        "selector": "non-default-fork-sync"
+      }
+    },
+    {
+      "id": "versionkeeping:using-persistent-git-worktrees",
+      "entrypoint": "plugins/versionkeeping/skills/using-persistent-git-worktrees/SKILL.md",
+      "companions": ["versionkeeping:checkpointing-and-publishing-git-work"],
+      "scenario": {
+        "id": "persistent-worktree-containment",
+        "kind": "simple-corpus",
+        "source": "evals/versionkeeping/corpus.json",
+        "selector": "persistent-worktree-containment"
+      }
+    },
+    {
+      "id": "mergecraft:writing-reviewable-pr-descriptions",
+      "entrypoint": "plugins/mergecraft/skills/writing-reviewable-pr-descriptions/SKILL.md",
+      "companions": ["tricritical:loop"],
+      "scenario": {
+        "id": "writer-owns-content",
+        "kind": "simple-corpus",
+        "source": "evals/mergecraft/corpus.json",
+        "selector": "writer-owns-content"
+      }
+    },
+    {
+      "id": "mergecraft:publishing-reviewable-prs",
+      "entrypoint": "plugins/mergecraft/skills/publishing-reviewable-prs/SKILL.md",
+      "companions": ["mergecraft:writing-reviewable-pr-descriptions"],
+      "scenario": {
+        "id": "publisher-owns-actuation",
+        "kind": "simple-corpus",
+        "source": "evals/mergecraft/corpus.json",
+        "selector": "publisher-owns-actuation"
+      }
+    },
+    {
+      "id": "mergecraft:graphite",
+      "entrypoint": "plugins/mergecraft/skills/graphite/SKILL.md",
+      "companions": [
+        "mergecraft:publishing-reviewable-prs",
+        "versionkeeping:checkpointing-and-publishing-git-work"
+      ],
+      "scenario": {
+        "id": "graphite-transport-boundary",
+        "kind": "simple-corpus",
+        "source": "evals/mergecraft/corpus.json",
+        "selector": "graphite-transport-boundary"
+      }
+    },
+    {
+      "id": "mergecraft:addressing-pr-review-feedback",
+      "entrypoint": "plugins/mergecraft/skills/addressing-pr-review-feedback/SKILL.md",
+      "companions": [
+        "mergecraft:interacting-with-pr-review-feedback",
+        "tricritical:adjudicate",
+        "tricritical:revise",
+        "versionkeeping:checkpointing-and-publishing-git-work"
+      ],
+      "scenario": {
+        "id": "feedback-natural-reply",
+        "kind": "simple-corpus",
+        "source": "evals/mergecraft/corpus.json",
+        "selector": "feedback-natural-reply"
+      }
+    },
+    {
+      "id": "mergecraft:interacting-with-pr-review-feedback",
+      "entrypoint": "plugins/mergecraft/skills/interacting-with-pr-review-feedback/SKILL.md",
+      "companions": [],
+      "scenario": {
+        "id": "authorized-reply-and-resolution-boundary",
+        "kind": "skill-evals",
+        "source": "evals/mergecraft/skills/interacting-with-pr-review-feedback/evals.json",
+        "selector": "authorized-reply-and-resolution-boundary"
+      }
+    },
+    {
+      "id": "mergecraft:resuming-reviewed-prs",
+      "entrypoint": "plugins/mergecraft/skills/resuming-reviewed-prs/SKILL.md",
+      "companions": ["mergecraft:publishing-reviewable-prs"],
+      "scenario": {
+        "id": "resume-selects-one-owner",
+        "kind": "simple-corpus",
+        "source": "evals/mergecraft/corpus.json",
+        "selector": "resume-selects-one-owner"
+      }
+    },
+    {
+      "id": "mergecraft:getting-prs-ready-for-review",
+      "entrypoint": "plugins/mergecraft/skills/getting-prs-ready-for-review/SKILL.md",
+      "companions": [
+        "versionkeeping:checkpointing-and-publishing-git-work",
+        "mergecraft:writing-reviewable-pr-descriptions",
+        "mergecraft:publishing-reviewable-prs"
+      ],
+      "scenario": {
+        "id": "ready-after-verified-checkpoint",
+        "kind": "skill-evals",
+        "source": "evals/mergecraft/skills/getting-prs-ready-for-review/evals.json",
+        "selector": "ready-after-verified-checkpoint"
+      }
+    },
+    {
+      "id": "mergecraft:getting-prs-merged",
+      "entrypoint": "plugins/mergecraft/skills/getting-prs-merged/SKILL.md",
+      "companions": ["mergecraft:publishing-reviewable-prs"],
+      "scenario": {
+        "id": "merge-explicit-review-loop",
+        "kind": "skill-evals",
+        "source": "evals/mergecraft/skills/getting-prs-merged/evals.json",
+        "selector": "explicit-review-loop-before-merge"
+      }
+    },
+    {
+      "id": "mergecraft:stacking-pr-fixups",
+      "entrypoint": "plugins/mergecraft/skills/stacking-pr-fixups/SKILL.md",
+      "companions": [
+        "mergecraft:writing-reviewable-pr-descriptions",
+        "mergecraft:publishing-reviewable-prs",
+        "mergecraft:graphite",
+        "versionkeeping:checkpointing-and-publishing-git-work"
+      ],
+      "scenario": {
+        "id": "narrow-stacked-fixup",
+        "kind": "skill-evals",
+        "source": "evals/mergecraft/skills/stacking-pr-fixups/evals.json",
+        "selector": "narrow-stacked-fixup"
+      }
+    }
+  ]
+}

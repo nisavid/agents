@@ -4,8 +4,8 @@ Personal agent tooling and plugin source.
 
 This repository is the source of truth for reusable agent assets shared across
 local harnesses. Its public plugins cover agent role selection (Rolecasting),
-Git and worktree provenance (Versionkeeping), and independent review through
-revision (Tricritical).
+Git and worktree provenance (Versionkeeping), pull-request lifecycles
+(Mergecraft), and independent review through revision (Tricritical).
 
 ## Layout
 
@@ -19,6 +19,10 @@ revision (Tricritical).
   fork-synchronization runtime policy. Its canonical evals, tests, and content
   lock are `evals/versionkeeping/`, `tests/plugins/versionkeeping/`, and
   `release/plugin-content-locks/versionkeeping.json`.
+- `plugins/mergecraft/` contains PR writing, publication, Graphite, feedback,
+  readiness, and merge runtime workflows. Its canonical evals, tests, and
+  content lock are `evals/mergecraft/`, `tests/plugins/mergecraft/`, and
+  `release/plugin-content-locks/mergecraft.json`.
 - `tooling/hindsight/` contains the reusable Hindsight control plane, local
   stack tooling, templates, schemas, skills, and validation.
 

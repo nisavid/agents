@@ -1,0 +1,4 @@
+interface:
+  display_name: Get PRs Ready For Review
+  short_description: Drive a draft PR to verified review readiness.
+  default_prompt: Use $mergecraft:getting-prs-ready-for-review to make this PR ready for review.

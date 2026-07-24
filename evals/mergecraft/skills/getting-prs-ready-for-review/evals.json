@@ -1,0 +1,35 @@
+{
+  "skill_name": "getting-prs-ready-for-review",
+  "evals": [
+    {
+      "id": 0,
+      "name": "ready-after-verified-checkpoint",
+      "prompt": "Using the provided scenario fixture, respond as the agent handling this request. Do not use live Git or forge tools; give the ordered readiness decision, gates, and stopping status.",
+      "expected_output": "The agent refreshes task and PR state, requires a verified task-owned checkpoint and current reviewer-facing content before ready-state actuation, and stops at any failing check or missing authority.",
+      "files": [
+        "getting-prs-ready-for-review/fixtures/ready-after-verified-checkpoint.md"
+      ],
+      "expectations": [
+        "The response discovers current branch, pull-request, and local-policy state before changing readiness.",
+        "The response requires Versionkeeping checkpoint evidence before publishing a readiness transition.",
+        "The response uses the writer and publisher boundaries for reviewer-facing PR content and ready-state actuation.",
+        "The response leaves the PR draft when required verification is failing or a required ownership gate is unresolved."
+      ]
+    },
+    {
+      "id": 1,
+      "name": "latest-publication-receipt-drift",
+      "prompt": "Using the provided scenario fixture, respond as the agent handling this request. Do not use live Git or forge tools; give the exact publication-audit command route, readiness gate, and stopping status.",
+      "expected_output": "The agent invokes the publisher's read-only audit with the exact current PR identity, treats sequence 8 as authoritative, and leaves the PR draft because the latest receipt drifts even though sequence 7 matches live state.",
+      "files": [
+        "getting-prs-ready-for-review/fixtures/latest-publication-receipt-drift.md"
+      ],
+      "expectations": [
+        "The response invokes audit_reviewable_pr.py audit through publishing-reviewable-prs with the exact repository, PR, refs, pushed OIDs, head repository, and owner.",
+        "The response uses only the authoritative latest receipt and explicitly rejects sequence 7 as readiness evidence even though it matches live state.",
+        "The response treats the sequence 8 drift result as a blocker before ready-state actuation.",
+        "The response performs no ready mutation, publication replay, reconciliation, or successful readiness handoff."
+      ]
+    }
+  ]
+}

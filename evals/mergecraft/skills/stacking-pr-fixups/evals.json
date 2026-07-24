@@ -1,0 +1,33 @@
+{
+  "skill_name": "stacking-pr-fixups",
+  "evals": [
+    {
+      "id": 0,
+      "name": "narrow-stacked-fixup",
+      "prompt": "Using the provided scenario fixture, respond as the agent handling this request. Do not use live Git or forge tools; give the branch, publication, and stopping decisions.",
+      "expected_output": "The agent isolates the narrow fixup from unrelated work, preserves the existing stack relationship, routes commits and pushes through Versionkeeping, and stops before publication when the stack base or reviewer-request scope is ambiguous.",
+      "files": ["stacking-pr-fixups/fixtures/narrow-stacked-fixup.md"],
+      "expectations": [
+        "The response confirms the exact reviewed pull request, stack base, and requested file scope before creating a fixup branch.",
+        "The response preserves unrelated local work and blocks a mixed-ownership path from the fixup commit.",
+        "The response uses Versionkeeping for the task-owned checkpoint and push, then the appropriate publisher or Graphite transport for the PR relationship.",
+        "The response does not rewrite or publish the stack when the parent identity or requested scope remains ambiguous."
+      ]
+    },
+    {
+      "id": 1,
+      "name": "latest-publication-receipt-drift",
+      "prompt": "Using the provided scenario fixture, respond as the agent handling this request. Do not use live Git or forge tools; give the exact publication-audit route and final handoff decision.",
+      "expected_output": "The agent runs the publisher's read-only audit after stack publication, treats sequence 5 as authoritative, and blocks the successful fixup handoff because the latest receipt drifts despite an older matching receipt.",
+      "files": [
+        "stacking-pr-fixups/fixtures/latest-publication-receipt-drift.md"
+      ],
+      "expectations": [
+        "The response invokes audit_reviewable_pr.py audit with the exact fixup PR identity after Graphite transport and canonical publication.",
+        "The response uses only sequence 5 as authoritative and does not substitute matching sequence 4.",
+        "The response treats drift as a blocker before reporting a verified review handoff.",
+        "The response performs no publication replay, retry, reconciliation, ready mutation, or merge actuation."
+      ]
+    }
+  ]
+}

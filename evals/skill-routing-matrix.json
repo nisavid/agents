@@ -1,0 +1,242 @@
+{
+  "schema_version": 2,
+  "semantic_definition": {
+    "path": "evals/control-plane-matrix.json",
+    "sha256": "7d1f07ac5b363430526f562c95feaeb5e9e82237d9fdf37b1236648698f59dcf"
+  },
+  "existing_trigger_sources": [
+    {
+      "skill": "versionkeeping:checkpointing-and-publishing-git-work",
+      "path": "evals/versionkeeping/skills/checkpointing-and-publishing-git-work/trigger-evals.json",
+      "sha256": "edeaff966905a2d60734a586cf798a617d1a5531809e24c4b443cbdd3de5ab26"
+    },
+    {
+      "skill": "mergecraft:getting-prs-merged",
+      "path": "evals/mergecraft/skills/getting-prs-merged/trigger-evals.json",
+      "sha256": "447a5f51340e6b4eb79b318ae544cc476c3c80a7d79c70e0a5c687f2b7d290e9"
+    }
+  ],
+  "skills": [
+    {
+      "id": "rolecasting:choosing-agent-models",
+      "cold_start": "Choose the model and reasoning effort for an already-authorized independent review.",
+      "explicit": "Use $choosing-agent-models to choose the model and reasoning effort for this delegated review.",
+      "supplemental": {
+        "positive": "The independent reviewer is already authorized; select its exact supported model and reasoning effort.",
+        "positive_expected_skills": ["choosing-agent-models"],
+        "negative": "Decide whether this investigation should be delegated to a native subagent at all; do not choose a model yet.",
+        "negative_expected_skills": ["delegating-cross-agent-work"]
+      }
+    },
+    {
+      "id": "rolecasting:delegating-cross-agent-work",
+      "cold_start": "Decide whether this bounded repository investigation should use a native subagent or a user-owned task.",
+      "explicit": "Use $delegating-cross-agent-work to choose the safe worker lifecycle.",
+      "supplemental": {
+        "positive": "Choose the safe worker lifecycle and authority boundary for this independent browser investigation.",
+        "positive_expected_skills": ["delegating-cross-agent-work"],
+        "negative": "Delegation is already fixed; choose the exact supported model and effort for the worker.",
+        "negative_expected_skills": ["choosing-agent-models"]
+      }
+    },
+    {
+      "id": "tricritical:review",
+      "cold_start": "Perform an independent read-only review of this candidate for intent, runtime, and structure evidence.",
+      "explicit": "Use $review for an independent read-only review of this candidate.",
+      "supplemental": {
+        "positive": "Give this frozen candidate a read-only independent review across requirements, runtime behavior, and structure.",
+        "positive_expected_skills": ["review"],
+        "negative": "Inspect only the candidate's concurrency and runtime failure paths; do not perform the three-axis synthesis.",
+        "negative_expected_skills": ["runtime"]
+      }
+    },
+    {
+      "id": "tricritical:intent",
+      "cold_start": "Review this candidate for requirement fit, missing outcomes, scope, authority, and acceptance criteria.",
+      "explicit": "Use $intent to assess this candidate's requirement fit.",
+      "supplemental": {
+        "positive": "Check whether this frozen patch actually satisfies the stated outcome, authority, and acceptance criteria.",
+        "positive_expected_skills": ["intent"],
+        "negative": "Ignore requirements and assess only whether the new retry loop can deadlock at runtime.",
+        "negative_expected_skills": ["runtime"]
+      }
+    },
+    {
+      "id": "tricritical:runtime",
+      "cold_start": "Review this candidate for runtime correctness, failure paths, security, and false verification.",
+      "explicit": "Use $runtime to assess runtime correctness for this candidate.",
+      "supplemental": {
+        "positive": "Probe this candidate's runtime failure modes, concurrency behavior, security assumptions, and misleading green tests.",
+        "positive_expected_skills": ["runtime"],
+        "negative": "The behavior is proven; review only duplication, ownership, and unnecessary abstraction in the source shape.",
+        "negative_expected_skills": ["structure"]
+      }
+    },
+    {
+      "id": "tricritical:structure",
+      "cold_start": "Review this candidate for duplication, weak ownership, boundary leaks, and needless complexity.",
+      "explicit": "Use $structure to assess this candidate's structure.",
+      "supplemental": {
+        "positive": "Find needless layers, duplicated policy, weak ownership, and boundary leaks in this frozen implementation.",
+        "positive_expected_skills": ["structure"],
+        "negative": "Assess only whether the patch meets the user's required outcome and stays within authorized scope.",
+        "negative_expected_skills": ["intent"]
+      }
+    },
+    {
+      "id": "tricritical:adjudicate",
+      "cold_start": "Classify these review findings as accepted, rejected, stale, blocked, or needing an operator decision without changing code.",
+      "explicit": "Use $adjudicate to classify these review findings.",
+      "supplemental": {
+        "positive": "Weigh each external review claim against the frozen evidence and assign its disposition without editing.",
+        "positive_expected_skills": ["adjudicate"],
+        "negative": "These findings are already accepted; integrate them under the original bounded mutation authority.",
+        "negative_expected_skills": ["revise"]
+      }
+    },
+    {
+      "id": "tricritical:revise",
+      "cold_start": "Integrate these accepted review findings under the original bounded mutation authority.",
+      "explicit": "Use $revise to integrate the accepted findings.",
+      "supplemental": {
+        "positive": "Apply only the independently accepted findings to the frozen candidate and preserve the revision contract.",
+        "positive_expected_skills": ["revise"],
+        "negative": "Before changing anything, decide which reviewer claims are valid, stale, duplicate, or out of scope.",
+        "negative_expected_skills": ["adjudicate"]
+      }
+    },
+    {
+      "id": "tricritical:loop",
+      "cold_start": "Review and revise this candidate until it reaches the authority-gated clean fixed point.",
+      "explicit": "Use $loop to review and revise this candidate until clean.",
+      "supplemental": {
+        "positive": "Run the authority-gated review, adjudication, and revision cycle until the candidate reaches a clean fixed point.",
+        "positive_expected_skills": ["loop"],
+        "negative": "Perform one independent read-only review pass and return findings; do not revise or iterate.",
+        "negative_expected_skills": ["review"]
+      }
+    },
+    {
+      "id": "versionkeeping:checkpointing-and-publishing-git-work",
+      "cold_start": "The tests are green; create the task-owned checkpoint commit and safely publish it with an exact lease.",
+      "explicit": "Use $checkpointing-and-publishing-git-work for this checkpoint and exact-lease publication.",
+      "supplemental": null
+    },
+    {
+      "id": "versionkeeping:syncing-forks-with-upstream",
+      "cold_start": "Synchronize the maintained fork with its discovered upstream ref without rewriting history.",
+      "explicit": "Use $syncing-forks-with-upstream to synchronize this maintained fork.",
+      "supplemental": {
+        "positive": "Discover the maintained fork contract, integrate its upstream ref without rewriting history, and verify containment.",
+        "positive_expected_skills": ["syncing-forks-with-upstream"],
+        "negative": "The fork is already synchronized; checkpoint and publish one task-owned local commit to its current branch.",
+        "negative_expected_skills": ["checkpointing-and-publishing-git-work"]
+      }
+    },
+    {
+      "id": "versionkeeping:using-persistent-git-worktrees",
+      "cold_start": "Prepare a durable isolated Git worktree for this feature before implementation begins.",
+      "explicit": "Use $using-persistent-git-worktrees to prepare the isolated worktree.",
+      "supplemental": {
+        "positive": "Choose and validate a durable sibling worktree location for this new isolated feature branch.",
+        "positive_expected_skills": ["using-persistent-git-worktrees"],
+        "negative": "The persistent worktree already exists; commit its verified task-owned changes without creating another worktree.",
+        "negative_expected_skills": ["checkpointing-and-publishing-git-work"]
+      }
+    },
+    {
+      "id": "mergecraft:writing-reviewable-pr-descriptions",
+      "cold_start": "Create the canonical title and body for this stacked pull request while preserving the authorized text surface.",
+      "explicit": "Use $writing-reviewable-pr-descriptions to prepare this PR title and body.",
+      "supplemental": {
+        "positive": "Draft the complete canonical title and reviewer-facing body for this PR, preserving retained custom sections.",
+        "positive_expected_skills": ["writing-reviewable-pr-descriptions"],
+        "negative": "Inspect the current PR title and body and report whether they are stale; do not change or publish text.",
+        "negative_expected_skills": []
+      }
+    },
+    {
+      "id": "mergecraft:publishing-reviewable-prs",
+      "cold_start": "Create this standalone draft pull request and publish its exact canonical title and body after transport.",
+      "explicit": "Use $publishing-reviewable-prs to publish this verified PR state.",
+      "supplemental": {
+        "positive": "Publish the validated canonical title and body to this existing draft PR with exact preimage checks.",
+        "positive_expected_skills": ["publishing-reviewable-prs"],
+        "negative": "Prepare the canonical PR title and body pair, but return the content without mutating GitHub.",
+        "negative_expected_skills": ["writing-reviewable-pr-descriptions"]
+      }
+    },
+    {
+      "id": "mergecraft:graphite",
+      "cold_start": "Restack this Graphite branch stack and submit draft transport for the intended stack.",
+      "explicit": "Use $graphite to manage this Graphite stack.",
+      "supplemental": {
+        "positive": "Repair the tracked Graphite ancestry, restack the branches, and submit only the intended draft stack.",
+        "positive_expected_skills": ["graphite"],
+        "negative": "Create one standalone draft PR for this unstacked branch; no Graphite topology is involved.",
+        "negative_expected_skills": ["publishing-reviewable-prs"]
+      }
+    },
+    {
+      "id": "mergecraft:addressing-pr-review-feedback",
+      "cold_start": "Collect complete PR feedback, classify the requested changes, and address the actionable findings.",
+      "explicit": "Use $addressing-pr-review-feedback to coordinate these requested changes.",
+      "supplemental": {
+        "positive": "Acquire the complete review snapshot, adjudicate each requested change, and coordinate the authorized fixes.",
+        "positive_expected_skills": ["addressing-pr-review-feedback"],
+        "negative": "The finding is already adjudicated and fixed; post one evidence-backed reply to its existing review thread.",
+        "negative_expected_skills": ["interacting-with-pr-review-feedback"]
+      }
+    },
+    {
+      "id": "mergecraft:interacting-with-pr-review-feedback",
+      "cold_start": "Post an evidence-backed reply to this PR review comment and resolve the authorized thread.",
+      "explicit": "Use $interacting-with-pr-review-feedback to reply to this review feedback.",
+      "supplemental": {
+        "positive": "Post the approved evidence-backed reply on this exact review comment and verify the resulting interaction.",
+        "positive_expected_skills": ["interacting-with-pr-review-feedback"],
+        "negative": "First collect every review thread and classify which findings are actionable, stale, or human-owned.",
+        "negative_expected_skills": ["addressing-pr-review-feedback"]
+      }
+    },
+    {
+      "id": "mergecraft:resuming-reviewed-prs",
+      "cold_start": "Resume this stale reviewed pull request, recover its exact target, and select its next lifecycle owner.",
+      "explicit": "Use $resuming-reviewed-prs to recover this reviewed PR.",
+      "supplemental": {
+        "positive": "Recover the exact target and current authority for this neglected reviewed PR before choosing its next owner.",
+        "positive_expected_skills": ["resuming-reviewed-prs"],
+        "negative": "This active draft is current and needs only the remaining review-readiness gates; no stale recovery is needed.",
+        "negative_expected_skills": ["getting-prs-ready-for-review"]
+      }
+    },
+    {
+      "id": "mergecraft:getting-prs-ready-for-review",
+      "cold_start": "Make this pull request ready for review end to end, and stop once it is review-ready.",
+      "explicit": "Use $getting-prs-ready-for-review to make this PR review-ready.",
+      "supplemental": {
+        "positive": "Bring this draft through every local and PR-state gate, mark it review-ready, and stop there.",
+        "positive_expected_skills": ["getting-prs-ready-for-review"],
+        "negative": "Continue beyond readiness and drive this PR through reviews, checks, and the final merge outcome.",
+        "negative_expected_skills": ["getting-prs-merged"]
+      }
+    },
+    {
+      "id": "mergecraft:getting-prs-merged",
+      "cold_start": "Drive this open pull request through the remaining gates to a merge outcome.",
+      "explicit": "Use $getting-prs-merged to drive this PR to merge.",
+      "supplemental": null
+    },
+    {
+      "id": "mergecraft:stacking-pr-fixups",
+      "cold_start": "Prepare a narrow fixup branch stacked on this open pull request head.",
+      "explicit": "Use $stacking-pr-fixups to prepare this stacked fixup.",
+      "supplemental": {
+        "positive": "Create a narrow follow-up fix whose base is the exact head of the still-open parent PR.",
+        "positive_expected_skills": ["stacking-pr-fixups"],
+        "negative": "Apply the fix directly on this ordinary unstacked branch and checkpoint it; there is no parent PR head.",
+        "negative_expected_skills": ["checkpointing-and-publishing-git-work"]
+      }
+    }
+  ]
+}

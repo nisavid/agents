@@ -1,0 +1,4 @@
+interface:
+  display_name: Write Reviewable PR Descriptions
+  short_description: Write exact, navigable PR titles and bodies.
+  default_prompt: Use $mergecraft:writing-reviewable-pr-descriptions to prepare the exact PR title and body.

@@ -19,6 +19,11 @@
       "name": "versionkeeping",
       "source": "./plugins/versionkeeping",
       "category": "developer-tools"
+    },
+    {
+      "name": "mergecraft",
+      "source": "./plugins/mergecraft",
+      "category": "developer-tools"
     }
   ]
 }

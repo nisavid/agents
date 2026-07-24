@@ -1,0 +1,89 @@
+{
+  "skill_name": "resuming-reviewed-prs",
+  "evals": [
+    {
+      "id": 0,
+      "name": "latest-publication-receipt-drift",
+      "prompt": "Using the provided scenario fixture, respond as the agent handling this request. Do not use live Git or forge tools; give the exact audit route, owner-selection gate, and stopping status.",
+      "expected_output": "The agent audits publication evidence before selecting a downstream lifecycle owner, treats sequence 8 as authoritative, and stops for inspection because the latest receipt drifts despite an older matching receipt.",
+      "files": [
+        "resuming-reviewed-prs/fixtures/latest-publication-receipt-drift.md"
+      ],
+      "expectations": [
+        "The response invokes audit_reviewable_pr.py audit through publishing-reviewable-prs with the exact current PR identity before lifecycle handoff.",
+        "The response does not substitute matching sequence 7 for the authoritative drifting sequence 8.",
+        "The response treats drift as evidence requiring inspection and does not replay a completed publication mutation.",
+        "The response stops without claiming a successful readiness, feedback, or merge-owner handoff."
+      ]
+    },
+    {
+      "id": 1,
+      "name": "feedback-terminal-handoff",
+      "prompt": "Using the provided scenario fixture, respond as the agent handling this request. Do not use live Git or forge tools; give the exact next-owner decision, invocation boundary, and stopping status.",
+      "expected_output": "The resume coordinator returns exactly one terminal handoff to addressing-pr-review-feedback and stops; the caller starts that owner separately, and any later lifecycle coordinator begins from freshly read live state.",
+      "files": ["resuming-reviewed-prs/fixtures/feedback-terminal-handoff.md"],
+      "expectations": [
+        "The response selects addressing-pr-review-feedback as the only next owner because current actionable feedback outranks readiness.",
+        "The resume invocation returns one terminal handoff and does not invoke the feedback coordinator itself.",
+        "The response performs no feedback disposition, source revision, interaction, readiness, or merge action.",
+        "The response requires a later coordinator invocation to reread live state instead of resuming from the stale snapshot."
+      ]
+    },
+    {
+      "id": 2,
+      "name": "readiness-terminal-handoff",
+      "prompt": "Using the provided scenario fixture, respond as the agent handling this request. Do not use live Git or forge tools; give the exact next-owner decision, invocation boundary, and stopping status.",
+      "expected_output": "The resume coordinator returns exactly one terminal handoff to getting-prs-ready-for-review and stops; the caller starts readiness separately from live state.",
+      "files": ["resuming-reviewed-prs/fixtures/readiness-terminal-handoff.md"],
+      "expectations": [
+        "The response selects getting-prs-ready-for-review as the only next owner for the draft with no actionable feedback.",
+        "The resume invocation returns one terminal handoff and does not invoke readiness itself.",
+        "The response performs no publication, readiness, feedback, or merge mutation.",
+        "The separate readiness invocation must bind current live state again."
+      ]
+    },
+    {
+      "id": 3,
+      "name": "active-conflict-terminal-handoff",
+      "prompt": "Using the provided scenario fixture, respond as the agent handling this request. Do not use live Git or forge tools; give the exact first recovery owner, precedence, invocation boundary, and stopping status.",
+      "expected_output": "The resume coordinator gives the active Git operation precedence and returns one terminal handoff to versionkeeping:resolving-merge-conflicts, without invoking it or acquiring merge authority; later recovery starts in a fresh resume invocation.",
+      "files": [
+        "resuming-reviewed-prs/fixtures/active-conflict-terminal-handoff.md"
+      ],
+      "expectations": [
+        "The response selects versionkeeping:resolving-merge-conflicts before failed Actions or the requested merge outcome.",
+        "The resume invocation does not interpret conflicts, edit files, stage, continue, abort, commit, or invoke the conflict owner.",
+        "The terminal handoff preserves Versionkeeping's split between conflict interpretation and Git integration mechanics.",
+        "The response requires a fresh resume invocation from live state after the conflict outcome."
+      ]
+    },
+    {
+      "id": 4,
+      "name": "required-actions-terminal-handoff",
+      "prompt": "Using the provided scenario fixture, respond as the agent handling this request. Do not use live Git or forge tools; give the exact first recovery owner, authority boundary, invocation boundary, and stopping status.",
+      "expected_output": "The resume coordinator returns one terminal handoff to operation:focused-ci for the failed required GitHub Actions, without invoking it or acquiring merge authority; later recovery starts in a fresh resume invocation.",
+      "files": [
+        "resuming-reviewed-prs/fixtures/required-actions-terminal-handoff.md"
+      ],
+      "expectations": [
+        "The response selects operation:focused-ci before the requested merge outcome.",
+        "The response preserves the internal Actions-only upstream gh-fix-ci seam and binds source repair separately.",
+        "The resume invocation performs no CI diagnosis, rerun, source or workflow edit, publication, or merge action.",
+        "The response requires a fresh resume invocation from live state after the focused-CI outcome."
+      ]
+    },
+    {
+      "id": 5,
+      "name": "status-only-read-only",
+      "prompt": "Using the provided scenario fixture, respond as the agent handling this request. Do not use live Git or forge tools; give the bound status, authority boundary, and stopping status.",
+      "expected_output": "The resume coordinator returns a read-only current-state report with terminal status reported and stops without selecting or invoking an owner, even though conflict and CI blockers exist.",
+      "files": ["resuming-reviewed-prs/fixtures/status-only-read-only.md"],
+      "expectations": [
+        "The response reports the active conflict, failed required Action, and current PR state without routing them.",
+        "The response selects and invokes no conflict, CI, readiness, feedback, or merge owner.",
+        "The response performs no source, Git, forge, interaction, readiness, or merge mutation.",
+        "The response stops with terminal status reported and does not claim merge authority."
+      ]
+    }
+  ]
+}

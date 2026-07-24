@@ -29,6 +29,23 @@ def load_coordinator():
 
 
 class Phase7ProductionIntegrationTests(unittest.TestCase):
+    def test_readme_documents_the_pinned_node_release_contract(self) -> None:
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+
+        for required in (
+            "scripts/validate_public_release.py",
+            "--node /absolute/path/to/physical/node",
+            "fixed system search path",
+            "resolved physical executable",
+            "main executable bytes and version",
+            "dynamic-loader or shared-library bytes",
+            "undetectable ABA swap",
+            "pathname-resolution boundary is not bound",
+            "scripts/run_phase7_production_integration.py",
+            "--node-executable /absolute/path/to/physical/node",
+        ):
+            self.assertIn(required, readme)
+
     def test_checked_in_coordinator_owns_the_exact_inherited_fd_pipeline(self) -> None:
         self.assertTrue(COORDINATOR.is_file())
         coordinator = load_coordinator()
@@ -241,12 +258,63 @@ class Phase7ProductionIntegrationTests(unittest.TestCase):
                     composed_output=composed_output,
                     routing_evidence=root,
                     plugin_eval_executable=Path(sys.executable),
+                    node_executable=Path("/safe/node"),
                     release_receipt_output=release_receipt,
                 )
 
             self.assertEqual(result, {"terminal": "passed"})
             self.assertTrue((composed_output / "phase7-composed-matrix.json").is_file())
             release.assert_called_once()
+            self.assertEqual(
+                release.call_args.kwargs["node_executable"], Path("/safe/node")
+            )
+
+    def test_main_requires_and_forwards_the_explicit_node_executable(self) -> None:
+        coordinator = load_coordinator()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            capability_manifest = root / "capability-manifest.json"
+            capability_manifest.write_text("{}\n", encoding="utf-8")
+            plugin_eval = root / "plugin-eval.js"
+            plugin_eval.write_text("fixture\n", encoding="utf-8")
+            node = root / "node"
+            node.write_text("fixture\n", encoding="utf-8")
+
+            with mock.patch.object(coordinator, "coordinate") as coordinate:
+                result = coordinator.main(
+                    [
+                        "--private-repository",
+                        str(root),
+                        "--private-commit-oid",
+                        "a" * 40,
+                        "--reviewed-producer-sha256",
+                        "sha256:" + "b" * 64,
+                        "--public-root",
+                        str(root),
+                        "--public-candidate-sha256",
+                        "sha256:" + "c" * 64,
+                        "--capability-manifest",
+                        str(capability_manifest),
+                        "--private-output",
+                        str(root / "private-output"),
+                        "--private-summary-output",
+                        str(root / "private-summary.json"),
+                        "--composed-output",
+                        str(root / "composed-output"),
+                        "--routing-evidence",
+                        str(root),
+                        "--plugin-eval-executable",
+                        str(plugin_eval),
+                        "--node-executable",
+                        str(node),
+                        "--release-receipt-output",
+                        str(root / "release-receipt.json"),
+                    ]
+                )
+
+            self.assertEqual(result, 0)
+            coordinate.assert_called_once()
+            self.assertEqual(coordinate.call_args.kwargs["node_executable"], node)
 
 
 if __name__ == "__main__":

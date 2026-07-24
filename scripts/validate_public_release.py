@@ -156,6 +156,13 @@ SOURCE_STAGE_VALIDATOR_FLAGS = {
 }
 SHA256 = re.compile(r"sha256:[0-9a-f]{64}$")
 GIT_OID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+NODE_SEMVER = re.compile(
+    r"v?(?P<major>0|[1-9][0-9]*)\.(?P<minor>0|[1-9][0-9]*)\.(?P<patch>0|[1-9][0-9]*)$"
+)
+MINIMUM_NODE_MAJOR = 20
+SAFE_NODE_SEARCH_PATH = os.pathsep.join(
+    ("/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin")
+)
 COMPOSED_FAMILIES = ("lifecycle-dispatch", "tricritical-contract")
 COMPOSED_CLAIM = (
     "provider-free public composition with replay-payload-bound frozen private evidence"
@@ -535,6 +542,241 @@ def load_plugin_eval_policy(snapshot: Path) -> dict[str, object]:
         "thresholds": thresholds,
         "policy_sha256": canonical_digest(policy),
         "calibration_manifest_sha256": baseline["manifest_sha256"],
+    }
+
+
+def private_plugin_eval_environment(root: Path) -> dict[str, str]:
+    """Create the intentionally small environment for pinned Node evaluation.
+
+    The evaluator is a local executable, but inherited loader, npm, and Node
+    settings can still change what its bytes execute.  It gets a fresh home and
+    temporary directory instead of the release process's ambient environment.
+    """
+
+    root.mkdir(mode=0o700)
+    home = root / "home"
+    temporary = root / "tmp"
+    home.mkdir(mode=0o700)
+    temporary.mkdir(mode=0o700)
+    return {
+        "HOME": str(home),
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": "/usr/bin:/bin",
+        "TEMP": str(temporary),
+        "TMP": str(temporary),
+        "TMPDIR": str(temporary),
+    }
+
+
+def _required_no_follow_directory_flags() -> int:
+    """Return the primitives needed for descriptor-safe pathname traversal."""
+
+    no_follow = getattr(os, "O_NOFOLLOW", None)
+    directory = getattr(os, "O_DIRECTORY", None)
+    if not isinstance(no_follow, int) or not isinstance(directory, int):
+        raise ReleaseError(
+            "safe Node interpreter resolution requires O_NOFOLLOW and O_DIRECTORY"
+        )
+    return os.O_RDONLY | directory | no_follow
+
+
+def _open_no_follow_directory(path: Path, label: str) -> int:
+    """Open an absolute directory without following any component symlink."""
+
+    require(path.is_absolute(), f"{label} parent path must be absolute")
+    flags = _required_no_follow_directory_flags()
+    descriptor = os.open(path.anchor, flags)
+    try:
+        for component in path.parts[1:]:
+            next_descriptor = os.open(component, flags, dir_fd=descriptor)
+            try:
+                metadata = os.fstat(next_descriptor)
+                require(
+                    stat.S_ISDIR(metadata.st_mode),
+                    f"{label} parent contains a non-directory component",
+                )
+            except BaseException:
+                os.close(next_descriptor)
+                raise
+            os.close(descriptor)
+            descriptor = next_descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor
+
+
+def _read_nofollow_regular_file(path: Path, label: str) -> tuple[bytes, os.stat_result]:
+    """Read one regular file through an O_NOFOLLOW descriptor.
+
+    Python cannot portably `fexecve` a Node binary on macOS, Linux, and WSL2.
+    We therefore bind its descriptor-derived bytes before and after every
+    analysis invocation. That detects persistent pathname replacement; an ABA
+    swap restored to the same bytes during exec is the unavoidable portable
+    pre/post boundary without `fexecve`.
+    """
+
+    require(path.is_absolute(), f"{label} path must be absolute")
+    path = Path(os.path.abspath(os.fspath(path)))
+    try:
+        parent_descriptor = _open_no_follow_directory(path.parent, label)
+    except OSError as error:
+        raise ReleaseError(f"{label} is unavailable or unsafe: {error}") from error
+    try:
+        descriptor = os.open(
+            path.name,
+            os.O_RDONLY | os.O_NOFOLLOW,
+            dir_fd=parent_descriptor,
+        )
+    except OSError as error:
+        os.close(parent_descriptor)
+        raise ReleaseError(f"{label} is unavailable or unsafe: {error}") from error
+    try:
+        metadata = os.fstat(descriptor)
+        require(stat.S_ISREG(metadata.st_mode), f"{label} must be a regular file")
+        require(
+            metadata.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH),
+            f"{label} must be executable",
+        )
+        entry_metadata = os.stat(
+            path.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        require(
+            _stable_file_metadata(entry_metadata) == _stable_file_metadata(metadata),
+            f"{label} changed while it was opened",
+        )
+        contents = bytearray()
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            contents.extend(chunk)
+        final_metadata = os.fstat(descriptor)
+        final_entry_metadata = os.stat(
+            path.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        require(
+            _stable_file_metadata(final_metadata) == _stable_file_metadata(metadata)
+            and _stable_file_metadata(final_entry_metadata)
+            == _stable_file_metadata(metadata),
+            f"{label} changed while it was read",
+        )
+        return bytes(contents), metadata
+    finally:
+        os.close(descriptor)
+        os.close(parent_descriptor)
+
+
+def _stable_file_metadata(
+    metadata: os.stat_result,
+) -> tuple[int, int, int, int, int, int]:
+    """Return the descriptor and directory-entry fields that bind a snapshot."""
+
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _canonical_node_path(node: Path | None) -> Path:
+    if node is None:
+        discovered = shutil.which("node", path=SAFE_NODE_SEARCH_PATH)
+        require(discovered is not None, "node executable is unavailable")
+        # The fixed search list may intentionally contain a package-manager
+        # launcher. Resolve it only as discovery, then bind and invoke the
+        # resulting target through descriptor traversal below.
+        return Path(os.path.realpath(os.path.abspath(discovered)))
+    # An explicit operator path is itself an assertion about the executable;
+    # reject any symlinked component rather than silently changing it.
+    return Path(os.path.abspath(os.fspath(node)))
+
+
+def _node_binary_digest(path: Path) -> str:
+    contents, _metadata = _read_nofollow_regular_file(path, "node executable")
+    require(
+        not contents.startswith(b"#!"), "node executable must not be a shebang shim"
+    )
+    return "sha256:" + hashlib.sha256(contents).hexdigest()
+
+
+def _node_version(path: Path, environment: dict[str, str]) -> str:
+    result = subprocess.run(
+        [str(path), "--version"],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+    require(
+        result.returncode == 0,
+        f"node executable version probe failed:\n{result.stdout}{result.stderr}",
+    )
+    version = result.stdout.strip()
+    match = NODE_SEMVER.fullmatch(version)
+    require(match is not None, "node executable version must be strict semver")
+    require(
+        int(match["major"]) >= MINIMUM_NODE_MAJOR,
+        f"node executable must be Node {MINIMUM_NODE_MAJOR} or newer",
+    )
+    return version
+
+
+def resolve_node_interpreter(
+    node: Path | None, environment: dict[str, str]
+) -> dict[str, str]:
+    """Resolve and bind one absolute Node binary for a release evaluation."""
+
+    path = _canonical_node_path(node)
+    digest = _node_binary_digest(path)
+    version = _node_version(path, environment)
+    require(
+        _node_binary_digest(path) == digest,
+        "node executable changed while its identity was derived",
+    )
+    return {"path": str(path), "sha256": digest, "version": version}
+
+
+def revalidate_node_interpreter(identity: dict[str, str]) -> None:
+    """Fail closed if the main executable bytes drift before or after a child."""
+
+    path = Path(identity["path"])
+    require(
+        _node_binary_digest(path) == identity["sha256"],
+        "node executable changed during plugin evaluation",
+    )
+
+
+def public_node_interpreter_evidence(identity: dict[str, str]) -> dict[str, object]:
+    """Project portable Node evidence without exposing a machine-local path.
+
+    The binding covers only the main executable's bytes and its single version
+    probe. Node may still load platform libraries, and a pathname can undergo an
+    undetectable ABA swap exactly while `execve` resolves it; those limits are
+    deliberately retained in the receipt instead of being implied away.
+    """
+
+    require(
+        set(identity) == {"path", "sha256", "version"},
+        "internal Node interpreter identity is malformed",
+    )
+    return {
+        "sha256": identity["sha256"],
+        "version": identity["version"],
+        "coverage": "main-executable-bytes-only",
+        "limitations": [
+            "dynamic-loader-and-shared-library-bytes-are-not-bound",
+            "pathname-exec-time-ABA-is-not-bound",
+        ],
     }
 
 
@@ -1207,22 +1449,7 @@ class ReceiptOutput:
 def open_no_follow_directory(path: Path) -> int:
     """Open an absolute directory by descriptor traversal without symlink hops."""
 
-    require(path.is_absolute(), "release receipt parent must be an absolute path")
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    descriptor = os.open(path.anchor, flags)
-    try:
-        for component in path.parts[1:]:
-            next_descriptor = os.open(
-                component,
-                flags | getattr(os, "O_NOFOLLOW", 0),
-                dir_fd=descriptor,
-            )
-            os.close(descriptor)
-            descriptor = next_descriptor
-    except BaseException:
-        os.close(descriptor)
-        raise
-    return descriptor
+    return _open_no_follow_directory(path, "release receipt")
 
 
 def receipt_entry_metadata(parent_descriptor: int, name: str) -> os.stat_result | None:
@@ -1429,8 +1656,7 @@ def validate_composed_receipt(repository: Path, path: Path | None) -> dict:
     backend = runtime["backend"]
     require(
         isinstance(backend, dict)
-        and set(backend)
-        == {"target", "binary", "version", "sha256", "version_sha256"}
+        and set(backend) == {"target", "binary", "version", "sha256", "version_sha256"}
         and (backend["target"], backend["binary"])
         in {
             ("macos-seatbelt", "sandbox-exec"),
@@ -1914,27 +2140,71 @@ def run_contract_validators(
     return identity
 
 
-def run_plugin_evals(snapshot: Path, executable: Path) -> dict[str, dict]:
+def run_plugin_evals(
+    snapshot: Path,
+    executable: Path,
+    *,
+    node_executable: Path | None = None,
+) -> dict[str, dict]:
     """Run all evaluations from one verified, private copy of the runtime."""
 
     policy = load_plugin_eval_policy(snapshot)
     with tempfile.TemporaryDirectory(prefix="pinned-plugin-eval-") as temporary:
+        temporary_root = Path(temporary)
+        environment = private_plugin_eval_environment(temporary_root / "environment")
+        interpreter = resolve_node_interpreter(node_executable, environment)
         pinned_executable, runtime = copy_pinned_plugin_eval_runtime(
-            executable, policy, Path(temporary) / "runtime"
+            executable, policy, temporary_root / "runtime"
         )
-        return run_pinned_plugin_evals(snapshot, pinned_executable, policy, runtime)
+        runtime = {
+            **runtime,
+            "interpreter": public_node_interpreter_evidence(interpreter),
+        }
+        return run_pinned_plugin_evals(
+            snapshot,
+            pinned_executable,
+            policy,
+            runtime,
+            environment,
+            node_interpreter=interpreter,
+        )
 
 
 def run_pinned_plugin_evals(
     snapshot: Path,
     executable: Path,
     policy: dict[str, object],
-    runtime: dict[str, str],
+    runtime: dict[str, object],
+    environment: dict[str, str],
+    *,
+    node_interpreter: dict[str, str],
 ) -> dict[str, dict]:
+    interpreter = runtime.get("interpreter")
+    require(
+        isinstance(interpreter, dict)
+        and set(interpreter) == {"sha256", "version", "coverage", "limitations"}
+        and isinstance(interpreter["sha256"], str)
+        and isinstance(interpreter["version"], str)
+        and interpreter["coverage"] == "main-executable-bytes-only"
+        and interpreter["limitations"]
+        == [
+            "dynamic-loader-and-shared-library-bytes-are-not-bound",
+            "pathname-exec-time-ABA-is-not-bound",
+        ],
+        "plugin-eval Node interpreter identity is malformed",
+    )
+    require(
+        set(node_interpreter) == {"path", "sha256", "version"}
+        and node_interpreter["sha256"] == interpreter["sha256"]
+        and node_interpreter["version"] == interpreter["version"],
+        "internal plugin-eval Node interpreter binding is malformed",
+    )
     evidence = {}
     for plugin in VALIDATED_PLUGINS:
+        revalidate_node_interpreter(node_interpreter)
         result = subprocess.run(
             [
+                node_interpreter["path"],
                 str(executable),
                 "analyze",
                 str(snapshot / "plugins" / plugin),
@@ -1945,8 +2215,10 @@ def run_pinned_plugin_evals(
             capture_output=True,
             check=False,
             cwd=snapshot,
+            env=environment,
             timeout=120,
         )
+        revalidate_node_interpreter(node_interpreter)
         require(
             result.returncode == 0,
             f"{plugin} plugin-eval invocation failed:\n{result.stdout}{result.stderr}",
@@ -2026,7 +2298,7 @@ def run_pinned_plugin_evals(
         warnings = sorted(warnings)
         advisories = sorted(advisories)
         policy_projection = {
-            "schema_version": 1,
+            "schema_version": 2,
             "plugin": plugin,
             "target_kind": "plugin",
             "outcome": "pass",
@@ -2064,6 +2336,7 @@ def validate_release(
     expected: dict | None = None,
     run_contracts: bool = True,
     plugin_eval_executable: Path | None = None,
+    node_executable: Path | None = None,
     routing_evidence: Path | None = None,
     receipt_output: Path | None = None,
     composed_receipt: Path | None = None,
@@ -2126,6 +2399,10 @@ def validate_release(
             "routing evidence must be outside the release repository",
         )
     else:
+        require(
+            node_executable is None,
+            "source-stage validation does not accept a Node executable",
+        )
         require(
             receipt_output is None,
             "source-stage validation does not accept a release receipt output",
@@ -2246,7 +2523,11 @@ def validate_release(
             )
         plugin_eval_evidence = None
         if plugin_eval_executable is not None:
-            plugin_eval_evidence = run_plugin_evals(snapshot, plugin_eval_executable)
+            plugin_eval_evidence = run_plugin_evals(
+                snapshot,
+                plugin_eval_executable,
+                node_executable=node_executable,
+            )
         if source_stage_validator is not None:
             source_stage_validator(snapshot)
         require(
@@ -2289,7 +2570,7 @@ def validate_release(
             write_release_receipt(
                 receipt_target,
                 {
-                    "schema_version": 4,
+                    "schema_version": 5,
                     "claim": routing_summary["claim"],
                     "candidate": expected_candidate,
                     "release_scope": {
@@ -2354,6 +2635,7 @@ def main() -> int:
     parser.add_argument("repository", nargs="?", type=Path, default=Path.cwd())
     parser.add_argument("--expected-identities", type=Path)
     parser.add_argument("--plugin-eval", type=Path)
+    parser.add_argument("--node", type=Path)
     parser.add_argument("--routing-evidence", type=Path)
     parser.add_argument("--receipt-output", type=Path)
     parser.add_argument("--composed-receipt", type=Path)
@@ -2373,10 +2655,11 @@ def main() -> int:
             require(
                 arguments.expected_identities is None
                 and arguments.plugin_eval is None
+                and arguments.node is None
                 and arguments.routing_evidence is None
                 and arguments.receipt_output is None,
                 "source-stage validation does not accept release identity, "
-                "plugin-eval, routing-evidence, composed-receipt, or receipt-output inputs",
+                "plugin-eval, node, routing-evidence, composed-receipt, or receipt-output inputs",
             )
             require(
                 arguments.composed_receipt is None,
@@ -2432,6 +2715,7 @@ def main() -> int:
             arguments.repository,
             expected=expected,
             plugin_eval_executable=plugin_eval,
+            node_executable=arguments.node,
             routing_evidence=arguments.routing_evidence,
             receipt_output=arguments.receipt_output,
             composed_receipt=arguments.composed_receipt,

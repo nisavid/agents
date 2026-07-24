@@ -171,7 +171,8 @@ def launch_private_builder(
             ]
             if proof_target is not None:
                 require(
-                    proof_target in {
+                    proof_target
+                    in {
                         "linux-bubblewrap",
                         "wsl2-bubblewrap",
                     },
@@ -228,8 +229,7 @@ def require_canonical_capability_manifest(path: Path) -> None:
     )
     require(
         isinstance(document, dict)
-        and set(document)
-        == {"schema_version", "contract", "roots", "expected_backend"}
+        and set(document) == {"schema_version", "contract", "roots", "expected_backend"}
         and document["schema_version"] == 2
         and document["contract"] == "phase7-readonly-capabilities-v2",
         "capability manifest is not the canonical v2 transport schema",
@@ -249,6 +249,7 @@ def coordinate(
     composed_output: Path,
     routing_evidence: Path,
     plugin_eval_executable: Path,
+    node_executable: Path,
     release_receipt_output: Path,
     backend_release_evidence: Path | None = None,
     expected_backend_release_evidence_sha256: str | None = None,
@@ -300,6 +301,7 @@ def coordinate(
         public_root,
         routing_evidence=routing_evidence,
         plugin_eval_executable=plugin_eval_executable,
+        node_executable=node_executable,
         receipt_output=release_receipt_output,
         composed_receipt=composed_output / "phase7-composed-matrix.json",
         private_producer_witness=witness_path,
@@ -326,6 +328,7 @@ def main(arguments: list[str] | None = None) -> int:
     parser.add_argument("--composed-output", required=True, type=Path)
     parser.add_argument("--routing-evidence", required=True, type=Path)
     parser.add_argument("--plugin-eval-executable", required=True, type=Path)
+    parser.add_argument("--node-executable", required=True, type=Path)
     parser.add_argument("--release-receipt-output", required=True, type=Path)
     parser.add_argument("--backend-release-evidence", type=Path)
     parser.add_argument("--expected-backend-release-evidence-sha256")
@@ -348,6 +351,7 @@ def main(arguments: list[str] | None = None) -> int:
             composed_output=parsed.composed_output.absolute(),
             routing_evidence=parsed.routing_evidence.resolve(strict=True),
             plugin_eval_executable=parsed.plugin_eval_executable.resolve(strict=True),
+            node_executable=parsed.node_executable.absolute(),
             release_receipt_output=parsed.release_receipt_output.absolute(),
             backend_release_evidence=(
                 parsed.backend_release_evidence.resolve(strict=True)

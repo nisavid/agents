@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import io
 import json
@@ -23,6 +24,7 @@ OPAQUE_OUTPUT = re.compile(r"output-[0-9a-f]{12}$")
 TIMESTAMP = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
 GIT_OBJECT = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 CANONICAL_EVALUATION_ID = "control-plane-integrated-v1"
+MERGECRAFT_RETIREMENT_EVALUATION_ID = "mergecraft-retirement-comparative-v1"
 CANONICAL_CANDIDATE_REPOSITORY = "https://github.com/nisavid/agents"
 CANONICAL_SKILL_IDS = (
     "rolecasting:choosing-agent-models",
@@ -225,6 +227,13 @@ def require(condition: bool, message: str) -> None:
         raise MalformedInput(message)
 
 
+def requires_bound_provider_contract(evaluation_id: str) -> bool:
+    return evaluation_id in {
+        CANONICAL_EVALUATION_ID,
+        MERGECRAFT_RETIREMENT_EVALUATION_ID,
+    }
+
+
 def canonical_digest(value: Any) -> str:
     encoded = json.dumps(
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
@@ -238,6 +247,23 @@ def canonical_bytes(value: Any) -> bytes:
     ).encode()
 
 
+def request_bundle_file(logical_path: str, content: bytes) -> dict[str, Any]:
+    try:
+        decoded = content.decode("utf-8")
+    except UnicodeDecodeError:
+        decoded = None
+    if decoded is not None and "\x00" not in decoded:
+        return {
+            "content": decoded,
+            "logical_path": logical_path,
+        }
+    return {
+        "content": base64.b64encode(content).decode("ascii"),
+        "encoding": "base64",
+        "logical_path": logical_path,
+    }
+
+
 def bundle_request_bytes(
     bundle: dict[str, Any], prompt: bytes, fixture: bytes, artifact_root: Path
 ) -> bytes:
@@ -248,20 +274,14 @@ def bundle_request_bytes(
         bundle["archive_relpath"],
         "bundle request archive path is invalid",
     )
-    files: list[dict[str, str]] = []
+    files: list[dict[str, Any]] = []
     with tarfile.open(archive_path, "r:*") as archive:
         for member in archive.getmembers():
             if not member.isfile():
                 continue
             stream = archive.extractfile(member)
             require(stream is not None, "bundle request archive entry is unreadable")
-            try:
-                content = stream.read().decode()
-            except UnicodeDecodeError as error:
-                raise MalformedInput(
-                    "bundle request archive entry is not UTF-8"
-                ) from error
-            files.append({"logical_path": member.name, "content": content})
+            files.append(request_bundle_file(member.name, stream.read()))
     return canonical_bytes(
         {
             "bundle_files": files,
@@ -1977,6 +1997,7 @@ def validate_evidence(
         "matrix definition digest mismatch",
     )
     production = evaluation_id == CANONICAL_EVALUATION_ID
+    provider_contract = requires_bound_provider_contract(evaluation_id)
     if production:
         require(
             skill_inventory == list(CANONICAL_SKILL_IDS),
@@ -2007,6 +2028,7 @@ def validate_evidence(
                 == expected_reverse,
                 "production reverse-dependency map drift",
             )
+    if provider_contract:
         require(
             evidence.get("phase") == "phase-1-four-condition-behavior-evidence",
             "production evidence phase drift",
@@ -2198,7 +2220,7 @@ def validate_evidence(
         evidence["executor_config"]["runtime"] == evidence["grader_config"]["runtime"],
         "executor and grader runtime identities differ",
     )
-    if production:
+    if provider_contract:
         for config_name, config in (
             ("executor", evidence["executor_config"]),
             ("grader", evidence["grader_config"]),
@@ -2256,7 +2278,7 @@ def validate_evidence(
             ],
             "candidate identity does not match candidate bundle provenance",
         )
-        if production:
+        if provider_contract:
             for condition in CONDITIONS:
                 require(
                     "content_lock_sha256"
@@ -2276,7 +2298,7 @@ def validate_evidence(
         list(bundle_ids_by_skill) == skill_inventory,
         "skill bundle sets do not follow the ordered skill inventory",
     )
-    if production:
+    if provider_contract:
         source = evidence["candidate_source"]
         expected_revision = bytes_digest(source["commit"].encode())
         for skill_id in skill_inventory:

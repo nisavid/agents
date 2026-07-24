@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import io
 import json
 import os
@@ -1877,6 +1878,23 @@ def config_document(
     return document
 
 
+def request_bundle_file(logical_path: str, content: bytes) -> dict[str, Any]:
+    try:
+        decoded = content.decode("utf-8")
+    except UnicodeDecodeError:
+        decoded = None
+    if decoded is not None and "\x00" not in decoded:
+        return {
+            "content": decoded,
+            "logical_path": logical_path,
+        }
+    return {
+        "content": base64.b64encode(content).decode("ascii"),
+        "encoding": "base64",
+        "logical_path": logical_path,
+    }
+
+
 def bundle_request(scenario: Scenario, bundle: dict[str, Any], archive: Path) -> bytes:
     # The no-skill control must be genuinely unguided.  In particular, it must
     # not receive a target-skill name, route, declared call, entrypoint, bundle
@@ -1885,16 +1903,14 @@ def bundle_request(scenario: Scenario, bundle: dict[str, Any], archive: Path) ->
         return canonical_bytes(
             {"fixture": scenario.fixture.decode(), "prompt": scenario.prompt.decode()}
         )
-    files: list[dict[str, str]] = []
+    files: list[dict[str, Any]] = []
     with tarfile.open(archive, "r:") as content:
         for member in content.getmembers():
             if member.isfile():
                 stream = content.extractfile(member)
                 if stream is None:
                     raise EvaluationError("bundle archive member is unreadable")
-                files.append(
-                    {"logical_path": member.name, "content": stream.read().decode()}
-                )
+                files.append(request_bundle_file(member.name, stream.read()))
     return canonical_bytes(
         {
             "bundle_files": files,

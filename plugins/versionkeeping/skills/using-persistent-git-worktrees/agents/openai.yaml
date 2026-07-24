@@ -1,0 +1,4 @@
+interface:
+  display_name: Persistent Git Worktrees
+  short_description: Create and manage durable Git worktrees safely.
+  default_prompt: Use $versionkeeping:using-persistent-git-worktrees to prepare an isolated worktree.

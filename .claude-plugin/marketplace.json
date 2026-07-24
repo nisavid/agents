@@ -14,6 +14,11 @@
       "name": "rolecasting",
       "source": "./plugins/rolecasting",
       "category": "developer-tools"
+    },
+    {
+      "name": "versionkeeping",
+      "source": "./plugins/versionkeeping",
+      "category": "developer-tools"
     }
   ]
 }

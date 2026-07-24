@@ -1,0 +1,4 @@
+interface:
+  display_name: Sync Forks With Upstream
+  short_description: Sync a maintained fork while preserving history and contracts.
+  default_prompt: Use $versionkeeping:syncing-forks-with-upstream to sync this fork safely.

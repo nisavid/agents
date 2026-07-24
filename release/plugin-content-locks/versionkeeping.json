@@ -1,0 +1,110 @@
+{
+  "schema_version": 2,
+  "algorithm": "sha256",
+  "files": {
+    ".claude-plugin/plugin.json": {
+      "sha256": "6e7a5850d9d2517b2b5ee42a4398f8221dddb00da10c430d7c647c0331d3ee8a",
+      "mode": 420
+    },
+    ".codex-plugin/plugin.json": {
+      "sha256": "bd7866309442cc00e92cc1a85ce449ba46457518454faf125705bf3f4722b09c",
+      "mode": 420
+    },
+    "README.md": {
+      "sha256": "6e6e1d20136bfd1bad5318ea113c43ade0980706c0535d18c80ea915fc4d5c18",
+      "mode": 420
+    },
+    "skills/checkpointing-and-publishing-git-work/SKILL.md": {
+      "sha256": "25c9f721540dbfa554a261c7b4bbee1cc8d3f6ad31ad3063aef2a3a9783188c4",
+      "mode": 420
+    },
+    "skills/checkpointing-and-publishing-git-work/agents/openai.yaml": {
+      "sha256": "acab93293ed09334a85c7db73a5dc241f08735b9346372bb15213e3b6b243f7c",
+      "mode": 420
+    },
+    "skills/checkpointing-and-publishing-git-work/references/evaluation-integrity.md": {
+      "sha256": "f2f1a5b7189ff4b6948e72425395faee85d4f35db652b4d6b92db764852586eb",
+      "mode": 420
+    },
+    "skills/checkpointing-and-publishing-git-work/references/publication-execution.md": {
+      "sha256": "1146b608572584de24b4b2cc3bffd5f44478367bd3dde086f1d5608fc4f7e154",
+      "mode": 420
+    },
+    "skills/checkpointing-and-publishing-git-work/references/terminal-cleanup.md": {
+      "sha256": "ec9d1a682274427dbd56a9d35d923833ff6f0427046a0a6a295f48b6d9ddcd4e",
+      "mode": 420
+    },
+    "skills/checkpointing-and-publishing-git-work/scripts/check_eval_gate.py": {
+      "sha256": "a00fc64d6337b489b80ed773886efbb8b3ea448d8071b7ad6c51d40435112ee0",
+      "mode": 420
+    },
+    "skills/checkpointing-and-publishing-git-work/scripts/execute_git_publication.py": {
+      "sha256": "ba7faeca3b0517fb7c91da75e65bb437e800a55263024c537553cb0779141839",
+      "mode": 420
+    },
+    "skills/checkpointing-and-publishing-git-work/scripts/execute_git_remote_ref_deletion.py": {
+      "sha256": "3e95c73090e981c72880239369189657119d4889c5d3526bfa8d2d4f8dfcc83b",
+      "mode": 420
+    },
+    "skills/checkpointing-and-publishing-git-work/scripts/git_publication/__init__.py": {
+      "sha256": "91b02274359fd760e3620438e95515edba965f4c8187a69a0654c6b3daaa4b73",
+      "mode": 420
+    },
+    "skills/checkpointing-and-publishing-git-work/scripts/git_publication/adapter.py": {
+      "sha256": "772764fd32ee503c794ac9fd6620e3bcc48f5283c70aa15140aa0c1813a01b9a",
+      "mode": 420
+    },
+    "skills/checkpointing-and-publishing-git-work/scripts/git_publication/core.py": {
+      "sha256": "c177cd55d8fdd3c184bcf3e10a94a2384213c7b416c8bddda0b90339322381f3",
+      "mode": 420
+    },
+    "skills/checkpointing-and-publishing-git-work/scripts/git_publication/deletion.py": {
+      "sha256": "e11c07c99da1c5df2549855e2e049e8a99c64039d9f2b51eb2c9cc82295d5ec8",
+      "mode": 420
+    },
+    "skills/checkpointing-and-publishing-git-work/scripts/git_publication/execution.py": {
+      "sha256": "90eb0262668ff07a95b8e01104fafab33ba231524c9a0379c22f1a21a64baec9",
+      "mode": 420
+    },
+    "skills/checkpointing-and-publishing-git-work/scripts/plan_git_publication.py": {
+      "sha256": "a4a43cdae51743f099a45d8a73eda54dde653a326db0a71dfb615e24cad1d316",
+      "mode": 493
+    },
+    "skills/checkpointing-and-publishing-git-work/scripts/plan_git_remote_ref_deletion.py": {
+      "sha256": "b1056bc5a24ddd7b9c4d83d92eeb3703fbb08dbb6df942bb14cc359d41c0c970",
+      "mode": 420
+    },
+    "skills/resolving-merge-conflicts/SKILL.md": {
+      "sha256": "c626fb766d44a802f919be4616b8e6772831850f1477ee80c53899ed33d1304f",
+      "mode": 420
+    },
+    "skills/resolving-merge-conflicts/agents/openai.yaml": {
+      "sha256": "5ee5d277d3e3feb465d586807fb3bd83cc6ad6b14276491bbba8a09048040c4f",
+      "mode": 420
+    },
+    "skills/syncing-forks-with-upstream/SKILL.md": {
+      "sha256": "eea20a0f9d4e0704247899afd09c5067d235c00e90c3bbd94ab15115256810f8",
+      "mode": 420
+    },
+    "skills/syncing-forks-with-upstream/agents/openai.yaml": {
+      "sha256": "9123e53d7625884736ae5c7466079ab82bb2de20e8b4a13fbf381c8ec4ef0427",
+      "mode": 420
+    },
+    "skills/using-persistent-git-worktrees/SKILL.md": {
+      "sha256": "d8677e7024a8ef670db2a24007c5ae1f0716b87b6da0b7ee762c827ee6620d40",
+      "mode": 420
+    },
+    "skills/using-persistent-git-worktrees/agents/openai.yaml": {
+      "sha256": "9dd3452f89a27f327c23e301ee8a91ce406734d10bd3e212d3d6595a1433f527",
+      "mode": 420
+    },
+    "skills/using-persistent-git-worktrees/scripts/validate_worktree_target.py": {
+      "sha256": "8dc69587dc2fe5b98fc4864a7aa0f76525412f7b1cb8940ca17f61bf6bec1749",
+      "mode": 420
+    },
+    "topology.json": {
+      "sha256": "e05f091acd83e0e684b4fadc8fa7f0ed5a910b728157144dd77eb091b1031048",
+      "mode": 420
+    }
+  }
+}

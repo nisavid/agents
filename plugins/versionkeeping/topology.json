@@ -1,0 +1,99 @@
+{
+  "schema_version": 2,
+  "plugin": "versionkeeping",
+  "terminal_handoff": {
+    "target": "checkpointing-and-publishing-git-work",
+    "resolver_owns": ["conflict-interpretation", "authorized-file-edits"],
+    "checkpointing_owns": ["stage", "continue", "commit", "push", "abort"],
+    "resolver_forbidden": ["stage", "continue", "commit", "push", "abort"]
+  },
+  "skills": [
+    {
+      "name": "checkpointing-and-publishing-git-work",
+      "entrypoint": "skills/checkpointing-and-publishing-git-work/SKILL.md",
+      "interface": "skills/checkpointing-and-publishing-git-work/agents/openai.yaml",
+      "references": [
+        "skills/checkpointing-and-publishing-git-work/references/publication-execution.md",
+        "skills/checkpointing-and-publishing-git-work/references/terminal-cleanup.md",
+        "skills/checkpointing-and-publishing-git-work/references/evaluation-integrity.md"
+      ],
+      "scripts": [
+        "skills/checkpointing-and-publishing-git-work/scripts/plan_git_publication.py",
+        "skills/checkpointing-and-publishing-git-work/scripts/execute_git_publication.py",
+        "skills/checkpointing-and-publishing-git-work/scripts/plan_git_remote_ref_deletion.py",
+        "skills/checkpointing-and-publishing-git-work/scripts/execute_git_remote_ref_deletion.py",
+        "skills/checkpointing-and-publishing-git-work/scripts/check_eval_gate.py"
+      ],
+      "modules": [
+        "skills/checkpointing-and-publishing-git-work/scripts/git_publication/__init__.py",
+        "skills/checkpointing-and-publishing-git-work/scripts/git_publication/adapter.py",
+        "skills/checkpointing-and-publishing-git-work/scripts/git_publication/core.py",
+        "skills/checkpointing-and-publishing-git-work/scripts/git_publication/deletion.py",
+        "skills/checkpointing-and-publishing-git-work/scripts/git_publication/execution.py"
+      ],
+      "calls": [],
+      "operations": [
+        "git-ref-push",
+        "remote-ref-deletion",
+        "local-git-integration",
+        "terminal-cleanup"
+      ]
+    },
+    {
+      "name": "resolving-merge-conflicts",
+      "entrypoint": "skills/resolving-merge-conflicts/SKILL.md",
+      "interface": "skills/resolving-merge-conflicts/agents/openai.yaml",
+      "references": [],
+      "scripts": [],
+      "modules": [],
+      "calls": ["checkpointing-and-publishing-git-work"],
+      "operations": ["conflict-resolution"]
+    },
+    {
+      "name": "using-persistent-git-worktrees",
+      "entrypoint": "skills/using-persistent-git-worktrees/SKILL.md",
+      "interface": "skills/using-persistent-git-worktrees/agents/openai.yaml",
+      "references": [],
+      "scripts": [
+        "skills/using-persistent-git-worktrees/scripts/validate_worktree_target.py"
+      ],
+      "modules": [],
+      "calls": ["checkpointing-and-publishing-git-work"],
+      "operations": ["persistent-worktree-lifecycle"]
+    },
+    {
+      "name": "syncing-forks-with-upstream",
+      "entrypoint": "skills/syncing-forks-with-upstream/SKILL.md",
+      "interface": "skills/syncing-forks-with-upstream/agents/openai.yaml",
+      "references": [],
+      "scripts": [],
+      "modules": [],
+      "calls": ["checkpointing-and-publishing-git-work"],
+      "operations": ["fork-synchronization"]
+    }
+  ],
+  "operation_owners": {
+    "git-ref-push": "checkpointing-and-publishing-git-work",
+    "remote-ref-deletion": "checkpointing-and-publishing-git-work",
+    "local-git-integration": "checkpointing-and-publishing-git-work",
+    "terminal-cleanup": "checkpointing-and-publishing-git-work",
+    "conflict-resolution": "resolving-merge-conflicts",
+    "persistent-worktree-lifecycle": "using-persistent-git-worktrees",
+    "fork-synchronization": "syncing-forks-with-upstream"
+  },
+  "ownership": {
+    "owned": [
+      "Git index, ref, and push safety",
+      "separately authorized terminal remote-ref deletion",
+      "local Git integration through checkpointing-and-publishing-git-work",
+      "conflict interpretation and authorized file edits",
+      "provenance-aware terminal cleanup",
+      "history-preserving fork synchronization discovery and coordination"
+    ],
+    "excluded": [
+      "Graphite operations",
+      "review and pull-request actuation",
+      "model and delegation policy"
+    ]
+  }
+}

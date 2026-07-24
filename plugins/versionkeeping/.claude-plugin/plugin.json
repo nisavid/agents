@@ -1,0 +1,21 @@
+{
+  "name": "versionkeeping",
+  "displayName": "Versionkeeping",
+  "version": "1.0.0+claude.20260720120700",
+  "description": "Versionkeeping: safe Git checkpoints, conflict resolution, exact-lease publication, provenance-aware worktree cleanup, and history-preserving fork sync.",
+  "author": {
+    "name": "Ivan D Vasin",
+    "url": "https://github.com/nisavid"
+  },
+  "homepage": "https://github.com/nisavid/agents/tree/main/plugins/versionkeeping",
+  "repository": "https://github.com/nisavid/agents",
+  "license": "MIT",
+  "keywords": [
+    "git",
+    "checkpoint",
+    "conflict-resolution",
+    "publication",
+    "worktree",
+    "fork-sync"
+  ]
+}

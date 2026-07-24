@@ -2,9 +2,10 @@
 
 Personal agent tooling and plugin source.
 
-This repository is the source of truth for reusable agent assets that are shared
-across local harnesses. It currently contains Thermos, a port of Cursor's
-thermo-nuclear review workflow for Codex-like harnesses and Claude Code.
+This repository is the source of truth for reusable agent assets shared across
+local harnesses. It contains Thermos, a port of Cursor's thermo-nuclear review
+workflow for Codex-like harnesses and Claude Code, plus Rolecasting for agent
+role selection and delegation topology.
 
 ## Layout
 
@@ -14,6 +15,8 @@ thermo-nuclear review workflow for Codex-like harnesses and Claude Code.
   and Claude Code adapter manifests.
 - `plugins/thermos/README.md` documents the Thermos adapter boundary, layout, and
   maintenance notes.
+- `plugins/rolecasting/` contains delegation-topology and model-selection
+  policy.
 - `tooling/hindsight/` contains the reusable Hindsight control plane, local
   stack tooling, templates, schemas, skills, and validation.
 

@@ -44,10 +44,12 @@ cloning to install the repository's `commit-msg` and `pre-push` hooks into
 
 First generate complete routing evidence for the clean frozen candidate using
 the command in [evals/README.md](evals/README.md). Then run this before a plugin
-release with `plugin-eval` available on `PATH`:
+release:
 
 ```sh
 uv run --with PyYAML --with pytest python scripts/validate_public_release.py . \
+  --plugin-eval /absolute/path/to/pinned/plugin-eval/scripts/plugin-eval.js \
+  --node /absolute/path/to/physical/node \
   --routing-evidence /absolute/path/to/routing-evidence \
   --composed-receipt /absolute/private/path/to/phase7-composed-matrix.json \
   --private-producer-witness /absolute/private/path/to/producer-witness.tar \
@@ -91,7 +93,34 @@ evidence names the bytes that passed. The release-owned plugin-eval policy may
 demote only an explicitly named static failure under frozen tool, metric, and
 runtime-component caps; every other failed or error-severity check blocks. Use
 `--plugin-eval /path/to/plugin-eval` when it is not on `PATH`; that path must be
-the pinned package's `scripts/plugin-eval.js` launcher.
+the pinned package's `scripts/plugin-eval.js` launcher. The evaluator resolves
+`node` only through its fixed system search path when `--node` is omitted. For
+fnm, nvm, package-manager toolcache, or other version-manager installations,
+pass `--node` with the resolved physical executable, not a launcher symlink.
+The recorded interpreter evidence binds the main executable bytes and version;
+it deliberately does not claim to bind dynamic-loader or shared-library bytes.
+Pathname resolution at exec time can also undergo an undetectable ABA swap, so
+that pathname-resolution boundary is not bound either.
+
+For the complete Phase 7 production coordinator, pass the same physical
+executable explicitly with `--node-executable`:
+
+```sh
+uv run --with PyYAML --with pytest python scripts/run_phase7_production_integration.py \
+  --private-repository /absolute/path/to/private-repository \
+  --private-commit-oid '<git-object-id>' \
+  --reviewed-producer-sha256 'sha256:<digest>' \
+  --public-root /absolute/path/to/public-candidate \
+  --public-candidate-sha256 'sha256:<digest>' \
+  --capability-manifest /absolute/path/to/capability-manifest.json \
+  --private-output /absolute/private/path/to/private-output \
+  --private-summary-output /absolute/private/path/to/private-summary.json \
+  --composed-output /absolute/private/path/to/composed-output \
+  --routing-evidence /absolute/path/to/routing-evidence \
+  --plugin-eval-executable /absolute/path/to/pinned/plugin-eval/scripts/plugin-eval.js \
+  --node-executable /absolute/path/to/physical/node \
+  --release-receipt-output /absolute/private/path/to/release-receipt.json
+```
 
 ## License
 

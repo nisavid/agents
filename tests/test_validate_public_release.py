@@ -487,12 +487,17 @@ class ValidatePublicReleaseTests(unittest.TestCase):
         self.temporary_directory.cleanup()
 
     def run_plugin_reports(self, factory):
+        def result(command, **_kwargs):
+            if command[1:] == ["--version"]:
+                return subprocess.CompletedProcess(command, 0, "v20.0.0\n", "")
+            return subprocess.CompletedProcess(
+                command, 0, json.dumps(factory(Path(command[3]))), ""
+            )
+
         with mock.patch.object(
             self.module.subprocess,
             "run",
-            side_effect=lambda command, **_kwargs: subprocess.CompletedProcess(
-                command, 0, json.dumps(factory(Path(command[2]))), ""
-            ),
+            side_effect=result,
         ):
             return self.module.run_plugin_evals(self.repository, self.plugin_eval)
 
@@ -500,23 +505,22 @@ class ValidatePublicReleaseTests(unittest.TestCase):
         """Install a small real executable that emits an otherwise-valid report."""
 
         self.plugin_eval.write_text(
-            "#!/usr/bin/env python3\n"
-            "import json\n"
-            "import pathlib\n"
-            "import sys\n"
-            "target = pathlib.Path(sys.argv[2])\n"
-            "report = {\n"
-            "  'schemaVersion': 1,\n"
-            "  'tool': {'name': 'plugin-eval', 'version': '0.1.0'},\n"
-            "  'target': {'kind': 'plugin', 'path': str(target), "
-            "'entryPath': str(target / '.codex-plugin/plugin.json'), "
-            "'name': target.name, 'relativePath': 'plugins/' + target.name},\n"
-            "  'checks': [],\n"
-            "  'summary': {'deductions': []},\n"
-            "  'budgets': {name: {'value': 0, 'components': []} for name in "
-            "('trigger_cost_tokens', 'invoke_cost_tokens', 'deferred_cost_tokens')},\n"
-            "}\n"
-            "print(json.dumps(report))\n",
+            "const path = require('node:path');\n"
+            "const target = path.resolve(process.argv[3]);\n"
+            "const name = path.basename(target);\n"
+            "const report = {\n"
+            "  schemaVersion: 1,\n"
+            "  tool: {name: 'plugin-eval', version: '0.1.0'},\n"
+            "  target: {kind: 'plugin', path: target, "
+            "entryPath: path.join(target, '.codex-plugin/plugin.json'), "
+            "name, relativePath: 'plugins/' + name},\n"
+            "  checks: [],\n"
+            "  summary: {deductions: []},\n"
+            "  budgets: Object.fromEntries(['trigger_cost_tokens', "
+            "'invoke_cost_tokens', 'deferred_cost_tokens'].map((name) => "
+            "[name, {value: 0, components: []}])),\n"
+            "};\n"
+            "console.log(JSON.stringify(report));\n",
             encoding="utf-8",
         )
         os.chmod(self.plugin_eval, 0o755)
@@ -1634,7 +1638,18 @@ class ValidatePublicReleaseTests(unittest.TestCase):
                 "policy_sha256": "sha256:" + "f" * 64,
                 "calibration_manifest_sha256": "sha256:" + "0" * 64,
                 "policy_projection_sha256": "sha256:" + "1" * 64,
-                "tool_runtime": {"runtime_tree_sha256": "sha256:" + "2" * 64},
+                "tool_runtime": {
+                    "runtime_tree_sha256": "sha256:" + "2" * 64,
+                    "interpreter": {
+                        "sha256": "sha256:" + "3" * 64,
+                        "version": "v20.0.0",
+                        "coverage": "main-executable-bytes-only",
+                        "limitations": [
+                            "dynamic-loader-and-shared-library-bytes-are-not-bound",
+                            "pathname-exec-time-ABA-is-not-bound",
+                        ],
+                    },
+                },
             }
         }
         contracts = {
@@ -1680,7 +1695,7 @@ class ValidatePublicReleaseTests(unittest.TestCase):
         receipt = self.module.strict_json(first_bytes.decode(), "release receipt")
         claimed_digest = receipt.pop("sha256")
         self.assertEqual(claimed_digest, self.module.canonical_digest(receipt))
-        self.assertEqual(receipt["schema_version"], 4)
+        self.assertEqual(receipt["schema_version"], 5)
         self.assertEqual(receipt["candidate"], candidate)
         self.assertEqual(receipt["routing"], routing)
         self.assertEqual(
@@ -1698,6 +1713,7 @@ class ValidatePublicReleaseTests(unittest.TestCase):
         self.assertNotIn(str(self.repository), serialized)
         self.assertNotIn(str(evidence_root), serialized)
         self.assertNotIn(str(self.plugin_eval), serialized)
+        self.assertNotIn("/opt/node/bin/node", serialized)
         self.assertNotRegex(
             serialized,
             r'"(createdAt|generatedAt|timestamp|prompt|raw_prompt|raw_output)"',
@@ -2121,21 +2137,344 @@ class ValidatePublicReleaseTests(unittest.TestCase):
         self.assertEqual(set(evidence), set(self.module.VALIDATED_PLUGINS))
         self.assertIn("SystemExit(73)", self.plugin_eval.read_text(encoding="utf-8"))
 
+    def test_node_interpreter_rejects_shims_and_noncompliant_versions(self) -> None:
+        environment_root = Path(self.temporary_directory.name) / "node-environment"
+        environment = self.module.private_plugin_eval_environment(environment_root)
+        shim = Path(self.temporary_directory.name) / "node-shim"
+        shim.write_text("#!/bin/sh\necho v99.0.0\n", encoding="utf-8")
+        os.chmod(shim, 0o700)
+        with self.assertRaisesRegex(
+            self.module.ReleaseError, "must not be a shebang shim"
+        ):
+            self.module.resolve_node_interpreter(
+                Path(os.path.realpath(shim)), environment
+            )
+
+        node = Path(os.path.realpath(shutil.which("node") or ""))
+        self.assertTrue(node.is_file())
+        for version, message in (
+            ("v19.9.9\n", "Node 20 or newer"),
+            ("v20.0.0-pre\n", "strict semver"),
+        ):
+            with (
+                self.subTest(version=version),
+                mock.patch.object(
+                    self.module.subprocess,
+                    "run",
+                    return_value=subprocess.CompletedProcess(
+                        [str(node), "--version"], 0, version, ""
+                    ),
+                ),
+                self.assertRaisesRegex(self.module.ReleaseError, message),
+            ):
+                self.module.resolve_node_interpreter(node, environment)
+
+    def test_node_interpreter_uses_private_environment_and_absolute_command(
+        self,
+    ) -> None:
+        node = Path(
+            os.path.realpath(
+                shutil.which("node", path=self.module.SAFE_NODE_SEARCH_PATH) or ""
+            )
+        )
+        self.assertTrue(node.is_file())
+        observed = []
+
+        def result(command, **kwargs):
+            observed.append((command, kwargs["env"]))
+            if command[1:] == ["--version"]:
+                return subprocess.CompletedProcess(command, 0, "v20.0.0\n", "")
+            return subprocess.CompletedProcess(
+                command, 0, json.dumps(plugin_eval_report([], Path(command[3]))), ""
+            )
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "NODE_OPTIONS": "--require /attacker/preload.js",
+                    "NODE_PATH": "/attacker/node-modules",
+                    "DYLD_INSERT_LIBRARIES": "/attacker/dylib",
+                    "LD_PRELOAD": "/attacker/library",
+                    "npm_config_prefix": "/attacker/npm",
+                    "PATH": "/attacker/bin",
+                },
+                clear=False,
+            ),
+            mock.patch.object(self.module.subprocess, "run", side_effect=result),
+        ):
+            evidence = self.module.run_plugin_evals(self.repository, self.plugin_eval)
+
+        self.assertEqual(set(evidence), set(self.module.VALIDATED_PLUGINS))
+        for command, environment in observed:
+            self.assertEqual(command[0], str(node))
+            self.assertNotIn("NODE_OPTIONS", environment)
+            self.assertNotIn("NODE_PATH", environment)
+            self.assertNotIn("DYLD_INSERT_LIBRARIES", environment)
+            self.assertNotIn("LD_PRELOAD", environment)
+            self.assertNotIn("npm_config_prefix", environment)
+            self.assertEqual(environment["PATH"], "/usr/bin:/bin")
+            self.assertTrue(Path(environment["HOME"]).is_absolute())
+            self.assertTrue(Path(environment["TMPDIR"]).is_absolute())
+        analysis_commands = [
+            command
+            for command, _environment in observed
+            if len(command) > 2 and command[2] == "analyze"
+        ]
+        self.assertEqual(len(analysis_commands), len(self.module.VALIDATED_PLUGINS))
+        self.assertTrue(
+            all(
+                command[1].endswith("scripts/plugin-eval.js")
+                for command in analysis_commands
+            )
+        )
+        serialized = json.dumps(evidence, sort_keys=True)
+        self.assertNotIn(str(node), serialized)
+        interpreter = evidence["rolecasting"]["tool_runtime"]["interpreter"]
+        self.assertEqual(interpreter["coverage"], "main-executable-bytes-only")
+        self.assertEqual(
+            interpreter["limitations"],
+            [
+                "dynamic-loader-and-shared-library-bytes-are-not-bound",
+                "pathname-exec-time-ABA-is-not-bound",
+            ],
+        )
+
+    def test_node_resolution_uses_only_the_fixed_fallback_path(self) -> None:
+        with (
+            mock.patch.object(
+                self.module.shutil,
+                "which",
+                return_value="/safe/node",
+            ) as which,
+            mock.patch.object(
+                self.module.os.path, "realpath", return_value="/safe/node"
+            ),
+        ):
+            self.assertEqual(self.module._canonical_node_path(None), Path("/safe/node"))
+
+        which.assert_called_once_with("node", path=self.module.SAFE_NODE_SEARCH_PATH)
+
+    def test_node_resolution_rejects_a_symlinked_parent_directory(self) -> None:
+        root = Path(os.path.realpath(self.temporary_directory.name))
+        target_directory = root / "target"
+        target_directory.mkdir()
+        node = target_directory / "node"
+        node.write_bytes(b"not-a-shebang")
+        os.chmod(node, 0o700)
+        linked_parent = root / "linked"
+        linked_parent.symlink_to(target_directory, target_is_directory=True)
+        linked_leaf = root / "node-link"
+        linked_leaf.symlink_to(node)
+
+        contents, _metadata = self.module._read_nofollow_regular_file(
+            node, "node executable"
+        )
+        self.assertEqual(contents, b"not-a-shebang")
+
+        with self.assertRaisesRegex(self.module.ReleaseError, "unavailable or unsafe"):
+            self.module._read_nofollow_regular_file(
+                linked_parent / "node", "node executable"
+            )
+        with self.assertRaisesRegex(self.module.ReleaseError, "unavailable or unsafe"):
+            self.module.resolve_node_interpreter(linked_parent / "node", {})
+        with self.assertRaisesRegex(self.module.ReleaseError, "unavailable or unsafe"):
+            self.module._read_nofollow_regular_file(linked_leaf, "node executable")
+        with self.assertRaisesRegex(self.module.ReleaseError, "unavailable or unsafe"):
+            self.module.resolve_node_interpreter(linked_leaf, {})
+
+    def test_node_resolution_fails_closed_without_descriptor_primitives(self) -> None:
+        with (
+            mock.patch.object(self.module.os, "O_NOFOLLOW", None),
+            self.assertRaisesRegex(
+                self.module.ReleaseError, "requires O_NOFOLLOW and O_DIRECTORY"
+            ),
+        ):
+            self.module._read_nofollow_regular_file(
+                Path(os.path.realpath(shutil.which("node") or "")), "node executable"
+            )
+
+    def test_node_snapshot_rejects_an_in_place_mutation_while_reading(self) -> None:
+        root = Path(os.path.realpath(self.temporary_directory.name))
+        node = root / "mutable-node"
+        node.write_bytes(b"first executable bytes\n")
+        os.chmod(node, 0o700)
+        original_read = self.module.os.read
+        mutated = False
+
+        def read(descriptor, size):
+            nonlocal mutated
+            if not mutated:
+                mutated = True
+                node.write_bytes(b"second executable bytes\n")
+                os.chmod(node, 0o700)
+            return original_read(descriptor, size)
+
+        with (
+            mock.patch.object(self.module.os, "read", side_effect=read),
+            self.assertRaisesRegex(
+                self.module.ReleaseError, "changed while it was read"
+            ),
+        ):
+            self.module._read_nofollow_regular_file(node, "node executable")
+
+    def test_node_interpreter_drift_blocks_evaluation_and_changes_evidence_digest(
+        self,
+    ) -> None:
+        environment = self.module.private_plugin_eval_environment(
+            Path(self.temporary_directory.name) / "drift-environment"
+        )
+        identity = {
+            "path": str(Path(os.path.realpath(shutil.which("node") or ""))),
+            "sha256": "sha256:" + "a" * 64,
+            "version": "v20.0.0",
+        }
+        with (
+            mock.patch.object(
+                self.module,
+                "_node_binary_digest",
+                return_value="sha256:" + "b" * 64,
+            ),
+            self.assertRaisesRegex(
+                self.module.ReleaseError, "changed during plugin evaluation"
+            ),
+        ):
+            self.module.revalidate_node_interpreter(identity)
+
+        policy = self.module.load_plugin_eval_policy(self.repository)
+        base_runtime = {
+            "plugin_manifest_version": "0.1.2",
+            "plugin_manifest_sha256": "sha256:" + "1" * 64,
+            "package_manifest_version": "0.1.0",
+            "runtime_tree_sha256": "sha256:" + "2" * 64,
+            "interpreter": self.module.public_node_interpreter_evidence(identity),
+        }
+
+        def evaluator(command, **_kwargs):
+            return subprocess.CompletedProcess(
+                command, 0, json.dumps(plugin_eval_report([], Path(command[3]))), ""
+            )
+
+        with (
+            mock.patch.object(self.module, "revalidate_node_interpreter"),
+            mock.patch.object(self.module.subprocess, "run", side_effect=evaluator),
+        ):
+            first = self.module.run_pinned_plugin_evals(
+                self.repository,
+                self.plugin_eval,
+                policy,
+                base_runtime,
+                environment,
+                node_interpreter=identity,
+            )
+            changed = {
+                **base_runtime,
+                "interpreter": {
+                    **self.module.public_node_interpreter_evidence(identity),
+                    "sha256": "sha256:" + "c" * 64,
+                },
+            }
+            changed_identity = {**identity, "sha256": "sha256:" + "c" * 64}
+            second = self.module.run_pinned_plugin_evals(
+                self.repository,
+                self.plugin_eval,
+                policy,
+                changed,
+                environment,
+                node_interpreter=changed_identity,
+            )
+        self.assertNotEqual(
+            first["rolecasting"]["policy_projection_sha256"],
+            second["rolecasting"]["policy_projection_sha256"],
+        )
+        self.assertEqual(
+            first["rolecasting"]["tool_runtime"]["interpreter"]["sha256"],
+            identity["sha256"],
+        )
+
+    def test_node_version_probe_is_bracketed_once_and_analysis_uses_byte_only_checks(
+        self,
+    ) -> None:
+        environment = self.module.private_plugin_eval_environment(
+            Path(self.temporary_directory.name) / "ordering-environment"
+        )
+        node = Path(os.path.realpath(shutil.which("node") or ""))
+        events = []
+
+        def digest(path):
+            events.append(("read", path))
+            return "sha256:" + "a" * 64
+
+        def version(path, _environment):
+            events.append(("version", path))
+            return "v20.0.0"
+
+        with (
+            mock.patch.object(self.module, "_node_binary_digest", side_effect=digest),
+            mock.patch.object(self.module, "_node_version", side_effect=version),
+        ):
+            identity = self.module.resolve_node_interpreter(node, environment)
+
+        self.assertEqual([event[0] for event in events], ["read", "version", "read"])
+        runtime = {
+            "plugin_manifest_version": "0.1.2",
+            "plugin_manifest_sha256": "sha256:" + "1" * 64,
+            "package_manifest_version": "0.1.0",
+            "runtime_tree_sha256": "sha256:" + "2" * 64,
+            "interpreter": self.module.public_node_interpreter_evidence(identity),
+        }
+        policy = self.module.load_plugin_eval_policy(self.repository)
+        events.clear()
+
+        def evaluator(command, **_kwargs):
+            events.append(("child", command[2]))
+            return subprocess.CompletedProcess(
+                command, 0, json.dumps(plugin_eval_report([], Path(command[3]))), ""
+            )
+
+        with (
+            mock.patch.object(self.module, "_node_binary_digest", side_effect=digest),
+            mock.patch.object(self.module.subprocess, "run", side_effect=evaluator),
+        ):
+            self.module.run_pinned_plugin_evals(
+                self.repository,
+                self.plugin_eval,
+                policy,
+                runtime,
+                environment,
+                node_interpreter=identity,
+            )
+
+        self.assertNotIn("version", [event[0] for event in events])
+        self.assertEqual(
+            [event[0] for event in events],
+            [
+                item
+                for _plugin in self.module.VALIDATED_PLUGINS
+                for item in ("read", "child", "read")
+            ],
+        )
+
     def test_plugin_eval_accepts_warnings_and_reports_each_control_plugin(self) -> None:
-        with mock.patch.object(
-            self.module.subprocess,
-            "run",
-            side_effect=lambda command, **_kwargs: subprocess.CompletedProcess(
+        def result(command, **_kwargs):
+            if command[1:] == ["--version"]:
+                return subprocess.CompletedProcess(command, 0, "v20.0.0\n", "")
+            return subprocess.CompletedProcess(
                 command,
                 0,
                 json.dumps(
                     plugin_eval_report(
                         [{"id": "deferred-cost", "category": "quality"}],
-                        Path(command[2]),
+                        Path(command[3]),
                     )
                 ),
                 "",
-            ),
+            )
+
+        with mock.patch.object(
+            self.module.subprocess,
+            "run",
+            side_effect=result,
         ) as run:
             evidence = self.module.run_plugin_evals(self.repository, self.plugin_eval)
 
@@ -2156,7 +2495,11 @@ class ValidatePublicReleaseTests(unittest.TestCase):
                 for item in evidence.values()
             )
         )
-        targets = {Path(call.args[0][2]).name for call in run.call_args_list}
+        targets = {
+            Path(call.args[0][3]).name
+            for call in run.call_args_list
+            if len(call.args[0]) > 3 and call.args[0][2] == "analyze"
+        }
         self.assertEqual(targets, set(self.module.VALIDATED_PLUGINS))
 
     def test_plugin_eval_authoritative_projection_ignores_ambient_report_state(
@@ -2284,6 +2627,8 @@ class ValidatePublicReleaseTests(unittest.TestCase):
                 severity=severity,
                 **_kwargs,
             ):
+                if command[1:] == ["--version"]:
+                    return subprocess.CompletedProcess(command, 0, "v20.0.0\n", "")
                 return subprocess.CompletedProcess(
                     command,
                     0,
@@ -2298,7 +2643,7 @@ class ValidatePublicReleaseTests(unittest.TestCase):
                                     "message": "must block",
                                 }
                             ],
-                            Path(command[2]),
+                            Path(command[3]),
                         )
                     ),
                     "",
@@ -2334,8 +2679,11 @@ class ValidatePublicReleaseTests(unittest.TestCase):
         }
 
         def result(command, **kwargs):
+            if command[1:] == ["--version"]:
+                return subprocess.CompletedProcess(command, 0, "v20.0.0\n", "")
             self.assertEqual(kwargs["cwd"], self.repository)
-            target = Path(command[2])
+            self.assertNotIn("NODE_OPTIONS", kwargs["env"])
+            target = Path(command[3])
             if target.name == "versionkeeping":
                 report = plugin_eval_report([advisory], target, deferred=66448)
             elif target.name == "mergecraft":
@@ -2393,12 +2741,17 @@ class ValidatePublicReleaseTests(unittest.TestCase):
                 self.optional_legal_field_deductions(target.name), target
             )
 
+        def exact_result(command, **_kwargs):
+            if command[1:] == ["--version"]:
+                return subprocess.CompletedProcess(command, 0, "v20.0.0\n", "")
+            return subprocess.CompletedProcess(
+                command, 0, json.dumps(exact_findings(Path(command[3]))), ""
+            )
+
         with mock.patch.object(
             self.module.subprocess,
             "run",
-            side_effect=lambda command, **_kwargs: subprocess.CompletedProcess(
-                command, 0, json.dumps(exact_findings(Path(command[2]))), ""
-            ),
+            side_effect=exact_result,
         ):
             evidence = self.module.run_plugin_evals(self.repository, self.plugin_eval)
 
@@ -2419,13 +2772,18 @@ class ValidatePublicReleaseTests(unittest.TestCase):
                 deductions[0]["penalty"] = 13
             return plugin_eval_report(deductions, target)
 
+        def drifted_result(command, **_kwargs):
+            if command[1:] == ["--version"]:
+                return subprocess.CompletedProcess(command, 0, "v20.0.0\n", "")
+            return subprocess.CompletedProcess(
+                command, 0, json.dumps(drifted_finding(Path(command[3]))), ""
+            )
+
         with (
             mock.patch.object(
                 self.module.subprocess,
                 "run",
-                side_effect=lambda command, **_kwargs: subprocess.CompletedProcess(
-                    command, 0, json.dumps(drifted_finding(Path(command[2]))), ""
-                ),
+                side_effect=drifted_result,
             ),
             self.assertRaisesRegex(
                 self.module.ReleaseError, "advisory deduction drift"
@@ -2448,7 +2806,9 @@ class ValidatePublicReleaseTests(unittest.TestCase):
         }
 
         def result(command, **_kwargs):
-            target = Path(command[2])
+            if command[1:] == ["--version"]:
+                return subprocess.CompletedProcess(command, 0, "v20.0.0\n", "")
+            target = Path(command[3])
             report = plugin_eval_report(
                 [advisory] if target.name == "versionkeeping" else [],
                 target,

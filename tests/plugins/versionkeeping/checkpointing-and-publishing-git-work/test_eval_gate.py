@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import copy
 import hashlib
 import io
@@ -544,6 +545,60 @@ class EvalGateV2Tests(unittest.TestCase):
                 gate.validate_config(drifted, "executor")
                 with self.assertRaisesRegex(gate.MalformedInput, "one exact identity"):
                     gate.validate_production_config("executor", drifted)
+
+    def test_retirement_evaluation_requires_the_bound_provider_contract(self) -> None:
+        gate = load_gate()
+
+        self.assertTrue(
+            gate.requires_bound_provider_contract("control-plane-integrated-v1")
+        )
+        self.assertTrue(
+            gate.requires_bound_provider_contract(
+                "mergecraft-retirement-comparative-v1"
+            )
+        )
+        self.assertFalse(
+            gate.requires_bound_provider_contract("focused-test:mergecraft-phase-7")
+        )
+
+    def test_bundle_request_represents_binary_members_losslessly(self) -> None:
+        gate = load_gate()
+        archive_path = self.root / "bundle.tar"
+        binary_content = b"\x89PNG\r\n\x1a\n\x00fixture"
+        with tarfile.open(archive_path, "w") as archive:
+            for logical_path, content in (
+                ("SKILL.md", b"instructions"),
+                ("assets/example.png", binary_content),
+            ):
+                member = tarfile.TarInfo(logical_path)
+                member.size = len(content)
+                archive.addfile(member, io.BytesIO(content))
+        bundle = {
+            "archive_relpath": "bundle.tar",
+            "declared_calls": [],
+            "kind": "skill_bundle",
+            "root_entrypoints": ["SKILL.md"],
+            "target_skill": "fixture:skill",
+        }
+
+        request = json.loads(
+            gate.bundle_request_bytes(bundle, b"prompt", b"fixture", self.root)
+        )
+
+        self.assertEqual(
+            request["bundle_files"],
+            [
+                {
+                    "content": "instructions",
+                    "logical_path": "SKILL.md",
+                },
+                {
+                    "content": base64.b64encode(binary_content).decode("ascii"),
+                    "encoding": "base64",
+                    "logical_path": "assets/example.png",
+                },
+            ],
+        )
 
     def bundle_request(
         self, bundle: dict[str, object], prompt: str, fixture: str

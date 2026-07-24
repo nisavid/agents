@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import importlib.util
 import json
 import shutil
@@ -477,6 +478,46 @@ def test_executor_request_excludes_rubric_and_condition_mapping(tmp_path: Path):
     serialized = json.dumps(request)
     assert "expectations" not in serialized
     assert "condition" not in request
+
+
+def test_executor_request_represents_binary_bundle_members_losslessly(tmp_path: Path):
+    runner = load_runner()
+    definition = json.loads(DEFINITION.read_text())
+    scenario = runner.load_scenario(ROOT, definition["skills"][0])
+    bundle = {
+        "archive_relpath": "bundle.tar",
+        "bundle_id": "sha256:" + "0" * 64,
+        "declared_calls": [],
+        "root_entrypoints": ["SKILL.md"],
+        "target_skill": "fixture:skill",
+    }
+    archive = tmp_path / "bundle.tar"
+    binary_content = b"\x89PNG\r\n\x1a\n\x00fixture"
+    runner.write_tar(
+        archive,
+        {
+            "SKILL.md": b"instructions",
+            "assets/example.png": binary_content,
+        },
+        {
+            "SKILL.md": 0o644,
+            "assets/example.png": 0o644,
+        },
+    )
+
+    request = json.loads(runner.bundle_request(scenario, bundle, archive))
+
+    assert request["bundle_files"] == [
+        {
+            "content": "instructions",
+            "logical_path": "SKILL.md",
+        },
+        {
+            "content": base64.b64encode(binary_content).decode("ascii"),
+            "encoding": "base64",
+            "logical_path": "assets/example.png",
+        },
+    ]
 
 
 def test_no_skill_request_has_no_bundle_or_route_cues(tmp_path: Path):
@@ -1942,6 +1983,139 @@ def test_gate_rejects_rehashed_superseded_checkpoint_input(tmp_path: Path):
     )
     assert rejected.returncode == 2
     assert "superseded grader input digest mismatch" in rejected.stdout
+
+
+def test_retirement_gate_requires_immutable_candidate_source(
+    tmp_path: Path, monkeypatch
+):
+    runner, output = build_local_production_evidence(tmp_path, monkeypatch)
+    manifest_path = output / "evidence-v2.json"
+    matrix_path = output / "matrix-v2.json"
+    matrix = json.loads(matrix_path.read_text())
+    manifest = json.loads(manifest_path.read_text())
+    evaluation_id = "mergecraft-retirement-comparative-v1"
+    matrix["evaluation_id"] = evaluation_id
+    matrix_path.write_text(json.dumps(matrix))
+    manifest["evaluation_id"] = evaluation_id
+    manifest["matrix_definition_sha256"] = runner.digest_bytes(
+        matrix_path.read_bytes()
+    )
+    manifest.pop("candidate_source")
+    manifest["final_result"]["sha256"] = runner.canonical_digest(
+        {key: value for key, value in manifest.items() if key != "final_result"}
+    )
+    manifest_path.write_text(json.dumps(manifest))
+
+    rejected = subprocess.run(
+        [
+            sys.executable,
+            str(GATE),
+            "--manifest",
+            str(manifest_path),
+            "--matrix",
+            str(matrix_path),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+
+    assert rejected.returncode == 2
+    assert "production immutable candidate source contract is invalid" in rejected.stdout
+
+
+def test_retirement_gate_binds_bundles_to_the_candidate_commit(
+    tmp_path: Path, monkeypatch
+):
+    runner, output = build_local_production_evidence(tmp_path, monkeypatch)
+    manifest_path = output / "evidence-v2.json"
+    matrix_path = output / "matrix-v2.json"
+    matrix = json.loads(matrix_path.read_text())
+    manifest = json.loads(manifest_path.read_text())
+    evaluation_id = "mergecraft-retirement-comparative-v1"
+    matrix["evaluation_id"] = evaluation_id
+    matrix_path.write_text(json.dumps(matrix))
+    manifest["evaluation_id"] = evaluation_id
+    manifest["matrix_definition_sha256"] = runner.digest_bytes(
+        matrix_path.read_bytes()
+    )
+    manifest["final_result"]["sha256"] = runner.canonical_digest(
+        {key: value for key, value in manifest.items() if key != "final_result"}
+    )
+    manifest_path.write_text(json.dumps(manifest))
+    accepted = subprocess.run(
+        [
+            sys.executable,
+            str(GATE),
+            "--manifest",
+            str(manifest_path),
+            "--matrix",
+            str(matrix_path),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert accepted.returncode == 0, accepted.stdout + accepted.stderr
+
+    repository = tmp_path / "candidate"
+    (repository / "unrelated.txt").write_text("different candidate commit\n")
+    subprocess.run(["git", "add", "unrelated.txt"], cwd=repository, check=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "test: create unrelated candidate commit"],
+        cwd=repository,
+        check=True,
+    )
+    alternate_revision = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    alternate_root = output / "alternate-source"
+    runner.prepare_private_directory(
+        alternate_root,
+        error_factory=runner.EvaluationError,
+    )
+    snapshot, _candidate_root, alternate_source = (
+        runner.materialize_candidate_snapshot(
+            repository,
+            alternate_root,
+            alternate_revision,
+            "https://github.com/nisavid/agents",
+        )
+    )
+    snapshot.cleanup()
+    source_directory = alternate_root / "artifacts/source"
+    retained_directory = output / "artifacts/source"
+    for artifact in source_directory.iterdir():
+        shutil.copyfile(artifact, retained_directory / artifact.name)
+    manifest["candidate_source"] = alternate_source
+    manifest["final_result"]["sha256"] = runner.canonical_digest(
+        {key: value for key, value in manifest.items() if key != "final_result"}
+    )
+    manifest_path.write_text(json.dumps(manifest))
+
+    rejected = subprocess.run(
+        [
+            sys.executable,
+            str(GATE),
+            "--manifest",
+            str(manifest_path),
+            "--matrix",
+            str(matrix_path),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+
+    assert rejected.returncode == 2
+    assert (
+        "production bundle provenance does not bind frozen candidate commit"
+        in rejected.stdout
+    )
 
 
 def test_fully_local_production_evidence_passes_gate(tmp_path: Path, monkeypatch):

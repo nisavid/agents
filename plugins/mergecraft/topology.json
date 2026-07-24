@@ -1,0 +1,983 @@
+{
+  "schema_version": 3,
+  "plugin": "mergecraft",
+  "skills": [
+    {
+      "name": "writing-reviewable-pr-descriptions",
+      "entrypoint": "skills/writing-reviewable-pr-descriptions/SKILL.md",
+      "interface": "skills/writing-reviewable-pr-descriptions/agents/openai.yaml",
+      "references": [
+        "skills/writing-reviewable-pr-descriptions/references/body-contract.md",
+        "skills/writing-reviewable-pr-descriptions/references/change-navigation.md",
+        "skills/writing-reviewable-pr-descriptions/references/review-atlas-extension.json",
+        "skills/writing-reviewable-pr-descriptions/review-atlas-reference-design.md"
+      ],
+      "scripts": [
+        "skills/writing-reviewable-pr-descriptions/scripts/validate_change_navigation.py"
+      ],
+      "modules": [
+        "skills/writing-reviewable-pr-descriptions/scripts/change_navigation/__init__.py",
+        "skills/writing-reviewable-pr-descriptions/scripts/change_navigation/badge_colors.py",
+        "skills/writing-reviewable-pr-descriptions/scripts/change_navigation/badge_links.py",
+        "skills/writing-reviewable-pr-descriptions/scripts/change_navigation/badge_presentation.py",
+        "skills/writing-reviewable-pr-descriptions/scripts/change_navigation/badge_wrappers.py",
+        "skills/writing-reviewable-pr-descriptions/scripts/change_navigation/badges.py",
+        "skills/writing-reviewable-pr-descriptions/scripts/change_navigation/categories.py",
+        "skills/writing-reviewable-pr-descriptions/scripts/change_navigation/diff.py",
+        "skills/writing-reviewable-pr-descriptions/scripts/change_navigation/diff_files.py",
+        "skills/writing-reviewable-pr-descriptions/scripts/change_navigation/diff_metrics.py",
+        "skills/writing-reviewable-pr-descriptions/scripts/change_navigation/html.py",
+        "skills/writing-reviewable-pr-descriptions/scripts/change_navigation/git_observer.py",
+        "skills/writing-reviewable-pr-descriptions/scripts/change_navigation/metrics.py",
+        "skills/writing-reviewable-pr-descriptions/scripts/change_navigation/model.py",
+        "skills/writing-reviewable-pr-descriptions/scripts/change_navigation/parsing.py",
+        "skills/writing-reviewable-pr-descriptions/scripts/change_navigation/review_input.py",
+        "skills/writing-reviewable-pr-descriptions/scripts/change_navigation/sensitive_content.py",
+        "skills/writing-reviewable-pr-descriptions/scripts/change_navigation/stack.py",
+        "skills/writing-reviewable-pr-descriptions/scripts/change_navigation/stack_inventory.py",
+        "skills/writing-reviewable-pr-descriptions/scripts/change_navigation/types.py",
+        "skills/writing-reviewable-pr-descriptions/scripts/change_navigation/urls.py"
+      ],
+      "calls": ["operation:review-loop"],
+      "conditional_calls": {},
+      "operations": ["pr-content"],
+      "contract": {
+        "trigger": "canonical-pr-title-or-body-request",
+        "modes": ["content-only"],
+        "authority": "candidate PR title and body bytes only",
+        "inputs": [
+          "exact-base-head-diff",
+          "current-pr-text",
+          "repository-policy"
+        ],
+        "outputs": [
+          "validated-title-body",
+          "authorized-text-surface",
+          "review-input-manifest"
+        ],
+        "forbidden_reverse_calls": [
+          "publishing-reviewable-prs",
+          "graphite",
+          "getting-prs-ready-for-review",
+          "getting-prs-merged",
+          "stacking-pr-fixups"
+        ],
+        "loop_owner": "tricritical:loop",
+        "terminal_statuses": ["validated", "blocked"]
+      }
+    },
+    {
+      "name": "publishing-reviewable-prs",
+      "entrypoint": "skills/publishing-reviewable-prs/SKILL.md",
+      "interface": "skills/publishing-reviewable-prs/agents/openai.yaml",
+      "references": [],
+      "scripts": [
+        "skills/publishing-reviewable-prs/scripts/audit_reviewable_pr.py",
+        "skills/publishing-reviewable-prs/scripts/create_reviewable_pr.py",
+        "skills/publishing-reviewable-prs/scripts/reviewable_pr_state.py",
+        "skills/publishing-reviewable-prs/scripts/update_reviewable_pr.py"
+      ],
+      "modules": [
+        "skills/publishing-reviewable-prs/scripts/publication_receipts.py"
+      ],
+      "calls": ["operation:pr-content"],
+      "conditional_calls": {},
+      "operations": [
+        "pr-creation",
+        "pr-text-read",
+        "pr-text-write",
+        "pr-readiness-read",
+        "pr-readiness-write",
+        "publication-evidence",
+        "publication-audit",
+        "publication-reconciliation"
+      ],
+      "contract": {
+        "trigger": "authorized-pr-publication-operation",
+        "modes": ["create", "update", "ready", "audit", "reconcile"],
+        "authority": "exact requested forge mutation or read-only audit",
+        "inputs": [
+          "bound-repository-pr-base-head",
+          "validated-title-body",
+          "expected-preimage",
+          "publication-authority"
+        ],
+        "outputs": ["verified-publication-receipt", "authoritative-audit"],
+        "forbidden_reverse_calls": [
+          "graphite",
+          "resuming-reviewed-prs",
+          "getting-prs-ready-for-review",
+          "getting-prs-merged",
+          "stacking-pr-fixups"
+        ],
+        "loop_owner": null,
+        "terminal_statuses": [
+          "verified",
+          "no-op",
+          "reconciled",
+          "blocked",
+          "ambiguous"
+        ]
+      }
+    },
+    {
+      "name": "graphite",
+      "entrypoint": "skills/graphite/SKILL.md",
+      "interface": "skills/graphite/agents/openai.yaml",
+      "references": [],
+      "scripts": ["skills/graphite/scripts/submit_draft_stack.py"],
+      "modules": [],
+      "calls": [
+        "operation:pr-text-write",
+        "operation:pr-readiness-write",
+        "operation:publication-audit",
+        "operation:publication-reconciliation",
+        "operation:git-ref-push"
+      ],
+      "conditional_calls": {},
+      "operations": ["graphite-topology", "graphite-transport"],
+      "contract": {
+        "trigger": "graphite-stack-transport-request",
+        "modes": [
+          "create",
+          "track",
+          "navigate",
+          "reparent",
+          "metadata-repair",
+          "diagnose",
+          "restack",
+          "submit-draft"
+        ],
+        "authority": "bound Graphite stack topology and intended draft transport",
+        "inputs": [
+          "tracked-stack",
+          "exact-branch-heads",
+          "transport-authority"
+        ],
+        "outputs": ["verified-stack-transport", "publication-handoff"],
+        "forbidden_reverse_calls": [
+          "resuming-reviewed-prs",
+          "getting-prs-ready-for-review",
+          "getting-prs-merged",
+          "stacking-pr-fixups"
+        ],
+        "loop_owner": null,
+        "terminal_statuses": ["verified", "blocked", "ambiguous"]
+      }
+    },
+    {
+      "name": "addressing-pr-review-feedback",
+      "entrypoint": "skills/addressing-pr-review-feedback/SKILL.md",
+      "interface": "skills/addressing-pr-review-feedback/agents/openai.yaml",
+      "references": [
+        "skills/addressing-pr-review-feedback/references/feedback-flow.md"
+      ],
+      "scripts": [
+        "skills/addressing-pr-review-feedback/scripts/review_feedback_state.py"
+      ],
+      "modules": [],
+      "calls": [
+        "operation:feedback-acquisition",
+        "operation:feedback-interaction",
+        "operation:finding-adjudication",
+        "operation:source-revision",
+        "operation:git-ref-push"
+      ],
+      "conditional_calls": {},
+      "operations": ["feedback-outcome"],
+      "contract": {
+        "trigger": "pr-feedback-snapshot-or-address-request",
+        "modes": ["snapshot", "address"],
+        "authority": "read-only snapshot or separately authorized finding revisions and interactions",
+        "inputs": [
+          "bound-repository-pr-head",
+          "complete-feedback-pages",
+          "revision-authority",
+          "interaction-authority"
+        ],
+        "outputs": [
+          "complete-feedback-snapshot",
+          "finding-dispositions",
+          "verified-feedback-outcome"
+        ],
+        "forbidden_reverse_calls": [
+          "resuming-reviewed-prs",
+          "getting-prs-merged"
+        ],
+        "loop_owner": null,
+        "terminal_statuses": ["snapshot", "addressed", "blocked"]
+      }
+    },
+    {
+      "name": "interacting-with-pr-review-feedback",
+      "entrypoint": "skills/interacting-with-pr-review-feedback/SKILL.md",
+      "interface": "skills/interacting-with-pr-review-feedback/agents/openai.yaml",
+      "references": [
+        "skills/interacting-with-pr-review-feedback/references/interaction-authority.md"
+      ],
+      "scripts": [],
+      "modules": [],
+      "calls": [],
+      "conditional_calls": {},
+      "operations": ["feedback-interaction"],
+      "contract": {
+        "trigger": "authorized-single-feedback-interaction",
+        "modes": ["reply", "react", "resolve"],
+        "authority": "exact selected feedback leaf and verified reviewer identity",
+        "inputs": [
+          "bound-repository-pr-head",
+          "selected-feedback-leaf",
+          "interaction-authority"
+        ],
+        "outputs": ["verified-feedback-interaction"],
+        "forbidden_reverse_calls": [
+          "addressing-pr-review-feedback",
+          "resuming-reviewed-prs",
+          "getting-prs-merged"
+        ],
+        "loop_owner": null,
+        "terminal_statuses": ["verified", "blocked", "ambiguous"]
+      }
+    },
+    {
+      "name": "resuming-reviewed-prs",
+      "entrypoint": "skills/resuming-reviewed-prs/SKILL.md",
+      "interface": "skills/resuming-reviewed-prs/agents/openai.yaml",
+      "references": [],
+      "scripts": [],
+      "modules": [],
+      "calls": ["operation:publication-audit"],
+      "conditional_calls": {},
+      "operations": [],
+      "contract": {
+        "trigger": "stale-reviewed-pr-resume-request",
+        "modes": ["recover-and-route", "status-only"],
+        "authority": "read current state, report status, or route to exactly one lifecycle owner",
+        "inputs": ["repository-hint", "pr-or-branch-hint", "current-authority"],
+        "outputs": [
+          "bound-target",
+          "read-only-status-report",
+          "next-owner-handoff"
+        ],
+        "forbidden_reverse_calls": [],
+        "loop_owner": null,
+        "terminal_handoffs": [
+          {
+            "trigger": "active-git-conflict-operation",
+            "owner": "versionkeeping:resolving-merge-conflicts",
+            "resume": "fresh-resuming-reviewed-prs-invocation-after-conflict-outcome"
+          },
+          {
+            "trigger": "failed-required-github-actions",
+            "owner": "operation:focused-ci",
+            "resume": "fresh-resuming-reviewed-prs-invocation-after-focused-ci-outcome"
+          },
+          {
+            "trigger": "explicit-merge-ship-or-merge-closeout-outcome",
+            "owner": "getting-prs-merged",
+            "resume": "fresh-getting-prs-merged-invocation-from-live-state"
+          },
+          {
+            "trigger": "live-actionable-feedback-or-requested-changes",
+            "owner": "addressing-pr-review-feedback",
+            "resume": "fresh-addressing-pr-review-feedback-invocation-from-live-state"
+          },
+          {
+            "trigger": "draft-or-readiness-only-outcome",
+            "owner": "getting-prs-ready-for-review",
+            "resume": "fresh-getting-prs-ready-for-review-invocation-from-live-state"
+          }
+        ],
+        "terminal_statuses": ["routed", "reported", "blocked"]
+      }
+    },
+    {
+      "name": "getting-prs-ready-for-review",
+      "entrypoint": "skills/getting-prs-ready-for-review/SKILL.md",
+      "interface": "skills/getting-prs-ready-for-review/agents/openai.yaml",
+      "references": [],
+      "scripts": [],
+      "modules": [],
+      "calls": [
+        "operation:pr-content",
+        "operation:pr-creation",
+        "operation:pr-text-write",
+        "operation:pr-readiness-write",
+        "operation:publication-audit",
+        "operation:git-ref-push"
+      ],
+      "conditional_calls": {},
+      "operations": ["readiness-outcome"],
+      "contract": {
+        "trigger": "pr-review-readiness-request",
+        "modes": ["prepare", "ready"],
+        "authority": "readiness-only coordination and separately authorized ready mutation",
+        "inputs": [
+          "bound-repository-pr-head",
+          "local-validation",
+          "current-pr-state",
+          "readiness-authority"
+        ],
+        "outputs": ["verified-readiness-outcome"],
+        "forbidden_reverse_calls": [
+          "resuming-reviewed-prs",
+          "getting-prs-merged"
+        ],
+        "loop_owner": null,
+        "terminal_statuses": ["ready", "blocked", "ambiguous"]
+      }
+    },
+    {
+      "name": "getting-prs-merged",
+      "entrypoint": "skills/getting-prs-merged/SKILL.md",
+      "interface": "skills/getting-prs-merged/agents/openai.yaml",
+      "references": [
+        "skills/getting-prs-merged/references/gh-fix-ci-adapter.md",
+        "skills/getting-prs-merged/references/merge-actuator.md"
+      ],
+      "scripts": [
+        "skills/getting-prs-merged/scripts/post_coderabbit_comment.py"
+      ],
+      "modules": [],
+      "calls": [
+        "operation:publication-audit",
+        "operation:feedback-acquisition",
+        "operation:check-inspection",
+        "operation:focused-ci",
+        "operation:merge-inspection",
+        "operation:merge-actuation",
+        "operation:coderabbit-top-level-comment"
+      ],
+      "conditional_calls": {},
+      "operations": ["merge-outcome"],
+      "contract": {
+        "trigger": "explicit-pr-merge-outcome-request",
+        "modes": ["closeout"],
+        "authority": "merge-outcome coordination with separately bound leaf authorities",
+        "inputs": [
+          "bound-repository-pr-base-head",
+          "repository-policy",
+          "complete-feedback",
+          "checks-approvals-mergeability",
+          "merge-method-authority"
+        ],
+        "outputs": [
+          "verified-merge-receipt",
+          "feedback-handoff",
+          "cleanup-handoff",
+          "deployment-handoff"
+        ],
+        "forbidden_reverse_calls": ["resuming-reviewed-prs"],
+        "loop_owner": null,
+        "terminal_handoffs": [
+          {
+            "trigger": "pr-absent-or-not-review-ready",
+            "owner": "getting-prs-ready-for-review",
+            "resume": "fresh-getting-prs-merged-invocation-after-readiness"
+          },
+          {
+            "trigger": "current-actionable-feedback-or-requested-changes",
+            "owner": "addressing-pr-review-feedback",
+            "resume": "fresh-getting-prs-merged-invocation-after-feedback-outcome"
+          },
+          {
+            "trigger": "operator-or-policy-required-fresh-review-and-revise",
+            "owner": "tricritical:loop",
+            "resume": "fresh-getting-prs-merged-invocation-after-clean"
+          },
+          {
+            "trigger": "verified-merge-and-authorized-remote-ref-deletion",
+            "owner": "operation:remote-ref-deletion",
+            "resume": "caller-consumes-terminal-cleanup-outcome-from-live-state"
+          }
+        ],
+        "terminal_statuses": [
+          "merged",
+          "cleanup-handoff",
+          "feedback-handoff",
+          "readiness-handoff",
+          "blocked",
+          "ambiguous"
+        ]
+      }
+    },
+    {
+      "name": "stacking-pr-fixups",
+      "entrypoint": "skills/stacking-pr-fixups/SKILL.md",
+      "interface": "skills/stacking-pr-fixups/agents/openai.yaml",
+      "references": [],
+      "scripts": [],
+      "modules": [],
+      "calls": [
+        "operation:pr-content",
+        "operation:pr-creation",
+        "operation:pr-text-write",
+        "operation:pr-readiness-write",
+        "operation:publication-audit",
+        "operation:graphite-topology",
+        "operation:graphite-transport",
+        "operation:git-ref-push"
+      ],
+      "conditional_calls": {},
+      "operations": ["stack-fixup"],
+      "contract": {
+        "trigger": "narrow-stacked-fixup-request",
+        "modes": ["prepare-fixup", "publish-stack"],
+        "authority": "task-owned fixup paths and intended stack only",
+        "inputs": [
+          "bound-stack",
+          "accepted-fix-scope",
+          "publication-authority"
+        ],
+        "outputs": ["verified-fixup-stack", "publication-receipts"],
+        "forbidden_reverse_calls": [],
+        "loop_owner": null,
+        "terminal_statuses": ["verified", "blocked", "ambiguous"]
+      }
+    }
+  ],
+  "operations": [
+    {
+      "semantic_id": "pr-content",
+      "github_aliases": [],
+      "surface": "workflow",
+      "owner": "writing-reviewable-pr-descriptions",
+      "implementation": "skills/writing-reviewable-pr-descriptions/SKILL.md",
+      "import": null,
+      "access": "coordinate",
+      "authority": "candidate PR title and body bytes only",
+      "callers": [
+        "getting-prs-ready-for-review",
+        "publishing-reviewable-prs",
+        "stacking-pr-fixups",
+        "writing-reviewable-pr-descriptions"
+      ],
+      "disposition": "public-skill"
+    },
+    {
+      "semantic_id": "pr-creation",
+      "github_aliases": ["pr-create"],
+      "surface": "github",
+      "owner": "publishing-reviewable-prs",
+      "implementation": "skills/publishing-reviewable-prs/SKILL.md",
+      "import": null,
+      "access": "write",
+      "authority": "exact repository, base, qualified head, head repository, and draft PR creation",
+      "callers": [
+        "getting-prs-ready-for-review",
+        "publishing-reviewable-prs",
+        "stacking-pr-fixups"
+      ],
+      "disposition": "public-skill"
+    },
+    {
+      "semantic_id": "pr-text-read",
+      "github_aliases": ["pr-text-read"],
+      "surface": "github",
+      "owner": "publishing-reviewable-prs",
+      "implementation": "skills/publishing-reviewable-prs/SKILL.md",
+      "import": null,
+      "access": "read",
+      "authority": "bound repository and PR identity for exact title and body acquisition",
+      "callers": ["publishing-reviewable-prs"],
+      "disposition": "public-skill"
+    },
+    {
+      "semantic_id": "pr-text-write",
+      "github_aliases": ["pr-text-write"],
+      "surface": "github",
+      "owner": "publishing-reviewable-prs",
+      "implementation": "skills/publishing-reviewable-prs/SKILL.md",
+      "import": null,
+      "access": "write",
+      "authority": "exact repository, PR, title and body preimage, candidate bytes, and authorized text surface",
+      "callers": [
+        "getting-prs-ready-for-review",
+        "graphite",
+        "publishing-reviewable-prs",
+        "stacking-pr-fixups"
+      ],
+      "disposition": "public-skill"
+    },
+    {
+      "semantic_id": "pr-readiness-read",
+      "github_aliases": ["pr-readiness-read"],
+      "surface": "github",
+      "owner": "publishing-reviewable-prs",
+      "implementation": "skills/publishing-reviewable-prs/SKILL.md",
+      "import": null,
+      "access": "read",
+      "authority": "bound repository and PR identity for exact draft or ready state acquisition",
+      "callers": ["publishing-reviewable-prs"],
+      "disposition": "public-skill"
+    },
+    {
+      "semantic_id": "pr-readiness-write",
+      "github_aliases": ["pr-readiness-write"],
+      "surface": "github",
+      "owner": "publishing-reviewable-prs",
+      "implementation": "skills/publishing-reviewable-prs/SKILL.md",
+      "import": null,
+      "access": "write",
+      "authority": "exact repository, PR, head, draft preimage, readiness gates, and mark-ready authority",
+      "callers": [
+        "getting-prs-ready-for-review",
+        "graphite",
+        "publishing-reviewable-prs",
+        "stacking-pr-fixups"
+      ],
+      "disposition": "public-skill"
+    },
+    {
+      "semantic_id": "publication-evidence",
+      "github_aliases": [],
+      "surface": "workflow",
+      "owner": "publishing-reviewable-prs",
+      "implementation": "skills/publishing-reviewable-prs/SKILL.md",
+      "import": null,
+      "access": "coordinate",
+      "authority": "exact requested forge mutation or read-only audit",
+      "callers": ["publishing-reviewable-prs"],
+      "disposition": "public-skill"
+    },
+    {
+      "semantic_id": "publication-audit",
+      "github_aliases": [],
+      "surface": "workflow",
+      "owner": "publishing-reviewable-prs",
+      "implementation": "skills/publishing-reviewable-prs/SKILL.md",
+      "import": null,
+      "access": "read",
+      "authority": "bound repository, PR, base, head, text, readiness, and authoritative receipt identity",
+      "callers": [
+        "getting-prs-merged",
+        "getting-prs-ready-for-review",
+        "graphite",
+        "publishing-reviewable-prs",
+        "resuming-reviewed-prs",
+        "stacking-pr-fixups"
+      ],
+      "disposition": "public-skill"
+    },
+    {
+      "semantic_id": "publication-reconciliation",
+      "github_aliases": [],
+      "surface": "workflow",
+      "owner": "publishing-reviewable-prs",
+      "implementation": "skills/publishing-reviewable-prs/SKILL.md",
+      "import": null,
+      "access": "coordinate",
+      "authority": "exact requested forge mutation or read-only audit",
+      "callers": ["graphite", "publishing-reviewable-prs"],
+      "disposition": "public-skill"
+    },
+    {
+      "semantic_id": "graphite-topology",
+      "github_aliases": [],
+      "surface": "workflow",
+      "owner": "graphite",
+      "implementation": "skills/graphite/SKILL.md",
+      "import": null,
+      "access": "coordinate",
+      "authority": "bound Graphite stack identity, ancestry, topology, and authorized topology operation",
+      "callers": ["graphite", "stacking-pr-fixups"],
+      "disposition": "public-skill"
+    },
+    {
+      "semantic_id": "graphite-transport",
+      "github_aliases": [],
+      "surface": "workflow",
+      "owner": "graphite",
+      "implementation": "skills/graphite/SKILL.md",
+      "import": null,
+      "access": "coordinate",
+      "authority": "bound Graphite stack topology and intended draft transport",
+      "callers": ["graphite", "stacking-pr-fixups"],
+      "disposition": "public-skill"
+    },
+    {
+      "semantic_id": "feedback-acquisition",
+      "github_aliases": ["review-comment-read"],
+      "surface": "github",
+      "owner": "internal:feedback-state-acquisition",
+      "implementation": "skills/addressing-pr-review-feedback/scripts/review_feedback_state.py",
+      "import": null,
+      "access": "read",
+      "authority": "separately bound authority for feedback-acquisition",
+      "callers": ["addressing-pr-review-feedback", "getting-prs-merged"],
+      "disposition": "internal-helper"
+    },
+    {
+      "semantic_id": "feedback-outcome",
+      "github_aliases": [],
+      "surface": "workflow",
+      "owner": "addressing-pr-review-feedback",
+      "implementation": "skills/addressing-pr-review-feedback/SKILL.md",
+      "import": null,
+      "access": "coordinate",
+      "authority": "read-only snapshot or separately authorized finding revisions and interactions",
+      "callers": ["addressing-pr-review-feedback"],
+      "disposition": "public-skill"
+    },
+    {
+      "semantic_id": "feedback-interaction",
+      "github_aliases": [
+        "reactions-write",
+        "review-reply-write",
+        "review-thread-resolution"
+      ],
+      "surface": "github",
+      "owner": "interacting-with-pr-review-feedback",
+      "implementation": "skills/interacting-with-pr-review-feedback/SKILL.md",
+      "import": null,
+      "access": "write",
+      "authority": "exact selected feedback leaf and verified reviewer identity",
+      "callers": [
+        "addressing-pr-review-feedback",
+        "interacting-with-pr-review-feedback"
+      ],
+      "disposition": "public-skill"
+    },
+    {
+      "semantic_id": "readiness-outcome",
+      "github_aliases": [],
+      "surface": "workflow",
+      "owner": "getting-prs-ready-for-review",
+      "implementation": "skills/getting-prs-ready-for-review/SKILL.md",
+      "import": null,
+      "access": "coordinate",
+      "authority": "readiness-only coordination and separately authorized ready mutation",
+      "callers": ["getting-prs-ready-for-review"],
+      "disposition": "public-skill"
+    },
+    {
+      "semantic_id": "check-inspection",
+      "github_aliases": ["check-inspection"],
+      "surface": "github",
+      "owner": "internal:gh-fix-ci-adapter",
+      "implementation": "skills/getting-prs-merged/references/gh-fix-ci-adapter.md",
+      "import": null,
+      "access": "read",
+      "authority": "bound repository, PR, head, required GitHub Actions run, job, and annotations",
+      "callers": ["getting-prs-merged"],
+      "disposition": "internal-helper"
+    },
+    {
+      "semantic_id": "focused-ci",
+      "github_aliases": ["check-rerun"],
+      "surface": "github",
+      "owner": "internal:gh-fix-ci-adapter",
+      "implementation": "skills/getting-prs-merged/references/gh-fix-ci-adapter.md",
+      "import": null,
+      "access": "write",
+      "authority": "exact failed GitHub Actions target and separately authorized scoped rerun or repair",
+      "callers": ["getting-prs-merged"],
+      "disposition": "internal-helper"
+    },
+    {
+      "semantic_id": "merge-inspection",
+      "github_aliases": ["merge-inspection"],
+      "surface": "github",
+      "owner": "internal:merge-actuator",
+      "implementation": "skills/getting-prs-merged/references/merge-actuator.md",
+      "import": null,
+      "access": "read",
+      "authority": "bound repository, PR, base, head, mergeability, and repository merge policy",
+      "callers": ["getting-prs-merged"],
+      "disposition": "internal-helper"
+    },
+    {
+      "semantic_id": "merge-actuation",
+      "github_aliases": ["merge-write"],
+      "surface": "github",
+      "owner": "internal:merge-actuator",
+      "implementation": "skills/getting-prs-merged/references/merge-actuator.md",
+      "import": null,
+      "access": "write",
+      "authority": "exact repository, PR, base, head, merge method, passed gates, and merge authority",
+      "callers": ["getting-prs-merged"],
+      "disposition": "internal-helper"
+    },
+    {
+      "semantic_id": "coderabbit-top-level-comment",
+      "github_aliases": ["bot-review-request", "top-level-comment-write"],
+      "surface": "github",
+      "owner": "internal:coderabbit-top-level-comment",
+      "implementation": "skills/getting-prs-merged/scripts/post_coderabbit_comment.py",
+      "import": null,
+      "access": "write",
+      "authority": "separately bound authority for coderabbit-top-level-comment",
+      "callers": ["getting-prs-merged"],
+      "disposition": "internal-helper"
+    },
+    {
+      "semantic_id": "merge-outcome",
+      "github_aliases": [],
+      "surface": "workflow",
+      "owner": "getting-prs-merged",
+      "implementation": "skills/getting-prs-merged/SKILL.md",
+      "import": null,
+      "access": "coordinate",
+      "authority": "merge-outcome coordination with separately bound leaf authorities",
+      "callers": ["getting-prs-merged"],
+      "disposition": "public-skill"
+    },
+    {
+      "semantic_id": "stack-fixup",
+      "github_aliases": [],
+      "surface": "workflow",
+      "owner": "stacking-pr-fixups",
+      "implementation": "skills/stacking-pr-fixups/SKILL.md",
+      "import": null,
+      "access": "coordinate",
+      "authority": "task-owned fixup paths and intended stack only",
+      "callers": ["stacking-pr-fixups"],
+      "disposition": "public-skill"
+    },
+    {
+      "semantic_id": "conflict-resolution",
+      "github_aliases": [],
+      "surface": "workflow",
+      "owner": "versionkeeping:resolving-merge-conflicts",
+      "implementation": null,
+      "import": "versionkeeping:resolving-merge-conflicts",
+      "access": "write",
+      "authority": "authority defined by imported owner versionkeeping:resolving-merge-conflicts",
+      "callers": [],
+      "disposition": "imported-operation"
+    },
+    {
+      "semantic_id": "git-ref-push",
+      "github_aliases": [],
+      "surface": "git",
+      "owner": "versionkeeping:checkpointing-and-publishing-git-work",
+      "implementation": null,
+      "import": "versionkeeping:checkpointing-and-publishing-git-work",
+      "access": "write",
+      "authority": "authority defined by imported owner versionkeeping:checkpointing-and-publishing-git-work",
+      "callers": [
+        "addressing-pr-review-feedback",
+        "getting-prs-ready-for-review",
+        "graphite",
+        "stacking-pr-fixups"
+      ],
+      "disposition": "imported-operation"
+    },
+    {
+      "semantic_id": "finding-adjudication",
+      "github_aliases": [],
+      "surface": "workflow",
+      "owner": "tricritical:adjudicate",
+      "implementation": null,
+      "import": "tricritical:adjudicate",
+      "access": "coordinate",
+      "authority": "authority defined by imported owner tricritical:adjudicate",
+      "callers": ["addressing-pr-review-feedback"],
+      "disposition": "imported-operation"
+    },
+    {
+      "semantic_id": "source-revision",
+      "github_aliases": [],
+      "surface": "workflow",
+      "owner": "tricritical:revise",
+      "implementation": null,
+      "import": "tricritical:revise",
+      "access": "write",
+      "authority": "authority defined by imported owner tricritical:revise",
+      "callers": ["addressing-pr-review-feedback"],
+      "disposition": "imported-operation"
+    },
+    {
+      "semantic_id": "review-loop",
+      "github_aliases": [],
+      "surface": "workflow",
+      "owner": "tricritical:loop",
+      "implementation": null,
+      "import": "tricritical:loop",
+      "access": "coordinate",
+      "authority": "authority defined by imported owner tricritical:loop",
+      "callers": ["writing-reviewable-pr-descriptions"],
+      "disposition": "imported-operation"
+    },
+    {
+      "semantic_id": "remote-ref-deletion",
+      "github_aliases": [],
+      "surface": "git",
+      "owner": "versionkeeping:checkpointing-and-publishing-git-work",
+      "implementation": null,
+      "import": "versionkeeping:checkpointing-and-publishing-git-work",
+      "access": "write",
+      "authority": "exact remote endpoint and full ref deletion authority",
+      "callers": [],
+      "disposition": "imported-operation"
+    },
+    {
+      "semantic_id": "github:repository-orientation",
+      "github_aliases": ["repository-orientation"],
+      "surface": "github",
+      "owner": "internal:github-read",
+      "implementation": "ordinary operation-specific GitHub read tool",
+      "import": null,
+      "access": "read",
+      "authority": "bound repository identity",
+      "callers": [],
+      "disposition": "ordinary-tool"
+    },
+    {
+      "semantic_id": "github:pr-orientation",
+      "github_aliases": ["pr-orientation"],
+      "surface": "github",
+      "owner": "internal:github-read",
+      "implementation": "ordinary operation-specific GitHub read tool",
+      "import": null,
+      "access": "read",
+      "authority": "bound repository and PR identity",
+      "callers": [],
+      "disposition": "ordinary-tool"
+    },
+    {
+      "semantic_id": "github:issue-orientation",
+      "github_aliases": ["issue-orientation"],
+      "surface": "github",
+      "owner": "internal:github-read",
+      "implementation": "ordinary operation-specific GitHub read tool",
+      "import": null,
+      "access": "read",
+      "authority": "bound repository and issue identity",
+      "callers": [],
+      "disposition": "ordinary-tool"
+    },
+    {
+      "semantic_id": "github:repository-summary",
+      "github_aliases": ["repository-summary"],
+      "surface": "github",
+      "owner": "internal:github-read",
+      "implementation": "ordinary operation-specific GitHub read tool",
+      "import": null,
+      "access": "read",
+      "authority": "bound repository identity",
+      "callers": [],
+      "disposition": "ordinary-tool"
+    },
+    {
+      "semantic_id": "github:pr-summary",
+      "github_aliases": ["pr-summary"],
+      "surface": "github",
+      "owner": "internal:github-read",
+      "implementation": "ordinary operation-specific GitHub read tool",
+      "import": null,
+      "access": "read",
+      "authority": "bound repository and PR identity",
+      "callers": [],
+      "disposition": "ordinary-tool"
+    },
+    {
+      "semantic_id": "github:issue-summary",
+      "github_aliases": ["issue-summary"],
+      "surface": "github",
+      "owner": "internal:github-read",
+      "implementation": "ordinary operation-specific GitHub read tool",
+      "import": null,
+      "access": "read",
+      "authority": "bound repository and issue identity",
+      "callers": [],
+      "disposition": "ordinary-tool"
+    },
+    {
+      "semantic_id": "github:patch-inspection",
+      "github_aliases": ["patch-inspection"],
+      "surface": "github",
+      "owner": "internal:github-read",
+      "implementation": "ordinary operation-specific GitHub read tool",
+      "import": null,
+      "access": "read",
+      "authority": "bound repository and base/head identity",
+      "callers": [],
+      "disposition": "ordinary-tool"
+    },
+    {
+      "semantic_id": "github:top-level-comment-read",
+      "github_aliases": ["top-level-comment-read"],
+      "surface": "github",
+      "owner": "internal:github-read",
+      "implementation": "ordinary operation-specific GitHub read tool",
+      "import": null,
+      "access": "read",
+      "authority": "bound repository and PR or issue identity",
+      "callers": [],
+      "disposition": "ordinary-tool"
+    },
+    {
+      "semantic_id": "github:labels-read",
+      "github_aliases": ["labels-read"],
+      "surface": "github",
+      "owner": "internal:github-read",
+      "implementation": "ordinary operation-specific GitHub read tool",
+      "import": null,
+      "access": "read",
+      "authority": "bound repository target identity",
+      "callers": [],
+      "disposition": "ordinary-tool"
+    },
+    {
+      "semantic_id": "github:labels-write",
+      "github_aliases": ["labels-write"],
+      "surface": "github",
+      "owner": "internal:github-label-write",
+      "implementation": "ordinary operation-specific GitHub label actuator",
+      "import": null,
+      "access": "write",
+      "authority": "exact target and label set",
+      "callers": [],
+      "disposition": "ordinary-tool"
+    },
+    {
+      "semantic_id": "github:reactions-read",
+      "github_aliases": ["reactions-read"],
+      "surface": "github",
+      "owner": "internal:github-read",
+      "implementation": "ordinary operation-specific GitHub read tool",
+      "import": null,
+      "access": "read",
+      "authority": "bound feedback or comment identity",
+      "callers": [],
+      "disposition": "ordinary-tool"
+    },
+    {
+      "semantic_id": "github:review-submit-comment",
+      "github_aliases": ["review-submit-comment"],
+      "surface": "github",
+      "owner": "internal:github-review-submit",
+      "implementation": "ordinary operation-specific GitHub review actuator",
+      "import": null,
+      "access": "write",
+      "authority": "bound PR head and exact review body",
+      "callers": [],
+      "disposition": "ordinary-tool"
+    },
+    {
+      "semantic_id": "github:review-submit-approve",
+      "github_aliases": ["review-submit-approve"],
+      "surface": "github",
+      "owner": "internal:github-review-submit",
+      "implementation": "ordinary operation-specific GitHub review actuator",
+      "import": null,
+      "access": "write",
+      "authority": "bound PR head and explicit approval authority",
+      "callers": [],
+      "disposition": "ordinary-tool"
+    },
+    {
+      "semantic_id": "github:review-submit-request-changes",
+      "github_aliases": ["review-submit-request-changes"],
+      "surface": "github",
+      "owner": "internal:github-review-submit",
+      "implementation": "ordinary operation-specific GitHub review actuator",
+      "import": null,
+      "access": "write",
+      "authority": "bound PR head and explicit request-changes authority",
+      "callers": [],
+      "disposition": "ordinary-tool"
+    }
+  ]
+}

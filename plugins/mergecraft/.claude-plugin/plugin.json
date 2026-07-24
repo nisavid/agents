@@ -1,0 +1,21 @@
+{
+  "name": "mergecraft",
+  "displayName": "Mergecraft",
+  "version": "1.0.0+claude.20260720145300",
+  "description": "Mergecraft: pull-request authoring, publication, Graphite transport, feedback, readiness, merge, and stack repair.",
+  "author": {
+    "name": "Ivan D Vasin",
+    "url": "https://github.com/nisavid"
+  },
+  "homepage": "https://github.com/nisavid/agents/tree/main/plugins/mergecraft",
+  "repository": "https://github.com/nisavid/agents",
+  "license": "MIT",
+  "keywords": [
+    "pull-request",
+    "github",
+    "graphite",
+    "feedback",
+    "merge",
+    "stack"
+  ]
+}

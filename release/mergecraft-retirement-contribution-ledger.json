@@ -1,0 +1,130 @@
+{
+  "schema_version": 2,
+  "purpose": "comparative-retirement-evidence",
+  "scope": {
+    "retired_upstream_skills": [
+      "github",
+      "yeet",
+      "gh-address-comments"
+    ],
+    "retained_upstream_specialist": "github:gh-fix-ci"
+  },
+  "limitations": "This ledger records reviewed contribution decisions and comparative evaluation bindings; it is not a runtime router or exhaustive route-enforcement claim.",
+  "fixture_manifest": "evals/mergecraft/retirement-fixtures.json",
+  "fixtures": [
+    "cold-repository-pr-orientation-summary",
+    "unresolved-thread-acquisition-and-response-only",
+    "mixed-worktree-checkpoint-push-and-draft-publication",
+    "direct-connector-and-fill-collision-refusal",
+    "gh-fix-ci-actions-only-updateability"
+  ],
+  "contributions": [
+    {
+      "id": "github-cold-repository-orientation",
+      "source_skill": "github",
+      "contribution": "cold repository orientation",
+      "disposition": "ordinary-tool",
+      "destination_owner": "ordinary-github-read-tools",
+      "fixture": "cold-repository-pr-orientation-summary",
+      "topology_operations": [
+        "github:repository-orientation",
+        "github:pr-orientation"
+      ]
+    },
+    {
+      "id": "github-pr-summary",
+      "source_skill": "github",
+      "contribution": "pull request summary",
+      "disposition": "ordinary-tool",
+      "destination_owner": "ordinary-github-read-tools",
+      "fixture": "cold-repository-pr-orientation-summary",
+      "topology_operations": [
+        "github:repository-summary",
+        "github:pr-summary"
+      ]
+    },
+    {
+      "id": "github-direct-connector-pr-create",
+      "source_skill": "github",
+      "contribution": "direct connector pull request creation",
+      "disposition": "discard-with-reason",
+      "destination_owner": "publishing-reviewable-prs",
+      "fixture": "direct-connector-and-fill-collision-refusal",
+      "topology_operations": [
+        "pr-creation"
+      ],
+      "reason": "The bound publisher owns pull request mutation and refuses unbound direct creation."
+    },
+    {
+      "id": "github-gh-fix-ci-authority",
+      "source_skill": "github",
+      "contribution": "GitHub Actions failure diagnosis and repair",
+      "disposition": "retain",
+      "destination_owner": "github:gh-fix-ci",
+      "fixture": "gh-fix-ci-actions-only-updateability",
+      "topology_operations": [
+        "check-inspection",
+        "focused-ci"
+      ]
+    },
+    {
+      "id": "yeet-mixed-worktree-checkpoint-and-push",
+      "source_skill": "yeet",
+      "contribution": "mixed-worktree checkpoint and push",
+      "disposition": "absorb",
+      "destination_owner": "versionkeeping:checkpointing-and-publishing-git-work",
+      "fixture": "mixed-worktree-checkpoint-push-and-draft-publication",
+      "topology_operations": [
+        "git-ref-push"
+      ]
+    },
+    {
+      "id": "yeet-draft-publication",
+      "source_skill": "yeet",
+      "contribution": "draft pull request publication",
+      "disposition": "absorb",
+      "destination_owner": "getting-prs-ready-for-review",
+      "fixture": "mixed-worktree-checkpoint-push-and-draft-publication",
+      "topology_operations": [
+        "pr-creation",
+        "pr-text-write",
+        "pr-readiness-write"
+      ]
+    },
+    {
+      "id": "yeet-fill-create",
+      "source_skill": "yeet",
+      "contribution": "filled raw gh pull request creation",
+      "disposition": "discard-with-reason",
+      "destination_owner": "publishing-reviewable-prs",
+      "fixture": "direct-connector-and-fill-collision-refusal",
+      "topology_operations": [
+        "pr-creation",
+        "pr-content"
+      ],
+      "reason": "The bound publisher owns generated review text and refuses raw filled creation routes."
+    },
+    {
+      "id": "gh-address-comments-unresolved-thread-acquisition",
+      "source_skill": "gh-address-comments",
+      "contribution": "unresolved review thread acquisition",
+      "disposition": "absorb",
+      "destination_owner": "addressing-pr-review-feedback",
+      "fixture": "unresolved-thread-acquisition-and-response-only",
+      "topology_operations": [
+        "feedback-acquisition"
+      ]
+    },
+    {
+      "id": "gh-address-comments-response-only-outcome",
+      "source_skill": "gh-address-comments",
+      "contribution": "authorized response-only review outcome",
+      "disposition": "absorb",
+      "destination_owner": "interacting-with-pr-review-feedback",
+      "fixture": "unresolved-thread-acquisition-and-response-only",
+      "topology_operations": [
+        "feedback-interaction"
+      ]
+    }
+  ]
+}

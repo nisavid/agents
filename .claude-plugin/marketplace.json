@@ -9,6 +9,11 @@
       "name": "thermos",
       "source": "./plugins/thermos",
       "category": "developer-tools"
+    },
+    {
+      "name": "rolecasting",
+      "source": "./plugins/rolecasting",
+      "category": "developer-tools"
     }
   ]
 }

@@ -1,0 +1,14 @@
+{
+  "name": "rolecasting",
+  "displayName": "Rolecasting",
+  "version": "1.0.0+claude.20260720121200",
+  "description": "Rolecasting: portable model selection and delegation topology for agent work.",
+  "author": {
+    "name": "Ivan D Vasin",
+    "url": "https://github.com/nisavid"
+  },
+  "homepage": "https://github.com/nisavid/agents/tree/main/plugins/rolecasting",
+  "repository": "https://github.com/nisavid/agents",
+  "license": "MIT",
+  "keywords": ["agents", "delegation", "model-selection", "orchestration"]
+}

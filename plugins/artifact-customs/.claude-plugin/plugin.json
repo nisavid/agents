@@ -1,0 +1,20 @@
+{
+  "name": "artifact-customs",
+  "displayName": "Artifact Customs",
+  "version": "1.0.0+claude.20260722221100",
+  "description": "Clear, adopt, maintain, replace, and retire exact third-party software components under explicit policy.",
+  "author": {
+    "name": "Ivan D Vasin",
+    "url": "https://github.com/nisavid"
+  },
+  "homepage": "https://github.com/nisavid/agents/tree/main/plugins/artifact-customs",
+  "repository": "https://github.com/nisavid/agents",
+  "license": "MIT",
+  "keywords": [
+    "dependencies",
+    "software-supply-chain",
+    "provenance",
+    "vendoring",
+    "automation"
+  ]
+}

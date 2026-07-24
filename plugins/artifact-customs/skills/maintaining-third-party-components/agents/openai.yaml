@@ -1,0 +1,4 @@
+interface:
+  display_name: "Maintain Third-Party Components"
+  short_description: "Update governed external components safely"
+  default_prompt: "Use $artifact-customs:maintaining-third-party-components to investigate and complete this exact policy-bound component lifecycle task."

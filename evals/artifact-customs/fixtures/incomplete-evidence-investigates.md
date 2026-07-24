@@ -1,0 +1,1 @@
+The candidate has a valid registry digest and source tag, but the license record is incomplete. The policy and task authorize read-only registry, canonical-source, metadata, license, and conformance investigation. No trust boundary, runtime capability, or legal exception is requested.

@@ -232,6 +232,62 @@ class GraphiteTransportTests(unittest.TestCase):
         )
         self.assertNotIn("ready", commands[0][:3])
 
+    def test_existing_ready_pr_drafted_by_transport_is_restored_and_audited(
+        self,
+    ) -> None:
+        body = Path(self.temporary.name) / "existing.md"
+        body.write_text("Canonical body\n", encoding="utf-8")
+        candidate = {
+            **self.candidate,
+            "body_source": {"mode": "file", "path": str(body)},
+            "review_input_pr": 42,
+        }
+        preimage = {
+            "number": 42,
+            "url": "https://github.com/acme/app/pull/42",
+            "title_sha256": "1" * 64,
+            "body_sha256": "2" * 64,
+            "is_draft": False,
+        }
+        item = GRAPHITE._handoff_entry(
+            candidate,
+            preimage,
+            self.stored(body="Old body\n", draft=True),
+            self.repository,
+        )
+        self.assertTrue(item["is_draft"])
+        self.assertFalse(item["target_is_draft"])
+        self.assertEqual(
+            [command[2] for command in item["publisher_commands"]],
+            ["text", "ready"],
+        )
+        handoff = {
+            "schema_version": 1,
+            "repository_root": str(self.root),
+            "pull_requests": [item],
+            "content_sha256": "d" * 64,
+        }
+        output = Path(self.temporary.name) / "repair.json"
+        final_audit = self.audit_for(item)
+        calls = iter(
+            [
+                {"status": "unavailable"},
+                {"status": "updated"},
+                {"status": "ready"},
+                final_audit,
+            ]
+        )
+        with mock.patch.object(
+            GRAPHITE,
+            "_run_json_command",
+            side_effect=lambda *_args, **_kwargs: next(calls),
+        ):
+            result = GRAPHITE.repair(handoff, output)
+
+        self.assertEqual(result["status"], "canonical-repair-complete")
+        self.assertFalse(result["pull_requests"][0]["target_is_draft"])
+        self.assertEqual(result["pull_requests"][0]["audit"]["final"]["is_draft"], False)
+
     def test_plan_drift_stops_before_transport(self) -> None:
         plan = self.plan()
         drifted = {**plan, "content_sha256": "0" * 64}

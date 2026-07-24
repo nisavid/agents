@@ -554,6 +554,7 @@ def _handoff_entry(
     )
     common = _common_arguments(expected, entry)
     commands: list[list[str]] = []
+    target_is_draft = True if preimage is None else preimage["is_draft"]
     if title != entry["title"] or body != target_body:
         body_flag = (
             "--body-template"
@@ -608,7 +609,7 @@ def _handoff_entry(
         "transport_body_sha256": _sha_text(body),
         "target_title_sha256": _sha_text(entry["title"]),
         "target_body_sha256": _sha_text(target_body),
-        "target_is_draft": is_draft,
+        "target_is_draft": target_is_draft,
         "target_review_input_sha256": entry["review_input_sha256"],
         "target_identity_epoch": {
             "repository": repository,

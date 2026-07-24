@@ -1,0 +1,1 @@
+Run the loop on a frozen candidate when the harness cannot isolate critic contexts. All required critics and specialists returned usable reports, review is complete but explicitly `non-independent / degraded`, adjudication leaves no actionable finding, and declared verification succeeds on unchanged bytes. Preserve the missing isolation and limits in the terminal result.

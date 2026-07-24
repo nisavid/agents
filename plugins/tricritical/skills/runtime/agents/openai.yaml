@@ -1,0 +1,4 @@
+interface:
+  display_name: "Runtime Review"
+  short_description: "Inspect runtime correctness and risk."
+  default_prompt: "Use $tricritical:runtime to inspect runtime correctness and risk."

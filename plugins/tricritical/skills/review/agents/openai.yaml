@@ -1,0 +1,4 @@
+interface:
+  display_name: "Tricritical Review"
+  short_description: "Run independent review axes."
+  default_prompt: "Use $tricritical:review with separate capability-proven model-selection and Rolecasting invocation-topology receipts for each selected critic and specialist dispatch."

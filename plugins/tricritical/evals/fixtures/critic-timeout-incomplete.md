@@ -1,0 +1,1 @@
+Use Tricritical `review` on a frozen candidate whose selected axes are intent, runtime, and structure. Intent and structure returned usable raw reports, but the runtime critic timed out after the harness recorded its raw timeout event. Synthesize the available material, report completeness, and do not start an undeclared retry or mutation.

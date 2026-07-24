@@ -6,8 +6,8 @@
   "description": "Personal agent tools: plugins shared across Claude Code and Codex-like harnesses.",
   "plugins": [
     {
-      "name": "thermos",
-      "source": "./plugins/thermos",
+      "name": "tricritical",
+      "source": "./plugins/tricritical",
       "category": "developer-tools"
     },
     {

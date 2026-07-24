@@ -1,0 +1,4 @@
+interface:
+  display_name: "Adjudicate Findings"
+  short_description: "Disposition review findings with evidence."
+  default_prompt: "Use $tricritical:adjudicate to disposition review findings."

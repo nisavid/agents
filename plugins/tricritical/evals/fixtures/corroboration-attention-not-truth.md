@@ -1,0 +1,1 @@
+Synthesize two independent critic reports about the same frozen authorization change. Both claim an account-takeover path, but both cite only the author’s summary rather than direct candidate evidence, and they describe the same alleged cause. A third report finds no matching path. Keep causal deduplication, confidence, attention, and severity distinct.

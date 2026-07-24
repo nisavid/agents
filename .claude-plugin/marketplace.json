@@ -24,6 +24,11 @@
       "name": "mergecraft",
       "source": "./plugins/mergecraft",
       "category": "developer-tools"
+    },
+    {
+      "name": "artifact-customs",
+      "source": "./plugins/artifact-customs",
+      "category": "developer-tools"
     }
   ]
 }

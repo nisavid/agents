@@ -1,0 +1,254 @@
+{
+  "schema_version": 5,
+  "tool": {
+    "name": "plugin-eval",
+    "plugin_manifest_relpath": ".codex-plugin/plugin.json",
+    "plugin_manifest_version": "0.1.2",
+    "plugin_manifest_sha256": "sha256:72b434478d5008496d17d43b9b847121f47145f71177540ab47893b1559c5aed",
+    "package_manifest_version": "0.1.0",
+    "report_version": "0.1.0",
+    "executable_relpath": "scripts/plugin-eval.js",
+    "runtime_paths": ["package.json", "scripts/plugin-eval.js", "src"],
+    "runtime_tree_sha256": "sha256:42e8d175df873174e6b23e34196bd00a8da32198c784b49f8fd53a2b6b584afb"
+  },
+  "calibration": {
+    "manifest_path": "release/plugin-eval-baseline-v1.json",
+    "manifest_sha256": "sha256:836d412b734cbf8a74fe98004cb0e805758e643e81700d9bfe8723e300160f09"
+  },
+  "native_budget_findings": [
+    {
+      "id": "trigger_cost_tokens-budget-high",
+      "category": "budget",
+      "severity": "error",
+      "status": "fail",
+      "message": "trigger_cost_tokens is excessive relative to the current Codex baseline.",
+      "penalty": 14,
+      "remediation": [
+        "Reduce repeated instruction text and move detail into deferred supporting files."
+      ],
+      "source": "core"
+    },
+    {
+      "id": "invoke_cost_tokens-budget-high",
+      "category": "budget",
+      "severity": "error",
+      "status": "fail",
+      "message": "invoke_cost_tokens is excessive relative to the current Codex baseline.",
+      "penalty": 14,
+      "remediation": [
+        "Reduce repeated instruction text and move detail into deferred supporting files."
+      ],
+      "source": "core"
+    },
+    {
+      "id": "deferred_cost_tokens-budget-high",
+      "category": "budget",
+      "severity": "error",
+      "status": "fail",
+      "message": "deferred_cost_tokens is excessive relative to the current Codex baseline.",
+      "penalty": 14,
+      "remediation": [
+        "Reduce repeated instruction text and move detail into deferred supporting files."
+      ],
+      "source": "core"
+    }
+  ],
+  "advisories": [
+    {
+      "kind": "exact_false_positive",
+      "plugin": "rolecasting",
+      "deduction": {
+        "id": "interface-missing-privacyPolicyURL",
+        "category": "manifest",
+        "severity": "error",
+        "status": "fail",
+        "message": "plugin.json interface is missing `privacyPolicyURL`.",
+        "penalty": 14,
+        "remediation": ["Add interface.privacyPolicyURL to plugin.json."],
+        "source": "core",
+        "targetPath": "plugins/rolecasting"
+      },
+      "reason": "The current Codex manifest contract makes this URL optional; the operator declined to fabricate a repository-wide privacy policy."
+    },
+    {
+      "kind": "exact_false_positive",
+      "plugin": "rolecasting",
+      "deduction": {
+        "id": "interface-missing-termsOfServiceURL",
+        "category": "manifest",
+        "severity": "error",
+        "status": "fail",
+        "message": "plugin.json interface is missing `termsOfServiceURL`.",
+        "penalty": 14,
+        "remediation": ["Add interface.termsOfServiceURL to plugin.json."],
+        "source": "core",
+        "targetPath": "plugins/rolecasting"
+      },
+      "reason": "The current Codex manifest contract makes this URL optional; the operator declined to fabricate repository-wide terms."
+    },
+    {
+      "kind": "exact_false_positive",
+      "plugin": "versionkeeping",
+      "deduction": {
+        "id": "interface-missing-privacyPolicyURL",
+        "category": "manifest",
+        "severity": "error",
+        "status": "fail",
+        "message": "plugin.json interface is missing `privacyPolicyURL`.",
+        "penalty": 14,
+        "remediation": ["Add interface.privacyPolicyURL to plugin.json."],
+        "source": "core",
+        "targetPath": "plugins/versionkeeping"
+      },
+      "reason": "The current Codex manifest contract makes this URL optional; the operator declined to fabricate a repository-wide privacy policy."
+    },
+    {
+      "kind": "exact_false_positive",
+      "plugin": "versionkeeping",
+      "deduction": {
+        "id": "interface-missing-termsOfServiceURL",
+        "category": "manifest",
+        "severity": "error",
+        "status": "fail",
+        "message": "plugin.json interface is missing `termsOfServiceURL`.",
+        "penalty": 14,
+        "remediation": ["Add interface.termsOfServiceURL to plugin.json."],
+        "source": "core",
+        "targetPath": "plugins/versionkeeping"
+      },
+      "reason": "The current Codex manifest contract makes this URL optional; the operator declined to fabricate repository-wide terms."
+    },
+    {
+      "kind": "exact_false_positive",
+      "plugin": "mergecraft",
+      "deduction": {
+        "id": "interface-missing-privacyPolicyURL",
+        "category": "manifest",
+        "severity": "error",
+        "status": "fail",
+        "message": "plugin.json interface is missing `privacyPolicyURL`.",
+        "penalty": 14,
+        "remediation": ["Add interface.privacyPolicyURL to plugin.json."],
+        "source": "core",
+        "targetPath": "plugins/mergecraft"
+      },
+      "reason": "The current Codex manifest contract makes this URL optional; the operator declined to fabricate a repository-wide privacy policy."
+    },
+    {
+      "kind": "exact_false_positive",
+      "plugin": "mergecraft",
+      "deduction": {
+        "id": "interface-missing-termsOfServiceURL",
+        "category": "manifest",
+        "severity": "error",
+        "status": "fail",
+        "message": "plugin.json interface is missing `termsOfServiceURL`.",
+        "penalty": 14,
+        "remediation": ["Add interface.termsOfServiceURL to plugin.json."],
+        "source": "core",
+        "targetPath": "plugins/mergecraft"
+      },
+      "reason": "The current Codex manifest contract makes this URL optional; the operator declined to fabricate repository-wide terms."
+    },
+    {
+      "kind": "exact_false_positive",
+      "plugin": "tricritical",
+      "deduction": {
+        "id": "interface-missing-privacyPolicyURL",
+        "category": "manifest",
+        "severity": "error",
+        "status": "fail",
+        "message": "plugin.json interface is missing `privacyPolicyURL`.",
+        "penalty": 14,
+        "remediation": ["Add interface.privacyPolicyURL to plugin.json."],
+        "source": "core",
+        "targetPath": "plugins/tricritical"
+      },
+      "reason": "The current Codex manifest contract makes this URL optional; the operator declined to fabricate a repository-wide privacy policy."
+    },
+    {
+      "kind": "exact_false_positive",
+      "plugin": "tricritical",
+      "deduction": {
+        "id": "interface-missing-termsOfServiceURL",
+        "category": "manifest",
+        "severity": "error",
+        "status": "fail",
+        "message": "plugin.json interface is missing `termsOfServiceURL`.",
+        "penalty": 14,
+        "remediation": ["Add interface.termsOfServiceURL to plugin.json."],
+        "source": "core",
+        "targetPath": "plugins/tricritical"
+      },
+      "reason": "The current Codex manifest contract makes this URL optional; the operator declined to fabricate repository-wide terms."
+    },
+    {
+      "kind": "exact_false_positive",
+      "plugin": "artifact-customs",
+      "deduction": {
+        "id": "interface-missing-privacyPolicyURL",
+        "category": "manifest",
+        "severity": "error",
+        "status": "fail",
+        "message": "plugin.json interface is missing `privacyPolicyURL`.",
+        "penalty": 14,
+        "remediation": ["Add interface.privacyPolicyURL to plugin.json."],
+        "source": "core",
+        "targetPath": "plugins/artifact-customs"
+      },
+      "reason": "The current Codex manifest contract makes this URL optional; the operator declined to fabricate a repository-wide privacy policy."
+    },
+    {
+      "kind": "exact_false_positive",
+      "plugin": "artifact-customs",
+      "deduction": {
+        "id": "interface-missing-termsOfServiceURL",
+        "category": "manifest",
+        "severity": "error",
+        "status": "fail",
+        "message": "plugin.json interface is missing `termsOfServiceURL`.",
+        "penalty": 14,
+        "remediation": ["Add interface.termsOfServiceURL to plugin.json."],
+        "source": "core",
+        "targetPath": "plugins/artifact-customs"
+      },
+      "reason": "The current Codex manifest contract makes this URL optional; the operator declined to fabricate repository-wide terms."
+    },
+    {
+      "kind": "bounded_runtime_cost",
+      "plugin": "versionkeeping",
+      "metric": "deferred_cost_tokens",
+      "reason": "The clean runtime root contains a directly invoked evaluation gate; the recursive static estimate is not automatic prompt use.",
+      "required_components": [
+        {
+          "label": "skills/checkpointing-and-publishing-git-work/scripts/check_eval_gate.py",
+          "path": "<snapshot>/plugins/versionkeeping/skills/checkpointing-and-publishing-git-work/scripts/check_eval_gate.py",
+          "maximum_tokens": 38792
+        }
+      ]
+    },
+    {
+      "kind": "bounded_runtime_cost",
+      "plugin": "mergecraft",
+      "metric": "deferred_cost_tokens",
+      "reason": "The lean plugin root contains directly executed publication, review-state, and Graphite helpers; plugin-eval counts their source bytes as deferred prompt cost even though the harness executes rather than injects them.",
+      "required_components": [
+        {
+          "label": "skills/addressing-pr-review-feedback/scripts/review_feedback_state.py",
+          "path": "<snapshot>/plugins/mergecraft/skills/addressing-pr-review-feedback/scripts/review_feedback_state.py",
+          "maximum_tokens": 10206
+        },
+        {
+          "label": "skills/publishing-reviewable-prs/scripts/publication_receipts.py",
+          "path": "<snapshot>/plugins/mergecraft/skills/publishing-reviewable-prs/scripts/publication_receipts.py",
+          "maximum_tokens": 8068
+        },
+        {
+          "label": "skills/graphite/scripts/submit_draft_stack.py",
+          "path": "<snapshot>/plugins/mergecraft/skills/graphite/scripts/submit_draft_stack.py",
+          "maximum_tokens": 7729
+        }
+      ]
+    }
+  ]
+}

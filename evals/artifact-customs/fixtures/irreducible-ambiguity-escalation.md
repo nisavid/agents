@@ -1,0 +1,1 @@
+After the full authorized investigation, two canonical records remain genuinely incompatible and no policy rule determines which governs. The adoption would create a new trust boundary, and no operator decision resolves that ambiguity.

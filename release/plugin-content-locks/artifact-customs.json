@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "algorithm": "sha256",
+  "files": {
+    ".claude-plugin/plugin.json": "bce229383519cdd55a57a26d59b97612f59e7a759575d9112b803a1b69666f63",
+    ".codex-plugin/plugin.json": "20d59687869ff467e33e899db2e44ae3a2d95191a75ec1997d65c21d7860ff2b",
+    "CHANGELOG.md": "bf80cfec13aa26a32aff9c77466ba7f7ac9ef933d56c88fc6d0876fd338df9c3",
+    "LICENSE": "68950fb14202e1a28da07612a6cc6978163fee3e678520c2740a0d1bde0680e8",
+    "README.md": "274017072ade6869deae319a7917bd39d34140aa283b6a16d11309a48c81afc8",
+    "references/component-clearance-contract.md": "6c682550316e639929120294381bfa27fe4bb067fc8eec2615b3bc6c414b818f",
+    "references/component-policy-contract.md": "7230d83ece8aa53ed9733c153b58213bfca3daf483134aa695b434c86045a05d",
+    "references/invocation-envelope.json": "23feba736e0ab586d316f621fa9f31498d4d3805331739860832970c787290bf",
+    "references/scheduler-adapters.json": "b92bb8040028c610c4bbfa0412fb63866ba0a327b8ca9e21fbc04556fc41b124",
+    "skills/adopting-third-party-components/SKILL.md": "b0a48472d661fb21fa793c8d1182a8046a95165f14b12edf75f7864f8d0cf549",
+    "skills/adopting-third-party-components/agents/openai.yaml": "733b2b4a33692102d82e8a5738118153f3211d7823c18b3bb23faa0e9a721d74",
+    "skills/assessing-third-party-components/SKILL.md": "409b0831e5b8e7741dcc79456e32b6f9b0cf282a2711fb80b5e6caeab8e0e0a2",
+    "skills/assessing-third-party-components/agents/openai.yaml": "629fd824c29e25013baa416eab8f58c7fc1d7257513ef6700e6abb232d250208",
+    "skills/maintaining-third-party-components/SKILL.md": "04ed0fe90fccc3cade5324650aa2f0465c637bcf7f36fda67066cbd4822495e7",
+    "skills/maintaining-third-party-components/agents/openai.yaml": "2a1e68ba1be0f8165ca7ee8f9e5fe3392e0d37ad3f8acc2fbff6212d99469842",
+    "topology.json": "0c0e988d0f86d569e598ac6c5535645b095d4674cfdc45e6cfb00b44c11f4435"
+  }
+}

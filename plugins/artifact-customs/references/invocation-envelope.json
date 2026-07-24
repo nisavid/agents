@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "manual_invocation": "permanent-repository-and-pr-number",
+  "request_required": [
+    "repository",
+    "pullRequest",
+    "mode",
+    "requestedLifecycleAction",
+    "callerIdentity",
+    "candidateIdentity",
+    "policyIdentity",
+    "authorityIdentity",
+    "autonomyMode"
+  ],
+  "modes": ["assess", "adopt", "maintain"],
+  "lock_owner": "artifact-customs",
+  "receipt_owner": "artifact-customs",
+  "candidate_binding": [
+    "repository",
+    "base",
+    "headNamespace",
+    "headCommit",
+    "author",
+    "changedPaths",
+    "componentIdentity"
+  ],
+  "identity_binding": [
+    "mode",
+    "requestedLifecycleAction",
+    "callerIdentity",
+    "autonomyMode",
+    "candidateIdentity",
+    "policyIdentity",
+    "authorityIdentity"
+  ],
+  "idempotence": "same-bound-invocation-candidate-policy-and-authority-converges-or-rejects",
+  "lifecycle_actions": {
+    "assess": ["clearance"],
+    "adopt": ["adopt"],
+    "maintain": [
+      "update",
+      "advisory",
+      "replace",
+      "seal",
+      "retire",
+      "pull-request"
+    ]
+  },
+  "mode_authority": {
+    "assess": {
+      "authority": "read-only",
+      "authority_identity": "read-only-clearance"
+    },
+    "adopt": {
+      "authority": "explicit-new-or-revised-boundary",
+      "authority_identity": "explicit-new-or-revised-boundary"
+    },
+    "maintain": {
+      "authority": "named-existing-policy",
+      "authority_identity": "named-existing-policy"
+    }
+  },
+  "pre_write_rebind": {
+    "resolves": ["candidateIdentity", "policyIdentity", "authorityIdentity"],
+    "before": [
+      "source-write",
+      "policy-write",
+      "retained-evidence-write",
+      "forge-close-or-reject",
+      "forge-publish-approve-or-merge"
+    ],
+    "on_drift": "invalidate-and-reassess-before-any-mutation"
+  },
+  "autonomy_modes": [
+    {
+      "id": "report-only",
+      "upgrade": "never-autonomous",
+      "outcome": "research-report-recommend"
+    },
+    {
+      "id": "high-confidence",
+      "upgrade": "only-after-adequate-verification-security-review-and-high-confidence-safe-judgment",
+      "otherwise": "escalate-with-comprehensive-report"
+    },
+    {
+      "id": "confidence-forward-deferred",
+      "upgrade": "when-confident",
+      "otherwise": "defer-to-later-research-cycle-for-ecosystem-evidence"
+    }
+  ],
+  "recommended_autonomy_mode": "high-confidence",
+  "recommendation_is_consent": false,
+  "autonomy_mode_selection": "operator-selected-required-for-scheduled-invocation-and-deployment",
+  "compromised_artifact": "fail-closed",
+  "preferred_scheduler": null,
+  "preferred_cadence": null
+}

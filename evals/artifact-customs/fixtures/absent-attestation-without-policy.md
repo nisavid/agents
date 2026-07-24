@@ -1,0 +1,1 @@
+The exact registry artifact digest is available, but no attestation was published. The repository policy contains no exception allowing attestation absence to be accepted. Do not treat the missing attestation as a positive claim and do not update dependencies.

@@ -1,0 +1,1 @@
+The proposed adoption adds a remote runtime downloader, requires acceptance of new legal terms, and requests trust in a previously unapproved publisher. The task asks to evaluate the component but delegates none of those trust, legal, or runtime expansions.

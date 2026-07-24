@@ -1,0 +1,1 @@
+The request names package `example-lib` release `9.9.9`, but the exact registry record says that release does not exist. The workspace has not changed. Do not create a lockfile entry, install a substitute, or modify a manifest while assessing this candidate.

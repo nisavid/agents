@@ -1,0 +1,1 @@
+The currently maintained component begins producing a deterministic result different from its pinned conformance baseline. Existing policy authorizes diagnosis and evidence gathering. The discrepancy can still be localized through the permitted checks; do not escalate solely because the deviation is deterministic.

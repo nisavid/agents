@@ -1,0 +1,31 @@
+{
+  "contract": "phase7-private-isolation-backends-v2",
+  "schema_version": 2,
+  "targets": [
+        {
+            "binary": "sandbox-exec",
+            "capabilities": ["seatbelt-profile", "descriptor-roots", "network-deny"],
+            "execution": "direct-required",
+            "release_evidence_required": false,
+            "sha256": "sha256:8290e4be7387a0df83cd1559e86afd880464f269450573d012795761fe298f16",
+            "target": "macos-seatbelt",
+            "version": "macos-seatbelt-v1"
+        },
+        {
+            "binary": "bwrap",
+            "capabilities": ["user-namespace", "bind-roots", "network-unshare"],
+            "execution": "external-release-required",
+            "release_evidence_required": true,
+            "target": "linux-bubblewrap",
+            "version": "bubblewrap-v1"
+        },
+        {
+            "binary": "bwrap",
+            "capabilities": ["wsl2-kernel", "bind-roots", "network-unshare"],
+            "execution": "external-release-required",
+            "release_evidence_required": true,
+            "target": "wsl2-bubblewrap",
+            "version": "bubblewrap-wsl2-v1"
+        }
+    ]
+}

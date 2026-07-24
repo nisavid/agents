@@ -1,0 +1,1 @@
+Review a frozen 680-line parser module for structure. Repository standards intentionally colocate the state machine, every branch belongs to that single grammar responsibility, no policy is duplicated, and callers change through one entry point. Test the named smell and file-size heuristics without turning labels, line count, or cosmetic preference into findings.

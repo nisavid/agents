@@ -1,0 +1,4 @@
+interface:
+  display_name: "Tricritical Loop"
+  short_description: "Review and revise to a terminal state."
+  default_prompt: "Use $tricritical:loop to review and revise to a terminal state. Map its portable synchronous operator-choice capability to `request_user_input` with no timeout or automatic resolution."

@@ -1,0 +1,1 @@
+Run the runtime critic on a frozen change whose unit suite is green. The tests mock `ProductionTokenStore` and assert only the returned status, while the deployed entry point uses that store to persist a newly required `tenant_id`; the mock accepts missing fields. Trace whether the green tests exercise the production path and what additional runtime proof is needed.

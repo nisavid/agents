@@ -1,0 +1,21 @@
+{
+  "name": "tricritical",
+  "displayName": "Tricritical",
+  "version": "1.0.0+claude.20260720101500",
+  "description": "Tricritical review: independently planned intent, runtime, and structure critics, adjudication, authority-gated revision, and one fixed-point loop.",
+  "author": {
+    "name": "Ivan D Vasin",
+    "url": "https://github.com/nisavid"
+  },
+  "homepage": "https://github.com/nisavid/agents/tree/main/plugins/tricritical",
+  "repository": "https://github.com/nisavid/agents",
+  "license": "MIT",
+  "keywords": [
+    "review",
+    "intent",
+    "runtime",
+    "structure",
+    "adjudication",
+    "revision"
+  ]
+}

@@ -1,0 +1,1 @@
+Run the loop on immutable candidate `sha256:blocked1`. Adjudication returns `blocked` because the required customer compatibility evidence is unavailable. A local unit test succeeds, but it cannot supply the missing evidence. Surface the blocked disposition and responsible owner before any clean terminal.

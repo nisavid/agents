@@ -1,0 +1,4 @@
+interface:
+  display_name: "Revise Candidate"
+  short_description: "Apply accepted review findings."
+  default_prompt: "Use $tricritical:revise to apply accepted review findings."

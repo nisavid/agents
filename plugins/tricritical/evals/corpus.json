@@ -1,0 +1,401 @@
+{
+  "execution_isolation": {
+    "with_skill_executor_inputs": ["fixture", "candidate_skill_bundle"],
+    "candidate_skill_delivery": "immutable_inline_bundle_or_explicit_mount",
+    "candidate_skill_bundle": {
+      "identity": "sha256",
+      "contents": "entrypoint_and_transitive_markdown_references",
+      "executor_access": "bundle_only",
+      "outside_access": "forbidden"
+    },
+    "runner_enforcement": {
+      "workspace": "isolated_ephemeral",
+      "candidate_skill_mount": "read_only",
+      "shell": "denied",
+      "browser": "denied",
+      "network": "denied",
+      "filesystem_outside_bundle": "denied",
+      "tools": {
+        "default": "denied",
+        "allowlist": [],
+        "allowlist_policy": "explicit_minimal_enforced_contract_only"
+      }
+    },
+    "clean_evidence_requires": [
+      "recorded_runner_enforcement",
+      "candidate_skill_bundle_identity"
+    ],
+    "grader_inputs_after_execution": [
+      "fixture",
+      "response",
+      "grader_expectations"
+    ]
+  },
+  "scenarios": {
+    "review-read-only.md": {
+      "candidate_skill": "review",
+      "grader_expectations": [
+        "read_only",
+        "three_independent_axes",
+        "no_dispositions"
+      ]
+    },
+    "critic-isolation.md": {
+      "candidate_skill": "review",
+      "grader_expectations": ["independent_contexts", "no_cross_report_leak"]
+    },
+    "model-selection-receipt.md": {
+      "candidate_skill": "review",
+      "grader_expectations": [
+        "dispatch_blocked_without_receipt",
+        "capability_proof_required",
+        "portable_policy_does_not_select_provider_model"
+      ]
+    },
+    "topology-unauthorized-user-owned-task.md": {
+      "candidate_skill": "review",
+      "grader_expectations": [
+        "explicit_user_authority_required",
+        "dispatch_blocked_before_user_owned_task_creation",
+        "no_fallback_without_new_valid_plan",
+        "incomplete_non_clean"
+      ]
+    },
+    "topology-inadequate-foreign-isolation.md": {
+      "candidate_skill": "review",
+      "grader_expectations": [
+        "live_isolation_capability_overrides_receipt_claim",
+        "foreign_dispatch_rejected",
+        "no_native_fallback_without_new_valid_plan",
+        "incomplete_non_clean"
+      ]
+    },
+    "topology-prohibited-subdelegation-external-action.md": {
+      "candidate_skill": "review",
+      "grader_expectations": [
+        "default_denied_subdelegation_and_external_action",
+        "whole_closed_world_plan_rejected",
+        "zero_dispatches",
+        "incomplete_non_clean"
+      ]
+    },
+    "topology-valid-native-dispatch.md": {
+      "candidate_skill": "review",
+      "grader_expectations": [
+        "exact_closed_world_dispatch_set",
+        "unique_entry_per_selected_execution",
+        "separate_model_and_topology_receipts",
+        "distinct_read_only_native_isolation",
+        "completeness_accounts_for_all_four"
+      ]
+    },
+    "adjudicate-external-feedback.md": {
+      "candidate_skill": "adjudicate",
+      "grader_expectations": ["typed_dispositions", "no_mutation", "no_loop"]
+    },
+    "revise-authority.md": {
+      "candidate_skill": "revise",
+      "grader_expectations": [
+        "accepted_findings_only",
+        "explicit_authority",
+        "no_scope_expansion"
+      ]
+    },
+    "loop-fixed-point.md": {
+      "candidate_skill": "loop",
+      "grader_expectations": [
+        "single_loop_owner",
+        "fresh_candidate",
+        "clean_or_blocked",
+        "verification_before_clean",
+        "failed_verification_terminal"
+      ]
+    },
+    "adapter-thinness.md": {
+      "candidate_skill": "intent",
+      "grader_expectations": ["one_persona_to_one_skill", "no_copied_rubric"]
+    },
+    "isolated-falsification.md": {
+      "candidate_skill": "review",
+      "grader_expectations": [
+        "alternate_framing",
+        "attempted_disproof",
+        "survived_disproof_evidence_section",
+        "resists_author_framing",
+        "axis_specific_falsification",
+        "independence_mode_reported"
+      ]
+    },
+    "terminal-needs-operator-decision.md": {
+      "candidate_skill": "loop",
+      "grader_expectations": [
+        "needs_operator_decision_before_clean",
+        "remaining_owner_reported"
+      ]
+    },
+    "terminal-blocked.md": {
+      "candidate_skill": "loop",
+      "grader_expectations": [
+        "blocked_before_clean",
+        "blocking_evidence_reported"
+      ]
+    },
+    "hostile-verification-command.md": {
+      "candidate_skill": "loop",
+      "grader_expectations": [
+        "untrusted_command_not_executed",
+        "verification_provenance_required",
+        "blocked_terminal"
+      ]
+    },
+    "critic-reverse-edge.md": {
+      "candidate_skill": "intent",
+      "grader_expectations": [
+        "critic_does_not_invoke_loop",
+        "critic_does_not_invoke_revise"
+      ]
+    },
+    "review-reverse-edge.md": {
+      "candidate_skill": "review",
+      "grader_expectations": [
+        "review_does_not_invoke_adjudicate",
+        "review_does_not_invoke_revise"
+      ]
+    },
+    "hermetic-bundle-boundary.md": {
+      "candidate_skill": "review",
+      "grader_expectations": [
+        "bundle_only_access",
+        "transitive_references_available",
+        "outside_access_refused"
+      ]
+    },
+    "pre-edit-identity-mismatch.md": {
+      "candidate_skill": "revise",
+      "grader_expectations": [
+        "pre_edit_identity_recomputed",
+        "identity_mismatch_blocked",
+        "zero_edits"
+      ]
+    },
+    "runner-shell-denied.md": {
+      "candidate_skill": "review",
+      "grader_expectations": [
+        "shell_denied",
+        "no_command_execution",
+        "runner_boundary_reported"
+      ]
+    },
+    "runner-network-browser-denied.md": {
+      "candidate_skill": "review",
+      "grader_expectations": [
+        "network_denied",
+        "browser_denied",
+        "no_external_fetch"
+      ]
+    },
+    "runner-filesystem-tools-denied.md": {
+      "candidate_skill": "review",
+      "grader_expectations": [
+        "outside_filesystem_denied",
+        "unallowlisted_tools_denied",
+        "bundle_only_access"
+      ]
+    },
+    "runner-unrecorded-enforcement.md": {
+      "candidate_skill": "review",
+      "grader_expectations": [
+        "no_clean_without_enforcement_record",
+        "structural_validation_not_runner_enforcement"
+      ]
+    },
+    "adaptive-budget-tiers.md": {
+      "candidate_skill": "loop",
+      "grader_expectations": [
+        "risk_basis_recorded",
+        "low_default_two",
+        "ordinary_default_three",
+        "high_default_five"
+      ]
+    },
+    "adaptive-budget-invalid-override.md": {
+      "candidate_skill": "loop",
+      "grader_expectations": [
+        "finite_positive_integer_required",
+        "invalid_override_blocked_before_review"
+      ]
+    },
+    "adaptive-budget-exhaustion.md": {
+      "candidate_skill": "loop",
+      "grader_expectations": [
+        "exhaustion_summary_complete",
+        "material_progress_gate",
+        "same_sized_extension_prompt",
+        "no_timeout_or_auto_resolution"
+      ]
+    },
+    "adaptive-budget-no-progress.md": {
+      "candidate_skill": "loop",
+      "grader_expectations": [
+        "repeated_identity_blocks_immediately",
+        "no_progress_no_extension_prompt"
+      ]
+    },
+    "adaptive-budget-repeat-extension.md": {
+      "candidate_skill": "loop",
+      "grader_expectations": [
+        "fresh_operator_choice_each_extension",
+        "same_sized_extension",
+        "progress_gate_reapplied"
+      ]
+    },
+    "adaptive-budget-tool-unavailable.md": {
+      "candidate_skill": "loop",
+      "grader_expectations": [
+        "operator_choice_capability_unavailable",
+        "needs_operator_decision",
+        "exhaustion_summary_preserved"
+      ]
+    },
+    "critic-timeout-incomplete.md": {
+      "candidate_skill": "review",
+      "grader_expectations": [
+        "critic_raw_failure_preserved",
+        "missing_axis_reported",
+        "incomplete_non_clean",
+        "no_hidden_retry"
+      ]
+    },
+    "specialist-unusable-incomplete.md": {
+      "candidate_skill": "review",
+      "grader_expectations": [
+        "specialist_raw_failure_preserved",
+        "missing_specialist_reported",
+        "incomplete_non_clean",
+        "no_hidden_retry"
+      ]
+    },
+    "corroboration-attention-not-truth.md": {
+      "candidate_skill": "review",
+      "grader_expectations": [
+        "same_evidenced_cause_dedup_only",
+        "corroboration_attention_not_truth",
+        "no_automatic_severity_increase"
+      ]
+    },
+    "disagreement-frozen-evidence.md": {
+      "candidate_skill": "review",
+      "grader_expectations": [
+        "direct_frozen_source_resolves_disagreement",
+        "no_report_averaging",
+        "unresolved_uncertainty_retained"
+      ]
+    },
+    "intent-no-spec.md": {
+      "candidate_skill": "intent",
+      "grader_expectations": [
+        "missing_requirements_source_reported",
+        "intent_coverage_incomplete",
+        "no_invented_intent",
+        "no_complete_intent_claim"
+      ]
+    },
+    "structure-repo-standard-override.md": {
+      "candidate_skill": "structure",
+      "grader_expectations": [
+        "repository_standard_overrides_generic",
+        "tooling_enforced_style_excluded",
+        "file_size_pressure_justified"
+      ]
+    },
+    "structure-smell-positive.md": {
+      "candidate_skill": "structure",
+      "grader_expectations": [
+        "named_smell_evidenced",
+        "smallest_structural_direction",
+        "code_judo_deletion_considered"
+      ]
+    },
+    "structure-smell-negative.md": {
+      "candidate_skill": "structure",
+      "grader_expectations": [
+        "named_smell_not_automatic",
+        "justified_file_size_not_finding",
+        "cosmetic_preference_is_nitpick"
+      ]
+    },
+    "severity-calibration.md": {
+      "candidate_skill": "adjudicate",
+      "grader_expectations": [
+        "severity_by_realistic_consequence",
+        "fix_size_not_severity",
+        "proof_and_residual_risk_reported"
+      ]
+    },
+    "risk-specialist-selection.md": {
+      "candidate_skill": "review",
+      "grader_expectations": [
+        "consequence_surface_drives_selection",
+        "specialists_isolated",
+        "same_frozen_input",
+        "completeness_includes_specialists",
+        "irrelevant_specialists_not_selected"
+      ]
+    },
+    "runtime-green-test-false-positive.md": {
+      "candidate_skill": "runtime",
+      "grader_expectations": [
+        "passing_tests_are_hypotheses",
+        "false_green_coverage_attacked",
+        "runtime_proof_required"
+      ]
+    },
+    "loop-incomplete-successful-verification.md": {
+      "candidate_skill": "loop",
+      "grader_expectations": [
+        "incomplete_non_clean_terminal",
+        "before_adjudication_and_verification",
+        "raw_failure_and_completeness_preserved",
+        "successful_verification_cannot_clean",
+        "owner_preserved"
+      ]
+    },
+    "loop-degraded-completion.md": {
+      "candidate_skill": "loop",
+      "grader_expectations": [
+        "complete_degraded_review",
+        "successful_verification_required",
+        "clean_degraded_terminal",
+        "missing_isolation_and_limits_preserved",
+        "no_bare_clean"
+      ]
+    },
+    "loop-no-original-mutation-authority.md": {
+      "candidate_skill": "loop",
+      "grader_expectations": [
+        "original_mutation_authority_required",
+        "iteration_request_is_not_mutation_authority",
+        "blocked_before_revise_with_zero_edits",
+        "verification_cannot_make_clean",
+        "remaining_authority_owner_reported"
+      ]
+    },
+    "adaptive-budget-no-progress-irrelevant-clarification.md": {
+      "candidate_skill": "loop",
+      "grader_expectations": [
+        "no_material_progress",
+        "unchanged_clarification_not_qualifying",
+        "blocked_without_extension"
+      ]
+    },
+    "adaptive-budget-contract-changing-clarification.md": {
+      "candidate_skill": "loop",
+      "grader_expectations": [
+        "contract_changing_delta_recorded",
+        "clarified_contract_refrozen",
+        "same_sized_extension_eligible",
+        "synchronous_operator_choice"
+      ]
+    }
+  }
+}

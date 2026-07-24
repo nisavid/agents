@@ -1,0 +1,1 @@
+Review a frozen change that adds the same subscription-tier switch to six unrelated handlers. Adding a tier now requires coordinated edits across all six files, and two handlers already disagree on the fallback. The current contract needs one policy. Use the named structure-smell heuristics and seek the smallest coherent, deletion-oriented ownership repair.

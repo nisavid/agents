@@ -3980,6 +3980,7 @@ class PortableInstallationManagerTest(unittest.TestCase):
         self,
     ) -> None:
         capture = self.root / "hook-authority"
+        arguments_capture = self.root / "hook-authority-arguments"
 
         def authority_release(version: str) -> Path:
             release = self.release(version)
@@ -3988,6 +3989,7 @@ class PortableInstallationManagerTest(unittest.TestCase):
                 (
                     "#!/bin/sh\n"
                     f"printf '%s' {version!r} > {str(capture)!r}\n"
+                    f"printf '%s\\n' \"$@\" > {str(arguments_capture)!r}\n"
                 ),
                 encoding="utf-8",
             )
@@ -4023,6 +4025,144 @@ class PortableInstallationManagerTest(unittest.TestCase):
 
         self.assertEqual(completed.returncode, 0, completed.stderr.decode())
         self.assertEqual(capture.read_text(encoding="utf-8"), "2.0.0")
+
+        state_scoped = subprocess.run(
+            [
+                str(
+                    self.install_root
+                    / "bin"
+                    / "hindsight-memory-hook-authority"
+                ),
+                "--state-dir",
+                str(self.state_root / "memory"),
+                "harness-config",
+                "disable",
+            ],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={"PATH": "/usr/bin:/bin"},
+            timeout=10,
+        )
+        self.assertEqual(
+            state_scoped.returncode,
+            0,
+            state_scoped.stderr.decode(),
+        )
+        self.assertEqual(
+            arguments_capture.read_text(encoding="utf-8").splitlines(),
+            [
+                "--state-dir",
+                str(self.state_root / "memory"),
+                "harness-config",
+                "disable",
+            ],
+        )
+        wrong_state = subprocess.run(
+            [
+                str(
+                    self.install_root
+                    / "bin"
+                    / "hindsight-memory-hook-authority"
+                ),
+                "--state-dir",
+                str(self.root / "wrong-state"),
+                "harness-config",
+                "disable",
+            ],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={"PATH": "/usr/bin:/bin"},
+            timeout=10,
+        )
+        self.assertNotEqual(wrong_state.returncode, 0)
+        self.assertIn(
+            b"hook authority state directory is invalid",
+            wrong_state.stderr,
+        )
+        disallowed = subprocess.run(
+            [
+                str(
+                    self.install_root
+                    / "bin"
+                    / "hindsight-memory-hook-authority"
+                ),
+                "--state-dir",
+                str(self.state_root / "memory"),
+                "harness-config",
+                "uninstall",
+            ],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={"PATH": "/usr/bin:/bin"},
+            timeout=10,
+        )
+        self.assertNotEqual(disallowed.returncode, 0)
+        self.assertIn(
+            b"hook authority permits only harness configuration commands",
+            disallowed.stderr,
+        )
+        self.assertEqual(
+            arguments_capture.read_text(encoding="utf-8").splitlines(),
+            [
+                "--state-dir",
+                str(self.state_root / "memory"),
+                "harness-config",
+                "disable",
+            ],
+        )
+
+        managed_config_path = self.install_root / "managed-config.json"
+        state_path = self.install_root / "install-state.json"
+        managed_config_preimage = managed_config_path.read_bytes()
+        state_preimage = state_path.read_bytes()
+        malformed_config = b'{"state_root":"/first","state_root":"/second"}\n'
+        malformed_digest = hashlib.sha256(malformed_config).hexdigest()
+        managed_config_path.chmod(0o700)
+        managed_config_path.write_bytes(malformed_config)
+        managed_config_path.chmod(0o500)
+        malformed_state = json.loads(state_preimage)
+        malformed_state["config_file_digest"] = malformed_digest
+        malformed_state["owned_install_files"][
+            str(managed_config_path)
+        ] = malformed_digest
+        state_path.write_text(
+            json.dumps(malformed_state),
+            encoding="utf-8",
+        )
+        malformed = subprocess.run(
+            [
+                str(
+                    self.install_root
+                    / "bin"
+                    / "hindsight-memory-hook-authority"
+                ),
+                "--state-dir",
+                str(self.state_root / "memory"),
+                "harness-config",
+                "disable",
+            ],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={"PATH": "/usr/bin:/bin"},
+            timeout=10,
+        )
+        self.assertNotEqual(malformed.returncode, 0)
+        self.assertEqual(
+            malformed.stderr,
+            b"managed config binding is invalid\n",
+        )
+        managed_config_path.chmod(0o700)
+        managed_config_path.write_bytes(managed_config_preimage)
+        managed_config_path.chmod(0o500)
+        state_path.write_bytes(state_preimage)
 
         authority_path = self.install_root / "hook-authority.json"
         authority = json.loads(authority_path.read_text(encoding="utf-8"))

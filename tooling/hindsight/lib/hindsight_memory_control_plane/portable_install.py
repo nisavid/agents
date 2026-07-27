@@ -1416,10 +1416,109 @@ if authority_mode:
         "disable",
         "reconcile",
     }
+    authority_arguments = sys.argv[1:]
+    command_index = 0
+    if authority_arguments[:1] == ["--state-dir"]:
+        config_path = root / "managed-config.json"
+        descriptor = -1
+        try:
+            observed = config_path.lstat()
+            descriptor = os.open(
+                config_path,
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            metadata = os.fstat(descriptor)
+            if (
+                stat.S_ISLNK(observed.st_mode)
+                or not stat.S_ISREG(metadata.st_mode)
+                or (metadata.st_dev, metadata.st_ino)
+                != (observed.st_dev, observed.st_ino)
+                or metadata.st_uid != os.geteuid()
+                or metadata.st_mode & 0o777 != 0o500
+                or metadata.st_nlink != 1
+                or metadata.st_size > 1024 * 1024
+            ):
+                raise ValueError
+            try:
+                reject_acl(config_path)
+            except SystemExit as error:
+                raise ValueError from error
+            chunks = bytearray()
+            while len(chunks) <= 1024 * 1024:
+                chunk = os.read(
+                    descriptor,
+                    min(65536, 1024 * 1024 + 1 - len(chunks)),
+                )
+                if not chunk:
+                    break
+                chunks.extend(chunk)
+            if len(chunks) > 1024 * 1024:
+                raise ValueError
+            after = config_path.lstat()
+            if (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_uid,
+                after.st_mode,
+                after.st_nlink,
+            ) != (
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_size,
+                metadata.st_uid,
+                metadata.st_mode,
+                metadata.st_nlink,
+            ):
+                raise ValueError
+            config_bytes = bytes(chunks)
+            config_digest = hashlib.sha256(config_bytes).hexdigest()
+            if (
+                owned.get(str(config_path)) != config_digest
+                or state.get("config_file_digest") != config_digest
+            ):
+                raise ValueError
+
+            def strict_object(pairs):
+                result = {}
+                for key, value in pairs:
+                    if key in result:
+                        raise ValueError
+                    result[key] = value
+                return result
+
+            managed_config = json.loads(
+                config_bytes,
+                object_pairs_hook=strict_object,
+            )
+            if not isinstance(managed_config, dict):
+                raise ValueError
+            state_root = managed_config.get("state_root")
+            if (
+                not isinstance(state_root, str)
+                or "\x00" in state_root
+                or not Path(state_root).is_absolute()
+                or ".." in Path(state_root).parts
+            ):
+                raise ValueError
+            expected_state_dir = str(Path(state_root) / "memory")
+        except (OSError, UnicodeError, ValueError):
+            raise SystemExit("managed config binding is invalid") from None
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        if (
+            len(authority_arguments) < 2
+            or authority_arguments[1] != expected_state_dir
+        ):
+            raise SystemExit("hook authority state directory is invalid")
+        command_index = 2
     if (
-        len(sys.argv) < 3
-        or sys.argv[1] != "harness-config"
-        or sys.argv[2] not in allowed
+        len(authority_arguments) < command_index + 2
+        or authority_arguments[command_index] != "harness-config"
+        or authority_arguments[command_index + 1] not in allowed
     ):
         raise SystemExit("hook authority permits only harness configuration commands")
 elif transaction is None:

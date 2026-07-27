@@ -2194,6 +2194,14 @@ hindsight_stack_ui_auth_status() {
 hindsight_stack_ui_status_probe() {
   emulate -L zsh
   local probe_timeout="${1:-$HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS}"
+  if hindsight_stack_runtime_active; then
+    # Upstream's UI status follows the unauthenticated root redirect. With
+    # access-key auth enabled that redirect loops at /login and reports a
+    # healthy UI as down. The authenticated probe proves both the UI policy and
+    # its data-plane binding, so it is the authoritative active-runtime check.
+    hindsight_stack_ui_auth_probe "$probe_timeout"
+    return
+  fi
   integer probe_deadline=$(( $(/bin/date +%s) + probe_timeout ))
 
   hindsight_stack_run_bounded "$probe_timeout" \
@@ -2201,11 +2209,7 @@ hindsight_stack_ui_status_probe() {
     --port "$HINDSIGHT_EMBED_UI_PORT" >/dev/null 2>&1 || return 1
   probe_timeout=$(( probe_deadline - $(/bin/date +%s) ))
   (( probe_timeout > 0 )) || return 1
-  if hindsight_stack_runtime_active; then
-    hindsight_stack_ui_auth_probe "$probe_timeout"
-  else
-    hindsight_stack_http_ok "$(hindsight_stack_ui_url)" "$probe_timeout"
-  fi
+  hindsight_stack_http_ok "$(hindsight_stack_ui_url)" "$probe_timeout"
 }
 
 hindsight_stack_ui_status() {

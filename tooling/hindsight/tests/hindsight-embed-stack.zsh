@@ -723,6 +723,27 @@ hardened_ui_restart_events="$tmp_dir/hardened-ui-restart-events"
   exit 1
 }
 
+authenticated_ui_status_events="$tmp_dir/authenticated-ui-status-events"
+authenticated_ui_status=0
+(
+  source "$rendered_stack_lib"
+  hindsight_stack_runtime_active() { return 0 }
+  hindsight_stack_run_bounded() {
+    print -r -- upstream-status >>"$authenticated_ui_status_events"
+    return 1
+  }
+  hindsight_stack_ui_auth_probe() {
+    print -r -- auth-probe >>"$authenticated_ui_status_events"
+    return 0
+  }
+  hindsight_stack_ui_status_probe 30
+) || authenticated_ui_status=$?
+(( authenticated_ui_status == 0 )) &&
+  [[ "$(<"$authenticated_ui_status_events")" == auth-probe ]] || {
+  print -ru2 -- "active UI status trusted the unauthenticated upstream status probe"
+  exit 1
+}
+
 desired_start_events="$tmp_dir/desired-start-events"
 (
   source "$rendered_stack_lib"

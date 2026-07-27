@@ -67,4 +67,46 @@ for lifecycle_function in \
   }
 done
 
+reconciler_scopes="$(mktemp)"
+trap '/bin/rm -f -- "$events" "$reconciler_scopes"' EXIT
+(
+  source "$repo_dir/lib/hindsight-embed-stack.zsh"
+  HINDSIGHT_MEMORY_HARNESS_RECONCILER=/bin/true
+  HINDSIGHT_MEMORY_HARNESS_RECONCILE_CONFIG=/private/reconcile.json
+  HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS=30
+  hindsight_stack_load_config() { return 0 }
+  hindsight_stack_validate_trusted_executable() { return 0 }
+  hindsight_stack_run_bounded_with_credential_scope() {
+    print -r -- "$1:${4}" >>"$reconciler_scopes"
+  }
+  hindsight_stack_run_harness_reconciler pre-start
+  hindsight_stack_run_harness_reconciler post-start
+  hindsight_stack_run_harness_reconciler disable
+)
+[[ "$(<"$reconciler_scopes")" == \
+  $'none:pre-start\ncontroller:post-start\nnone:disable' ]] || {
+  print -ru2 -- "harness reconciliation received an incorrect credential scope"
+  exit 1
+}
+
+controller_credentials="$(
+  (
+    export HINDSIGHT_MEMORY_INVENTORY=/private/inventory.json
+    export HINDSIGHT_MEMORY_DATA_PLANE_TOKEN_ENV=TEST_DATA_PLANE_TOKEN
+    export HINDSIGHT_MEMORY_MINT_AUTHORITY_ENV=TEST_MINT_AUTHORITY
+    export HINDSIGHT_MEMORY_UI_ACCESS_KEY_ENV=TEST_UI_ACCESS_KEY
+    export TEST_DATA_PLANE_TOKEN=data-plane
+    export TEST_MINT_AUTHORITY=mint-authority
+    export TEST_UI_ACCESS_KEY=ui-access
+    source "$repo_dir/lib/hindsight-embed-stack.zsh"
+    hindsight_stack_run_with_credential_scope controller \
+      /bin/zsh -f -c \
+      'print -r -- "${+TEST_DATA_PLANE_TOKEN}:${+TEST_MINT_AUTHORITY}:${+TEST_UI_ACCESS_KEY}"'
+  )
+)"
+[[ "$controller_credentials" == "1:0:0" ]] || {
+  print -ru2 -- "controller reconciliation retained excess credentials"
+  exit 1
+}
+
 print -r -- "hindsight-embed-stack-authority-recovery: PASS"

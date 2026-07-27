@@ -329,7 +329,7 @@ credential_scope_results="$tmp_dir/credential-scope-results"
   export TEST_MINT_AUTHORITY=test-mint-authority
   export TEST_UI_ACCESS_KEY=test-ui-access-key
   source "$rendered_stack_lib"
-  for credential_scope in none api ui-proxy broker; do
+  for credential_scope in none api ui-proxy broker controller; do
     print -rn -- "${credential_scope}:"
     hindsight_stack_run_with_credential_scope "$credential_scope" \
       /bin/zsh -c '
@@ -344,7 +344,7 @@ credential_scope_results="$tmp_dir/credential-scope-results"
   done
 ) > "$credential_scope_results"
 [[ "$(<"$credential_scope_results")" == \
-  $'none:0:0:0:0:0:0:0:0:0\napi:0:0:0:1:0:0:1:0:0\nui-proxy:0:0:0:0:1:1:0:1:1\nbroker:1:1:0:0:0:0:0:0:0' ]] || {
+  $'none:0:0:0:0:0:0:0:0:0\napi:0:0:0:1:0:0:1:0:0\nui-proxy:0:0:0:0:1:1:0:1:1\nbroker:1:1:0:0:0:0:0:0:0\ncontroller:1:0:0:0:0:0:0:0:0' ]] || {
   print -ru2 -- "managed child credential scopes exceeded their authority"
   exit 1
 }
@@ -363,7 +363,7 @@ authorized_credential_scope_results="$tmp_dir/authorized-credential-scope-result
   export HINDSIGHT_MINT_AUTHORITY=ambient-mint-authority
   export HINDSIGHT_UI_ACCESS_KEY=ambient-ui-access-key
   source "$rendered_stack_lib"
-  for credential_scope in none api ui-proxy broker preflight; do
+  for credential_scope in none api ui-proxy broker controller preflight; do
     print -rn -- "${credential_scope}:"
     hindsight_stack_run_with_credential_scope "$credential_scope" \
       /bin/zsh -f -c '
@@ -380,7 +380,7 @@ authorized_credential_scope_results="$tmp_dir/authorized-credential-scope-result
   done
 ) > "$authorized_credential_scope_results"
 [[ "$(<"$authorized_credential_scope_results")" == \
-  $'none:0000000000\napi:0000000100\nui-proxy:0000000011\nbroker:1100000000\npreflight:1110000000' ]] || {
+  $'none:0000000000\napi:0000000100\nui-proxy:0000000011\nbroker:1100000000\ncontroller:1000000000\npreflight:1110000000' ]] || {
   print -ru2 -- "managed child scopes retained unauthorized credential destinations"
   exit 1
 }

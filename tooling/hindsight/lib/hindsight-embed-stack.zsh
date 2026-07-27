@@ -584,7 +584,7 @@ hindsight_stack_apply_credential_scope() {
   local scope="$1"
   if [[ "$scope" != none && "$scope" != api && \
     "$scope" != ui-proxy && "$scope" != broker && \
-    "$scope" != preflight ]]; then
+    "$scope" != controller && "$scope" != preflight ]]; then
     print -ru2 -- "hindsight-embed-stack: invalid credential scope: ${scope}"
     return 2
   fi
@@ -619,7 +619,8 @@ hindsight_stack_apply_credential_scope() {
   unset "${credential_names[@]}"
 
   if hindsight_stack_runtime_active; then
-    if [[ "$scope" == api || "$scope" == ui-proxy ]]; then
+    if [[ "$scope" == api || "$scope" == ui-proxy || \
+      "$scope" == controller ]]; then
       if [[ -z "$data_credential" || "$data_credential" == *$'\n'* || \
         "$data_credential" == *$'\r'* ]]; then
         print -ru2 -- "hindsight-embed-stack: data-plane credential resolver is unavailable"
@@ -637,6 +638,9 @@ hindsight_stack_apply_credential_scope() {
       # The broker may hold only its resolver-bound data-plane and mint inputs.
       [[ -n "$data_name" ]] && typeset -gx "${data_name}=${data_credential}"
       [[ -n "$mint_name" ]] && typeset -gx "${mint_name}=${mint_credential}"
+    elif [[ "$scope" == controller ]]; then
+      # Post-start controller state persistence needs only the data-plane input.
+      [[ -n "$data_name" ]] && typeset -gx "${data_name}=${data_credential}"
     elif [[ "$scope" == preflight ]]; then
       # Preflight validates the three resolver inputs without mapping credentials.
       [[ -n "$data_name" ]] && typeset -gx "${data_name}=${data_credential}"
@@ -2986,7 +2990,7 @@ hindsight_stack_reconcile_once() {
 
 hindsight_stack_run_harness_reconciler() {
   emulate -L zsh
-  local phase="$1"
+  local phase="$1" credential_scope=none
   [[ "$phase" == pre-start || "$phase" == post-start || "$phase" == disable ]] ||
     return 2
   hindsight_stack_load_config || return 1
@@ -2994,7 +2998,9 @@ hindsight_stack_run_harness_reconciler() {
   hindsight_stack_validate_trusted_executable \
     "$HINDSIGHT_MEMORY_HARNESS_RECONCILER" \
     "harness authority reconciler" || return 1
-  hindsight_stack_run_bounded \
+  [[ "$phase" == post-start ]] && credential_scope=controller
+  hindsight_stack_run_bounded_with_credential_scope \
+    "$credential_scope" \
     "$HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS" \
     "$HINDSIGHT_MEMORY_HARNESS_RECONCILER" \
     "$phase" \

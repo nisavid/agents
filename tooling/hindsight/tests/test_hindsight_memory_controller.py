@@ -1829,6 +1829,153 @@ class ControllerCliTest(unittest.TestCase):
         )
         self.assertIn("disable-failed:cursor", events)
 
+    def test_harness_reconcile_post_start_restores_exact_fail_closed_prestate(
+        self,
+    ):
+        module = runpy.run_path(str(CLI))
+        harnesses = ("codex", "claude-code", "cursor")
+        config = {
+            "schema_version": 1,
+            "state_dir": "/private/state",
+            "inventory": "/private/inventory.json",
+            "policy": "/private/policy.json",
+            "profile": "systalyze",
+            "token_env": "TOKEN",
+            "entries": [
+                {
+                    "destination": f"/private/{harness}.destination.json",
+                    "generation": f"/private/{harness}.generation",
+                    "plan": f"/private/{harness}.plan.json",
+                    "upstream_integration_roots": ["/private/upstream"],
+                }
+                for harness in harnesses
+            ],
+            "schedule_paths": ["/private/schedule.plist"],
+        }
+        events = []
+
+        class Destination:
+            destination_digest = "d" * 64
+
+            def __init__(self, harness_id):
+                self.harness_id = harness_id
+                self.configuration = {
+                    "harness_id": harness_id,
+                    "authority": "disabled",
+                }
+
+            def read_configuration(self):
+                return dict(self.configuration)
+
+            def to_record(self):
+                return {"harness_id": self.harness_id}
+
+        class Adapter:
+            def read_migration_generation(self):
+                events.append("server-generation-read")
+                return "generation:1"
+
+            def record_controller_state(self, _state):
+                events.append("controller-state-write")
+                return {"generation": "generation:2"}
+
+        def harness_id_from(path):
+            return Path(path).name.split(".", 1)[0]
+
+        destinations = {
+            harness_id: Destination(harness_id) for harness_id in harnesses
+        }
+
+        def load_record(path):
+            harness_id = harness_id_from(path)
+            return (
+                {
+                    "approval_digest": "a" * 64,
+                    "destination": {"harness_id": harness_id},
+                    "destination_digest": "d" * 64,
+                },
+                {
+                    "harness_id": harness_id,
+                    "expected_prestate_digest": digest(
+                        destinations[harness_id].configuration
+                    ),
+                },
+            )
+
+        def apply(args):
+            harness_id = harness_id_from(args.destination)
+            self.assertTrue(args.broker_healthy)
+            self.assertTrue(args.profile_healthy)
+            self.assertTrue(args.adapter_self_test)
+            events.append(f"apply:{harness_id}")
+            destinations[harness_id].configuration["authority"] = "active"
+            return 0
+
+        def verify(args):
+            harness_id = harness_id_from(args.destination)
+            events.append(f"verify:{harness_id}")
+            return (
+                0
+                if destinations[harness_id].configuration["authority"]
+                == "active"
+                else 2
+            )
+
+        command = module["harness_config_reconcile_command"]
+        output = StringIO()
+        with (
+            patch.dict(
+                command.__globals__,
+                {
+                    "_read_harness_reconciliation_config": (
+                        lambda _path: (config, "e" * 64)
+                    ),
+                    "_load_harness_activation_record": load_record,
+                    "_harness_destination": lambda args: destinations[
+                        harness_id_from(args.destination)
+                    ],
+                    "_validate_activation_record": lambda *_args: None,
+                    "_replay_http_adapter": lambda _args: Adapter(),
+                    "_harness_reconciliation_controller_state": (
+                        lambda _config: {
+                            "configuration_digest": "a" * 64,
+                            "hook_digest": "b" * 64,
+                            "schedule_digest": "c" * 64,
+                        }
+                    ),
+                    "harness_config_apply_command": apply,
+                    "harness_config_verify_command": verify,
+                },
+            ),
+            patch.dict(module["os"].environ, {"TOKEN": "secret"}),
+            redirect_stdout(output),
+        ):
+            result = command(
+                module["argparse"].Namespace(
+                    config="reconcile.json",
+                    config_digest="e" * 64,
+                    phase="post-start",
+                )
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            events,
+            [
+                "apply:codex",
+                "verify:codex",
+                "apply:claude-code",
+                "verify:claude-code",
+                "apply:cursor",
+                "verify:cursor",
+                "server-generation-read",
+                "controller-state-write",
+            ],
+        )
+        payload = json.loads(output.getvalue().splitlines()[-1])
+        self.assertEqual(payload["status"], "healthy")
+        self.assertEqual(payload["server_generation"], "generation:2")
+
     def test_harness_reconcile_post_start_server_failure_disables_all(self):
         module = runpy.run_path(str(CLI))
         harnesses = ("codex", "claude-code", "cursor")
@@ -1898,7 +2045,10 @@ class ControllerCliTest(unittest.TestCase):
                     "destination": {"harness_id": harness_id},
                     "destination_digest": "d" * 64,
                 },
-                {"harness_id": harness_id},
+                {
+                    "harness_id": harness_id,
+                    "expected_prestate_digest": "b" * 64,
+                },
             )
 
         destinations = {

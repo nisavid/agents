@@ -2948,10 +2948,11 @@ hindsight_stack_reconcile_once() {
     hindsight_stack_disable_harness_authority >/dev/null 2>&1 || true
     return 1
   }
-  hindsight_stack_reconcile_harness_authority || {
-    hindsight_stack_disable_harness_authority >/dev/null 2>&1 || true
-    return 1
-  }
+  if ! hindsight_stack_reconcile_harness_authority; then
+    hindsight_stack_log \
+      "harness authority is not active; recovering runtime before restoration"
+    hindsight_stack_disable_harness_authority >/dev/null 2>&1 || return 1
+  fi
 
   local ok=0
 
@@ -2966,16 +2967,21 @@ hindsight_stack_reconcile_once() {
     hindsight_stack_reconcile_control || ok=1
     hindsight_stack_for_each_profile hindsight_stack_reconcile_profile "" || ok=1
   fi
-  if (( ok == 0 )) &&
-    hindsight_stack_for_each_profile \
+  if (( ok != 0 )) ||
+    ! hindsight_stack_for_each_profile \
       hindsight_stack_daemon_desired_running ""; then
-    hindsight_stack_record_harness_authority || ok=1
-  else
     ok=1
   fi
-  (( ok == 0 )) ||
+  if (( ok != 0 )); then
     hindsight_stack_disable_harness_authority >/dev/null 2>&1 || true
-  return "$ok"
+    return "$ok"
+  fi
+  if ! hindsight_stack_record_harness_authority; then
+    hindsight_stack_log \
+      "runtime is healthy but harness authority restoration failed"
+    hindsight_stack_disable_harness_authority >/dev/null 2>&1 || return 1
+  fi
+  return 0
 }
 
 hindsight_stack_run_harness_reconciler() {
@@ -3100,10 +3106,11 @@ hindsight_stack_start_all() {
     hindsight_stack_disable_harness_authority >/dev/null 2>&1 || true
     return 1
   }
-  hindsight_stack_reconcile_harness_authority || {
-    hindsight_stack_disable_harness_authority >/dev/null 2>&1 || true
-    return 1
-  }
+  if ! hindsight_stack_reconcile_harness_authority; then
+    hindsight_stack_log \
+      "harness authority is not active; starting runtime before restoration"
+    hindsight_stack_disable_harness_authority >/dev/null 2>&1 || return 1
+  fi
 
   local ok=0
   if hindsight_stack_runtime_active; then

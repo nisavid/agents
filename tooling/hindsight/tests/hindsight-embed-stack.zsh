@@ -869,6 +869,12 @@ for lifecycle_function in hindsight_stack_reconcile_once hindsight_stack_start_a
       print -r -- authority >>"$harness_authority_events"
       return 23
     }
+    hindsight_stack_disable_harness_authority() {
+      print -r -- disable >>"$harness_authority_events"
+    }
+    hindsight_stack_record_harness_authority() {
+      print -r -- post >>"$harness_authority_events"
+    }
     hindsight_stack_runtime_active() {
       print -r -- runtime >>"$harness_authority_events"
       return 1
@@ -891,11 +897,18 @@ for lifecycle_function in hindsight_stack_reconcile_once hindsight_stack_start_a
     hindsight_stack_start_profile() {
       print -r -- profile >>"$harness_authority_events"
     }
+    hindsight_stack_for_each_profile() {
+      if [[ "$1" == hindsight_stack_daemon_desired_running ]]; then
+        return 0
+      fi
+      "$1"
+    }
     "$lifecycle_function"
   ) >/dev/null 2>&1 || lifecycle_status=$?
-  (( lifecycle_status != 0 )) &&
-    [[ "$(<"$harness_authority_events")" == authority ]] || {
-    print -ru2 -- "${lifecycle_function} started dependencies after harness authority reconciliation failed"
+  (( lifecycle_status == 0 )) &&
+    [[ "$(<"$harness_authority_events")" == \
+      $'authority\ndisable\nruntime\nbroker\ncontrol\nprofile\npost' ]] || {
+    print -ru2 -- "${lifecycle_function} did not recover dependencies before restoring fail-closed harness authority"
     exit 1
   }
 done

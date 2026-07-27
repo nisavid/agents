@@ -3530,16 +3530,35 @@ def harness_config_reconcile_command(args: argparse.Namespace) -> int:
             record["approval_digest"],
         )
         prepared_entries.append(
-            (verify_args, destination, receipt["harness_id"])
+            (verify_args, destination, receipt)
         )
 
     failures = []
     first_unexpected_error: Exception | None = None
-    for verify_args, destination, harness_id in prepared_entries:
+    for verify_args, destination, receipt in prepared_entries:
+        harness_id = receipt["harness_id"]
         failure: dict[str, Any] | None = None
         try:
+            if (
+                args.phase == "post-start"
+                and hmac.compare_digest(
+                    digest(destination.read_configuration()),
+                    receipt["expected_prestate_digest"],
+                )
+            ):
+                apply_args = argparse.Namespace(
+                    **vars(verify_args),
+                    broker_healthy=True,
+                    profile_healthy=True,
+                    adapter_self_test=True,
+                )
+                if harness_config_apply_command(apply_args) != 0:
+                    failure = {
+                        "harness_id": harness_id,
+                        "reason": "activation_restore_failed",
+                    }
             verify_result = harness_config_verify_command(verify_args)
-            if verify_result != 0:
+            if verify_result != 0 and failure is None:
                 failure = {
                     "harness_id": harness_id,
                     "reason": "activation_drift",
@@ -3558,7 +3577,8 @@ def harness_config_reconcile_command(args: argparse.Namespace) -> int:
     def disable_all() -> tuple[list[dict[str, Any]], Exception | None]:
         disable_failures: list[dict[str, Any]] = []
         disable_error: Exception | None = None
-        for verify_args, destination, harness_id in prepared_entries:
+        for verify_args, destination, receipt in prepared_entries:
+            harness_id = receipt["harness_id"]
             try:
                 _disable_harness_authority(
                     destination,

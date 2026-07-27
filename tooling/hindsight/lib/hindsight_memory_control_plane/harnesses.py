@@ -37,6 +37,15 @@ CLAUDE_EMPTY_MCP_SETTING = ("enableKnowledgeTools", False)
 UPSTREAM_HINDSIGHT_SCRIPTS = frozenset(
     {"recall.py", "retain.py", "session_start.py", "session_end.py"}
 )
+CONTROLLER_TOOL_EVENTS = MappingProxyType(
+    {
+        "recall": "tool-recall",
+        "reflect": "reflect",
+        "model": "model",
+        "status": "status",
+    }
+)
+CONTROLLER_TOOL_NAMES = tuple(CONTROLLER_TOOL_EVENTS)
 
 
 class ActivationCASMismatch(ValueError):
@@ -113,6 +122,7 @@ class NativeActivationPlan:
     native_artifact_digest: str
     staged_generation_digest: str
     upstream_integration_roots_digest: str
+    upstream_integration_roots: tuple[str, ...] = field(repr=False)
     retired_direct_hooks_digest: str
     expected_prestate_digest: str
     target_digest: str
@@ -121,6 +131,11 @@ class NativeActivationPlan:
     plan_digest: str
 
     def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "upstream_integration_roots",
+            tuple(self.upstream_integration_roots),
+        )
         object.__setattr__(self, "prestate", deep_freeze(self.prestate))
         object.__setattr__(self, "target", deep_freeze(self.target))
 
@@ -141,6 +156,7 @@ class NativeActivationPlan:
 
     def to_dict(self) -> dict[str, Any]:
         return {**self.body(), "plan_digest": self.plan_digest}
+
 
 @dataclass(frozen=True)
 class NativeActivationOutcome:
@@ -387,10 +403,8 @@ def render_native_harness_artifact(
         # zero tools when this upstream setting is false.
         settings[CLAUDE_EMPTY_MCP_SETTING[0]] = CLAUDE_EMPTY_MCP_SETTING[1]
     tools = {
-        "recall": {"command": command("tool-recall"), "input": "json-stdin"},
-        "reflect": {"command": command("reflect"), "input": "json-stdin"},
-        "model": {"command": command("model"), "input": "json-stdin"},
-        "status": {"command": command("status"), "input": "json-stdin"},
+        name: {"command": command(event), "input": "json-stdin"}
+        for name, event in CONTROLLER_TOOL_EVENTS.items()
     }
     rendered = {
         "schemaVersion": 1,
@@ -639,7 +653,7 @@ def _hook_commands(value: Any) -> list[str]:
             if key != "command":
                 commands.extend(_hook_commands(child))
         return commands
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple)):
         commands = []
         for child in value:
             commands.extend(_hook_commands(child))
@@ -684,7 +698,7 @@ def _is_upstream_hindsight_hook(
     for command in commands:
         script_names = [name for name in UPSTREAM_HINDSIGHT_SCRIPTS if name in command]
         if len(script_names) != 1:
-            return False
+            continue
         script = script_names[0]
         if harness_id == "claude-code":
             expected = (
@@ -692,15 +706,15 @@ def _is_upstream_hindsight_hook(
                 f'python "${{CLAUDE_PLUGIN_ROOT}}/scripts/{script}"'
             )
             if command == expected:
-                continue
+                return True
         if harness_id in {"codex", "cursor"} and command == (
             f'python3 "__SCRIPTS_DIR__/{script}"'
         ):
-            continue
+            return True
         try:
             arguments = shlex.split(command, posix=True)
         except ValueError:
-            return False
+            continue
         if len(arguments) == 2 and arguments[0] in {"python", "python3"}:
             candidate = Path(arguments[1])
             if candidate.is_absolute():
@@ -718,10 +732,9 @@ def _is_upstream_hindsight_hook(
                     ):
                         break
                 else:
-                    return False
-                continue
-        return False
-    return True
+                    continue
+                return True
+    return False
 
 
 def _native_target(
@@ -819,6 +832,214 @@ def _retired_direct_hooks(
     }
 
 
+def _is_controller_hook(entry: Any) -> bool:
+    commands = _hook_commands(entry)
+    if not commands:
+        return False
+
+    malformed_exact = re.compile(
+        r"""(?:^|[\s"'=])(?:[^\s"'=]*/)?hindsight-memory"""
+        r"""(?:$|[\s"';&|)])"""
+    )
+
+    def contains_controller_executable(command: str, depth: int = 0) -> bool:
+        try:
+            arguments = shlex.split(command, posix=True)
+        except ValueError:
+            return malformed_exact.search(command) is not None
+        if any(Path(argument).name == "hindsight-memory" for argument in arguments):
+            return True
+        if depth >= 2:
+            return False
+        return any(
+            contains_controller_executable(argument, depth + 1)
+            for argument in arguments
+            if any(character.isspace() for character in argument)
+        )
+
+    return any(contains_controller_executable(command) for command in commands)
+
+
+def native_activation_findings(
+    plan: NativeActivationPlan,
+    current: Mapping[str, Any],
+) -> tuple[str, ...]:
+    """Report semantic routing drift while allowing unrelated hook changes."""
+
+    if not _valid_native_plan(plan):
+        raise ValueError("native activation plan is invalid")
+    if not isinstance(current, Mapping):
+        raise ValueError("current native harness configuration must be an object")
+    current = deep_thaw(deep_freeze(current))
+    target = deep_thaw(plan.target)
+    integration_roots = tuple(Path(root) for root in plan.upstream_integration_roots)
+    findings: list[str] = []
+    hooks = current.get("hooks", {})
+    target_hooks = target.get("hooks", {})
+    events = hooks.get("hooks", {}) if isinstance(hooks, Mapping) else None
+    target_events = (
+        target_hooks.get("hooks", {}) if isinstance(target_hooks, Mapping) else None
+    )
+    if not isinstance(events, Mapping) or not isinstance(target_events, Mapping):
+        findings.append("hook_surface_invalid")
+    else:
+        expected_controller = {
+            event: [
+                deep_thaw(entry)
+                for entry in entries
+                if _is_controller_hook(entry)
+            ]
+            for event, entries in target_events.items()
+            if isinstance(entries, (list, tuple))
+        }
+        for event, entries in events.items():
+            if not isinstance(entries, list):
+                findings.append("hook_registration_invalid")
+                continue
+            actual_controller = [
+                entry for entry in entries if _is_controller_hook(entry)
+            ]
+            if actual_controller != expected_controller.get(event, []):
+                findings.append("controller_hook_drift")
+            if any(
+                _is_upstream_hindsight_hook(
+                    plan.harness_id, entry, integration_roots
+                )
+                for entry in entries
+            ):
+                findings.append("direct_hook_present")
+        for event, entries in expected_controller.items():
+            if entries and event not in events:
+                findings.append("controller_hook_missing")
+
+    settings = current.get("settings", {})
+    if not isinstance(settings, Mapping):
+        findings.append("settings_surface_invalid")
+    else:
+        if RETIRED_DIRECT_KEYS.intersection(settings):
+            findings.append("direct_setting_present")
+        if settings.get("autoRecall") is not False:
+            findings.append("auto_recall_enabled")
+        if settings.get("autoRetain") is not False:
+            findings.append("auto_retain_enabled")
+        if (
+            plan.harness_id == "claude-code"
+            and settings.get(CLAUDE_EMPTY_MCP_SETTING[0])
+            is not CLAUDE_EMPTY_MCP_SETTING[1]
+        ):
+            findings.append("claude_knowledge_tools_enabled")
+
+    tools = current.get("tools", {})
+    target_tools = target.get("tools", {})
+    if not isinstance(tools, Mapping) or not isinstance(target_tools, Mapping):
+        findings.append("tools_surface_invalid")
+    else:
+        for name in CONTROLLER_TOOL_NAMES:
+            if tools.get(name) != target_tools.get(name):
+                findings.append("controller_tool_drift")
+                break
+    return tuple(dict.fromkeys(findings))
+
+
+def _fail_closed(
+    harness_id: str,
+    current: Mapping[str, Any],
+    *,
+    integration_roots: tuple[Path, ...],
+    restore_tools: Mapping[str, Any] | None,
+) -> Mapping[str, Any]:
+    disabled = deep_thaw(deep_freeze(current))
+    hooks = disabled.get("hooks", {})
+    if not isinstance(hooks, Mapping):
+        raise ValueError("native hook surface changed")
+    events = hooks.get("hooks", {})
+    if not isinstance(events, Mapping):
+        raise ValueError("native hook events changed")
+    filtered_events: dict[str, list[Any]] = {}
+    for event, entries in events.items():
+        if not isinstance(entries, list):
+            raise ValueError("native hook registration changed")
+        retained = [
+            entry
+            for entry in entries
+            if not _is_controller_hook(entry)
+            and not _is_upstream_hindsight_hook(
+                harness_id, entry, integration_roots
+            )
+        ]
+        if retained:
+            filtered_events[event] = retained
+    hooks["hooks"] = filtered_events
+    disabled["hooks"] = hooks
+
+    settings = disabled.get("settings", {})
+    if not isinstance(settings, Mapping):
+        raise ValueError("native settings surface changed")
+    settings = deep_thaw(settings)
+    for key in RETIRED_DIRECT_KEYS:
+        settings.pop(key, None)
+    settings["autoRecall"] = False
+    settings["autoRetain"] = False
+    if harness_id == "claude-code":
+        settings[CLAUDE_EMPTY_MCP_SETTING[0]] = CLAUDE_EMPTY_MCP_SETTING[1]
+    if "active" in settings:
+        settings["active"] = False
+    disabled["settings"] = settings
+
+    tools = disabled.get("tools", {})
+    if not isinstance(tools, Mapping):
+        raise ValueError("native tools surface changed")
+    tools = deep_thaw(tools)
+    for name in CONTROLLER_TOOL_NAMES:
+        if restore_tools is not None and name in restore_tools:
+            tools[name] = deep_thaw(restore_tools[name])
+        else:
+            tools.pop(name, None)
+    disabled["tools"] = tools
+    return deep_freeze(disabled)
+
+
+def native_fail_closed_target(
+    plan: NativeActivationPlan,
+    current: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Disable every recognized Hindsight authority and preserve unrelated hooks."""
+
+    if not _valid_native_plan(plan):
+        raise ValueError("native activation plan is invalid")
+    if not isinstance(current, Mapping):
+        raise ValueError("current native harness configuration must be an object")
+    prestate_tools = plan.prestate.get("tools", {})
+    if not isinstance(prestate_tools, Mapping):
+        raise ValueError("native tools surface changed")
+    return _fail_closed(
+        plan.harness_id,
+        current,
+        integration_roots=tuple(Path(root) for root in plan.upstream_integration_roots),
+        restore_tools=prestate_tools,
+    )
+
+
+def native_fail_closed_configuration(
+    harness_id: str,
+    current: Mapping[str, Any],
+    *,
+    upstream_integration_roots: tuple[str | Path, ...],
+) -> Mapping[str, Any]:
+    """Disable recognized direct and broker Hindsight authority without a plan."""
+
+    if harness_id not in SUPPORTED_HARNESSES:
+        raise ValueError("native harness identity is invalid")
+    if not isinstance(current, Mapping):
+        raise ValueError("current native harness configuration must be an object")
+    return _fail_closed(
+        harness_id,
+        current,
+        integration_roots=_integration_roots(upstream_integration_roots),
+        restore_tools=None,
+    )
+
+
 def native_activation_plan(
     artifact: NativeHarnessArtifact,
     current: Mapping[str, Any],
@@ -877,6 +1098,7 @@ def native_activation_plan(
         artifact.artifact_digest,
         staged_generation_digest,
         upstream_integration_roots_digest,
+        integration_roots,
         retired_direct_hooks_digest,
         body["expected_prestate_digest"],
         body["target_digest"],
@@ -911,6 +1133,8 @@ def _valid_native_plan(plan: Any) -> bool:
         return (
             digest(plan.prestate) == plan.expected_prestate_digest
             and digest(plan.target) == plan.target_digest
+            and digest(list(plan.upstream_integration_roots))
+            == plan.upstream_integration_roots_digest
             and digest(plan.body()) == plan.plan_digest
         )
     except (TypeError, ValueError):
@@ -1085,10 +1309,14 @@ def apply_native_activation(
         rollback_current = read_configuration()
         if not isinstance(rollback_current, Mapping):
             raise ValueError("rollback state unavailable")
-        rollback_target = _native_rollback_target(
-            rollback_current, plan.prestate, plan.target
+        rollback_target = native_fail_closed_target(
+            plan,
+            rollback_current,
         )
-        write_configuration(digest(rollback_current), rollback_target)
+        write_configuration(
+            digest(rollback_current),
+            deep_thaw(rollback_target),
+        )
         restored = read_configuration()
         succeeded = (
             isinstance(restored, Mapping)

@@ -18,9 +18,12 @@ from hindsight_memory_control_plane.harnesses import (  # noqa: E402
     ActivationCASMismatch,
     NativeActivationPlan,
     OWNED_KEYS,
+    _is_controller_hook,
     apply_activation,
     activation_plan,
     apply_native_activation,
+    native_fail_closed_configuration,
+    native_fail_closed_target,
     native_activation_plan,
     render_native_harness_artifact,
     stage_native_harness_artifacts,
@@ -38,6 +41,33 @@ DIGESTS = {
     "artifact_digest": "2" * 64,
     "policy_digest": "3" * 64,
 }
+
+
+class ControllerHookClassificationTest(unittest.TestCase):
+    def test_matches_exact_nested_executable_and_preserves_substrings(self):
+        self.assertTrue(
+            _is_controller_hook(
+                {
+                    "command": (
+                        "sh -c '/opt/hindsight/bin/hindsight-memory "
+                        "session-hook'"
+                    )
+                }
+            )
+        )
+        self.assertTrue(
+            _is_controller_hook(
+                {"command": '"/opt/hindsight/bin/hindsight-memory'}
+            )
+        )
+        for unrelated in (
+            "/opt/check-hindsight-memory-health",
+            "python /tmp/hindsight-memory-metrics.py",
+        ):
+            with self.subTest(command=unrelated):
+                self.assertFalse(
+                    _is_controller_hook({"command": unrelated})
+                )
 
 
 class HarnessRenderingTest(unittest.TestCase):
@@ -1192,6 +1222,32 @@ class NativeHarnessActivationTest(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
+    def assert_failed_closed(self, configuration, *, plan=None):
+        selected_plan = self.plan if plan is None else plan
+        self.assertIs(configuration["settings"]["autoRecall"], False)
+        self.assertIs(configuration["settings"]["autoRetain"], False)
+        self.assertIs(
+            configuration["settings"]["enableKnowledgeTools"],
+            False,
+        )
+        self.assertEqual(
+            configuration["tools"],
+            deep_thaw(selected_plan.prestate["tools"]),
+        )
+        serialized_hooks = json.dumps(configuration["hooks"])
+        self.assertNotIn("CLAUDE_PLUGIN_ROOT", serialized_hooks)
+        self.assertNotIn("/opt/hindsight/bin/hindsight-memory", serialized_hooks)
+        self.assertNotIn("SessionStart", configuration["hooks"]["hooks"])
+        self.assertNotIn("Stop", configuration["hooks"]["hooks"])
+        prompt_hooks = configuration["hooks"]["hooks"]["UserPromptSubmit"]
+        self.assertEqual(
+            [entry["hooks"][0]["command"] for entry in prompt_hooks],
+            [
+                "third-party recall",
+                'python3 "/tmp/hindsight-unrelated/scripts/retain.py"',
+            ],
+        )
+
     def test_plan_semantically_merges_only_memory_owned_surfaces(self):
         self.assertIsInstance(self.plan, NativeActivationPlan)
         target = deep_thaw(self.plan.target)
@@ -1216,6 +1272,103 @@ class NativeHarnessActivationTest(unittest.TestCase):
             self.staged_generation.name,
         )
         self.assertNotIn("/opt/hindsight", json.dumps(self.plan.to_dict()))
+
+    def test_plan_retires_registration_when_any_nested_command_is_upstream(self):
+        current = deep_thaw(self.current)
+        mixed = {
+            "matcher": "mixed",
+            "hooks": [
+                {"type": "command", "command": "third-party audit"},
+                {
+                    "type": "command",
+                    "command": (
+                        'python3 "${CLAUDE_PLUGIN_ROOT}/scripts/recall.py" '
+                        '|| python "${CLAUDE_PLUGIN_ROOT}/scripts/recall.py"'
+                    ),
+                },
+            ],
+        }
+        unrelated = {
+            "matcher": "unrelated",
+            "hooks": [
+                {"type": "command", "command": "third-party audit"},
+                {"type": "command", "command": "third-party metrics"},
+            ],
+        }
+        current["hooks"]["hooks"]["UserPromptSubmit"].extend(
+            [mixed, unrelated]
+        )
+
+        plan = native_activation_plan(
+            self.artifact,
+            current,
+            staged_generation=self.staged_generation,
+            **DIGESTS,
+        )
+        target_entries = deep_thaw(plan.target)["hooks"]["hooks"][
+            "UserPromptSubmit"
+        ]
+
+        self.assertNotIn(mixed, target_entries)
+        self.assertIn(unrelated, target_entries)
+
+    def test_planless_fail_closed_disables_direct_and_controller_authority(self):
+        active = deep_thaw(self.plan.target)
+        active["hooks"]["hooks"]["UserPromptSubmit"].extend(
+            [
+                {
+                    "hooks": [
+                        {
+                            "command": (
+                                "env HINDSIGHT_PROFILE=engineering "
+                                "/opt/hindsight/bin/hindsight-memory status"
+                            )
+                        }
+                    ]
+                },
+                {
+                    "hooks": [
+                        {
+                            "command": (
+                                '/opt/hindsight/bin/hindsight-memory "unterminated'
+                            )
+                        }
+                    ]
+                },
+                {
+                    "hooks": [
+                        {
+                            "command": (
+                                "sh -c '/opt/hindsight/bin/"
+                                "hindsight-memory status'"
+                            )
+                        }
+                    ]
+                },
+            ]
+        )
+        disabled = deep_thaw(
+            native_fail_closed_configuration(
+                "claude-code",
+                active,
+                upstream_integration_roots=(),
+            )
+        )
+
+        self.assert_failed_closed(disabled)
+        self.assertNotIn("recall", disabled["tools"])
+        self.assertIn("unrelated", disabled["tools"])
+        self.assertNotIn("hindsight-memory", json.dumps(disabled["hooks"]))
+
+        direct = deep_thaw(
+            native_fail_closed_configuration(
+                "claude-code",
+                deep_thaw(self.current),
+                upstream_integration_roots=(),
+            )
+        )
+        self.assertNotIn("SessionStart", direct["hooks"]["hooks"])
+        self.assertNotIn("Stop", direct["hooks"]["hooks"])
 
     def test_plan_rejects_an_unverified_or_corrupt_staged_generation(self):
         (self.staged_generation / "claude-code" / "tools.json").unlink()
@@ -1254,6 +1407,85 @@ class NativeHarnessActivationTest(unittest.TestCase):
         self.assertNotIn(
             str(integration_root),
             json.dumps(deep_thaw(plan.target)["hooks"]),
+        )
+        self.assertEqual(
+            plan.upstream_integration_roots,
+            (str(integration_root.resolve()),),
+        )
+
+    def test_failed_postcheck_reuses_plan_roots_and_writes_mutable_target(self):
+        integration_root = self.staging_root / "rollback-upstream"
+        scripts = integration_root / "scripts"
+        scripts.mkdir(parents=True, mode=0o700)
+        upstream_recall = scripts / "recall.py"
+        upstream_recall.write_text("# upstream\n", encoding="utf-8")
+        current = deep_thaw(self.current)
+        direct_hook = {
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": f'python3 "{upstream_recall}"',
+                    "timeout": 12,
+                }
+            ]
+        }
+        current["hooks"]["hooks"]["UserPromptSubmit"].append(deep_thaw(direct_hook))
+        plan = native_activation_plan(
+            self.artifact,
+            current,
+            staged_generation=self.staged_generation,
+            upstream_integration_roots=(integration_root,),
+            **DIGESTS,
+        )
+        persisted = deep_thaw(current)
+        rollback = []
+        writes = 0
+
+        def write(expected_digest, value):
+            nonlocal persisted, writes
+            if digest(persisted) != expected_digest:
+                raise ActivationCASMismatch("changed")
+            writes += 1
+            if writes == 2:
+                self.assertIs(type(value), dict)
+                self.assertIs(
+                    type(value["hooks"]["hooks"]["UserPromptSubmit"]),
+                    list,
+                )
+            persisted = deep_thaw(value)
+
+        def postcheck(*_):
+            persisted["hooks"]["hooks"]["UserPromptSubmit"].append(
+                deep_thaw(direct_hook)
+            )
+            return False
+
+        outcome = apply_native_activation(
+            plan,
+            current,
+            staged_generation=self.staged_generation,
+            approved_plan_digest=plan.plan_digest,
+            inventory_digest=DIGESTS["inventory_digest"],
+            artifact_digest=DIGESTS["artifact_digest"],
+            policy_digest=DIGESTS["policy_digest"],
+            broker_healthy=True,
+            profile_healthy=True,
+            adapter_self_test=True,
+            persist_rollback=lambda value: rollback.append(deep_thaw(value)),
+            read_rollback=lambda: deep_thaw(rollback[-1]),
+            read_configuration=lambda: deep_thaw(persisted),
+            write_configuration=write,
+            postcheck=postcheck,
+        )
+
+        self.assertEqual(
+            (outcome.status, outcome.reason), ("rolled_back", "postcheck_failed")
+        )
+        self.assert_failed_closed(persisted, plan=plan)
+        self.assertNotIn(str(integration_root), json.dumps(persisted["hooks"]))
+        self.assertEqual(
+            deep_thaw(native_fail_closed_target(plan, persisted)),
+            persisted,
         )
 
     def test_plan_rejects_degenerate_roots_and_preserves_substring_matches(self):
@@ -1326,7 +1558,7 @@ class NativeHarnessActivationTest(unittest.TestCase):
         self.assertEqual(rollback, [self.current])
         self.assertEqual(persisted, deep_thaw(self.plan.target))
 
-    def test_failed_postcheck_restores_exact_prestate(self):
+    def test_failed_postcheck_disables_hindsight_authority(self):
         persisted = deep_thaw(self.current)
         rollback = []
 
@@ -1356,7 +1588,7 @@ class NativeHarnessActivationTest(unittest.TestCase):
         self.assertEqual((outcome.status, outcome.reason), ("rolled_back", "postcheck_failed"))
         self.assertTrue(outcome.rollback_attempted)
         self.assertTrue(outcome.rollback_succeeded)
-        self.assertEqual(persisted, self.current)
+        self.assert_failed_closed(persisted)
 
     def test_write_then_raise_rolls_back_the_possibly_persisted_target(self):
         persisted = deep_thaw(self.current)
@@ -1394,9 +1626,9 @@ class NativeHarnessActivationTest(unittest.TestCase):
             ("rolled_back", "activation_write_failed"),
         )
         self.assertTrue(outcome.rollback_succeeded)
-        self.assertEqual(persisted, self.current)
+        self.assert_failed_closed(persisted)
 
-    def test_partial_surface_write_rolls_back_exact_hook_order(self):
+    def test_partial_surface_write_disables_hindsight_and_preserves_hook_order(self):
         persisted = deep_thaw(self.current)
         rollback = []
         writes = 0
@@ -1430,9 +1662,9 @@ class NativeHarnessActivationTest(unittest.TestCase):
             postcheck=lambda *_: True,
         )
         self.assertEqual(outcome.status, "rolled_back")
-        self.assertEqual(persisted["hooks"], self.current["hooks"])
+        self.assert_failed_closed(persisted)
 
-    def test_partial_rollback_restores_duplicate_direct_hook_occurrences(self):
+    def test_partial_rollback_removes_duplicate_direct_hook_occurrences(self):
         current = deep_thaw(self.current)
         upstream = deep_thaw(current["hooks"]["hooks"]["Stop"][0])
         current["hooks"]["hooks"]["Stop"].insert(0, deep_thaw(upstream))
@@ -1480,7 +1712,7 @@ class NativeHarnessActivationTest(unittest.TestCase):
             postcheck=lambda *_: True,
         )
         self.assertEqual(outcome.status, "rolled_back")
-        self.assertEqual(persisted["hooks"], current["hooks"])
+        self.assert_failed_closed(persisted, plan=plan)
 
     def test_true_postcheck_requires_a_final_exact_readback(self):
         persisted = deep_thaw(self.current)
@@ -1518,7 +1750,7 @@ class NativeHarnessActivationTest(unittest.TestCase):
             ("rolled_back", "postcheck_drift"),
         )
         self.assertEqual(persisted["settings"]["theme"], "cool")
-        self.assertTrue(persisted["settings"]["autoRecall"])
+        self.assert_failed_closed(persisted)
 
     def test_postcheck_rollback_preserves_concurrent_unrelated_changes(self):
         persisted = deep_thaw(self.current)
@@ -1554,7 +1786,7 @@ class NativeHarnessActivationTest(unittest.TestCase):
         )
         self.assertEqual(outcome.status, "rolled_back")
         self.assertEqual(persisted["settings"]["theme"], "cool")
-        self.assertTrue(persisted["settings"]["autoRecall"])
+        self.assert_failed_closed(persisted)
         self.assertEqual(
             persisted["registrations"],
             [{"id": "unrelated"}, {"id": "concurrent"}],

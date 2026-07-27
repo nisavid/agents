@@ -37,7 +37,7 @@ class NativeHarnessDestinationTest(unittest.TestCase):
                 {
                     "hooks": {
                         "PreToolUse": [
-                            {"hooks": [{"command": "echo hindsight-memory"}]}
+                            {"hooks": [{"command": "echo unrelated-memory"}]}
                         ]
                     }
                 }
@@ -411,6 +411,13 @@ class NativeHarnessDestinationTest(unittest.TestCase):
         locators = self.root / "locators"
         for path in (state, staging, locators):
             path.mkdir(mode=0o700)
+        upstream = self.root / "upstream"
+        (upstream / "scripts").mkdir(parents=True, mode=0o700)
+        upstream.chmod(0o700)
+        (upstream / "scripts").chmod(0o700)
+        upstream_recall = upstream / "scripts" / "recall.py"
+        upstream_recall.write_text("# trusted upstream fixture\n", encoding="utf-8")
+        upstream_recall.chmod(0o600)
         destination_path = self.root / "destination.json"
         destination_path.write_text(
             json.dumps(
@@ -447,7 +454,9 @@ class NativeHarnessDestinationTest(unittest.TestCase):
             stdout=subprocess.PIPE,
             timeout=10,
         )
-        self.assertFalse(json.loads(initial_status.stdout)["controller_hooks_present"])
+        self.assertFalse(
+            json.loads(initial_status.stdout)["controller_hooks_present"]
+        )
         staged = subprocess.run(
             [*base, "stage", *shared, "--staging-root", str(staging)],
             check=True,
@@ -461,6 +470,42 @@ class NativeHarnessDestinationTest(unittest.TestCase):
             repository / "tooling/hindsight/examples/portable-consumer/inventory.json"
         )
         policy = repository / "tooling/hindsight/examples/provider-runtime-policy.json"
+        noncanonical_inventory = self.root / "noncanonical-inventory.json"
+        noncanonical = json.loads(inventory.read_text(encoding="utf-8"))
+        noncanonical["banks"][0]["id"] = "codex"
+        for harness in noncanonical["harnesses"]:
+            harness["home_bank"]["bank_id"] = "codex"
+            harness["write_bank"]["bank_id"] = "codex"
+        noncanonical_inventory.write_text(
+            json.dumps(noncanonical), encoding="utf-8"
+        )
+        noncanonical_inventory.chmod(0o600)
+        refused_plan_path = self.root / "refused-plan.json"
+        refused = subprocess.run(
+            [
+                *base,
+                "plan",
+                *shared,
+                "--generation",
+                generation,
+                "--inventory",
+                str(noncanonical_inventory),
+                "--policy",
+                str(policy),
+                "--upstream-integration-root",
+                str(upstream),
+                "--output",
+                str(refused_plan_path),
+            ],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("engineering", refused.stderr)
+        self.assertFalse(refused_plan_path.exists())
         planned = subprocess.run(
             [
                 *base,
@@ -472,6 +517,8 @@ class NativeHarnessDestinationTest(unittest.TestCase):
                 str(inventory),
                 "--policy",
                 str(policy),
+                "--upstream-integration-root",
+                str(upstream),
                 "--output",
                 str(plan_path),
             ],
@@ -502,6 +549,8 @@ class NativeHarnessDestinationTest(unittest.TestCase):
                 str(inventory),
                 "--policy",
                 str(policy),
+                "--upstream-integration-root",
+                str(upstream),
                 "--plan",
                 str(plan_path),
                 "--approval-digest",
@@ -536,6 +585,114 @@ class NativeHarnessDestinationTest(unittest.TestCase):
         )
         self.assertTrue(json.loads(status.stdout)["target_matches"])
         self.assertTrue(json.loads(status.stdout)["destination_matches"])
+        verified = subprocess.run(
+            [
+                *base,
+                "verify",
+                "--destination",
+                str(destination_path),
+                "--generation",
+                generation,
+                "--inventory",
+                str(inventory),
+                "--policy",
+                str(policy),
+                "--upstream-integration-root",
+                str(upstream),
+                "--plan",
+                str(plan_path),
+                "--approval-digest",
+                approval_digest,
+            ],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+        self.assertEqual(verified.returncode, 0, verified.stderr or verified.stdout)
+        self.assertEqual(json.loads(verified.stdout)["status"], "healthy")
+
+        drifted_hooks = json.loads(self.hooks.read_text(encoding="utf-8"))
+        drifted_hooks["hooks"]["UserPromptSubmit"] = [
+            entry
+            for entry in drifted_hooks["hooks"]["UserPromptSubmit"]
+            if str(cli) not in json.dumps(entry)
+        ]
+        drifted_hooks["hooks"]["UserPromptSubmit"].append(
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": f'python3 "{upstream_recall}"',
+                    }
+                ]
+            }
+        )
+        drifted_hooks["hooks"]["PreToolUse"].append(
+            {"hooks": [{"command": "other-hook"}]}
+        )
+        self.hooks.write_text(json.dumps(drifted_hooks), encoding="utf-8")
+        self.hooks.chmod(0o600)
+        drifted_settings = json.loads(self.settings.read_text(encoding="utf-8"))
+        drifted_settings["bankId"] = "codex"
+        self.settings.write_text(json.dumps(drifted_settings), encoding="utf-8")
+        self.settings.chmod(0o600)
+
+        failed_closed = subprocess.run(
+            [
+                *base,
+                "verify",
+                "--destination",
+                str(destination_path),
+                "--generation",
+                generation,
+                "--inventory",
+                str(inventory),
+                "--policy",
+                str(policy),
+                "--upstream-integration-root",
+                str(upstream),
+                "--plan",
+                str(plan_path),
+                "--approval-digest",
+                approval_digest,
+            ],
+            check=False,
+            text=True,
+            capture_output=True,
+            timeout=10,
+        )
+        self.assertEqual(
+            failed_closed.returncode,
+            2,
+            failed_closed.stderr or failed_closed.stdout,
+        )
+        failed_closed_result = json.loads(failed_closed.stdout)
+        self.assertEqual(failed_closed_result["status"], "disabled")
+        self.assertEqual(failed_closed_result["reason"], "activation_drift")
+        self.assertIn(
+            "controller_hook_drift", failed_closed_result["findings"]
+        )
+        self.assertIn("direct_hook_present", failed_closed_result["findings"])
+        self.assertIn("direct_setting_present", failed_closed_result["findings"])
+        disabled = self.destination.read_configuration()
+        self.assertNotIn("hindsight-memory", json.dumps(disabled["hooks"]))
+        self.assertFalse(
+            any(
+                str(cli) in json.dumps(entry)
+                or "recall.py" in json.dumps(entry)
+                for entries in disabled["hooks"]["hooks"].values()
+                for entry in entries
+            )
+        )
+        self.assertIn(
+            {"hooks": [{"command": "other-hook"}]},
+            disabled["hooks"]["hooks"]["PreToolUse"],
+        )
+        self.assertNotIn("bankId", disabled["settings"])
+        self.assertIs(disabled["settings"]["autoRecall"], False)
+        self.assertIs(disabled["settings"]["autoRetain"], False)
         rolled_back = subprocess.run(
             [
                 *base,
@@ -548,6 +705,8 @@ class NativeHarnessDestinationTest(unittest.TestCase):
                 str(inventory),
                 "--policy",
                 str(policy),
+                "--upstream-integration-root",
+                str(upstream),
                 "--plan",
                 str(plan_path),
                 "--approval-digest",
@@ -558,11 +717,23 @@ class NativeHarnessDestinationTest(unittest.TestCase):
             stdout=subprocess.PIPE,
             timeout=10,
         )
-        self.assertEqual(json.loads(rolled_back.stdout)["status"], "rolled_back")
+        rollback_result = json.loads(rolled_back.stdout)
+        self.assertEqual(rollback_result["status"], "rolled_back")
         self.assertEqual(
-            self.destination.read_configuration()["settings"],
-            {"unrelated": True, "tenantToken": "plan-secret"},
+            rollback_result["prestate_path"],
+            str(
+                self.rollback
+                / (
+                    "codex."
+                    f"{plan_record['plan']['expected_prestate_digest']}.json"
+                )
+            ),
         )
+        rolled_back_configuration = self.destination.read_configuration()
+        self.assertEqual(rolled_back_configuration["settings"]["unrelated"], True)
+        self.assertNotIn("tenantToken", rolled_back_configuration["settings"])
+        self.assertIs(rolled_back_configuration["settings"]["autoRecall"], False)
+        self.assertIs(rolled_back_configuration["settings"]["autoRetain"], False)
 
 
 if __name__ == "__main__":

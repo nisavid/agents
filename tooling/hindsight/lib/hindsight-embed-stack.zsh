@@ -121,6 +121,28 @@ hindsight_stack_load_config() {
     print -ru2 -- "hindsight-embed-stack: HINDSIGHT_MEMORY_BROKER_SOCKET must be absolute"
     return 1
   }
+  local harness_reconcile_binding_count=0
+  [[ -n "${HINDSIGHT_MEMORY_HARNESS_RECONCILER:-}" ]] &&
+    (( harness_reconcile_binding_count += 1 ))
+  [[ -n "${HINDSIGHT_MEMORY_HARNESS_RECONCILE_CONFIG:-}" ]] &&
+    (( harness_reconcile_binding_count += 1 ))
+  if (( harness_reconcile_binding_count != 0 && harness_reconcile_binding_count != 2 )); then
+    print -ru2 -- "hindsight-embed-stack: harness reconciliation bindings must be all set or all unset"
+    return 1
+  fi
+  if (( harness_reconcile_binding_count == 2 )); then
+    [[
+      "$HINDSIGHT_MEMORY_HARNESS_RECONCILER" == /* &&
+      "$HINDSIGHT_MEMORY_HARNESS_RECONCILER" != *$'\n'* &&
+      "$HINDSIGHT_MEMORY_HARNESS_RECONCILER" != *$'\r'* &&
+      "$HINDSIGHT_MEMORY_HARNESS_RECONCILE_CONFIG" == /* &&
+      "$HINDSIGHT_MEMORY_HARNESS_RECONCILE_CONFIG" != *$'\n'* &&
+      "$HINDSIGHT_MEMORY_HARNESS_RECONCILE_CONFIG" != *$'\r'*
+    ]] || {
+      print -ru2 -- "hindsight-embed-stack: harness reconciliation paths must be absolute single-line paths"
+      return 1
+    }
+  fi
   if [[ -n "${HINDSIGHT_MEMORY_INTEGRATION_UPGRADE_STATE:-}" ]]; then
     [[
       "$HINDSIGHT_MEMORY_INTEGRATION_UPGRADE_STATE" == /* &&
@@ -366,7 +388,7 @@ hindsight_stack_set_desired_state() {
 hindsight_stack_desired_state() {
   emulate -L zsh
   hindsight_stack_load_config || return 1
-  local component="$1" profile="${2:-$HINDSIGHT_EMBED_PROFILE}" path desired owner mode owner_mode
+  local component="$1" profile="${2:-$HINDSIGHT_EMBED_PROFILE}" path desired extra owner mode owner_mode desired_state_fd
   path="$(hindsight_stack_desired_state_path "$component" "$profile")" || return 1
   if [[ ! -e "$path" ]]; then
     case "$component" in
@@ -384,7 +406,17 @@ hindsight_stack_desired_state() {
   owner="${owner_mode%%:*}"
   mode="${owner_mode#*:}"
   (( owner == EUID && (8#$mode & 8#0077) == 0 )) || return 1
-  desired="$(<"$path")"
+  exec {desired_state_fd}<"$path" || return 1
+  if ! IFS= read -r desired <&$desired_state_fd; then
+    exec {desired_state_fd}<&-
+    return 1
+  fi
+  extra=""
+  if IFS= read -r extra <&$desired_state_fd || [[ -n "$extra" ]]; then
+    exec {desired_state_fd}<&-
+    return 1
+  fi
+  exec {desired_state_fd}<&-
   case "$desired" in
     running|stopped) print -r -- "$desired" ;;
     *) return 1 ;;
@@ -2866,11 +2898,30 @@ hindsight_stack_reconcile_profile() {
 hindsight_stack_reconcile_once() {
   emulate -L zsh
   hindsight_stack_load_config || return 1
-  hindsight_stack_preflight_runtime_credentials || return 1
-  hindsight_stack_require_current_user || return 1
-  hindsight_stack_require_tools || return 1
-  hindsight_stack_validate_fleet || return 1
-  hindsight_stack_initialize_desired_state || return 1
+  hindsight_stack_preflight_runtime_credentials || {
+    hindsight_stack_disable_harness_authority >/dev/null 2>&1 || true
+    return 1
+  }
+  hindsight_stack_require_current_user || {
+    hindsight_stack_disable_harness_authority >/dev/null 2>&1 || true
+    return 1
+  }
+  hindsight_stack_require_tools || {
+    hindsight_stack_disable_harness_authority >/dev/null 2>&1 || true
+    return 1
+  }
+  hindsight_stack_validate_fleet || {
+    hindsight_stack_disable_harness_authority >/dev/null 2>&1 || true
+    return 1
+  }
+  hindsight_stack_initialize_desired_state || {
+    hindsight_stack_disable_harness_authority >/dev/null 2>&1 || true
+    return 1
+  }
+  hindsight_stack_reconcile_harness_authority || {
+    hindsight_stack_disable_harness_authority >/dev/null 2>&1 || true
+    return 1
+  }
 
   local ok=0
 
@@ -2885,8 +2936,52 @@ hindsight_stack_reconcile_once() {
     hindsight_stack_reconcile_control || ok=1
     hindsight_stack_for_each_profile hindsight_stack_reconcile_profile "" || ok=1
   fi
-
+  if (( ok == 0 )) &&
+    hindsight_stack_for_each_profile \
+      hindsight_stack_daemon_desired_running ""; then
+    hindsight_stack_record_harness_authority || ok=1
+  else
+    ok=1
+  fi
+  (( ok == 0 )) ||
+    hindsight_stack_disable_harness_authority >/dev/null 2>&1 || true
   return "$ok"
+}
+
+hindsight_stack_run_harness_reconciler() {
+  emulate -L zsh
+  local phase="$1"
+  [[ "$phase" == pre-start || "$phase" == post-start || "$phase" == disable ]] ||
+    return 2
+  hindsight_stack_load_config || return 1
+  [[ -n "${HINDSIGHT_MEMORY_HARNESS_RECONCILER:-}" ]] || return 0
+  hindsight_stack_validate_trusted_executable \
+    "$HINDSIGHT_MEMORY_HARNESS_RECONCILER" \
+    "harness authority reconciler" || return 1
+  hindsight_stack_run_bounded \
+    "$HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS" \
+    "$HINDSIGHT_MEMORY_HARNESS_RECONCILER" \
+    "$phase" \
+    "$HINDSIGHT_MEMORY_HARNESS_RECONCILE_CONFIG"
+}
+
+hindsight_stack_reconcile_harness_authority() {
+  hindsight_stack_run_harness_reconciler pre-start
+}
+
+hindsight_stack_record_harness_authority() {
+  hindsight_stack_run_harness_reconciler post-start
+}
+
+hindsight_stack_disable_harness_authority() {
+  hindsight_stack_run_harness_reconciler disable
+}
+
+hindsight_stack_daemon_desired_running() {
+  emulate -L zsh
+  local desired
+  desired="$(hindsight_stack_desired_state daemon)" || return 1
+  [[ "$desired" == running ]]
 }
 
 hindsight_stack_start_profile() {
@@ -2951,22 +3046,59 @@ hindsight_stack_start_control_dependency() {
 hindsight_stack_start_all() {
   emulate -L zsh
   hindsight_stack_load_config || return 1
-  hindsight_stack_preflight_runtime_credentials || return 1
-  hindsight_stack_require_current_user || return 1
-  hindsight_stack_require_tools || return 1
-  hindsight_stack_require_runtime_helpers || return 1
-  hindsight_stack_validate_fleet || return 1
-  hindsight_stack_initialize_desired_state || return 1
+  hindsight_stack_preflight_runtime_credentials || {
+    hindsight_stack_disable_harness_authority >/dev/null 2>&1 || true
+    return 1
+  }
+  hindsight_stack_require_current_user || {
+    hindsight_stack_disable_harness_authority >/dev/null 2>&1 || true
+    return 1
+  }
+  hindsight_stack_require_tools || {
+    hindsight_stack_disable_harness_authority >/dev/null 2>&1 || true
+    return 1
+  }
+  hindsight_stack_require_runtime_helpers || {
+    hindsight_stack_disable_harness_authority >/dev/null 2>&1 || true
+    return 1
+  }
+  hindsight_stack_validate_fleet || {
+    hindsight_stack_disable_harness_authority >/dev/null 2>&1 || true
+    return 1
+  }
+  hindsight_stack_initialize_desired_state || {
+    hindsight_stack_disable_harness_authority >/dev/null 2>&1 || true
+    return 1
+  }
+  hindsight_stack_reconcile_harness_authority || {
+    hindsight_stack_disable_harness_authority >/dev/null 2>&1 || true
+    return 1
+  }
 
+  local ok=0
   if hindsight_stack_runtime_active; then
-    hindsight_stack_start_control_dependency || return 1
-    hindsight_stack_for_each_profile hindsight_stack_start_profile "" || return 1
-    hindsight_stack_start_broker_dependency
+    hindsight_stack_start_control_dependency || ok=1
+    (( ok != 0 )) ||
+      hindsight_stack_for_each_profile hindsight_stack_start_profile "" ||
+      ok=1
+    (( ok != 0 )) || hindsight_stack_start_broker_dependency || ok=1
   else
-    hindsight_stack_start_broker_dependency || return 1
-    hindsight_stack_start_control_dependency || return 1
-    hindsight_stack_for_each_profile hindsight_stack_start_profile ""
+    hindsight_stack_start_broker_dependency || ok=1
+    (( ok != 0 )) || hindsight_stack_start_control_dependency || ok=1
+    (( ok != 0 )) ||
+      hindsight_stack_for_each_profile hindsight_stack_start_profile "" ||
+      ok=1
   fi
+  if (( ok == 0 )) &&
+    hindsight_stack_for_each_profile \
+      hindsight_stack_daemon_desired_running ""; then
+    hindsight_stack_record_harness_authority || ok=1
+  else
+    ok=1
+  fi
+  (( ok == 0 )) ||
+    hindsight_stack_disable_harness_authority >/dev/null 2>&1 || true
+  return "$ok"
 }
 
 hindsight_stack_wait_profile() {
@@ -3025,11 +3157,12 @@ hindsight_stack_stop_profile() {
 hindsight_stack_stop_all() {
   emulate -L zsh
   hindsight_stack_load_config || return 1
+  local ok=0
+  hindsight_stack_disable_harness_authority || ok=1
   hindsight_stack_require_current_user || return 1
   hindsight_stack_require_tools || return 1
   hindsight_stack_require_runtime_helpers || return 1
 
-  local ok=0
   hindsight_stack_for_each_profile_for_stop hindsight_stack_stop_profile || ok=1
   hindsight_stack_broker_stop || ok=1
   hindsight_stack_wait_stopped_for broker "$HINDSIGHT_EMBED_STOP_WAIT_SECONDS" || {

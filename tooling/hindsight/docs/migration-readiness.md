@@ -43,6 +43,8 @@ The discovery command has this shape:
   --approved-offline-package-digest "$approved_package_digest" \
   --private-catalog-digests /absolute/path/to/private-catalog-digests.json \
   --retain-watermarks /absolute/path/to/retain-watermarks.json \
+  --harness-reconciliation-config \
+    /absolute/path/to/harness-reconciliation.json \
   --completion-marker /absolute/path/to/distillation-complete.marker \
   --token-env HINDSIGHT_DATA_PLANE_TOKEN
 ```

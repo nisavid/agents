@@ -5,6 +5,7 @@ from pathlib import Path
 import os
 import sys
 import tempfile
+import threading
 from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -189,6 +190,54 @@ class ControlServerHooksTest(unittest.TestCase):
         )
         self.assertFalse(catalog["openai-codex"].needs_api_key)
         self.assertFalse(catalog["claude-code"].needs_api_key)
+        self.assertEqual(
+            catalog["openai-codex"].label,
+            "[Systalyze] OpenAI Codex",
+        )
+
+    def test_managed_codex_save_persists_work_home_marker(self):
+        runtime = ProfileConfig(
+            "example-profile",
+            "openai-codex",
+            self.module.MANAGED_CODEX_MODEL,
+            "",
+        )
+        saved = []
+        service = SimpleNamespace(
+            get_profile_config=lambda _name: runtime,
+            list_profiles=lambda: [],
+            save_llm_config=lambda **kwargs: saved.append(kwargs) or runtime,
+        )
+        self.module.install_provider_alias(service, None)
+
+        service.save_llm_config(
+            name="example-profile",
+            provider="openai-codex",
+            api_key="",
+            model=None,
+            base_url=None,
+        )
+
+        self.assertEqual(
+            saved[-1]["api_key"],
+            "provider-policy:work-codex",
+        )
+        self.assertEqual(
+            saved[-1]["model"],
+            "gpt-5.3-codex-spark",
+        )
+        self.assertEqual(saved[-1]["base_url"], "")
+        with self.assertRaisesRegex(
+            ValueError,
+            "not permitted",
+        ):
+            service.save_llm_config(
+                name="example-profile",
+                provider="claude-code",
+                api_key="",
+                model="claude",
+                base_url=None,
+            )
 
     def test_provider_preset_catalog_and_alias_round_trip(self):
         runtime = ProfileConfig(
@@ -327,7 +376,6 @@ class ControlServerHooksTest(unittest.TestCase):
 
     def test_lifecycle_hooks_preserve_intent_and_required_daemon(self):
         self.service.stop_daemon("example-profile")
-        self.service.stop_ui("example-profile")
         self.assertEqual(self.desired("example-profile", "daemon"), "stopped")
         self.assertEqual(self.desired("example-profile", "ui"), "stopped")
 
@@ -335,7 +383,8 @@ class ControlServerHooksTest(unittest.TestCase):
         self.assertEqual(self.desired("example-profile", "daemon"), "running")
         self.assertEqual(self.desired("example-profile", "ui"), "running")
 
-    def test_failed_stop_restores_running_intent(self):
+    def test_failed_stop_restores_absent_daemon_intent(self):
+        self.service.stop_ui("example-profile")
         service = SimpleNamespace(**vars(self.service))
         service.stop_daemon = lambda _name: DaemonResult(
             ok=False, running=True
@@ -344,7 +393,132 @@ class ControlServerHooksTest(unittest.TestCase):
 
         service.stop_daemon("example-profile")
 
-        self.assertEqual(self.desired("example-profile", "daemon"), "running")
+        profile = self.state_dir / "profiles" / "example-profile"
+        self.assertFalse((profile / "daemon").exists())
+        self.assertEqual(self.desired("example-profile", "ui"), "stopped")
+
+    def test_failed_stop_cannot_overwrite_later_serialized_start(self):
+        profile = "concurrent-profile"
+        self.module.set_desired_state(
+            self.state_dir,
+            profile,
+            "daemon",
+            "stopped",
+        )
+        stop_entered = threading.Event()
+        release_stop = threading.Event()
+        start_entered = threading.Event()
+
+        def stop(_profile):
+            stop_entered.set()
+            self.assertTrue(release_stop.wait(timeout=3))
+            return DaemonResult(ok=False, running=True)
+
+        def start(_profile):
+            start_entered.set()
+            return DaemonResult(ok=True, running=True)
+
+        service = SimpleNamespace(**vars(self.service))
+        service.stop_daemon = stop
+        service.start_daemon = start
+        self.module.install_lifecycle_hooks(service, self.state_dir)
+        stop_thread = threading.Thread(
+            target=service.stop_daemon,
+            args=(profile,),
+        )
+        start_thread = threading.Thread(
+            target=service.start_daemon,
+            args=(profile,),
+        )
+
+        stop_thread.start()
+        self.assertTrue(stop_entered.wait(timeout=3))
+        start_thread.start()
+        self.assertFalse(start_entered.wait(timeout=0.1))
+        release_stop.set()
+        stop_thread.join(timeout=3)
+        start_thread.join(timeout=3)
+
+        self.assertFalse(stop_thread.is_alive())
+        self.assertFalse(start_thread.is_alive())
+        self.assertTrue(start_entered.is_set())
+        self.assertEqual(
+            self.desired(profile, "daemon"),
+            "running",
+        )
+
+    def test_missing_desired_state_is_explicit_and_failed_stop_restores_absence(
+        self,
+    ):
+        self.assertIsNone(
+            self.module.desired_state(
+                self.state_dir,
+                "example-profile",
+                "daemon",
+            )
+        )
+        marker = (
+            self.state_dir
+            / "profiles"
+            / "example-profile"
+            / "unrelated"
+        )
+
+        def fail_stop(_name):
+            marker.write_text("preserved\n", encoding="ascii")
+            marker.chmod(0o600)
+            return DaemonResult(ok=False, running=True)
+
+        service = SimpleNamespace(**vars(self.service))
+        service.stop_daemon = fail_stop
+        self.module.install_lifecycle_hooks(service, self.state_dir)
+
+        service.stop_daemon("example-profile")
+
+        profile = self.state_dir / "profiles" / "example-profile"
+        self.assertFalse((profile / "daemon").exists())
+        self.assertFalse((profile / "ui").exists())
+        self.assertEqual(marker.read_text(encoding="ascii"), "preserved\n")
+
+    def test_stop_rollback_preserves_primary_error_and_restores_every_component(
+        self,
+    ):
+        restored = []
+
+        def set_state(_root, _profile, component, state):
+            if state == "running":
+                restored.append(component)
+                if component == "daemon":
+                    raise RuntimeError("restore failed")
+
+        def fail(_profile):
+            raise ValueError("primary action failure")
+
+        with (
+            patch.object(
+                self.module,
+                "desired_state",
+                return_value="running",
+            ),
+            patch.object(
+                self.module,
+                "set_desired_state",
+                side_effect=set_state,
+            ),
+        ):
+            wrapped = self.module._stopping_action(
+                fail,
+                self.state_dir,
+                ("daemon", "ui"),
+                lambda _profile: self.module.threading.Lock(),
+            )
+            with self.assertRaisesRegex(
+                ValueError,
+                "primary action failure",
+            ):
+                wrapped("example-profile")
+
+        self.assertEqual(restored, ["daemon", "ui"])
 
     def test_desired_state_is_private_and_rejects_unsafe_names_and_paths(self):
         self.module.set_desired_state(
@@ -354,6 +528,31 @@ class ControlServerHooksTest(unittest.TestCase):
         self.assertEqual(os.stat(self.state_dir).st_mode & 0o777, 0o700)
         self.assertEqual(os.stat(profile).st_mode & 0o777, 0o700)
         self.assertEqual(os.stat(profile / "daemon").st_mode & 0o777, 0o600)
+        self.assertEqual(
+            self.module.desired_state(
+                self.state_dir,
+                "example-profile",
+                "daemon",
+            ),
+            "stopped",
+        )
+        for payload in (
+            b"stopped",
+            b" stopped\n",
+            b"stopped \n",
+            b"stopped\n\n",
+        ):
+            with self.subTest(payload=payload):
+                (profile / "daemon").write_bytes(payload)
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "desired-state file is invalid",
+                ):
+                    self.module.desired_state(
+                        self.state_dir,
+                        "example-profile",
+                        "daemon",
+                    )
 
         for name in ("../outside", "bad/name"):
             with self.subTest(profile=name), self.assertRaises(ValueError):

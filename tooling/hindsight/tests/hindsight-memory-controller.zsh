@@ -259,6 +259,24 @@ if print -r -- "$help_output" | rg -v '^(Usage:|$|Commands:|[[:space:]]+(install
   fail "service help gained an unreviewed operator command"
 fi
 
+portable_help="$("$repo_dir/bin/hindsight-memory" service --help)"
+for command in start restart stop status; do
+  "$repo_dir/bin/hindsight-memory" service "$command" --help \
+    >"$tmp_dir/portable-service-${command}.help" ||
+    fail "portable service help lost the ${command} command"
+  rg -q "^usage: .* service ${command} " \
+    "$tmp_dir/portable-service-${command}.help" ||
+    fail "portable service help did not identify the ${command} command"
+done
+if "$repo_dir/bin/hindsight-memory" service status \
+  --config "$tmp_dir/missing-installation.json" \
+  >"$tmp_dir/portable-service-status.out" 2>&1; then
+  fail "portable service status accepted a missing installation"
+fi
+rg -q 'installation config is unreadable or invalid' \
+  "$tmp_dir/portable-service-status.out" ||
+  fail "portable service command did not read lifecycle state from --config"
+
 if env -i HOME="$tmp_dir/unbound-home" PATH=/usr/bin:/bin \
   /bin/zsh "$repo_dir/bin/hindsight-embed-service" status \
   >"$tmp_dir/unbound-service.out" 2>&1; then

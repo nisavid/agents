@@ -164,6 +164,21 @@ class InactiveSystemdRunner(RecordingRunner):
         return None
 
 
+class InactiveLaunchdServiceRunner(RecordingRunner):
+    def __call__(self, argv: tuple[str, ...]) -> str | None:
+        result = super().__call__(argv)
+        if (
+            argv[:2] == ("/bin/launchctl", "print")
+            and argv[2].endswith(
+                "/io.nisavid.hindsight.synthetic.broker"
+            )
+        ):
+            if result is None:
+                return None
+            return result.replace("state = running", "state = waiting")
+        return result
+
+
 class ForeignManifestRunner(RecordingRunner):
     def __call__(self, argv: tuple[str, ...]) -> str | None:
         if argv[:2] == ("/bin/launchctl", "print"):
@@ -372,6 +387,404 @@ class PortableInstallationManagerTest(unittest.TestCase):
         self.assertTrue(
             any(call[0].endswith("launchctl") for call in self.runner.calls)
         )
+
+    def test_intentional_service_stop_preserves_installation_and_stays_stopped(
+        self,
+    ) -> None:
+        release = self.release("1.0.0")
+        manager = self.manager()
+        manager.install(release, version="1.0.0")
+
+        stopped = manager.stop_services()
+
+        self.assertEqual(stopped["status"], "stopped")
+        self.assertEqual(stopped["services"], {"broker": "stopped"})
+        self.assertNotIn(
+            "io.nisavid.hindsight.synthetic.broker",
+            self.runner.launchd_jobs,
+        )
+        self.assertTrue((self.install_root / "install-state.json").is_file())
+        self.assertTrue(
+            (
+                self.service_root
+                / "io.nisavid.hindsight.synthetic.broker.plist"
+            ).is_file()
+        )
+
+    def test_service_status_reports_intentional_stop_without_requiring_health(
+        self,
+    ) -> None:
+        manager = self.manager(health_runner=lambda _check, _release: True)
+        manager.install(
+            self.release("1.0.0"),
+            version="1.0.0",
+        )
+        manager.stop_services()
+        manager._health_runner = lambda _check, _release: False
+
+        status = manager.service_status()
+
+        self.assertEqual(status["status"], "stopped")
+        self.assertEqual(status["services"], {"broker": "stopped"})
+        self.assertEqual(
+            status["timers"], {"integration-upgrades": "stopped"}
+        )
+
+    def test_explicit_service_start_recovers_an_intentionally_stopped_stack(
+        self,
+    ) -> None:
+        manager = self.manager(health_runner=lambda _check, _release: True)
+        manager.install(self.release("1.0.0"), version="1.0.0")
+        manager.stop_services()
+
+        started = manager.start_services()
+
+        self.assertEqual(started["status"], "running")
+        self.assertEqual(started["managed_health"], "healthy")
+        self.assertEqual(started["services"], {"broker": "running"})
+        self.assertEqual(
+            started["timers"], {"integration-upgrades": "running"}
+        )
+
+    def test_service_start_is_idempotent_for_running_launchd_jobs(self) -> None:
+        manager = self.manager(health_runner=lambda _check, _release: True)
+        manager.install(self.release("1.0.0"), version="1.0.0")
+        self.runner.calls.clear()
+
+        started = manager.start_services()
+
+        self.assertEqual(started["status"], "running")
+        self.assertFalse(
+            any(
+                call[1] in {"bootout", "bootstrap", "kickstart"}
+                for call in self.runner.calls
+                if call[0] == "/bin/launchctl"
+            )
+        )
+
+    def test_service_restart_replaces_loaded_jobs_and_requires_health(self) -> None:
+        manager = self.manager(health_runner=lambda _check, _release: True)
+        manager.install(self.release("1.0.0"), version="1.0.0")
+        self.runner.calls.clear()
+
+        restarted = manager.restart_services()
+
+        self.assertEqual(restarted["status"], "running")
+        self.assertEqual(restarted["managed_health"], "healthy")
+        for label in (
+            "io.nisavid.hindsight.synthetic.broker",
+            "io.nisavid.hindsight.synthetic.integration-upgrades",
+        ):
+            self.assertIn(
+                ("/bin/launchctl", "bootout", f"gui/{os.getuid()}/{label}"),
+                self.runner.calls,
+            )
+        self.assertEqual(
+            sum(
+                call[:2] == ("/bin/launchctl", "bootstrap")
+                for call in self.runner.calls
+            ),
+            2,
+        )
+
+    def test_service_restart_explicitly_resets_component_stop_intent(self) -> None:
+        data = self.config_data()
+        stack_state = self.state_root / "embed"
+        data["services"][0]["environment"].update(
+            {
+                "HINDSIGHT_EMBED_STATE_DIR": str(stack_state),
+                "HINDSIGHT_EMBED_FLEET_PROFILES": "work",
+                "HINDSIGHT_EMBED_AUTOSTART_DAEMON": "true",
+                "HINDSIGHT_EMBED_AUTOSTART_UI": "true",
+            }
+        )
+        self.config_path.write_text(
+            json.dumps(data, sort_keys=True), encoding="utf-8"
+        )
+        manager = PortableInstallationManager(
+            InstallationConfig.load(data, source_path=self.config_path),
+            command_runner=self.runner,
+            health_runner=lambda _check, _release: True,
+        )
+        manager.install(self.release("1.0.0"), version="1.0.0")
+        desired = stack_state / "desired" / "profiles" / "work"
+        desired.mkdir(parents=True, mode=0o700)
+        for directory in (
+            stack_state,
+            stack_state / "desired",
+            stack_state / "desired" / "profiles",
+            desired,
+        ):
+            directory.chmod(0o700)
+        for component in ("daemon", "ui"):
+            (desired / component).write_text("stopped\n", encoding="ascii")
+            (desired / component).chmod(0o600)
+
+        manager.restart_services()
+
+        for component in ("daemon", "ui"):
+            self.assertEqual(
+                (desired / component).read_text(encoding="ascii"),
+                "running\n",
+            )
+
+    def test_failed_service_start_restores_the_intentional_stop(self) -> None:
+        manager = self.manager(health_runner=lambda _check, _release: True)
+        manager.install(self.release("1.0.0"), version="1.0.0")
+        manager.stop_services()
+        manager._health_runner = lambda _check, _release: False
+
+        with self.assertRaisesRegex(
+            PortableInstallError, "health verification failed"
+        ):
+            manager.start_services()
+
+        self.assertEqual(manager.service_status()["status"], "stopped")
+
+    def test_failed_systemd_start_restores_the_intentional_stop(self) -> None:
+        class StatefulSystemdRunner:
+            def __init__(self, service_root):
+                self.service_root = service_root
+                self.calls = []
+                self.active = set()
+                self.enabled = set()
+                self.ignored_restore = None
+
+            def __call__(self, argv):
+                self.calls.append(argv)
+                if argv[:5] == (
+                    "/usr/bin/systemctl",
+                    "--user",
+                    "show",
+                    "--property=FragmentPath",
+                    "--value",
+                ):
+                    return str(self.service_root / argv[-1])
+                if argv[:3] == (
+                    "/usr/bin/systemctl",
+                    "--user",
+                    "is-active",
+                ):
+                    if argv[-1] not in self.active:
+                        raise _ManagedServiceCommandError(3)
+                    return "active"
+                if argv[:3] == (
+                    "/usr/bin/systemctl",
+                    "--user",
+                    "is-enabled",
+                ):
+                    if argv[-1] not in self.enabled:
+                        raise _ManagedServiceCommandError(1)
+                    return "enabled"
+                if argv[:4] == (
+                    "/usr/bin/systemctl",
+                    "--user",
+                    "enable",
+                    "--now",
+                ):
+                    self.enabled.add(argv[-1])
+                    self.active.add(argv[-1])
+                elif argv[:3] == (
+                    "/usr/bin/systemctl",
+                    "--user",
+                    "enable",
+                ):
+                    self.enabled.add(argv[-1])
+                elif argv[:3] == (
+                    "/usr/bin/systemctl",
+                    "--user",
+                    "restart",
+                ):
+                    self.active.add(argv[-1])
+                elif argv[:4] == (
+                    "/usr/bin/systemctl",
+                    "--user",
+                    "disable",
+                    "--now",
+                ):
+                    self.enabled.discard(argv[-1])
+                    self.active.discard(argv[-1])
+                elif argv[:3] == (
+                    "/usr/bin/systemctl",
+                    "--user",
+                    "disable",
+                ):
+                    if self.ignored_restore != ("disable", argv[-1]):
+                        self.enabled.discard(argv[-1])
+                elif argv[:3] == (
+                    "/usr/bin/systemctl",
+                    "--user",
+                    "start",
+                ):
+                    self.active.add(argv[-1])
+                elif argv[:3] == (
+                    "/usr/bin/systemctl",
+                    "--user",
+                    "stop",
+                ):
+                    if self.ignored_restore != ("stop", argv[-1]):
+                        self.active.discard(argv[-1])
+                return None
+
+        manager = self.manager(
+            platform="systemd-user",
+            health_runner=lambda _check, _release: True,
+        )
+        runner = StatefulSystemdRunner(self.service_root)
+        manager._command_runner = runner
+        manager.install(self.release("1.0.0"), version="1.0.0")
+        manager.stop_services()
+        manager._health_runner = lambda _check, _release: False
+        runner.calls.clear()
+
+        with self.assertRaisesRegex(
+            PortableInstallError,
+            "health verification failed",
+        ):
+            manager.start_services()
+
+        label = "io.nisavid.hindsight.synthetic"
+        for command in (
+            (
+                "/usr/bin/systemctl",
+                "--user",
+                "disable",
+                f"{label}.integration-upgrades.timer",
+            ),
+            (
+                "/usr/bin/systemctl",
+                "--user",
+                "stop",
+                f"{label}.integration-upgrades.timer",
+            ),
+            (
+                "/usr/bin/systemctl",
+                "--user",
+                "disable",
+                f"{label}.broker.service",
+            ),
+            (
+                "/usr/bin/systemctl",
+                "--user",
+                "stop",
+                f"{label}.broker.service",
+            ),
+            ("/usr/bin/systemctl", "--user", "daemon-reload"),
+        ):
+            self.assertIn(command, runner.calls)
+        self.assertEqual(manager.service_status()["status"], "stopped")
+
+        manager._health_runner = lambda _check, _release: True
+        manager.start_services()
+        label = "io.nisavid.hindsight.synthetic"
+        service_unit = f"{label}.broker.service"
+        timer_unit = f"{label}.integration-upgrades.timer"
+        runner.active.discard(service_unit)
+        runner.enabled.discard(timer_unit)
+        prior_active = set(runner.active)
+        prior_enabled = set(runner.enabled)
+        manager._health_runner = lambda _check, _release: False
+
+        with self.assertRaisesRegex(
+            PortableInstallError,
+            "health verification failed",
+        ):
+            manager.start_services()
+
+        self.assertEqual(runner.active, prior_active)
+        self.assertEqual(runner.enabled, prior_enabled)
+
+        runner.active.discard(service_unit)
+        runner.ignored_restore = ("stop", service_unit)
+        with self.assertRaisesRegex(
+            PortableInstallError,
+            "health verification failed",
+        ) as raised:
+            manager.start_services()
+        self.assertIsInstance(
+            raised.exception.__cause__,
+            PortableInstallError,
+        )
+        self.assertIn(
+            "service manager prestate restoration failed",
+            str(raised.exception.__cause__),
+        )
+
+    def test_failed_service_start_restores_a_partial_prestate(self) -> None:
+        manager = self.manager(health_runner=lambda _check, _release: True)
+        manager.install(self.release("1.0.0"), version="1.0.0")
+        manager.stop_services()
+        service = manager.config.services[0]
+        service_manifest = (
+            manager.config.service_root / f"{service.label}.plist"
+        )
+        self.runner.launchd_jobs[service.label] = service_manifest
+        self.assertEqual(manager.service_status()["status"], "partial")
+        manager._health_runner = lambda _check, _release: False
+
+        with self.assertRaisesRegex(
+            PortableInstallError,
+            "health verification failed",
+        ):
+            manager.start_services()
+
+        status = manager.service_status()
+        self.assertEqual(status["status"], "partial")
+        self.assertEqual(status["services"]["broker"], "running")
+        self.assertEqual(status["timers"]["integration-upgrades"], "stopped")
+
+    def test_failed_launchd_activation_restores_running_job_booted_out_first(
+        self,
+    ) -> None:
+        manager = self.manager(health_runner=lambda _check, _release: True)
+        manager.install(self.release("1.0.0"), version="1.0.0")
+        expected_jobs = dict(self.runner.launchd_jobs)
+        failed_once = False
+
+        def fail_first_bootstrap(argv: tuple[str, ...]) -> str | None:
+            nonlocal failed_once
+            if argv[:2] == ("/bin/launchctl", "bootstrap") and not failed_once:
+                failed_once = True
+                self.runner.calls.append(argv)
+                raise _ManagedServiceCommandError(22)
+            return self.runner(argv)
+
+        manager._command_runner = fail_first_bootstrap
+
+        with self.assertRaises(_ManagedServiceCommandError):
+            manager.restart_services()
+
+        self.assertTrue(failed_once)
+        self.assertEqual(self.runner.launchd_jobs, expected_jobs)
+        self.assertEqual(manager.service_status()["status"], "running")
+
+    def test_service_status_treats_loaded_inactive_launchd_service_as_stopped(
+        self,
+    ) -> None:
+        manager = self.manager(health_runner=lambda _check, _release: True)
+        manager.install(self.release("1.0.0"), version="1.0.0")
+        inactive_runner = InactiveLaunchdServiceRunner()
+        inactive_runner.launchd_jobs = dict(self.runner.launchd_jobs)
+        manager._command_runner = inactive_runner
+
+        status = manager.service_status()
+
+        self.assertEqual(status["status"], "partial")
+        self.assertEqual(status["services"]["broker"], "stopped")
+        self.assertEqual(status["timers"]["integration-upgrades"], "running")
+
+    def test_service_status_treats_unknown_launchd_output_as_loaded_and_active(
+        self,
+    ) -> None:
+        manager = self.manager(health_runner=lambda _check, _release: True)
+        manager.install(self.release("1.0.0"), version="1.0.0")
+        manager._command_runner = lambda _argv: None
+
+        status = manager.service_status()
+
+        self.assertEqual(status["status"], "running")
+        self.assertEqual(status["services"]["broker"], "running")
+        self.assertEqual(status["timers"]["integration-upgrades"], "running")
 
     def test_portable_consumer_examples_match_the_closed_schema(self) -> None:
         examples = ROOT / "examples" / "portable-consumer"
@@ -1696,6 +2109,163 @@ class PortableInstallationManagerTest(unittest.TestCase):
         self.assertEqual(result["version"], "1.0.0")
         self.assertEqual(result["release_digest"], first["release_digest"])
         self.assertEqual(manager.verify()["current"]["version"], "1.0.0")
+
+    def test_rollback_disables_bound_harness_authority_before_quiesce(
+        self,
+    ) -> None:
+        reconciler = self.root / "harness-reconcile"
+        reconciler.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        reconciler.chmod(0o700)
+        reconcile_config = self.root / "harness-reconcile.json"
+        reconcile_config.write_text("{}\n", encoding="utf-8")
+        reconcile_config.chmod(0o600)
+        data = self.config_data()
+        for collection in ("services", "timers", "health_checks"):
+            for surface in data[collection]:
+                surface["environment"].update(
+                    {
+                        "HINDSIGHT_MEMORY_HARNESS_RECONCILER": str(
+                            reconciler
+                        ),
+                        "HINDSIGHT_MEMORY_HARNESS_RECONCILE_CONFIG": str(
+                            reconcile_config
+                        ),
+                    }
+                )
+        self.config_path.write_text(
+            json.dumps(data, sort_keys=True),
+            encoding="utf-8",
+        )
+        manager = PortableInstallationManager(
+            InstallationConfig.load(data, source_path=self.config_path),
+            command_runner=self.runner,
+            health_runner=lambda _check, _release: True,
+        )
+        manager.install(self.release("1.0.0"), version="1.0.0")
+        current = self.upgrade(
+            manager,
+            self.release("2.0.0"),
+            version="2.0.0",
+        )
+        self.runner.calls.clear()
+
+        manager.rollback(expected_current_digest=current["release_digest"])
+
+        disable = (str(reconciler), "disable", str(reconcile_config))
+        self.assertIn(disable, self.runner.calls)
+        first_quiesce = next(
+            index
+            for index, call in enumerate(self.runner.calls)
+            if call[:2] == ("/bin/launchctl", "bootout")
+        )
+        self.assertLess(self.runner.calls.index(disable), first_quiesce)
+
+    def test_rollback_rejects_inconsistent_harness_authority_binding(
+        self,
+    ) -> None:
+        reconciler = self.root / "harness-reconcile"
+        reconciler.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        reconciler.chmod(0o700)
+        data = self.config_data()
+        data["services"][0]["environment"].update(
+            {
+                "HINDSIGHT_MEMORY_HARNESS_RECONCILER": str(reconciler),
+                "HINDSIGHT_MEMORY_HARNESS_RECONCILE_CONFIG": str(
+                    self.root / "one.json"
+                ),
+            }
+        )
+        self.config_path.write_text(
+            json.dumps(data, sort_keys=True),
+            encoding="utf-8",
+        )
+        manager = PortableInstallationManager(
+            InstallationConfig.load(data, source_path=self.config_path),
+            command_runner=self.runner,
+            health_runner=lambda _check, _release: True,
+        )
+        manager.install(self.release("1.0.0"), version="1.0.0")
+        current = self.upgrade(
+            manager,
+            self.release("2.0.0"),
+            version="2.0.0",
+        )
+
+        with self.assertRaisesRegex(
+            PortableInstallError,
+            "harness rollback authority binding is inconsistent",
+        ):
+            manager.rollback(
+                expected_current_digest=current["release_digest"],
+            )
+
+    def test_rollback_uses_installed_harness_binding_not_caller_source(
+        self,
+    ) -> None:
+        reconciler = self.root / "installed-harness-reconcile"
+        reconciler.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        reconciler.chmod(0o700)
+        reconcile_config = self.root / "installed-harness-reconcile.json"
+        reconcile_config.write_text("{}\n", encoding="utf-8")
+        reconcile_config.chmod(0o600)
+        installed_data = self.config_data()
+        for collection in ("services", "timers", "health_checks"):
+            for surface in installed_data[collection]:
+                surface["environment"].update(
+                    {
+                        "HINDSIGHT_MEMORY_HARNESS_RECONCILER": str(
+                            reconciler
+                        ),
+                        "HINDSIGHT_MEMORY_HARNESS_RECONCILE_CONFIG": str(
+                            reconcile_config
+                        ),
+                    }
+                )
+        self.config_path.write_text(
+            json.dumps(installed_data, sort_keys=True),
+            encoding="utf-8",
+        )
+        installed_manager = PortableInstallationManager(
+            InstallationConfig.load(
+                installed_data,
+                source_path=self.config_path,
+            ),
+            command_runner=self.runner,
+            health_runner=lambda _check, _release: True,
+        )
+        installed_manager.install(
+            self.release("1.0.0"),
+            version="1.0.0",
+        )
+        current = self.upgrade(
+            installed_manager,
+            self.release("2.0.0"),
+            version="2.0.0",
+        )
+
+        caller_data = self.config_data()
+        self.config_path.write_text(
+            json.dumps(caller_data, sort_keys=True),
+            encoding="utf-8",
+        )
+        caller = PortableInstallationManager(
+            InstallationConfig.load(
+                caller_data,
+                source_path=self.config_path,
+            ),
+            command_runner=self.runner,
+            health_runner=lambda _check, _release: True,
+        )
+        self.runner.calls.clear()
+
+        caller.rollback(
+            expected_current_digest=current["release_digest"],
+        )
+
+        self.assertIn(
+            (str(reconciler), "disable", str(reconcile_config)),
+            self.runner.calls,
+        )
 
     def test_interrupted_rollback_recovers_the_prestate(self) -> None:
         v1 = self.release("1.0.0")
@@ -3208,6 +3778,238 @@ class PortableInstallationManagerTest(unittest.TestCase):
 
         self.assertEqual(completed.returncode, 0, completed.stderr.decode())
         self.assertEqual(capture.read_text(encoding="utf-8"), "2.0.0")
+
+    def test_hook_authority_remains_on_candidate_after_runtime_rollback(
+        self,
+    ) -> None:
+        capture = self.root / "hook-authority"
+
+        def authority_release(version: str) -> Path:
+            release = self.release(version)
+            target = release / "bin" / "hindsight-memory"
+            target.write_text(
+                (
+                    "#!/bin/sh\n"
+                    f"printf '%s' {version!r} > {str(capture)!r}\n"
+                ),
+                encoding="utf-8",
+            )
+            target.chmod(0o755)
+            return release
+
+        manager = self.manager(health_runner=lambda _check, _release: True)
+        manager.install(authority_release("1.0.0"), version="1.0.0")
+        current = self.upgrade(
+            manager,
+            authority_release("2.0.0"),
+            version="2.0.0",
+        )
+
+        manager.rollback(expected_current_digest=current["release_digest"])
+        completed = subprocess.run(
+            [
+                str(
+                    self.install_root
+                    / "bin"
+                    / "hindsight-memory-hook-authority"
+                ),
+                "harness-config",
+                "status",
+            ],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={"PATH": "/usr/bin:/bin"},
+            timeout=10,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode())
+        self.assertEqual(capture.read_text(encoding="utf-8"), "2.0.0")
+
+        authority_path = self.install_root / "hook-authority.json"
+        authority = json.loads(authority_path.read_text(encoding="utf-8"))
+        authority["version"] = "1.0.0"
+        authority_path.chmod(0o700)
+        authority_path.write_text(
+            json.dumps(authority),
+            encoding="utf-8",
+        )
+        authority_path.chmod(0o500)
+        drifted = subprocess.run(
+            [
+                str(
+                    self.install_root
+                    / "bin"
+                    / "hindsight-memory-hook-authority"
+                ),
+                "harness-config",
+                "status",
+            ],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={"PATH": "/usr/bin:/bin"},
+            timeout=10,
+        )
+        self.assertNotEqual(drifted.returncode, 0)
+        self.assertIn(b"hook authority digest mismatch", drifted.stderr)
+
+    def test_rollback_launcher_uses_candidate_authority_and_omits_extension(
+        self,
+    ) -> None:
+        runtime_capture = self.root / "runtime-capture.json"
+        authority_capture = self.root / "authority-capture.json"
+
+        def release_with_probes(version: str, *, authority: bool) -> Path:
+            release = self.release(version)
+            runtime = release / "bin" / "runtime-capture"
+            runtime.write_text(
+                (
+                    "#!/usr/bin/env python3\n"
+                    "import json, os, pathlib\n"
+                    f"pathlib.Path({str(runtime_capture)!r}).write_text("
+                    "json.dumps({"
+                    f"'version': {version!r}, "
+                    "'extension': os.environ.get("
+                    "'HINDSIGHT_API_HTTP_EXTENSION')"
+                    "}))\n"
+                ),
+                encoding="utf-8",
+            )
+            runtime.chmod(0o755)
+            if authority:
+                supervisor = (
+                    release / "bin/hindsight-hook-authority-supervisor"
+                )
+                supervisor.write_text(
+                    (
+                        "#!/usr/bin/env python3\n"
+                        "import json, os, pathlib\n"
+                        f"pathlib.Path({str(authority_capture)!r}).write_text("
+                        "json.dumps({"
+                        "'release': os.environ.get("
+                        "'HINDSIGHT_HOOK_AUTHORITY_RELEASE_DIGEST'), "
+                        "'controller': os.environ.get("
+                        "'HINDSIGHT_HOOK_AUTHORITY_CONTROLLER_SHA256')"
+                        "}))\n"
+                    ),
+                    encoding="utf-8",
+                )
+                supervisor.chmod(0o755)
+            return release
+
+        base = release_with_probes("1.0.0", authority=False)
+        old_data = self.config_data()
+        old_data["services"][0].update(
+            entrypoint="bin/runtime-capture",
+            arguments=[],
+            credentials=[],
+        )
+        self.config_path.write_text(
+            json.dumps(old_data, sort_keys=True),
+            encoding="utf-8",
+        )
+        old_manager = PortableInstallationManager(
+            InstallationConfig.load(
+                old_data,
+                source_path=self.config_path,
+            ),
+            command_runner=self.runner,
+            health_runner=lambda _check, _release: True,
+        )
+        installed = old_manager.install(base, version="1.0.0")
+
+        candidate = release_with_probes("2.0.0", authority=True)
+        new_data = json.loads(json.dumps(old_data))
+        extension = (
+            "hindsight_memory_control_plane."
+            "migration_generation_extension:"
+            "MigrationGenerationHttpExtension"
+        )
+        new_data["services"][0]["environment"][
+            "HINDSIGHT_API_HTTP_EXTENSION"
+        ] = extension
+        new_data["health_checks"][0]["environment"][
+            "HINDSIGHT_API_HTTP_EXTENSION"
+        ] = extension
+        new_data["services"].append(
+            {
+                "service_id": "hook-authority",
+                "label": "io.nisavid.hindsight.synthetic.hook-authority",
+                "entrypoint": "bin/hindsight-hook-authority-supervisor",
+                "arguments": [],
+                "environment": {"PATH": "/usr/bin:/bin"},
+                "credentials": [],
+                "restart": "on-failure",
+            }
+        )
+        self.config_path.write_text(
+            json.dumps(new_data, sort_keys=True),
+            encoding="utf-8",
+        )
+        manager = PortableInstallationManager(
+            InstallationConfig.load(
+                new_data,
+                source_path=self.config_path,
+            ),
+            command_runner=self.runner,
+            health_runner=lambda _check, _release: True,
+        )
+        upgraded = manager.upgrade(
+            candidate,
+            version="2.0.0",
+            expected_current_binding_generation_digest=installed[
+                "binding_generation_digest"
+            ],
+        )
+        manager.rollback(
+            expected_current_digest=upgraded["release_digest"],
+        )
+
+        runtime = subprocess.run(
+            manager._launch_argv("service", "broker"),
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={"PATH": "/usr/bin:/bin"},
+            timeout=10,
+        )
+        authority = subprocess.run(
+            manager._launch_argv("service", "hook-authority"),
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={"PATH": "/usr/bin:/bin"},
+            timeout=10,
+        )
+
+        self.assertEqual(runtime.returncode, 0, runtime.stderr.decode())
+        self.assertEqual(authority.returncode, 0, authority.stderr.decode())
+        self.assertEqual(
+            json.loads(runtime_capture.read_text()),
+            {"version": "1.0.0", "extension": None},
+        )
+        authority_environment = json.loads(authority_capture.read_text())
+        self.assertEqual(
+            authority_environment["release"],
+            upgraded["release_digest"],
+        )
+        self.assertEqual(
+            authority_environment["controller"],
+            next(
+                entry["sha256"]
+                for entry in json.loads(
+                    (
+                        self.install_root / "hook-authority.json"
+                    ).read_text()
+                )["manifest"]["files"]
+                if entry["path"] == "bin/hindsight-memory"
+            ),
+        )
 
     def test_service_launcher_uses_owned_inventory_after_external_drift(self) -> None:
         data = self.config_data()

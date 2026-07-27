@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from datetime import datetime
 import errno
 import hmac
-import json
 import os
 from pathlib import Path
 import re
@@ -42,6 +41,8 @@ SNAPSHOT_KEYS = {
     "endpoint",
     "provider_identity",
     "versions",
+    "snapshot_generation",
+    "controller_state",
     "banks",
     "operations",
     "hooks",
@@ -65,6 +66,7 @@ DOCUMENT_OPTIONAL_KEYS = {
     "created_at",
     "text_length",
     "memory_unit_count",
+    "embedded_memory_unit_count",
     "tags",
     "document_metadata",
     "retain_params",
@@ -379,7 +381,11 @@ def _validate_document(
     if "created_at" in record and record["created_at"] is not None:
         if not _aware_timestamp(record["created_at"]):
             blockers.append(f"invalid:{role}.documents.created_at")
-    for key in ("text_length", "memory_unit_count"):
+    for key in (
+        "text_length",
+        "memory_unit_count",
+        "embedded_memory_unit_count",
+    ):
         if key in record and record[key] is not None and (
             type(record[key]) is not int or record[key] < 0
         ):
@@ -538,8 +544,23 @@ def _snapshot_blockers(snapshot: Any, source_bank: BankRef, candidate_bank: Bank
         blockers.append("invalid:snapshot_values")
     if type(snapshot["schema_version"]) is not int or snapshot["schema_version"] != 1:
         blockers.append("invalid:schema_version")
-    for key in ("endpoint", "provider_identity", "versions", "banks", "operations", "retain_watermarks"):
+    for key in (
+        "endpoint",
+        "provider_identity",
+        "versions",
+        "controller_state",
+        "banks",
+        "operations",
+        "retain_watermarks",
+    ):
         _mapping(snapshot[key], key, blockers)
+    try:
+        _identifier(
+            snapshot["snapshot_generation"],
+            "snapshot generation",
+        )
+    except MigrationError:
+        blockers.append("invalid:snapshot_generation")
     for key in ("hooks", "schedules"):
         if not isinstance(snapshot[key], list):
             blockers.append(f"invalid:{key}")
@@ -702,8 +723,26 @@ def _drift_blockers(before: Mapping[str, Any], after: Mapping[str, Any], before_
         "schedules": (before["schedules"], after["schedules"]),
         "retain_watermarks": (before["retain_watermarks"], after["retain_watermarks"]),
         "identity": (
-            {key: before[key] for key in ("endpoint", "provider_identity", "versions")},
-            {key: after[key] for key in ("endpoint", "provider_identity", "versions")},
+            {
+                key: before[key]
+                for key in (
+                    "endpoint",
+                    "provider_identity",
+                    "versions",
+                    "snapshot_generation",
+                    "controller_state",
+                )
+            },
+            {
+                key: after[key]
+                for key in (
+                    "endpoint",
+                    "provider_identity",
+                    "versions",
+                    "snapshot_generation",
+                    "controller_state",
+                )
+            },
         ),
     }
     return [f"drift:{name}" for name, values in checks.items() if digest(_normalized(values[0])) != digest(_normalized(values[1]))]
@@ -1622,6 +1661,7 @@ def discover_migration_state(
     approved_offline_package_digest: str,
     migration_paths: Mapping[str, Any],
     retain_watermark_reader: Callable[[], Mapping[str, Any]],
+    controller_state_reader: Callable[[], Mapping[str, Any]],
     private_catalog_digests: Mapping[str, str],
     timestamp: str,
     repository_catalog: Mapping[str, Any] | None = None,
@@ -1648,6 +1688,15 @@ def discover_migration_state(
         _sha(value, "private catalog digest")
     approved_package = _normalized(offline_package_manifest)
 
+    try:
+        local_controller_state_before = _normalized(
+            controller_state_reader()
+        )
+    except Exception:
+        return MigrationDiscovery(
+            False,
+            ("controller:local_state_unavailable",),
+        )
     try:
         before_generation = _adapter_generation_snapshot(adapter)
     except MigrationError:
@@ -1677,10 +1726,25 @@ def discover_migration_state(
         return MigrationDiscovery(
             False, ("adapter:migration_generation_unavailable",)
         )
+    try:
+        local_controller_state_after = _normalized(
+            controller_state_reader()
+        )
+    except Exception:
+        return MigrationDiscovery(
+            False,
+            ("controller:local_state_unavailable",),
+        )
 
     blockers = _snapshot_blockers(before, source_bank, candidate_bank)
     blockers.extend(_snapshot_blockers(after, source_bank, candidate_bank))
     blockers.extend(package_blockers)
+    if (
+        local_controller_state_before != local_controller_state_after
+        or local_controller_state_before != before.get("controller_state")
+        or local_controller_state_after != after.get("controller_state")
+    ):
+        blockers.append("drift:controller_local_state")
     if not blockers:
         repository_catalog = _validate_repository_catalog(
             repository_catalog,

@@ -13,6 +13,7 @@ import re
 import stat
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Mapping, NamedTuple
@@ -23,6 +24,8 @@ PROFILE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 COMPONENTS = frozenset({"daemon", "ui"})
 STATES = frozenset({"running", "stopped"})
 CONTROL_PID_LOCK_NAME = ".control-pid.lifecycle.lock"
+MANAGED_CODEX_MARKER = "provider-policy:work-codex"
+MANAGED_CODEX_MODEL = "gpt-5.3-codex-spark"
 PROVIDER_PRESET_ENV = {
     "id": "HINDSIGHT_EMBED_PROVIDER_PRESET_ID",
     "label": "HINDSIGHT_EMBED_PROVIDER_PRESET_LABEL",
@@ -193,15 +196,24 @@ def _open_absolute_directory(
         raise
 
 
-def _open_private_child(parent: int, name: str, label: str) -> int:
-    try:
-        os.mkdir(name, mode=0o700, dir_fd=parent)
-    except FileExistsError:
-        pass
-    except OSError as error:
-        raise ValueError(f"refusing unsafe {label}") from error
+def _open_private_child(
+    parent: int,
+    name: str,
+    label: str,
+    *,
+    create: bool = True,
+) -> int:
+    if create:
+        try:
+            os.mkdir(name, mode=0o700, dir_fd=parent)
+        except FileExistsError:
+            pass
+        except OSError as error:
+            raise ValueError(f"refusing unsafe {label}") from error
     try:
         descriptor = os.open(name, _directory_flags(), dir_fd=parent)
+    except FileNotFoundError:
+        raise
     except OSError as error:
         raise ValueError(f"refusing unsafe {label}") from error
     try:
@@ -300,50 +312,238 @@ def set_desired_state(root: Path, profile: str, component: str, state: str) -> N
         os.close(root_descriptor)
 
 
-def _running_action(action, root: Path, components: tuple[str, ...]):
+def desired_state(root: Path, profile: str, component: str) -> str | None:
+    profile = normalize_profile(profile)
+    if component not in COMPONENTS:
+        raise ValueError(f"invalid component: {component!r}")
+
+    root_descriptor: int | None = None
+    profiles_descriptor: int | None = None
+    profile_descriptor: int | None = None
+    descriptor: int | None = None
+    try:
+        try:
+            root_descriptor = _open_absolute_directory(
+                root,
+                create=False,
+                private=True,
+                label="desired-state root",
+            )
+            profiles_descriptor = _open_private_child(
+                root_descriptor,
+                "profiles",
+                "desired-state directory",
+                create=False,
+            )
+            profile_descriptor = _open_private_child(
+                profiles_descriptor,
+                profile,
+                "desired-state profile directory",
+                create=False,
+            )
+        except FileNotFoundError:
+            return None
+        try:
+            descriptor = os.open(
+                component,
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=profile_descriptor,
+            )
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            raise ValueError("refusing unsafe desired-state file") from error
+        _validate_private_file(os.fstat(descriptor), "desired-state file")
+        payload = os.read(descriptor, 32)
+        if len(payload) == 32 or os.read(descriptor, 1):
+            raise ValueError("desired-state file is invalid")
+        if payload not in {b"running\n", b"stopped\n"}:
+            raise ValueError("desired-state file is invalid")
+        return payload[:-1].decode("ascii")
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if profile_descriptor is not None:
+            os.close(profile_descriptor)
+        if profiles_descriptor is not None:
+            os.close(profiles_descriptor)
+        if root_descriptor is not None:
+            os.close(root_descriptor)
+
+
+def remove_desired_state(root: Path, profile: str, component: str) -> None:
+    profile = normalize_profile(profile)
+    if component not in COMPONENTS:
+        raise ValueError(f"invalid component: {component!r}")
+
+    root_descriptor: int | None = None
+    profiles_descriptor: int | None = None
+    profile_descriptor: int | None = None
+    try:
+        try:
+            root_descriptor = _open_absolute_directory(
+                root,
+                create=False,
+                private=True,
+                label="desired-state root",
+            )
+            profiles_descriptor = _open_private_child(
+                root_descriptor,
+                "profiles",
+                "desired-state directory",
+                create=False,
+            )
+            profile_descriptor = _open_private_child(
+                profiles_descriptor,
+                profile,
+                "desired-state profile directory",
+                create=False,
+            )
+        except FileNotFoundError:
+            return
+        try:
+            metadata = os.stat(
+                component,
+                dir_fd=profile_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            raise ValueError("refusing unsafe desired-state file") from error
+        _validate_private_file(metadata, "desired-state file")
+        try:
+            os.unlink(component, dir_fd=profile_descriptor)
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            raise ValueError("could not remove desired-state file") from error
+        os.fsync(profile_descriptor)
+    finally:
+        if profile_descriptor is not None:
+            os.close(profile_descriptor)
+        if profiles_descriptor is not None:
+            os.close(profiles_descriptor)
+        if root_descriptor is not None:
+            os.close(root_descriptor)
+
+
+def _running_action(
+    action,
+    root: Path,
+    components: tuple[str, ...],
+    profile_lock,
+):
     @functools.wraps(action)
     def wrapped(profile: str):
-        for component in components:
-            set_desired_state(root, profile, component, "running")
-        return action(profile)
+        with profile_lock(profile):
+            for component in components:
+                set_desired_state(root, profile, component, "running")
+            return action(profile)
 
     return wrapped
 
 
-def _stopping_action(action, root: Path, component: str):
+def _stopping_action(
+    action,
+    root: Path,
+    components: tuple[str, ...],
+    profile_lock,
+):
+    def restore(profile: str, previous: dict[str, str | None]) -> None:
+        for component, state in previous.items():
+            try:
+                if state is None:
+                    remove_desired_state(root, profile, component)
+                else:
+                    set_desired_state(root, profile, component, state)
+            except Exception as error:
+                print(
+                    "hindsight-embed-control-server: could not restore "
+                    f"desired state for {component}: {error}",
+                    file=sys.stderr,
+                )
+                continue
+
     @functools.wraps(action)
     def wrapped(profile: str):
-        set_desired_state(root, profile, component, "stopped")
-        try:
-            result = action(profile)
-        except Exception:
-            set_desired_state(root, profile, component, "running")
-            raise
-        if not getattr(result, "ok", True) or getattr(result, "running", False):
-            set_desired_state(root, profile, component, "running")
-        return result
+        with profile_lock(profile):
+            previous = {
+                component: desired_state(root, profile, component)
+                for component in components
+            }
+            try:
+                for component in components:
+                    set_desired_state(root, profile, component, "stopped")
+            except Exception:
+                restore(profile, previous)
+                raise
+            try:
+                result = action(profile)
+            except Exception:
+                restore(profile, previous)
+                raise
+            if not getattr(result, "ok", True) or getattr(
+                result,
+                "running",
+                False,
+            ):
+                restore(profile, previous)
+            return result
 
     return wrapped
 
 
 def install_lifecycle_hooks(service, desired_state_dir: Path) -> None:
+    locks: dict[str, threading.Lock] = {}
+    locks_guard = threading.Lock()
+
+    def profile_lock(profile: str) -> threading.Lock:
+        if (
+            not isinstance(profile, str)
+            or PROFILE_PATTERN.fullmatch(profile) is None
+        ):
+            raise ValueError("invalid profile")
+        with locks_guard:
+            return locks.setdefault(profile, threading.Lock())
+
     service.start_daemon = _running_action(
-        service.start_daemon, desired_state_dir, ("daemon",)
+        service.start_daemon,
+        desired_state_dir,
+        ("daemon",),
+        profile_lock,
     )
     service.restart_daemon = _running_action(
-        service.restart_daemon, desired_state_dir, ("daemon",)
+        service.restart_daemon,
+        desired_state_dir,
+        ("daemon",),
+        profile_lock,
     )
     service.stop_daemon = _stopping_action(
-        service.stop_daemon, desired_state_dir, "daemon"
+        service.stop_daemon,
+        desired_state_dir,
+        ("daemon", "ui"),
+        profile_lock,
     )
     service.start_ui = _running_action(
-        service.start_ui, desired_state_dir, ("daemon", "ui")
+        service.start_ui,
+        desired_state_dir,
+        ("daemon", "ui"),
+        profile_lock,
     )
     service.restart_ui = _running_action(
-        service.restart_ui, desired_state_dir, ("daemon", "ui")
+        service.restart_ui,
+        desired_state_dir,
+        ("daemon", "ui"),
+        profile_lock,
     )
     service.stop_ui = _stopping_action(
-        service.stop_ui, desired_state_dir, "ui"
+        service.stop_ui,
+        desired_state_dir,
+        ("ui",),
+        profile_lock,
     )
 
 
@@ -358,7 +558,7 @@ def install_provider_catalog(
     if "openai-codex" not in existing:
         additions.append(
             providers.ProviderInfo(
-                "openai-codex", "OpenAI Codex (subscription)", False
+                "openai-codex", "[Systalyze] OpenAI Codex", False
             )
         )
     if "claude-code" not in existing:
@@ -384,13 +584,16 @@ def _matches_provider_preset(config, preset: ProviderPreset) -> bool:
     )
 
 
-def install_provider_alias(service, preset: ProviderPreset) -> None:
+def install_provider_alias(
+    service,
+    preset: ProviderPreset | None,
+) -> None:
     original_get_profile_config = service.get_profile_config
     original_list_profiles = service.list_profiles
     original_save_llm_config = service.save_llm_config
 
     def display_config(config):
-        if _matches_provider_preset(config, preset):
+        if preset is not None and _matches_provider_preset(config, preset):
             return replace(config, provider=preset.id)
         return config
 
@@ -401,7 +604,7 @@ def install_provider_alias(service, preset: ProviderPreset) -> None:
         summaries = []
         for summary in original_list_profiles():
             config = get_profile_config(summary.name)
-            if config.provider == preset.id:
+            if preset is not None and config.provider == preset.id:
                 summary = replace(
                     summary, provider=preset.id, model=preset.model
                 )
@@ -420,12 +623,24 @@ def install_provider_alias(service, preset: ProviderPreset) -> None:
         cp_version: str | None = None,
     ):
         current = original_get_profile_config(name)
-        if provider == preset.id:
+        if provider == "openai-codex":
+            api_key = MANAGED_CODEX_MARKER
+            model = MANAGED_CODEX_MODEL
+            base_url = ""
+        elif provider == "claude-code":
+            raise ValueError(
+                "Claude Code is not permitted by the managed provider policy"
+            )
+        elif preset is not None and provider == preset.id:
             provider = preset.runtime_provider
             api_key = ""
             model = preset.model
             base_url = preset.base_url
-        elif base_url is None and _matches_provider_preset(current, preset):
+        elif (
+            preset is not None
+            and base_url is None
+            and _matches_provider_preset(current, preset)
+        ):
             base_url = ""
 
         return display_config(
@@ -451,7 +666,14 @@ def install_hooks(service, providers, desired_state_dir: Path) -> None:
     preset = provider_preset_from_environment()
     install_provider_catalog(providers, preset)
     install_lifecycle_hooks(service, desired_state_dir)
-    if preset is not None:
+    if preset is not None or all(
+        hasattr(service, name)
+        for name in (
+            "get_profile_config",
+            "list_profiles",
+            "save_llm_config",
+        )
+    ):
         install_provider_alias(service, preset)
 
 

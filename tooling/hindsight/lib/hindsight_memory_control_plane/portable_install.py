@@ -32,6 +32,7 @@ from .canonical import canonical_bytes, digest, strict_json_loads
 
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 IDENTIFIER = re.compile(r"[a-z0-9][a-z0-9._-]{0,126}\Z")
+PROFILE_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,126}\Z")
 ENVIRONMENT_NAME = re.compile(r"[A-Z_][A-Z0-9_]{0,127}\Z")
 VERSION = re.compile(r"[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}\Z")
 DAILY_AT = re.compile(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]\Z")
@@ -1378,13 +1379,41 @@ if not isinstance(current, dict):
     raise SystemExit("installation state is invalid")
 identity = {key: current.get(key) for key in ("version", "release_digest", "release_path")}
 transaction = state.get("transaction")
-selected = current
-if transaction is None:
+authority_mode = bool(
+    sys.argv[1:] and sys.argv[1] == "--hindsight-hook-authority"
+)
+if authority_mode:
+    sys.argv.pop(1)
+    authority_path = root / "hook-authority.json"
+    protected(authority_path, 0o500)
+    if owned.get(str(authority_path)) != hashlib.sha256(
+        authority_path.read_bytes()
+    ).hexdigest():
+        raise SystemExit("hook authority digest mismatch")
+    selected = json.loads(authority_path.read_text(encoding="utf-8"))
+    allowed = {
+        "plan",
+        "apply",
+        "status",
+        "verify",
+        "rollback",
+        "disable",
+        "reconcile",
+    }
+    if (
+        len(sys.argv) < 3
+        or sys.argv[1] != "harness-config"
+        or sys.argv[2] not in allowed
+    ):
+        raise SystemExit("hook authority permits only harness configuration commands")
+elif transaction is None:
+    selected = current
     protected(root / "active.json", 0o600)
     active = json.loads((root / "active.json").read_text(encoding="utf-8"))
     if active != identity:
         raise SystemExit("installation state is not launchable")
 else:
+    selected = current
     lifecycle_commands = {"install", "upgrade", "verify", "rollback", "uninstall"}
     if not sys.argv[1:] or sys.argv[1] not in lifecycle_commands:
         raise SystemExit("installation permits only lifecycle recovery commands")
@@ -1866,15 +1895,33 @@ try:
         os.close(inventory_fd)
 except (OSError, ValueError):
     raise SystemExit("managed inventory binding is invalid") from None
-release = (root / active["release_path"]).resolve(strict=True)
-if root.resolve() not in release.parents:
-    raise SystemExit("active release is outside the installation root")
 relative = PurePosixPath(spec["entrypoint"])
 if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
     raise SystemExit("managed entrypoint is invalid")
+launch_release = current
+authority_path = root / "hook-authority.json"
+try:
+    authority, authority_digest = snapshot_json(authority_path, 0o500)
+except (OSError, UnicodeDecodeError, ValueError):
+    raise SystemExit("hook authority binding is invalid") from None
+if (
+    state.get("owned_install_files", {}).get(str(authority_path))
+    != authority_digest
+    or state.get("releases", {}).get(authority.get("release_digest"))
+    != authority
+):
+    raise SystemExit("hook authority binding is invalid")
+legacy_runtime = (
+    current.get("release_digest") != authority.get("release_digest")
+)
+if relative.as_posix() == "bin/hindsight-hook-authority-supervisor":
+    launch_release = authority
+release = (root / launch_release["release_path"]).resolve(strict=True)
+if root.resolve() not in release.parents:
+    raise SystemExit("managed release is outside the installation root")
 target = release.joinpath(*relative.parts)
 metadata = target.lstat()
-entry_matches = [item for item in current.get("manifest", {}).get("files", []) if item.get("path") == relative.as_posix()]
+entry_matches = [item for item in launch_release.get("manifest", {}).get("files", []) if item.get("path") == relative.as_posix()]
 expected_mode = 0o500 if len(entry_matches) == 1 and entry_matches[0].get("executable") else 0o400
 try:
     protected(release, 0o500, directory=True)
@@ -1916,6 +1963,14 @@ if credentials:
     values = response["values"]
 environment = {name: os.environ[name] for name in ("TMPDIR", "LANG", "LC_ALL") if name in os.environ}
 for name, value in spec.get("environment", {}).items():
+    if (
+        legacy_runtime
+        and name == "HINDSIGHT_API_HTTP_EXTENSION"
+        and value
+        == "hindsight_memory_control_plane.migration_generation_extension:"
+        "MigrationGenerationHttpExtension"
+    ):
+        continue
     if value.startswith("release://"):
         relative_value = PurePosixPath(value.removeprefix("release://"))
         if relative_value.is_absolute() or any(part in {"", ".", ".."} for part in relative_value.parts):
@@ -1926,6 +1981,21 @@ environment.update(values)
 environment.update(account_environment)
 environment["HINDSIGHT_MEMORY_INVENTORY"] = str(inventory_path)
 environment["HINDSIGHT_EMBED_UVX_EXECUTABLE"] = config["uvx_executable"]
+if relative.as_posix() == "bin/hindsight-hook-authority-supervisor":
+    controller_entries = [
+        item
+        for item in launch_release.get("manifest", {}).get("files", [])
+        if item.get("path") == "bin/hindsight-memory"
+        and item.get("executable")
+    ]
+    if len(controller_entries) != 1:
+        raise SystemExit("hook authority controller binding is invalid")
+    environment["HINDSIGHT_HOOK_AUTHORITY_RELEASE_DIGEST"] = launch_release[
+        "release_digest"
+    ]
+    environment["HINDSIGHT_HOOK_AUTHORITY_CONTROLLER_SHA256"] = (
+        controller_entries[0]["sha256"]
+    )
 try:
     npx_directory = str(
         protected_external_executable(
@@ -2038,6 +2108,48 @@ class PortableInstallationManager:
                 "systemd-user service_root is not searched by the user manager"
             )
 
+    def _disable_harness_authority_for_rollback(self) -> None:
+        bindings: set[tuple[str, str]] = set()
+        surfaces = (
+            *self.config.services,
+            *self.config.timers,
+            *self.config.health_checks,
+        )
+        unbound = 0
+        for surface in surfaces:
+            environment = dict(surface.environment)
+            reconciler = environment.get(
+                "HINDSIGHT_MEMORY_HARNESS_RECONCILER"
+            )
+            reconcile_config = environment.get(
+                "HINDSIGHT_MEMORY_HARNESS_RECONCILE_CONFIG"
+            )
+            if reconciler is None and reconcile_config is None:
+                unbound += 1
+                continue
+            if reconciler is None or reconcile_config is None:
+                raise PortableInstallError(
+                    "harness rollback authority binding is incomplete"
+                )
+            bindings.add((reconciler, reconcile_config))
+        if not bindings:
+            return
+        if len(bindings) != 1 or unbound:
+            raise PortableInstallError(
+                "harness rollback authority binding is inconsistent"
+            )
+        reconciler_raw, config_raw = next(iter(bindings))
+        reconciler = _protected_executable_path(
+            Path(reconciler_raw),
+            "harness rollback authority reconciler",
+        )
+        config = Path(config_raw)
+        if not config.is_absolute():
+            raise PortableInstallError(
+                "harness rollback authority config must be absolute"
+            )
+        self._command_runner((str(reconciler), "disable", str(config)))
+
     @property
     def _state_path(self) -> Path:
         return self.config.install_root / "install-state.json"
@@ -2146,6 +2258,22 @@ class PortableInstallationManager:
     def _launchd_loaded_manifest(
         self, label: str, expected: Path, *, require_running: bool = False
     ) -> Path | None:
+        loaded, output = self._launchd_job_snapshot(label, expected)
+        if (
+            loaded is not None
+            and require_running
+            and output is not None
+            and re.search(r"^\s*state = running\s*$", output, re.MULTILINE)
+            is None
+        ):
+            raise PortableInstallError(f"managed launchd job is not active: {label}")
+        return loaded
+
+    def _launchd_job_snapshot(
+        self,
+        label: str,
+        expected: Path,
+    ) -> tuple[Path | None, str | None]:
         domain = f"gui/{os.getuid()}"
         try:
             output = self._command_runner(
@@ -2153,10 +2281,10 @@ class PortableInstallationManager:
             )
         except _ManagedServiceCommandError as error:
             if error.returncode in {3, 113}:
-                return None
+                return None, None
             raise
         if output is None:
-            return expected
+            return expected, None
         match = re.search(r"^\s*path = (.+?)\s*$", output, re.MULTILINE)
         if match is None:
             raise PortableInstallError("launchd loaded plist identity is unavailable")
@@ -2170,12 +2298,7 @@ class PortableInstallationManager:
             ) from error
         if loaded_identity != expected_identity:
             raise PortableInstallError("launchd loaded plist is not owned")
-        if (
-            require_running
-            and re.search(r"^\s*state = running\s*$", output, re.MULTILINE) is None
-        ):
-            raise PortableInstallError(f"managed launchd job is not active: {label}")
-        return loaded
+        return loaded, output
 
     def _assert_systemd_fragment(
         self, unit: str, expected: Path, *, absent_ok: bool = False
@@ -2215,6 +2338,222 @@ class PortableInstallationManager:
             ) from error
         if output is not None and output.strip() != status:
             raise PortableInstallError(f"systemd unit is not {status}: {unit}")
+
+    def _systemd_unit_active(self, unit: str) -> bool:
+        try:
+            output = self._command_runner(
+                ("/usr/bin/systemctl", "--user", "is-active", unit)
+            )
+        except _ManagedServiceCommandError as error:
+            if error.returncode in {3, 4}:
+                return False
+            raise
+        return output is None or output.strip() == "active"
+
+    def _systemd_unit_enabled(self, unit: str) -> bool:
+        try:
+            output = self._command_runner(
+                ("/usr/bin/systemctl", "--user", "is-enabled", unit)
+            )
+        except _ManagedServiceCommandError as error:
+            if error.returncode in {1, 3, 4}:
+                return False
+            raise
+        return output is None or output.strip() == "enabled"
+
+    def _launchd_job_running(self, label: str, expected: Path) -> bool:
+        loaded, output = self._launchd_job_snapshot(label, expected)
+        if loaded is None:
+            return False
+        if output is None:
+            return True
+        return (
+            re.search(
+                r"^\s*state = running\s*$",
+                output,
+                re.MULTILINE,
+            )
+            is not None
+        )
+
+    def _service_manager_status(self) -> dict[str, dict[str, str]]:
+        services: dict[str, str] = {}
+        timers: dict[str, str] = {}
+        if self.config.platform == "launchd":
+            for item in self.config.services:
+                manifest = self.config.service_root / f"{item.label}.plist"
+                services[item.service_id] = (
+                    "running"
+                    if self._launchd_job_running(item.label, manifest)
+                    else "stopped"
+                )
+            for item in self.config.timers:
+                manifest = self.config.service_root / f"{item.label}.plist"
+                timers[item.timer_id] = (
+                    "running"
+                    if self._launchd_loaded_manifest(item.label, manifest) is not None
+                    else "stopped"
+                )
+        else:
+            for item in self.config.services:
+                unit = f"{item.label}.service"
+                self._assert_systemd_fragment(
+                    unit, self.config.service_root / unit
+                )
+                services[item.service_id] = (
+                    "running" if self._systemd_unit_active(unit) else "stopped"
+                )
+            for item in self.config.timers:
+                unit = f"{item.label}.timer"
+                self._assert_systemd_fragment(
+                    unit, self.config.service_root / unit
+                )
+                timers[item.timer_id] = (
+                    "running" if self._systemd_unit_active(unit) else "stopped"
+                )
+        return {"services": services, "timers": timers}
+
+    def _service_manager_prestate(self) -> dict[str, Any]:
+        if self.config.platform == "launchd":
+            return self._service_manager_status()
+        units: dict[str, dict[str, bool]] = {}
+        for service in self.config.services:
+            unit = f"{service.label}.service"
+            self._assert_systemd_fragment(
+                unit,
+                self.config.service_root / unit,
+            )
+            units[unit] = {
+                "active": self._systemd_unit_active(unit),
+                "enabled": self._systemd_unit_enabled(unit),
+            }
+        for timer in self.config.timers:
+            unit = f"{timer.label}.timer"
+            self._assert_systemd_fragment(
+                unit,
+                self.config.service_root / unit,
+            )
+            units[unit] = {
+                "active": self._systemd_unit_active(unit),
+                "enabled": self._systemd_unit_enabled(unit),
+            }
+        return {"systemd_units": units}
+
+    def _component_desired_state_binding(
+        self,
+    ) -> tuple[Path, tuple[str, ...], str, str] | None:
+        bindings: set[tuple[Path, tuple[str, ...], str, str]] = set()
+        required = {
+            "HINDSIGHT_EMBED_STATE_DIR",
+            "HINDSIGHT_EMBED_FLEET_PROFILES",
+            "HINDSIGHT_EMBED_AUTOSTART_DAEMON",
+            "HINDSIGHT_EMBED_AUTOSTART_UI",
+        }
+        relevant = required | {"HINDSIGHT_EMBED_DESIRED_STATE_DIR"}
+        consumers = (
+            *self.config.services,
+            *self.config.timers,
+            *self.config.health_checks,
+        )
+        for consumer in consumers:
+            environment = dict(consumer.environment)
+            present = relevant & set(environment)
+            if not present:
+                continue
+            if not required <= set(environment):
+                raise PortableInstallError(
+                    "managed stack desired-state binding is incomplete"
+                )
+            profiles = tuple(environment["HINDSIGHT_EMBED_FLEET_PROFILES"].split(","))
+            if (
+                any(
+                    PROFILE_IDENTIFIER.fullmatch(profile) is None
+                    for profile in profiles
+                )
+                or len(profiles) != len(set(profiles))
+            ):
+                raise PortableInstallError(
+                    "managed stack fleet profile binding is invalid"
+                )
+            daemon_state = environment["HINDSIGHT_EMBED_AUTOSTART_DAEMON"]
+            ui_state = environment["HINDSIGHT_EMBED_AUTOSTART_UI"]
+            if daemon_state not in {"true", "false"} or ui_state not in {
+                "true",
+                "false",
+            }:
+                raise PortableInstallError(
+                    "managed stack autostart binding is invalid"
+                )
+            if daemon_state == "false" and ui_state == "true":
+                raise PortableInstallError(
+                    "managed stack UI cannot autostart without its API"
+                )
+            root = Path(
+                environment.get(
+                    "HINDSIGHT_EMBED_DESIRED_STATE_DIR",
+                    str(Path(environment["HINDSIGHT_EMBED_STATE_DIR"]) / "desired"),
+                )
+            )
+            if not root.is_absolute() or ".." in root.parts:
+                raise PortableInstallError(
+                    "managed stack desired-state path is invalid"
+                )
+            bindings.add((root, profiles, daemon_state, ui_state))
+        if len(bindings) > 1:
+            raise PortableInstallError(
+                "managed stack desired-state bindings disagree"
+            )
+        return next(iter(bindings)) if bindings else None
+
+    def _reset_component_desired_state(self) -> dict[Path, bytes | None]:
+        binding = self._component_desired_state_binding()
+        if binding is None:
+            return {}
+        root, profiles, daemon_autostart, ui_autostart = binding
+        _mkdir_private(root)
+        preimage: dict[Path, bytes | None] = {}
+        try:
+            for profile in profiles:
+                profile_root = root / "profiles" / profile
+                _mkdir_private(profile_root)
+                for component, autostart in (
+                    ("daemon", daemon_autostart),
+                    ("ui", ui_autostart),
+                ):
+                    path = profile_root / component
+                    if path.exists() or path.is_symlink():
+                        _verify_owned_file(
+                            path, "component desired-state file", mode=0o600
+                        )
+                        current = path.read_bytes()
+                        if current not in {b"running\n", b"stopped\n"}:
+                            raise PortableInstallError(
+                                "component desired-state file is invalid"
+                            )
+                        preimage[path] = current
+                    else:
+                        preimage[path] = None
+                    desired = b"running\n" if autostart == "true" else b"stopped\n"
+                    _atomic_write(path, desired, 0o600)
+        except BaseException:
+            self._restore_component_desired_state(preimage)
+            raise
+        return preimage
+
+    def _restore_component_desired_state(
+        self, preimage: Mapping[Path, bytes | None]
+    ) -> None:
+        for path, content in preimage.items():
+            if content is None:
+                if not path.exists() and not path.is_symlink():
+                    continue
+                _verify_owned_file(
+                    path, "component desired-state file", mode=0o600
+                )
+                path.unlink()
+                _fsync_directory(path.parent)
+            else:
+                _atomic_write(path, content, 0o600)
 
     def _verify_service_manager(self) -> None:
         if self.config.platform == "launchd":
@@ -2634,7 +2973,11 @@ class PortableInstallationManager:
         destination = self.config.install_root / str(release["release_path"])
         _copy_release(source, destination, release["manifest"], temporary=temporary)
 
-    def _launcher_payloads(self, snapshot: BindingSnapshot) -> dict[Path, bytes]:
+    def _launcher_payloads(
+        self,
+        snapshot: BindingSnapshot,
+        release: Mapping[str, Any],
+    ) -> dict[Path, bytes]:
         python = _validated_python_runtime(self.config.python_executable)
         wrapper = (
             "#!/bin/sh\nexec "
@@ -2643,10 +2986,22 @@ class PortableInstallationManager:
             + shlex.quote(str(self.config.install_root / "wrapper.py"))
             + ' "$@"\n'
         ).encode()
+        authority_wrapper = (
+            "#!/bin/sh\nexec "
+            + shlex.quote(str(python))
+            + " -I "
+            + shlex.quote(str(self.config.install_root / "wrapper.py"))
+            + ' --hindsight-hook-authority "$@"\n'
+        ).encode()
+        authority = canonical_bytes(release)
         return {
             self.config.install_root / "launcher.py": SERVICE_LAUNCHER.encode(),
             self.config.install_root / "wrapper.py": WRAPPER.encode(),
             self.config.install_root / "bin" / "hindsight-memory": wrapper,
+            self.config.install_root
+            / "bin"
+            / "hindsight-memory-hook-authority": authority_wrapper,
+            self.config.install_root / "hook-authority.json": authority,
             self.config.install_root / "managed-config.json": snapshot.config_bytes,
             self.config.install_root
             / "managed-inventory.json": snapshot.inventory_bytes,
@@ -2932,6 +3287,80 @@ class PortableInstallationManager:
                     ("/usr/bin/systemctl", "--user", "restart", f"{timer.label}.timer")
                 )
 
+    def _start_services_idempotently(self) -> None:
+        self._preflight_service_manager(absent_ok=True)
+        if self.config.platform == "launchd":
+            domain = f"gui/{os.getuid()}"
+            candidates = (
+                *((item, True) for item in self.config.services),
+                *((item, False) for item in self.config.timers),
+            )
+            for item, require_running in candidates:
+                plist = self.config.service_root / f"{item.label}.plist"
+                loaded, output = self._launchd_job_snapshot(item.label, plist)
+                running = loaded is not None and (
+                    not require_running
+                    or output is None
+                    or re.search(
+                        r"^\s*state = running\s*$",
+                        output,
+                        re.MULTILINE,
+                    )
+                    is not None
+                )
+                if running:
+                    continue
+                if loaded is None:
+                    self._bootstrap_launchd(
+                        domain,
+                        plist,
+                        replacing_loaded_job=False,
+                    )
+                self._command_runner(
+                    (
+                        "/bin/launchctl",
+                        "kickstart",
+                        "-k",
+                        f"{domain}/{item.label}",
+                    )
+                )
+            return
+
+        self._command_runner(("/usr/bin/systemctl", "--user", "daemon-reload"))
+        for service in self.config.services:
+            unit = f"{service.label}.service"
+            self._assert_systemd_fragment(
+                unit,
+                self.config.service_root / unit,
+            )
+            if not self._systemd_unit_enabled(unit):
+                self._command_runner(
+                    ("/usr/bin/systemctl", "--user", "enable", unit)
+                )
+            if not self._systemd_unit_active(unit):
+                self._command_runner(
+                    ("/usr/bin/systemctl", "--user", "start", unit)
+                )
+        for timer in self.config.timers:
+            companion = f"{timer.label}.service"
+            unit = f"{timer.label}.timer"
+            self._assert_systemd_fragment(
+                companion,
+                self.config.service_root / companion,
+            )
+            self._assert_systemd_fragment(
+                unit,
+                self.config.service_root / unit,
+            )
+            if not self._systemd_unit_enabled(unit):
+                self._command_runner(
+                    ("/usr/bin/systemctl", "--user", "enable", unit)
+                )
+            if not self._systemd_unit_active(unit):
+                self._command_runner(
+                    ("/usr/bin/systemctl", "--user", "start", unit)
+                )
+
     def _deactivate_services(self, *, absent_ok: bool = False) -> None:
         self._preflight_service_manager(absent_ok=absent_ok)
         if self.config.platform == "launchd":
@@ -3013,6 +3442,89 @@ class PortableInstallationManager:
                     )
                 )
             self._command_runner(("/usr/bin/systemctl", "--user", "daemon-reload"))
+
+    def _restore_service_manager_prestate(
+        self,
+        prior: Mapping[str, Any],
+    ) -> None:
+        if self.config.platform == "systemd-user":
+            for unit, state in prior["systemd_units"].items():
+                self._assert_systemd_fragment(
+                    unit,
+                    self.config.service_root / unit,
+                )
+                self._command_runner(
+                    (
+                        "/usr/bin/systemctl",
+                        "--user",
+                        "enable" if state["enabled"] else "disable",
+                        unit,
+                    )
+                )
+                self._command_runner(
+                    (
+                        "/usr/bin/systemctl",
+                        "--user",
+                        "start" if state["active"] else "stop",
+                        unit,
+                    )
+                )
+            self._command_runner(
+                ("/usr/bin/systemctl", "--user", "daemon-reload")
+            )
+            if self._service_manager_prestate() != prior:
+                raise PortableInstallError(
+                    "service manager prestate restoration failed"
+                )
+            return
+        domain = f"gui/{os.getuid()}"
+        candidates = (
+            *((item, prior["services"][item.service_id])
+              for item in self.config.services),
+            *((item, prior["timers"][item.timer_id])
+              for item in self.config.timers),
+        )
+        for item, expected_status in candidates:
+            plist = self.config.service_root / f"{item.label}.plist"
+            loaded = self._launchd_loaded_manifest(item.label, plist) is not None
+            if expected_status == "running":
+                if not loaded:
+                    self._bootstrap_launchd(
+                        domain,
+                        plist,
+                        replacing_loaded_job=False,
+                    )
+                self._command_runner(
+                    (
+                        "/bin/launchctl",
+                        "kickstart",
+                        "-k",
+                        f"{domain}/{item.label}",
+                    )
+                )
+                continue
+            if expected_status != "stopped":
+                raise PortableInstallError(
+                    "service manager prestate is invalid"
+                )
+            if not loaded:
+                continue
+            try:
+                self._command_runner(
+                    (
+                        "/bin/launchctl",
+                        "bootout",
+                        f"{domain}/{item.label}",
+                    )
+                )
+            except _ManagedServiceCommandError as error:
+                if error.returncode not in {3, 113}:
+                    raise
+        observed = self._service_manager_status()
+        if observed != prior:
+            raise PortableInstallError(
+                "service manager prestate restoration failed"
+            )
 
     def _health(self, release: Mapping[str, Any]) -> bool:
         runner = self._health_runner or self._default_health_runner
@@ -3202,6 +3714,8 @@ class PortableInstallationManager:
                 "launcher.py",
                 "wrapper.py",
                 "bin/hindsight-memory",
+                "bin/hindsight-memory-hook-authority",
+                "hook-authority.json",
                 "managed-config.json",
                 "managed-inventory.json",
                 "credential-resolver",
@@ -3742,7 +4256,10 @@ class PortableInstallationManager:
             )
             if release_staging.exists() or release_staging.is_symlink():
                 raise PortableInstallError("release staging path already exists")
-            launcher_payloads = self._launcher_payloads(external_bindings)
+            launcher_payloads = self._launcher_payloads(
+                external_bindings,
+                release,
+            )
             launcher_owned = {
                 str(path): hashlib.sha256(content).hexdigest()
                 for path, content in launcher_payloads.items()
@@ -4173,6 +4690,112 @@ class PortableInstallationManager:
                 raise PortableInstallError("health verification failed")
             return {**verification, "managed_health": "healthy"}
 
+    def stop_services(self) -> dict[str, Any]:
+        self._preflight_lifecycle()
+        self._validate_config_source()
+        with self._lock():
+            self._recover_pending_locked()
+            state = self._load_state()
+            if state is None:
+                raise PortableInstallError("installation is absent")
+            verification = self._verify_locked(state)
+            installed = self._installed_manager(state)
+            installed._deactivate_services(absent_ok=True)
+            status = installed._service_manager_status()
+            if any(
+                value != "stopped"
+                for group in status.values()
+                for value in group.values()
+            ):
+                raise PortableInstallError("managed services did not stop")
+            return {
+                "status": "stopped",
+                **status,
+                "current": verification["current"],
+            }
+
+    def service_status(self) -> dict[str, Any]:
+        self._preflight_lifecycle()
+        self._validate_config_source()
+        with self._lock():
+            self._recover_pending_locked()
+            state = self._load_state()
+            if state is None:
+                raise PortableInstallError("installation is absent")
+            verification = self._verify_locked(state)
+            installed = self._installed_manager(state)
+            status = installed._service_manager_status()
+            observed = [
+                value for group in status.values() for value in group.values()
+            ]
+            if observed and all(value == "running" for value in observed):
+                overall = "running"
+            elif all(value == "stopped" for value in observed):
+                overall = "stopped"
+            else:
+                overall = "partial"
+            return {
+                "status": overall,
+                **status,
+                "current": verification["current"],
+            }
+
+    def _set_services_running(
+        self,
+        *,
+        restart_existing: bool,
+    ) -> dict[str, Any]:
+        self._preflight_lifecycle()
+        self._validate_config_source()
+        with self._lock():
+            self._recover_pending_locked()
+            state = self._load_state()
+            if state is None:
+                raise PortableInstallError("installation is absent")
+            verification = self._verify_locked(state)
+            installed = self._installed_manager(state)
+            prior = installed._service_manager_prestate()
+            component_preimage = installed._reset_component_desired_state()
+            try:
+                if restart_existing:
+                    installed._activate_services()
+                else:
+                    installed._start_services_idempotently()
+                installed._verify_service_manager()
+                if not installed._health(state["current"]):
+                    raise PortableInstallError("health verification failed")
+            except BaseException as start_error:
+                rollback_error: BaseException | None = None
+                try:
+                    installed._restore_service_manager_prestate(
+                        prior
+                    )
+                except BaseException as error:
+                    rollback_error = error
+                try:
+                    installed._restore_component_desired_state(component_preimage)
+                except BaseException as error:
+                    rollback_error = rollback_error or error
+                if rollback_error is not None:
+                    start_error.add_note(
+                        "The intentional stop could not be fully restored."
+                    )
+                    raise start_error from rollback_error
+                raise
+            status = installed._service_manager_status()
+            return {
+                "status": "running",
+                **status,
+                "current": verification["current"],
+                "managed_health": "healthy",
+            }
+
+    def start_services(self) -> dict[str, Any]:
+        return self._set_services_running(restart_existing=False)
+
+    def restart_services(self) -> dict[str, Any]:
+        return self._set_services_running(restart_existing=True)
+
     def rollback(self, *, expected_current_digest: str) -> dict[str, Any]:
         self._preflight_lifecycle()
         if SHA256.fullmatch(expected_current_digest) is None:
@@ -4223,6 +4846,7 @@ class PortableInstallationManager:
                 },
             )
             try:
+                installed._disable_harness_authority_for_rollback()
                 installed._quiesce_scheduled_jobs()
                 self._write_state(pending_state)
                 _atomic_json(

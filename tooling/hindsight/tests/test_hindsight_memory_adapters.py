@@ -1,3 +1,4 @@
+import copy
 import json
 import hashlib
 import fcntl
@@ -771,6 +772,7 @@ class HttpAdapterContractTest(AdapterContractMixin, unittest.TestCase):
             "release_notes": "private-version-content",
         }
         responses[("GET", "/v1/migration/generation")] = {"generation": "commit-42"}
+        migration_snapshot_banks = {}
         for index, bank_id in enumerate(("engineering", "historical-candidate"), start=1):
             base = f"/v1/default/banks/{bank_id}"
             responses[("GET", f"{base}/config")] = {
@@ -840,6 +842,82 @@ class HttpAdapterContractTest(AdapterContractMixin, unittest.TestCase):
                 responses[("GET", f"{base}/operations?status={status}&limit=100&offset=0")] = {
                     "bank_id": bank_id, "operations": [], "total": 0, "limit": 100, "offset": 0,
                 }
+            migration_snapshot_banks[
+                "source" if bank_id == "engineering" else "candidate"
+            ] = {
+                "config": responses[("GET", f"{base}/config")],
+                "stats": responses[("GET", f"{base}/stats")],
+                "scopes": responses[
+                    ("GET", f"{base}/observations/scopes")
+                ],
+                "tags": responses[
+                    ("GET", f"{base}/tags?limit=1000&offset=0")
+                ]["items"],
+                "documents": responses[
+                    ("GET", f"{base}/documents?limit=1000&offset=0")
+                ]["items"],
+                "models": [
+                    {
+                        "model_id": item["id"],
+                        "content_digest": digest(item),
+                    }
+                    for item in responses[
+                        (
+                            "GET",
+                            f"{base}/mental-models?detail=full&limit=1000&offset=0",
+                        )
+                    ]["items"]
+                ],
+                "directives": [
+                    {
+                        "directive_id": item["id"],
+                        "content_digest": digest(item),
+                    }
+                    for item in responses[
+                    (
+                        "GET",
+                        f"{base}/directives?active_only=false&limit=1000&offset=0",
+                    )
+                    ]["items"]
+                ],
+                "invalidated_memories": responses[
+                    (
+                        "GET",
+                        f"{base}/memories/list?state=invalidated&limit=1000&offset=0",
+                    )
+                ]["items"],
+                "webhooks": [
+                    {
+                        "id": item["id"],
+                        "target_digest": digest(item["target"]),
+                        "event_types": item["activation"]["events"],
+                        "enabled": item["activation"]["enabled"],
+                        "config_digest": digest(item["config"]),
+                    }
+                    for item in responses[
+                        ("GET", f"{base}/webhooks")
+                    ]["items"]
+                ],
+                "operations": [],
+            }
+        responses[
+            (
+                "GET",
+                "/v1/migration/snapshot?"
+                "source_bank=engineering&"
+                "candidate_bank=historical-candidate",
+            )
+        ] = {
+            "schema_version": 1,
+            "generation_before": "commit-42",
+            "generation_after": "commit-42",
+            "controller_state": {
+                "configuration_digest": "1" * 64,
+                "hook_digest": "2" * 64,
+                "schedule_digest": "3" * 64,
+            },
+            "banks": migration_snapshot_banks,
+        }
         self.responses = responses
 
         class Handler(BaseHTTPRequestHandler):
@@ -1593,7 +1671,7 @@ class HttpAdapterContractTest(AdapterContractMixin, unittest.TestCase):
             with self.assertRaisesRegex(AdapterError, "tags response is invalid"):
                 self.adapter.snapshot()
 
-    def test_read_migration_inventory_composes_documented_get_surfaces(self):
+    def test_read_migration_inventory_uses_one_server_snapshot(self):
         before = len(self.seen)
         result = self.adapter.read_migration_inventory(
             BankRef("core", "engineering"),
@@ -1613,6 +1691,15 @@ class HttpAdapterContractTest(AdapterContractMixin, unittest.TestCase):
             },
         )
         self.assertEqual(result["provider_identity"]["profile_id"], "core")
+        self.assertEqual(result["snapshot_generation"], "commit-42")
+        self.assertEqual(
+            result["controller_state"],
+            {
+                "configuration_digest": "1" * 64,
+                "hook_digest": "2" * 64,
+                "schedule_digest": "3" * 64,
+            },
+        )
 
         self.assertEqual(result["banks"]["source"]["bank_ref"]["bank_id"], "engineering")
         self.assertEqual(result["banks"]["candidate"]["bank_ref"]["bank_id"], "historical-candidate")
@@ -1664,27 +1751,38 @@ class HttpAdapterContractTest(AdapterContractMixin, unittest.TestCase):
         )
         self.assertNotIn("private", json.dumps(result))
         calls = self.seen[before:]
-        self.assertTrue(calls)
+        self.assertEqual(
+            [path for _method, path, _auth, _body in calls],
+            [
+                "/version",
+                "/v1/migration/snapshot?"
+                "source_bank=engineering&"
+                "candidate_bank=historical-candidate",
+            ],
+        )
         self.assertTrue(all(method == "GET" for method, _path, _auth, _body in calls))
-        self.assertFalse(any(path.startswith("/v1/migrations/") for _method, path, _auth, _body in calls))
+        self.assertFalse(
+            any(
+                "/banks/" in path
+                for _method, path, _auth, _body in calls
+            )
+        )
         self.assertTrue(all(auth == "Bearer contract-token" for _method, _path, auth, _body in calls))
 
     def test_migration_inventory_rejects_duplicate_operation_ids_across_statuses(self):
-        base = "/v1/default/banks/engineering"
+        path = (
+            "/v1/migration/snapshot?"
+            "source_bank=engineering&"
+            "candidate_bank=historical-candidate"
+        )
         operation = {
             "id": "operation-1",
             "updated_at": "2026-07-13T12:00:00Z",
         }
-        for status in ("pending", "processing"):
-            self.responses[(
-                "GET", f"{base}/operations?status={status}&limit=100&offset=0"
-            )] = {
-                "bank_id": "engineering",
-                "operations": [operation],
-                "total": 1,
-                "limit": 100,
-                "offset": 0,
-            }
+        self.responses[("GET", path)]["banks"]["source"]["operations"] = [
+            {**operation, "status": status}
+            for status in ("pending", "processing")
+        ]
         with self.assertRaisesRegex(AdapterError, "operation response is invalid"):
             self.adapter.read_migration_inventory(
                 BankRef("core", "engineering"),
@@ -1692,14 +1790,22 @@ class HttpAdapterContractTest(AdapterContractMixin, unittest.TestCase):
             )
 
     def test_migration_inventory_rejects_duplicate_webhook_ids(self):
-        path = "/v1/default/banks/engineering/webhooks"
+        path = (
+            "/v1/migration/snapshot?"
+            "source_bank=engineering&"
+            "candidate_bank=historical-candidate"
+        )
         item = {
             "id": "hook-duplicate",
-            "target": {"url": "https://hooks.example"},
-            "activation": {"enabled": True},
-            "config": {"timeout": 5},
+            "event_types": ["retain"],
+            "enabled": True,
+            "target_digest": "1" * 64,
+            "config_digest": "2" * 64,
         }
-        self.responses[("GET", path)] = {"items": [item, dict(item)]}
+        self.responses[("GET", path)]["banks"]["source"]["webhooks"] = [
+            item,
+            dict(item),
+        ]
         with self.assertRaisesRegex(AdapterError, "webhook response is invalid"):
             self.adapter.read_migration_inventory(
                 BankRef("core", "engineering"),
@@ -1798,6 +1904,309 @@ class HttpAdapterContractTest(AdapterContractMixin, unittest.TestCase):
         self.assertEqual(self.adapter.read_migration_generation(), "commit-42")
         self.assert_operation("GET", "/v1/migration/generation")
 
+    def test_controller_state_is_digest_bound_through_the_server(self):
+        state = {
+            "configuration_digest": "1" * 64,
+            "hook_digest": "2" * 64,
+            "schedule_digest": "3" * 64,
+        }
+        with patch.object(
+            self.adapter,
+            "_request",
+            return_value={
+                "generation": "core:public:43",
+                "changed": True,
+            },
+        ) as request:
+            self.assertEqual(
+                self.adapter.record_controller_state(state),
+                {
+                    "generation": "core:public:43",
+                    "changed": True,
+                },
+            )
+        request.assert_called_once_with(
+            "POST",
+            "/v1/migration/controller-state",
+            state,
+        )
+
+    def test_replay_document_reads_raw_source_and_submits_normal_retain(self):
+        source = BankRef("core", "codex")
+        target = BankRef("core", "engineering")
+        document = {
+            "id": "session/one",
+            "bank_id": "codex",
+            "original_text": "complete original transcript",
+            "content_hash": "4" * 64,
+            "created_at": "2026-07-13T11:00:00Z",
+            "updated_at": "2026-07-13T12:00:00Z",
+            "memory_unit_count": 0,
+            "nodes_by_fact_type": {},
+            "tags": ["agent:codex"],
+            "document_metadata": {"source": "codex-hook"},
+            "retain_params": {"context": "session"},
+            "observation_scopes": "combined",
+        }
+        responses = iter(
+            (
+                document,
+                {
+                    "success": True,
+                    "bank_id": "engineering",
+                    "items_count": 1,
+                    "async": True,
+                    "operation_id": RUNTIME_OPERATION_ID,
+                },
+            )
+        )
+        with patch.object(
+            self.adapter,
+            "_request",
+            side_effect=lambda *_args: next(responses),
+        ) as request:
+            self.assertEqual(
+                self.adapter.read_replay_document(source, "session/one"),
+                document,
+            )
+            submission = self.adapter.submit_replay_document(
+                target,
+                {
+                    "content": document["original_text"],
+                    "document_id": "misroute-codex-1",
+                    "timestamp": document["created_at"],
+                    "context": "session",
+                    "metadata": {"source": "codex-hook"},
+                    "tags": ["agent:codex", "source:codex"],
+                    "observation_scopes": [
+                        ["scope:one"],
+                        ["scope:two", "scope:three"],
+                    ],
+                    "update_mode": "replace",
+                },
+            )
+        self.assertEqual(submission, {"operation_id": RUNTIME_OPERATION_ID})
+        self.assertEqual(
+            request.call_args_list[0].args,
+            (
+                "GET",
+                "/v1/default/banks/codex/documents/session%2Fone",
+            ),
+        )
+        self.assertEqual(
+            request.call_args_list[1].args[0:2],
+            (
+                "POST",
+                "/v1/default/banks/engineering/memories",
+            ),
+        )
+        self.assertTrue(request.call_args_list[1].args[2]["async"])
+
+        for extra in (
+            {"operation_ids": [RUNTIME_OPERATION_ID]},
+            {"usage": {"input_tokens": 1}},
+        ):
+            with (
+                self.subTest(extra=extra),
+                patch.object(
+                    self.adapter,
+                    "_request",
+                    return_value={
+                        "success": True,
+                        "bank_id": "engineering",
+                        "items_count": 1,
+                        "async": True,
+                        "operation_id": RUNTIME_OPERATION_ID,
+                        **extra,
+                    },
+                ),
+                self.assertRaisesRegex(AdapterError, "response is invalid"),
+            ):
+                self.adapter.submit_replay_document(
+                    target,
+                    {
+                        "content": "content",
+                        "document_id": "target",
+                        "timestamp": document["created_at"],
+                        "context": "session",
+                        "metadata": {"source": "codex-hook"},
+                        "tags": ["source:codex"],
+                        "observation_scopes": "combined",
+                        "update_mode": "replace",
+                    },
+                )
+
+    def test_replay_document_requires_recoverable_original_text(self):
+        source = BankRef("core", "codex")
+        with patch.object(
+            self.adapter,
+            "_request",
+            return_value={
+                "id": "missing",
+                "bank_id": "codex",
+                "original_text": None,
+                "content_hash": None,
+                "created_at": "2026-07-13T11:00:00Z",
+                "updated_at": "2026-07-13T12:00:00Z",
+                "memory_unit_count": 0,
+                "tags": [],
+            },
+        ), self.assertRaisesRegex(AdapterError, "original text"):
+            self.adapter.read_replay_document(source, "missing")
+
+    def test_replay_inventory_status_collision_probe_and_exact_delete(self):
+        source = BankRef("core", "codex")
+        target = BankRef("core", "engineering")
+        document_pages = iter(
+            (
+                {
+                    "items": [
+                        {"id": "second", "bank_id": "codex"},
+                        {"id": "first", "bank_id": "codex"},
+                    ],
+                    "total": 2,
+                    "limit": 1000,
+                    "offset": 0,
+                },
+            )
+        )
+        with patch.object(
+            self.adapter,
+            "_request",
+            side_effect=lambda *_args: next(document_pages),
+        ) as request:
+            self.assertEqual(
+                self.adapter.list_replay_document_ids(source),
+                ["first", "second"],
+            )
+        request.assert_called_once_with(
+            "GET",
+            "/v1/default/banks/codex/documents?limit=1000&offset=0",
+        )
+
+        with patch.object(
+            self.adapter,
+            "_request",
+            return_value={
+                "operation_id": RUNTIME_OPERATION_ID,
+                "status": "completed",
+            },
+        ):
+            self.assertEqual(
+                self.adapter.read_replay_operation(
+                    target,
+                    RUNTIME_OPERATION_ID,
+                ),
+                {"operation_id": RUNTIME_OPERATION_ID, "status": "completed"},
+            )
+
+        with patch.object(
+            self.adapter,
+            "_request",
+            side_effect=EndpointNotFoundError("not found"),
+        ):
+            self.assertEqual(
+                self.adapter.read_replay_operation(
+                    target,
+                    RUNTIME_OPERATION_ID,
+                ),
+                {
+                    "operation_id": RUNTIME_OPERATION_ID,
+                    "status": "not_found",
+                },
+            )
+
+        with patch.object(
+            self.adapter,
+            "read_replay_document",
+            side_effect=EndpointNotFoundError("not found"),
+        ):
+            self.assertIsNone(
+                self.adapter.find_replay_document(target, "missing"),
+            )
+
+        with patch.object(
+            self.adapter,
+            "_request",
+            return_value={
+                "success": True,
+                "message": "deleted",
+                "deleted_count": 12,
+            },
+        ) as request:
+            self.assertEqual(
+                self.adapter.delete_replay_source_bank(source),
+                {"bank_id": "codex", "deleted_count": 12},
+            )
+        request.assert_called_once_with(
+            "DELETE",
+            "/v1/default/banks/codex",
+        )
+        with patch.object(
+            self.adapter,
+            "_request",
+            return_value={
+                "banks": [
+                    {"bank_id": "engineering"},
+                    {"bank_id": "codex-memory-migration-v1-20260708"},
+                ]
+            },
+        ):
+            self.assertEqual(
+                self.adapter.list_replay_bank_ids(),
+                ["codex-memory-migration-v1-20260708", "engineering"],
+            )
+        with self.assertRaisesRegex(AdapterError, "exact codex"):
+            self.adapter.delete_replay_source_bank(
+                BankRef("core", "codex-memory-migration-v1-20260708"),
+            )
+
+    def test_replay_closeout_accepts_deferred_external_cleanup(self):
+        authority = {
+            "schema_version": 1,
+            "expected_generation": "core:public:7",
+            "expected_bank_ids": ["codex", "engineering"],
+            "source_documents": [
+                {
+                    "source_document_id": "source-1",
+                    "record_digest": "1" * 64,
+                }
+            ],
+            "replay_plan_digest": "2" * 64,
+            "verification_digest": "3" * 64,
+            "backup_evidence_digest": "4" * 64,
+            "closeout_plan_digest": "5" * 64,
+        }
+        response = {
+            "schema_version": 1,
+            "status": "deleted",
+            "deleted_bank_id": "codex",
+            "deleted_count": 5,
+            "pre_delete_generation": "core:public:7",
+            "post_delete_generation": "core:public:12",
+            "remaining_bank_ids": ["engineering"],
+            "cleanup_status": "deferred",
+            "replay_plan_digest": authority["replay_plan_digest"],
+            "verification_digest": authority["verification_digest"],
+            "backup_evidence_digest":
+                authority["backup_evidence_digest"],
+            "closeout_plan_digest": authority["closeout_plan_digest"],
+        }
+        with patch.object(
+            self.adapter,
+            "_request",
+            return_value=response,
+        ) as request:
+            self.assertEqual(
+                self.adapter.conditional_replay_closeout(authority),
+                response,
+            )
+        request.assert_called_once_with(
+            "POST",
+            "/v1/migration/replay-closeout",
+            authority,
+        )
+
     def test_migration_bank_paths_use_the_selected_endpoint_tenant(self):
         selected = inventory_for(
             self.server.server_port,
@@ -1814,15 +2223,22 @@ class HttpAdapterContractTest(AdapterContractMixin, unittest.TestCase):
         )
 
     def test_migration_bank_config_is_bound_to_requested_bank(self):
-        with patch.object(
-            self.adapter,
-            "_request",
-            return_value={"bank_id": "other", "config": {}, "overrides": {}},
-        ), self.assertRaisesRegex(AdapterError, "identity drifted"):
-            self.adapter._read_migration_bank(
+        raw = copy.deepcopy(
+            self.responses[
+                (
+                    "GET",
+                    "/v1/migration/snapshot?"
+                    "source_bank=engineering&"
+                    "candidate_bank=historical-candidate",
+                )
+            ]["banks"]["source"]
+        )
+        raw["config"]["bank_id"] = "other"
+        with self.assertRaisesRegex(AdapterError, "identity drifted"):
+            self.adapter._normalize_migration_bank_snapshot(
                 "source",
                 BankRef("core", "engineering"),
-                deadline=time.monotonic() + 5,
+                raw,
             )
 
     def test_destructive_migration_actions_have_no_direct_http_route(self):
@@ -2146,18 +2562,33 @@ class HttpAdapterSecurityTest(unittest.TestCase):
         )
         observed = []
 
-        def request(_method, _path, _payload=None, *, deadline=None):
+        def request(_method, path, _payload=None, *, deadline=None):
             observed.append(deadline)
-            return {}
+            if path == "/version":
+                return {}
+            return {
+                "schema_version": 1,
+                "generation_before": "generation-1",
+                "generation_after": "generation-1",
+                "controller_state": {
+                    "configuration_digest": "1" * 64,
+                    "hook_digest": "2" * 64,
+                    "schedule_digest": "3" * 64,
+                },
+                "banks": {"source": {}, "candidate": {}},
+            }
 
-        def read_bank(_role, bank, *, deadline):
-            observed.append(deadline)
+        def normalize_bank(_role, bank, _raw):
             return ({"bank_ref": bank.to_dict()}, [], [], [])
 
         with (
             patch.object(adapter, "_request", side_effect=request),
             patch.object(adapter, "_migration_versions", return_value={}),
-            patch.object(adapter, "_read_migration_bank", side_effect=read_bank),
+            patch.object(
+                adapter,
+                "_normalize_migration_bank_snapshot",
+                side_effect=normalize_bank,
+            ),
             patch.object(adapter, "_declared_provider_identity", return_value={}),
             patch.object(adapter, "_validate_migration_inventory"),
         ):
@@ -2165,7 +2596,7 @@ class HttpAdapterSecurityTest(unittest.TestCase):
                 BankRef("core", "source"),
                 BankRef("core", "candidate"),
             )
-        self.assertEqual(len(observed), 3)
+        self.assertEqual(len(observed), 2)
         self.assertIsNotNone(observed[0])
         self.assertEqual(observed, [observed[0]] * len(observed))
 

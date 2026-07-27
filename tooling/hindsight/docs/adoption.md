@@ -458,6 +458,23 @@ Set the stack health-check deadline long enough for asynchronous API, UI,
 control, and broker readiness. The portable manager retries the isolated check
 until that deadline and rolls back the generation if readiness never converges.
 
+Use the installed manager for ordinary lifecycle control:
+
+```zsh
+"$installed_cli" service status --config /absolute/path/to/installation.json
+"$installed_cli" service stop --config /absolute/path/to/installation.json
+"$installed_cli" service start --config /absolute/path/to/installation.json
+"$installed_cli" service restart --config /absolute/path/to/installation.json
+```
+
+An explicit stop preserves the installed release, manifests, configuration, and
+data while disabling the managed user services. It remains stopped until an
+explicit start or restart. While running, launchd or systemd still recovers a
+genuine supervisor crash. Start and restart reset the managed API/UI component
+intent to the configured autostart policy and require complete managed health.
+Control Center API/UI stops use the same desired-state files: an API stop also
+stops its dependent UI, while a UI-only stop leaves the API running.
+
 ## Upgrade and roll back
 
 Upgrade from another immutable release tree:
@@ -494,7 +511,12 @@ For an explicit compare-and-swap rollback, copy the current release digest from
 ```
 
 Rollback fails if the active digest changed or no distinct last-known-good
-release exists.
+release exists. Before service quiescence, rollback invokes the protected
+harness reconciler's disable phase. The installer-owned hook-authority service
+continues that fail-closed state while the legacy release runs, and the
+installer-owned launcher withholds candidate-only migration extensions from
+the legacy runtime. Restore hook authority only by repairing or forward
+activating the authority release.
 
 ## Uninstall without deleting data
 
@@ -562,14 +584,19 @@ verified empty-MCP-server mode. The tools destination records the controller
 commands exposed through the installed Hindsight memory skill. Destination
 files must be current-user-owned regular files without group or world write
 access, and the rollback root must be mode `0700`.
+Each trusted upstream integration root and its `scripts` child must already be
+directories with group and world write access removed. Resolve the canonical
+root and verify those permissions before using it in a plan; do not trust a
+checkout or package directory writable by another user.
 
 Use the production persistence commands to separate staging, review, apply,
-status, and rollback:
+read-only status, semantic verification, and rollback:
 
 ```zsh
 controller=/absolute/install/root/bin/hindsight-memory
 state=/absolute/private/state
 destination=/absolute/path/to/codex-destination.json
+upstream_root=/absolute/path/to/verified/upstream/hindsight-integration
 
 if ! stage="$($controller --state-dir "$state" harness-config stage \
   --destination "$destination" \
@@ -592,6 +619,7 @@ $controller --state-dir "$state" harness-config plan \
   --generation "$generation" \
   --inventory /absolute/path/to/inventory.json \
   --policy /absolute/path/to/provider-runtime-policy.json \
+  --upstream-integration-root "$upstream_root" \
   --output "$state/codex-activation-plan.json"
 
 # Supply the printed approval digest only after reviewing the destination-bound
@@ -602,6 +630,7 @@ $controller --state-dir "$state" harness-config apply \
   --generation "$generation" \
   --inventory /absolute/path/to/inventory.json \
   --policy /absolute/path/to/provider-runtime-policy.json \
+  --upstream-integration-root "$upstream_root" \
   --plan "$state/codex-activation-plan.json" \
   --approval-digest "$approved_activation_digest" \
   --broker-healthy --profile-healthy --adapter-self-test
@@ -610,25 +639,57 @@ $controller --state-dir "$state" harness-config status \
   --destination "$destination" \
   --plan "$state/codex-activation-plan.json"
 
+$controller --state-dir "$state" harness-config verify \
+  --destination "$destination" \
+  --generation "$generation" \
+  --inventory /absolute/path/to/inventory.json \
+  --policy /absolute/path/to/provider-runtime-policy.json \
+  --upstream-integration-root "$upstream_root" \
+  --plan "$state/codex-activation-plan.json" \
+  --approval-digest "$approved_activation_digest"
+
 $controller --state-dir "$state" harness-config rollback \
   --destination "$destination" \
   --generation "$generation" \
   --inventory /absolute/path/to/inventory.json \
   --policy /absolute/path/to/provider-runtime-policy.json \
+  --upstream-integration-root "$upstream_root" \
   --plan "$state/codex-activation-plan.json" \
   --approval-digest "$approved_activation_digest"
 ```
 
 The activation record contains only digests and binds the plan to the exact
 destination paths. Apply reconstructs it from the current configuration;
-rollback reconstructs it from the private rollback snapshot. Direct endpoint,
-bank, and credential values never enter the record. The persistence adapter
+verify and rollback reconstruct it from the private rollback snapshot. Direct
+endpoint, bank, and credential values never enter the record. Planning and
+every mutating command require trusted upstream integration roots and refuse an
+inventory in which any automatic supported harness route names a bank other
+than literal `engineering`. The persistence adapter
 serializes concurrent activation with an owner-only lock,
 uses compare-and-swap on the complete projected configuration, and keeps a
 phase-marked recovery journal. A process interrupted before commit restores the
-exact prestate; one interrupted after commit finishes the target. Explicit
-rollback requires the same approved activation digest and removes only
-activation-owned changes while preserving later unrelated configuration.
+exact prestate; one interrupted after commit finishes the target. A failed
+postcheck, semantic verification failure, or explicit rollback removes
+controller and recognized direct Hindsight hooks, keeps upstream automatic
+recall and retain disabled, removes direct bank, endpoint, and credential
+authority, and preserves unrelated configuration. It never restores the
+upstream integration's harness-specific default bank.
+
+Run the approved `harness-config verify` command after each managed startup and
+as the post-activation smoke runner for every compatible integration upgrade.
+A nonzero result means the controller has already disabled the unsafe Hindsight
+surface; repair and reapply an approved plan rather than enabling the upstream
+direct integration.
+
+Consumers configure their supervisor with a trusted reconciliation executable.
+Before activation, that executable runs `harness-config disable` for every
+supported destination, retiring recognized direct hooks. After all three plans
+are approved and applied, it runs `harness-config reconcile --config` on every
+supervisor interval. The private reconciliation configuration binds each
+destination, staged generation, approved activation record, inventory, policy,
+and trusted upstream integration roots. A healthy pass records digest-only
+configuration, hook, and schedule state in the server-backed migration
+generation.
 
 CLI consumers start through
 `hindsight-memory --state-dir /absolute/private/state harness <harness> launch`.

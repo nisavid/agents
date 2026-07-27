@@ -353,6 +353,147 @@ class StackCredentialBindingTest(unittest.TestCase):
                     result.stderr,
                 )
 
+    def test_harness_reconciliation_bindings_are_all_or_nothing(self):
+        for variable in (
+            "HINDSIGHT_MEMORY_HARNESS_RECONCILER",
+            "HINDSIGHT_MEMORY_HARNESS_RECONCILE_CONFIG",
+        ):
+            with self.subTest(variable=variable):
+                env = dict(self.env)
+                env[variable] = str(self.root / variable.lower())
+                result = self.run_stack("hindsight_stack_load_config", env)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(
+                    "harness reconciliation bindings must be all set or all unset",
+                    result.stderr,
+                )
+        env = {
+            **self.env,
+            "HINDSIGHT_MEMORY_HARNESS_RECONCILER":
+                f"{self.root}/reconcile\ninjected",
+            "HINDSIGHT_MEMORY_HARNESS_RECONCILE_CONFIG":
+                str(self.root / "reconcile.json"),
+        }
+        result = self.run_stack("hindsight_stack_load_config", env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("absolute single-line paths", result.stderr)
+
+    def test_harness_reconciliation_is_invoked_and_failure_propagates(self):
+        reconciler = self.root / "reconcile"
+        config = self.root / "reconcile.json"
+        marker = self.root / "reconcile-argument"
+        reconciler.write_text(
+            "#!/bin/zsh\n"
+            f'print -r -- "$1|$2" >>"{marker}"\n'
+            'exit "${HINDSIGHT_TEST_RECONCILE_STATUS:-0}"\n',
+            encoding="utf-8",
+        )
+        reconciler.chmod(0o700)
+        config.write_text("{}\n", encoding="utf-8")
+        env = {
+            **self.env,
+            "HINDSIGHT_MEMORY_HARNESS_RECONCILER": str(reconciler),
+            "HINDSIGHT_MEMORY_HARNESS_RECONCILE_CONFIG": str(config),
+        }
+        command = (
+            "hindsight_stack_validate_trusted_executable() { return 0 }; "
+            "hindsight_stack_run_bounded() { "
+            '[[ "$1" == 300 ]] || return 99; shift; "$@"; }; '
+            "typeset -g HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS=300; "
+            "hindsight_stack_reconcile_harness_authority; "
+            "hindsight_stack_record_harness_authority"
+        )
+
+        result = self.run_stack(command, env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            marker.read_text(encoding="utf-8").splitlines(),
+            [
+                f"pre-start|{config}",
+                f"post-start|{config}",
+            ],
+        )
+
+        env["HINDSIGHT_TEST_RECONCILE_STATUS"] = "23"
+        result = self.run_stack(command, env)
+        self.assertEqual(result.returncode, 23)
+
+    def test_missing_harness_config_is_delegated_to_fail_closed_reconciler(self):
+        reconciler = self.root / "reconcile-missing"
+        config = self.root / "not-yet-activated.json"
+        marker = self.root / "missing-config-argument"
+        reconciler.write_text(
+            "#!/bin/zsh\n"
+            f'[[ ! -e "$2" ]] || exit 91\n'
+            f'print -r -- "$1|$2" >"{marker}"\n',
+            encoding="utf-8",
+        )
+        reconciler.chmod(0o700)
+        env = {
+            **self.env,
+            "HINDSIGHT_MEMORY_HARNESS_RECONCILER": str(reconciler),
+            "HINDSIGHT_MEMORY_HARNESS_RECONCILE_CONFIG": str(config),
+        }
+        command = (
+            "hindsight_stack_validate_trusted_executable() { return 0 }; "
+            "hindsight_stack_run_bounded() { shift; \"$@\"; }; "
+            "typeset -g HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS=300; "
+            "hindsight_stack_reconcile_harness_authority"
+        )
+
+        result = self.run_stack(command, env)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            marker.read_text(encoding="utf-8").strip(),
+            f"pre-start|{config}",
+        )
+
+    def test_symlinked_harness_config_is_delegated_to_fail_closed_reconciler(self):
+        reconciler = self.root / "reconcile-symlink"
+        target = self.root / "untrusted-target.json"
+        config = self.root / "unsafe-config.json"
+        marker = self.root / "symlink-config-argument"
+        target.write_text("{}\n", encoding="utf-8")
+        config.symlink_to(target)
+        reconciler.write_text(
+            "#!/bin/zsh\n"
+            '[[ -L "$2" ]] || exit 91\n'
+            f'print -r -- "$1|$2" >"{marker}"\n',
+            encoding="utf-8",
+        )
+        reconciler.chmod(0o700)
+        env = {
+            **self.env,
+            "HINDSIGHT_MEMORY_HARNESS_RECONCILER": str(reconciler),
+            "HINDSIGHT_MEMORY_HARNESS_RECONCILE_CONFIG": str(config),
+        }
+        command = (
+            "hindsight_stack_validate_trusted_executable() { return 0 }; "
+            "hindsight_stack_run_bounded() { shift; \"$@\"; }; "
+            "typeset -g HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS=300; "
+            "hindsight_stack_reconcile_harness_authority"
+        )
+
+        result = self.run_stack(command, env)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            marker.read_text(encoding="utf-8").strip(),
+            f"pre-start|{config}",
+        )
+
+    def test_direct_harness_reconciliation_loads_and_validates_config(self):
+        env = {**self.env, "HINDSIGHT_EMBED_CONTROL_PORT": "0"}
+
+        result = self.run_stack(
+            "hindsight_stack_reconcile_harness_authority",
+            env,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("HINDSIGHT_EMBED_CONTROL_PORT", result.stderr)
+
 
 class ManagedServiceCredentialPreflightTest(unittest.TestCase):
     def setUp(self):

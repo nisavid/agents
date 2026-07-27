@@ -206,6 +206,26 @@ reap_bounded() {
   clear_child "$pid"
 }
 
+typeset -g SIGNAL_RACE_STATUS=0
+run_signal_race() {
+  local label="$1" output="$2" pid
+  shift 2
+  "$@" >"$output" 2>&1 &
+  pid=$!
+  track_child "$pid" || fail "could not capture ${label} child identity"
+  for _ in {1..100}; do
+    child_job_running "$pid" || break
+    sleep 0.05
+  done
+  if child_job_running "$pid"; then
+    cleanup_child "$pid" || true
+    fail "${label} did not stop within the bounded timeout"
+  fi
+  SIGNAL_RACE_STATUS=0
+  wait "$pid" || SIGNAL_RACE_STATUS=$?
+  clear_child "$pid"
+}
+
 rendered_stack_lib="$repo_dir/lib/hindsight-embed-stack.zsh"
 supervisor_root_checks="$(rg -F -c '[[ "$path" == / ]] && break' "$repo_dir/bin/hindsight-embed-supervisor")"
 [[ "$supervisor_root_checks" == 1 ]] ||
@@ -499,6 +519,238 @@ supervisor_pid=""
 if rg -qi '(credential-sentinel|payload-sentinel|authorization:|bearer[[:space:]]|api[_-]?key)' "$supervisor_log"; then
   fail "supervisor log contains a credential or payload"
 fi
+
+signal_race_stack="$tmp_dir/signal-race-stack.zsh"
+cat > "$signal_race_stack" <<'ZSH'
+zmodload zsh/system
+typeset -g HINDSIGHT_TEST_SIGNAL_RACE_SUPERVISOR_PID=$$
+wait() {
+  builtin wait "$@"
+  local result=$?
+  if [[ "${HINDSIGHT_TEST_SIGNAL_RACE_AFTER_REAP:-0}" == 1 ]]; then
+    print -r -- reaped >>"$HINDSIGHT_TEST_SIGNAL_RACE_EVENTS"
+    /bin/kill "-$HINDSIGHT_TEST_SIGNAL_RACE_FIRST_SIGNAL" \
+      "$HINDSIGHT_TEST_SIGNAL_RACE_SUPERVISOR_PID"
+  fi
+  return "$result"
+}
+hindsight_stack_load_config() {
+  typeset -g HINDSIGHT_EMBED_PROFILE="test-profile"
+  typeset -g HINDSIGHT_EMBED_FLEET_PROFILES="test-profile"
+  typeset -g HINDSIGHT_MEMORY_BROKER_SOCKET="$HINDSIGHT_EMBED_STATE_DIR/broker.sock"
+}
+hindsight_stack_log() { return 0 }
+hindsight_stack_fleet_profiles_csv() { print -r -- test-profile }
+hindsight_stack_broker_status() { return 0 }
+hindsight_stack_initialize_desired_state() { return 0 }
+hindsight_stack_reconcile_once() {
+  print -r -- reconcile >>"$HINDSIGHT_TEST_SIGNAL_RACE_EVENTS"
+  if [[ "${HINDSIGHT_TEST_SIGNAL_RACE_DURING_SLEEP:-0}" == 1 ||
+    "${HINDSIGHT_TEST_SIGNAL_RACE_AFTER_REAP:-0}" == 1 ||
+    "${HINDSIGHT_TEST_SIGNAL_RACE_STOPPED_WAIT:-0}" == 1 ]]; then
+    print -r -- reconciled >>"$HINDSIGHT_TEST_SIGNAL_RACE_EVENTS"
+    return 0
+  fi
+  /bin/kill "-$HINDSIGHT_TEST_SIGNAL_RACE_FIRST_SIGNAL" $$
+  /bin/kill "-$HINDSIGHT_TEST_SIGNAL_RACE_SECOND_SIGNAL" $$
+  print -r -- reconciled >>"$HINDSIGHT_TEST_SIGNAL_RACE_EVENTS"
+  return 1
+}
+hindsight_stack_require_current_user() { return 0 }
+hindsight_stack_require_runtime_helpers() { return 0 }
+hindsight_stack_require_tools() { return 0 }
+hindsight_stack_validate_fleet() { return 0 }
+hindsight_stack_sleep() {
+  if [[ "${HINDSIGHT_TEST_SIGNAL_RACE_STOPPED_WAIT:-0}" == 1 ]]; then
+    local wait_child_pid="$sysparams[pid]"
+    print -r -- "$wait_child_pid" >"$HINDSIGHT_TEST_SIGNAL_RACE_WAIT_CHILD"
+    print -r -- sleep >>"$HINDSIGHT_TEST_SIGNAL_RACE_EVENTS"
+    (
+      /bin/kill -STOP "$wait_child_pid"
+      /bin/kill "-$HINDSIGHT_TEST_SIGNAL_RACE_FIRST_SIGNAL" \
+        "$HINDSIGHT_TEST_SIGNAL_RACE_SUPERVISOR_PID"
+    ) &
+    sleep 60
+    return
+  fi
+  if [[ "${HINDSIGHT_TEST_SIGNAL_RACE_AFTER_REAP:-0}" == 1 ]]; then
+    print -r -- "$sysparams[pid]" >"$HINDSIGHT_TEST_SIGNAL_RACE_WAIT_CHILD"
+    print -r -- sleep >>"$HINDSIGHT_TEST_SIGNAL_RACE_EVENTS"
+    return 0
+  fi
+  if [[ "${HINDSIGHT_TEST_SIGNAL_RACE_DURING_SLEEP:-0}" == 1 ]]; then
+    print -r -- sleep >>"$HINDSIGHT_TEST_SIGNAL_RACE_EVENTS"
+    /bin/kill "-$HINDSIGHT_TEST_SIGNAL_RACE_FIRST_SIGNAL" \
+      "$HINDSIGHT_TEST_SIGNAL_RACE_SUPERVISOR_PID"
+    sleep 60
+    return
+  fi
+  sleep "$1"
+}
+hindsight_stack_status_report() { return 0 }
+hindsight_stack_stop_all() {
+  print -r -- cleanup >>"$HINDSIGHT_TEST_SIGNAL_RACE_EVENTS"
+  print -r -- stop >>"$HINDSIGHT_TEST_SIGNAL_RACE_STOP"
+}
+hindsight_stack_with_lifecycle_lock() {
+  unsetopt ERR_EXIT
+  local callback="$1"
+  shift
+  if [[ "${HINDSIGHT_TEST_SIGNAL_RACE_LOCKED:-0}" == 1 ]]; then
+    touch "$HINDSIGHT_TEST_SIGNAL_RACE_REENTERED"
+    return 1
+  fi
+  typeset -g HINDSIGHT_TEST_SIGNAL_RACE_LOCKED=1
+  local result=0
+  {
+    "$callback" "$@"
+    result=$?
+  } always {
+    typeset -g HINDSIGHT_TEST_SIGNAL_RACE_LOCKED=0
+    print -r -- unlocked >>"$HINDSIGHT_TEST_SIGNAL_RACE_EVENTS"
+  }
+  return "$result"
+}
+ZSH
+for signal_race_case in \
+  "INT INT 130" \
+  "INT TERM 130" \
+  "TERM TERM 143" \
+  "TERM INT 143"; do
+  read -r first_signal second_signal expected_status <<<"$signal_race_case"
+  signal_race_prefix="$tmp_dir/signal-race-${first_signal:l}-${second_signal:l}"
+  signal_race_stop="${signal_race_prefix}-stop"
+  signal_race_reentered="${signal_race_prefix}-reentered"
+  signal_race_events="${signal_race_prefix}-events"
+  run_signal_race \
+    "supervisor ${first_signal}/${second_signal} reconciliation race" \
+    /dev/null \
+    /usr/bin/env \
+    HINDSIGHT_EMBED_STACK_LIB="$signal_race_stack" \
+    HINDSIGHT_EMBED_STATE_DIR="${signal_race_prefix}-state" \
+    HINDSIGHT_EMBED_POLL_SECONDS=1 \
+    HINDSIGHT_TEST_SIGNAL_RACE_FIRST_SIGNAL="$first_signal" \
+    HINDSIGHT_TEST_SIGNAL_RACE_SECOND_SIGNAL="$second_signal" \
+    HINDSIGHT_TEST_SIGNAL_RACE_STOP="$signal_race_stop" \
+    HINDSIGHT_TEST_SIGNAL_RACE_REENTERED="$signal_race_reentered" \
+    HINDSIGHT_TEST_SIGNAL_RACE_EVENTS="$signal_race_events" \
+    zsh "$repo_dir/bin/hindsight-embed-supervisor"
+  signal_race_status="$SIGNAL_RACE_STATUS"
+  [[ "$signal_race_status" == "$expected_status" ]] ||
+    fail "supervisor ${first_signal}/${second_signal} during reconciliation exited ${signal_race_status}, expected ${expected_status}"
+  [[ "$(paste -sd, - <"$signal_race_events")" == \
+    "reconcile,reconciled,unlocked,cleanup,unlocked" ]] ||
+    fail "supervisor ${first_signal}/${second_signal} cleanup order was $(paste -sd, - <"$signal_race_events")"
+  [[ -e "$signal_race_stop" && "$(<"$signal_race_stop")" == stop ]] ||
+    fail "supervisor ${first_signal}/${second_signal} did not perform exactly one stack cleanup"
+  [[ ! -e "$signal_race_reentered" ]] ||
+    fail "supervisor ${first_signal}/${second_signal} reentered the lifecycle lock"
+done
+
+for first_signal expected_status in INT 130 TERM 143; do
+  signal_race_prefix="$tmp_dir/signal-sleep-${first_signal:l}"
+  signal_race_stop="${signal_race_prefix}-stop"
+  signal_race_reentered="${signal_race_prefix}-reentered"
+  signal_race_events="${signal_race_prefix}-events"
+  run_signal_race \
+    "supervisor ${first_signal} pre-sleep race" \
+    /dev/null \
+    /usr/bin/env \
+    HINDSIGHT_EMBED_STACK_LIB="$signal_race_stack" \
+    HINDSIGHT_EMBED_STATE_DIR="${signal_race_prefix}-state" \
+    HINDSIGHT_EMBED_POLL_SECONDS=3600 \
+    HINDSIGHT_TEST_SIGNAL_RACE_DURING_SLEEP=1 \
+    HINDSIGHT_TEST_SIGNAL_RACE_FIRST_SIGNAL="$first_signal" \
+    HINDSIGHT_TEST_SIGNAL_RACE_STOP="$signal_race_stop" \
+    HINDSIGHT_TEST_SIGNAL_RACE_REENTERED="$signal_race_reentered" \
+    HINDSIGHT_TEST_SIGNAL_RACE_EVENTS="$signal_race_events" \
+    zsh "$repo_dir/bin/hindsight-embed-supervisor"
+  signal_race_status="$SIGNAL_RACE_STATUS"
+  [[ "$signal_race_status" == "$expected_status" ]] ||
+    fail "supervisor ${first_signal} before poll sleep exited ${signal_race_status}, expected ${expected_status}"
+  [[ "$(paste -sd, - <"$signal_race_events")" == \
+    "reconcile,reconciled,unlocked,sleep,cleanup,unlocked" ]] ||
+    fail "supervisor ${first_signal} before poll sleep cleanup order was $(paste -sd, - <"$signal_race_events")"
+  [[ -e "$signal_race_stop" && "$(<"$signal_race_stop")" == stop ]] ||
+    fail "supervisor ${first_signal} before poll sleep did not perform exactly one stack cleanup"
+  [[ ! -e "$signal_race_reentered" ]] ||
+    fail "supervisor ${first_signal} before poll sleep reentered the lifecycle lock"
+done
+
+for first_signal expected_status in INT 130 TERM 143; do
+  signal_race_prefix="$tmp_dir/signal-after-reap-${first_signal:l}"
+  signal_race_stop="${signal_race_prefix}-stop"
+  signal_race_reentered="${signal_race_prefix}-reentered"
+  signal_race_events="${signal_race_prefix}-events"
+  signal_race_wait_child="${signal_race_prefix}-wait-child"
+  signal_race_log="${signal_race_prefix}-log"
+  run_signal_race \
+    "supervisor ${first_signal} post-reap race" \
+    "$signal_race_log" \
+    /usr/bin/env \
+    HINDSIGHT_EMBED_STACK_LIB="$signal_race_stack" \
+    HINDSIGHT_EMBED_STATE_DIR="${signal_race_prefix}-state" \
+    HINDSIGHT_EMBED_POLL_SECONDS=3600 \
+    HINDSIGHT_TEST_SIGNAL_RACE_AFTER_REAP=1 \
+    HINDSIGHT_TEST_SIGNAL_RACE_FIRST_SIGNAL="$first_signal" \
+    HINDSIGHT_TEST_SIGNAL_RACE_STOP="$signal_race_stop" \
+    HINDSIGHT_TEST_SIGNAL_RACE_REENTERED="$signal_race_reentered" \
+    HINDSIGHT_TEST_SIGNAL_RACE_WAIT_CHILD="$signal_race_wait_child" \
+    HINDSIGHT_TEST_SIGNAL_RACE_EVENTS="$signal_race_events" \
+    zsh "$repo_dir/bin/hindsight-embed-supervisor"
+  signal_race_status="$SIGNAL_RACE_STATUS"
+  [[ "$signal_race_status" == "$expected_status" ]] ||
+    fail "supervisor ${first_signal} after wait-child reap exited ${signal_race_status}, expected ${expected_status}: $(paste -sd' ' - <"$signal_race_log")"
+  [[ "$(paste -sd, - <"$signal_race_events")" == \
+    "reconcile,reconciled,unlocked,sleep,reaped,cleanup,unlocked" ]] ||
+    fail "supervisor ${first_signal} after wait-child reap cleanup order was $(paste -sd, - <"$signal_race_events")"
+  [[ -s "$signal_race_wait_child" ]] ||
+    fail "supervisor ${first_signal} did not record its wait child"
+  if /bin/kill -0 "$(<"$signal_race_wait_child")" >/dev/null 2>&1; then
+    fail "supervisor ${first_signal} left its reaped wait child live"
+  fi
+  [[ -e "$signal_race_stop" && "$(<"$signal_race_stop")" == stop ]] ||
+    fail "supervisor ${first_signal} after wait-child reap did not perform exactly one stack cleanup"
+  [[ ! -e "$signal_race_reentered" ]] ||
+    fail "supervisor ${first_signal} after wait-child reap reentered the lifecycle lock"
+done
+
+for first_signal expected_status in INT 130 TERM 143; do
+  signal_race_prefix="$tmp_dir/signal-stopped-wait-${first_signal:l}"
+  signal_race_stop="${signal_race_prefix}-stop"
+  signal_race_reentered="${signal_race_prefix}-reentered"
+  signal_race_events="${signal_race_prefix}-events"
+  signal_race_wait_child="${signal_race_prefix}-wait-child"
+  run_signal_race \
+    "supervisor ${first_signal} stopped-wait race" \
+    /dev/null \
+    /usr/bin/env \
+    HINDSIGHT_EMBED_STACK_LIB="$signal_race_stack" \
+    HINDSIGHT_EMBED_STATE_DIR="${signal_race_prefix}-state" \
+    HINDSIGHT_EMBED_POLL_SECONDS=3600 \
+    HINDSIGHT_TEST_SIGNAL_RACE_STOPPED_WAIT=1 \
+    HINDSIGHT_TEST_SIGNAL_RACE_FIRST_SIGNAL="$first_signal" \
+    HINDSIGHT_TEST_SIGNAL_RACE_STOP="$signal_race_stop" \
+    HINDSIGHT_TEST_SIGNAL_RACE_REENTERED="$signal_race_reentered" \
+    HINDSIGHT_TEST_SIGNAL_RACE_WAIT_CHILD="$signal_race_wait_child" \
+    HINDSIGHT_TEST_SIGNAL_RACE_EVENTS="$signal_race_events" \
+    zsh "$repo_dir/bin/hindsight-embed-supervisor"
+  signal_race_status="$SIGNAL_RACE_STATUS"
+  [[ "$signal_race_status" == "$expected_status" ]] ||
+    fail "supervisor ${first_signal} with a stopped wait child exited ${signal_race_status}, expected ${expected_status}"
+  [[ "$(paste -sd, - <"$signal_race_events")" == \
+    "reconcile,reconciled,unlocked,sleep,cleanup,unlocked" ]] ||
+    fail "supervisor ${first_signal} with a stopped wait child cleanup order was $(paste -sd, - <"$signal_race_events")"
+  [[ -s "$signal_race_wait_child" ]] ||
+    fail "supervisor ${first_signal} did not record its stopped wait child"
+  if /bin/kill -0 "$(<"$signal_race_wait_child")" >/dev/null 2>&1; then
+    fail "supervisor ${first_signal} left its stopped wait child live"
+  fi
+  [[ -e "$signal_race_stop" && "$(<"$signal_race_stop")" == stop ]] ||
+    fail "supervisor ${first_signal} with a stopped wait child did not perform exactly one stack cleanup"
+  [[ ! -e "$signal_race_reentered" ]] ||
+    fail "supervisor ${first_signal} with a stopped wait child reentered the lifecycle lock"
+done
 
 for invalid_poll in 0 01 +1 -1 3601; do
   invalid_poll_log="$tmp_dir/invalid-poll-${invalid_poll//[-+]/_}.log"

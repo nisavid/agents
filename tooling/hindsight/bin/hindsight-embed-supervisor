@@ -115,6 +115,9 @@ fail() {
 
 typeset -g HINDSIGHT_EMBED_SHUTDOWN_STATE=idle
 typeset -g HINDSIGHT_EMBED_SHUTDOWN_STATUS=0
+typeset -g HINDSIGHT_EMBED_SHUTDOWN_REQUESTED=0
+typeset -g HINDSIGHT_EMBED_SHUTDOWN_SIGNAL_STATUS=0
+typeset -g HINDSIGHT_EMBED_WAIT_PID=''
 shutdown() {
   [[ "$HINDSIGHT_EMBED_SHUTDOWN_STATE" == done ]] && return "$HINDSIGHT_EMBED_SHUTDOWN_STATUS"
   [[ "$HINDSIGHT_EMBED_SHUTDOWN_STATE" == running ]] && return 0
@@ -133,15 +136,50 @@ shutdown() {
 
 handle_signal() {
   local signal_status="$1"
+  (( HINDSIGHT_EMBED_SHUTDOWN_REQUESTED == 0 )) || return 0
+  HINDSIGHT_EMBED_SHUTDOWN_REQUESTED=1
+  HINDSIGHT_EMBED_SHUTDOWN_SIGNAL_STATUS="$signal_status"
   trap '' INT TERM
-  if shutdown; then
-    trap - EXIT
-    exit "$signal_status"
-  else
-    local shutdown_status=$?
-    trap - EXIT
-    exit "$shutdown_status"
+  supervisor_signal_wait_child "$HINDSIGHT_EMBED_WAIT_PID"
+}
+
+supervisor_signal_wait_child() {
+  emulate -L zsh
+  local pid="$1" job_number state field member job_status
+  [[ "$pid" == <-> ]] || return 1
+  zmodload zsh/parameter || return 1
+  for job_number in "${(@k)jobstates}"; do
+    state="$jobstates[$job_number]"
+    for field in "${(@s.:.)state}"; do
+      [[ "$field" == <->=* ]] || continue
+      member="${field%%=*}"
+      job_status="${field#*=}"
+      if [[ "$member" == "$pid" ]]; then
+        if [[ "$job_status" == running ]]; then
+          builtin kill -TERM "%${job_number}" >/dev/null 2>&1 || true
+        elif [[ "$job_status" == suspended* ]]; then
+          builtin kill -TERM "%${job_number}" >/dev/null 2>&1 || true
+          builtin kill -CONT "%${job_number}" >/dev/null 2>&1 || true
+        fi
+        return 0
+      fi
+    done
+  done
+  return 0
+}
+
+supervisor_sleep() {
+  local duration="$1" wait_status=0
+  (( HINDSIGHT_EMBED_SHUTDOWN_REQUESTED == 0 )) || return 0
+  hindsight_stack_sleep "$duration" &
+  HINDSIGHT_EMBED_WAIT_PID=$!
+  if (( HINDSIGHT_EMBED_SHUTDOWN_REQUESTED )); then
+    supervisor_signal_wait_child "$HINDSIGHT_EMBED_WAIT_PID"
   fi
+  wait "$HINDSIGHT_EMBED_WAIT_PID" || wait_status=$?
+  HINDSIGHT_EMBED_WAIT_PID=''
+  (( HINDSIGHT_EMBED_SHUTDOWN_REQUESTED )) && return 0
+  return "$wait_status"
 }
 
 main() {
@@ -178,11 +216,23 @@ main() {
   hindsight_stack_log "supervisor started pid=$$ profiles=$(hindsight_stack_fleet_profiles_csv) broker_socket=${HINDSIGHT_MEMORY_BROKER_SOCKET} control_port=${HINDSIGHT_EMBED_CONTROL_PORT}"
 
   local consecutive_failures=0
-  local retry_seconds
+  local retry_seconds reconcile_status
   while true; do
-    if hindsight_stack_with_lifecycle_lock hindsight_stack_reconcile_once; then
+    if (( HINDSIGHT_EMBED_SHUTDOWN_REQUESTED )); then
+      return "$HINDSIGHT_EMBED_SHUTDOWN_SIGNAL_STATUS"
+    fi
+    reconcile_status=0
+    hindsight_stack_with_lifecycle_lock hindsight_stack_reconcile_once ||
+      reconcile_status=$?
+    # Signal traps must not run stack cleanup while reconciliation owns the
+    # lifecycle lock. Return only after the callback has unwound and released
+    # it; the EXIT trap can then acquire the lock and stop detached children.
+    if (( HINDSIGHT_EMBED_SHUTDOWN_REQUESTED )); then
+      return "$HINDSIGHT_EMBED_SHUTDOWN_SIGNAL_STATUS"
+    fi
+    if (( reconcile_status == 0 )); then
       consecutive_failures=0
-      hindsight_stack_sleep "$poll_seconds"
+      supervisor_sleep "$poll_seconds"
       continue
     fi
     (( consecutive_failures += 1 ))
@@ -192,7 +242,7 @@ main() {
     retry_seconds=$(( poll_seconds * (consecutive_failures + 1) ))
     (( retry_seconds >= cooldown_seconds )) || retry_seconds=$cooldown_seconds
     (( retry_seconds <= 3600 )) || retry_seconds=3600
-    hindsight_stack_sleep "$retry_seconds"
+    supervisor_sleep "$retry_seconds"
   done
 }
 

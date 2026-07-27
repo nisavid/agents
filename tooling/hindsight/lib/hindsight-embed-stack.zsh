@@ -568,9 +568,14 @@ hindsight_stack_with_lifecycle_lock() {
     print -ru2 -- "hindsight-embed-stack: timed out acquiring lifecycle lock"
     return 1
   }
-  "$callback" "$@"
-  local result=$?
-  zsystem flock -u "$lock_descriptor" || return 1
+  local result=0 unlock_result=0
+  {
+    "$callback" "$@"
+    result=$?
+  } always {
+    zsystem flock -u "$lock_descriptor" || unlock_result=$?
+  }
+  (( unlock_result == 0 )) || return "$unlock_result"
   return "$result"
 }
 

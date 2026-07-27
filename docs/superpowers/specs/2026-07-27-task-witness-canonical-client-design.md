@@ -1,7 +1,7 @@
 # Task Witness Canonical Client And Deployment Design
 
-**Status:** Design approved; independent specification review clean; operator
-review pending
+**Status:** Approved implementation contract; independent specification review
+clean; operator approved 2026-07-27
 
 **Date:** 2026-07-27
 

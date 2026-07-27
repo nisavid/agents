@@ -452,6 +452,72 @@ class ControlServerHooksTest(unittest.TestCase):
         self.assertEqual(self.desired("example-profile", "daemon"), "running")
         self.assertEqual(self.desired("example-profile", "ui"), "running")
 
+    def test_restart_actions_can_call_wrapped_start_for_the_same_profile(self):
+        calls = []
+        service = SimpleNamespace()
+
+        def start_daemon(profile) -> DaemonResult:
+            calls.append(("start-daemon", profile))
+            return DaemonResult(ok=True, running=True)
+
+        def restart_daemon(profile) -> DaemonResult:
+            calls.append(("restart-daemon", profile))
+            return service.start_daemon(profile)
+
+        def start_ui(profile) -> UiResult:
+            calls.append(("start-ui", profile))
+            return UiResult(running=True)
+
+        def restart_ui(profile) -> UiResult:
+            calls.append(("restart-ui", profile))
+            return service.start_ui(profile)
+
+        service.start_daemon = start_daemon
+        service.restart_daemon = restart_daemon
+        service.stop_daemon = lambda _profile: DaemonResult(
+            ok=True, running=False
+        )
+        service.start_ui = start_ui
+        service.restart_ui = restart_ui
+        service.stop_ui = lambda _profile: UiResult(running=False)
+        self.module.install_lifecycle_hooks(service, self.state_dir)
+
+        threads = [
+            threading.Thread(
+                target=service.restart_daemon,
+                args=("daemon-profile",),
+                daemon=True,
+            ),
+            threading.Thread(
+                target=service.restart_ui,
+                args=("ui-profile",),
+                daemon=True,
+            ),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=1)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(
+            [call for call in calls if call[1] == "daemon-profile"],
+            [
+                ("restart-daemon", "daemon-profile"),
+                ("start-daemon", "daemon-profile"),
+            ],
+        )
+        self.assertEqual(
+            [call for call in calls if call[1] == "ui-profile"],
+            [
+                ("restart-ui", "ui-profile"),
+                ("start-ui", "ui-profile"),
+            ],
+        )
+        self.assertEqual(self.desired("daemon-profile", "daemon"), "running")
+        self.assertEqual(self.desired("ui-profile", "daemon"), "running")
+        self.assertEqual(self.desired("ui-profile", "ui"), "running")
+
     def test_failed_stop_restores_absent_daemon_intent(self):
         self.service.stop_ui("example-profile")
         service = SimpleNamespace(**vars(self.service))

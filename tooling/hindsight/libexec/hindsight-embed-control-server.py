@@ -503,17 +503,17 @@ def _stopping_action(
 
 
 def install_lifecycle_hooks(service, desired_state_dir: Path) -> None:
-    locks: dict[str, threading.Lock] = {}
+    locks: dict[str, threading.RLock] = {}
     locks_guard = threading.Lock()
 
-    def profile_lock(profile: str) -> threading.Lock:
+    def profile_lock(profile: str) -> threading.RLock:
         if (
             not isinstance(profile, str)
             or PROFILE_PATTERN.fullmatch(profile) is None
         ):
             raise ValueError("invalid profile")
         with locks_guard:
-            return locks.setdefault(profile, threading.Lock())
+            return locks.setdefault(profile, threading.RLock())
 
     service.start_daemon = _running_action(
         service.start_daemon,

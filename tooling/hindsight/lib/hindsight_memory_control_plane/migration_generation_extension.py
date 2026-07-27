@@ -300,15 +300,21 @@ class MigrationGenerationHttpExtension(HttpExtension):
                     GENERATION_TABLE,
                     list(PLANNING_STATE_TABLES),
                 )
-                for entry in tables:
-                    table_name = _quoted_identifier(
-                        entry["table_name"],
-                        "planning-state table",
-                    )
-                    trigger_name = _quoted_identifier(
-                        TRIGGER_NAME,
-                        "generation trigger",
-                    )
+            # Commit generation-table and function locks before acquiring an
+            # AccessExclusiveLock for any trigger DDL. A concurrent worker
+            # write holds its planning table before the trigger updates the
+            # generation row; holding those locks in the opposite order here
+            # would deadlock API startup.
+            for entry in tables:
+                table_name = _quoted_identifier(
+                    entry["table_name"],
+                    "planning-state table",
+                )
+                trigger_name = _quoted_identifier(
+                    TRIGGER_NAME,
+                    "generation trigger",
+                )
+                async with connection.transaction():
                     await connection.execute(
                         f"""
                     DROP TRIGGER IF EXISTS {trigger_name}

@@ -348,7 +348,7 @@ class MigrationGenerationHttpExtensionTest(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 401)
 
-    def test_startup_installs_statement_triggers_for_planning_state(self):
+    def test_startup_commits_generation_schema_before_trigger_ddl(self):
         asyncio.run(self.extension.on_startup())
 
         statements = "\n".join(
@@ -360,7 +360,10 @@ class MigrationGenerationHttpExtensionTest(unittest.TestCase):
         self.assertIn('"documents"', statements)
         self.assertIn('"async_operations"', statements)
         self.assertIn("c.relname = ANY($3::text[])", statements)
-        self.assertEqual(self.memory.connection.transactions, [{}])
+        self.assertEqual(
+            self.memory.connection.transactions,
+            [{}, {}, {}, {}],
+        )
 
     def test_generation_is_unavailable_when_trigger_coverage_is_incomplete(self):
         self.memory.connection.missing_trigger_count = 1

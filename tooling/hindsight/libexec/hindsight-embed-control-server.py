@@ -82,6 +82,7 @@ def provider_preset_from_environment(
         ).is_loopback
     except ValueError:
         host_is_loopback = False
+    host_is_tailnet = (endpoint.hostname or "").endswith(".ts.net")
     if (
         endpoint.scheme not in {"http", "https"}
         or not endpoint.netloc
@@ -90,7 +91,11 @@ def provider_preset_from_environment(
         or endpoint.password is not None
         or endpoint.query
         or endpoint.fragment
-        or (endpoint.scheme == "http" and not host_is_loopback)
+        or (
+            endpoint.scheme == "http"
+            and not host_is_loopback
+            and not host_is_tailnet
+        )
         or port == 0
     ):
         raise ValueError("invalid provider preset base URL")

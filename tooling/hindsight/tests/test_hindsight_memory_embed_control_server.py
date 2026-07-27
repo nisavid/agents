@@ -330,6 +330,7 @@ class ControlServerHooksTest(unittest.TestCase):
             "https://host/v1?api_key=credential",
             "https://host/v1#credential",
             "http://192.0.2.1/v1",
+            "http://hatchery.ts.net.example/v1",
             "http://127.0.0.1:0/v1",
             "file:///private/provider",
         ):
@@ -350,6 +351,16 @@ class ControlServerHooksTest(unittest.TestCase):
         self.assertEqual(
             self.module.provider_preset_from_environment(loopback).base_url,
             "http://127.0.0.1:1234/v1",
+        )
+        tailnet = {
+            **complete,
+            "HINDSIGHT_EMBED_PROVIDER_PRESET_BASE_URL": (
+                "http://hatchery.komodo-vector.ts.net:13305/v1"
+            ),
+        }
+        self.assertEqual(
+            self.module.provider_preset_from_environment(tailnet).base_url,
+            "http://hatchery.komodo-vector.ts.net:13305/v1",
         )
 
     def test_provider_preset_rejects_reserved_and_existing_ids(self):

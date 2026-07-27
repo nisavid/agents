@@ -73,9 +73,13 @@ class ControlServerHooksTest(unittest.TestCase):
             start_daemon=lambda _name: DaemonResult(ok=True, running=True),
             restart_daemon=lambda _name: DaemonResult(ok=True, running=True),
             stop_daemon=lambda _name: DaemonResult(ok=True, running=False),
+            daemon_status=lambda _name: DaemonResult(
+                ok=True, running=True
+            ),
             start_ui=lambda _name: UiResult(running=True),
             restart_ui=lambda _name: UiResult(running=True),
             stop_ui=lambda _name: UiResult(running=False),
+            ui_status=lambda _name: UiResult(running=True),
         )
         self.module.install_hooks(
             self.service, self.providers, self.state_dir
@@ -443,66 +447,6 @@ class ControlServerHooksTest(unittest.TestCase):
                         expected,
                     )
 
-    def test_managed_uvx_replaces_only_the_upstream_api_fallback(self):
-        uvx = Path(self.temporary.name) / "uvx"
-        uvx.touch(mode=0o410)
-
-        def find_api_command(version: str) -> list[str]:
-            if version == "installed":
-                return ["/managed/hindsight-api"]
-            return ["uvx", f"hindsight-api@{version}"]
-
-        def service_with(manager) -> SimpleNamespace:
-            return SimpleNamespace(
-                start_daemon=lambda _profile: DaemonResult(
-                    ok=True, running=True
-                ),
-                restart_daemon=lambda _profile: DaemonResult(
-                    ok=True, running=True
-                ),
-                stop_daemon=lambda _profile: DaemonResult(
-                    ok=True, running=False
-                ),
-                start_ui=lambda _profile: UiResult(running=True),
-                restart_ui=lambda _profile: UiResult(running=True),
-                stop_ui=lambda _profile: UiResult(running=False),
-                daemon_client=SimpleNamespace(_manager=manager),
-            )
-
-        with patch.dict(
-            os.environ,
-            {"HINDSIGHT_EMBED_UVX_EXECUTABLE": str(uvx)},
-        ):
-            invalid_manager = SimpleNamespace(
-                _find_api_command=find_api_command
-            )
-            with self.assertRaisesRegex(
-                ValueError,
-                "managed API uvx selector is invalid",
-            ):
-                self.module.install_hooks(
-                    service_with(invalid_manager),
-                    self.providers,
-                    self.state_dir,
-                )
-
-            uvx.chmod(0o700)
-            manager = SimpleNamespace(_find_api_command=find_api_command)
-            self.module.install_hooks(
-                service_with(manager),
-                self.providers,
-                self.state_dir,
-            )
-
-        self.assertEqual(
-            manager._find_api_command("0.8.4"),
-            [str(uvx), "hindsight-api@0.8.4"],
-        )
-        self.assertEqual(
-            manager._find_api_command("installed"),
-            ["/managed/hindsight-api"],
-        )
-
     def test_lifecycle_hooks_preserve_intent_and_required_daemon(self):
         self.service.stop_daemon("example-profile")
         self.assertEqual(self.desired("example-profile", "daemon"), "stopped")
@@ -512,66 +456,89 @@ class ControlServerHooksTest(unittest.TestCase):
         self.assertEqual(self.desired("example-profile", "daemon"), "running")
         self.assertEqual(self.desired("example-profile", "ui"), "running")
 
-    def test_restart_actions_can_call_wrapped_start_for_the_same_profile(self):
+    def test_start_waits_for_supervisor_without_direct_launch(self):
+        ready = threading.Event()
+        completed = threading.Event()
         calls = []
-        service = SimpleNamespace()
-
-        def start_daemon(profile) -> DaemonResult:
-            calls.append(("start-daemon", profile))
-            return DaemonResult(ok=True, running=True)
-
-        def restart_daemon(profile) -> DaemonResult:
-            calls.append(("restart-daemon", profile))
-            return service.start_daemon(profile)
-
-        def start_ui(profile) -> UiResult:
-            calls.append(("start-ui", profile))
-            return UiResult(running=True)
-
-        def restart_ui(profile) -> UiResult:
-            calls.append(("restart-ui", profile))
-            return service.start_ui(profile)
-
-        service.start_daemon = start_daemon
-        service.restart_daemon = restart_daemon
-        service.stop_daemon = lambda _profile: DaemonResult(
-            ok=True, running=False
+        results = []
+        service = SimpleNamespace(
+            start_daemon=lambda profile: calls.append(
+                ("start-daemon", profile)
+            ),
+            restart_daemon=lambda profile: calls.append(
+                ("restart-daemon", profile)
+            ),
+            stop_daemon=lambda _profile: DaemonResult(
+                ok=True, running=False
+            ),
+            daemon_status=lambda _profile: DaemonResult(
+                ok=ready.is_set(),
+                running=ready.is_set(),
+            ),
+            start_ui=lambda _profile: UiResult(running=True),
+            restart_ui=lambda _profile: UiResult(running=True),
+            stop_ui=lambda _profile: UiResult(running=False),
+            ui_status=lambda _profile: UiResult(running=True),
         )
-        service.start_ui = start_ui
-        service.restart_ui = restart_ui
-        service.stop_ui = lambda _profile: UiResult(running=False)
         self.module.install_lifecycle_hooks(service, self.state_dir)
 
-        threads = [
-            threading.Thread(
-                target=service.restart_daemon,
-                args=("daemon-profile",),
-                daemon=True,
-            ),
-            threading.Thread(
-                target=service.restart_ui,
-                args=("ui-profile",),
-                daemon=True,
-            ),
-        ]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join(timeout=1)
+        def start() -> None:
+            results.append(service.start_daemon("daemon-profile"))
+            completed.set()
 
-        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        thread = threading.Thread(target=start, daemon=True)
+        thread.start()
+        self.assertFalse(completed.wait(timeout=0.1))
         self.assertEqual(
-            [call for call in calls if call[1] == "daemon-profile"],
-            [
-                ("restart-daemon", "daemon-profile"),
-                ("start-daemon", "daemon-profile"),
-            ],
+            self.desired("daemon-profile", "daemon"),
+            "running",
         )
+        ready.set()
+        thread.join(timeout=1)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(calls, [])
         self.assertEqual(
-            [call for call in calls if call[1] == "ui-profile"],
+            results,
+            [DaemonResult(ok=True, running=True)],
+        )
+
+    def test_restart_stops_then_waits_for_supervisor(self):
+        calls = []
+        service = SimpleNamespace(
+            start_daemon=lambda profile: calls.append(
+                ("start-daemon", profile)
+            ),
+            restart_daemon=lambda profile: calls.append(
+                ("restart-daemon", profile)
+            ),
+            stop_daemon=lambda profile: (
+                calls.append(("stop-daemon", profile))
+                or DaemonResult(ok=True, running=False)
+            ),
+            daemon_status=lambda _profile: DaemonResult(
+                ok=True, running=True
+            ),
+            start_ui=lambda profile: calls.append(("start-ui", profile)),
+            restart_ui=lambda profile: calls.append(
+                ("restart-ui", profile)
+            ),
+            stop_ui=lambda profile: (
+                calls.append(("stop-ui", profile))
+                or UiResult(running=False)
+            ),
+            ui_status=lambda _profile: UiResult(running=True),
+        )
+        self.module.install_lifecycle_hooks(service, self.state_dir)
+
+        self.assertTrue(service.restart_daemon("daemon-profile").running)
+        self.assertTrue(service.restart_ui("ui-profile").running)
+
+        self.assertEqual(
+            calls,
             [
-                ("restart-ui", "ui-profile"),
-                ("start-ui", "ui-profile"),
+                ("stop-daemon", "daemon-profile"),
+                ("stop-ui", "ui-profile"),
             ],
         )
         self.assertEqual(self.desired("daemon-profile", "daemon"), "running")
@@ -602,20 +569,21 @@ class ControlServerHooksTest(unittest.TestCase):
         )
         stop_entered = threading.Event()
         release_stop = threading.Event()
-        start_entered = threading.Event()
+        status_entered = threading.Event()
+        stop_released = []
 
-        def stop(_profile):
+        def stop(_profile) -> DaemonResult:
             stop_entered.set()
-            self.assertTrue(release_stop.wait(timeout=3))
+            stop_released.append(release_stop.wait(timeout=3))
             return DaemonResult(ok=False, running=True)
 
-        def start(_profile):
-            start_entered.set()
+        def status(_profile) -> DaemonResult:
+            status_entered.set()
             return DaemonResult(ok=True, running=True)
 
         service = SimpleNamespace(**vars(self.service))
         service.stop_daemon = stop
-        service.start_daemon = start
+        service.daemon_status = status
         self.module.install_lifecycle_hooks(service, self.state_dir)
         stop_thread = threading.Thread(
             target=service.stop_daemon,
@@ -629,14 +597,15 @@ class ControlServerHooksTest(unittest.TestCase):
         stop_thread.start()
         self.assertTrue(stop_entered.wait(timeout=3))
         start_thread.start()
-        self.assertFalse(start_entered.wait(timeout=0.1))
+        self.assertFalse(status_entered.wait(timeout=0.1))
         release_stop.set()
         stop_thread.join(timeout=3)
         start_thread.join(timeout=3)
 
         self.assertFalse(stop_thread.is_alive())
         self.assertFalse(start_thread.is_alive())
-        self.assertTrue(start_entered.is_set())
+        self.assertEqual(stop_released, [True])
+        self.assertTrue(status_entered.is_set())
         self.assertEqual(
             self.desired(profile, "daemon"),
             "running",

@@ -17,7 +17,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Mapping, NamedTuple
+from typing import Any, Mapping, NamedTuple
 from urllib.parse import urlsplit
 
 
@@ -436,18 +436,47 @@ def remove_desired_state(root: Path, profile: str, component: str) -> None:
             os.close(root_descriptor)
 
 
-def _running_action(
+def _wait_for_running(
+    status_action, profile: str, timeout: int
+) -> Any:
+    deadline = time.monotonic() + timeout
+    while True:
+        result = status_action(profile)
+        if getattr(result, "ok", True) and getattr(
+            result,
+            "running",
+            False,
+        ):
+            return result
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return result
+        time.sleep(min(0.25, remaining))
+
+
+def _supervised_running_action(
     action,
+    status_action,
     root: Path,
     components: tuple[str, ...],
     profile_lock,
+    timeout: int,
+    stop_action=None,
 ):
     @functools.wraps(action)
     def wrapped(profile: str):
         with profile_lock(profile):
             for component in components:
                 set_desired_state(root, profile, component, "running")
-            return action(profile)
+            if stop_action is not None:
+                stopped = stop_action(profile)
+                if not getattr(stopped, "ok", True) or getattr(
+                    stopped,
+                    "running",
+                    False,
+                ):
+                    return stopped
+            return _wait_for_running(status_action, profile, timeout)
 
     return wrapped
 
@@ -515,38 +544,74 @@ def install_lifecycle_hooks(service, desired_state_dir: Path) -> None:
         with locks_guard:
             return locks.setdefault(profile, threading.RLock())
 
-    service.start_daemon = _running_action(
-        service.start_daemon,
+    daemon_status = getattr(service, "daemon_status", None)
+    ui_status = getattr(service, "ui_status", None)
+    if not callable(daemon_status) or not callable(ui_status):
+        raise ValueError("managed lifecycle status actions are unavailable")
+    try:
+        daemon_timeout = int(
+            os.environ.get(
+                "HINDSIGHT_EMBED_DAEMON_STARTUP_TIMEOUT",
+                "300",
+            )
+        )
+        ui_timeout = int(
+            os.environ.get("HINDSIGHT_EMBED_UI_WAIT_SECONDS", "60")
+        )
+    except ValueError as error:
+        raise ValueError("managed lifecycle timeout is invalid") from error
+    if not 1 <= daemon_timeout <= 3600 or not 1 <= ui_timeout <= 3600:
+        raise ValueError("managed lifecycle timeout is invalid")
+
+    start_daemon = service.start_daemon
+    restart_daemon = service.restart_daemon
+    stop_daemon = service.stop_daemon
+    start_ui = service.start_ui
+    restart_ui = service.restart_ui
+    stop_ui = service.stop_ui
+
+    service.start_daemon = _supervised_running_action(
+        start_daemon,
+        daemon_status,
         desired_state_dir,
         ("daemon",),
         profile_lock,
+        daemon_timeout,
     )
-    service.restart_daemon = _running_action(
-        service.restart_daemon,
+    service.restart_daemon = _supervised_running_action(
+        restart_daemon,
+        daemon_status,
         desired_state_dir,
         ("daemon",),
         profile_lock,
+        daemon_timeout,
+        stop_daemon,
     )
     service.stop_daemon = _stopping_action(
-        service.stop_daemon,
+        stop_daemon,
         desired_state_dir,
         ("daemon", "ui"),
         profile_lock,
     )
-    service.start_ui = _running_action(
-        service.start_ui,
+    service.start_ui = _supervised_running_action(
+        start_ui,
+        ui_status,
         desired_state_dir,
         ("daemon", "ui"),
         profile_lock,
+        ui_timeout,
     )
-    service.restart_ui = _running_action(
-        service.restart_ui,
+    service.restart_ui = _supervised_running_action(
+        restart_ui,
+        ui_status,
         desired_state_dir,
         ("daemon", "ui"),
         profile_lock,
+        ui_timeout,
+        stop_ui,
     )
     service.stop_ui = _stopping_action(
-        service.stop_ui,
+        stop_ui,
         desired_state_dir,
         ("ui",),
         profile_lock,
@@ -593,89 +658,6 @@ def install_ui_readiness(service) -> None:
         )
 
     manager.is_ui_running = is_ui_running
-
-
-def _effective_execute_permission(metadata: os.stat_result) -> bool:
-    mode = stat.S_IMODE(metadata.st_mode)
-    effective_user = os.geteuid()
-    if effective_user == 0:
-        return bool(mode & 0o111)
-    if metadata.st_uid == effective_user:
-        return bool(mode & 0o100)
-    effective_groups = {os.getegid(), *os.getgroups()}
-    if metadata.st_gid in effective_groups:
-        return bool(mode & 0o010)
-    return bool(mode & 0o001)
-
-
-def _validated_managed_executable(value: str, label: str) -> Path:
-    path = Path(value)
-    if not path.is_absolute() or ".." in path.parts:
-        raise ValueError(f"{label} is invalid")
-    parent = None
-    descriptor = None
-    try:
-        parent = _open_absolute_directory(
-            path.parent,
-            create=False,
-            private=False,
-            label=f"{label} ancestry",
-        )
-        descriptor = os.open(
-            path.name,
-            os.O_RDONLY
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
-            dir_fd=parent,
-        )
-        metadata = os.fstat(descriptor)
-        observed = os.stat(
-            path.name,
-            dir_fd=parent,
-            follow_symlinks=False,
-        )
-        if (
-            not stat.S_ISREG(metadata.st_mode)
-            or (metadata.st_dev, metadata.st_ino)
-            != (observed.st_dev, observed.st_ino)
-            or metadata.st_uid not in {0, os.geteuid()}
-            or stat.S_IMODE(metadata.st_mode) & 0o022
-            or not _effective_execute_permission(metadata)
-        ):
-            raise ValueError(f"{label} is invalid")
-    except OSError as error:
-        raise ValueError(f"{label} is invalid") from error
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
-        if parent is not None:
-            os.close(parent)
-    return path
-
-
-def install_api_command_selector(service) -> None:
-    daemon_client = getattr(service, "daemon_client", None)
-    manager = getattr(daemon_client, "_manager", None)
-    original = getattr(manager, "_find_api_command", None)
-    if manager is None or not callable(original):
-        return
-
-    configured = os.environ.get("HINDSIGHT_EMBED_UVX_EXECUTABLE")
-    if not configured:
-        raise ValueError("managed API uvx selector is required")
-    executable = _validated_managed_executable(
-        configured,
-        "managed API uvx selector",
-    )
-
-    @functools.wraps(original)
-    def find_api_command(api_version: str):
-        command = original(api_version)
-        if command and command[0] == "uvx":
-            return [str(executable), *command[1:]]
-        return command
-
-    manager._find_api_command = find_api_command
 
 
 def install_provider_catalog(
@@ -796,7 +778,6 @@ def install_provider_alias(
 def install_hooks(service, providers, desired_state_dir: Path) -> None:
     preset = provider_preset_from_environment()
     install_provider_catalog(providers, preset)
-    install_api_command_selector(service)
     install_ui_readiness(service)
     install_lifecycle_hooks(service, desired_state_dir)
     if preset is not None or all(

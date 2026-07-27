@@ -443,6 +443,66 @@ class ControlServerHooksTest(unittest.TestCase):
                         expected,
                     )
 
+    def test_managed_uvx_replaces_only_the_upstream_api_fallback(self):
+        uvx = Path(self.temporary.name) / "uvx"
+        uvx.touch(mode=0o410)
+
+        def find_api_command(version: str) -> list[str]:
+            if version == "installed":
+                return ["/managed/hindsight-api"]
+            return ["uvx", f"hindsight-api@{version}"]
+
+        def service_with(manager) -> SimpleNamespace:
+            return SimpleNamespace(
+                start_daemon=lambda _profile: DaemonResult(
+                    ok=True, running=True
+                ),
+                restart_daemon=lambda _profile: DaemonResult(
+                    ok=True, running=True
+                ),
+                stop_daemon=lambda _profile: DaemonResult(
+                    ok=True, running=False
+                ),
+                start_ui=lambda _profile: UiResult(running=True),
+                restart_ui=lambda _profile: UiResult(running=True),
+                stop_ui=lambda _profile: UiResult(running=False),
+                daemon_client=SimpleNamespace(_manager=manager),
+            )
+
+        with patch.dict(
+            os.environ,
+            {"HINDSIGHT_EMBED_UVX_EXECUTABLE": str(uvx)},
+        ):
+            invalid_manager = SimpleNamespace(
+                _find_api_command=find_api_command
+            )
+            with self.assertRaisesRegex(
+                ValueError,
+                "managed API uvx selector is invalid",
+            ):
+                self.module.install_hooks(
+                    service_with(invalid_manager),
+                    self.providers,
+                    self.state_dir,
+                )
+
+            uvx.chmod(0o700)
+            manager = SimpleNamespace(_find_api_command=find_api_command)
+            self.module.install_hooks(
+                service_with(manager),
+                self.providers,
+                self.state_dir,
+            )
+
+        self.assertEqual(
+            manager._find_api_command("0.8.4"),
+            [str(uvx), "hindsight-api@0.8.4"],
+        )
+        self.assertEqual(
+            manager._find_api_command("installed"),
+            ["/managed/hindsight-api"],
+        )
+
     def test_lifecycle_hooks_preserve_intent_and_required_daemon(self):
         self.service.stop_daemon("example-profile")
         self.assertEqual(self.desired("example-profile", "daemon"), "stopped")

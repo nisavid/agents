@@ -595,6 +595,89 @@ def install_ui_readiness(service) -> None:
     manager.is_ui_running = is_ui_running
 
 
+def _effective_execute_permission(metadata: os.stat_result) -> bool:
+    mode = stat.S_IMODE(metadata.st_mode)
+    effective_user = os.geteuid()
+    if effective_user == 0:
+        return bool(mode & 0o111)
+    if metadata.st_uid == effective_user:
+        return bool(mode & 0o100)
+    effective_groups = {os.getegid(), *os.getgroups()}
+    if metadata.st_gid in effective_groups:
+        return bool(mode & 0o010)
+    return bool(mode & 0o001)
+
+
+def _validated_managed_executable(value: str, label: str) -> Path:
+    path = Path(value)
+    if not path.is_absolute() or ".." in path.parts:
+        raise ValueError(f"{label} is invalid")
+    parent = None
+    descriptor = None
+    try:
+        parent = _open_absolute_directory(
+            path.parent,
+            create=False,
+            private=False,
+            label=f"{label} ancestry",
+        )
+        descriptor = os.open(
+            path.name,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent,
+        )
+        metadata = os.fstat(descriptor)
+        observed = os.stat(
+            path.name,
+            dir_fd=parent,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or (metadata.st_dev, metadata.st_ino)
+            != (observed.st_dev, observed.st_ino)
+            or metadata.st_uid not in {0, os.geteuid()}
+            or stat.S_IMODE(metadata.st_mode) & 0o022
+            or not _effective_execute_permission(metadata)
+        ):
+            raise ValueError(f"{label} is invalid")
+    except OSError as error:
+        raise ValueError(f"{label} is invalid") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if parent is not None:
+            os.close(parent)
+    return path
+
+
+def install_api_command_selector(service) -> None:
+    daemon_client = getattr(service, "daemon_client", None)
+    manager = getattr(daemon_client, "_manager", None)
+    original = getattr(manager, "_find_api_command", None)
+    if manager is None or not callable(original):
+        return
+
+    configured = os.environ.get("HINDSIGHT_EMBED_UVX_EXECUTABLE")
+    if not configured:
+        raise ValueError("managed API uvx selector is required")
+    executable = _validated_managed_executable(
+        configured,
+        "managed API uvx selector",
+    )
+
+    @functools.wraps(original)
+    def find_api_command(api_version: str):
+        command = original(api_version)
+        if command and command[0] == "uvx":
+            return [str(executable), *command[1:]]
+        return command
+
+    manager._find_api_command = find_api_command
+
+
 def install_provider_catalog(
     providers, preset: ProviderPreset | None = None
 ) -> None:
@@ -713,6 +796,7 @@ def install_provider_alias(
 def install_hooks(service, providers, desired_state_dir: Path) -> None:
     preset = provider_preset_from_environment()
     install_provider_catalog(providers, preset)
+    install_api_command_selector(service)
     install_ui_readiness(service)
     install_lifecycle_hooks(service, desired_state_dir)
     if preset is not None or all(

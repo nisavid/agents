@@ -940,6 +940,15 @@ class HttpAdapter:
             raise AdapterError("replay operation response is invalid")
         return {"operation_id": operation_id, "status": status}
 
+    @staticmethod
+    def replay_operation_status_error_is_transient(
+        error: Exception,
+    ) -> bool:
+        return isinstance(error, AdapterError) and str(error) in {
+            "endpoint request failed",
+            "endpoint request timed out",
+        }
+
     def read_replay_processing_evidence(
         self,
         source_bank: BankRef,

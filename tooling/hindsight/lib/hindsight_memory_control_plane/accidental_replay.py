@@ -889,20 +889,49 @@ def apply_replay_plan(
         )
         deadline = time.monotonic() + float(timeout_seconds)
         while True:
-            status = adapter.read_replay_operation(
-                target_bank,
-                operation_id,
-            ).get("status")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ReplayError("replay operation timed out")
+            try:
+                status = adapter.read_replay_operation(
+                    target_bank,
+                    operation_id,
+                ).get("status")
+            except Exception as error:
+                classifier = getattr(
+                    adapter,
+                    "replay_operation_status_error_is_transient",
+                    None,
+                )
+                transient = False
+                if callable(classifier):
+                    try:
+                        transient = classifier(error) is True
+                    except Exception:
+                        transient = False
+                if not transient:
+                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ReplayError("replay operation timed out") from error
+                if poll_interval_seconds:
+                    time.sleep(
+                        min(float(poll_interval_seconds), remaining)
+                    )
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ReplayError("replay operation timed out")
             if status == "completed":
                 break
             if status in {"failed", "cancelled", "not_found"}:
                 raise ReplayError("replay operation failed")
             if status not in {"pending", "processing"}:
                 raise ReplayError("replay operation status is invalid")
-            if time.monotonic() >= deadline:
-                raise ReplayError("replay operation timed out")
             if poll_interval_seconds:
-                time.sleep(float(poll_interval_seconds))
+                time.sleep(
+                    min(float(poll_interval_seconds), remaining)
+                )
         target_document = adapter.read_replay_document(
             target_bank,
             descriptor["target_document_id"],

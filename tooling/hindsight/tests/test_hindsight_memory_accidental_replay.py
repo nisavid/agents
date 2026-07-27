@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 from pathlib import Path
 import sys
+import time
 import unittest
 from unittest.mock import patch
 
@@ -550,6 +551,22 @@ class AccidentalReplayTest(unittest.TestCase):
                 timeout_seconds=0.001,
                 poll_interval_seconds=0,
             )
+        bounded_sleep_adapter = FakeReplayAdapter()
+        bounded_sleep_plan = create_replay_plan(
+            bounded_sleep_adapter,
+            source_bank=self.source,
+            target_bank=self.target,
+        )
+        bounded_sleep_adapter.next_status_script = ["pending"] * 10
+        started = time.monotonic()
+        with self.assertRaisesRegex(ReplayError, "timed out"):
+            apply_replay_plan(
+                bounded_sleep_adapter,
+                bounded_sleep_plan,
+                timeout_seconds=0.001,
+                poll_interval_seconds=60,
+            )
+        self.assertLess(time.monotonic() - started, 0.5)
         for timeout_seconds, poll_interval_seconds in (
             (0, 0),
             (1, -1),
@@ -584,6 +601,58 @@ class AccidentalReplayTest(unittest.TestCase):
         self.assertTrue(
             replay_receipt_status(plan, receipts)["complete"]
         )
+
+    def test_apply_retries_only_classified_transient_status_reads(self):
+        class TransientStatusAdapter(FakeReplayAdapter):
+            def __init__(self):
+                super().__init__()
+                self.transient_failures = 1
+
+            def read_replay_operation(self, bank, operation_id):
+                if self.transient_failures:
+                    self.transient_failures -= 1
+                    raise ConnectionError("temporary endpoint outage")
+                return super().read_replay_operation(bank, operation_id)
+
+            @staticmethod
+            def replay_operation_status_error_is_transient(error):
+                return isinstance(error, ConnectionError)
+
+        transient_adapter = TransientStatusAdapter()
+        plan = create_replay_plan(
+            transient_adapter,
+            source_bank=self.source,
+            target_bank=self.target,
+        )
+        receipts = apply_replay_plan(
+            transient_adapter,
+            plan,
+            timeout_seconds=1,
+            poll_interval_seconds=0,
+        )
+        self.assertEqual(len(receipts), 2)
+
+        class PermanentStatusAdapter(TransientStatusAdapter):
+            @staticmethod
+            def replay_operation_status_error_is_transient(error):
+                return False
+
+        permanent_adapter = PermanentStatusAdapter()
+        permanent_plan = create_replay_plan(
+            permanent_adapter,
+            source_bank=self.source,
+            target_bank=self.target,
+        )
+        with self.assertRaisesRegex(
+            ConnectionError,
+            "temporary endpoint outage",
+        ):
+            apply_replay_plan(
+                permanent_adapter,
+                permanent_plan,
+                timeout_seconds=1,
+                poll_interval_seconds=0,
+            )
 
     def test_apply_gives_each_document_a_fresh_timeout_budget(self):
         class PendingOnceAdapter(FakeReplayAdapter):

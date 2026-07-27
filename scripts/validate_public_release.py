@@ -45,19 +45,22 @@ from private_phase7_evidence import (
 
 CONTROL_PLUGINS = ("rolecasting", "versionkeeping", "mergecraft", "tricritical")
 CANONICAL_REPOSITORY_URL = "https://github.com/nisavid/agents"
-VALIDATED_PLUGINS = (
+SKILL_PLUGINS = (
     "rolecasting",
     "versionkeeping",
     "mergecraft",
     "tricritical",
     "artifact-customs",
 )
+RUNTIME_PACKAGES = ("task-witness",)
+VALIDATED_PLUGINS = SKILL_PLUGINS + RUNTIME_PACKAGES
 MARKETPLACE_PLUGINS = {
     "tricritical": "./plugins/tricritical",
     "rolecasting": "./plugins/rolecasting",
     "versionkeeping": "./plugins/versionkeeping",
     "mergecraft": "./plugins/mergecraft",
     "artifact-customs": "./plugins/artifact-customs",
+    "task-witness": "./plugins/task-witness",
 }
 COMMON_SUPPORT_PATHS = {
     ".claude-plugin/marketplace.json",
@@ -134,6 +137,13 @@ PLUGIN_SUPPORT_PATHS = {
         "evals/artifact-customs",
         "release/plugin-content-locks/artifact-customs.json",
     },
+    "task-witness": {
+        "release/task-witness/source-shape-review.json",
+        "scripts/validate_task_witness.py",
+        "tests/plugins/test_task_witness_launcher.py",
+        "tests/plugins/test_task_witness_runtime.py",
+        "tests/test_task_witness_package.py",
+    },
 }
 PLUGIN_EVAL_POLICY_PATH = "release/plugin-eval-policy.json"
 PLUGIN_EVAL_BASELINE_PATH = "release/plugin-eval-baseline-v1.json"
@@ -148,6 +158,7 @@ VALIDATOR_PATHS = {
     "mergecraft": "scripts/validate_mergecraft.py",
     "tricritical": "scripts/validate_tricritical.py",
     "artifact-customs": "scripts/validate_artifact_customs.py",
+    "task-witness": "scripts/validate_task_witness.py",
 }
 SOURCE_STAGE_VALIDATOR_FLAGS = {
     **{plugin: () for plugin in VALIDATED_PLUGINS},
@@ -468,7 +479,7 @@ def load_plugin_eval_policy(snapshot: Path) -> dict[str, object]:
         if kind == "bounded_runtime_cost":
             metric = advisory["metric"]
             require(
-                plugin in VALIDATED_PLUGINS
+                plugin in SKILL_PLUGINS
                 and metric in BUDGET_METRICS
                 and isinstance(advisory["reason"], str)
                 and advisory["reason"].strip(),
@@ -478,7 +489,7 @@ def load_plugin_eval_policy(snapshot: Path) -> dict[str, object]:
         else:
             deduction_id = deduction.get("id") if isinstance(deduction, dict) else None
             require(
-                plugin in VALIDATED_PLUGINS
+                plugin in SKILL_PLUGINS
                 and isinstance(deduction, dict)
                 and set(deduction)
                 in (deduction_fields, deduction_fields | {"targetPath"})
@@ -2200,7 +2211,7 @@ def run_pinned_plugin_evals(
         "internal plugin-eval Node interpreter binding is malformed",
     )
     evidence = {}
-    for plugin in VALIDATED_PLUGINS:
+    for plugin in SKILL_PLUGINS:
         revalidate_node_interpreter(node_interpreter)
         result = subprocess.run(
             [

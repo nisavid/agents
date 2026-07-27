@@ -29,6 +29,11 @@
       "name": "artifact-customs",
       "source": "./plugins/artifact-customs",
       "category": "developer-tools"
+    },
+    {
+      "name": "task-witness",
+      "source": "./plugins/task-witness",
+      "category": "developer-tools"
     }
   ]
 }

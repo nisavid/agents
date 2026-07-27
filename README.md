@@ -7,6 +7,36 @@ local harnesses. Its public plugins cover agent role selection (Rolecasting),
 Git and worktree provenance (Versionkeeping), pull-request lifecycles
 (Mergecraft), independent review through revision (Tricritical), and explicit
 third-party component assessment, adoption, and maintenance (Artifact Customs).
+Task Witness is the code-only task-evidence validation package shared by
+registered providers; it has no prompt or skill surface. It loads the exact
+byte-pinned, operator-approved validator selected by a retained trust snapshot
+to validate one supplied task-evidence bundle and return its canonical
+projection. Registered validators are a full-process Python trusted computing
+base with the invoking user's ambient authority. Task Witness grants no
+workflow authority and is not a sandbox. Task Witness-owned package modules
+perform no I/O merely on import and no implicit or background I/O before
+registered-validator execution; Task Witness deliberately reads the supplied
+bundle and trust snapshot to select that validator. This package-boundary claim
+does not constrain the selected validator, which may perform I/O under its
+ambient authority.
+Only a canonical client invocation is acceptable. The client itself invokes the
+canonical Task Witness subprocess with deployment-owned exact `argv` and a
+scrubbed environment. It accepts the result only if that child exits with status
+0, emits exactly one schema-valid canonical envelope, and returns exactly the
+expected complete anchor. The anchor does not authenticate invocation
+provenance or arbitrary caller ambient state.
+
+`main()` is Task Witness's only supported subprocess entry point. The launcher
+defensively rejects noncanonical CPython warning options, implementation
+options, and semantic flags before loading payloads. It cannot prove the
+caller's exact argv, environment, cwd, stdin, inherited descriptors, or timeout;
+the canonical client and deployment own those invocation conditions.
+
+Task Witness's filesystem checks operate within a cooperative same-EUID
+deployment boundary. They cannot adversarially protect the launcher, active
+record, or generation state from an actor with the same EUID who can replace
+those files. Deployment policy and external deployment receipts own that trust;
+a successful envelope is not a deployment receipt.
 
 ## Layout
 
@@ -27,6 +57,8 @@ third-party component assessment, adoption, and maintenance (Artifact Customs).
 - `plugins/artifact-customs/` contains the public component assessment,
   adoption, and maintenance workflows. Its external runtime content lock is
   `release/plugin-content-locks/artifact-customs.json`.
+- `plugins/task-witness/` contains the task-evidence runtime and its code-only
+  package manifest.
 - `tooling/hindsight/` contains the reusable Hindsight control plane, local
   stack tooling, templates, schemas, skills, and validation.
 

@@ -52,6 +52,8 @@ SENSITIVE_HEADER = re.compile(
 )
 SERVICE_MANAGER_COMMAND_TIMEOUT_SECONDS = 360
 SYSTEMD_STOP_TIMEOUT_SECONDS = 330
+LAUNCHD_SERVICE_START_TIMEOUT_SECONDS = 10.0
+LAUNCHD_SERVICE_START_POLL_SECONDS = 0.1
 RESOLVER_ENVIRONMENT_BINDINGS = frozenset(
     {
         "HINDSIGHT_MEMORY_DATA_PLANE_TOKEN_ENV",
@@ -2376,6 +2378,27 @@ class PortableInstallationManager:
             is not None
         )
 
+    def _wait_for_launchd_job_running(self, label: str, expected: Path) -> Path:
+        deadline = time.monotonic() + LAUNCHD_SERVICE_START_TIMEOUT_SECONDS
+        while True:
+            loaded, output = self._launchd_job_snapshot(label, expected)
+            if loaded is None:
+                raise PortableInstallError(
+                    f"managed launchd job is absent: {label}"
+                )
+            if output is None or re.search(
+                r"^\s*state = running\s*$",
+                output,
+                re.MULTILINE,
+            ):
+                return loaded
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise PortableInstallError(
+                    f"managed launchd job is not active: {label}"
+                )
+            time.sleep(min(LAUNCHD_SERVICE_START_POLL_SECONDS, remaining))
+
     def _service_manager_status(self) -> dict[str, dict[str, str]]:
         services: dict[str, str] = {}
         timers: dict[str, str] = {}
@@ -2559,15 +2582,7 @@ class PortableInstallationManager:
         if self.config.platform == "launchd":
             for item in self.config.services:
                 manifest = self.config.service_root / f"{item.label}.plist"
-                if (
-                    self._launchd_loaded_manifest(
-                        item.label, manifest, require_running=True
-                    )
-                    is None
-                ):
-                    raise PortableInstallError(
-                        f"managed launchd job is absent: {item.label}"
-                    )
+                self._wait_for_launchd_job_running(item.label, manifest)
             for item in self.config.timers:
                 manifest = self.config.service_root / f"{item.label}.plist"
                 if self._launchd_loaded_manifest(item.label, manifest) is None:

@@ -179,6 +179,26 @@ class InactiveLaunchdServiceRunner(RecordingRunner):
         return result
 
 
+class DelayedLaunchdServiceRunner(RecordingRunner):
+    def __init__(self, delayed_snapshots: int = 2) -> None:
+        super().__init__()
+        self.delayed_snapshots = delayed_snapshots
+
+    def __call__(self, argv: tuple[str, ...]) -> str | None:
+        result = super().__call__(argv)
+        if (
+            argv[:2] == ("/bin/launchctl", "print")
+            and argv[2].endswith("/io.nisavid.hindsight.synthetic.broker")
+            and result is not None
+            and self.delayed_snapshots > 0
+        ):
+            self.delayed_snapshots -= 1
+            return result.replace(
+                "state = running", "state = spawn scheduled"
+            )
+        return result
+
+
 class ForeignManifestRunner(RecordingRunner):
     def __call__(self, argv: tuple[str, ...]) -> str | None:
         if argv[:2] == ("/bin/launchctl", "print"):
@@ -387,6 +407,55 @@ class PortableInstallationManagerTest(unittest.TestCase):
         self.assertTrue(
             any(call[0].endswith("launchctl") for call in self.runner.calls)
         )
+
+    def test_fresh_install_waits_for_launchd_service_to_become_running(
+        self,
+    ) -> None:
+        runner = DelayedLaunchdServiceRunner()
+        manager = self.manager()
+        manager._command_runner = runner
+
+        with mock.patch.object(portable_install_module.time, "sleep"):
+            result = manager.install(
+                self.release("1.0.0"),
+                version="1.0.0",
+            )
+
+        self.assertEqual(result["status"], "installed")
+        service_prints = [
+            call
+            for call in runner.calls
+            if call[:2] == ("/bin/launchctl", "print")
+            and call[2].endswith(
+                "/io.nisavid.hindsight.synthetic.broker"
+            )
+        ]
+        self.assertGreaterEqual(len(service_prints), 3)
+
+    def test_fresh_install_rolls_back_when_launchd_never_becomes_running(
+        self,
+    ) -> None:
+        runner = InactiveLaunchdServiceRunner()
+        manager = self.manager()
+        manager._command_runner = runner
+
+        with (
+            mock.patch.object(
+                portable_install_module,
+                "LAUNCHD_SERVICE_START_TIMEOUT_SECONDS",
+                0,
+            ),
+            self.assertRaisesRegex(
+                PortableInstallError,
+                "managed launchd job is not active",
+            ),
+        ):
+            manager.install(self.release("1.0.0"), version="1.0.0")
+
+        self.assertEqual(runner.launchd_jobs, {})
+        self.assertFalse(self.install_root.exists())
+        self.assertTrue(self.data_root.is_dir())
+        self.assertEqual(list(self.service_root.glob("*")), [])
 
     def test_intentional_service_stop_preserves_installation_and_stays_stopped(
         self,

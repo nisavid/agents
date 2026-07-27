@@ -385,6 +385,64 @@ class ControlServerHooksTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "provider preset ID is reserved"):
             self.module.install_provider_catalog(self.providers, preset)
 
+    def test_ui_readiness_accepts_only_success_or_login_redirect(self):
+        class Response:
+            def __init__(self, status, location=None):
+                self.status = status
+                self.location = location
+
+            def getheader(self, name):
+                return self.location if name == "Location" else None
+
+            def read(self, _size):
+                return b""
+
+        class Connection:
+            response = Response(200)
+
+            def __init__(self, host, port, timeout):
+                self.arguments = (host, port, timeout)
+
+            def request(self, method, path):
+                self.request_arguments = (method, path)
+
+            def getresponse(self):
+                return self.response
+
+            def close(self):
+                return None
+
+        manager = SimpleNamespace(
+            get_ui_url=lambda _profile, _port, hostname: (
+                f"http://{hostname}:17979"
+            ),
+            is_ui_running=lambda _profile, _port=None: False,
+        )
+        service = SimpleNamespace(
+            daemon_client=SimpleNamespace(_manager=manager),
+        )
+        self.module.install_ui_readiness(service)
+
+        with patch.object(
+            self.module.http.client,
+            "HTTPConnection",
+            Connection,
+        ):
+            for response, expected in (
+                (Response(200), True),
+                (Response(307, "/login"), True),
+                (Response(307, "/login?returnTo=%2F"), True),
+                (Response(307, "/other"), False),
+                (Response(307, "http://[invalid/login"), False),
+                (Response(401), False),
+            ):
+                with self.subTest(status=response.status, expected=expected):
+                    Connection.response = response
+                    self.assertEqual(
+                        manager.is_ui_running("systalyze"),
+                        expected,
+                    )
+
     def test_lifecycle_hooks_preserve_intent_and_required_daemon(self):
         self.service.stop_daemon("example-profile")
         self.assertEqual(self.desired("example-profile", "daemon"), "stopped")

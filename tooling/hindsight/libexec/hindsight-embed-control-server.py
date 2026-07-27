@@ -6,6 +6,7 @@ import contextlib
 from dataclasses import replace
 import fcntl
 import functools
+import http.client
 import ipaddress
 import json
 import os
@@ -552,6 +553,48 @@ def install_lifecycle_hooks(service, desired_state_dir: Path) -> None:
     )
 
 
+def install_ui_readiness(service) -> None:
+    daemon_client = getattr(service, "daemon_client", None)
+    manager = getattr(daemon_client, "_manager", None)
+    if manager is None or not callable(getattr(manager, "get_ui_url", None)):
+        return
+
+    def is_ui_running(profile: str, ui_port: int | None = None) -> bool:
+        try:
+            endpoint = urlsplit(
+                manager.get_ui_url(
+                    profile,
+                    ui_port,
+                    hostname="127.0.0.1",
+                )
+            )
+            connection = http.client.HTTPConnection(
+                endpoint.hostname,
+                endpoint.port,
+                timeout=2,
+            )
+            try:
+                connection.request("GET", "/")
+                response = connection.getresponse()
+                location = response.getheader("Location")
+                location_path = (
+                    None if location is None else urlsplit(location).path
+                )
+                response.read(1)
+            finally:
+                connection.close()
+        except (OSError, http.client.HTTPException, ValueError):
+            return False
+        if response.status == 200:
+            return True
+        return (
+            response.status in {301, 302, 303, 307, 308}
+            and location_path == "/login"
+        )
+
+    manager.is_ui_running = is_ui_running
+
+
 def install_provider_catalog(
     providers, preset: ProviderPreset | None = None
 ) -> None:
@@ -670,6 +713,7 @@ def install_provider_alias(
 def install_hooks(service, providers, desired_state_dir: Path) -> None:
     preset = provider_preset_from_environment()
     install_provider_catalog(providers, preset)
+    install_ui_readiness(service)
     install_lifecycle_hooks(service, desired_state_dir)
     if preset is not None or all(
         hasattr(service, name)

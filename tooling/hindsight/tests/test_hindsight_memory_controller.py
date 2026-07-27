@@ -1652,6 +1652,37 @@ class ControllerCliTest(unittest.TestCase):
             [(verified_plan, receipt_artifact["receipts"])],
         )
 
+    def test_migration_replay_uses_maximum_http_request_timeout(self):
+        module = runpy.run_path(str(CLI))
+        command = module["_replay_http_adapter"]
+        calls = []
+
+        def adapter(**kwargs):
+            calls.append(kwargs)
+            return object()
+
+        with (
+            patch.dict(
+                command.__globals__,
+                {
+                    "HttpAdapter": adapter,
+                    "load_inventory": lambda path: f"inventory:{path}",
+                },
+            ),
+            patch.dict(module["os"].environ, {"TOKEN": "secret"}),
+        ):
+            result = command(
+                module["argparse"].Namespace(
+                    inventory="inventory.json",
+                    profile="systalyze",
+                    token_env="TOKEN",
+                )
+            )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["timeout"], 30.0)
+
     def test_harness_reconcile_pre_start_never_uses_server_and_disables_all(self):
         module = runpy.run_path(str(CLI))
         harnesses = ("codex", "claude-code", "cursor")

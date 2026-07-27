@@ -1009,6 +1009,7 @@ def _replay_http_adapter(args: argparse.Namespace) -> HttpAdapter:
         inventory=load_inventory(args.inventory),
         profile_id=args.profile,
         token_resolver=lambda: os.environ.get(args.token_env, ""),
+        timeout=30.0,
     )
 
 

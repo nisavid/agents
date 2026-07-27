@@ -809,9 +809,9 @@ raw Hindsight bank selection remains an implementation detail.
   no-authorization rules.
 - Directives affect `reflect` only. Equivalent invariants are enforced in the
   controller and adapters for recall, retain, injection, and projection.
-- Native Hindsight audit logging is disabled because it stores request and
-  response bodies. Native LLM request tracing is disabled because it stores
-  prompts and outputs.
+- Native Hindsight audit logging and LLM request tracing store content-bearing
+  request, response, prompt, and output data. Each consumer declares both
+  settings explicitly and gives every enabled log a bounded retention period.
 - The controller writes a content-free ledger containing action and correlation
   ID, full source and target bank references, policy and artifact digests,
   decision, reason code, timestamp, and any reversible record ID. Default
@@ -1320,7 +1320,8 @@ raw Hindsight bank selection remains an implementation detail.
   migration adapter is not an ad hoc rewrite.
 - Changes to OptiQ itself. The control plane owns the protocol adapter.
 - Raw Hindsight MCP or API capabilities exposed directly to harness agents.
-- Content-bearing native Hindsight audit logging or LLM request tracing.
+- Unbounded or implicitly enabled native Hindsight audit logging or LLM request
+  tracing.
 - Automatic full-transcript routing by content classification.
 - Automatic airlock-to-core promotion or indefinite airlock retention.
 - A production Hermes ambient-memory adapter before its capability audit.

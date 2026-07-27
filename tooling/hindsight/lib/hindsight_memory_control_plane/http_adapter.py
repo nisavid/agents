@@ -2564,7 +2564,7 @@ class HttpAdapter:
             or response.get("api_version") != SUPPORTED_RUNTIME_VERSION
             or not isinstance(response.get("features"), Mapping)
             or response["features"].get("worker") is not True
-            or response["features"].get("audit_log") is not False
+            or type(response["features"].get("audit_log")) is not bool
             or type(response["features"].get("llm_trace")) is not bool
         ):
             raise AdapterError(

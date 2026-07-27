@@ -393,9 +393,9 @@ HINDSIGHT_EMBED_NPX_EXECUTABLE="$npx_executable" \
 Interactive setup keeps provider credentials out of process arguments. The
 configured profile may exist outside the installer-managed data root, but the
 declared fresh data root must be empty. The broker requires the upstream worker
-feature and rejects native audit logging. Keep audit logging explicitly disabled,
-declare LLM request tracing explicitly according to the consumer's bounded
-retention policy, and give each managed profile a stable, consumer-scoped worker
+feature and explicit boolean audit-log and LLM-trace feature declarations. Set
+both content-bearing log policies explicitly, give each enabled log a bounded
+retention period, and give each managed profile a stable, consumer-scoped worker
 ID.
 The broker validates the selected runtime and compiles its routes before it
 publishes the socket. Give that first-start gate a bounded five-minute budget
@@ -405,8 +405,8 @@ bounded independently.
 For adoption, do not configure the profile or change its bank. Inspect the
 existing profile, bank, ports, worker ID, privacy flags, and data root without
 printing provider credentials. Broker activation requires audit logging and
-LLM request tracing to be explicitly disabled; include any required privacy or
-stable-worker correction in the approved activation plan. Set
+LLM request tracing to be explicitly declared; include their retention and any
+required privacy or stable-worker correction in the approved activation plan. Set
 `installation_mode` to `adopt` and point `data_root` at the existing database
 root. The installer records its filesystem identity, rechecks that digest
 immediately before first service activation, and refuses later lifecycle

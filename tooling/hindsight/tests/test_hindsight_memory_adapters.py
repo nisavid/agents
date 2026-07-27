@@ -1226,7 +1226,7 @@ class HttpAdapterContractTest(AdapterContractMixin, unittest.TestCase):
         ):
             adapter.verify_runtime_compatibility()
 
-    def test_runtime_adapter_fails_closed_when_audit_logging_is_enabled(self):
+    def test_runtime_adapter_accepts_explicit_audit_logging(self):
         adapter = HttpAdapter(
             inventory=inventory_for(self.server.server_port),
             profile_id="core", token_resolver=lambda: "contract-token",
@@ -1240,11 +1240,8 @@ class HttpAdapterContractTest(AdapterContractMixin, unittest.TestCase):
                 "llm_trace": False,
             },
         }
-        with self.assertRaisesRegex(
-            AdapterError,
-            "version, worker, or privacy features are unsupported",
-        ):
-            adapter.verify_runtime_compatibility()
+
+        adapter._require_runtime_version()
 
     def test_runtime_adapter_accepts_explicit_llm_request_tracing(self):
         adapter = HttpAdapter(
@@ -1278,6 +1275,31 @@ class HttpAdapterContractTest(AdapterContractMixin, unittest.TestCase):
             "version, worker, or privacy features are unsupported",
         ):
             adapter.verify_runtime_compatibility()
+
+    def test_runtime_adapter_rejects_non_boolean_content_logging_flags(self):
+        adapter = HttpAdapter(
+            inventory=inventory_for(self.server.server_port),
+            profile_id="core", token_resolver=lambda: "contract-token",
+            runtime_bank_id="engineering", runtime_harness_id="codex",
+        )
+        for feature in ("audit_log", "llm_trace"):
+            for value in (0, "false", None):
+                with self.subTest(feature=feature, value=value):
+                    features = {
+                        "worker": True,
+                        "audit_log": False,
+                        "llm_trace": False,
+                    }
+                    features[feature] = value
+                    adapter._request = lambda *_args, selected=features: {
+                        "api_version": SUPPORTED_RUNTIME_VERSION,
+                        "features": selected,
+                    }
+                    with self.assertRaisesRegex(
+                        AdapterError,
+                        "version, worker, or privacy features are unsupported",
+                    ):
+                        adapter._require_runtime_version()
 
     def test_runtime_adapter_revalidates_version_before_each_operation(self):
         adapter = HttpAdapter(

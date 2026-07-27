@@ -52,6 +52,7 @@ SENSITIVE_HEADER = re.compile(
 )
 SERVICE_MANAGER_COMMAND_TIMEOUT_SECONDS = 360
 SYSTEMD_STOP_TIMEOUT_SECONDS = 330
+LAUNCHD_EXIT_TIMEOUT_SECONDS = 330
 LAUNCHD_SERVICE_START_TIMEOUT_SECONDS = 10.0
 LAUNCHD_SERVICE_START_POLL_SECONDS = 0.1
 RESOLVER_ENVIRONMENT_BINDINGS = frozenset(
@@ -3217,6 +3218,7 @@ class PortableInstallationManager:
                 "KeepAlive": keep_alive,
                 "WorkingDirectory": str(self.config.state_root),
                 "ProcessType": "Background",
+                "ExitTimeOut": LAUNCHD_EXIT_TIMEOUT_SECONDS,
             }
             rendered[self.config.service_root / f"{service.label}.plist"] = (
                 plistlib.dumps(payload, sort_keys=True)

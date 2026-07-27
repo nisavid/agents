@@ -403,6 +403,7 @@ class PortableInstallationManagerTest(unittest.TestCase):
         self.assertNotIn("HINDSIGHT_API_KEY", rendered)
         self.assertNotIn("pass://hindsight/data-plane", rendered)
         self.assertEqual(plist["Label"], "io.nisavid.hindsight.synthetic.broker")
+        self.assertEqual(plist["ExitTimeOut"], 330)
         self.assertIn("--service", plist["ProgramArguments"])
         self.assertTrue(
             any(call[0].endswith("launchctl") for call in self.runner.calls)

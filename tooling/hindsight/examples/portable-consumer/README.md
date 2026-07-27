@@ -80,8 +80,10 @@ Keep `HINDSIGHT_API_TENANT_EXTENSION` bound to
 service and health-check environments. The launcher maps the resolved data
 plane token to `HINDSIGHT_API_TENANT_API_KEY` only for the API child; the
 extension selector is non-secret and does not grant authority by itself.
-Keep upstream audit logging and LLM request tracing explicitly disabled, and
-replace the example worker ID with a stable consumer-and-profile identity.
+Keep upstream audit logging explicitly disabled. The example also disables LLM
+request tracing; a consumer that enables it must declare a bounded retention
+policy. Replace the example worker ID with a stable consumer-and-profile
+identity.
 Keep the broker startup budget long enough for the first authenticated runtime
 probe and route compilation; the examples use five minutes.
 

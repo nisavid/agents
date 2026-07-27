@@ -2565,7 +2565,7 @@ class HttpAdapter:
             or not isinstance(response.get("features"), Mapping)
             or response["features"].get("worker") is not True
             or response["features"].get("audit_log") is not False
-            or response["features"].get("llm_trace") is not False
+            or type(response["features"].get("llm_trace")) is not bool
         ):
             raise AdapterError(
                 "runtime Hindsight version, worker, or privacy features "

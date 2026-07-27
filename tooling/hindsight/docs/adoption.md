@@ -383,9 +383,10 @@ HINDSIGHT_EMBED_UVX_EXECUTABLE="$uvx_executable" \
 Interactive setup keeps provider credentials out of process arguments. The
 configured profile may exist outside the installer-managed data root, but the
 declared fresh data root must be empty. The broker requires the upstream worker
-feature while rejecting native audit logging and LLM request tracing; keep both
-privacy features explicitly disabled and give each managed profile a stable,
-consumer-scoped worker ID.
+feature and rejects native audit logging. Keep audit logging explicitly disabled,
+declare LLM request tracing explicitly according to the consumer's bounded
+retention policy, and give each managed profile a stable, consumer-scoped worker
+ID.
 The broker validates the selected runtime and compiles its routes before it
 publishes the socket. Give that first-start gate a bounded five-minute budget
 with `HINDSIGHT_MEMORY_BROKER_WAIT_SECONDS=300`; later health probes remain

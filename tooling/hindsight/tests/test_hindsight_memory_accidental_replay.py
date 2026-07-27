@@ -463,6 +463,33 @@ class AccidentalReplayTest(unittest.TestCase):
         )
         self.assertEqual(len(self.adapter.submissions), 2)
 
+    def test_apply_treats_returned_tag_order_as_non_semantic(self):
+        class ReorderedTagsAdapter(FakeReplayAdapter):
+            def submit_replay_document(self, bank, item):
+                submission = super().submit_replay_document(bank, item)
+                self.target[item["document_id"]]["tags"].reverse()
+                return submission
+
+        adapter = ReorderedTagsAdapter()
+        plan = create_replay_plan(
+            adapter,
+            source_bank=self.source,
+            target_bank=self.target,
+        )
+
+        receipts = apply_replay_plan(
+            adapter,
+            plan,
+            timeout_seconds=1,
+            poll_interval_seconds=0,
+        )
+
+        self.assertEqual(len(receipts), 2)
+        self.assertEqual(
+            verify_replay_receipts(adapter, plan, receipts)["status"],
+            "verified",
+        )
+
     def test_apply_requires_approved_restore_tested_backup_before_mutation(self):
         plan = create_replay_plan(
             self.adapter,
@@ -669,7 +696,10 @@ class AccidentalReplayTest(unittest.TestCase):
         )
         with patch(
             "hindsight_memory_control_plane.accidental_replay.time.monotonic",
-            side_effect=(0.0, 0.9, 0.9, 1.8),
+            side_effect=(
+                0.0, 0.9, 0.9, 0.9, 0.9,
+                1.8, 2.7, 2.7, 2.7, 2.7,
+            ),
         ):
             receipts = apply_replay_plan(
                 adapter,

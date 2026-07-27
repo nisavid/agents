@@ -611,7 +611,7 @@ def _target_projection(document: Mapping[str, Any]) -> Mapping[str, Any]:
             "content_digest": _content_digest(document),
             "timestamp": retain_params.get("event_date"),
             "metadata": document.get("document_metadata") or {},
-            "tags": document.get("tags") or [],
+            "tags": sorted(document.get("tags") or []),
             "context": retain_params.get("context"),
             "observation_scopes": observation_scopes,
         }
@@ -632,7 +632,7 @@ def _expected_target_projection(
             "content_digest": submission["content_digest"],
             "timestamp": submission["timestamp"],
             "metadata": submission["metadata"],
-            "tags": submission["tags"],
+            "tags": sorted(submission["tags"]),
             "context": submission.get("context"),
             "observation_scopes": submission.get(
                 "observation_scopes"

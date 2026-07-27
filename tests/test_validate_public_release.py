@@ -630,7 +630,7 @@ class ValidatePublicReleaseTests(unittest.TestCase):
             run_contracts=False,
         )
 
-    def test_artifact_customs_is_exactly_validated_fifth_public_plugin_without_expanding_phase7(
+    def test_code_only_task_witness_is_marketplace_validated_without_expanding_phase7(
         self,
     ) -> None:
         self.assertEqual(
@@ -639,11 +639,15 @@ class ValidatePublicReleaseTests(unittest.TestCase):
             "Artifact Customs must not alter the four-plugin Phase 7 control projection.",
         )
         expected_public_plugins = self.module.CONTROL_PLUGINS + ("artifact-customs",)
+        expected_validated = expected_public_plugins + ("task-witness",)
+        self.assertEqual(self.module.SKILL_PLUGINS, expected_public_plugins)
+        self.assertEqual(self.module.RUNTIME_PACKAGES, ("task-witness",))
         self.assertEqual(
             self.module.VALIDATED_PLUGINS,
-            expected_public_plugins,
-            "Artifact Customs must be an exactly validated fifth public plugin; arbitrary extras are forbidden.",
+            expected_validated,
+            "Task Witness must be identity-validated without entering skill evaluation.",
         )
+        self.assertNotIn("task-witness", self.module.SKILL_PLUGINS)
         self.assertEqual(
             self.module.MARKETPLACE_PLUGINS,
             {
@@ -652,13 +656,33 @@ class ValidatePublicReleaseTests(unittest.TestCase):
                 "versionkeeping": "./plugins/versionkeeping",
                 "mergecraft": "./plugins/mergecraft",
                 "artifact-customs": "./plugins/artifact-customs",
+                "task-witness": "./plugins/task-witness",
             },
-            "The public marketplace inventory must be the four Phase 7 plugins plus Artifact Customs only.",
+            "The public marketplace inventory must include the code-only Task Witness package.",
         )
         self.assertEqual(
             set(self.module.VALIDATOR_PATHS),
-            set(expected_public_plugins),
+            set(expected_validated),
             "Every public plugin must have an exact validator entry; arbitrary validators are forbidden.",
+        )
+        self.assertIn(
+            "tests/plugins/test_task_witness_launcher.py",
+            self.module.PLUGIN_SUPPORT_PATHS["task-witness"],
+            "The public Task Witness release gate must execute the launcher contract suite.",
+        )
+        self.assertIn(
+            "release/task-witness/source-shape-review.json",
+            self.module.PLUGIN_SUPPORT_PATHS["task-witness"],
+            "The public Task Witness release scope must retain its reviewed source shape.",
+        )
+        self.assertTrue(
+            {
+                "tests/plugins/review_evidence_fixtures.py",
+                "tests/plugins/test_rolecasting_review_evidence.py",
+                "tests/plugins/test_task_witness_review_evidence.py",
+                "tests/plugins/test_tricritical_review_evidence.py",
+            }.isdisjoint(self.module.PLUGIN_SUPPORT_PATHS["task-witness"]),
+            "The standalone Task Witness release must not own semantic-consumer tests.",
         )
 
     def test_rejects_expected_identity_mismatch(self) -> None:
@@ -1808,6 +1832,7 @@ class ValidatePublicReleaseTests(unittest.TestCase):
                 "validate_mergecraft.py",
                 "validate_tricritical.py",
                 "validate_artifact_customs.py",
+                "validate_task_witness.py",
             },
         )
         pytest_calls = [
@@ -2134,7 +2159,7 @@ class ValidatePublicReleaseTests(unittest.TestCase):
         ):
             evidence = self.module.run_plugin_evals(self.repository, self.plugin_eval)
 
-        self.assertEqual(set(evidence), set(self.module.VALIDATED_PLUGINS))
+        self.assertEqual(set(evidence), set(self.module.SKILL_PLUGINS))
         self.assertIn("SystemExit(73)", self.plugin_eval.read_text(encoding="utf-8"))
 
     def test_node_interpreter_rejects_shims_and_noncompliant_versions(self) -> None:
@@ -2205,7 +2230,7 @@ class ValidatePublicReleaseTests(unittest.TestCase):
         ):
             evidence = self.module.run_plugin_evals(self.repository, self.plugin_eval)
 
-        self.assertEqual(set(evidence), set(self.module.VALIDATED_PLUGINS))
+        self.assertEqual(set(evidence), set(self.module.SKILL_PLUGINS))
         for command, environment in observed:
             self.assertEqual(command[0], str(node))
             self.assertNotIn("NODE_OPTIONS", environment)
@@ -2221,12 +2246,15 @@ class ValidatePublicReleaseTests(unittest.TestCase):
             for command, _environment in observed
             if len(command) > 2 and command[2] == "analyze"
         ]
-        self.assertEqual(len(analysis_commands), len(self.module.VALIDATED_PLUGINS))
+        self.assertEqual(len(analysis_commands), len(self.module.SKILL_PLUGINS))
         self.assertTrue(
             all(
                 command[1].endswith("scripts/plugin-eval.js")
                 for command in analysis_commands
             )
+        )
+        self.assertNotIn(
+            "task-witness", {Path(command[3]).name for command in analysis_commands}
         )
         serialized = json.dumps(evidence, sort_keys=True)
         self.assertNotIn(str(node), serialized)
@@ -2450,7 +2478,7 @@ class ValidatePublicReleaseTests(unittest.TestCase):
             [event[0] for event in events],
             [
                 item
-                for _plugin in self.module.VALIDATED_PLUGINS
+                for _plugin in self.module.SKILL_PLUGINS
                 for item in ("read", "child", "read")
             ],
         )
@@ -2478,7 +2506,7 @@ class ValidatePublicReleaseTests(unittest.TestCase):
         ) as run:
             evidence = self.module.run_plugin_evals(self.repository, self.plugin_eval)
 
-        self.assertEqual(set(evidence), set(self.module.VALIDATED_PLUGINS))
+        self.assertEqual(set(evidence), set(self.module.SKILL_PLUGINS))
         self.assertTrue(
             all(item["warnings"] == ["deferred-cost"] for item in evidence.values())
         )
@@ -2500,7 +2528,8 @@ class ValidatePublicReleaseTests(unittest.TestCase):
             for call in run.call_args_list
             if len(call.args[0]) > 3 and call.args[0][2] == "analyze"
         }
-        self.assertEqual(targets, set(self.module.VALIDATED_PLUGINS))
+        self.assertEqual(targets, set(self.module.SKILL_PLUGINS))
+        self.assertNotIn("task-witness", targets)
 
     def test_plugin_eval_authoritative_projection_ignores_ambient_report_state(
         self,

@@ -1,0 +1,85 @@
+{
+  "measurement": "python-nonblank-noncomment-lines-v1+ordered-source-byte-identity-v1",
+  "rebaseline_requirement": "independent-source-shape-review",
+  "review_context": {
+    "alternatives": [
+      {
+        "name": "line-count-only-tripwire",
+        "reason": "A line-count-neutral byte change would evade the reviewed source identity.",
+        "status": "rejected"
+      },
+      {
+        "name": "source-shape-record-as-review-proof",
+        "reason": "This record binds a measurement and cannot authenticate an independent review.",
+        "status": "rejected"
+      },
+      {
+        "name": "validator-sandboxing",
+        "reason": "Registered validators are full-process Python code with ambient user authority, not sandboxed code.",
+        "status": "rejected"
+      },
+      {
+        "name": "protected-bootstrap-helper",
+        "reason": "A second pre-verification artifact would add coordinated rotation, rollback, and partial-update recovery without reducing trusted responsibilities.",
+        "status": "rejected"
+      }
+    ],
+    "architecture": {
+      "canonical_executor": "`main()` is Task Witness's only supported subprocess entry point. The launcher defensively rejects noncanonical CPython warning options, implementation options, and semantic flags before loading payloads. It cannot prove the caller's exact argv, environment, cwd, stdin, inherited descriptors, or timeout; the canonical client and deployment own those invocation conditions.",
+      "client_acceptance": "Only a canonical client invocation is acceptable. The client itself invokes the canonical Task Witness subprocess with deployment-owned exact `argv` and a scrubbed environment. It accepts the result only if that child exits with status 0, emits exactly one schema-valid canonical envelope, and returns exactly the expected complete anchor. The anchor does not authenticate invocation provenance or arbitrary caller ambient state.",
+      "deployment_boundary": "Task Witness's filesystem checks operate within a cooperative same-EUID deployment boundary. They cannot adversarially protect the launcher, active record, or generation state from an actor with the same EUID who can replace those files. Deployment policy and external deployment receipts own that trust; a successful envelope is not a deployment receipt.",
+      "rationale": "Bind the independently reviewed Task Witness payload paths, source measurements, and exact bytes in one release-owned record.",
+      "validator_execution_model": "Registered validators are exact-byte-pinned, operator-approved full-process Python TCB with ambient user authority; Task Witness grants no workflow authority and is not a sandbox."
+    },
+    "external_review": {
+      "authenticity_proof": "external-frozen-review-evidence",
+      "record_role": "source-shape-measurement-not-review-authentication"
+    },
+    "protocol": {
+      "canonical_projection_contract": "task-witness-canonical-projection-v2",
+      "launch_envelope_contract": "task-witness-launch-envelope-v1"
+    }
+  },
+  "reviewed_shape": {
+    "aggregate_source_lines": 1681,
+    "module_source_lines": {
+      "plugins/task-witness/launcher/task_witness_launch.py": 587,
+      "plugins/task-witness/runtime/bundle_io.py": 290,
+      "plugins/task-witness/runtime/canonical.py": 156,
+      "plugins/task-witness/runtime/task_witness.py": 280,
+      "plugins/task-witness/runtime/trust.py": 368
+    }
+  },
+  "schema_version": 2,
+  "source_byte_identity": {
+    "aggregate_sha256": "46692d342cf6821c04a4d8cba2488ada18bf45b12343d817a67004fba1752aab",
+    "algorithm": "sha256",
+    "entries": [
+      {
+        "path": "plugins/task-witness/launcher/task_witness_launch.py",
+        "sha256": "60e754b05e83a1655e7dfc5c2f89f001d9814bdb3e9737e24c4a9e67d0ea4786"
+      },
+      {
+        "path": "plugins/task-witness/runtime/bundle_io.py",
+        "sha256": "ed000de6e4d0bc8d9a0c09ac270803377762de2a1ddab015645a4622abdeae26"
+      },
+      {
+        "path": "plugins/task-witness/runtime/canonical.py",
+        "sha256": "55dd41b0977708c91b6841d9aee00dbd03d9d0c8c405a3f174fa4d5cc9afbc3d"
+      },
+      {
+        "path": "plugins/task-witness/runtime/task_witness.py",
+        "sha256": "9c61d4ad10f54fe14abafeca9016f8d7e472edff7b66b6d871b2f212a0c06afd"
+      },
+      {
+        "path": "plugins/task-witness/runtime/trust.py",
+        "sha256": "e46866d82bf1427c774467d61c1706a3b69efa399c653b7ed3d6633decd5ba1e"
+      }
+    ],
+    "framing": "path-utf8-nul-sha256-hex-nul-v1"
+  },
+  "tripwires": {
+    "aggregate_source_lines": 1725,
+    "per_module_source_lines": 625
+  }
+}

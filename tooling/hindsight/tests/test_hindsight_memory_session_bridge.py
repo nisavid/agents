@@ -854,6 +854,49 @@ class UnixBridgeTransportTest(unittest.TestCase):
                 lifetime_seconds=MAX_SESSION_TTL_SECONDS + 1,
             )
 
+    def test_bridge_process_reuses_the_managed_python_interpreter(self):
+        process = Mock()
+        with (
+            patch(
+                "hindsight_memory_control_plane.session_bridge.subprocess.Popen",
+                return_value=process,
+            ) as popen,
+            patch(
+                "hindsight_memory_control_plane.session_bridge.os.write",
+                return_value=64,
+            ),
+        ):
+            started = start_bridge_process(
+                executable="/opt/hindsight-memory",
+                python_executable=sys.executable,
+                state_dir="/private/state",
+                bridge_socket=self.root / "managed-python.sock",
+                broker_socket="/private/broker.sock",
+                handle="a" * 64,
+                session_id="session-1",
+                harness_id="codex",
+            )
+        self.assertIs(started, process)
+        self.assertEqual(
+            popen.call_args.args[0][:3],
+            [sys.executable, "-I", "/opt/hindsight-memory"],
+        )
+
+    def test_bridge_process_rejects_an_invalid_python_interpreter(self):
+        with self.assertRaisesRegex(
+            BridgeError, "PYTHON_EXECUTABLE_INVALID"
+        ):
+            start_bridge_process(
+                executable="/opt/hindsight-memory",
+                python_executable="/managed/missing-python",
+                state_dir="/private/state",
+                bridge_socket=self.root / "missing-python.sock",
+                broker_socket="/private/broker.sock",
+                handle="a" * 64,
+                session_id="session-1",
+                harness_id="codex",
+            )
+
     def test_bridge_startup_failure_closes_both_handle_pipe_descriptors(self):
         read_descriptor, write_descriptor = os.pipe()
         with (
@@ -865,7 +908,9 @@ class UnixBridgeTransportTest(unittest.TestCase):
                 "hindsight_memory_control_plane.session_bridge.subprocess.Popen",
                 side_effect=OSError("start failed"),
             ),
-            self.assertRaisesRegex(OSError, "start failed"),
+            self.assertRaisesRegex(
+                BridgeError, "BRIDGE_START_FAILED"
+            ),
         ):
             start_bridge_process(
                 executable="/opt/hindsight-memory",

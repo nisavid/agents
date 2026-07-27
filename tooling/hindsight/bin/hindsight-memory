@@ -2528,6 +2528,7 @@ def _activate_gui_envelope(
             )
             process = start_bridge_process(
                 executable=str(Path(__file__).resolve()),
+                python_executable=sys.executable,
                 state_dir=Path(envelope["state_dir"]),
                 bridge_socket=socket_path,
                 broker_socket=broker_socket,
@@ -2719,6 +2720,7 @@ def _start_harness_bridge(
         )
         process = start_bridge_process(
             executable=str(Path(__file__).resolve()),
+            python_executable=sys.executable,
             state_dir=Path(args.state_dir).resolve(),
             bridge_socket=socket_path,
             broker_socket=Path(args.broker_socket).resolve(),

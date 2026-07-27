@@ -401,6 +401,7 @@ component_credential_scopes="$tmp_dir/component-credential-scopes"
   hindsight_stack_ensure_profile_ports() { return 0 }
   hindsight_stack_daemon_status() { return 0 }
   hindsight_stack_ui_running() { return 1 }
+  hindsight_stack_prepare_ui_package() { return 0 }
   hindsight_stack_run_bounded_with_credential_scope() {
     print -r -- "$1" >> "$component_credential_scopes"
   }
@@ -729,6 +730,7 @@ hardened_ui_restart_events="$tmp_dir/hardened-ui-restart-events"
   hindsight_stack_load_config() { return 0 }
   hindsight_stack_runtime_active() { return 0 }
   hindsight_stack_preflight_runtime_credentials() { return 0 }
+  hindsight_stack_prepare_ui_package() { return 0 }
   hindsight_stack_daemon_status() { return 0 }
   hindsight_stack_ui_running() { return 0 }
   hindsight_stack_ui_status() { return 1 }

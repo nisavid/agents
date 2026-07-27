@@ -298,7 +298,11 @@ running. A clean service start or restart resets that intent before starting
 the fleet; a new login initializes the configured autostart policy. Consumers
 bind the reusable control-server helper through
 `HINDSIGHT_EMBED_CONTROL_SERVER` and do not fork its lifecycle logic into
-machine configuration.
+machine configuration. Managed UI startup also prepares the selected
+published control-plane package under a no-credential scope. The preparer
+accepts only the exact authenticated locale-routing contract it can repair,
+applies that change atomically, and rejects unknown package shapes before the
+UI receives credentials or starts.
 
 ## Migration safety
 

@@ -2592,6 +2592,44 @@ hindsight_stack_daemon_start() {
   hindsight_stack_wait_daemon
 }
 
+hindsight_stack_prepare_ui_package() {
+  emulate -L zsh
+
+  local npx="${HINDSIGHT_EMBED_NPX_EXECUTABLE:-}"
+  [[ -n "$npx" ]] || {
+    print -ru2 -- "hindsight-embed-stack: HINDSIGHT_EMBED_NPX_EXECUTABLE is required"
+    return 1
+  }
+  hindsight_stack_require_trusted_artifact \
+    "$npx" "Hindsight UI npx" executable allow-symlink || return 1
+
+  local helper="${HINDSIGHT_EMBED_STOP_HELPER:h}/hindsight-embed-ui-compat.py"
+  hindsight_stack_require_trusted_artifact \
+    "$helper" "Hindsight UI compatibility helper" readable allow-symlink || return 1
+
+  local version="${HINDSIGHT_EMBED_CP_VERSION:-}"
+  if [[ -z "$version" ]]; then
+    local version_output
+    version_output="$(
+      hindsight_stack_run_with_credential_scope none \
+        "$HINDSIGHT_EMBED_UVX" hindsight-embed --version
+    )" || {
+      print -ru2 -- "hindsight-embed-stack: control-plane version discovery failed"
+      return 1
+    }
+    version="${version_output##* }"
+  fi
+  [[ "$version" =~ '^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$' ]] || {
+    print -ru2 -- "hindsight-embed-stack: control-plane version is invalid"
+    return 1
+  }
+
+  hindsight_stack_run_with_credential_scope none \
+    "$HINDSIGHT_EMBED_PYTHON" -I "$helper" \
+    --npx "$npx" \
+    --version "$version"
+}
+
 hindsight_stack_ui_start() {
   emulate -L zsh
   hindsight_stack_load_config || return 1
@@ -2601,6 +2639,9 @@ hindsight_stack_ui_start() {
     print -ru2 -- "hindsight-embed-stack: refusing to start UI for ${HINDSIGHT_EMBED_PROFILE} without a healthy daemon"
     return 1
   }
+  if hindsight_stack_runtime_active; then
+    hindsight_stack_prepare_ui_package || return 1
+  fi
 
   if hindsight_stack_runtime_active && hindsight_stack_ui_running; then
     hindsight_stack_ui_status && return 0

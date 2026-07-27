@@ -57,7 +57,10 @@ The resolver should retrieve each locator from a protected store such as
 `pass`, the macOS Keychain, or Secret Service. It must write no diagnostics or
 secret values to logs. Its file and ancestry must be owned by the current user
 or root and must not be group- or world-writable. The installer verifies its
-digest and copies it into the private managed install root before activation.
+configured path and digest before activation and keeps a protected copy as
+installer-owned rollback and uninstall evidence. Every managed launch repeats
+the configured-path verification and executes that exact resolver in place so
+native credential-store ACLs remain bound to its final installed path.
 The managed launcher supplies a trusted `HOME`, `USER`, and `LOGNAME`, a
 minimal system `PATH`, and a validated bound user-session bus when one is
 available. Resolver implementations must invoke non-system helpers such as a

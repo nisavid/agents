@@ -2179,6 +2179,31 @@ class PortableInstallationManagerTest(unittest.TestCase):
         self.assertEqual(result["release_digest"], first["release_digest"])
         self.assertEqual(manager.verify()["current"]["version"], "1.0.0")
 
+    def test_rollback_rejects_resolver_drift_before_mutation(self) -> None:
+        manager = self.manager(health_runner=lambda _check, _release: True)
+        manager.install(self.release("1.0.0"), version="1.0.0")
+        current = self.upgrade(
+            manager,
+            self.release("2.0.0"),
+            version="2.0.0",
+        )
+        calls_before = list(self.runner.calls)
+        self.resolver.chmod(0o700)
+        self.resolver.write_text("#!/bin/sh\nexit 91\n", encoding="utf-8")
+        self.resolver.chmod(0o500)
+
+        with self.assertRaisesRegex(
+            PortableInstallError,
+            "credential resolver digest mismatch",
+        ):
+            manager.rollback(
+                expected_current_digest=current["release_digest"],
+            )
+
+        self.assertEqual(self.runner.calls, calls_before)
+        self.assertFalse(manager._transaction_path.exists())
+        self.assertEqual(manager._load_state()["current"]["version"], "2.0.0")
+
     def test_rollback_disables_bound_harness_authority_before_quiesce(
         self,
     ) -> None:
@@ -2592,6 +2617,91 @@ class PortableInstallationManagerTest(unittest.TestCase):
         manager.install(release, version="1.0.0")
 
         self.assertEqual(manager.verify()["managed_health"], "healthy")
+
+    def test_runtime_executes_the_exact_configured_credential_resolver(self) -> None:
+        marker = self.root / "resolver-path"
+        self.resolver.chmod(0o700)
+        self.resolver.write_text(
+            "#!/bin/sh\n"
+            f"printf '%s' \"$0\" > {str(marker)!r}\n"
+            "printf '%s\\n' "
+            '\'{"schema_version":1,"values":{"HINDSIGHT_API_KEY":"canary"}}\'\n',
+            encoding="utf-8",
+        )
+        self.resolver.chmod(0o500)
+        data = self.config_data()
+        data["credential_resolver"]["sha256"] = file_sha256(self.resolver)
+        data["health_checks"][0]["credentials"] = [
+            {
+                "environment": "HINDSIGHT_API_KEY",
+                "locator": "pass://hindsight/data-plane",
+            }
+        ]
+        self.config_path.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
+        manager = PortableInstallationManager(
+            InstallationConfig.load(data, source_path=self.config_path),
+            command_runner=self.runner,
+            health_runner=lambda _check, _release: True,
+        )
+        manager.install(self.release("1.0.0"), version="1.0.0")
+
+        self.assertTrue(
+            manager._default_health_runner(
+                manager.config.health_checks[0].to_dict(),
+                manager._load_state()["current"],
+            )
+        )
+        self.assertEqual(marker.read_text(encoding="utf-8"), str(self.resolver))
+        self.assertTrue((self.install_root / "credential-resolver").is_file())
+
+    def test_runtime_rejects_credential_resolver_symlinked_ancestry(self) -> None:
+        resolver_parent = self.root / "resolver-parent"
+        resolver_parent.mkdir()
+        resolver = resolver_parent / "resolver"
+        resolver.write_text(
+            "#!/bin/sh\n"
+            "printf '%s\\n' "
+            '\'{"schema_version":1,"values":{"HINDSIGHT_API_KEY":"canary"}}\'\n',
+            encoding="utf-8",
+        )
+        resolver.chmod(0o500)
+        data = self.config_data()
+        data["credential_resolver"] = {
+            "path": str(resolver),
+            "sha256": file_sha256(resolver),
+        }
+        data["health_checks"][0]["credentials"] = [
+            {
+                "environment": "HINDSIGHT_API_KEY",
+                "locator": "pass://hindsight/data-plane",
+            }
+        ]
+        self.config_path.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
+        manager = PortableInstallationManager(
+            InstallationConfig.load(data, source_path=self.config_path),
+            command_runner=self.runner,
+            health_runner=lambda _check, _release: True,
+        )
+        manager.install(self.release("1.0.0"), version="1.0.0")
+        relocated_parent = self.root / "relocated-resolver-parent"
+        resolver_parent.rename(relocated_parent)
+        resolver_parent.symlink_to(relocated_parent, target_is_directory=True)
+
+        completed = subprocess.run(
+            manager._launch_argv("health", "broker"),
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={"PATH": "/usr/bin:/bin"},
+            timeout=10,
+        )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(
+            completed.stderr,
+            b"credential resolver is not protected\n",
+        )
 
     def test_install_rejects_an_unprotected_managed_python(self) -> None:
         managed_python = self.root / "consumer" / "python"
@@ -3464,12 +3574,12 @@ class PortableInstallationManagerTest(unittest.TestCase):
         )
         child.chmod(0o755)
         self.resolver.chmod(0o700)
-        self.resolver.write_text(
+        resolver_source = (
             "#!/usr/bin/env python3\n"
             "import json\n"
-            'print(json.dumps({"schema_version": 1, "values": {"HINDSIGHT_API_KEY": "test-canary-secret"}}))\n',
-            encoding="utf-8",
+            'print(json.dumps({"schema_version": 1, "values": {"HINDSIGHT_API_KEY": "test-canary-secret"}}))\n'
         )
+        self.resolver.write_text(resolver_source, encoding="utf-8")
         self.resolver.chmod(0o500)
         data = self.config_data()
         npx_directory = self.inventory.parent / "node-bin"
@@ -3488,12 +3598,6 @@ class PortableInstallationManagerTest(unittest.TestCase):
         manager = PortableInstallationManager(config, command_runner=self.runner)
         manager.install(release, version="1.0.0")
         launcher = self.install_root / "launcher.py"
-        self.resolver.chmod(0o700)
-        self.resolver.write_text(
-            "#!/bin/sh\nprintf '%s\\n' 'source resolver was replaced' >&2\nexit 91\n",
-            encoding="utf-8",
-        )
-        self.resolver.chmod(0o500)
 
         environment = {
             "UNRELATED_AMBIENT": "must-not-cross",
@@ -3530,6 +3634,30 @@ class PortableInstallationManagerTest(unittest.TestCase):
         self.assertEqual(captured["isolated"], 1)
         for path in self.service_root.glob("*"):
             self.assertNotIn("test-canary-secret", path.read_text())
+
+        self.resolver.chmod(0o700)
+        self.resolver.write_text(
+            "#!/bin/sh\nprintf '%s\\n' 'source resolver was replaced' >&2\nexit 91\n",
+            encoding="utf-8",
+        )
+        self.resolver.chmod(0o500)
+        drifted_resolver = subprocess.run(
+            manager._launch_argv("service", "broker"),
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environment,
+            timeout=10,
+        )
+        self.assertNotEqual(drifted_resolver.returncode, 0)
+        self.assertEqual(
+            drifted_resolver.stderr,
+            b"credential resolver is not protected\n",
+        )
+        self.resolver.chmod(0o700)
+        self.resolver.write_text(resolver_source, encoding="utf-8")
+        self.resolver.chmod(0o500)
 
         original_config = self.config_path.read_text()
         self.config_path.chmod(0o600)
@@ -4246,6 +4374,33 @@ class PortableInstallationManagerTest(unittest.TestCase):
         with self.assertRaisesRegex(PortableInstallError, "credential resolver"):
             manager.install(self.release("1.0.0"), version="1.0.0")
 
+    def test_install_rejects_credential_resolver_symlinked_ancestry(self) -> None:
+        real_parent = self.root / "real-resolver-parent"
+        real_parent.mkdir()
+        real_resolver = real_parent / "resolver"
+        real_resolver.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        real_resolver.chmod(0o500)
+        linked_parent = self.root / "linked-resolver-parent"
+        linked_parent.symlink_to(real_parent, target_is_directory=True)
+        configured_resolver = linked_parent / "resolver"
+        data = self.config_data()
+        data["credential_resolver"] = {
+            "path": str(configured_resolver),
+            "sha256": file_sha256(real_resolver),
+        }
+        self.config_path.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
+        manager = PortableInstallationManager(
+            InstallationConfig.load(data, source_path=self.config_path),
+            command_runner=self.runner,
+            health_runner=lambda _check, _release: True,
+        )
+
+        with self.assertRaisesRegex(
+            PortableInstallError,
+            "credential resolver ancestry",
+        ):
+            manager.install(self.release("1.0.0"), version="1.0.0")
+
     def test_install_rejects_symlink_managed_roots_and_lock(self) -> None:
         outside = self.root / "outside"
         outside.mkdir()
@@ -4489,7 +4644,7 @@ class PortableInstallationManagerTest(unittest.TestCase):
                 manager._launch_argv("health", "broker"),
             ),
             (
-                self.install_root / "credential-resolver",
+                self.resolver,
                 manager._launch_argv("health", "broker"),
             ),
         )
@@ -4621,6 +4776,26 @@ class PortableInstallationManagerTest(unittest.TestCase):
         self.assertTrue(self.resolver.exists())
         self.assertFalse(self.install_root.exists())
         self.assertEqual(list(self.service_root.glob("*")), [])
+
+    def test_uninstall_rejects_resolver_drift_before_mutation(self) -> None:
+        manager = self.manager(health_runner=lambda _check, _release: True)
+        manager.install(self.release("1.0.0"), version="1.0.0")
+        calls_before = list(self.runner.calls)
+        manifests = tuple(manager.config.service_root.iterdir())
+        self.resolver.chmod(0o700)
+        self.resolver.write_text("#!/bin/sh\nexit 91\n", encoding="utf-8")
+        self.resolver.chmod(0o500)
+
+        with self.assertRaisesRegex(
+            PortableInstallError,
+            "credential resolver digest mismatch",
+        ):
+            manager.uninstall()
+
+        self.assertEqual(self.runner.calls, calls_before)
+        self.assertFalse(manager._uninstall_transaction_path.exists())
+        self.assertTrue(self.install_root.is_dir())
+        self.assertTrue(all(path.is_file() for path in manifests))
 
     def test_uninstall_rejects_external_owned_install_paths(self) -> None:
         manager = self.manager(health_runner=lambda _check, _release: True)

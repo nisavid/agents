@@ -875,9 +875,23 @@ def _protected_executable_bytes(path: Path, label: str, expected_digest: str) ->
     if path.is_symlink():
         raise PortableInstallError(f"{label} must not be a symlink")
     try:
-        resolved = path.resolve(strict=True)
-        current = Path(resolved.anchor)
+        current = Path(path.anchor)
         allowed_owners = {0, os.geteuid()}
+        for part in path.parts[1:-1]:
+            current /= part
+            metadata = current.lstat()
+            sticky_root = metadata.st_uid == 0 and metadata.st_mode & stat.S_ISVTX
+            if current.is_symlink() or not stat.S_ISDIR(metadata.st_mode):
+                raise PortableInstallError(f"{label} ancestry is not protected")
+            if metadata.st_uid not in allowed_owners or (
+                metadata.st_mode & 0o022 and not sticky_root
+            ):
+                raise PortableInstallError(f"{label} ancestry is not protected")
+            _reject_extended_acl(current, f"{label} ancestry")
+        resolved = path.resolve(strict=True)
+        if resolved != path:
+            raise PortableInstallError(f"{label} path is not canonical")
+        current = Path(resolved.anchor)
         for part in resolved.parts[1:-1]:
             current /= part
             metadata = current.lstat()
@@ -1617,10 +1631,11 @@ def sha256_fd(descriptor):
 
 def protected_resolver(path, expected_digest):
     allowed_owners = {0, os.geteuid()}
-    if path.is_symlink():
+    if not path.is_absolute():
         raise ValueError("unsafe resolver executable")
-    path = path.resolve(strict=True)
     protected_ancestry(path.parent, allow_root_symlinks=False)
+    if path.is_symlink() or path.resolve(strict=True) != path:
+        raise ValueError("unsafe resolver executable")
     descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     try:
         metadata = os.fstat(descriptor)
@@ -1937,9 +1952,11 @@ except (OSError, ValueError):
 if len(entry_matches) != 1 or sha256(target) != entry_matches[0].get("sha256"):
     raise SystemExit("managed entrypoint digest mismatch")
 resolver = config["credential_resolver"]
-resolver_path = root / "credential-resolver"
 try:
-    resolver_path = protected_resolver(resolver_path, resolver["sha256"])
+    resolver_path = protected_resolver(
+        Path(resolver["path"]),
+        resolver["sha256"],
+    )
 except (OSError, ValueError):
     raise SystemExit("credential resolver is not protected") from None
 credentials = spec.get("credentials", [])
@@ -2850,6 +2867,13 @@ class PortableInstallationManager:
                 return False
             time.sleep(min(0.5, remaining))
 
+    def _validate_credential_resolver_binding(self) -> None:
+        _protected_executable_bytes(
+            self.config.credential_resolver.path,
+            "credential resolver",
+            self.config.credential_resolver.sha256,
+        )
+
     def _validate_external_bindings(self) -> BindingSnapshot:
         inventory_snapshot = _snapshot_regular_file(
             self.config.inventory_path, "inventory"
@@ -2866,11 +2890,7 @@ class PortableInstallationManager:
         zsh_executable = _protected_executable_path(
             self.config.zsh_executable, "Zsh executable"
         )
-        _protected_executable_bytes(
-            self.config.credential_resolver.path,
-            "credential resolver",
-            self.config.credential_resolver.sha256,
-        )
+        self._validate_credential_resolver_binding()
         effective_config = self.config.to_dict()
         effective_config.update(
             {
@@ -4823,6 +4843,7 @@ class PortableInstallationManager:
                 raise PortableInstallError("installation is absent")
             self._verify_installed_locked(state)
             installed = self._installed_manager(state)
+            installed._validate_credential_resolver_binding()
             current = state["current"]
             target = state["last_known_good"]
             if current["release_digest"] != expected_current_digest:
@@ -5085,6 +5106,7 @@ class PortableInstallationManager:
                 return {"status": "absent", "data_preserved": True}
             self._verify_installed_locked(state)
             installed = self._installed_manager(state)
+            installed._validate_credential_resolver_binding()
             installed._verify_all_releases(state)
             self._audit_owned_install_tree(state)
             tombstone = self._uninstall_tombstone_path

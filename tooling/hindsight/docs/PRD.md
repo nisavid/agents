@@ -593,12 +593,15 @@ raw Hindsight bank selection remains an implementation detail.
 - Install, upgrade, and rollback are journaled transitions. Failed or
   interrupted activation restores the verified prestate; explicit rollback is
   compare-and-swap bound to the observed active release digest.
-- Managed service manifests contain no resolved secret. A digest-bound,
-  owner- and mode-protected resolver is copied into the private install root,
-  receives opaque locators out of band, and injects the exact values only into
-  the authorized child environment. Credential bindings use a positive set of
-  Hindsight secret destinations and cannot target process-control environment
-  names. The launcher runs under the configured Python with isolated mode.
+- Managed service manifests contain no resolved secret. The installer keeps a
+  protected copy of the digest-bound resolver as ownership and rollback
+  evidence, while every managed launch revalidates and executes the exact
+  configured resolver path so native credential-store ACLs remain authoritative.
+  The resolver receives opaque locators out of band and injects the exact values
+  only into the authorized child environment. Credential bindings use a positive
+  set of Hindsight secret destinations and cannot target process-control
+  environment names. The launcher runs under the configured Python with isolated
+  mode.
 - A launchd integration job checks compatible harness integration upgrades when
   loaded and daily. A systemd-user timer checks two minutes after its user
   manager starts and daily. Hindsight server, database, provider, embedding,

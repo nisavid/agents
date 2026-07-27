@@ -2889,7 +2889,7 @@ class PortableInstallationManager:
         *,
         replacing_loaded_job: bool,
     ) -> None:
-        deadline = time.monotonic() + 3.0
+        deadline = time.monotonic() + LAUNCHD_EXIT_TIMEOUT_SECONDS
         while True:
             try:
                 self._command_runner(
@@ -3360,7 +3360,11 @@ class PortableInstallationManager:
             else:
                 _atomic_write(path, content, 0o600, private_parent=False)
 
-    def _activate_services(self) -> None:
+    def _activate_services(
+        self,
+        *,
+        retry_bootstrap_after_stop: bool = False,
+    ) -> None:
         if self.config.platform == "launchd":
             domain = f"gui/{os.getuid()}"
             self._preflight_service_manager(absent_ok=True)
@@ -3380,7 +3384,9 @@ class PortableInstallationManager:
                 self._bootstrap_launchd(
                     domain,
                     plist,
-                    replacing_loaded_job=replacing_loaded_job,
+                    replacing_loaded_job=(
+                        replacing_loaded_job or retry_bootstrap_after_stop
+                    ),
                 )
                 self._command_runner(
                     ("/bin/launchctl", "kickstart", "-k", f"{domain}/{item.label}")
@@ -4285,7 +4291,7 @@ class PortableInstallationManager:
             self._remove_release_record(candidate)
         if prior_manager is None:
             raise PortableInstallError("installation transaction prestate is invalid")
-        prior_manager._activate_services()
+        prior_manager._activate_services(retry_bootstrap_after_stop=True)
         prior_manager._verify_service_manager()
         if not prior_manager._health(prior["current"]):
             raise PortableInstallError(
@@ -4478,7 +4484,9 @@ class PortableInstallationManager:
                 )
                 if self._prepare_data_identity(initial=False) != data_identity:
                     raise PortableInstallError("data identity changed")
-                self._activate_services()
+                self._activate_services(
+                    retry_bootstrap_after_stop=prior is not None
+                )
                 self._verify_service_manager()
                 if not self._health(release):
                     raise PortableInstallError("health verification failed")
@@ -4995,7 +5003,7 @@ class PortableInstallationManager:
                         for key in ("version", "release_digest", "release_path")
                     },
                 )
-                installed._activate_services()
+                installed._activate_services(retry_bootstrap_after_stop=True)
                 installed._verify_service_manager()
                 if not installed._health(target):
                     raise PortableInstallError("rollback health verification failed")
@@ -5191,7 +5199,7 @@ class PortableInstallationManager:
         self._restore_manifests(preimage)
         self._verify_installed_locked(state)
         installed = self._installed_manager(state)
-        installed._activate_services()
+        installed._activate_services(retry_bootstrap_after_stop=True)
         installed._verify_service_manager()
         if not installed._health(state["current"]):
             raise PortableInstallError("uninstall recovery health check failed")

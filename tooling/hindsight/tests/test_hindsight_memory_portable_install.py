@@ -3401,6 +3401,27 @@ class PortableInstallationManagerTest(unittest.TestCase):
 
         self.assertEqual(calls, 2)
 
+    def test_launchd_retries_transient_bootstrap_after_an_explicit_stop(self) -> None:
+        manager = self.manager(health_runner=lambda _check, _release: True)
+        manager.install(self.release("1.0.0"), version="1.0.0")
+        manager._deactivate_services()
+        bootstrap_calls = 0
+
+        def transient_runner(argv: tuple[str, ...]) -> str | None:
+            nonlocal bootstrap_calls
+            if argv[:2] == ("/bin/launchctl", "bootstrap"):
+                bootstrap_calls += 1
+                if bootstrap_calls == 1:
+                    raise _ManagedServiceCommandError(5)
+            return self.runner(argv)
+
+        manager._command_runner = transient_runner
+
+        manager._activate_services(retry_bootstrap_after_stop=True)
+
+        self.assertEqual(bootstrap_calls, 3)
+        self.assertEqual(manager.service_status()["status"], "running")
+
     def test_launchd_does_not_retry_a_fresh_invalid_bootstrap(self) -> None:
         manager = self.manager()
         manager._command_runner = lambda _argv: (_ for _ in ()).throw(
@@ -3413,6 +3434,24 @@ class PortableInstallationManagerTest(unittest.TestCase):
                 self.service_root / "owned.plist",
                 replacing_loaded_job=False,
             )
+
+    def test_fresh_install_does_not_retry_an_invalid_launchd_bootstrap(self) -> None:
+        manager = self.manager(health_runner=lambda _check, _release: True)
+        bootstrap_calls = 0
+
+        def invalid_bootstrap_runner(argv: tuple[str, ...]) -> str | None:
+            nonlocal bootstrap_calls
+            if argv[:2] == ("/bin/launchctl", "bootstrap"):
+                bootstrap_calls += 1
+                raise _ManagedServiceCommandError(5)
+            return self.runner(argv)
+
+        manager._command_runner = invalid_bootstrap_runner
+
+        with self.assertRaises(_ManagedServiceCommandError):
+            manager.install(self.release("1.0.0"), version="1.0.0")
+
+        self.assertEqual(bootstrap_calls, 1)
 
     def test_systemd_refuses_to_restart_or_disable_a_foreign_fragment(self) -> None:
         data = self.config_data(platform="systemd-user")

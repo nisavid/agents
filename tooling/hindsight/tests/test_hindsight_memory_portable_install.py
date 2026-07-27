@@ -3570,7 +3570,7 @@ class PortableInstallationManagerTest(unittest.TestCase):
         child.write_text(
             "#!/usr/bin/env python3\n"
             "import json, os, pathlib, sys\n"
-            'pathlib.Path(sys.argv[1]).write_text(json.dumps({"secret": os.environ.get("HINDSIGHT_API_KEY"), "ambient": os.environ.get("UNRELATED_AMBIENT"), "release_path": os.environ.get("CAPTURE_RELEASE"), "inventory": os.environ.get("HINDSIGHT_MEMORY_INVENTORY"), "uvx": os.environ.get("HINDSIGHT_EMBED_UVX_EXECUTABLE"), "path": os.environ.get("PATH"), "isolated": sys.flags.isolated}))\n',
+            'pathlib.Path(sys.argv[1]).write_text(json.dumps({"secret": os.environ.get("HINDSIGHT_API_KEY"), "ambient": os.environ.get("UNRELATED_AMBIENT"), "release_path": os.environ.get("CAPTURE_RELEASE"), "inventory": os.environ.get("HINDSIGHT_MEMORY_INVENTORY"), "uvx": os.environ.get("HINDSIGHT_EMBED_UVX_EXECUTABLE"), "npx": os.environ.get("HINDSIGHT_EMBED_NPX_EXECUTABLE"), "path": os.environ.get("PATH"), "isolated": sys.flags.isolated}))\n',
             encoding="utf-8",
         )
         child.chmod(0o755)
@@ -3631,6 +3631,7 @@ class PortableInstallationManagerTest(unittest.TestCase):
             str((self.install_root / "managed-inventory.json").resolve()),
         )
         self.assertEqual(captured["uvx"], "/usr/bin/true")
+        self.assertEqual(captured["npx"], str(npx))
         self.assertEqual(captured["path"], f"{npx_directory}:/usr/bin:/bin")
         self.assertEqual(captured["isolated"], 1)
         for path in self.service_root.glob("*"):

@@ -38,7 +38,39 @@ case "$uvx_directory" in
     exit 69
     ;;
 esac
-PATH="$uvx_directory:/usr/bin:/bin:/usr/sbin:/sbin"
+
+npx_executable=${HINDSIGHT_EMBED_NPX_EXECUTABLE:-}
+if [ -z "$npx_executable" ]; then
+  printf '%s\n' \
+    'hindsight-embed-uvx: HINDSIGHT_EMBED_NPX_EXECUTABLE is required' >&2
+  exit 69
+fi
+case "$npx_executable" in
+  /*) ;;
+  *)
+    printf '%s\n' \
+      'hindsight-embed-uvx: HINDSIGHT_EMBED_NPX_EXECUTABLE must be absolute' >&2
+    exit 69
+    ;;
+esac
+if [ ! -f "$npx_executable" ] || [ ! -x "$npx_executable" ]; then
+  printf '%s\n' \
+    'hindsight-embed-uvx: configured npx is unavailable or not executable' >&2
+  exit 69
+fi
+
+npx_directory=${npx_executable%/*}
+if [ -z "$npx_directory" ]; then
+  npx_directory=/
+fi
+case "$npx_directory" in
+  *:*)
+    printf '%s\n' \
+      'hindsight-embed-uvx: configured npx directory is not PATH-safe' >&2
+    exit 69
+    ;;
+esac
+PATH="$uvx_directory:$npx_directory:/usr/bin:/bin:/usr/sbin:/sbin"
 export PATH
 
 exec "$uvx_executable" --from 'hindsight-embed==0.8.4' "$@"

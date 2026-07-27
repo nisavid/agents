@@ -36,10 +36,12 @@ stack commands on exactly `hindsight-embed==0.8.4`; upgrading the Hindsight
 server remains an explicit, separately validated release decision. The
 top-level `uvx_executable` selects the protected absolute `uvx` runtime; the
 installer validates it and the managed launcher injects it without consulting
-the service's `PATH`. The top-level `npx_executable` selects the protected UI
-package runner; the launcher prepends only its validated directory to the
-closed service path. The top-level `zsh_executable` similarly pins Zsh
-entrypoints to a protected runtime invoked with startup files disabled.
+ambient `PATH`. The top-level `npx_executable` selects the protected UI package
+runner. The launcher supplies both exact executable bindings to the
+release-owned embed wrapper, which constructs its child `PATH` from only their
+validated directories and protected system directories. The top-level
+`zsh_executable` similarly pins Zsh entrypoints to a protected runtime invoked
+with startup files disabled.
 
 The resolver receives one strict JSON object on standard input:
 

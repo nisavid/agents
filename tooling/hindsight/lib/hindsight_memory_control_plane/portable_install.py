@@ -2116,13 +2116,15 @@ if relative.as_posix() == "bin/hindsight-hook-authority-supervisor":
         controller_entries[0]["sha256"]
     )
 try:
+    npx_alias = Path(state["npx_alias"])
     npx_directory = str(
         protected_external_executable(
-            Path(state["npx_alias"]), Path(config["npx_executable"])
+            npx_alias, Path(config["npx_executable"])
         )
     )
 except (KeyError, TypeError):
     raise SystemExit("managed npx binding is not protected") from None
+environment["HINDSIGHT_EMBED_NPX_EXECUTABLE"] = str(npx_alias)
 path_entries = environment.get("PATH", "/usr/bin:/bin").split(":")
 environment["PATH"] = ":".join(
     [npx_directory, *(entry for entry in path_entries if entry != npx_directory)]

@@ -340,10 +340,14 @@ The installer validates a closed JSON schema. Use paths such as
 `bin/hindsight-memory`, never absolute paths or `release://` values, for
 release-owned entrypoints. Use `release://bin/hindsight-embed-uvx` for the
 `HINDSIGHT_EMBED_UVX` environment binding; that protected wrapper always runs
-`hindsight-embed==0.8.4`. `release://` environment values resolve only inside
-the verified active release. The credential resolver must match its declared
-SHA-256 digest and implement the request and response protocol in the portable
-consumer example.
+`hindsight-embed==0.8.4`. The managed launcher supplies both validated runtime
+bindings: `HINDSIGHT_EMBED_UVX_EXECUTABLE` for the pinned server package runner
+and `HINDSIGHT_EMBED_NPX_EXECUTABLE` for the UI's Node package runner. The
+wrapper reconstructs a closed child `PATH` from those two executable
+directories and protected system directories. `release://` environment values
+resolve only inside the verified active release. The credential resolver must
+match its declared SHA-256 digest and implement the request and response
+protocol in the portable consumer example.
 
 The installer queries the systemd user manager for its `XDG_CONFIG_HOME` and
 requires `service_root` to match that manager-visible unit directory before any
@@ -362,20 +366,26 @@ api_port=7979
 bank_id=engineering
 worker_id='replace-with-stable-consumer-and-profile-id'
 uvx_executable=/absolute/path/to/uvx
+npx_executable=/absolute/path/to/npx
 
 HINDSIGHT_EMBED_UVX_EXECUTABLE="$uvx_executable" \
+HINDSIGHT_EMBED_NPX_EXECUTABLE="$npx_executable" \
   tooling/hindsight/bin/hindsight-embed-uvx hindsight-embed configure \
   --profile "$profile" --port "$api_port"
 HINDSIGHT_EMBED_UVX_EXECUTABLE="$uvx_executable" \
+HINDSIGHT_EMBED_NPX_EXECUTABLE="$npx_executable" \
   tooling/hindsight/bin/hindsight-embed-uvx hindsight-embed profile set-env \
   "$profile" HINDSIGHT_BANK_ID "$bank_id"
 HINDSIGHT_EMBED_UVX_EXECUTABLE="$uvx_executable" \
+HINDSIGHT_EMBED_NPX_EXECUTABLE="$npx_executable" \
   tooling/hindsight/bin/hindsight-embed-uvx hindsight-embed profile set-env \
   "$profile" HINDSIGHT_API_AUDIT_LOG_ENABLED false
 HINDSIGHT_EMBED_UVX_EXECUTABLE="$uvx_executable" \
+HINDSIGHT_EMBED_NPX_EXECUTABLE="$npx_executable" \
   tooling/hindsight/bin/hindsight-embed-uvx hindsight-embed profile set-env \
   "$profile" HINDSIGHT_API_LLM_TRACE_ENABLED false
 HINDSIGHT_EMBED_UVX_EXECUTABLE="$uvx_executable" \
+HINDSIGHT_EMBED_NPX_EXECUTABLE="$npx_executable" \
   tooling/hindsight/bin/hindsight-embed-uvx hindsight-embed profile set-env \
   "$profile" HINDSIGHT_API_WORKER_ID "$worker_id"
 ```

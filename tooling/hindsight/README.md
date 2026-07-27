@@ -161,9 +161,11 @@ digest-verified active release. The example stack binds
 `HINDSIGHT_EMBED_UVX=release://bin/hindsight-embed-uvx`; this release-owned
 wrapper pins managed server commands to `hindsight-embed==0.8.4`.
 The installer requires a working Python 3.11 or newer and validates the
-configured absolute Python, `uvx`, and Zsh executables' ownership, mode,
+configured absolute Python, `npx`, `uvx`, and Zsh executables' ownership, mode,
 ancestry, and ACLs. The managed launcher binds those exact paths to release
-wrappers and entrypoints without consulting `PATH`.
+wrappers and entrypoints without consulting ambient `PATH`; the embed wrapper
+constructs its child `PATH` from only the validated `uvx` and `npx`
+directories plus protected system directories.
 Credential resolution receives one bounded
 strict-JSON request and
 must return one bounded strict-JSON response containing exactly the requested

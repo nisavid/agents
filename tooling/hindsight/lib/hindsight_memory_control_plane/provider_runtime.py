@@ -167,7 +167,7 @@ class ProviderIdentity:
         return self.matches_values(
             provider=str(getattr(member, "provider", "")),
             model=getattr(member, "model", None),
-            base_url=str(getattr(member, "base_url", "")),
+            base_url=getattr(member, "base_url", ""),
             credential_marker=getattr(member, "api_key", None),
         )
 
@@ -184,7 +184,9 @@ class ProviderIdentity:
         if model != self.model:
             return False
         try:
-            normalized_base_url = _base_url(base_url)
+            normalized_base_url = _base_url(
+                "" if base_url is None else base_url
+            )
         except ProviderRuntimeCompatibilityError:
             return False
         if normalized_base_url != self.base_url:

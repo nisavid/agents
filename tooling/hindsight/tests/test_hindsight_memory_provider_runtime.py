@@ -167,6 +167,17 @@ class ProviderRuntimePolicyTest(unittest.TestCase):
 
         self.assertEqual(policy.match(runtime_member).id, "fallback")
 
+    def test_matching_canonicalizes_an_unset_runtime_base_url(self) -> None:
+        policy = ProviderRuntimePolicy.load(policy_data())
+        runtime_member = types.SimpleNamespace(
+            provider="openai-codex",
+            model="codex-model",
+            base_url=None,
+            api_key="provider-policy:personal",
+        )
+
+        self.assertEqual(policy.match(runtime_member).id, "personal")
+
     def test_credential_markers_are_non_secret_member_references(self) -> None:
         invalid = policy_data()
         invalid["members"][0]["identity"]["credential_marker"] = "actual-secret-value"
@@ -415,7 +426,7 @@ class HindsightProviderAdapterTest(unittest.TestCase):
             personal = CodexLLM(
                 provider="openai-codex",
                 api_key="provider-policy:personal",
-                base_url="",
+                base_url=None,
                 model="codex-model",
                 reasoning_effort="xhigh",
             )

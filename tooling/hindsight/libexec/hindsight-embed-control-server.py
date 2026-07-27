@@ -25,6 +25,7 @@ PROFILE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 COMPONENTS = frozenset({"daemon", "ui"})
 STATES = frozenset({"running", "stopped"})
 CONTROL_PID_LOCK_NAME = ".control-pid.lifecycle.lock"
+COMPONENT_LIFECYCLE_LOCK_NAME = ".lifecycle.lock"
 MANAGED_CODEX_MARKER = "provider-policy:work-codex"
 MANAGED_CODEX_MODEL = "gpt-5.3-codex-spark"
 PROVIDER_PRESET_ENV = {
@@ -437,7 +438,11 @@ def remove_desired_state(root: Path, profile: str, component: str) -> None:
 
 
 def _wait_for_running(
-    status_action, profile: str, timeout: int
+    status_action,
+    profile: str,
+    timeout: int,
+    root: Path,
+    components: tuple[str, ...],
 ) -> Any:
     deadline = time.monotonic() + timeout
     while True:
@@ -448,10 +453,112 @@ def _wait_for_running(
             False,
         ):
             return result
+        if any(
+            desired_state(root, profile, component) != "running"
+            for component in components
+        ):
+            return result
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return result
         time.sleep(min(0.25, remaining))
+
+
+def _component_lifecycle_state_dir(
+    desired_state_dir: Path,
+    environ: Mapping[str, str] = os.environ,
+) -> Path:
+    desired_state_dir = Path(
+        os.path.abspath(desired_state_dir.expanduser())
+    )
+    configured = environ.get("HINDSIGHT_EMBED_STATE_DIR", "").strip()
+    if not configured:
+        return desired_state_dir.parent
+    state_dir = Path(os.path.abspath(Path(configured).expanduser()))
+    configured_desired = environ.get(
+        "HINDSIGHT_EMBED_DESIRED_STATE_DIR",
+        str(state_dir / "desired"),
+    )
+    expected_desired = Path(
+        os.path.abspath(Path(configured_desired).expanduser())
+    )
+    if desired_state_dir != expected_desired:
+        raise ValueError("managed lifecycle state binding disagrees")
+    return state_dir
+
+
+def _lifecycle_operation_label(action) -> str:
+    label = getattr(action, "__name__", "")
+    if (
+        not isinstance(label, str)
+        or not label
+        or len(label) > 128
+        or any(ord(character) < 0x20 for character in label)
+    ):
+        return "managed lifecycle action"
+    return label
+
+
+@contextlib.contextmanager
+def _component_lifecycle_lock(
+    desired_state_dir: Path,
+    *,
+    timeout: float,
+    operation: str,
+):
+    if (
+        type(timeout) not in {int, float}
+        or not 0 < timeout <= 3600
+        or not isinstance(operation, str)
+        or not operation
+        or len(operation) > 128
+        or any(ord(character) < 0x20 for character in operation)
+    ):
+        raise ValueError("component lifecycle lock request is invalid")
+    state_dir = _component_lifecycle_state_dir(desired_state_dir)
+    parent = _open_absolute_directory(
+        state_dir,
+        create=True,
+        private=True,
+        label="lifecycle state directory",
+    )
+    descriptor: int | None = None
+    locked = False
+    try:
+        descriptor = os.open(
+            COMPONENT_LIFECYCLE_LOCK_NAME,
+            os.O_RDWR
+            | os.O_CREAT
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=parent,
+        )
+        _validate_private_file(os.fstat(descriptor), "component lifecycle lock")
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(
+                    descriptor,
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+                locked = True
+                break
+            except BlockingIOError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        "timed out acquiring component lifecycle lock "
+                        f"for {operation}"
+                    ) from None
+                time.sleep(min(0.05, remaining))
+        yield
+    finally:
+        if descriptor is not None:
+            if locked:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+        os.close(parent)
 
 
 def _supervised_running_action(
@@ -460,23 +567,34 @@ def _supervised_running_action(
     root: Path,
     components: tuple[str, ...],
     profile_lock,
+    lifecycle_lock,
     timeout: int,
     stop_action=None,
 ):
     @functools.wraps(action)
     def wrapped(profile: str):
         with profile_lock(profile):
-            for component in components:
-                set_desired_state(root, profile, component, "running")
-            if stop_action is not None:
-                stopped = stop_action(profile)
-                if not getattr(stopped, "ok", True) or getattr(
-                    stopped,
-                    "running",
-                    False,
-                ):
-                    return stopped
-            return _wait_for_running(status_action, profile, timeout)
+            with lifecycle_lock(
+                timeout=timeout,
+                operation=_lifecycle_operation_label(action),
+            ):
+                for component in components:
+                    set_desired_state(root, profile, component, "running")
+                if stop_action is not None:
+                    stopped = stop_action(profile)
+                    if not getattr(stopped, "ok", True) or getattr(
+                        stopped,
+                        "running",
+                        False,
+                    ):
+                        return stopped
+        return _wait_for_running(
+            status_action,
+            profile,
+            timeout,
+            root,
+            components,
+        )
 
     return wrapped
 
@@ -486,6 +604,8 @@ def _stopping_action(
     root: Path,
     components: tuple[str, ...],
     profile_lock,
+    lifecycle_lock,
+    timeout: int,
 ):
     def restore(profile: str, previous: dict[str, str | None]) -> None:
         for component, state in previous.items():
@@ -505,28 +625,36 @@ def _stopping_action(
     @functools.wraps(action)
     def wrapped(profile: str):
         with profile_lock(profile):
-            previous = {
-                component: desired_state(root, profile, component)
-                for component in components
-            }
-            try:
-                for component in components:
-                    set_desired_state(root, profile, component, "stopped")
-            except Exception:
-                restore(profile, previous)
-                raise
-            try:
-                result = action(profile)
-            except Exception:
-                restore(profile, previous)
-                raise
-            if not getattr(result, "ok", True) or getattr(
-                result,
-                "running",
-                False,
+            with lifecycle_lock(
+                timeout=timeout,
+                operation=_lifecycle_operation_label(action),
             ):
-                restore(profile, previous)
-            return result
+                previous = {
+                    component: desired_state(root, profile, component)
+                    for component in components
+                }
+                try:
+                    for component in components:
+                        set_desired_state(root, profile, component, "stopped")
+                except Exception:
+                    restore(profile, previous)
+                    raise
+                try:
+                    # The intent transition and stop action are one
+                    # cross-process critical section. Releasing this lock
+                    # before the stop completes lets a reconciliation that
+                    # read the prior running intent restart the component.
+                    result = action(profile)
+                except Exception:
+                    restore(profile, previous)
+                    raise
+                if not getattr(result, "ok", True) or getattr(
+                    result,
+                    "running",
+                    False,
+                ):
+                    restore(profile, previous)
+                return result
 
     return wrapped
 
@@ -544,6 +672,10 @@ def install_lifecycle_hooks(service, desired_state_dir: Path) -> None:
         with locks_guard:
             return locks.setdefault(profile, threading.RLock())
 
+    lifecycle_lock = functools.partial(
+        _component_lifecycle_lock,
+        desired_state_dir,
+    )
     daemon_status = getattr(service, "daemon_status", None)
     ui_status = getattr(service, "ui_status", None)
     if not callable(daemon_status) or not callable(ui_status):
@@ -576,6 +708,7 @@ def install_lifecycle_hooks(service, desired_state_dir: Path) -> None:
         desired_state_dir,
         ("daemon",),
         profile_lock,
+        lifecycle_lock,
         daemon_timeout,
     )
     service.restart_daemon = _supervised_running_action(
@@ -584,6 +717,7 @@ def install_lifecycle_hooks(service, desired_state_dir: Path) -> None:
         desired_state_dir,
         ("daemon",),
         profile_lock,
+        lifecycle_lock,
         daemon_timeout,
         stop_daemon,
     )
@@ -592,6 +726,8 @@ def install_lifecycle_hooks(service, desired_state_dir: Path) -> None:
         desired_state_dir,
         ("daemon", "ui"),
         profile_lock,
+        lifecycle_lock,
+        daemon_timeout,
     )
     service.start_ui = _supervised_running_action(
         start_ui,
@@ -599,6 +735,7 @@ def install_lifecycle_hooks(service, desired_state_dir: Path) -> None:
         desired_state_dir,
         ("daemon", "ui"),
         profile_lock,
+        lifecycle_lock,
         ui_timeout,
     )
     service.restart_ui = _supervised_running_action(
@@ -607,6 +744,7 @@ def install_lifecycle_hooks(service, desired_state_dir: Path) -> None:
         desired_state_dir,
         ("daemon", "ui"),
         profile_lock,
+        lifecycle_lock,
         ui_timeout,
         stop_ui,
     )
@@ -615,6 +753,8 @@ def install_lifecycle_hooks(service, desired_state_dir: Path) -> None:
         desired_state_dir,
         ("ui",),
         profile_lock,
+        lifecycle_lock,
+        ui_timeout,
     )
 
 

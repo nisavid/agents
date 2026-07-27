@@ -65,6 +65,15 @@ class ControlServerHooksTest(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.state_dir = Path(self.temporary.name) / "desired"
+        environment = patch.dict(
+            os.environ,
+            {
+                "HINDSIGHT_EMBED_STATE_DIR": str(self.state_dir.parent),
+                "HINDSIGHT_EMBED_DESIRED_STATE_DIR": str(self.state_dir),
+            },
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
         self.providers = SimpleNamespace(
             ProviderInfo=ProviderInfo,
             PROVIDER_CATALOG=(ProviderInfo("openai", "OpenAI", True),),
@@ -456,6 +465,162 @@ class ControlServerHooksTest(unittest.TestCase):
         self.assertEqual(self.desired("example-profile", "daemon"), "running")
         self.assertEqual(self.desired("example-profile", "ui"), "running")
 
+    def test_stop_waits_for_supervisor_lifecycle_lock(self):
+        entered = threading.Event()
+        service = SimpleNamespace(
+            start_daemon=lambda _profile: DaemonResult(
+                ok=True, running=True
+            ),
+            restart_daemon=lambda _profile: DaemonResult(
+                ok=True, running=True
+            ),
+            stop_daemon=lambda _profile: DaemonResult(
+                ok=True, running=False
+            ),
+            daemon_status=lambda _profile: DaemonResult(
+                ok=True, running=True
+            ),
+            start_ui=lambda _profile: UiResult(running=True),
+            restart_ui=lambda _profile: UiResult(running=True),
+            stop_ui=self.module.functools.partial(
+                lambda _profile: (
+                    entered.set() or UiResult(running=False)
+                )
+            ),
+            ui_status=lambda _profile: UiResult(running=True),
+        )
+        self.module.install_lifecycle_hooks(service, self.state_dir)
+        lifecycle_lock = self.state_dir.parent / ".lifecycle.lock"
+        lifecycle_lock.touch(mode=0o600)
+        descriptor = os.open(lifecycle_lock, os.O_RDWR)
+        self.addCleanup(os.close, descriptor)
+        self.module.fcntl.flock(descriptor, self.module.fcntl.LOCK_EX)
+        self.addCleanup(
+            self.module.fcntl.flock,
+            descriptor,
+            self.module.fcntl.LOCK_UN,
+        )
+
+        thread = threading.Thread(
+            target=service.stop_ui,
+            args=("locked-profile",),
+            daemon=True,
+        )
+        lock_attempted = threading.Event()
+        real_flock = self.module.fcntl.flock
+
+        def observe_flock(fd: int, operation: int) -> None:
+            if (
+                fd != descriptor
+                and operation & self.module.fcntl.LOCK_EX
+                and operation & self.module.fcntl.LOCK_NB
+            ):
+                lock_attempted.set()
+            real_flock(fd, operation)
+
+        with patch.object(
+            self.module.fcntl,
+            "flock",
+            side_effect=observe_flock,
+        ):
+            thread.start()
+            self.assertTrue(lock_attempted.wait(timeout=1))
+            self.assertFalse(entered.is_set())
+            self.assertIsNone(
+                self.module.desired_state(
+                    self.state_dir,
+                    "locked-profile",
+                    "ui",
+                )
+            )
+            real_flock(descriptor, self.module.fcntl.LOCK_UN)
+            thread.join(timeout=1)
+
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(entered.is_set())
+        self.assertEqual(
+            self.desired("locked-profile", "ui"),
+            "stopped",
+        )
+
+    def test_lifecycle_lock_timeout_names_the_blocked_operation(self):
+        lifecycle_lock = self.state_dir.parent / ".lifecycle.lock"
+        lifecycle_lock.touch(mode=0o600)
+        descriptor = os.open(lifecycle_lock, os.O_RDWR)
+        self.addCleanup(os.close, descriptor)
+        self.module.fcntl.flock(descriptor, self.module.fcntl.LOCK_EX)
+        self.addCleanup(
+            self.module.fcntl.flock,
+            descriptor,
+            self.module.fcntl.LOCK_UN,
+        )
+
+        with self.assertRaisesRegex(
+            TimeoutError,
+            "stop ui",
+        ):
+            with self.module._component_lifecycle_lock(
+                self.state_dir,
+                timeout=0.01,
+                operation="stop ui",
+            ):
+                self.fail("contended lifecycle lock was acquired")
+
+    def test_stop_cancels_a_stalled_start_without_waiting_for_timeout(self):
+        status_entered = threading.Event()
+        start_results = []
+
+        def ui_status(_profile) -> UiResult:
+            status_entered.set()
+            return UiResult(running=False)
+
+        service = SimpleNamespace(
+            start_daemon=lambda _profile: DaemonResult(
+                ok=True, running=True
+            ),
+            restart_daemon=lambda _profile: DaemonResult(
+                ok=True, running=True
+            ),
+            stop_daemon=lambda _profile: DaemonResult(
+                ok=True, running=False
+            ),
+            daemon_status=lambda _profile: DaemonResult(
+                ok=True, running=True
+            ),
+            start_ui=lambda _profile: UiResult(running=True),
+            restart_ui=lambda _profile: UiResult(running=True),
+            stop_ui=lambda _profile: UiResult(running=False),
+            ui_status=ui_status,
+        )
+        with patch.dict(
+            os.environ,
+            {"HINDSIGHT_EMBED_UI_WAIT_SECONDS": "1"},
+        ):
+            self.module.install_lifecycle_hooks(service, self.state_dir)
+
+        thread = threading.Thread(
+            target=lambda: start_results.append(
+                service.start_ui("cancel-profile")
+            ),
+            daemon=True,
+        )
+        thread.start()
+        self.assertTrue(status_entered.wait(timeout=1))
+
+        started = self.module.time.monotonic()
+        stopped = service.stop_ui("cancel-profile")
+        elapsed = self.module.time.monotonic() - started
+        thread.join(timeout=0.5)
+
+        self.assertLess(elapsed, 0.5)
+        self.assertFalse(stopped.running)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(start_results, [UiResult(running=False)])
+        self.assertEqual(
+            self.desired("cancel-profile", "ui"),
+            "stopped",
+        )
+
     def test_start_waits_for_supervisor_without_direct_launch(self):
         ready = threading.Event()
         completed = threading.Event()
@@ -675,6 +840,8 @@ class ControlServerHooksTest(unittest.TestCase):
                 self.state_dir,
                 ("daemon", "ui"),
                 lambda _profile: self.module.threading.Lock(),
+                lambda **_kwargs: self.module.contextlib.nullcontext(),
+                1,
             )
             with self.assertRaisesRegex(
                 ValueError,

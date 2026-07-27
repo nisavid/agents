@@ -394,6 +394,8 @@ component_credential_scopes="$tmp_dir/component-credential-scopes"
   export TEST_DATA_PLANE_TOKEN=test-data-plane-token
   export TEST_MINT_AUTHORITY=test-mint-authority
   export TEST_UI_ACCESS_KEY=test-ui-access-key
+  export HINDSIGHT_EMBED_CONTROL_SERVER="$tmp_dir/managed-control-server.py"
+  export HINDSIGHT_EMBED_DESIRED_STATE_DIR="$tmp_dir/managed-desired-state"
   source "$rendered_stack_lib"
   hindsight_stack_load_config() { return 0 }
   hindsight_stack_ensure_profile_ports() { return 0 }
@@ -653,6 +655,28 @@ if (
 fi
 [[ ! -e "$sync_start_waits" ]] || {
   print -ru2 -- "stack waited after a synchronous component-start failure"
+  exit 1
+}
+
+managed_control_start_events="$tmp_dir/managed-control-start-events"
+(
+  source "$rendered_stack_lib"
+  HINDSIGHT_EMBED_CONTROL_SERVER="$tmp_dir/managed-control-server.py"
+  HINDSIGHT_EMBED_DESIRED_STATE_DIR="$tmp_dir/managed-desired-state"
+  HINDSIGHT_EMBED_CONTROL_PORT=7878
+  HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS=30
+  HINDSIGHT_EMBED_PYTHON=/managed/python
+  hindsight_stack_load_config() { return 0 }
+  hindsight_stack_runtime_active() { return 0 }
+  hindsight_stack_preflight_runtime_credentials() { return 0 }
+  hindsight_stack_run_bounded() {
+    print -rl -- "$@" >"$managed_control_start_events"
+  }
+  hindsight_stack_control_start
+)
+[[ "$(paste -sd, - <"$managed_control_start_events")" == \
+  "30,/managed/python,-I,$tmp_dir/managed-control-server.py,start,--port,7878,--desired-state-dir,$tmp_dir/managed-desired-state" ]] || {
+  print -ru2 -- "active control start bypassed the managed desired-state wrapper"
   exit 1
 }
 

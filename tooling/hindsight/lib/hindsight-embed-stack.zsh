@@ -968,6 +968,19 @@ hindsight_stack_require_runtime_helpers() {
 
   hindsight_stack_require_trusted_artifact \
     "$HINDSIGHT_EMBED_PYTHON" "Hindsight embed Python" executable allow-symlink || return 1
+  if hindsight_stack_runtime_active; then
+    [[ -n "${HINDSIGHT_EMBED_CONTROL_SERVER:-}" ]] || {
+      print -ru2 -- "hindsight-embed-stack: active runtime requires HINDSIGHT_EMBED_CONTROL_SERVER"
+      return 1
+    }
+    hindsight_stack_require_trusted_artifact \
+      "$HINDSIGHT_EMBED_CONTROL_SERVER" "control server" readable allow-symlink || return 1
+    hindsight_stack_run_bounded "$HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS" \
+      "$HINDSIGHT_EMBED_PYTHON" -I "$HINDSIGHT_EMBED_CONTROL_SERVER" --help >/dev/null 2>&1 || {
+      print -ru2 -- "hindsight-embed-stack: control server failed import/preflight at ${HINDSIGHT_EMBED_CONTROL_SERVER}"
+      return 1
+    }
+  fi
   hindsight_stack_require_trusted_artifact \
     "$HINDSIGHT_EMBED_STOP_HELPER" "stop helper" readable allow-symlink || return 1
   hindsight_stack_run_bounded "$HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS" \
@@ -2245,6 +2258,14 @@ hindsight_stack_control_start() {
   hindsight_stack_load_config || return 1
   hindsight_stack_preflight_runtime_credentials || return 1
 
+  if hindsight_stack_runtime_active; then
+    [[ -n "${HINDSIGHT_EMBED_CONTROL_SERVER:-}" ]] || return 1
+    hindsight_stack_run_bounded "$HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS" \
+      "$HINDSIGHT_EMBED_PYTHON" -I "$HINDSIGHT_EMBED_CONTROL_SERVER" start \
+      --port "$HINDSIGHT_EMBED_CONTROL_PORT" \
+      --desired-state-dir "$HINDSIGHT_EMBED_DESIRED_STATE_DIR"
+    return
+  fi
   hindsight_stack_run_bounded "$HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS" \
     "$HINDSIGHT_EMBED_UVX" hindsight-embed control start --no-open \
     --port "$HINDSIGHT_EMBED_CONTROL_PORT" >/dev/null 2>&1

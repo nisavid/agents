@@ -21,8 +21,10 @@ class HindsightEmbedUvxTest(unittest.TestCase):
             fake_uvx = root / "uvx"
             fake_uvx.write_text(
                 "#!/bin/sh\n"
-                '"$PYTHON_FOR_TEST" -c \'import json, os, sys; '
-                "open(os.environ[\"CAPTURE\"], \"w\").write(json.dumps(sys.argv[1:]))' "
+                '"$PYTHON_FOR_TEST" -c \'import json, os, shutil, sys; '
+                "open(os.environ[\"CAPTURE\"], \"w\").write(json.dumps({"
+                "\"argv\": sys.argv[1:], \"path\": os.environ[\"PATH\"], "
+                "\"nested_uvx\": shutil.which(\"uvx\")}))' "
                 '"$@"\n',
                 encoding="utf-8",
             )
@@ -31,7 +33,7 @@ class HindsightEmbedUvxTest(unittest.TestCase):
             environment = {
                 "CAPTURE": str(capture),
                 "HINDSIGHT_EMBED_UVX_EXECUTABLE": str(fake_uvx),
-                "PATH": f"{root}:/usr/bin:/bin",
+                "PATH": "/usr/bin:/bin",
                 "PYTHON_FOR_TEST": sys.executable,
             }
             result = subprocess.run(
@@ -51,7 +53,7 @@ class HindsightEmbedUvxTest(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(
-                json.loads(capture.read_text(encoding="utf-8")),
+                json.loads(capture.read_text(encoding="utf-8"))["argv"],
                 [
                     "--from",
                     "hindsight-embed==0.8.4",
@@ -62,6 +64,12 @@ class HindsightEmbedUvxTest(unittest.TestCase):
                     "status",
                 ],
             )
+            observed = json.loads(capture.read_text(encoding="utf-8"))
+            self.assertEqual(
+                observed["path"],
+                f"{root}:/usr/bin:/bin:/usr/sbin:/sbin",
+            )
+            self.assertEqual(observed["nested_uvx"], str(fake_uvx))
 
     def test_wrapper_ignores_path_without_a_configured_uvx(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -80,6 +88,28 @@ class HindsightEmbedUvxTest(unittest.TestCase):
 
             self.assertEqual(result.returncode, 69)
             self.assertIn("HINDSIGHT_EMBED_UVX_EXECUTABLE", result.stderr)
+
+    def test_wrapper_rejects_a_colon_in_the_configured_uvx_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            unsafe = Path(temporary) / "unsafe:path"
+            unsafe.mkdir()
+            fake_uvx = unsafe / "uvx"
+            fake_uvx.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            fake_uvx.chmod(0o700)
+
+            result = subprocess.run(
+                [str(WRAPPER), "hindsight-embed", "daemon", "status"],
+                check=False,
+                capture_output=True,
+                env={
+                    "HINDSIGHT_EMBED_UVX_EXECUTABLE": str(fake_uvx),
+                    "PATH": "/usr/bin:/bin",
+                },
+                text=True,
+            )
+
+            self.assertEqual(result.returncode, 69)
+            self.assertIn("directory is not PATH-safe", result.stderr)
 
     def test_wrapper_rejects_other_uvx_commands(self) -> None:
         result = subprocess.run(

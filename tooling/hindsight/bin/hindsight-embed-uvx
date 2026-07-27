@@ -27,4 +27,18 @@ if [ ! -f "$uvx_executable" ] || [ ! -x "$uvx_executable" ]; then
   exit 69
 fi
 
+uvx_directory=${uvx_executable%/*}
+if [ -z "$uvx_directory" ]; then
+  uvx_directory=/
+fi
+case "$uvx_directory" in
+  *:*)
+    printf '%s\n' \
+      'hindsight-embed-uvx: configured uvx directory is not PATH-safe' >&2
+    exit 69
+    ;;
+esac
+PATH="$uvx_directory:/usr/bin:/bin:/usr/sbin:/sbin"
+export PATH
+
 exec "$uvx_executable" --from 'hindsight-embed==0.8.4' "$@"

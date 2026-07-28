@@ -239,6 +239,14 @@ timeout, and retry mechanics. Consumers supply the closed policy shape shown in
 The policy contains OAuth-home locators, never resolved paths or credential
 values.
 
+The Hindsight strategy selects linear failover or round-robin request starts.
+Both modes use the policy's declared member order and try each member at most
+once per request. Round-robin wraps from the last member to the first. A
+provider-reported usage reset is a hint, not a durable exclusion: the runtime
+caps it to `default_usage_limit_cooldown_seconds` and probes the account again.
+Startup verification is bounded independently of member request timeouts, so an
+offline fallback cannot prevent the API from starting.
+
 The repository policy is a schema example, not a deployable failover chain.
 Its `example.invalid` endpoint is deliberately non-routable. Consumers must
 replace every example member identity, endpoint, model, locator, and ordering

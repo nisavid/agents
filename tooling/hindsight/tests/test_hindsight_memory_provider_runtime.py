@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import importlib.util
 import json
 import logging
@@ -17,6 +18,7 @@ HINDSIGHT_ROOT = Path(__file__).resolve().parent.parent
 LIB = HINDSIGHT_ROOT / "lib"
 sys.path.insert(0, str(LIB))
 
+import hindsight_memory_control_plane.provider_runtime as provider_runtime  # noqa: E402
 from hindsight_memory_control_plane.provider_runtime import (  # noqa: E402
     HindsightProviderAdapter,
     ProviderRuntimeCompatibilityError,
@@ -98,6 +100,67 @@ def policy_data() -> dict[str, object]:
                 "quota_cooldown": False,
             },
         ],
+    }
+
+
+def four_codex_policy_data() -> dict[str, object]:
+    value = copy.deepcopy(policy_data())
+    personal, work, fallback = value["members"]
+    alt1 = copy.deepcopy(personal)
+    alt1["id"] = "alt1"
+    alt1["identity"]["credential_marker"] = "provider-policy:alt1"
+    alt1["credential"]["locator"] = "oauth-home:alt1"
+    alt2 = copy.deepcopy(personal)
+    alt2["id"] = "alt2"
+    alt2["identity"]["credential_marker"] = "provider-policy:alt2"
+    alt2["credential"]["locator"] = "oauth-home:alt2"
+    value["failover_order"] = ["work", "personal", "alt1", "alt2", "fallback"]
+    value["members"] = [work, personal, alt1, alt2, fallback]
+    return value
+
+
+def four_codex_homes() -> dict[str, str]:
+    return {
+        "oauth-home:work": "/tmp/work-codex",
+        "oauth-home:personal": "/tmp/personal-codex",
+        "oauth-home:alt1": "/tmp/alt1-codex",
+        "oauth-home:alt2": "/tmp/alt2-codex",
+    }
+
+
+class StaticMember:
+    def __init__(
+        self,
+        provider: str,
+        model: str,
+        base_url: str,
+        api_key: str,
+        result: str | BaseException,
+    ) -> None:
+        self.provider = provider
+        self.model = model
+        self.base_url = base_url
+        self.api_key = api_key
+        self.result = result
+        self.calls = 0
+
+    async def call(self, **_kwargs):
+        self.calls += 1
+        if isinstance(self.result, BaseException):
+            raise self.result
+        return self.result
+
+
+def four_codex_members() -> dict[str, StaticMember]:
+    return {
+        member_id: StaticMember(
+            "openai-codex",
+            "codex-model",
+            "",
+            f"provider-policy:{member_id}",
+            member_id,
+        )
+        for member_id in ("work", "personal", "alt1", "alt2")
     }
 
 
@@ -383,8 +446,17 @@ class HindsightProviderAdapterTest(unittest.TestCase):
                 self.kwargs = kwargs
 
         class MultiLLMProvider:
+            def __init__(self) -> None:
+                self._members = []
+                self._strategy = types.SimpleNamespace(mode="failover")
+                self.verification = None
+
             async def _dispatch(self, _method_name: str, **_kwargs):
                 return None
+
+            async def verify_connection(self) -> None:
+                if self.verification is not None:
+                    await self.verification()
 
         multi_module = types.ModuleType("hindsight_api.engine.multi_llm")
         multi_module.MultiLLMProvider = MultiLLMProvider
@@ -401,14 +473,19 @@ class HindsightProviderAdapterTest(unittest.TestCase):
         }
         return modules, LLMProvider, CodexLLM, MultiLLMProvider
 
-    def install(self):
+    def install(
+        self,
+        *,
+        policy_value: dict[str, object] | None = None,
+        homes: dict[str, str] | None = None,
+    ):
         modules, *classes = self.runtime_modules()
-        homes = {
+        homes = homes or {
             "oauth-home:personal": "/tmp/personal-codex",
             "oauth-home:work": "/tmp/work-codex",
         }
         adapter = HindsightProviderAdapter(
-            ProviderRuntimePolicy.load(policy_data()),
+            ProviderRuntimePolicy.load(policy_value or policy_data()),
             credential_resolver=homes.__getitem__,
             version_resolver=lambda: "0.8.4",
         )
@@ -483,6 +560,32 @@ class HindsightProviderAdapterTest(unittest.TestCase):
         )
         self.assertEqual(
             asyncio.run(nearby.call(max_retries=7))["max_retries"], 7
+        )
+
+    def test_install_resolves_four_independent_codex_homes(self) -> None:
+        homes = four_codex_homes()
+        _LLMProvider, CodexLLM, _MultiLLMProvider = self.install(
+            policy_value=four_codex_policy_data(),
+            homes=homes,
+        )
+
+        resolved = {}
+        for member_id in ("work", "personal", "alt1", "alt2"):
+            resolved[member_id] = CodexLLM(
+                provider="openai-codex",
+                api_key=f"provider-policy:{member_id}",
+                base_url="",
+                model="codex-model",
+            ).codex_home
+
+        self.assertEqual(
+            resolved,
+            {
+                "work": "/tmp/work-codex",
+                "personal": "/tmp/personal-codex",
+                "alt1": "/tmp/alt1-codex",
+                "alt2": "/tmp/alt2-codex",
+            },
         )
 
     def test_reinstalling_the_same_policy_is_an_idempotent_noop(self) -> None:
@@ -681,6 +784,216 @@ class HindsightProviderAdapterTest(unittest.TestCase):
         self.assertEqual((personal.calls, work.calls, fallback.calls), (1, 2, 0))
         self.assertNotIn("credential-secret-must-not-be-logged", "\n".join(logs.output))
         self.assertNotIn("inf", "\n".join(logs.output).lower())
+
+    def test_round_robin_rotates_four_codex_accounts_and_hatchery(self) -> None:
+        _LLMProvider, _CodexLLM, MultiLLMProvider = self.install(
+            policy_value=four_codex_policy_data(),
+            homes=four_codex_homes(),
+        )
+
+        codex_members = four_codex_members()
+        fallback = StaticMember(
+            "lmstudio",
+            "private-fallback-model",
+            "http://inference.example.test:13305/v1",
+            "",
+            "fallback",
+        )
+        provider = MultiLLMProvider()
+        provider._strategy.mode = "round-robin"
+        provider._members = [
+            fallback,
+            codex_members["alt2"],
+            codex_members["alt1"],
+            codex_members["personal"],
+            codex_members["work"],
+        ]
+
+        observed = [
+            asyncio.run(provider._dispatch("call"))
+            for _request in range(6)
+        ]
+
+        self.assertEqual(
+            observed,
+            ["work", "personal", "alt1", "alt2", "fallback", "work"],
+        )
+
+    def test_round_robin_hatchery_failure_wraps_to_codex_once(self) -> None:
+        _LLMProvider, _CodexLLM, MultiLLMProvider = self.install(
+            policy_value=four_codex_policy_data(),
+            homes=four_codex_homes(),
+        )
+
+        codex_members = four_codex_members()
+        fallback = StaticMember(
+            "lmstudio",
+            "private-fallback-model",
+            "http://inference.example.test:13305/v1",
+            "",
+            ConnectionError("fallback offline"),
+        )
+        provider = MultiLLMProvider()
+        provider._strategy.mode = "round-robin"
+        provider._members = [
+            codex_members["personal"],
+            fallback,
+            codex_members["alt2"],
+            codex_members["work"],
+            codex_members["alt1"],
+        ]
+
+        self.assertEqual(asyncio.run(provider._dispatch("call")), "work")
+        self.assertEqual(asyncio.run(provider._dispatch("call")), "personal")
+        self.assertEqual(asyncio.run(provider._dispatch("call")), "alt1")
+        self.assertEqual(asyncio.run(provider._dispatch("call")), "alt2")
+        with self.assertLogs("test-provider-runtime", level="WARNING"):
+            self.assertEqual(asyncio.run(provider._dispatch("call")), "work")
+
+        self.assertEqual(
+            (
+                codex_members["work"].calls,
+                codex_members["personal"].calls,
+                codex_members["alt1"].calls,
+                codex_members["alt2"].calls,
+                fallback.calls,
+            ),
+            (2, 1, 1, 1, 1),
+        )
+
+    def test_usage_limit_reset_hint_is_capped_to_the_probe_cooldown(self) -> None:
+        class Response:
+            status_code = 429
+
+            @staticmethod
+            def json():
+                return {
+                    "error": {
+                        "type": "usage_limit_reached",
+                        "resets_at": 99_999,
+                    }
+                }
+
+        class UsageLimit(Exception):
+            response = Response()
+
+        self.assertEqual(
+            provider_runtime._usage_limit_reset_at(
+                UsageLimit(),
+                now=1_000,
+                default_cooldown=300,
+            ),
+            1_300,
+        )
+
+    def test_fallback_verification_timeout_does_not_block_startup(self) -> None:
+        _LLMProvider, _CodexLLM, MultiLLMProvider = self.install()
+
+        provider = MultiLLMProvider()
+
+        async def never_finishes() -> None:
+            await asyncio.Event().wait()
+
+        provider.verification = never_finishes
+        with mock.patch.object(
+            provider_runtime,
+            "STARTUP_LLM_VERIFICATION_TIMEOUT_SECONDS",
+            0.01,
+        ), self.assertLogs("test-provider-runtime", level="WARNING") as logs:
+            asyncio.run(asyncio.wait_for(provider.verify_connection(), timeout=0.1))
+
+        self.assertIn(
+            "LLM startup verification exceeded 0.01s",
+            "\n".join(logs.output),
+        )
+
+    def test_fast_startup_verification_failure_does_not_block_startup(self) -> None:
+        _LLMProvider, _CodexLLM, MultiLLMProvider = self.install()
+
+        provider = MultiLLMProvider()
+
+        async def fails_fast() -> None:
+            raise ConnectionError("fallback DNS unavailable")
+
+        provider.verification = fails_fast
+        with self.assertLogs("test-provider-runtime", level="WARNING") as logs:
+            asyncio.run(provider.verify_connection())
+
+        rendered_logs = "\n".join(logs.output)
+        self.assertIn(
+            "LLM startup verification failed with ConnectionError",
+            rendered_logs,
+        )
+        self.assertNotIn("fallback DNS unavailable", rendered_logs)
+
+    def test_expired_cooldown_allows_only_one_concurrent_probe(self) -> None:
+        policy = ProviderRuntimePolicy.load(policy_data())
+        runtime = provider_runtime._ProviderRuntime(
+            policy,
+            credential_resolver=lambda locator: f"/tmp/{locator.split(':')[-1]}",
+            logger=logging.getLogger("test-provider-runtime-probe"),
+            clock=lambda: 1_300,
+        )
+        runtime._cooldowns["personal"] = 1_300
+
+        personal_started = asyncio.Event()
+        release_personal = asyncio.Event()
+
+        class ProbeMember(StaticMember):
+            async def call(self, **_kwargs):
+                self.calls += 1
+                personal_started.set()
+                await release_personal.wait()
+                return self.result
+
+        personal = ProbeMember(
+            "openai-codex",
+            "codex-model",
+            "",
+            "provider-policy:personal",
+            "personal",
+        )
+        work = StaticMember(
+            "openai-codex",
+            "codex-model",
+            "",
+            "provider-policy:work",
+            "work",
+        )
+        fallback = StaticMember(
+            "lmstudio",
+            "private-fallback-model",
+            "http://inference.example.test:13305/v1",
+            "",
+            "fallback",
+        )
+
+        async def scenario() -> tuple[str, str]:
+            first = asyncio.create_task(
+                runtime.dispatch(
+                    [fallback, work, personal],
+                    "call",
+                    {},
+                    lambda exc: isinstance(exc, Exception),
+                    strategy_mode="failover",
+                )
+            )
+            await personal_started.wait()
+            second = asyncio.create_task(
+                runtime.dispatch(
+                    [personal, fallback, work],
+                    "call",
+                    {},
+                    lambda exc: isinstance(exc, Exception),
+                    strategy_mode="failover",
+                )
+            )
+            await asyncio.sleep(0)
+            release_personal.set()
+            return await first, await second
+
+        self.assertEqual(asyncio.run(scenario()), ("personal", "work"))
+        self.assertEqual((personal.calls, work.calls), (1, 1))
 
     def test_member_gate_serializes_and_prioritizes_interactive_work(self) -> None:
         LLMProvider, _CodexLLM, _MultiLLMProvider = self.install()

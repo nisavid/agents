@@ -236,6 +236,7 @@ hindsight_stack_load_config() {
   typeset -g HINDSIGHT_EMBED_STOP_WAIT_SECONDS="${HINDSIGHT_EMBED_STOP_WAIT_SECONDS:-30}"
   typeset -g HINDSIGHT_EMBED_START_COOLDOWN_SECONDS="${HINDSIGHT_EMBED_START_COOLDOWN_SECONDS:-20}"
   typeset -g HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS="${HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS:-300}"
+  typeset -g HINDSIGHT_EMBED_STATUS_PROBE_TIMEOUT_SECONDS="${HINDSIGHT_EMBED_STATUS_PROBE_TIMEOUT_SECONDS:-5}"
   local timeout_name timeout_value timeout_max
   for timeout_name timeout_max in \
     HINDSIGHT_EMBED_CONTROL_WAIT_SECONDS 3600 \
@@ -246,7 +247,8 @@ hindsight_stack_load_config() {
     HINDSIGHT_MEMORY_BROKER_WAIT_SECONDS 3600 \
     HINDSIGHT_EMBED_STOP_WAIT_SECONDS 3600 \
     HINDSIGHT_EMBED_START_COOLDOWN_SECONDS 3600 \
-    HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS 300; do
+    HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS 300 \
+    HINDSIGHT_EMBED_STATUS_PROBE_TIMEOUT_SECONDS 30; do
     timeout_value="${(P)timeout_name}"
     if [[ "$timeout_name" == HINDSIGHT_EMBED_START_COOLDOWN_SECONDS ]]; then
       hindsight_stack_validate_seconds "$timeout_value" "$timeout_name" "$timeout_max" 0 || return 1
@@ -3264,20 +3266,23 @@ hindsight_stack_stop_all() {
 hindsight_stack_status_word() {
   emulate -L zsh
   local component="$1"
+  local probe_timeout="${2:-$HINDSIGHT_EMBED_STATUS_PROBE_TIMEOUT_SECONDS}"
 
   case "$component" in
     broker)
-      if hindsight_stack_broker_status && hindsight_stack_broker_identity_matches; then
+      if hindsight_stack_broker_status "$probe_timeout" &&
+        hindsight_stack_broker_identity_matches; then
         print -r -- "healthy"
       else
         print -r -- "down"
       fi
       ;;
     control)
-      hindsight_stack_control_status && print -r -- "healthy" || print -r -- "down"
+      hindsight_stack_control_status "$probe_timeout" &&
+        print -r -- "healthy" || print -r -- "down"
       ;;
     daemon)
-      if hindsight_stack_daemon_status; then
+      if hindsight_stack_daemon_status "$probe_timeout"; then
         print -r -- "healthy"
       else
         local desired
@@ -3285,7 +3290,8 @@ hindsight_stack_status_word() {
           print -r -- "unknown"
           return 1
         }
-        if [[ "$desired" == stopped ]] && ! hindsight_stack_daemon_running; then
+        if [[ "$desired" == stopped ]] &&
+          ! hindsight_stack_daemon_running "$probe_timeout"; then
           print -r -- "stopped"
         else
           print -r -- "down"
@@ -3293,7 +3299,7 @@ hindsight_stack_status_word() {
       fi
       ;;
     ui)
-      if hindsight_stack_ui_status; then
+      if hindsight_stack_ui_status "$probe_timeout"; then
         print -r -- "healthy"
       else
         local desired
@@ -3301,7 +3307,8 @@ hindsight_stack_status_word() {
           print -r -- "unknown"
           return 1
         }
-        if [[ "$desired" == stopped ]] && ! hindsight_stack_ui_running; then
+        if [[ "$desired" == stopped ]] &&
+          ! hindsight_stack_ui_running "$probe_timeout"; then
           print -r -- "stopped"
         else
           print -r -- "down"
@@ -3317,11 +3324,13 @@ hindsight_stack_status_word() {
 
 hindsight_stack_status_profile() {
   emulate -L zsh
-  local profile="$1" sidecar
+  local profile="$1" probe_timeout="$2" sidecar
   [[ -z "$requested" || "$requested" == "$profile" ]] || return 0
-  daemon_health="$(hindsight_stack_status_word daemon)" || fleet_health=degraded
+  daemon_health="$(hindsight_stack_status_word daemon "$probe_timeout")" ||
+    fleet_health=degraded
   [[ "$daemon_health" == healthy || "$daemon_health" == stopped ]] || fleet_health=degraded
-  ui_health="$(hindsight_stack_status_word ui)" || fleet_health=degraded
+  ui_health="$(hindsight_stack_status_word ui "$probe_timeout")" ||
+    fleet_health=degraded
   [[ "$ui_health" == healthy || "$ui_health" == stopped ]] || fleet_health=degraded
   sidecar_records=()
   local -a sidecars
@@ -3331,7 +3340,7 @@ hindsight_stack_status_profile() {
   }
   sidecars=("${(@)sidecars:#}")
   for sidecar in "${sidecars[@]}"; do
-    if hindsight_stack_sidecar_status "$sidecar"; then
+    if hindsight_stack_sidecar_status "$sidecar" "$probe_timeout"; then
       sidecar_health=healthy
     else
       sidecar_health=down
@@ -3351,16 +3360,17 @@ hindsight_stack_status_report() {
   emulate -L zsh
   hindsight_stack_load_config || return 1
   hindsight_stack_require_tools || return 1
+  local probe_timeout="$HINDSIGHT_EMBED_STATUS_PROBE_TIMEOUT_SECONDS"
   hindsight_stack_push_profile_state
   hindsight_stack_select_profile "$HINDSIGHT_EMBED_PRIMARY_PROFILE" || {
     hindsight_stack_pop_profile_state
     return 1
   }
-  print -r -- "broker: $(hindsight_stack_status_word broker) (${HINDSIGHT_MEMORY_BROKER_SOCKET})"
-  print -r -- "control: $(hindsight_stack_status_word control) ($(hindsight_stack_http_url "$HINDSIGHT_EMBED_CONTROL_HOSTNAME" "$HINDSIGHT_EMBED_CONTROL_PORT"))"
+  print -r -- "broker: $(hindsight_stack_status_word broker "$probe_timeout") (${HINDSIGHT_MEMORY_BROKER_SOCKET})"
+  print -r -- "control: $(hindsight_stack_status_word control "$probe_timeout") ($(hindsight_stack_http_url "$HINDSIGHT_EMBED_CONTROL_HOSTNAME" "$HINDSIGHT_EMBED_CONTROL_PORT"))"
   local primary_daemon_health primary_ui_health
-  primary_daemon_health="$(hindsight_stack_status_word daemon)"
-  primary_ui_health="$(hindsight_stack_status_word ui)"
+  primary_daemon_health="$(hindsight_stack_status_word daemon "$probe_timeout")"
+  primary_ui_health="$(hindsight_stack_status_word ui "$probe_timeout")"
   print -r -- "daemon: ${primary_daemon_health} (${HINDSIGHT_EMBED_PROFILE}, $(hindsight_stack_http_url 127.0.0.1 "$HINDSIGHT_EMBED_API_PORT"))"
   print -r -- "ui: ${primary_ui_health} (${HINDSIGHT_EMBED_PROFILE}, $(hindsight_stack_ui_url))"
   hindsight_stack_pop_profile_state
@@ -3376,13 +3386,15 @@ hindsight_stack_status_report() {
   fi
 
   local fleet_health=healthy daemon_health ui_health sidecar_health
-  hindsight_stack_broker_status && hindsight_stack_broker_identity_matches || fleet_health=degraded
-  hindsight_stack_control_status || fleet_health=degraded
+  hindsight_stack_broker_status "$probe_timeout" &&
+    hindsight_stack_broker_identity_matches || fleet_health=degraded
+  hindsight_stack_control_status "$probe_timeout" || fleet_health=degraded
   local profile_count="${#profiles}"
   [[ -z "$requested" ]] || profile_count=1
   local profile_label=profiles
   (( profile_count == 1 )) && profile_label=profile
-  hindsight_stack_for_each_profile hindsight_stack_status_profile "$requested" || fleet_health=degraded
+  hindsight_stack_for_each_profile hindsight_stack_status_profile \
+    "$requested" "$probe_timeout" || fleet_health=degraded
   print -r -- "fleet: ${fleet_health} (${profile_count} enabled ${profile_label})"
   print -rl -- "${profile_records[@]}"
   [[ "$fleet_health" == healthy ]]

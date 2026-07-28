@@ -217,12 +217,14 @@ default_startup_timeouts="$tmp_dir/default-startup-timeouts"
 (
   unset HINDSIGHT_EMBED_DAEMON_WAIT_SECONDS
   unset HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS
+  unset HINDSIGHT_EMBED_STATUS_PROBE_TIMEOUT_SECONDS
   source "$rendered_stack_lib"
   hindsight_stack_load_config
   print -r -- "daemon:$HINDSIGHT_EMBED_DAEMON_WAIT_SECONDS" >"$default_startup_timeouts"
   print -r -- "command:$HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS" >>"$default_startup_timeouts"
+  print -r -- "status:$HINDSIGHT_EMBED_STATUS_PROBE_TIMEOUT_SECONDS" >>"$default_startup_timeouts"
 )
-[[ "$(<"$default_startup_timeouts")" == $'daemon:300\ncommand:300' ]] || {
+[[ "$(<"$default_startup_timeouts")" == $'daemon:300\ncommand:300\nstatus:5' ]] || {
   print -ru2 -- "stack defaults do not cover the embedded daemon's bounded startup contract"
   exit 1
 }
@@ -522,6 +524,29 @@ if (
   print -ru2 -- "stack accepted a nonnumeric lifecycle command timeout"
   exit 1
 fi
+
+for valid_status_timeout in 1 30; do
+  (
+    export HINDSIGHT_EMBED_STATUS_PROBE_TIMEOUT_SECONDS="$valid_status_timeout"
+    source "$rendered_stack_lib"
+    hindsight_stack_load_config
+  ) >/dev/null 2>&1 || {
+    print -ru2 -- \
+      "stack rejected status probe timeout boundary ${valid_status_timeout}"
+    exit 1
+  }
+done
+for invalid_status_timeout in 0 00 +5 31 not-a-timeout; do
+  if (
+    export HINDSIGHT_EMBED_STATUS_PROBE_TIMEOUT_SECONDS="$invalid_status_timeout"
+    source "$rendered_stack_lib"
+    hindsight_stack_load_config
+  ) >/dev/null 2>&1; then
+    print -ru2 -- \
+      "stack accepted invalid status probe timeout ${invalid_status_timeout}"
+    exit 1
+  fi
+done
 
 for invalid_base_port in 07979 +7979 0 65536; do
   if (
@@ -940,7 +965,7 @@ chmod 700 "$post_start_reconciler"
   hindsight_stack_validate_fleet() { return 0 }
   hindsight_stack_initialize_desired_state() { return 0 }
   hindsight_stack_validate_trusted_executable() { return 0 }
-  hindsight_stack_run_bounded() { shift; "$@" }
+  hindsight_stack_run_bounded_with_credential_scope() { shift 2; "$@" }
   hindsight_stack_runtime_active() { return 1 }
   hindsight_stack_start_broker_dependency() { return 0 }
   hindsight_stack_start_control_dependency() { return 0 }
@@ -1131,6 +1156,72 @@ while IFS= read -r probe_call; do
     exit 1
   }
 done < "$probe_timeout_calls"
+
+status_probe_calls="$tmp_dir/status-probe-calls"
+(
+  export HOME="$test_home"
+  export HINDSIGHT_EMBED_STATE_DIR="$tmp_dir/status-probe-state"
+  export HINDSIGHT_EMBED_PROFILE="present-profile"
+  export HINDSIGHT_EMBED_PRIMARY_PROFILE="present-profile"
+  export HINDSIGHT_EMBED_FLEET_PROFILES="present-profile"
+  source "$rendered_stack_lib"
+  HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS=300
+  HINDSIGHT_EMBED_STATUS_PROBE_TIMEOUT_SECONDS=5
+  hindsight_stack_broker_status() {
+    print -r -- "broker:$1" >> "$status_probe_calls"
+  }
+  hindsight_stack_broker_identity_matches() { return 0 }
+  hindsight_stack_control_status() {
+    print -r -- "control:$1" >> "$status_probe_calls"
+  }
+  hindsight_stack_daemon_status() {
+    print -r -- "daemon:$1" >> "$status_probe_calls"
+    return 1
+  }
+  hindsight_stack_daemon_running() {
+    print -r -- "daemon-running:$1" >> "$status_probe_calls"
+    return 1
+  }
+  hindsight_stack_ui_status() {
+    print -r -- "ui:$1" >> "$status_probe_calls"
+    return 1
+  }
+  hindsight_stack_ui_running() {
+    print -r -- "ui-running:$1" >> "$status_probe_calls"
+    return 1
+  }
+  hindsight_stack_desired_state() {
+    print -r -- stopped
+  }
+  hindsight_stack_sidecar_names() {
+    print -r -- test-sidecar
+  }
+  hindsight_stack_sidecar_status() {
+    print -r -- "sidecar:$2" >> "$status_probe_calls"
+  }
+  hindsight_stack_sidecar_port() {
+    print -r -- 19000
+  }
+  hindsight_stack_status_report >/dev/null
+)
+while IFS= read -r status_probe_call; do
+  [[ "${status_probe_call#*:}" == 5 ]] || {
+    print -ru2 -- \
+      "status report used the lifecycle timeout for a health probe: ${status_probe_call}"
+    exit 1
+  }
+done < "$status_probe_calls"
+[[ -s "$status_probe_calls" ]] || {
+  print -ru2 -- "status report did not issue bounded component probes"
+  exit 1
+}
+for required_status_probe in daemon-running:5 ui-running:5 sidecar:5; do
+  rg -F -x -q "$required_status_probe" "$status_probe_calls" || {
+    print -ru2 -- \
+      "status report did not exercise bounded ${required_status_probe%%:*} fallback"
+    exit 1
+  }
+done
 
 ui_wait_calls="$tmp_dir/ui-wait-calls"
 (

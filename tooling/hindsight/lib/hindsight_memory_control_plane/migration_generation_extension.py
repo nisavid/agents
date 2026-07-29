@@ -5,9 +5,16 @@ from __future__ import annotations
 import json
 import logging
 import re
+import uuid
+from datetime import datetime
 from typing import Any
 
 from fastapi import APIRouter, Header, HTTPException, Query
+from hindsight_api.engine.memory_engine import count_tokens
+from hindsight_api.engine.operation_metadata import (
+    BatchRetainChildMetadata,
+    BatchRetainParentMetadata,
+)
 from hindsight_api.extensions.tenant import AuthenticationError
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -15,6 +22,7 @@ from hindsight_api.extensions import HttpExtension
 from hindsight_api.models import RequestContext
 
 from .accidental_replay import ReplayError, _document_descriptor
+from .canonical import digest
 
 
 IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,62}\Z")
@@ -23,6 +31,11 @@ BANK_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}\Z")
 GENERATION_TABLE = "hindsight_migration_generation"
 TRIGGER_FUNCTION = "hindsight_bump_migration_generation"
 TRIGGER_NAME = "hindsight_migration_generation_bump"
+GENERIC_IMPORT_GUARD_FUNCTION = "hindsight_guard_generic_import_document"
+GENERIC_IMPORT_GUARD_TRIGGER = "hindsight_generic_import_document_guard"
+GENERIC_IMPORT_TRUNCATE_GUARD_TRIGGER = (
+    "hindsight_generic_import_truncate_guard"
+)
 MAX_SNAPSHOT_ITEMS = 10_000
 PLANNING_STATE_TABLES = (
     "async_operations",
@@ -72,6 +85,36 @@ class ReplayCloseoutAuthority(BaseModel):
     verification_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
     backup_evidence_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
     closeout_plan_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class GenericImportProcessingRequest(BaseModel):
+    """Payload-free target processing evidence request."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    bank_id: str = Field(min_length=1, max_length=256)
+    document_ids: list[str] = Field(
+        min_length=1,
+        max_length=MAX_SNAPSHOT_ITEMS,
+    )
+
+
+class GenericImportRetainRequest(BaseModel):
+    """Generation-bound authority for one generic-import retain."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: int = Field(ge=1, le=1)
+    expected_generation: str = Field(min_length=1, max_length=256)
+    expected_bank_set_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    plan_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    item_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    bank_id: str = Field(min_length=1, max_length=256)
+    document_id: str = Field(min_length=1, max_length=4096)
+    content: str = Field(min_length=1, max_length=65536)
+    timestamp: str = Field(min_length=1, max_length=128)
+    metadata: dict[str, str] = Field(max_length=64)
+    tags: list[str] = Field(max_length=256)
 
 
 def _quoted_identifier(value: str, label: str) -> str:
@@ -170,6 +213,31 @@ class MigrationGenerationHttpExtension(HttpExtension):
                 authority,
             )
 
+        @router.post("/v1/migration/generic-import-processing")
+        async def generic_import_processing(
+            request: GenericImportProcessingRequest,
+            authorization: str | None = Header(default=None),
+        ) -> dict[str, Any]:
+            schema = await self._authenticated_schema(authorization)
+            return await self._read_generic_import_processing(
+                schema,
+                request,
+            )
+
+        @router.post("/v1/migration/generic-import-retain")
+        async def generic_import_retain(
+            request: GenericImportRetainRequest,
+            authorization: str | None = Header(default=None),
+        ) -> dict[str, Any]:
+            schema, request_context = await self._authenticated_context(
+                authorization
+            )
+            return await self._conditional_generic_import_retain(
+                schema,
+                request_context,
+                request,
+            )
+
         return router
 
     async def on_startup(self) -> None:
@@ -201,21 +269,34 @@ class MigrationGenerationHttpExtension(HttpExtension):
         self,
         authorization: str | None,
     ) -> str:
+        schema, _request_context = await self._authenticated_context(
+            authorization
+        )
+        return schema
+
+    async def _authenticated_context(
+        self,
+        authorization: str | None,
+    ) -> tuple[str, RequestContext]:
         token = _bearer_token(authorization)
         memory = self._required_memory()
         tenant_extension = getattr(memory, "tenant_extension", None)
         if tenant_extension is None:
             raise HTTPException(status_code=401, detail="authentication required")
+        request_context = RequestContext(
+            api_key=token,
+            user_initiated=True,
+        )
         try:
             tenant = await tenant_extension.authenticate(
-                RequestContext(api_key=token)
+                request_context
             )
         except AuthenticationError:
             raise HTTPException(
                 status_code=401,
                 detail="authentication failed",
             ) from None
-        return self._schema_name(tenant.schema_name)
+        return self._schema_name(tenant.schema_name), request_context
 
     def _opaque_generation(self, schema: str, generation: int) -> str:
         if type(generation) is not int or generation < 1:
@@ -232,6 +313,10 @@ class MigrationGenerationHttpExtension(HttpExtension):
         quoted_function = _quoted_identifier(
             TRIGGER_FUNCTION,
             "generation trigger function",
+        )
+        quoted_guard_function = _quoted_identifier(
+            GENERIC_IMPORT_GUARD_FUNCTION,
+            "generic import guard function",
         )
         connection_context = await self._connection()
         async with connection_context as connection:
@@ -283,6 +368,93 @@ class MigrationGenerationHttpExtension(HttpExtension):
                 $$
                     """
                 )
+                await connection.execute(
+                    f"""
+                CREATE OR REPLACE FUNCTION
+                    {quoted_schema}.{quoted_guard_function}()
+                RETURNS trigger
+                LANGUAGE plpgsql
+                SECURITY INVOKER
+                SET search_path = pg_catalog
+                AS $$
+                BEGIN
+                    IF TG_OP = 'TRUNCATE'
+                       AND current_setting(
+                           'hindsight.generic_import_closeout',
+                           true
+                       ) IS DISTINCT FROM 'approved'
+                       AND EXISTS (
+                           SELECT 1
+                           FROM {quoted_schema}.documents
+                           WHERE bank_id = 'engineering'
+                             AND id LIKE 'generic-import:%'
+                       )
+                    THEN
+                        RAISE EXCEPTION
+                            'controller-owned generic import documents are immutable'
+                            USING ERRCODE = 'integrity_constraint_violation';
+                    ELSIF TG_OP = 'UPDATE'
+                          AND (
+                              (
+                                  OLD.bank_id = 'engineering'
+                                  AND OLD.id LIKE 'generic-import:%'
+                              )
+                              OR (
+                                  NEW.bank_id = 'engineering'
+                                  AND NEW.id LIKE 'generic-import:%'
+                              )
+                          )
+                          AND (
+                              NEW.id IS DISTINCT FROM OLD.id
+                              OR NEW.bank_id IS DISTINCT FROM OLD.bank_id
+                              OR NEW.original_text
+                                  IS DISTINCT FROM OLD.original_text
+                              OR NEW.content_hash
+                                  IS DISTINCT FROM OLD.content_hash
+                              OR NEW.retain_params
+                                  IS DISTINCT FROM OLD.retain_params
+                              OR NEW.tags IS DISTINCT FROM OLD.tags
+                          )
+                          AND current_setting(
+                              'hindsight.generic_import_closeout',
+                              true
+                          ) IS DISTINCT FROM 'approved'
+                    THEN
+                        RAISE EXCEPTION
+                            'controller-owned generic import documents are immutable'
+                            USING ERRCODE = 'integrity_constraint_violation';
+                    ELSIF TG_OP = 'DELETE'
+                          AND OLD.bank_id = 'engineering'
+                          AND OLD.id LIKE 'generic-import:%'
+                          AND NOT (
+                              OLD.original_text IS NOT DISTINCT FROM ''
+                              AND OLD.content_hash
+                                  IS NOT DISTINCT FROM '__pending__'
+                              AND NOT EXISTS (
+                                  SELECT 1
+                                  FROM {quoted_schema}.memory_units
+                                  WHERE bank_id = OLD.bank_id
+                                    AND document_id = OLD.id
+                              )
+                          )
+                          AND current_setting(
+                              'hindsight.generic_import_closeout',
+                              true
+                          ) IS DISTINCT FROM 'approved'
+                    THEN
+                        RAISE EXCEPTION
+                            'controller-owned generic import documents are immutable'
+                            USING ERRCODE = 'integrity_constraint_violation';
+                    END IF;
+                    RETURN CASE
+                        WHEN TG_OP = 'DELETE' THEN OLD
+                        WHEN TG_OP = 'TRUNCATE' THEN NULL
+                        ELSE NEW
+                    END;
+                END
+                $$
+                    """
+                )
                 tables = await connection.fetch(
                     """
                 SELECT c.relname AS table_name
@@ -330,6 +502,49 @@ class MigrationGenerationHttpExtension(HttpExtension):
                     EXECUTE FUNCTION {quoted_schema}.{quoted_function}()
                         """
                     )
+            quoted_documents = _quoted_identifier(
+                "documents",
+                "generic import document table",
+            )
+            quoted_guard_trigger = _quoted_identifier(
+                GENERIC_IMPORT_GUARD_TRIGGER,
+                "generic import guard trigger",
+            )
+            quoted_truncate_guard_trigger = _quoted_identifier(
+                GENERIC_IMPORT_TRUNCATE_GUARD_TRIGGER,
+                "generic import truncate guard trigger",
+            )
+            async with connection.transaction():
+                await connection.execute(
+                    f"""
+                DROP TRIGGER IF EXISTS {quoted_guard_trigger}
+                ON {quoted_schema}.{quoted_documents}
+                    """
+                )
+                await connection.execute(
+                    f"""
+                DROP TRIGGER IF EXISTS {quoted_truncate_guard_trigger}
+                ON {quoted_schema}.{quoted_documents}
+                    """
+                )
+                await connection.execute(
+                    f"""
+                CREATE TRIGGER {quoted_truncate_guard_trigger}
+                BEFORE TRUNCATE
+                ON {quoted_schema}.{quoted_documents}
+                FOR EACH STATEMENT
+                EXECUTE FUNCTION {quoted_schema}.{quoted_guard_function}()
+                    """
+                )
+                await connection.execute(
+                    f"""
+                CREATE TRIGGER {quoted_guard_trigger}
+                BEFORE UPDATE OR DELETE
+                ON {quoted_schema}.{quoted_documents}
+                FOR EACH ROW
+                EXECUTE FUNCTION {quoted_schema}.{quoted_guard_function}()
+                    """
+                )
 
     async def _read_generation(self, schema: str) -> int:
         connection_context = await self._connection()
@@ -338,6 +553,331 @@ class MigrationGenerationHttpExtension(HttpExtension):
                 connection,
                 schema,
             )
+
+    async def _read_generic_import_processing(
+        self,
+        schema: str,
+        request: GenericImportProcessingRequest,
+    ) -> dict[str, Any]:
+        document_ids = request.document_ids
+        if (
+            request.bank_id != "engineering"
+            or len(document_ids) != len(set(document_ids))
+            or document_ids != sorted(document_ids)
+            or any(
+                re.fullmatch(
+                    r"generic-import:[0-9a-f]{64}",
+                    document_id,
+                )
+                is None
+                or len(document_id.encode("utf-8")) > 4096
+                or any(
+                    character in document_id
+                    for character in "\r\n\0"
+                )
+                for document_id in document_ids
+            )
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="generic import processing request is invalid",
+            )
+        quoted_schema = _quoted_identifier(schema, "tenant schema")
+        connection_context = await self._connection()
+        async with connection_context as connection:
+            async with connection.transaction(
+                isolation="repeatable_read",
+                readonly=True,
+            ):
+                before = await self._read_generation_on_connection(
+                    connection,
+                    schema,
+                )
+                rows = await connection.fetch(
+                    f"""
+                    SELECT document.id AS target_document_id,
+                           count(memory.id)::bigint AS memory_unit_count,
+                           count(memory.id) FILTER (
+                               WHERE memory.embedding IS NOT NULL
+                           )::bigint AS embedded_memory_unit_count
+                    FROM {quoted_schema}.documents AS document
+                    LEFT JOIN {quoted_schema}.memory_units AS memory
+                      ON memory.bank_id = document.bank_id
+                     AND memory.document_id = document.id
+                    WHERE document.bank_id = 'engineering'
+                      AND document.id = ANY($1::text[])
+                    GROUP BY document.id
+                    ORDER BY document.id
+                    """,
+                    document_ids,
+                )
+                after = await self._read_generation_on_connection(
+                    connection,
+                    schema,
+                )
+        documents = [dict(row) for row in rows]
+        if (
+            before != after
+            or [item.get("target_document_id") for item in documents]
+            != document_ids
+            or any(
+                type(item.get("memory_unit_count")) is not int
+                or item["memory_unit_count"] < 1
+                or type(item.get("embedded_memory_unit_count")) is not int
+                or item["embedded_memory_unit_count"]
+                != item["memory_unit_count"]
+                for item in documents
+            )
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="generic import processing is incomplete",
+            )
+        return {
+            "schema_version": 1,
+            "generation_before":
+                self._opaque_generation(schema, before),
+            "generation_after":
+                self._opaque_generation(schema, after),
+            "documents": documents,
+        }
+
+    async def _conditional_generic_import_retain(
+        self,
+        schema: str,
+        request_context: RequestContext,
+        request: GenericImportRetainRequest,
+    ) -> dict[str, Any]:
+        """Atomically validate controller authority and enqueue one retain."""
+
+        metadata = request.metadata
+        tags = request.tags
+        try:
+            raw_timestamp = request.timestamp
+            if raw_timestamp.endswith("Z"):
+                raw_timestamp = raw_timestamp[:-1] + "+00:00"
+            timestamp = datetime.fromisoformat(
+                raw_timestamp
+            )
+        except ValueError:
+            timestamp = None
+        if (
+            request.schema_version != 1
+            or request.bank_id != "engineering"
+            or not request.document_id.startswith("generic-import:")
+            or len(request.document_id) != len("generic-import:") + 64
+            or re.fullmatch(
+                r"generic-import:[0-9a-f]{64}",
+                request.document_id,
+            )
+            is None
+            or any(character in request.document_id for character in "\r\n\0")
+            or len(request.content.encode("utf-8")) > 65536
+            or timestamp is None
+            or timestamp.tzinfo is None
+            or timestamp.utcoffset() is None
+            or any(
+                not key
+                or len(key.encode("utf-8")) > 256
+                or len(value.encode("utf-8")) > 4096
+                or any(character in key + value for character in "\r\n\0")
+                for key, value in metadata.items()
+            )
+            or metadata.get("generic_import_plan_digest")
+            != request.plan_digest
+            or metadata.get("generic_import_item_digest")
+            != request.item_digest
+            or tags != sorted(tags)
+            or len(tags) != len(set(tags))
+            or any(
+                not tag
+                or len(tag.encode("utf-8")) > 256
+                or any(character in tag for character in "\r\n\0")
+                for tag in tags
+            )
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="generic import retain request is invalid",
+            )
+
+        content_item = {
+            "content": request.content,
+            "document_id": request.document_id,
+            "event_date": request.timestamp,
+            "metadata": metadata,
+            "tags": tags,
+            "update_mode": "replace",
+        }
+        memory = self._required_memory()
+        operation_validator = getattr(memory, "_operation_validator", None)
+        if operation_validator is not None:
+            from hindsight_api.extensions import RetainContext
+
+            context = RetainContext(
+                bank_id="engineering",
+                contents=[dict(content_item)],
+                request_context=request_context,
+            )
+            result = await memory._validate_operation(
+                operation_validator.validate_retain(context)
+            )
+            if (
+                result is not None
+                and result.contents is not None
+                and result.contents != [content_item]
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="generic import retain validation changed content",
+                )
+
+        parent_operation_id = uuid.uuid4()
+        child_operation_id = uuid.uuid4()
+        parent_metadata = BatchRetainParentMetadata(
+            items_count=1,
+            total_tokens=count_tokens(request.content),
+            num_sub_batches=1,
+        )
+        child_metadata = BatchRetainChildMetadata(
+            items_count=1,
+            parent_operation_id=str(parent_operation_id),
+            sub_batch_index=1,
+            total_sub_batches=1,
+        )
+        task_payload = {
+            "type": "batch_retain",
+            "operation_id": str(child_operation_id),
+            "bank_id": "engineering",
+            "contents": [content_item],
+        }
+        if request_context.tenant_id:
+            task_payload["_tenant_id"] = request_context.tenant_id
+        if request_context.api_key_id:
+            task_payload["_api_key_id"] = request_context.api_key_id
+
+        quoted_schema = _quoted_identifier(schema, "tenant schema")
+        quoted_table = _quoted_identifier(
+            GENERATION_TABLE,
+            "generation table",
+        )
+        backend = await memory._get_backend()
+        pre_generation = 0
+        accepted_generation = 0
+        async with backend.acquire() as connection:
+            async with connection.transaction(isolation="serializable"):
+                generation_row = await connection.fetchrow(
+                    f"""
+                    SELECT generation
+                    FROM {quoted_schema}.{quoted_table}
+                    WHERE singleton
+                    FOR UPDATE
+                    """
+                )
+                if generation_row is None:
+                    raise RuntimeError("migration generation is unavailable")
+                pre_generation = await self._read_generation_on_connection(
+                    connection,
+                    schema,
+                )
+                if (
+                    generation_row["generation"] != pre_generation
+                    or self._opaque_generation(schema, pre_generation)
+                    != request.expected_generation
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="generic import retain generation drifted",
+                    )
+                bank_rows = await connection.fetch(
+                    f"""
+                    SELECT bank_id
+                    FROM {quoted_schema}.banks
+                    ORDER BY bank_id
+                    """
+                )
+                bank_ids = [row["bank_id"] for row in bank_rows]
+                if (
+                    "engineering" not in bank_ids
+                    or "codex" in bank_ids
+                    or digest(bank_ids) != request.expected_bank_set_digest
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="generic import retain bank set drifted",
+                    )
+                active_operations = await connection.fetch(
+                    f"""
+                    SELECT operation_id::text AS operation_id
+                    FROM {quoted_schema}.async_operations
+                    WHERE status IN ('pending', 'processing')
+                    ORDER BY operation_id
+                    LIMIT 1
+                    """
+                )
+                if active_operations:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="generic import retain queue is not idle",
+                    )
+                existing_document = await connection.fetchrow(
+                    f"""
+                    SELECT id
+                    FROM {quoted_schema}.documents
+                    WHERE bank_id = 'engineering'
+                      AND id = $1
+                    """,
+                    request.document_id,
+                )
+                if existing_document is not None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="generic import retain target already exists",
+                    )
+                await connection.execute(
+                    f"""
+                    INSERT INTO {quoted_schema}.async_operations (
+                        operation_id,
+                        bank_id,
+                        operation_type,
+                        result_metadata,
+                        status,
+                        task_payload
+                    )
+                    VALUES ($1, 'engineering', 'batch_retain', $2, 'pending', NULL),
+                           ($3, 'engineering', 'retain', $4, 'pending', $5::jsonb)
+                    """,
+                    parent_operation_id,
+                    json.dumps(parent_metadata.to_dict()),
+                    child_operation_id,
+                    json.dumps(child_metadata.to_dict()),
+                    json.dumps(task_payload),
+                )
+                accepted_generation = (
+                    await self._read_generation_on_connection(
+                        connection,
+                        schema,
+                    )
+                )
+                if accepted_generation <= pre_generation:
+                    raise RuntimeError(
+                        "generic import retain generation did not advance"
+                    )
+
+        await memory._task_backend.submit_task(task_payload)
+        return {
+            "schema_version": 1,
+            "status": "accepted",
+            "operation_id": str(parent_operation_id),
+            "pre_generation": self._opaque_generation(
+                schema,
+                pre_generation,
+            ),
+            "accepted_generation": self._opaque_generation(
+                schema,
+                accepted_generation,
+            ),
+        }
 
     async def _read_generation_on_connection(
         self,
@@ -368,6 +908,22 @@ class MigrationGenerationHttpExtension(HttpExtension):
                                    AND t.tgenabled <> 'D'
                              )
                        ) AS missing_trigger_count
+                       ,(
+                           SELECT count(*)
+                           FROM pg_catalog.pg_class AS c
+                           JOIN pg_catalog.pg_namespace AS n
+                             ON n.oid = c.relnamespace
+                           WHERE n.nspname = $1
+                             AND c.relname = 'documents'
+                             AND c.relkind IN ('r', 'p')
+                             AND (
+                                 SELECT count(*)
+                                 FROM pg_catalog.pg_trigger AS t
+                                 WHERE t.tgrelid = c.oid
+                                   AND t.tgname = ANY($5::text[])
+                                   AND t.tgenabled IN ('O', 'A')
+                             ) <> 2
+                       ) AS missing_generic_import_guard_count
                 FROM {quoted_schema}.{quoted_table}
                 WHERE singleton
                 """,
@@ -375,19 +931,26 @@ class MigrationGenerationHttpExtension(HttpExtension):
                 GENERATION_TABLE,
                 TRIGGER_NAME,
                 list(PLANNING_STATE_TABLES),
+                [
+                    GENERIC_IMPORT_GUARD_TRIGGER,
+                    GENERIC_IMPORT_TRUNCATE_GUARD_TRIGGER,
+                ],
         )
         if row is None:
             raise RuntimeError("migration generation is unavailable")
         generation = row["generation"]
         missing_trigger_count = row["missing_trigger_count"]
+        missing_guard_count = row["missing_generic_import_guard_count"]
         if (
             type(generation) is not int
             or generation < 1
             or type(missing_trigger_count) is not int
             or missing_trigger_count < 0
+            or type(missing_guard_count) is not int
+            or missing_guard_count < 0
         ):
             raise RuntimeError("migration generation is invalid")
-        if missing_trigger_count:
+        if missing_trigger_count or missing_guard_count:
             raise RuntimeError(
                 "migration generation trigger coverage is incomplete"
             )

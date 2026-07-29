@@ -25,6 +25,7 @@ sys.path.insert(0, str(ROOT / "lib"))
 from hindsight_memory_control_plane.accidental_replay import (  # noqa: E402
     _document_descriptor,
 )
+from hindsight_memory_control_plane.canonical import digest  # noqa: E402
 
 
 class _TenantContext:
@@ -72,6 +73,7 @@ class _Connection:
         self.controller_state_raw_override = None
         self.replay_closeout_receipts = {}
         self.missing_trigger_count = 0
+        self.missing_generic_import_guard_count = 0
         self.snapshot_scope_count = 0
         self.snapshot_webhooks = []
         self.transactions: list[dict[str, object]] = []
@@ -81,6 +83,7 @@ class _Connection:
             "engineering",
         ]
         self.source_documents = []
+        self.generic_import_documents = {}
 
     class _Transaction:
         async def __aenter__(self):
@@ -95,6 +98,12 @@ class _Connection:
 
     async def execute(self, statement, *arguments):
         self.statements.append((statement, arguments))
+        if (
+            'INSERT INTO "public".async_operations' in statement
+            and "batch_retain" in statement
+        ):
+            self.generation += 1
+            return "INSERT 0 2"
         if "replay_closeout_receipts =" in statement:
             self.replay_closeout_receipts[arguments[0]] = json.loads(
                 arguments[1]
@@ -106,6 +115,15 @@ class _Connection:
 
     async def fetch(self, statement, *arguments):
         self.statements.append((statement, arguments))
+        if "AS target_document_id" in statement:
+            return [
+                {
+                    "target_document_id": document_id,
+                    **self.generic_import_documents[document_id],
+                }
+                for document_id in arguments[0]
+                if document_id in self.generic_import_documents
+            ]
         if (
             'FROM "public".banks' in statement
             and "SELECT bank_id" in statement
@@ -152,6 +170,14 @@ class _Connection:
                 "replay_closeout_receipts":
                     self.replay_closeout_receipts,
             }
+        if (
+            'FROM "public".documents' in statement
+            and "bank_id = 'engineering'" in statement
+            and "id = $1" in statement
+        ):
+            if arguments[0] in self.generic_import_documents:
+                return {"id": arguments[0]}
+            return None
         if (
             "AS memory_units" in statement
             and "bank_id = 'codex'" in statement
@@ -200,6 +226,8 @@ class _Connection:
                     else json.dumps(self.controller_state)
                 ),
                 "missing_trigger_count": self.missing_trigger_count,
+                "missing_generic_import_guard_count":
+                    self.missing_generic_import_guard_count,
             }
         raise AssertionError(f"unexpected fetchrow statement: {statement}")
 
@@ -237,6 +265,8 @@ class _Memory:
         self.connection = _Connection()
         self.tenant_extension = _TenantExtension()
         self._bank_stats_cache = _BankStatsCache()
+        self._operation_validator = None
+        self._task_backend = AsyncMock()
 
     async def _get_pool(self):
         return _Pool(self.connection)
@@ -287,6 +317,110 @@ class MigrationGenerationHttpExtensionTest(unittest.TestCase):
             response.json(),
             {"generation": "systalyze:public:7"},
         )
+
+    def test_generic_import_processing_evidence_is_embedding_complete(self):
+        document_id = "generic-import:" + "a" * 64
+        self.memory.connection.generic_import_documents[document_id] = {
+            "memory_unit_count": 2,
+            "embedded_memory_unit_count": 2,
+        }
+        response = self.client.post(
+            "/v1/migration/generic-import-processing",
+            headers={"Authorization": "Bearer test-token"},
+            json={
+                "bank_id": "engineering",
+                "document_ids": [document_id],
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json()["generation_before"],
+            "systalyze:public:7",
+        )
+        self.memory.connection.generic_import_documents[document_id][
+            "embedded_memory_unit_count"
+        ] = 1
+        response = self.client.post(
+            "/v1/migration/generic-import-processing",
+            headers={"Authorization": "Bearer test-token"},
+            json={
+                "bank_id": "engineering",
+                "document_ids": [document_id],
+            },
+        )
+        self.assertEqual(response.status_code, 409)
+
+    def test_generic_import_retain_atomically_checks_and_enqueues(self):
+        self.memory.connection.banks = [
+            "codex-memory-migration-v1-20260708",
+            "engineering",
+        ]
+        document_id = "generic-import:" + "a" * 64
+        payload = {
+            "schema_version": 1,
+            "expected_generation": "systalyze:public:7",
+            "expected_bank_set_digest": digest(
+                self.memory.connection.banks
+            ),
+            "plan_digest": "b" * 64,
+            "item_digest": "c" * 64,
+            "bank_id": "engineering",
+            "document_id": document_id,
+            "content": "Reviewed memory content.",
+            "timestamp": "2026-07-01T00:00:00Z",
+            "metadata": {
+                "generic_import_plan_digest": "b" * 64,
+                "generic_import_item_digest": "c" * 64,
+            },
+            "tags": ["repo:agents"],
+        }
+
+        response = self.client.post(
+            "/v1/migration/generic-import-retain",
+            headers={"Authorization": "Bearer test-token"},
+            json=payload,
+        )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        value = response.json()
+        self.assertEqual(value["status"], "accepted")
+        self.assertEqual(
+            value["pre_generation"],
+            "systalyze:public:7",
+        )
+        self.assertEqual(
+            value["accepted_generation"],
+            "systalyze:public:8",
+        )
+        self.assertIn(
+            {"isolation": "serializable"},
+            self.memory.connection.transactions,
+        )
+        self.memory._task_backend.submit_task.assert_awaited_once()
+
+        drifted = self.client.post(
+            "/v1/migration/generic-import-retain",
+            headers={"Authorization": "Bearer test-token"},
+            json=payload,
+        )
+        self.assertEqual(drifted.status_code, 409)
+        self.memory._task_backend.submit_task.assert_awaited_once()
+
+        self.memory.connection.generic_import_documents[document_id] = {
+            "memory_unit_count": 1,
+            "embedded_memory_unit_count": 1,
+        }
+        collision_payload = {
+            **payload,
+            "expected_generation": "systalyze:public:8",
+        }
+        collision = self.client.post(
+            "/v1/migration/generic-import-retain",
+            headers={"Authorization": "Bearer test-token"},
+            json=collision_payload,
+        )
+        self.assertEqual(collision.status_code, 409)
+        self.memory._task_backend.submit_task.assert_awaited_once()
 
     def test_authentication_infrastructure_failure_is_not_mapped_to_401(self):
         with patch.object(
@@ -356,18 +490,36 @@ class MigrationGenerationHttpExtensionTest(unittest.TestCase):
         )
         self.assertIn("hindsight_migration_generation", statements)
         self.assertIn("hindsight_bump_migration_generation", statements)
+        self.assertIn("hindsight_guard_generic_import_document", statements)
+        self.assertIn("hindsight_generic_import_document_guard", statements)
+        self.assertIn("hindsight_generic_import_truncate_guard", statements)
+        self.assertIn("NEW.bank_id = 'engineering'", statements)
+        self.assertIn("NEW.id LIKE 'generic-import:%'", statements)
+        self.assertIn(
+            "OLD.original_text IS NOT DISTINCT FROM ''",
+            statements,
+        )
+        self.assertIn(
+            "IS NOT DISTINCT FROM '__pending__'",
+            statements,
+        )
         self.assertIn('"banks"', statements)
         self.assertIn('"documents"', statements)
         self.assertIn('"async_operations"', statements)
         self.assertIn("c.relname = ANY($3::text[])", statements)
         self.assertEqual(
             self.memory.connection.transactions,
-            [{}, {}, {}, {}],
+            [{}, {}, {}, {}, {}],
         )
 
     def test_generation_is_unavailable_when_trigger_coverage_is_incomplete(self):
         self.memory.connection.missing_trigger_count = 1
 
+        with self.assertRaisesRegex(RuntimeError, "coverage is incomplete"):
+            asyncio.run(self.extension._read_generation("public"))
+
+        self.memory.connection.missing_trigger_count = 0
+        self.memory.connection.missing_generic_import_guard_count = 1
         with self.assertRaisesRegex(RuntimeError, "coverage is incomplete"):
             asyncio.run(self.extension._read_generation("public"))
 

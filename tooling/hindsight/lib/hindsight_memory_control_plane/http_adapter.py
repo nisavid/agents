@@ -444,6 +444,13 @@ class HttpAdapter:
             raise AdapterError("endpoint identity does not match selected inventory")
         return identity
 
+    def inventory_identity(self) -> Mapping[str, str]:
+        """Return the validated controller inventory identity without payload data."""
+        return {
+            "inventory_digest": self._inventory.inventory_digest,
+            "artifact_digest": self._inventory.artifact_digest,
+        }
+
     def snapshot(self) -> Mapping[str, Any]:
         raw_compatibility = self._request("GET", self.READ_PATHS["read_compatibility"])
         if not isinstance(raw_compatibility, Mapping) or set(raw_compatibility) != {"compatibility"}:
@@ -1328,6 +1335,254 @@ class HttpAdapter:
         if str(parsed_operation_id) != operation_id:
             raise AdapterError("replay retain response is invalid")
         return {"operation_id": operation_id}
+
+    def submit_generic_import_document(
+        self,
+        bank: BankRef,
+        item: Mapping[str, Any],
+        *,
+        expected_generation: str,
+        expected_bank_set_digest: str,
+        plan_digest: str,
+        item_digest: str,
+    ) -> Mapping[str, str]:
+        """Atomically submit one controller-owned document."""
+        if not isinstance(item, Mapping):
+            raise AdapterError("generic import conditional retain conflict")
+        document_id = item.get("document_id")
+        metadata = item.get("metadata")
+        allowed_item_keys = {
+            "content",
+            "document_id",
+            "timestamp",
+            "metadata",
+            "tags",
+        }
+        if (
+            bank != BankRef("systalyze", "engineering")
+            or set(item) != allowed_item_keys
+            or not isinstance(document_id, str)
+            or not document_id.startswith("generic-import:")
+            or not isinstance(metadata, Mapping)
+            or metadata.get("generic_import_plan_digest") != plan_digest
+            or metadata.get("generic_import_item_digest") != item_digest
+            or not isinstance(expected_generation, str)
+            or not expected_generation
+            or not isinstance(expected_bank_set_digest, str)
+            or DIGEST.fullmatch(expected_bank_set_digest) is None
+            or not isinstance(plan_digest, str)
+            or DIGEST.fullmatch(plan_digest) is None
+            or not isinstance(item_digest, str)
+            or DIGEST.fullmatch(item_digest) is None
+        ):
+            raise AdapterError("generic import conditional retain conflict")
+        try:
+            normalized_item = strict_json_loads(
+                canonical_bytes(dict(item))
+            )
+        except (StrictJsonError, TypeError, ValueError):
+            raise AdapterError(
+                "generic import conditional retain conflict"
+            ) from None
+        response = self._request(
+            "POST",
+            "/v1/migration/generic-import-retain",
+            {
+                **normalized_item,
+                "schema_version": 1,
+                "expected_generation": expected_generation,
+                "expected_bank_set_digest": expected_bank_set_digest,
+                "plan_digest": plan_digest,
+                "item_digest": item_digest,
+                "bank_id": "engineering",
+            },
+        )
+        if (
+            not isinstance(response, Mapping)
+            or set(response)
+            != {
+                "schema_version",
+                "status",
+                "operation_id",
+                "pre_generation",
+                "accepted_generation",
+            }
+            or type(response["schema_version"]) is not int
+            or response["schema_version"] != 1
+            or response["status"] != "accepted"
+            or response["pre_generation"] != expected_generation
+            or not isinstance(response["accepted_generation"], str)
+            or not response["accepted_generation"]
+            or len(response["accepted_generation"].encode("utf-8")) > 256
+            or any(
+                character in response["accepted_generation"]
+                for character in "\r\n\0"
+            )
+            or response["accepted_generation"] == expected_generation
+        ):
+            raise AdapterError("generic import conditional retain response is invalid")
+        operation_id = response.get("operation_id")
+        try:
+            parsed_operation_id = UUID(operation_id)
+        except (TypeError, ValueError, AttributeError):
+            raise AdapterError(
+                "generic import conditional retain response is invalid"
+            ) from None
+        if str(parsed_operation_id) != operation_id:
+            raise AdapterError(
+                "generic import conditional retain response is invalid"
+            )
+        return {"operation_id": operation_id}
+
+    def read_generic_import_processing_evidence(
+        self,
+        bank: BankRef,
+        document_ids: Sequence[str],
+    ) -> Mapping[str, Any]:
+        if (
+            bank != BankRef("systalyze", "engineering")
+            or not isinstance(document_ids, Sequence)
+            or isinstance(document_ids, (str, bytes))
+            or not document_ids
+            or any(
+                not isinstance(document_id, str)
+                or re.fullmatch(
+                    r"generic-import:[0-9a-f]{64}",
+                    document_id,
+                )
+                is None
+                for document_id in document_ids
+            )
+            or list(document_ids) != sorted(document_ids)
+            or len(document_ids) != len(set(document_ids))
+        ):
+            raise AdapterError(
+                "generic import processing evidence request is invalid"
+            )
+        response = self._request(
+            "POST",
+            "/v1/migration/generic-import-processing",
+            {
+                "bank_id": "engineering",
+                "document_ids": list(document_ids),
+            },
+        )
+        if (
+            not isinstance(response, Mapping)
+            or set(response)
+            != {
+                "schema_version",
+                "generation_before",
+                "generation_after",
+                "documents",
+            }
+            or type(response["schema_version"]) is not int
+            or response["schema_version"] != 1
+            or response["generation_before"] != response["generation_after"]
+            or not isinstance(response["documents"], list)
+            or [
+                item.get("target_document_id")
+                for item in response["documents"]
+                if isinstance(item, Mapping)
+            ]
+            != list(document_ids)
+        ):
+            raise AdapterError(
+                "generic import processing evidence is invalid"
+            )
+        for item in response["documents"]:
+            if (
+                not isinstance(item, Mapping)
+                or set(item)
+                != {
+                    "target_document_id",
+                    "memory_unit_count",
+                    "embedded_memory_unit_count",
+                }
+                or type(item["memory_unit_count"]) is not int
+                or item["memory_unit_count"] < 1
+                or type(item["embedded_memory_unit_count"]) is not int
+                or item["embedded_memory_unit_count"]
+                != item["memory_unit_count"]
+            ):
+                raise AdapterError(
+                    "generic import processing evidence is incomplete"
+                )
+        representative: dict[str, Any] | None = None
+        for document_id in document_ids:
+            document = self.read_replay_document(bank, document_id)
+            query = " ".join(document["original_text"].split())[:1024].strip()
+            if not query:
+                continue
+            recall = self._request(
+                "POST",
+                f"{self._bank_path(bank)}/memories/recall",
+                {
+                    "query": query,
+                    "types": ["world", "experience", "observation"],
+                    "budget": "high",
+                    "max_tokens": 8192,
+                    "trace": True,
+                },
+            )
+            results = (
+                recall.get("results")
+                if isinstance(recall, Mapping)
+                else None
+            )
+            if (
+                not isinstance(results, list)
+                or len(results) > self.MAX_DISCOVERY_ITEMS
+                or any(not isinstance(result, Mapping) for result in results)
+            ):
+                raise AdapterError(
+                    "generic import semantic evidence is invalid"
+                )
+            result_projection = [
+                {
+                    "id": result.get("id"),
+                    "document_id": result.get("document_id"),
+                }
+                for result in results
+            ]
+            if any(
+                not isinstance(result["id"], str)
+                or (
+                    result["document_id"] is not None
+                    and not isinstance(result["document_id"], str)
+                )
+                for result in result_projection
+            ):
+                raise AdapterError(
+                    "generic import semantic evidence is invalid"
+                )
+            if any(
+                result["document_id"] == document_id
+                for result in result_projection
+            ):
+                representative = {
+                    "target_document_id": document_id,
+                    "query_digest": digest(query),
+                    "result_count": len(result_projection),
+                    "result_projection_digest": digest(result_projection),
+                }
+                break
+        if representative is None:
+            raise AdapterError(
+                "generic import representative semantic recall failed"
+            )
+        body = strict_json_loads(
+            canonical_bytes(
+                {
+                    **dict(response),
+                    "representative_recall": representative,
+                }
+            )
+        )
+        return {
+            **body,
+            "processing_evidence_digest": digest(body),
+        }
 
     @classmethod
     def _migration_versions(cls, value: Any) -> Mapping[str, Any]:

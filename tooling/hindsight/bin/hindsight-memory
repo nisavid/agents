@@ -23,7 +23,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Any, Mapping, NamedTuple
+from typing import Any, Mapping, NamedTuple, Sequence
 
 
 sys.dont_write_bytecode = True
@@ -49,6 +49,19 @@ from hindsight_memory_control_plane.canonical import (  # noqa: E402
     strict_json_loads,
 )
 from hindsight_memory_control_plane.http_adapter import HttpAdapter  # noqa: E402
+from hindsight_memory_control_plane.generic_import import (  # noqa: E402
+    GenericImportError,
+    apply_generic_import_plan,
+    create_generic_import_plan,
+    generic_import_status,
+    inspect_import_target,
+    verify_generic_import_plan,
+    verify_generic_import_receipts,
+)
+from hindsight_memory_control_plane.importing import (  # noqa: E402
+    ImportValidationError,
+    projection_from_dict,
+)
 from hindsight_memory_control_plane.inventory import (  # noqa: E402
     InventoryError,
     load_inventory,
@@ -1029,6 +1042,7 @@ def _replay_receipts_for_plan(
     if (
         not isinstance(artifact, Mapping)
         or set(artifact) != {"schema_version", "plan_digest", "receipts"}
+        or type(artifact["schema_version"]) is not int
         or artifact["schema_version"] != 1
         or not isinstance(artifact["receipts"], list)
         or artifact["plan_digest"] != plan["plan_digest"]
@@ -1161,6 +1175,156 @@ def migration_replay_closeout_command(args: argparse.Namespace) -> int:
     )
     write_private(args.output, receipt, create_only=True)
     print(json.dumps(receipt, sort_keys=True))
+    return 0
+
+
+def _generic_import_http_adapter(args: argparse.Namespace) -> HttpAdapter:
+    if ENVIRONMENT_NAME.fullmatch(args.token_env) is None:
+        raise GenericImportError(
+            "generic import token environment locator is invalid"
+        )
+    if not os.environ.get(args.token_env):
+        raise GenericImportError("generic import data-plane token is unavailable")
+    return HttpAdapter(
+        inventory=load_inventory(args.inventory),
+        profile_id=args.profile,
+        token_resolver=lambda: os.environ.get(args.token_env, ""),
+        timeout=30.0,
+    )
+
+
+def _generic_import_receipts(
+    plan: Mapping[str, Any],
+    path: str,
+) -> list[Mapping[str, Any]]:
+    artifact = read_json(path)
+    if (
+        not isinstance(artifact, Mapping)
+        or set(artifact) != {"schema_version", "plan_digest", "receipts"}
+        or type(artifact["schema_version"]) is not int
+        or artifact["schema_version"] != 1
+        or artifact["plan_digest"] != plan["plan_digest"]
+        or not isinstance(artifact["receipts"], list)
+    ):
+        raise GenericImportError("generic import receipt artifact is invalid")
+    return artifact["receipts"]
+
+
+def generic_import_inspect_command(args: argparse.Namespace) -> int:
+    adapter = _generic_import_http_adapter(args)
+    projection = projection_from_dict(read_json(args.projection))
+    inspection = inspect_import_target(
+        adapter,
+        projection,
+        BankRef(args.profile, args.target_bank),
+    )
+    write_private(args.output, inspection, create_only=True)
+    counts = {"exact_duplicate": 0, "novelty_candidate": 0}
+    for finding in inspection["findings"]:
+        counts[finding["status"]] += 1
+    print(
+        json.dumps(
+            {
+                "exact_duplicate_count": counts["exact_duplicate"],
+                "inspection_digest": inspection["inspection_digest"],
+                "novelty_candidate_count": counts["novelty_candidate"],
+                "output": str(Path(args.output)),
+                "target_generation":
+                    inspection["controller_snapshot"]["target_generation"],
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def generic_import_plan_command(args: argparse.Namespace) -> int:
+    adapter = _generic_import_http_adapter(args)
+    projection = projection_from_dict(read_json(args.projection))
+    plan = create_generic_import_plan(
+        adapter,
+        projection,
+        read_json(args.inspection),
+        read_json(args.replay_closeout_receipt),
+        read_json(args.backup_evidence),
+    )
+    write_private(args.output, plan, create_only=True)
+    print(
+        json.dumps(
+            {
+                "action_count": len(plan["import_plan"]["actions"]),
+                "output": str(Path(args.output)),
+                "plan_digest": plan["plan_digest"],
+                "target_generation": plan["target_generation"],
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def generic_import_apply_command(args: argparse.Namespace) -> int:
+    adapter = _generic_import_http_adapter(args)
+    plan = verify_generic_import_plan(read_json(args.plan))
+    projection = projection_from_dict(read_json(args.projection))
+    receipt_path = Path(args.receipts)
+    existing = (
+        _generic_import_receipts(plan, args.receipts)
+        if receipt_path.exists()
+        else []
+    )
+
+    def checkpoint(receipts: Sequence[Mapping[str, Any]]) -> None:
+        write_private(
+            receipt_path,
+            {
+                "schema_version": 1,
+                "plan_digest": plan["plan_digest"],
+                "receipts": list(receipts),
+            },
+        )
+
+    receipts = apply_generic_import_plan(
+        adapter,
+        plan,
+        projection,
+        read_json(args.replay_closeout_receipt),
+        read_json(args.backup_evidence),
+        approval_digest=args.approval_digest,
+        existing_receipts=existing,
+        timeout_seconds=args.timeout_seconds,
+        poll_interval_seconds=args.poll_interval_seconds,
+        receipt_writer=checkpoint,
+    )
+    checkpoint(receipts)
+    print(json.dumps(generic_import_status(plan, receipts), sort_keys=True))
+    return 0
+
+
+def generic_import_status_command(args: argparse.Namespace) -> int:
+    plan = verify_generic_import_plan(read_json(args.plan))
+    receipts = (
+        _generic_import_receipts(plan, args.receipts)
+        if Path(args.receipts).exists()
+        else []
+    )
+    print(json.dumps(generic_import_status(plan, receipts), sort_keys=True))
+    return 0
+
+
+def generic_import_verify_command(args: argparse.Namespace) -> int:
+    adapter = _generic_import_http_adapter(args)
+    plan = verify_generic_import_plan(read_json(args.plan))
+    projection = projection_from_dict(read_json(args.projection))
+    receipts = _generic_import_receipts(plan, args.receipts)
+    verification = verify_generic_import_receipts(
+        adapter,
+        plan,
+        projection,
+        receipts,
+    )
+    write_private(args.output, verification, create_only=True)
+    print(json.dumps(verification, sort_keys=True))
     return 0
 
 
@@ -4127,6 +4291,76 @@ def parser() -> argparse.ArgumentParser:
     replay_closeout.add_argument("--output", required=True)
     replay_closeout.set_defaults(run=migration_replay_closeout_command)
 
+    generic_import = commands.add_parser("import")
+    generic_import_commands = generic_import.add_subparsers(
+        dest="import_command",
+        required=True,
+    )
+
+    def add_generic_import_connection_arguments(
+        command_parser: argparse.ArgumentParser,
+    ) -> None:
+        command_parser.add_argument("--inventory", required=True)
+        command_parser.add_argument("--profile", required=True)
+        command_parser.add_argument("--token-env", required=True)
+
+    generic_import_inspect = generic_import_commands.add_parser("inspect")
+    add_generic_import_connection_arguments(generic_import_inspect)
+    generic_import_inspect.add_argument("--projection", required=True)
+    generic_import_inspect.add_argument("--output", required=True)
+    generic_import_inspect.set_defaults(
+        run=generic_import_inspect_command,
+        target_bank="engineering",
+    )
+
+    generic_import_plan = generic_import_commands.add_parser("plan")
+    add_generic_import_connection_arguments(generic_import_plan)
+    generic_import_plan.add_argument("--projection", required=True)
+    generic_import_plan.add_argument("--inspection", required=True)
+    generic_import_plan.add_argument(
+        "--replay-closeout-receipt",
+        required=True,
+    )
+    generic_import_plan.add_argument("--backup-evidence", required=True)
+    generic_import_plan.add_argument("--output", required=True)
+    generic_import_plan.set_defaults(run=generic_import_plan_command)
+
+    generic_import_apply = generic_import_commands.add_parser("apply")
+    add_generic_import_connection_arguments(generic_import_apply)
+    generic_import_apply.add_argument("--projection", required=True)
+    generic_import_apply.add_argument("--plan", required=True)
+    generic_import_apply.add_argument(
+        "--replay-closeout-receipt",
+        required=True,
+    )
+    generic_import_apply.add_argument("--backup-evidence", required=True)
+    generic_import_apply.add_argument("--approval-digest", required=True)
+    generic_import_apply.add_argument("--receipts", required=True)
+    generic_import_apply.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=1800,
+    )
+    generic_import_apply.add_argument(
+        "--poll-interval-seconds",
+        type=float,
+        default=1,
+    )
+    generic_import_apply.set_defaults(run=generic_import_apply_command)
+
+    generic_import_status = generic_import_commands.add_parser("status")
+    generic_import_status.add_argument("--plan", required=True)
+    generic_import_status.add_argument("--receipts", required=True)
+    generic_import_status.set_defaults(run=generic_import_status_command)
+
+    generic_import_verify = generic_import_commands.add_parser("verify")
+    add_generic_import_connection_arguments(generic_import_verify)
+    generic_import_verify.add_argument("--projection", required=True)
+    generic_import_verify.add_argument("--plan", required=True)
+    generic_import_verify.add_argument("--receipts", required=True)
+    generic_import_verify.add_argument("--output", required=True)
+    generic_import_verify.set_defaults(run=generic_import_verify_command)
+
     integration_upgrade = commands.add_parser("integration-upgrade")
     integration_upgrade_commands = integration_upgrade.add_subparsers(
         dest="integration_upgrade_command", required=True
@@ -4418,11 +4652,13 @@ def _validate_state_directory_argument(
         "rollback",
         "uninstall",
         "service",
+        "import",
     }:
         if args.state_dir is not None:
-            argument_parser.error(
-                "portable installation commands read state paths from --config"
-            )
+            if args.command != "import":
+                argument_parser.error(
+                    "portable installation commands read state paths from --config"
+                )
         return
     if args.state_dir is None:
         argument_parser.error("--state-dir is required for this command")
@@ -4443,6 +4679,8 @@ def main() -> int:
         InventoryError,
         IntegrationUpgradeError,
         HarnessPersistenceError,
+        GenericImportError,
+        ImportValidationError,
         MigrationAdapterError,
         MigrationError,
         PlanError,

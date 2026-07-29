@@ -2073,6 +2073,131 @@ class HttpAdapterContractTest(AdapterContractMixin, unittest.TestCase):
                     },
                 )
 
+    def test_generic_import_submit_uses_atomic_server_authority(self):
+        target = BankRef("systalyze", "engineering")
+        item = {
+            "content": "Reviewed memory content.",
+            "document_id": "generic-import:" + "a" * 64,
+            "timestamp": "2026-07-01T00:00:00Z",
+            "metadata": {
+                "generic_import_plan_digest": "b" * 64,
+                "generic_import_item_digest": "c" * 64,
+            },
+            "tags": ["repo:agents"],
+        }
+        response = {
+            "schema_version": 1,
+            "status": "accepted",
+            "operation_id": RUNTIME_OPERATION_ID,
+            "pre_generation": "systalyze:public:10",
+            "accepted_generation": "systalyze:public:11",
+        }
+        with (
+            patch.object(
+                self.adapter,
+                "endpoint",
+                EndpointIdentity(
+                    "systalyze",
+                    "http",
+                    "127.0.0.1",
+                    self.server.server_port,
+                    "default",
+                ),
+            ),
+            patch.object(
+                self.adapter,
+                "_request",
+                return_value=response,
+            ) as request,
+        ):
+            submission = self.adapter.submit_generic_import_document(
+                target,
+                item,
+                expected_generation="systalyze:public:10",
+                expected_bank_set_digest="d" * 64,
+                plan_digest="b" * 64,
+                item_digest="c" * 64,
+            )
+
+        self.assertEqual(
+            submission,
+            {"operation_id": RUNTIME_OPERATION_ID},
+        )
+        request.assert_called_once_with(
+            "POST",
+            "/v1/migration/generic-import-retain",
+            {
+                "schema_version": 1,
+                "expected_generation": "systalyze:public:10",
+                "expected_bank_set_digest": "d" * 64,
+                "plan_digest": "b" * 64,
+                "item_digest": "c" * 64,
+                "bank_id": "engineering",
+                **item,
+            },
+        )
+        with (
+            patch.object(
+                self.adapter,
+                "endpoint",
+                EndpointIdentity(
+                    "systalyze",
+                    "http",
+                    "127.0.0.1",
+                    self.server.server_port,
+                    "default",
+                ),
+            ),
+            patch.object(self.adapter, "_request") as request,
+            self.assertRaisesRegex(
+                AdapterError,
+                "conditional retain conflict",
+            ),
+        ):
+            self.adapter.submit_generic_import_document(
+                target,
+                {**item, "bank_id": "attacker-controlled"},
+                expected_generation="systalyze:public:10",
+                expected_bank_set_digest="d" * 64,
+                plan_digest="b" * 64,
+                item_digest="c" * 64,
+            )
+        request.assert_not_called()
+
+        with (
+            patch.object(
+                self.adapter,
+                "endpoint",
+                EndpointIdentity(
+                    "systalyze",
+                    "http",
+                    "127.0.0.1",
+                    self.server.server_port,
+                    "default",
+                ),
+            ),
+            patch.object(
+                self.adapter,
+                "_request",
+                return_value={
+                    **response,
+                    "accepted_generation": response["pre_generation"],
+                },
+            ),
+            self.assertRaisesRegex(
+                AdapterError,
+                "response is invalid",
+            ),
+        ):
+            self.adapter.submit_generic_import_document(
+                target,
+                item,
+                expected_generation="systalyze:public:10",
+                expected_bank_set_digest="d" * 64,
+                plan_digest="b" * 64,
+                item_digest="c" * 64,
+            )
+
     def test_replay_document_requires_recoverable_original_text(self):
         source = BankRef("core", "codex")
         with patch.object(

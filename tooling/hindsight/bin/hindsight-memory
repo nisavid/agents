@@ -4089,6 +4089,55 @@ def portable_uninstall_command(args: argparse.Namespace) -> int:
     return _print_result(_portable_manager(args).uninstall())
 
 
+def data_identity_rebind_plan_command(args: argparse.Namespace) -> int:
+    plan = _portable_manager(args).data_identity_rebind_plan(
+        read_json(args.evidence)
+    )
+    write_private(args.output, plan, create_only=True)
+    return _print_result(
+        {
+            "status": "planned",
+            "plan_digest": plan["plan_digest"],
+            "expires_at": plan["expires_at"],
+            "output": str(Path(args.output).resolve()),
+        }
+    )
+
+
+def data_identity_rebind_apply_command(args: argparse.Namespace) -> int:
+    return _print_result(
+        _portable_manager(args).data_identity_rebind_apply(
+            read_json(args.plan),
+            approval_digest=args.approval_digest,
+            pre_apply_evidence_value=read_json(args.pre_apply_evidence),
+        )
+    )
+
+
+def data_identity_rebind_status_command(args: argparse.Namespace) -> int:
+    return _print_result(
+        _portable_manager(args).data_identity_rebind_status(read_json(args.plan))
+    )
+
+
+def data_identity_rebind_verify_command(args: argparse.Namespace) -> int:
+    result = _portable_manager(args).data_identity_rebind_verify(
+        read_json(args.plan),
+        read_json(args.post_evidence),
+    )
+    write_private(args.output, result, create_only=True)
+    return _print_result(result)
+
+
+def data_identity_rebind_rollback_command(args: argparse.Namespace) -> int:
+    return _print_result(
+        _portable_manager(args).data_identity_rebind_rollback(
+            read_json(args.plan),
+            approval_digest=args.approval_digest,
+        )
+    )
+
+
 def _portable_service_manager(
     args: argparse.Namespace,
 ) -> PortableInstallationManager:
@@ -4183,6 +4232,41 @@ def parser() -> argparse.ArgumentParser:
         service_command.add_argument("--config", required=True)
         service_command.add_argument("--profile")
         service_command.set_defaults(run=command)
+
+    data_identity = commands.add_parser("data-identity")
+    data_identity_commands = data_identity.add_subparsers(
+        dest="data_identity_command", required=True
+    )
+    data_identity_plan = data_identity_commands.add_parser("plan")
+    data_identity_plan.add_argument("--config", required=True)
+    data_identity_plan.add_argument("--evidence", required=True)
+    data_identity_plan.add_argument("--output", required=True)
+    data_identity_plan.set_defaults(run=data_identity_rebind_plan_command)
+
+    data_identity_apply = data_identity_commands.add_parser("apply")
+    data_identity_apply.add_argument("--config", required=True)
+    data_identity_apply.add_argument("--plan", required=True)
+    data_identity_apply.add_argument("--approval-digest", required=True)
+    data_identity_apply.add_argument("--pre-apply-evidence", required=True)
+    data_identity_apply.set_defaults(run=data_identity_rebind_apply_command)
+
+    data_identity_status = data_identity_commands.add_parser("status")
+    data_identity_status.add_argument("--config", required=True)
+    data_identity_status.add_argument("--plan", required=True)
+    data_identity_status.set_defaults(run=data_identity_rebind_status_command)
+
+    data_identity_verify = data_identity_commands.add_parser("verify")
+    data_identity_verify.add_argument("--config", required=True)
+    data_identity_verify.add_argument("--plan", required=True)
+    data_identity_verify.add_argument("--post-evidence", required=True)
+    data_identity_verify.add_argument("--output", required=True)
+    data_identity_verify.set_defaults(run=data_identity_rebind_verify_command)
+
+    data_identity_rollback = data_identity_commands.add_parser("rollback")
+    data_identity_rollback.add_argument("--config", required=True)
+    data_identity_rollback.add_argument("--plan", required=True)
+    data_identity_rollback.add_argument("--approval-digest", required=True)
+    data_identity_rollback.set_defaults(run=data_identity_rebind_rollback_command)
 
     validate = commands.add_parser("validate")
     validate.add_argument("--inventory", required=True)
@@ -4653,6 +4737,7 @@ def _validate_state_directory_argument(
         "uninstall",
         "service",
         "import",
+        "data-identity",
     }:
         if args.state_dir is not None:
             if args.command != "import":

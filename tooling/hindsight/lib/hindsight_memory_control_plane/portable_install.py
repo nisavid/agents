@@ -5692,10 +5692,6 @@ class PortableInstallationManager:
                 state,
                 expected_data_identity_digest=observed_identity,
             )
-            installed = self._installed_manager(state)
-            installed._verify_service_manager()
-            if not installed._health(state["current"]):
-                raise PortableInstallError("health verification failed")
             profile = self._data_identity_profile()
             if checked_evidence["profile_id"] != profile:
                 raise PortableInstallError("data-identity evidence profile differs")

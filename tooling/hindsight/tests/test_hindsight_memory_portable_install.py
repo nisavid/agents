@@ -5824,6 +5824,23 @@ class PortableInstallationManagerTest(unittest.TestCase):
         with self.assertRaisesRegex(PortableInstallError, "profile differs"):
             manager.data_identity_rebind_plan(evidence, now=1000)
 
+    def test_data_identity_rebind_plan_does_not_require_pre_repair_health(
+        self,
+    ) -> None:
+        manager, evidence, _prestate, _sentinel = self.rebind_inputs()
+        health_runner = mock.Mock(return_value=True)
+        manager._health_runner = health_runner
+
+        with mock.patch.object(
+            PortableInstallationManager,
+            "_verify_service_manager",
+        ) as service_manager_check:
+            plan = manager.data_identity_rebind_plan(evidence, now=1000)
+
+        health_runner.assert_not_called()
+        service_manager_check.assert_not_called()
+        self.assertEqual(plan["action"], "rebind-data-identity")
+
     def test_data_identity_profile_refuses_incomplete_desired_state_binding(
         self,
     ) -> None:

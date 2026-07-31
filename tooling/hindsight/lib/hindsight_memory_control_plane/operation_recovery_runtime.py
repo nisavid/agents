@@ -61,6 +61,9 @@ SELECT
          ELSE to_char(next_retry_at AT TIME ZONE 'UTC',
                       'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') END AS next_retry_at,
     (worker_id IS NOT NULL) AS worker_id_present,
+    CASE WHEN worker_id IS NULL THEN NULL
+         ELSE encode(sha256(convert_to(worker_id, 'UTF8')), 'hex')
+    END AS worker_id_digest,
     CASE WHEN claimed_at IS NULL THEN NULL
          ELSE to_char(claimed_at AT TIME ZONE 'UTC',
                       'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') END AS claimed_at,
@@ -477,6 +480,7 @@ def live_row_digest(row: Mapping[str, Any]) -> str:
         "retry_count": row["retry_count"],
         "next_retry_at": row["next_retry_at"],
         "worker_id_present": row["worker_id_present"],
+        "worker_id_digest": row["worker_id_digest"],
         "claimed_at": row["claimed_at"],
         "task_payload_present": row["task_payload_present"],
         "task_payload_digest": row["task_payload_digest"],
@@ -619,9 +623,11 @@ async def apply_requeue_transaction(
                    OR (
                        status IN ('pending', 'failed', 'cancelled')
                        AND (worker_id IS NOT NULL OR claimed_at IS NOT NULL)
+                       AND NOT (operation_id = ANY($1::uuid[]))
                    )
             )
-            """
+            """,
+            identifiers,
         )
         if claimed is not False:
             raise OperationRecoveryError(
@@ -710,6 +716,7 @@ async def apply_requeue_transaction(
                 or row["retry_count"] != 0
                 or row["next_retry_at"] is not None
                 or row["worker_id_present"]
+                or row["worker_id_digest"] is not None
                 or row["claimed_at"] is not None
                 or row["error_category"] != "none"
                 or row["error_digest"] is not None
@@ -792,8 +799,6 @@ async def rollback_requeue_transaction(
             or row.get("task_payload_digest")
             != selected[operation_id]["task_payload_digest"]
             or row.get("status") not in {"failed", "cancelled"}
-            or row.get("worker_id") is not None
-            or row.get("claimed_at") is not None
         ):
             raise OperationRecoveryError("rollback preimage differs")
         rollback_rows.append(
@@ -855,6 +860,14 @@ async def rollback_requeue_transaction(
                         str(error_message).encode("utf-8")
                     ).hexdigest()
                 )
+                worker_id = restored.get("worker_id")
+                worker_id_digest = (
+                    None
+                    if worker_id is None
+                    else hashlib.sha256(
+                        str(worker_id).encode("utf-8")
+                    ).hexdigest()
+                )
                 if (
                     row["bank_id"] != bank_id
                     or row["operation_type"] != item["operation_type"]
@@ -862,7 +875,9 @@ async def rollback_requeue_transaction(
                     or row["completed_at"] != restored.get("completed_at")
                     or row["next_retry_at"] != restored.get("next_retry_at")
                     or row["worker_id_present"]
-                    or row["claimed_at"] is not None
+                    != (restored.get("worker_id") is not None)
+                    or row["worker_id_digest"] != worker_id_digest
+                    or row["claimed_at"] != restored.get("claimed_at")
                     or row["retry_count"] != restored.get("retry_count")
                     or row["updated_at"] != restored.get("updated_at")
                     or row["task_payload_digest"]
@@ -882,6 +897,7 @@ async def rollback_requeue_transaction(
                 row["status"] != "pending"
                 or row["retry_count"] != 0
                 or row["worker_id_present"]
+                or row["worker_id_digest"] is not None
                 or row["claimed_at"] is not None
                 or row["completed_at"] is not None
                 or row["next_retry_at"] is not None

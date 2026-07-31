@@ -7316,6 +7316,7 @@ async def _operation_recovery_verify_live(
                 after["status"] != "pending"
                 or after["retry_count"] != 0
                 or after["worker_id_present"]
+                or after["worker_id_digest"] is not None
                 or after["claimed_at"] is not None
                 or after["completed_at"] is not None
                 or after["next_retry_at"] is not None

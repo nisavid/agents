@@ -105,6 +105,7 @@ SAFE_ROW_KEYS = frozenset(
         "retry_count",
         "next_retry_at",
         "worker_id_present",
+        "worker_id_digest",
         "claimed_at",
         "task_payload_present",
         "task_payload_digest",
@@ -168,6 +169,7 @@ LIVE_OPERATION_KEYS = frozenset(
         "retry_count",
         "next_retry_at",
         "worker_id_present",
+        "worker_id_digest",
         "claimed_at",
         "task_payload_present",
         "task_payload_digest",
@@ -579,6 +581,14 @@ def _safe_row(value: Any) -> dict[str, Any]:
         raise OperationRecoveryError("operation error category is invalid")
     if type(row["worker_id_present"]) is not bool:
         raise OperationRecoveryError("operation worker evidence is invalid")
+    worker_id_digest = row["worker_id_digest"]
+    if row["worker_id_present"]:
+        worker_id_digest = _sha(
+            worker_id_digest,
+            "operation worker ID digest",
+        )
+    elif worker_id_digest is not None:
+        raise OperationRecoveryError("operation worker evidence is invalid")
     if type(row["task_payload_present"]) is not bool:
         raise OperationRecoveryError("operation payload evidence is invalid")
     payload_digest = row["task_payload_digest"]
@@ -612,6 +622,7 @@ def _safe_row(value: Any) -> dict[str, Any]:
             "operation next-retry-at",
         ),
         "worker_id_present": row["worker_id_present"],
+        "worker_id_digest": worker_id_digest,
         "claimed_at": _optional_text(row["claimed_at"], "operation claimed-at"),
         "task_payload_present": row["task_payload_present"],
         "task_payload_digest": payload_digest,
@@ -921,6 +932,7 @@ def _live_operation(value: Any) -> dict[str, Any]:
             "operation next-retry-at",
         ),
         "worker_id_present": item["worker_id_present"],
+        "worker_id_digest": item["worker_id_digest"],
         "claimed_at": _optional_text(item["claimed_at"], "operation claimed-at"),
         "task_payload_present": item["task_payload_present"],
         "task_payload_digest": item["task_payload_digest"],
@@ -943,6 +955,13 @@ def _live_operation(value: Any) -> dict[str, Any]:
         or body["error_category"] not in ERROR_CATEGORIES
     ):
         raise OperationRecoveryError("live operation entry is invalid")
+    if body["worker_id_present"]:
+        body["worker_id_digest"] = _sha(
+            body["worker_id_digest"],
+            "operation worker ID digest",
+        )
+    elif body["worker_id_digest"] is not None:
+        raise OperationRecoveryError("live operation worker evidence is invalid")
     body["task_payload_digest"] = _sha(
         body["task_payload_digest"],
         "operation payload digest",
@@ -1008,6 +1027,7 @@ def create_live_snapshot(
             "retry_count": row["retry_count"],
             "next_retry_at": row["next_retry_at"],
             "worker_id_present": row["worker_id_present"],
+            "worker_id_digest": row["worker_id_digest"],
             "claimed_at": row["claimed_at"],
             "task_payload_present": row["task_payload_present"],
             "task_payload_digest": row["task_payload_digest"],

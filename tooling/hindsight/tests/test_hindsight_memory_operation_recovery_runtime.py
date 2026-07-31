@@ -64,6 +64,7 @@ class FakeConnection:
                 "retry_count": 1,
                 "next_retry_at": None,
                 "worker_id_present": False,
+                "worker_id_digest": None,
                 "claimed_at": None,
                 "task_payload_present": True,
                 "task_payload_digest": "a" * 64,
@@ -176,10 +177,12 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         select_list = SAFE_OPERATION_QUERY.split("FROM {schema}.async_operations")[0]
         self.assertNotIn("task_payload AS", select_list)
         self.assertNotIn("error_message AS", select_list)
+        self.assertNotIn("worker_id AS", select_list)
         self.assertIn("task_payload_digest", select_list)
+        self.assertIn("worker_id_digest", select_list)
         self.assertIn("error_digest", select_list)
 
-    def test_apply_uses_one_exact_retry_update_and_advances_generation_once(self):
+    def test_apply_allows_bound_claim_on_selected_terminal_row(self):
         before = {
             "operation_id": "00000000-0000-4000-8000-000000000001",
             "bank_id": "engineering",
@@ -190,8 +193,11 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
             "completed_at": "2026-07-29T13:00:00.000000Z",
             "retry_count": 2,
             "next_retry_at": None,
-            "worker_id_present": False,
-            "claimed_at": None,
+            "worker_id_present": True,
+            "worker_id_digest": hashlib.sha256(
+                b"orphaned-worker"
+            ).hexdigest(),
+            "claimed_at": "2026-07-29T12:30:00.000000Z",
             "task_payload_present": True,
             "task_payload_digest": "a" * 64,
             "result_metadata_digest": "b" * 64,
@@ -204,6 +210,9 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
             "updated_at": "2026-07-30T16:00:00.000000Z",
             "completed_at": None,
             "retry_count": 0,
+            "worker_id_present": False,
+            "worker_id_digest": None,
+            "claimed_at": None,
             "error_category": "none",
             "error_digest": None,
         }
@@ -211,7 +220,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         class ApplyConnection(FakeConnection):
             def __init__(self):
                 super().__init__()
-                self.fetchval_results = [123, 0, False, 124]
+                self.fetchval_results = [123, 0, 124]
                 self.fetch_results = [[before], [after]]
                 self.execute_call = None
                 self.deadline_settings = []
@@ -220,6 +229,9 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
                 if "set_config" in query:
                     self.deadline_settings.append((query, arguments))
                     return arguments[-1]
+                if "SELECT EXISTS" in query:
+                    self.assert_selected_ids = arguments
+                    return False
                 return self.fetchval_results.pop(0)
 
             async def fetch(self, query, *arguments):
@@ -254,6 +266,10 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
 
         self.assertEqual(generation_before, "systalyze:public:123")
         self.assertEqual(generation_after, "systalyze:public:124")
+        self.assertEqual(
+            [str(value) for value in connection.assert_selected_ids[0]],
+            [before["operation_id"]],
+        )
         update, arguments = connection.execute_call
         self.assertIn("SET status = 'pending'", update)
         self.assertIn("retry_count = 0", update)
@@ -301,6 +317,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
             "retry_count": 2,
             "next_retry_at": None,
             "worker_id_present": False,
+            "worker_id_digest": None,
             "claimed_at": None,
             "task_payload_present": True,
             "task_payload_digest": "a" * 64,
@@ -369,6 +386,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
             "retry_count": 2,
             "next_retry_at": "2026-07-29T13:05:00.000000Z",
             "worker_id_present": False,
+            "worker_id_digest": None,
             "claimed_at": None,
             "task_payload_present": True,
             "task_payload_digest": "a" * 64,
@@ -463,6 +481,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
             "retry_count": 2,
             "next_retry_at": "2026-07-29T13:05:00.000000Z",
             "worker_id_present": False,
+            "worker_id_digest": None,
             "claimed_at": None,
             "task_payload_present": True,
             "task_payload_digest": "a" * 64,
@@ -538,7 +557,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
                         )
                     )
 
-    def test_rollback_reconciles_a_committed_journal_without_mutation(self):
+    def test_rollback_reconciles_claimed_selected_preimage(self):
         restored = {
             "operation_id": "00000000-0000-4000-8000-000000000001",
             "bank_id": "engineering",
@@ -549,8 +568,11 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
             "completed_at": "2026-07-29T13:00:00.000000Z",
             "retry_count": 2,
             "next_retry_at": None,
-            "worker_id_present": False,
-            "claimed_at": None,
+            "worker_id_present": True,
+            "worker_id_digest": hashlib.sha256(
+                b"orphaned-worker"
+            ).hexdigest(),
+            "claimed_at": "2026-07-29T12:30:00.000000Z",
             "task_payload_present": True,
             "task_payload_digest": "a" * 64,
             "result_metadata_digest": "b" * 64,
@@ -572,8 +594,8 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
             "error_message": "provider capacity exhausted",
             "completed_at": restored["completed_at"],
             "next_retry_at": None,
-            "worker_id": None,
-            "claimed_at": None,
+            "worker_id": "orphaned-worker",
+            "claimed_at": restored["claimed_at"],
             "retry_count": 2,
             "updated_at": restored["updated_at"],
             "task_payload_digest": restored["task_payload_digest"],
@@ -616,6 +638,33 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         self.assertEqual(before, "systalyze:public:124")
         self.assertEqual(after, "systalyze:public:125")
         self.assertEqual(connection.execute_calls, [])
+
+        restored["worker_id_digest"] = hashlib.sha256(
+            b"different-worker"
+        ).hexdigest()
+        drifted = ReconcileConnection()
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "rollback post-state differs",
+        ):
+            asyncio.run(
+                rollback_requeue_transaction(
+                    drifted,
+                    profile_id="systalyze",
+                    schema="public",
+                    bank_id="engineering",
+                    plan={"selected_operations": [selected]},
+                    application={
+                        "post_generation": "systalyze:public:124"
+                    },
+                    rollback_record={
+                        "pre_generation": "systalyze:public:124",
+                        "post_generation": "systalyze:public:125",
+                    },
+                    preimage=[preimage],
+                )
+            )
+        self.assertEqual(drifted.execute_calls, [])
 
     def test_connect_authenticates_only_over_exact_unix_peer_pid(self):
         class Connected:

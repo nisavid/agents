@@ -151,6 +151,7 @@ def operation_rows() -> list[dict]:
                 "retry_count": 0,
                 "next_retry_at": None,
                 "worker_id_present": False,
+                "worker_id_digest": None,
                 "claimed_at": None,
                 "task_payload_present": True,
                 "task_payload_digest": f"{position:064x}",

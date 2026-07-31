@@ -2,6 +2,8 @@
 """Validate and inspect Hindsight memory desired-state plans."""
 
 import argparse
+import asyncio
+import base64
 from contextlib import contextmanager
 import ctypes
 from datetime import datetime, timezone
@@ -14,7 +16,9 @@ import os
 from pathlib import Path
 import re
 import secrets
+import select
 import shlex
+import shutil
 import signal
 import socket
 import stat
@@ -147,6 +151,28 @@ from hindsight_memory_control_plane.portable_install import (  # noqa: E402
     InstallationConfig,
     PortableInstallError,
     PortableInstallationManager,
+    _release_manifest,
+)
+from hindsight_memory_control_plane.operation_recovery import (  # noqa: E402
+    OperationRecoveryError,
+    create_cohort_manifest,
+    create_live_snapshot,
+    create_requeue_plan,
+    normalize_pg0_binding,
+    verify_cohort_manifest,
+    verify_live_snapshot,
+    verify_requeue_plan,
+)
+from hindsight_memory_control_plane.operation_recovery_runtime import (  # noqa: E402
+    apply_requeue_transaction,
+    assert_connected_live_database,
+    connect_verified_local_postgres,
+    live_row_digest,
+    read_pg0_registration,
+    read_restore_identity,
+    read_selected_preimage,
+    read_snapshot as read_operation_recovery_snapshot,
+    rollback_requeue_transaction,
 )
 from hindsight_memory_control_plane.harness_persistence import (  # noqa: E402
     HarnessPersistenceError,
@@ -4138,6 +4164,3497 @@ def data_identity_rebind_rollback_command(args: argparse.Namespace) -> int:
     )
 
 
+EXPECTED_OPERATION_RECOVERY_INSTALLATION = {
+    "consumer_id": "stlz-ivan-mbp",
+    "installed_release_version": "2026.07.28+fc7dfa9",
+    "current_release_digest": (
+        "c8d125204fcf93d842cf835580906c533e3c166e6dd66f4cd3860bec7b71e275"
+    ),
+    "install_state_digest": (
+        "3cfbfe44b24ed889155db7de92f845567354e5df352baa8af9c3289aaaabc54a"
+    ),
+    "binding_generation_digest": (
+        "4a72234b6a00ebd4476155dfdb684f2c6f043591bbaf8d51f6d04dfd20c5bd43"
+    ),
+    "recorded_data_identity_digest": (
+        "8a3a00e9bc8f44ad48067c089f4b1ff8eb55fc5dca07c84f5718f6f1f08c6b47"
+    ),
+    "postgres_system_identifier": "7659746962107358086",
+}
+
+EXPECTED_OPERATION_RECOVERY_SOURCE_BACKUP = {
+    "path": (
+        "/Users/ivan/.local/state/hindsight-control-plane/"
+        "data-identity-rebind/backups/"
+        "hindsight-systalyze-full-20260729T163300Z.dump.age"
+    ),
+    "sha256": (
+        "9ca67eef52ff9a80653e780e280ba5b2a0ec30cdd093c9f7dfaa7fecb3fb8703"
+    ),
+}
+
+EXPECTED_OPERATION_RECOVERY_RECIPIENT_SHA256 = (
+    "62a6244e496064fbd7dcb10bf137b9fad761a5a541bce662da3ea4cd47ba55fc"
+)
+
+EXPECTED_OPERATION_RECOVERY_POSTGRES_PREFIX = {
+    "path": "/Users/ivan/.pg0/installation/18.1.0",
+    "sha256": (
+        "c67bfac40d454d2c1882e76461d5572dbabdd79f0e83f4ef5b4e79d79de3024c"
+    ),
+}
+
+EXPECTED_OPERATION_RECOVERY_TOOLCHAIN = {
+    "age": {
+        "path": "/opt/homebrew/Cellar/age/1.3.1/bin/age",
+        "sha256": (
+            "f52e5ee772e1c0e3c6be5bf837b469a40346df3515db9a1b41230376fdff6a76"
+        ),
+    },
+    "initdb": {
+        "path": "/Users/ivan/.pg0/installation/18.1.0/bin/initdb",
+        "sha256": (
+            "f03a1327c0875751a642510c63b4f6d11f79d7e1b2cf06e1d3227071e9689399"
+        ),
+    },
+    "pg_ctl": {
+        "path": "/Users/ivan/.pg0/installation/18.1.0/bin/pg_ctl",
+        "sha256": (
+            "32c9bba97fda5a24280aae01391c8def91e44f85c6d0ef6fbf8b7ad7e264dd1e"
+        ),
+    },
+    "createdb": {
+        "path": "/Users/ivan/.pg0/installation/18.1.0/bin/createdb",
+        "sha256": (
+            "d2e42765a280b32a61659329d0572e2c78147136704ab552228e4b4c51260f3e"
+        ),
+    },
+    "pg_restore": {
+        "path": "/Users/ivan/.pg0/installation/18.1.0/bin/pg_restore",
+        "sha256": (
+            "44ddff61075de3308da625ad42ea58e6cb94ebf5a50fc068dca8b643ecb688c9"
+        ),
+    },
+    "pg_dump": {
+        "path": "/Users/ivan/.pg0/installation/18.1.0/bin/pg_dump",
+        "sha256": (
+            "4030ff0b5530931d082513717fd21831873485b314148db175c2b3eee5eb2d17"
+        ),
+    },
+    "postgres": {
+        "path": "/Users/ivan/.pg0/installation/18.1.0/bin/postgres",
+        "sha256": (
+            "01ebc3472a16e4ee255c403458261f69cd9e1b94e91a067680ad7f824f1bba3c"
+        ),
+    },
+    "libssl": {
+        "path": (
+            "/opt/homebrew/Cellar/openssl@3/3.6.3/lib/libssl.3.dylib"
+        ),
+        "sha256": (
+            "4c3c554adc8ace6ec2245b4962b181451d245edfab92c3a09fc7b3be094e7438"
+        ),
+    },
+    "libcrypto": {
+        "path": (
+            "/opt/homebrew/Cellar/openssl@3/3.6.3/lib/libcrypto.3.dylib"
+        ),
+        "sha256": (
+            "34bc039f5c725691e757ef42d26f1709830b18046c3ad6d93985153c83d0bbbc"
+        ),
+    },
+}
+
+
+class OperationRecoveryPinnedTool(NamedTuple):
+    path: Path
+    device: int
+    inode: int
+    sha256: str
+
+
+def _operation_recovery_tool(
+    supplied_path: Path,
+    key: str,
+) -> Path:
+    """Resolve one exact content-pinned tool from the closed capsule contract."""
+    expected = EXPECTED_OPERATION_RECOVERY_TOOLCHAIN[key]
+    try:
+        resolved = supplied_path.resolve(strict=True)
+    except OSError as error:
+        raise OperationRecoveryError(
+            f"operation-recovery {key} executable is unavailable"
+        ) from error
+    expected_path = Path(expected["path"])
+    if resolved != expected_path:
+        raise OperationRecoveryError(
+            f"operation-recovery {key} executable path differs"
+        )
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            resolved,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        metadata = os.fstat(descriptor)
+        observed = resolved.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or (metadata.st_dev, metadata.st_ino)
+            != (observed.st_dev, observed.st_ino)
+            or not hmac.compare_digest(
+                _operation_recovery_fd_sha256(descriptor),
+                expected["sha256"],
+            )
+        ):
+            raise OperationRecoveryError(
+                f"operation-recovery {key} executable differs"
+            )
+    except OSError as error:
+        raise OperationRecoveryError(
+            f"operation-recovery {key} executable is unavailable"
+        ) from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    return resolved
+
+
+def _copy_operation_recovery_tool(
+    source: Path,
+    destination: Path,
+    key: str,
+) -> OperationRecoveryPinnedTool:
+    """Copy one verified executable into a private, run-owned inode."""
+    expected = EXPECTED_OPERATION_RECOVERY_TOOLCHAIN[key]
+    source_descriptor = -1
+    destination_descriptor = -1
+    try:
+        source_descriptor = os.open(
+            source,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        source_metadata = os.fstat(source_descriptor)
+        source_observed = source.lstat()
+        if (
+            not stat.S_ISREG(source_metadata.st_mode)
+            or (source_metadata.st_dev, source_metadata.st_ino)
+            != (source_observed.st_dev, source_observed.st_ino)
+            or not hmac.compare_digest(
+                _operation_recovery_fd_sha256(source_descriptor),
+                expected["sha256"],
+            )
+        ):
+            raise OperationRecoveryError(
+                f"operation-recovery {key} executable differs"
+            )
+        destination_descriptor = os.open(
+            destination,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o500,
+        )
+        while True:
+            chunk = os.read(source_descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            view = memoryview(chunk)
+            while view:
+                written = os.write(destination_descriptor, view)
+                if written <= 0:
+                    raise OperationRecoveryError(
+                        f"operation-recovery {key} executable copy failed"
+                    )
+                view = view[written:]
+        os.fsync(destination_descriptor)
+        os.fchmod(destination_descriptor, 0o500)
+        metadata = os.fstat(destination_descriptor)
+        observed = destination.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o500
+            or metadata.st_nlink != 1
+            or (metadata.st_dev, metadata.st_ino)
+            != (observed.st_dev, observed.st_ino)
+        ):
+            raise OperationRecoveryError(
+                f"operation-recovery {key} private executable is invalid"
+            )
+    except OSError as error:
+        raise OperationRecoveryError(
+            f"operation-recovery {key} private executable is unavailable"
+        ) from error
+    finally:
+        if source_descriptor >= 0:
+            os.close(source_descriptor)
+        if destination_descriptor >= 0:
+            os.close(destination_descriptor)
+    pinned = OperationRecoveryPinnedTool(
+        destination,
+        metadata.st_dev,
+        metadata.st_ino,
+        expected["sha256"],
+    )
+    _assert_operation_recovery_pinned_tool(pinned, key)
+    return pinned
+
+
+def _assert_operation_recovery_pinned_tool(
+    tool: OperationRecoveryPinnedTool,
+    key: str,
+) -> None:
+    try:
+        descriptor = os.open(
+            tool.path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except OSError as error:
+        raise OperationRecoveryError(
+            f"operation-recovery {key} private executable is unavailable"
+        ) from error
+    try:
+        metadata = os.fstat(descriptor)
+        observed = tool.path.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o500
+            or metadata.st_nlink != 1
+            or (metadata.st_dev, metadata.st_ino)
+            != (tool.device, tool.inode)
+            or (observed.st_dev, observed.st_ino)
+            != (tool.device, tool.inode)
+            or not hmac.compare_digest(
+                _operation_recovery_fd_sha256(descriptor),
+                tool.sha256,
+            )
+            or not hmac.compare_digest(
+                tool.sha256,
+                EXPECTED_OPERATION_RECOVERY_TOOLCHAIN[key]["sha256"],
+            )
+        ):
+            raise OperationRecoveryError(
+                f"operation-recovery {key} private executable differs"
+            )
+    finally:
+        os.close(descriptor)
+
+
+def _operation_recovery_tree_digest(root: Path) -> str:
+    try:
+        resolved_root = root.resolve(strict=True)
+    except OSError as error:
+        raise OperationRecoveryError(
+            "operation-recovery runtime prefix is unavailable"
+        ) from error
+    entries: list[dict[str, Any]] = []
+    try:
+        paths = sorted(
+            resolved_root.rglob("*"),
+            key=lambda path: path.relative_to(resolved_root).as_posix(),
+        )
+        for path in paths:
+            relative = path.relative_to(resolved_root).as_posix()
+            metadata = path.lstat()
+            if stat.S_ISDIR(metadata.st_mode):
+                entries.append({"kind": "directory", "path": relative})
+                continue
+            target = path.resolve(strict=True)
+            if (
+                resolved_root not in target.parents
+                or not target.is_file()
+            ):
+                raise OperationRecoveryError(
+                    "operation-recovery runtime prefix contains "
+                    "an unsupported entry"
+                )
+            descriptor = os.open(
+                target,
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            try:
+                entries.append(
+                    {
+                        "kind": "file",
+                        "path": relative,
+                        "sha256": _operation_recovery_fd_sha256(
+                            descriptor
+                        ),
+                    }
+                )
+            finally:
+                os.close(descriptor)
+    except OSError as error:
+        raise OperationRecoveryError(
+            "operation-recovery runtime prefix is unreadable"
+        ) from error
+    return digest(entries)
+
+
+def _stage_operation_recovery_tools(
+    supplied: Mapping[str, Path],
+) -> tuple[Path, dict[str, OperationRecoveryPinnedTool]]:
+    """Stage verified executables into a private immutable runtime copy."""
+    resolved = {
+        key: _operation_recovery_tool(path, key)
+        for key, path in supplied.items()
+    }
+    root = Path(
+        "/private/tmp"
+    ) / f"hindsight-operation-tools-{secrets.token_hex(16)}"
+    try:
+        root.mkdir(mode=0o700)
+        tools: dict[str, OperationRecoveryPinnedTool] = {}
+        postgres_keys = {
+            key
+            for key in supplied
+            if key in {"initdb", "pg_ctl", "createdb", "pg_restore", "pg_dump"}
+        }
+        if postgres_keys:
+            source_prefix = Path(
+                EXPECTED_OPERATION_RECOVERY_TOOLCHAIN["postgres"]["path"]
+            ).parents[1]
+            if (
+                source_prefix
+                != Path(EXPECTED_OPERATION_RECOVERY_POSTGRES_PREFIX["path"])
+                or not hmac.compare_digest(
+                    _operation_recovery_tree_digest(source_prefix),
+                    EXPECTED_OPERATION_RECOVERY_POSTGRES_PREFIX["sha256"],
+                )
+            ):
+                raise OperationRecoveryError(
+                    "operation-recovery PostgreSQL prefix differs"
+                )
+            private_prefix = root / "postgres"
+            shutil.copytree(
+                source_prefix,
+                private_prefix,
+                symlinks=False,
+                copy_function=shutil.copyfile,
+            )
+            for key in (*sorted(postgres_keys), "postgres"):
+                destination = private_prefix / "bin" / key
+                destination.unlink()
+                source = (
+                    resolved[key]
+                    if key in resolved
+                    else _operation_recovery_tool(
+                        Path(
+                            EXPECTED_OPERATION_RECOVERY_TOOLCHAIN[key]["path"]
+                        ),
+                        key,
+                    )
+                )
+                tools[key] = _copy_operation_recovery_tool(
+                    source,
+                    destination,
+                    key,
+                )
+            private_openssl = root / "openssl"
+            private_openssl.mkdir(mode=0o700)
+            for key, filename in (
+                ("libssl", "libssl.3.dylib"),
+                ("libcrypto", "libcrypto.3.dylib"),
+            ):
+                source = _operation_recovery_tool(
+                    Path(
+                        EXPECTED_OPERATION_RECOVERY_TOOLCHAIN[key]["path"]
+                    ),
+                    key,
+                )
+                tools[key] = _copy_operation_recovery_tool(
+                    source,
+                    private_openssl / filename,
+                    key,
+                )
+            private_openssl.chmod(0o500)
+            for path in sorted(
+                private_prefix.rglob("*"),
+                key=lambda item: len(item.parts),
+                reverse=True,
+            ):
+                path.chmod(0o500 if path.is_dir() or os.access(path, os.X_OK) else 0o400)
+            private_prefix.chmod(0o500)
+            if not hmac.compare_digest(
+                _operation_recovery_tree_digest(private_prefix),
+                EXPECTED_OPERATION_RECOVERY_POSTGRES_PREFIX["sha256"],
+            ):
+                raise OperationRecoveryError(
+                    "operation-recovery private PostgreSQL prefix differs"
+                )
+        if "age" in supplied:
+            tools["age"] = _copy_operation_recovery_tool(
+                resolved["age"],
+                root / "age",
+                "age",
+            )
+        root.chmod(0o500)
+        for key in supplied:
+            _assert_operation_recovery_pinned_tool(tools[key], key)
+        return root, tools
+    except Exception:
+        if root.exists():
+            for path in root.rglob("*"):
+                try:
+                    path.chmod(0o700 if path.is_dir() else 0o600)
+                except OSError:
+                    pass
+            root.chmod(0o700)
+            shutil.rmtree(root)
+        raise
+
+
+def _remove_operation_recovery_tools(root: Path) -> None:
+    if not root.exists() or root.parent != Path("/private/tmp"):
+        raise OperationRecoveryError(
+            "operation-recovery private tool root is invalid"
+        )
+    for path in sorted(
+        root.rglob("*"),
+        key=lambda item: len(item.parts),
+        reverse=True,
+    ):
+        path.chmod(0o700 if path.is_dir() else 0o600)
+    root.chmod(0o700)
+    shutil.rmtree(root)
+
+
+def _operation_recovery_toolchain_digest() -> str:
+    return digest(
+        {
+            "executables": EXPECTED_OPERATION_RECOVERY_TOOLCHAIN,
+            "postgres_prefix": EXPECTED_OPERATION_RECOVERY_POSTGRES_PREFIX,
+        }
+    )
+
+
+def _operation_recovery_rollback_encryption(recipient: str) -> dict[str, str]:
+    if (
+        not recipient.startswith("age1")
+        or len(recipient) > 4096
+        or not recipient.isascii()
+        or any(character in recipient for character in "\r\n\0")
+        or not hmac.compare_digest(
+            hashlib.sha256(recipient.encode("ascii")).hexdigest(),
+            EXPECTED_OPERATION_RECOVERY_RECIPIENT_SHA256,
+        )
+    ):
+        raise OperationRecoveryError("rollback recipient is invalid")
+    age = EXPECTED_OPERATION_RECOVERY_TOOLCHAIN["age"]
+    return {
+        "recipient": recipient,
+        "age_path": age["path"],
+        "age_sha256": age["sha256"],
+    }
+
+
+def _operation_recovery_historical_source_authority(
+    backup_path: Path,
+    supplied_digest: str,
+) -> dict[str, str]:
+    try:
+        resolved = backup_path.resolve(strict=True)
+    except OSError as error:
+        raise OperationRecoveryError(
+            "operation-recovery source backup is unavailable"
+        ) from error
+    if (
+        resolved != Path(EXPECTED_OPERATION_RECOVERY_SOURCE_BACKUP["path"])
+        or not hmac.compare_digest(
+            supplied_digest,
+            EXPECTED_OPERATION_RECOVERY_SOURCE_BACKUP["sha256"],
+        )
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery source backup authority differs"
+        )
+    return {
+        "kind": "approved-historical-backup",
+        "artifact_path": str(resolved),
+        "artifact_sha256": (
+            EXPECTED_OPERATION_RECOVERY_SOURCE_BACKUP["sha256"]
+        ),
+        "postgres_system_identifier": (
+            EXPECTED_OPERATION_RECOVERY_INSTALLATION[
+                "postgres_system_identifier"
+            ]
+        ),
+    }
+
+
+def _operation_recovery_candidate(args: argparse.Namespace) -> dict[str, str]:
+    identity = _operation_recovery_read_private_json(
+        args.candidate_release_identity,
+        "candidate release identity",
+    )
+    required = {
+        "schema_version",
+        "source_commit",
+        "version",
+        "release_digest",
+        "manifest",
+    }
+    if not isinstance(identity, Mapping) or set(identity) != required:
+        raise OperationRecoveryError("candidate release identity is invalid")
+    runtime_root = Path(__file__).resolve(strict=True).parents[1]
+    expected_root = Path(args.candidate_release_root).resolve(strict=True)
+    if runtime_root != expected_root:
+        raise OperationRecoveryError(
+            "operation recovery must run from the packaged candidate"
+        )
+    observed_manifest = _release_manifest(expected_root, identity["version"])
+    if (
+        identity["schema_version"] != 1
+        or identity["manifest"] != observed_manifest
+        or identity["release_digest"] != observed_manifest["release_digest"]
+    ):
+        raise OperationRecoveryError("candidate release identity differs")
+    return {
+        "source_commit": identity["source_commit"],
+        "version": identity["version"],
+        "release_digest": identity["release_digest"],
+    }
+
+
+def _assert_recovery_services_stopped(
+    manager: PortableInstallationManager,
+) -> None:
+    labels = [service.label for service in manager.config.services]
+    domain = f"gui/{os.geteuid()}"
+    for label in labels:
+        result = subprocess.run(
+            ("/bin/launchctl", "print", f"{domain}/{label}"),
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            cwd="/",
+            env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"},
+            timeout=10,
+        )
+        if result.returncode == 0:
+            raise OperationRecoveryError(
+                "managed Hindsight service remains loaded"
+            )
+    for port in (7878, 7979, 8889, 17979):
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            probe.settimeout(0.1)
+            if probe.connect_ex(("127.0.0.1", port)) == 0:
+                raise OperationRecoveryError(
+                    "managed Hindsight service port remains active"
+                )
+        finally:
+            probe.close()
+    process_list = subprocess.run(
+        ("/bin/ps", "-axo", "pid=,command="),
+        check=False,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        cwd="/",
+        env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"},
+        timeout=10,
+    )
+    if process_list.returncode != 0:
+        raise OperationRecoveryError(
+            "managed Hindsight process census is unavailable"
+        )
+    worker_markers = (
+        "hindsight-embed-supervisor",
+        "hindsight-hook-authority-supervisor",
+        "hindsight-embed-service",
+        "/hindsight-api",
+        "hindsight_api",
+        "hindsight-worker",
+        "hindsight-memory broker",
+        "hindsight-memory sidecar",
+        "hindsight-memory service",
+    )
+    for line in process_list.stdout.decode("utf-8", errors="replace").splitlines():
+        fields = line.strip().split(maxsplit=1)
+        if (
+            len(fields) == 2
+            and fields[0].isdigit()
+            and int(fields[0]) != os.getpid()
+            and any(marker in fields[1] for marker in worker_markers)
+        ):
+            raise OperationRecoveryError(
+                "orphan or manual Hindsight process remains active"
+            )
+
+
+def _operation_recovery_authority(
+    args: argparse.Namespace,
+    *,
+    postgres_system_identifier: str,
+    lock_installer: bool = True,
+) -> dict[str, Any]:
+    manager = _portable_manager(args)
+    _assert_recovery_services_stopped(manager)
+
+    def capture():
+        snapshot = manager._require_quiescent_rebind_state_locked()
+        if snapshot is None:
+            raise OperationRecoveryError("portable installation is absent")
+        state, state_bytes, _state_identity, _root_identity = snapshot
+        observed_identity = manager._prepare_data_identity(initial=False)
+        bindings = manager._validate_external_bindings()
+        manager._verify_installed_locked(
+            state,
+            expected_data_identity_digest=observed_identity,
+        )
+        profile_id = manager._data_identity_profile()
+        return state, state_bytes, observed_identity, bindings, profile_id
+
+    if lock_installer:
+        with manager._lock():
+            (
+                state,
+                state_bytes,
+                observed_identity,
+                bindings,
+                profile_id,
+            ) = capture()
+    else:
+        (
+            state,
+            state_bytes,
+            observed_identity,
+            bindings,
+            profile_id,
+        ) = capture()
+    current = state.get("current")
+    if not isinstance(current, Mapping):
+        raise OperationRecoveryError("installed release authority is invalid")
+    authority = {
+        "consumer_id": manager.config.consumer_id,
+        "profile_id": profile_id,
+        "schema": "public",
+        "bank_id": "engineering",
+        "install_state_digest": hashlib.sha256(state_bytes).hexdigest(),
+        "binding_generation_digest": bindings.generation_digest,
+        "installed_release_version": current.get("version"),
+        "current_release_digest": current.get("release_digest"),
+        "recorded_data_identity_digest": state.get("data_identity_digest"),
+        "observed_data_identity_digest": observed_identity,
+        "postgres_system_identifier": postgres_system_identifier,
+    }
+    expected = EXPECTED_OPERATION_RECOVERY_INSTALLATION
+    for key in (
+        "consumer_id",
+        "installed_release_version",
+        "current_release_digest",
+        "install_state_digest",
+        "binding_generation_digest",
+        "recorded_data_identity_digest",
+        "postgres_system_identifier",
+    ):
+        if authority.get(key) != expected[key]:
+            raise OperationRecoveryError(
+                f"operation-recovery installation {key} drifted"
+            )
+    if (
+        authority["profile_id"] != "systalyze"
+        or authority["observed_data_identity_digest"]
+        == authority["recorded_data_identity_digest"]
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery data identity boundary is invalid"
+        )
+    return authority
+
+
+def _load_asyncpg():
+    try:
+        import asyncpg  # type: ignore[import-not-found]
+    except ImportError as error:
+        raise OperationRecoveryError(
+            "operation recovery requires the managed Hindsight API Python"
+        ) from error
+    return asyncpg
+
+
+async def _operation_recovery_connect_live(
+    args: argparse.Namespace,
+    *,
+    readonly: bool = True,
+):
+    asyncpg = _load_asyncpg()
+    binding = read_pg0_registration("systalyze")
+    password = binding.pop("_password")
+    connection = None
+    try:
+        connection = await connect_verified_local_postgres(
+            asyncpg,
+            binding,
+            password=password,
+            readonly=readonly,
+        )
+    finally:
+        password = ""
+    try:
+        await assert_connected_live_database(
+            connection,
+            binding,
+            expected_system_identifier=(
+                EXPECTED_OPERATION_RECOVERY_INSTALLATION[
+                    "postgres_system_identifier"
+                ]
+            ),
+        )
+    except Exception:
+        if connection is not None:
+            await connection.close()
+        raise
+    return connection
+
+
+def _run_private_subprocess(
+    argv: Sequence[str],
+    *,
+    pinned_tool: OperationRecoveryPinnedTool,
+    tool_key: str,
+    pinned_dependencies: Mapping[
+        str,
+        OperationRecoveryPinnedTool,
+    ] | None = None,
+    pass_fds: tuple[int, ...] = (),
+    environment: Mapping[str, str] | None = None,
+    timeout: float = 300,
+    stdout: int | None = None,
+    stderr: int | None = None,
+    input_value: bytes | None = None,
+) -> subprocess.CompletedProcess[bytes]:
+    command = tuple(argv)
+    if not command:
+        raise OperationRecoveryError("private recovery command is empty")
+    _assert_operation_recovery_pinned_tool(pinned_tool, tool_key)
+    if Path(command[0]) != pinned_tool.path:
+        raise OperationRecoveryError("private recovery executable differs")
+    dependencies = dict(pinned_dependencies or {})
+    postgres_tool = tool_key in {
+        "initdb",
+        "pg_ctl",
+        "createdb",
+        "pg_restore",
+        "pg_dump",
+        "postgres",
+    }
+    if postgres_tool and set(dependencies) != {"libssl", "libcrypto"}:
+        raise OperationRecoveryError(
+            "private PostgreSQL dependency set differs"
+        )
+    if not postgres_tool and dependencies:
+        raise OperationRecoveryError(
+            "private recovery dependency set is unexpected"
+        )
+    for key, dependency in dependencies.items():
+        _assert_operation_recovery_pinned_tool(dependency, key)
+    process_environment = (
+        {"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"}
+        if environment is None
+        else dict(environment)
+    )
+    if postgres_tool:
+        private_root = pinned_tool.path.parents[2]
+        private_library_path = private_root / "openssl"
+        if (
+            not private_library_path.is_dir()
+            or "DYLD_LIBRARY_PATH" in process_environment
+        ):
+            raise OperationRecoveryError(
+                "private PostgreSQL library path differs"
+            )
+        process_environment["DYLD_LIBRARY_PATH"] = str(
+            private_library_path
+        )
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            stdin=subprocess.DEVNULL if input_value is None else None,
+            input=input_value,
+            stdout=subprocess.DEVNULL if stdout is None else stdout,
+            stderr=subprocess.DEVNULL if stderr is None else stderr,
+            cwd="/",
+            env=process_environment,
+            pass_fds=pass_fds,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise OperationRecoveryError("private recovery subprocess failed") from error
+    finally:
+        _assert_operation_recovery_pinned_tool(pinned_tool, tool_key)
+        for key, dependency in dependencies.items():
+            _assert_operation_recovery_pinned_tool(dependency, key)
+    if result.returncode != 0:
+        raise OperationRecoveryError("private recovery subprocess failed")
+    return result
+
+
+def _operation_recovery_read_private_json(
+    path_value: str | Path,
+    label: str,
+) -> Any:
+    path = Path(path_value)
+    if not path.is_absolute() or path.name in {"", ".", ".."}:
+        raise OperationRecoveryError(f"{label} path is invalid")
+    directory = _open_private_parent(path.parent)
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path.name,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory,
+        )
+        metadata = os.fstat(descriptor)
+        observed = os.stat(
+            path.name,
+            dir_fd=directory,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) & 0o077
+            or metadata.st_nlink != 1
+            or metadata.st_size > 16 * 1024 * 1024
+            or (metadata.st_dev, metadata.st_ino)
+            != (observed.st_dev, observed.st_ino)
+        ):
+            raise OperationRecoveryError(f"{label} is not private")
+        body = bytearray()
+        while len(body) <= metadata.st_size:
+            chunk = os.read(descriptor, min(1024 * 1024, metadata.st_size + 1))
+            if not chunk:
+                break
+            body.extend(chunk)
+        if len(body) != metadata.st_size:
+            raise OperationRecoveryError(f"{label} changed while reading")
+        return strict_json_loads(bytes(body))
+    except OperationRecoveryError:
+        raise
+    except (OSError, StrictJsonError, UnicodeError, ValueError) as error:
+        raise OperationRecoveryError(f"{label} is unreadable") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(directory)
+
+
+def _open_operation_recovery_artifact(
+    path: Path,
+    label: str,
+) -> int:
+    if not path.is_absolute() or path.name in {"", ".", ".."}:
+        raise OperationRecoveryError(f"{label} path is invalid")
+    directory = _open_private_parent(path.parent)
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path.name,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory,
+        )
+        metadata = os.fstat(descriptor)
+        observed = os.stat(
+            path.name,
+            dir_fd=directory,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) & 0o077
+            or metadata.st_nlink != 1
+            or (metadata.st_dev, metadata.st_ino)
+            != (observed.st_dev, observed.st_ino)
+        ):
+            raise OperationRecoveryError(f"{label} is not private")
+        return descriptor
+    except Exception:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+    finally:
+        os.close(directory)
+
+
+def _operation_recovery_fd_sha256(descriptor: int) -> str:
+    value = hashlib.sha256()
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    while True:
+        chunk = os.read(descriptor, 1024 * 1024)
+        if not chunk:
+            break
+        value.update(chunk)
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    return value.hexdigest()
+
+
+def _create_pinned_recovery_root(path: Path) -> tuple[int, tuple[int, int]]:
+    path.mkdir(mode=0o700)
+    descriptor = os.open(
+        path,
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    metadata = os.fstat(descriptor)
+    observed = path.lstat()
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) & 0o077
+        or (metadata.st_dev, metadata.st_ino)
+        != (observed.st_dev, observed.st_ino)
+    ):
+        os.close(descriptor)
+        raise OperationRecoveryError("disposable restore root is not private")
+    return descriptor, (metadata.st_dev, metadata.st_ino)
+
+
+def _pinned_recovery_root_path(
+    descriptor: int,
+    identity: tuple[int, int],
+) -> Path:
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) & 0o077
+        or (metadata.st_dev, metadata.st_ino) != identity
+        or sys.platform != "darwin"
+    ):
+        raise OperationRecoveryError("disposable restore root identity changed")
+    try:
+        raw_path = fcntl.fcntl(descriptor, 50, b"\0" * 1024)
+        current = Path(raw_path.split(b"\0", 1)[0].decode("utf-8"))
+        observed = current.lstat()
+    except (OSError, UnicodeError) as error:
+        raise OperationRecoveryError(
+            "disposable restore root path is unavailable"
+        ) from error
+    if (
+        not current.is_absolute()
+        or (observed.st_dev, observed.st_ino) != identity
+        or not stat.S_ISDIR(observed.st_mode)
+    ):
+        raise OperationRecoveryError("disposable restore root path changed")
+    return current
+
+
+@contextmanager
+def _verified_postgres_proxy(
+    root_descriptor: int,
+    root_identity: tuple[int, int],
+    binding: Mapping[str, Any],
+):
+    """Forward one pg_dump connection over a PID-verified PostgreSQL socket."""
+    proxy_name = f"p-{secrets.token_hex(4)}"
+    os.mkdir(proxy_name, 0o700, dir_fd=root_descriptor)
+    current_root = _pinned_recovery_root_path(
+        root_descriptor,
+        root_identity,
+    )
+    listener_path = current_root / proxy_name / (
+        f".s.PGSQL.{binding['port']}"
+    )
+    upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client: socket.socket | None = None
+    errors: list[BaseException] = []
+    stopped = threading.Event()
+    try:
+        upstream.connect(binding["socket_path"])
+        peer_pid = struct.unpack(
+            "i",
+            upstream.getsockopt(0, 2, struct.calcsize("i")),
+        )[0]
+        if peer_pid != binding["pid"]:
+            raise OperationRecoveryError(
+                "PostgreSQL backup peer PID differs"
+            )
+        listener.bind(str(listener_path))
+        listener.listen(1)
+        listener.settimeout(0.5)
+
+        def forward() -> None:
+            nonlocal client
+            try:
+                while client is None and not stopped.is_set():
+                    try:
+                        client, _address = listener.accept()
+                    except TimeoutError:
+                        continue
+                if client is None:
+                    return
+                readable = {client, upstream}
+                peers = {client: upstream, upstream: client}
+                while readable and not stopped.is_set():
+                    ready, _writable, _exceptional = select.select(
+                        list(readable),
+                        [],
+                        [],
+                        0.5,
+                    )
+                    for source in ready:
+                        body = source.recv(1024 * 1024)
+                        target = peers[source]
+                        if body:
+                            target.sendall(body)
+                        else:
+                            readable.discard(source)
+                            try:
+                                target.shutdown(socket.SHUT_WR)
+                            except OSError:
+                                pass
+            except BaseException as error:
+                errors.append(error)
+
+        thread = threading.Thread(
+            target=forward,
+            name="hindsight-operation-recovery-pg-proxy",
+        )
+        thread.start()
+        try:
+            yield str(listener_path.parent)
+        finally:
+            stopped.set()
+            try:
+                listener.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            if client is not None:
+                try:
+                    client.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+            try:
+                upstream.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            thread.join(timeout=10)
+            if thread.is_alive():
+                raise OperationRecoveryError(
+                    "PostgreSQL backup proxy did not stop"
+                )
+            if errors:
+                raise OperationRecoveryError(
+                    "PostgreSQL backup proxy failed"
+                ) from errors[0]
+    finally:
+        if client is not None:
+            client.close()
+        listener.close()
+        upstream.close()
+
+
+def _private_identity_descriptor(path: Path) -> int:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        metadata = os.fstat(descriptor)
+        observed = path.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid not in {0, os.geteuid()}
+            or stat.S_IMODE(metadata.st_mode) & 0o077
+            or metadata.st_nlink != 1
+            or (metadata.st_dev, metadata.st_ino)
+            != (observed.st_dev, observed.st_ino)
+        ):
+            raise OperationRecoveryError(
+                "backup decryption identity is not private"
+            )
+        return descriptor
+    except OperationRecoveryError:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+    except OSError as error:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        raise OperationRecoveryError(
+            "backup decryption identity is unavailable"
+        ) from error
+
+
+def _disposable_postgres_binding(
+    root: Path,
+    port: int,
+) -> dict[str, Any]:
+    """Pin the exact postmaster and socket created inside one private root."""
+    data_dir = root / "data"
+    pid_path = data_dir / "postmaster.pid"
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            pid_path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        metadata = os.fstat(descriptor)
+        observed = pid_path.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or metadata.st_size > 4096
+            or (metadata.st_dev, metadata.st_ino)
+            != (observed.st_dev, observed.st_ino)
+        ):
+            raise OperationRecoveryError(
+                "disposable PostgreSQL process identity is invalid"
+            )
+        payload = os.read(descriptor, metadata.st_size + 1)
+    except OSError as error:
+        raise OperationRecoveryError(
+            "disposable PostgreSQL process identity is unavailable"
+        ) from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    try:
+        lines = payload.decode("ascii").splitlines()
+        pid = int(lines[0])
+        data_line = Path(lines[1]).resolve(strict=True)
+        bound_port = int(lines[3])
+        socket_dir = Path(lines[4])
+    except (IndexError, OSError, UnicodeError, ValueError) as error:
+        raise OperationRecoveryError(
+            "disposable PostgreSQL process identity is invalid"
+        ) from error
+    socket_path = socket_dir / f".s.PGSQL.{port}"
+    try:
+        socket_metadata = socket_path.lstat()
+        os.kill(pid, 0)
+    except OSError as error:
+        raise OperationRecoveryError(
+            "disposable PostgreSQL socket identity is unavailable"
+        ) from error
+    if (
+        pid <= 0
+        or bound_port != port
+        or data_line != data_dir.resolve(strict=True)
+        or socket_dir != root / "socket"
+        or not stat.S_ISSOCK(socket_metadata.st_mode)
+        or socket_metadata.st_uid != os.geteuid()
+    ):
+        raise OperationRecoveryError(
+            "disposable PostgreSQL process identity is invalid"
+        )
+    return {
+        "pid": pid,
+        "socket_dir": str(socket_dir),
+        "socket_path": str(socket_path),
+        "port": port,
+        "user": "hindsight",
+        "database": "hindsight",
+        "data_dir": str(data_dir),
+    }
+
+
+async def _classify_disposable_restore(
+    *,
+    binding: Mapping[str, Any],
+) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
+    asyncpg = _load_asyncpg()
+    connection = await connect_verified_local_postgres(
+        asyncpg,
+        binding,
+        password="disposable-trust-auth-not-a-secret",
+        readonly=True,
+    )
+    try:
+        generation_before, generation_after, rows = (
+            await read_operation_recovery_snapshot(
+                connection,
+                profile_id="systalyze",
+                schema="public",
+                bank_id="engineering",
+                operation_ids=None,
+                statuses=("pending", "processing"),
+            )
+        )
+        if generation_before != generation_after:
+            raise OperationRecoveryError(
+                "restored backup generation changed"
+            )
+        restore_identity = await read_restore_identity(
+            connection,
+            schema="public",
+        )
+        return generation_before, rows, restore_identity
+    finally:
+        await connection.close()
+
+
+def operation_recovery_classify_backup_command(
+    args: argparse.Namespace,
+) -> int:
+    _operation_recovery_candidate(args)
+    source_system_identifier = (
+        EXPECTED_OPERATION_RECOVERY_INSTALLATION[
+            "postgres_system_identifier"
+        ]
+    )
+    _operation_recovery_authority(
+        args,
+        postgres_system_identifier=source_system_identifier,
+    )
+    backup_path = Path(args.backup)
+    backup_digest = ""
+    run_root = Path(args.run_root)
+    if (
+        not run_root.is_absolute()
+        or run_root.parent != Path("/private/tmp")
+        or re.fullmatch(
+            r"hindsight-operation-recovery-[0-9a-f]{32}",
+            run_root.name,
+        )
+        is None
+        or run_root.exists()
+        or run_root.is_symlink()
+        or type(args.port) is not int
+        or not 1024 <= args.port <= 65535
+    ):
+        raise OperationRecoveryError("disposable restore root is invalid")
+    postgres_bin = Path(args.postgres_bin_dir).resolve(strict=True)
+    tool_root, pinned_tools = _stage_operation_recovery_tools(
+        {
+            "initdb": postgres_bin / "initdb",
+            "pg_ctl": postgres_bin / "pg_ctl",
+            "createdb": postgres_bin / "createdb",
+            "pg_restore": postgres_bin / "pg_restore",
+            "age": Path(args.age),
+        }
+    )
+    initdb = pinned_tools["initdb"].path
+    pg_ctl = pinned_tools["pg_ctl"].path
+    createdb = pinned_tools["createdb"].path
+    pg_restore = pinned_tools["pg_restore"].path
+    age = pinned_tools["age"].path
+    postgres_dependencies = {
+        "libssl": pinned_tools["libssl"],
+        "libcrypto": pinned_tools["libcrypto"],
+    }
+    historical_source = not getattr(args, "attest_only", False)
+    historical_authority = (
+        _operation_recovery_historical_source_authority(
+            backup_path,
+            args.backup_digest,
+        )
+        if historical_source
+        else None
+    )
+    identity_descriptor = -1
+    backup_descriptor = -1
+    root_descriptor = -1
+    root_identity: tuple[int, int] | None = None
+    plaintext_descriptor = -1
+    started = False
+    root_removed = False
+    generation = ""
+    rows: list[dict[str, Any]] = []
+    restore_identity: dict[str, Any] = {}
+    try:
+        identity_descriptor = _private_identity_descriptor(
+            Path(args.age_identity).resolve(strict=True)
+        )
+        backup_descriptor = _open_operation_recovery_artifact(
+            backup_path,
+            "operation-recovery backup",
+        )
+        backup_digest = _operation_recovery_fd_sha256(backup_descriptor)
+        if not hmac.compare_digest(backup_digest, args.backup_digest):
+            raise OperationRecoveryError(
+                "operation-recovery backup digest differs"
+            )
+        root_descriptor, root_identity = _create_pinned_recovery_root(run_root)
+        os.mkdir("socket", 0o700, dir_fd=root_descriptor)
+        plaintext_descriptor = os.open(
+            "backup.dump",
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=root_descriptor,
+        )
+        os.unlink("backup.dump", dir_fd=root_descriptor)
+        _run_private_subprocess(
+            (
+                str(age),
+                "--decrypt",
+                "--identity",
+                f"/dev/fd/{identity_descriptor}",
+                f"/dev/fd/{backup_descriptor}",
+            ),
+            pass_fds=(identity_descriptor, backup_descriptor),
+            timeout=1800,
+            stdout=plaintext_descriptor,
+            pinned_tool=pinned_tools["age"],
+            tool_key="age",
+        )
+        os.fsync(plaintext_descriptor)
+        os.lseek(plaintext_descriptor, 0, os.SEEK_SET)
+        current_root = _pinned_recovery_root_path(
+            root_descriptor,
+            root_identity,
+        )
+        _run_private_subprocess(
+            (
+                str(initdb),
+                "-D",
+                str(current_root / "data"),
+                "--username=hindsight",
+                "--auth=trust",
+                "--no-instructions",
+            ),
+            pinned_tool=pinned_tools["initdb"],
+            tool_key="initdb",
+            pinned_dependencies=postgres_dependencies,
+        )
+        current_root = _pinned_recovery_root_path(
+            root_descriptor,
+            root_identity,
+        )
+        _run_private_subprocess(
+            (
+                str(pg_ctl),
+                "-D",
+                str(current_root / "data"),
+                "-l",
+                str(current_root / "postgres.log"),
+                "-o",
+                (
+                    f"-p {args.port} -k "
+                    f"{shlex.quote(str(current_root / 'socket'))} "
+                    "-c listen_addresses="
+                ),
+                "-w",
+                "start",
+            ),
+            pinned_tool=pinned_tools["pg_ctl"],
+            tool_key="pg_ctl",
+            pinned_dependencies=postgres_dependencies,
+        )
+        started = True
+        current_root = _pinned_recovery_root_path(
+            root_descriptor,
+            root_identity,
+        )
+        disposable_binding = _disposable_postgres_binding(
+            current_root,
+            args.port,
+        )
+        with _verified_postgres_proxy(
+            root_descriptor,
+            root_identity,
+            disposable_binding,
+        ) as proxy_host:
+            _run_private_subprocess(
+                (
+                    str(createdb),
+                    "-h",
+                    proxy_host,
+                    "-p",
+                    str(args.port),
+                    "-U",
+                    "hindsight",
+                    "hindsight",
+                ),
+                pinned_tool=pinned_tools["createdb"],
+                tool_key="createdb",
+                pinned_dependencies=postgres_dependencies,
+            )
+        current_root = _pinned_recovery_root_path(
+            root_descriptor,
+            root_identity,
+        )
+        disposable_binding = _disposable_postgres_binding(
+            current_root,
+            args.port,
+        )
+        with _verified_postgres_proxy(
+            root_descriptor,
+            root_identity,
+            disposable_binding,
+        ) as proxy_host:
+            _run_private_subprocess(
+                (
+                    str(pg_restore),
+                    "-h",
+                    proxy_host,
+                    "-p",
+                    str(args.port),
+                    "-U",
+                    "hindsight",
+                    "-d",
+                    "hindsight",
+                    "--exit-on-error",
+                    f"/dev/fd/{plaintext_descriptor}",
+                ),
+                pass_fds=(plaintext_descriptor,),
+                timeout=1800,
+                pinned_tool=pinned_tools["pg_restore"],
+                tool_key="pg_restore",
+                pinned_dependencies=postgres_dependencies,
+            )
+        current_root = _pinned_recovery_root_path(
+            root_descriptor,
+            root_identity,
+        )
+        generation, rows, restore_identity = asyncio.run(
+            _classify_disposable_restore(
+                binding=disposable_binding,
+            )
+        )
+    finally:
+        if identity_descriptor >= 0:
+            os.close(identity_descriptor)
+        if backup_descriptor >= 0:
+            os.close(backup_descriptor)
+        if plaintext_descriptor >= 0:
+            os.close(plaintext_descriptor)
+        stop_failure: OperationRecoveryError | None = None
+        current_root = None
+        if root_descriptor >= 0 and root_identity is not None:
+            try:
+                current_root = _pinned_recovery_root_path(
+                    root_descriptor,
+                    root_identity,
+                )
+            except OperationRecoveryError as error:
+                stop_failure = error
+        if started and current_root is not None:
+            try:
+                _run_private_subprocess(
+                    (
+                        str(pg_ctl),
+                        "-D",
+                        str(current_root / "data"),
+                        "-m",
+                        "fast",
+                        "-w",
+                        "stop",
+                    ),
+                    pinned_tool=pinned_tools["pg_ctl"],
+                    tool_key="pg_ctl",
+                    pinned_dependencies=postgres_dependencies,
+                )
+            except OperationRecoveryError as error:
+                stop_failure = error
+                try:
+                    current_root = _pinned_recovery_root_path(
+                        root_descriptor,
+                        root_identity,
+                    )
+                    _run_private_subprocess(
+                        (
+                            str(pg_ctl),
+                            "-D",
+                            str(current_root / "data"),
+                            "-m",
+                            "immediate",
+                            "-w",
+                            "stop",
+                        ),
+                        pinned_tool=pinned_tools["pg_ctl"],
+                        tool_key="pg_ctl",
+                        pinned_dependencies=postgres_dependencies,
+                    )
+                    stop_failure = None
+                except OperationRecoveryError:
+                    pass
+        if stop_failure is None and current_root is not None:
+            shutil.rmtree(current_root)
+            root_removed = True
+        if root_descriptor >= 0:
+            os.close(root_descriptor)
+        _remove_operation_recovery_tools(tool_root)
+        if stop_failure is not None:
+            raise OperationRecoveryError(
+                "disposable restore instance did not stop; "
+                f"preserved at {current_root or run_root}"
+            ) from stop_failure
+    if (
+        not historical_source
+        and (
+            not isinstance(args.live_source_authority, Mapping)
+            or args.live_source_authority.get("generation_before")
+            != generation
+            or args.live_source_authority.get("generation_after")
+            != generation
+        )
+    ):
+        raise OperationRecoveryError(
+            "restored rollback backup generation differs"
+        )
+    source_authority = (
+        {
+            **historical_authority,
+            "generation_before": generation,
+            "generation_after": generation,
+        }
+        if historical_source
+        else args.live_source_authority
+    )
+    backup = {
+        "schema_version": 1,
+        "artifact_sha256": backup_digest,
+        "restore_identity_digest": digest(
+            {
+                "generation": generation,
+                "restore_identity": restore_identity,
+            }
+        ),
+        "postgres_system_identifier": source_system_identifier,
+        "source_authority": source_authority,
+        "source_authority_digest": digest(source_authority),
+        "toolchain_digest": _operation_recovery_toolchain_digest(),
+        "full_schema": True,
+        "restore_tested": True,
+        "plaintext_disposed": True,
+    }
+    if getattr(args, "attest_only", False):
+        write_private(args.output, backup, create_only=True)
+        return _print_result(
+            {
+                "status": "attested",
+                "artifact_sha256": backup_digest,
+                "restore_identity_digest": backup[
+                    "restore_identity_digest"
+                ],
+                "output": str(Path(args.output).resolve()),
+                "disposable_restore_removed": root_removed,
+            }
+        )
+    cohort = create_cohort_manifest(
+        rows,
+        profile_id="systalyze",
+        schema="public",
+        bank_id="engineering",
+        generation=generation,
+        backup=backup,
+    )
+    write_private(args.output, cohort, create_only=True)
+    return _print_result(
+        {
+            "status": "classified",
+            "cohort_digest": cohort["cohort_digest"],
+            "operation_count": len(cohort["operations"]),
+            "output": str(Path(args.output).resolve()),
+            "disposable_restore_removed": root_removed,
+        }
+    )
+
+
+def operation_recovery_backup_live_command(args: argparse.Namespace) -> int:
+    _operation_recovery_candidate(args)
+    binding = read_pg0_registration("systalyze")
+    password = binding.pop("_password")
+
+    async def verify_source() -> tuple[dict[str, Any], str]:
+        asyncpg = _load_asyncpg()
+        connection = await connect_verified_local_postgres(
+            asyncpg,
+            binding,
+            password=password,
+            readonly=True,
+        )
+        try:
+            await assert_connected_live_database(
+                connection,
+                binding,
+                expected_system_identifier=(
+                    EXPECTED_OPERATION_RECOVERY_INSTALLATION[
+                        "postgres_system_identifier"
+                    ]
+                ),
+            )
+            system_identifier = await connection.fetchval(
+                "SELECT system_identifier::text FROM pg_control_system()"
+            )
+            generation_before, generation_after, _rows = (
+                await read_operation_recovery_snapshot(
+                    connection,
+                    profile_id="systalyze",
+                    schema="public",
+                    bank_id="engineering",
+                    operation_ids=[],
+                )
+            )
+            competing_connections = await connection.fetchval(
+                """
+                SELECT count(*)
+                FROM pg_stat_activity
+                WHERE pid <> pg_backend_pid()
+                  AND datname = current_database()
+                  AND backend_type = 'client backend'
+                """
+            )
+            if (
+                generation_before != generation_after
+                or competing_connections != 0
+            ):
+                raise OperationRecoveryError(
+                    "live backup source is not quiescent"
+                )
+            return (
+                _operation_recovery_authority(
+                    args,
+                    postgres_system_identifier=system_identifier,
+                ),
+                generation_before,
+            )
+        finally:
+            await connection.close()
+
+    authority, source_generation_before = asyncio.run(verify_source())
+    run_root = Path(args.run_root)
+    restore_root = Path(args.restore_run_root)
+    artifact = Path(args.artifact)
+    if (
+        not run_root.is_absolute()
+        or run_root.parent != Path("/private/tmp")
+        or re.fullmatch(
+            r"hindsight-operation-recovery-[0-9a-f]{32}",
+            run_root.name,
+        )
+        is None
+        or run_root.exists()
+        or run_root.is_symlink()
+        or not restore_root.is_absolute()
+        or restore_root.parent != Path("/private/tmp")
+        or re.fullmatch(
+            r"hindsight-operation-recovery-[0-9a-f]{32}",
+            restore_root.name,
+        )
+        is None
+        or restore_root.exists()
+        or restore_root.is_symlink()
+        or not artifact.is_absolute()
+        or not artifact.name
+        or artifact.exists()
+        or artifact.is_symlink()
+        or type(args.port) is not int
+        or not 1024 <= args.port <= 65535
+    ):
+        raise OperationRecoveryError("live backup path boundary is invalid")
+    if (
+        not args.recipient.startswith("age1")
+        or len(args.recipient) > 4096
+        or not args.recipient.isascii()
+        or any(character in args.recipient for character in "\r\n\0")
+        or not hmac.compare_digest(
+            hashlib.sha256(args.recipient.encode("ascii")).hexdigest(),
+            EXPECTED_OPERATION_RECOVERY_RECIPIENT_SHA256,
+        )
+    ):
+        raise OperationRecoveryError("backup recipient is invalid")
+    postgres_bin = Path(args.postgres_bin_dir).resolve(strict=True)
+    tool_root, pinned_tools = _stage_operation_recovery_tools(
+        {
+            "pg_dump": postgres_bin / "pg_dump",
+            "age": Path(args.age),
+        }
+    )
+    pg_dump = pinned_tools["pg_dump"].path
+    age = pinned_tools["age"].path
+    postgres_dependencies = {
+        "libssl": pinned_tools["libssl"],
+        "libcrypto": pinned_tools["libcrypto"],
+    }
+    root_descriptor = -1
+    root_identity: tuple[int, int] | None = None
+    plaintext_descriptor = -1
+    pgpass_descriptor = -1
+    artifact_directory = -1
+    artifact_descriptor = -1
+    artifact_identity: tuple[int, int] | None = None
+    success = False
+    root_removed = False
+    digest_value = ""
+    try:
+        root_descriptor, root_identity = _create_pinned_recovery_root(run_root)
+        pgpass_descriptor = os.open(
+            "pgpass",
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=root_descriptor,
+        )
+        os.unlink("pgpass", dir_fd=root_descriptor)
+        plaintext_descriptor = os.open(
+            "live.dump",
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=root_descriptor,
+        )
+        os.unlink("live.dump", dir_fd=root_descriptor)
+        try:
+            escaped_password = password.replace("\\", "\\\\").replace(":", "\\:")
+            secret = (
+                f"*:{binding['port']}:{binding['database']}:"
+                f"{binding['user']}:{escaped_password}\n"
+            ).encode()
+            os.write(pgpass_descriptor, secret)
+            os.fsync(pgpass_descriptor)
+            os.lseek(pgpass_descriptor, 0, os.SEEK_SET)
+        finally:
+            secret = b""
+            escaped_password = ""
+        with _verified_postgres_proxy(
+            root_descriptor,
+            root_identity,
+            binding,
+        ) as proxy_host:
+            _run_private_subprocess(
+                (
+                    str(pg_dump),
+                    "-h",
+                    proxy_host,
+                    "-p",
+                    str(binding["port"]),
+                    "-U",
+                    binding["user"],
+                    "-d",
+                    binding["database"],
+                    "--format=custom",
+                    "--no-owner",
+                    "--no-acl",
+                    "--file",
+                    f"/dev/fd/{plaintext_descriptor}",
+                ),
+                pass_fds=(
+                    root_descriptor,
+                    plaintext_descriptor,
+                    pgpass_descriptor,
+                ),
+                environment={
+                    "PATH": "/usr/bin:/bin",
+                    "LANG": "C",
+                    "LC_ALL": "C",
+                    "PGPASSFILE": f"/dev/fd/{pgpass_descriptor}",
+                },
+                timeout=1800,
+                pinned_tool=pinned_tools["pg_dump"],
+                tool_key="pg_dump",
+                pinned_dependencies=postgres_dependencies,
+            )
+        post_authority, source_generation_after = asyncio.run(
+            verify_source()
+        )
+        current_binding = read_pg0_registration("systalyze")
+        current_binding.pop("_password")
+        if (
+            post_authority != authority
+            or source_generation_after != source_generation_before
+            or current_binding != binding
+        ):
+            raise OperationRecoveryError(
+                "live backup source changed during snapshot"
+            )
+        os.fsync(plaintext_descriptor)
+        os.lseek(plaintext_descriptor, 0, os.SEEK_SET)
+        artifact_directory = _open_private_parent(artifact.parent)
+        artifact_descriptor = os.open(
+            artifact.name,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=artifact_directory,
+        )
+        artifact_metadata = os.fstat(artifact_descriptor)
+        artifact_identity = (
+            artifact_metadata.st_dev,
+            artifact_metadata.st_ino,
+        )
+        _run_private_subprocess(
+            (
+                str(age),
+                "--encrypt",
+                "--recipient",
+                args.recipient,
+                f"/dev/fd/{plaintext_descriptor}",
+            ),
+            pass_fds=(plaintext_descriptor,),
+            timeout=1800,
+            stdout=artifact_descriptor,
+            pinned_tool=pinned_tools["age"],
+            tool_key="age",
+        )
+        os.fsync(artifact_descriptor)
+        digest_value = _operation_recovery_fd_sha256(artifact_descriptor)
+        success = True
+    finally:
+        password = ""
+        if pgpass_descriptor >= 0:
+            os.close(pgpass_descriptor)
+        if plaintext_descriptor >= 0:
+            os.close(plaintext_descriptor)
+        if artifact_descriptor >= 0:
+            os.close(artifact_descriptor)
+        if (
+            not success
+            and artifact_directory >= 0
+            and artifact_identity is not None
+        ):
+            try:
+                if (
+                    _directory_entry_identity(
+                        artifact_directory,
+                        artifact.name,
+                    )
+                    == artifact_identity
+                ):
+                    os.unlink(artifact.name, dir_fd=artifact_directory)
+            except OSError:
+                pass
+        if artifact_directory >= 0:
+            os.close(artifact_directory)
+        if root_descriptor >= 0 and root_identity is not None:
+            current_root = _pinned_recovery_root_path(
+                root_descriptor,
+                root_identity,
+            )
+            shutil.rmtree(current_root)
+            root_removed = True
+            os.close(root_descriptor)
+        _remove_operation_recovery_tools(tool_root)
+    if not root_removed:
+        raise OperationRecoveryError(
+            "live backup scratch root was not removed"
+        )
+    args.backup = str(artifact)
+    args.backup_digest = digest_value
+    args.run_root = str(restore_root)
+    args.attest_only = True
+    live_binding = normalize_pg0_binding(
+        {
+            key: binding[key]
+            for key in (
+                "instance",
+                "data_dir",
+                "data_device",
+                "data_inode",
+                "port",
+                "pid",
+                "started_at",
+                "socket_dir",
+                "socket_path",
+                "database",
+                "user",
+            )
+        },
+        "operation-recovery live backup pg0 binding",
+    )
+    args.live_source_authority = {
+        "kind": "verified-live-pg0-backup",
+        "postgres_system_identifier": authority["postgres_system_identifier"],
+        "data_identity_digest": authority["observed_data_identity_digest"],
+        "generation_before": source_generation_before,
+        "generation_after": source_generation_after,
+        "binding": live_binding,
+    }
+    return operation_recovery_classify_backup_command(args)
+
+
+async def _classify_live(
+    args: argparse.Namespace,
+    cohort: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    connection = await _operation_recovery_connect_live(args)
+    try:
+        system_identifier = await connection.fetchval(
+            "SELECT system_identifier::text FROM pg_control_system()"
+        )
+        authority = _operation_recovery_authority(
+            args,
+            postgres_system_identifier=system_identifier,
+        )
+        generation_before, generation_after, rows = (
+            await read_operation_recovery_snapshot(
+                connection,
+                profile_id="systalyze",
+                schema="public",
+                bank_id="engineering",
+                operation_ids=[
+                    item["operation_id"] for item in cohort["operations"]
+                ],
+            )
+        )
+        return create_live_snapshot(
+            cohort,
+            rows,
+            generation_before=generation_before,
+            generation_after=generation_after,
+            installation_authority=authority,
+        )
+    finally:
+        await connection.close()
+
+
+def operation_recovery_classify_live_command(args: argparse.Namespace) -> int:
+    _operation_recovery_candidate(args)
+    cohort = verify_cohort_manifest(
+        _operation_recovery_read_private_json(args.cohort, "operation cohort")
+    )
+    snapshot = asyncio.run(_classify_live(args, cohort))
+    write_private(args.output, snapshot, create_only=True)
+    return _print_result(
+        {
+            "status": "classified",
+            "snapshot_digest": snapshot["snapshot_digest"],
+            "status_counts": snapshot["status_counts"],
+            "output": str(Path(args.output).resolve()),
+        }
+    )
+
+
+def operation_recovery_plan_command(args: argparse.Namespace) -> int:
+    candidate = _operation_recovery_candidate(args)
+    age = _operation_recovery_tool(Path(args.age), "age")
+    cohort = verify_cohort_manifest(
+        _operation_recovery_read_private_json(args.cohort, "operation cohort")
+    )
+    snapshot = verify_live_snapshot(
+        _operation_recovery_read_private_json(
+            args.snapshot,
+            "operation live snapshot",
+        )
+    )
+    rollback_backup = _operation_recovery_read_private_json(
+        args.rollback_backup_evidence,
+        "operation rollback backup evidence",
+    )
+    expected_toolchain = _operation_recovery_toolchain_digest()
+    historical_authority = cohort["backup"]["source_authority"]
+    if (
+        cohort["backup"]["artifact_sha256"]
+        != EXPECTED_OPERATION_RECOVERY_SOURCE_BACKUP["sha256"]
+        or historical_authority["artifact_path"]
+        != EXPECTED_OPERATION_RECOVERY_SOURCE_BACKUP["path"]
+        or historical_authority["artifact_sha256"]
+        != EXPECTED_OPERATION_RECOVERY_SOURCE_BACKUP["sha256"]
+        or historical_authority["postgres_system_identifier"]
+        != EXPECTED_OPERATION_RECOVERY_INSTALLATION[
+            "postgres_system_identifier"
+        ]
+        or historical_authority["generation_before"]
+        != cohort["generation"]
+        or historical_authority["generation_after"]
+        != cohort["generation"]
+        or cohort["backup"]["toolchain_digest"] != expected_toolchain
+        or not isinstance(rollback_backup, Mapping)
+        or rollback_backup.get("toolchain_digest") != expected_toolchain
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery backup provenance differs"
+        )
+    plan = create_requeue_plan(
+        cohort,
+        snapshot,
+        candidate_release=candidate,
+        rollback_backup=rollback_backup,
+        rollback_encryption={
+            **_operation_recovery_rollback_encryption(
+                args.rollback_recipient
+            ),
+            "age_path": str(age),
+        },
+        rollback_backup_path=args.rollback_backup,
+        rollback_bundle_path=args.rollback_bundle,
+        authorization_receipt_path=args.authorization_receipt,
+        application_receipt_path=args.application_receipt,
+        verification_receipt_path=args.verification_receipt,
+        rollback_receipt_path=args.rollback_receipt,
+    )
+    rollback_authority = plan["rollback_backup"]["source_authority"]
+    current_binding = read_pg0_registration("systalyze")
+    current_binding.pop("_password")
+    current_binding = normalize_pg0_binding(
+        current_binding,
+        "operation-recovery current pg0 binding",
+    )
+    if (
+        rollback_authority["binding"] != current_binding
+        or rollback_authority["generation_before"]
+        != snapshot["generation_before"]
+        or rollback_authority["generation_after"]
+        != snapshot["generation_after"]
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery rollback backup authority drifted"
+        )
+    write_private(args.output, plan, create_only=True)
+    return _print_result(
+        {
+            "status": "planned",
+            "plan_digest": plan["plan_digest"],
+            "expires_at": plan["expires_at"],
+            "selected_operation_count": plan["selected_operation_count"],
+            "output": str(Path(args.output).resolve()),
+        }
+    )
+
+
+def operation_recovery_status_command(args: argparse.Namespace) -> int:
+    _operation_recovery_candidate(args)
+    plan = verify_requeue_plan(
+        _operation_recovery_read_private_json(args.plan, "operation requeue plan"),
+        allow_expired=True,
+    )
+    result = {
+        "status": "awaiting-approval",
+        "plan_digest": plan["plan_digest"],
+        "expires_at": plan["expires_at"],
+        "expired": int(time.time()) >= plan["expires_at"],
+        "selected_operation_count": plan["selected_operation_count"],
+    }
+    if Path(plan["application_receipt_path"]).exists():
+        application = _operation_recovery_validate_application(
+            _operation_recovery_read_private_json(
+                plan["application_receipt_path"],
+                "operation application receipt",
+            ),
+            plan=plan,
+        )
+        result.update(
+            {
+                "status": "applied",
+                "application_receipt_digest": application["receipt_digest"],
+                "rollback_approval_digest": (
+                    _operation_recovery_rollback_approval(plan, application)
+                ),
+            }
+        )
+    return _print_result(result)
+
+
+@contextmanager
+def _operation_recovery_lock(
+    manager: PortableInstallationManager,
+    *,
+    expires_at: int | None = None,
+):
+    path = manager.config.state_root / "operation-recovery" / "recovery.lock"
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor = os.open(
+        path,
+        os.O_RDWR
+        | os.O_CREAT
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        metadata = os.fstat(descriptor)
+        observed = path.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or (metadata.st_dev, metadata.st_ino)
+            != (observed.st_dev, observed.st_ino)
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery lock identity is invalid"
+            )
+        os.fchmod(descriptor, 0o600)
+        while True:
+            if expires_at is not None and time.time() >= expires_at:
+                raise OperationRecoveryError(
+                    "operation-recovery plan expired while waiting for lock"
+                )
+            try:
+                fcntl.flock(
+                    descriptor,
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+                break
+            except BlockingIOError:
+                time.sleep(0.05)
+        yield
+    finally:
+        if descriptor >= 0:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
+
+@contextmanager
+def _operation_recovery_install_lock(
+    manager: PortableInstallationManager,
+    *,
+    expires_at: int,
+):
+    path = manager.config.state_root / "portable-install.lock"
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor = os.open(
+        path,
+        os.O_RDWR
+        | os.O_CREAT
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        metadata = os.fstat(descriptor)
+        observed = path.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or (metadata.st_dev, metadata.st_ino)
+            != (observed.st_dev, observed.st_ino)
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery installation lock identity is invalid"
+            )
+        os.fchmod(descriptor, 0o600)
+        while True:
+            if time.time() >= expires_at:
+                raise OperationRecoveryError(
+                    "operation-recovery plan expired while waiting for lock"
+                )
+            try:
+                fcntl.flock(
+                    descriptor,
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+                break
+            except BlockingIOError:
+                time.sleep(0.05)
+        yield
+    finally:
+        if descriptor >= 0:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(descriptor)
+
+
+def _operation_recovery_preimage_bytes(
+    preimage: Sequence[Mapping[str, Any]],
+    plan_digest: str,
+) -> bytes:
+    return canonical_bytes(
+        {
+            "schema_version": 1,
+            "kind": "operation-recovery-selected-row-preimage",
+            "plan_digest": plan_digest,
+            "rows": list(preimage),
+        }
+    )
+
+
+def _age_decrypt_ciphertext(
+    *,
+    age_path: Path,
+    age_identity_path: Path,
+    ciphertext: bytes,
+) -> bytes:
+    identity_descriptor = _private_identity_descriptor(
+        age_identity_path.resolve(strict=True)
+    )
+    tool_root, pinned_tools = _stage_operation_recovery_tools(
+        {"age": age_path}
+    )
+    try:
+        pinned_age = pinned_tools["age"]
+        result = _run_private_subprocess(
+            (
+                str(pinned_age.path),
+                "--decrypt",
+                "--identity",
+                f"/dev/fd/{identity_descriptor}",
+            ),
+            pinned_tool=pinned_age,
+            tool_key="age",
+            input_value=ciphertext,
+            stdout=subprocess.PIPE,
+            environment={
+                "PATH": "/usr/bin:/bin",
+                "LANG": "C",
+                "LC_ALL": "C",
+            },
+            pass_fds=(identity_descriptor,),
+            timeout=30,
+        )
+        return result.stdout
+    finally:
+        os.close(identity_descriptor)
+        _remove_operation_recovery_tools(tool_root)
+
+
+def _age_encrypt_preimage(
+    *,
+    age_path: Path,
+    age_identity_path: Path,
+    recipient: str,
+    preimage: Sequence[Mapping[str, Any]],
+    plan_digest: str,
+) -> dict[str, Any]:
+    if (
+        not recipient.startswith("age1")
+        or len(recipient) > 4096
+        or not recipient.isascii()
+        or any(character in recipient for character in "\r\n\0")
+        or not hmac.compare_digest(
+            hashlib.sha256(recipient.encode("ascii")).hexdigest(),
+            EXPECTED_OPERATION_RECOVERY_RECIPIENT_SHA256,
+        )
+    ):
+        raise OperationRecoveryError("rollback recipient is invalid")
+    plaintext = _operation_recovery_preimage_bytes(preimage, plan_digest)
+    plaintext_digest = hashlib.sha256(plaintext).hexdigest()
+    identity_descriptor = _private_identity_descriptor(
+        age_identity_path.resolve(strict=True)
+    )
+    tool_root, pinned_tools = _stage_operation_recovery_tools(
+        {"age": age_path}
+    )
+    try:
+        age = pinned_tools["age"].path
+        result = _run_private_subprocess(
+            (str(age), "--encrypt", "--recipient", recipient),
+            pinned_tool=pinned_tools["age"],
+            tool_key="age",
+            input_value=plaintext,
+            stdout=subprocess.PIPE,
+            environment={
+                "PATH": "/usr/bin:/bin",
+                "LANG": "C",
+                "LC_ALL": "C",
+            },
+            timeout=30,
+        )
+        if (
+            not result.stdout
+            or not result.stdout.startswith(b"age-encryption.org/")
+        ):
+            raise OperationRecoveryError("rollback bundle encryption failed")
+        ciphertext = result.stdout
+        round_trip = _run_private_subprocess(
+            (
+                str(age),
+                "--decrypt",
+                "--identity",
+                f"/dev/fd/{identity_descriptor}",
+            ),
+            pinned_tool=pinned_tools["age"],
+            tool_key="age",
+            input_value=ciphertext,
+            stdout=subprocess.PIPE,
+            environment={
+                "PATH": "/usr/bin:/bin",
+                "LANG": "C",
+                "LC_ALL": "C",
+            },
+            pass_fds=(identity_descriptor,),
+            timeout=30,
+        )
+        if (
+            not hmac.compare_digest(
+                hashlib.sha256(round_trip.stdout).hexdigest(),
+                plaintext_digest,
+            )
+        ):
+            raise OperationRecoveryError(
+                "rollback bundle is not decryptable by the approved identity"
+            )
+        return {
+            "schema_version": 1,
+            "kind": "operation-recovery-encrypted-rollback-bundle",
+            "plan_digest": plan_digest,
+            "ciphertext_sha256": hashlib.sha256(ciphertext).hexdigest(),
+            "ciphertext_base64": base64.b64encode(ciphertext).decode("ascii"),
+        }
+    finally:
+        os.close(identity_descriptor)
+        _remove_operation_recovery_tools(tool_root)
+        plaintext = b""
+
+
+def _operation_recovery_next_generation(value: str) -> str:
+    try:
+        profile_id, schema, generation = value.rsplit(":", 2)
+        number = int(generation)
+    except (AttributeError, TypeError, ValueError) as error:
+        raise OperationRecoveryError(
+            "operation-recovery generation is invalid"
+        ) from error
+    if not profile_id or not schema or number < 1:
+        raise OperationRecoveryError("operation-recovery generation is invalid")
+    return f"{profile_id}:{schema}:{number + 1}"
+
+
+def _operation_recovery_receipt_digest(value: Mapping[str, Any]) -> str:
+    return digest({key: item for key, item in value.items() if key != "receipt_digest"})
+
+
+def _operation_recovery_validate_authorization(
+    plan: Mapping[str, Any],
+) -> dict[str, Any]:
+    value = _operation_recovery_read_private_json(
+        plan["authorization_receipt_path"],
+        "operation authorization receipt",
+    )
+    required = {
+        "schema_version",
+        "kind",
+        "plan_digest",
+        "approval_digest",
+        "candidate_release_digest",
+        "authorized_at",
+        "receipt_digest",
+    }
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != required
+        or value.get("schema_version") != 1
+        or value.get("kind")
+        != "operation-recovery-authorization-receipt"
+        or value.get("plan_digest") != plan["plan_digest"]
+        or value.get("approval_digest") != plan["plan_digest"]
+        or value.get("candidate_release_digest")
+        != plan["candidate_release"]["release_digest"]
+        or type(value.get("authorized_at")) is not int
+        or value.get("authorized_at") < plan["created_at"]
+        or value.get("authorized_at") >= plan["expires_at"]
+        or value.get("receipt_digest")
+        != _operation_recovery_receipt_digest(value)
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery authorization receipt is invalid"
+        )
+    return dict(value)
+
+
+def _operation_recovery_validate_bundle(
+    plan: Mapping[str, Any],
+) -> dict[str, Any]:
+    value = _operation_recovery_read_private_json(
+        plan["rollback_bundle_path"],
+        "operation rollback bundle",
+    )
+    required = {
+        "schema_version",
+        "kind",
+        "plan_digest",
+        "ciphertext_sha256",
+        "ciphertext_base64",
+    }
+    try:
+        ciphertext = base64.b64decode(
+            value.get("ciphertext_base64"),
+            validate=True,
+        )
+    except (AttributeError, TypeError, ValueError) as error:
+        raise OperationRecoveryError(
+            "operation-recovery rollback bundle is invalid"
+        ) from error
+    try:
+        if (
+            not isinstance(value, Mapping)
+            or set(value) != required
+            or value.get("schema_version") != 1
+            or value.get("kind")
+            != "operation-recovery-encrypted-rollback-bundle"
+            or value.get("plan_digest") != plan["plan_digest"]
+            or re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(value.get("ciphertext_sha256")),
+            )
+            is None
+            or hashlib.sha256(ciphertext).hexdigest()
+            != value.get("ciphertext_sha256")
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery rollback bundle is invalid"
+            )
+        return dict(value)
+    finally:
+        ciphertext = b""
+
+
+def _operation_recovery_planned_backup_digest(
+    plan: Mapping[str, Any],
+) -> str:
+    descriptor = _open_operation_recovery_artifact(
+        Path(plan["rollback_backup_path"]),
+        "operation-recovery rollback backup",
+    )
+    try:
+        observed = _operation_recovery_fd_sha256(descriptor)
+    finally:
+        os.close(descriptor)
+    if not hmac.compare_digest(
+        observed,
+        plan["rollback_backup"]["artifact_sha256"],
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery rollback backup differs"
+        )
+    return observed
+
+
+def _operation_recovery_artifact_identity(
+    path_value: str,
+) -> tuple[int, int]:
+    path = Path(path_value)
+    directory = _open_private_parent(path.parent)
+    try:
+        metadata = os.stat(
+            path.name,
+            dir_fd=directory,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) & 0o077
+            or metadata.st_nlink != 1
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery artifact identity is invalid"
+            )
+        return metadata.st_dev, metadata.st_ino
+    finally:
+        os.close(directory)
+
+
+def _operation_recovery_remove_owned_artifact(
+    path_value: str,
+    identity: tuple[int, int],
+) -> None:
+    path = Path(path_value)
+    directory = _open_private_parent(path.parent)
+    try:
+        if _directory_entry_identity(directory, path.name) != identity:
+            raise OperationRecoveryError(
+                "operation-recovery artifact ownership changed"
+            )
+        os.unlink(path.name, dir_fd=directory)
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+@contextmanager
+def _operation_recovery_precommit_artifacts():
+    state: dict[str, Any] = {
+        "mutation_attempted": False,
+        "created": [],
+    }
+    try:
+        yield state
+    except BaseException:
+        cleanup_failure: BaseException | None = None
+        if not state["mutation_attempted"]:
+            for path_value, identity in reversed(state["created"]):
+                try:
+                    _operation_recovery_remove_owned_artifact(
+                        path_value,
+                        identity,
+                    )
+                except BaseException as error:
+                    cleanup_failure = error
+        if cleanup_failure is not None:
+            raise OperationRecoveryError(
+                "operation-recovery precommit artifact cleanup failed"
+            ) from cleanup_failure
+        raise
+
+
+def _operation_recovery_validate_application(
+    value: Any,
+    *,
+    plan: Mapping[str, Any],
+) -> dict[str, Any]:
+    required = {
+        "schema_version",
+        "kind",
+        "plan_digest",
+        "authorization_receipt_digest",
+        "rollback_bundle_digest",
+        "rollback_backup_digest",
+        "pre_generation",
+        "post_generation",
+        "selected_operation_count",
+        "installation_authority_digest",
+        "applied_at",
+        "receipt_digest",
+    }
+    authorization = _operation_recovery_validate_authorization(plan)
+    bundle = _operation_recovery_validate_bundle(plan)
+    backup_digest = _operation_recovery_planned_backup_digest(plan)
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != required
+        or value.get("schema_version") != 1
+        or value.get("kind") != "operation-recovery-application-receipt"
+        or value.get("plan_digest") != plan["plan_digest"]
+        or value.get("pre_generation") != plan["pre_generation"]
+        or value.get("post_generation")
+        != _operation_recovery_next_generation(plan["pre_generation"])
+        or value.get("selected_operation_count")
+        != plan["selected_operation_count"]
+        or value.get("installation_authority_digest")
+        != digest(plan["installation_authority"])
+        or value.get("authorization_receipt_digest")
+        != authorization["receipt_digest"]
+        or value.get("rollback_bundle_digest")
+        != bundle["ciphertext_sha256"]
+        or value.get("rollback_backup_digest") != backup_digest
+        or re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(value.get("authorization_receipt_digest")),
+        )
+        is None
+        or re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(value.get("rollback_bundle_digest")),
+        )
+        is None
+        or re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(value.get("rollback_backup_digest")),
+        )
+        is None
+        or value.get("receipt_digest")
+        != _operation_recovery_receipt_digest(value)
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery application receipt is invalid"
+        )
+    return dict(value)
+
+
+def _operation_recovery_validate_journal(
+    value: Any,
+    *,
+    plan: Mapping[str, Any],
+) -> dict[str, Any]:
+    required = {
+        "schema_version",
+        "kind",
+        "plan_digest",
+        "authorization_receipt_digest",
+        "rollback_bundle_digest",
+        "rollback_backup_digest",
+        "pre_generation",
+        "post_generation",
+        "selected_operation_count",
+        "installation_authority_digest",
+        "applied_at",
+        "receipt_digest",
+    }
+    authorization = _operation_recovery_validate_authorization(plan)
+    bundle = _operation_recovery_validate_bundle(plan)
+    backup_digest = _operation_recovery_planned_backup_digest(plan)
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != required
+        or value.get("schema_version") != 1
+        or value.get("kind") != "operation-recovery-application-journal"
+        or value.get("plan_digest") != plan["plan_digest"]
+        or value.get("pre_generation") != plan["pre_generation"]
+        or value.get("post_generation")
+        != _operation_recovery_next_generation(plan["pre_generation"])
+        or value.get("selected_operation_count")
+        != plan["selected_operation_count"]
+        or value.get("installation_authority_digest")
+        != digest(plan["installation_authority"])
+        or value.get("authorization_receipt_digest")
+        != authorization["receipt_digest"]
+        or value.get("rollback_bundle_digest")
+        != bundle["ciphertext_sha256"]
+        or value.get("rollback_backup_digest") != backup_digest
+        or value.get("receipt_digest")
+        != _operation_recovery_receipt_digest(value)
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery application journal is invalid"
+        )
+    return dict(value)
+
+
+def _operation_recovery_finalize_journal(
+    journal: Mapping[str, Any],
+) -> dict[str, Any]:
+    body = {
+        **{
+            key: value
+            for key, value in journal.items()
+            if key not in {"kind", "receipt_digest"}
+        },
+        "kind": "operation-recovery-application-receipt",
+    }
+    return {**body, "receipt_digest": digest(body)}
+
+
+def _operation_recovery_validate_rollback_record(
+    value: Any,
+    *,
+    plan: Mapping[str, Any],
+    application: Mapping[str, Any],
+    kind: str,
+) -> dict[str, Any]:
+    required = {
+        "schema_version",
+        "kind",
+        "plan_digest",
+        "application_receipt_digest",
+        "pre_generation",
+        "post_generation",
+        "selected_operation_count",
+        "installation_authority_digest",
+        "recorded_at",
+        "receipt_digest",
+    }
+    label = (
+        "receipt"
+        if kind == "operation-recovery-rollback-receipt"
+        else "journal"
+    )
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != required
+        or value.get("schema_version") != 1
+        or value.get("kind") != kind
+        or value.get("plan_digest") != plan["plan_digest"]
+        or value.get("application_receipt_digest")
+        != application["receipt_digest"]
+        or value.get("pre_generation") != application["post_generation"]
+        or value.get("post_generation")
+        != _operation_recovery_next_generation(
+            application["post_generation"]
+        )
+        or value.get("selected_operation_count")
+        != plan["selected_operation_count"]
+        or value.get("installation_authority_digest")
+        != digest(plan["installation_authority"])
+        or not isinstance(value.get("recorded_at"), int)
+        or isinstance(value.get("recorded_at"), bool)
+        or value.get("receipt_digest")
+        != _operation_recovery_receipt_digest(value)
+    ):
+        raise OperationRecoveryError(
+            f"operation-recovery rollback {label} is invalid"
+        )
+    return dict(value)
+
+
+def _operation_recovery_validate_rollback_journal(
+    value: Any,
+    *,
+    plan: Mapping[str, Any],
+    application: Mapping[str, Any],
+) -> dict[str, Any]:
+    return _operation_recovery_validate_rollback_record(
+        value,
+        plan=plan,
+        application=application,
+        kind="operation-recovery-rollback-journal",
+    )
+
+
+def _operation_recovery_validate_rollback_receipt(
+    value: Any,
+    *,
+    plan: Mapping[str, Any],
+    application: Mapping[str, Any],
+) -> dict[str, Any]:
+    return _operation_recovery_validate_rollback_record(
+        value,
+        plan=plan,
+        application=application,
+        kind="operation-recovery-rollback-receipt",
+    )
+
+
+def _operation_recovery_finalize_rollback_journal(
+    journal: Mapping[str, Any],
+) -> dict[str, Any]:
+    body = {
+        **{
+            key: value
+            for key, value in journal.items()
+            if key not in {"kind", "receipt_digest"}
+        },
+        "kind": "operation-recovery-rollback-receipt",
+    }
+    return {**body, "receipt_digest": digest(body)}
+
+
+def _operation_recovery_rollback_approval(
+    plan: Mapping[str, Any],
+    application: Mapping[str, Any],
+) -> str:
+    return digest(
+        {
+            "schema_version": 1,
+            "action": "rollback-operation-recovery",
+            "plan_digest": plan["plan_digest"],
+            "application_receipt_digest": application["receipt_digest"],
+        }
+    )
+
+
+async def _operation_recovery_prepare_apply(
+    args: argparse.Namespace,
+    plan: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    encryption = plan["rollback_encryption"]
+    age = _operation_recovery_tool(Path(args.age), "age")
+    if (
+        str(age) != encryption["age_path"]
+        or not hmac.compare_digest(
+            EXPECTED_OPERATION_RECOVERY_TOOLCHAIN["age"]["sha256"],
+            encryption["age_sha256"],
+        )
+        or args.rollback_recipient != encryption["recipient"]
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery rollback encryption differs"
+        )
+    identity_path = Path(args.age_identity)
+    identity_descriptor = _private_identity_descriptor(
+        identity_path.resolve(strict=True)
+    )
+    os.close(identity_descriptor)
+    read_connection = await _operation_recovery_connect_live(
+        args,
+        readonly=True,
+    )
+    try:
+        preimage = await read_selected_preimage(
+            read_connection,
+            schema="public",
+            selected_operations=plan["selected_operations"],
+        )
+    finally:
+        await read_connection.close()
+    if Path(plan["rollback_bundle_path"]).exists():
+        encrypted_bundle = _operation_recovery_validate_bundle(plan)
+        try:
+            ciphertext = base64.b64decode(
+                encrypted_bundle["ciphertext_base64"],
+                validate=True,
+            )
+            restored = _age_decrypt_ciphertext(
+                age_path=age,
+                age_identity_path=identity_path,
+                ciphertext=ciphertext,
+            )
+            expected = _operation_recovery_preimage_bytes(
+                preimage,
+                plan["plan_digest"],
+            )
+            if not hmac.compare_digest(
+                hashlib.sha256(restored).digest(),
+                hashlib.sha256(expected).digest(),
+            ):
+                raise OperationRecoveryError(
+                    "existing rollback bundle preimage differs"
+                )
+            return encrypted_bundle
+        finally:
+            ciphertext = b""
+            restored = b""
+            expected = b""
+    encrypted_bundle = _age_encrypt_preimage(
+        age_path=age,
+        age_identity_path=identity_path,
+        recipient=args.rollback_recipient,
+        preimage=preimage,
+        plan_digest=plan["plan_digest"],
+    )
+    write_private(
+        plan["rollback_bundle_path"],
+        encrypted_bundle,
+        create_only=True,
+    )
+    return encrypted_bundle
+
+
+async def _operation_recovery_apply(
+    args: argparse.Namespace,
+    plan: Mapping[str, Any],
+    precommit: dict[str, Any],
+) -> tuple[str, str]:
+    write_connection = await _operation_recovery_connect_live(
+        args,
+        readonly=False,
+    )
+    try:
+        before, after = await apply_requeue_transaction(
+            write_connection,
+            profile_id="systalyze",
+            schema="public",
+            bank_id="engineering",
+            plan=plan,
+            on_mutation_attempt=lambda: precommit.__setitem__(
+                "mutation_attempted",
+                True,
+            ),
+        )
+    finally:
+        await write_connection.close()
+    return before, after
+
+
+def operation_recovery_apply_command(args: argparse.Namespace) -> int:
+    candidate = _operation_recovery_candidate(args)
+    plan = verify_requeue_plan(
+        _operation_recovery_read_private_json(args.plan, "operation requeue plan")
+    )
+    if (
+        not hmac.compare_digest(args.approval_digest, plan["plan_digest"])
+        or candidate != plan["candidate_release"]
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery apply approval differs"
+        )
+    supplied_backup = Path(args.rollback_backup).resolve(strict=True)
+    planned_backup = Path(plan["rollback_backup_path"]).resolve(strict=True)
+    if supplied_backup != planned_backup:
+        raise OperationRecoveryError(
+            "operation-recovery rollback backup path differs"
+        )
+    backup_descriptor = _open_operation_recovery_artifact(
+        supplied_backup,
+        "operation-recovery rollback backup",
+    )
+    try:
+        backup_digest = _operation_recovery_fd_sha256(backup_descriptor)
+    finally:
+        os.close(backup_descriptor)
+    if not hmac.compare_digest(
+        backup_digest,
+        plan["rollback_backup"]["artifact_sha256"],
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery rollback backup differs"
+        )
+    manager = _portable_manager(args)
+    with _operation_recovery_precommit_artifacts() as precommit, (
+        _operation_recovery_install_lock(
+        manager,
+        expires_at=plan["expires_at"],
+        )
+    ), _operation_recovery_lock(
+        manager,
+        expires_at=plan["expires_at"],
+    ):
+        locked_plan = verify_requeue_plan(
+            _operation_recovery_read_private_json(
+                args.plan,
+                "operation requeue plan",
+            )
+        )
+        if locked_plan != plan:
+            raise OperationRecoveryError(
+                "operation-recovery plan changed while waiting for lock"
+            )
+        authority = _operation_recovery_authority(
+            args,
+            postgres_system_identifier=(
+                EXPECTED_OPERATION_RECOVERY_INSTALLATION[
+                    "postgres_system_identifier"
+                ]
+            ),
+            lock_installer=False,
+        )
+        if authority != plan["installation_authority"]:
+            raise OperationRecoveryError(
+                "operation-recovery installation authority drifted"
+            )
+        if Path(plan["authorization_receipt_path"]).exists():
+            authorization = _operation_recovery_validate_authorization(plan)
+        else:
+            authorization = {
+                "schema_version": 1,
+                "kind": "operation-recovery-authorization-receipt",
+                "plan_digest": plan["plan_digest"],
+                "approval_digest": args.approval_digest,
+                "candidate_release_digest": candidate["release_digest"],
+                "authorized_at": int(time.time()),
+            }
+            authorization["receipt_digest"] = digest(authorization)
+            write_private(
+                plan["authorization_receipt_path"],
+                authorization,
+                create_only=True,
+            )
+            precommit["created"].append(
+                (
+                    plan["authorization_receipt_path"],
+                    _operation_recovery_artifact_identity(
+                        plan["authorization_receipt_path"]
+                    ),
+                )
+            )
+        bundle_existed = Path(plan["rollback_bundle_path"]).exists()
+        bundle = asyncio.run(
+            _operation_recovery_prepare_apply(args, plan)
+        )
+        if not bundle_existed:
+            precommit["created"].append(
+                (
+                    plan["rollback_bundle_path"],
+                    _operation_recovery_artifact_identity(
+                        plan["rollback_bundle_path"]
+                    ),
+                )
+            )
+        verify_requeue_plan(plan)
+        if Path(plan["application_receipt_path"]).exists():
+            existing = _operation_recovery_read_private_json(
+                plan["application_receipt_path"],
+                "operation application journal",
+            )
+            if (
+                isinstance(existing, Mapping)
+                and existing.get("kind")
+                == "operation-recovery-application-receipt"
+            ):
+                application = _operation_recovery_validate_application(
+                    existing,
+                    plan=plan,
+                )
+                return _print_result(
+                    {
+                        "status": "already-applied",
+                        "plan_digest": plan["plan_digest"],
+                        "pre_generation": application["pre_generation"],
+                        "post_generation": application["post_generation"],
+                        "application_receipt_digest": application[
+                            "receipt_digest"
+                        ],
+                    }
+                )
+            journal = _operation_recovery_validate_journal(
+                existing,
+                plan=plan,
+            )
+        else:
+            journal_body = {
+                "schema_version": 1,
+                "kind": "operation-recovery-application-journal",
+                "plan_digest": plan["plan_digest"],
+                "authorization_receipt_digest": authorization[
+                    "receipt_digest"
+                ],
+                "rollback_bundle_digest": bundle["ciphertext_sha256"],
+                "rollback_backup_digest": backup_digest,
+                "pre_generation": plan["pre_generation"],
+                "post_generation": _operation_recovery_next_generation(
+                    plan["pre_generation"]
+                ),
+                "selected_operation_count": plan[
+                    "selected_operation_count"
+                ],
+                "installation_authority_digest": digest(authority),
+                "applied_at": int(time.time()),
+            }
+            journal = {
+                **journal_body,
+                "receipt_digest": digest(journal_body),
+            }
+            write_private(
+                plan["application_receipt_path"],
+                journal,
+                create_only=True,
+            )
+            precommit["created"].append(
+                (
+                    plan["application_receipt_path"],
+                    _operation_recovery_artifact_identity(
+                        plan["application_receipt_path"]
+                    ),
+                )
+            )
+        verify_requeue_plan(plan)
+        before, after = asyncio.run(
+            _operation_recovery_apply(args, plan, precommit)
+        )
+        post_authority = _operation_recovery_authority(
+            args,
+            postgres_system_identifier=(
+                EXPECTED_OPERATION_RECOVERY_INSTALLATION[
+                    "postgres_system_identifier"
+                ]
+            ),
+            lock_installer=False,
+        )
+        if post_authority != authority:
+            raise OperationRecoveryError(
+                "installer authority changed during operation recovery"
+            )
+        if (
+            before != journal["pre_generation"]
+            or after != journal["post_generation"]
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery application generation differs"
+            )
+        application = _operation_recovery_finalize_journal(journal)
+        write_private(
+            plan["application_receipt_path"],
+            application,
+        )
+    return _print_result(
+        {
+            "status": "applied",
+            "plan_digest": plan["plan_digest"],
+            "pre_generation": before,
+            "post_generation": after,
+            "application_receipt_digest": application["receipt_digest"],
+        }
+    )
+
+
+async def _operation_recovery_verify_live(
+    args: argparse.Namespace,
+    cohort: Mapping[str, Any],
+    before_snapshot: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    application: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    connection = await _operation_recovery_connect_live(args, readonly=True)
+    try:
+        generation_before, generation_after, rows = (
+            await read_operation_recovery_snapshot(
+                connection,
+                profile_id="systalyze",
+                schema="public",
+                bank_id="engineering",
+                operation_ids=[
+                    item["operation_id"] for item in cohort["operations"]
+                ],
+            )
+        )
+    finally:
+        await connection.close()
+    if (
+        generation_before != generation_after
+        or generation_before != application["post_generation"]
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery verification generation differs"
+        )
+    before_by_id = {
+        item["operation_id"]: item for item in before_snapshot["operations"]
+    }
+    selected = {
+        item["operation_id"]: item for item in plan["selected_operations"]
+    }
+    after_by_id = {row["operation_id"]: row for row in rows}
+    if set(after_by_id) != set(before_by_id):
+        raise OperationRecoveryError(
+            "operation-recovery verification cohort differs"
+        )
+    for operation_id, before in before_by_id.items():
+        after = after_by_id[operation_id]
+        if operation_id in selected:
+            if (
+                after["status"] != "pending"
+                or after["retry_count"] != 0
+                or after["worker_id_present"]
+                or after["claimed_at"] is not None
+                or after["completed_at"] is not None
+                or after["next_retry_at"] is not None
+                or after["error_category"] != "none"
+                or after["error_digest"] is not None
+                or after["updated_at"] == before["updated_at"]
+                or after["task_payload_digest"]
+                != selected[operation_id]["task_payload_digest"]
+            ):
+                raise OperationRecoveryError(
+                    "operation-recovery selected verification differs"
+                )
+        else:
+            if live_row_digest(after) != before["row_digest"]:
+                raise OperationRecoveryError(
+                    "operation-recovery nonselected row changed"
+                )
+    return {
+        "generation": generation_before,
+        "selected_operation_count": len(selected),
+        "cohort_operation_count": len(after_by_id),
+    }
+
+
+def operation_recovery_verify_command(args: argparse.Namespace) -> int:
+    candidate = _operation_recovery_candidate(args)
+    plan = verify_requeue_plan(
+        _operation_recovery_read_private_json(
+            args.plan,
+            "operation requeue plan",
+        ),
+        allow_expired=True,
+    )
+    cohort = verify_cohort_manifest(
+        _operation_recovery_read_private_json(args.cohort, "operation cohort")
+    )
+    snapshot = verify_live_snapshot(
+        _operation_recovery_read_private_json(
+            args.snapshot,
+            "operation live snapshot",
+        )
+    )
+    application_value = _operation_recovery_read_private_json(
+        plan["application_receipt_path"],
+        "operation application receipt",
+    )
+    if (
+        candidate != plan["candidate_release"]
+        or cohort != plan["cohort"]
+        or snapshot != plan["live_snapshot"]
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery verification evidence differs"
+        )
+    is_journal = (
+        isinstance(application_value, Mapping)
+        and application_value.get("kind")
+        == "operation-recovery-application-journal"
+    )
+    application = (
+        _operation_recovery_validate_journal(application_value, plan=plan)
+        if is_journal
+        else _operation_recovery_validate_application(
+            application_value,
+            plan=plan,
+        )
+    )
+    manager = _portable_manager(args)
+    with manager._lock(), _operation_recovery_lock(manager):
+        authority = _operation_recovery_authority(
+            args,
+            postgres_system_identifier=(
+                EXPECTED_OPERATION_RECOVERY_INSTALLATION[
+                    "postgres_system_identifier"
+                ]
+            ),
+            lock_installer=False,
+        )
+        if authority != plan["installation_authority"]:
+            raise OperationRecoveryError(
+                "operation-recovery installer authority changed"
+            )
+        evidence = asyncio.run(
+            _operation_recovery_verify_live(
+                args,
+                cohort,
+                snapshot,
+                plan,
+                application,
+            )
+        )
+        if is_journal:
+            application = _operation_recovery_finalize_journal(application)
+            write_private(
+                plan["application_receipt_path"],
+                application,
+            )
+        receipt = {
+            "schema_version": 1,
+            "kind": "operation-recovery-verification-receipt",
+            "plan_digest": plan["plan_digest"],
+            "application_receipt_digest": application["receipt_digest"],
+            "installation_authority_digest": digest(authority),
+            "evidence": evidence,
+            "verified_at": int(time.time()),
+        }
+        receipt["receipt_digest"] = digest(receipt)
+        write_private(
+            plan["verification_receipt_path"],
+            receipt,
+            create_only=True,
+        )
+    return _print_result(
+        {
+            "status": "verified",
+            "plan_digest": plan["plan_digest"],
+            "receipt_digest": receipt["receipt_digest"],
+            **evidence,
+        }
+    )
+
+
+def operation_recovery_rollback_command(args: argparse.Namespace) -> int:
+    candidate = _operation_recovery_candidate(args)
+    plan = verify_requeue_plan(
+        _operation_recovery_read_private_json(
+            args.plan,
+            "operation requeue plan",
+        ),
+        allow_expired=True,
+    )
+    application = _operation_recovery_validate_application(
+        _operation_recovery_read_private_json(
+            plan["application_receipt_path"],
+            "operation application receipt",
+        ),
+        plan=plan,
+    )
+    if (
+        candidate != plan["candidate_release"]
+        or not hmac.compare_digest(
+            args.approval_digest,
+            _operation_recovery_rollback_approval(plan, application),
+        )
+    ):
+        raise OperationRecoveryError("operation-recovery rollback approval differs")
+    envelope = _operation_recovery_read_private_json(
+        plan["rollback_bundle_path"],
+        "operation rollback bundle",
+    )
+    required = {
+        "schema_version",
+        "kind",
+        "plan_digest",
+        "ciphertext_sha256",
+        "ciphertext_base64",
+    }
+    if (
+        not isinstance(envelope, Mapping)
+        or set(envelope) != required
+        or envelope.get("schema_version") != 1
+        or envelope.get("kind")
+        != "operation-recovery-encrypted-rollback-bundle"
+        or envelope.get("plan_digest") != plan["plan_digest"]
+        or envelope.get("ciphertext_sha256")
+        != application.get("rollback_bundle_digest")
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery rollback bundle is invalid"
+        )
+    try:
+        ciphertext = base64.b64decode(
+            envelope["ciphertext_base64"],
+            validate=True,
+        )
+    except (TypeError, ValueError) as error:
+        raise OperationRecoveryError(
+            "operation-recovery rollback bundle is invalid"
+        ) from error
+    if hashlib.sha256(ciphertext).hexdigest() != envelope["ciphertext_sha256"]:
+        raise OperationRecoveryError(
+            "operation-recovery rollback bundle differs"
+        )
+    age = _operation_recovery_tool(Path(args.age), "age")
+    encryption = plan["rollback_encryption"]
+    if (
+        str(age) != encryption["age_path"]
+        or not hmac.compare_digest(
+            EXPECTED_OPERATION_RECOVERY_TOOLCHAIN["age"]["sha256"],
+            encryption["age_sha256"],
+        )
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery rollback encryption differs"
+        )
+    identity_descriptor = _private_identity_descriptor(
+        Path(args.age_identity).resolve(strict=True)
+    )
+    tool_root, pinned_tools = _stage_operation_recovery_tools({"age": age})
+    try:
+        pinned_age = pinned_tools["age"]
+        result = _run_private_subprocess(
+            (
+                str(pinned_age.path),
+                "--decrypt",
+                "--identity",
+                f"/dev/fd/{identity_descriptor}",
+            ),
+            pinned_tool=pinned_age,
+            tool_key="age",
+            input_value=ciphertext,
+            stdout=subprocess.PIPE,
+            environment={
+                "PATH": "/usr/bin:/bin",
+                "LANG": "C",
+                "LC_ALL": "C",
+            },
+            pass_fds=(identity_descriptor,),
+            timeout=30,
+        )
+    finally:
+        os.close(identity_descriptor)
+        _remove_operation_recovery_tools(tool_root)
+        ciphertext = b""
+    plaintext = result.stdout
+    try:
+        bundle = strict_json_loads(plaintext)
+    finally:
+        plaintext = b""
+    if (
+        not isinstance(bundle, Mapping)
+        or set(bundle) != {"schema_version", "kind", "plan_digest", "rows"}
+        or bundle.get("schema_version") != 1
+        or bundle.get("kind")
+        != "operation-recovery-selected-row-preimage"
+        or bundle.get("plan_digest") != plan["plan_digest"]
+        or not isinstance(bundle.get("rows"), list)
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery rollback preimage is invalid"
+        )
+    manager = _portable_manager(args)
+    with manager._lock(), _operation_recovery_lock(manager):
+        authority = _operation_recovery_authority(
+            args,
+            postgres_system_identifier=(
+                EXPECTED_OPERATION_RECOVERY_INSTALLATION[
+                    "postgres_system_identifier"
+                ]
+            ),
+            lock_installer=False,
+        )
+        if authority != plan["installation_authority"]:
+            raise OperationRecoveryError(
+                "operation-recovery rollback authority drifted"
+            )
+        if Path(plan["rollback_receipt_path"]).exists():
+            existing = _operation_recovery_read_private_json(
+                plan["rollback_receipt_path"],
+                "operation rollback journal",
+            )
+            if (
+                isinstance(existing, Mapping)
+                and existing.get("kind")
+                == "operation-recovery-rollback-receipt"
+            ):
+                receipt = _operation_recovery_validate_rollback_receipt(
+                    existing,
+                    plan=plan,
+                    application=application,
+                )
+                return _print_result(
+                    {
+                        "status": "already-rolled-back",
+                        "plan_digest": plan["plan_digest"],
+                        "pre_generation": receipt["pre_generation"],
+                        "post_generation": receipt["post_generation"],
+                        "receipt_digest": receipt["receipt_digest"],
+                    }
+                )
+            journal = _operation_recovery_validate_rollback_journal(
+                existing,
+                plan=plan,
+                application=application,
+            )
+        else:
+            journal_body = {
+                "schema_version": 1,
+                "kind": "operation-recovery-rollback-journal",
+                "plan_digest": plan["plan_digest"],
+                "application_receipt_digest": application[
+                    "receipt_digest"
+                ],
+                "pre_generation": application["post_generation"],
+                "post_generation": _operation_recovery_next_generation(
+                    application["post_generation"]
+                ),
+                "selected_operation_count": plan[
+                    "selected_operation_count"
+                ],
+                "installation_authority_digest": digest(authority),
+                "recorded_at": int(time.time()),
+            }
+            journal = {
+                **journal_body,
+                "receipt_digest": digest(journal_body),
+            }
+            write_private(
+                plan["rollback_receipt_path"],
+                journal,
+                create_only=True,
+            )
+
+        async def rollback():
+            connection = await _operation_recovery_connect_live(
+                args,
+                readonly=False,
+            )
+            try:
+                return await rollback_requeue_transaction(
+                    connection,
+                    profile_id="systalyze",
+                    schema="public",
+                    bank_id="engineering",
+                    plan=plan,
+                    application=application,
+                    rollback_record=journal,
+                    preimage=bundle["rows"],
+                )
+            finally:
+                await connection.close()
+
+        before, after = asyncio.run(rollback())
+        post_authority = _operation_recovery_authority(
+            args,
+            postgres_system_identifier=(
+                EXPECTED_OPERATION_RECOVERY_INSTALLATION[
+                    "postgres_system_identifier"
+                ]
+            ),
+            lock_installer=False,
+        )
+        if post_authority != authority:
+            raise OperationRecoveryError(
+                "installer authority changed during operation recovery rollback"
+            )
+        if (
+            before != journal["pre_generation"]
+            or after != journal["post_generation"]
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery rollback generation differs"
+            )
+        receipt = _operation_recovery_finalize_rollback_journal(journal)
+        write_private(
+            plan["rollback_receipt_path"],
+            receipt,
+        )
+    return _print_result(
+        {
+            "status": "rolled-back",
+            "plan_digest": plan["plan_digest"],
+            "pre_generation": before,
+            "post_generation": after,
+            "receipt_digest": receipt["receipt_digest"],
+        }
+    )
+
+
 def _portable_service_manager(
     args: argparse.Namespace,
 ) -> PortableInstallationManager:
@@ -4267,6 +7784,104 @@ def parser() -> argparse.ArgumentParser:
     data_identity_rollback.add_argument("--plan", required=True)
     data_identity_rollback.add_argument("--approval-digest", required=True)
     data_identity_rollback.set_defaults(run=data_identity_rebind_rollback_command)
+
+    operation_recovery = commands.add_parser("operation-recovery")
+    operation_recovery_commands = operation_recovery.add_subparsers(
+        dest="operation_recovery_command",
+        required=True,
+    )
+
+    def add_operation_recovery_authority(
+        command: argparse.ArgumentParser,
+    ) -> None:
+        command.add_argument("--config", required=True)
+        command.add_argument("--candidate-release-root", required=True)
+        command.add_argument("--candidate-release-identity", required=True)
+
+    recovery_backup = operation_recovery_commands.add_parser(
+        "classify-backup"
+    )
+    add_operation_recovery_authority(recovery_backup)
+    recovery_backup.add_argument("--backup", required=True)
+    recovery_backup.add_argument("--backup-digest", required=True)
+    recovery_backup.add_argument("--age", required=True)
+    recovery_backup.add_argument("--age-identity", required=True)
+    recovery_backup.add_argument("--postgres-bin-dir", required=True)
+    recovery_backup.add_argument("--run-root", required=True)
+    recovery_backup.add_argument("--port", required=True, type=int)
+    recovery_backup.add_argument("--output", required=True)
+    recovery_backup.set_defaults(
+        run=operation_recovery_classify_backup_command
+    )
+
+    recovery_live_backup = operation_recovery_commands.add_parser(
+        "backup-live"
+    )
+    add_operation_recovery_authority(recovery_live_backup)
+    recovery_live_backup.add_argument("--artifact", required=True)
+    recovery_live_backup.add_argument("--output", required=True)
+    recovery_live_backup.add_argument("--age", required=True)
+    recovery_live_backup.add_argument("--age-identity", required=True)
+    recovery_live_backup.add_argument("--recipient", required=True)
+    recovery_live_backup.add_argument("--postgres-bin-dir", required=True)
+    recovery_live_backup.add_argument("--run-root", required=True)
+    recovery_live_backup.add_argument("--restore-run-root", required=True)
+    recovery_live_backup.add_argument("--port", required=True, type=int)
+    recovery_live_backup.set_defaults(
+        run=operation_recovery_backup_live_command
+    )
+
+    recovery_live = operation_recovery_commands.add_parser("classify-live")
+    add_operation_recovery_authority(recovery_live)
+    recovery_live.add_argument("--cohort", required=True)
+    recovery_live.add_argument("--output", required=True)
+    recovery_live.set_defaults(run=operation_recovery_classify_live_command)
+
+    recovery_plan = operation_recovery_commands.add_parser("plan")
+    add_operation_recovery_authority(recovery_plan)
+    recovery_plan.add_argument("--cohort", required=True)
+    recovery_plan.add_argument("--snapshot", required=True)
+    recovery_plan.add_argument("--rollback-backup-evidence", required=True)
+    recovery_plan.add_argument("--rollback-backup", required=True)
+    recovery_plan.add_argument("--age", required=True)
+    recovery_plan.add_argument("--rollback-recipient", required=True)
+    recovery_plan.add_argument("--rollback-bundle", required=True)
+    recovery_plan.add_argument("--authorization-receipt", required=True)
+    recovery_plan.add_argument("--application-receipt", required=True)
+    recovery_plan.add_argument("--verification-receipt", required=True)
+    recovery_plan.add_argument("--rollback-receipt", required=True)
+    recovery_plan.add_argument("--output", required=True)
+    recovery_plan.set_defaults(run=operation_recovery_plan_command)
+
+    recovery_status = operation_recovery_commands.add_parser("status")
+    add_operation_recovery_authority(recovery_status)
+    recovery_status.add_argument("--plan", required=True)
+    recovery_status.set_defaults(run=operation_recovery_status_command)
+
+    recovery_apply = operation_recovery_commands.add_parser("apply")
+    add_operation_recovery_authority(recovery_apply)
+    recovery_apply.add_argument("--plan", required=True)
+    recovery_apply.add_argument("--approval-digest", required=True)
+    recovery_apply.add_argument("--rollback-backup", required=True)
+    recovery_apply.add_argument("--age", required=True)
+    recovery_apply.add_argument("--age-identity", required=True)
+    recovery_apply.add_argument("--rollback-recipient", required=True)
+    recovery_apply.set_defaults(run=operation_recovery_apply_command)
+
+    recovery_verify = operation_recovery_commands.add_parser("verify")
+    add_operation_recovery_authority(recovery_verify)
+    recovery_verify.add_argument("--plan", required=True)
+    recovery_verify.add_argument("--cohort", required=True)
+    recovery_verify.add_argument("--snapshot", required=True)
+    recovery_verify.set_defaults(run=operation_recovery_verify_command)
+
+    recovery_rollback = operation_recovery_commands.add_parser("rollback")
+    add_operation_recovery_authority(recovery_rollback)
+    recovery_rollback.add_argument("--plan", required=True)
+    recovery_rollback.add_argument("--approval-digest", required=True)
+    recovery_rollback.add_argument("--age", required=True)
+    recovery_rollback.add_argument("--age-identity", required=True)
+    recovery_rollback.set_defaults(run=operation_recovery_rollback_command)
 
     validate = commands.add_parser("validate")
     validate.add_argument("--inventory", required=True)
@@ -4738,6 +8353,7 @@ def _validate_state_directory_argument(
         "service",
         "import",
         "data-identity",
+        "operation-recovery",
     }:
         if args.state_dir is not None:
             if args.command != "import":
@@ -4771,6 +8387,7 @@ def main() -> int:
         PlanError,
         PortableInstallError,
         ReplayError,
+        OperationRecoveryError,
         StrictJsonError,
         UnicodeDecodeError,
         OSError,

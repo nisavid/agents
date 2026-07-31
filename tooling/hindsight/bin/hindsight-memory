@@ -4196,6 +4196,9 @@ EXPECTED_OPERATION_RECOVERY_SOURCE_BACKUP = {
 EXPECTED_OPERATION_RECOVERY_RECIPIENT_SHA256 = (
     "62a6244e496064fbd7dcb10bf137b9fad761a5a541bce662da3ea4cd47ba55fc"
 )
+EXPECTED_OPERATION_RECOVERY_ROLLBACK_IDENTITY = (
+    "/Users/ivan/.config/age/key.txt"
+)
 
 EXPECTED_OPERATION_RECOVERY_POSTGRES_PREFIX = {
     "path": "/Users/ivan/.pg0/installation/18.1.0",
@@ -4640,18 +4643,46 @@ def _operation_recovery_toolchain_digest() -> str:
     )
 
 
-def _operation_recovery_rollback_encryption(recipient: str) -> dict[str, str]:
+def _operation_recovery_validate_recipient(
+    recipient: str,
+    label: str,
+) -> str:
     if (
         not recipient.startswith("age1")
         or len(recipient) > 4096
         or not recipient.isascii()
         or any(character in recipient for character in "\r\n\0")
         or not hmac.compare_digest(
-            hashlib.sha256(recipient.encode("ascii")).hexdigest(),
+            hashlib.sha256(f"{recipient}\n".encode("ascii")).hexdigest(),
             EXPECTED_OPERATION_RECOVERY_RECIPIENT_SHA256,
         )
     ):
-        raise OperationRecoveryError("rollback recipient is invalid")
+        raise OperationRecoveryError(f"{label} is invalid")
+    return recipient
+
+
+def _operation_recovery_rollback_identity_path(value: str | Path) -> Path:
+    try:
+        path = Path(value).resolve(strict=True)
+        expected = Path(
+            EXPECTED_OPERATION_RECOVERY_ROLLBACK_IDENTITY
+        ).resolve(strict=True)
+    except OSError as error:
+        raise OperationRecoveryError(
+            "operation-recovery rollback identity path is unavailable"
+        ) from error
+    if path != expected:
+        raise OperationRecoveryError(
+            "operation-recovery rollback identity path differs"
+        )
+    return path
+
+
+def _operation_recovery_rollback_encryption(recipient: str) -> dict[str, str]:
+    recipient = _operation_recovery_validate_recipient(
+        recipient,
+        "rollback recipient",
+    )
     age = EXPECTED_OPERATION_RECOVERY_TOOLCHAIN["age"]
     return {
         "recipient": recipient,
@@ -5785,6 +5816,9 @@ def operation_recovery_classify_backup_command(
 
 def operation_recovery_backup_live_command(args: argparse.Namespace) -> int:
     _operation_recovery_candidate(args)
+    args.age_identity = str(
+        _operation_recovery_rollback_identity_path(args.age_identity)
+    )
     binding = read_pg0_registration("systalyze")
     password = binding.pop("_password")
 
@@ -5875,17 +5909,10 @@ def operation_recovery_backup_live_command(args: argparse.Namespace) -> int:
         or not 1024 <= args.port <= 65535
     ):
         raise OperationRecoveryError("live backup path boundary is invalid")
-    if (
-        not args.recipient.startswith("age1")
-        or len(args.recipient) > 4096
-        or not args.recipient.isascii()
-        or any(character in args.recipient for character in "\r\n\0")
-        or not hmac.compare_digest(
-            hashlib.sha256(args.recipient.encode("ascii")).hexdigest(),
-            EXPECTED_OPERATION_RECOVERY_RECIPIENT_SHA256,
-        )
-    ):
-        raise OperationRecoveryError("backup recipient is invalid")
+    _operation_recovery_validate_recipient(
+        args.recipient,
+        "backup recipient",
+    )
     postgres_bin = Path(args.postgres_bin_dir).resolve(strict=True)
     tool_root, pinned_tools = _stage_operation_recovery_tools(
         {
@@ -6426,17 +6453,10 @@ def _age_encrypt_preimage(
     preimage: Sequence[Mapping[str, Any]],
     plan_digest: str,
 ) -> dict[str, Any]:
-    if (
-        not recipient.startswith("age1")
-        or len(recipient) > 4096
-        or not recipient.isascii()
-        or any(character in recipient for character in "\r\n\0")
-        or not hmac.compare_digest(
-            hashlib.sha256(recipient.encode("ascii")).hexdigest(),
-            EXPECTED_OPERATION_RECOVERY_RECIPIENT_SHA256,
-        )
-    ):
-        raise OperationRecoveryError("rollback recipient is invalid")
+    _operation_recovery_validate_recipient(
+        recipient,
+        "rollback recipient",
+    )
     plaintext = _operation_recovery_preimage_bytes(preimage, plan_digest)
     plaintext_digest = hashlib.sha256(plaintext).hexdigest()
     identity_descriptor = _private_identity_descriptor(
@@ -6950,7 +6970,9 @@ async def _operation_recovery_prepare_apply(
         raise OperationRecoveryError(
             "operation-recovery rollback encryption differs"
         )
-    identity_path = Path(args.age_identity)
+    identity_path = _operation_recovery_rollback_identity_path(
+        args.age_identity
+    )
     identity_descriptor = _private_identity_descriptor(
         identity_path.resolve(strict=True)
     )
@@ -7490,7 +7512,7 @@ def operation_recovery_rollback_command(args: argparse.Namespace) -> int:
             "operation-recovery rollback encryption differs"
         )
     identity_descriptor = _private_identity_descriptor(
-        Path(args.age_identity).resolve(strict=True)
+        _operation_recovery_rollback_identity_path(args.age_identity)
     )
     tool_root, pinned_tools = _stage_operation_recovery_tools({"age": age})
     try:

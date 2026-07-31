@@ -236,6 +236,9 @@ class OperationRecoveryCliTest(unittest.TestCase):
                     ]
                 ),
                 "_operation_recovery_connect_live": connect,
+                "_operation_recovery_rollback_identity_path": (
+                    lambda _value: identity_path
+                ),
                 "rollback_requeue_transaction": rollback,
                 "write_private": write,
                 "_print_result": lambda value: value,
@@ -488,6 +491,47 @@ class OperationRecoveryCliTest(unittest.TestCase):
         ]
         with self.assertRaisesRegex(Exception, "authority differs"):
             authority(Path("/bin/echo"), "0" * 64)
+
+    def test_recipient_validation_uses_canonical_keygen_output(self):
+        validate = self.controller[
+            "_operation_recovery_validate_recipient"
+        ]
+        globals_ = validate.__globals__
+        original_digest = globals_[
+            "EXPECTED_OPERATION_RECOVERY_RECIPIENT_SHA256"
+        ]
+        recipient = "age1canonicalrecipient"
+        globals_["EXPECTED_OPERATION_RECOVERY_RECIPIENT_SHA256"] = (
+            hashlib.sha256(f"{recipient}\n".encode("ascii")).hexdigest()
+        )
+        try:
+            self.assertEqual(
+                validate(recipient, "backup recipient"),
+                recipient,
+            )
+            with self.assertRaisesRegex(Exception, "backup recipient"):
+                validate(f"{recipient}\n", "backup recipient")
+        finally:
+            globals_[
+                "EXPECTED_OPERATION_RECOVERY_RECIPIENT_SHA256"
+            ] = original_digest
+
+    def test_rollback_identity_rejects_alternate_private_key(self):
+        pin_identity = self.controller[
+            "_operation_recovery_rollback_identity_path"
+        ]
+        with tempfile.TemporaryDirectory(
+            dir="/private/tmp",
+            prefix="hindsight-recovery-alternate-key-",
+        ) as directory:
+            alternate = Path(directory) / "key.txt"
+            alternate.write_text("AGE-SECRET-KEY-TEST-ONLY\n", encoding="ascii")
+            alternate.chmod(0o600)
+            with self.assertRaisesRegex(
+                Exception,
+                "rollback identity path differs",
+            ):
+                pin_identity(alternate)
 
     def test_plan_normalizes_live_binding_before_drift_check(self):
         command = self.controller["operation_recovery_plan_command"]

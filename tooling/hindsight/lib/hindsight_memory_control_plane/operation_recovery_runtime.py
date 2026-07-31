@@ -11,7 +11,6 @@ import asyncio
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timezone
 import hashlib
-import ipaddress
 import json
 import os
 from pathlib import Path
@@ -363,7 +362,7 @@ async def assert_connected_live_database(
         SELECT current_database() AS database,
                current_user AS database_user,
                current_setting('data_directory') AS data_directory,
-               inet_server_port() AS port,
+               current_setting('port')::integer AS port,
                inet_server_addr()::text AS address,
                (SELECT system_identifier::text
                 FROM pg_control_system()) AS system_identifier
@@ -372,16 +371,15 @@ async def assert_connected_live_database(
     row = _mapping(values)
     try:
         connected_data_dir = Path(row["data_directory"]).resolve(strict=True)
-        loopback = ipaddress.ip_interface(row["address"]).ip.is_loopback
     except (KeyError, OSError, TypeError, ValueError):
         connected_data_dir = None
-        loopback = False
     if (
         row.get("database") != binding["database"]
         or row.get("database_user") != binding["user"]
         or connected_data_dir != Path(str(binding["data_dir"]))
         or row.get("port") != binding["port"]
-        or not loopback
+        or "address" not in row
+        or row["address"] is not None
         or row.get("system_identifier") != expected_system_identifier
     ):
         raise OperationRecoveryError(

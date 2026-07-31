@@ -20,6 +20,7 @@ if str(LIB) not in sys.path:
 from hindsight_memory_control_plane.operation_recovery_runtime import (  # noqa: E402
     SAFE_OPERATION_QUERY,
     apply_requeue_transaction,
+    assert_connected_live_database,
     connect_verified_local_postgres,
     live_row_digest,
     read_snapshot,
@@ -74,6 +75,74 @@ class FakeConnection:
 
 
 class OperationRecoveryRuntimeTest(unittest.TestCase):
+    def test_live_identity_accepts_verified_unix_socket_connection(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            data_dir = Path(temporary).resolve()
+
+            class UnixConnection:
+                async def fetchrow(self, query):
+                    if (
+                        "current_setting('port')::integer AS port"
+                        not in query
+                        or "inet_server_port()" in query
+                    ):
+                        raise AssertionError(
+                            "live identity must read the configured server port"
+                        )
+                    return {
+                        "database": "hindsight",
+                        "database_user": "hindsight",
+                        "data_directory": str(data_dir),
+                        "port": 5432,
+                        "address": None,
+                        "system_identifier": "7659746962107358086",
+                    }
+
+            asyncio.run(
+                assert_connected_live_database(
+                    UnixConnection(),
+                    {
+                        "database": "hindsight",
+                        "user": "hindsight",
+                        "data_dir": str(data_dir),
+                        "port": 5432,
+                    },
+                    expected_system_identifier="7659746962107358086",
+                )
+            )
+
+    def test_live_identity_rejects_tcp_connection(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            data_dir = Path(temporary).resolve()
+
+            class TcpConnection:
+                async def fetchrow(self, query):
+                    return {
+                        "database": "hindsight",
+                        "database_user": "hindsight",
+                        "data_directory": str(data_dir),
+                        "port": 5432,
+                        "address": "127.0.0.1",
+                        "system_identifier": "7659746962107358086",
+                    }
+
+            with self.assertRaisesRegex(
+                OperationRecoveryError,
+                "does not match the pinned live pg0 identity",
+            ):
+                asyncio.run(
+                    assert_connected_live_database(
+                        TcpConnection(),
+                        {
+                            "database": "hindsight",
+                            "user": "hindsight",
+                            "data_dir": str(data_dir),
+                            "port": 5432,
+                        },
+                        expected_system_identifier="7659746962107358086",
+                    )
+                )
+
     def test_snapshot_is_repeatable_read_readonly_and_payload_free(self):
         connection = FakeConnection()
         before, after, rows = asyncio.run(

@@ -387,6 +387,51 @@ class OperationRecoveryCliTest(unittest.TestCase):
             remove(root)
         self.assertFalse(root.exists())
 
+    def test_private_subprocess_accepts_one_anonymous_stdin_descriptor(self):
+        stage = self.controller["_stage_operation_recovery_tools"]
+        run = self.controller["_run_private_subprocess"]
+        remove = self.controller["_remove_operation_recovery_tools"]
+        expected = self.controller["EXPECTED_OPERATION_RECOVERY_TOOLCHAIN"]
+        subprocess_module = run.__globals__["subprocess"]
+        original_run = subprocess_module.run
+        seen = {}
+
+        def capture(*arguments, **keywords):
+            seen.update(keywords)
+            return subprocess.CompletedProcess(arguments[0], 0)
+
+        root, tools = stage({"age": Path(expected["age"]["path"])})
+        descriptor, path = tempfile.mkstemp(
+            dir="/private/tmp",
+            prefix="hindsight-anonymous-stdin-",
+        )
+        os.unlink(path)
+        try:
+            subprocess_module.run = capture
+            run(
+                (str(tools["age"].path), "--version"),
+                pinned_tool=tools["age"],
+                tool_key="age",
+                stdin=descriptor,
+            )
+            self.assertEqual(seen["stdin"], descriptor)
+            with self.assertRaisesRegex(
+                Exception,
+                "input sources are ambiguous",
+            ):
+                run(
+                    (str(tools["age"].path), "--version"),
+                    pinned_tool=tools["age"],
+                    tool_key="age",
+                    stdin=descriptor,
+                    input_value=b"ambiguous",
+                )
+        finally:
+            subprocess_module.run = original_run
+            os.close(descriptor)
+            remove(root)
+        self.assertFalse(root.exists())
+
     def test_postgres_toolchain_executes_private_prefix_copy(self):
         stage = self.controller["_stage_operation_recovery_tools"]
         run = self.controller["_run_private_subprocess"]

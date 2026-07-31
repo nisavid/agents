@@ -4934,6 +4934,7 @@ def _run_private_subprocess(
     pass_fds: tuple[int, ...] = (),
     environment: Mapping[str, str] | None = None,
     timeout: float = 300,
+    stdin: int | None = None,
     stdout: int | None = None,
     stderr: int | None = None,
     input_value: bytes | None = None,
@@ -4941,6 +4942,10 @@ def _run_private_subprocess(
     command = tuple(argv)
     if not command:
         raise OperationRecoveryError("private recovery command is empty")
+    if stdin is not None and input_value is not None:
+        raise OperationRecoveryError(
+            "private recovery input sources are ambiguous"
+        )
     _assert_operation_recovery_pinned_tool(pinned_tool, tool_key)
     if Path(command[0]) != pinned_tool.path:
         raise OperationRecoveryError("private recovery executable differs")
@@ -4985,7 +4990,11 @@ def _run_private_subprocess(
         result = subprocess.run(
             command,
             check=False,
-            stdin=subprocess.DEVNULL if input_value is None else None,
+            stdin=(
+                subprocess.DEVNULL
+                if stdin is None and input_value is None
+                else stdin
+            ),
             input=input_value,
             stdout=subprocess.DEVNULL if stdout is None else stdout,
             stderr=subprocess.DEVNULL if stderr is None else stderr,
@@ -5618,9 +5627,8 @@ def operation_recovery_classify_backup_command(
                     "-d",
                     "hindsight",
                     "--exit-on-error",
-                    f"/dev/fd/{plaintext_descriptor}",
                 ),
-                pass_fds=(plaintext_descriptor,),
+                stdin=plaintext_descriptor,
                 timeout=1800,
                 pinned_tool=pinned_tools["pg_restore"],
                 tool_key="pg_restore",

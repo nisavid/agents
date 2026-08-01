@@ -22,12 +22,14 @@ from hindsight_memory_control_plane.operation_recovery_runtime import (  # noqa:
     QUEUE_BLOCKER_GUARD_CONTRACT_DIGEST,
     QUEUE_BLOCKER_GUARD_CONTRACT_VERSION,
     QUEUE_BLOCKER_PREDICATE,
+    CLAIM_RELEASE_EVIDENCE_QUERY,
     SAFE_OPERATION_QUERY,
     apply_requeue_transaction,
     assert_connected_live_database,
     connect_verified_local_postgres,
     live_row_digest,
     read_global_queue_blockers,
+    read_claim_release_evidence,
     read_snapshot,
     rollback_requeue_transaction,
 )
@@ -371,6 +373,108 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
                         reference_selected_operation_ids=selected_ids,
                     )
                 )
+
+    def test_claim_release_evidence_is_generation_bound_and_payload_free(self):
+        operation_id = "00000000-0000-4000-8000-000000000099"
+
+        class ClaimEvidenceConnection(FakeConnection):
+            async def fetch(self, query, *arguments):
+                self.fetch_calls.append((query, arguments))
+                return [
+                    {
+                        "operation_id": operation_id,
+                        "bank_id": "codex",
+                        "operation_type": "retain",
+                        "status": "failed",
+                        "created_at": "2026-07-29T12:00:00.000000Z",
+                        "updated_at": "2026-07-29T13:00:00.000000Z",
+                        "completed_at": "2026-07-29T13:00:00.000000Z",
+                        "retry_count": 2,
+                        "next_retry_at": None,
+                        "worker_id_present": True,
+                        "worker_id_digest": "6" * 64,
+                        "claimed_at": "2026-07-29T12:30:00.000000Z",
+                        "task_payload_present": True,
+                        "task_payload_digest": "7" * 64,
+                        "in_reference_cohort": False,
+                        "in_reference_selected_set": False,
+                        "blocker_reason": "claimed_failed",
+                        "nonclaim_state_digest": "8" * 64,
+                    }
+                ]
+
+        connection = ClaimEvidenceConnection()
+        before, after, rows = asyncio.run(
+            read_claim_release_evidence(
+                connection,
+                profile_id="systalyze",
+                schema="public",
+                operation_ids=[operation_id],
+                expected_generation="systalyze:public:123",
+            )
+        )
+
+        self.assertEqual((before, after), (
+            "systalyze:public:123",
+            "systalyze:public:123",
+        ))
+        self.assertEqual(
+            connection.transaction_arguments,
+            {"isolation": "repeatable_read", "readonly": True},
+        )
+        self.assertEqual(rows[0]["nonclaim_state_digest"], "8" * 64)
+        self.assertEqual(connection.generation_reads, 2)
+        _query, arguments = connection.fetch_calls[0]
+        self.assertEqual([str(value) for value in arguments[0]], [operation_id])
+        select_list = CLAIM_RELEASE_EVIDENCE_QUERY.split(
+            "FROM {schema}.async_operations"
+        )[0]
+        self.assertNotIn("task_payload AS", select_list)
+        self.assertNotIn("error_message AS", select_list)
+        self.assertNotIn("worker_id AS", select_list)
+        self.assertIn("nonclaim_state_digest", select_list)
+
+    def test_claim_release_evidence_rejects_generation_or_row_set_drift(self):
+        operation_id = "00000000-0000-4000-8000-000000000001"
+
+        class GenerationDriftConnection(FakeConnection):
+            async def fetchrow(self, query, *arguments):
+                self.generation_reads += 1
+                return {
+                    "generation": 122 + self.generation_reads,
+                    "missing_trigger_count": 0,
+                    "reserved_guard_count": 0,
+                }
+
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "generation changed during claim-release planning",
+        ):
+            asyncio.run(
+                read_claim_release_evidence(
+                    GenerationDriftConnection(),
+                    profile_id="systalyze",
+                    schema="public",
+                    operation_ids=[operation_id],
+                    expected_generation="systalyze:public:123",
+                )
+            )
+
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "claim-release row set changed",
+        ):
+            asyncio.run(
+                read_claim_release_evidence(
+                    FakeConnection(),
+                    profile_id="systalyze",
+                    schema="public",
+                    operation_ids=[
+                        "00000000-0000-4000-8000-000000000002"
+                    ],
+                    expected_generation="systalyze:public:123",
+                )
+            )
 
     def test_apply_allows_bound_claim_on_selected_terminal_row(self):
         before = {

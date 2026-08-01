@@ -1,4 +1,5 @@
 from copy import deepcopy
+import json
 from pathlib import Path
 import sys
 import unittest
@@ -12,12 +13,14 @@ if str(LIB) not in sys.path:
 from hindsight_memory_control_plane.canonical import digest  # noqa: E402
 from hindsight_memory_control_plane.operation_recovery import (  # noqa: E402
     OperationRecoveryError,
+    create_claim_release_plan,
     create_cohort_manifest,
     create_global_queue_blocker_classification,
     create_live_snapshot,
     create_requeue_plan,
     normalize_pg0_binding,
     verify_cohort_manifest,
+    verify_claim_release_plan,
     verify_global_queue_blocker_classification,
     verify_live_snapshot,
     verify_requeue_plan,
@@ -297,6 +300,62 @@ class OperationRecoveryContractTest(unittest.TestCase):
             guard_contract_digest="a" * 64,
             observed_at=reference_plan["expires_at"] + 1,
         )
+
+    def claim_release_inputs(
+        self,
+        *,
+        planned_at: int = 1_785_460_800,
+        live_generation: str = "systalyze:public:124",
+    ) -> tuple[dict, dict, dict[str, str]]:
+        blockers = []
+        for index in range(43):
+            blockers.append(
+                {
+                    **self.queue_blocker_row(),
+                    "operation_id": (
+                        f"00000000-0000-4000-8000-{index + 100:012x}"
+                    ),
+                    "bank_id": "codex" if index < 37 else "engineering",
+                    "operation_type": (
+                        "retain" if index < 37 else "refresh_mental_model"
+                    ),
+                    "status": "failed",
+                    "completed_at": "2026-07-29T13:00:00.000000Z",
+                    "blocker_reason": "claimed_failed",
+                }
+            )
+        reference_plan = self.requeue_plan()
+        predecessor = create_global_queue_blocker_classification(
+            blockers,
+            classifier_candidate_release={
+                "source_commit": "9" * 40,
+                "version": "2026.08.01+9999999.operation-recovery.6",
+                "release_digest": "8" * 64,
+            },
+            reference_plan=reference_plan,
+            installation_authority=installation_authority(),
+            generation_before="systalyze:public:123",
+            generation_after="systalyze:public:123",
+            guard_contract_version=1,
+            guard_contract_digest="a" * 64,
+            observed_at=planned_at - 7200,
+        )
+        live = create_global_queue_blocker_classification(
+            blockers,
+            classifier_candidate_release=release_identity(),
+            reference_plan=reference_plan,
+            installation_authority=installation_authority(),
+            generation_before=live_generation,
+            generation_after=live_generation,
+            guard_contract_version=1,
+            guard_contract_digest="a" * 64,
+            observed_at=planned_at,
+        )
+        nonclaim_digests = {
+            row["operation_id"]: f"{index + 1:064x}"
+            for index, row in enumerate(live["blockers"])
+        }
+        return dict(predecessor), dict(live), nonclaim_digests
 
     def test_global_queue_blocker_classification_is_closed_and_read_only(self):
         row = self.queue_blocker_row()
@@ -943,6 +1002,169 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 verification_receipt_path="/private/tmp/verification.json",
                 rollback_receipt_path="/private/tmp/rollback-receipt.json",
                 created_at=1_785_401_100,
+            )
+
+    def test_claim_release_plan_is_closed_unapproved_and_exactly_bound(self):
+        predecessor, live, nonclaim_digests = self.claim_release_inputs(
+            live_generation="systalyze:public:123"
+        )
+        candidate = release_identity()
+
+        plan = create_claim_release_plan(
+            predecessor,
+            live,
+            nonclaim_state_digests=nonclaim_digests,
+            candidate_release=candidate,
+            installation_authority=installation_authority(),
+            rollback_encryption=rollback_encryption(),
+            rollback_bundle_path="/private/tmp/claim-release.bundle.json",
+            authorization_receipt_path=(
+                "/private/tmp/claim-release.authorization.json"
+            ),
+            application_receipt_path=(
+                "/private/tmp/claim-release.application.json"
+            ),
+            verification_receipt_path=(
+                "/private/tmp/claim-release.verification.json"
+            ),
+            rollback_receipt_path="/private/tmp/claim-release.rollback.json",
+            created_at=live["observed_at"],
+        )
+
+        self.assertEqual(
+            verify_claim_release_plan(plan, now=plan["created_at"]),
+            plan,
+        )
+        self.assertEqual(plan["kind"], "operation-recovery-claim-release-plan")
+        self.assertEqual(plan["authority"], "unapproved-plan")
+        self.assertIs(plan["mutation_authorized"], False)
+        self.assertEqual(plan["selected_row_count"], 43)
+        self.assertEqual(plan["status_counts"], {"failed": 43})
+        self.assertEqual(plan["bank_counts"], {"codex": 37, "engineering": 6})
+        self.assertEqual(
+            plan["operation_type_counts"],
+            {"refresh_mental_model": 6, "retain": 37},
+        )
+        self.assertEqual(plan["pre_generation"], "systalyze:public:123")
+        self.assertEqual(plan["expires_at"], plan["created_at"] + 3600)
+        self.assertEqual(
+            plan["predecessor_classification_digest"],
+            predecessor["classification_digest"],
+        )
+        self.assertEqual(
+            plan["live_classification_digest"],
+            live["classification_digest"],
+        )
+        serialized = json.dumps(plan, sort_keys=True)
+        self.assertNotIn('"task_payload":', serialized)
+        self.assertNotIn('"worker_id":', serialized)
+        self.assertNotIn('"error_message":', serialized)
+
+    def test_claim_release_plan_binds_fresh_generation_not_predecessor(self):
+        planned_at = 1_785_460_800
+        predecessor, live, nonclaim_digests = self.claim_release_inputs(
+            planned_at=planned_at
+        )
+
+        plan = create_claim_release_plan(
+            predecessor,
+            live,
+            nonclaim_state_digests=nonclaim_digests,
+            candidate_release=release_identity(),
+            installation_authority=installation_authority(),
+            rollback_encryption=rollback_encryption(),
+            rollback_bundle_path="/private/tmp/claim-release-rollback.json",
+            authorization_receipt_path="/private/tmp/claim-release-authorization.json",
+            application_receipt_path="/private/tmp/claim-release-application.json",
+            verification_receipt_path="/private/tmp/claim-release-verification.json",
+            rollback_receipt_path="/private/tmp/claim-release-rollback-receipt.json",
+            created_at=planned_at,
+        )
+
+        self.assertEqual(plan["pre_generation"], "systalyze:public:124")
+
+    def test_claim_release_plan_verification_rejects_tampering_and_expiry(self):
+        planned_at = 1_785_460_800
+        predecessor, live, nonclaim_digests = self.claim_release_inputs(
+            planned_at=planned_at
+        )
+        plan = dict(
+            create_claim_release_plan(
+                predecessor,
+                live,
+                nonclaim_state_digests=nonclaim_digests,
+                candidate_release=release_identity(),
+                installation_authority=installation_authority(),
+                rollback_encryption=rollback_encryption(),
+                rollback_bundle_path=(
+                    "/private/tmp/claim-release.bundle.json"
+                ),
+                authorization_receipt_path=(
+                    "/private/tmp/claim-release.authorization.json"
+                ),
+                application_receipt_path=(
+                    "/private/tmp/claim-release.application.json"
+                ),
+                verification_receipt_path=(
+                    "/private/tmp/claim-release.verification.json"
+                ),
+                rollback_receipt_path=(
+                    "/private/tmp/claim-release.rollback.json"
+                ),
+                created_at=planned_at,
+            )
+        )
+
+        guard_tampered = deepcopy(plan)
+        guard_tampered["guard_contract_version"] = 2
+        with self.assertRaisesRegex(OperationRecoveryError, "digest differs"):
+            verify_claim_release_plan(guard_tampered, now=planned_at)
+
+        with self.assertRaisesRegex(OperationRecoveryError, "expired"):
+            verify_claim_release_plan(plan, now=plan["expires_at"])
+
+        alias_tampered = deepcopy(plan)
+        alias_tampered["authorization_receipt_path"] = plan[
+            "rollback_bundle_path"
+        ].upper()
+        alias_body = {
+            key: value
+            for key, value in alias_tampered.items()
+            if key != "plan_digest"
+        }
+        alias_tampered["plan_digest"] = digest(alias_body)
+        with self.assertRaisesRegex(OperationRecoveryError, "must be distinct"):
+            verify_claim_release_plan(alias_tampered, now=planned_at)
+
+        distribution_tampered = deepcopy(plan)
+        first = distribution_tampered["selected_rows"][0]
+        first["bank_id"] = "engineering"
+        first_body = {
+            key: value
+            for key, value in first.items()
+            if key not in {"row_digest", "nonclaim_state_digest"}
+        }
+        first["row_digest"] = digest(first_body)
+        distribution_tampered["selected_row_set_digest"] = digest(
+            [
+                {
+                    "operation_id": row["operation_id"],
+                    "row_digest": row["row_digest"],
+                    "nonclaim_state_digest": row["nonclaim_state_digest"],
+                }
+                for row in distribution_tampered["selected_rows"]
+            ]
+        )
+        distribution_body = {
+            key: value
+            for key, value in distribution_tampered.items()
+            if key != "plan_digest"
+        }
+        distribution_tampered["plan_digest"] = digest(distribution_body)
+        with self.assertRaisesRegex(OperationRecoveryError, "plan is invalid"):
+            verify_claim_release_plan(
+                distribution_tampered,
+                now=planned_at,
             )
 
 

@@ -27,6 +27,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 from typing import Any, Mapping, NamedTuple, Sequence
 
 
@@ -155,27 +156,35 @@ from hindsight_memory_control_plane.portable_install import (  # noqa: E402
 )
 from hindsight_memory_control_plane.operation_recovery import (  # noqa: E402
     OperationRecoveryError,
+    create_claim_release_plan,
     create_cohort_manifest,
     create_global_queue_blocker_classification,
     create_live_snapshot,
     create_requeue_plan,
     normalize_pg0_binding,
     verify_cohort_manifest,
+    verify_claim_release_plan,
+    verify_global_queue_blocker_classification,
     verify_live_snapshot,
     verify_requeue_plan,
 )
 from hindsight_memory_control_plane.operation_recovery_runtime import (  # noqa: E402
     QUEUE_BLOCKER_GUARD_CONTRACT_DIGEST,
     QUEUE_BLOCKER_GUARD_CONTRACT_VERSION,
+    apply_claim_release_transaction,
     apply_requeue_transaction,
     assert_connected_live_database,
     connect_verified_local_postgres,
     live_row_digest,
+    read_claim_release_evidence,
+    read_claim_release_preimage,
     read_global_queue_blockers,
+    read_generation,
     read_pg0_registration,
     read_restore_identity,
     read_selected_preimage,
     read_snapshot as read_operation_recovery_snapshot,
+    rollback_claim_release_transaction,
     rollback_requeue_transaction,
 )
 from hindsight_memory_control_plane.harness_persistence import (  # noqa: E402
@@ -208,6 +217,10 @@ ENVIRONMENT_NAME = re.compile(r"[A-Z_][A-Z0-9_]{0,127}\Z")
 MAX_SIGNAL_PID = (1 << 31) - 1
 SUPPORTED_NATIVE_HARNESSES = frozenset(
     {"codex", "claude-code", "cursor"}
+)
+CLAIM_RELEASE_PREIMAGE_KIND = "operation-recovery-claim-release-preimage"
+CLAIM_RELEASE_BUNDLE_KIND = (
+    "operation-recovery-claim-release-encrypted-rollback-bundle"
 )
 
 
@@ -6268,6 +6281,1254 @@ def operation_recovery_classify_queue_blockers_command(
     )
 
 
+def _claim_release_receipt_digest(value: Mapping[str, Any]) -> str:
+    return digest(
+        {key: item for key, item in value.items() if key != "receipt_digest"}
+    )
+
+
+def _claim_release_assert_guard(value: Mapping[str, Any]) -> None:
+    if (
+        value.get("guard_contract_version")
+        != QUEUE_BLOCKER_GUARD_CONTRACT_VERSION
+        or not hmac.compare_digest(
+            str(value.get("guard_contract_digest")),
+            QUEUE_BLOCKER_GUARD_CONTRACT_DIGEST,
+        )
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery claim-release guard contract differs"
+        )
+
+
+def _claim_release_validate_authorization(
+    plan: Mapping[str, Any],
+) -> dict[str, Any]:
+    value = _operation_recovery_read_private_json(
+        plan["authorization_receipt_path"],
+        "claim-release authorization receipt",
+    )
+    required = {
+        "schema_version",
+        "kind",
+        "plan_digest",
+        "approval_digest",
+        "candidate_release_digest",
+        "authorized_at",
+        "receipt_digest",
+    }
+    if (
+        set(value) != required
+        or value.get("schema_version") != 1
+        or value.get("kind")
+        != "operation-recovery-claim-release-authorization-receipt"
+        or value.get("plan_digest") != plan["plan_digest"]
+        or value.get("approval_digest") != plan["plan_digest"]
+        or value.get("candidate_release_digest")
+        != plan["candidate_release"]["release_digest"]
+        or type(value.get("authorized_at")) is not int
+        or value["authorized_at"] < plan["created_at"]
+        or value["authorized_at"] >= plan["expires_at"]
+        or value.get("receipt_digest")
+        != _claim_release_receipt_digest(value)
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery claim-release authorization receipt is invalid"
+        )
+    return dict(value)
+
+
+def _claim_release_validate_bundle(
+    plan: Mapping[str, Any],
+) -> dict[str, Any]:
+    value = _operation_recovery_read_private_json(
+        plan["rollback_bundle_path"],
+        "claim-release rollback bundle",
+    )
+    required = {
+        "schema_version",
+        "kind",
+        "plan_digest",
+        "ciphertext_sha256",
+        "ciphertext_base64",
+    }
+    try:
+        ciphertext = base64.b64decode(
+            value.get("ciphertext_base64"),
+            validate=True,
+        )
+    except (AttributeError, TypeError, ValueError) as error:
+        raise OperationRecoveryError(
+            "operation-recovery claim-release rollback bundle is invalid"
+        ) from error
+    try:
+        if (
+            set(value) != required
+            or value.get("schema_version") != 1
+            or value.get("kind")
+            != CLAIM_RELEASE_BUNDLE_KIND
+            or value.get("plan_digest") != plan["plan_digest"]
+            or re.fullmatch(
+                r"[0-9a-f]{64}",
+                str(value.get("ciphertext_sha256")),
+            )
+            is None
+            or hashlib.sha256(ciphertext).hexdigest()
+            != value.get("ciphertext_sha256")
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery claim-release rollback bundle is invalid"
+            )
+        return dict(value)
+    finally:
+        ciphertext = b""
+
+
+def _claim_release_validate_application_record(
+    value: Any,
+    *,
+    plan: Mapping[str, Any],
+    kind: str,
+) -> dict[str, Any]:
+    required = {
+        "schema_version",
+        "kind",
+        "plan_digest",
+        "authorization_receipt_digest",
+        "rollback_bundle_digest",
+        "pre_generation",
+        "post_generation",
+        "selected_row_count",
+        "selected_row_set_digest",
+        "installation_authority_digest",
+        "applied_at",
+        "receipt_digest",
+    }
+    authorization = _claim_release_validate_authorization(plan)
+    bundle = _claim_release_validate_bundle(plan)
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != required
+        or value.get("schema_version") != 1
+        or value.get("kind") != kind
+        or value.get("plan_digest") != plan["plan_digest"]
+        or value.get("authorization_receipt_digest")
+        != authorization["receipt_digest"]
+        or value.get("rollback_bundle_digest")
+        != bundle["ciphertext_sha256"]
+        or value.get("pre_generation") != plan["pre_generation"]
+        or value.get("post_generation")
+        != _operation_recovery_next_generation(plan["pre_generation"])
+        or value.get("selected_row_count") != plan["selected_row_count"]
+        or value.get("selected_row_set_digest")
+        != plan["selected_row_set_digest"]
+        or value.get("installation_authority_digest")
+        != digest(plan["installation_authority"])
+        or type(value.get("applied_at")) is not int
+        or value.get("receipt_digest")
+        != _claim_release_receipt_digest(value)
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery claim-release application record is invalid"
+        )
+    return dict(value)
+
+
+def _claim_release_finalize_application(
+    journal: Mapping[str, Any],
+) -> dict[str, Any]:
+    body = {
+        **{
+            key: value
+            for key, value in journal.items()
+            if key not in {"kind", "receipt_digest"}
+        },
+        "kind": "operation-recovery-claim-release-application-receipt",
+    }
+    return {**body, "receipt_digest": digest(body)}
+
+
+def _claim_release_validate_application(
+    value: Any,
+    *,
+    plan: Mapping[str, Any],
+) -> dict[str, Any]:
+    return _claim_release_validate_application_record(
+        value,
+        plan=plan,
+        kind="operation-recovery-claim-release-application-receipt",
+    )
+
+
+def _claim_release_validate_journal(
+    value: Any,
+    *,
+    plan: Mapping[str, Any],
+) -> dict[str, Any]:
+    return _claim_release_validate_application_record(
+        value,
+        plan=plan,
+        kind="operation-recovery-claim-release-application-journal",
+    )
+
+
+def _claim_release_validate_verification(
+    value: Any,
+    *,
+    plan: Mapping[str, Any],
+    application: Mapping[str, Any],
+) -> dict[str, Any]:
+    required = {
+        "schema_version",
+        "kind",
+        "plan_digest",
+        "application_receipt_digest",
+        "installation_authority_digest",
+        "evidence",
+        "verified_at",
+        "receipt_digest",
+    }
+    evidence = value.get("evidence") if isinstance(value, Mapping) else None
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != required
+        or value.get("schema_version") != 1
+        or value.get("kind")
+        != "operation-recovery-claim-release-verification-receipt"
+        or value.get("plan_digest") != plan["plan_digest"]
+        or value.get("application_receipt_digest")
+        != application["receipt_digest"]
+        or value.get("installation_authority_digest")
+        != digest(plan["installation_authority"])
+        or not isinstance(evidence, Mapping)
+        or set(evidence)
+        != {
+            "generation",
+            "selected_row_count",
+            "selected_row_set_digest",
+        }
+        or evidence.get("generation") != application["post_generation"]
+        or evidence.get("selected_row_count") != plan["selected_row_count"]
+        or evidence.get("selected_row_set_digest")
+        != plan["selected_row_set_digest"]
+        or type(value.get("verified_at")) is not int
+        or value.get("receipt_digest")
+        != _claim_release_receipt_digest(value)
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery claim-release verification receipt is invalid"
+        )
+    return dict(value)
+
+
+def _claim_release_rollback_approval(
+    plan: Mapping[str, Any],
+    application: Mapping[str, Any],
+) -> str:
+    return digest(
+        {
+            "schema_version": 1,
+            "action": "rollback-operation-recovery-claim-release",
+            "plan_digest": plan["plan_digest"],
+            "application_receipt_digest": application["receipt_digest"],
+        }
+    )
+
+
+def _claim_release_validate_rollback_record(
+    value: Any,
+    *,
+    plan: Mapping[str, Any],
+    application: Mapping[str, Any],
+    kind: str,
+) -> dict[str, Any]:
+    required = {
+        "schema_version",
+        "kind",
+        "plan_digest",
+        "application_receipt_digest",
+        "pre_generation",
+        "post_generation",
+        "selected_row_count",
+        "selected_row_set_digest",
+        "installation_authority_digest",
+        "recorded_at",
+        "receipt_digest",
+    }
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != required
+        or value.get("schema_version") != 1
+        or value.get("kind") != kind
+        or value.get("plan_digest") != plan["plan_digest"]
+        or value.get("application_receipt_digest")
+        != application["receipt_digest"]
+        or value.get("pre_generation") != application["post_generation"]
+        or value.get("post_generation")
+        != _operation_recovery_next_generation(application["post_generation"])
+        or value.get("selected_row_count") != plan["selected_row_count"]
+        or value.get("selected_row_set_digest")
+        != plan["selected_row_set_digest"]
+        or value.get("installation_authority_digest")
+        != digest(plan["installation_authority"])
+        or type(value.get("recorded_at")) is not int
+        or value.get("receipt_digest")
+        != _claim_release_receipt_digest(value)
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery claim-release rollback record is invalid"
+        )
+    return dict(value)
+
+
+def _claim_release_finalize_rollback(
+    journal: Mapping[str, Any],
+) -> dict[str, Any]:
+    body = {
+        **{
+            key: value
+            for key, value in journal.items()
+            if key not in {"kind", "receipt_digest"}
+        },
+        "kind": "operation-recovery-claim-release-rollback-receipt",
+    }
+    return {**body, "receipt_digest": digest(body)}
+
+
+async def _claim_release_plan_evidence(
+    args: argparse.Namespace,
+    classification: Mapping[str, Any],
+) -> tuple[Mapping[str, Any], Mapping[str, str]]:
+    connection = await _operation_recovery_connect_live(args, readonly=True)
+    try:
+        system_identifier_before = await connection.fetchval(
+            "SELECT system_identifier::text FROM pg_control_system()"
+        )
+        authority_before = _operation_recovery_authority(
+            args,
+            postgres_system_identifier=system_identifier_before,
+        )
+        generation_before, generation_after, rows = (
+            await read_claim_release_evidence(
+                connection,
+                profile_id="systalyze",
+                schema="public",
+                operation_ids=[
+                    row["operation_id"] for row in classification["blockers"]
+                ],
+                expected_generation=classification["generation_before"],
+            )
+        )
+        system_identifier_after = await connection.fetchval(
+            "SELECT system_identifier::text FROM pg_control_system()"
+        )
+        authority_after = _operation_recovery_authority(
+            args,
+            postgres_system_identifier=system_identifier_after,
+        )
+    finally:
+        await connection.close()
+    blocker_by_id = {
+        row["operation_id"]: row for row in classification["blockers"]
+    }
+    for row in rows:
+        blocker = blocker_by_id.get(row.get("operation_id"))
+        if blocker is None or {
+            key: row.get(key)
+            for key in blocker
+            if key != "row_digest"
+        } != {
+            key: blocker[key]
+            for key in blocker
+            if key != "row_digest"
+        }:
+            raise OperationRecoveryError(
+                "operation-recovery claim-release live row differs"
+            )
+    if (
+        generation_before != generation_after
+        or authority_before != authority_after
+        or authority_after != classification["installation_authority"]
+        or system_identifier_before != system_identifier_after
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery claim-release authority drifted"
+        )
+    return authority_after, {
+        row["operation_id"]: row["nonclaim_state_digest"] for row in rows
+    }
+
+
+def operation_recovery_claim_release_plan_command(
+    args: argparse.Namespace,
+) -> int:
+    candidate = _operation_recovery_candidate(args)
+    age = _operation_recovery_tool(Path(args.age), "age")
+    predecessor = verify_global_queue_blocker_classification(
+        _operation_recovery_read_private_json(
+            args.predecessor_classification,
+            "predecessor queue blocker classification",
+        ),
+        allow_expired=True,
+    )
+    if not hmac.compare_digest(
+        args.predecessor_classification_digest,
+        predecessor["classification_digest"],
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery predecessor classification digest differs"
+        )
+    live = verify_global_queue_blocker_classification(
+        _operation_recovery_read_private_json(
+            args.live_classification,
+            "live queue blocker classification",
+        )
+    )
+    _claim_release_assert_guard(predecessor)
+    _claim_release_assert_guard(live)
+    authority, nonclaim_digests = asyncio.run(
+        _claim_release_plan_evidence(args, live)
+    )
+    plan = create_claim_release_plan(
+        predecessor,
+        live,
+        nonclaim_state_digests=nonclaim_digests,
+        candidate_release=candidate,
+        installation_authority=authority,
+        rollback_encryption={
+            **_operation_recovery_rollback_encryption(
+                args.rollback_recipient
+            ),
+            "age_path": str(age),
+        },
+        rollback_bundle_path=args.rollback_bundle,
+        authorization_receipt_path=args.authorization_receipt,
+        application_receipt_path=args.application_receipt,
+        verification_receipt_path=args.verification_receipt,
+        rollback_receipt_path=args.rollback_receipt,
+    )
+    artifact_paths = [
+        str(Path(args.output).resolve()),
+        plan["rollback_bundle_path"],
+        plan["authorization_receipt_path"],
+        plan["application_receipt_path"],
+        plan["verification_receipt_path"],
+        plan["rollback_receipt_path"],
+    ]
+    if len(
+        {
+            unicodedata.normalize(
+                "NFD",
+                unicodedata.normalize("NFD", value).casefold(),
+            )
+            for value in artifact_paths
+        }
+    ) != len(artifact_paths):
+        raise OperationRecoveryError(
+            "operation-recovery claim-release plan path aliases an artifact"
+        )
+    if _operation_recovery_candidate(args) != candidate:
+        raise OperationRecoveryError(
+            "operation-recovery candidate drifted during claim-release planning"
+        )
+    write_private(args.output, plan, create_only=True)
+    return _print_result(
+        {
+            "status": "planned",
+            "plan_digest": plan["plan_digest"],
+            "expires_at": plan["expires_at"],
+            "selected_row_count": plan["selected_row_count"],
+            "output": str(Path(args.output).resolve()),
+        }
+    )
+
+
+def operation_recovery_claim_release_status_command(
+    args: argparse.Namespace,
+) -> int:
+    candidate = _operation_recovery_candidate(args)
+    plan = verify_claim_release_plan(
+        _operation_recovery_read_private_json(
+            args.plan,
+            "claim-release plan",
+        ),
+        allow_expired=True,
+    )
+    _claim_release_assert_guard(plan)
+    if candidate != plan["candidate_release"]:
+        raise OperationRecoveryError(
+            "operation-recovery claim-release candidate differs"
+        )
+    result = {
+        "status": "awaiting-approval",
+        "plan_digest": plan["plan_digest"],
+        "expires_at": plan["expires_at"],
+        "expired": int(time.time()) >= plan["expires_at"],
+        "selected_row_count": plan["selected_row_count"],
+    }
+    application_path = Path(plan["application_receipt_path"])
+    if application_path.exists():
+        value = _operation_recovery_read_private_json(
+            application_path,
+            "claim-release application record",
+        )
+        if value.get("kind") == (
+            "operation-recovery-claim-release-application-receipt"
+        ):
+            application = _claim_release_validate_application(
+                value,
+                plan=plan,
+            )
+            result.update(
+                {
+                    "status": "applied",
+                    "application_receipt_digest": application[
+                        "receipt_digest"
+                    ],
+                    "rollback_approval_digest": (
+                        _claim_release_rollback_approval(plan, application)
+                    ),
+                }
+            )
+        else:
+            journal = _claim_release_validate_journal(value, plan=plan)
+            result.update(
+                {
+                    "status": "apply-journal-present",
+                    "application_journal_digest": journal["receipt_digest"],
+                }
+            )
+    if Path(plan["verification_receipt_path"]).exists():
+        if result["status"] != "applied":
+            raise OperationRecoveryError(
+                "claim-release verification exists without application receipt"
+            )
+        verification = _claim_release_validate_verification(
+            _operation_recovery_read_private_json(
+                plan["verification_receipt_path"],
+                "claim-release verification receipt",
+            ),
+            plan=plan,
+            application=application,
+        )
+        result["verified"] = True
+        result["verification_receipt_digest"] = verification[
+            "receipt_digest"
+        ]
+    if Path(plan["rollback_receipt_path"]).exists():
+        if result["status"] != "applied":
+            raise OperationRecoveryError(
+                "claim-release rollback exists without application receipt"
+            )
+        rollback = _claim_release_validate_rollback_record(
+            _operation_recovery_read_private_json(
+                plan["rollback_receipt_path"],
+                "claim-release rollback receipt",
+            ),
+            plan=plan,
+            application=application,
+            kind="operation-recovery-claim-release-rollback-receipt",
+        )
+        result["rolled_back"] = True
+        result["rollback_receipt_digest"] = rollback["receipt_digest"]
+    return _print_result(result)
+
+
+async def _claim_release_prepare_apply(
+    args: argparse.Namespace,
+    plan: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    encryption = plan["rollback_encryption"]
+    age = _operation_recovery_tool(Path(args.age), "age")
+    if (
+        str(age) != encryption["age_path"]
+        or not hmac.compare_digest(
+            EXPECTED_OPERATION_RECOVERY_TOOLCHAIN["age"]["sha256"],
+            encryption["age_sha256"],
+        )
+        or args.rollback_recipient != encryption["recipient"]
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery claim-release rollback encryption differs"
+        )
+    identity_path = _operation_recovery_rollback_identity_path(
+        args.age_identity
+    )
+    identity_descriptor = _private_identity_descriptor(
+        identity_path.resolve(strict=True)
+    )
+    os.close(identity_descriptor)
+    connection = await _operation_recovery_connect_live(args, readonly=True)
+    try:
+        preimage = await read_claim_release_preimage(
+            connection,
+            schema="public",
+            plan=plan,
+        )
+    finally:
+        await connection.close()
+    preimage_kind = CLAIM_RELEASE_PREIMAGE_KIND
+    bundle_kind = CLAIM_RELEASE_BUNDLE_KIND
+    if Path(plan["rollback_bundle_path"]).exists():
+        bundle = _claim_release_validate_bundle(plan)
+        ciphertext = base64.b64decode(
+            bundle["ciphertext_base64"],
+            validate=True,
+        )
+        try:
+            restored = _age_decrypt_ciphertext(
+                age_path=age,
+                age_identity_path=identity_path,
+                ciphertext=ciphertext,
+            )
+            expected = _operation_recovery_preimage_bytes(
+                preimage,
+                plan["plan_digest"],
+                kind=preimage_kind,
+            )
+            if not hmac.compare_digest(
+                hashlib.sha256(restored).digest(),
+                hashlib.sha256(expected).digest(),
+            ):
+                raise OperationRecoveryError(
+                    "existing claim-release rollback bundle differs"
+                )
+            return bundle
+        finally:
+            ciphertext = b""
+            restored = b""
+            expected = b""
+    bundle = _age_encrypt_preimage(
+        age_path=age,
+        age_identity_path=identity_path,
+        recipient=args.rollback_recipient,
+        preimage=preimage,
+        plan_digest=plan["plan_digest"],
+        preimage_kind=preimage_kind,
+        bundle_kind=bundle_kind,
+    )
+    write_private(plan["rollback_bundle_path"], bundle, create_only=True)
+    return bundle
+
+
+async def _claim_release_apply(
+    args: argparse.Namespace,
+    plan: Mapping[str, Any],
+    precommit: dict[str, Any],
+) -> tuple[str, str]:
+    connection = await _operation_recovery_connect_live(args, readonly=False)
+    try:
+        return await apply_claim_release_transaction(
+            connection,
+            profile_id="systalyze",
+            schema="public",
+            plan=plan,
+            on_mutation_attempt=lambda: precommit.__setitem__(
+                "mutation_attempted",
+                True,
+            ),
+        )
+    finally:
+        await connection.close()
+
+
+async def _claim_release_current_generation(
+    args: argparse.Namespace,
+) -> str:
+    connection = await _operation_recovery_connect_live(args, readonly=True)
+    try:
+        return await read_generation(connection, "public", "systalyze")
+    finally:
+        await connection.close()
+
+
+def operation_recovery_claim_release_apply_command(
+    args: argparse.Namespace,
+) -> int:
+    candidate = _operation_recovery_candidate(args)
+    plan = verify_claim_release_plan(
+        _operation_recovery_read_private_json(args.plan, "claim-release plan")
+    )
+    _claim_release_assert_guard(plan)
+    if (
+        candidate != plan["candidate_release"]
+        or not hmac.compare_digest(args.approval_digest, plan["plan_digest"])
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery claim-release apply approval differs"
+        )
+    manager = _portable_manager(args)
+    with _operation_recovery_precommit_artifacts() as precommit, (
+        _operation_recovery_install_lock(
+            manager,
+            expires_at=plan["expires_at"],
+        )
+    ), _operation_recovery_lock(manager, expires_at=plan["expires_at"]):
+        locked_plan = verify_claim_release_plan(
+            _operation_recovery_read_private_json(
+                args.plan,
+                "claim-release plan",
+            )
+        )
+        if locked_plan != plan:
+            raise OperationRecoveryError(
+                "operation-recovery claim-release plan changed while locking"
+            )
+        authority = _operation_recovery_authority(
+            args,
+            postgres_system_identifier=(
+                EXPECTED_OPERATION_RECOVERY_INSTALLATION[
+                    "postgres_system_identifier"
+                ]
+            ),
+            lock_installer=False,
+        )
+        if authority != plan["installation_authority"]:
+            raise OperationRecoveryError(
+                "operation-recovery claim-release authority drifted"
+            )
+        authorization_path = Path(plan["authorization_receipt_path"])
+        if authorization_path.exists():
+            authorization = _claim_release_validate_authorization(plan)
+        else:
+            authorization = {
+                "schema_version": 1,
+                "kind": (
+                    "operation-recovery-claim-release-authorization-receipt"
+                ),
+                "plan_digest": plan["plan_digest"],
+                "approval_digest": args.approval_digest,
+                "candidate_release_digest": candidate["release_digest"],
+                "authorized_at": int(time.time()),
+            }
+            authorization["receipt_digest"] = digest(authorization)
+            write_private(authorization_path, authorization, create_only=True)
+            precommit["created"].append(
+                (
+                    str(authorization_path),
+                    _operation_recovery_artifact_identity(
+                        str(authorization_path)
+                    ),
+                )
+            )
+        application_path = Path(plan["application_receipt_path"])
+        existing_journal = None
+        if application_path.exists():
+            existing_application = _operation_recovery_read_private_json(
+                application_path,
+                "claim-release application record",
+            )
+            if existing_application.get("kind") == (
+                "operation-recovery-claim-release-application-receipt"
+            ):
+                application = _claim_release_validate_application(
+                    existing_application,
+                    plan=plan,
+                )
+                return _print_result(
+                    {
+                        "status": "already-applied",
+                        "plan_digest": plan["plan_digest"],
+                        "pre_generation": application["pre_generation"],
+                        "post_generation": application["post_generation"],
+                        "application_receipt_digest": application[
+                            "receipt_digest"
+                        ],
+                    }
+                )
+            existing_journal = _claim_release_validate_journal(
+                existing_application,
+                plan=plan,
+            )
+            current_generation = asyncio.run(
+                _claim_release_current_generation(args)
+            )
+            if current_generation == existing_journal["post_generation"]:
+                return _print_result(
+                    {
+                        "status": "verification-required",
+                        "plan_digest": plan["plan_digest"],
+                        "post_generation": current_generation,
+                        "next_command": (
+                            "operation-recovery claim-release verify"
+                        ),
+                    }
+                )
+            if current_generation != existing_journal["pre_generation"]:
+                raise OperationRecoveryError(
+                    "operation-recovery claim-release journal generation differs"
+                )
+        bundle_existed = Path(plan["rollback_bundle_path"]).exists()
+        bundle = asyncio.run(_claim_release_prepare_apply(args, plan))
+        if not bundle_existed:
+            precommit["created"].append(
+                (
+                    plan["rollback_bundle_path"],
+                    _operation_recovery_artifact_identity(
+                        plan["rollback_bundle_path"]
+                    ),
+                )
+            )
+        if application_path.exists():
+            journal = existing_journal
+        else:
+            journal_body = {
+                "schema_version": 1,
+                "kind": "operation-recovery-claim-release-application-journal",
+                "plan_digest": plan["plan_digest"],
+                "authorization_receipt_digest": authorization[
+                    "receipt_digest"
+                ],
+                "rollback_bundle_digest": bundle["ciphertext_sha256"],
+                "pre_generation": plan["pre_generation"],
+                "post_generation": _operation_recovery_next_generation(
+                    plan["pre_generation"]
+                ),
+                "selected_row_count": plan["selected_row_count"],
+                "selected_row_set_digest": plan["selected_row_set_digest"],
+                "installation_authority_digest": digest(authority),
+                "applied_at": int(time.time()),
+            }
+            journal = {
+                **journal_body,
+                "receipt_digest": digest(journal_body),
+            }
+            write_private(application_path, journal, create_only=True)
+            precommit["created"].append(
+                (
+                    str(application_path),
+                    _operation_recovery_artifact_identity(
+                        str(application_path)
+                    ),
+                )
+            )
+        before, after = asyncio.run(
+            _claim_release_apply(args, plan, precommit)
+        )
+        post_authority = _operation_recovery_authority(
+            args,
+            postgres_system_identifier=(
+                EXPECTED_OPERATION_RECOVERY_INSTALLATION[
+                    "postgres_system_identifier"
+                ]
+            ),
+            lock_installer=False,
+        )
+        if (
+            post_authority != authority
+            or before != journal["pre_generation"]
+            or after != journal["post_generation"]
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery claim-release application differs"
+            )
+        application = _claim_release_finalize_application(journal)
+        write_private(application_path, application)
+    return _print_result(
+        {
+            "status": "applied",
+            "plan_digest": plan["plan_digest"],
+            "pre_generation": before,
+            "post_generation": after,
+            "application_receipt_digest": application["receipt_digest"],
+        }
+    )
+
+
+def _claim_release_post_evidence_matches(
+    plan: Mapping[str, Any],
+    rows: Sequence[Mapping[str, Any]],
+) -> bool:
+    expected = {row["operation_id"]: row for row in plan["selected_rows"]}
+    actual = {row.get("operation_id"): row for row in rows}
+    preserved = {
+        "operation_id",
+        "bank_id",
+        "operation_type",
+        "status",
+        "created_at",
+        "updated_at",
+        "completed_at",
+        "retry_count",
+        "next_retry_at",
+        "task_payload_present",
+        "task_payload_digest",
+        "in_reference_cohort",
+        "in_reference_selected_set",
+        "blocker_reason",
+        "nonclaim_state_digest",
+    }
+    return set(actual) == set(expected) and all(
+        row.get("worker_id_present") is False
+        and row.get("worker_id_digest") is None
+        and row.get("claimed_at") is None
+        and {key: row.get(key) for key in preserved}
+        == {key: expected[operation_id].get(key) for key in preserved}
+        for operation_id, row in actual.items()
+    )
+
+
+async def _claim_release_verify_live(
+    args: argparse.Namespace,
+    plan: Mapping[str, Any],
+    application: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    connection = await _operation_recovery_connect_live(args, readonly=True)
+    try:
+        generation_before, generation_after, rows = (
+            await read_claim_release_evidence(
+                connection,
+                profile_id="systalyze",
+                schema="public",
+                operation_ids=[
+                    row["operation_id"] for row in plan["selected_rows"]
+                ],
+                expected_generation=application["post_generation"],
+            )
+        )
+    finally:
+        await connection.close()
+    if (
+        generation_before != generation_after
+        or not _claim_release_post_evidence_matches(plan, rows)
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery claim-release verification differs"
+        )
+    return {
+        "generation": generation_before,
+        "selected_row_count": len(rows),
+        "selected_row_set_digest": plan["selected_row_set_digest"],
+    }
+
+
+def operation_recovery_claim_release_verify_command(
+    args: argparse.Namespace,
+) -> int:
+    candidate = _operation_recovery_candidate(args)
+    plan = verify_claim_release_plan(
+        _operation_recovery_read_private_json(args.plan, "claim-release plan"),
+        allow_expired=True,
+    )
+    _claim_release_assert_guard(plan)
+    value = _operation_recovery_read_private_json(
+        plan["application_receipt_path"],
+        "claim-release application record",
+    )
+    is_journal = value.get("kind") == (
+        "operation-recovery-claim-release-application-journal"
+    )
+    application = (
+        _claim_release_validate_journal(value, plan=plan)
+        if is_journal
+        else _claim_release_validate_application(value, plan=plan)
+    )
+    if candidate != plan["candidate_release"]:
+        raise OperationRecoveryError(
+            "operation-recovery claim-release candidate differs"
+        )
+    verification_path = Path(plan["verification_receipt_path"])
+    if verification_path.exists():
+        if is_journal:
+            raise OperationRecoveryError(
+                "claim-release verification exists before application finalization"
+            )
+        receipt = _claim_release_validate_verification(
+            _operation_recovery_read_private_json(
+                verification_path,
+                "claim-release verification receipt",
+            ),
+            plan=plan,
+            application=application,
+        )
+        return _print_result(
+            {
+                "status": "already-verified",
+                "plan_digest": plan["plan_digest"],
+                "receipt_digest": receipt["receipt_digest"],
+                **receipt["evidence"],
+            }
+        )
+    manager = _portable_manager(args)
+    with manager._lock(), _operation_recovery_lock(manager):
+        locked_plan = verify_claim_release_plan(
+            _operation_recovery_read_private_json(
+                args.plan,
+                "claim-release plan",
+            ),
+            allow_expired=True,
+        )
+        _claim_release_assert_guard(locked_plan)
+        locked_application_value = _operation_recovery_read_private_json(
+            plan["application_receipt_path"],
+            "claim-release application record",
+        )
+        locked_application = (
+            _claim_release_validate_journal(
+                locked_application_value,
+                plan=locked_plan,
+            )
+            if is_journal
+            else _claim_release_validate_application(
+                locked_application_value,
+                plan=locked_plan,
+            )
+        )
+        if locked_plan != plan or locked_application != application:
+            raise OperationRecoveryError(
+                "operation-recovery claim-release verification inputs changed while locking"
+            )
+        authority = _operation_recovery_authority(
+            args,
+            postgres_system_identifier=(
+                EXPECTED_OPERATION_RECOVERY_INSTALLATION[
+                    "postgres_system_identifier"
+                ]
+            ),
+            lock_installer=False,
+        )
+        if authority != plan["installation_authority"]:
+            raise OperationRecoveryError(
+                "operation-recovery claim-release authority drifted"
+            )
+        evidence = asyncio.run(
+            _claim_release_verify_live(args, plan, application)
+        )
+        if is_journal:
+            application = _claim_release_finalize_application(application)
+            write_private(plan["application_receipt_path"], application)
+        receipt = {
+            "schema_version": 1,
+            "kind": "operation-recovery-claim-release-verification-receipt",
+            "plan_digest": plan["plan_digest"],
+            "application_receipt_digest": application["receipt_digest"],
+            "installation_authority_digest": digest(authority),
+            "evidence": evidence,
+            "verified_at": int(time.time()),
+        }
+        receipt["receipt_digest"] = digest(receipt)
+        write_private(
+            verification_path,
+            receipt,
+            create_only=True,
+        )
+    return _print_result(
+        {
+            "status": "verified",
+            "plan_digest": plan["plan_digest"],
+            "receipt_digest": receipt["receipt_digest"],
+            **evidence,
+        }
+    )
+
+
+def operation_recovery_claim_release_rollback_command(
+    args: argparse.Namespace,
+) -> int:
+    candidate = _operation_recovery_candidate(args)
+    plan = verify_claim_release_plan(
+        _operation_recovery_read_private_json(args.plan, "claim-release plan"),
+        allow_expired=True,
+    )
+    _claim_release_assert_guard(plan)
+    application = _claim_release_validate_application(
+        _operation_recovery_read_private_json(
+            plan["application_receipt_path"],
+            "claim-release application receipt",
+        ),
+        plan=plan,
+    )
+    if (
+        candidate != plan["candidate_release"]
+        or not hmac.compare_digest(
+            args.approval_digest,
+            _claim_release_rollback_approval(plan, application),
+        )
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery claim-release rollback approval differs"
+        )
+    bundle = _claim_release_validate_bundle(plan)
+    ciphertext = base64.b64decode(
+        bundle["ciphertext_base64"],
+        validate=True,
+    )
+    age = _operation_recovery_tool(Path(args.age), "age")
+    if (
+        str(age) != plan["rollback_encryption"]["age_path"]
+        or not hmac.compare_digest(
+            EXPECTED_OPERATION_RECOVERY_TOOLCHAIN["age"]["sha256"],
+            plan["rollback_encryption"]["age_sha256"],
+        )
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery claim-release rollback encryption differs"
+        )
+    try:
+        plaintext = _age_decrypt_ciphertext(
+            age_path=age,
+            age_identity_path=_operation_recovery_rollback_identity_path(
+                args.age_identity
+            ),
+            ciphertext=ciphertext,
+        )
+        preimage_document = strict_json_loads(plaintext)
+    finally:
+        ciphertext = b""
+        plaintext = b""
+    if (
+        not isinstance(preimage_document, Mapping)
+        or set(preimage_document) != {
+            "schema_version",
+            "kind",
+            "plan_digest",
+            "rows",
+        }
+        or preimage_document.get("schema_version") != 1
+        or preimage_document.get("kind")
+        != CLAIM_RELEASE_PREIMAGE_KIND
+        or preimage_document.get("plan_digest") != plan["plan_digest"]
+        or not isinstance(preimage_document.get("rows"), list)
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery claim-release rollback preimage is invalid"
+        )
+    manager = _portable_manager(args)
+    with manager._lock(), _operation_recovery_lock(manager):
+        locked_plan = verify_claim_release_plan(
+            _operation_recovery_read_private_json(
+                args.plan,
+                "claim-release plan",
+            ),
+            allow_expired=True,
+        )
+        _claim_release_assert_guard(locked_plan)
+        locked_application = _claim_release_validate_application(
+            _operation_recovery_read_private_json(
+                plan["application_receipt_path"],
+                "claim-release application receipt",
+            ),
+            plan=locked_plan,
+        )
+        if locked_plan != plan or locked_application != application:
+            raise OperationRecoveryError(
+                "operation-recovery claim-release rollback inputs changed while locking"
+            )
+        authority = _operation_recovery_authority(
+            args,
+            postgres_system_identifier=(
+                EXPECTED_OPERATION_RECOVERY_INSTALLATION[
+                    "postgres_system_identifier"
+                ]
+            ),
+            lock_installer=False,
+        )
+        if authority != plan["installation_authority"]:
+            raise OperationRecoveryError(
+                "operation-recovery claim-release rollback authority drifted"
+            )
+        rollback_path = Path(plan["rollback_receipt_path"])
+        if rollback_path.exists():
+            value = _operation_recovery_read_private_json(
+                rollback_path,
+                "claim-release rollback record",
+            )
+            if value.get("kind") == (
+                "operation-recovery-claim-release-rollback-receipt"
+            ):
+                receipt = _claim_release_validate_rollback_record(
+                    value,
+                    plan=plan,
+                    application=application,
+                    kind=(
+                        "operation-recovery-claim-release-rollback-receipt"
+                    ),
+                )
+                return _print_result(
+                    {
+                        "status": "already-rolled-back",
+                        "plan_digest": plan["plan_digest"],
+                        "pre_generation": receipt["pre_generation"],
+                        "post_generation": receipt["post_generation"],
+                        "receipt_digest": receipt["receipt_digest"],
+                    }
+                )
+            journal = _claim_release_validate_rollback_record(
+                value,
+                plan=plan,
+                application=application,
+                kind="operation-recovery-claim-release-rollback-journal",
+            )
+        else:
+            journal_body = {
+                "schema_version": 1,
+                "kind": "operation-recovery-claim-release-rollback-journal",
+                "plan_digest": plan["plan_digest"],
+                "application_receipt_digest": application["receipt_digest"],
+                "pre_generation": application["post_generation"],
+                "post_generation": _operation_recovery_next_generation(
+                    application["post_generation"]
+                ),
+                "selected_row_count": plan["selected_row_count"],
+                "selected_row_set_digest": plan["selected_row_set_digest"],
+                "installation_authority_digest": digest(authority),
+                "recorded_at": int(time.time()),
+            }
+            journal = {
+                **journal_body,
+                "receipt_digest": digest(journal_body),
+            }
+            write_private(rollback_path, journal, create_only=True)
+
+        async def rollback():
+            connection = await _operation_recovery_connect_live(
+                args,
+                readonly=False,
+            )
+            try:
+                return await rollback_claim_release_transaction(
+                    connection,
+                    profile_id="systalyze",
+                    schema="public",
+                    plan=plan,
+                    application=application,
+                    rollback_record=journal,
+                    preimage=preimage_document["rows"],
+                )
+            finally:
+                await connection.close()
+
+        before, after = asyncio.run(rollback())
+        post_authority = _operation_recovery_authority(
+            args,
+            postgres_system_identifier=(
+                EXPECTED_OPERATION_RECOVERY_INSTALLATION[
+                    "postgres_system_identifier"
+                ]
+            ),
+            lock_installer=False,
+        )
+        if (
+            post_authority != authority
+            or before != journal["pre_generation"]
+            or after != journal["post_generation"]
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery claim-release rollback differs"
+            )
+        receipt = _claim_release_finalize_rollback(journal)
+        write_private(rollback_path, receipt)
+    return _print_result(
+        {
+            "status": "rolled-back",
+            "plan_digest": plan["plan_digest"],
+            "pre_generation": before,
+            "post_generation": after,
+            "receipt_digest": receipt["receipt_digest"],
+        }
+    )
+
+
 def operation_recovery_plan_command(args: argparse.Namespace) -> int:
     candidate = _operation_recovery_candidate(args)
     age = _operation_recovery_tool(Path(args.age), "age")
@@ -6492,11 +7753,13 @@ def _operation_recovery_install_lock(
 def _operation_recovery_preimage_bytes(
     preimage: Sequence[Mapping[str, Any]],
     plan_digest: str,
+    *,
+    kind: str = "operation-recovery-selected-row-preimage",
 ) -> bytes:
     return canonical_bytes(
         {
             "schema_version": 1,
-            "kind": "operation-recovery-selected-row-preimage",
+            "kind": kind,
             "plan_digest": plan_digest,
             "rows": list(preimage),
         }
@@ -6549,12 +7812,18 @@ def _age_encrypt_preimage(
     recipient: str,
     preimage: Sequence[Mapping[str, Any]],
     plan_digest: str,
+    preimage_kind: str = "operation-recovery-selected-row-preimage",
+    bundle_kind: str = "operation-recovery-encrypted-rollback-bundle",
 ) -> dict[str, Any]:
     _operation_recovery_validate_recipient(
         recipient,
         "rollback recipient",
     )
-    plaintext = _operation_recovery_preimage_bytes(preimage, plan_digest)
+    plaintext = _operation_recovery_preimage_bytes(
+        preimage,
+        plan_digest,
+        kind=preimage_kind,
+    )
     plaintext_digest = hashlib.sha256(plaintext).hexdigest()
     identity_descriptor = _private_identity_descriptor(
         age_identity_path.resolve(strict=True)
@@ -6613,7 +7882,7 @@ def _age_encrypt_preimage(
             )
         return {
             "schema_version": 1,
-            "kind": "operation-recovery-encrypted-rollback-bundle",
+            "kind": bundle_kind,
             "plan_digest": plan_digest,
             "ciphertext_sha256": hashlib.sha256(ciphertext).hexdigest(),
             "ciphertext_base64": base64.b64encode(ciphertext).decode("ascii"),
@@ -7973,6 +9242,118 @@ def parser() -> argparse.ArgumentParser:
     recovery_queue_blockers.add_argument("--output", required=True)
     recovery_queue_blockers.set_defaults(
         run=operation_recovery_classify_queue_blockers_command
+    )
+
+    recovery_claim_release = operation_recovery_commands.add_parser(
+        "claim-release"
+    )
+    recovery_claim_release_commands = recovery_claim_release.add_subparsers(
+        dest="operation_recovery_claim_release_command",
+        required=True,
+    )
+
+    recovery_claim_release_plan = recovery_claim_release_commands.add_parser(
+        "plan"
+    )
+    add_operation_recovery_authority(recovery_claim_release_plan)
+    recovery_claim_release_plan.add_argument(
+        "--predecessor-classification",
+        required=True,
+    )
+    recovery_claim_release_plan.add_argument(
+        "--predecessor-classification-digest",
+        required=True,
+    )
+    recovery_claim_release_plan.add_argument(
+        "--live-classification",
+        required=True,
+    )
+    recovery_claim_release_plan.add_argument("--age", required=True)
+    recovery_claim_release_plan.add_argument(
+        "--rollback-recipient",
+        required=True,
+    )
+    recovery_claim_release_plan.add_argument(
+        "--rollback-bundle",
+        required=True,
+    )
+    recovery_claim_release_plan.add_argument(
+        "--authorization-receipt",
+        required=True,
+    )
+    recovery_claim_release_plan.add_argument(
+        "--application-receipt",
+        required=True,
+    )
+    recovery_claim_release_plan.add_argument(
+        "--verification-receipt",
+        required=True,
+    )
+    recovery_claim_release_plan.add_argument(
+        "--rollback-receipt",
+        required=True,
+    )
+    recovery_claim_release_plan.add_argument("--output", required=True)
+    recovery_claim_release_plan.set_defaults(
+        run=operation_recovery_claim_release_plan_command
+    )
+
+    recovery_claim_release_apply = recovery_claim_release_commands.add_parser(
+        "apply"
+    )
+    add_operation_recovery_authority(recovery_claim_release_apply)
+    recovery_claim_release_apply.add_argument("--plan", required=True)
+    recovery_claim_release_apply.add_argument(
+        "--approval-digest",
+        required=True,
+    )
+    recovery_claim_release_apply.add_argument("--age", required=True)
+    recovery_claim_release_apply.add_argument(
+        "--age-identity",
+        required=True,
+    )
+    recovery_claim_release_apply.add_argument(
+        "--rollback-recipient",
+        required=True,
+    )
+    recovery_claim_release_apply.set_defaults(
+        run=operation_recovery_claim_release_apply_command
+    )
+
+    recovery_claim_release_status = (
+        recovery_claim_release_commands.add_parser("status")
+    )
+    add_operation_recovery_authority(recovery_claim_release_status)
+    recovery_claim_release_status.add_argument("--plan", required=True)
+    recovery_claim_release_status.set_defaults(
+        run=operation_recovery_claim_release_status_command
+    )
+
+    recovery_claim_release_verify = (
+        recovery_claim_release_commands.add_parser("verify")
+    )
+    add_operation_recovery_authority(recovery_claim_release_verify)
+    recovery_claim_release_verify.add_argument("--plan", required=True)
+    recovery_claim_release_verify.set_defaults(
+        run=operation_recovery_claim_release_verify_command
+    )
+
+    recovery_claim_release_rollback = (
+        recovery_claim_release_commands.add_parser("rollback")
+    )
+    add_operation_recovery_authority(recovery_claim_release_rollback)
+    recovery_claim_release_rollback.add_argument("--plan", required=True)
+    recovery_claim_release_rollback.add_argument(
+        "--approval-digest",
+        required=True,
+    )
+    recovery_claim_release_rollback.add_argument("--age", required=True)
+    recovery_claim_release_rollback.add_argument(
+        "--age-identity",
+        required=True,
+    )
+    recovery_claim_release_rollback.set_defaults(
+        run=operation_recovery_claim_release_rollback_command
     )
 
     recovery_plan = operation_recovery_commands.add_parser("plan")

@@ -23,6 +23,7 @@ import uuid
 from typing import Any
 
 from .operation_recovery import (
+    EXPECTED_CLAIM_RELEASE_ROW_COUNT,
     EXPECTED_OPERATION_COUNTS,
     OperationRecoveryError,
 )
@@ -164,6 +165,118 @@ FROM {{schema}}.async_operations
 WHERE {QUEUE_BLOCKER_PREDICATE}
 ORDER BY created_at, operation_id
 """
+CLAIM_RELEASE_NONCLAIM_DIGEST_SQL = """
+encode(
+    sha256(
+        convert_to(
+            jsonb_build_object(
+                'operation_id', operation_id::text,
+                'bank_id', bank_id,
+                'operation_type', operation_type,
+                'status', status,
+                'created_at', to_char(
+                    created_at AT TIME ZONE 'UTC',
+                    'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+                ),
+                'updated_at', to_char(
+                    updated_at AT TIME ZONE 'UTC',
+                    'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+                ),
+                'completed_at', CASE WHEN completed_at IS NULL THEN NULL
+                    ELSE to_char(
+                        completed_at AT TIME ZONE 'UTC',
+                        'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+                    ) END,
+                'retry_count', retry_count,
+                'next_retry_at', CASE WHEN next_retry_at IS NULL THEN NULL
+                    ELSE to_char(
+                        next_retry_at AT TIME ZONE 'UTC',
+                        'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+                    ) END,
+                'task_payload', task_payload,
+                'result_metadata', result_metadata,
+                'error_message', error_message
+            )::text,
+            'UTF8'
+        )
+    ),
+    'hex'
+)
+""".strip()
+CLAIM_RELEASE_EVIDENCE_QUERY = f"""
+SELECT
+    operation_id::text AS operation_id,
+    bank_id,
+    operation_type,
+    status,
+    to_char(created_at AT TIME ZONE 'UTC',
+            'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at,
+    to_char(updated_at AT TIME ZONE 'UTC',
+            'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at,
+    CASE WHEN completed_at IS NULL THEN NULL
+         ELSE to_char(completed_at AT TIME ZONE 'UTC',
+                      'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') END AS completed_at,
+    retry_count,
+    CASE WHEN next_retry_at IS NULL THEN NULL
+         ELSE to_char(next_retry_at AT TIME ZONE 'UTC',
+                      'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') END AS next_retry_at,
+    (worker_id IS NOT NULL) AS worker_id_present,
+    CASE WHEN worker_id IS NULL THEN NULL
+         ELSE encode(sha256(convert_to(worker_id, 'UTF8')), 'hex')
+    END AS worker_id_digest,
+    CASE WHEN claimed_at IS NULL THEN NULL
+         ELSE to_char(claimed_at AT TIME ZONE 'UTC',
+                      'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') END AS claimed_at,
+    (task_payload IS NOT NULL) AS task_payload_present,
+    CASE WHEN task_payload IS NULL THEN NULL
+         ELSE encode(sha256(convert_to(task_payload::text, 'UTF8')), 'hex')
+    END AS task_payload_digest,
+    false AS in_reference_cohort,
+    false AS in_reference_selected_set,
+    CASE status
+        WHEN 'processing' THEN 'processing'
+        WHEN 'pending' THEN 'claimed_pending'
+        WHEN 'failed' THEN 'claimed_failed'
+        WHEN 'cancelled' THEN 'claimed_cancelled'
+    END AS blocker_reason,
+    {CLAIM_RELEASE_NONCLAIM_DIGEST_SQL} AS nonclaim_state_digest
+FROM {{schema}}.async_operations
+WHERE operation_id = ANY($1::uuid[])
+ORDER BY created_at, operation_id
+{{lock_clause}}
+"""
+CLAIM_RELEASE_PREIMAGE_QUERY = f"""
+SELECT
+    operation_id::text AS operation_id,
+    worker_id,
+    CASE WHEN claimed_at IS NULL THEN NULL
+         ELSE to_char(claimed_at AT TIME ZONE 'UTC',
+                      'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') END AS claimed_at,
+    {CLAIM_RELEASE_NONCLAIM_DIGEST_SQL} AS nonclaim_state_digest
+FROM {{schema}}.async_operations
+WHERE operation_id = ANY($1::uuid[])
+ORDER BY operation_id
+{{lock_clause}}
+"""
+CLAIM_RELEASE_BLOCKER_KEYS = (
+    "operation_id",
+    "bank_id",
+    "operation_type",
+    "status",
+    "created_at",
+    "updated_at",
+    "completed_at",
+    "retry_count",
+    "next_retry_at",
+    "worker_id_present",
+    "worker_id_digest",
+    "claimed_at",
+    "task_payload_present",
+    "task_payload_digest",
+    "in_reference_cohort",
+    "in_reference_selected_set",
+    "blocker_reason",
+)
 
 
 def _quoted_identifier(value: str, label: str) -> str:
@@ -579,6 +692,181 @@ async def read_global_queue_blockers(
     return generation_before, generation_after, [_mapping(row) for row in rows]
 
 
+def _operation_identifiers(values: Sequence[str]) -> list[uuid.UUID]:
+    try:
+        identifiers = [uuid.UUID(value) for value in values]
+    except (AttributeError, TypeError, ValueError) as error:
+        raise OperationRecoveryError("operation ID set is invalid") from error
+    if not identifiers or len(identifiers) != len(set(identifiers)):
+        raise OperationRecoveryError(
+            "operation ID set is empty or contains duplicates"
+        )
+    return identifiers
+
+
+async def _fetch_claim_release_evidence(
+    connection: Any,
+    *,
+    schema: str,
+    identifiers: Sequence[uuid.UUID],
+    for_update: bool,
+) -> list[dict[str, Any]]:
+    quoted_schema = _quoted_identifier(schema, "database schema")
+    rows = await connection.fetch(
+        CLAIM_RELEASE_EVIDENCE_QUERY.format(
+            schema=quoted_schema,
+            lock_clause="FOR UPDATE" if for_update else "",
+        ),
+        list(identifiers),
+    )
+    return [_mapping(row) for row in rows]
+
+
+async def read_claim_release_evidence(
+    connection: Any,
+    *,
+    profile_id: str,
+    schema: str,
+    operation_ids: Sequence[str],
+    expected_generation: str,
+) -> tuple[str, str, list[dict[str, Any]]]:
+    """Read exact claim-cleanup evidence without projecting protected text."""
+    identifiers = _operation_identifiers(operation_ids)
+    generation_before = await read_generation(connection, schema, profile_id)
+    async with connection.transaction(
+        isolation="repeatable_read",
+        readonly=True,
+    ):
+        rows = await _fetch_claim_release_evidence(
+            connection,
+            schema=schema,
+            identifiers=identifiers,
+            for_update=False,
+        )
+    generation_after = await read_generation(connection, schema, profile_id)
+    if (
+        generation_before != generation_after
+        or generation_before != expected_generation
+    ):
+        raise OperationRecoveryError(
+            "migration generation changed during claim-release planning"
+        )
+    if {row.get("operation_id") for row in rows} != {
+        str(identifier) for identifier in identifiers
+    } or len(rows) != len(identifiers):
+        raise OperationRecoveryError(
+            "operation-recovery claim-release row set changed"
+        )
+    return generation_before, generation_after, rows
+
+
+def _claim_release_row_digest(row: Mapping[str, Any]) -> str:
+    return digest({key: row[key] for key in CLAIM_RELEASE_BLOCKER_KEYS})
+
+
+def _claim_release_expected(plan: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    selected = plan.get("selected_rows")
+    if (
+        not isinstance(selected, list)
+        or len(selected) != EXPECTED_CLAIM_RELEASE_ROW_COUNT
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery claim-release selected set is invalid"
+        )
+    expected = {}
+    for item in selected:
+        if not isinstance(item, Mapping):
+            raise OperationRecoveryError(
+                "operation-recovery claim-release selected set is invalid"
+            )
+        operation_id = item.get("operation_id")
+        if not isinstance(operation_id, str) or operation_id in expected:
+            raise OperationRecoveryError(
+                "operation-recovery claim-release selected set is invalid"
+            )
+        expected[operation_id] = dict(item)
+    _operation_identifiers(list(expected))
+    return expected
+
+
+def _claim_release_before_matches(
+    row: Mapping[str, Any],
+    expected: Mapping[str, Any],
+) -> bool:
+    return (
+        {key: row.get(key) for key in CLAIM_RELEASE_BLOCKER_KEYS}
+        == {key: expected.get(key) for key in CLAIM_RELEASE_BLOCKER_KEYS}
+        and row.get("nonclaim_state_digest")
+        == expected.get("nonclaim_state_digest")
+        and _claim_release_row_digest(row) == expected.get("row_digest")
+    )
+
+
+def _claim_release_after_matches(
+    row: Mapping[str, Any],
+    expected: Mapping[str, Any],
+) -> bool:
+    preserved_keys = set(CLAIM_RELEASE_BLOCKER_KEYS) - {
+        "worker_id_present",
+        "worker_id_digest",
+        "claimed_at",
+    }
+    return (
+        row.get("worker_id_present") is False
+        and row.get("worker_id_digest") is None
+        and row.get("claimed_at") is None
+        and {key: row.get(key) for key in preserved_keys}
+        == {key: expected.get(key) for key in preserved_keys}
+        and row.get("nonclaim_state_digest")
+        == expected.get("nonclaim_state_digest")
+    )
+
+
+async def read_claim_release_preimage(
+    connection: Any,
+    *,
+    schema: str,
+    plan: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Read only raw claim fields for immediate encrypted rollback capture."""
+    expected = _claim_release_expected(plan)
+    identifiers = _operation_identifiers(list(expected))
+    quoted_schema = _quoted_identifier(schema, "database schema")
+    async with connection.transaction(
+        isolation="repeatable_read",
+        readonly=True,
+    ):
+        rows = await connection.fetch(
+            CLAIM_RELEASE_PREIMAGE_QUERY.format(
+                schema=quoted_schema,
+                lock_clause="",
+            ),
+            identifiers,
+        )
+    preimage = [_mapping(row) for row in rows]
+    if len(preimage) != len(expected):
+        raise OperationRecoveryError(
+            "operation-recovery claim-release preimage is incomplete"
+        )
+    for row in preimage:
+        item = expected.get(row.get("operation_id"))
+        worker_id = row.get("worker_id")
+        if (
+            item is None
+            or not isinstance(worker_id, str)
+            or not worker_id
+            or hashlib.sha256(worker_id.encode("utf-8")).hexdigest()
+            != item.get("worker_id_digest")
+            or row.get("claimed_at") != item.get("claimed_at")
+            or row.get("nonclaim_state_digest")
+            != item.get("nonclaim_state_digest")
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery claim-release preimage drifted"
+            )
+    return sorted(preimage, key=lambda row: row["operation_id"])
+
+
 def live_row_digest(row: Mapping[str, Any]) -> str:
     """Calculate the row digest used by a live-snapshot operation entry."""
     body = {
@@ -840,6 +1128,146 @@ async def apply_requeue_transaction(
     )
 
 
+async def apply_claim_release_transaction(
+    connection: Any,
+    *,
+    profile_id: str,
+    schema: str,
+    plan: Mapping[str, Any],
+    on_mutation_attempt: Callable[[], None] | None = None,
+) -> tuple[str, str]:
+    """Clear only claim metadata from the exact 43 planned failed rows."""
+    quoted_schema = _quoted_identifier(schema, "database schema")
+    quoted_generation = _quoted_identifier(
+        GENERATION_TABLE,
+        "migration generation table",
+    )
+    expected = _claim_release_expected(plan)
+    identifiers = _operation_identifiers(list(expected))
+    expires_at = plan.get("expires_at")
+    _assert_transaction_deadline(expires_at)
+    async with connection.transaction(isolation="serializable"):
+        await _configure_transaction_deadline(
+            connection,
+            expires_at,
+            start_transaction_timeout=True,
+        )
+        generation_value = await connection.fetchval(
+            f"""
+            SELECT generation
+            FROM {quoted_schema}.{quoted_generation}
+            WHERE singleton
+            FOR UPDATE
+            """
+        )
+        if type(generation_value) is not int:
+            raise OperationRecoveryError("migration generation is unavailable")
+        generation_before = f"{profile_id}:{schema}:{generation_value}"
+        if generation_before != plan.get("pre_generation"):
+            raise OperationRecoveryError(
+                "operation-recovery claim-release apply generation drifted"
+            )
+        verified_generation = await read_generation(
+            connection,
+            schema,
+            profile_id,
+        )
+        if verified_generation != generation_before:
+            raise OperationRecoveryError(
+                "operation-recovery claim-release generation authority differs"
+            )
+        competing_connections = await connection.fetchval(
+            """
+            SELECT count(*)
+            FROM pg_catalog.pg_stat_activity
+            WHERE datname = current_database()
+              AND pid <> pg_backend_pid()
+            """
+        )
+        if competing_connections != 0:
+            raise OperationRecoveryError(
+                "operation-recovery claim-release requires exclusive database access"
+            )
+        outside_blocker = await connection.fetchval(
+            f"""
+            SELECT EXISTS (
+                SELECT 1
+                FROM {quoted_schema}.async_operations
+                WHERE {QUEUE_BLOCKER_PREDICATE}
+            )
+            """,
+            identifiers,
+        )
+        if outside_blocker is not False:
+            raise OperationRecoveryError(
+                "operation-recovery claim-release queue guard differs"
+            )
+        rows = await _fetch_claim_release_evidence(
+            connection,
+            schema=schema,
+            identifiers=identifiers,
+            for_update=True,
+        )
+        by_id = {row.get("operation_id"): row for row in rows}
+        if set(by_id) != set(expected) or any(
+            not _claim_release_before_matches(by_id[operation_id], item)
+            for operation_id, item in expected.items()
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery claim-release selected row drifted"
+            )
+        await _configure_transaction_deadline(connection, expires_at)
+        if on_mutation_attempt is not None:
+            on_mutation_attempt()
+        result = await connection.execute(
+            f"""
+            UPDATE {quoted_schema}.async_operations
+            SET worker_id = NULL,
+                claimed_at = NULL
+            WHERE operation_id = ANY($1::uuid[])
+              AND status = 'failed'
+              AND worker_id IS NOT NULL
+              AND claimed_at IS NOT NULL
+            """,
+            identifiers,
+        )
+        if result != f"UPDATE {len(expected)}":
+            raise OperationRecoveryError(
+                "operation-recovery claim-release row count differs"
+            )
+        generation_after_value = await connection.fetchval(
+            f"""
+            SELECT generation
+            FROM {quoted_schema}.{quoted_generation}
+            WHERE singleton
+            """
+        )
+        if generation_after_value != generation_value + 1:
+            raise OperationRecoveryError(
+                "operation-recovery claim-release generation did not advance exactly once"
+            )
+        post_rows = await _fetch_claim_release_evidence(
+            connection,
+            schema=schema,
+            identifiers=identifiers,
+            for_update=False,
+        )
+        post = {row.get("operation_id"): row for row in post_rows}
+        if set(post) != set(expected) or any(
+            not _claim_release_after_matches(post[operation_id], item)
+            for operation_id, item in expected.items()
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery claim-release post-state differs"
+            )
+        await _configure_transaction_deadline(connection, expires_at)
+        _assert_transaction_deadline(expires_at)
+    return (
+        generation_before,
+        f"{profile_id}:{schema}:{generation_after_value}",
+    )
+
+
 def _assert_transaction_deadline(expires_at: Any) -> float:
     observed_at = time.time()
     if type(expires_at) is not int or observed_at >= expires_at:
@@ -1066,6 +1494,206 @@ async def rollback_requeue_transaction(
         generation_before,
         generation_after,
     )
+
+
+async def rollback_claim_release_transaction(
+    connection: Any,
+    *,
+    profile_id: str,
+    schema: str,
+    plan: Mapping[str, Any],
+    application: Mapping[str, Any],
+    rollback_record: Mapping[str, Any],
+    preimage: Sequence[Mapping[str, Any]],
+) -> tuple[str, str]:
+    """Restore only the claim fields cleared by claim-release apply."""
+    quoted_schema = _quoted_identifier(schema, "database schema")
+    quoted_generation = _quoted_identifier(
+        GENERATION_TABLE,
+        "migration generation table",
+    )
+    expected = _claim_release_expected(plan)
+    identifiers = _operation_identifiers(list(expected))
+    preimage_by_id: dict[str, dict[str, Any]] = {}
+    for raw in preimage:
+        if not isinstance(raw, Mapping):
+            raise OperationRecoveryError(
+                "operation-recovery claim-release rollback preimage is invalid"
+            )
+        row = dict(raw)
+        operation_id = row.get("operation_id")
+        item = expected.get(operation_id)
+        worker_id = row.get("worker_id")
+        if (
+            set(row)
+            != {
+                "operation_id",
+                "worker_id",
+                "claimed_at",
+                "nonclaim_state_digest",
+            }
+            or item is None
+            or operation_id in preimage_by_id
+            or not isinstance(worker_id, str)
+            or not worker_id
+            or hashlib.sha256(worker_id.encode("utf-8")).hexdigest()
+            != item.get("worker_id_digest")
+            or row.get("claimed_at") != item.get("claimed_at")
+            or row.get("nonclaim_state_digest")
+            != item.get("nonclaim_state_digest")
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery claim-release rollback preimage differs"
+            )
+        preimage_by_id[operation_id] = row
+    if set(preimage_by_id) != set(expected):
+        raise OperationRecoveryError(
+            "operation-recovery claim-release rollback preimage differs"
+        )
+    async with connection.transaction(isolation="serializable"):
+        generation_value = await connection.fetchval(
+            f"""
+            SELECT generation
+            FROM {quoted_schema}.{quoted_generation}
+            WHERE singleton
+            FOR UPDATE
+            """
+        )
+        if type(generation_value) is not int:
+            raise OperationRecoveryError("migration generation is unavailable")
+        generation_before = f"{profile_id}:{schema}:{generation_value}"
+        if generation_before not in {
+            application.get("post_generation"),
+            rollback_record.get("post_generation"),
+        } or rollback_record.get("pre_generation") != application.get(
+            "post_generation"
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery claim-release rollback generation drifted"
+            )
+        verified_generation = await read_generation(
+            connection,
+            schema,
+            profile_id,
+        )
+        if verified_generation != generation_before:
+            raise OperationRecoveryError(
+                "operation-recovery claim-release rollback authority differs"
+            )
+        competing_connections = await connection.fetchval(
+            """
+            SELECT count(*)
+            FROM pg_catalog.pg_stat_activity
+            WHERE datname = current_database()
+              AND pid <> pg_backend_pid()
+            """
+        )
+        if competing_connections != 0:
+            raise OperationRecoveryError(
+                "operation-recovery claim-release rollback requires exclusive database access"
+            )
+        outside_blocker = await connection.fetchval(
+            f"""
+            SELECT EXISTS (
+                SELECT 1
+                FROM {quoted_schema}.async_operations
+                WHERE {QUEUE_BLOCKER_PREDICATE}
+            )
+            """,
+            identifiers,
+        )
+        if outside_blocker is not False:
+            raise OperationRecoveryError(
+                "operation-recovery claim-release rollback queue guard differs"
+            )
+        rows = await _fetch_claim_release_evidence(
+            connection,
+            schema=schema,
+            identifiers=identifiers,
+            for_update=True,
+        )
+        by_id = {row.get("operation_id"): row for row in rows}
+        if generation_before == rollback_record.get("post_generation"):
+            if set(by_id) != set(expected) or any(
+                not _claim_release_before_matches(
+                    by_id[operation_id],
+                    item,
+                )
+                for operation_id, item in expected.items()
+            ):
+                raise OperationRecoveryError(
+                    "operation-recovery claim-release rollback post-state differs"
+                )
+            return (
+                rollback_record["pre_generation"],
+                rollback_record["post_generation"],
+            )
+        if set(by_id) != set(expected) or any(
+            not _claim_release_after_matches(by_id[operation_id], item)
+            for operation_id, item in expected.items()
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery claim-release rollback state differs"
+            )
+        restore_rows = [preimage_by_id[key] for key in sorted(preimage_by_id)]
+        result = await connection.execute(
+            f"""
+            WITH restored AS (
+                SELECT operation_id::uuid AS operation_id,
+                       worker_id,
+                       claimed_at::timestamptz AS claimed_at
+                FROM jsonb_to_recordset($1::jsonb) AS value(
+                    operation_id text,
+                    worker_id text,
+                    claimed_at text
+                )
+            )
+            UPDATE {quoted_schema}.async_operations AS operations
+            SET worker_id = restored.worker_id,
+                claimed_at = restored.claimed_at
+            FROM restored
+            WHERE operations.operation_id = restored.operation_id
+              AND operations.status = 'failed'
+              AND operations.worker_id IS NULL
+              AND operations.claimed_at IS NULL
+            """,
+            json.dumps(restore_rows, sort_keys=True),
+        )
+        if result != f"UPDATE {len(expected)}":
+            raise OperationRecoveryError(
+                "operation-recovery claim-release rollback row count differs"
+            )
+        generation_after_value = await connection.fetchval(
+            f"""
+            SELECT generation
+            FROM {quoted_schema}.{quoted_generation}
+            WHERE singleton
+            """
+        )
+        if generation_after_value != generation_value + 1:
+            raise OperationRecoveryError(
+                "operation-recovery claim-release rollback generation did not advance exactly once"
+            )
+        post_rows = await _fetch_claim_release_evidence(
+            connection,
+            schema=schema,
+            identifiers=identifiers,
+            for_update=False,
+        )
+        post = {row.get("operation_id"): row for row in post_rows}
+        if set(post) != set(expected) or any(
+            not _claim_release_before_matches(post[operation_id], item)
+            for operation_id, item in expected.items()
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery claim-release rollback verification differs"
+            )
+        post_generation = f"{profile_id}:{schema}:{generation_after_value}"
+        if rollback_record.get("post_generation") != post_generation:
+            raise OperationRecoveryError(
+                "operation-recovery claim-release rollback receipt generation differs"
+            )
+    return generation_before, post_generation
 
 
 async def read_snapshot(

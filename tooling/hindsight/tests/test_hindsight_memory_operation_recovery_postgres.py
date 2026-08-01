@@ -22,16 +22,21 @@ if str(TESTS) not in sys.path:
 
 from hindsight_memory_control_plane.operation_recovery import (  # noqa: E402
     OperationRecoveryError,
+    create_claim_release_plan,
     create_global_queue_blocker_classification,
     verify_global_queue_blocker_classification,
 )
 from hindsight_memory_control_plane.operation_recovery_runtime import (  # noqa: E402
     QUEUE_BLOCKER_GUARD_CONTRACT_DIGEST,
     QUEUE_BLOCKER_GUARD_CONTRACT_VERSION,
+    apply_claim_release_transaction,
     apply_requeue_transaction,
     live_row_digest,
+    read_claim_release_evidence,
+    read_claim_release_preimage,
     read_global_queue_blockers,
     read_safe_operation_rows,
+    rollback_claim_release_transaction,
     rollback_requeue_transaction,
 )
 import test_hindsight_memory_operation_recovery as recovery_fixtures  # noqa: E402
@@ -695,6 +700,238 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
                 self.assertTrue(wrapped.mutated)
             finally:
                 await mutator.close()
+                await connection.close()
+
+        asyncio.run(exercise())
+
+    def test_claim_release_clears_only_claims_and_rollback_restores_them(self):
+        async def exercise():
+            connection = await self._connect()
+            try:
+                await self._reset(connection)
+                operation_ids = []
+                for position in range(43):
+                    operation_id = (
+                        f"00000000-0000-4000-8000-{position + 1000:012x}"
+                    )
+                    operation_ids.append(operation_id)
+                    await self._insert_operation(
+                        connection,
+                        operation_id,
+                        status="failed",
+                        bank_id="codex" if position < 37 else "engineering",
+                        operation_type=(
+                            "retain"
+                            if position < 37
+                            else "refresh_mental_model"
+                        ),
+                        worker_id=f"orphaned-worker-{position}",
+                        claimed_at=CLAIMED_AT,
+                        task_payload=json.dumps(
+                            {"memory": f"payload-secret-{position}"}
+                        ),
+                        result_metadata=json.dumps(
+                            {"result": f"result-secret-{position}"}
+                        ),
+                        error_message=f"error-secret-{position}",
+                    )
+                await connection.execute(
+                    "UPDATE public.hindsight_migration_generation "
+                    "SET generation = 123 WHERE singleton"
+                )
+                before_generation, after_generation, rows = (
+                    await read_claim_release_evidence(
+                        connection,
+                        profile_id="systalyze",
+                        schema="public",
+                        operation_ids=operation_ids,
+                        expected_generation="systalyze:public:123",
+                    )
+                )
+                self.assertEqual(before_generation, after_generation)
+                reference_plan = (
+                    recovery_fixtures.OperationRecoveryContractTest()
+                    .requeue_plan()
+                )
+                classifier_rows = [
+                    {
+                        key: value
+                        for key, value in row.items()
+                        if key != "nonclaim_state_digest"
+                    }
+                    for row in rows
+                ]
+                predecessor = create_global_queue_blocker_classification(
+                    classifier_rows,
+                    classifier_candidate_release={
+                        "source_commit": "9" * 40,
+                        "version": (
+                            "2026.08.01+9999999.operation-recovery.6"
+                        ),
+                        "release_digest": "8" * 64,
+                    },
+                    reference_plan=reference_plan,
+                    installation_authority=(
+                        recovery_fixtures.installation_authority()
+                    ),
+                    generation_before=before_generation,
+                    generation_after=after_generation,
+                    guard_contract_version=(
+                        QUEUE_BLOCKER_GUARD_CONTRACT_VERSION
+                    ),
+                    guard_contract_digest=(
+                        QUEUE_BLOCKER_GUARD_CONTRACT_DIGEST
+                    ),
+                    observed_at=int(time.time()) - 7200,
+                )
+                candidate = recovery_fixtures.release_identity()
+                live = create_global_queue_blocker_classification(
+                    classifier_rows,
+                    classifier_candidate_release=candidate,
+                    reference_plan=reference_plan,
+                    installation_authority=(
+                        recovery_fixtures.installation_authority()
+                    ),
+                    generation_before=before_generation,
+                    generation_after=after_generation,
+                    guard_contract_version=(
+                        QUEUE_BLOCKER_GUARD_CONTRACT_VERSION
+                    ),
+                    guard_contract_digest=(
+                        QUEUE_BLOCKER_GUARD_CONTRACT_DIGEST
+                    ),
+                    observed_at=int(time.time()),
+                )
+                plan = create_claim_release_plan(
+                    predecessor,
+                    live,
+                    nonclaim_state_digests={
+                        row["operation_id"]: row["nonclaim_state_digest"]
+                        for row in rows
+                    },
+                    candidate_release=candidate,
+                    installation_authority=(
+                        recovery_fixtures.installation_authority()
+                    ),
+                    rollback_encryption=(
+                        recovery_fixtures.rollback_encryption()
+                    ),
+                    rollback_bundle_path="/private/tmp/claim-release.bundle",
+                    authorization_receipt_path=(
+                        "/private/tmp/claim-release.authorization"
+                    ),
+                    application_receipt_path=(
+                        "/private/tmp/claim-release.application"
+                    ),
+                    verification_receipt_path=(
+                        "/private/tmp/claim-release.verification"
+                    ),
+                    rollback_receipt_path=(
+                        "/private/tmp/claim-release.rollback"
+                    ),
+                    created_at=int(time.time()),
+                )
+                preimage = await read_claim_release_preimage(
+                    connection,
+                    schema="public",
+                    plan=plan,
+                )
+                updated_before = {
+                    row["operation_id"]: row["updated_at"] for row in rows
+                }
+
+                self.assertEqual(
+                    await apply_claim_release_transaction(
+                        connection,
+                        profile_id="systalyze",
+                        schema="public",
+                        plan=plan,
+                    ),
+                    ("systalyze:public:123", "systalyze:public:124"),
+                )
+                applied = await connection.fetch(
+                    "SELECT operation_id::text AS operation_id, status, "
+                    "worker_id, claimed_at, "
+                    "to_char(updated_at AT TIME ZONE 'UTC', "
+                    "'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at "
+                    "FROM public.async_operations ORDER BY operation_id"
+                )
+                self.assertEqual(len(applied), 43)
+                for row in applied:
+                    self.assertEqual(row["status"], "failed")
+                    self.assertIsNone(row["worker_id"])
+                    self.assertIsNone(row["claimed_at"])
+                    self.assertEqual(
+                        row["updated_at"],
+                        updated_before[row["operation_id"]],
+                    )
+
+                application = {"post_generation": "systalyze:public:124"}
+                rollback_record = {
+                    "pre_generation": "systalyze:public:124",
+                    "post_generation": "systalyze:public:125",
+                }
+                self.assertEqual(
+                    await rollback_claim_release_transaction(
+                        connection,
+                        profile_id="systalyze",
+                        schema="public",
+                        plan=plan,
+                        application=application,
+                        rollback_record=rollback_record,
+                        preimage=preimage,
+                    ),
+                    ("systalyze:public:124", "systalyze:public:125"),
+                )
+                generation_before_retry = await connection.fetchval(
+                    "SELECT generation FROM "
+                    "public.hindsight_migration_generation WHERE singleton"
+                )
+                self.assertEqual(
+                    await rollback_claim_release_transaction(
+                        connection,
+                        profile_id="systalyze",
+                        schema="public",
+                        plan=plan,
+                        application=application,
+                        rollback_record=rollback_record,
+                        preimage=preimage,
+                    ),
+                    ("systalyze:public:124", "systalyze:public:125"),
+                )
+                self.assertEqual(
+                    await connection.fetchval(
+                        "SELECT generation FROM "
+                        "public.hindsight_migration_generation WHERE singleton"
+                    ),
+                    generation_before_retry,
+                )
+                restored = await connection.fetch(
+                    "SELECT operation_id::text AS operation_id, status, "
+                    "worker_id, "
+                    "to_char(claimed_at AT TIME ZONE 'UTC', "
+                    "'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS claimed_at "
+                    "FROM public.async_operations ORDER BY operation_id"
+                )
+                self.assertEqual(len(restored), 43)
+                preimage_by_id = {
+                    row["operation_id"]: row for row in preimage
+                }
+                for row in restored:
+                    expected = preimage_by_id[row["operation_id"]]
+                    self.assertEqual(row["status"], "failed")
+                    self.assertEqual(row["worker_id"], expected["worker_id"])
+                    self.assertEqual(row["claimed_at"], expected["claimed_at"])
+
+                serialized_evidence = json.dumps(rows, sort_keys=True)
+                self.assertNotIn("payload-secret-", serialized_evidence)
+                self.assertNotIn("result-secret-", serialized_evidence)
+                self.assertNotIn("error-secret-", serialized_evidence)
+                self.assertNotIn("orphaned-worker-", serialized_evidence)
+                self.assertNotIn('"task_payload":', serialized_evidence)
+                self.assertNotIn('"error_message":', serialized_evidence)
+                self.assertNotIn('"worker_id":', serialized_evidence)
+            finally:
                 await connection.close()
 
         asyncio.run(exercise())

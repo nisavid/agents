@@ -22,6 +22,13 @@ EXPECTED_OPERATION_COUNTS = {
     "refresh_mental_model": 4,
     "consolidation": 2,
 }
+EXPECTED_CLAIM_RELEASE_ROW_COUNT = 43
+EXPECTED_CLAIM_RELEASE_STATUS_COUNTS = {"failed": 43}
+EXPECTED_CLAIM_RELEASE_BANK_COUNTS = {"codex": 37, "engineering": 6}
+EXPECTED_CLAIM_RELEASE_TYPE_COUNTS = {
+    "refresh_mental_model": 6,
+    "retain": 37,
+}
 OPERATION_STATUSES = (
     "pending",
     "processing",
@@ -310,6 +317,39 @@ QUEUE_BLOCKER_CLASSIFICATION_KEYS = frozenset(
         "observed_at",
         "expires_at",
         "classification_digest",
+    }
+)
+CLAIM_RELEASE_ROW_KEYS = QUEUE_BLOCKER_KEYS | {"nonclaim_state_digest"}
+CLAIM_RELEASE_PLAN_KEYS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "authority",
+        "mutation_authorized",
+        "candidate_release",
+        "installation_authority",
+        "predecessor_classification_digest",
+        "live_classification_digest",
+        "guard_contract_version",
+        "guard_contract_digest",
+        "profile_id",
+        "schema",
+        "pre_generation",
+        "selected_rows",
+        "selected_row_count",
+        "selected_row_set_digest",
+        "status_counts",
+        "bank_counts",
+        "operation_type_counts",
+        "rollback_encryption",
+        "rollback_bundle_path",
+        "authorization_receipt_path",
+        "application_receipt_path",
+        "verification_receipt_path",
+        "rollback_receipt_path",
+        "created_at",
+        "expires_at",
+        "plan_digest",
     }
 )
 
@@ -1963,3 +2003,320 @@ def verify_global_queue_blocker_classification(
             "operation-recovery queue blocker classification digest differs"
         )
     return {**body, "classification_digest": classification["classification_digest"]}
+
+
+def _claim_release_row(value: Any) -> dict[str, Any]:
+    row = _closed(
+        _normalized(value),
+        CLAIM_RELEASE_ROW_KEYS,
+        "operation-recovery claim-release row",
+    )
+    blocker = _queue_blocker(
+        {key: row[key] for key in QUEUE_BLOCKER_KEYS},
+        include_digest=True,
+    )
+    if (
+        blocker["status"] != "failed"
+        or blocker["blocker_reason"] != "claimed_failed"
+        or blocker["in_reference_cohort"]
+        or blocker["in_reference_selected_set"]
+        or not blocker["worker_id_present"]
+        or blocker["claimed_at"] is None
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery claim-release row is invalid"
+        )
+    return {
+        **blocker,
+        "nonclaim_state_digest": _sha(
+            row["nonclaim_state_digest"],
+            "operation-recovery nonclaim state digest",
+        ),
+    }
+
+
+def _claim_release_row_set_digest(
+    rows: Sequence[Mapping[str, Any]],
+) -> str:
+    return digest(
+        [
+            {
+                "operation_id": row["operation_id"],
+                "row_digest": row["row_digest"],
+                "nonclaim_state_digest": row["nonclaim_state_digest"],
+            }
+            for row in rows
+        ]
+    )
+
+
+def _claim_release_artifact_paths(values: Mapping[str, Any]) -> dict[str, str]:
+    labels = {
+        "rollback_bundle_path": "claim-release rollback bundle path",
+        "authorization_receipt_path": (
+            "claim-release authorization receipt path"
+        ),
+        "application_receipt_path": "claim-release application receipt path",
+        "verification_receipt_path": (
+            "claim-release verification receipt path"
+        ),
+        "rollback_receipt_path": "claim-release rollback receipt path",
+    }
+    paths = {
+        key: _absolute_path(values[key], f"operation-recovery {label}")
+        for key, label in labels.items()
+    }
+    if (
+        len(
+            {
+                unicodedata.normalize("NFD", value.casefold())
+                for value in paths.values()
+            }
+        )
+        != len(paths)
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery claim-release artifact paths must be distinct"
+        )
+    return paths
+
+
+def create_claim_release_plan(
+    predecessor_classification_value: Mapping[str, Any],
+    live_classification_value: Mapping[str, Any],
+    *,
+    nonclaim_state_digests: Mapping[str, Any],
+    candidate_release: Mapping[str, Any],
+    installation_authority: Mapping[str, Any],
+    rollback_encryption: Mapping[str, Any],
+    rollback_bundle_path: str,
+    authorization_receipt_path: str,
+    application_receipt_path: str,
+    verification_receipt_path: str,
+    rollback_receipt_path: str,
+    created_at: int | None = None,
+) -> Mapping[str, Any]:
+    """Build a read-only, unapproved plan for exact terminal-claim cleanup."""
+    planned_at = (
+        int(time.time())
+        if created_at is None
+        else _integer(created_at, "claim-release plan created-at")
+    )
+    predecessor = verify_global_queue_blocker_classification(
+        predecessor_classification_value,
+        now=planned_at,
+        allow_expired=True,
+    )
+    live = verify_global_queue_blocker_classification(
+        live_classification_value,
+        now=planned_at,
+    )
+    candidate = _candidate_release(candidate_release)
+    authority = _installation_authority(installation_authority)
+    if (
+        live["classifier_candidate_release"] != candidate
+        or predecessor["classification_digest"]
+        == live["classification_digest"]
+        or predecessor["observed_at"] >= live["observed_at"]
+        or predecessor["installation_authority"] != authority
+        or live["installation_authority"] != authority
+        or predecessor["blockers"] != live["blockers"]
+        or predecessor["guard_contract_version"]
+        != live["guard_contract_version"]
+        or predecessor["guard_contract_digest"]
+        != live["guard_contract_digest"]
+        or predecessor["blocker_count"]
+        != EXPECTED_CLAIM_RELEASE_ROW_COUNT
+        or predecessor["status_counts"]
+        != EXPECTED_CLAIM_RELEASE_STATUS_COUNTS
+        or predecessor["bank_counts"]
+        != EXPECTED_CLAIM_RELEASE_BANK_COUNTS
+        or predecessor["operation_type_counts"]
+        != EXPECTED_CLAIM_RELEASE_TYPE_COUNTS
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery claim-release classification differs"
+        )
+    if not isinstance(nonclaim_state_digests, Mapping):
+        raise OperationRecoveryError(
+            "operation-recovery claim-release nonclaim evidence is invalid"
+        )
+    blocker_ids = [row["operation_id"] for row in live["blockers"]]
+    if set(nonclaim_state_digests) != set(blocker_ids):
+        raise OperationRecoveryError(
+            "operation-recovery claim-release nonclaim evidence differs"
+        )
+    rows = [
+        _claim_release_row(
+            {
+                **row,
+                "nonclaim_state_digest": nonclaim_state_digests[
+                    row["operation_id"]
+                ],
+            }
+        )
+        for row in live["blockers"]
+    ]
+    if rows != sorted(
+        rows,
+        key=lambda row: (row["created_at"], row["operation_id"]),
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery claim-release rows are not ordered"
+        )
+    paths = _claim_release_artifact_paths(
+        {
+            "rollback_bundle_path": rollback_bundle_path,
+            "authorization_receipt_path": authorization_receipt_path,
+            "application_receipt_path": application_receipt_path,
+            "verification_receipt_path": verification_receipt_path,
+            "rollback_receipt_path": rollback_receipt_path,
+        }
+    )
+    body = {
+        "schema_version": 1,
+        "kind": "operation-recovery-claim-release-plan",
+        "authority": "unapproved-plan",
+        "mutation_authorized": False,
+        "candidate_release": candidate,
+        "installation_authority": authority,
+        "predecessor_classification_digest": predecessor[
+            "classification_digest"
+        ],
+        "live_classification_digest": live["classification_digest"],
+        "guard_contract_version": live["guard_contract_version"],
+        "guard_contract_digest": live["guard_contract_digest"],
+        "profile_id": "systalyze",
+        "schema": "public",
+        "pre_generation": live["generation_before"],
+        "selected_rows": rows,
+        "selected_row_count": len(rows),
+        "selected_row_set_digest": _claim_release_row_set_digest(rows),
+        "status_counts": dict(live["status_counts"]),
+        "bank_counts": dict(live["bank_counts"]),
+        "operation_type_counts": dict(live["operation_type_counts"]),
+        "rollback_encryption": _rollback_encryption(rollback_encryption),
+        **paths,
+        "created_at": planned_at,
+        "expires_at": planned_at + MAX_PLAN_LIFETIME_SECONDS,
+    }
+    return {**body, "plan_digest": digest(body)}
+
+
+def verify_claim_release_plan(
+    value: Any,
+    *,
+    now: int | None = None,
+    allow_expired: bool = False,
+) -> Mapping[str, Any]:
+    plan = _closed(
+        _normalized(value),
+        CLAIM_RELEASE_PLAN_KEYS,
+        "operation-recovery claim-release plan",
+    )
+    rows_value = plan["selected_rows"]
+    if not isinstance(rows_value, list):
+        raise OperationRecoveryError(
+            "operation-recovery claim-release rows are invalid"
+        )
+    rows = [_claim_release_row(row) for row in rows_value]
+    identifiers = [row["operation_id"] for row in rows]
+    created_at = _integer(plan["created_at"], "claim-release plan created-at")
+    expires_at = _integer(plan["expires_at"], "claim-release plan expires-at")
+    observed_at = (
+        int(time.time())
+        if now is None
+        else _integer(now, "claim-release plan verification time")
+    )
+    status_counts = _count_map(plan["status_counts"], "claim-release status counts")
+    bank_counts = _count_map(plan["bank_counts"], "claim-release bank counts")
+    type_counts = _count_map(
+        plan["operation_type_counts"],
+        "claim-release operation type counts",
+    )
+    row_status_counts = _queue_blocker_counts(rows, "status")
+    row_bank_counts = _queue_blocker_counts(rows, "bank_id")
+    row_type_counts = _queue_blocker_counts(rows, "operation_type")
+    if (
+        plan["schema_version"] != 1
+        or plan["kind"] != "operation-recovery-claim-release-plan"
+        or plan["authority"] != "unapproved-plan"
+        or plan["mutation_authorized"] is not False
+        or plan["profile_id"] != "systalyze"
+        or plan["schema"] != "public"
+        or len(rows) != EXPECTED_CLAIM_RELEASE_ROW_COUNT
+        or len(identifiers) != len(set(identifiers))
+        or rows
+        != sorted(rows, key=lambda row: (row["created_at"], row["operation_id"]))
+        or plan["selected_row_count"] != EXPECTED_CLAIM_RELEASE_ROW_COUNT
+        or plan["selected_row_set_digest"]
+        != _claim_release_row_set_digest(rows)
+        or status_counts != EXPECTED_CLAIM_RELEASE_STATUS_COUNTS
+        or bank_counts != EXPECTED_CLAIM_RELEASE_BANK_COUNTS
+        or type_counts != EXPECTED_CLAIM_RELEASE_TYPE_COUNTS
+        or status_counts != row_status_counts
+        or bank_counts != row_bank_counts
+        or type_counts != row_type_counts
+        or expires_at - created_at != MAX_PLAN_LIFETIME_SECONDS
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery claim-release plan is invalid"
+        )
+    if not allow_expired and observed_at >= expires_at:
+        raise OperationRecoveryError(
+            "operation-recovery claim-release plan expired"
+        )
+    paths = _claim_release_artifact_paths(plan)
+    body = {
+        "schema_version": 1,
+        "kind": "operation-recovery-claim-release-plan",
+        "authority": "unapproved-plan",
+        "mutation_authorized": False,
+        "candidate_release": _candidate_release(plan["candidate_release"]),
+        "installation_authority": _installation_authority(
+            plan["installation_authority"]
+        ),
+        "predecessor_classification_digest": _sha(
+            plan["predecessor_classification_digest"],
+            "predecessor classification digest",
+        ),
+        "live_classification_digest": _sha(
+            plan["live_classification_digest"],
+            "live classification digest",
+        ),
+        "guard_contract_version": _integer(
+            plan["guard_contract_version"],
+            "claim-release guard contract version",
+            minimum=1,
+        ),
+        "guard_contract_digest": _sha(
+            plan["guard_contract_digest"],
+            "claim-release guard contract digest",
+        ),
+        "profile_id": "systalyze",
+        "schema": "public",
+        "pre_generation": _text(
+            plan["pre_generation"],
+            "claim-release pre-generation",
+        ),
+        "selected_rows": rows,
+        "selected_row_count": EXPECTED_CLAIM_RELEASE_ROW_COUNT,
+        "selected_row_set_digest": _sha(
+            plan["selected_row_set_digest"],
+            "claim-release selected-row-set digest",
+        ),
+        "status_counts": status_counts,
+        "bank_counts": bank_counts,
+        "operation_type_counts": type_counts,
+        "rollback_encryption": _rollback_encryption(
+            plan["rollback_encryption"]
+        ),
+        **paths,
+        "created_at": created_at,
+        "expires_at": expires_at,
+    }
+    if _sha(plan["plan_digest"], "claim-release plan digest") != digest(body):
+        raise OperationRecoveryError(
+            "operation-recovery claim-release plan digest differs"
+        )
+    return {**body, "plan_digest": plan["plan_digest"]}

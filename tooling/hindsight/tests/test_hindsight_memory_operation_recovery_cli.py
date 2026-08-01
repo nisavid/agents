@@ -706,6 +706,299 @@ class OperationRecoveryCliTest(unittest.TestCase):
         self.assertIs(create_only, True)
         self.assertEqual(stored, classification)
 
+    def test_claim_release_plan_command_is_read_only_and_digest_bound(self):
+        command = self.controller[
+            "operation_recovery_claim_release_plan_command"
+        ]
+        globals_ = command.__globals__
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        predecessor, live, nonclaim_digests = fixtures.claim_release_inputs(
+            planned_at=int(time.time())
+        )
+        for classification in (predecessor, live):
+            body = {
+                **{
+                    key: value
+                    for key, value in classification.items()
+                    if key != "classification_digest"
+                },
+                "guard_contract_version": self.controller[
+                    "QUEUE_BLOCKER_GUARD_CONTRACT_VERSION"
+                ],
+                "guard_contract_digest": self.controller[
+                    "QUEUE_BLOCKER_GUARD_CONTRACT_DIGEST"
+                ],
+            }
+            classification.clear()
+            classification.update(
+                {**body, "classification_digest": self.controller["digest"](body)}
+            )
+        candidate = recovery_fixtures.release_identity()
+        authority = recovery_fixtures.installation_authority()
+        encryption = recovery_fixtures.rollback_encryption()
+        documents = {
+            "predecessor.json": predecessor,
+            "live.json": live,
+        }
+        written = {}
+
+        async def evidence(_args, classification):
+            self.assertEqual(classification, live)
+            return authority, nonclaim_digests
+
+        replacements = {
+            "_operation_recovery_candidate": lambda _args: candidate,
+            "_operation_recovery_tool": (
+                lambda _path, _key: Path(encryption["age_path"])
+            ),
+            "_operation_recovery_read_private_json": (
+                lambda path, _label: documents[str(path)]
+            ),
+            "_claim_release_plan_evidence": evidence,
+            "_operation_recovery_rollback_encryption": (
+                lambda recipient: {
+                    "recipient": recipient,
+                    "age_sha256": encryption["age_sha256"],
+                }
+            ),
+            "write_private": (
+                lambda path, value, *, create_only: written.update(
+                    {str(path): (value, create_only)}
+                )
+            ),
+            "_print_result": lambda value: value,
+        }
+        originals = {key: globals_[key] for key in replacements}
+        globals_.update(replacements)
+        args = SimpleNamespace(
+            predecessor_classification="predecessor.json",
+            predecessor_classification_digest=(
+                predecessor["classification_digest"]
+            ),
+            live_classification="live.json",
+            age=encryption["age_path"],
+            rollback_recipient=encryption["recipient"],
+            rollback_bundle="/private/tmp/claim-release.bundle.json",
+            authorization_receipt=(
+                "/private/tmp/claim-release.authorization.json"
+            ),
+            application_receipt=(
+                "/private/tmp/claim-release.application.json"
+            ),
+            verification_receipt=(
+                "/private/tmp/claim-release.verification.json"
+            ),
+            rollback_receipt=(
+                "/private/tmp/claim-release.rollback.json"
+            ),
+            output="/private/tmp/claim-release.plan.json",
+        )
+        try:
+            result = command(args)
+        finally:
+            globals_.update(originals)
+
+        self.assertEqual(
+            set(result),
+            {
+                "status",
+                "plan_digest",
+                "expires_at",
+                "selected_row_count",
+                "output",
+            },
+        )
+        self.assertEqual(result["status"], "planned")
+        self.assertEqual(result["selected_row_count"], 43)
+        plan, create_only = written[args.output]
+        self.assertIs(create_only, True)
+        self.assertEqual(plan["authority"], "unapproved-plan")
+        self.assertIs(plan["mutation_authorized"], False)
+        self.assertEqual(
+            plan["predecessor_classification_digest"],
+            predecessor["classification_digest"],
+        )
+        self.assertEqual(
+            plan["live_classification_digest"],
+            live["classification_digest"],
+        )
+        serialized = json.dumps(plan, sort_keys=True)
+        self.assertNotIn('"task_payload":', serialized)
+        self.assertNotIn('"worker_id":', serialized)
+        self.assertNotIn('"error_message":', serialized)
+
+        alias_args = SimpleNamespace(**vars(args))
+        alias_args.output = args.authorization_receipt.upper()
+        written.clear()
+        globals_.update(replacements)
+        try:
+            with self.assertRaisesRegex(
+                Exception,
+                "plan path aliases an artifact",
+            ):
+                command(alias_args)
+        finally:
+            globals_.update(originals)
+        self.assertEqual(written, {})
+
+        drifted_candidate = {**candidate, "release_digest": "0" * 64}
+        candidates = iter((candidate, drifted_candidate))
+        drift_replacements = {
+            **replacements,
+            "_operation_recovery_candidate": lambda _args: next(candidates),
+            "write_private": lambda *_args, **_kwargs: self.fail(
+                "drifted candidate must not write a plan"
+            ),
+        }
+        globals_.update(drift_replacements)
+        try:
+            with self.assertRaisesRegex(
+                Exception,
+                "candidate drifted during claim-release planning",
+            ):
+                command(args)
+        finally:
+            globals_.update(originals)
+
+    def test_claim_release_already_applied_skips_preimage_recapture(self):
+        command = self.controller[
+            "operation_recovery_claim_release_apply_command"
+        ]
+        globals_ = command.__globals__
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        planned_at = int(time.time())
+        predecessor, live, nonclaim_digests = fixtures.claim_release_inputs(
+            planned_at=planned_at,
+            live_generation="systalyze:public:123",
+        )
+        candidate = recovery_fixtures.release_identity()
+        authority = recovery_fixtures.installation_authority()
+        with tempfile.TemporaryDirectory(
+            dir="/private/tmp",
+            prefix="claim-release-applied-",
+        ) as directory:
+            root = Path(directory)
+            root.chmod(0o700)
+            plan = self.controller["create_claim_release_plan"](
+                predecessor,
+                live,
+                nonclaim_state_digests=nonclaim_digests,
+                candidate_release=candidate,
+                installation_authority=authority,
+                rollback_encryption=(
+                    recovery_fixtures.rollback_encryption()
+                ),
+                rollback_bundle_path=str(root / "rollback-bundle.json"),
+                authorization_receipt_path=str(root / "authorization.json"),
+                application_receipt_path=str(root / "application.json"),
+                verification_receipt_path=str(root / "verification.json"),
+                rollback_receipt_path=str(root / "rollback.json"),
+                created_at=planned_at,
+            )
+            application = {
+                "kind": (
+                    "operation-recovery-claim-release-application-receipt"
+                ),
+                "pre_generation": plan["pre_generation"],
+                "post_generation": self.controller[
+                    "_operation_recovery_next_generation"
+                ](plan["pre_generation"]),
+                "receipt_digest": "b" * 64,
+            }
+            for path in (
+                Path(plan["authorization_receipt_path"]),
+                Path(plan["application_receipt_path"]),
+            ):
+                path.write_text("{}", encoding="utf-8")
+                path.chmod(0o600)
+
+            async def recapture(*_args, **_kwargs):
+                self.fail("already-applied retries must not recapture preimage")
+
+            class Manager:
+                pass
+
+            documents = {
+                "plan.json": plan,
+                plan["application_receipt_path"]: application,
+            }
+            replacements = {
+                "_operation_recovery_candidate": lambda _args: candidate,
+                "_operation_recovery_read_private_json": (
+                    lambda path, _label: documents[str(path)]
+                ),
+                "_claim_release_assert_guard": lambda _plan: None,
+                "_portable_manager": lambda _args: Manager(),
+                "_operation_recovery_install_lock": (
+                    lambda _manager, *, expires_at: nullcontext()
+                ),
+                "_operation_recovery_lock": (
+                    lambda _manager, *, expires_at: nullcontext()
+                ),
+                "_operation_recovery_authority": (
+                    lambda _args, **_kwargs: authority
+                ),
+                "_claim_release_validate_authorization": (
+                    lambda _plan: {"receipt_digest": "a" * 64}
+                ),
+                "_claim_release_validate_application": (
+                    lambda _value, *, plan: application
+                ),
+                "_claim_release_prepare_apply": recapture,
+                "_print_result": lambda value: value,
+            }
+            originals = {key: globals_[key] for key in replacements}
+            globals_.update(replacements)
+            try:
+                result = command(
+                    SimpleNamespace(
+                        plan="plan.json",
+                        approval_digest=plan["plan_digest"],
+                    )
+                )
+            finally:
+                globals_.update(originals)
+
+            journal = {
+                **application,
+                "kind": (
+                    "operation-recovery-claim-release-application-journal"
+                ),
+            }
+            documents[plan["application_receipt_path"]] = journal
+
+            async def current_generation(_args):
+                return journal["post_generation"]
+
+            journal_replacements = {
+                **replacements,
+                "_claim_release_validate_journal": (
+                    lambda _value, *, plan: journal
+                ),
+                "_claim_release_current_generation": current_generation,
+            }
+            journal_originals = {
+                key: globals_[key] for key in journal_replacements
+            }
+            globals_.update(journal_replacements)
+            try:
+                journal_result = command(
+                    SimpleNamespace(
+                        plan="plan.json",
+                        approval_digest=plan["plan_digest"],
+                    )
+                )
+            finally:
+                globals_.update(journal_originals)
+
+        self.assertEqual(result["status"], "already-applied")
+        self.assertEqual(result["plan_digest"], plan["plan_digest"])
+        self.assertEqual(journal_result["status"], "verification-required")
+        self.assertEqual(
+            journal_result["post_generation"],
+            journal["post_generation"],
+        )
+
     def test_queue_blocker_command_rejects_candidate_drift(self):
         command = self.controller[
             "operation_recovery_classify_queue_blockers_command"

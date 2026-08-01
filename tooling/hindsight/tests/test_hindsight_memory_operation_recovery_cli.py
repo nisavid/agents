@@ -1330,6 +1330,112 @@ class OperationRecoveryCliTest(unittest.TestCase):
 
         self.assertEqual(authority_calls, [authority, drifted_authority])
 
+    def test_claim_release_status_reports_valid_rollback_journal(self):
+        command = self.controller[
+            "operation_recovery_claim_release_status_command"
+        ]
+        globals_ = command.__globals__
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        planned_at = int(time.time())
+        predecessor, live, nonclaim_digests = fixtures.claim_release_inputs(
+            planned_at=planned_at,
+            live_generation="systalyze:public:123",
+        )
+        candidate = recovery_fixtures.release_identity()
+        with tempfile.TemporaryDirectory(
+            dir="/private/tmp",
+            prefix="claim-release-status-journal-",
+        ) as directory:
+            root = Path(directory)
+            root.chmod(0o700)
+            plan = self.controller["create_claim_release_plan"](
+                predecessor,
+                live,
+                nonclaim_state_digests=nonclaim_digests,
+                candidate_release=candidate,
+                installation_authority=(
+                    recovery_fixtures.installation_authority()
+                ),
+                rollback_encryption=(
+                    recovery_fixtures.rollback_encryption()
+                ),
+                rollback_bundle_path=str(root / "rollback-bundle.json"),
+                authorization_receipt_path=str(root / "authorization.json"),
+                application_receipt_path=str(root / "application.json"),
+                verification_receipt_path=str(root / "verification.json"),
+                rollback_receipt_path=str(root / "rollback.json"),
+                created_at=planned_at,
+            )
+            application = {"receipt_digest": "b" * 64}
+            rollback_journal = {
+                "kind": (
+                    "operation-recovery-claim-release-rollback-journal"
+                ),
+                "receipt_digest": "c" * 64,
+            }
+            for path in (
+                Path(plan["application_receipt_path"]),
+                Path(plan["rollback_receipt_path"]),
+            ):
+                path.write_text("{}", encoding="utf-8")
+                path.chmod(0o600)
+            documents = {
+                "plan.json": plan,
+                plan["application_receipt_path"]: {
+                    "kind": (
+                        "operation-recovery-claim-release-application-receipt"
+                    )
+                },
+                plan["rollback_receipt_path"]: rollback_journal,
+            }
+            rollback_kinds = []
+
+            def validate_rollback(
+                value,
+                *,
+                plan,
+                application,
+                kind,
+            ):
+                self.assertEqual(value, rollback_journal)
+                rollback_kinds.append(kind)
+                return rollback_journal
+
+            replacements = {
+                "_operation_recovery_candidate": lambda _args: candidate,
+                "_operation_recovery_read_private_json": (
+                    lambda path, _label: documents[str(path)]
+                ),
+                "_claim_release_assert_guard": lambda _plan: None,
+                "_claim_release_validate_application": (
+                    lambda _value, *, plan: application
+                ),
+                "_claim_release_rollback_approval": (
+                    lambda _plan, _application: "d" * 64
+                ),
+                "_claim_release_validate_rollback_record": (
+                    validate_rollback
+                ),
+                "_print_result": lambda value: value,
+            }
+            originals = {key: globals_[key] for key in replacements}
+            globals_.update(replacements)
+            try:
+                result = command(SimpleNamespace(plan="plan.json"))
+            finally:
+                globals_.update(originals)
+
+        self.assertEqual(result["status"], "rollback-journal-present")
+        self.assertEqual(
+            result["rollback_journal_digest"],
+            rollback_journal["receipt_digest"],
+        )
+        self.assertNotIn("rolled_back", result)
+        self.assertEqual(
+            rollback_kinds,
+            ["operation-recovery-claim-release-rollback-journal"],
+        )
+
     def test_queue_blocker_command_rejects_candidate_drift(self):
         command = self.controller[
             "operation_recovery_classify_queue_blockers_command"

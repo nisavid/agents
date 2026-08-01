@@ -6820,17 +6820,36 @@ def operation_recovery_claim_release_status_command(
             raise OperationRecoveryError(
                 "claim-release rollback exists without application receipt"
             )
-        rollback = _claim_release_validate_rollback_record(
-            _operation_recovery_read_private_json(
-                plan["rollback_receipt_path"],
-                "claim-release rollback receipt",
-            ),
-            plan=plan,
-            application=application,
-            kind="operation-recovery-claim-release-rollback-receipt",
+        rollback_value = _operation_recovery_read_private_json(
+            plan["rollback_receipt_path"],
+            "claim-release rollback record",
         )
-        result["rolled_back"] = True
-        result["rollback_receipt_digest"] = rollback["receipt_digest"]
+        if rollback_value.get("kind") == (
+            "operation-recovery-claim-release-rollback-receipt"
+        ):
+            rollback = _claim_release_validate_rollback_record(
+                rollback_value,
+                plan=plan,
+                application=application,
+                kind="operation-recovery-claim-release-rollback-receipt",
+            )
+            result["rolled_back"] = True
+            result["rollback_receipt_digest"] = rollback["receipt_digest"]
+        else:
+            rollback_journal = _claim_release_validate_rollback_record(
+                rollback_value,
+                plan=plan,
+                application=application,
+                kind="operation-recovery-claim-release-rollback-journal",
+            )
+            result.update(
+                {
+                    "status": "rollback-journal-present",
+                    "rollback_journal_digest": rollback_journal[
+                        "receipt_digest"
+                    ],
+                }
+            )
     return _print_result(result)
 
 

@@ -2,6 +2,8 @@ from pathlib import Path
 import asyncio
 from datetime import datetime
 import getpass
+import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -12,18 +14,27 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 LIB = ROOT / "lib"
+TESTS = ROOT / "tests"
 if str(LIB) not in sys.path:
     sys.path.insert(0, str(LIB))
+if str(TESTS) not in sys.path:
+    sys.path.insert(0, str(TESTS))
 
 from hindsight_memory_control_plane.operation_recovery import (  # noqa: E402
     OperationRecoveryError,
+    create_global_queue_blocker_classification,
+    verify_global_queue_blocker_classification,
 )
 from hindsight_memory_control_plane.operation_recovery_runtime import (  # noqa: E402
+    QUEUE_BLOCKER_GUARD_CONTRACT_DIGEST,
+    QUEUE_BLOCKER_GUARD_CONTRACT_VERSION,
     apply_requeue_transaction,
     live_row_digest,
+    read_global_queue_blockers,
     read_safe_operation_rows,
     rollback_requeue_transaction,
 )
+import test_hindsight_memory_operation_recovery as recovery_fixtures  # noqa: E402
 
 
 POSTGRES_BIN_ENV = "HINDSIGHT_OPERATION_RECOVERY_POSTGRES_BIN"
@@ -201,8 +212,13 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
         operation_id,
         *,
         status,
+        bank_id="engineering",
+        operation_type="retain",
         worker_id=None,
         claimed_at=None,
+        task_payload='{"memory": "synthetic disposable payload"}',
+        result_metadata="{}",
+        error_message=None,
     ):
         await connection.execute(
             """
@@ -212,19 +228,24 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
                 next_retry_at, worker_id, claimed_at, task_payload,
                 result_metadata, error_message
             ) VALUES (
-                $1::uuid, 'engineering', 'retain', $2,
-                '2026-07-29T12:00:00Z', $3::timestamptz,
-                CASE WHEN $2 IN ('failed', 'cancelled')
-                     THEN $4::timestamptz ELSE NULL END,
-                CASE WHEN $2 IN ('failed', 'cancelled') THEN 2 ELSE 0 END,
-                NULL, $5, $6::timestamptz,
-                '{"memory": "synthetic disposable payload"}'::jsonb,
-                '{}'::jsonb,
-                CASE WHEN $2 IN ('failed', 'cancelled')
-                     THEN 'provider capacity exhausted' ELSE NULL END
+                $1::uuid, $2, $3, $4,
+                '2026-07-29T12:00:00Z', $5::timestamptz,
+                CASE WHEN $4 IN ('completed', 'failed', 'cancelled')
+                     THEN $6::timestamptz ELSE NULL END,
+                CASE WHEN $4 IN ('failed', 'cancelled') THEN 2 ELSE 0 END,
+                NULL, $7, $8::timestamptz,
+                $9::jsonb,
+                $10::jsonb,
+                COALESCE(
+                    $11,
+                    CASE WHEN $4 IN ('failed', 'cancelled')
+                         THEN 'provider capacity exhausted' ELSE NULL END
+                )
             )
             """,
             operation_id,
+            bank_id,
+            operation_type,
             status,
             datetime.fromisoformat(UPDATED_AT.replace("Z", "+00:00")),
             datetime.fromisoformat(COMPLETED_AT.replace("Z", "+00:00")),
@@ -236,6 +257,9 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
                     claimed_at.replace("Z", "+00:00")
                 )
             ),
+            task_payload,
+            result_metadata,
+            error_message,
         )
 
     @staticmethod
@@ -455,6 +479,225 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
         for blocker_status, blocker_id in cases:
             with self.subTest(status=blocker_status, blocker=blocker_id):
                 asyncio.run(exercise(blocker_status, blocker_id))
+
+    def test_global_blocker_classification_matches_guard_without_payload_exposure(self):
+        async def exercise():
+            connection = await self._connect()
+            try:
+                await self._reset(connection)
+                worker_sentinel = "worker-secret-sentinel-9d3e"
+                payload_sentinel = "payload-secret-sentinel-41ba"
+                error_sentinel = "error-secret-sentinel-c12f"
+                result_sentinel = "result-secret-sentinel-e68a"
+                outside_id = "00000000-0000-4000-8000-000000000099"
+                reference_plan = (
+                    recovery_fixtures.OperationRecoveryContractTest()
+                    .requeue_plan()
+                )
+                self.assertEqual(
+                    SELECTED_ID,
+                    reference_plan["selected_operations"][0]["operation_id"],
+                )
+                selected_claimed_id = reference_plan["selected_operations"][1][
+                    "operation_id"
+                ]
+                rows = (
+                    (SELECTED_ID, "engineering", "retain", "processing", True),
+                    (selected_claimed_id, "engineering", "retain", "failed", True),
+                    (outside_id, "outside-bank", "outside-type", "pending", True),
+                    ("00000000-0000-4000-8000-000000000098", "engineering", "retain", "completed", True),
+                    ("00000000-0000-4000-8000-000000000097", "engineering", "retain", "pending", False),
+                    ("00000000-0000-4000-8000-000000000096", "engineering", "retain", "failed", False),
+                    ("00000000-0000-4000-8000-000000000095", "engineering", "retain", "cancelled", False),
+                )
+                for operation_id, bank_id, operation_type, status, claimed in rows:
+                    await self._insert_operation(
+                        connection,
+                        operation_id,
+                        status=status,
+                        bank_id=bank_id,
+                        operation_type=operation_type,
+                        worker_id=worker_sentinel if claimed else None,
+                        claimed_at=CLAIMED_AT if claimed else None,
+                        task_payload=json.dumps({"memory": payload_sentinel}),
+                        result_metadata=json.dumps({"secret": result_sentinel}),
+                        error_message=error_sentinel,
+                    )
+                await connection.execute(
+                    "UPDATE public.hindsight_migration_generation "
+                    "SET generation = 123 WHERE singleton"
+                )
+
+                before, after, blockers = await read_global_queue_blockers(
+                    connection,
+                    profile_id="systalyze",
+                    schema="public",
+                    reference_cohort_operation_ids=[
+                        item["operation_id"]
+                        for item in reference_plan["cohort"]["operations"]
+                    ],
+                    reference_selected_operation_ids=[
+                        item["operation_id"]
+                        for item in reference_plan["selected_operations"]
+                    ],
+                )
+
+                self.assertEqual((before, after), (
+                    "systalyze:public:123",
+                    "systalyze:public:123",
+                ))
+                self.assertEqual(
+                    [row["operation_id"] for row in blockers],
+                    [SELECTED_ID, outside_id],
+                )
+                self.assertNotIn(
+                    selected_claimed_id,
+                    [row["operation_id"] for row in blockers],
+                )
+                self.assertEqual(
+                    [row["blocker_reason"] for row in blockers],
+                    ["processing", "claimed_pending"],
+                )
+                self.assertTrue(blockers[0]["in_reference_selected_set"])
+                self.assertFalse(blockers[1]["in_reference_cohort"])
+                self.assertEqual(
+                    blockers[1]["worker_id_digest"],
+                    hashlib.sha256(worker_sentinel.encode()).hexdigest(),
+                )
+                serialized = json.dumps(blockers, sort_keys=True)
+                self.assertNotIn(worker_sentinel, serialized)
+                self.assertNotIn(payload_sentinel, serialized)
+                self.assertNotIn(error_sentinel, serialized)
+                self.assertNotIn(result_sentinel, serialized)
+                self.assertNotIn("error_message", serialized)
+                self.assertNotIn('"worker_id"', serialized)
+                self.assertNotIn('"task_payload"', serialized)
+                for blocker in blockers:
+                    self.assertNotIn("result_metadata_digest", blocker)
+                    self.assertNotIn("error_category", blocker)
+                    self.assertNotIn("error_digest", blocker)
+
+                classification = create_global_queue_blocker_classification(
+                    blockers,
+                    classifier_candidate_release={
+                        "source_commit": "9" * 40,
+                        "version": (
+                            "2026.07.31+9999999.operation-recovery.6"
+                        ),
+                        "release_digest": "8" * 64,
+                    },
+                    reference_plan=reference_plan,
+                    installation_authority=(
+                        recovery_fixtures.installation_authority()
+                    ),
+                    generation_before=before,
+                    generation_after=after,
+                    guard_contract_version=(
+                        QUEUE_BLOCKER_GUARD_CONTRACT_VERSION
+                    ),
+                    guard_contract_digest=(
+                        QUEUE_BLOCKER_GUARD_CONTRACT_DIGEST
+                    ),
+                    observed_at=reference_plan["expires_at"] + 1,
+                )
+                self.assertEqual(
+                    verify_global_queue_blocker_classification(
+                        classification,
+                        now=classification["observed_at"],
+                    ),
+                    classification,
+                )
+                self.assertEqual(classification["blocker_count"], 2)
+                self.assertEqual(
+                    classification["status_counts"],
+                    {"pending": 1, "processing": 1},
+                )
+                self.assertEqual(
+                    classification["bank_counts"],
+                    {"engineering": 1, "outside-bank": 1},
+                )
+                self.assertEqual(
+                    classification["operation_type_counts"],
+                    {"outside-type": 1, "retain": 1},
+                )
+                serialized_artifact = json.dumps(
+                    classification,
+                    sort_keys=True,
+                )
+                self.assertNotIn(worker_sentinel, serialized_artifact)
+                self.assertNotIn(payload_sentinel, serialized_artifact)
+                self.assertNotIn(error_sentinel, serialized_artifact)
+                self.assertNotIn(result_sentinel, serialized_artifact)
+                self.assertNotIn("result_metadata_digest", serialized_artifact)
+                self.assertNotIn("error_category", serialized_artifact)
+                self.assertNotIn("error_digest", serialized_artifact)
+            finally:
+                await connection.close()
+
+        asyncio.run(exercise())
+
+    def test_global_blocker_classification_rejects_concurrent_queue_mutation(self):
+        async def exercise():
+            connection = await self._connect()
+            mutator = await self._connect()
+            try:
+                await self._reset(connection)
+                await self._insert_operation(
+                    connection,
+                    SELECTED_ID,
+                    status="failed",
+                )
+                await connection.execute(
+                    "UPDATE public.hindsight_migration_generation "
+                    "SET generation = 123 WHERE singleton"
+                )
+
+                class InterleavingConnection:
+                    def __init__(self, observed, writer):
+                        self.observed = observed
+                        self.writer = writer
+                        self.mutated = False
+
+                    def transaction(self, **arguments):
+                        return self.observed.transaction(**arguments)
+
+                    async def fetchrow(self, query, *arguments):
+                        return await self.observed.fetchrow(query, *arguments)
+
+                    async def fetch(self, query, *arguments):
+                        rows = await self.observed.fetch(query, *arguments)
+                        if not self.mutated:
+                            self.mutated = True
+                            await self._mutate_queue()
+                        return rows
+
+                    async def _mutate_queue(self):
+                        await OperationRecoveryPostgresTest._insert_operation(
+                            self.writer,
+                            NONSELECTED_ID,
+                            status="pending",
+                            worker_id="concurrent-worker",
+                            claimed_at=CLAIMED_AT,
+                        )
+
+                wrapped = InterleavingConnection(connection, mutator)
+                with self.assertRaisesRegex(
+                    OperationRecoveryError,
+                    "generation changed during queue blocker classification",
+                ):
+                    await read_global_queue_blockers(
+                        wrapped,
+                        profile_id="systalyze",
+                        schema="public",
+                        reference_cohort_operation_ids=[SELECTED_ID],
+                        reference_selected_operation_ids=[SELECTED_ID],
+                    )
+                self.assertTrue(wrapped.mutated)
+            finally:
+                await mutator.close()
+                await connection.close()
+
+        asyncio.run(exercise())
 
 
 if __name__ == "__main__":

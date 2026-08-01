@@ -244,6 +244,74 @@ PLAN_KEYS = frozenset(
         "plan_digest",
     }
 )
+QUEUE_BLOCKER_INPUT_KEYS = frozenset(
+    {
+        "operation_id",
+        "bank_id",
+        "operation_type",
+        "status",
+        "created_at",
+        "updated_at",
+        "completed_at",
+        "retry_count",
+        "next_retry_at",
+        "worker_id_present",
+        "worker_id_digest",
+        "claimed_at",
+        "task_payload_present",
+        "task_payload_digest",
+        "in_reference_cohort",
+        "in_reference_selected_set",
+        "blocker_reason",
+    }
+)
+QUEUE_BLOCKER_KEYS = QUEUE_BLOCKER_INPUT_KEYS | {"row_digest"}
+QUEUE_BLOCKER_REASONS = {
+    "processing": "processing",
+    "pending": "claimed_pending",
+    "failed": "claimed_failed",
+    "cancelled": "claimed_cancelled",
+}
+QUEUE_BLOCKER_SCOPE = {
+    "bank_ids": "all",
+    "operation_types": "all",
+    "statuses": list(QUEUE_BLOCKER_REASONS),
+    "completed_claims": "excluded",
+    "unclaimed_terminal_or_pending": "excluded",
+    "selected_failed_or_cancelled_claims": "excluded",
+    "processing_selection_exception": "none",
+}
+QUEUE_BLOCKER_CLASSIFICATION_KEYS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "authority",
+        "mutation_authorized",
+        "classifier_candidate_release",
+        "guard_reference_candidate_release",
+        "guard_contract_version",
+        "guard_contract_digest",
+        "reference_plan_digest",
+        "reference_plan_expired",
+        "reference_cohort_digest",
+        "reference_snapshot_digest",
+        "reference_selected_operation_ids_digest",
+        "installation_authority",
+        "profile_id",
+        "schema",
+        "generation_before",
+        "generation_after",
+        "scope",
+        "blocker_count",
+        "status_counts",
+        "bank_counts",
+        "operation_type_counts",
+        "blockers",
+        "observed_at",
+        "expires_at",
+        "classification_digest",
+    }
+)
 
 
 def _normalized(value: Any) -> Any:
@@ -1532,3 +1600,366 @@ def verify_requeue_plan(
     if _sha(plan["plan_digest"], "operation-recovery plan digest") != digest(body):
         raise OperationRecoveryError("operation-recovery plan digest differs")
     return {**body, "plan_digest": plan["plan_digest"]}
+
+
+def _queue_blocker(value: Any, *, include_digest: bool) -> dict[str, Any]:
+    keys = QUEUE_BLOCKER_KEYS if include_digest else QUEUE_BLOCKER_INPUT_KEYS
+    row = _closed(
+        _normalized(value),
+        keys,
+        "operation-recovery queue blocker",
+    )
+    status = _text(row["status"], "queue blocker status", maximum=32)
+    reason = _text(row["blocker_reason"], "queue blocker reason", maximum=32)
+    worker_present = row["worker_id_present"]
+    payload_present = row["task_payload_present"]
+    in_cohort = row["in_reference_cohort"]
+    in_selected = row["in_reference_selected_set"]
+    if (
+        status not in QUEUE_BLOCKER_REASONS
+        or reason != QUEUE_BLOCKER_REASONS[status]
+        or type(worker_present) is not bool
+        or type(payload_present) is not bool
+        or type(in_cohort) is not bool
+        or type(in_selected) is not bool
+        or (in_selected and not in_cohort)
+        or (in_selected and status != "processing")
+        or (status != "processing" and not worker_present and row["claimed_at"] is None)
+        or (not worker_present and row["worker_id_digest"] is not None)
+        or (not payload_present and row["task_payload_digest"] is not None)
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery queue blocker is invalid"
+        )
+    checked = {
+        "operation_id": _operation_id(row["operation_id"]),
+        "bank_id": _text(row["bank_id"], "queue blocker bank", maximum=256),
+        "operation_type": _text(
+            row["operation_type"],
+            "queue blocker operation type",
+            maximum=128,
+        ),
+        "status": status,
+        "created_at": _text(row["created_at"], "queue blocker created-at"),
+        "updated_at": _text(row["updated_at"], "queue blocker updated-at"),
+        "completed_at": _optional_text(
+            row["completed_at"],
+            "queue blocker completed-at",
+        ),
+        "retry_count": _integer(row["retry_count"], "queue blocker retry count"),
+        "next_retry_at": _optional_text(
+            row["next_retry_at"],
+            "queue blocker next-retry-at",
+        ),
+        "worker_id_present": worker_present,
+        "worker_id_digest": (
+            _sha(row["worker_id_digest"], "queue blocker worker digest")
+            if worker_present
+            else None
+        ),
+        "claimed_at": _optional_text(
+            row["claimed_at"],
+            "queue blocker claimed-at",
+        ),
+        "task_payload_present": payload_present,
+        "task_payload_digest": (
+            _sha(row["task_payload_digest"], "queue blocker payload digest")
+            if payload_present
+            else None
+        ),
+        "in_reference_cohort": in_cohort,
+        "in_reference_selected_set": in_selected,
+        "blocker_reason": reason,
+    }
+    row_digest = digest(checked)
+    if include_digest and _sha(
+        row["row_digest"],
+        "queue blocker row digest",
+    ) != row_digest:
+        raise OperationRecoveryError("queue blocker row digest differs")
+    return {**checked, "row_digest": row_digest}
+
+
+def _count_map(value: Any, label: str) -> dict[str, int]:
+    if not isinstance(value, Mapping):
+        raise OperationRecoveryError(f"{label} is invalid")
+    checked = {}
+    for key, count in value.items():
+        text = _text(key, f"{label} key", maximum=256)
+        checked[text] = _integer(count, f"{label} count", minimum=1)
+    if list(checked) != sorted(checked):
+        raise OperationRecoveryError(f"{label} is invalid")
+    return checked
+
+
+def _queue_blocker_counts(
+    blockers: Sequence[Mapping[str, Any]],
+    key: str,
+) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for blocker in blockers:
+        value = str(blocker[key])
+        counts[value] = counts.get(value, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def _queue_blocker_scope() -> dict[str, Any]:
+    return {
+        **QUEUE_BLOCKER_SCOPE,
+        "statuses": list(QUEUE_BLOCKER_SCOPE["statuses"]),
+    }
+
+
+def create_global_queue_blocker_classification(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    classifier_candidate_release: Mapping[str, Any],
+    reference_plan: Mapping[str, Any],
+    installation_authority: Mapping[str, Any],
+    generation_before: str,
+    generation_after: str,
+    guard_contract_version: int,
+    guard_contract_digest: str,
+    observed_at: int | None = None,
+) -> Mapping[str, Any]:
+    """Create expiring read-only evidence for the exact apply queue guard."""
+    observed = (
+        int(time.time())
+        if observed_at is None
+        else _integer(observed_at, "queue blocker observation time")
+    )
+    plan = verify_requeue_plan(
+        reference_plan,
+        now=observed,
+        allow_expired=True,
+    )
+    before = _text(generation_before, "queue blocker pre-generation")
+    after = _text(generation_after, "queue blocker post-generation")
+    if before != after:
+        raise OperationRecoveryError(
+            "migration generation changed during queue blocker classification"
+        )
+    authority = _installation_authority(installation_authority)
+    if authority != plan["installation_authority"]:
+        raise OperationRecoveryError(
+            "operation-recovery queue blocker authority differs"
+        )
+    if isinstance(rows, (str, bytes)) or not isinstance(rows, Sequence):
+        raise OperationRecoveryError("live operation evidence is invalid")
+    blockers = sorted(
+        (_queue_blocker(row, include_digest=False) for row in rows),
+        key=lambda item: (item["created_at"], item["operation_id"]),
+    )
+    identifiers = [item["operation_id"] for item in blockers]
+    if len(identifiers) != len(set(identifiers)):
+        raise OperationRecoveryError(
+            "operation-recovery queue blocker set contains duplicates"
+        )
+    reference_cohort_ids = {
+        item["operation_id"] for item in plan["cohort"]["operations"]
+    }
+    reference_selected_ids = {
+        item["operation_id"] for item in plan["selected_operations"]
+    }
+    if any(
+        item["in_reference_cohort"]
+        != (item["operation_id"] in reference_cohort_ids)
+        or item["in_reference_selected_set"]
+        != (item["operation_id"] in reference_selected_ids)
+        for item in blockers
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery queue blocker reference membership differs"
+        )
+    body = {
+        "schema_version": 1,
+        "kind": "operation-recovery-global-queue-blocker-classification",
+        "authority": "read-only-classification",
+        "mutation_authorized": False,
+        "classifier_candidate_release": _candidate_release(
+            classifier_candidate_release
+        ),
+        "guard_reference_candidate_release": plan["candidate_release"],
+        "guard_contract_version": _integer(
+            guard_contract_version,
+            "queue blocker guard contract version",
+            minimum=1,
+        ),
+        "guard_contract_digest": _sha(
+            guard_contract_digest,
+            "queue blocker guard contract digest",
+        ),
+        "reference_plan_digest": plan["plan_digest"],
+        "reference_plan_expired": observed >= plan["expires_at"],
+        "reference_cohort_digest": plan["cohort_digest"],
+        "reference_snapshot_digest": plan["snapshot_digest"],
+        "reference_selected_operation_ids_digest": digest(
+            sorted(reference_selected_ids)
+        ),
+        "installation_authority": authority,
+        "profile_id": "systalyze",
+        "schema": "public",
+        "generation_before": before,
+        "generation_after": after,
+        "scope": _queue_blocker_scope(),
+        "blocker_count": len(blockers),
+        "status_counts": _queue_blocker_counts(blockers, "status"),
+        "bank_counts": _queue_blocker_counts(blockers, "bank_id"),
+        "operation_type_counts": _queue_blocker_counts(
+            blockers,
+            "operation_type",
+        ),
+        "blockers": blockers,
+        "observed_at": observed,
+        "expires_at": observed + MAX_PLAN_LIFETIME_SECONDS,
+    }
+    return {**body, "classification_digest": digest(body)}
+
+
+def verify_global_queue_blocker_classification(
+    value: Any,
+    *,
+    now: int | None = None,
+    allow_expired: bool = False,
+) -> Mapping[str, Any]:
+    classification = _closed(
+        _normalized(value),
+        QUEUE_BLOCKER_CLASSIFICATION_KEYS,
+        "operation-recovery queue blocker classification",
+    )
+    blockers_value = classification["blockers"]
+    if not isinstance(blockers_value, list):
+        raise OperationRecoveryError(
+            "operation-recovery queue blocker classification is invalid"
+        )
+    blockers = [_queue_blocker(row, include_digest=True) for row in blockers_value]
+    identifiers = [item["operation_id"] for item in blockers]
+    if len(identifiers) != len(set(identifiers)):
+        raise OperationRecoveryError(
+            "operation-recovery queue blocker set contains duplicates"
+        )
+    if blockers != sorted(
+        blockers,
+        key=lambda item: (item["created_at"], item["operation_id"]),
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery queue blockers are not ordered"
+        )
+    observed = _integer(
+        classification["observed_at"],
+        "queue blocker observation time",
+    )
+    expires = _integer(
+        classification["expires_at"],
+        "queue blocker expiry time",
+    )
+    verified_at = (
+        int(time.time())
+        if now is None
+        else _integer(now, "queue blocker verification time")
+    )
+    if not allow_expired and verified_at >= expires:
+        raise OperationRecoveryError(
+            "operation-recovery queue blocker classification expired"
+        )
+    before = _text(
+        classification["generation_before"],
+        "queue blocker pre-generation",
+    )
+    after = _text(
+        classification["generation_after"],
+        "queue blocker post-generation",
+    )
+    status_counts = _count_map(
+        classification["status_counts"],
+        "queue blocker status counts",
+    )
+    bank_counts = _count_map(
+        classification["bank_counts"],
+        "queue blocker bank counts",
+    )
+    type_counts = _count_map(
+        classification["operation_type_counts"],
+        "queue blocker operation type counts",
+    )
+    if (
+        classification["schema_version"] != 1
+        or classification["kind"]
+        != "operation-recovery-global-queue-blocker-classification"
+        or classification["authority"] != "read-only-classification"
+        or classification["mutation_authorized"] is not False
+        or type(classification["reference_plan_expired"]) is not bool
+        or classification["profile_id"] != "systalyze"
+        or classification["schema"] != "public"
+        or before != after
+        or classification["scope"] != _queue_blocker_scope()
+        or classification["blocker_count"] != len(blockers)
+        or expires - observed != MAX_PLAN_LIFETIME_SECONDS
+        or status_counts != _queue_blocker_counts(blockers, "status")
+        or bank_counts != _queue_blocker_counts(blockers, "bank_id")
+        or type_counts != _queue_blocker_counts(blockers, "operation_type")
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery queue blocker classification is invalid"
+        )
+    body = {
+        "schema_version": 1,
+        "kind": "operation-recovery-global-queue-blocker-classification",
+        "authority": "read-only-classification",
+        "mutation_authorized": False,
+        "classifier_candidate_release": _candidate_release(
+            classification["classifier_candidate_release"]
+        ),
+        "guard_reference_candidate_release": _candidate_release(
+            classification["guard_reference_candidate_release"]
+        ),
+        "guard_contract_version": _integer(
+            classification["guard_contract_version"],
+            "queue blocker guard contract version",
+            minimum=1,
+        ),
+        "guard_contract_digest": _sha(
+            classification["guard_contract_digest"],
+            "queue blocker guard contract digest",
+        ),
+        "reference_plan_digest": _sha(
+            classification["reference_plan_digest"],
+            "queue blocker reference plan digest",
+        ),
+        "reference_plan_expired": classification["reference_plan_expired"],
+        "reference_cohort_digest": _sha(
+            classification["reference_cohort_digest"],
+            "queue blocker reference cohort digest",
+        ),
+        "reference_snapshot_digest": _sha(
+            classification["reference_snapshot_digest"],
+            "queue blocker reference snapshot digest",
+        ),
+        "reference_selected_operation_ids_digest": _sha(
+            classification["reference_selected_operation_ids_digest"],
+            "queue blocker selected operation IDs digest",
+        ),
+        "installation_authority": _installation_authority(
+            classification["installation_authority"]
+        ),
+        "profile_id": "systalyze",
+        "schema": "public",
+        "generation_before": before,
+        "generation_after": after,
+        "scope": _queue_blocker_scope(),
+        "blocker_count": len(blockers),
+        "status_counts": status_counts,
+        "bank_counts": bank_counts,
+        "operation_type_counts": type_counts,
+        "blockers": blockers,
+        "observed_at": observed,
+        "expires_at": expires,
+    }
+    if _sha(
+        classification["classification_digest"],
+        "queue blocker classification digest",
+    ) != digest(body):
+        raise OperationRecoveryError(
+            "operation-recovery queue blocker classification digest differs"
+        )
+    return {**body, "classification_digest": classification["classification_digest"]}

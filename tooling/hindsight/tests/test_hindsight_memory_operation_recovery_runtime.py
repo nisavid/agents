@@ -18,11 +18,16 @@ if str(LIB) not in sys.path:
     sys.path.insert(0, str(LIB))
 
 from hindsight_memory_control_plane.operation_recovery_runtime import (  # noqa: E402
+    GLOBAL_QUEUE_BLOCKER_QUERY,
+    QUEUE_BLOCKER_GUARD_CONTRACT_DIGEST,
+    QUEUE_BLOCKER_GUARD_CONTRACT_VERSION,
+    QUEUE_BLOCKER_PREDICATE,
     SAFE_OPERATION_QUERY,
     apply_requeue_transaction,
     assert_connected_live_database,
     connect_verified_local_postgres,
     live_row_digest,
+    read_global_queue_blockers,
     read_snapshot,
     rollback_requeue_transaction,
 )
@@ -181,6 +186,191 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         self.assertIn("task_payload_digest", select_list)
         self.assertIn("worker_id_digest", select_list)
         self.assertIn("error_digest", select_list)
+
+    def test_global_queue_blockers_share_the_apply_guard_and_are_payload_free(self):
+        class BlockerConnection(FakeConnection):
+            async def fetch(self, query, *arguments):
+                self.fetch_calls.append((query, arguments))
+                return [
+                    {
+                        "operation_id": (
+                            "00000000-0000-4000-8000-000000000099"
+                        ),
+                        "bank_id": "another-bank",
+                        "operation_type": "another-operation",
+                        "status": "pending",
+                        "created_at": "2026-07-29T12:00:00.000000Z",
+                        "updated_at": "2026-07-29T13:00:00.000000Z",
+                        "completed_at": None,
+                        "retry_count": 1,
+                        "next_retry_at": None,
+                        "worker_id_present": True,
+                        "worker_id_digest": "6" * 64,
+                        "claimed_at": "2026-07-29T12:30:00.000000Z",
+                        "task_payload_present": True,
+                        "task_payload_digest": "7" * 64,
+                        "in_reference_cohort": False,
+                        "in_reference_selected_set": False,
+                        "blocker_reason": "claimed_pending",
+                    }
+                ]
+
+        connection = BlockerConnection()
+        before, after, rows = asyncio.run(
+            read_global_queue_blockers(
+                connection,
+                profile_id="systalyze",
+                schema="public",
+                reference_cohort_operation_ids=[
+                    "00000000-0000-4000-8000-000000000001",
+                    "00000000-0000-4000-8000-000000000002",
+                ],
+                reference_selected_operation_ids=[
+                    "00000000-0000-4000-8000-000000000002"
+                ],
+            )
+        )
+
+        self.assertEqual((before, after), (
+            "systalyze:public:123",
+            "systalyze:public:123",
+        ))
+        self.assertEqual(
+            connection.transaction_arguments,
+            {"isolation": "repeatable_read", "readonly": True},
+        )
+        self.assertEqual(rows[0]["bank_id"], "another-bank")
+        self.assertEqual(rows[0]["operation_type"], "another-operation")
+        query, arguments = connection.fetch_calls[0]
+        self.assertEqual(
+            [[str(value) for value in group] for group in arguments],
+            [
+                ["00000000-0000-4000-8000-000000000002"],
+                [
+                    "00000000-0000-4000-8000-000000000001",
+                    "00000000-0000-4000-8000-000000000002",
+                ],
+            ],
+        )
+        self.assertEqual(connection.generation_reads, 2)
+        self.assertIn(QUEUE_BLOCKER_PREDICATE, query)
+        self.assertIn(QUEUE_BLOCKER_PREDICATE, GLOBAL_QUEUE_BLOCKER_QUERY)
+        self.assertEqual(QUEUE_BLOCKER_GUARD_CONTRACT_VERSION, 1)
+        self.assertEqual(len(QUEUE_BLOCKER_GUARD_CONTRACT_DIGEST), 64)
+        select_list = GLOBAL_QUEUE_BLOCKER_QUERY.split(
+            "FROM {schema}.async_operations"
+        )[0]
+        self.assertNotIn("task_payload AS", select_list)
+        self.assertNotIn("error_message", select_list)
+        self.assertNotIn("worker_id AS", select_list)
+        self.assertIn("task_payload_digest", select_list)
+        self.assertIn("worker_id_digest", select_list)
+
+    def test_global_queue_blocker_generation_reads_bracket_the_snapshot(self):
+        class BracketConnection(FakeConnection):
+            def __init__(self):
+                super().__init__()
+                self.in_transaction = False
+                self.events = []
+
+            @asynccontextmanager
+            async def transaction(self, **arguments):
+                self.transaction_arguments = arguments
+                self.in_transaction = True
+                self.events.append("transaction_enter")
+                try:
+                    yield
+                finally:
+                    self.events.append("transaction_exit")
+                    self.in_transaction = False
+
+            async def fetchrow(self, query, *arguments):
+                self.assert_generation_outside_transaction()
+                self.events.append("generation")
+                return await super().fetchrow(query, *arguments)
+
+            async def fetch(self, query, *arguments):
+                if not self.in_transaction:
+                    raise AssertionError("blocker query must use a snapshot")
+                self.events.append("blockers")
+                return await super().fetch(query, *arguments)
+
+            def assert_generation_outside_transaction(self):
+                if self.in_transaction:
+                    raise AssertionError(
+                        "generation reads must bracket the snapshot"
+                    )
+
+        connection = BracketConnection()
+        asyncio.run(
+            read_global_queue_blockers(
+                connection,
+                profile_id="systalyze",
+                schema="public",
+                reference_cohort_operation_ids=[
+                    "00000000-0000-4000-8000-000000000001",
+                    "00000000-0000-4000-8000-000000000002",
+                ],
+                reference_selected_operation_ids=[
+                    "00000000-0000-4000-8000-000000000002"
+                ],
+            )
+        )
+
+        self.assertEqual(
+            connection.events,
+            [
+                "generation",
+                "transaction_enter",
+                "blockers",
+                "transaction_exit",
+                "generation",
+            ],
+        )
+
+    def test_global_queue_blocker_rejects_invalid_reference_sets(self):
+        invalid_sets = (
+            (
+                [
+                    "00000000-0000-4000-8000-000000000001",
+                    "00000000-0000-4000-8000-000000000001",
+                ],
+                ["00000000-0000-4000-8000-000000000001"],
+                "contains duplicates",
+            ),
+            (
+                ["00000000-0000-4000-8000-000000000001"],
+                [
+                    "00000000-0000-4000-8000-000000000001",
+                    "00000000-0000-4000-8000-000000000001",
+                ],
+                "contains duplicates",
+            ),
+            (
+                ["00000000-0000-4000-8000-000000000001"],
+                [],
+                "is empty",
+            ),
+            (
+                ["00000000-0000-4000-8000-000000000001"],
+                ["00000000-0000-4000-8000-000000000002"],
+                "not a cohort subset",
+            ),
+        )
+        for cohort_ids, selected_ids, message in invalid_sets:
+            with self.subTest(message=message), self.assertRaisesRegex(
+                OperationRecoveryError,
+                message,
+            ):
+                asyncio.run(
+                    read_global_queue_blockers(
+                        FakeConnection(),
+                        profile_id="systalyze",
+                        schema="public",
+                        reference_cohort_operation_ids=cohort_ids,
+                        reference_selected_operation_ids=selected_ids,
+                    )
+                )
 
     def test_apply_allows_bound_claim_on_selected_terminal_row(self):
         before = {

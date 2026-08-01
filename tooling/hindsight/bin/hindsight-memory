@@ -156,6 +156,7 @@ from hindsight_memory_control_plane.portable_install import (  # noqa: E402
 from hindsight_memory_control_plane.operation_recovery import (  # noqa: E402
     OperationRecoveryError,
     create_cohort_manifest,
+    create_global_queue_blocker_classification,
     create_live_snapshot,
     create_requeue_plan,
     normalize_pg0_binding,
@@ -164,10 +165,13 @@ from hindsight_memory_control_plane.operation_recovery import (  # noqa: E402
     verify_requeue_plan,
 )
 from hindsight_memory_control_plane.operation_recovery_runtime import (  # noqa: E402
+    QUEUE_BLOCKER_GUARD_CONTRACT_DIGEST,
+    QUEUE_BLOCKER_GUARD_CONTRACT_VERSION,
     apply_requeue_transaction,
     assert_connected_live_database,
     connect_verified_local_postgres,
     live_row_digest,
+    read_global_queue_blockers,
     read_pg0_registration,
     read_restore_identity,
     read_selected_preimage,
@@ -6171,6 +6175,99 @@ def operation_recovery_classify_live_command(args: argparse.Namespace) -> int:
     )
 
 
+async def _classify_global_queue_blockers(
+    args: argparse.Namespace,
+    reference_plan: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    connection = await _operation_recovery_connect_live(args)
+    try:
+        system_identifier_before = await connection.fetchval(
+            "SELECT system_identifier::text FROM pg_control_system()"
+        )
+        authority_before = _operation_recovery_authority(
+            args,
+            postgres_system_identifier=system_identifier_before,
+        )
+        generation_before, generation_after, rows = (
+            await read_global_queue_blockers(
+                connection,
+                profile_id="systalyze",
+                schema="public",
+                reference_cohort_operation_ids=[
+                    item["operation_id"]
+                    for item in reference_plan["cohort"]["operations"]
+                ],
+                reference_selected_operation_ids=[
+                    item["operation_id"]
+                    for item in reference_plan["selected_operations"]
+                ],
+            )
+        )
+        system_identifier_after = await connection.fetchval(
+            "SELECT system_identifier::text FROM pg_control_system()"
+        )
+        authority_after = _operation_recovery_authority(
+            args,
+            postgres_system_identifier=system_identifier_after,
+        )
+        if (
+            system_identifier_before != system_identifier_after
+            or authority_before != authority_after
+            or authority_before != reference_plan["installation_authority"]
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery queue blocker authority drifted"
+            )
+        return create_global_queue_blocker_classification(
+            rows,
+            classifier_candidate_release=candidate,
+            reference_plan=reference_plan,
+            installation_authority=authority_after,
+            generation_before=generation_before,
+            generation_after=generation_after,
+            guard_contract_version=QUEUE_BLOCKER_GUARD_CONTRACT_VERSION,
+            guard_contract_digest=QUEUE_BLOCKER_GUARD_CONTRACT_DIGEST,
+        )
+    finally:
+        await connection.close()
+
+
+def operation_recovery_classify_queue_blockers_command(
+    args: argparse.Namespace,
+) -> int:
+    candidate = _operation_recovery_candidate(args)
+    reference_plan = verify_requeue_plan(
+        _operation_recovery_read_private_json(
+            args.reference_plan,
+            "operation recovery reference plan",
+        ),
+        allow_expired=True,
+    )
+    classification = asyncio.run(
+        _classify_global_queue_blockers(args, reference_plan, candidate)
+    )
+    candidate_after = _operation_recovery_candidate(args)
+    if (
+        candidate_after != candidate
+        or classification["classifier_candidate_release"] != candidate_after
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery candidate drifted during queue blocker "
+            "classification"
+        )
+    write_private(args.output, classification, create_only=True)
+    return _print_result(
+        {
+            "status": "classified",
+            "classification_digest": classification["classification_digest"],
+            "blocker_count": classification["blocker_count"],
+            "expires_at": classification["expires_at"],
+            "output": str(Path(args.output).resolve()),
+        }
+    )
+
+
 def operation_recovery_plan_command(args: argparse.Namespace) -> int:
     candidate = _operation_recovery_candidate(args)
     age = _operation_recovery_tool(Path(args.age), "age")
@@ -7867,6 +7964,16 @@ def parser() -> argparse.ArgumentParser:
     recovery_live.add_argument("--cohort", required=True)
     recovery_live.add_argument("--output", required=True)
     recovery_live.set_defaults(run=operation_recovery_classify_live_command)
+
+    recovery_queue_blockers = operation_recovery_commands.add_parser(
+        "classify-queue-blockers"
+    )
+    add_operation_recovery_authority(recovery_queue_blockers)
+    recovery_queue_blockers.add_argument("--reference-plan", required=True)
+    recovery_queue_blockers.add_argument("--output", required=True)
+    recovery_queue_blockers.set_defaults(
+        run=operation_recovery_classify_queue_blockers_command
+    )
 
     recovery_plan = operation_recovery_commands.add_parser("plan")
     add_operation_recovery_authority(recovery_plan)

@@ -13,10 +13,12 @@ from hindsight_memory_control_plane.canonical import digest  # noqa: E402
 from hindsight_memory_control_plane.operation_recovery import (  # noqa: E402
     OperationRecoveryError,
     create_cohort_manifest,
+    create_global_queue_blocker_classification,
     create_live_snapshot,
     create_requeue_plan,
     normalize_pg0_binding,
     verify_cohort_manifest,
+    verify_global_queue_blocker_classification,
     verify_live_snapshot,
     verify_requeue_plan,
 )
@@ -202,6 +204,289 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 installation_authority=installation_authority(),
                 observed_at=1_785_401_000,
             )
+        )
+
+    def requeue_plan(self) -> dict:
+        return dict(
+            create_requeue_plan(
+                self.cohort(),
+                self.live_snapshot(),
+                candidate_release=release_identity(),
+                rollback_backup=rollback_backup_evidence(),
+                rollback_encryption=rollback_encryption(),
+                rollback_backup_path="/private/tmp/queue-blocker-backup.age",
+                rollback_bundle_path="/private/tmp/queue-blocker-bundle.age",
+                authorization_receipt_path=(
+                    "/private/tmp/queue-blocker-authorization.json"
+                ),
+                application_receipt_path=(
+                    "/private/tmp/queue-blocker-application.json"
+                ),
+                verification_receipt_path=(
+                    "/private/tmp/queue-blocker-verification.json"
+                ),
+                rollback_receipt_path=(
+                    "/private/tmp/queue-blocker-rollback.json"
+                ),
+                created_at=1_785_402_000,
+            )
+        )
+
+    @staticmethod
+    def queue_blocker_row() -> dict:
+        return {
+            "operation_id": "00000000-0000-4000-8000-000000000099",
+            "bank_id": "unexpected-bank",
+            "operation_type": "unexpected-operation",
+            "status": "pending",
+            "created_at": "2026-07-29T12:00:00.000000Z",
+            "updated_at": "2026-07-29T13:00:00.000000Z",
+            "completed_at": None,
+            "retry_count": 2,
+            "next_retry_at": None,
+            "worker_id_present": True,
+            "worker_id_digest": "6" * 64,
+            "claimed_at": "2026-07-29T12:30:00.000000Z",
+            "task_payload_present": True,
+            "task_payload_digest": "7" * 64,
+            "in_reference_cohort": False,
+            "in_reference_selected_set": False,
+            "blocker_reason": "claimed_pending",
+        }
+
+    def selected_queue_blocker_row(self, reference_plan, status) -> dict:
+        selected = reference_plan["selected_operations"][0]
+        return {
+            **self.queue_blocker_row(),
+            "operation_id": selected["operation_id"],
+            "bank_id": "engineering",
+            "operation_type": selected["operation_type"],
+            "status": status,
+            "completed_at": (
+                None
+                if status == "processing"
+                else "2026-07-29T13:00:00.000000Z"
+            ),
+            "in_reference_cohort": True,
+            "in_reference_selected_set": True,
+            "blocker_reason": (
+                "processing" if status == "processing" else f"claimed_{status}"
+            ),
+        }
+
+    def queue_blocker_classification(
+        self,
+        rows=None,
+        *,
+        reference_plan=None,
+        authority=None,
+    ):
+        reference_plan = reference_plan or self.requeue_plan()
+        return create_global_queue_blocker_classification(
+            [self.queue_blocker_row()] if rows is None else rows,
+            classifier_candidate_release={
+                "source_commit": "9" * 40,
+                "version": "2026.07.31+9999999.operation-recovery.6",
+                "release_digest": "8" * 64,
+            },
+            reference_plan=reference_plan,
+            installation_authority=authority or installation_authority(),
+            generation_before="systalyze:public:123",
+            generation_after="systalyze:public:123",
+            guard_contract_version=1,
+            guard_contract_digest="a" * 64,
+            observed_at=reference_plan["expires_at"] + 1,
+        )
+
+    def test_global_queue_blocker_classification_is_closed_and_read_only(self):
+        row = self.queue_blocker_row()
+        classification = self.queue_blocker_classification([row])
+
+        self.assertEqual(
+            verify_global_queue_blocker_classification(
+                classification,
+                now=classification["observed_at"],
+            ),
+            classification,
+        )
+        self.assertEqual(classification["authority"], "read-only-classification")
+        self.assertIs(classification["mutation_authorized"], False)
+        self.assertIs(classification["reference_plan_expired"], True)
+        self.assertEqual(
+            classification["expires_at"],
+            classification["observed_at"] + 3600,
+        )
+        self.assertEqual(classification["blocker_count"], 1)
+        self.assertEqual(classification["status_counts"], {"pending": 1})
+        self.assertEqual(classification["bank_counts"], {"unexpected-bank": 1})
+        self.assertEqual(
+            classification["operation_type_counts"],
+            {"unexpected-operation": 1},
+        )
+        self.assertEqual(
+            classification["blockers"][0]["row_digest"],
+            digest(row),
+        )
+        blocker = classification["blockers"][0]
+        self.assertNotIn("task_payload", blocker)
+        self.assertNotIn("error_message", blocker)
+        self.assertNotIn("worker_id", blocker)
+        with self.assertRaises(OperationRecoveryError):
+            verify_requeue_plan(classification, allow_expired=True)
+
+    def test_global_queue_blocker_classification_rejects_authority_drift(self):
+        drifted_authority = installation_authority()
+        drifted_authority["install_state_digest"] = "0" * 64
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "authority differs",
+        ):
+            self.queue_blocker_classification(
+                authority=drifted_authority,
+            )
+
+    def test_global_queue_blocker_classification_rejects_selected_terminal_row(self):
+        reference_plan = self.requeue_plan()
+        selected_row = self.selected_queue_blocker_row(reference_plan, "failed")
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "queue blocker is invalid",
+        ):
+            self.queue_blocker_classification(
+                [selected_row],
+                reference_plan=reference_plan,
+            )
+
+    def test_global_queue_blocker_classification_accepts_selected_processing(self):
+        reference_plan = self.requeue_plan()
+        selected_processing = self.selected_queue_blocker_row(
+            reference_plan,
+            "processing",
+        )
+        classification = self.queue_blocker_classification(
+            [selected_processing],
+            reference_plan=reference_plan,
+        )
+        self.assertEqual(
+            classification["status_counts"],
+            {"processing": 1},
+        )
+
+    def test_global_queue_blocker_classification_rejects_invalid_row_evidence(self):
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "live operation evidence is invalid",
+        ):
+            self.queue_blocker_classification(
+                "not-row-evidence",
+            )
+
+    def test_global_queue_blocker_verification_rejects_duplicate_ids(self):
+        classification = self.queue_blocker_classification()
+        duplicate = deepcopy(classification)
+        duplicate["blockers"].append(deepcopy(duplicate["blockers"][0]))
+        duplicate["blocker_count"] = 2
+        duplicate["status_counts"]["pending"] = 2
+        duplicate["bank_counts"]["unexpected-bank"] = 2
+        duplicate["operation_type_counts"]["unexpected-operation"] = 2
+        duplicate["classification_digest"] = digest(
+            {
+                key: value
+                for key, value in duplicate.items()
+                if key != "classification_digest"
+            }
+        )
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "contains duplicates",
+        ):
+            verify_global_queue_blocker_classification(
+                duplicate,
+                allow_expired=True,
+            )
+
+    def test_global_queue_blocker_verification_rejects_digest_tampering(self):
+        tampered = deepcopy(self.queue_blocker_classification())
+        tampered["guard_contract_version"] = 2
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "classification digest differs",
+        ):
+            verify_global_queue_blocker_classification(
+                tampered,
+                allow_expired=True,
+            )
+
+    def test_global_queue_blocker_verification_rejects_row_digest_tampering(self):
+        tampered = deepcopy(self.queue_blocker_classification())
+        tampered["blockers"][0]["row_digest"] = "0" * 64
+        tampered["classification_digest"] = digest(
+            {
+                key: value
+                for key, value in tampered.items()
+                if key != "classification_digest"
+            }
+        )
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "row digest differs",
+        ):
+            verify_global_queue_blocker_classification(
+                tampered,
+                allow_expired=True,
+            )
+
+    def test_global_queue_blocker_verification_rejects_reordered_rows(self):
+        first = self.queue_blocker_row()
+        second = {
+            **first,
+            "operation_id": "00000000-0000-4000-8000-000000000098",
+            "created_at": "2026-07-29T13:00:00.000000Z",
+        }
+        reordered = deepcopy(self.queue_blocker_classification([first, second]))
+        reordered["blockers"].reverse()
+        reordered["classification_digest"] = digest(
+            {
+                key: value
+                for key, value in reordered.items()
+                if key != "classification_digest"
+            }
+        )
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "are not ordered",
+        ):
+            verify_global_queue_blocker_classification(
+                reordered,
+                allow_expired=True,
+            )
+
+    def test_global_queue_blocker_verification_rejects_expired_artifact(self):
+        classification = self.queue_blocker_classification()
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "classification expired",
+        ):
+            verify_global_queue_blocker_classification(
+                classification,
+                now=classification["expires_at"],
+            )
+        self.assertEqual(
+            verify_global_queue_blocker_classification(
+                classification,
+                now=classification["expires_at"],
+                allow_expired=True,
+            ),
+            classification,
+        )
+
+    def test_global_queue_blocker_scope_isolation(self):
+        classification = self.queue_blocker_classification()
+        classification["scope"]["statuses"].append("mutated")
+        fresh = self.queue_blocker_classification()
+        self.assertEqual(
+            fresh["scope"]["statuses"],
+            ["processing", "pending", "failed", "cancelled"],
         )
 
     def test_backup_manifest_freezes_exact_authorized_cohort_without_payloads(self):

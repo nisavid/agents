@@ -109,6 +109,61 @@ WHERE bank_id = $1
   AND ($4::text[] IS NULL OR status = ANY($4::text[]))
 ORDER BY created_at, operation_id
 """
+QUEUE_BLOCKER_PREDICATE = """(
+    status = 'processing'
+    OR (
+        status IN ('pending', 'failed', 'cancelled')
+        AND (worker_id IS NOT NULL OR claimed_at IS NOT NULL)
+        AND NOT (operation_id = ANY($1::uuid[]))
+    )
+)"""
+QUEUE_BLOCKER_GUARD_CONTRACT_VERSION = 1
+QUEUE_BLOCKER_GUARD_CONTRACT_DIGEST = digest(
+    {
+        "version": QUEUE_BLOCKER_GUARD_CONTRACT_VERSION,
+        "predicate": QUEUE_BLOCKER_PREDICATE,
+    }
+)
+GLOBAL_QUEUE_BLOCKER_QUERY = f"""
+SELECT
+    operation_id::text AS operation_id,
+    bank_id,
+    operation_type,
+    status,
+    to_char(created_at AT TIME ZONE 'UTC',
+            'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS created_at,
+    to_char(updated_at AT TIME ZONE 'UTC',
+            'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS updated_at,
+    CASE WHEN completed_at IS NULL THEN NULL
+         ELSE to_char(completed_at AT TIME ZONE 'UTC',
+                      'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') END AS completed_at,
+    retry_count,
+    CASE WHEN next_retry_at IS NULL THEN NULL
+         ELSE to_char(next_retry_at AT TIME ZONE 'UTC',
+                      'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') END AS next_retry_at,
+    (worker_id IS NOT NULL) AS worker_id_present,
+    CASE WHEN worker_id IS NULL THEN NULL
+         ELSE encode(sha256(convert_to(worker_id, 'UTF8')), 'hex')
+    END AS worker_id_digest,
+    CASE WHEN claimed_at IS NULL THEN NULL
+         ELSE to_char(claimed_at AT TIME ZONE 'UTC',
+                      'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') END AS claimed_at,
+    (task_payload IS NOT NULL) AS task_payload_present,
+    CASE WHEN task_payload IS NULL THEN NULL
+         ELSE encode(sha256(convert_to(task_payload::text, 'UTF8')), 'hex')
+    END AS task_payload_digest,
+    (operation_id = ANY($2::uuid[])) AS in_reference_cohort,
+    (operation_id = ANY($1::uuid[])) AS in_reference_selected_set,
+    CASE status
+        WHEN 'processing' THEN 'processing'
+        WHEN 'pending' THEN 'claimed_pending'
+        WHEN 'failed' THEN 'claimed_failed'
+        WHEN 'cancelled' THEN 'claimed_cancelled'
+    END AS blocker_reason
+FROM {{schema}}.async_operations
+WHERE {QUEUE_BLOCKER_PREDICATE}
+ORDER BY created_at, operation_id
+"""
 
 
 def _quoted_identifier(value: str, label: str) -> str:
@@ -468,6 +523,62 @@ async def read_safe_operation_rows(
     return [_mapping(row) for row in rows]
 
 
+async def read_global_queue_blockers(
+    connection: Any,
+    *,
+    profile_id: str,
+    schema: str,
+    reference_cohort_operation_ids: Sequence[str],
+    reference_selected_operation_ids: Sequence[str],
+) -> tuple[str, str, list[dict[str, Any]]]:
+    """Read every global apply-guard blocker without projecting payloads."""
+    quoted_schema = _quoted_identifier(schema, "database schema")
+    try:
+        cohort_identifiers = [
+            uuid.UUID(value) for value in reference_cohort_operation_ids
+        ]
+        selected_identifiers = [
+            uuid.UUID(value) for value in reference_selected_operation_ids
+        ]
+    except (AttributeError, TypeError, ValueError) as error:
+        raise OperationRecoveryError("operation ID set is invalid") from error
+    if (
+        len(cohort_identifiers) != len(set(cohort_identifiers))
+        or len(selected_identifiers) != len(set(selected_identifiers))
+    ):
+        raise OperationRecoveryError("operation ID set contains duplicates")
+    if not selected_identifiers:
+        raise OperationRecoveryError("selected operation ID set is empty")
+    if not set(selected_identifiers).issubset(cohort_identifiers):
+        raise OperationRecoveryError(
+            "selected operation ID set is not a cohort subset"
+        )
+    generation_before = await read_generation(
+        connection,
+        schema,
+        profile_id,
+    )
+    async with connection.transaction(
+        isolation="repeatable_read",
+        readonly=True,
+    ):
+        rows = await connection.fetch(
+            GLOBAL_QUEUE_BLOCKER_QUERY.format(schema=quoted_schema),
+            selected_identifiers,
+            cohort_identifiers,
+        )
+    generation_after = await read_generation(
+        connection,
+        schema,
+        profile_id,
+    )
+    if generation_before != generation_after:
+        raise OperationRecoveryError(
+            "migration generation changed during queue blocker classification"
+        )
+    return generation_before, generation_after, [_mapping(row) for row in rows]
+
+
 def live_row_digest(row: Mapping[str, Any]) -> str:
     """Calculate the row digest used by a live-snapshot operation entry."""
     body = {
@@ -619,12 +730,7 @@ async def apply_requeue_transaction(
             SELECT EXISTS (
                 SELECT 1
                 FROM {quoted_schema}.async_operations
-                WHERE status = 'processing'
-                   OR (
-                       status IN ('pending', 'failed', 'cancelled')
-                       AND (worker_id IS NOT NULL OR claimed_at IS NOT NULL)
-                       AND NOT (operation_id = ANY($1::uuid[]))
-                   )
+                WHERE {QUEUE_BLOCKER_PREDICATE}
             )
             """,
             identifiers,

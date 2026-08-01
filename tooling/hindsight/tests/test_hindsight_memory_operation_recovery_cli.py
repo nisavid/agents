@@ -624,6 +624,293 @@ class OperationRecoveryCliTest(unittest.TestCase):
             "/private/tmp",
         )
 
+    def test_queue_blocker_command_writes_only_read_only_safe_evidence(self):
+        command = self.controller[
+            "operation_recovery_classify_queue_blockers_command"
+        ]
+        globals_ = command.__globals__
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        reference_plan = fixtures.requeue_plan()
+        blocker = {
+            **fixtures.queue_blocker_row(),
+            "bank_id": "outside-bank",
+            "operation_type": "outside-type",
+            "retry_count": 1,
+        }
+        classification = self.controller[
+            "create_global_queue_blocker_classification"
+        ](
+            [blocker],
+            classifier_candidate_release={
+                "source_commit": "9" * 40,
+                "version": "2026.07.31+9999999.operation-recovery.6",
+                "release_digest": "8" * 64,
+            },
+            reference_plan=reference_plan,
+            installation_authority=recovery_fixtures.installation_authority(),
+            generation_before="systalyze:public:123",
+            generation_after="systalyze:public:123",
+            guard_contract_version=1,
+            guard_contract_digest="a" * 64,
+            observed_at=reference_plan["expires_at"] + 1,
+        )
+        written = {}
+
+        async def classify(_args, _plan, _candidate):
+            return classification
+
+        replacements = {
+            "_operation_recovery_candidate": (
+                lambda _args: classification["classifier_candidate_release"]
+            ),
+            "_operation_recovery_read_private_json": (
+                lambda _path, _label: reference_plan
+            ),
+            "_classify_global_queue_blockers": (
+                classify
+            ),
+            "write_private": (
+                lambda path, value, *, create_only: written.update(
+                    {path: (value, create_only)}
+                )
+            ),
+            "_print_result": lambda value: value,
+        }
+        originals = {key: globals_[key] for key in replacements}
+        globals_.update(replacements)
+        args = SimpleNamespace(
+            reference_plan="reference-plan.json",
+            output="global-queue-blockers.json",
+        )
+        try:
+            result = command(args)
+        finally:
+            globals_.update(originals)
+
+        self.assertEqual(
+            set(result),
+            {
+                "status",
+                "classification_digest",
+                "blocker_count",
+                "expires_at",
+                "output",
+            },
+        )
+        self.assertEqual(result["status"], "classified")
+        self.assertEqual(result["blocker_count"], 1)
+        self.assertNotIn("operation_id", result)
+        self.assertNotIn("bank_counts", result)
+        self.assertNotIn("operation_type_counts", result)
+        stored, create_only = written["global-queue-blockers.json"]
+        self.assertIs(create_only, True)
+        self.assertEqual(stored, classification)
+
+    def test_queue_blocker_command_rejects_candidate_drift(self):
+        command = self.controller[
+            "operation_recovery_classify_queue_blockers_command"
+        ]
+        globals_ = command.__globals__
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        reference_plan = fixtures.requeue_plan()
+        initial_candidate = {
+            "source_commit": "9" * 40,
+            "version": "2026.07.31+9999999.operation-recovery.6",
+            "release_digest": "8" * 64,
+        }
+        drifted_candidate = {
+            **initial_candidate,
+            "release_digest": "7" * 64,
+        }
+        classification = self.controller[
+            "create_global_queue_blocker_classification"
+        ](
+            [fixtures.queue_blocker_row()],
+            classifier_candidate_release=initial_candidate,
+            reference_plan=reference_plan,
+            installation_authority=recovery_fixtures.installation_authority(),
+            generation_before="systalyze:public:123",
+            generation_after="systalyze:public:123",
+            guard_contract_version=1,
+            guard_contract_digest="a" * 64,
+            observed_at=reference_plan["expires_at"] + 1,
+        )
+        candidates = iter((initial_candidate, drifted_candidate))
+
+        async def classify(_args, _plan, _candidate):
+            return classification
+
+        replacements = {
+            "_operation_recovery_candidate": lambda _args: next(candidates),
+            "_operation_recovery_read_private_json": (
+                lambda _path, _label: reference_plan
+            ),
+            "_classify_global_queue_blockers": classify,
+            "write_private": lambda *_args, **_kwargs: self.fail(
+                "drifted candidate must not write an artifact"
+            ),
+        }
+        originals = {key: globals_[key] for key in replacements}
+        globals_.update(replacements)
+        try:
+            with self.assertRaisesRegex(
+                self.controller["OperationRecoveryError"],
+                "candidate drifted during queue blocker classification",
+            ):
+                command(
+                    SimpleNamespace(
+                        reference_plan="reference-plan.json",
+                        output="global-queue-blockers.json",
+                    )
+                )
+        finally:
+            globals_.update(originals)
+
+    def _assert_queue_blocker_authority_drift(self, authorities):
+        classify = self.controller["_classify_global_queue_blockers"]
+        globals_ = classify.__globals__
+        reference_plan = (
+            recovery_fixtures.OperationRecoveryContractTest().requeue_plan()
+        )
+        candidate = {
+            "source_commit": "9" * 40,
+            "version": "2026.07.31+9999999.operation-recovery.6",
+            "release_digest": "8" * 64,
+        }
+        connection_closed = []
+
+        class Connection:
+            async def fetchval(self, _query):
+                return "7659746962107358086"
+
+            async def close(self):
+                connection_closed.append(True)
+
+        async def connect(_args):
+            return Connection()
+
+        async def read_blockers(_connection, **_arguments):
+            return "systalyze:public:123", "systalyze:public:123", []
+
+        authority_calls = []
+        authority_values = iter(authorities)
+
+        def authority(_args, *, postgres_system_identifier):
+            self.assertEqual(
+                postgres_system_identifier,
+                "7659746962107358086",
+            )
+            value = dict(next(authority_values))
+            authority_calls.append(value)
+            return value
+
+        replacements = {
+            "_operation_recovery_connect_live": connect,
+            "read_global_queue_blockers": read_blockers,
+            "_operation_recovery_authority": authority,
+        }
+        originals = {key: globals_[key] for key in replacements}
+        globals_.update(replacements)
+        try:
+            with self.assertRaisesRegex(Exception, "authority drifted"):
+                asyncio.run(
+                    classify(
+                        SimpleNamespace(),
+                        reference_plan,
+                        candidate,
+                    )
+                )
+        finally:
+            globals_.update(originals)
+
+        self.assertEqual(len(authority_calls), 2)
+        self.assertEqual(connection_closed, [True])
+
+    def test_queue_blocker_live_classification_rechecks_authority(self):
+        reference_plan = (
+            recovery_fixtures.OperationRecoveryContractTest().requeue_plan()
+        )
+        authority = reference_plan["installation_authority"]
+        drifted = {**authority, "install_state_digest": "0" * 64}
+        self._assert_queue_blocker_authority_drift([authority, drifted])
+
+    def test_queue_blocker_live_classification_rejects_reference_authority_drift(self):
+        reference_plan = (
+            recovery_fixtures.OperationRecoveryContractTest().requeue_plan()
+        )
+        drifted = {
+            **reference_plan["installation_authority"],
+            "install_state_digest": "0" * 64,
+        }
+        self._assert_queue_blocker_authority_drift([drifted, drifted])
+
+    def test_queue_blocker_live_classification_returns_bound_evidence(self):
+        classify = self.controller["_classify_global_queue_blockers"]
+        globals_ = classify.__globals__
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        reference_plan = fixtures.requeue_plan()
+        authority = reference_plan["installation_authority"]
+        candidate = {
+            "source_commit": "9" * 40,
+            "version": "2026.07.31+9999999.operation-recovery.6",
+            "release_digest": "8" * 64,
+        }
+        blocker = fixtures.queue_blocker_row()
+        closed = []
+
+        class Connection:
+            async def fetchval(self, _query):
+                return "7659746962107358086"
+
+            async def close(self):
+                closed.append(True)
+
+        async def connect(_args):
+            return Connection()
+
+        async def read_blockers(_connection, **_arguments):
+            return (
+                "systalyze:public:123",
+                "systalyze:public:123",
+                [blocker],
+            )
+
+        replacements = {
+            "_operation_recovery_connect_live": connect,
+            "read_global_queue_blockers": read_blockers,
+            "_operation_recovery_authority": (
+                lambda _args, *, postgres_system_identifier: authority
+            ),
+        }
+        originals = {key: globals_[key] for key in replacements}
+        globals_.update(replacements)
+        try:
+            result = asyncio.run(
+                classify(SimpleNamespace(), reference_plan, candidate)
+            )
+        finally:
+            globals_.update(originals)
+
+        expected = self.controller[
+            "create_global_queue_blocker_classification"
+        ](
+            [blocker],
+            classifier_candidate_release=candidate,
+            reference_plan=reference_plan,
+            installation_authority=authority,
+            generation_before="systalyze:public:123",
+            generation_after="systalyze:public:123",
+            guard_contract_version=self.controller[
+                "QUEUE_BLOCKER_GUARD_CONTRACT_VERSION"
+            ],
+            guard_contract_digest=self.controller[
+                "QUEUE_BLOCKER_GUARD_CONTRACT_DIGEST"
+            ],
+            observed_at=result["observed_at"],
+        )
+        self.assertEqual(result, expected)
+        self.assertEqual(closed, [True])
+
     def test_precommit_failure_removes_only_run_created_artifacts(self):
         cleanup = self.controller[
             "_operation_recovery_precommit_artifacts"

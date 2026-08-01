@@ -1167,6 +1167,37 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 now=planned_at,
             )
 
+        pair_tampered = deepcopy(plan)
+        codex_row = pair_tampered["selected_rows"][0]
+        engineering_row = pair_tampered["selected_rows"][-1]
+        codex_row["operation_type"] = "refresh_mental_model"
+        engineering_row["operation_type"] = "retain"
+        for row in (codex_row, engineering_row):
+            row_body = {
+                key: value
+                for key, value in row.items()
+                if key not in {"row_digest", "nonclaim_state_digest"}
+            }
+            row["row_digest"] = digest(row_body)
+        pair_tampered["selected_row_set_digest"] = digest(
+            [
+                {
+                    "operation_id": row["operation_id"],
+                    "row_digest": row["row_digest"],
+                    "nonclaim_state_digest": row["nonclaim_state_digest"],
+                }
+                for row in pair_tampered["selected_rows"]
+            ]
+        )
+        pair_body = {
+            key: value
+            for key, value in pair_tampered.items()
+            if key != "plan_digest"
+        }
+        pair_tampered["plan_digest"] = digest(pair_body)
+        with self.assertRaisesRegex(OperationRecoveryError, "plan is invalid"):
+            verify_claim_release_plan(pair_tampered, now=planned_at)
+
 
 if __name__ == "__main__":
     unittest.main()

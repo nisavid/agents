@@ -29,6 +29,10 @@ EXPECTED_CLAIM_RELEASE_TYPE_COUNTS = {
     "refresh_mental_model": 6,
     "retain": 37,
 }
+EXPECTED_CLAIM_RELEASE_PAIR_COUNTS = {
+    ("codex", "retain"): 37,
+    ("engineering", "refresh_mental_model"): 6,
+}
 OPERATION_STATUSES = (
     "pending",
     "processing",
@@ -2050,6 +2054,16 @@ def _claim_release_row_set_digest(
     )
 
 
+def _claim_release_pair_counts(
+    rows: Sequence[Mapping[str, Any]],
+) -> dict[tuple[str, str], int]:
+    counts: dict[tuple[str, str], int] = {}
+    for row in rows:
+        pair = (row["bank_id"], row["operation_type"])
+        counts[pair] = counts.get(pair, 0) + 1
+    return counts
+
+
 def _claim_release_artifact_paths(values: Mapping[str, Any]) -> dict[str, str]:
     labels = {
         "rollback_bundle_path": "claim-release rollback bundle path",
@@ -2133,6 +2147,8 @@ def create_claim_release_plan(
         != EXPECTED_CLAIM_RELEASE_BANK_COUNTS
         or predecessor["operation_type_counts"]
         != EXPECTED_CLAIM_RELEASE_TYPE_COUNTS
+        or _claim_release_pair_counts(predecessor["blockers"])
+        != EXPECTED_CLAIM_RELEASE_PAIR_COUNTS
     ):
         raise OperationRecoveryError(
             "operation-recovery claim-release classification differs"
@@ -2237,6 +2253,7 @@ def verify_claim_release_plan(
     row_status_counts = _queue_blocker_counts(rows, "status")
     row_bank_counts = _queue_blocker_counts(rows, "bank_id")
     row_type_counts = _queue_blocker_counts(rows, "operation_type")
+    row_pair_counts = _claim_release_pair_counts(rows)
     if (
         plan["schema_version"] != 1
         or plan["kind"] != "operation-recovery-claim-release-plan"
@@ -2257,6 +2274,7 @@ def verify_claim_release_plan(
         or status_counts != row_status_counts
         or bank_counts != row_bank_counts
         or type_counts != row_type_counts
+        or row_pair_counts != EXPECTED_CLAIM_RELEASE_PAIR_COUNTS
         or expires_at - created_at != MAX_PLAN_LIFETIME_SECONDS
     ):
         raise OperationRecoveryError(

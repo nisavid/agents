@@ -7102,6 +7102,11 @@ def operation_recovery_claim_release_apply_command(
                     ),
                 )
             )
+        transaction_candidate = _operation_recovery_candidate(args)
+        if transaction_candidate != candidate:
+            raise OperationRecoveryError(
+                "operation-recovery claim-release candidate drifted before apply"
+            )
         before, after = asyncio.run(
             _claim_release_apply(args, plan, precommit)
         )
@@ -7294,6 +7299,19 @@ def operation_recovery_claim_release_verify_command(
         evidence = asyncio.run(
             _claim_release_verify_live(args, plan, application)
         )
+        verified_authority = _operation_recovery_authority(
+            args,
+            postgres_system_identifier=(
+                EXPECTED_OPERATION_RECOVERY_INSTALLATION[
+                    "postgres_system_identifier"
+                ]
+            ),
+            lock_installer=False,
+        )
+        if verified_authority != authority:
+            raise OperationRecoveryError(
+                "operation-recovery claim-release authority drifted"
+            )
         if is_journal:
             application = _claim_release_finalize_application(application)
             write_private(plan["application_receipt_path"], application)
@@ -7302,7 +7320,7 @@ def operation_recovery_claim_release_verify_command(
             "kind": "operation-recovery-claim-release-verification-receipt",
             "plan_digest": plan["plan_digest"],
             "application_receipt_digest": application["receipt_digest"],
-            "installation_authority_digest": digest(authority),
+            "installation_authority_digest": digest(verified_authority),
             "evidence": evidence,
             "verified_at": int(time.time()),
         }
@@ -7479,6 +7497,12 @@ def operation_recovery_claim_release_rollback_command(
                 "receipt_digest": digest(journal_body),
             }
             write_private(rollback_path, journal, create_only=True)
+
+        transaction_candidate = _operation_recovery_candidate(args)
+        if transaction_candidate != candidate:
+            raise OperationRecoveryError(
+                "operation-recovery claim-release candidate drifted before rollback"
+            )
 
         async def rollback():
             connection = await _operation_recovery_connect_live(

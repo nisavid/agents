@@ -999,6 +999,337 @@ class OperationRecoveryCliTest(unittest.TestCase):
             journal["post_generation"],
         )
 
+    def test_claim_release_apply_rechecks_candidate_before_transaction(self):
+        command = self.controller[
+            "operation_recovery_claim_release_apply_command"
+        ]
+        globals_ = command.__globals__
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        planned_at = int(time.time())
+        predecessor, live, nonclaim_digests = fixtures.claim_release_inputs(
+            planned_at=planned_at,
+            live_generation="systalyze:public:123",
+        )
+        candidate = recovery_fixtures.release_identity()
+        authority = recovery_fixtures.installation_authority()
+        with tempfile.TemporaryDirectory(
+            dir="/private/tmp",
+            prefix="claim-release-apply-candidate-",
+        ) as directory:
+            root = Path(directory)
+            root.chmod(0o700)
+            plan = self.controller["create_claim_release_plan"](
+                predecessor,
+                live,
+                nonclaim_state_digests=nonclaim_digests,
+                candidate_release=candidate,
+                installation_authority=authority,
+                rollback_encryption=(
+                    recovery_fixtures.rollback_encryption()
+                ),
+                rollback_bundle_path=str(root / "rollback-bundle.json"),
+                authorization_receipt_path=str(root / "authorization.json"),
+                application_receipt_path=str(root / "application.json"),
+                verification_receipt_path=str(root / "verification.json"),
+                rollback_receipt_path=str(root / "rollback.json"),
+                created_at=planned_at,
+            )
+            drifted_candidate = {
+                **candidate,
+                "release_digest": "0" * 64,
+            }
+            candidates = iter((candidate, drifted_candidate))
+            written = {}
+
+            async def prepare(_args, _plan):
+                return {"ciphertext_sha256": "c" * 64}
+
+            async def apply(*_args, **_kwargs):
+                self.fail("candidate drift must prevent database apply")
+
+            class Manager:
+                pass
+
+            replacements = {
+                "_operation_recovery_candidate": (
+                    lambda _args: next(candidates)
+                ),
+                "_operation_recovery_read_private_json": (
+                    lambda _path, _label: plan
+                ),
+                "_claim_release_assert_guard": lambda _plan: None,
+                "_portable_manager": lambda _args: Manager(),
+                "_operation_recovery_precommit_artifacts": (
+                    lambda: nullcontext(
+                        {"mutation_attempted": False, "created": []}
+                    )
+                ),
+                "_operation_recovery_install_lock": (
+                    lambda _manager, *, expires_at: nullcontext()
+                ),
+                "_operation_recovery_lock": (
+                    lambda _manager, *, expires_at: nullcontext()
+                ),
+                "_operation_recovery_authority": (
+                    lambda _args, **_kwargs: authority
+                ),
+                "_claim_release_prepare_apply": prepare,
+                "_claim_release_apply": apply,
+                "_operation_recovery_artifact_identity": (
+                    lambda path: (path, "test")
+                ),
+                "write_private": (
+                    lambda path, value, **_kwargs: written.update(
+                        {str(path): value}
+                    )
+                ),
+            }
+            originals = {key: globals_[key] for key in replacements}
+            globals_.update(replacements)
+            try:
+                with self.assertRaisesRegex(Exception, "candidate drifted"):
+                    command(
+                        SimpleNamespace(
+                            plan="plan.json",
+                            approval_digest=plan["plan_digest"],
+                        )
+                    )
+            finally:
+                globals_.update(originals)
+
+        self.assertIn(plan["application_receipt_path"], written)
+
+    def test_claim_release_rollback_rechecks_candidate_before_transaction(self):
+        command = self.controller[
+            "operation_recovery_claim_release_rollback_command"
+        ]
+        globals_ = command.__globals__
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        planned_at = int(time.time())
+        predecessor, live, nonclaim_digests = fixtures.claim_release_inputs(
+            planned_at=planned_at,
+            live_generation="systalyze:public:123",
+        )
+        candidate = recovery_fixtures.release_identity()
+        authority = recovery_fixtures.installation_authority()
+        with tempfile.TemporaryDirectory(
+            dir="/private/tmp",
+            prefix="claim-release-rollback-candidate-",
+        ) as directory:
+            root = Path(directory)
+            root.chmod(0o700)
+            plan = self.controller["create_claim_release_plan"](
+                predecessor,
+                live,
+                nonclaim_state_digests=nonclaim_digests,
+                candidate_release=candidate,
+                installation_authority=authority,
+                rollback_encryption=(
+                    recovery_fixtures.rollback_encryption()
+                ),
+                rollback_bundle_path=str(root / "rollback-bundle.json"),
+                authorization_receipt_path=str(root / "authorization.json"),
+                application_receipt_path=str(root / "application.json"),
+                verification_receipt_path=str(root / "verification.json"),
+                rollback_receipt_path=str(root / "rollback.json"),
+                created_at=planned_at,
+            )
+            application = {
+                "kind": (
+                    "operation-recovery-claim-release-application-receipt"
+                ),
+                "pre_generation": plan["pre_generation"],
+                "post_generation": self.controller[
+                    "_operation_recovery_next_generation"
+                ](plan["pre_generation"]),
+                "receipt_digest": "b" * 64,
+            }
+            drifted_candidate = {
+                **candidate,
+                "release_digest": "0" * 64,
+            }
+            candidates = iter((candidate, drifted_candidate))
+            bundle = {
+                "ciphertext_base64": base64.b64encode(b"ciphertext").decode(
+                    "ascii"
+                )
+            }
+            preimage = {
+                "schema_version": 1,
+                "kind": self.controller["CLAIM_RELEASE_PREIMAGE_KIND"],
+                "plan_digest": plan["plan_digest"],
+                "rows": [],
+            }
+
+            class Manager:
+                def _lock(self):
+                    return nullcontext()
+
+            async def connect(*_args, **_kwargs):
+                self.fail("candidate drift must prevent database rollback")
+
+            documents = {
+                "plan.json": plan,
+                plan["application_receipt_path"]: application,
+            }
+            replacements = {
+                "_operation_recovery_candidate": (
+                    lambda _args: next(candidates)
+                ),
+                "_operation_recovery_read_private_json": (
+                    lambda path, _label: documents[str(path)]
+                ),
+                "_claim_release_assert_guard": lambda _plan: None,
+                "_claim_release_validate_application": (
+                    lambda _value, *, plan: application
+                ),
+                "_claim_release_validate_bundle": lambda _plan: bundle,
+                "_operation_recovery_tool": (
+                    lambda _path, _key: Path(
+                        plan["rollback_encryption"]["age_path"]
+                    )
+                ),
+                "EXPECTED_OPERATION_RECOVERY_TOOLCHAIN": {
+                    "age": {
+                        "sha256": plan["rollback_encryption"]["age_sha256"]
+                    }
+                },
+                "_operation_recovery_rollback_identity_path": (
+                    lambda _path: Path("/dev/null")
+                ),
+                "_age_decrypt_ciphertext": (
+                    lambda **_kwargs: json.dumps(preimage).encode("utf-8")
+                ),
+                "_portable_manager": lambda _args: Manager(),
+                "_operation_recovery_lock": (
+                    lambda _manager: nullcontext()
+                ),
+                "_operation_recovery_authority": (
+                    lambda _args, **_kwargs: authority
+                ),
+                "_operation_recovery_connect_live": connect,
+                "write_private": lambda *_args, **_kwargs: None,
+            }
+            originals = {key: globals_[key] for key in replacements}
+            globals_.update(replacements)
+            try:
+                with self.assertRaisesRegex(Exception, "candidate drifted"):
+                    command(
+                        SimpleNamespace(
+                            plan="plan.json",
+                            approval_digest=self.controller[
+                                "_claim_release_rollback_approval"
+                            ](plan, application),
+                            age=plan["rollback_encryption"]["age_path"],
+                            age_identity="/dev/null",
+                        )
+                    )
+            finally:
+                globals_.update(originals)
+
+    def test_claim_release_verify_rechecks_authority_after_live_evidence(self):
+        command = self.controller[
+            "operation_recovery_claim_release_verify_command"
+        ]
+        globals_ = command.__globals__
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        planned_at = int(time.time())
+        predecessor, live, nonclaim_digests = fixtures.claim_release_inputs(
+            planned_at=planned_at,
+            live_generation="systalyze:public:123",
+        )
+        authority = recovery_fixtures.installation_authority()
+        candidate = recovery_fixtures.release_identity()
+        with tempfile.TemporaryDirectory(
+            dir="/private/tmp",
+            prefix="claim-release-verify-authority-",
+        ) as directory:
+            root = Path(directory)
+            root.chmod(0o700)
+            plan = self.controller["create_claim_release_plan"](
+                predecessor,
+                live,
+                nonclaim_state_digests=nonclaim_digests,
+                candidate_release=candidate,
+                installation_authority=authority,
+                rollback_encryption=(
+                    recovery_fixtures.rollback_encryption()
+                ),
+                rollback_bundle_path=str(root / "rollback-bundle.json"),
+                authorization_receipt_path=str(root / "authorization.json"),
+                application_receipt_path=str(root / "application.json"),
+                verification_receipt_path=str(root / "verification.json"),
+                rollback_receipt_path=str(root / "rollback.json"),
+                created_at=planned_at,
+            )
+            application = {
+                "kind": (
+                    "operation-recovery-claim-release-application-receipt"
+                ),
+                "pre_generation": plan["pre_generation"],
+                "post_generation": self.controller[
+                    "_operation_recovery_next_generation"
+                ](plan["pre_generation"]),
+                "receipt_digest": "b" * 64,
+            }
+            documents = {
+                "plan.json": plan,
+                plan["application_receipt_path"]: application,
+            }
+            drifted_authority = {
+                **authority,
+                "install_state_digest": "0" * 64,
+            }
+            authorities = iter((authority, drifted_authority))
+            authority_calls = []
+
+            def read_authority(_args, **_kwargs):
+                value = next(authorities)
+                authority_calls.append(value)
+                return value
+
+            async def verify_live(_args, _plan, _application):
+                return {
+                    "generation": application["post_generation"],
+                    "selected_row_count": 43,
+                    "selected_row_set_digest": plan[
+                        "selected_row_set_digest"
+                    ],
+                }
+
+            class Manager:
+                def _lock(self):
+                    return nullcontext()
+
+            replacements = {
+                "_operation_recovery_candidate": lambda _args: candidate,
+                "_operation_recovery_read_private_json": (
+                    lambda path, _label: documents[str(path)]
+                ),
+                "_claim_release_assert_guard": lambda _plan: None,
+                "_claim_release_validate_application": (
+                    lambda _value, *, plan: application
+                ),
+                "_portable_manager": lambda _args: Manager(),
+                "_operation_recovery_lock": (
+                    lambda _manager: nullcontext()
+                ),
+                "_operation_recovery_authority": read_authority,
+                "_claim_release_verify_live": verify_live,
+                "write_private": lambda *_args, **_kwargs: self.fail(
+                    "authority drift must not write a receipt"
+                ),
+            }
+            originals = {key: globals_[key] for key in replacements}
+            globals_.update(replacements)
+            try:
+                with self.assertRaisesRegex(Exception, "authority drifted"):
+                    command(SimpleNamespace(plan="plan.json"))
+            finally:
+                globals_.update(originals)
+
+        self.assertEqual(authority_calls, [authority, drifted_authority])
+
     def test_queue_blocker_command_rejects_candidate_drift(self):
         command = self.controller[
             "operation_recovery_classify_queue_blockers_command"

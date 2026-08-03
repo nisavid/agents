@@ -23,6 +23,7 @@ import uuid
 from typing import Any
 
 from .operation_recovery import (
+    EXPECTED_CLAIM_RELEASE_PERMITTED_BLOCKER_COUNT,
     EXPECTED_CLAIM_RELEASE_ROW_COUNT,
     EXPECTED_OPERATION_COUNTS,
     OperationRecoveryError,
@@ -231,8 +232,8 @@ SELECT
     CASE WHEN task_payload IS NULL THEN NULL
          ELSE encode(sha256(convert_to(task_payload::text, 'UTF8')), 'hex')
     END AS task_payload_digest,
-    false AS in_reference_cohort,
-    false AS in_reference_selected_set,
+    (operation_id = ANY($2::uuid[])) AS in_reference_cohort,
+    (operation_id = ANY($3::uuid[])) AS in_reference_selected_set,
     CASE status
         WHEN 'processing' THEN 'processing'
         WHEN 'pending' THEN 'claimed_pending'
@@ -709,6 +710,8 @@ async def _fetch_claim_release_evidence(
     *,
     schema: str,
     identifiers: Sequence[uuid.UUID],
+    reference_cohort_identifiers: Sequence[uuid.UUID],
+    reference_selected_identifiers: Sequence[uuid.UUID],
     for_update: bool,
 ) -> list[dict[str, Any]]:
     quoted_schema = _quoted_identifier(schema, "database schema")
@@ -718,6 +721,8 @@ async def _fetch_claim_release_evidence(
             lock_clause="FOR UPDATE" if for_update else "",
         ),
         list(identifiers),
+        list(reference_cohort_identifiers),
+        list(reference_selected_identifiers),
     )
     return [_mapping(row) for row in rows]
 
@@ -728,10 +733,32 @@ async def read_claim_release_evidence(
     profile_id: str,
     schema: str,
     operation_ids: Sequence[str],
+    reference_cohort_operation_ids: Sequence[str],
+    reference_selected_operation_ids: Sequence[str],
     expected_generation: str,
 ) -> tuple[str, str, list[dict[str, Any]]]:
     """Read exact claim-cleanup evidence without projecting protected text."""
     identifiers = _operation_identifiers(operation_ids)
+    try:
+        reference_cohort_identifiers = [
+            uuid.UUID(value) for value in reference_cohort_operation_ids
+        ]
+        reference_selected_identifiers = [
+            uuid.UUID(value) for value in reference_selected_operation_ids
+        ]
+    except (AttributeError, TypeError, ValueError) as error:
+        raise OperationRecoveryError("operation ID set is invalid") from error
+    if (
+        len(reference_cohort_identifiers)
+        != len(set(reference_cohort_identifiers))
+        or len(reference_selected_identifiers)
+        != len(set(reference_selected_identifiers))
+        or not set(reference_selected_identifiers).issubset(
+            reference_cohort_identifiers
+        )
+        or not set(reference_selected_identifiers).issubset(identifiers)
+    ):
+        raise OperationRecoveryError("operation ID set is invalid")
     generation_before = await read_generation(connection, schema, profile_id)
     async with connection.transaction(
         isolation="repeatable_read",
@@ -741,6 +768,8 @@ async def read_claim_release_evidence(
             connection,
             schema=schema,
             identifiers=identifiers,
+            reference_cohort_identifiers=reference_cohort_identifiers,
+            reference_selected_identifiers=reference_selected_identifiers,
             for_update=False,
         )
     generation_after = await read_generation(connection, schema, profile_id)
@@ -789,6 +818,79 @@ def _claim_release_expected(plan: Mapping[str, Any]) -> dict[str, dict[str, Any]
     return expected
 
 
+def _claim_release_permitted_expected(
+    plan: Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    permitted_rows = plan.get("permitted_blocker_rows")
+    if (
+        not isinstance(permitted_rows, list)
+        or len(permitted_rows)
+        != EXPECTED_CLAIM_RELEASE_PERMITTED_BLOCKER_COUNT
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery claim-release permitted blocker set is invalid"
+        )
+    expected = {}
+    for item in permitted_rows:
+        if not isinstance(item, Mapping):
+            raise OperationRecoveryError(
+                "operation-recovery claim-release permitted blocker set is invalid"
+            )
+        operation_id = item.get("operation_id")
+        if (
+            not isinstance(operation_id, str)
+            or operation_id in expected
+            or item.get("in_reference_cohort") is not True
+            or item.get("in_reference_selected_set") is not True
+            or item.get("status") not in {"failed", "cancelled"}
+            or item.get("worker_id_present") is not True
+            or item.get("claimed_at") is None
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery claim-release permitted blocker set is invalid"
+            )
+        expected[operation_id] = dict(item)
+    _operation_identifiers(list(expected))
+    return expected
+
+
+def _claim_release_expected_sets(
+    plan: Mapping[str, Any],
+) -> tuple[
+    dict[str, dict[str, Any]],
+    dict[str, dict[str, Any]],
+    list[uuid.UUID],
+]:
+    selected = _claim_release_expected(plan)
+    permitted = _claim_release_permitted_expected(plan)
+    cohort_value = plan.get("reference_cohort_operation_ids")
+    if not isinstance(cohort_value, list):
+        raise OperationRecoveryError(
+            "operation-recovery claim-release reference cohort is invalid"
+        )
+    try:
+        cohort = [uuid.UUID(value) for value in cohort_value]
+    except (AttributeError, TypeError, ValueError) as error:
+        raise OperationRecoveryError(
+            "operation-recovery claim-release reference cohort is invalid"
+        ) from error
+    if set(selected) & set(permitted):
+        raise OperationRecoveryError(
+            "operation-recovery claim-release blocker sets overlap"
+        )
+    if (
+        len(cohort) != sum(EXPECTED_OPERATION_COUNTS.values())
+        or len(cohort) != len(set(cohort))
+        or not {
+            uuid.UUID(value) for value in permitted.keys()
+        }.issubset(cohort)
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery claim-release reference cohort is invalid"
+        )
+    return selected, permitted, cohort
+
+
 def _claim_release_before_matches(
     row: Mapping[str, Any],
     expected: Mapping[str, Any],
@@ -819,6 +921,29 @@ def _claim_release_after_matches(
         == {key: expected.get(key) for key in preserved_keys}
         and row.get("nonclaim_state_digest")
         == expected.get("nonclaim_state_digest")
+    )
+
+
+def _claim_release_groups_match(
+    rows_by_id: Mapping[str, Mapping[str, Any]],
+    expected: Mapping[str, Mapping[str, Any]],
+    permitted: Mapping[str, Mapping[str, Any]],
+    *,
+    selected_matches: Callable[
+        [Mapping[str, Any], Mapping[str, Any]],
+        bool,
+    ],
+) -> bool:
+    return (
+        set(rows_by_id) == set(expected) | set(permitted)
+        and all(
+            selected_matches(rows_by_id[operation_id], item)
+            for operation_id, item in expected.items()
+        )
+        and all(
+            _claim_release_before_matches(rows_by_id[operation_id], item)
+            for operation_id, item in permitted.items()
+        )
     )
 
 
@@ -1142,8 +1267,12 @@ async def apply_claim_release_transaction(
         GENERATION_TABLE,
         "migration generation table",
     )
-    expected = _claim_release_expected(plan)
+    expected, permitted, reference_cohort_identifiers = (
+        _claim_release_expected_sets(plan)
+    )
     identifiers = _operation_identifiers(list(expected))
+    permitted_identifiers = _operation_identifiers(list(permitted))
+    guard_identifiers = identifiers + permitted_identifiers
     expires_at = plan.get("expires_at")
     _assert_transaction_deadline(expires_at)
     async with connection.transaction(isolation="serializable"):
@@ -1196,7 +1325,7 @@ async def apply_claim_release_transaction(
                 WHERE {QUEUE_BLOCKER_PREDICATE}
             )
             """,
-            identifiers,
+            guard_identifiers,
         )
         if outside_blocker is not False:
             raise OperationRecoveryError(
@@ -1205,13 +1334,17 @@ async def apply_claim_release_transaction(
         rows = await _fetch_claim_release_evidence(
             connection,
             schema=schema,
-            identifiers=identifiers,
+            identifiers=guard_identifiers,
+            reference_cohort_identifiers=reference_cohort_identifiers,
+            reference_selected_identifiers=permitted_identifiers,
             for_update=True,
         )
         by_id = {row.get("operation_id"): row for row in rows}
-        if set(by_id) != set(expected) or any(
-            not _claim_release_before_matches(by_id[operation_id], item)
-            for operation_id, item in expected.items()
+        if not _claim_release_groups_match(
+            by_id,
+            expected,
+            permitted,
+            selected_matches=_claim_release_before_matches,
         ):
             raise OperationRecoveryError(
                 "operation-recovery claim-release selected row drifted"
@@ -1249,13 +1382,17 @@ async def apply_claim_release_transaction(
         post_rows = await _fetch_claim_release_evidence(
             connection,
             schema=schema,
-            identifiers=identifiers,
+            identifiers=guard_identifiers,
+            reference_cohort_identifiers=reference_cohort_identifiers,
+            reference_selected_identifiers=permitted_identifiers,
             for_update=False,
         )
         post = {row.get("operation_id"): row for row in post_rows}
-        if set(post) != set(expected) or any(
-            not _claim_release_after_matches(post[operation_id], item)
-            for operation_id, item in expected.items()
+        if not _claim_release_groups_match(
+            post,
+            expected,
+            permitted,
+            selected_matches=_claim_release_after_matches,
         ):
             raise OperationRecoveryError(
                 "operation-recovery claim-release post-state differs"
@@ -1512,8 +1649,12 @@ async def rollback_claim_release_transaction(
         GENERATION_TABLE,
         "migration generation table",
     )
-    expected = _claim_release_expected(plan)
+    expected, permitted, reference_cohort_identifiers = (
+        _claim_release_expected_sets(plan)
+    )
     identifiers = _operation_identifiers(list(expected))
+    permitted_identifiers = _operation_identifiers(list(permitted))
+    guard_identifiers = identifiers + permitted_identifiers
     preimage_by_id: dict[str, dict[str, Any]] = {}
     for raw in preimage:
         if not isinstance(raw, Mapping):
@@ -1600,7 +1741,7 @@ async def rollback_claim_release_transaction(
                 WHERE {QUEUE_BLOCKER_PREDICATE}
             )
             """,
-            identifiers,
+            guard_identifiers,
         )
         if outside_blocker is not False:
             raise OperationRecoveryError(
@@ -1609,17 +1750,18 @@ async def rollback_claim_release_transaction(
         rows = await _fetch_claim_release_evidence(
             connection,
             schema=schema,
-            identifiers=identifiers,
+            identifiers=guard_identifiers,
+            reference_cohort_identifiers=reference_cohort_identifiers,
+            reference_selected_identifiers=permitted_identifiers,
             for_update=True,
         )
         by_id = {row.get("operation_id"): row for row in rows}
         if generation_before == rollback_record.get("post_generation"):
-            if set(by_id) != set(expected) or any(
-                not _claim_release_before_matches(
-                    by_id[operation_id],
-                    item,
-                )
-                for operation_id, item in expected.items()
+            if not _claim_release_groups_match(
+                by_id,
+                expected,
+                permitted,
+                selected_matches=_claim_release_before_matches,
             ):
                 raise OperationRecoveryError(
                     "operation-recovery claim-release rollback post-state differs"
@@ -1628,9 +1770,11 @@ async def rollback_claim_release_transaction(
                 rollback_record["pre_generation"],
                 rollback_record["post_generation"],
             )
-        if set(by_id) != set(expected) or any(
-            not _claim_release_after_matches(by_id[operation_id], item)
-            for operation_id, item in expected.items()
+        if not _claim_release_groups_match(
+            by_id,
+            expected,
+            permitted,
+            selected_matches=_claim_release_after_matches,
         ):
             raise OperationRecoveryError(
                 "operation-recovery claim-release rollback state differs"
@@ -1677,13 +1821,17 @@ async def rollback_claim_release_transaction(
         post_rows = await _fetch_claim_release_evidence(
             connection,
             schema=schema,
-            identifiers=identifiers,
+            identifiers=guard_identifiers,
+            reference_cohort_identifiers=reference_cohort_identifiers,
+            reference_selected_identifiers=permitted_identifiers,
             for_update=False,
         )
         post = {row.get("operation_id"): row for row in post_rows}
-        if set(post) != set(expected) or any(
-            not _claim_release_before_matches(post[operation_id], item)
-            for operation_id, item in expected.items()
+        if not _claim_release_groups_match(
+            post,
+            expected,
+            permitted,
+            selected_matches=_claim_release_before_matches,
         ):
             raise OperationRecoveryError(
                 "operation-recovery claim-release rollback verification differs"

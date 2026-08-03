@@ -715,6 +715,8 @@ class OperationRecoveryCliTest(unittest.TestCase):
         predecessor, live, nonclaim_digests = fixtures.claim_release_inputs(
             planned_at=int(time.time())
         )
+        reference_plan = fixtures.requeue_plan()
+        permitted_rows = fixtures.permitted_blocker_rows(reference_plan)
         for classification in (predecessor, live):
             body = {
                 **{
@@ -739,12 +741,14 @@ class OperationRecoveryCliTest(unittest.TestCase):
         documents = {
             "predecessor.json": predecessor,
             "live.json": live,
+            "reference.json": reference_plan,
         }
         written = {}
 
-        async def evidence(_args, classification):
+        async def evidence(_args, classification, reference):
             self.assertEqual(classification, live)
-            return authority, nonclaim_digests
+            self.assertEqual(reference, reference_plan)
+            return authority, nonclaim_digests, permitted_rows
 
         replacements = {
             "_operation_recovery_candidate": lambda _args: candidate,
@@ -776,6 +780,7 @@ class OperationRecoveryCliTest(unittest.TestCase):
                 predecessor["classification_digest"]
             ),
             live_classification="live.json",
+            reference_plan="reference.json",
             age=encryption["age_path"],
             rollback_recipient=encryption["recipient"],
             rollback_bundle="/private/tmp/claim-release.bundle.json",
@@ -805,11 +810,13 @@ class OperationRecoveryCliTest(unittest.TestCase):
                 "plan_digest",
                 "expires_at",
                 "selected_row_count",
+                "permitted_blocker_count",
                 "output",
             },
         )
         self.assertEqual(result["status"], "planned")
         self.assertEqual(result["selected_row_count"], 43)
+        self.assertEqual(result["permitted_blocker_count"], 11)
         plan, create_only = written[args.output]
         self.assertIs(create_only, True)
         self.assertEqual(plan["authority"], "unapproved-plan")
@@ -882,6 +889,8 @@ class OperationRecoveryCliTest(unittest.TestCase):
             plan = self.controller["create_claim_release_plan"](
                 predecessor,
                 live,
+                reference_plan=fixtures.requeue_plan(),
+                permitted_blocker_rows=fixtures.permitted_blocker_rows(),
                 nonclaim_state_digests=nonclaim_digests,
                 candidate_release=candidate,
                 installation_authority=authority,
@@ -1021,6 +1030,8 @@ class OperationRecoveryCliTest(unittest.TestCase):
             plan = self.controller["create_claim_release_plan"](
                 predecessor,
                 live,
+                reference_plan=fixtures.requeue_plan(),
+                permitted_blocker_rows=fixtures.permitted_blocker_rows(),
                 nonclaim_state_digests=nonclaim_digests,
                 candidate_release=candidate,
                 installation_authority=authority,
@@ -1121,6 +1132,8 @@ class OperationRecoveryCliTest(unittest.TestCase):
             plan = self.controller["create_claim_release_plan"](
                 predecessor,
                 live,
+                reference_plan=fixtures.requeue_plan(),
+                permitted_blocker_rows=fixtures.permitted_blocker_rows(),
                 nonclaim_state_digests=nonclaim_digests,
                 candidate_release=candidate,
                 installation_authority=authority,
@@ -1249,6 +1262,8 @@ class OperationRecoveryCliTest(unittest.TestCase):
             plan = self.controller["create_claim_release_plan"](
                 predecessor,
                 live,
+                reference_plan=fixtures.requeue_plan(),
+                permitted_blocker_rows=fixtures.permitted_blocker_rows(),
                 nonclaim_state_digests=nonclaim_digests,
                 candidate_release=candidate,
                 installation_authority=authority,
@@ -1351,6 +1366,8 @@ class OperationRecoveryCliTest(unittest.TestCase):
             plan = self.controller["create_claim_release_plan"](
                 predecessor,
                 live,
+                reference_plan=fixtures.requeue_plan(),
+                permitted_blocker_rows=fixtures.permitted_blocker_rows(),
                 nonclaim_state_digests=nonclaim_digests,
                 candidate_release=candidate,
                 installation_authority=(

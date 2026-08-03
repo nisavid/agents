@@ -404,12 +404,15 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
                 ]
 
         connection = ClaimEvidenceConnection()
+        cohort_only_id = "00000000-0000-4000-8000-000000000002"
         before, after, rows = asyncio.run(
             read_claim_release_evidence(
                 connection,
                 profile_id="systalyze",
                 schema="public",
                 operation_ids=[operation_id],
+                reference_cohort_operation_ids=[operation_id, cohort_only_id],
+                reference_selected_operation_ids=[operation_id],
                 expected_generation="systalyze:public:123",
             )
         )
@@ -426,6 +429,11 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         self.assertEqual(connection.generation_reads, 2)
         _query, arguments = connection.fetch_calls[0]
         self.assertEqual([str(value) for value in arguments[0]], [operation_id])
+        self.assertEqual(
+            [str(value) for value in arguments[1]],
+            [operation_id, cohort_only_id],
+        )
+        self.assertEqual([str(value) for value in arguments[2]], [operation_id])
         select_list = CLAIM_RELEASE_EVIDENCE_QUERY.split(
             "FROM {schema}.async_operations"
         )[0]
@@ -456,6 +464,8 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
                     profile_id="systalyze",
                     schema="public",
                     operation_ids=[operation_id],
+                    reference_cohort_operation_ids=[],
+                    reference_selected_operation_ids=[],
                     expected_generation="systalyze:public:123",
                 )
             )
@@ -472,9 +482,39 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
                     operation_ids=[
                         "00000000-0000-4000-8000-000000000002"
                     ],
+                    reference_cohort_operation_ids=[],
+                    reference_selected_operation_ids=[],
                     expected_generation="systalyze:public:123",
                 )
             )
+
+        invalid_selected_sets = (
+            ([operation_id], [operation_id, operation_id]),
+            ([], [operation_id]),
+            (
+                [operation_id, "00000000-0000-4000-8000-000000000098"],
+                ["00000000-0000-4000-8000-000000000098"],
+            ),
+        )
+        for cohort_ids, selected_ids in invalid_selected_sets:
+            with self.subTest(
+                cohort_ids=cohort_ids,
+                selected_ids=selected_ids,
+            ), self.assertRaisesRegex(
+                OperationRecoveryError,
+                "operation ID set is invalid",
+            ):
+                asyncio.run(
+                    read_claim_release_evidence(
+                        FakeConnection(),
+                        profile_id="systalyze",
+                        schema="public",
+                        operation_ids=[operation_id],
+                        reference_cohort_operation_ids=cohort_ids,
+                        reference_selected_operation_ids=selected_ids,
+                        expected_generation="systalyze:public:123",
+                    )
+                )
 
     def test_apply_allows_bound_claim_on_selected_terminal_row(self):
         before = {

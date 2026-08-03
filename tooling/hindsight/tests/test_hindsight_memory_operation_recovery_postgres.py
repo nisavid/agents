@@ -1,5 +1,6 @@
 from pathlib import Path
 import asyncio
+from copy import deepcopy
 from datetime import datetime
 import getpass
 import hashlib
@@ -23,10 +24,14 @@ if str(TESTS) not in sys.path:
 from hindsight_memory_control_plane.operation_recovery import (  # noqa: E402
     OperationRecoveryError,
     create_claim_release_plan,
+    create_cohort_manifest,
     create_global_queue_blocker_classification,
+    create_live_snapshot,
+    create_requeue_plan,
     verify_global_queue_blocker_classification,
 )
 from hindsight_memory_control_plane.operation_recovery_runtime import (  # noqa: E402
+    CLAIM_RELEASE_BLOCKER_KEYS,
     QUEUE_BLOCKER_GUARD_CONTRACT_DIGEST,
     QUEUE_BLOCKER_GUARD_CONTRACT_VERSION,
     apply_claim_release_transaction,
@@ -274,6 +279,200 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
             "UPDATE public.hindsight_migration_generation "
             "SET generation = 123 WHERE singleton"
         )
+
+    async def _claim_release_case(self, connection):
+        await self._reset(connection)
+        operation_types = ["retain"] * 42 + ["refresh_mental_model"] * 4 + [
+            "consolidation"
+        ] * 2
+        selected_positions = {0, 1, 2, 3, 4, 5, 6, 7, 42, 43, 46}
+        cohort_ids = []
+        for position, operation_type in enumerate(operation_types):
+            operation_id = f"00000000-0000-4000-8000-{position + 1:012d}"
+            cohort_ids.append(operation_id)
+            selected = position in selected_positions
+            await self._insert_operation(
+                connection,
+                operation_id,
+                status="failed" if selected else "pending",
+                operation_type=operation_type,
+                worker_id=(f"permitted-worker-{position}" if selected else None),
+                claimed_at=CLAIMED_AT if selected else None,
+                task_payload=json.dumps({"cohort": position}),
+                result_metadata=json.dumps({"cohort-result": position}),
+            )
+        mutation_ids = []
+        for position in range(43):
+            operation_id = f"00000000-0000-4000-8000-{position + 1000:012x}"
+            mutation_ids.append(operation_id)
+            await self._insert_operation(
+                connection,
+                operation_id,
+                status="failed",
+                bank_id="codex" if position < 37 else "engineering",
+                operation_type=(
+                    "retain" if position < 37 else "refresh_mental_model"
+                ),
+                worker_id=f"orphaned-worker-{position}",
+                claimed_at=CLAIMED_AT,
+                task_payload=json.dumps({"memory": f"payload-secret-{position}"}),
+                result_metadata=json.dumps(
+                    {"result": f"result-secret-{position}"}
+                ),
+                error_message=f"error-secret-{position}",
+            )
+        await connection.execute(
+            "UPDATE public.hindsight_migration_generation "
+            "SET generation = 123 WHERE singleton"
+        )
+        live_rows = await read_safe_operation_rows(
+            connection,
+            schema="public",
+            bank_id="engineering",
+            operation_ids=cohort_ids,
+        )
+        baseline_rows = []
+        for row in live_rows:
+            baseline = deepcopy(row)
+            baseline.update(
+                {
+                    "status": "pending",
+                    "completed_at": None,
+                    "retry_count": 0,
+                    "next_retry_at": None,
+                    "worker_id_present": False,
+                    "worker_id_digest": None,
+                    "claimed_at": None,
+                    "error_category": "none",
+                    "error_digest": None,
+                }
+            )
+            baseline_rows.append(baseline)
+        cohort = create_cohort_manifest(
+            baseline_rows,
+            profile_id="systalyze",
+            schema="public",
+            bank_id="engineering",
+            generation="systalyze:public:90",
+            backup=recovery_fixtures.backup_evidence(),
+            created_at=int(time.time()) - 10_000,
+        )
+        snapshot = create_live_snapshot(
+            cohort,
+            live_rows,
+            generation_before="systalyze:public:123",
+            generation_after="systalyze:public:123",
+            installation_authority=recovery_fixtures.installation_authority(),
+            observed_at=int(time.time()) - 9000,
+        )
+        reference_plan = create_requeue_plan(
+            cohort,
+            snapshot,
+            candidate_release=recovery_fixtures.release_identity(),
+            rollback_backup=recovery_fixtures.rollback_backup_evidence(),
+            rollback_encryption=recovery_fixtures.rollback_encryption(),
+            rollback_backup_path="/private/tmp/reference-backup.age",
+            rollback_bundle_path="/private/tmp/reference-bundle.age",
+            authorization_receipt_path="/private/tmp/reference-authorization",
+            application_receipt_path="/private/tmp/reference-application",
+            verification_receipt_path="/private/tmp/reference-verification",
+            rollback_receipt_path="/private/tmp/reference-rollback",
+            created_at=int(time.time()) - 8000,
+        )
+        permitted_ids = [
+            row["operation_id"] for row in reference_plan["selected_operations"]
+        ]
+        before_generation, after_generation, classifier_rows = (
+            await read_global_queue_blockers(
+                connection,
+                profile_id="systalyze",
+                schema="public",
+                reference_cohort_operation_ids=cohort_ids,
+                reference_selected_operation_ids=permitted_ids,
+            )
+        )
+        self.assertEqual(len(classifier_rows), 43)
+        predecessor = create_global_queue_blocker_classification(
+            classifier_rows,
+            classifier_candidate_release={
+                "source_commit": "9" * 40,
+                "version": "2026.08.01+9999999.operation-recovery.6",
+                "release_digest": "8" * 64,
+            },
+            reference_plan=reference_plan,
+            installation_authority=recovery_fixtures.installation_authority(),
+            generation_before=before_generation,
+            generation_after=after_generation,
+            guard_contract_version=QUEUE_BLOCKER_GUARD_CONTRACT_VERSION,
+            guard_contract_digest=QUEUE_BLOCKER_GUARD_CONTRACT_DIGEST,
+            observed_at=int(time.time()) - 7200,
+        )
+        candidate = recovery_fixtures.release_identity()
+        live = create_global_queue_blocker_classification(
+            classifier_rows,
+            classifier_candidate_release=candidate,
+            reference_plan=reference_plan,
+            installation_authority=recovery_fixtures.installation_authority(),
+            generation_before=before_generation,
+            generation_after=after_generation,
+            guard_contract_version=QUEUE_BLOCKER_GUARD_CONTRACT_VERSION,
+            guard_contract_digest=QUEUE_BLOCKER_GUARD_CONTRACT_DIGEST,
+            observed_at=int(time.time()),
+        )
+        _, _, evidence = await read_claim_release_evidence(
+            connection,
+            profile_id="systalyze",
+            schema="public",
+            operation_ids=mutation_ids + permitted_ids,
+            reference_cohort_operation_ids=[
+                row["operation_id"]
+                for row in reference_plan["cohort"]["operations"]
+            ],
+            reference_selected_operation_ids=permitted_ids,
+            expected_generation="systalyze:public:123",
+        )
+        evidence_by_id = {row["operation_id"]: row for row in evidence}
+        reference_by_id = {
+            row["operation_id"]: row
+            for row in reference_plan["selected_operations"]
+        }
+        permitted_rows = []
+        for operation_id in permitted_ids:
+            row = evidence_by_id[operation_id]
+            body = {key: row[key] for key in CLAIM_RELEASE_BLOCKER_KEYS}
+            permitted_rows.append(
+                {
+                    **body,
+                    "row_digest": recovery_fixtures.digest(body),
+                    "nonclaim_state_digest": row["nonclaim_state_digest"],
+                    "reference_row_digest": reference_by_id[operation_id][
+                        "row_digest"
+                    ],
+                }
+            )
+        permitted_rows.sort(key=lambda row: (row["created_at"], row["operation_id"]))
+        plan = create_claim_release_plan(
+            predecessor,
+            live,
+            reference_plan=reference_plan,
+            permitted_blocker_rows=permitted_rows,
+            nonclaim_state_digests={
+                operation_id: evidence_by_id[operation_id][
+                    "nonclaim_state_digest"
+                ]
+                for operation_id in mutation_ids
+            },
+            candidate_release=candidate,
+            installation_authority=recovery_fixtures.installation_authority(),
+            rollback_encryption=recovery_fixtures.rollback_encryption(),
+            rollback_bundle_path="/private/tmp/claim-release.bundle",
+            authorization_receipt_path="/private/tmp/claim-release.authorization",
+            application_receipt_path="/private/tmp/claim-release.application",
+            verification_receipt_path="/private/tmp/claim-release.verification",
+            rollback_receipt_path="/private/tmp/claim-release.rollback",
+            created_at=int(time.time()),
+        )
+        return plan, mutation_ids, permitted_ids, evidence
 
     @staticmethod
     def _plan(row):
@@ -704,142 +903,153 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
 
         asyncio.run(exercise())
 
-    def test_claim_release_clears_only_claims_and_rollback_restores_them(self):
+    def test_claim_release_allows_exact_43_mutations_and_11_bound_blockers(self):
         async def exercise():
             connection = await self._connect()
             try:
-                await self._reset(connection)
-                operation_ids = []
-                for position in range(43):
-                    operation_id = (
-                        f"00000000-0000-4000-8000-{position + 1000:012x}"
-                    )
-                    operation_ids.append(operation_id)
-                    await self._insert_operation(
+                plan, mutation_ids, permitted_ids, before = (
+                    await self._claim_release_case(connection)
+                )
+                mutation_attempts = 0
+
+                def attempted():
+                    nonlocal mutation_attempts
+                    mutation_attempts += 1
+
+                self.assertEqual(
+                    await apply_claim_release_transaction(
                         connection,
-                        operation_id,
-                        status="failed",
-                        bank_id="codex" if position < 37 else "engineering",
-                        operation_type=(
-                            "retain"
-                            if position < 37
-                            else "refresh_mental_model"
-                        ),
-                        worker_id=f"orphaned-worker-{position}",
-                        claimed_at=CLAIMED_AT,
-                        task_payload=json.dumps(
-                            {"memory": f"payload-secret-{position}"}
-                        ),
-                        result_metadata=json.dumps(
-                            {"result": f"result-secret-{position}"}
-                        ),
-                        error_message=f"error-secret-{position}",
+                        profile_id="systalyze",
+                        schema="public",
+                        plan=plan,
+                        on_mutation_attempt=attempted,
+                    ),
+                    ("systalyze:public:123", "systalyze:public:124"),
+                )
+                self.assertEqual(mutation_attempts, 1)
+                _, _, after = await read_claim_release_evidence(
+                    connection,
+                    profile_id="systalyze",
+                    schema="public",
+                    operation_ids=mutation_ids + permitted_ids,
+                    reference_cohort_operation_ids=plan[
+                        "reference_cohort_operation_ids"
+                    ],
+                    reference_selected_operation_ids=permitted_ids,
+                    expected_generation="systalyze:public:124",
+                )
+                before_by_id = {row["operation_id"]: row for row in before}
+                after_by_id = {row["operation_id"]: row for row in after}
+                self.assertEqual(set(after_by_id), set(mutation_ids + permitted_ids))
+                for operation_id in mutation_ids:
+                    self.assertIs(after_by_id[operation_id]["worker_id_present"], False)
+                    self.assertIsNone(after_by_id[operation_id]["worker_id_digest"])
+                    self.assertIsNone(after_by_id[operation_id]["claimed_at"])
+                    for key in set(after_by_id[operation_id]) - {
+                        "worker_id_present",
+                        "worker_id_digest",
+                        "claimed_at",
+                    }:
+                        self.assertEqual(
+                            after_by_id[operation_id][key],
+                            before_by_id[operation_id][key],
+                        )
+                for operation_id in permitted_ids:
+                    self.assertEqual(
+                        after_by_id[operation_id],
+                        before_by_id[operation_id],
                     )
+                serialized = json.dumps(after, sort_keys=True)
+                self.assertNotIn("payload-secret-", serialized)
+                self.assertNotIn("result-secret-", serialized)
+                self.assertNotIn("error-secret-", serialized)
+                self.assertNotIn("orphaned-worker-", serialized)
+                self.assertNotIn("permitted-worker-", serialized)
+                self.assertNotIn('"task_payload":', serialized)
+                self.assertNotIn('"error_message":', serialized)
+                self.assertNotIn('"worker_id":', serialized)
+            finally:
+                await connection.close()
+
+        asyncio.run(exercise())
+
+    def test_claim_release_rejects_a_row_outside_the_54_guarded_rows(self):
+        async def exercise():
+            connection = await self._connect()
+            try:
+                plan, mutation_ids, permitted_ids, before = (
+                    await self._claim_release_case(connection)
+                )
+                unexpected_id = "ffffffff-ffff-4fff-8fff-ffffffffffff"
+                await self._insert_operation(
+                    connection,
+                    unexpected_id,
+                    status="failed",
+                    worker_id="unexpected-worker",
+                    claimed_at=CLAIMED_AT,
+                )
                 await connection.execute(
                     "UPDATE public.hindsight_migration_generation "
                     "SET generation = 123 WHERE singleton"
                 )
-                before_generation, after_generation, rows = (
-                    await read_claim_release_evidence(
+                mutation_attempted = False
+
+                def attempted():
+                    nonlocal mutation_attempted
+                    mutation_attempted = True
+
+                with self.assertRaisesRegex(
+                    OperationRecoveryError,
+                    "claim-release queue guard differs",
+                ):
+                    await apply_claim_release_transaction(
                         connection,
                         profile_id="systalyze",
                         schema="public",
-                        operation_ids=operation_ids,
-                        expected_generation="systalyze:public:123",
+                        plan=plan,
+                        on_mutation_attempt=attempted,
                     )
+                self.assertIs(mutation_attempted, False)
+                _, _, after = await read_claim_release_evidence(
+                    connection,
+                    profile_id="systalyze",
+                    schema="public",
+                    operation_ids=mutation_ids + permitted_ids + [unexpected_id],
+                    reference_cohort_operation_ids=plan[
+                        "reference_cohort_operation_ids"
+                    ],
+                    reference_selected_operation_ids=permitted_ids,
+                    expected_generation="systalyze:public:123",
                 )
-                self.assertEqual(before_generation, after_generation)
-                reference_plan = (
-                    recovery_fixtures.OperationRecoveryContractTest()
-                    .requeue_plan()
-                )
-                classifier_rows = [
+                after_by_id = {row["operation_id"]: row for row in after}
+                self.assertEqual(
+                    {row["operation_id"]: row for row in before},
                     {
-                        key: value
-                        for key, value in row.items()
-                        if key != "nonclaim_state_digest"
-                    }
-                    for row in rows
-                ]
-                predecessor = create_global_queue_blocker_classification(
-                    classifier_rows,
-                    classifier_candidate_release={
-                        "source_commit": "9" * 40,
-                        "version": (
-                            "2026.08.01+9999999.operation-recovery.6"
-                        ),
-                        "release_digest": "8" * 64,
+                        operation_id: after_by_id[operation_id]
+                        for operation_id in mutation_ids + permitted_ids
                     },
-                    reference_plan=reference_plan,
-                    installation_authority=(
-                        recovery_fixtures.installation_authority()
-                    ),
-                    generation_before=before_generation,
-                    generation_after=after_generation,
-                    guard_contract_version=(
-                        QUEUE_BLOCKER_GUARD_CONTRACT_VERSION
-                    ),
-                    guard_contract_digest=(
-                        QUEUE_BLOCKER_GUARD_CONTRACT_DIGEST
-                    ),
-                    observed_at=int(time.time()) - 7200,
                 )
-                candidate = recovery_fixtures.release_identity()
-                live = create_global_queue_blocker_classification(
-                    classifier_rows,
-                    classifier_candidate_release=candidate,
-                    reference_plan=reference_plan,
-                    installation_authority=(
-                        recovery_fixtures.installation_authority()
-                    ),
-                    generation_before=before_generation,
-                    generation_after=after_generation,
-                    guard_contract_version=(
-                        QUEUE_BLOCKER_GUARD_CONTRACT_VERSION
-                    ),
-                    guard_contract_digest=(
-                        QUEUE_BLOCKER_GUARD_CONTRACT_DIGEST
-                    ),
-                    observed_at=int(time.time()),
+                self.assertIs(
+                    after_by_id[unexpected_id]["worker_id_present"],
+                    True,
                 )
-                plan = create_claim_release_plan(
-                    predecessor,
-                    live,
-                    nonclaim_state_digests={
-                        row["operation_id"]: row["nonclaim_state_digest"]
-                        for row in rows
-                    },
-                    candidate_release=candidate,
-                    installation_authority=(
-                        recovery_fixtures.installation_authority()
-                    ),
-                    rollback_encryption=(
-                        recovery_fixtures.rollback_encryption()
-                    ),
-                    rollback_bundle_path="/private/tmp/claim-release.bundle",
-                    authorization_receipt_path=(
-                        "/private/tmp/claim-release.authorization"
-                    ),
-                    application_receipt_path=(
-                        "/private/tmp/claim-release.application"
-                    ),
-                    verification_receipt_path=(
-                        "/private/tmp/claim-release.verification"
-                    ),
-                    rollback_receipt_path=(
-                        "/private/tmp/claim-release.rollback"
-                    ),
-                    created_at=int(time.time()),
+            finally:
+                await connection.close()
+
+        asyncio.run(exercise())
+
+    def test_claim_release_clears_only_claims_and_rollback_restores_them(self):
+        async def exercise():
+            connection = await self._connect()
+            try:
+                plan, mutation_ids, permitted_ids, before = (
+                    await self._claim_release_case(connection)
                 )
                 preimage = await read_claim_release_preimage(
                     connection,
                     schema="public",
                     plan=plan,
                 )
-                updated_before = {
-                    row["operation_id"]: row["updated_at"] for row in rows
-                }
-
                 self.assertEqual(
                     await apply_claim_release_transaction(
                         connection,
@@ -849,23 +1059,6 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
                     ),
                     ("systalyze:public:123", "systalyze:public:124"),
                 )
-                applied = await connection.fetch(
-                    "SELECT operation_id::text AS operation_id, status, "
-                    "worker_id, claimed_at, "
-                    "to_char(updated_at AT TIME ZONE 'UTC', "
-                    "'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS updated_at "
-                    "FROM public.async_operations ORDER BY operation_id"
-                )
-                self.assertEqual(len(applied), 43)
-                for row in applied:
-                    self.assertEqual(row["status"], "failed")
-                    self.assertIsNone(row["worker_id"])
-                    self.assertIsNone(row["claimed_at"])
-                    self.assertEqual(
-                        row["updated_at"],
-                        updated_before[row["operation_id"]],
-                    )
-
                 application = {"post_generation": "systalyze:public:124"}
                 rollback_record = {
                     "pre_generation": "systalyze:public:124",
@@ -906,31 +1099,21 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
                     ),
                     generation_before_retry,
                 )
-                restored = await connection.fetch(
-                    "SELECT operation_id::text AS operation_id, status, "
-                    "worker_id, "
-                    "to_char(claimed_at AT TIME ZONE 'UTC', "
-                    "'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS claimed_at "
-                    "FROM public.async_operations ORDER BY operation_id"
+                _, _, restored = await read_claim_release_evidence(
+                    connection,
+                    profile_id="systalyze",
+                    schema="public",
+                    operation_ids=mutation_ids + permitted_ids,
+                    reference_cohort_operation_ids=plan[
+                        "reference_cohort_operation_ids"
+                    ],
+                    reference_selected_operation_ids=permitted_ids,
+                    expected_generation="systalyze:public:125",
                 )
-                self.assertEqual(len(restored), 43)
-                preimage_by_id = {
-                    row["operation_id"]: row for row in preimage
-                }
-                for row in restored:
-                    expected = preimage_by_id[row["operation_id"]]
-                    self.assertEqual(row["status"], "failed")
-                    self.assertEqual(row["worker_id"], expected["worker_id"])
-                    self.assertEqual(row["claimed_at"], expected["claimed_at"])
-
-                serialized_evidence = json.dumps(rows, sort_keys=True)
-                self.assertNotIn("payload-secret-", serialized_evidence)
-                self.assertNotIn("result-secret-", serialized_evidence)
-                self.assertNotIn("error-secret-", serialized_evidence)
-                self.assertNotIn("orphaned-worker-", serialized_evidence)
-                self.assertNotIn('"task_payload":', serialized_evidence)
-                self.assertNotIn('"error_message":', serialized_evidence)
-                self.assertNotIn('"worker_id":', serialized_evidence)
+                self.assertEqual(
+                    {row["operation_id"]: row for row in restored},
+                    {row["operation_id"]: row for row in before},
+                )
             finally:
                 await connection.close()
 

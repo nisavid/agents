@@ -23,6 +23,7 @@ EXPECTED_OPERATION_COUNTS = {
     "consolidation": 2,
 }
 EXPECTED_CLAIM_RELEASE_ROW_COUNT = 43
+EXPECTED_CLAIM_RELEASE_PERMITTED_BLOCKER_COUNT = 11
 EXPECTED_CLAIM_RELEASE_STATUS_COUNTS = {"failed": 43}
 EXPECTED_CLAIM_RELEASE_BANK_COUNTS = {"codex": 37, "engineering": 6}
 EXPECTED_CLAIM_RELEASE_TYPE_COUNTS = {
@@ -324,6 +325,9 @@ QUEUE_BLOCKER_CLASSIFICATION_KEYS = frozenset(
     }
 )
 CLAIM_RELEASE_ROW_KEYS = QUEUE_BLOCKER_KEYS | {"nonclaim_state_digest"}
+CLAIM_RELEASE_PERMITTED_BLOCKER_ROW_KEYS = CLAIM_RELEASE_ROW_KEYS | {
+    "reference_row_digest"
+}
 CLAIM_RELEASE_PLAN_KEYS = frozenset(
     {
         "schema_version",
@@ -334,6 +338,10 @@ CLAIM_RELEASE_PLAN_KEYS = frozenset(
         "installation_authority",
         "predecessor_classification_digest",
         "live_classification_digest",
+        "reference_plan_digest",
+        "reference_cohort_operation_ids",
+        "reference_cohort_operation_ids_digest",
+        "reference_selected_operation_ids_digest",
         "guard_contract_version",
         "guard_contract_digest",
         "profile_id",
@@ -342,6 +350,10 @@ CLAIM_RELEASE_PLAN_KEYS = frozenset(
         "selected_rows",
         "selected_row_count",
         "selected_row_set_digest",
+        "permitted_blocker_rows",
+        "permitted_blocker_count",
+        "permitted_blocker_row_set_digest",
+        "guard_exclusion_set_digest",
         "status_counts",
         "bank_counts",
         "operation_type_counts",
@@ -1646,7 +1658,12 @@ def verify_requeue_plan(
     return {**body, "plan_digest": plan["plan_digest"]}
 
 
-def _queue_blocker(value: Any, *, include_digest: bool) -> dict[str, Any]:
+def _queue_blocker(
+    value: Any,
+    *,
+    include_digest: bool,
+    allow_terminal_reference_selected: bool = False,
+) -> dict[str, Any]:
     keys = QUEUE_BLOCKER_KEYS if include_digest else QUEUE_BLOCKER_INPUT_KEYS
     row = _closed(
         _normalized(value),
@@ -1667,7 +1684,14 @@ def _queue_blocker(value: Any, *, include_digest: bool) -> dict[str, Any]:
         or type(in_cohort) is not bool
         or type(in_selected) is not bool
         or (in_selected and not in_cohort)
-        or (in_selected and status != "processing")
+        or (
+            in_selected
+            and status != "processing"
+            and not (
+                allow_terminal_reference_selected
+                and status in {"failed", "cancelled"}
+            )
+        )
         or (status != "processing" and not worker_present and row["claimed_at"] is None)
         or (not worker_present and row["worker_id_digest"] is not None)
         or (not payload_present and row["task_payload_digest"] is not None)
@@ -2039,6 +2063,42 @@ def _claim_release_row(value: Any) -> dict[str, Any]:
     }
 
 
+def _claim_release_permitted_blocker_row(value: Any) -> dict[str, Any]:
+    row = _closed(
+        _normalized(value),
+        CLAIM_RELEASE_PERMITTED_BLOCKER_ROW_KEYS,
+        "operation-recovery claim-release permitted blocker row",
+    )
+    blocker = _queue_blocker(
+        {key: row[key] for key in QUEUE_BLOCKER_KEYS},
+        include_digest=True,
+        allow_terminal_reference_selected=True,
+    )
+    if (
+        blocker["bank_id"] != "engineering"
+        or blocker["operation_type"] not in EXPECTED_OPERATION_COUNTS
+        or blocker["status"] not in {"failed", "cancelled"}
+        or blocker["in_reference_cohort"] is not True
+        or blocker["in_reference_selected_set"] is not True
+        or blocker["worker_id_present"] is not True
+        or blocker["claimed_at"] is None
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery claim-release permitted blocker row is invalid"
+        )
+    return {
+        **blocker,
+        "nonclaim_state_digest": _sha(
+            row["nonclaim_state_digest"],
+            "operation-recovery permitted blocker nonclaim state digest",
+        ),
+        "reference_row_digest": _sha(
+            row["reference_row_digest"],
+            "operation-recovery permitted blocker reference row digest",
+        ),
+    }
+
+
 def _claim_release_row_set_digest(
     rows: Sequence[Mapping[str, Any]],
 ) -> str:
@@ -2051,6 +2111,34 @@ def _claim_release_row_set_digest(
             }
             for row in rows
         ]
+    )
+
+
+def _claim_release_permitted_blocker_row_set_digest(
+    rows: Sequence[Mapping[str, Any]],
+) -> str:
+    return digest(
+        [
+            {
+                "operation_id": row["operation_id"],
+                "row_digest": row["row_digest"],
+                "nonclaim_state_digest": row["nonclaim_state_digest"],
+                "reference_row_digest": row["reference_row_digest"],
+            }
+            for row in rows
+        ]
+    )
+
+
+def _claim_release_guard_exclusion_set_digest(
+    selected_rows: Sequence[Mapping[str, Any]],
+    permitted_rows: Sequence[Mapping[str, Any]],
+) -> str:
+    return digest(
+        sorted(
+            [row["operation_id"] for row in selected_rows]
+            + [row["operation_id"] for row in permitted_rows]
+        )
     )
 
 
@@ -2099,6 +2187,8 @@ def create_claim_release_plan(
     predecessor_classification_value: Mapping[str, Any],
     live_classification_value: Mapping[str, Any],
     *,
+    reference_plan: Mapping[str, Any],
+    permitted_blocker_rows: Sequence[Mapping[str, Any]],
     nonclaim_state_digests: Mapping[str, Any],
     candidate_release: Mapping[str, Any],
     installation_authority: Mapping[str, Any],
@@ -2127,6 +2217,18 @@ def create_claim_release_plan(
     )
     candidate = _candidate_release(candidate_release)
     authority = _installation_authority(installation_authority)
+    reference = verify_requeue_plan(
+        reference_plan,
+        now=planned_at,
+        allow_expired=True,
+    )
+    reference_selected = reference["selected_operations"]
+    reference_cohort_ids = sorted(
+        row["operation_id"] for row in reference["cohort"]["operations"]
+    )
+    reference_selected_ids = [
+        row["operation_id"] for row in reference_selected
+    ]
     if (
         live["classifier_candidate_release"] != candidate
         or predecessor["classification_digest"]
@@ -2135,6 +2237,14 @@ def create_claim_release_plan(
         or predecessor["installation_authority"] != authority
         or live["installation_authority"] != authority
         or predecessor["blockers"] != live["blockers"]
+        or predecessor["reference_plan_digest"] != reference["plan_digest"]
+        or live["reference_plan_digest"] != reference["plan_digest"]
+        or predecessor["reference_selected_operation_ids_digest"]
+        != digest(sorted(reference_selected_ids))
+        or live["reference_selected_operation_ids_digest"]
+        != digest(sorted(reference_selected_ids))
+        or len(reference_selected)
+        != EXPECTED_CLAIM_RELEASE_PERMITTED_BLOCKER_COUNT
         or predecessor["guard_contract_version"]
         != live["guard_contract_version"]
         or predecessor["guard_contract_digest"]
@@ -2180,6 +2290,46 @@ def create_claim_release_plan(
         raise OperationRecoveryError(
             "operation-recovery claim-release rows are not ordered"
         )
+    if isinstance(permitted_blocker_rows, (str, bytes)) or not isinstance(
+        permitted_blocker_rows,
+        Sequence,
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery claim-release permitted blocker evidence is invalid"
+        )
+    permitted = [
+        _claim_release_permitted_blocker_row(row)
+        for row in permitted_blocker_rows
+    ]
+    permitted_by_id = {row["operation_id"]: row for row in permitted}
+    reference_by_id = {
+        row["operation_id"]: row for row in reference_selected
+    }
+    if (
+        len(permitted) != EXPECTED_CLAIM_RELEASE_PERMITTED_BLOCKER_COUNT
+        or len(permitted_by_id) != len(permitted)
+        or set(permitted_by_id) != set(reference_by_id)
+        or permitted
+        != sorted(
+            permitted,
+            key=lambda row: (row["created_at"], row["operation_id"]),
+        )
+        or any(
+            permitted_by_id[operation_id]["operation_type"]
+            != item["operation_type"]
+            or permitted_by_id[operation_id]["status"]
+            != item["expected_status"]
+            or permitted_by_id[operation_id]["task_payload_digest"]
+            != item["task_payload_digest"]
+            or permitted_by_id[operation_id]["reference_row_digest"]
+            != item["row_digest"]
+            for operation_id, item in reference_by_id.items()
+        )
+        or set(permitted_by_id) & {row["operation_id"] for row in rows}
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery claim-release permitted blocker evidence differs"
+        )
     paths = _claim_release_artifact_paths(
         {
             "rollback_bundle_path": rollback_bundle_path,
@@ -2190,7 +2340,7 @@ def create_claim_release_plan(
         }
     )
     body = {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": "operation-recovery-claim-release-plan",
         "authority": "unapproved-plan",
         "mutation_authorized": False,
@@ -2200,6 +2350,12 @@ def create_claim_release_plan(
             "classification_digest"
         ],
         "live_classification_digest": live["classification_digest"],
+        "reference_plan_digest": reference["plan_digest"],
+        "reference_cohort_operation_ids": reference_cohort_ids,
+        "reference_cohort_operation_ids_digest": digest(reference_cohort_ids),
+        "reference_selected_operation_ids_digest": digest(
+            sorted(reference_selected_ids)
+        ),
         "guard_contract_version": live["guard_contract_version"],
         "guard_contract_digest": live["guard_contract_digest"],
         "profile_id": "systalyze",
@@ -2208,6 +2364,15 @@ def create_claim_release_plan(
         "selected_rows": rows,
         "selected_row_count": len(rows),
         "selected_row_set_digest": _claim_release_row_set_digest(rows),
+        "permitted_blocker_rows": permitted,
+        "permitted_blocker_count": len(permitted),
+        "permitted_blocker_row_set_digest": (
+            _claim_release_permitted_blocker_row_set_digest(permitted)
+        ),
+        "guard_exclusion_set_digest": _claim_release_guard_exclusion_set_digest(
+            rows,
+            permitted,
+        ),
         "status_counts": dict(live["status_counts"]),
         "bank_counts": dict(live["bank_counts"]),
         "operation_type_counts": dict(live["operation_type_counts"]),
@@ -2231,12 +2396,25 @@ def verify_claim_release_plan(
         "operation-recovery claim-release plan",
     )
     rows_value = plan["selected_rows"]
-    if not isinstance(rows_value, list):
+    permitted_value = plan["permitted_blocker_rows"]
+    if not isinstance(rows_value, list) or not isinstance(permitted_value, list):
         raise OperationRecoveryError(
             "operation-recovery claim-release rows are invalid"
         )
     rows = [_claim_release_row(row) for row in rows_value]
+    permitted = [
+        _claim_release_permitted_blocker_row(row) for row in permitted_value
+    ]
     identifiers = [row["operation_id"] for row in rows]
+    permitted_identifiers = [row["operation_id"] for row in permitted]
+    cohort_identifiers_value = plan["reference_cohort_operation_ids"]
+    if not isinstance(cohort_identifiers_value, list):
+        raise OperationRecoveryError(
+            "operation-recovery claim-release reference cohort is invalid"
+        )
+    cohort_identifiers = [
+        _operation_id(value) for value in cohort_identifiers_value
+    ]
     created_at = _integer(plan["created_at"], "claim-release plan created-at")
     expires_at = _integer(plan["expires_at"], "claim-release plan expires-at")
     observed_at = (
@@ -2255,7 +2433,7 @@ def verify_claim_release_plan(
     row_type_counts = _queue_blocker_counts(rows, "operation_type")
     row_pair_counts = _claim_release_pair_counts(rows)
     if (
-        plan["schema_version"] != 1
+        plan["schema_version"] != 2
         or plan["kind"] != "operation-recovery-claim-release-plan"
         or plan["authority"] != "unapproved-plan"
         or plan["mutation_authorized"] is not False
@@ -2263,11 +2441,37 @@ def verify_claim_release_plan(
         or plan["schema"] != "public"
         or len(rows) != EXPECTED_CLAIM_RELEASE_ROW_COUNT
         or len(identifiers) != len(set(identifiers))
+        or len(permitted)
+        != EXPECTED_CLAIM_RELEASE_PERMITTED_BLOCKER_COUNT
+        or len(permitted_identifiers) != len(set(permitted_identifiers))
+        or len(cohort_identifiers) != sum(EXPECTED_OPERATION_COUNTS.values())
+        or len(cohort_identifiers) != len(set(cohort_identifiers))
+        or cohort_identifiers != sorted(cohort_identifiers)
+        or not set(permitted_identifiers).issubset(cohort_identifiers)
+        or set(identifiers) & set(permitted_identifiers)
         or rows
         != sorted(rows, key=lambda row: (row["created_at"], row["operation_id"]))
+        or permitted
+        != sorted(
+            permitted,
+            key=lambda row: (row["created_at"], row["operation_id"]),
+        )
         or plan["selected_row_count"] != EXPECTED_CLAIM_RELEASE_ROW_COUNT
         or plan["selected_row_set_digest"]
         != _claim_release_row_set_digest(rows)
+        or plan["permitted_blocker_count"]
+        != EXPECTED_CLAIM_RELEASE_PERMITTED_BLOCKER_COUNT
+        or plan["permitted_blocker_row_set_digest"]
+        != _claim_release_permitted_blocker_row_set_digest(permitted)
+        or plan["reference_cohort_operation_ids_digest"]
+        != digest(cohort_identifiers)
+        # Plan creation proves that the permitted IDs exactly equal the
+        # reference requeue plan's selected IDs. Recomputing the digest here
+        # preserves that binding without reopening the reference artifact.
+        or plan["reference_selected_operation_ids_digest"]
+        != digest(sorted(permitted_identifiers))
+        or plan["guard_exclusion_set_digest"]
+        != _claim_release_guard_exclusion_set_digest(rows, permitted)
         or status_counts != EXPECTED_CLAIM_RELEASE_STATUS_COUNTS
         or bank_counts != EXPECTED_CLAIM_RELEASE_BANK_COUNTS
         or type_counts != EXPECTED_CLAIM_RELEASE_TYPE_COUNTS
@@ -2286,7 +2490,7 @@ def verify_claim_release_plan(
         )
     paths = _claim_release_artifact_paths(plan)
     body = {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": "operation-recovery-claim-release-plan",
         "authority": "unapproved-plan",
         "mutation_authorized": False,
@@ -2301,6 +2505,19 @@ def verify_claim_release_plan(
         "live_classification_digest": _sha(
             plan["live_classification_digest"],
             "live classification digest",
+        ),
+        "reference_plan_digest": _sha(
+            plan["reference_plan_digest"],
+            "claim-release reference plan digest",
+        ),
+        "reference_cohort_operation_ids": cohort_identifiers,
+        "reference_cohort_operation_ids_digest": _sha(
+            plan["reference_cohort_operation_ids_digest"],
+            "claim-release reference cohort operation IDs digest",
+        ),
+        "reference_selected_operation_ids_digest": _sha(
+            plan["reference_selected_operation_ids_digest"],
+            "claim-release reference selected operation IDs digest",
         ),
         "guard_contract_version": _integer(
             plan["guard_contract_version"],
@@ -2322,6 +2539,18 @@ def verify_claim_release_plan(
         "selected_row_set_digest": _sha(
             plan["selected_row_set_digest"],
             "claim-release selected-row-set digest",
+        ),
+        "permitted_blocker_rows": permitted,
+        "permitted_blocker_count": (
+            EXPECTED_CLAIM_RELEASE_PERMITTED_BLOCKER_COUNT
+        ),
+        "permitted_blocker_row_set_digest": _sha(
+            plan["permitted_blocker_row_set_digest"],
+            "claim-release permitted blocker row-set digest",
+        ),
+        "guard_exclusion_set_digest": _sha(
+            plan["guard_exclusion_set_digest"],
+            "claim-release guard exclusion set digest",
         ),
         "status_counts": status_counts,
         "bank_counts": bank_counts,

@@ -182,19 +182,27 @@ class OperationRecoveryContractTest(unittest.TestCase):
             )
         )
 
-    def live_snapshot(self) -> dict:
+    def live_snapshot(
+        self,
+        *,
+        cancelled_positions: frozenset[int] = frozenset(),
+    ) -> dict:
         rows = operation_rows()
-        failed = {0, 1, 2, 42, 46}
-        completed = {6, 7, 8, 9, 10, 11}
+        failed = {0, 1, 2, 3, 4, 5, 6, 7, 42, 43, 46}
+        if not cancelled_positions.issubset(failed):
+            raise ValueError("cancelled test positions must be selected")
+        completed = {12, 13, 14, 15, 16, 17}
         for index, row in enumerate(rows):
             if index in failed:
-                row["status"] = "failed"
+                row["status"] = (
+                    "cancelled" if index in cancelled_positions else "failed"
+                )
                 row["completed_at"] = "2026-07-29T13:00:00Z"
                 row["error_category"] = "provider_capacity"
                 row["error_digest"] = f"{index + 500:064x}"
-            elif index == 5:
-                row["status"] = "cancelled"
-                row["completed_at"] = "2026-07-29T13:00:01Z"
+                row["worker_id_present"] = True
+                row["worker_id_digest"] = f"{index + 800:064x}"
+                row["claimed_at"] = "2026-07-29T12:30:00.000000Z"
             elif index in completed:
                 row["status"] = "completed"
                 row["completed_at"] = "2026-07-29T13:00:02Z"
@@ -209,11 +217,11 @@ class OperationRecoveryContractTest(unittest.TestCase):
             )
         )
 
-    def requeue_plan(self) -> dict:
+    def requeue_plan(self, snapshot=None) -> dict:
         return dict(
             create_requeue_plan(
                 self.cohort(),
-                self.live_snapshot(),
+                snapshot or self.live_snapshot(),
                 candidate_release=release_identity(),
                 rollback_backup=rollback_backup_evidence(),
                 rollback_encryption=rollback_encryption(),
@@ -306,6 +314,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
         *,
         planned_at: int = 1_785_460_800,
         live_generation: str = "systalyze:public:124",
+        reference_plan=None,
     ) -> tuple[dict, dict, dict[str, str]]:
         blockers = []
         for index in range(43):
@@ -324,7 +333,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
                     "blocker_reason": "claimed_failed",
                 }
             )
-        reference_plan = self.requeue_plan()
+        reference_plan = reference_plan or self.requeue_plan()
         predecessor = create_global_queue_blocker_classification(
             blockers,
             classifier_candidate_release={
@@ -356,6 +365,45 @@ class OperationRecoveryContractTest(unittest.TestCase):
             for index, row in enumerate(live["blockers"])
         }
         return dict(predecessor), dict(live), nonclaim_digests
+
+    def permitted_blocker_rows(self, reference_plan=None) -> list[dict]:
+        reference_plan = reference_plan or self.requeue_plan()
+        live_by_id = {
+            row["operation_id"]: row
+            for row in reference_plan["live_snapshot"]["operations"]
+        }
+        rows = []
+        for index, selected in enumerate(reference_plan["selected_operations"]):
+            live = live_by_id[selected["operation_id"]]
+            body = {
+                "operation_id": selected["operation_id"],
+                "bank_id": "engineering",
+                "operation_type": selected["operation_type"],
+                "status": selected["expected_status"],
+                "created_at": live["created_at"],
+                "updated_at": live["updated_at"],
+                "completed_at": live["completed_at"],
+                "retry_count": live["retry_count"],
+                "next_retry_at": live["next_retry_at"],
+                "worker_id_present": live["worker_id_present"],
+                "worker_id_digest": live["worker_id_digest"],
+                "claimed_at": live["claimed_at"],
+                "task_payload_present": True,
+                "task_payload_digest": selected["task_payload_digest"],
+                "in_reference_cohort": True,
+                "in_reference_selected_set": True,
+                "blocker_reason": f"claimed_{selected['expected_status']}",
+            }
+            rows.append(
+                {
+                    **body,
+                    "row_digest": digest(body),
+                    "nonclaim_state_digest": f"{index + 900:064x}",
+                    "reference_row_digest": selected["row_digest"],
+                }
+            )
+        rows.sort(key=lambda row: (row["created_at"], row["operation_id"]))
+        return rows
 
     def test_global_queue_blocker_classification_is_closed_and_read_only(self):
         row = self.queue_blocker_row()
@@ -653,10 +701,10 @@ class OperationRecoveryContractTest(unittest.TestCase):
 
     def test_live_snapshot_requires_same_ids_payload_digests_and_generation(self):
         snapshot = self.live_snapshot()
-        self.assertEqual(snapshot["status_counts"]["failed"], 5)
-        self.assertEqual(snapshot["status_counts"]["cancelled"], 1)
+        self.assertEqual(snapshot["status_counts"]["failed"], 11)
+        self.assertEqual(snapshot["status_counts"]["cancelled"], 0)
         self.assertEqual(snapshot["status_counts"]["completed"], 6)
-        self.assertEqual(snapshot["status_counts"]["pending"], 36)
+        self.assertEqual(snapshot["status_counts"]["pending"], 31)
         self.assertEqual(verify_live_snapshot(snapshot), snapshot)
 
         rows = operation_rows()
@@ -681,7 +729,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 observed_at=1_785_401_000,
             )
 
-    def test_plan_requeues_only_failed_and_cancelled_rows(self):
+    def test_plan_requeues_the_exact_failed_rows(self):
         snapshot = self.live_snapshot()
         plan = dict(
             create_requeue_plan(
@@ -715,10 +763,10 @@ class OperationRecoveryContractTest(unittest.TestCase):
             )
         )
 
-        self.assertEqual(len(plan["selected_operations"]), 6)
+        self.assertEqual(len(plan["selected_operations"]), 11)
         self.assertEqual(
             {item["expected_status"] for item in plan["selected_operations"]},
-            {"failed", "cancelled"},
+            {"failed"},
         )
         self.assertEqual(plan["policy"]["pending"], "preserve")
         self.assertEqual(plan["policy"]["completed"], "preserve")
@@ -1004,15 +1052,56 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 created_at=1_785_401_100,
             )
 
+    def test_claim_release_permits_a_bound_cancelled_reference_row(self):
+        planned_at = 1_785_460_800
+        reference_plan = self.requeue_plan(
+            self.live_snapshot(cancelled_positions=frozenset({7}))
+        )
+        predecessor, live, nonclaim_digests = self.claim_release_inputs(
+            planned_at=planned_at,
+            reference_plan=reference_plan,
+        )
+        permitted_rows = self.permitted_blocker_rows(reference_plan)
+
+        plan = create_claim_release_plan(
+            predecessor,
+            live,
+            reference_plan=reference_plan,
+            permitted_blocker_rows=permitted_rows,
+            nonclaim_state_digests=nonclaim_digests,
+            candidate_release=release_identity(),
+            installation_authority=installation_authority(),
+            rollback_encryption=rollback_encryption(),
+            rollback_bundle_path="/private/tmp/cancelled.bundle.json",
+            authorization_receipt_path="/private/tmp/cancelled.authorization.json",
+            application_receipt_path="/private/tmp/cancelled.application.json",
+            verification_receipt_path="/private/tmp/cancelled.verification.json",
+            rollback_receipt_path="/private/tmp/cancelled.rollback.json",
+            created_at=planned_at,
+        )
+
+        self.assertEqual(
+            {row["status"] for row in plan["permitted_blocker_rows"]},
+            {"failed", "cancelled"},
+        )
+        self.assertEqual(
+            verify_claim_release_plan(plan, now=planned_at),
+            plan,
+        )
+
     def test_claim_release_plan_is_closed_unapproved_and_exactly_bound(self):
         predecessor, live, nonclaim_digests = self.claim_release_inputs(
             live_generation="systalyze:public:123"
         )
         candidate = release_identity()
+        reference_plan = self.requeue_plan()
+        permitted_rows = self.permitted_blocker_rows(reference_plan)
 
         plan = create_claim_release_plan(
             predecessor,
             live,
+            reference_plan=reference_plan,
+            permitted_blocker_rows=permitted_rows,
             nonclaim_state_digests=nonclaim_digests,
             candidate_release=candidate,
             installation_authority=installation_authority(),
@@ -1039,6 +1128,12 @@ class OperationRecoveryContractTest(unittest.TestCase):
         self.assertEqual(plan["authority"], "unapproved-plan")
         self.assertIs(plan["mutation_authorized"], False)
         self.assertEqual(plan["selected_row_count"], 43)
+        self.assertEqual(plan["permitted_blocker_count"], 11)
+        self.assertEqual(
+            plan["reference_plan_digest"],
+            reference_plan["plan_digest"],
+        )
+        self.assertEqual(plan["permitted_blocker_rows"], permitted_rows)
         self.assertEqual(plan["status_counts"], {"failed": 43})
         self.assertEqual(plan["bank_counts"], {"codex": 37, "engineering": 6})
         self.assertEqual(
@@ -1069,6 +1164,8 @@ class OperationRecoveryContractTest(unittest.TestCase):
         plan = create_claim_release_plan(
             predecessor,
             live,
+            reference_plan=self.requeue_plan(),
+            permitted_blocker_rows=self.permitted_blocker_rows(),
             nonclaim_state_digests=nonclaim_digests,
             candidate_release=release_identity(),
             installation_authority=installation_authority(),
@@ -1083,6 +1180,73 @@ class OperationRecoveryContractTest(unittest.TestCase):
 
         self.assertEqual(plan["pre_generation"], "systalyze:public:124")
 
+    def test_claim_release_plan_rejects_permitted_blocker_set_drift(self):
+        planned_at = 1_785_460_800
+        predecessor, live, nonclaim_digests = self.claim_release_inputs(
+            planned_at=planned_at
+        )
+        reference_plan = self.requeue_plan()
+        base_rows = self.permitted_blocker_rows(reference_plan)
+        kwargs = {
+            "reference_plan": reference_plan,
+            "nonclaim_state_digests": nonclaim_digests,
+            "candidate_release": release_identity(),
+            "installation_authority": installation_authority(),
+            "rollback_encryption": rollback_encryption(),
+            "rollback_bundle_path": "/private/tmp/claim-release.bundle.json",
+            "authorization_receipt_path": (
+                "/private/tmp/claim-release.authorization.json"
+            ),
+            "application_receipt_path": (
+                "/private/tmp/claim-release.application.json"
+            ),
+            "verification_receipt_path": (
+                "/private/tmp/claim-release.verification.json"
+            ),
+            "rollback_receipt_path": (
+                "/private/tmp/claim-release.rollback.json"
+            ),
+            "created_at": planned_at,
+        }
+
+        duplicate_rows = deepcopy(base_rows)
+        duplicate_rows[-1] = deepcopy(duplicate_rows[0])
+        outside_reference_rows = deepcopy(base_rows)
+        outside_reference_rows[0]["operation_id"] = live["blockers"][0][
+            "operation_id"
+        ]
+        outside_reference_body = {
+            key: value
+            for key, value in outside_reference_rows[0].items()
+            if key
+            not in {
+                "row_digest",
+                "nonclaim_state_digest",
+                "reference_row_digest",
+            }
+        }
+        outside_reference_rows[0]["row_digest"] = digest(
+            outside_reference_body
+        )
+        reference_drift_rows = deepcopy(base_rows)
+        reference_drift_rows[0]["reference_row_digest"] = "0" * 64
+
+        for label, rows in (
+            ("duplicate", duplicate_rows),
+            ("outside reference set", outside_reference_rows),
+            ("reference digest", reference_drift_rows),
+        ):
+            with self.subTest(label=label), self.assertRaisesRegex(
+                OperationRecoveryError,
+                "permitted blocker evidence differs",
+            ):
+                create_claim_release_plan(
+                    predecessor,
+                    live,
+                    permitted_blocker_rows=rows,
+                    **kwargs,
+                )
+
     def test_claim_release_plan_verification_rejects_tampering_and_expiry(self):
         planned_at = 1_785_460_800
         predecessor, live, nonclaim_digests = self.claim_release_inputs(
@@ -1092,6 +1256,8 @@ class OperationRecoveryContractTest(unittest.TestCase):
             create_claim_release_plan(
                 predecessor,
                 live,
+                reference_plan=self.requeue_plan(),
+                permitted_blocker_rows=self.permitted_blocker_rows(),
                 nonclaim_state_digests=nonclaim_digests,
                 candidate_release=release_identity(),
                 installation_authority=installation_authority(),
@@ -1197,6 +1363,42 @@ class OperationRecoveryContractTest(unittest.TestCase):
         pair_tampered["plan_digest"] = digest(pair_body)
         with self.assertRaisesRegex(OperationRecoveryError, "plan is invalid"):
             verify_claim_release_plan(pair_tampered, now=planned_at)
+
+        permitted_tampered = deepcopy(plan)
+        permitted_row = permitted_tampered["permitted_blocker_rows"][0]
+        permitted_row["operation_id"] = (
+            "ffffffff-ffff-4fff-8fff-ffffffffffff"
+        )
+        permitted_row_body = {
+            key: value
+            for key, value in permitted_row.items()
+            if key
+            not in {
+                "row_digest",
+                "nonclaim_state_digest",
+                "reference_row_digest",
+            }
+        }
+        permitted_row["row_digest"] = digest(permitted_row_body)
+        permitted_tampered["permitted_blocker_row_set_digest"] = digest(
+            [
+                {
+                    "operation_id": row["operation_id"],
+                    "row_digest": row["row_digest"],
+                    "nonclaim_state_digest": row["nonclaim_state_digest"],
+                    "reference_row_digest": row["reference_row_digest"],
+                }
+                for row in permitted_tampered["permitted_blocker_rows"]
+            ]
+        )
+        permitted_body = {
+            key: value
+            for key, value in permitted_tampered.items()
+            if key != "plan_digest"
+        }
+        permitted_tampered["plan_digest"] = digest(permitted_body)
+        with self.assertRaisesRegex(OperationRecoveryError, "plan is invalid"):
+            verify_claim_release_plan(permitted_tampered, now=planned_at)
 
 
 if __name__ == "__main__":

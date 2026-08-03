@@ -169,6 +169,7 @@ from hindsight_memory_control_plane.operation_recovery import (  # noqa: E402
     verify_requeue_plan,
 )
 from hindsight_memory_control_plane.operation_recovery_runtime import (  # noqa: E402
+    CLAIM_RELEASE_BLOCKER_KEYS,
     QUEUE_BLOCKER_GUARD_CONTRACT_DIGEST,
     QUEUE_BLOCKER_GUARD_CONTRACT_VERSION,
     apply_claim_release_transaction,
@@ -6400,6 +6401,8 @@ def _claim_release_validate_application_record(
         "post_generation",
         "selected_row_count",
         "selected_row_set_digest",
+        "permitted_blocker_count",
+        "permitted_blocker_row_set_digest",
         "installation_authority_digest",
         "applied_at",
         "receipt_digest",
@@ -6422,6 +6425,10 @@ def _claim_release_validate_application_record(
         or value.get("selected_row_count") != plan["selected_row_count"]
         or value.get("selected_row_set_digest")
         != plan["selected_row_set_digest"]
+        or value.get("permitted_blocker_count")
+        != plan["permitted_blocker_count"]
+        or value.get("permitted_blocker_row_set_digest")
+        != plan["permitted_blocker_row_set_digest"]
         or value.get("installation_authority_digest")
         != digest(plan["installation_authority"])
         or type(value.get("applied_at")) is not int
@@ -6506,11 +6513,17 @@ def _claim_release_validate_verification(
             "generation",
             "selected_row_count",
             "selected_row_set_digest",
+            "permitted_blocker_count",
+            "permitted_blocker_row_set_digest",
         }
         or evidence.get("generation") != application["post_generation"]
         or evidence.get("selected_row_count") != plan["selected_row_count"]
         or evidence.get("selected_row_set_digest")
         != plan["selected_row_set_digest"]
+        or evidence.get("permitted_blocker_count")
+        != plan["permitted_blocker_count"]
+        or evidence.get("permitted_blocker_row_set_digest")
+        != plan["permitted_blocker_row_set_digest"]
         or type(value.get("verified_at")) is not int
         or value.get("receipt_digest")
         != _claim_release_receipt_digest(value)
@@ -6551,6 +6564,8 @@ def _claim_release_validate_rollback_record(
         "post_generation",
         "selected_row_count",
         "selected_row_set_digest",
+        "permitted_blocker_count",
+        "permitted_blocker_row_set_digest",
         "installation_authority_digest",
         "recorded_at",
         "receipt_digest",
@@ -6569,6 +6584,10 @@ def _claim_release_validate_rollback_record(
         or value.get("selected_row_count") != plan["selected_row_count"]
         or value.get("selected_row_set_digest")
         != plan["selected_row_set_digest"]
+        or value.get("permitted_blocker_count")
+        != plan["permitted_blocker_count"]
+        or value.get("permitted_blocker_row_set_digest")
+        != plan["permitted_blocker_row_set_digest"]
         or value.get("installation_authority_digest")
         != digest(plan["installation_authority"])
         or type(value.get("recorded_at")) is not int
@@ -6598,7 +6617,8 @@ def _claim_release_finalize_rollback(
 async def _claim_release_plan_evidence(
     args: argparse.Namespace,
     classification: Mapping[str, Any],
-) -> tuple[Mapping[str, Any], Mapping[str, str]]:
+    reference_plan: Mapping[str, Any],
+) -> tuple[Mapping[str, Any], Mapping[str, str], list[dict[str, Any]]]:
     connection = await _operation_recovery_connect_live(args, readonly=True)
     try:
         system_identifier_before = await connection.fetchval(
@@ -6608,14 +6628,21 @@ async def _claim_release_plan_evidence(
             args,
             postgres_system_identifier=system_identifier_before,
         )
+        reference_selected = reference_plan["selected_operations"]
+        reference_cohort_ids = [
+            row["operation_id"]
+            for row in reference_plan["cohort"]["operations"]
+        ]
+        mutation_ids = [row["operation_id"] for row in classification["blockers"]]
+        permitted_ids = [row["operation_id"] for row in reference_selected]
         generation_before, generation_after, rows = (
             await read_claim_release_evidence(
                 connection,
                 profile_id="systalyze",
                 schema="public",
-                operation_ids=[
-                    row["operation_id"] for row in classification["blockers"]
-                ],
+                operation_ids=mutation_ids + permitted_ids,
+                reference_cohort_operation_ids=reference_cohort_ids,
+                reference_selected_operation_ids=permitted_ids,
                 expected_generation=classification["generation_before"],
             )
         )
@@ -6631,9 +6658,10 @@ async def _claim_release_plan_evidence(
     blocker_by_id = {
         row["operation_id"]: row for row in classification["blockers"]
     }
-    for row in rows:
-        blocker = blocker_by_id.get(row.get("operation_id"))
-        if blocker is None or {
+    row_by_id = {row["operation_id"]: row for row in rows}
+    for operation_id, blocker in blocker_by_id.items():
+        row = row_by_id.get(operation_id)
+        if row is None or {
             key: row.get(key)
             for key in blocker
             if key != "row_digest"
@@ -6645,6 +6673,36 @@ async def _claim_release_plan_evidence(
             raise OperationRecoveryError(
                 "operation-recovery claim-release live row differs"
             )
+    reference_by_id = {
+        row["operation_id"]: row for row in reference_selected
+    }
+    permitted_rows = []
+    for operation_id, selected in reference_by_id.items():
+        row = row_by_id.get(operation_id)
+        if (
+            row is None
+            or row.get("operation_type") != selected["operation_type"]
+            or row.get("status") != selected["expected_status"]
+            or row.get("task_payload_digest")
+            != selected["task_payload_digest"]
+            or row.get("in_reference_cohort") is not True
+            or row.get("in_reference_selected_set") is not True
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery claim-release permitted blocker differs"
+            )
+        body = {key: row[key] for key in CLAIM_RELEASE_BLOCKER_KEYS}
+        permitted_rows.append(
+            {
+                **body,
+                "row_digest": digest(body),
+                "nonclaim_state_digest": row["nonclaim_state_digest"],
+                "reference_row_digest": selected["row_digest"],
+            }
+        )
+    permitted_rows.sort(
+        key=lambda row: (row["created_at"], row["operation_id"])
+    )
     if (
         generation_before != generation_after
         or authority_before != authority_after
@@ -6654,9 +6712,14 @@ async def _claim_release_plan_evidence(
         raise OperationRecoveryError(
             "operation-recovery claim-release authority drifted"
         )
-    return authority_after, {
-        row["operation_id"]: row["nonclaim_state_digest"] for row in rows
-    }
+    return (
+        authority_after,
+        {
+            operation_id: row_by_id[operation_id]["nonclaim_state_digest"]
+            for operation_id in mutation_ids
+        },
+        permitted_rows,
+    )
 
 
 def operation_recovery_claim_release_plan_command(
@@ -6686,12 +6749,21 @@ def operation_recovery_claim_release_plan_command(
     )
     _claim_release_assert_guard(predecessor)
     _claim_release_assert_guard(live)
-    authority, nonclaim_digests = asyncio.run(
-        _claim_release_plan_evidence(args, live)
+    reference_plan = verify_requeue_plan(
+        _operation_recovery_read_private_json(
+            args.reference_plan,
+            "reference requeue plan",
+        ),
+        allow_expired=True,
+    )
+    authority, nonclaim_digests, permitted_rows = asyncio.run(
+        _claim_release_plan_evidence(args, live, reference_plan)
     )
     plan = create_claim_release_plan(
         predecessor,
         live,
+        reference_plan=reference_plan,
+        permitted_blocker_rows=permitted_rows,
         nonclaim_state_digests=nonclaim_digests,
         candidate_release=candidate,
         installation_authority=authority,
@@ -6738,6 +6810,7 @@ def operation_recovery_claim_release_plan_command(
             "plan_digest": plan["plan_digest"],
             "expires_at": plan["expires_at"],
             "selected_row_count": plan["selected_row_count"],
+            "permitted_blocker_count": plan["permitted_blocker_count"],
             "output": str(Path(args.output).resolve()),
         }
     )
@@ -7105,6 +7178,10 @@ def operation_recovery_claim_release_apply_command(
                 ),
                 "selected_row_count": plan["selected_row_count"],
                 "selected_row_set_digest": plan["selected_row_set_digest"],
+                "permitted_blocker_count": plan["permitted_blocker_count"],
+                "permitted_blocker_row_set_digest": plan[
+                    "permitted_blocker_row_set_digest"
+                ],
                 "installation_authority_digest": digest(authority),
                 "applied_at": int(time.time()),
             }
@@ -7164,6 +7241,9 @@ def _claim_release_post_evidence_matches(
     rows: Sequence[Mapping[str, Any]],
 ) -> bool:
     expected = {row["operation_id"]: row for row in plan["selected_rows"]}
+    permitted = {
+        row["operation_id"]: row for row in plan["permitted_blocker_rows"]
+    }
     actual = {row.get("operation_id"): row for row in rows}
     preserved = {
         "operation_id",
@@ -7182,13 +7262,37 @@ def _claim_release_post_evidence_matches(
         "blocker_reason",
         "nonclaim_state_digest",
     }
-    return set(actual) == set(expected) and all(
-        row.get("worker_id_present") is False
-        and row.get("worker_id_digest") is None
-        and row.get("claimed_at") is None
-        and {key: row.get(key) for key in preserved}
-        == {key: expected[operation_id].get(key) for key in preserved}
-        for operation_id, row in actual.items()
+    return (
+        set(actual) == set(expected) | set(permitted)
+        and all(
+            actual[operation_id].get("worker_id_present") is False
+            and actual[operation_id].get("worker_id_digest") is None
+            and actual[operation_id].get("claimed_at") is None
+            and {
+                key: actual[operation_id].get(key) for key in preserved
+            }
+            == {key: item.get(key) for key in preserved}
+            for operation_id, item in expected.items()
+        )
+        and all(
+            {
+                key: actual[operation_id].get(key)
+                for key in CLAIM_RELEASE_BLOCKER_KEYS
+            }
+            == {
+                key: item.get(key) for key in CLAIM_RELEASE_BLOCKER_KEYS
+            }
+            and actual[operation_id].get("nonclaim_state_digest")
+            == item.get("nonclaim_state_digest")
+            and digest(
+                {
+                    key: actual[operation_id].get(key)
+                    for key in CLAIM_RELEASE_BLOCKER_KEYS
+                }
+            )
+            == item.get("row_digest")
+            for operation_id, item in permitted.items()
+        )
     )
 
 
@@ -7206,6 +7310,17 @@ async def _claim_release_verify_live(
                 schema="public",
                 operation_ids=[
                     row["operation_id"] for row in plan["selected_rows"]
+                ]
+                + [
+                    row["operation_id"]
+                    for row in plan["permitted_blocker_rows"]
+                ],
+                reference_cohort_operation_ids=plan[
+                    "reference_cohort_operation_ids"
+                ],
+                reference_selected_operation_ids=[
+                    row["operation_id"]
+                    for row in plan["permitted_blocker_rows"]
                 ],
                 expected_generation=application["post_generation"],
             )
@@ -7221,8 +7336,12 @@ async def _claim_release_verify_live(
         )
     return {
         "generation": generation_before,
-        "selected_row_count": len(rows),
+        "selected_row_count": plan["selected_row_count"],
         "selected_row_set_digest": plan["selected_row_set_digest"],
+        "permitted_blocker_count": plan["permitted_blocker_count"],
+        "permitted_blocker_row_set_digest": plan[
+            "permitted_blocker_row_set_digest"
+        ],
     }
 
 
@@ -7508,6 +7627,10 @@ def operation_recovery_claim_release_rollback_command(
                 ),
                 "selected_row_count": plan["selected_row_count"],
                 "selected_row_set_digest": plan["selected_row_set_digest"],
+                "permitted_blocker_count": plan["permitted_blocker_count"],
+                "permitted_blocker_row_set_digest": plan[
+                    "permitted_blocker_row_set_digest"
+                ],
                 "installation_authority_digest": digest(authority),
                 "recorded_at": int(time.time()),
             }
@@ -9311,6 +9434,7 @@ def parser() -> argparse.ArgumentParser:
         "--live-classification",
         required=True,
     )
+    recovery_claim_release_plan.add_argument("--reference-plan", required=True)
     recovery_claim_release_plan.add_argument("--age", required=True)
     recovery_claim_release_plan.add_argument(
         "--rollback-recipient",

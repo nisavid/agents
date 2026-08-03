@@ -3,6 +3,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+import runpy
 import stat
 import subprocess
 import threading
@@ -21,7 +22,11 @@ if str(LIB) not in sys.path:
 
 from hindsight_memory_control_plane.adapters import AdapterError, FakeAdapter
 from hindsight_memory_control_plane.canonical import digest
-from hindsight_memory_control_plane.harnesses import render_harness
+from hindsight_memory_control_plane.harnesses import (
+    NativeHarnessArtifact,
+    render_harness,
+    stage_native_harness_artifacts,
+)
 from hindsight_memory_control_plane.http_adapter import HttpAdapter
 from hindsight_memory_control_plane.ledger import LedgerError, validate_record
 from hindsight_memory_control_plane.migration import (
@@ -104,6 +109,12 @@ def migration_inventory():
             "hindsight": "0.8.4",
             "adapter": "1",
             "providers": {"llm": "current", "embedding": "current", "reranking": "current"},
+        },
+        "snapshot_generation": "example:public:7",
+        "controller_state": {
+            "configuration_digest": SHA_A,
+            "hook_digest": SHA_B,
+            "schedule_digest": SHA_C,
         },
         "banks": {
             "source": bank_surface(SOURCE, "source-1", SHA_A, invalidated=True),
@@ -451,6 +462,7 @@ class MigrationDiscoveryContractTest(unittest.TestCase):
         catalog=None,
         watermarks=None,
         generations=None,
+        controller_states=None,
         adapter=None,
     ):
         manifest = copy.deepcopy(package or package_manifest())
@@ -467,6 +479,15 @@ class MigrationDiscoveryContractTest(unittest.TestCase):
                 ]
             )
         )
+        controller_values = iter(
+            copy.deepcopy(
+                controller_states
+                or [
+                    migration_inventory()["controller_state"],
+                    migration_inventory()["controller_state"],
+                ]
+            )
+        )
         result = discover_migration_state(
             adapter,
             source_bank=SOURCE,
@@ -475,6 +496,7 @@ class MigrationDiscoveryContractTest(unittest.TestCase):
             approved_offline_package_digest=approved_digest or manifest["approved_manifest_digest"],
             migration_paths=write_gate_files(root),
             retain_watermark_reader=lambda: next(watermark_values),
+            controller_state_reader=lambda: next(controller_values),
             private_catalog_digests=catalog or {
                 "catalog": SHA_A,
                 "bank_archetypes": SHA_B,
@@ -484,6 +506,26 @@ class MigrationDiscoveryContractTest(unittest.TestCase):
             timestamp="20260713T120000Z",
         )
         return adapter, result
+
+    def test_local_controller_state_drift_blocks_artifact_publication(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            changed = {
+                **migration_inventory()["controller_state"],
+                "hook_digest": SHA_D,
+            }
+            _, result = self.discover(
+                root,
+                controller_states=[
+                    migration_inventory()["controller_state"],
+                    changed,
+                ],
+            )
+
+            self.assertFalse(result.complete)
+            self.assertIn("drift:controller_local_state", result.blockers)
+            self.assertIsNone(result.run_dir)
+            self.assertFalse(any(root.glob("artifacts/*")))
 
     def test_complete_discovery_writes_private_content_inventory_and_redacted_unapproved_plan(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1269,6 +1311,9 @@ class MigrationDiscoveryContractTest(unittest.TestCase):
                     approved_offline_package_digest=manifest["approved_manifest_digest"],
                     migration_paths=paths,
                     retain_watermark_reader=lambda: {"codex": {"epoch": 1}},
+                    controller_state_reader=lambda: migration_inventory()[
+                        "controller_state"
+                    ],
                     private_catalog_digests={"catalog": SHA_A},
                     repository_catalog=repository_catalog(),
                     timestamp="20260713T120000Z",
@@ -1292,6 +1337,9 @@ class MigrationDiscoveryContractTest(unittest.TestCase):
                     approved_offline_package_digest=manifest["approved_manifest_digest"],
                     migration_paths=paths,
                     retain_watermark_reader=lambda: {"codex": {"epoch": 1}},
+                    controller_state_reader=lambda: migration_inventory()[
+                        "controller_state"
+                    ],
                     private_catalog_digests={"catalog": SHA_A},
                     repository_catalog=repository_catalog(),
                     timestamp="20260713T120000Z",
@@ -1324,6 +1372,9 @@ class MigrationDiscoveryContractTest(unittest.TestCase):
                     retain_watermark_reader=lambda: {
                         "codex": {"epoch": 1}
                     },
+                    controller_state_reader=lambda: migration_inventory()[
+                        "controller_state"
+                    ],
                     private_catalog_digests={"catalog": SHA_A},
                     repository_catalog=repository_catalog(),
                     timestamp="20260713T120000Z",
@@ -1496,6 +1547,9 @@ class MigrationDiscoveryContractTest(unittest.TestCase):
                         retain_watermark_reader=lambda: {
                             "codex": {"epoch": 1}
                         },
+                        controller_state_reader=lambda: migration_inventory()[
+                            "controller_state"
+                        ],
                         private_catalog_digests={"catalog": SHA_A},
                         repository_catalog=repository_catalog(),
                         timestamp="20260713T120000Z",
@@ -1544,6 +1598,11 @@ class MigrationCliContractTest(unittest.TestCase):
             root = Path(directory)
             seen = []
             handler_errors = []
+            local_controller_state = {
+                "configuration_digest": SHA_A,
+                "hook_digest": SHA_B,
+                "schedule_digest": SHA_C,
+            }
             surfaces = {
                 "engineering": bank_surface(BankRef("core", "engineering"), "source-1", SHA_A, invalidated=True),
                 "historical-candidate": bank_surface(
@@ -1560,6 +1619,83 @@ class MigrationCliContractTest(unittest.TestCase):
                     return {"api_version": "0.8.4", "features": {"observations": True}}
                 if parsed.path == "/v1/migration/generation":
                     return {"generation": "commit-42"}
+                if parsed.path == "/v1/migration/snapshot":
+                    banks = {}
+                    for role, bank_id in (
+                        ("source", "engineering"),
+                        ("candidate", "historical-candidate"),
+                    ):
+                        surface = surfaces[bank_id]
+                        banks[role] = {
+                            "config": {
+                                "bank_id": bank_id,
+                                "config": surface["config"],
+                                "overrides": {},
+                            },
+                            "stats": {
+                                "bank_id": bank_id,
+                                "total_documents": surface["stats"][
+                                    "documents"
+                                ],
+                                "total_memories": surface["stats"][
+                                    "memories"
+                                ],
+                            },
+                            "scopes": {"scopes": surface["scopes"]},
+                            "tags": surface["tags"],
+                            "documents": [
+                                {
+                                    "id": item["document_id"],
+                                    "updated_at": item["updated_at"],
+                                    "content_hash": item["content_digest"],
+                                    "created_at": item["updated_at"],
+                                    "text_length": len(
+                                        item.get("content", "")
+                                    ),
+                                    "memory_unit_count": 1,
+                                    "tags": item.get("tags", []),
+                                    "document_metadata_digest": SHA_B,
+                                    "retain_params_digest": SHA_C,
+                                }
+                                for item in surface["documents"]
+                            ],
+                            "models": [
+                                {
+                                    "model_id": item["model_id"],
+                                    "content_digest": item[
+                                        "content_digest"
+                                    ],
+                                }
+                                for item in surface["models"]
+                            ],
+                            "directives": surface["directives"],
+                            "invalidated_memories": [
+                                {
+                                    "item_id": item["item_id"],
+                                    "document_id": item[
+                                        "source_document_id"
+                                    ],
+                                    "content_digest": item[
+                                        "content_digest"
+                                    ],
+                                    "reason_digest": item[
+                                        "reason_digest"
+                                    ],
+                                }
+                                for item in surface[
+                                    "invalidated_memories"
+                                ]
+                            ],
+                            "webhooks": [],
+                            "operations": [],
+                        }
+                    return {
+                        "schema_version": 1,
+                        "generation_before": "commit-42",
+                        "generation_after": "commit-42",
+                        "controller_state": local_controller_state,
+                        "banks": banks,
+                    }
                 parts = parsed.path.split("/")
                 bank_id = parts[4]
                 suffix = "/" + "/".join(parts[5:])
@@ -1711,6 +1847,84 @@ class MigrationCliContractTest(unittest.TestCase):
                 json.dumps({"codex": {"document_id": "source-1", "epoch": 4, "checkpoint": 9}}),
                 encoding="utf-8",
             )
+            policy_path = root / "policy.json"
+            policy_path.write_text("{}", encoding="utf-8")
+            schedule_path = root / "schedule.plist"
+            schedule_path.write_text("schedule", encoding="utf-8")
+            entries = []
+            for harness in ("codex", "claude-code", "cursor"):
+                hooks_path = root / f"{harness}.hooks.json"
+                settings_path = root / f"{harness}.settings.json"
+                tools_path = root / f"{harness}.tools.json"
+                for surface_path in (
+                    hooks_path,
+                    settings_path,
+                    tools_path,
+                ):
+                    surface_path.write_text("{}", encoding="utf-8")
+                destination_path = root / f"{harness}.destination.json"
+                destination_path.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "harness_id": harness,
+                            "hooks_path": str(hooks_path),
+                            "settings_path": str(settings_path),
+                            "tools_path": str(tools_path),
+                            "rollback_root": str(root / f"{harness}.rollback"),
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                staging_root = root / f"{harness}.staging"
+                staging_root.mkdir(mode=0o700)
+                rendered = {
+                    "schemaVersion": 1,
+                    "controllerOwned": True,
+                    "active": False,
+                    "hooks": {},
+                    "settings": {},
+                    "tools": {},
+                }
+                generation_path = stage_native_harness_artifacts(
+                    staging_root,
+                    {
+                        harness: NativeHarnessArtifact(
+                            harness,
+                            rendered,
+                            digest(rendered),
+                        )
+                    },
+                )
+                plan_path = root / f"{harness}.plan.json"
+                plan_path.write_text("{}", encoding="utf-8")
+                entries.append(
+                    {
+                        "destination": str(destination_path),
+                        "generation": str(generation_path),
+                        "plan": str(plan_path),
+                        "upstream_integration_roots": [str(root)],
+                    }
+                )
+            reconciliation_path = root / "reconciliation.json"
+            reconciliation_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "state_dir": str(root / "state"),
+                        "inventory": str(inventory_path),
+                        "policy": str(policy_path),
+                        "profile": "core",
+                        "token_env": "TEST_HINDSIGHT_TOKEN",
+                        "entries": entries,
+                        "schedule_paths": [str(schedule_path)],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            local_controller_state = runpy.run_path(str(CLI))[
+                "_harness_reconciliation_controller_state"
+            ](str(reconciliation_path))
             env = dict(os.environ)
             env["TEST_HINDSIGHT_TOKEN"] = "read-only-test-token"
             result = self.run_cli(
@@ -1723,6 +1937,8 @@ class MigrationCliContractTest(unittest.TestCase):
                 "--approved-offline-package-digest", manifest["approved_manifest_digest"],
                 "--private-catalog-digests", str(catalog_path),
                 "--retain-watermarks", str(watermark_path),
+                "--harness-reconciliation-config",
+                str(reconciliation_path),
                 "--completion-marker", paths["completion_marker"],
                 "--token-env", "TEST_HINDSIGHT_TOKEN",
                 "--timestamp", "20260713T120000Z",
@@ -1737,6 +1953,12 @@ class MigrationCliContractTest(unittest.TestCase):
             self.assertGreater(len(seen), 2)
             self.assertTrue(all(method == "GET" for method, _path, _auth in seen))
             self.assertFalse(any(path.startswith("/v1/migrations/") for _method, path, _auth in seen))
+            self.assertFalse(
+                any(
+                    path.startswith("/v1/default/banks/")
+                    for _method, path, _auth in seen
+                )
+            )
             self.assertTrue(all(auth == "Bearer read-only-test-token" for _method, _path, auth in seen))
             artifact_bytes = b"".join(
                 path.read_bytes()

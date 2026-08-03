@@ -121,6 +121,28 @@ hindsight_stack_load_config() {
     print -ru2 -- "hindsight-embed-stack: HINDSIGHT_MEMORY_BROKER_SOCKET must be absolute"
     return 1
   }
+  local harness_reconcile_binding_count=0
+  [[ -n "${HINDSIGHT_MEMORY_HARNESS_RECONCILER:-}" ]] &&
+    (( harness_reconcile_binding_count += 1 ))
+  [[ -n "${HINDSIGHT_MEMORY_HARNESS_RECONCILE_CONFIG:-}" ]] &&
+    (( harness_reconcile_binding_count += 1 ))
+  if (( harness_reconcile_binding_count != 0 && harness_reconcile_binding_count != 2 )); then
+    print -ru2 -- "hindsight-embed-stack: harness reconciliation bindings must be all set or all unset"
+    return 1
+  fi
+  if (( harness_reconcile_binding_count == 2 )); then
+    [[
+      "$HINDSIGHT_MEMORY_HARNESS_RECONCILER" == /* &&
+      "$HINDSIGHT_MEMORY_HARNESS_RECONCILER" != *$'\n'* &&
+      "$HINDSIGHT_MEMORY_HARNESS_RECONCILER" != *$'\r'* &&
+      "$HINDSIGHT_MEMORY_HARNESS_RECONCILE_CONFIG" == /* &&
+      "$HINDSIGHT_MEMORY_HARNESS_RECONCILE_CONFIG" != *$'\n'* &&
+      "$HINDSIGHT_MEMORY_HARNESS_RECONCILE_CONFIG" != *$'\r'*
+    ]] || {
+      print -ru2 -- "hindsight-embed-stack: harness reconciliation paths must be absolute single-line paths"
+      return 1
+    }
+  fi
   if [[ -n "${HINDSIGHT_MEMORY_INTEGRATION_UPGRADE_STATE:-}" ]]; then
     [[
       "$HINDSIGHT_MEMORY_INTEGRATION_UPGRADE_STATE" == /* &&
@@ -214,6 +236,7 @@ hindsight_stack_load_config() {
   typeset -g HINDSIGHT_EMBED_STOP_WAIT_SECONDS="${HINDSIGHT_EMBED_STOP_WAIT_SECONDS:-30}"
   typeset -g HINDSIGHT_EMBED_START_COOLDOWN_SECONDS="${HINDSIGHT_EMBED_START_COOLDOWN_SECONDS:-20}"
   typeset -g HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS="${HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS:-300}"
+  typeset -g HINDSIGHT_EMBED_STATUS_PROBE_TIMEOUT_SECONDS="${HINDSIGHT_EMBED_STATUS_PROBE_TIMEOUT_SECONDS:-5}"
   local timeout_name timeout_value timeout_max
   for timeout_name timeout_max in \
     HINDSIGHT_EMBED_CONTROL_WAIT_SECONDS 3600 \
@@ -224,7 +247,8 @@ hindsight_stack_load_config() {
     HINDSIGHT_MEMORY_BROKER_WAIT_SECONDS 3600 \
     HINDSIGHT_EMBED_STOP_WAIT_SECONDS 3600 \
     HINDSIGHT_EMBED_START_COOLDOWN_SECONDS 3600 \
-    HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS 300; do
+    HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS 300 \
+    HINDSIGHT_EMBED_STATUS_PROBE_TIMEOUT_SECONDS 30; do
     timeout_value="${(P)timeout_name}"
     if [[ "$timeout_name" == HINDSIGHT_EMBED_START_COOLDOWN_SECONDS ]]; then
       hindsight_stack_validate_seconds "$timeout_value" "$timeout_name" "$timeout_max" 0 || return 1
@@ -366,7 +390,7 @@ hindsight_stack_set_desired_state() {
 hindsight_stack_desired_state() {
   emulate -L zsh
   hindsight_stack_load_config || return 1
-  local component="$1" profile="${2:-$HINDSIGHT_EMBED_PROFILE}" path desired owner mode owner_mode
+  local component="$1" profile="${2:-$HINDSIGHT_EMBED_PROFILE}" path desired extra owner mode owner_mode desired_state_fd
   path="$(hindsight_stack_desired_state_path "$component" "$profile")" || return 1
   if [[ ! -e "$path" ]]; then
     case "$component" in
@@ -384,7 +408,17 @@ hindsight_stack_desired_state() {
   owner="${owner_mode%%:*}"
   mode="${owner_mode#*:}"
   (( owner == EUID && (8#$mode & 8#0077) == 0 )) || return 1
-  desired="$(<"$path")"
+  exec {desired_state_fd}<"$path" || return 1
+  if ! IFS= read -r desired <&$desired_state_fd; then
+    exec {desired_state_fd}<&-
+    return 1
+  fi
+  extra=""
+  if IFS= read -r extra <&$desired_state_fd || [[ -n "$extra" ]]; then
+    exec {desired_state_fd}<&-
+    return 1
+  fi
+  exec {desired_state_fd}<&-
   case "$desired" in
     running|stopped) print -r -- "$desired" ;;
     *) return 1 ;;
@@ -536,9 +570,14 @@ hindsight_stack_with_lifecycle_lock() {
     print -ru2 -- "hindsight-embed-stack: timed out acquiring lifecycle lock"
     return 1
   }
-  "$callback" "$@"
-  local result=$?
-  zsystem flock -u "$lock_descriptor" || return 1
+  local result=0 unlock_result=0
+  {
+    "$callback" "$@"
+    result=$?
+  } always {
+    zsystem flock -u "$lock_descriptor" || unlock_result=$?
+  }
+  (( unlock_result == 0 )) || return "$unlock_result"
   return "$result"
 }
 
@@ -547,7 +586,7 @@ hindsight_stack_apply_credential_scope() {
   local scope="$1"
   if [[ "$scope" != none && "$scope" != api && \
     "$scope" != ui-proxy && "$scope" != broker && \
-    "$scope" != preflight ]]; then
+    "$scope" != controller && "$scope" != preflight ]]; then
     print -ru2 -- "hindsight-embed-stack: invalid credential scope: ${scope}"
     return 2
   fi
@@ -582,7 +621,8 @@ hindsight_stack_apply_credential_scope() {
   unset "${credential_names[@]}"
 
   if hindsight_stack_runtime_active; then
-    if [[ "$scope" == api || "$scope" == ui-proxy ]]; then
+    if [[ "$scope" == api || "$scope" == ui-proxy || \
+      "$scope" == controller ]]; then
       if [[ -z "$data_credential" || "$data_credential" == *$'\n'* || \
         "$data_credential" == *$'\r'* ]]; then
         print -ru2 -- "hindsight-embed-stack: data-plane credential resolver is unavailable"
@@ -600,6 +640,9 @@ hindsight_stack_apply_credential_scope() {
       # The broker may hold only its resolver-bound data-plane and mint inputs.
       [[ -n "$data_name" ]] && typeset -gx "${data_name}=${data_credential}"
       [[ -n "$mint_name" ]] && typeset -gx "${mint_name}=${mint_credential}"
+    elif [[ "$scope" == controller ]]; then
+      # Post-start controller state persistence needs only the data-plane input.
+      [[ -n "$data_name" ]] && typeset -gx "${data_name}=${data_credential}"
     elif [[ "$scope" == preflight ]]; then
       # Preflight validates the three resolver inputs without mapping credentials.
       [[ -n "$data_name" ]] && typeset -gx "${data_name}=${data_credential}"
@@ -931,6 +974,19 @@ hindsight_stack_require_runtime_helpers() {
 
   hindsight_stack_require_trusted_artifact \
     "$HINDSIGHT_EMBED_PYTHON" "Hindsight embed Python" executable allow-symlink || return 1
+  if hindsight_stack_runtime_active; then
+    [[ -n "${HINDSIGHT_EMBED_CONTROL_SERVER:-}" ]] || {
+      print -ru2 -- "hindsight-embed-stack: active runtime requires HINDSIGHT_EMBED_CONTROL_SERVER"
+      return 1
+    }
+    hindsight_stack_require_trusted_artifact \
+      "$HINDSIGHT_EMBED_CONTROL_SERVER" "control server" readable allow-symlink || return 1
+    hindsight_stack_run_bounded "$HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS" \
+      "$HINDSIGHT_EMBED_PYTHON" -I "$HINDSIGHT_EMBED_CONTROL_SERVER" --help >/dev/null 2>&1 || {
+      print -ru2 -- "hindsight-embed-stack: control server failed import/preflight at ${HINDSIGHT_EMBED_CONTROL_SERVER}"
+      return 1
+    }
+  fi
   hindsight_stack_require_trusted_artifact \
     "$HINDSIGHT_EMBED_STOP_HELPER" "stop helper" readable allow-symlink || return 1
   hindsight_stack_run_bounded "$HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS" \
@@ -2157,6 +2213,14 @@ hindsight_stack_ui_auth_status() {
 hindsight_stack_ui_status_probe() {
   emulate -L zsh
   local probe_timeout="${1:-$HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS}"
+  if hindsight_stack_runtime_active; then
+    # Upstream's UI status follows the unauthenticated root redirect. With
+    # access-key auth enabled that redirect loops at /login and reports a
+    # healthy UI as down. The authenticated probe proves both the UI policy and
+    # its data-plane binding, so it is the authoritative active-runtime check.
+    hindsight_stack_ui_auth_probe "$probe_timeout"
+    return
+  fi
   integer probe_deadline=$(( $(/bin/date +%s) + probe_timeout ))
 
   hindsight_stack_run_bounded "$probe_timeout" \
@@ -2164,11 +2228,7 @@ hindsight_stack_ui_status_probe() {
     --port "$HINDSIGHT_EMBED_UI_PORT" >/dev/null 2>&1 || return 1
   probe_timeout=$(( probe_deadline - $(/bin/date +%s) ))
   (( probe_timeout > 0 )) || return 1
-  if hindsight_stack_runtime_active; then
-    hindsight_stack_ui_auth_probe "$probe_timeout"
-  else
-    hindsight_stack_http_ok "$(hindsight_stack_ui_url)" "$probe_timeout"
-  fi
+  hindsight_stack_http_ok "$(hindsight_stack_ui_url)" "$probe_timeout"
 }
 
 hindsight_stack_ui_status() {
@@ -2204,6 +2264,14 @@ hindsight_stack_control_start() {
   hindsight_stack_load_config || return 1
   hindsight_stack_preflight_runtime_credentials || return 1
 
+  if hindsight_stack_runtime_active; then
+    [[ -n "${HINDSIGHT_EMBED_CONTROL_SERVER:-}" ]] || return 1
+    hindsight_stack_run_bounded "$HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS" \
+      "$HINDSIGHT_EMBED_PYTHON" -I "$HINDSIGHT_EMBED_CONTROL_SERVER" start \
+      --port "$HINDSIGHT_EMBED_CONTROL_PORT" \
+      --desired-state-dir "$HINDSIGHT_EMBED_DESIRED_STATE_DIR"
+    return
+  fi
   hindsight_stack_run_bounded "$HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS" \
     "$HINDSIGHT_EMBED_UVX" hindsight-embed control start --no-open \
     --port "$HINDSIGHT_EMBED_CONTROL_PORT" >/dev/null 2>&1
@@ -2526,6 +2594,44 @@ hindsight_stack_daemon_start() {
   hindsight_stack_wait_daemon
 }
 
+hindsight_stack_prepare_ui_package() {
+  emulate -L zsh
+
+  local npx="${HINDSIGHT_EMBED_NPX_EXECUTABLE:-}"
+  [[ -n "$npx" ]] || {
+    print -ru2 -- "hindsight-embed-stack: HINDSIGHT_EMBED_NPX_EXECUTABLE is required"
+    return 1
+  }
+  hindsight_stack_require_trusted_artifact \
+    "$npx" "Hindsight UI npx" executable allow-symlink || return 1
+
+  local helper="${HINDSIGHT_EMBED_STOP_HELPER:h}/hindsight-embed-ui-compat.py"
+  hindsight_stack_require_trusted_artifact \
+    "$helper" "Hindsight UI compatibility helper" readable allow-symlink || return 1
+
+  local version="${HINDSIGHT_EMBED_CP_VERSION:-}"
+  if [[ -z "$version" ]]; then
+    local version_output
+    version_output="$(
+      hindsight_stack_run_with_credential_scope none \
+        "$HINDSIGHT_EMBED_UVX" hindsight-embed --version
+    )" || {
+      print -ru2 -- "hindsight-embed-stack: control-plane version discovery failed"
+      return 1
+    }
+    version="${version_output##* }"
+  fi
+  [[ "$version" =~ '^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$' ]] || {
+    print -ru2 -- "hindsight-embed-stack: control-plane version is invalid"
+    return 1
+  }
+
+  hindsight_stack_run_with_credential_scope none \
+    "$HINDSIGHT_EMBED_PYTHON" -I "$helper" \
+    --npx "$npx" \
+    --version "$version"
+}
+
 hindsight_stack_ui_start() {
   emulate -L zsh
   hindsight_stack_load_config || return 1
@@ -2535,6 +2641,9 @@ hindsight_stack_ui_start() {
     print -ru2 -- "hindsight-embed-stack: refusing to start UI for ${HINDSIGHT_EMBED_PROFILE} without a healthy daemon"
     return 1
   }
+  if hindsight_stack_runtime_active; then
+    hindsight_stack_prepare_ui_package || return 1
+  fi
 
   if hindsight_stack_runtime_active && hindsight_stack_ui_running; then
     hindsight_stack_ui_status && return 0
@@ -2866,11 +2975,31 @@ hindsight_stack_reconcile_profile() {
 hindsight_stack_reconcile_once() {
   emulate -L zsh
   hindsight_stack_load_config || return 1
-  hindsight_stack_preflight_runtime_credentials || return 1
-  hindsight_stack_require_current_user || return 1
-  hindsight_stack_require_tools || return 1
-  hindsight_stack_validate_fleet || return 1
-  hindsight_stack_initialize_desired_state || return 1
+  hindsight_stack_preflight_runtime_credentials || {
+    hindsight_stack_disable_harness_authority >/dev/null 2>&1 || true
+    return 1
+  }
+  hindsight_stack_require_current_user || {
+    hindsight_stack_disable_harness_authority >/dev/null 2>&1 || true
+    return 1
+  }
+  hindsight_stack_require_tools || {
+    hindsight_stack_disable_harness_authority >/dev/null 2>&1 || true
+    return 1
+  }
+  hindsight_stack_validate_fleet || {
+    hindsight_stack_disable_harness_authority >/dev/null 2>&1 || true
+    return 1
+  }
+  hindsight_stack_initialize_desired_state || {
+    hindsight_stack_disable_harness_authority >/dev/null 2>&1 || true
+    return 1
+  }
+  if ! hindsight_stack_reconcile_harness_authority; then
+    hindsight_stack_log \
+      "harness authority is not active; recovering runtime before restoration"
+    hindsight_stack_disable_harness_authority >/dev/null 2>&1 || return 1
+  fi
 
   local ok=0
 
@@ -2885,8 +3014,59 @@ hindsight_stack_reconcile_once() {
     hindsight_stack_reconcile_control || ok=1
     hindsight_stack_for_each_profile hindsight_stack_reconcile_profile "" || ok=1
   fi
+  if (( ok != 0 )) ||
+    ! hindsight_stack_for_each_profile \
+      hindsight_stack_daemon_desired_running ""; then
+    ok=1
+  fi
+  if (( ok != 0 )); then
+    hindsight_stack_disable_harness_authority >/dev/null 2>&1 || true
+    return "$ok"
+  fi
+  if ! hindsight_stack_record_harness_authority; then
+    hindsight_stack_log \
+      "runtime is healthy but harness authority restoration failed"
+    hindsight_stack_disable_harness_authority >/dev/null 2>&1 || return 1
+  fi
+  return 0
+}
 
-  return "$ok"
+hindsight_stack_run_harness_reconciler() {
+  emulate -L zsh
+  local phase="$1" credential_scope=none
+  [[ "$phase" == pre-start || "$phase" == post-start || "$phase" == disable ]] ||
+    return 2
+  hindsight_stack_load_config || return 1
+  [[ -n "${HINDSIGHT_MEMORY_HARNESS_RECONCILER:-}" ]] || return 0
+  hindsight_stack_validate_trusted_executable \
+    "$HINDSIGHT_MEMORY_HARNESS_RECONCILER" \
+    "harness authority reconciler" || return 1
+  [[ "$phase" == post-start ]] && credential_scope=controller
+  hindsight_stack_run_bounded_with_credential_scope \
+    "$credential_scope" \
+    "$HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS" \
+    "$HINDSIGHT_MEMORY_HARNESS_RECONCILER" \
+    "$phase" \
+    "$HINDSIGHT_MEMORY_HARNESS_RECONCILE_CONFIG"
+}
+
+hindsight_stack_reconcile_harness_authority() {
+  hindsight_stack_run_harness_reconciler pre-start
+}
+
+hindsight_stack_record_harness_authority() {
+  hindsight_stack_run_harness_reconciler post-start
+}
+
+hindsight_stack_disable_harness_authority() {
+  hindsight_stack_run_harness_reconciler disable
+}
+
+hindsight_stack_daemon_desired_running() {
+  emulate -L zsh
+  local desired
+  desired="$(hindsight_stack_desired_state daemon)" || return 1
+  [[ "$desired" == running ]]
 }
 
 hindsight_stack_start_profile() {
@@ -2951,22 +3131,60 @@ hindsight_stack_start_control_dependency() {
 hindsight_stack_start_all() {
   emulate -L zsh
   hindsight_stack_load_config || return 1
-  hindsight_stack_preflight_runtime_credentials || return 1
-  hindsight_stack_require_current_user || return 1
-  hindsight_stack_require_tools || return 1
-  hindsight_stack_require_runtime_helpers || return 1
-  hindsight_stack_validate_fleet || return 1
-  hindsight_stack_initialize_desired_state || return 1
-
-  if hindsight_stack_runtime_active; then
-    hindsight_stack_start_control_dependency || return 1
-    hindsight_stack_for_each_profile hindsight_stack_start_profile "" || return 1
-    hindsight_stack_start_broker_dependency
-  else
-    hindsight_stack_start_broker_dependency || return 1
-    hindsight_stack_start_control_dependency || return 1
-    hindsight_stack_for_each_profile hindsight_stack_start_profile ""
+  hindsight_stack_preflight_runtime_credentials || {
+    hindsight_stack_disable_harness_authority >/dev/null 2>&1 || true
+    return 1
+  }
+  hindsight_stack_require_current_user || {
+    hindsight_stack_disable_harness_authority >/dev/null 2>&1 || true
+    return 1
+  }
+  hindsight_stack_require_tools || {
+    hindsight_stack_disable_harness_authority >/dev/null 2>&1 || true
+    return 1
+  }
+  hindsight_stack_require_runtime_helpers || {
+    hindsight_stack_disable_harness_authority >/dev/null 2>&1 || true
+    return 1
+  }
+  hindsight_stack_validate_fleet || {
+    hindsight_stack_disable_harness_authority >/dev/null 2>&1 || true
+    return 1
+  }
+  hindsight_stack_initialize_desired_state || {
+    hindsight_stack_disable_harness_authority >/dev/null 2>&1 || true
+    return 1
+  }
+  if ! hindsight_stack_reconcile_harness_authority; then
+    hindsight_stack_log \
+      "harness authority is not active; starting runtime before restoration"
+    hindsight_stack_disable_harness_authority >/dev/null 2>&1 || return 1
   fi
+
+  local ok=0
+  if hindsight_stack_runtime_active; then
+    hindsight_stack_start_control_dependency || ok=1
+    (( ok != 0 )) ||
+      hindsight_stack_for_each_profile hindsight_stack_start_profile "" ||
+      ok=1
+    (( ok != 0 )) || hindsight_stack_start_broker_dependency || ok=1
+  else
+    hindsight_stack_start_broker_dependency || ok=1
+    (( ok != 0 )) || hindsight_stack_start_control_dependency || ok=1
+    (( ok != 0 )) ||
+      hindsight_stack_for_each_profile hindsight_stack_start_profile "" ||
+      ok=1
+  fi
+  if (( ok == 0 )) &&
+    hindsight_stack_for_each_profile \
+      hindsight_stack_daemon_desired_running ""; then
+    hindsight_stack_record_harness_authority || ok=1
+  else
+    ok=1
+  fi
+  (( ok == 0 )) ||
+    hindsight_stack_disable_harness_authority >/dev/null 2>&1 || true
+  return "$ok"
 }
 
 hindsight_stack_wait_profile() {
@@ -3025,11 +3243,12 @@ hindsight_stack_stop_profile() {
 hindsight_stack_stop_all() {
   emulate -L zsh
   hindsight_stack_load_config || return 1
+  local ok=0
+  hindsight_stack_disable_harness_authority || ok=1
   hindsight_stack_require_current_user || return 1
   hindsight_stack_require_tools || return 1
   hindsight_stack_require_runtime_helpers || return 1
 
-  local ok=0
   hindsight_stack_for_each_profile_for_stop hindsight_stack_stop_profile || ok=1
   hindsight_stack_broker_stop || ok=1
   hindsight_stack_wait_stopped_for broker "$HINDSIGHT_EMBED_STOP_WAIT_SECONDS" || {
@@ -3047,20 +3266,23 @@ hindsight_stack_stop_all() {
 hindsight_stack_status_word() {
   emulate -L zsh
   local component="$1"
+  local probe_timeout="${2:-$HINDSIGHT_EMBED_STATUS_PROBE_TIMEOUT_SECONDS}"
 
   case "$component" in
     broker)
-      if hindsight_stack_broker_status && hindsight_stack_broker_identity_matches; then
+      if hindsight_stack_broker_status "$probe_timeout" &&
+        hindsight_stack_broker_identity_matches; then
         print -r -- "healthy"
       else
         print -r -- "down"
       fi
       ;;
     control)
-      hindsight_stack_control_status && print -r -- "healthy" || print -r -- "down"
+      hindsight_stack_control_status "$probe_timeout" &&
+        print -r -- "healthy" || print -r -- "down"
       ;;
     daemon)
-      if hindsight_stack_daemon_status; then
+      if hindsight_stack_daemon_status "$probe_timeout"; then
         print -r -- "healthy"
       else
         local desired
@@ -3068,7 +3290,8 @@ hindsight_stack_status_word() {
           print -r -- "unknown"
           return 1
         }
-        if [[ "$desired" == stopped ]] && ! hindsight_stack_daemon_running; then
+        if [[ "$desired" == stopped ]] &&
+          ! hindsight_stack_daemon_running "$probe_timeout"; then
           print -r -- "stopped"
         else
           print -r -- "down"
@@ -3076,7 +3299,7 @@ hindsight_stack_status_word() {
       fi
       ;;
     ui)
-      if hindsight_stack_ui_status; then
+      if hindsight_stack_ui_status "$probe_timeout"; then
         print -r -- "healthy"
       else
         local desired
@@ -3084,7 +3307,8 @@ hindsight_stack_status_word() {
           print -r -- "unknown"
           return 1
         }
-        if [[ "$desired" == stopped ]] && ! hindsight_stack_ui_running; then
+        if [[ "$desired" == stopped ]] &&
+          ! hindsight_stack_ui_running "$probe_timeout"; then
           print -r -- "stopped"
         else
           print -r -- "down"
@@ -3100,11 +3324,13 @@ hindsight_stack_status_word() {
 
 hindsight_stack_status_profile() {
   emulate -L zsh
-  local profile="$1" sidecar
+  local profile="$1" probe_timeout="$2" sidecar
   [[ -z "$requested" || "$requested" == "$profile" ]] || return 0
-  daemon_health="$(hindsight_stack_status_word daemon)" || fleet_health=degraded
+  daemon_health="$(hindsight_stack_status_word daemon "$probe_timeout")" ||
+    fleet_health=degraded
   [[ "$daemon_health" == healthy || "$daemon_health" == stopped ]] || fleet_health=degraded
-  ui_health="$(hindsight_stack_status_word ui)" || fleet_health=degraded
+  ui_health="$(hindsight_stack_status_word ui "$probe_timeout")" ||
+    fleet_health=degraded
   [[ "$ui_health" == healthy || "$ui_health" == stopped ]] || fleet_health=degraded
   sidecar_records=()
   local -a sidecars
@@ -3114,7 +3340,7 @@ hindsight_stack_status_profile() {
   }
   sidecars=("${(@)sidecars:#}")
   for sidecar in "${sidecars[@]}"; do
-    if hindsight_stack_sidecar_status "$sidecar"; then
+    if hindsight_stack_sidecar_status "$sidecar" "$probe_timeout"; then
       sidecar_health=healthy
     else
       sidecar_health=down
@@ -3134,16 +3360,17 @@ hindsight_stack_status_report() {
   emulate -L zsh
   hindsight_stack_load_config || return 1
   hindsight_stack_require_tools || return 1
+  local probe_timeout="$HINDSIGHT_EMBED_STATUS_PROBE_TIMEOUT_SECONDS"
   hindsight_stack_push_profile_state
   hindsight_stack_select_profile "$HINDSIGHT_EMBED_PRIMARY_PROFILE" || {
     hindsight_stack_pop_profile_state
     return 1
   }
-  print -r -- "broker: $(hindsight_stack_status_word broker) (${HINDSIGHT_MEMORY_BROKER_SOCKET})"
-  print -r -- "control: $(hindsight_stack_status_word control) ($(hindsight_stack_http_url "$HINDSIGHT_EMBED_CONTROL_HOSTNAME" "$HINDSIGHT_EMBED_CONTROL_PORT"))"
+  print -r -- "broker: $(hindsight_stack_status_word broker "$probe_timeout") (${HINDSIGHT_MEMORY_BROKER_SOCKET})"
+  print -r -- "control: $(hindsight_stack_status_word control "$probe_timeout") ($(hindsight_stack_http_url "$HINDSIGHT_EMBED_CONTROL_HOSTNAME" "$HINDSIGHT_EMBED_CONTROL_PORT"))"
   local primary_daemon_health primary_ui_health
-  primary_daemon_health="$(hindsight_stack_status_word daemon)"
-  primary_ui_health="$(hindsight_stack_status_word ui)"
+  primary_daemon_health="$(hindsight_stack_status_word daemon "$probe_timeout")"
+  primary_ui_health="$(hindsight_stack_status_word ui "$probe_timeout")"
   print -r -- "daemon: ${primary_daemon_health} (${HINDSIGHT_EMBED_PROFILE}, $(hindsight_stack_http_url 127.0.0.1 "$HINDSIGHT_EMBED_API_PORT"))"
   print -r -- "ui: ${primary_ui_health} (${HINDSIGHT_EMBED_PROFILE}, $(hindsight_stack_ui_url))"
   hindsight_stack_pop_profile_state
@@ -3159,13 +3386,15 @@ hindsight_stack_status_report() {
   fi
 
   local fleet_health=healthy daemon_health ui_health sidecar_health
-  hindsight_stack_broker_status && hindsight_stack_broker_identity_matches || fleet_health=degraded
-  hindsight_stack_control_status || fleet_health=degraded
+  hindsight_stack_broker_status "$probe_timeout" &&
+    hindsight_stack_broker_identity_matches || fleet_health=degraded
+  hindsight_stack_control_status "$probe_timeout" || fleet_health=degraded
   local profile_count="${#profiles}"
   [[ -z "$requested" ]] || profile_count=1
   local profile_label=profiles
   (( profile_count == 1 )) && profile_label=profile
-  hindsight_stack_for_each_profile hindsight_stack_status_profile "$requested" || fleet_health=degraded
+  hindsight_stack_for_each_profile hindsight_stack_status_profile \
+    "$requested" "$probe_timeout" || fleet_health=degraded
   print -r -- "fleet: ${fleet_health} (${profile_count} enabled ${profile_label})"
   print -rl -- "${profile_records[@]}"
   [[ "$fleet_health" == healthy ]]

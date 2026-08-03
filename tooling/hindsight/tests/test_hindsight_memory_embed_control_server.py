@@ -5,6 +5,7 @@ from pathlib import Path
 import os
 import sys
 import tempfile
+import threading
 from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -64,6 +65,15 @@ class ControlServerHooksTest(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.state_dir = Path(self.temporary.name) / "desired"
+        environment = patch.dict(
+            os.environ,
+            {
+                "HINDSIGHT_EMBED_STATE_DIR": str(self.state_dir.parent),
+                "HINDSIGHT_EMBED_DESIRED_STATE_DIR": str(self.state_dir),
+            },
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
         self.providers = SimpleNamespace(
             ProviderInfo=ProviderInfo,
             PROVIDER_CATALOG=(ProviderInfo("openai", "OpenAI", True),),
@@ -72,9 +82,13 @@ class ControlServerHooksTest(unittest.TestCase):
             start_daemon=lambda _name: DaemonResult(ok=True, running=True),
             restart_daemon=lambda _name: DaemonResult(ok=True, running=True),
             stop_daemon=lambda _name: DaemonResult(ok=True, running=False),
+            daemon_status=lambda _name: DaemonResult(
+                ok=True, running=True
+            ),
             start_ui=lambda _name: UiResult(running=True),
             restart_ui=lambda _name: UiResult(running=True),
             stop_ui=lambda _name: UiResult(running=False),
+            ui_status=lambda _name: UiResult(running=True),
         )
         self.module.install_hooks(
             self.service, self.providers, self.state_dir
@@ -189,6 +203,54 @@ class ControlServerHooksTest(unittest.TestCase):
         )
         self.assertFalse(catalog["openai-codex"].needs_api_key)
         self.assertFalse(catalog["claude-code"].needs_api_key)
+        self.assertEqual(
+            catalog["openai-codex"].label,
+            "[Systalyze] OpenAI Codex",
+        )
+
+    def test_managed_codex_save_persists_work_home_marker(self):
+        runtime = ProfileConfig(
+            "example-profile",
+            "openai-codex",
+            self.module.MANAGED_CODEX_MODEL,
+            "",
+        )
+        saved = []
+        service = SimpleNamespace(
+            get_profile_config=lambda _name: runtime,
+            list_profiles=lambda: [],
+            save_llm_config=lambda **kwargs: saved.append(kwargs) or runtime,
+        )
+        self.module.install_provider_alias(service, None)
+
+        service.save_llm_config(
+            name="example-profile",
+            provider="openai-codex",
+            api_key="",
+            model=None,
+            base_url=None,
+        )
+
+        self.assertEqual(
+            saved[-1]["api_key"],
+            "provider-policy:work-codex",
+        )
+        self.assertEqual(
+            saved[-1]["model"],
+            "gpt-5.3-codex-spark",
+        )
+        self.assertEqual(saved[-1]["base_url"], "")
+        with self.assertRaisesRegex(
+            ValueError,
+            "not permitted",
+        ):
+            service.save_llm_config(
+                name="example-profile",
+                provider="claude-code",
+                api_key="",
+                model="claude",
+                base_url=None,
+            )
 
     def test_provider_preset_catalog_and_alias_round_trip(self):
         runtime = ProfileConfig(
@@ -281,6 +343,7 @@ class ControlServerHooksTest(unittest.TestCase):
             "https://host/v1?api_key=credential",
             "https://host/v1#credential",
             "http://192.0.2.1/v1",
+            "http://hatchery.ts.net.example/v1",
             "http://127.0.0.1:0/v1",
             "file:///private/provider",
         ):
@@ -301,6 +364,16 @@ class ControlServerHooksTest(unittest.TestCase):
         self.assertEqual(
             self.module.provider_preset_from_environment(loopback).base_url,
             "http://127.0.0.1:1234/v1",
+        )
+        tailnet = {
+            **complete,
+            "HINDSIGHT_EMBED_PROVIDER_PRESET_BASE_URL": (
+                "http://hatchery.komodo-vector.ts.net:13305/v1"
+            ),
+        }
+        self.assertEqual(
+            self.module.provider_preset_from_environment(tailnet).base_url,
+            "http://hatchery.komodo-vector.ts.net:13305/v1",
         )
 
     def test_provider_preset_rejects_reserved_and_existing_ids(self):
@@ -325,9 +398,66 @@ class ControlServerHooksTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "provider preset ID is reserved"):
             self.module.install_provider_catalog(self.providers, preset)
 
+    def test_ui_readiness_accepts_only_success_or_login_redirect(self):
+        class Response:
+            def __init__(self, status, location=None):
+                self.status = status
+                self.location = location
+
+            def getheader(self, name):
+                return self.location if name == "Location" else None
+
+            def read(self, _size):
+                return b""
+
+        class Connection:
+            response = Response(200)
+
+            def __init__(self, host, port, timeout):
+                self.arguments = (host, port, timeout)
+
+            def request(self, method, path):
+                self.request_arguments = (method, path)
+
+            def getresponse(self):
+                return self.response
+
+            def close(self):
+                return None
+
+        manager = SimpleNamespace(
+            get_ui_url=lambda _profile, _port, hostname: (
+                f"http://{hostname}:17979"
+            ),
+            is_ui_running=lambda _profile, _port=None: False,
+        )
+        service = SimpleNamespace(
+            daemon_client=SimpleNamespace(_manager=manager),
+        )
+        self.module.install_ui_readiness(service)
+
+        with patch.object(
+            self.module.http.client,
+            "HTTPConnection",
+            Connection,
+        ):
+            for response, expected in (
+                (Response(200), True),
+                (Response(307, "/login"), True),
+                (Response(307, "/login?returnTo=%2F"), True),
+                (Response(307, "/other"), False),
+                (Response(307, "http://[invalid/login"), False),
+                (Response(401), False),
+            ):
+                with self.subTest(status=response.status, expected=expected):
+                    Connection.response = response
+                    self.assertEqual(
+                        manager.is_ui_running("systalyze"),
+                        expected,
+                    )
+
     def test_lifecycle_hooks_preserve_intent_and_required_daemon(self):
         self.service.stop_daemon("example-profile")
-        self.service.stop_ui("example-profile")
         self.assertEqual(self.desired("example-profile", "daemon"), "stopped")
         self.assertEqual(self.desired("example-profile", "ui"), "stopped")
 
@@ -335,7 +465,253 @@ class ControlServerHooksTest(unittest.TestCase):
         self.assertEqual(self.desired("example-profile", "daemon"), "running")
         self.assertEqual(self.desired("example-profile", "ui"), "running")
 
-    def test_failed_stop_restores_running_intent(self):
+    def test_stop_waits_for_supervisor_lifecycle_lock(self):
+        entered = threading.Event()
+        service = SimpleNamespace(
+            start_daemon=lambda _profile: DaemonResult(
+                ok=True, running=True
+            ),
+            restart_daemon=lambda _profile: DaemonResult(
+                ok=True, running=True
+            ),
+            stop_daemon=lambda _profile: DaemonResult(
+                ok=True, running=False
+            ),
+            daemon_status=lambda _profile: DaemonResult(
+                ok=True, running=True
+            ),
+            start_ui=lambda _profile: UiResult(running=True),
+            restart_ui=lambda _profile: UiResult(running=True),
+            stop_ui=self.module.functools.partial(
+                lambda _profile: (
+                    entered.set() or UiResult(running=False)
+                )
+            ),
+            ui_status=lambda _profile: UiResult(running=True),
+        )
+        self.module.install_lifecycle_hooks(service, self.state_dir)
+        lifecycle_lock = self.state_dir.parent / ".lifecycle.lock"
+        lifecycle_lock.touch(mode=0o600)
+        descriptor = os.open(lifecycle_lock, os.O_RDWR)
+        self.addCleanup(os.close, descriptor)
+        self.module.fcntl.flock(descriptor, self.module.fcntl.LOCK_EX)
+        self.addCleanup(
+            self.module.fcntl.flock,
+            descriptor,
+            self.module.fcntl.LOCK_UN,
+        )
+
+        thread = threading.Thread(
+            target=service.stop_ui,
+            args=("locked-profile",),
+            daemon=True,
+        )
+        lock_attempted = threading.Event()
+        real_flock = self.module.fcntl.flock
+
+        def observe_flock(fd: int, operation: int) -> None:
+            if (
+                fd != descriptor
+                and operation & self.module.fcntl.LOCK_EX
+                and operation & self.module.fcntl.LOCK_NB
+            ):
+                lock_attempted.set()
+            real_flock(fd, operation)
+
+        with patch.object(
+            self.module.fcntl,
+            "flock",
+            side_effect=observe_flock,
+        ):
+            thread.start()
+            self.assertTrue(lock_attempted.wait(timeout=1))
+            self.assertFalse(entered.is_set())
+            self.assertIsNone(
+                self.module.desired_state(
+                    self.state_dir,
+                    "locked-profile",
+                    "ui",
+                )
+            )
+            real_flock(descriptor, self.module.fcntl.LOCK_UN)
+            thread.join(timeout=1)
+
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(entered.is_set())
+        self.assertEqual(
+            self.desired("locked-profile", "ui"),
+            "stopped",
+        )
+
+    def test_lifecycle_lock_timeout_names_the_blocked_operation(self):
+        lifecycle_lock = self.state_dir.parent / ".lifecycle.lock"
+        lifecycle_lock.touch(mode=0o600)
+        descriptor = os.open(lifecycle_lock, os.O_RDWR)
+        self.addCleanup(os.close, descriptor)
+        self.module.fcntl.flock(descriptor, self.module.fcntl.LOCK_EX)
+        self.addCleanup(
+            self.module.fcntl.flock,
+            descriptor,
+            self.module.fcntl.LOCK_UN,
+        )
+
+        with self.assertRaisesRegex(
+            TimeoutError,
+            "stop ui",
+        ):
+            with self.module._component_lifecycle_lock(
+                self.state_dir,
+                timeout=0.01,
+                operation="stop ui",
+            ):
+                self.fail("contended lifecycle lock was acquired")
+
+    def test_stop_cancels_a_stalled_start_without_waiting_for_timeout(self):
+        status_entered = threading.Event()
+        start_results = []
+
+        def ui_status(_profile) -> UiResult:
+            status_entered.set()
+            return UiResult(running=False)
+
+        service = SimpleNamespace(
+            start_daemon=lambda _profile: DaemonResult(
+                ok=True, running=True
+            ),
+            restart_daemon=lambda _profile: DaemonResult(
+                ok=True, running=True
+            ),
+            stop_daemon=lambda _profile: DaemonResult(
+                ok=True, running=False
+            ),
+            daemon_status=lambda _profile: DaemonResult(
+                ok=True, running=True
+            ),
+            start_ui=lambda _profile: UiResult(running=True),
+            restart_ui=lambda _profile: UiResult(running=True),
+            stop_ui=lambda _profile: UiResult(running=False),
+            ui_status=ui_status,
+        )
+        with patch.dict(
+            os.environ,
+            {"HINDSIGHT_EMBED_UI_WAIT_SECONDS": "1"},
+        ):
+            self.module.install_lifecycle_hooks(service, self.state_dir)
+
+        thread = threading.Thread(
+            target=lambda: start_results.append(
+                service.start_ui("cancel-profile")
+            ),
+            daemon=True,
+        )
+        thread.start()
+        self.assertTrue(status_entered.wait(timeout=1))
+
+        started = self.module.time.monotonic()
+        stopped = service.stop_ui("cancel-profile")
+        elapsed = self.module.time.monotonic() - started
+        thread.join(timeout=0.5)
+
+        self.assertLess(elapsed, 0.5)
+        self.assertFalse(stopped.running)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(start_results, [UiResult(running=False)])
+        self.assertEqual(
+            self.desired("cancel-profile", "ui"),
+            "stopped",
+        )
+
+    def test_start_waits_for_supervisor_without_direct_launch(self):
+        ready = threading.Event()
+        completed = threading.Event()
+        calls = []
+        results = []
+        service = SimpleNamespace(
+            start_daemon=lambda profile: calls.append(
+                ("start-daemon", profile)
+            ),
+            restart_daemon=lambda profile: calls.append(
+                ("restart-daemon", profile)
+            ),
+            stop_daemon=lambda _profile: DaemonResult(
+                ok=True, running=False
+            ),
+            daemon_status=lambda _profile: DaemonResult(
+                ok=ready.is_set(),
+                running=ready.is_set(),
+            ),
+            start_ui=lambda _profile: UiResult(running=True),
+            restart_ui=lambda _profile: UiResult(running=True),
+            stop_ui=lambda _profile: UiResult(running=False),
+            ui_status=lambda _profile: UiResult(running=True),
+        )
+        self.module.install_lifecycle_hooks(service, self.state_dir)
+
+        def start() -> None:
+            results.append(service.start_daemon("daemon-profile"))
+            completed.set()
+
+        thread = threading.Thread(target=start, daemon=True)
+        thread.start()
+        self.assertFalse(completed.wait(timeout=0.1))
+        self.assertEqual(
+            self.desired("daemon-profile", "daemon"),
+            "running",
+        )
+        ready.set()
+        thread.join(timeout=1)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(calls, [])
+        self.assertEqual(
+            results,
+            [DaemonResult(ok=True, running=True)],
+        )
+
+    def test_restart_stops_then_waits_for_supervisor(self):
+        calls = []
+        service = SimpleNamespace(
+            start_daemon=lambda profile: calls.append(
+                ("start-daemon", profile)
+            ),
+            restart_daemon=lambda profile: calls.append(
+                ("restart-daemon", profile)
+            ),
+            stop_daemon=lambda profile: (
+                calls.append(("stop-daemon", profile))
+                or DaemonResult(ok=True, running=False)
+            ),
+            daemon_status=lambda _profile: DaemonResult(
+                ok=True, running=True
+            ),
+            start_ui=lambda profile: calls.append(("start-ui", profile)),
+            restart_ui=lambda profile: calls.append(
+                ("restart-ui", profile)
+            ),
+            stop_ui=lambda profile: (
+                calls.append(("stop-ui", profile))
+                or UiResult(running=False)
+            ),
+            ui_status=lambda _profile: UiResult(running=True),
+        )
+        self.module.install_lifecycle_hooks(service, self.state_dir)
+
+        self.assertTrue(service.restart_daemon("daemon-profile").running)
+        self.assertTrue(service.restart_ui("ui-profile").running)
+
+        self.assertEqual(
+            calls,
+            [
+                ("stop-daemon", "daemon-profile"),
+                ("stop-ui", "ui-profile"),
+            ],
+        )
+        self.assertEqual(self.desired("daemon-profile", "daemon"), "running")
+        self.assertEqual(self.desired("ui-profile", "daemon"), "running")
+        self.assertEqual(self.desired("ui-profile", "ui"), "running")
+
+    def test_failed_stop_restores_absent_daemon_intent(self):
+        self.service.stop_ui("example-profile")
         service = SimpleNamespace(**vars(self.service))
         service.stop_daemon = lambda _name: DaemonResult(
             ok=False, running=True
@@ -344,7 +720,136 @@ class ControlServerHooksTest(unittest.TestCase):
 
         service.stop_daemon("example-profile")
 
-        self.assertEqual(self.desired("example-profile", "daemon"), "running")
+        profile = self.state_dir / "profiles" / "example-profile"
+        self.assertFalse((profile / "daemon").exists())
+        self.assertEqual(self.desired("example-profile", "ui"), "stopped")
+
+    def test_failed_stop_cannot_overwrite_later_serialized_start(self):
+        profile = "concurrent-profile"
+        self.module.set_desired_state(
+            self.state_dir,
+            profile,
+            "daemon",
+            "stopped",
+        )
+        stop_entered = threading.Event()
+        release_stop = threading.Event()
+        status_entered = threading.Event()
+        stop_released = []
+
+        def stop(_profile) -> DaemonResult:
+            stop_entered.set()
+            stop_released.append(release_stop.wait(timeout=3))
+            return DaemonResult(ok=False, running=True)
+
+        def status(_profile) -> DaemonResult:
+            status_entered.set()
+            return DaemonResult(ok=True, running=True)
+
+        service = SimpleNamespace(**vars(self.service))
+        service.stop_daemon = stop
+        service.daemon_status = status
+        self.module.install_lifecycle_hooks(service, self.state_dir)
+        stop_thread = threading.Thread(
+            target=service.stop_daemon,
+            args=(profile,),
+        )
+        start_thread = threading.Thread(
+            target=service.start_daemon,
+            args=(profile,),
+        )
+
+        stop_thread.start()
+        self.assertTrue(stop_entered.wait(timeout=3))
+        start_thread.start()
+        self.assertFalse(status_entered.wait(timeout=0.1))
+        release_stop.set()
+        stop_thread.join(timeout=3)
+        start_thread.join(timeout=3)
+
+        self.assertFalse(stop_thread.is_alive())
+        self.assertFalse(start_thread.is_alive())
+        self.assertEqual(stop_released, [True])
+        self.assertTrue(status_entered.is_set())
+        self.assertEqual(
+            self.desired(profile, "daemon"),
+            "running",
+        )
+
+    def test_missing_desired_state_is_explicit_and_failed_stop_restores_absence(
+        self,
+    ):
+        self.assertIsNone(
+            self.module.desired_state(
+                self.state_dir,
+                "example-profile",
+                "daemon",
+            )
+        )
+        marker = (
+            self.state_dir
+            / "profiles"
+            / "example-profile"
+            / "unrelated"
+        )
+
+        def fail_stop(_name):
+            marker.write_text("preserved\n", encoding="ascii")
+            marker.chmod(0o600)
+            return DaemonResult(ok=False, running=True)
+
+        service = SimpleNamespace(**vars(self.service))
+        service.stop_daemon = fail_stop
+        self.module.install_lifecycle_hooks(service, self.state_dir)
+
+        service.stop_daemon("example-profile")
+
+        profile = self.state_dir / "profiles" / "example-profile"
+        self.assertFalse((profile / "daemon").exists())
+        self.assertFalse((profile / "ui").exists())
+        self.assertEqual(marker.read_text(encoding="ascii"), "preserved\n")
+
+    def test_stop_rollback_preserves_primary_error_and_restores_every_component(
+        self,
+    ):
+        restored = []
+
+        def set_state(_root, _profile, component, state):
+            if state == "running":
+                restored.append(component)
+                if component == "daemon":
+                    raise RuntimeError("restore failed")
+
+        def fail(_profile):
+            raise ValueError("primary action failure")
+
+        with (
+            patch.object(
+                self.module,
+                "desired_state",
+                return_value="running",
+            ),
+            patch.object(
+                self.module,
+                "set_desired_state",
+                side_effect=set_state,
+            ),
+        ):
+            wrapped = self.module._stopping_action(
+                fail,
+                self.state_dir,
+                ("daemon", "ui"),
+                lambda _profile: self.module.threading.Lock(),
+                lambda **_kwargs: self.module.contextlib.nullcontext(),
+                1,
+            )
+            with self.assertRaisesRegex(
+                ValueError,
+                "primary action failure",
+            ):
+                wrapped("example-profile")
+
+        self.assertEqual(restored, ["daemon", "ui"])
 
     def test_desired_state_is_private_and_rejects_unsafe_names_and_paths(self):
         self.module.set_desired_state(
@@ -354,6 +859,31 @@ class ControlServerHooksTest(unittest.TestCase):
         self.assertEqual(os.stat(self.state_dir).st_mode & 0o777, 0o700)
         self.assertEqual(os.stat(profile).st_mode & 0o777, 0o700)
         self.assertEqual(os.stat(profile / "daemon").st_mode & 0o777, 0o600)
+        self.assertEqual(
+            self.module.desired_state(
+                self.state_dir,
+                "example-profile",
+                "daemon",
+            ),
+            "stopped",
+        )
+        for payload in (
+            b"stopped",
+            b" stopped\n",
+            b"stopped \n",
+            b"stopped\n\n",
+        ):
+            with self.subTest(payload=payload):
+                (profile / "daemon").write_bytes(payload)
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "desired-state file is invalid",
+                ):
+                    self.module.desired_state(
+                        self.state_dir,
+                        "example-profile",
+                        "daemon",
+                    )
 
         for name in ("../outside", "bad/name"):
             with self.subTest(profile=name), self.assertRaises(ValueError):

@@ -11,7 +11,7 @@ import stat
 import subprocess
 import sys
 import tempfile
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import Mock, patch
@@ -1493,6 +1493,1176 @@ class ControllerCliTest(unittest.TestCase):
             module["MigrationError"], "token environment locator is invalid"
         ):
             module["migration_discover_command"](args)
+
+    def test_migration_replay_cli_exposes_all_digest_bound_phases(self):
+        module = runpy.run_path(str(CLI))
+        argument_parser = module["parser"]()
+        common = [
+            "--state-dir",
+            "/private/test/state",
+            "migration",
+            "replay",
+        ]
+        cases = {
+            "plan": [
+                "--inventory",
+                "inventory.json",
+                "--profile",
+                "systalyze",
+                "--token-env",
+                "TOKEN",
+                "--output",
+                "plan.json",
+            ],
+            "apply": [
+                "--inventory",
+                "inventory.json",
+                "--profile",
+                "systalyze",
+                "--token-env",
+                "TOKEN",
+                "--plan",
+                "plan.json",
+                "--backup-evidence",
+                "backup-evidence.json",
+                "--approval-digest",
+                "a" * 64,
+                "--receipts",
+                "receipts.json",
+            ],
+            "status": [
+                "--plan",
+                "plan.json",
+                "--receipts",
+                "receipts.json",
+            ],
+            "verify": [
+                "--inventory",
+                "inventory.json",
+                "--profile",
+                "systalyze",
+                "--token-env",
+                "TOKEN",
+                "--plan",
+                "plan.json",
+                "--receipts",
+                "receipts.json",
+                "--output",
+                "verification.json",
+            ],
+            "closeout": [
+                "--inventory",
+                "inventory.json",
+                "--profile",
+                "systalyze",
+                "--token-env",
+                "TOKEN",
+                "--plan",
+                "plan.json",
+                "--receipts",
+                "receipts.json",
+                "--verification",
+                "verification.json",
+                "--backup-evidence",
+                "backup-evidence.json",
+                "--prepare",
+                "--output",
+                "closeout-plan.json",
+            ],
+        }
+        expected = {
+            phase: module[f"migration_replay_{phase}_command"]
+            for phase in cases
+        }
+        for phase, arguments in cases.items():
+            with self.subTest(phase=phase):
+                parsed = argument_parser.parse_args(
+                    [*common, phase, *arguments]
+                )
+                self.assertEqual(parsed.migration_replay_command, phase)
+                self.assertIs(parsed.run, expected[phase])
+
+    def test_migration_replay_apply_reads_the_verified_plan_once(self):
+        module = runpy.run_path(str(CLI))
+        verified_plan = {
+            "plan_digest": "a" * 64,
+            "documents": [],
+        }
+        receipt_artifact = {
+            "schema_version": 1,
+            "plan_digest": verified_plan["plan_digest"],
+            "receipts": [{"receipt": "existing"}],
+        }
+        reads = []
+        applied = []
+        with tempfile.TemporaryDirectory() as directory:
+            receipt_path = Path(directory) / "receipts.json"
+            receipt_path.write_text("{}", encoding="utf-8")
+            args = module["argparse"].Namespace(
+                inventory="inventory.json",
+                profile="systalyze",
+                token_env="TOKEN",
+                plan="plan.json",
+                backup_evidence="backup-evidence.json",
+                approval_digest="a" * 64,
+                receipts=str(receipt_path),
+                timeout_seconds=10,
+                poll_interval_seconds=0,
+            )
+
+            def read_json(path):
+                reads.append(path)
+                if path == args.plan:
+                    if reads.count(args.plan) > 1:
+                        raise AssertionError("plan was reread after verification")
+                    return {"unverified": True}
+                if path == args.receipts:
+                    return receipt_artifact
+                if path == args.backup_evidence:
+                    return {"backup": True}
+                raise AssertionError(path)
+
+            def apply(_adapter, plan, **kwargs):
+                applied.append((plan, kwargs["existing_receipts"]))
+                return kwargs["existing_receipts"]
+
+            command = module["migration_replay_apply_command"]
+            with (
+                patch.dict(
+                    command.__globals__,
+                    {
+                        "_replay_http_adapter": lambda _args: object(),
+                        "read_json": read_json,
+                        "verify_replay_plan": lambda _value: verified_plan,
+                        "replay_apply_authorization_digest": (
+                            lambda *_args: "a" * 64
+                        ),
+                        "apply_replay_plan": apply,
+                        "write_private": lambda *_args, **_kwargs: None,
+                        "replay_receipt_status": lambda *_args: {"complete": True},
+                    },
+                ),
+                redirect_stdout(StringIO()),
+            ):
+                self.assertEqual(command(args), 0)
+
+        self.assertEqual(reads.count(args.plan), 1)
+        self.assertEqual(
+            applied,
+            [(verified_plan, receipt_artifact["receipts"])],
+        )
+
+    def test_migration_replay_uses_maximum_http_request_timeout(self):
+        module = runpy.run_path(str(CLI))
+        command = module["_replay_http_adapter"]
+        calls = []
+
+        def adapter(**kwargs):
+            calls.append(kwargs)
+            return object()
+
+        with (
+            patch.dict(
+                command.__globals__,
+                {
+                    "HttpAdapter": adapter,
+                    "load_inventory": lambda path: f"inventory:{path}",
+                },
+            ),
+            patch.dict(module["os"].environ, {"TOKEN": "secret"}),
+        ):
+            result = command(
+                module["argparse"].Namespace(
+                    inventory="inventory.json",
+                    profile="systalyze",
+                    token_env="TOKEN",
+                )
+            )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["timeout"], 30.0)
+
+    def test_harness_reconcile_pre_start_never_uses_server_and_disables_all(self):
+        module = runpy.run_path(str(CLI))
+        harnesses = ("codex", "claude-code", "cursor")
+        config = {
+            "schema_version": 1,
+            "state_dir": "/private/state",
+            "inventory": "/private/inventory.json",
+            "policy": "/private/policy.json",
+            "profile": "systalyze",
+            "token_env": "TOKEN",
+            "entries": [
+                {
+                    "destination": f"/private/{harness}.destination.json",
+                    "generation": f"/private/{harness}.generation",
+                    "plan": f"/private/{harness}.plan.json",
+                    "upstream_integration_roots": ["/private/upstream"],
+                }
+                for harness in harnesses
+            ],
+            "schedule_paths": ["/private/schedule.plist"],
+        }
+        events = []
+        disable_mismatches = set()
+        test_case = self
+
+        class Destination:
+            def __init__(self, harness_id):
+                self.harness_id = harness_id
+                self.configuration = {
+                    "harness_id": self.harness_id,
+                    "authority": "active",
+                }
+
+            def read_configuration(self):
+                return dict(self.configuration)
+
+            def write_configuration(self, expected_digest, target):
+                test_case.assertEqual(
+                    digest(self.configuration),
+                    expected_digest,
+                )
+                if self.harness_id in disable_mismatches:
+                    events.append(f"disable-failed:{self.harness_id}")
+                    return dict(self.configuration)
+                self.configuration = dict(target)
+                events.append(f"disable:{self.harness_id}")
+                return dict(self.configuration)
+
+            def to_record(self):
+                return {"harness_id": self.harness_id}
+
+            destination_digest = "d" * 64
+
+        def harness_id_from(path):
+            return Path(path).name.split(".", 1)[0]
+
+        def load_record(path):
+            harness_id = harness_id_from(path)
+            return (
+                {
+                    "approval_digest": "a" * 64,
+                    "destination": {"harness_id": harness_id},
+                    "destination_digest": "d" * 64,
+                },
+                {"harness_id": harness_id},
+            )
+
+        def destination(args):
+            return Destination(harness_id_from(args.destination))
+
+        def verify(args):
+            harness_id = harness_id_from(args.destination)
+            events.append(f"verify:{harness_id}")
+            if harness_id == "codex":
+                return 2
+            if harness_id == "claude-code":
+                raise module["HarnessPersistenceError"]("injected failure")
+            return 0
+
+        command = module["harness_config_reconcile_command"]
+        output = StringIO()
+        with (
+            patch.dict(
+                command.__globals__,
+                {
+                    "read_json": lambda path: (
+                        config if path == "reconcile.json" else {}
+                    ),
+                    "_read_harness_reconciliation_config": (
+                        lambda _path: (config, "e" * 64)
+                    ),
+                    "_load_harness_activation_record": load_record,
+                    "_harness_destination": destination,
+                    "_validate_activation_record": lambda *_args: None,
+                    "_replay_http_adapter": lambda _args: (_ for _ in ()).throw(
+                        AssertionError("pre-start reconciliation used HTTP")
+                    ),
+                    "_regular_file_digest": lambda *_args: "f" * 64,
+                    "_harness_reconciliation_controller_state": (
+                        lambda _path: {
+                            "configuration_digest": "a" * 64,
+                            "hook_digest": "b" * 64,
+                            "schedule_digest": "c" * 64,
+                        }
+                    ),
+                    "harness_config_verify_command": verify,
+                    "native_fail_closed_configuration": (
+                        lambda harness_id, _current, **_kwargs: {
+                            "harness_id": harness_id,
+                            "authority": "disabled",
+                        }
+                    ),
+                },
+            ),
+            patch.dict(module["os"].environ, {"TOKEN": "secret"}),
+            redirect_stdout(output),
+        ):
+            result = command(
+                module["argparse"].Namespace(
+                    config="reconcile.json",
+                    config_digest="e" * 64,
+                    phase="pre-start",
+                )
+            )
+            first_events = list(events)
+            events.clear()
+            disable_mismatches.add("cursor")
+            second_output = StringIO()
+            with redirect_stdout(second_output):
+                second_result = command(
+                    module["argparse"].Namespace(
+                        config="reconcile.json",
+                        config_digest="e" * 64,
+                        phase="pre-start",
+                    )
+                )
+
+        self.assertEqual(result, 2)
+        self.assertNotIn("adapter-preflight", first_events)
+        self.assertEqual(
+            [
+                event
+                for event in first_events
+                if event.startswith("verify:")
+            ],
+            [f"verify:{harness}" for harness in harnesses],
+        )
+        self.assertEqual(
+            [
+                event
+                for event in first_events
+                if event.startswith("disable:")
+            ],
+            [
+                "disable:codex",
+                "disable:claude-code",
+                "disable:cursor",
+            ],
+        )
+        self.assertNotIn("controller-state-write", first_events)
+        summary = json.loads(output.getvalue().splitlines()[-1])
+        self.assertEqual(summary["status"], "degraded")
+        self.assertEqual(
+            [failure["harness_id"] for failure in summary["failures"]],
+            ["claude-code", "codex"],
+        )
+        self.assertEqual(summary["disable_failures"], [])
+        self.assertEqual(second_result, 2)
+        second_summary = json.loads(
+            second_output.getvalue().splitlines()[-1]
+        )
+        self.assertEqual(
+            second_summary["disable_failures"],
+            [{"harness_id": "cursor", "reason": "disable_failed"}],
+        )
+        self.assertIn("disable-failed:cursor", events)
+
+    def test_harness_reconcile_post_start_restores_exact_fail_closed_prestate(
+        self,
+    ):
+        module = runpy.run_path(str(CLI))
+        harnesses = ("codex", "claude-code", "cursor")
+        config = {
+            "schema_version": 1,
+            "state_dir": "/private/state",
+            "inventory": "/private/inventory.json",
+            "policy": "/private/policy.json",
+            "profile": "systalyze",
+            "token_env": "TOKEN",
+            "entries": [
+                {
+                    "destination": f"/private/{harness}.destination.json",
+                    "generation": f"/private/{harness}.generation",
+                    "plan": f"/private/{harness}.plan.json",
+                    "upstream_integration_roots": ["/private/upstream"],
+                }
+                for harness in harnesses
+            ],
+            "schedule_paths": ["/private/schedule.plist"],
+        }
+        events = []
+
+        class Destination:
+            destination_digest = "d" * 64
+
+            def __init__(self, harness_id):
+                self.harness_id = harness_id
+                self.configuration = {
+                    "harness_id": harness_id,
+                    "authority": "disabled",
+                }
+
+            def read_configuration(self):
+                return dict(self.configuration)
+
+            def to_record(self):
+                return {"harness_id": self.harness_id}
+
+        class Adapter:
+            def read_migration_generation(self):
+                events.append("server-generation-read")
+                return "generation:1"
+
+            def record_controller_state(self, _state):
+                events.append("controller-state-write")
+                return {"generation": "generation:2"}
+
+        def harness_id_from(path):
+            return Path(path).name.split(".", 1)[0]
+
+        destinations = {
+            harness_id: Destination(harness_id) for harness_id in harnesses
+        }
+
+        def load_record(path):
+            harness_id = harness_id_from(path)
+            return (
+                {
+                    "approval_digest": "a" * 64,
+                    "destination": {"harness_id": harness_id},
+                    "destination_digest": "d" * 64,
+                },
+                {
+                    "harness_id": harness_id,
+                    "expected_prestate_digest": digest(
+                        destinations[harness_id].configuration
+                    ),
+                },
+            )
+
+        def apply(args):
+            harness_id = harness_id_from(args.destination)
+            self.assertTrue(args.broker_healthy)
+            self.assertTrue(args.profile_healthy)
+            self.assertTrue(args.adapter_self_test)
+            events.append(f"apply:{harness_id}")
+            destinations[harness_id].configuration["authority"] = "active"
+            return 0
+
+        def verify(args):
+            harness_id = harness_id_from(args.destination)
+            events.append(f"verify:{harness_id}")
+            return (
+                0
+                if destinations[harness_id].configuration["authority"]
+                == "active"
+                else 2
+            )
+
+        command = module["harness_config_reconcile_command"]
+        output = StringIO()
+        with (
+            patch.dict(
+                command.__globals__,
+                {
+                    "_read_harness_reconciliation_config": (
+                        lambda _path: (config, "e" * 64)
+                    ),
+                    "_load_harness_activation_record": load_record,
+                    "_harness_destination": lambda args: destinations[
+                        harness_id_from(args.destination)
+                    ],
+                    "_validate_activation_record": lambda *_args: None,
+                    "_replay_http_adapter": lambda _args: Adapter(),
+                    "_harness_reconciliation_controller_state": (
+                        lambda _config: {
+                            "configuration_digest": "a" * 64,
+                            "hook_digest": "b" * 64,
+                            "schedule_digest": "c" * 64,
+                        }
+                    ),
+                    "harness_config_apply_command": apply,
+                    "harness_config_verify_command": verify,
+                },
+            ),
+            patch.dict(module["os"].environ, {"TOKEN": "secret"}),
+            redirect_stdout(output),
+        ):
+            result = command(
+                module["argparse"].Namespace(
+                    config="reconcile.json",
+                    config_digest="e" * 64,
+                    phase="post-start",
+                )
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(
+            events,
+            [
+                "apply:codex",
+                "verify:codex",
+                "apply:claude-code",
+                "verify:claude-code",
+                "apply:cursor",
+                "verify:cursor",
+                "server-generation-read",
+                "controller-state-write",
+            ],
+        )
+        payload = json.loads(output.getvalue().splitlines()[-1])
+        self.assertEqual(payload["status"], "healthy")
+        self.assertEqual(payload["server_generation"], "generation:2")
+
+    def test_harness_reconcile_post_start_server_failure_disables_all(self):
+        module = runpy.run_path(str(CLI))
+        harnesses = ("codex", "claude-code", "cursor")
+        config = {
+            "schema_version": 1,
+            "state_dir": "/private/state",
+            "inventory": "/private/inventory.json",
+            "policy": "/private/policy.json",
+            "profile": "systalyze",
+            "token_env": "TOKEN",
+            "entries": [
+                {
+                    "destination": f"/private/{harness}.destination.json",
+                    "generation": f"/private/{harness}.generation",
+                    "plan": f"/private/{harness}.plan.json",
+                    "upstream_integration_roots": ["/private/upstream"],
+                }
+                for harness in harnesses
+            ],
+            "schedule_paths": ["/private/schedule.plist"],
+        }
+        events = []
+
+        class Destination:
+            destination_digest = "d" * 64
+
+            def __init__(self, harness_id):
+                self.harness_id = harness_id
+                self.configuration = {
+                    "harness_id": harness_id,
+                    "authority": "active",
+                }
+
+            def read_configuration(self):
+                return dict(self.configuration)
+
+            def write_configuration(self, expected_digest, target):
+                self.assert_digest(expected_digest)
+                self.configuration = dict(target)
+                events.append(f"disable:{self.harness_id}")
+                return dict(self.configuration)
+
+            def assert_digest(self, expected_digest):
+                if digest(self.configuration) != expected_digest:
+                    raise AssertionError("unexpected configuration digest")
+
+            def to_record(self):
+                return {"harness_id": self.harness_id}
+
+        class Adapter:
+            def read_migration_generation(self):
+                events.append("server-generation-read")
+                return "generation:1"
+
+            def record_controller_state(self, _state):
+                events.append("controller-state-write")
+                raise ConnectionError("server unavailable")
+
+        def harness_id_from(path):
+            return Path(path).name.split(".", 1)[0]
+
+        def load_record(path):
+            harness_id = harness_id_from(path)
+            return (
+                {
+                    "approval_digest": "a" * 64,
+                    "destination": {"harness_id": harness_id},
+                    "destination_digest": "d" * 64,
+                },
+                {
+                    "harness_id": harness_id,
+                    "expected_prestate_digest": "b" * 64,
+                },
+            )
+
+        destinations = {
+            harness_id: Destination(harness_id) for harness_id in harnesses
+        }
+
+        def verify(args):
+            events.append(f"verify:{harness_id_from(args.destination)}")
+            return 0
+
+        command = module["harness_config_reconcile_command"]
+        with (
+            patch.dict(
+                command.__globals__,
+                {
+                    "read_json": lambda path: (
+                        config if path == "reconcile.json" else {}
+                    ),
+                    "_read_harness_reconciliation_config": (
+                        lambda _path: (config, "e" * 64)
+                    ),
+                    "_load_harness_activation_record": load_record,
+                    "_harness_destination": lambda args: destinations[
+                        harness_id_from(args.destination)
+                    ],
+                    "_validate_activation_record": lambda *_args: None,
+                    "_replay_http_adapter": lambda _args: Adapter(),
+                    "_regular_file_digest": lambda *_args: "f" * 64,
+                    "_harness_reconciliation_controller_state": (
+                        lambda _path: {
+                            "configuration_digest": "a" * 64,
+                            "hook_digest": "b" * 64,
+                            "schedule_digest": "c" * 64,
+                        }
+                    ),
+                    "harness_config_verify_command": verify,
+                    "native_fail_closed_configuration": (
+                        lambda harness_id, _current, **_kwargs: {
+                            "harness_id": harness_id,
+                            "authority": "disabled",
+                        }
+                    ),
+                },
+            ),
+            patch.dict(module["os"].environ, {"TOKEN": "secret"}),
+            self.assertRaisesRegex(ConnectionError, "server unavailable"),
+            redirect_stdout(StringIO()),
+        ):
+            command(
+                module["argparse"].Namespace(
+                    config="reconcile.json",
+                    config_digest="e" * 64,
+                    phase="post-start",
+                )
+            )
+
+        self.assertEqual(
+            events,
+            [
+                "verify:codex",
+                "verify:claude-code",
+                "verify:cursor",
+                "server-generation-read",
+                "controller-state-write",
+                "disable:codex",
+                "disable:claude-code",
+                "disable:cursor",
+            ],
+        )
+
+    def test_harness_reconcile_rejects_changed_config_snapshot(self):
+        module = runpy.run_path(str(CLI))
+        command = module["harness_config_reconcile_command"]
+        verification = Mock(side_effect=AssertionError("verification began"))
+        with patch.dict(
+            command.__globals__,
+            {
+                "_read_harness_reconciliation_config": (
+                    lambda _path: ({"schema_version": 2}, "a" * 64)
+                ),
+                "harness_config_verify_command": verification,
+            },
+        ):
+            with self.assertRaisesRegex(
+                module["HarnessPersistenceError"],
+                "configuration digest does not match",
+            ):
+                command(
+                    module["argparse"].Namespace(
+                        config="reconcile.json",
+                        config_digest="b" * 64,
+                        phase="pre-start",
+                    )
+                )
+        verification.assert_not_called()
+
+    def test_harness_reconcile_disables_all_before_reraising_programming_error(self):
+        module = runpy.run_path(str(CLI))
+        harnesses = ("codex", "claude-code", "cursor")
+        config = {
+            "schema_version": 1,
+            "state_dir": "/private/state",
+            "inventory": "/private/inventory.json",
+            "policy": "/private/policy.json",
+            "profile": "systalyze",
+            "token_env": "TOKEN",
+            "entries": [
+                {
+                    "destination": f"/private/{harness}.destination.json",
+                    "generation": f"/private/{harness}.generation",
+                    "plan": f"/private/{harness}.plan.json",
+                    "upstream_integration_roots": ["/private/upstream"],
+                }
+                for harness in harnesses
+            ],
+            "schedule_paths": ["/private/schedule.plist"],
+        }
+        events = []
+
+        class Destination:
+            destination_digest = "d" * 64
+
+            def __init__(self, harness_id):
+                self.harness_id = harness_id
+                self.configuration = {"authority": "active"}
+
+            def read_configuration(self):
+                return dict(self.configuration)
+
+            def write_configuration(self, expected_digest, target):
+                if digest(self.configuration) != expected_digest:
+                    raise module["HarnessPersistenceError"]("CAS mismatch")
+                self.configuration = dict(target)
+                events.append(f"disable:{self.harness_id}")
+                return dict(self.configuration)
+
+            def to_record(self):
+                return {"harness_id": self.harness_id}
+
+        def harness_id_from(path):
+            return Path(path).name.split(".", 1)[0]
+
+        def load_record(path):
+            harness_id = harness_id_from(path)
+            return (
+                {
+                    "approval_digest": "a" * 64,
+                    "destination": {"harness_id": harness_id},
+                    "destination_digest": "d" * 64,
+                },
+                {"harness_id": harness_id},
+            )
+
+        def verify(args):
+            harness_id = harness_id_from(args.destination)
+            events.append(f"verify:{harness_id}")
+            if harness_id == "codex":
+                raise AssertionError("programming defect")
+            return 0
+
+        command = module["harness_config_reconcile_command"]
+        with (
+            patch.dict(
+                command.__globals__,
+                {
+                    "read_json": lambda path: (
+                        config if path == "reconcile.json" else {}
+                    ),
+                    "_read_harness_reconciliation_config": (
+                        lambda _path: (config, "e" * 64)
+                    ),
+                    "_load_harness_activation_record": load_record,
+                    "_harness_destination": lambda args: Destination(
+                        harness_id_from(args.destination)
+                    ),
+                    "_validate_activation_record": lambda *_args: None,
+                    "_replay_http_adapter": lambda _args: type(
+                        "Adapter",
+                        (),
+                        {
+                            "read_migration_generation": lambda self: (
+                                "generation:1"
+                            )
+                        },
+                    )(),
+                    "_regular_file_digest": lambda *_args: "f" * 64,
+                    "_harness_reconciliation_controller_state": (
+                        lambda _path: {
+                            "configuration_digest": "a" * 64,
+                            "hook_digest": "b" * 64,
+                            "schedule_digest": "c" * 64,
+                        }
+                    ),
+                    "harness_config_verify_command": verify,
+                    "native_fail_closed_configuration": (
+                        lambda harness_id, _current, **_kwargs: {
+                            "harness_id": harness_id,
+                            "authority": "disabled",
+                        }
+                    ),
+                },
+            ),
+            patch.dict(module["os"].environ, {"TOKEN": "secret"}),
+            self.assertRaisesRegex(AssertionError, "programming defect"),
+        ):
+            command(
+                module["argparse"].Namespace(
+                    config="reconcile.json",
+                    config_digest="e" * 64,
+                    phase="pre-start",
+                )
+            )
+
+        self.assertEqual(
+            [event for event in events if event.startswith("verify:")],
+            [f"verify:{harness}" for harness in harnesses],
+        )
+        self.assertEqual(
+            [event for event in events if event.startswith("disable:")],
+            [f"disable:{harness}" for harness in harnesses],
+        )
+
+    def test_harness_reconcile_rejects_destination_harness_mismatch_prewrite(self):
+        module = runpy.run_path(str(CLI))
+        harnesses = ("codex", "claude-code", "cursor")
+        config = {
+            "schema_version": 1,
+            "state_dir": "/private/state",
+            "inventory": "/private/inventory.json",
+            "policy": "/private/policy.json",
+            "profile": "systalyze",
+            "token_env": "TOKEN",
+            "entries": [
+                {
+                    "destination": f"/private/{harness}.destination.json",
+                    "generation": f"/private/{harness}.generation",
+                    "plan": f"/private/{harness}.plan.json",
+                    "upstream_integration_roots": ["/private/upstream"],
+                }
+                for harness in harnesses
+            ],
+            "schedule_paths": ["/private/schedule.plist"],
+        }
+        verifies = []
+        command = module["harness_config_reconcile_command"]
+
+        def load_record(path):
+            harness_id = Path(path).name.split(".", 1)[0]
+            if harness_id == "codex":
+                harness_id = "cursor"
+            elif harness_id == "cursor":
+                harness_id = "codex"
+            return (
+                {"approval_digest": "a" * 64},
+                {"harness_id": harness_id},
+            )
+
+        class Destination:
+            def __init__(self, path):
+                self.harness_id = Path(path).name.split(".", 1)[0]
+
+        with (
+            patch.dict(
+                command.__globals__,
+                {
+                    "read_json": lambda path: (
+                        config if path == "reconcile.json" else {}
+                    ),
+                    "_read_harness_reconciliation_config": (
+                        lambda _path: (config, "e" * 64)
+                    ),
+                    "_load_harness_activation_record": load_record,
+                    "_harness_destination": lambda args: Destination(
+                        args.destination
+                    ),
+                    "_replay_http_adapter": lambda _args: object(),
+                    "harness_config_verify_command": lambda args: verifies.append(
+                        args
+                    ),
+                },
+            ),
+            patch.dict(module["os"].environ, {"TOKEN": "secret"}),
+            self.assertRaisesRegex(
+                module["HarnessPersistenceError"],
+                "^harness reconciliation destination harness changed$",
+            ),
+        ):
+            command(
+                module["argparse"].Namespace(
+                    config="reconcile.json",
+                    config_digest="e" * 64,
+                    phase="pre-start",
+                )
+            )
+
+        self.assertEqual(verifies, [])
+
+    def test_harness_verify_checks_fail_closed_write_result(self):
+        module = runpy.run_path(str(CLI))
+        current = {"hooks": {"hooks": {}}, "settings": {}, "tools": {}}
+        target = {
+            "hooks": {"hooks": {}},
+            "settings": {"autoRecall": False, "autoRetain": False},
+            "tools": {},
+        }
+
+        class Destination:
+            harness_id = "codex"
+
+            def read_rollback(self, _digest):
+                return current
+
+            def read_configuration(self):
+                return current
+
+            def write_configuration(self, _expected, _target):
+                return current
+
+        plan = SimpleNamespace(
+            plan_digest="a" * 64,
+            expected_prestate_digest="b" * 64,
+        )
+        command = module["harness_config_verify_command"]
+        output = StringIO()
+        with (
+            patch.dict(
+                command.__globals__,
+                {
+                    "_harness_destination": lambda _args: Destination(),
+                    "_load_harness_activation_record": lambda _path: (
+                        {"approval_digest": "c" * 64},
+                        {"expected_prestate_digest": "b" * 64},
+                    ),
+                    "_validate_activation_record": lambda *_args: None,
+                    "_reconstruct_harness_activation_plan": (
+                        lambda *_args: plan
+                    ),
+                    "native_activation_findings": lambda *_args: (
+                        "controller_tool_drift",
+                    ),
+                    "native_fail_closed_target": lambda *_args: target,
+                },
+            ),
+            redirect_stdout(output),
+        ):
+            result = command(
+                module["argparse"].Namespace(
+                    destination="destination.json",
+                    plan="plan.json",
+                    approval_digest="c" * 64,
+                )
+            )
+
+        self.assertEqual(result, 2)
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["status"], "disable_failed")
+        self.assertEqual(payload["reason"], "activation_drift")
+
+    def test_migration_replay_closeout_rejects_ambiguous_authority(self):
+        module = runpy.run_path(str(CLI))
+        base = dict(
+            inventory="inventory.json",
+            profile="systalyze",
+            token_env="TOKEN",
+            plan="plan.json",
+            receipts="receipts.json",
+            verification="verification.json",
+            backup_evidence="backup.json",
+            output="output.json",
+        )
+        adapter = Mock()
+        globals_patch = {
+            "_replay_http_adapter": adapter,
+            "_replay_plan_and_receipts": lambda *_args: ({}, []),
+            "read_json": lambda _path: {},
+        }
+        command = module["migration_replay_closeout_command"]
+        with patch.dict(command.__globals__, globals_patch):
+            for args in (
+                module["argparse"].Namespace(
+                    **base,
+                    prepare=True,
+                    closeout_plan="closeout.json",
+                    approval_digest=None,
+                ),
+                module["argparse"].Namespace(
+                    **base,
+                    prepare=True,
+                    closeout_plan=None,
+                    approval_digest="a" * 64,
+                ),
+                module["argparse"].Namespace(
+                    **base,
+                    prepare=False,
+                    closeout_plan=None,
+                    approval_digest="a" * 64,
+                ),
+                module["argparse"].Namespace(
+                    **base,
+                    prepare=False,
+                    closeout_plan="closeout.json",
+                    approval_digest=None,
+                ),
+            ):
+                with self.subTest(args=args), self.assertRaises(
+                    module["ReplayError"]
+                ):
+                    command(args)
+        adapter.assert_not_called()
+
+    def test_service_cli_preserves_profile_selector_compatibility(self):
+        module = runpy.run_path(str(CLI))
+        parsed = module["parser"]().parse_args(
+            [
+                "service",
+                "restart",
+                "--profile",
+                "systalyze",
+                "--config",
+                "/private/test/installation.json",
+            ]
+        )
+        self.assertEqual(parsed.service_command, "restart")
+        self.assertEqual(parsed.profile, "systalyze")
+
+        single_profile_manager = SimpleNamespace(
+            config=SimpleNamespace(
+                services=(
+                    SimpleNamespace(
+                        environment=(
+                            (
+                                "HINDSIGHT_EMBED_FLEET_PROFILES",
+                                "systalyze",
+                            ),
+                        )
+                    ),
+                )
+            )
+        )
+        selector = module["argparse"].Namespace(profile="systalyze")
+        with patch.dict(
+            module["_portable_service_manager"].__globals__,
+            {"_portable_manager": lambda _args: single_profile_manager},
+        ):
+            self.assertIs(
+                module["_portable_service_manager"](selector),
+                single_profile_manager,
+            )
+
+        multi_profile_manager = SimpleNamespace(
+            config=SimpleNamespace(
+                services=(
+                    SimpleNamespace(
+                        environment=(
+                            (
+                                "HINDSIGHT_EMBED_FLEET_PROFILES",
+                                "systalyze,personal",
+                            ),
+                        )
+                    ),
+                )
+            )
+        )
+        with (
+            patch.dict(
+                module["_portable_service_manager"].__globals__,
+                {"_portable_manager": lambda _args: multi_profile_manager},
+            ),
+            self.assertRaisesRegex(
+                module["PortableInstallError"],
+                "single-profile",
+            ),
+        ):
+            module["_portable_service_manager"](selector)
+
+    def test_service_cli_rejects_an_unmanaged_profile_selector(self):
+        module = runpy.run_path(str(CLI))
+        manager = SimpleNamespace(
+            config=SimpleNamespace(
+                services=(
+                    SimpleNamespace(
+                        environment=(
+                            (
+                                "HINDSIGHT_EMBED_FLEET_PROFILES",
+                                "engineering",
+                            ),
+                        )
+                    ),
+                )
+            )
+        )
+        selector = module["argparse"].Namespace(profile="unmanaged")
+
+        with (
+            patch.dict(
+                module["_portable_service_manager"].__globals__,
+                {"_portable_manager": lambda _args: manager},
+            ),
+            self.assertRaisesRegex(
+                module["PortableInstallError"],
+                "not managed",
+            ),
+        ):
+            module["_portable_service_manager"](selector)
+
+    def test_service_cli_accepts_an_unscoped_empty_profile_set(self):
+        module = runpy.run_path(str(CLI))
+        manager = SimpleNamespace(
+            config=SimpleNamespace(
+                services=(
+                    SimpleNamespace(environment=()),
+                )
+            )
+        )
+        selector = module["argparse"].Namespace(profile=None)
+
+        with patch.dict(
+            module["_portable_service_manager"].__globals__,
+            {"_portable_manager": lambda _args: manager},
+        ):
+            self.assertIs(module["_portable_service_manager"](selector), manager)
+
+    def test_service_cli_rejects_a_selector_for_an_empty_profile_set(self):
+        module = runpy.run_path(str(CLI))
+        manager = SimpleNamespace(
+            config=SimpleNamespace(
+                services=(
+                    SimpleNamespace(environment=()),
+                )
+            )
+        )
+        selector = module["argparse"].Namespace(profile="engineering")
+
+        with (
+            patch.dict(
+                module["_portable_service_manager"].__globals__,
+                {"_portable_manager": lambda _args: manager},
+            ),
+            self.assertRaisesRegex(
+                module["PortableInstallError"],
+                "not managed",
+            ),
+        ):
+            module["_portable_service_manager"](selector)
+
+    def test_service_cli_rejects_an_explicitly_empty_profile_selector(self):
+        module = runpy.run_path(str(CLI))
+        parsed = module["parser"]().parse_args(
+            [
+                "service",
+                "restart",
+                "--profile",
+                "",
+                "--config",
+                "/private/test/installation.json",
+            ]
+        )
+        manager = SimpleNamespace(
+            config=SimpleNamespace(
+                services=(
+                    SimpleNamespace(
+                        environment=(
+                            (
+                                "HINDSIGHT_EMBED_FLEET_PROFILES",
+                                "engineering",
+                            ),
+                        )
+                    ),
+                )
+            )
+        )
+
+        with (
+            patch.dict(
+                module["_portable_service_manager"].__globals__,
+                {"_portable_manager": lambda _args: manager},
+            ),
+            self.assertRaisesRegex(
+                module["PortableInstallError"],
+                "not managed",
+            ),
+        ):
+            module["_portable_service_manager"](parsed)
 
     def test_broker_termination_prefers_pidfd_after_identity_revalidation(self):
         module = runpy.run_path(str(CLI))
@@ -3009,7 +4179,6 @@ class ControllerCliTest(unittest.TestCase):
                 else:
                     self.assertEqual(action.details["profile_id"], "core")
 
-            bank = value["banks"][0]
             matching = {
                 **live,
                 "state": {

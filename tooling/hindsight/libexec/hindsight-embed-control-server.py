@@ -6,6 +6,7 @@ import contextlib
 from dataclasses import replace
 import fcntl
 import functools
+import http.client
 import ipaddress
 import json
 import os
@@ -13,9 +14,10 @@ import re
 import stat
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
-from typing import Mapping, NamedTuple
+from typing import Any, Mapping, NamedTuple
 from urllib.parse import urlsplit
 
 
@@ -23,6 +25,9 @@ PROFILE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 COMPONENTS = frozenset({"daemon", "ui"})
 STATES = frozenset({"running", "stopped"})
 CONTROL_PID_LOCK_NAME = ".control-pid.lifecycle.lock"
+COMPONENT_LIFECYCLE_LOCK_NAME = ".lifecycle.lock"
+MANAGED_CODEX_MARKER = "provider-policy:work-codex"
+MANAGED_CODEX_MODEL = "gpt-5.3-codex-spark"
 PROVIDER_PRESET_ENV = {
     "id": "HINDSIGHT_EMBED_PROVIDER_PRESET_ID",
     "label": "HINDSIGHT_EMBED_PROVIDER_PRESET_LABEL",
@@ -79,6 +84,7 @@ def provider_preset_from_environment(
         ).is_loopback
     except ValueError:
         host_is_loopback = False
+    host_is_tailnet = (endpoint.hostname or "").endswith(".ts.net")
     if (
         endpoint.scheme not in {"http", "https"}
         or not endpoint.netloc
@@ -87,7 +93,11 @@ def provider_preset_from_environment(
         or endpoint.password is not None
         or endpoint.query
         or endpoint.fragment
-        or (endpoint.scheme == "http" and not host_is_loopback)
+        or (
+            endpoint.scheme == "http"
+            and not host_is_loopback
+            and not host_is_tailnet
+        )
         or port == 0
     ):
         raise ValueError("invalid provider preset base URL")
@@ -193,15 +203,24 @@ def _open_absolute_directory(
         raise
 
 
-def _open_private_child(parent: int, name: str, label: str) -> int:
-    try:
-        os.mkdir(name, mode=0o700, dir_fd=parent)
-    except FileExistsError:
-        pass
-    except OSError as error:
-        raise ValueError(f"refusing unsafe {label}") from error
+def _open_private_child(
+    parent: int,
+    name: str,
+    label: str,
+    *,
+    create: bool = True,
+) -> int:
+    if create:
+        try:
+            os.mkdir(name, mode=0o700, dir_fd=parent)
+        except FileExistsError:
+            pass
+        except OSError as error:
+            raise ValueError(f"refusing unsafe {label}") from error
     try:
         descriptor = os.open(name, _directory_flags(), dir_fd=parent)
+    except FileNotFoundError:
+        raise
     except OSError as error:
         raise ValueError(f"refusing unsafe {label}") from error
     try:
@@ -300,51 +319,485 @@ def set_desired_state(root: Path, profile: str, component: str, state: str) -> N
         os.close(root_descriptor)
 
 
-def _running_action(action, root: Path, components: tuple[str, ...]):
+def desired_state(root: Path, profile: str, component: str) -> str | None:
+    profile = normalize_profile(profile)
+    if component not in COMPONENTS:
+        raise ValueError(f"invalid component: {component!r}")
+
+    root_descriptor: int | None = None
+    profiles_descriptor: int | None = None
+    profile_descriptor: int | None = None
+    descriptor: int | None = None
+    try:
+        try:
+            root_descriptor = _open_absolute_directory(
+                root,
+                create=False,
+                private=True,
+                label="desired-state root",
+            )
+            profiles_descriptor = _open_private_child(
+                root_descriptor,
+                "profiles",
+                "desired-state directory",
+                create=False,
+            )
+            profile_descriptor = _open_private_child(
+                profiles_descriptor,
+                profile,
+                "desired-state profile directory",
+                create=False,
+            )
+        except FileNotFoundError:
+            return None
+        try:
+            descriptor = os.open(
+                component,
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=profile_descriptor,
+            )
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            raise ValueError("refusing unsafe desired-state file") from error
+        _validate_private_file(os.fstat(descriptor), "desired-state file")
+        payload = os.read(descriptor, 32)
+        if len(payload) == 32 or os.read(descriptor, 1):
+            raise ValueError("desired-state file is invalid")
+        if payload not in {b"running\n", b"stopped\n"}:
+            raise ValueError("desired-state file is invalid")
+        return payload[:-1].decode("ascii")
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if profile_descriptor is not None:
+            os.close(profile_descriptor)
+        if profiles_descriptor is not None:
+            os.close(profiles_descriptor)
+        if root_descriptor is not None:
+            os.close(root_descriptor)
+
+
+def remove_desired_state(root: Path, profile: str, component: str) -> None:
+    profile = normalize_profile(profile)
+    if component not in COMPONENTS:
+        raise ValueError(f"invalid component: {component!r}")
+
+    root_descriptor: int | None = None
+    profiles_descriptor: int | None = None
+    profile_descriptor: int | None = None
+    try:
+        try:
+            root_descriptor = _open_absolute_directory(
+                root,
+                create=False,
+                private=True,
+                label="desired-state root",
+            )
+            profiles_descriptor = _open_private_child(
+                root_descriptor,
+                "profiles",
+                "desired-state directory",
+                create=False,
+            )
+            profile_descriptor = _open_private_child(
+                profiles_descriptor,
+                profile,
+                "desired-state profile directory",
+                create=False,
+            )
+        except FileNotFoundError:
+            return
+        try:
+            metadata = os.stat(
+                component,
+                dir_fd=profile_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            raise ValueError("refusing unsafe desired-state file") from error
+        _validate_private_file(metadata, "desired-state file")
+        try:
+            os.unlink(component, dir_fd=profile_descriptor)
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            raise ValueError("could not remove desired-state file") from error
+        os.fsync(profile_descriptor)
+    finally:
+        if profile_descriptor is not None:
+            os.close(profile_descriptor)
+        if profiles_descriptor is not None:
+            os.close(profiles_descriptor)
+        if root_descriptor is not None:
+            os.close(root_descriptor)
+
+
+def _wait_for_running(
+    status_action,
+    profile: str,
+    timeout: int,
+    root: Path,
+    components: tuple[str, ...],
+) -> Any:
+    deadline = time.monotonic() + timeout
+    while True:
+        result = status_action(profile)
+        if getattr(result, "ok", True) and getattr(
+            result,
+            "running",
+            False,
+        ):
+            return result
+        if any(
+            desired_state(root, profile, component) != "running"
+            for component in components
+        ):
+            return result
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return result
+        time.sleep(min(0.25, remaining))
+
+
+def _component_lifecycle_state_dir(
+    desired_state_dir: Path,
+    environ: Mapping[str, str] = os.environ,
+) -> Path:
+    desired_state_dir = Path(
+        os.path.abspath(desired_state_dir.expanduser())
+    )
+    configured = environ.get("HINDSIGHT_EMBED_STATE_DIR", "").strip()
+    if not configured:
+        return desired_state_dir.parent
+    state_dir = Path(os.path.abspath(Path(configured).expanduser()))
+    configured_desired = environ.get(
+        "HINDSIGHT_EMBED_DESIRED_STATE_DIR",
+        str(state_dir / "desired"),
+    )
+    expected_desired = Path(
+        os.path.abspath(Path(configured_desired).expanduser())
+    )
+    if desired_state_dir != expected_desired:
+        raise ValueError("managed lifecycle state binding disagrees")
+    return state_dir
+
+
+def _lifecycle_operation_label(action) -> str:
+    label = getattr(action, "__name__", "")
+    if (
+        not isinstance(label, str)
+        or not label
+        or len(label) > 128
+        or any(ord(character) < 0x20 for character in label)
+    ):
+        return "managed lifecycle action"
+    return label
+
+
+@contextlib.contextmanager
+def _component_lifecycle_lock(
+    desired_state_dir: Path,
+    *,
+    timeout: float,
+    operation: str,
+):
+    if (
+        type(timeout) not in {int, float}
+        or not 0 < timeout <= 3600
+        or not isinstance(operation, str)
+        or not operation
+        or len(operation) > 128
+        or any(ord(character) < 0x20 for character in operation)
+    ):
+        raise ValueError("component lifecycle lock request is invalid")
+    state_dir = _component_lifecycle_state_dir(desired_state_dir)
+    parent = _open_absolute_directory(
+        state_dir,
+        create=True,
+        private=True,
+        label="lifecycle state directory",
+    )
+    descriptor: int | None = None
+    locked = False
+    try:
+        descriptor = os.open(
+            COMPONENT_LIFECYCLE_LOCK_NAME,
+            os.O_RDWR
+            | os.O_CREAT
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=parent,
+        )
+        _validate_private_file(os.fstat(descriptor), "component lifecycle lock")
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(
+                    descriptor,
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+                locked = True
+                break
+            except BlockingIOError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        "timed out acquiring component lifecycle lock "
+                        f"for {operation}"
+                    ) from None
+                time.sleep(min(0.05, remaining))
+        yield
+    finally:
+        if descriptor is not None:
+            if locked:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+        os.close(parent)
+
+
+def _supervised_running_action(
+    action,
+    status_action,
+    root: Path,
+    components: tuple[str, ...],
+    profile_lock,
+    lifecycle_lock,
+    timeout: int,
+    stop_action=None,
+):
     @functools.wraps(action)
     def wrapped(profile: str):
-        for component in components:
-            set_desired_state(root, profile, component, "running")
-        return action(profile)
+        with profile_lock(profile):
+            with lifecycle_lock(
+                timeout=timeout,
+                operation=_lifecycle_operation_label(action),
+            ):
+                for component in components:
+                    set_desired_state(root, profile, component, "running")
+                if stop_action is not None:
+                    stopped = stop_action(profile)
+                    if not getattr(stopped, "ok", True) or getattr(
+                        stopped,
+                        "running",
+                        False,
+                    ):
+                        return stopped
+        return _wait_for_running(
+            status_action,
+            profile,
+            timeout,
+            root,
+            components,
+        )
 
     return wrapped
 
 
-def _stopping_action(action, root: Path, component: str):
+def _stopping_action(
+    action,
+    root: Path,
+    components: tuple[str, ...],
+    profile_lock,
+    lifecycle_lock,
+    timeout: int,
+):
+    def restore(profile: str, previous: dict[str, str | None]) -> None:
+        for component, state in previous.items():
+            try:
+                if state is None:
+                    remove_desired_state(root, profile, component)
+                else:
+                    set_desired_state(root, profile, component, state)
+            except Exception as error:
+                print(
+                    "hindsight-embed-control-server: could not restore "
+                    f"desired state for {component}: {error}",
+                    file=sys.stderr,
+                )
+                continue
+
     @functools.wraps(action)
     def wrapped(profile: str):
-        set_desired_state(root, profile, component, "stopped")
-        try:
-            result = action(profile)
-        except Exception:
-            set_desired_state(root, profile, component, "running")
-            raise
-        if not getattr(result, "ok", True) or getattr(result, "running", False):
-            set_desired_state(root, profile, component, "running")
-        return result
+        with profile_lock(profile):
+            with lifecycle_lock(
+                timeout=timeout,
+                operation=_lifecycle_operation_label(action),
+            ):
+                previous = {
+                    component: desired_state(root, profile, component)
+                    for component in components
+                }
+                try:
+                    for component in components:
+                        set_desired_state(root, profile, component, "stopped")
+                except Exception:
+                    restore(profile, previous)
+                    raise
+                try:
+                    # The intent transition and stop action are one
+                    # cross-process critical section. Releasing this lock
+                    # before the stop completes lets a reconciliation that
+                    # read the prior running intent restart the component.
+                    result = action(profile)
+                except Exception:
+                    restore(profile, previous)
+                    raise
+                if not getattr(result, "ok", True) or getattr(
+                    result,
+                    "running",
+                    False,
+                ):
+                    restore(profile, previous)
+                return result
 
     return wrapped
 
 
 def install_lifecycle_hooks(service, desired_state_dir: Path) -> None:
-    service.start_daemon = _running_action(
-        service.start_daemon, desired_state_dir, ("daemon",)
+    locks: dict[str, threading.RLock] = {}
+    locks_guard = threading.Lock()
+
+    def profile_lock(profile: str) -> threading.RLock:
+        if (
+            not isinstance(profile, str)
+            or PROFILE_PATTERN.fullmatch(profile) is None
+        ):
+            raise ValueError("invalid profile")
+        with locks_guard:
+            return locks.setdefault(profile, threading.RLock())
+
+    lifecycle_lock = functools.partial(
+        _component_lifecycle_lock,
+        desired_state_dir,
     )
-    service.restart_daemon = _running_action(
-        service.restart_daemon, desired_state_dir, ("daemon",)
+    daemon_status = getattr(service, "daemon_status", None)
+    ui_status = getattr(service, "ui_status", None)
+    if not callable(daemon_status) or not callable(ui_status):
+        raise ValueError("managed lifecycle status actions are unavailable")
+    try:
+        daemon_timeout = int(
+            os.environ.get(
+                "HINDSIGHT_EMBED_DAEMON_STARTUP_TIMEOUT",
+                "300",
+            )
+        )
+        ui_timeout = int(
+            os.environ.get("HINDSIGHT_EMBED_UI_WAIT_SECONDS", "60")
+        )
+    except ValueError as error:
+        raise ValueError("managed lifecycle timeout is invalid") from error
+    if not 1 <= daemon_timeout <= 3600 or not 1 <= ui_timeout <= 3600:
+        raise ValueError("managed lifecycle timeout is invalid")
+
+    start_daemon = service.start_daemon
+    restart_daemon = service.restart_daemon
+    stop_daemon = service.stop_daemon
+    start_ui = service.start_ui
+    restart_ui = service.restart_ui
+    stop_ui = service.stop_ui
+
+    service.start_daemon = _supervised_running_action(
+        start_daemon,
+        daemon_status,
+        desired_state_dir,
+        ("daemon",),
+        profile_lock,
+        lifecycle_lock,
+        daemon_timeout,
+    )
+    service.restart_daemon = _supervised_running_action(
+        restart_daemon,
+        daemon_status,
+        desired_state_dir,
+        ("daemon",),
+        profile_lock,
+        lifecycle_lock,
+        daemon_timeout,
+        stop_daemon,
     )
     service.stop_daemon = _stopping_action(
-        service.stop_daemon, desired_state_dir, "daemon"
+        stop_daemon,
+        desired_state_dir,
+        ("daemon", "ui"),
+        profile_lock,
+        lifecycle_lock,
+        daemon_timeout,
     )
-    service.start_ui = _running_action(
-        service.start_ui, desired_state_dir, ("daemon", "ui")
+    service.start_ui = _supervised_running_action(
+        start_ui,
+        ui_status,
+        desired_state_dir,
+        ("daemon", "ui"),
+        profile_lock,
+        lifecycle_lock,
+        ui_timeout,
     )
-    service.restart_ui = _running_action(
-        service.restart_ui, desired_state_dir, ("daemon", "ui")
+    service.restart_ui = _supervised_running_action(
+        restart_ui,
+        ui_status,
+        desired_state_dir,
+        ("daemon", "ui"),
+        profile_lock,
+        lifecycle_lock,
+        ui_timeout,
+        stop_ui,
     )
     service.stop_ui = _stopping_action(
-        service.stop_ui, desired_state_dir, "ui"
+        stop_ui,
+        desired_state_dir,
+        ("ui",),
+        profile_lock,
+        lifecycle_lock,
+        ui_timeout,
     )
+
+
+def install_ui_readiness(service) -> None:
+    daemon_client = getattr(service, "daemon_client", None)
+    manager = getattr(daemon_client, "_manager", None)
+    if manager is None or not callable(getattr(manager, "get_ui_url", None)):
+        return
+
+    def is_ui_running(profile: str, ui_port: int | None = None) -> bool:
+        try:
+            endpoint = urlsplit(
+                manager.get_ui_url(
+                    profile,
+                    ui_port,
+                    hostname="127.0.0.1",
+                )
+            )
+            connection = http.client.HTTPConnection(
+                endpoint.hostname,
+                endpoint.port,
+                timeout=2,
+            )
+            try:
+                connection.request("GET", "/")
+                response = connection.getresponse()
+                location = response.getheader("Location")
+                location_path = (
+                    None if location is None else urlsplit(location).path
+                )
+                response.read(1)
+            finally:
+                connection.close()
+        except (OSError, http.client.HTTPException, ValueError):
+            return False
+        if response.status == 200:
+            return True
+        return (
+            response.status in {301, 302, 303, 307, 308}
+            and location_path == "/login"
+        )
+
+    manager.is_ui_running = is_ui_running
 
 
 def install_provider_catalog(
@@ -358,7 +811,7 @@ def install_provider_catalog(
     if "openai-codex" not in existing:
         additions.append(
             providers.ProviderInfo(
-                "openai-codex", "OpenAI Codex (subscription)", False
+                "openai-codex", "[Systalyze] OpenAI Codex", False
             )
         )
     if "claude-code" not in existing:
@@ -384,13 +837,16 @@ def _matches_provider_preset(config, preset: ProviderPreset) -> bool:
     )
 
 
-def install_provider_alias(service, preset: ProviderPreset) -> None:
+def install_provider_alias(
+    service,
+    preset: ProviderPreset | None,
+) -> None:
     original_get_profile_config = service.get_profile_config
     original_list_profiles = service.list_profiles
     original_save_llm_config = service.save_llm_config
 
     def display_config(config):
-        if _matches_provider_preset(config, preset):
+        if preset is not None and _matches_provider_preset(config, preset):
             return replace(config, provider=preset.id)
         return config
 
@@ -401,7 +857,7 @@ def install_provider_alias(service, preset: ProviderPreset) -> None:
         summaries = []
         for summary in original_list_profiles():
             config = get_profile_config(summary.name)
-            if config.provider == preset.id:
+            if preset is not None and config.provider == preset.id:
                 summary = replace(
                     summary, provider=preset.id, model=preset.model
                 )
@@ -420,12 +876,24 @@ def install_provider_alias(service, preset: ProviderPreset) -> None:
         cp_version: str | None = None,
     ):
         current = original_get_profile_config(name)
-        if provider == preset.id:
+        if provider == "openai-codex":
+            api_key = MANAGED_CODEX_MARKER
+            model = MANAGED_CODEX_MODEL
+            base_url = ""
+        elif provider == "claude-code":
+            raise ValueError(
+                "Claude Code is not permitted by the managed provider policy"
+            )
+        elif preset is not None and provider == preset.id:
             provider = preset.runtime_provider
             api_key = ""
             model = preset.model
             base_url = preset.base_url
-        elif base_url is None and _matches_provider_preset(current, preset):
+        elif (
+            preset is not None
+            and base_url is None
+            and _matches_provider_preset(current, preset)
+        ):
             base_url = ""
 
         return display_config(
@@ -450,8 +918,16 @@ def install_provider_alias(service, preset: ProviderPreset) -> None:
 def install_hooks(service, providers, desired_state_dir: Path) -> None:
     preset = provider_preset_from_environment()
     install_provider_catalog(providers, preset)
+    install_ui_readiness(service)
     install_lifecycle_hooks(service, desired_state_dir)
-    if preset is not None:
+    if preset is not None or all(
+        hasattr(service, name)
+        for name in (
+            "get_profile_config",
+            "list_profiles",
+            "save_llm_config",
+        )
+    ):
         install_provider_alias(service, preset)
 
 

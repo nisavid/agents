@@ -53,14 +53,19 @@ is still attempted when the final checkpoint is unavailable.
 Rendered harness artifacts are inactive, content-addressed generations.
 Activation is a separate digest- and compare-and-swap-bound operation that
 preserves unrelated hooks and settings, disables upstream automatic recall and
-retention, and rolls back the controller-owned fields when a post-activation
-check fails. Claude's upstream knowledge tools are disabled with its verified
+retention, and leaves Hindsight authority disabled when a post-activation check
+fails. Claude's upstream knowledge tools are disabled with its verified
 empty-MCP-server mode when this path is activated.
 
 `hindsight-memory harness-config stage` and `plan` persist inactive artifacts
-and destination-bound activation records; `status` is read-only. Only `apply`
-and `rollback` mutate controller-owned fields in real native configuration
-files. The secret-free approved activation record binds the prestate and target
+and destination-bound activation records; `status` is read-only. `apply`
+activates the controller-owned surface. `verify` is read-only while the
+semantic routing contract is healthy and atomically disables recognized
+Hindsight hooks when direct authority, controller-hook drift, or automatic
+upstream memory settings return. `rollback` also leaves Hindsight disabled
+instead of restoring a retired direct integration. Every automatic supported
+harness route in the validated inventory must name the literal `engineering`
+bank. The secret-free approved activation record binds the prestate and target
 digests to the exact destination paths. An owner-only transaction journal makes
 multi-file updates recoverable across interruption. The
 `hindsight-memory-runtime` skill exposes the explicit session tools without
@@ -83,6 +88,10 @@ transcript behavior, security isolation, and broker transport. A direct-only
 package may become the selected upstream package, but it cannot replace the
 controller-owned or previously certified memory authority. Broker-compatible
 packages receive authority only after their post-activation smoke test passes.
+That smoke runner invokes the approved `harness-config verify` command.
+Managed startup reconciliation invokes the same command before exposing
+Hindsight hooks; an unsafe result remains disabled and cannot fall back to the
+package's direct/default bank routing.
 The update policy sets bounded recent-generation retention; current, certified
 last-known-good, and pending generations are always retained.
 
@@ -126,6 +135,17 @@ every installed path and runtime binding, while `install` and `upgrade` receive
 the release source and version through `--release-root` and `--version`. See
 `examples/portable-consumer/` and the [adoption guide](docs/adoption.md).
 
+After installation, the `hindsight-memory service` `status`, `start`,
+`restart`, and `stop` subcommands own ordinary service control without changing
+the installed release, manifests, or data root. Each command takes the
+installation path through `--config`. `stop` disables the managed user services
+so they remain stopped until an explicit `start` or `restart`; process failure
+is still recovered by launchd or systemd while the service is running. Start
+and restart reset managed API/UI component intent to the configured autostart
+policy before requiring complete managed health. An optional `--profile`
+asserts the named profile; it is accepted only when the installation manages
+that single profile and never narrows a command to a subset of services.
+
 An installation configuration contains:
 
 - a schema version, consumer ID, platform, and `fresh` or `adopt` mode;
@@ -141,9 +161,11 @@ digest-verified active release. The example stack binds
 `HINDSIGHT_EMBED_UVX=release://bin/hindsight-embed-uvx`; this release-owned
 wrapper pins managed server commands to `hindsight-embed==0.8.4`.
 The installer requires a working Python 3.11 or newer and validates the
-configured absolute Python, `uvx`, and Zsh executables' ownership, mode,
+configured absolute Python, `npx`, `uvx`, and Zsh executables' ownership, mode,
 ancestry, and ACLs. The managed launcher binds those exact paths to release
-wrappers and entrypoints without consulting `PATH`.
+wrappers and entrypoints without consulting ambient `PATH`; the embed wrapper
+constructs its child `PATH` from only the validated `uvx` and `npx`
+directories plus protected system directories.
 Credential resolution receives one bounded
 strict-JSON request and
 must return one bounded strict-JSON response containing exactly the requested
@@ -182,6 +204,11 @@ Install and upgrade copy regular files into content-addressed read-only release
 directories, atomically switch the active pointer, render only declared unit
 files, and require managed health. Failed or interrupted transitions recover
 the last verified prestate. Explicit rollback uses a compare-and-swap digest.
+Rollback disables harness hooks before quiescing services. An installer-owned
+authority service keeps them disabled while a legacy runtime is active, and
+the launcher omits candidate-only migration extensions from that legacy
+runtime. Hook activation requires repair or forward activation of the
+authority release; rollback never restores direct upstream hooks.
 Uninstall removes only unchanged installer-owned files and always preserves the
 data root, consumer inputs, protected resolver, and external state root.
 
@@ -211,6 +238,14 @@ timeout, and retry mechanics. Consumers supply the closed policy shape shown in
 `examples/provider-runtime-policy.json` and a protected credential resolver.
 The policy contains OAuth-home locators, never resolved paths or credential
 values.
+
+The Hindsight strategy selects linear failover or round-robin request starts.
+Both modes use the policy's declared member order and try each member at most
+once per request. Round-robin wraps from the last member to the first. A
+provider-reported usage reset is a hint, not a durable exclusion: the runtime
+caps it to `default_usage_limit_cooldown_seconds` and probes the account again.
+Startup verification is bounded independently of member request timeouts, so an
+offline fallback cannot prevent the API from starting.
 
 The repository policy is a schema example, not a deployable failover chain.
 Its `example.invalid` endpoint is deliberately non-routable. Consumers must
@@ -265,21 +300,57 @@ service or migration is started.
 
 The managed Embed control-server wrapper and stack share the desired-state
 directory. Explicit daemon and UI stops persist for the current login session,
-so supervisor reconciliation does not undo operator intent. A clean service
-restart resets that intent before starting the fleet; a new login initializes
-the configured autostart policy. Consumers bind the reusable control-server
-helper through `HINDSIGHT_EMBED_CONTROL_SERVER` and do not fork its lifecycle
-logic into machine configuration.
+so supervisor reconciliation does not undo operator intent. Stopping the API
+also stops its dependent UI intent; stopping only the UI leaves the API
+running. A clean service start or restart resets that intent before starting
+the fleet; a new login initializes the configured autostart policy. Consumers
+bind the reusable control-server helper through
+`HINDSIGHT_EMBED_CONTROL_SERVER` and do not fork its lifecycle logic into
+machine configuration. Managed UI startup also prepares the selected
+published control-plane package under a no-credential scope. The preparer
+accepts only the exact authenticated locale-routing contract it can repair,
+applies that change atomically, and rejects unknown package shapes before the
+UI receives credentials or starts.
 
 ## Migration safety
 
-Read-only migration discovery requires a server-backed opaque monotonic generation captured before and after the complete discovery read. If that generation is unavailable or changes, discovery fails closed. Do not run live migration mutations or mark the live-discovery checklist complete without satisfying that exact gate.
+`hindsight-memory migration replay` exposes separate `plan`, `apply`, `status`,
+`verify`, and `closeout` phases for the exact `codex` to `engineering`
+accidental-bank repair. Planning freezes a chronological, content-digested raw
+document manifest without copying payloads into the plan. Apply submits each
+source document through the normal asynchronous retain API with deterministic
+target IDs and checkpoints a generation-chained receipt after every successful
+operation. Verify requires complete receipt, operation, and target-content
+coverage.
 
-The current CLI can publish only an immutable, unapproved discovery shadow
-plan. It has no migration apply or cutover command. Follow the status and gates
-in [Migration readiness](docs/migration-readiness.md);
-the generic desired-state `apply` command does not authorize a migration
-shadow plan.
+Closeout is separately prepared and approved. Its digest binds the verified
+replay, encrypted restore-tested exports for both banks, the restore-tested
+full-schema backup, the exact pre-delete bank set, and the server generation.
+Closeout apply deletes only literal `codex` and proves that every other bank
+remains.
+
+The replay lifecycle is explicit:
+
+```sh
+hindsight-memory --state-dir STATE migration replay plan --inventory INVENTORY --profile PROFILE --token-env TOKEN_ENV --output replay-plan.json
+hindsight-memory --state-dir STATE migration replay apply --inventory INVENTORY --profile PROFILE --token-env TOKEN_ENV --plan replay-plan.json --backup-evidence backup-evidence.json --approval-digest APPROVED_REPLAY_DIGEST --receipts replay-receipts.json
+hindsight-memory --state-dir STATE migration replay status --plan replay-plan.json --receipts replay-receipts.json
+hindsight-memory --state-dir STATE migration replay verify --inventory INVENTORY --profile PROFILE --token-env TOKEN_ENV --plan replay-plan.json --receipts replay-receipts.json --output replay-verification.json
+hindsight-memory --state-dir STATE migration replay closeout --inventory INVENTORY --profile PROFILE --token-env TOKEN_ENV --plan replay-plan.json --receipts replay-receipts.json --verification replay-verification.json --backup-evidence backup-evidence.json --prepare --output replay-closeout.json
+hindsight-memory --state-dir STATE migration replay closeout --inventory INVENTORY --profile PROFILE --token-env TOKEN_ENV --plan replay-plan.json --receipts replay-receipts.json --verification replay-verification.json --backup-evidence backup-evidence.json --closeout-plan replay-closeout.json --approval-digest APPROVED_DIGEST --output replay-closeout-receipt.json
+```
+
+The replay approval digest is the canonical digest of the replay-plan digest
+and the validated backup-evidence digest. Apply rejects missing, unencrypted,
+or untested rollback evidence before its first target read or write.
+
+Only `status` is offline. Read-only migration discovery requires a server-backed
+opaque monotonic generation captured before and after the complete discovery
+read. It also recomputes the configured inventory, policy, native-hook,
+activation, and schedule state before and after the snapshot and requires an
+exact match with the server-recorded controller state. If either authority is
+unavailable or changes, discovery and replay fail closed. The generic
+desired-state `apply` command does not authorize a migration replay or closeout.
 
 Generated plans, credentials, profile state, control tokens, logs, archives, and other runtime artifacts must not enter this repository.
 

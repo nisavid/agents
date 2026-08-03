@@ -76,6 +76,7 @@ SUPPORTED_RUNTIME_PROVIDERS_084 = frozenset(
         "zai",
     }
 )
+STARTUP_LLM_VERIFICATION_TIMEOUT_SECONDS = 10.0
 _CODEX_ENVIRONMENT_LOCK = threading.Lock()
 
 
@@ -167,7 +168,7 @@ class ProviderIdentity:
         return self.matches_values(
             provider=str(getattr(member, "provider", "")),
             model=getattr(member, "model", None),
-            base_url=str(getattr(member, "base_url", "")),
+            base_url=getattr(member, "base_url", ""),
             credential_marker=getattr(member, "api_key", None),
         )
 
@@ -184,7 +185,9 @@ class ProviderIdentity:
         if model != self.model:
             return False
         try:
-            normalized_base_url = _base_url(base_url)
+            normalized_base_url = _base_url(
+                "" if base_url is None else base_url
+            )
         except ProviderRuntimeCompatibilityError:
             return False
         if normalized_base_url != self.base_url:
@@ -491,11 +494,13 @@ class HindsightProviderAdapter:
             }
             original_codex_init = CodexLLM.__init__
             original_dispatch = MultiLLMProvider._dispatch
+            original_verify_connection = MultiLLMProvider.verify_connection
             targets = (
                 original_llm_init,
                 *original_methods.values(),
                 original_codex_init,
                 original_dispatch,
+                original_verify_connection,
                 _should_failover,
             )
             if any(not callable(target) for target in targets):
@@ -584,10 +589,33 @@ class HindsightProviderAdapter:
                 method_name,
                 kwargs,
                 _should_failover,
+                strategy_mode=str(getattr(instance._strategy, "mode", "")),
             )
 
         policy_dispatch._hindsight_provider_policy = True  # type: ignore[attr-defined]
         MultiLLMProvider._dispatch = policy_dispatch
+
+        async def bounded_verify_connection(instance: Any) -> None:
+            try:
+                await asyncio.wait_for(
+                    original_verify_connection(instance),
+                    timeout=STARTUP_LLM_VERIFICATION_TIMEOUT_SECONDS,
+                )
+            except TimeoutError:
+                logger.warning(
+                    "LLM startup verification exceeded %.2fs; "
+                    "continuing with request-time provider failover",
+                    STARTUP_LLM_VERIFICATION_TIMEOUT_SECONDS,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "LLM startup verification failed with %s; "
+                    "continuing with request-time provider failover",
+                    type(exc).__name__,
+                )
+
+        bounded_verify_connection._hindsight_provider_policy = True  # type: ignore[attr-defined]
+        MultiLLMProvider.verify_connection = bounded_verify_connection
         LLMProvider._hindsight_provider_runtime_policy = self.policy
         logger.info(
             "Installed version-gated Hindsight provider runtime policy for %s",
@@ -689,6 +717,7 @@ def _usage_limit_reset_at(
     error = payload.get("error")
     if not isinstance(error, dict) or error.get("type") != "usage_limit_reached":
         return None
+    probe_at = now + default_cooldown
     reset = error.get("resets_at")
     if (
         isinstance(reset, (int, float))
@@ -696,7 +725,7 @@ def _usage_limit_reset_at(
         and math.isfinite(float(reset))
         and reset > now
     ):
-        return float(reset)
+        return min(float(reset), probe_at)
     remaining = error.get("resets_in_seconds")
     if (
         isinstance(remaining, (int, float))
@@ -704,8 +733,8 @@ def _usage_limit_reset_at(
         and math.isfinite(float(remaining))
         and remaining > 0
     ):
-        return now + float(remaining)
-    return now + default_cooldown
+        return min(now + float(remaining), probe_at)
+    return probe_at
 
 
 class _ProviderRuntime:
@@ -722,7 +751,10 @@ class _ProviderRuntime:
         self._logger = logger
         self._clock = clock
         self._cooldowns: dict[str, float] = {}
+        self._quota_probes_in_flight: set[str] = set()
         self._cooldown_lock = threading.Lock()
+        self._rotation_lock = threading.Lock()
+        self._rotation_index = 0
         self._gate_lock = threading.Lock()
         self._gates: dict[str, _PriorityGate] = {}
         self._resolved_oauth_homes: dict[str, Path] = {}
@@ -835,15 +867,26 @@ class _ProviderRuntime:
         async with gate.slot(member.priority(str(call_kwargs.get("scope", "")))):
             return await operation(*args, **call_kwargs)
 
-    def _available(self, member_id: str, now: float) -> bool:
+    def _claim_quota_member(self, member_id: str, now: float) -> tuple[bool, bool]:
         with self._cooldown_lock:
             reset = self._cooldowns.get(member_id)
             if reset is None:
-                return True
-            if reset <= now:
+                return True, False
+            if reset > now or member_id in self._quota_probes_in_flight:
+                return False, False
+            self._quota_probes_in_flight.add(member_id)
+            return True, True
+
+    def _finish_quota_probe(
+        self,
+        member_id: str,
+        *,
+        usage_limited: bool,
+    ) -> None:
+        with self._cooldown_lock:
+            self._quota_probes_in_flight.discard(member_id)
+            if not usage_limited:
                 self._cooldowns.pop(member_id, None)
-                return True
-            return False
 
     async def dispatch(
         self,
@@ -851,6 +894,8 @@ class _ProviderRuntime:
         method_name: str,
         kwargs: dict[str, Any],
         should_failover: Callable[[BaseException], bool],
+        *,
+        strategy_mode: str,
     ) -> Any:
         by_id: dict[str, Any] = {}
         for runtime_member in runtime_members:
@@ -870,14 +915,33 @@ class _ProviderRuntime:
                 f"Hindsight provider failover membership is incomplete: {missing}"
             )
 
+        if strategy_mode == "failover":
+            member_order = self.policy.failover_order
+        elif strategy_mode == "round-robin":
+            with self._rotation_lock:
+                start = self._rotation_index % len(self.policy.failover_order)
+                self._rotation_index += 1
+            member_order = (
+                self.policy.failover_order[start:]
+                + self.policy.failover_order[:start]
+            )
+        else:
+            raise ProviderRuntimeCompatibilityError(
+                "Hindsight provider strategy must be failover or round-robin"
+            )
+
         last_exc: BaseException | None = None
         attempted = 0
-        for member_id in self.policy.failover_order:
+        for member_id in member_order:
             member_policy = self.policy.member(member_id)
             now = self._clock()
-            if member_policy.quota_cooldown and not self._available(member_id, now):
-                continue
+            quota_probe = False
+            if member_policy.quota_cooldown:
+                available, quota_probe = self._claim_quota_member(member_id, now)
+                if not available:
+                    continue
             attempted += 1
+            usage_limited = False
             try:
                 return await getattr(by_id[member_id], method_name)(**kwargs)
             except BaseException as exc:
@@ -891,13 +955,14 @@ class _ProviderRuntime:
                         default_cooldown=self.policy.default_usage_limit_cooldown_seconds,
                     )
                     if reset is not None:
+                        usage_limited = True
                         with self._cooldown_lock:
                             self._cooldowns[member_id] = max(
                                 reset, self._cooldowns.get(member_id, 0.0)
                             )
                         self._logger.warning(
                             "LLM account %s reached its usage limit; "
-                            "bypassing it until reset epoch %.0f",
+                            "bypassing it until probe epoch %.0f",
                             member_id,
                             reset,
                         )
@@ -907,10 +972,16 @@ class _ProviderRuntime:
                     method_name,
                     type(exc).__name__,
                 )
+            finally:
+                if quota_probe:
+                    self._finish_quota_probe(
+                        member_id,
+                        usage_limited=usage_limited,
+                    )
         if last_exc is not None:
             raise last_exc
         if attempted == 0:
             raise RuntimeError(
-                "All LLM accounts are waiting for their reported quota reset"
+                "All LLM accounts are waiting for their next quota probe"
             )
         raise RuntimeError("LLM failover chain completed without a result")

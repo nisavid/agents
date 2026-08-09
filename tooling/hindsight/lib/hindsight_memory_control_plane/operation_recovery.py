@@ -23,7 +23,6 @@ EXPECTED_OPERATION_COUNTS = {
     "consolidation": 2,
 }
 EXPECTED_CLAIM_RELEASE_ROW_COUNT = 43
-EXPECTED_CLAIM_RELEASE_PERMITTED_BLOCKER_COUNT = 11
 EXPECTED_CLAIM_RELEASE_STATUS_COUNTS = {"failed": 43}
 EXPECTED_CLAIM_RELEASE_BANK_COUNTS = {"codex": 37, "engineering": 6}
 EXPECTED_CLAIM_RELEASE_TYPE_COUNTS = {
@@ -2243,8 +2242,8 @@ def create_claim_release_plan(
         != digest(sorted(reference_selected_ids))
         or live["reference_selected_operation_ids_digest"]
         != digest(sorted(reference_selected_ids))
-        or len(reference_selected)
-        != EXPECTED_CLAIM_RELEASE_PERMITTED_BLOCKER_COUNT
+        or not reference_selected
+        or len(reference_selected) > len(reference_cohort_ids)
         or predecessor["guard_contract_version"]
         != live["guard_contract_version"]
         or predecessor["guard_contract_digest"]
@@ -2306,7 +2305,7 @@ def create_claim_release_plan(
         row["operation_id"]: row for row in reference_selected
     }
     if (
-        len(permitted) != EXPECTED_CLAIM_RELEASE_PERMITTED_BLOCKER_COUNT
+        len(permitted) != len(reference_selected)
         or len(permitted_by_id) != len(permitted)
         or set(permitted_by_id) != set(reference_by_id)
         or permitted
@@ -2441,8 +2440,8 @@ def verify_claim_release_plan(
         or plan["schema"] != "public"
         or len(rows) != EXPECTED_CLAIM_RELEASE_ROW_COUNT
         or len(identifiers) != len(set(identifiers))
-        or len(permitted)
-        != EXPECTED_CLAIM_RELEASE_PERMITTED_BLOCKER_COUNT
+        or not permitted
+        or len(permitted) > len(cohort_identifiers)
         or len(permitted_identifiers) != len(set(permitted_identifiers))
         or len(cohort_identifiers) != sum(EXPECTED_OPERATION_COUNTS.values())
         or len(cohort_identifiers) != len(set(cohort_identifiers))
@@ -2459,8 +2458,7 @@ def verify_claim_release_plan(
         or plan["selected_row_count"] != EXPECTED_CLAIM_RELEASE_ROW_COUNT
         or plan["selected_row_set_digest"]
         != _claim_release_row_set_digest(rows)
-        or plan["permitted_blocker_count"]
-        != EXPECTED_CLAIM_RELEASE_PERMITTED_BLOCKER_COUNT
+        or plan["permitted_blocker_count"] != len(permitted)
         or plan["permitted_blocker_row_set_digest"]
         != _claim_release_permitted_blocker_row_set_digest(permitted)
         or plan["reference_cohort_operation_ids_digest"]
@@ -2541,9 +2539,7 @@ def verify_claim_release_plan(
             "claim-release selected-row-set digest",
         ),
         "permitted_blocker_rows": permitted,
-        "permitted_blocker_count": (
-            EXPECTED_CLAIM_RELEASE_PERMITTED_BLOCKER_COUNT
-        ),
+        "permitted_blocker_count": len(permitted),
         "permitted_blocker_row_set_digest": _sha(
             plan["permitted_blocker_row_set_digest"],
             "claim-release permitted blocker row-set digest",

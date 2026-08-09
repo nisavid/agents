@@ -23,7 +23,6 @@ import uuid
 from typing import Any
 
 from .operation_recovery import (
-    EXPECTED_CLAIM_RELEASE_PERMITTED_BLOCKER_COUNT,
     EXPECTED_CLAIM_RELEASE_ROW_COUNT,
     EXPECTED_OPERATION_COUNTS,
     OperationRecoveryError,
@@ -822,10 +821,14 @@ def _claim_release_permitted_expected(
     plan: Mapping[str, Any],
 ) -> dict[str, dict[str, Any]]:
     permitted_rows = plan.get("permitted_blocker_rows")
+    permitted_count = plan.get("permitted_blocker_count")
+    cohort_operation_ids = plan.get("reference_cohort_operation_ids")
     if (
         not isinstance(permitted_rows, list)
-        or len(permitted_rows)
-        != EXPECTED_CLAIM_RELEASE_PERMITTED_BLOCKER_COUNT
+        or type(permitted_count) is not int
+        or permitted_count != len(permitted_rows)
+        or not isinstance(cohort_operation_ids, list)
+        or not 1 <= permitted_count <= len(cohort_operation_ids)
     ):
         raise OperationRecoveryError(
             "operation-recovery claim-release permitted blocker set is invalid"

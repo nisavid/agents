@@ -32,6 +32,30 @@ EXPECTED_COUNTS = {
     "refresh_mental_model": 4,
     "consolidation": 2,
 }
+PERMITTED_POSITIONS = frozenset(
+    {
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        42,
+        43,
+        46,
+        47,
+    }
+)
 
 
 def historical_source_authority() -> dict:
@@ -186,12 +210,13 @@ class OperationRecoveryContractTest(unittest.TestCase):
         self,
         *,
         cancelled_positions: frozenset[int] = frozenset(),
+        failed_positions: frozenset[int] = PERMITTED_POSITIONS,
     ) -> dict:
         rows = operation_rows()
-        failed = {0, 1, 2, 3, 4, 5, 6, 7, 42, 43, 46}
+        failed = set(failed_positions)
         if not cancelled_positions.issubset(failed):
             raise ValueError("cancelled test positions must be selected")
-        completed = {12, 13, 14, 15, 16, 17}
+        completed = {20, 21, 22, 23, 24, 25}
         for index, row in enumerate(rows):
             if index in failed:
                 row["status"] = (
@@ -701,10 +726,16 @@ class OperationRecoveryContractTest(unittest.TestCase):
 
     def test_live_snapshot_requires_same_ids_payload_digests_and_generation(self):
         snapshot = self.live_snapshot()
-        self.assertEqual(snapshot["status_counts"]["failed"], 11)
+        self.assertEqual(
+            snapshot["status_counts"]["failed"],
+            len(PERMITTED_POSITIONS),
+        )
         self.assertEqual(snapshot["status_counts"]["cancelled"], 0)
         self.assertEqual(snapshot["status_counts"]["completed"], 6)
-        self.assertEqual(snapshot["status_counts"]["pending"], 31)
+        self.assertEqual(
+            snapshot["status_counts"]["pending"],
+            sum(EXPECTED_COUNTS.values()) - len(PERMITTED_POSITIONS) - 6,
+        )
         self.assertEqual(verify_live_snapshot(snapshot), snapshot)
 
         rows = operation_rows()
@@ -763,7 +794,10 @@ class OperationRecoveryContractTest(unittest.TestCase):
             )
         )
 
-        self.assertEqual(len(plan["selected_operations"]), 11)
+        self.assertEqual(
+            len(plan["selected_operations"]),
+            len(PERMITTED_POSITIONS),
+        )
         self.assertEqual(
             {item["expected_status"] for item in plan["selected_operations"]},
             {"failed"},
@@ -1128,7 +1162,10 @@ class OperationRecoveryContractTest(unittest.TestCase):
         self.assertEqual(plan["authority"], "unapproved-plan")
         self.assertIs(plan["mutation_authorized"], False)
         self.assertEqual(plan["selected_row_count"], 43)
-        self.assertEqual(plan["permitted_blocker_count"], 11)
+        self.assertEqual(
+            plan["permitted_blocker_count"],
+            len(PERMITTED_POSITIONS),
+        )
         self.assertEqual(
             plan["reference_plan_digest"],
             reference_plan["plan_digest"],
@@ -1154,6 +1191,42 @@ class OperationRecoveryContractTest(unittest.TestCase):
         self.assertNotIn('"task_payload":', serialized)
         self.assertNotIn('"worker_id":', serialized)
         self.assertNotIn('"error_message":', serialized)
+
+    def test_claim_release_plan_derives_permitted_count_from_reference(self):
+        planned_at = 1_785_460_800
+        reduced_positions = frozenset({0, 42})
+        reference_plan = self.requeue_plan(
+            self.live_snapshot(failed_positions=reduced_positions)
+        )
+        predecessor, live, nonclaim_digests = self.claim_release_inputs(
+            planned_at=planned_at,
+            live_generation="systalyze:public:123",
+            reference_plan=reference_plan,
+        )
+        permitted_rows = self.permitted_blocker_rows(reference_plan)
+
+        plan = create_claim_release_plan(
+            predecessor,
+            live,
+            reference_plan=reference_plan,
+            permitted_blocker_rows=permitted_rows,
+            nonclaim_state_digests=nonclaim_digests,
+            candidate_release=release_identity(),
+            installation_authority=installation_authority(),
+            rollback_encryption=rollback_encryption(),
+            rollback_bundle_path="/private/tmp/dynamic.bundle.json",
+            authorization_receipt_path="/private/tmp/dynamic.authorization.json",
+            application_receipt_path="/private/tmp/dynamic.application.json",
+            verification_receipt_path="/private/tmp/dynamic.verification.json",
+            rollback_receipt_path="/private/tmp/dynamic.rollback.json",
+            created_at=planned_at,
+        )
+
+        self.assertEqual(plan["permitted_blocker_count"], len(reduced_positions))
+        self.assertEqual(
+            verify_claim_release_plan(plan, now=planned_at),
+            plan,
+        )
 
     def test_claim_release_plan_binds_fresh_generation_not_predecessor(self):
         planned_at = 1_785_460_800

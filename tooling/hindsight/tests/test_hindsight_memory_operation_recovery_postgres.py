@@ -285,7 +285,7 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
         operation_types = ["retain"] * 42 + ["refresh_mental_model"] * 4 + [
             "consolidation"
         ] * 2
-        selected_positions = {0, 1, 2, 3, 4, 5, 6, 7, 42, 43, 46}
+        selected_positions = recovery_fixtures.PERMITTED_POSITIONS
         cohort_ids = []
         for position, operation_type in enumerate(operation_types):
             operation_id = f"00000000-0000-4000-8000-{position + 1:012d}"
@@ -903,7 +903,7 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
 
         asyncio.run(exercise())
 
-    def test_claim_release_allows_exact_43_mutations_and_11_bound_blockers(self):
+    def test_claim_release_allows_exact_43_mutations_and_20_bound_blockers(self):
         async def exercise():
             connection = await self._connect()
             try:
@@ -973,7 +973,7 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
 
         asyncio.run(exercise())
 
-    def test_claim_release_rejects_a_row_outside_the_54_guarded_rows(self):
+    def test_claim_release_rejects_a_row_outside_the_63_guarded_rows(self):
         async def exercise():
             connection = await self._connect()
             try:

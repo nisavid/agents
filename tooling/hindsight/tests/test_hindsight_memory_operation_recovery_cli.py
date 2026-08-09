@@ -816,7 +816,10 @@ class OperationRecoveryCliTest(unittest.TestCase):
         )
         self.assertEqual(result["status"], "planned")
         self.assertEqual(result["selected_row_count"], 43)
-        self.assertEqual(result["permitted_blocker_count"], 11)
+        self.assertEqual(
+            result["permitted_blocker_count"],
+            len(recovery_fixtures.PERMITTED_POSITIONS),
+        )
         plan, create_only = written[args.output]
         self.assertIs(create_only, True)
         self.assertEqual(plan["authority"], "unapproved-plan")

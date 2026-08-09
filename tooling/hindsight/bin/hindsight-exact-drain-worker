@@ -1,0 +1,324 @@
+#!/usr/bin/env python3
+"""Run the upstream Hindsight worker behind an exact-ID claim adapter."""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import hashlib
+import os
+import signal
+import stat
+import sys
+from pathlib import Path
+
+
+sys.dont_write_bytecode = True
+LIB = Path(__file__).resolve().parents[1] / "lib"
+sys.path.insert(0, str(LIB))
+import hindsight_memory_control_plane as _control_plane  # noqa: E402
+
+_CANDIDATE_PACKAGE = str(LIB / "hindsight_memory_control_plane")
+if _CANDIDATE_PACKAGE not in _control_plane.__path__:
+    _control_plane.__path__.insert(0, _CANDIDATE_PACKAGE)
+
+from hindsight_memory_control_plane.canonical import (  # noqa: E402
+    StrictJsonError,
+    strict_json_loads,
+)
+from hindsight_memory_control_plane.operation_recovery import (  # noqa: E402
+    OperationRecoveryError,
+    verify_exact_drain_authorization_receipt,
+    verify_exact_drain_plan,
+)
+from hindsight_memory_control_plane.operation_recovery_runtime import (  # noqa: E402
+    ExactDrainClaimAdapter,
+    EXACT_DRAIN_PROFILE_ENVIRONMENT_KEYS,
+    exact_drain_effective_profile_digest,
+    exact_drain_runtime_evidence,
+    exact_drain_worker_id,
+    install_exact_drain_runtime_guards,
+    validate_exact_drain_provider_policy,
+)
+from hindsight_memory_control_plane.provider_runtime import (  # noqa: E402
+    ProviderRuntimeCompatibilityError,
+    ProviderRuntimePolicy,
+)
+
+
+def _private_bytes(value: str | Path, label: str) -> bytes:
+    path = Path(value)
+    if not path.is_absolute():
+        raise OperationRecoveryError(f"{label} path must be absolute")
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        metadata = os.fstat(descriptor)
+        observed = path.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_mode & 0o077
+            or metadata.st_nlink != 1
+            or metadata.st_size > 16 * 1024 * 1024
+            or (metadata.st_dev, metadata.st_ino)
+            != (observed.st_dev, observed.st_ino)
+        ):
+            raise OperationRecoveryError(f"{label} is untrusted")
+        chunks = []
+        observed_size = 0
+        while observed_size <= metadata.st_size:
+            chunk = os.read(
+                descriptor,
+                min(1024 * 1024, metadata.st_size + 1),
+            )
+            if not chunk:
+                break
+            chunks.append(chunk)
+            observed_size += len(chunk)
+        if observed_size != metadata.st_size:
+            raise OperationRecoveryError(f"{label} changed while reading")
+        return b"".join(chunks)
+    except OSError as error:
+        raise OperationRecoveryError(f"{label} is unavailable") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(prog="hindsight-exact-drain-worker")
+    result.add_argument("--plan", required=True)
+    result.add_argument("--provider-policy", required=True)
+    result.add_argument("--provider-runtime-root", required=True)
+    result.add_argument("--worker-runtime", required=True)
+    result.add_argument("--resume", action="store_true")
+    return result
+
+
+def main() -> int:
+    args = parser().parse_args()
+    plan = verify_exact_drain_plan(
+        strict_json_loads(
+            _private_bytes(args.plan, "exact drain plan").decode("utf-8")
+        ),
+        allow_expired=args.resume,
+    )
+    verify_exact_drain_authorization_receipt(
+        strict_json_loads(
+            _private_bytes(
+                plan["authorization_receipt_path"],
+                "exact drain authorization receipt",
+            ).decode("utf-8")
+        ),
+        plan=plan,
+    )
+    canonical_policy = (
+        Path.home()
+        / ".config"
+        / "hindsight-control-plane"
+        / "provider-runtime-policy.json"
+    ).resolve(strict=True)
+    runtime_digest, provider_bootstrap = exact_drain_runtime_evidence(
+        args.worker_runtime,
+        args.provider_runtime_root,
+    )
+    provider_policy_bytes = _private_bytes(
+        args.provider_policy,
+        "exact drain provider policy",
+    )
+    try:
+        provider_policy = ProviderRuntimePolicy.load(
+            strict_json_loads(provider_policy_bytes)
+        )
+    except (
+        ProviderRuntimeCompatibilityError,
+        StrictJsonError,
+    ) as error:
+        raise OperationRecoveryError(
+            "exact drain provider policy differs"
+        ) from error
+    validate_exact_drain_provider_policy(provider_policy)
+    if (
+        Path(args.provider_policy).resolve(strict=True) != canonical_policy
+        or hashlib.sha256(provider_policy_bytes).hexdigest()
+        != plan["provider_policy_digest"]
+        or runtime_digest != plan["worker_runtime_digest"]
+    ):
+        raise OperationRecoveryError("exact drain runtime authority drifted")
+    start_descriptor_value = os.environ.get(
+        "HINDSIGHT_EXACT_DRAIN_START_FD",
+        "",
+    )
+    try:
+        start_descriptor = int(start_descriptor_value)
+        start_metadata = os.fstat(start_descriptor)
+    except (OSError, TypeError, ValueError) as error:
+        raise OperationRecoveryError(
+            "exact drain start gate is unavailable"
+        ) from error
+    if (
+        start_descriptor < 0
+        or not stat.S_ISFIFO(start_metadata.st_mode)
+    ):
+        raise OperationRecoveryError("exact drain start gate differs")
+    expected_environment = {
+        "HOME": str(Path.home()),
+        "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONPATH": str(LIB),
+        "HINDSIGHT_EXACT_DRAIN_START_FD": start_descriptor_value,
+        "HINDSIGHT_API_WORKER_MAX_SLOTS": "2",
+        "HINDSIGHT_API_WORKER_CONSOLIDATION_RESERVED_SLOTS": "1",
+        "HINDSIGHT_API_WORKER_RETAIN_RESERVED_SLOTS": "0",
+        "HINDSIGHT_API_WORKER_FILE_CONVERT_RETAIN_RESERVED_SLOTS": "0",
+        "HINDSIGHT_API_WORKER_REFRESH_MENTAL_MODEL_RESERVED_SLOTS": "0",
+        "HINDSIGHT_API_WORKER_GRAPH_MAINTENANCE_RESERVED_SLOTS": "0",
+        "HINDSIGHT_API_WORKER_IMPORT_DOCUMENTS_RESERVED_SLOTS": "0",
+        "HINDSIGHT_API_RETAIN_MAX_CONCURRENT": "1",
+        "HINDSIGHT_API_OPERATION_RETENTION_DAYS": "0",
+        "HINDSIGHT_API_AUDIT_LOG_RETENTION_DAYS": "0",
+        "HINDSIGHT_API_LLM_TRACE_RETENTION_DAYS": "0",
+        "HINDSIGHT_API_CONSOLIDATION_RECONCILE_INTERVAL_SECONDS": "0",
+        "HINDSIGHT_API_MENTAL_MODEL_REFRESH_TICK_SECONDS": "0",
+        "HINDSIGHT_CODEX_TERMINAL_AUTH_COOLDOWN_SECONDS": "300",
+        "HINDSIGHT_EMBEDDING_FAILOVER_ORDER": (
+            "work-codex,personal-codex,alt1-codex,alt2-codex"
+        ),
+    }
+    allowed_environment = (
+        set(EXACT_DRAIN_PROFILE_ENVIRONMENT_KEYS)
+        | set(expected_environment)
+        | {"HINDSIGHT_API_DATABASE_URL", "LC_CTYPE"}
+    )
+    if (
+        any(
+            os.environ.get(key) != value
+            for key, value in expected_environment.items()
+        )
+        or set(os.environ) - allowed_environment
+        or not os.environ.get("HINDSIGHT_API_DATABASE_URL", "").startswith(
+            "postgresql://"
+        )
+    ):
+        raise OperationRecoveryError("exact drain worker environment differs")
+    if (
+        exact_drain_effective_profile_digest(
+            provider_policy,
+            os.environ,
+        )
+        != plan["effective_profile_digest"]
+    ):
+        raise OperationRecoveryError("exact drain LLM profile differs")
+    try:
+        start_signal = os.read(start_descriptor, 2)
+    finally:
+        os.close(start_descriptor)
+    if start_signal != b"1":
+        raise OperationRecoveryError("exact drain start was not authorized")
+
+    provider_globals = {
+        "__builtins__": __builtins__,
+        "__file__": str(
+            Path(args.provider_runtime_root) / "sitecustomize.py"
+        ),
+        "__name__": "_hindsight_exact_provider_bootstrap",
+    }
+    provider_tree = ast.parse(
+        provider_bootstrap,
+        filename=provider_globals["__file__"],
+    )
+    if not provider_tree.body or not isinstance(
+        provider_tree.body[-1], ast.If
+    ):
+        raise OperationRecoveryError(
+            "exact drain provider bootstrap shape differs"
+        )
+    definitions = ast.Module(
+        body=provider_tree.body[:-1],
+        type_ignores=provider_tree.type_ignores,
+    )
+    activation = ast.Module(
+        body=[provider_tree.body[-1]],
+        type_ignores=[],
+    )
+    exec(
+        compile(
+            ast.fix_missing_locations(definitions),
+            provider_globals["__file__"],
+            "exec",
+        ),
+        provider_globals,
+    )
+    original_protected_reader = provider_globals.get(
+        "_read_protected_file"
+    )
+    if not callable(original_protected_reader):
+        raise OperationRecoveryError(
+            "exact drain provider bootstrap reader differs"
+        )
+
+    def read_bound_provider_file(path: Path, label: str) -> bytes:
+        if Path(path) == canonical_policy:
+            return provider_policy_bytes
+        return original_protected_reader(path, label)
+
+    provider_globals["_read_protected_file"] = read_bound_provider_file
+    exec(
+        compile(
+            ast.fix_missing_locations(activation),
+            provider_globals["__file__"],
+            "exec",
+        ),
+        provider_globals,
+    )
+
+    def complete() -> None:
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    adapter = ExactDrainClaimAdapter(
+        plan,
+        completion_callback=complete,
+        resume=args.resume,
+    )
+    from hindsight_api import MemoryEngine
+    from hindsight_api.engine.db.ops_postgresql import PostgreSQLOps
+    from hindsight_api.worker.main import main as worker_main
+    from hindsight_api.worker.poller import WorkerPoller
+
+    install_exact_drain_runtime_guards(
+        PostgreSQLOps,
+        WorkerPoller,
+        MemoryEngine,
+        adapter,
+    )
+    sys.argv = [
+        "hindsight-worker",
+        "--worker-id",
+        exact_drain_worker_id(plan["plan_digest"]),
+        "--poll-interval",
+        "250",
+        "--max-retries",
+        str(plan["worker_max_retries"]),
+        "--http-host",
+        "127.0.0.1",
+        "--http-port",
+        "0",
+        "--log-level",
+        "info",
+    ]
+    worker_main()
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (OperationRecoveryError, UnicodeDecodeError) as error:
+        print(f"hindsight-exact-drain-worker: {error}", file=sys.stderr)
+        raise SystemExit(2) from None

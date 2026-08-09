@@ -1,5 +1,6 @@
 import asyncio
 import base64
+from dataclasses import replace
 import hashlib
 import json
 import os
@@ -7,6 +8,7 @@ import runpy
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -23,10 +25,1289 @@ from tooling.hindsight.tests import (
 ROOT = Path(__file__).resolve().parents[1]
 
 
+async def _locked_status(events, plan):
+    if events[:2] != ["recovery-enter", "manager-enter"]:
+        raise AssertionError("exact drain status ran outside its locks")
+    return {
+        "selected_status_counts": {"pending": 43},
+        "preserved_status_counts": {"completed": 5},
+        "outside_nonterminal_counts": [],
+        "status_digest": "6" * 64,
+        "generation_before": plan["pre_generation"],
+    }
+
+
+async def _immediate(value):
+    return value
+
+
 class OperationRecoveryCliTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.controller = runpy.run_path(str(ROOT / "bin" / "hindsight-memory"))
+
+    def test_exact_drain_cli_exposes_plan_apply_status_and_verify(self):
+        parser = self.controller["parser"]()
+        authority = [
+            "--config",
+            "/private/tmp/config.json",
+            "--candidate-release-root",
+            "/private/tmp/candidate",
+            "--candidate-release-identity",
+            "/private/tmp/candidate.json",
+        ]
+        plan = parser.parse_args(
+            [
+                "operation-recovery",
+                "drain",
+                "plan",
+                *authority,
+                "--cohort",
+                "/private/tmp/cohort.json",
+                "--snapshot",
+                "/private/tmp/snapshot.json",
+                "--rollback-backup-evidence",
+                "/private/tmp/backup.json",
+                "--rollback-backup",
+                "/private/tmp/backup.dump.age",
+                "--provider-policy",
+                "/private/tmp/providers.json",
+                "--provider-runtime-root",
+                "/private/tmp/provider-runtime",
+                "--worker-runtime",
+                "/private/tmp/hindsight-worker",
+                "--authorization-receipt",
+                "/private/tmp/authorization.json",
+                "--application-receipt",
+                "/private/tmp/application.json",
+                "--status-artifact",
+                "/private/tmp/status.json",
+                "--verification-receipt",
+                "/private/tmp/verification.json",
+                "--output",
+                "/private/tmp/plan.json",
+            ]
+        )
+        self.assertIs(
+            plan.run,
+            self.controller["operation_recovery_drain_plan_command"],
+        )
+        for command, extra, function in (
+            (
+                "apply",
+                [
+                    "--approval-digest",
+                    "a" * 64,
+                    "--provider-policy",
+                    "/private/tmp/providers.json",
+                    "--provider-runtime-root",
+                    "/private/tmp/provider-runtime",
+                    "--worker-runtime",
+                    "/private/tmp/hindsight-worker",
+                ],
+                "operation_recovery_drain_apply_command",
+            ),
+            ("status", [], "operation_recovery_drain_status_command"),
+            ("verify", [], "operation_recovery_drain_verify_command"),
+        ):
+            parsed = parser.parse_args(
+                [
+                    "operation-recovery",
+                    "drain",
+                    command,
+                    *authority,
+                    "--plan",
+                    "/private/tmp/plan.json",
+                    *extra,
+                ]
+            )
+            self.assertIs(parsed.run, self.controller[function])
+
+    def test_exact_drain_journal_tracks_the_live_child_identity(self):
+        start_time = self.controller["_process_start_time"](os.getpid())
+        self.assertIsNotNone(start_time)
+        journal = {
+            "worker_pid": os.getpid(),
+            "worker_start_time": start_time,
+        }
+        active = self.controller[
+            "_operation_recovery_exact_journal_worker_active"
+        ]
+        self.assertTrue(active(journal))
+        self.assertFalse(
+            active({**journal, "worker_start_time": "identity-mismatch"})
+        )
+
+    def test_exact_drain_plan_command_is_unapproved_and_payload_free(self):
+        command = self.controller["operation_recovery_drain_plan_command"]
+        globals_ = command.__globals__
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        with tempfile.TemporaryDirectory(
+            dir="/private/tmp",
+            prefix="exact-drain-plan-",
+        ) as directory:
+            root = Path(directory)
+            root.chmod(0o700)
+            rollback_path = root / "rollback.dump.age"
+            rollback_path.write_bytes(b"synthetic-encrypted-backup")
+            rollback_path.chmod(0o600)
+            backup = recovery_fixtures.drain_backup_evidence()
+            backup["artifact_sha256"] = hashlib.sha256(
+                rollback_path.read_bytes()
+            ).hexdigest()
+            documents = {
+                "cohort": fixtures.cohort(),
+                "snapshot": fixtures.drain_snapshot(),
+                "backup": backup,
+            }
+            written = {}
+            candidate = recovery_fixtures.release_identity()
+            replacements = {
+                "_operation_recovery_candidate": lambda _args: candidate,
+                "_operation_recovery_read_private_json": (
+                    lambda path, _label: documents[str(path)]
+                ),
+                "_operation_recovery_exact_provider_policy_evidence": (
+                    lambda _path: ("9" * 64, object())
+                ),
+                "_operation_recovery_profile_environment": lambda: {},
+                "exact_drain_effective_profile_digest": (
+                    lambda _policy, _environment: "7" * 64
+                ),
+                "_operation_recovery_exact_runtime_digest": (
+                    lambda _args: "8" * 64
+                ),
+                "write_private": (
+                    lambda path, value, *, create_only: written.update(
+                        {str(path): (value, create_only)}
+                    )
+                ),
+                "_print_result": lambda value: value,
+            }
+            originals = {key: globals_[key] for key in replacements}
+            globals_.update(replacements)
+            args = SimpleNamespace(
+                cohort="cohort",
+                snapshot="snapshot",
+                rollback_backup_evidence="backup",
+                rollback_backup=str(rollback_path),
+                provider_policy=str(root / "providers.json"),
+                provider_runtime_root=str(root / "provider-runtime"),
+                worker_runtime=str(root / "hindsight-worker"),
+                authorization_receipt=str(root / "authorization.json"),
+                application_receipt=str(root / "application.json"),
+                status_artifact=str(root / "status.json"),
+                verification_receipt=str(root / "verification.json"),
+                output=str(root / "plan.json"),
+            )
+            try:
+                result = command(args)
+            finally:
+                globals_.update(originals)
+
+            self.assertEqual(result["status"], "planned")
+            self.assertEqual(result["authority"], "unapproved-plan")
+            self.assertEqual(result["selected_operation_count"], 43)
+            plan, create_only = written[args.output]
+            self.assertIs(create_only, True)
+            self.assertIs(plan["mutation_authorized"], False)
+            serialized = json.dumps(plan, sort_keys=True)
+            self.assertNotIn('"task_payload":', serialized)
+            self.assertNotIn('"worker_id":', serialized)
+            self.assertNotIn('"error_message":', serialized)
+
+    def test_exact_drain_worker_environment_disables_global_maintenance(self):
+        build = self.controller[
+            "_operation_recovery_exact_worker_environment"
+        ]
+        inherited = {
+            "KEEP_ME": "yes",
+            "HOME": "/private/tmp/untrusted-home",
+            "HINDSIGHT_API_WORKER_CONSOLIDATION_MAX_SLOTS": "9",
+            "HINDSIGHT_API_WORKER_FILE_CONVERT_RETAIN_MAX_SLOTS": "8",
+            "HINDSIGHT_API_WORKER_GRAPH_MAINTENANCE_RESERVED_SLOTS": "7",
+            "HINDSIGHT_API_OPERATION_RETENTION_DAYS": "7",
+            "HINDSIGHT_API_AUDIT_LOG_RETENTION_DAYS": "7",
+            "HINDSIGHT_API_LLM_TRACE_RETENTION_DAYS": "7",
+            "HINDSIGHT_API_CONSOLIDATION_RECONCILE_INTERVAL_SECONDS": "60",
+            "HINDSIGHT_API_MENTAL_MODEL_REFRESH_TICK_SECONDS": "60",
+        }
+
+        environment = build(
+            inherited,
+            database_url=(
+                "postgresql://hindsight:secret@localhost/hindsight"
+                "?host=%2Fprivate%2Ftmp&port=54329"
+            ),
+            start_gate_descriptor=9,
+        )
+
+        self.assertNotIn("KEEP_ME", environment)
+        self.assertEqual(environment["HOME"], str(Path.home()))
+        self.assertFalse(
+            any(
+                key.endswith("_MAX_SLOTS")
+                and key != "HINDSIGHT_API_WORKER_MAX_SLOTS"
+                for key in environment
+            )
+        )
+        self.assertEqual(
+            environment["HINDSIGHT_API_WORKER_MAX_SLOTS"], "2"
+        )
+        self.assertEqual(
+            environment[
+                "HINDSIGHT_API_WORKER_CONSOLIDATION_RESERVED_SLOTS"
+            ],
+            "1",
+        )
+        for operation_type in (
+            "RETAIN",
+            "FILE_CONVERT_RETAIN",
+            "REFRESH_MENTAL_MODEL",
+            "GRAPH_MAINTENANCE",
+            "IMPORT_DOCUMENTS",
+        ):
+            self.assertEqual(
+                environment[
+                    f"HINDSIGHT_API_WORKER_{operation_type}_RESERVED_SLOTS"
+                ],
+                "0",
+            )
+        for key in (
+            "HINDSIGHT_API_OPERATION_RETENTION_DAYS",
+            "HINDSIGHT_API_AUDIT_LOG_RETENTION_DAYS",
+            "HINDSIGHT_API_LLM_TRACE_RETENTION_DAYS",
+            "HINDSIGHT_API_CONSOLIDATION_RECONCILE_INTERVAL_SECONDS",
+            "HINDSIGHT_API_MENTAL_MODEL_REFRESH_TICK_SECONDS",
+        ):
+            self.assertEqual(environment[key], "0")
+        self.assertEqual(
+            environment["HINDSIGHT_API_DATABASE_URL"],
+            (
+                "postgresql://hindsight:secret@localhost/hindsight"
+                "?host=%2Fprivate%2Ftmp&port=54329"
+            ),
+        )
+        self.assertEqual(
+            environment["HINDSIGHT_EXACT_DRAIN_START_FD"],
+            "9",
+        )
+
+    def test_exact_drain_worker_uses_the_venv_interpreter_path(self):
+        resolve = self.controller[
+            "_operation_recovery_exact_worker_interpreter"
+        ]
+        worker = Path(
+            "/Users/ivan/.local/share/uv/tools/hindsight-api/bin/"
+            "hindsight-worker"
+        )
+        interpreter = resolve(worker)
+        self.assertEqual(interpreter, worker.parent / "python3")
+        self.assertNotEqual(interpreter, interpreter.resolve(strict=True))
+        result = subprocess.run(
+            [str(interpreter), "-c", "import hindsight_api"],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_exact_drain_provider_policy_must_be_the_canonical_home_policy(self):
+        validate = self.controller[
+            "_operation_recovery_exact_provider_policy"
+        ]
+        with self.assertRaisesRegex(
+            Exception,
+            "provider policy path differs",
+        ):
+            validate("/private/tmp/not-the-canonical-provider-policy.json")
+
+    def test_exact_drain_provider_policy_hashes_the_validated_bytes(self):
+        evidence = self.controller[
+            "_operation_recovery_exact_provider_policy_evidence"
+        ]
+        globals_ = evidence.__globals__
+        policy_path = (
+            Path.home()
+            / ".config/hindsight-control-plane/provider-runtime-policy.json"
+        )
+        body = policy_path.read_bytes()
+        reads = []
+        original = globals_["_operation_recovery_read_private_bytes"]
+        globals_["_operation_recovery_read_private_bytes"] = (
+            lambda _path, _label: reads.append(True) or body
+        )
+        try:
+            observed, _policy = evidence(policy_path)
+        finally:
+            globals_["_operation_recovery_read_private_bytes"] = original
+        self.assertEqual(reads, [True])
+        self.assertEqual(observed, hashlib.sha256(body).hexdigest())
+
+    def test_exact_drain_provider_policy_requires_four_dedicated_codex_homes(self):
+        validate = self.controller[
+            "_operation_recovery_validate_exact_provider_policy"
+        ]
+        policy_path = (
+            Path.home()
+            / ".config/hindsight-control-plane/provider-runtime-policy.json"
+        )
+        policy = self.controller["ProviderRuntimePolicy"].load(
+            self.controller["strict_json_loads"](
+                policy_path.read_text(encoding="utf-8")
+            )
+        )
+        validate(policy)
+        work = policy.member("work-codex")
+        changed_identity = replace(
+            work.identity,
+            provider="openai-compatible",
+        )
+        changed_member = replace(work, identity=changed_identity)
+        changed = replace(
+            policy,
+            members=tuple(
+                changed_member if member.id == work.id else member
+                for member in policy.members
+            ),
+        )
+        with self.assertRaisesRegex(
+            Exception,
+            "provider policy differs",
+        ):
+            validate(changed)
+
+    def test_exact_drain_effective_profile_requires_the_policy_projection(self):
+        policy_path = (
+            Path.home()
+            / ".config/hindsight-control-plane/provider-runtime-policy.json"
+        )
+        _policy_digest, policy = self.controller[
+            "_operation_recovery_exact_provider_policy_evidence"
+        ](policy_path)
+        profile = {
+            "HINDSIGHT_API_LLM_STRATEGY": '{"mode":"round-robin"}',
+            "HINDSIGHT_API_EMBEDDINGS_PROVIDER": "openai-codex",
+            "HINDSIGHT_API_RERANKER_PROVIDER": "jina-mlx",
+        }
+        for position, member_id in enumerate(policy.failover_order):
+            member = policy.member(member_id)
+            prefix = (
+                "HINDSIGHT_API_LLM"
+                if position == 0
+                else f"HINDSIGHT_API_LLM_{position}"
+            )
+            profile[f"{prefix}_PROVIDER"] = member.identity.provider
+            profile[f"{prefix}_MODEL"] = member.identity.model
+            if member.identity.base_url:
+                profile[f"{prefix}_BASE_URL"] = member.identity.base_url
+            if member.identity.credential_marker is not None:
+                profile[f"{prefix}_API_KEY"] = (
+                    member.identity.credential_marker
+                )
+        bind = self.controller["exact_drain_effective_profile_digest"]
+        initial = bind(policy, profile)
+        changed_effort = dict(profile)
+        changed_effort["HINDSIGHT_API_LLM_REASONING_EFFORT"] = "high"
+        self.assertNotEqual(bind(policy, changed_effort), initial)
+        changed_provider = dict(profile)
+        changed_provider["HINDSIGHT_API_LLM_PROVIDER"] = "claude-code"
+        with self.assertRaisesRegex(
+            Exception,
+            "LLM profile differs",
+        ):
+            bind(policy, changed_provider)
+        changed_embeddings = dict(profile)
+        changed_embeddings["HINDSIGHT_API_EMBEDDINGS_PROVIDER"] = "local"
+        with self.assertRaisesRegex(
+            Exception,
+            "LLM profile differs",
+        ):
+            bind(policy, changed_embeddings)
+        changed_trace = dict(profile)
+        changed_trace["HINDSIGHT_API_LLM_TRACE_ENABLED"] = "false"
+        self.assertNotEqual(bind(policy, changed_trace), initial)
+        changed_extraction_policy = dict(profile)
+        changed_extraction_policy[
+            "HINDSIGHT_API_FAIL_ON_EXTRACTION_ERRORS"
+        ] = "true"
+        with self.assertRaisesRegex(
+            Exception,
+            "LLM profile differs",
+        ):
+            bind(policy, changed_extraction_policy)
+
+    def test_exact_drain_apply_rechecks_the_rollback_backup_digest(self):
+        verify = self.controller[
+            "_operation_recovery_assert_exact_backup"
+        ]
+        with tempfile.TemporaryDirectory(
+            dir="/private/tmp",
+            prefix="exact-drain-backup-",
+        ) as directory:
+            path = Path(directory) / "rollback.dump.age"
+            path.write_bytes(b"approved-backup")
+            path.chmod(0o600)
+            plan = {
+                "rollback_backup_path": str(path),
+                "rollback_backup": {
+                    "artifact_sha256": hashlib.sha256(
+                        path.read_bytes()
+                    ).hexdigest()
+                },
+            }
+            verify(plan)
+            path.write_bytes(b"changed-backup")
+            with self.assertRaisesRegex(
+                Exception,
+                "rollback backup differs",
+            ):
+                verify(plan)
+
+    def test_exact_drain_wrapper_adopts_candidate_modules_after_provider_bootstrap(self):
+        with tempfile.TemporaryDirectory(
+            dir="/private/tmp",
+            prefix="exact-drain-bootstrap-",
+        ) as directory:
+            fake_root = Path(directory) / "active-lib"
+            package = fake_root / "hindsight_memory_control_plane"
+            package.mkdir(parents=True)
+            (package / "__init__.py").write_text("", encoding="utf-8")
+            wrapper = ROOT / "bin" / "hindsight-exact-drain-worker"
+            bootstrap = (
+                "import runpy, sys; "
+                f"sys.path.insert(0, {str(fake_root)!r}); "
+                "import hindsight_memory_control_plane; "
+                f"sys.argv = [{str(wrapper)!r}, '--help']; "
+                f"runpy.run_path({str(wrapper)!r}, run_name='__main__')"
+            )
+            environment = dict(os.environ)
+            environment.pop("PYTHONPATH", None)
+            result = subprocess.run(
+                [sys.executable, "-S", "-c", bootstrap],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("hindsight-exact-drain-worker", result.stdout)
+
+    def test_exact_drain_application_receipt_binds_authorization_and_status(self):
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        now = int(time.time())
+        plan = self.controller["create_exact_drain_plan"](
+            fixtures.cohort(),
+            fixtures.drain_snapshot(),
+            candidate_release=recovery_fixtures.release_identity(),
+            rollback_backup=recovery_fixtures.drain_backup_evidence(),
+            rollback_backup_path="/private/tmp/drain-backup.age",
+            provider_policy_digest="9" * 64,
+            effective_profile_digest="7" * 64,
+            worker_runtime_digest="8" * 64,
+            authorization_receipt_path="/private/tmp/drain-auth.json",
+            application_receipt_path="/private/tmp/drain-application.json",
+            status_artifact_path="/private/tmp/drain-status.json",
+            verification_receipt_path="/private/tmp/drain-verify.json",
+            created_at=now,
+        )
+        make_receipt = self.controller["_operation_recovery_exact_receipt"]
+        authorization = make_receipt(
+            {
+                "schema_version": 1,
+                "kind": (
+                    "operation-recovery-exact-drain-authorization-receipt"
+                ),
+                "plan_digest": plan["plan_digest"],
+                "approval_digest": plan["plan_digest"],
+                "candidate_release": plan["candidate_release"],
+                "provider_policy_digest": plan["provider_policy_digest"],
+                "worker_runtime_digest": plan["worker_runtime_digest"],
+                "authorized_at": now,
+            }
+        )
+        status_body = {
+            "schema_version": 1,
+            "kind": "operation-recovery-exact-drain-status",
+            "plan_digest": plan["plan_digest"],
+            "generation_before": "systalyze:public:200",
+            "generation_after": "systalyze:public:200",
+            "selected_operation_count": 43,
+            "selected_status_counts": {"completed": 43},
+            "preserved_status_counts": {"completed": 5},
+            "outside_nonterminal_counts": [],
+            "observed_at": now + 1,
+        }
+        terminal_status = {
+            **status_body,
+            "status_digest": self.controller["digest"](status_body),
+        }
+        journal_body = {
+            "schema_version": 1,
+            "kind": "operation-recovery-exact-drain-application-journal",
+            "plan_digest": plan["plan_digest"],
+            "authorization_receipt_digest": authorization[
+                "receipt_digest"
+            ],
+            "started_at": now,
+            "worker_pid": 12345,
+            "worker_start_time": "2026-08-09T21:00:00.000000Z",
+            "worker_attempt": 2,
+        }
+        application = make_receipt(
+            {
+                "schema_version": 1,
+                "kind": "operation-recovery-exact-drain-application-receipt",
+                "plan_digest": plan["plan_digest"],
+                "candidate_release": plan["candidate_release"],
+                "authorization_receipt_digest": authorization[
+                    "receipt_digest"
+                ],
+                "application_journal_digest": self.controller["digest"](
+                    journal_body
+                ),
+                "worker_runtime_digest": plan["worker_runtime_digest"],
+                "provider_policy_digest": plan["provider_policy_digest"],
+                "terminal_status_digest": terminal_status["status_digest"],
+                "selected_status_counts": {"completed": 43},
+                "outside_nonterminal_counts": [],
+                "worker_pid": journal_body["worker_pid"],
+                "worker_start_time": journal_body[
+                    "worker_start_time"
+                ],
+                "worker_attempt": journal_body["worker_attempt"],
+                "started_at": now,
+                "completed_at": now + 2,
+            }
+        )
+        validate = self.controller["_operation_recovery_exact_application"]
+        self.assertEqual(
+            validate(
+                application,
+                plan=plan,
+                authorization=authorization,
+                terminal_status=terminal_status,
+            ),
+            application,
+        )
+        forged = dict(application)
+        forged["authorization_receipt_digest"] = "0" * 64
+        forged["receipt_digest"] = self.controller["digest"](
+            {
+                key: value
+                for key, value in forged.items()
+                if key != "receipt_digest"
+            }
+        )
+        with self.assertRaisesRegex(
+            Exception,
+            "application receipt is invalid",
+        ):
+            validate(
+                forged,
+                plan=plan,
+                authorization=authorization,
+                terminal_status=terminal_status,
+            )
+        excessive_journal_body = {
+            **journal_body,
+            "worker_attempt": plan["worker_max_attempts"] + 1,
+        }
+        excessive_journal = {
+            **excessive_journal_body,
+            "receipt_digest": self.controller["digest"](
+                excessive_journal_body
+            ),
+        }
+        with self.assertRaisesRegex(
+            Exception,
+            "application journal is invalid",
+        ):
+            self.controller["_operation_recovery_exact_journal"](
+                excessive_journal,
+                plan=plan,
+                authorization=authorization,
+            )
+        outside_processing = dict(application)
+        outside_processing["outside_nonterminal_counts"] = [
+            {
+                "bank_id": "engineering",
+                "operation_type": "retain",
+                "status": "processing",
+                "operation_count": 1,
+            }
+        ]
+        outside_processing["receipt_digest"] = self.controller["digest"](
+            {
+                key: value
+                for key, value in outside_processing.items()
+                if key != "receipt_digest"
+            }
+        )
+        with self.assertRaisesRegex(
+            Exception,
+            "application receipt is invalid",
+        ):
+            validate(
+                outside_processing,
+                plan=plan,
+                authorization=authorization,
+                terminal_status={
+                    **terminal_status,
+                    "outside_nonterminal_counts": outside_processing[
+                        "outside_nonterminal_counts"
+                    ],
+                },
+            )
+        excessive_attempt = dict(application)
+        excessive_attempt["worker_attempt"] = plan["worker_max_attempts"] + 1
+        excessive_attempt["receipt_digest"] = self.controller["digest"](
+            {
+                key: value
+                for key, value in excessive_attempt.items()
+                if key != "receipt_digest"
+            }
+        )
+        with self.assertRaisesRegex(
+            Exception,
+            "application receipt is invalid",
+        ):
+            validate(
+                excessive_attempt,
+                plan=plan,
+                authorization=authorization,
+                terminal_status=terminal_status,
+            )
+
+    def test_exact_drain_status_and_verify_share_the_recovery_lock(self):
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        with tempfile.TemporaryDirectory(
+            dir="/private/tmp",
+            prefix="exact-drain-command-locks-",
+        ) as directory:
+            root = Path(directory)
+            plan = self.controller["create_exact_drain_plan"](
+                fixtures.cohort(),
+                fixtures.drain_snapshot(),
+                candidate_release=recovery_fixtures.release_identity(),
+                rollback_backup=recovery_fixtures.drain_backup_evidence(),
+                rollback_backup_path=str(root / "backup.age"),
+                provider_policy_digest="9" * 64,
+                effective_profile_digest="7" * 64,
+                worker_runtime_digest="8" * 64,
+                authorization_receipt_path=str(root / "auth.json"),
+                application_receipt_path=str(root / "application.json"),
+                status_artifact_path=str(root / "status.json"),
+                verification_receipt_path=str(root / "verify.json"),
+                created_at=int(time.time()),
+            )
+            events = []
+
+            class Tracked:
+                def __init__(self, name):
+                    self.name = name
+
+                def __enter__(self):
+                    events.append(f"{self.name}-enter")
+
+                def __exit__(self, *_arguments):
+                    events.append(f"{self.name}-exit")
+
+            class Manager:
+                def _lock(self):
+                    return Tracked("manager")
+
+            args = SimpleNamespace(plan="plan.json")
+            commands = (
+                self.controller["operation_recovery_drain_status_command"],
+                self.controller["operation_recovery_drain_verify_command"],
+            )
+            for command in commands:
+                globals_ = command.__globals__
+                replacements = {
+                    "_operation_recovery_candidate": (
+                        lambda _args: plan["candidate_release"]
+                    ),
+                    "_operation_recovery_read_private_json": (
+                        lambda _path, _label: plan
+                    ),
+                    "_portable_manager": lambda _args: Manager(),
+                    "_operation_recovery_lock": (
+                        lambda _manager: Tracked("recovery")
+                    ),
+                    "_operation_recovery_drain_verify_locked": (
+                        lambda _args, _plan: events.append("verify-body") or 0
+                    ),
+                    "_operation_recovery_read_exact_drain_status": (
+                        lambda _args, _plan: _locked_status(events, plan)
+                    ),
+                    "write_private": (
+                        lambda *_arguments, **_keywords: events.append(
+                            "status-write"
+                        )
+                    ),
+                    "_print_result": lambda value: value,
+                }
+                originals = {
+                    key: globals_[key]
+                    for key in replacements
+                }
+                globals_.update(replacements)
+                events.clear()
+                try:
+                    command(args)
+                finally:
+                    globals_.update(originals)
+                self.assertEqual(events[:2], [
+                    "recovery-enter",
+                    "manager-enter",
+                ])
+                self.assertEqual(events[-2:], [
+                    "manager-exit",
+                    "recovery-exit",
+                ])
+                self.assertTrue(
+                    "verify-body" in events or "status-write" in events
+                )
+
+    def test_exact_drain_verification_receipt_is_idempotent(self):
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        now = int(time.time())
+        with tempfile.TemporaryDirectory(
+            dir="/private/tmp",
+            prefix="exact-drain-idempotent-verify-",
+        ) as directory:
+            root = Path(directory)
+            root.chmod(0o700)
+            plan = self.controller["create_exact_drain_plan"](
+                fixtures.cohort(),
+                fixtures.drain_snapshot(),
+                candidate_release=recovery_fixtures.release_identity(),
+                rollback_backup=recovery_fixtures.drain_backup_evidence(),
+                rollback_backup_path=str(root / "backup.age"),
+                provider_policy_digest="9" * 64,
+                effective_profile_digest="7" * 64,
+                worker_runtime_digest="8" * 64,
+                authorization_receipt_path=str(root / "auth.json"),
+                application_receipt_path=str(root / "application.json"),
+                status_artifact_path=str(root / "status.json"),
+                verification_receipt_path=str(root / "verify.json"),
+                created_at=now,
+            )
+            make_receipt = self.controller[
+                "_operation_recovery_exact_receipt"
+            ]
+            authorization = make_receipt(
+                {
+                    "schema_version": 1,
+                    "kind": (
+                        "operation-recovery-exact-drain-"
+                        "authorization-receipt"
+                    ),
+                    "plan_digest": plan["plan_digest"],
+                    "approval_digest": plan["plan_digest"],
+                    "candidate_release": plan["candidate_release"],
+                    "provider_policy_digest": plan[
+                        "provider_policy_digest"
+                    ],
+                    "worker_runtime_digest": plan[
+                        "worker_runtime_digest"
+                    ],
+                    "authorized_at": now,
+                }
+            )
+            status_body = {
+                "schema_version": 1,
+                "kind": "operation-recovery-exact-drain-status",
+                "plan_digest": plan["plan_digest"],
+                "generation_before": "systalyze:public:200",
+                "generation_after": "systalyze:public:200",
+                "selected_operation_count": 43,
+                "selected_status_counts": {"completed": 43},
+                "preserved_status_counts": {"completed": 5},
+                "outside_nonterminal_counts": [],
+                "observed_at": now + 1,
+            }
+            terminal_status = {
+                **status_body,
+                "status_digest": self.controller["digest"](status_body),
+            }
+            journal_body = {
+                "schema_version": 1,
+                "kind": "operation-recovery-exact-drain-application-journal",
+                "plan_digest": plan["plan_digest"],
+                "authorization_receipt_digest": authorization[
+                    "receipt_digest"
+                ],
+                "started_at": now,
+                "worker_pid": 12345,
+                "worker_start_time": "2026-08-09T21:00:00.000000Z",
+                "worker_attempt": 1,
+            }
+            application = make_receipt(
+                {
+                    "schema_version": 1,
+                    "kind": (
+                        "operation-recovery-exact-drain-application-receipt"
+                    ),
+                    "plan_digest": plan["plan_digest"],
+                    "candidate_release": plan["candidate_release"],
+                    "authorization_receipt_digest": authorization[
+                        "receipt_digest"
+                    ],
+                    "application_journal_digest": self.controller["digest"](
+                        journal_body
+                    ),
+                    "worker_runtime_digest": plan[
+                        "worker_runtime_digest"
+                    ],
+                    "provider_policy_digest": plan[
+                        "provider_policy_digest"
+                    ],
+                    "terminal_status_digest": terminal_status[
+                        "status_digest"
+                    ],
+                    "selected_status_counts": {"completed": 43},
+                    "outside_nonterminal_counts": [],
+                    "worker_pid": journal_body["worker_pid"],
+                    "worker_start_time": journal_body[
+                        "worker_start_time"
+                    ],
+                    "worker_attempt": 1,
+                    "started_at": now,
+                    "completed_at": now,
+                }
+            )
+            for path, value in (
+                (plan["authorization_receipt_path"], authorization),
+                (plan["status_artifact_path"], terminal_status),
+                (plan["application_receipt_path"], application),
+            ):
+                Path(path).write_text(json.dumps(value), encoding="utf-8")
+                Path(path).chmod(0o600)
+            verify = self.controller[
+                "_operation_recovery_drain_verify_locked"
+            ]
+            globals_ = verify.__globals__
+
+            async def live(_args, _plan):
+                return terminal_status
+
+            replacements = {
+                "_operation_recovery_read_exact_drain_status": live,
+                "_print_result": lambda value: value,
+            }
+            originals = {key: globals_[key] for key in replacements}
+            globals_.update(replacements)
+            try:
+                first = verify(SimpleNamespace(), plan)
+                second = verify(SimpleNamespace(), plan)
+            finally:
+                globals_.update(originals)
+            self.assertEqual(first, second)
+            self.assertEqual(first["status"], "verified")
+            self.assertTrue(Path(plan["verification_receipt_path"]).is_file())
+
+    def test_exact_drain_authorization_only_resume_survives_plan_expiry(self):
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        now = int(time.time())
+        with tempfile.TemporaryDirectory(
+            dir="/private/tmp",
+            prefix="exact-drain-expired-authorization-",
+        ) as directory:
+            root = Path(directory)
+            root.chmod(0o700)
+            plan = self.controller["create_exact_drain_plan"](
+                fixtures.cohort(),
+                fixtures.drain_snapshot(),
+                candidate_release=recovery_fixtures.release_identity(),
+                rollback_backup=recovery_fixtures.drain_backup_evidence(),
+                rollback_backup_path=str(root / "backup.age"),
+                provider_policy_digest="9" * 64,
+                effective_profile_digest="7" * 64,
+                worker_runtime_digest="8" * 64,
+                authorization_receipt_path=str(root / "auth.json"),
+                application_receipt_path=str(root / "application.json"),
+                status_artifact_path=str(root / "status.json"),
+                verification_receipt_path=str(root / "verify.json"),
+                created_at=now - 7200,
+            )
+            make_receipt = self.controller[
+                "_operation_recovery_exact_receipt"
+            ]
+            authorization = make_receipt(
+                {
+                    "schema_version": 1,
+                    "kind": (
+                        "operation-recovery-exact-drain-"
+                        "authorization-receipt"
+                    ),
+                    "plan_digest": plan["plan_digest"],
+                    "approval_digest": plan["plan_digest"],
+                    "candidate_release": plan["candidate_release"],
+                    "provider_policy_digest": plan[
+                        "provider_policy_digest"
+                    ],
+                    "worker_runtime_digest": plan[
+                        "worker_runtime_digest"
+                    ],
+                    "authorized_at": plan["created_at"] + 1,
+                }
+            )
+            plan_path = root / "plan.json"
+            for path, value in (
+                (plan_path, plan),
+                (Path(plan["authorization_receipt_path"]), authorization),
+            ):
+                path.write_text(json.dumps(value), encoding="utf-8")
+                path.chmod(0o600)
+
+            class StopHere(RuntimeError):
+                pass
+
+            class Manager:
+                def _lock(self):
+                    return nullcontext()
+
+            command = self.controller[
+                "operation_recovery_drain_apply_command"
+            ]
+            globals_ = command.__globals__
+            replacements = {
+                "_operation_recovery_candidate": (
+                    lambda _args: plan["candidate_release"]
+                ),
+                "_operation_recovery_exact_provider_policy_evidence": (
+                    lambda _path: (plan["provider_policy_digest"], object())
+                ),
+                "_operation_recovery_profile_environment": lambda: {},
+                "exact_drain_effective_profile_digest": (
+                    lambda _policy, _environment: plan[
+                        "effective_profile_digest"
+                    ]
+                ),
+                "_operation_recovery_exact_runtime_digest": (
+                    lambda _args: plan["worker_runtime_digest"]
+                ),
+                "_portable_manager": lambda _args: Manager(),
+                "_operation_recovery_lock": lambda _manager: nullcontext(),
+                "_assert_recovery_services_stopped": (
+                    lambda _manager: (_ for _ in ()).throw(StopHere())
+                ),
+            }
+            originals = {key: globals_[key] for key in replacements}
+            globals_.update(replacements)
+            args = SimpleNamespace(
+                plan=str(plan_path),
+                approval_digest=plan["plan_digest"],
+                provider_policy="providers.json",
+                provider_runtime_root="provider-runtime",
+                worker_runtime="worker-runtime",
+            )
+            try:
+                with self.assertRaises(StopHere):
+                    command(args)
+            finally:
+                globals_.update(originals)
+
+    def test_exact_drain_zero_exit_keeps_nonterminal_journal_resumable(self):
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        now = int(time.time())
+        with tempfile.TemporaryDirectory(
+            dir="/private/tmp",
+            prefix="exact-drain-premature-exit-",
+        ) as directory:
+            root = Path(directory)
+            root.chmod(0o700)
+            backup = root / "backup.age"
+            backup.write_bytes(b"synthetic-backup")
+            backup.chmod(0o600)
+            plan = self.controller["create_exact_drain_plan"](
+                fixtures.cohort(),
+                fixtures.drain_snapshot(),
+                candidate_release=recovery_fixtures.release_identity(),
+                rollback_backup=recovery_fixtures.drain_backup_evidence(),
+                rollback_backup_path=str(backup),
+                provider_policy_digest="9" * 64,
+                effective_profile_digest="7" * 64,
+                worker_runtime_digest="8" * 64,
+                authorization_receipt_path=str(root / "auth.json"),
+                application_receipt_path=str(root / "application.json"),
+                status_artifact_path=str(root / "status.json"),
+                verification_receipt_path=str(root / "verify.json"),
+                created_at=now,
+            )
+            plan_path = root / "plan.json"
+            plan_path.write_text(json.dumps(plan), encoding="utf-8")
+            plan_path.chmod(0o600)
+            provider_policy_path = root / "providers.json"
+            provider_policy_path.write_text("{}", encoding="utf-8")
+            provider_policy_path.chmod(0o600)
+            provider_runtime_root = root / "provider-runtime"
+            provider_runtime_root.mkdir()
+            worker_runtime = root / "hindsight-worker"
+            worker_runtime.write_text("#!/bin/sh\n", encoding="utf-8")
+            worker_runtime.chmod(0o700)
+            live = {
+                "generation_before": plan["pre_generation"],
+                "selected_status_counts": {"pending": 43},
+                "preserved_status_counts": {"completed": 5},
+                "outside_nonterminal_counts": [],
+                "status_digest": "6" * 64,
+            }
+
+            class Process:
+                pid = 4242
+
+                def __init__(self, *_arguments, **keywords):
+                    self._gate = os.dup(keywords["pass_fds"][0])
+                    self._returncode = None
+
+                def poll(self):
+                    return self._returncode
+
+                def wait(self):
+                    if self._gate >= 0:
+                        os.close(self._gate)
+                        self._gate = -1
+                    self._returncode = 0
+                    return 0
+
+                def kill(self):
+                    raise AssertionError("completed process was killed")
+
+            class Manager:
+                def _lock(self):
+                    return nullcontext()
+
+            command = self.controller[
+                "operation_recovery_drain_apply_command"
+            ]
+            globals_ = command.__globals__
+            replacements = {
+                "_operation_recovery_candidate": (
+                    lambda _args: plan["candidate_release"]
+                ),
+                "_operation_recovery_exact_provider_policy_evidence": (
+                    lambda _path: (plan["provider_policy_digest"], object())
+                ),
+                "_operation_recovery_profile_environment": lambda: {},
+                "exact_drain_effective_profile_digest": (
+                    lambda _policy, _environment: plan[
+                        "effective_profile_digest"
+                    ]
+                ),
+                "_operation_recovery_exact_runtime_digest": (
+                    lambda _args: plan["worker_runtime_digest"]
+                ),
+                "_portable_manager": lambda _args: Manager(),
+                "_operation_recovery_lock": lambda _manager: nullcontext(),
+                "_assert_recovery_services_stopped": lambda _manager: None,
+                "_operation_recovery_assert_exact_backup": lambda _plan: None,
+                "_operation_recovery_read_exact_drain_status": (
+                    lambda _args, _plan: _immediate(live)
+                ),
+                "_operation_recovery_exact_worker_interpreter": (
+                    lambda _path: Path("/private/tmp/python")
+                ),
+                "_operation_recovery_exact_database_url": (
+                    lambda _plan: "postgresql://local"
+                ),
+                "_operation_recovery_exact_worker_environment": (
+                    lambda *_arguments, **_keywords: {}
+                ),
+                "_process_start_time": lambda _pid: "start-token",
+                "subprocess": SimpleNamespace(
+                    Popen=Process,
+                    DEVNULL=-3,
+                ),
+            }
+            originals = {key: globals_[key] for key in replacements}
+            globals_.update(replacements)
+            args = SimpleNamespace(
+                plan=str(plan_path),
+                approval_digest=plan["plan_digest"],
+                provider_policy=str(provider_policy_path),
+                provider_runtime_root=str(provider_runtime_root),
+                worker_runtime=str(worker_runtime),
+            )
+            try:
+                with self.assertRaisesRegex(
+                    Exception,
+                    "stopped before terminal state",
+                ):
+                    command(args)
+            finally:
+                globals_.update(originals)
+            journal = json.loads(
+                Path(plan["application_receipt_path"]).read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                journal["kind"],
+                "operation-recovery-exact-drain-application-journal",
+            )
+            self.assertFalse(Path(plan["status_artifact_path"]).exists())
+
+    def test_exact_drain_dead_terminal_journal_finalizes_without_relaunch(self):
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        now = int(time.time())
+        with tempfile.TemporaryDirectory(
+            dir="/private/tmp",
+            prefix="exact-drain-terminal-journal-",
+        ) as directory:
+            root = Path(directory)
+            root.chmod(0o700)
+            plan = self.controller["create_exact_drain_plan"](
+                fixtures.cohort(),
+                fixtures.drain_snapshot(),
+                candidate_release=recovery_fixtures.release_identity(),
+                rollback_backup=recovery_fixtures.drain_backup_evidence(),
+                rollback_backup_path=str(root / "backup.age"),
+                provider_policy_digest="9" * 64,
+                effective_profile_digest="7" * 64,
+                worker_runtime_digest="8" * 64,
+                authorization_receipt_path=str(root / "auth.json"),
+                application_receipt_path=str(root / "application.json"),
+                status_artifact_path=str(root / "status.json"),
+                verification_receipt_path=str(root / "verify.json"),
+                created_at=now,
+            )
+            make_receipt = self.controller[
+                "_operation_recovery_exact_receipt"
+            ]
+            authorization = make_receipt(
+                {
+                    "schema_version": 1,
+                    "kind": (
+                        "operation-recovery-exact-drain-"
+                        "authorization-receipt"
+                    ),
+                    "plan_digest": plan["plan_digest"],
+                    "approval_digest": plan["plan_digest"],
+                    "candidate_release": plan["candidate_release"],
+                    "provider_policy_digest": plan[
+                        "provider_policy_digest"
+                    ],
+                    "worker_runtime_digest": plan[
+                        "worker_runtime_digest"
+                    ],
+                    "authorized_at": now,
+                }
+            )
+            journal = make_receipt(
+                {
+                    "schema_version": 1,
+                    "kind": (
+                        "operation-recovery-exact-drain-application-journal"
+                    ),
+                    "plan_digest": plan["plan_digest"],
+                    "authorization_receipt_digest": authorization[
+                        "receipt_digest"
+                    ],
+                    "started_at": now,
+                    "worker_pid": 4242,
+                    "worker_start_time": "dead-worker-token",
+                    "worker_attempt": plan["worker_max_attempts"],
+                }
+            )
+            status_body = {
+                "schema_version": 1,
+                "kind": "operation-recovery-exact-drain-status",
+                "plan_digest": plan["plan_digest"],
+                "generation_before": "systalyze:public:250",
+                "generation_after": "systalyze:public:250",
+                "selected_operation_count": 43,
+                "selected_status_counts": {"completed": 43},
+                "preserved_status_counts": {"completed": 5},
+                "outside_nonterminal_counts": [],
+                "observed_at": now + 1,
+            }
+            terminal = {
+                **status_body,
+                "status_digest": self.controller["digest"](status_body),
+            }
+            plan_path = root / "plan.json"
+            for path, value in (
+                (plan_path, plan),
+                (Path(plan["authorization_receipt_path"]), authorization),
+                (Path(plan["application_receipt_path"]), journal),
+            ):
+                path.write_text(json.dumps(value), encoding="utf-8")
+                path.chmod(0o600)
+
+            class Manager:
+                def _lock(self):
+                    return nullcontext()
+
+            command = self.controller[
+                "operation_recovery_drain_apply_command"
+            ]
+            globals_ = command.__globals__
+            replacements = {
+                "_operation_recovery_candidate": (
+                    lambda _args: plan["candidate_release"]
+                ),
+                "_operation_recovery_exact_provider_policy_evidence": (
+                    lambda _path: (plan["provider_policy_digest"], object())
+                ),
+                "_operation_recovery_profile_environment": lambda: {},
+                "exact_drain_effective_profile_digest": (
+                    lambda _policy, _environment: plan[
+                        "effective_profile_digest"
+                    ]
+                ),
+                "_operation_recovery_exact_runtime_digest": (
+                    lambda _args: plan["worker_runtime_digest"]
+                ),
+                "_portable_manager": lambda _args: Manager(),
+                "_operation_recovery_lock": lambda _manager: nullcontext(),
+                "_operation_recovery_exact_journal_worker_active": (
+                    lambda _journal: False
+                ),
+                "_assert_recovery_services_stopped": lambda _manager: None,
+                "_operation_recovery_assert_exact_backup": lambda _plan: None,
+                "_operation_recovery_read_exact_drain_status": (
+                    lambda _args, _plan: _immediate(terminal)
+                ),
+                "_print_result": lambda value: value,
+                "subprocess": SimpleNamespace(
+                    Popen=lambda *_arguments, **_keywords: (
+                        _ for _ in ()
+                    ).throw(AssertionError("worker relaunched")),
+                    DEVNULL=-3,
+                ),
+            }
+            originals = {key: globals_[key] for key in replacements}
+            globals_.update(replacements)
+            args = SimpleNamespace(
+                plan=str(plan_path),
+                approval_digest=plan["plan_digest"],
+                provider_policy="providers.json",
+                provider_runtime_root="provider-runtime",
+                worker_runtime="worker-runtime",
+            )
+            try:
+                result = command(args)
+            finally:
+                globals_.update(originals)
+            self.assertEqual(result["status"], "terminal")
+            application = json.loads(
+                Path(plan["application_receipt_path"]).read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                application["worker_attempt"], journal["worker_attempt"]
+            )
+            self.assertEqual(application["worker_pid"], journal["worker_pid"])
+            self.assertEqual(
+                application["application_journal_digest"],
+                journal["receipt_digest"],
+            )
+            self.assertTrue(Path(plan["status_artifact_path"]).is_file())
 
     def test_private_json_reader_rejects_symlink(self):
         reader = self.controller["_operation_recovery_read_private_json"]

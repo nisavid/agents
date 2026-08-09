@@ -33,6 +33,14 @@ EXPECTED_CLAIM_RELEASE_PAIR_COUNTS = {
     ("codex", "retain"): 37,
     ("engineering", "refresh_mental_model"): 6,
 }
+EXPECTED_EXACT_DRAIN_PENDING_COUNT = 43
+EXPECTED_EXACT_DRAIN_TYPE_COUNTS = {
+    "retain": 40,
+    "refresh_mental_model": 2,
+    "consolidation": 1,
+}
+EXACT_DRAIN_WORKER_MAX_RETRIES = 3
+EXACT_DRAIN_WORKER_MAX_ATTEMPTS = 4
 OPERATION_STATUSES = (
     "pending",
     "processing",
@@ -250,6 +258,42 @@ PLAN_KEYS = frozenset(
         "application_receipt_path",
         "verification_receipt_path",
         "rollback_receipt_path",
+        "created_at",
+        "expires_at",
+        "plan_digest",
+    }
+)
+EXACT_DRAIN_PLAN_KEYS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "action",
+        "authority",
+        "mutation_authorized",
+        "candidate_release",
+        "installation_authority",
+        "cohort",
+        "live_snapshot",
+        "cohort_digest",
+        "snapshot_digest",
+        "pre_generation",
+        "selected_operations",
+        "selected_operation_count",
+        "selected_status_counts",
+        "selected_type_counts",
+        "selected_row_set_digest",
+        "preserved_status_counts",
+        "rollback_backup",
+        "rollback_backup_path",
+        "provider_policy_digest",
+        "effective_profile_digest",
+        "worker_runtime_digest",
+        "worker_max_attempts",
+        "worker_max_retries",
+        "authorization_receipt_path",
+        "application_receipt_path",
+        "status_artifact_path",
+        "verification_receipt_path",
         "created_at",
         "expires_at",
         "plan_digest",
@@ -1655,6 +1699,595 @@ def verify_requeue_plan(
     if _sha(plan["plan_digest"], "operation-recovery plan digest") != digest(body):
         raise OperationRecoveryError("operation-recovery plan digest differs")
     return {**body, "plan_digest": plan["plan_digest"]}
+
+
+def _exact_drain_selected(snapshot: Mapping[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {
+            "operation_id": item["operation_id"],
+            "operation_type": item["operation_type"],
+            "expected_status": item["current_status"],
+            "row_digest": item["row_digest"],
+            "task_payload_digest": item["task_payload_digest"],
+        }
+        for item in snapshot["operations"]
+        if item["current_status"] == "pending"
+    ]
+
+
+def _exact_drain_type_counts(
+    selected: Sequence[Mapping[str, Any]],
+) -> dict[str, int]:
+    return {
+        operation_type: sum(
+            item["operation_type"] == operation_type for item in selected
+        )
+        for operation_type in EXPECTED_OPERATION_COUNTS
+        if any(
+            item["operation_type"] == operation_type for item in selected
+        )
+    }
+
+
+def _exact_drain_row_set_digest(
+    selected: Sequence[Mapping[str, Any]],
+) -> str:
+    return digest(
+        [
+            {
+                "operation_id": item["operation_id"],
+                "row_digest": item["row_digest"],
+                "task_payload_digest": item["task_payload_digest"],
+            }
+            for item in selected
+        ]
+    )
+
+
+def create_exact_drain_plan(
+    cohort_value: Mapping[str, Any],
+    live_snapshot_value: Mapping[str, Any],
+    *,
+    candidate_release: Mapping[str, Any],
+    rollback_backup: Mapping[str, Any],
+    rollback_backup_path: str,
+    provider_policy_digest: str,
+    effective_profile_digest: str,
+    worker_runtime_digest: str,
+    authorization_receipt_path: str,
+    application_receipt_path: str,
+    status_artifact_path: str,
+    verification_receipt_path: str,
+    created_at: int | None = None,
+) -> Mapping[str, Any]:
+    """Plan an exact-ID worker drain without starting a worker."""
+    cohort = verify_cohort_manifest(cohort_value)
+    snapshot = verify_live_snapshot(live_snapshot_value)
+    selected = _exact_drain_selected(snapshot)
+    selected_type_counts = _exact_drain_type_counts(selected)
+    expected_status_counts = {
+        "pending": EXPECTED_EXACT_DRAIN_PENDING_COUNT,
+        "processing": 0,
+        "completed": sum(EXPECTED_OPERATION_COUNTS.values())
+        - EXPECTED_EXACT_DRAIN_PENDING_COUNT,
+        "failed": 0,
+        "cancelled": 0,
+    }
+    cohort_by_id = {
+        item["operation_id"]: item for item in cohort["operations"]
+    }
+    if (
+        snapshot["cohort_digest"] != cohort["cohort_digest"]
+        or snapshot["status_counts"] != expected_status_counts
+        or len(selected) != EXPECTED_EXACT_DRAIN_PENDING_COUNT
+        or selected_type_counts != EXPECTED_EXACT_DRAIN_TYPE_COUNTS
+        or set(cohort_by_id)
+        != {item["operation_id"] for item in snapshot["operations"]}
+        or any(
+            item["operation_type"]
+            != cohort_by_id[item["operation_id"]]["operation_type"]
+            or item["task_payload_digest"]
+            != cohort_by_id[item["operation_id"]]["task_payload_digest"]
+            for item in snapshot["operations"]
+        )
+        or any(
+            item["expected_status"] != "pending"
+            for item in selected
+        )
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery exact drain pending set is invalid"
+        )
+    authority = snapshot["installation_authority"]
+    backup = _backup(
+        rollback_backup,
+        "operation-recovery exact drain backup",
+        expected_source_kind="verified-live-pg0-backup",
+    )
+    source_authority = backup["source_authority"]
+    if (
+        backup["postgres_system_identifier"]
+        != authority["postgres_system_identifier"]
+        or source_authority["data_identity_digest"]
+        != authority["observed_data_identity_digest"]
+        or source_authority["generation_before"]
+        != snapshot["generation_before"]
+        or source_authority["generation_after"]
+        != snapshot["generation_after"]
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery exact drain backup identity differs"
+        )
+    artifact_paths = {
+        "rollback_backup_path": _absolute_path(
+            rollback_backup_path,
+            "operation-recovery exact drain backup path",
+        ),
+        "authorization_receipt_path": _absolute_path(
+            authorization_receipt_path,
+            "operation-recovery exact drain authorization path",
+        ),
+        "application_receipt_path": _absolute_path(
+            application_receipt_path,
+            "operation-recovery exact drain application path",
+        ),
+        "status_artifact_path": _absolute_path(
+            status_artifact_path,
+            "operation-recovery exact drain status path",
+        ),
+        "verification_receipt_path": _absolute_path(
+            verification_receipt_path,
+            "operation-recovery exact drain verification path",
+        ),
+    }
+    if len(
+        {
+            unicodedata.normalize("NFD", value.casefold())
+            for value in artifact_paths.values()
+        }
+    ) != len(artifact_paths):
+        raise OperationRecoveryError(
+            "operation-recovery exact drain artifact paths must be distinct"
+        )
+    planned_at = (
+        int(time.time())
+        if created_at is None
+        else _integer(created_at, "exact drain plan created-at")
+    )
+    body = {
+        "schema_version": 1,
+        "kind": "operation-recovery-exact-drain-plan",
+        "action": "drain-exact-operation-cohort",
+        "authority": "unapproved-plan",
+        "mutation_authorized": False,
+        "candidate_release": _candidate_release(candidate_release),
+        "installation_authority": authority,
+        "cohort": cohort,
+        "live_snapshot": snapshot,
+        "cohort_digest": cohort["cohort_digest"],
+        "snapshot_digest": snapshot["snapshot_digest"],
+        "pre_generation": snapshot["generation_before"],
+        "selected_operations": selected,
+        "selected_operation_count": len(selected),
+        "selected_status_counts": {"pending": len(selected)},
+        "selected_type_counts": selected_type_counts,
+        "selected_row_set_digest": _exact_drain_row_set_digest(selected),
+        "preserved_status_counts": {
+            "completed": snapshot["status_counts"]["completed"]
+        },
+        "rollback_backup": backup,
+        **artifact_paths,
+        "provider_policy_digest": _sha(
+            provider_policy_digest,
+            "provider policy digest",
+        ),
+        "effective_profile_digest": _sha(
+            effective_profile_digest,
+            "effective profile digest",
+        ),
+        "worker_runtime_digest": _sha(
+            worker_runtime_digest,
+            "worker runtime digest",
+        ),
+        "worker_max_attempts": EXACT_DRAIN_WORKER_MAX_ATTEMPTS,
+        "worker_max_retries": EXACT_DRAIN_WORKER_MAX_RETRIES,
+        "created_at": planned_at,
+        "expires_at": planned_at + MAX_PLAN_LIFETIME_SECONDS,
+    }
+    return {**body, "plan_digest": digest(body)}
+
+
+def verify_exact_drain_plan(
+    value: Any,
+    *,
+    now: int | None = None,
+    allow_expired: bool = False,
+) -> Mapping[str, Any]:
+    plan = _closed(
+        _normalized(value),
+        EXACT_DRAIN_PLAN_KEYS,
+        "operation-recovery exact drain plan",
+    )
+    cohort = verify_cohort_manifest(plan["cohort"])
+    snapshot = verify_live_snapshot(plan["live_snapshot"])
+    selected_value = plan.get("selected_operations")
+    if not isinstance(selected_value, list):
+        raise OperationRecoveryError(
+            "operation-recovery exact drain plan is invalid"
+        )
+    selected = []
+    for item_value in selected_value:
+        item = _closed(
+            _normalized(item_value),
+            SELECTED_OPERATION_KEYS,
+            "exact drain selected operation",
+        )
+        selected.append(
+            {
+                "operation_id": _operation_id(item["operation_id"]),
+                "operation_type": _text(
+                    item["operation_type"],
+                    "exact drain operation type",
+                    maximum=128,
+                ),
+                "expected_status": _text(
+                    item["expected_status"],
+                    "exact drain operation status",
+                    maximum=32,
+                ),
+                "row_digest": _sha(
+                    item["row_digest"],
+                    "exact drain row digest",
+                ),
+                "task_payload_digest": _sha(
+                    item["task_payload_digest"],
+                    "exact drain payload digest",
+                ),
+            }
+        )
+    expected_selected = _exact_drain_selected(snapshot)
+    selected_type_counts = _exact_drain_type_counts(selected)
+    status_counts = _count_map(
+        plan["selected_status_counts"],
+        "exact drain selected status counts",
+    )
+    type_counts = _count_map(
+        plan["selected_type_counts"],
+        "exact drain selected type counts",
+    )
+    preserved = _count_map(
+        plan["preserved_status_counts"],
+        "exact drain preserved status counts",
+    )
+    created_at = _integer(plan["created_at"], "exact drain plan created-at")
+    expires_at = _integer(plan["expires_at"], "exact drain plan expires-at")
+    observed_at = (
+        int(time.time())
+        if now is None
+        else _integer(now, "exact drain verification time")
+    )
+    if not allow_expired and observed_at >= expires_at:
+        raise OperationRecoveryError("operation-recovery exact drain plan expired")
+    backup = _backup(
+        plan["rollback_backup"],
+        "operation-recovery exact drain backup",
+        expected_source_kind="verified-live-pg0-backup",
+    )
+    authority = _installation_authority(plan["installation_authority"])
+    source_authority = backup["source_authority"]
+    artifact_paths = {
+        "rollback_backup_path": _absolute_path(
+            plan["rollback_backup_path"],
+            "operation-recovery exact drain backup path",
+        ),
+        "authorization_receipt_path": _absolute_path(
+            plan["authorization_receipt_path"],
+            "operation-recovery exact drain authorization path",
+        ),
+        "application_receipt_path": _absolute_path(
+            plan["application_receipt_path"],
+            "operation-recovery exact drain application path",
+        ),
+        "status_artifact_path": _absolute_path(
+            plan["status_artifact_path"],
+            "operation-recovery exact drain status path",
+        ),
+        "verification_receipt_path": _absolute_path(
+            plan["verification_receipt_path"],
+            "operation-recovery exact drain verification path",
+        ),
+    }
+    if (
+        plan.get("schema_version") != 1
+        or plan.get("kind") != "operation-recovery-exact-drain-plan"
+        or plan.get("action") != "drain-exact-operation-cohort"
+        or plan.get("authority") != "unapproved-plan"
+        or plan.get("mutation_authorized") is not False
+        or selected != expected_selected
+        or len(selected) != EXPECTED_EXACT_DRAIN_PENDING_COUNT
+        or len({item["operation_id"] for item in selected}) != len(selected)
+        or selected
+        != sorted(selected, key=lambda item: item["operation_id"])
+        or plan.get("selected_operation_count") != len(selected)
+        or status_counts != {"pending": EXPECTED_EXACT_DRAIN_PENDING_COUNT}
+        or type_counts != EXPECTED_EXACT_DRAIN_TYPE_COUNTS
+        or type_counts != selected_type_counts
+        or preserved != {"completed": 5}
+        or snapshot["status_counts"]
+        != {
+            "pending": 43,
+            "processing": 0,
+            "completed": 5,
+            "failed": 0,
+            "cancelled": 0,
+        }
+        or plan.get("selected_row_set_digest")
+        != _exact_drain_row_set_digest(selected)
+        or plan.get("worker_max_retries")
+        != EXACT_DRAIN_WORKER_MAX_RETRIES
+        or plan.get("worker_max_attempts")
+        != EXACT_DRAIN_WORKER_MAX_ATTEMPTS
+        or plan.get("cohort_digest") != cohort["cohort_digest"]
+        or plan.get("snapshot_digest") != snapshot["snapshot_digest"]
+        or snapshot["cohort_digest"] != cohort["cohort_digest"]
+        or authority != snapshot["installation_authority"]
+        or plan.get("pre_generation") != snapshot["generation_before"]
+        or backup["postgres_system_identifier"]
+        != authority["postgres_system_identifier"]
+        or source_authority["data_identity_digest"]
+        != authority["observed_data_identity_digest"]
+        or source_authority["generation_before"]
+        != snapshot["generation_before"]
+        or source_authority["generation_after"]
+        != snapshot["generation_after"]
+        or expires_at - created_at != MAX_PLAN_LIFETIME_SECONDS
+        or len(
+            {
+                unicodedata.normalize("NFD", value.casefold())
+                for value in artifact_paths.values()
+            }
+        )
+        != len(artifact_paths)
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery exact drain plan is invalid"
+        )
+    body = {
+        "schema_version": 1,
+        "kind": "operation-recovery-exact-drain-plan",
+        "action": "drain-exact-operation-cohort",
+        "authority": "unapproved-plan",
+        "mutation_authorized": False,
+        "candidate_release": _candidate_release(plan["candidate_release"]),
+        "installation_authority": authority,
+        "cohort": cohort,
+        "live_snapshot": snapshot,
+        "cohort_digest": cohort["cohort_digest"],
+        "snapshot_digest": snapshot["snapshot_digest"],
+        "pre_generation": snapshot["generation_before"],
+        "selected_operations": selected,
+        "selected_operation_count": len(selected),
+        "selected_status_counts": status_counts,
+        "selected_type_counts": type_counts,
+        "selected_row_set_digest": _sha(
+            plan["selected_row_set_digest"],
+            "exact drain row-set digest",
+        ),
+        "preserved_status_counts": preserved,
+        "rollback_backup": backup,
+        **artifact_paths,
+        "provider_policy_digest": _sha(
+            plan["provider_policy_digest"],
+            "provider policy digest",
+        ),
+        "effective_profile_digest": _sha(
+            plan["effective_profile_digest"],
+            "effective profile digest",
+        ),
+        "worker_runtime_digest": _sha(
+            plan["worker_runtime_digest"],
+            "worker runtime digest",
+        ),
+        "worker_max_attempts": EXACT_DRAIN_WORKER_MAX_ATTEMPTS,
+        "worker_max_retries": EXACT_DRAIN_WORKER_MAX_RETRIES,
+        "created_at": created_at,
+        "expires_at": expires_at,
+    }
+    if _sha(plan["plan_digest"], "exact drain plan digest") != digest(body):
+        raise OperationRecoveryError(
+            "operation-recovery exact drain plan digest differs"
+        )
+    return {**body, "plan_digest": plan["plan_digest"]}
+
+
+def verify_exact_drain_authorization_receipt(
+    value: Any,
+    *,
+    plan: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Validate the approval handoff consumed by the detached worker."""
+    verified_plan = verify_exact_drain_plan(plan, allow_expired=True)
+    keys = frozenset(
+        {
+            "schema_version",
+            "kind",
+            "plan_digest",
+            "approval_digest",
+            "candidate_release",
+            "provider_policy_digest",
+            "worker_runtime_digest",
+            "authorized_at",
+            "receipt_digest",
+        }
+    )
+    receipt = _closed(
+        _normalized(value),
+        keys,
+        "operation-recovery exact drain authorization receipt",
+    )
+    authorized_at = _integer(
+        receipt["authorized_at"],
+        "exact drain authorization time",
+    )
+    body = {
+        "schema_version": 1,
+        "kind": "operation-recovery-exact-drain-authorization-receipt",
+        "plan_digest": _sha(receipt["plan_digest"], "exact drain plan digest"),
+        "approval_digest": _sha(
+            receipt["approval_digest"],
+            "exact drain approval digest",
+        ),
+        "candidate_release": _candidate_release(
+            receipt["candidate_release"]
+        ),
+        "provider_policy_digest": _sha(
+            receipt["provider_policy_digest"],
+            "provider policy digest",
+        ),
+        "worker_runtime_digest": _sha(
+            receipt["worker_runtime_digest"],
+            "worker runtime digest",
+        ),
+        "authorized_at": authorized_at,
+    }
+    if (
+        body["plan_digest"] != verified_plan["plan_digest"]
+        or body["approval_digest"] != verified_plan["plan_digest"]
+        or body["candidate_release"] != verified_plan["candidate_release"]
+        or body["provider_policy_digest"]
+        != verified_plan["provider_policy_digest"]
+        or body["worker_runtime_digest"]
+        != verified_plan["worker_runtime_digest"]
+        or authorized_at < verified_plan["created_at"]
+        or authorized_at >= verified_plan["expires_at"]
+        or _sha(
+            receipt["receipt_digest"],
+            "exact drain authorization receipt digest",
+        )
+        != digest(body)
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery exact drain authorization receipt is invalid"
+        )
+    return {**body, "receipt_digest": receipt["receipt_digest"]}
+
+
+def verify_exact_drain_status(
+    value: Any,
+    *,
+    plan: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    verified_plan = verify_exact_drain_plan(plan, allow_expired=True)
+    keys = frozenset(
+        {
+            "schema_version",
+            "kind",
+            "plan_digest",
+            "generation_before",
+            "generation_after",
+            "selected_operation_count",
+            "selected_status_counts",
+            "preserved_status_counts",
+            "outside_nonterminal_counts",
+            "observed_at",
+            "status_digest",
+        }
+    )
+    status = _closed(
+        _normalized(value),
+        keys,
+        "operation-recovery exact drain status",
+    )
+    selected_counts = _count_map(
+        status["selected_status_counts"],
+        "exact drain selected status counts",
+    )
+    preserved_counts = _count_map(
+        status["preserved_status_counts"],
+        "exact drain preserved status counts",
+    )
+    outside_value = status["outside_nonterminal_counts"]
+    if not isinstance(outside_value, list):
+        raise OperationRecoveryError(
+            "operation-recovery exact drain status is invalid"
+        )
+    outside = []
+    for item_value in outside_value:
+        item = _closed(
+            _normalized(item_value),
+            frozenset(
+                {"bank_id", "operation_type", "status", "operation_count"}
+            ),
+            "exact drain outside nonterminal count",
+        )
+        checked = {
+            "bank_id": _text(item["bank_id"], "outside bank ID", maximum=256),
+            "operation_type": _text(
+                item["operation_type"],
+                "outside operation type",
+                maximum=128,
+            ),
+            "status": _text(item["status"], "outside status", maximum=32),
+            "operation_count": _integer(
+                item["operation_count"],
+                "outside operation count",
+                minimum=1,
+            ),
+        }
+        if checked["status"] not in {"pending", "processing"}:
+            raise OperationRecoveryError(
+                "operation-recovery exact drain status is invalid"
+            )
+        outside.append(checked)
+    generation_before = _text(
+        status["generation_before"],
+        "exact drain status generation",
+    )
+    generation_after = _text(
+        status["generation_after"],
+        "exact drain status generation",
+    )
+    observed_at = _integer(status["observed_at"], "exact drain observed-at")
+    body = {
+        "schema_version": 1,
+        "kind": "operation-recovery-exact-drain-status",
+        "plan_digest": _sha(status["plan_digest"], "exact drain plan digest"),
+        "generation_before": generation_before,
+        "generation_after": generation_after,
+        "selected_operation_count": _integer(
+            status["selected_operation_count"],
+            "exact drain selected operation count",
+        ),
+        "selected_status_counts": selected_counts,
+        "preserved_status_counts": preserved_counts,
+        "outside_nonterminal_counts": outside,
+        "observed_at": observed_at,
+    }
+    if (
+        body["plan_digest"] != verified_plan["plan_digest"]
+        or generation_before != generation_after
+        or body["selected_operation_count"]
+        != verified_plan["selected_operation_count"]
+        or set(selected_counts) - set(OPERATION_STATUSES)
+        or sum(selected_counts.values())
+        != verified_plan["selected_operation_count"]
+        or preserved_counts != {"completed": 5}
+        or outside
+        != sorted(
+            outside,
+            key=lambda item: (
+                item["bank_id"],
+                item["operation_type"],
+                item["status"],
+            ),
+        )
+        or _sha(status["status_digest"], "exact drain status digest")
+        != digest(body)
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery exact drain status is invalid"
+        )
+    return {**body, "status_digest": status["status_digest"]}
 
 
 def _queue_blocker(

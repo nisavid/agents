@@ -11,6 +11,7 @@ import asyncio
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timezone
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -23,11 +24,15 @@ import uuid
 from typing import Any
 
 from .operation_recovery import (
+    EXACT_DRAIN_WORKER_MAX_RETRIES,
     EXPECTED_CLAIM_RELEASE_ROW_COUNT,
     EXPECTED_OPERATION_COUNTS,
     OperationRecoveryError,
+    verify_exact_drain_plan,
+    verify_exact_drain_status,
 )
-from .canonical import digest
+from .canonical import StrictJsonError, digest, strict_json_loads
+from .provider_runtime import ProviderRuntimePolicy
 
 
 IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,62}\Z")
@@ -44,6 +49,166 @@ PLANNING_STATE_TABLES = (
 )
 GENERATION_TABLE = "hindsight_migration_generation"
 GENERATION_TRIGGER = "hindsight_migration_generation_bump"
+EXACT_DRAIN_PROFILE_ENVIRONMENT_KEYS = frozenset(
+    {
+        "HINDSIGHT_API_AUDIT_LOG_ENABLED",
+        "HINDSIGHT_API_EMBEDDINGS_PROVIDER",
+        "HINDSIGHT_API_FAIL_ON_EXTRACTION_ERRORS",
+        "HINDSIGHT_API_LLM_API_KEY",
+        "HINDSIGHT_API_LLM_MODEL",
+        "HINDSIGHT_API_LLM_PROVIDER",
+        "HINDSIGHT_API_LLM_REASONING_EFFORT",
+        "HINDSIGHT_API_LLM_STRATEGY",
+        "HINDSIGHT_API_LLM_TRACE_ENABLED",
+        "HINDSIGHT_API_LLM_TRACE_MAX_CHARS",
+        "HINDSIGHT_API_LLM_TRACE_SCOPES",
+        "HINDSIGHT_API_RECALL_BUDGET_FUNCTION",
+        "HINDSIGHT_API_RERANKER_PROVIDER",
+        "HINDSIGHT_API_SKIP_LLM_VERIFICATION",
+        *(
+            f"HINDSIGHT_API_LLM_{position}_{suffix}"
+            for position in range(1, 5)
+            for suffix in (
+                "API_KEY",
+                "BASE_URL",
+                "MODEL",
+                "PROVIDER",
+                "REASONING_EFFORT",
+            )
+        ),
+    }
+)
+EXACT_DRAIN_PROVIDER_ORDER = (
+    "work-codex",
+    "personal-codex",
+    "alt1-codex",
+    "alt2-codex",
+    "hatchery",
+)
+EXACT_DRAIN_OAUTH_LOCATORS = {
+    "work-codex": "oauth-home:work",
+    "personal-codex": "oauth-home:personal",
+    "alt1-codex": "oauth-home:alt1",
+    "alt2-codex": "oauth-home:alt2",
+}
+
+
+def validate_exact_drain_provider_policy(
+    policy: ProviderRuntimePolicy,
+) -> None:
+    """Require the exact four-Codex then Hatchery provider authority."""
+    members = {member.id: member for member in policy.members}
+    if (
+        policy.failover_order != EXACT_DRAIN_PROVIDER_ORDER
+        or set(members) != set(EXACT_DRAIN_PROVIDER_ORDER)
+        or any(
+            members[member_id].identity.provider != "openai-codex"
+            or members[member_id].identity.base_url != ""
+            or members[member_id].identity.credential_marker
+            != f"provider-policy:{member_id}"
+            or members[member_id].credential_mode != "oauth-home"
+            or members[member_id].credential_locator != locator
+            for member_id, locator in EXACT_DRAIN_OAUTH_LOCATORS.items()
+        )
+        or members["hatchery"].identity.provider != "lmstudio"
+        or members["hatchery"].identity.base_url
+        != "http://hatchery.komodo-vector.ts.net:13305/v1"
+        or members["hatchery"].identity.credential_marker is not None
+        or members["hatchery"].credential_mode != "none"
+        or members["hatchery"].credential_locator is not None
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery exact drain provider policy differs"
+        )
+
+
+def exact_drain_effective_profile_digest(
+    policy: ProviderRuntimePolicy,
+    environment: Mapping[str, str],
+) -> str:
+    """Validate and bind the effective five-member Hindsight LLM profile."""
+    validate_exact_drain_provider_policy(policy)
+    try:
+        strategy = strict_json_loads(
+            environment.get("HINDSIGHT_API_LLM_STRATEGY", "").encode(
+                "utf-8"
+            )
+        )
+    except (StrictJsonError, UnicodeError, ValueError) as error:
+        raise OperationRecoveryError(
+            "operation-recovery exact drain LLM profile differs"
+        ) from error
+    if strategy != {"mode": "round-robin"}:
+        raise OperationRecoveryError(
+            "operation-recovery exact drain LLM profile differs"
+        )
+    if (
+        environment.get("HINDSIGHT_API_EMBEDDINGS_PROVIDER")
+        != "openai-codex"
+        or environment.get("HINDSIGHT_API_RERANKER_PROVIDER")
+        != "jina-mlx"
+        or environment.get("HINDSIGHT_API_FAIL_ON_EXTRACTION_ERRORS")
+        not in {None, "false"}
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery exact drain LLM profile differs"
+        )
+    projection: list[dict[str, Any]] = []
+    for position, member_id in enumerate(EXACT_DRAIN_PROVIDER_ORDER):
+        member = policy.member(member_id)
+        prefix = (
+            "HINDSIGHT_API_LLM"
+            if position == 0
+            else f"HINDSIGHT_API_LLM_{position}"
+        )
+        provider = environment.get(f"{prefix}_PROVIDER")
+        model = environment.get(f"{prefix}_MODEL")
+        base_url = environment.get(f"{prefix}_BASE_URL", "")
+        api_key = environment.get(f"{prefix}_API_KEY")
+        reasoning_effort = environment.get(f"{prefix}_REASONING_EFFORT")
+        expected_marker = member.identity.credential_marker
+        if (
+            provider != member.identity.provider
+            or model != member.identity.model
+            or base_url.rstrip("/")
+            != member.identity.base_url.rstrip("/")
+            or (
+                expected_marker is not None
+                and api_key != expected_marker
+            )
+            or (
+                expected_marker is None
+                and api_key not in {None, ""}
+            )
+            or reasoning_effort
+            not in {None, "low", "medium", "high", "xhigh"}
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery exact drain LLM profile differs"
+            )
+        projection.append(
+            {
+                "member_id": member_id,
+                "provider": provider,
+                "model": model,
+                "base_url": base_url.rstrip("/"),
+                "credential_marker": expected_marker,
+                "reasoning_effort": reasoning_effort,
+            }
+        )
+    return digest(
+        {
+            "strategy": {"mode": "round-robin"},
+            "members": projection,
+            "embeddings_provider": "openai-codex",
+            "reranker_provider": "jina-mlx",
+            "profile_environment": {
+                key: environment[key]
+                for key in sorted(EXACT_DRAIN_PROFILE_ENVIRONMENT_KEYS)
+                if key in environment
+            },
+        }
+    )
 SAFE_OPERATION_QUERY = """
 SELECT
     operation_id::text AS operation_id,
@@ -613,10 +778,15 @@ async def read_safe_operation_rows(
     bank_id: str,
     operation_ids: Sequence[str] | None,
     statuses: Sequence[str] | None = None,
+    lock_clause: str = "",
 ) -> list[dict[str, Any]]:
     """Return safe metadata; payload and error text never leave PostgreSQL."""
     if bank_id != "engineering":
         raise OperationRecoveryError("operation-recovery bank is invalid")
+    if lock_clause not in {"", "FOR SHARE", "FOR UPDATE"}:
+        raise OperationRecoveryError(
+            "operation-recovery row lock clause is invalid"
+        )
     quoted_schema = _quoted_identifier(schema, "database schema")
     identifiers: list[uuid.UUID] | None = None
     if operation_ids is not None:
@@ -627,13 +797,1295 @@ async def read_safe_operation_rows(
         if len(identifiers) != len(set(identifiers)):
             raise OperationRecoveryError("operation ID set contains duplicates")
     rows = await connection.fetch(
-        SAFE_OPERATION_QUERY.format(schema=quoted_schema),
+        f"{SAFE_OPERATION_QUERY.format(schema=quoted_schema)} {lock_clause}",
         bank_id,
         list(EXPECTED_OPERATION_COUNTS),
         identifiers,
         None if statuses is None else list(statuses),
     )
     return [_mapping(row) for row in rows]
+
+
+def exact_drain_worker_id(plan_digest: str) -> str:
+    """Derive the private worker identity from an approved plan digest."""
+    if not isinstance(plan_digest, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", plan_digest
+    ):
+        raise OperationRecoveryError("exact drain plan digest is invalid")
+    return f"operation-recovery-exact-drain-{plan_digest[:12]}"
+
+
+def install_exact_drain_runtime_guards(
+    postgresql_ops_type: type[Any],
+    worker_poller_type: type[Any],
+    memory_engine_type: type[Any],
+    adapter: Any,
+) -> None:
+    """Restrict upstream worker lifecycle seams to the exact drain cohort."""
+
+    async def claim_tasks(_ops: Any, *args: Any, **kwargs: Any) -> Any:
+        return await adapter.claim_tasks(*args, **kwargs)
+
+    async def scan_active_schemas(
+        _poller: Any,
+        schemas: Sequence[str | None],
+    ) -> set[str | None]:
+        if None in schemas:
+            return {None}
+        if "public" in schemas:
+            return {"public"}
+        raise OperationRecoveryError(
+            "operation-recovery exact drain public schema is unavailable"
+        )
+
+    async def recover_exact_tasks(poller: Any) -> int:
+        return await adapter.recover_own_tasks(poller._backend)
+
+    async def schedule_exact_retry(
+        poller: Any,
+        operation_id: str,
+        retry_at: Any,
+        error_message: str,
+        schema: str | None,
+    ) -> None:
+        await adapter.schedule_retry(
+            poller._backend,
+            operation_id,
+            retry_at,
+            error_message,
+            schema,
+        )
+
+    async def defer_exact_operation(
+        poller: Any,
+        operation_id: str,
+        exec_date: Any,
+        reason: str,
+        schema: str | None,
+    ) -> None:
+        await adapter.defer_operation(
+            poller._backend,
+            operation_id,
+            exec_date,
+            reason,
+            schema,
+        )
+
+    async def mark_exact_completed(
+        poller: Any,
+        operation_id: str,
+        schema: str | None,
+    ) -> None:
+        await adapter.mark_completed(
+            poller._backend,
+            operation_id,
+            schema,
+        )
+
+    async def mark_exact_failed(
+        poller: Any,
+        operation_id: str,
+        error_message: str,
+        schema: str | None,
+    ) -> None:
+        await adapter.mark_failed(
+            poller._backend,
+            operation_id,
+            error_message,
+            schema,
+        )
+
+    async def engine_mark_exact_completed(
+        engine: Any,
+        operation_id: str,
+    ) -> None:
+        await adapter.mark_completed(
+            await engine._get_backend(),
+            operation_id,
+            None,
+        )
+
+    async def engine_mark_exact_failed(
+        engine: Any,
+        operation_id: str,
+        error_message: str,
+        error_traceback: str,
+    ) -> None:
+        await adapter.mark_failed(
+            await engine._get_backend(),
+            operation_id,
+            f"{error_message}\n\nTraceback:\n{error_traceback}",
+            None,
+        )
+
+    async def engine_mark_exact_consolidation_completed(
+        engine: Any,
+        operation_id: str,
+        bank_id: str,
+        status: str,
+        result: Mapping[str, Any] | None,
+        schema: str | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        del result
+        if bank_id != "engineering":
+            raise OperationRecoveryError(
+                "operation-recovery exact drain consolidation bank differs"
+            )
+        backend = await engine._get_backend()
+        if status == "completed" and error_message in {None, ""}:
+            await adapter.mark_completed(backend, operation_id, schema)
+            return
+        if status == "failed" and isinstance(error_message, str):
+            await adapter.mark_failed(
+                backend,
+                operation_id,
+                error_message,
+                schema,
+            )
+            return
+        raise OperationRecoveryError(
+            "operation-recovery exact drain consolidation status differs"
+        )
+
+    async def suppress_parent_propagation(
+        _owner: Any,
+        *_args: Any,
+        **_kwargs: Any,
+    ) -> None:
+        return None
+
+    postgresql_ops_type.claim_tasks = claim_tasks
+    worker_poller_type._scan_active_schemas = scan_active_schemas
+    worker_poller_type.recover_own_tasks = recover_exact_tasks
+    worker_poller_type._schedule_retry = schedule_exact_retry
+    worker_poller_type._defer_operation = defer_exact_operation
+    worker_poller_type._mark_completed = mark_exact_completed
+    worker_poller_type._mark_failed = mark_exact_failed
+    worker_poller_type._maybe_update_parent_operation = (
+        suppress_parent_propagation
+    )
+    memory_engine_type._maybe_update_parent_operation = (
+        suppress_parent_propagation
+    )
+    memory_engine_type._mark_operation_completed = (
+        engine_mark_exact_completed
+    )
+    memory_engine_type._mark_operation_failed = engine_mark_exact_failed
+    memory_engine_type._mark_operation_completed_and_fire_webhook = (
+        engine_mark_exact_consolidation_completed
+    )
+
+
+def _exact_drain_file_bytes(path: Path, label: str) -> bytes:
+    descriptor = -1
+    try:
+        resolved = path.resolve(strict=True)
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        before = os.fstat(descriptor)
+        observed = path.lstat()
+    except OSError as error:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise OperationRecoveryError(f"{label} is unavailable") from error
+    if (
+        path != resolved
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_uid != os.geteuid()
+        or before.st_mode & 0o022
+        or before.st_nlink != 1
+        or (before.st_dev, before.st_ino)
+        != (observed.st_dev, observed.st_ino)
+    ):
+        os.close(descriptor)
+        raise OperationRecoveryError(f"{label} is untrusted")
+    chunks: list[bytes] = []
+    try:
+        while chunk := os.read(descriptor, 1024 * 1024):
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        current = path.lstat()
+    except OSError as error:
+        raise OperationRecoveryError(f"{label} is unreadable") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if (
+        (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+        != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        or (after.st_dev, after.st_ino) != (current.st_dev, current.st_ino)
+    ):
+        raise OperationRecoveryError(f"{label} changed while reading")
+    return b"".join(chunks)
+
+
+def _exact_drain_file_digest(path: Path, label: str) -> str:
+    return hashlib.sha256(_exact_drain_file_bytes(path, label)).hexdigest()
+
+
+def exact_drain_worker_interpreter_path(
+    worker_runtime: str | Path,
+) -> Path:
+    """Return the bound venv launch path without dereferencing it."""
+    worker_path = Path(worker_runtime)
+    if not worker_path.is_absolute():
+        raise OperationRecoveryError(
+            "exact drain worker runtime path must be absolute"
+        )
+    try:
+        first_line = (
+            _exact_drain_file_bytes(
+                worker_path,
+                "exact drain worker entrypoint",
+            )
+            .splitlines()[0]
+            .decode("utf-8")
+            .strip()
+        )
+    except (IndexError, UnicodeDecodeError) as error:
+        raise OperationRecoveryError(
+            "exact drain worker interpreter is unavailable"
+        ) from error
+    interpreter = Path(first_line.removeprefix("#!"))
+    if (
+        not first_line.startswith("#!/")
+        or interpreter.parent != worker_path.parent
+        or interpreter.name not in {"python", "python3"}
+        or not interpreter.is_file()
+        or not (worker_path.parent.parent / "pyvenv.cfg").is_file()
+    ):
+        raise OperationRecoveryError(
+            "exact drain worker interpreter is invalid"
+        )
+    return interpreter
+
+
+def _exact_drain_interpreter_evidence(interpreter: Path) -> dict[str, str]:
+    evidence: dict[str, str] = {"launch_path": str(interpreter)}
+    current = interpreter
+    seen: set[Path] = set()
+    for position in range(8):
+        if current in seen:
+            raise OperationRecoveryError(
+                "exact drain worker interpreter link cycle"
+            )
+        seen.add(current)
+        metadata = current.lstat()
+        if not stat.S_ISLNK(metadata.st_mode):
+            if not stat.S_ISREG(metadata.st_mode):
+                raise OperationRecoveryError(
+                    "exact drain worker interpreter is invalid"
+                )
+            evidence["resolved_path"] = str(current)
+            evidence["resolved_sha256"] = _exact_drain_file_digest(
+                current,
+                "exact drain worker interpreter",
+            )
+            return evidence
+        target = os.readlink(current)
+        evidence[f"link_{position}_path"] = str(current)
+        evidence[f"link_{position}_target"] = target
+        next_path = Path(target)
+        current = (
+            next_path
+            if next_path.is_absolute()
+            else current.parent / next_path
+        )
+    raise OperationRecoveryError(
+        "exact drain worker interpreter link chain is too deep"
+    )
+
+
+def exact_drain_runtime_evidence(
+    worker_runtime: str | Path,
+    provider_runtime_root: str | Path,
+) -> tuple[str, bytes]:
+    """Bind runtime sources and retain prevalidated provider bootstrap bytes."""
+    worker_path = Path(worker_runtime)
+    provider_root = Path(provider_runtime_root)
+    if not worker_path.is_absolute() or not provider_root.is_absolute():
+        raise OperationRecoveryError("exact drain runtime paths must be absolute")
+    sources: dict[str, str] = {
+        "worker-entrypoint": _exact_drain_file_digest(
+            worker_path, "exact drain worker entrypoint"
+        )
+    }
+    interpreter = exact_drain_worker_interpreter_path(worker_path)
+    sources["worker-interpreter"] = digest(
+        _exact_drain_interpreter_evidence(interpreter)
+    )
+    sources["worker-venv-config"] = _exact_drain_file_digest(
+        worker_path.parent.parent / "pyvenv.cfg",
+        "exact drain worker venv configuration",
+    )
+    provider_sources = {
+        name: _exact_drain_file_bytes(
+            provider_root / name,
+            f"exact drain provider runtime {name}",
+        )
+        for name in ("sitecustomize.py", "hindsight_llm_failover.py")
+    }
+    for name, source in provider_sources.items():
+        sources[f"provider/{name}"] = hashlib.sha256(source).hexdigest()
+    spec = importlib.util.find_spec("hindsight_api")
+    locations = None if spec is None else spec.submodule_search_locations
+    if not locations or len(locations) != 1:
+        raise OperationRecoveryError(
+            "exact drain upstream worker runtime is unavailable"
+        )
+    package_root = Path(next(iter(locations))).resolve(strict=True)
+    package_sources = sorted(package_root.rglob("*.py"))
+    if not package_sources:
+        raise OperationRecoveryError(
+            "exact drain upstream worker runtime is unavailable"
+        )
+    for path in package_sources:
+        relative = path.relative_to(package_root).as_posix()
+        sources[f"upstream/hindsight_api/{relative}"] = (
+            _exact_drain_file_digest(
+                path,
+                f"exact drain upstream module {relative}",
+            )
+        )
+    return digest(sources), provider_sources["sitecustomize.py"]
+
+
+def exact_drain_runtime_digest(
+    worker_runtime: str | Path,
+    provider_runtime_root: str | Path,
+) -> str:
+    """Bind the worker entrypoint, claim seam, and provider patch sources."""
+    runtime_digest, _provider_bootstrap = exact_drain_runtime_evidence(
+        worker_runtime,
+        provider_runtime_root,
+    )
+    return runtime_digest
+
+
+class ExactDrainClaimAdapter:
+    """Constrain the upstream worker's claim seam to a digest-bound ID set.
+
+    The first claim verifies every selected row against the planning snapshot
+    and generation. Later claims permit retries of those same IDs, while still
+    checking the immutable operation type and task-payload digest. Rows outside
+    the selected set are never selected or updated.
+    """
+
+    _ALLOWED_TABLES = frozenset(
+        {
+            "async_operations",
+            "public.async_operations",
+            '"public".async_operations',
+        }
+    )
+
+    def __init__(
+        self,
+        plan: Mapping[str, Any],
+        *,
+        completion_callback: Callable[[], None] | None = None,
+        resume: bool = False,
+    ):
+        verified = verify_exact_drain_plan(plan, allow_expired=resume)
+        self._plan = verified
+        self._selected = {
+            item["operation_id"]: item
+            for item in verified["selected_operations"]
+        }
+        snapshot = {
+            item["operation_id"]: item
+            for item in verified["live_snapshot"]["operations"]
+        }
+        self._preserved = {
+            operation_id: item
+            for operation_id, item in snapshot.items()
+            if operation_id not in self._selected
+        }
+        self._identifiers = [uuid.UUID(value) for value in self._selected]
+        self._worker_id = exact_drain_worker_id(verified["plan_digest"])
+        self._worker_digest = hashlib.sha256(
+            self._worker_id.encode("utf-8")
+        ).hexdigest()
+        self._max_retries = verified["worker_max_retries"]
+        self._initial_guard_complete = False
+        self._started_ids: set[str] = set()
+        self._resume = resume
+        self._completion_callback = completion_callback
+        self._completion_signalled = False
+
+    async def _verify_initial_state(self, connection: Any) -> None:
+        identity = _mapping(
+            await connection.fetchrow(
+                """
+                SELECT current_database() AS database,
+                       current_user AS database_user,
+                       current_setting('data_directory') AS data_directory,
+                       current_setting('port')::integer AS port,
+                       inet_server_addr()::text AS address,
+                       (SELECT system_identifier::text
+                        FROM pg_control_system()) AS system_identifier
+                """
+            )
+        )
+        binding = self._plan["rollback_backup"]["source_authority"][
+            "binding"
+        ]
+        try:
+            data_directory = Path(identity["data_directory"]).resolve(
+                strict=True
+            )
+        except (KeyError, OSError, TypeError, ValueError):
+            data_directory = None
+        if (
+            identity.get("database") != binding["database"]
+            or identity.get("database_user") != binding["user"]
+            or data_directory != Path(binding["data_dir"])
+            or identity.get("port") != binding["port"]
+            or identity.get("address") is not None
+            or identity.get("system_identifier")
+            != self._plan["installation_authority"][
+                "postgres_system_identifier"
+            ]
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery exact drain database identity differs"
+            )
+        generation = await read_generation(connection, "public", "systalyze")
+        if not self._resume and generation != self._plan["pre_generation"]:
+            raise OperationRecoveryError(
+                "operation-recovery exact drain generation drifted"
+            )
+        rows = await read_safe_operation_rows(
+            connection,
+            schema="public",
+            bank_id="engineering",
+            operation_ids=[*self._selected, *self._preserved],
+            lock_clause="FOR SHARE",
+        )
+        if len(rows) != len(self._selected) + len(self._preserved):
+            raise OperationRecoveryError(
+                "operation-recovery exact drain cohort row set changed"
+            )
+        for row in rows:
+            preserved = self._preserved.get(row["operation_id"])
+            if preserved is not None:
+                if live_row_digest(row) != preserved["row_digest"]:
+                    raise OperationRecoveryError(
+                        "operation-recovery exact drain preserved row drifted"
+                    )
+                continue
+            item = self._selected.get(row["operation_id"])
+            exact = item is not None and live_row_digest(row) == item["row_digest"]
+            if exact:
+                continue
+            if (
+                item is None
+                or row["operation_type"] != item["operation_type"]
+                or row["task_payload_digest"] != item["task_payload_digest"]
+                or not self._resume
+                or row["status"]
+                not in {"pending", "processing", "completed", "failed", "cancelled"}
+                or row["worker_id_digest"] != self._worker_digest
+            ):
+                raise OperationRecoveryError(
+                    "operation-recovery exact drain selected row drifted"
+                )
+            self._started_ids.add(row["operation_id"])
+
+    async def recover_own_tasks(self, backend: Any) -> int:
+        """Recover only exact-plan rows owned by an interrupted capsule."""
+        if not self._resume:
+            return 0
+        async with backend.acquire() as connection:
+            async with connection.transaction(isolation="serializable"):
+                await self._verify_initial_state(connection)
+                rows = await connection.fetch(
+                    """
+                    SELECT operation_id,
+                           operation_type,
+                           retry_count,
+                           encode(
+                               sha256(convert_to(task_payload::text, 'UTF8')),
+                               'hex'
+                           ) AS task_payload_digest
+                    FROM public.async_operations
+                    WHERE operation_id = ANY($1::uuid[])
+                      AND bank_id = 'engineering'
+                      AND status = 'processing'
+                      AND worker_id = $2
+                      AND task_payload IS NOT NULL
+                    ORDER BY operation_id
+                    FOR UPDATE
+                    """,
+                    self._identifiers,
+                    self._worker_id,
+                )
+                for row_value in rows:
+                    row = _mapping(row_value)
+                    item = self._selected.get(str(row["operation_id"]))
+                    if (
+                        item is None
+                        or row["operation_type"] != item["operation_type"]
+                        or row["task_payload_digest"]
+                        != item["task_payload_digest"]
+                    ):
+                        raise OperationRecoveryError(
+                            "operation-recovery exact drain recovery row drifted"
+                        )
+                identifiers = [row["operation_id"] for row in rows]
+                if not identifiers:
+                    self._initial_guard_complete = True
+                    return 0
+                retryable = [
+                    row["operation_id"]
+                    for row in rows
+                    if row["retry_count"] < self._max_retries
+                ]
+                exhausted = [
+                    row["operation_id"]
+                    for row in rows
+                    if row["retry_count"] >= self._max_retries
+                ]
+                result = await connection.execute(
+                    """
+                    UPDATE public.async_operations
+                    SET status = 'pending',
+                        retry_count = retry_count + 1,
+                        updated_at = NOW()
+                    WHERE operation_id = ANY($1::uuid[])
+                      AND bank_id = 'engineering'
+                      AND status = 'processing'
+                      AND worker_id = $2
+                    """,
+                    retryable,
+                    self._worker_id,
+                )
+                if result != f"UPDATE {len(retryable)}":
+                    raise OperationRecoveryError(
+                        "operation-recovery exact drain recovery count differs"
+                    )
+                result = await connection.execute(
+                    """
+                    UPDATE public.async_operations
+                    SET status = 'failed',
+                        next_retry_at = NULL,
+                        error_message = $3,
+                        completed_at = NOW(),
+                        updated_at = NOW()
+                    WHERE operation_id = ANY($1::uuid[])
+                      AND bank_id = 'engineering'
+                      AND status = 'processing'
+                      AND worker_id = $2
+                    """,
+                    exhausted,
+                    self._worker_id,
+                    "operation-recovery exact drain retry ceiling reached",
+                )
+                if result != f"UPDATE {len(exhausted)}":
+                    raise OperationRecoveryError(
+                        "operation-recovery exact drain recovery count differs"
+                    )
+                self._started_ids.update(str(value) for value in identifiers)
+                self._initial_guard_complete = True
+                return len(identifiers)
+
+    async def _verify_unstarted_state(self, connection: Any) -> None:
+        preserved_rows = await read_safe_operation_rows(
+            connection,
+            schema="public",
+            bank_id="engineering",
+            operation_ids=list(self._preserved),
+            lock_clause="FOR SHARE",
+        )
+        preserved_by_id = {
+            row["operation_id"]: row for row in preserved_rows
+        }
+        if set(preserved_by_id) != set(self._preserved) or any(
+            live_row_digest(preserved_by_id[operation_id])
+            != self._preserved[operation_id]["row_digest"]
+            for operation_id in self._preserved
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery exact drain preserved row drifted"
+            )
+        unstarted = sorted(set(self._selected) - self._started_ids)
+        if not unstarted:
+            return
+        rows = await read_safe_operation_rows(
+            connection,
+            schema="public",
+            bank_id="engineering",
+            operation_ids=unstarted,
+        )
+        rows_by_id = {row["operation_id"]: row for row in rows}
+        if set(rows_by_id) != set(unstarted) or any(
+            live_row_digest(rows_by_id[operation_id])
+            != self._selected[operation_id]["row_digest"]
+            for operation_id in unstarted
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery exact drain unstarted row drifted"
+            )
+
+    async def _reschedule_owned_task(
+        self,
+        backend: Any,
+        operation_id: str,
+        next_retry_at: Any,
+        *,
+        error_message: str | None,
+        schema: str | None,
+    ) -> None:
+        if schema not in {None, "public"}:
+            raise OperationRecoveryError(
+                "operation-recovery exact drain public schema is unavailable"
+            )
+        try:
+            identifier = uuid.UUID(operation_id)
+        except (AttributeError, TypeError, ValueError) as error:
+            raise OperationRecoveryError(
+                "operation-recovery exact drain retry ID is invalid"
+            ) from error
+        item = self._selected.get(str(identifier))
+        if item is None:
+            raise OperationRecoveryError(
+                "operation-recovery exact drain retry row is outside plan"
+            )
+        async with backend.acquire() as connection:
+            async with connection.transaction(isolation="serializable"):
+                await self._verify_unstarted_state(connection)
+                row_value = await connection.fetchrow(
+                    """
+                    SELECT operation_id::text AS operation_id,
+                           operation_type,
+                           status,
+                           worker_id,
+                           retry_count,
+                           encode(
+                               sha256(convert_to(task_payload::text, 'UTF8')),
+                               'hex'
+                           ) AS task_payload_digest
+                    FROM public.async_operations
+                    WHERE operation_id = $1
+                      AND bank_id = 'engineering'
+                      AND task_payload IS NOT NULL
+                    FOR UPDATE
+                    """,
+                    identifier,
+                )
+                row = None if row_value is None else _mapping(row_value)
+                if (
+                    row is None
+                    or row["operation_type"] != item["operation_type"]
+                    or row["status"] != "processing"
+                    or row["worker_id"] != self._worker_id
+                    or row["task_payload_digest"]
+                    != item["task_payload_digest"]
+                    or type(row["retry_count"]) is not int
+                    or row["retry_count"] < 0
+                    or row["retry_count"] > self._max_retries
+                ):
+                    raise OperationRecoveryError(
+                        "operation-recovery exact drain retry row drifted"
+                    )
+                if row["retry_count"] >= self._max_retries:
+                    result = await connection.execute(
+                        """
+                        UPDATE public.async_operations
+                        SET status = 'failed',
+                            next_retry_at = NULL,
+                            error_message = $2,
+                            completed_at = NOW(),
+                            updated_at = NOW()
+                        WHERE operation_id = $1
+                          AND bank_id = 'engineering'
+                          AND status = 'processing'
+                          AND worker_id = $3
+                        """,
+                        identifier,
+                        "operation-recovery exact drain retry ceiling reached",
+                        self._worker_id,
+                    )
+                elif error_message is None:
+                    result = await connection.execute(
+                        """
+                        UPDATE public.async_operations
+                        SET status = 'pending',
+                            next_retry_at = $2,
+                            retry_count = retry_count + 1,
+                            updated_at = NOW()
+                        WHERE operation_id = $1
+                          AND bank_id = 'engineering'
+                          AND status = 'processing'
+                          AND worker_id = $3
+                        """,
+                        identifier,
+                        next_retry_at,
+                        self._worker_id,
+                    )
+                else:
+                    result = await connection.execute(
+                        """
+                        UPDATE public.async_operations
+                        SET status = 'pending',
+                            next_retry_at = $2,
+                            retry_count = retry_count + 1,
+                            error_message = $3,
+                            updated_at = NOW()
+                        WHERE operation_id = $1
+                          AND bank_id = 'engineering'
+                          AND status = 'processing'
+                          AND worker_id = $4
+                        """,
+                        identifier,
+                        next_retry_at,
+                        error_message[:5000],
+                        self._worker_id,
+                    )
+                if result != "UPDATE 1":
+                    raise OperationRecoveryError(
+                        "operation-recovery exact drain retry count differs"
+                    )
+                self._started_ids.add(str(identifier))
+                self._initial_guard_complete = True
+
+    async def schedule_retry(
+        self,
+        backend: Any,
+        operation_id: str,
+        retry_at: Any,
+        error_message: str,
+        schema: str | None,
+    ) -> None:
+        """Schedule one exact owned retry without relinquishing authority."""
+        if not isinstance(error_message, str):
+            raise OperationRecoveryError(
+                "operation-recovery exact drain retry error is invalid"
+            )
+        await self._reschedule_owned_task(
+            backend,
+            operation_id,
+            retry_at,
+            error_message=error_message,
+            schema=schema,
+        )
+
+    async def defer_operation(
+        self,
+        backend: Any,
+        operation_id: str,
+        exec_date: Any,
+        reason: str,
+        schema: str | None,
+    ) -> None:
+        """Defer one exact owned row while consuming its retry budget."""
+        if not isinstance(reason, str):
+            raise OperationRecoveryError(
+                "operation-recovery exact drain defer reason is invalid"
+            )
+        await self._reschedule_owned_task(
+            backend,
+            operation_id,
+            exec_date,
+            error_message=None,
+            schema=schema,
+        )
+
+    async def _terminalize_owned_task(
+        self,
+        backend: Any,
+        operation_id: str,
+        schema: str | None,
+        *,
+        error_message: str | None,
+    ) -> None:
+        if schema not in {None, "public"}:
+            raise OperationRecoveryError(
+                "operation-recovery exact drain public schema is unavailable"
+            )
+        try:
+            identifier = uuid.UUID(operation_id)
+        except (AttributeError, TypeError, ValueError) as error:
+            raise OperationRecoveryError(
+                "operation-recovery exact drain terminal ID is invalid"
+            ) from error
+        item = self._selected.get(str(identifier))
+        if item is None:
+            raise OperationRecoveryError(
+                "operation-recovery exact drain terminal row is outside plan"
+            )
+        async with backend.acquire() as connection:
+            async with connection.transaction(isolation="serializable"):
+                await self._verify_unstarted_state(connection)
+                row_value = await connection.fetchrow(
+                    """
+                    SELECT operation_type,
+                           status,
+                           worker_id,
+                           encode(
+                               sha256(convert_to(task_payload::text, 'UTF8')),
+                               'hex'
+                           ) AS task_payload_digest
+                    FROM public.async_operations
+                    WHERE operation_id = $1
+                      AND bank_id = 'engineering'
+                      AND task_payload IS NOT NULL
+                    FOR UPDATE
+                    """,
+                    identifier,
+                )
+                row = None if row_value is None else _mapping(row_value)
+                if (
+                    row is None
+                    or row["operation_type"] != item["operation_type"]
+                    or row["worker_id"] != self._worker_id
+                    or row["task_payload_digest"]
+                    != item["task_payload_digest"]
+                ):
+                    raise OperationRecoveryError(
+                        "operation-recovery exact drain terminal row drifted"
+                    )
+                if row["status"] in {"completed", "failed", "cancelled"}:
+                    self._started_ids.add(str(identifier))
+                    self._initial_guard_complete = True
+                    return
+                if row["status"] != "processing":
+                    raise OperationRecoveryError(
+                        "operation-recovery exact drain terminal row drifted"
+                    )
+                if error_message is None:
+                    result = await connection.execute(
+                        """
+                        UPDATE public.async_operations
+                        SET status = 'completed',
+                            completed_at = NOW(),
+                            updated_at = NOW()
+                        WHERE operation_id = $1
+                          AND bank_id = 'engineering'
+                          AND status = 'processing'
+                          AND worker_id = $2
+                        """,
+                        identifier,
+                        self._worker_id,
+                    )
+                else:
+                    result = await connection.execute(
+                        """
+                        UPDATE public.async_operations
+                        SET status = 'failed',
+                            error_message = $2,
+                            completed_at = NOW(),
+                            updated_at = NOW()
+                        WHERE operation_id = $1
+                          AND bank_id = 'engineering'
+                          AND status = 'processing'
+                          AND worker_id = $3
+                        """,
+                        identifier,
+                        error_message[:5000],
+                        self._worker_id,
+                    )
+                if result != "UPDATE 1":
+                    raise OperationRecoveryError(
+                        "operation-recovery exact drain terminal count differs"
+                    )
+                self._started_ids.add(str(identifier))
+                self._initial_guard_complete = True
+
+    async def mark_completed(
+        self,
+        backend: Any,
+        operation_id: str,
+        schema: str | None,
+    ) -> None:
+        """Complete one exact owned row under the preserved-row guard."""
+        await self._terminalize_owned_task(
+            backend,
+            operation_id,
+            schema,
+            error_message=None,
+        )
+
+    async def mark_failed(
+        self,
+        backend: Any,
+        operation_id: str,
+        error_message: str,
+        schema: str | None,
+    ) -> None:
+        """Fail one exact owned row under the preserved-row guard."""
+        if not isinstance(error_message, str):
+            raise OperationRecoveryError(
+                "operation-recovery exact drain terminal error is invalid"
+            )
+        await self._terminalize_owned_task(
+            backend,
+            operation_id,
+            schema,
+            error_message=error_message,
+        )
+
+    @staticmethod
+    def _claim_capacity(
+        reserved_limits: Mapping[str, int], shared_limit: int
+    ) -> int:
+        values = [shared_limit, *reserved_limits.values()]
+        if any(type(value) is not int or value < 0 for value in values):
+            raise OperationRecoveryError(
+                "operation-recovery exact drain capacity is invalid"
+            )
+        return sum(values)
+
+    @staticmethod
+    def _choose_rows(
+        rows: Sequence[Mapping[str, Any]],
+        reserved_limits: Mapping[str, int],
+        shared_limit: int,
+    ) -> list[Mapping[str, Any]]:
+        remaining = list(rows)
+        chosen: list[Mapping[str, Any]] = []
+        for operation_type, limit in reserved_limits.items():
+            matching = [
+                row
+                for row in remaining
+                if row["operation_type"] == operation_type
+            ][:limit]
+            chosen.extend(matching)
+            selected_ids = {row["operation_id"] for row in matching}
+            remaining = [
+                row for row in remaining if row["operation_id"] not in selected_ids
+            ]
+        chosen.extend(remaining[:shared_limit])
+        return chosen
+
+    @staticmethod
+    def _canonical_task_payload(row: Mapping[str, Any]) -> str:
+        raw = row.get("task_payload")
+        try:
+            payload = (
+                strict_json_loads(raw.encode("utf-8"))
+                if isinstance(raw, str)
+                else dict(raw)
+                if isinstance(raw, Mapping)
+                else None
+            )
+        except (StrictJsonError, TypeError, UnicodeError, ValueError) as error:
+            raise OperationRecoveryError(
+                "operation-recovery exact drain task payload is invalid"
+            ) from error
+        operation_id = str(row["operation_id"])
+        expected_type = {
+            "retain": "batch_retain",
+            "refresh_mental_model": "refresh_mental_model",
+            "consolidation": "consolidation",
+        }.get(row["operation_type"])
+        if (
+            not isinstance(payload, dict)
+            or payload.get("operation_id") != operation_id
+            or payload.get("bank_id") != "engineering"
+            or expected_type is None
+            or payload.get("type") != expected_type
+            or payload.get("_schema") not in {None, "public"}
+            or payload.get("_tenant_id") is not None
+            or payload.get("_api_key_id") is not None
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery exact drain task payload target differs"
+            )
+        payload["operation_id"] = operation_id
+        payload["bank_id"] = "engineering"
+        payload["type"] = expected_type
+        payload.pop("_schema", None)
+        payload.pop("_tenant_id", None)
+        payload.pop("_api_key_id", None)
+        return json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+    async def claim_tasks(
+        self,
+        connection: Any,
+        table: str,
+        worker_id: str,
+        reserved_limits: Mapping[str, int],
+        shared_limit: int,
+        *,
+        consolidation_bank_priority: Mapping[str, int] | None = None,
+    ) -> list[Mapping[str, Any]]:
+        """Claim only plan-selected rows through the upstream public seam."""
+        del consolidation_bank_priority
+        if table not in self._ALLOWED_TABLES:
+            raise OperationRecoveryError(
+                "operation-recovery exact drain table is invalid"
+            )
+        if worker_id != self._worker_id:
+            raise OperationRecoveryError(
+                "operation-recovery exact drain worker identity differs"
+            )
+        capacity = self._claim_capacity(reserved_limits, shared_limit)
+        if capacity == 0:
+            return []
+        await connection.execute(
+            "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"
+        )
+        if not self._initial_guard_complete:
+            await self._verify_initial_state(connection)
+        else:
+            await self._verify_unstarted_state(connection)
+        rows = await connection.fetch(
+            """
+            SELECT operation_id,
+                   operation_type,
+                   task_payload,
+                   retry_count,
+                   CASE WHEN worker_id IS NULL THEN NULL
+                        ELSE encode(
+                            sha256(convert_to(worker_id, 'UTF8')),
+                            'hex'
+                        )
+                   END AS worker_id_digest,
+                   encode(
+                       sha256(convert_to(task_payload::text, 'UTF8')),
+                       'hex'
+                   ) AS task_payload_digest
+            FROM public.async_operations
+            WHERE operation_id = ANY($1::uuid[])
+              AND bank_id = 'engineering'
+              AND status = 'pending'
+              AND task_payload IS NOT NULL
+              AND (next_retry_at IS NULL OR next_retry_at <= NOW())
+            ORDER BY created_at, operation_id
+            FOR UPDATE SKIP LOCKED
+            """,
+            self._identifiers,
+        )
+        safe_rows = [_mapping(row) for row in rows]
+        for row in safe_rows:
+            item = self._selected.get(str(row["operation_id"]))
+            if (
+                item is None
+                or row["operation_type"] != item["operation_type"]
+                or row["task_payload_digest"] != item["task_payload_digest"]
+                or type(row["retry_count"]) is not int
+                or row["retry_count"] < 0
+                or row["retry_count"] > self._max_retries
+                or (
+                    str(row["operation_id"]) in self._started_ids
+                    and row["worker_id_digest"] != self._worker_digest
+                )
+            ):
+                raise OperationRecoveryError(
+                    "operation-recovery exact drain claim row drifted"
+                )
+            row["task_payload"] = self._canonical_task_payload(row)
+        chosen = self._choose_rows(safe_rows, reserved_limits, shared_limit)
+        if not chosen:
+            self._initial_guard_complete = True
+            statuses = await connection.fetch(
+                """
+                SELECT operation_id::text AS operation_id,
+                       status,
+                       encode(
+                           sha256(convert_to(task_payload::text, 'UTF8')),
+                           'hex'
+                       ) AS task_payload_digest
+                FROM public.async_operations
+                WHERE operation_id = ANY($1::uuid[])
+                  AND bank_id = 'engineering'
+                ORDER BY operation_id
+                """,
+                self._identifiers,
+            )
+            terminal = {"completed", "failed", "cancelled"}
+            if len(statuses) != len(self._selected):
+                raise OperationRecoveryError(
+                    "operation-recovery exact drain selected row set changed"
+                )
+            for status_row in statuses:
+                item = self._selected.get(status_row["operation_id"])
+                if (
+                    item is None
+                    or status_row["task_payload_digest"]
+                    != item["task_payload_digest"]
+                ):
+                    raise OperationRecoveryError(
+                        "operation-recovery exact drain claim row drifted"
+                    )
+            if (
+                not self._completion_signalled
+                and all(row["status"] in terminal for row in statuses)
+                and self._completion_callback is not None
+            ):
+                self._completion_signalled = True
+                self._completion_callback()
+            return []
+        chosen_ids = [row["operation_id"] for row in chosen]
+        result = await connection.execute(
+            """
+            UPDATE public.async_operations
+            SET status = 'processing',
+                worker_id = $1,
+                claimed_at = NOW(),
+                updated_at = NOW()
+            WHERE operation_id = ANY($2::uuid[])
+              AND bank_id = 'engineering'
+              AND status = 'pending'
+              AND task_payload IS NOT NULL
+            """,
+            worker_id,
+            chosen_ids,
+        )
+        if result != f"UPDATE {len(chosen)}":
+            raise OperationRecoveryError(
+                "operation-recovery exact drain claim row count differs"
+            )
+        self._started_ids.update(str(row["operation_id"]) for row in chosen)
+        self._initial_guard_complete = True
+        return chosen
+
+
+async def read_exact_drain_status(
+    connection: Any,
+    *,
+    profile_id: str,
+    schema: str,
+    plan: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Read stable, payload-free exact-drain and outside-queue evidence."""
+    verified = verify_exact_drain_plan(plan, allow_expired=True)
+    if profile_id != "systalyze" or schema != "public":
+        raise OperationRecoveryError(
+            "operation-recovery exact drain profile is invalid"
+        )
+    cohort_ids = [
+        item["operation_id"] for item in verified["cohort"]["operations"]
+    ]
+    selected = {
+        item["operation_id"]: item for item in verified["selected_operations"]
+    }
+    selected_ids = list(selected)
+    worker_digest = hashlib.sha256(
+        exact_drain_worker_id(verified["plan_digest"]).encode("utf-8")
+    ).hexdigest()
+    generation_before = await read_generation(connection, schema, profile_id)
+    async with connection.transaction(isolation="repeatable_read", readonly=True):
+        rows = await read_safe_operation_rows(
+            connection,
+            schema=schema,
+            bank_id="engineering",
+            operation_ids=cohort_ids,
+        )
+        outside_rows = await connection.fetch(
+            """
+            SELECT bank_id,
+                   operation_type,
+                   status,
+                   count(*)::bigint AS operation_count
+            FROM public.async_operations
+            WHERE operation_id != ALL($1::uuid[])
+              AND status IN ('pending', 'processing')
+            GROUP BY bank_id, operation_type, status
+            ORDER BY bank_id, operation_type, status
+            """,
+            [uuid.UUID(value) for value in selected_ids],
+        )
+    generation_after = await read_generation(connection, schema, profile_id)
+    if generation_before != generation_after:
+        raise OperationRecoveryError(
+            "migration generation changed during exact drain status"
+        )
+    rows_by_id = {row["operation_id"]: row for row in rows}
+    cohort_by_id = {
+        item["operation_id"]: item for item in verified["cohort"]["operations"]
+    }
+    snapshot_by_id = {
+        item["operation_id"]: item
+        for item in verified["live_snapshot"]["operations"]
+    }
+    if set(rows_by_id) != set(cohort_by_id):
+        raise OperationRecoveryError(
+            "operation-recovery exact drain cohort row set changed"
+        )
+    for operation_id, row in rows_by_id.items():
+        expected = cohort_by_id[operation_id]
+        if (
+            row["operation_type"] != expected["operation_type"]
+            or row["task_payload_digest"] != expected["task_payload_digest"]
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery exact drain cohort row drifted"
+            )
+        if (
+            operation_id in selected
+            and live_row_digest(row)
+            != snapshot_by_id[operation_id]["row_digest"]
+            and row["worker_id_digest"] != worker_digest
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery exact drain selected row ownership drifted"
+            )
+        if (
+            operation_id not in selected
+            and live_row_digest(row)
+            != snapshot_by_id[operation_id]["row_digest"]
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery exact drain preserved row drifted"
+            )
+    selected_status_counts = {
+        status: sum(
+            rows_by_id[operation_id]["status"] == status
+            for operation_id in selected
+        )
+        for status in ("pending", "processing", "completed", "failed", "cancelled")
+    }
+    selected_status_counts = {
+        key: value for key, value in selected_status_counts.items() if value
+    }
+    preserved_status_counts = {
+        status: sum(
+            row["status"] == status
+            for operation_id, row in rows_by_id.items()
+            if operation_id not in selected
+        )
+        for status in ("pending", "processing", "completed", "failed", "cancelled")
+    }
+    preserved_status_counts = {
+        key: value for key, value in preserved_status_counts.items() if value
+    }
+    outside = [
+        {
+            "bank_id": row["bank_id"],
+            "operation_type": row["operation_type"],
+            "status": row["status"],
+            "operation_count": row["operation_count"],
+        }
+        for row in outside_rows
+    ]
+    body = {
+        "schema_version": 1,
+        "kind": "operation-recovery-exact-drain-status",
+        "plan_digest": verified["plan_digest"],
+        "generation_before": generation_before,
+        "generation_after": generation_after,
+        "selected_operation_count": len(selected),
+        "selected_status_counts": selected_status_counts,
+        "preserved_status_counts": preserved_status_counts,
+        "outside_nonterminal_counts": outside,
+        "observed_at": int(time.time()),
+    }
+    return verify_exact_drain_status(
+        {**body, "status_digest": digest(body)},
+        plan=verified,
+    )
 
 
 async def read_global_queue_blockers(

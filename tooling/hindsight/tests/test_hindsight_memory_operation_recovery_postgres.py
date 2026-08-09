@@ -1,5 +1,6 @@
 from pathlib import Path
 import asyncio
+from contextlib import asynccontextmanager
 from copy import deepcopy
 from datetime import datetime
 import getpass
@@ -25,6 +26,7 @@ from hindsight_memory_control_plane.operation_recovery import (  # noqa: E402
     OperationRecoveryError,
     create_claim_release_plan,
     create_cohort_manifest,
+    create_exact_drain_plan,
     create_global_queue_blocker_classification,
     create_live_snapshot,
     create_requeue_plan,
@@ -32,13 +34,16 @@ from hindsight_memory_control_plane.operation_recovery import (  # noqa: E402
 )
 from hindsight_memory_control_plane.operation_recovery_runtime import (  # noqa: E402
     CLAIM_RELEASE_BLOCKER_KEYS,
+    ExactDrainClaimAdapter,
     QUEUE_BLOCKER_GUARD_CONTRACT_DIGEST,
     QUEUE_BLOCKER_GUARD_CONTRACT_VERSION,
     apply_claim_release_transaction,
     apply_requeue_transaction,
+    exact_drain_worker_id,
     live_row_digest,
     read_claim_release_evidence,
     read_claim_release_preimage,
+    read_exact_drain_status,
     read_global_queue_blockers,
     read_safe_operation_rows,
     rollback_claim_release_transaction,
@@ -473,6 +478,954 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
             created_at=int(time.time()),
         )
         return plan, mutation_ids, permitted_ids, evidence
+
+    async def _exact_drain_case(
+        self,
+        connection,
+        *,
+        embedded_operation_id_mismatch=False,
+        embedded_bank_id_mismatch=False,
+        embedded_type_mismatch=False,
+        embedded_schema_mismatch=False,
+        embedded_tenant_mismatch=False,
+        embedded_api_key_mismatch=False,
+    ):
+        await self._reset(connection)
+        operation_types = ["retain"] * 42 + ["refresh_mental_model"] * 4 + [
+            "consolidation"
+        ] * 2
+        completed_positions = {0, 1, 42, 43, 46}
+        cohort_ids = []
+        for position, operation_type in enumerate(operation_types):
+            operation_id = f"00000000-0000-4000-8000-{position + 1:012d}"
+            cohort_ids.append(operation_id)
+            await self._insert_operation(
+                connection,
+                operation_id,
+                status=(
+                    "completed" if position in completed_positions else "pending"
+                ),
+                operation_type=operation_type,
+                task_payload=json.dumps(
+                    {
+                        "cohort": position,
+                        "operation_id": (
+                            "ffffffff-ffff-4fff-8fff-ffffffffffff"
+                            if embedded_operation_id_mismatch and position == 2
+                            else operation_id
+                        ),
+                        "bank_id": (
+                            "codex"
+                            if embedded_bank_id_mismatch and position == 2
+                            else "engineering"
+                        ),
+                        "type": (
+                            "graph_maintenance"
+                            if embedded_type_mismatch and position == 2
+                            else
+                            "batch_retain"
+                            if operation_type == "retain"
+                            else operation_type
+                        ),
+                        **(
+                            {"_schema": "foreign_schema"}
+                            if embedded_schema_mismatch and position == 2
+                            else {}
+                        ),
+                        **(
+                            {"_tenant_id": "foreign-tenant"}
+                            if embedded_tenant_mismatch and position == 2
+                            else {}
+                        ),
+                        **(
+                            {"_api_key_id": "foreign-api-key"}
+                            if embedded_api_key_mismatch and position == 2
+                            else {}
+                        ),
+                    }
+                ),
+                result_metadata=json.dumps({"cohort-result": position}),
+            )
+        unexpected_id = "ffffffff-ffff-4fff-8fff-fffffffffff0"
+        await self._insert_operation(
+            connection,
+            unexpected_id,
+            status="pending",
+            task_payload='{"memory": "unexpected-44th"}',
+        )
+        await connection.execute(
+            "UPDATE public.hindsight_migration_generation "
+            "SET generation = 123 WHERE singleton"
+        )
+        live_rows = await read_safe_operation_rows(
+            connection,
+            schema="public",
+            bank_id="engineering",
+            operation_ids=cohort_ids,
+        )
+        baseline_rows = []
+        for row in live_rows:
+            baseline = deepcopy(row)
+            baseline.update(
+                {
+                    "status": "pending",
+                    "completed_at": None,
+                    "retry_count": 0,
+                    "next_retry_at": None,
+                    "worker_id_present": False,
+                    "worker_id_digest": None,
+                    "claimed_at": None,
+                    "error_category": "none",
+                    "error_digest": None,
+                }
+            )
+            baseline_rows.append(baseline)
+        cohort = create_cohort_manifest(
+            baseline_rows,
+            profile_id="systalyze",
+            schema="public",
+            bank_id="engineering",
+            generation="systalyze:public:90",
+            backup=recovery_fixtures.backup_evidence(),
+            created_at=int(time.time()) - 10_000,
+        )
+        snapshot = create_live_snapshot(
+            cohort,
+            live_rows,
+            generation_before="systalyze:public:123",
+            generation_after="systalyze:public:123",
+            installation_authority=recovery_fixtures.installation_authority(),
+            observed_at=int(time.time()) - 60,
+        )
+        rollback = recovery_fixtures.drain_backup_evidence()
+        rollback["source_authority"]["generation_before"] = (
+            "systalyze:public:123"
+        )
+        rollback["source_authority"]["generation_after"] = (
+            "systalyze:public:123"
+        )
+        rollback["source_authority_digest"] = recovery_fixtures.digest(
+            rollback["source_authority"]
+        )
+        plan = create_exact_drain_plan(
+            cohort,
+            snapshot,
+            candidate_release=recovery_fixtures.release_identity(),
+            rollback_backup=rollback,
+            rollback_backup_path="/private/tmp/drain-backup.age",
+            provider_policy_digest="9" * 64,
+            effective_profile_digest="7" * 64,
+            worker_runtime_digest="8" * 64,
+            authorization_receipt_path="/private/tmp/drain-authorization.json",
+            application_receipt_path="/private/tmp/drain-application.json",
+            status_artifact_path="/private/tmp/drain-status.json",
+            verification_receipt_path="/private/tmp/drain-verification.json",
+            created_at=int(time.time()),
+        )
+        return plan, cohort_ids, unexpected_id
+
+    @staticmethod
+    async def _bind_disposable_exact_drain_identity(adapter, connection):
+        identity = await connection.fetchrow(
+            """
+            SELECT current_database() AS database,
+                   current_user AS database_user,
+                   current_setting('data_directory') AS data_directory,
+                   current_setting('port')::integer AS port,
+                   (SELECT system_identifier::text
+                    FROM pg_control_system()) AS system_identifier
+            """
+        )
+        adapter._plan = deepcopy(adapter._plan)
+        adapter._plan["installation_authority"][
+            "postgres_system_identifier"
+        ] = identity["system_identifier"]
+        binding = adapter._plan["rollback_backup"]["source_authority"][
+            "binding"
+        ]
+        binding.update(
+            {
+                "database": identity["database"],
+                "user": identity["database_user"],
+                "data_dir": identity["data_directory"],
+                "port": identity["port"],
+            }
+        )
+
+    def test_exact_drain_claims_only_bound_ids_and_ignores_derived_work(self):
+        async def exercise():
+            connection = await self._connect()
+            try:
+                plan, cohort_ids, unexpected_id = await self._exact_drain_case(
+                    connection
+                )
+                completion_signals = 0
+
+                def completed():
+                    nonlocal completion_signals
+                    completion_signals += 1
+
+                adapter = ExactDrainClaimAdapter(
+                    plan,
+                    completion_callback=completed,
+                )
+                await self._bind_disposable_exact_drain_identity(
+                    adapter,
+                    connection,
+                )
+                worker_id = exact_drain_worker_id(plan["plan_digest"])
+                claimed_ids = set()
+                derived_id = "ffffffff-ffff-4fff-8fff-fffffffffff1"
+                for attempt in range(30):
+                    async with connection.transaction():
+                        claimed = await adapter.claim_tasks(
+                            connection,
+                            '"public".async_operations',
+                            worker_id,
+                            {},
+                            2,
+                        )
+                    claimed_ids.update(str(row["operation_id"]) for row in claimed)
+                    if attempt == 0:
+                        await self._insert_operation(
+                            connection,
+                            derived_id,
+                            status="pending",
+                            operation_type="consolidation",
+                            task_payload='{"memory": "derived-after-start"}',
+                        )
+                    if len(claimed_ids) == 43:
+                        break
+
+                selected_ids = {
+                    item["operation_id"] for item in plan["selected_operations"]
+                }
+                self.assertEqual(claimed_ids, selected_ids)
+                self.assertEqual(len(claimed_ids), 43)
+                rows = await connection.fetch(
+                    """
+                    SELECT operation_id::text AS operation_id,
+                           status,
+                           worker_id,
+                           encode(
+                               sha256(convert_to(task_payload::text, 'UTF8')),
+                               'hex'
+                           ) AS task_payload_digest
+                    FROM public.async_operations
+                    ORDER BY operation_id
+                    """
+                )
+                rows_by_id = {row["operation_id"]: row for row in rows}
+                for item in plan["selected_operations"]:
+                    row = rows_by_id[item["operation_id"]]
+                    self.assertEqual(row["status"], "processing")
+                    self.assertEqual(row["worker_id"], worker_id)
+                    self.assertEqual(
+                        row["task_payload_digest"],
+                        item["task_payload_digest"],
+                    )
+                for untouched_id in (unexpected_id, derived_id):
+                    self.assertEqual(rows_by_id[untouched_id]["status"], "pending")
+                    self.assertIsNone(rows_by_id[untouched_id]["worker_id"])
+                for completed_id in set(cohort_ids) - selected_ids:
+                    self.assertEqual(rows_by_id[completed_id]["status"], "completed")
+                status = await read_exact_drain_status(
+                    connection,
+                    profile_id="systalyze",
+                    schema="public",
+                    plan=plan,
+                )
+                self.assertEqual(
+                    status["selected_status_counts"],
+                    {"processing": 43},
+                )
+                self.assertEqual(
+                    status["preserved_status_counts"],
+                    {"completed": 5},
+                )
+                self.assertEqual(
+                    sum(
+                        item["operation_count"]
+                        for item in status["outside_nonterminal_counts"]
+                    ),
+                    2,
+                )
+                serialized = json.dumps(status, sort_keys=True)
+                self.assertNotIn("unexpected-44th", serialized)
+                self.assertNotIn("derived-after-start", serialized)
+                self.assertNotIn('"task_payload":', serialized)
+                await connection.execute(
+                    """
+                    UPDATE public.async_operations
+                    SET status = 'completed',
+                        completed_at = NOW(),
+                        updated_at = NOW()
+                    WHERE operation_id = ANY($1::uuid[])
+                    """,
+                    list(selected_ids),
+                )
+                async with connection.transaction():
+                    self.assertEqual(
+                        await adapter.claim_tasks(
+                            connection,
+                            '"public".async_operations',
+                            worker_id,
+                            {},
+                            2,
+                        ),
+                        [],
+                    )
+                self.assertEqual(completion_signals, 1)
+            finally:
+                await connection.close()
+
+        asyncio.run(exercise())
+
+    def test_exact_drain_claim_rejects_mismatched_embedded_targets(self):
+        async def exercise():
+            connection = await self._connect()
+            try:
+                for mismatch in (
+                    {"embedded_operation_id_mismatch": True},
+                    {"embedded_bank_id_mismatch": True},
+                    {"embedded_type_mismatch": True},
+                    {"embedded_schema_mismatch": True},
+                    {"embedded_tenant_mismatch": True},
+                    {"embedded_api_key_mismatch": True},
+                ):
+                    with self.subTest(mismatch=mismatch):
+                        plan, _cohort_ids, _unexpected_id = (
+                            await self._exact_drain_case(
+                                connection,
+                                **mismatch,
+                            )
+                        )
+                        adapter = ExactDrainClaimAdapter(plan)
+                        await self._bind_disposable_exact_drain_identity(
+                            adapter,
+                            connection,
+                        )
+                        async with connection.transaction():
+                            with self.assertRaisesRegex(
+                                OperationRecoveryError,
+                                "task payload target differs",
+                            ):
+                                await adapter.claim_tasks(
+                                    connection,
+                                    '"public".async_operations',
+                                    exact_drain_worker_id(
+                                        plan["plan_digest"]
+                                    ),
+                                    {},
+                                    2,
+                                )
+                        status_counts = {
+                            row["status"]: row["operation_count"]
+                            for row in await connection.fetch(
+                                "SELECT status, count(*)::bigint AS operation_count "
+                                "FROM public.async_operations "
+                                "WHERE operation_id = ANY($1::uuid[]) "
+                                "GROUP BY status",
+                                [
+                                    item["operation_id"]
+                                    for item in plan["selected_operations"]
+                                ],
+                            )
+                        }
+                        self.assertEqual(
+                            status_counts,
+                            {"pending": 43},
+                        )
+            finally:
+                await connection.close()
+
+        asyncio.run(exercise())
+
+    def test_exact_drain_rejects_drift_on_an_unstarted_selected_row(self):
+        async def exercise():
+            connection = await self._connect()
+            try:
+                plan, _cohort_ids, _unexpected_id = (
+                    await self._exact_drain_case(connection)
+                )
+                adapter = ExactDrainClaimAdapter(plan)
+                await self._bind_disposable_exact_drain_identity(
+                    adapter,
+                    connection,
+                )
+                worker_id = exact_drain_worker_id(plan["plan_digest"])
+                async with connection.transaction():
+                    first = await adapter.claim_tasks(
+                        connection,
+                        '"public".async_operations',
+                        worker_id,
+                        {},
+                        2,
+                    )
+                claimed = {str(row["operation_id"]) for row in first}
+                unstarted = next(
+                    item["operation_id"]
+                    for item in plan["selected_operations"]
+                    if item["operation_id"] not in claimed
+                )
+                await connection.execute(
+                    "UPDATE public.async_operations "
+                    "SET retry_count = retry_count + 1, updated_at = NOW() "
+                    "WHERE operation_id = $1::uuid",
+                    unstarted,
+                )
+                async with connection.transaction():
+                    with self.assertRaisesRegex(
+                        OperationRecoveryError,
+                        "unstarted row drifted",
+                    ):
+                        await adapter.claim_tasks(
+                            connection,
+                            '"public".async_operations',
+                            worker_id,
+                            {},
+                            2,
+                        )
+            finally:
+                await connection.close()
+
+        asyncio.run(exercise())
+
+    def test_exact_drain_status_rejects_drift_on_a_preserved_row(self):
+        async def exercise():
+            connection = await self._connect()
+            try:
+                plan, cohort_ids, _unexpected_id = (
+                    await self._exact_drain_case(connection)
+                )
+                selected = {
+                    item["operation_id"]
+                    for item in plan["selected_operations"]
+                }
+                preserved = next(
+                    operation_id
+                    for operation_id in cohort_ids
+                    if operation_id not in selected
+                )
+                await connection.execute(
+                    "UPDATE public.async_operations "
+                    "SET retry_count = retry_count + 1, updated_at = NOW() "
+                    "WHERE operation_id = $1::uuid",
+                    preserved,
+                )
+                with self.assertRaisesRegex(
+                    OperationRecoveryError,
+                    "preserved row drifted",
+                ):
+                    await read_exact_drain_status(
+                        connection,
+                        profile_id="systalyze",
+                        schema="public",
+                        plan=plan,
+                    )
+            finally:
+                await connection.close()
+
+        asyncio.run(exercise())
+
+    def test_exact_drain_status_rejects_terminal_selected_foreign_owner(self):
+        async def exercise():
+            connection = await self._connect()
+            try:
+                plan, _cohort_ids, _unexpected_id = (
+                    await self._exact_drain_case(connection)
+                )
+                selected_id = plan["selected_operations"][0]["operation_id"]
+                await connection.execute(
+                    "UPDATE public.async_operations "
+                    "SET status = 'completed', worker_id = 'foreign-worker', "
+                    "claimed_at = NOW(), completed_at = NOW(), "
+                    "updated_at = NOW() WHERE operation_id = $1::uuid",
+                    selected_id,
+                )
+                with self.assertRaisesRegex(
+                    OperationRecoveryError,
+                    "selected row ownership drifted",
+                ):
+                    await read_exact_drain_status(
+                        connection,
+                        profile_id="systalyze",
+                        schema="public",
+                        plan=plan,
+                    )
+            finally:
+                await connection.close()
+
+        asyncio.run(exercise())
+
+    def test_exact_drain_claim_rejects_drift_on_a_preserved_row(self):
+        async def exercise():
+            connection = await self._connect()
+            try:
+                plan, cohort_ids, _unexpected_id = (
+                    await self._exact_drain_case(connection)
+                )
+                selected = {
+                    item["operation_id"]
+                    for item in plan["selected_operations"]
+                }
+                preserved = next(
+                    operation_id
+                    for operation_id in cohort_ids
+                    if operation_id not in selected
+                )
+                adapter = ExactDrainClaimAdapter(plan)
+                await self._bind_disposable_exact_drain_identity(
+                    adapter,
+                    connection,
+                )
+                worker_id = exact_drain_worker_id(plan["plan_digest"])
+                async with connection.transaction():
+                    await adapter.claim_tasks(
+                        connection,
+                        '"public".async_operations',
+                        worker_id,
+                        {},
+                        2,
+                    )
+                await connection.execute(
+                    "UPDATE public.async_operations "
+                    "SET retry_count = retry_count + 1, updated_at = NOW() "
+                    "WHERE operation_id = $1::uuid",
+                    preserved,
+                )
+                async with connection.transaction():
+                    with self.assertRaisesRegex(
+                        OperationRecoveryError,
+                        "preserved row drifted",
+                    ):
+                        await adapter.claim_tasks(
+                            connection,
+                            '"public".async_operations',
+                            worker_id,
+                            {},
+                            2,
+                        )
+            finally:
+                await connection.close()
+
+        asyncio.run(exercise())
+
+    def test_exact_drain_claim_locks_preserved_rows_until_selected_mutation(self):
+        async def exercise():
+            connection = await self._connect()
+            concurrent = await self._connect()
+            try:
+                plan, cohort_ids, _unexpected_id = (
+                    await self._exact_drain_case(connection)
+                )
+                selected = {
+                    item["operation_id"]
+                    for item in plan["selected_operations"]
+                }
+                preserved = next(
+                    operation_id
+                    for operation_id in cohort_ids
+                    if operation_id not in selected
+                )
+                adapter = ExactDrainClaimAdapter(plan)
+                await self._bind_disposable_exact_drain_identity(
+                    adapter,
+                    connection,
+                )
+                locked = asyncio.Event()
+                release = asyncio.Event()
+
+                class PausingConnection:
+                    def __getattr__(self, name):
+                        return getattr(connection, name)
+
+                    async def fetch(self, query, *arguments):
+                        rows = await connection.fetch(query, *arguments)
+                        if "FOR SHARE" in query and not locked.is_set():
+                            locked.set()
+                            await release.wait()
+                        return rows
+
+                async with connection.transaction():
+                    claim = asyncio.create_task(
+                        adapter.claim_tasks(
+                            PausingConnection(),
+                            '"public".async_operations',
+                            exact_drain_worker_id(plan["plan_digest"]),
+                            {},
+                            1,
+                        )
+                    )
+                    await asyncio.wait_for(locked.wait(), timeout=2)
+                    await concurrent.execute("SET lock_timeout = '100ms'")
+                    with self.assertRaisesRegex(
+                        Exception,
+                        "lock timeout|canceling statement",
+                    ):
+                        await concurrent.execute(
+                            "UPDATE public.async_operations "
+                            "SET retry_count = retry_count + 1 "
+                            "WHERE operation_id = $1::uuid",
+                            preserved,
+                        )
+                    release.set()
+                    self.assertEqual(len(await claim), 1)
+            finally:
+                await concurrent.close()
+                await connection.close()
+
+        asyncio.run(exercise())
+
+    def test_exact_drain_retry_and_defer_remain_owned_and_bounded(self):
+        async def exercise():
+            connection = await self._connect()
+            try:
+                plan, _cohort_ids, _unexpected_id = (
+                    await self._exact_drain_case(connection)
+                )
+                worker_id = exact_drain_worker_id(plan["plan_digest"])
+                adapter = ExactDrainClaimAdapter(plan)
+                await self._bind_disposable_exact_drain_identity(
+                    adapter,
+                    connection,
+                )
+
+                class Backend:
+                    @asynccontextmanager
+                    async def acquire(self):
+                        yield connection
+
+                async with connection.transaction():
+                    claimed = await adapter.claim_tasks(
+                        connection,
+                        '"public".async_operations',
+                        worker_id,
+                        {"consolidation": 1},
+                        0,
+                    )
+                self.assertEqual(len(claimed), 1)
+                operation_id = str(claimed[0]["operation_id"])
+                await adapter.schedule_retry(
+                    Backend(),
+                    operation_id,
+                    datetime(2026, 1, 1),
+                    "provider unavailable",
+                    "public",
+                )
+                pending = await connection.fetchrow(
+                    "SELECT status, worker_id, claimed_at, retry_count "
+                    "FROM public.async_operations "
+                    "WHERE operation_id = $1::uuid",
+                    operation_id,
+                )
+                self.assertEqual(pending["status"], "pending")
+                self.assertEqual(pending["worker_id"], worker_id)
+                self.assertIsNotNone(pending["claimed_at"])
+                self.assertEqual(pending["retry_count"], 1)
+
+                resumed = ExactDrainClaimAdapter(plan, resume=True)
+                await self._bind_disposable_exact_drain_identity(
+                    resumed,
+                    connection,
+                )
+                self.assertEqual(await resumed.recover_own_tasks(Backend()), 0)
+                async with connection.transaction():
+                    claimed_again = await resumed.claim_tasks(
+                        connection,
+                        '"public".async_operations',
+                        worker_id,
+                        {"consolidation": 1},
+                        0,
+                    )
+                self.assertEqual(
+                    [str(row["operation_id"]) for row in claimed_again],
+                    [operation_id],
+                )
+                await resumed.defer_operation(
+                    Backend(),
+                    operation_id,
+                    datetime(2026, 1, 1),
+                    "dependency warming",
+                    None,
+                )
+                await connection.execute(
+                    "UPDATE public.async_operations "
+                    "SET status = 'processing', retry_count = $2 "
+                    "WHERE operation_id = $1::uuid",
+                    operation_id,
+                    plan["worker_max_retries"],
+                )
+                await resumed.schedule_retry(
+                    Backend(),
+                    operation_id,
+                    datetime(2026, 1, 1),
+                    "still unavailable",
+                    None,
+                )
+                exhausted = await connection.fetchrow(
+                    "SELECT status, worker_id, retry_count, completed_at "
+                    "FROM public.async_operations "
+                    "WHERE operation_id = $1::uuid",
+                    operation_id,
+                )
+                self.assertEqual(exhausted["status"], "failed")
+                self.assertEqual(exhausted["worker_id"], worker_id)
+                self.assertEqual(
+                    exhausted["retry_count"], plan["worker_max_retries"]
+                )
+                self.assertIsNotNone(exhausted["completed_at"])
+            finally:
+                await connection.close()
+
+        asyncio.run(exercise())
+
+    async def _exact_drain_terminal_transition_lock_case(self, *, failed):
+        connection = await self._connect()
+        concurrent = await self._connect()
+        try:
+            plan, cohort_ids, _unexpected_id = await self._exact_drain_case(
+                connection
+            )
+            selected = {
+                item["operation_id"] for item in plan["selected_operations"]
+            }
+            preserved = next(
+                operation_id
+                for operation_id in cohort_ids
+                if operation_id not in selected
+            )
+            adapter = ExactDrainClaimAdapter(plan)
+            await self._bind_disposable_exact_drain_identity(
+                adapter,
+                connection,
+            )
+            worker_id = exact_drain_worker_id(plan["plan_digest"])
+            async with connection.transaction():
+                claimed = await adapter.claim_tasks(
+                    connection,
+                    '"public".async_operations',
+                    worker_id,
+                    {},
+                    1,
+                )
+            operation_id = str(claimed[0]["operation_id"])
+            locked = asyncio.Event()
+            release = asyncio.Event()
+
+            class PausingConnection:
+                def __getattr__(self, name):
+                    return getattr(connection, name)
+
+                async def fetch(self, query, *arguments):
+                    rows = await connection.fetch(query, *arguments)
+                    if "FOR SHARE" in query and not locked.is_set():
+                        locked.set()
+                        await release.wait()
+                    return rows
+
+            class Backend:
+                @asynccontextmanager
+                async def acquire(self):
+                    yield PausingConnection()
+
+            transition = (
+                asyncio.create_task(
+                    adapter.mark_failed(
+                        Backend(),
+                        operation_id,
+                        "provider failure",
+                        "public",
+                    )
+                )
+                if failed
+                else asyncio.create_task(
+                    adapter.mark_completed(
+                        Backend(),
+                        operation_id,
+                        "public",
+                    )
+                )
+            )
+            await asyncio.wait_for(locked.wait(), timeout=2)
+            await concurrent.execute("SET lock_timeout = '100ms'")
+            with self.assertRaisesRegex(
+                Exception,
+                "lock timeout|canceling statement",
+            ):
+                await concurrent.execute(
+                    "UPDATE public.async_operations "
+                    "SET retry_count = retry_count + 1 "
+                    "WHERE operation_id = $1::uuid",
+                    preserved,
+                )
+            release.set()
+            await transition
+            await adapter.mark_completed(
+                Backend(),
+                operation_id,
+                "public",
+            )
+            terminal = await connection.fetchrow(
+                "SELECT status, worker_id, completed_at "
+                "FROM public.async_operations "
+                "WHERE operation_id = $1::uuid",
+                operation_id,
+            )
+            self.assertEqual(
+                terminal["status"], "failed" if failed else "completed"
+            )
+            self.assertEqual(terminal["worker_id"], worker_id)
+            self.assertIsNotNone(terminal["completed_at"])
+        finally:
+            await concurrent.close()
+            await connection.close()
+
+    def test_exact_drain_completion_locks_preserved_rows(self):
+        asyncio.run(
+            self._exact_drain_terminal_transition_lock_case(failed=False)
+        )
+
+    def test_exact_drain_failure_locks_preserved_rows(self):
+        asyncio.run(
+            self._exact_drain_terminal_transition_lock_case(failed=True)
+        )
+
+    def test_exact_drain_resume_recovers_only_its_owned_processing_rows(self):
+        async def exercise():
+            connection = await self._connect()
+            try:
+                plan, _cohort_ids, unexpected_id = (
+                    await self._exact_drain_case(connection)
+                )
+                worker_id = exact_drain_worker_id(plan["plan_digest"])
+                selected_id = plan["selected_operations"][0]["operation_id"]
+                await connection.execute(
+                    "UPDATE public.async_operations "
+                    "SET status = 'processing', worker_id = $2, "
+                    "claimed_at = NOW(), updated_at = NOW() "
+                    "WHERE operation_id = $1::uuid",
+                    selected_id,
+                    worker_id,
+                )
+                adapter = ExactDrainClaimAdapter(plan, resume=True)
+                await self._bind_disposable_exact_drain_identity(
+                    adapter,
+                    connection,
+                )
+
+                class Backend:
+                    @asynccontextmanager
+                    async def acquire(self):
+                        yield connection
+
+                self.assertEqual(await adapter.recover_own_tasks(Backend()), 1)
+                recovered = await connection.fetchrow(
+                    "SELECT status, worker_id, claimed_at, retry_count "
+                    "FROM public.async_operations "
+                    "WHERE operation_id = $1::uuid",
+                    selected_id,
+                )
+                self.assertEqual(recovered["status"], "pending")
+                self.assertEqual(recovered["worker_id"], worker_id)
+                self.assertIsNotNone(recovered["claimed_at"])
+                self.assertEqual(recovered["retry_count"], 1)
+                outside = await connection.fetchrow(
+                    "SELECT status, worker_id, retry_count "
+                    "FROM public.async_operations "
+                    "WHERE operation_id = $1::uuid",
+                    unexpected_id,
+                )
+                self.assertEqual(outside["status"], "pending")
+                self.assertIsNone(outside["worker_id"])
+                self.assertEqual(outside["retry_count"], 0)
+            finally:
+                await connection.close()
+
+        asyncio.run(exercise())
+
+    def test_exact_drain_resume_rejects_a_terminal_row_owned_elsewhere(self):
+        async def exercise():
+            connection = await self._connect()
+            try:
+                plan, _cohort_ids, _unexpected_id = (
+                    await self._exact_drain_case(connection)
+                )
+                selected_id = plan["selected_operations"][0]["operation_id"]
+                await connection.execute(
+                    "UPDATE public.async_operations "
+                    "SET status = 'completed', worker_id = 'other-worker', "
+                    "claimed_at = NOW(), completed_at = NOW(), "
+                    "updated_at = NOW() WHERE operation_id = $1::uuid",
+                    selected_id,
+                )
+                adapter = ExactDrainClaimAdapter(plan, resume=True)
+                await self._bind_disposable_exact_drain_identity(
+                    adapter,
+                    connection,
+                )
+
+                class Backend:
+                    @asynccontextmanager
+                    async def acquire(self):
+                        yield connection
+
+                with self.assertRaisesRegex(
+                    OperationRecoveryError,
+                    "selected row drifted",
+                ):
+                    await adapter.recover_own_tasks(Backend())
+            finally:
+                await connection.close()
+
+        asyncio.run(exercise())
+
+    def test_exact_drain_resume_stops_at_the_bound_retry_ceiling(self):
+        async def exercise():
+            connection = await self._connect()
+            try:
+                plan, _cohort_ids, _unexpected_id = (
+                    await self._exact_drain_case(connection)
+                )
+                worker_id = exact_drain_worker_id(plan["plan_digest"])
+                selected_id = plan["selected_operations"][0]["operation_id"]
+                await connection.execute(
+                    "UPDATE public.async_operations "
+                    "SET status = 'processing', worker_id = $2, "
+                    "claimed_at = NOW(), retry_count = $3, updated_at = NOW() "
+                    "WHERE operation_id = $1::uuid",
+                    selected_id,
+                    worker_id,
+                    plan["worker_max_retries"],
+                )
+                adapter = ExactDrainClaimAdapter(plan, resume=True)
+                await self._bind_disposable_exact_drain_identity(
+                    adapter,
+                    connection,
+                )
+
+                class Backend:
+                    @asynccontextmanager
+                    async def acquire(self):
+                        yield connection
+
+                self.assertEqual(await adapter.recover_own_tasks(Backend()), 1)
+                state = await connection.fetchrow(
+                    "SELECT status, worker_id, retry_count "
+                    "FROM public.async_operations "
+                    "WHERE operation_id = $1::uuid",
+                    selected_id,
+                )
+                self.assertEqual(state["status"], "failed")
+                self.assertEqual(state["worker_id"], worker_id)
+                self.assertEqual(
+                    state["retry_count"],
+                    plan["worker_max_retries"],
+                )
+            finally:
+                await connection.close()
+
+        asyncio.run(exercise())
 
     @staticmethod
     def _plan(row):

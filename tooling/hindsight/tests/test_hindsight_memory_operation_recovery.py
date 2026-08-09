@@ -11,6 +11,7 @@ if str(LIB) not in sys.path:
     sys.path.insert(0, str(LIB))
 
 from hindsight_memory_control_plane.canonical import digest  # noqa: E402
+import hindsight_memory_control_plane.operation_recovery as recovery_contract  # noqa: E402
 from hindsight_memory_control_plane.operation_recovery import (  # noqa: E402
     OperationRecoveryError,
     create_claim_release_plan,
@@ -21,6 +22,7 @@ from hindsight_memory_control_plane.operation_recovery import (  # noqa: E402
     normalize_pg0_binding,
     verify_cohort_manifest,
     verify_claim_release_plan,
+    verify_exact_drain_authorization_receipt,
     verify_global_queue_blocker_classification,
     verify_live_snapshot,
     verify_requeue_plan,
@@ -128,6 +130,20 @@ def rollback_backup_evidence() -> dict:
         "restore_tested": True,
         "plaintext_disposed": True,
     }
+
+
+def drain_backup_evidence() -> dict:
+    evidence = deepcopy(rollback_backup_evidence())
+    evidence["source_authority"]["generation_before"] = (
+        "systalyze:public:124"
+    )
+    evidence["source_authority"]["generation_after"] = (
+        "systalyze:public:124"
+    )
+    evidence["source_authority_digest"] = digest(
+        evidence["source_authority"]
+    )
+    return evidence
 
 
 def release_identity() -> dict:
@@ -267,6 +283,143 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 created_at=1_785_402_000,
             )
         )
+
+    def drain_snapshot(
+        self,
+        *,
+        completed_positions: set[int] | None = None,
+    ) -> dict:
+        rows = operation_rows()
+        completed_positions = (
+            {0, 1, 42, 43, 46}
+            if completed_positions is None
+            else completed_positions
+        )
+        for index, row in enumerate(rows):
+            if index in completed_positions:
+                row["status"] = "completed"
+                row["completed_at"] = "2026-07-29T13:00:02Z"
+        return dict(
+            create_live_snapshot(
+                self.cohort(),
+                rows,
+                generation_before="systalyze:public:124",
+                generation_after="systalyze:public:124",
+                installation_authority=installation_authority(),
+                observed_at=1_785_461_000,
+            )
+        )
+
+    def test_exact_drain_plan_binds_the_43_pending_operations(self):
+        planned_at = 1_785_462_000
+        plan = recovery_contract.create_exact_drain_plan(
+            self.cohort(),
+            self.drain_snapshot(),
+            candidate_release=release_identity(),
+            rollback_backup=drain_backup_evidence(),
+            rollback_backup_path="/private/tmp/drain-backup.age",
+            provider_policy_digest="9" * 64,
+            effective_profile_digest="7" * 64,
+            worker_runtime_digest="8" * 64,
+            authorization_receipt_path="/private/tmp/drain-authorization.json",
+            application_receipt_path="/private/tmp/drain-application.json",
+            status_artifact_path="/private/tmp/drain-status.json",
+            verification_receipt_path="/private/tmp/drain-verification.json",
+            created_at=planned_at,
+        )
+
+        self.assertEqual(plan["kind"], "operation-recovery-exact-drain-plan")
+        self.assertEqual(plan["selected_operation_count"], 43)
+        self.assertEqual(
+            plan["selected_type_counts"],
+            {"retain": 40, "refresh_mental_model": 2, "consolidation": 1},
+        )
+        self.assertEqual(plan["effective_profile_digest"], "7" * 64)
+        self.assertEqual(plan["worker_max_attempts"], 4)
+        self.assertEqual(plan["worker_max_retries"], 3)
+        self.assertEqual(plan["selected_status_counts"], {"pending": 43})
+        self.assertEqual(plan["preserved_status_counts"], {"completed": 5})
+        self.assertEqual(plan["pre_generation"], "systalyze:public:124")
+        self.assertEqual(
+            recovery_contract.verify_exact_drain_plan(plan, now=planned_at),
+            plan,
+        )
+        serialized = json.dumps(plan, sort_keys=True)
+        self.assertNotIn('"task_payload":', serialized)
+        self.assertNotIn('"worker_id":', serialized)
+        self.assertNotIn('"error_message":', serialized)
+        self.assertNotIn('"result_metadata":', serialized)
+
+        incomplete = self.drain_snapshot(
+            completed_positions={0, 1, 2, 42, 43, 46}
+        )
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "exact drain pending set is invalid",
+        ):
+            recovery_contract.create_exact_drain_plan(
+                self.cohort(),
+                incomplete,
+                candidate_release=release_identity(),
+                rollback_backup=drain_backup_evidence(),
+                rollback_backup_path="/private/tmp/drain-backup.age",
+                provider_policy_digest="9" * 64,
+                effective_profile_digest="7" * 64,
+                worker_runtime_digest="8" * 64,
+                authorization_receipt_path=(
+                    "/private/tmp/drain-authorization.json"
+                ),
+                application_receipt_path="/private/tmp/drain-application.json",
+                status_artifact_path="/private/tmp/drain-status.json",
+                verification_receipt_path=(
+                    "/private/tmp/drain-verification.json"
+                ),
+                created_at=planned_at,
+            )
+
+    def test_exact_drain_worker_requires_the_exact_authorization_receipt(self):
+        now = int(__import__("time").time())
+        plan = recovery_contract.create_exact_drain_plan(
+            self.cohort(),
+            self.drain_snapshot(),
+            candidate_release=release_identity(),
+            rollback_backup=drain_backup_evidence(),
+            rollback_backup_path="/private/tmp/drain-backup.age",
+            provider_policy_digest="9" * 64,
+            effective_profile_digest="7" * 64,
+            worker_runtime_digest="8" * 64,
+            authorization_receipt_path=(
+                "/private/tmp/drain-authorization.json"
+            ),
+            application_receipt_path="/private/tmp/drain-application.json",
+            status_artifact_path="/private/tmp/drain-status.json",
+            verification_receipt_path=(
+                "/private/tmp/drain-verification.json"
+            ),
+            created_at=now,
+        )
+        body = {
+            "schema_version": 1,
+            "kind": "operation-recovery-exact-drain-authorization-receipt",
+            "plan_digest": plan["plan_digest"],
+            "approval_digest": plan["plan_digest"],
+            "candidate_release": plan["candidate_release"],
+            "provider_policy_digest": plan["provider_policy_digest"],
+            "worker_runtime_digest": plan["worker_runtime_digest"],
+            "authorized_at": now,
+        }
+        receipt = {**body, "receipt_digest": digest(body)}
+        self.assertEqual(
+            verify_exact_drain_authorization_receipt(receipt, plan=plan),
+            receipt,
+        )
+        changed = deepcopy(receipt)
+        changed["approval_digest"] = "0" * 64
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "authorization receipt is invalid",
+        ):
+            verify_exact_drain_authorization_receipt(changed, plan=plan)
 
     @staticmethod
     def queue_blocker_row() -> dict:

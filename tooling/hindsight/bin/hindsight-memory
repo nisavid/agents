@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 import fcntl
 import hashlib
 import hmac
+from io import StringIO
 import json
 import math
 import os
@@ -28,6 +29,7 @@ import sys
 import threading
 import time
 import unicodedata
+from urllib.parse import quote
 from typing import Any, Mapping, NamedTuple, Sequence
 
 
@@ -154,39 +156,54 @@ from hindsight_memory_control_plane.portable_install import (  # noqa: E402
     PortableInstallationManager,
     _release_manifest,
 )
+from hindsight_memory_control_plane.provider_runtime import (  # noqa: E402
+    ProviderRuntimeCompatibilityError,
+    ProviderRuntimePolicy,
+)
 from hindsight_memory_control_plane.operation_recovery import (  # noqa: E402
     OperationRecoveryError,
     create_claim_release_plan,
     create_cohort_manifest,
+    create_exact_drain_plan,
     create_global_queue_blocker_classification,
     create_live_snapshot,
     create_requeue_plan,
     normalize_pg0_binding,
     verify_cohort_manifest,
     verify_claim_release_plan,
+    verify_exact_drain_authorization_receipt,
+    verify_exact_drain_plan,
+    verify_exact_drain_status,
     verify_global_queue_blocker_classification,
     verify_live_snapshot,
     verify_requeue_plan,
 )
 from hindsight_memory_control_plane.operation_recovery_runtime import (  # noqa: E402
     CLAIM_RELEASE_BLOCKER_KEYS,
+    EXACT_DRAIN_PROFILE_ENVIRONMENT_KEYS,
     QUEUE_BLOCKER_GUARD_CONTRACT_DIGEST,
     QUEUE_BLOCKER_GUARD_CONTRACT_VERSION,
     apply_claim_release_transaction,
     apply_requeue_transaction,
     assert_connected_live_database,
     connect_verified_local_postgres,
+    exact_drain_effective_profile_digest,
+    exact_drain_runtime_digest,
+    exact_drain_worker_interpreter_path,
+    exact_drain_worker_id,
     live_row_digest,
     read_claim_release_evidence,
     read_claim_release_preimage,
     read_global_queue_blockers,
     read_generation,
+    read_exact_drain_status,
     read_pg0_registration,
     read_restore_identity,
     read_selected_preimage,
     read_snapshot as read_operation_recovery_snapshot,
     rollback_claim_release_transaction,
     rollback_requeue_transaction,
+    validate_exact_drain_provider_policy,
 )
 from hindsight_memory_control_plane.harness_persistence import (  # noqa: E402
     HarnessPersistenceError,
@@ -5063,10 +5080,10 @@ def _run_private_subprocess(
     return result
 
 
-def _operation_recovery_read_private_json(
+def _operation_recovery_read_private_bytes(
     path_value: str | Path,
     label: str,
-) -> Any:
+) -> bytes:
     path = Path(path_value)
     if not path.is_absolute() or path.name in {"", ".", ".."}:
         raise OperationRecoveryError(f"{label} path is invalid")
@@ -5104,15 +5121,27 @@ def _operation_recovery_read_private_json(
             body.extend(chunk)
         if len(body) != metadata.st_size:
             raise OperationRecoveryError(f"{label} changed while reading")
-        return strict_json_loads(bytes(body))
+        return bytes(body)
     except OperationRecoveryError:
         raise
-    except (OSError, StrictJsonError, UnicodeError, ValueError) as error:
+    except OSError as error:
         raise OperationRecoveryError(f"{label} is unreadable") from error
     finally:
         if descriptor >= 0:
             os.close(descriptor)
         os.close(directory)
+
+
+def _operation_recovery_read_private_json(
+    path_value: str | Path,
+    label: str,
+) -> Any:
+    try:
+        return strict_json_loads(
+            _operation_recovery_read_private_bytes(path_value, label)
+        )
+    except (StrictJsonError, UnicodeError, ValueError) as error:
+        raise OperationRecoveryError(f"{label} is unreadable") from error
 
 
 def _open_operation_recovery_artifact(
@@ -7782,6 +7811,1124 @@ def operation_recovery_plan_command(args: argparse.Namespace) -> int:
     )
 
 
+def _operation_recovery_validate_exact_provider_policy(
+    policy: ProviderRuntimePolicy,
+) -> None:
+    validate_exact_drain_provider_policy(policy)
+
+
+def _operation_recovery_exact_provider_policy_evidence(
+    path: str | Path,
+) -> tuple[str, ProviderRuntimePolicy]:
+    canonical = (
+        Path.home()
+        / ".config"
+        / "hindsight-control-plane"
+        / "provider-runtime-policy.json"
+    ).resolve(strict=False)
+    if Path(path).resolve(strict=False) != canonical:
+        raise OperationRecoveryError(
+            "operation-recovery exact drain provider policy path differs"
+        )
+    body = _operation_recovery_read_private_bytes(
+        path,
+        "exact drain provider policy",
+    )
+    try:
+        policy = ProviderRuntimePolicy.load(strict_json_loads(body))
+    except (ProviderRuntimeCompatibilityError, StrictJsonError) as error:
+        raise OperationRecoveryError(
+            "operation-recovery exact drain provider policy differs"
+        ) from error
+    _operation_recovery_validate_exact_provider_policy(policy)
+    return hashlib.sha256(body).hexdigest(), policy
+
+
+def _operation_recovery_exact_provider_policy(path: str | Path) -> str:
+    policy_digest, _policy = (
+        _operation_recovery_exact_provider_policy_evidence(path)
+    )
+    return policy_digest
+
+
+def _operation_recovery_exact_runtime_digest(args: argparse.Namespace) -> str:
+    return exact_drain_runtime_digest(
+        args.worker_runtime,
+        args.provider_runtime_root,
+    )
+
+
+def operation_recovery_drain_plan_command(args: argparse.Namespace) -> int:
+    candidate_before = _operation_recovery_candidate(args)
+    cohort = verify_cohort_manifest(
+        _operation_recovery_read_private_json(args.cohort, "operation cohort")
+    )
+    snapshot = verify_live_snapshot(
+        _operation_recovery_read_private_json(
+            args.snapshot,
+            "operation live snapshot",
+        )
+    )
+    rollback_backup = _operation_recovery_read_private_json(
+        args.rollback_backup_evidence,
+        "exact drain rollback backup evidence",
+    )
+    provider_policy_digest, provider_policy = (
+        _operation_recovery_exact_provider_policy_evidence(
+            args.provider_policy
+        )
+    )
+    effective_profile_digest = exact_drain_effective_profile_digest(
+        provider_policy,
+        _operation_recovery_profile_environment(),
+    )
+    worker_runtime_digest = _operation_recovery_exact_runtime_digest(args)
+    output_path = Path(args.output)
+    artifact_paths = [
+        args.rollback_backup,
+        args.authorization_receipt,
+        args.application_receipt,
+        args.status_artifact,
+        args.verification_receipt,
+    ]
+    normalized_paths = {
+        unicodedata.normalize("NFD", str(Path(value).resolve(strict=False)).casefold())
+        for value in [output_path, *artifact_paths]
+    }
+    if len(normalized_paths) != len(artifact_paths) + 1:
+        raise OperationRecoveryError(
+            "operation-recovery exact drain plan path aliases an artifact"
+        )
+    source_authority = rollback_backup.get("source_authority", {})
+    if (
+        not isinstance(source_authority, Mapping)
+        or _regular_file_digest(
+            args.rollback_backup,
+            "exact drain rollback backup",
+        )
+        != rollback_backup.get("artifact_sha256")
+        or source_authority.get("generation_before")
+        != snapshot["generation_before"]
+        or source_authority.get("generation_after")
+        != snapshot["generation_after"]
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery exact drain backup authority differs"
+        )
+    plan = create_exact_drain_plan(
+        cohort,
+        snapshot,
+        candidate_release=candidate_before,
+        rollback_backup=rollback_backup,
+        rollback_backup_path=args.rollback_backup,
+        provider_policy_digest=provider_policy_digest,
+        effective_profile_digest=effective_profile_digest,
+        worker_runtime_digest=worker_runtime_digest,
+        authorization_receipt_path=args.authorization_receipt,
+        application_receipt_path=args.application_receipt,
+        status_artifact_path=args.status_artifact,
+        verification_receipt_path=args.verification_receipt,
+    )
+    if _operation_recovery_candidate(args) != candidate_before:
+        raise OperationRecoveryError(
+            "operation-recovery candidate drifted during exact drain planning"
+        )
+    write_private(output_path, plan, create_only=True)
+    return _print_result(
+        {
+            "status": "planned",
+            "authority": plan["authority"],
+            "plan_digest": plan["plan_digest"],
+            "expires_at": plan["expires_at"],
+            "selected_operation_count": plan["selected_operation_count"],
+            "selected_type_counts": plan["selected_type_counts"],
+            "output": str(output_path.resolve()),
+        }
+    )
+
+
+async def _operation_recovery_read_exact_drain_status(
+    args: argparse.Namespace,
+    plan: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    connection = await _operation_recovery_connect_live(args)
+    try:
+        system_identifier_before = await connection.fetchval(
+            "SELECT system_identifier::text FROM pg_control_system()"
+        )
+        authority_before = _operation_recovery_authority(
+            args,
+            postgres_system_identifier=system_identifier_before,
+        )
+        status_value = await read_exact_drain_status(
+            connection,
+            profile_id="systalyze",
+            schema="public",
+            plan=plan,
+        )
+        system_identifier_after = await connection.fetchval(
+            "SELECT system_identifier::text FROM pg_control_system()"
+        )
+        authority_after = _operation_recovery_authority(
+            args,
+            postgres_system_identifier=system_identifier_after,
+        )
+        if (
+            authority_before != authority_after
+            or authority_after != plan["installation_authority"]
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery exact drain authority drifted"
+            )
+        return status_value
+    finally:
+        await connection.close()
+
+
+def _operation_recovery_exact_receipt(
+    body: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    return {**body, "receipt_digest": digest(body)}
+
+
+def _operation_recovery_exact_application(
+    value: Any,
+    *,
+    plan: Mapping[str, Any],
+    authorization: Mapping[str, Any],
+    terminal_status: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise OperationRecoveryError("exact drain application receipt is invalid")
+    required = {
+        "schema_version",
+        "kind",
+        "plan_digest",
+        "candidate_release",
+        "authorization_receipt_digest",
+        "application_journal_digest",
+        "worker_runtime_digest",
+        "provider_policy_digest",
+        "terminal_status_digest",
+        "selected_status_counts",
+        "outside_nonterminal_counts",
+        "worker_pid",
+        "worker_start_time",
+        "worker_attempt",
+        "started_at",
+        "completed_at",
+        "receipt_digest",
+    }
+    if set(value) != required:
+        raise OperationRecoveryError("exact drain application receipt is invalid")
+    body = {key: value[key] for key in required if key != "receipt_digest"}
+    expected_journal_digest = digest(
+        {
+            "schema_version": 1,
+            "kind": "operation-recovery-exact-drain-application-journal",
+            "plan_digest": plan["plan_digest"],
+            "authorization_receipt_digest": authorization[
+                "receipt_digest"
+            ],
+            "started_at": authorization["authorized_at"],
+            "worker_pid": value["worker_pid"],
+            "worker_start_time": value["worker_start_time"],
+            "worker_attempt": value["worker_attempt"],
+        }
+    )
+    if (
+        value.get("schema_version") != 1
+        or value.get("kind") != "operation-recovery-exact-drain-application-receipt"
+        or value.get("plan_digest") != plan["plan_digest"]
+        or value.get("candidate_release") != plan["candidate_release"]
+        or value.get("authorization_receipt_digest")
+        != authorization["receipt_digest"]
+        or not isinstance(value.get("application_journal_digest"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", value["application_journal_digest"])
+        is None
+        or value.get("application_journal_digest")
+        != expected_journal_digest
+        or value.get("worker_runtime_digest") != plan["worker_runtime_digest"]
+        or value.get("provider_policy_digest") != plan["provider_policy_digest"]
+        or value.get("terminal_status_digest")
+        != terminal_status["status_digest"]
+        or value.get("selected_status_counts")
+        != terminal_status["selected_status_counts"]
+        or value.get("selected_status_counts", {}).get("pending", 0)
+        or value.get("selected_status_counts", {}).get("processing", 0)
+        or value.get("outside_nonterminal_counts")
+        != terminal_status["outside_nonterminal_counts"]
+        or type(value.get("worker_pid")) is not int
+        or not 1 <= value["worker_pid"] <= MAX_SIGNAL_PID
+        or not isinstance(value.get("worker_start_time"), str)
+        or not value["worker_start_time"]
+        or len(value["worker_start_time"]) > 128
+        or value["worker_start_time"]
+        != " ".join(value["worker_start_time"].split())
+        or type(value.get("worker_attempt")) is not int
+        or not 1 <= value["worker_attempt"] <= plan["worker_max_attempts"]
+        or any(
+            item.get("status") == "processing"
+            for item in value.get("outside_nonterminal_counts", [])
+        )
+        or type(value.get("started_at")) is not int
+        or value.get("started_at") != authorization["authorized_at"]
+        or type(value.get("completed_at")) is not int
+        or value.get("completed_at") < value.get("started_at")
+        or value.get("receipt_digest") != digest(body)
+    ):
+        raise OperationRecoveryError("exact drain application receipt is invalid")
+    return dict(value)
+
+
+def _operation_recovery_exact_authorization(
+    plan: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    return verify_exact_drain_authorization_receipt(
+        _operation_recovery_read_private_json(
+            plan["authorization_receipt_path"],
+            "exact drain authorization receipt",
+        ),
+        plan=plan,
+    )
+
+
+def _operation_recovery_exact_journal(
+    value: Any,
+    *,
+    plan: Mapping[str, Any],
+    authorization: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise OperationRecoveryError("exact drain application journal is invalid")
+    required = {
+        "schema_version",
+        "kind",
+        "plan_digest",
+        "authorization_receipt_digest",
+        "started_at",
+        "worker_pid",
+        "worker_start_time",
+        "worker_attempt",
+        "receipt_digest",
+    }
+    if set(value) != required:
+        raise OperationRecoveryError("exact drain application journal is invalid")
+    body = {key: value[key] for key in required if key != "receipt_digest"}
+    if (
+        value.get("schema_version") != 1
+        or value.get("kind")
+        != "operation-recovery-exact-drain-application-journal"
+        or value.get("plan_digest") != plan["plan_digest"]
+        or value.get("authorization_receipt_digest")
+        != authorization["receipt_digest"]
+        or value.get("started_at") != authorization["authorized_at"]
+        or type(value.get("worker_pid")) is not int
+        or not 1 <= value["worker_pid"] <= MAX_SIGNAL_PID
+        or not isinstance(value.get("worker_start_time"), str)
+        or not value["worker_start_time"]
+        or len(value["worker_start_time"]) > 128
+        or value["worker_start_time"]
+        != " ".join(value["worker_start_time"].split())
+        or type(value.get("worker_attempt")) is not int
+        or not 1 <= value["worker_attempt"] <= plan["worker_max_attempts"]
+        or value.get("receipt_digest") != digest(body)
+    ):
+        raise OperationRecoveryError("exact drain application journal is invalid")
+    return dict(value)
+
+
+def _operation_recovery_exact_journal_worker_active(
+    journal: Mapping[str, Any],
+) -> bool:
+    return _process_identity_matches(
+        BrokerProcessIdentity(
+            journal["worker_pid"],
+            journal["worker_start_time"],
+        )
+    )
+
+
+def operation_recovery_drain_status_command(args: argparse.Namespace) -> int:
+    candidate = _operation_recovery_candidate(args)
+    plan = verify_exact_drain_plan(
+        _operation_recovery_read_private_json(args.plan, "exact drain plan"),
+        allow_expired=True,
+    )
+    if candidate != plan["candidate_release"]:
+        raise OperationRecoveryError("exact drain candidate differs")
+    manager = _portable_manager(args)
+    with _operation_recovery_lock(manager):
+        with manager._lock():
+            live = asyncio.run(
+                _operation_recovery_read_exact_drain_status(args, plan)
+            )
+            result = {
+                "status": "awaiting-approval",
+                "plan_digest": plan["plan_digest"],
+                "expires_at": plan["expires_at"],
+                "expired": int(time.time()) >= plan["expires_at"],
+                "selected_status_counts": live[
+                    "selected_status_counts"
+                ],
+                "outside_nonterminal_counts": live[
+                    "outside_nonterminal_counts"
+                ],
+                "status_digest": live["status_digest"],
+            }
+            application_path = Path(plan["application_receipt_path"])
+            if not application_path.exists():
+                write_private(plan["status_artifact_path"], live)
+            else:
+                application_value = _operation_recovery_read_private_json(
+                    application_path,
+                    "exact drain application record",
+                )
+                if application_value.get("kind") == (
+                    "operation-recovery-exact-drain-application-journal"
+                ):
+                    authorization = _operation_recovery_exact_authorization(
+                        plan
+                    )
+                    journal = _operation_recovery_exact_journal(
+                        application_value,
+                        plan=plan,
+                        authorization=authorization,
+                    )
+                    write_private(plan["status_artifact_path"], live)
+                    result["status"] = (
+                        "running"
+                        if _operation_recovery_exact_journal_worker_active(
+                            journal
+                        )
+                        else "interrupted"
+                    )
+                else:
+                    authorization = _operation_recovery_exact_authorization(
+                        plan
+                    )
+                    terminal_status = verify_exact_drain_status(
+                        _operation_recovery_read_private_json(
+                            plan["status_artifact_path"],
+                            "exact drain terminal status",
+                        ),
+                        plan=plan,
+                    )
+                    application = _operation_recovery_exact_application(
+                        application_value,
+                        plan=plan,
+                        authorization=authorization,
+                        terminal_status=terminal_status,
+                    )
+                    result["status"] = "terminal"
+                    result["application_receipt_digest"] = application[
+                        "receipt_digest"
+                    ]
+    return _print_result(result)
+
+
+def _operation_recovery_profile_environment() -> dict[str, str]:
+    path = Path.home() / ".hindsight" / "profiles" / "systalyze.env"
+    directory = _open_private_parent(path.parent)
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path.name,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory,
+        )
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) & 0o077
+            or metadata.st_nlink != 1
+            or metadata.st_size > 1024 * 1024
+        ):
+            raise OperationRecoveryError("exact drain profile is not private")
+        body = bytearray()
+        while len(body) <= metadata.st_size:
+            chunk = os.read(
+                descriptor,
+                min(1024 * 1024, metadata.st_size + 1),
+            )
+            if not chunk:
+                break
+            body.extend(chunk)
+        if len(body) != metadata.st_size:
+            raise OperationRecoveryError("exact drain profile changed while reading")
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(directory)
+    from dotenv import dotenv_values
+
+    values = dotenv_values(stream=StringIO(body.decode("utf-8")))
+    environment = {
+        key: value
+        for key, value in values.items()
+        if isinstance(key, str) and isinstance(value, str)
+    }
+    if any(
+        not key or any(character in key + value for character in "\0\r\n")
+        for key, value in environment.items()
+    ):
+        raise OperationRecoveryError("exact drain profile is invalid")
+    return environment
+
+
+def _operation_recovery_exact_worker_interpreter(worker_runtime: str | Path) -> Path:
+    return exact_drain_worker_interpreter_path(worker_runtime)
+
+
+def _operation_recovery_exact_worker_environment(
+    inherited: Mapping[str, str],
+    *,
+    database_url: str,
+    start_gate_descriptor: int,
+) -> dict[str, str]:
+    if (
+        not isinstance(database_url, str)
+        or not database_url.startswith("postgresql://")
+        or any(character in database_url for character in "\0\r\n")
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery exact drain database URL is invalid"
+        )
+    if (
+        type(start_gate_descriptor) is not int
+        or start_gate_descriptor < 0
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery exact drain start gate is invalid"
+        )
+    environment = {
+        key: inherited[key]
+        for key in sorted(EXACT_DRAIN_PROFILE_ENVIRONMENT_KEYS)
+        if key in inherited
+    }
+    environment.update(
+        {
+            "HOME": str(Path.home()),
+            "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "lib"),
+            "HINDSIGHT_API_DATABASE_URL": database_url,
+            "HINDSIGHT_EXACT_DRAIN_START_FD": str(
+                start_gate_descriptor
+            ),
+            "HINDSIGHT_API_WORKER_MAX_SLOTS": "2",
+            "HINDSIGHT_API_WORKER_CONSOLIDATION_RESERVED_SLOTS": "1",
+            "HINDSIGHT_API_WORKER_RETAIN_RESERVED_SLOTS": "0",
+            "HINDSIGHT_API_WORKER_FILE_CONVERT_RETAIN_RESERVED_SLOTS": "0",
+            "HINDSIGHT_API_WORKER_REFRESH_MENTAL_MODEL_RESERVED_SLOTS": "0",
+            "HINDSIGHT_API_WORKER_GRAPH_MAINTENANCE_RESERVED_SLOTS": "0",
+            "HINDSIGHT_API_WORKER_IMPORT_DOCUMENTS_RESERVED_SLOTS": "0",
+            "HINDSIGHT_API_RETAIN_MAX_CONCURRENT": "1",
+            "HINDSIGHT_API_OPERATION_RETENTION_DAYS": "0",
+            "HINDSIGHT_API_AUDIT_LOG_RETENTION_DAYS": "0",
+            "HINDSIGHT_API_LLM_TRACE_RETENTION_DAYS": "0",
+            "HINDSIGHT_API_CONSOLIDATION_RECONCILE_INTERVAL_SECONDS": "0",
+            "HINDSIGHT_API_MENTAL_MODEL_REFRESH_TICK_SECONDS": "0",
+            "HINDSIGHT_CODEX_TERMINAL_AUTH_COOLDOWN_SECONDS": "300",
+            "HINDSIGHT_EMBEDDING_FAILOVER_ORDER": (
+                "work-codex,personal-codex,alt1-codex,alt2-codex"
+            ),
+        }
+    )
+    return environment
+
+
+def _operation_recovery_exact_database_url(
+    plan: Mapping[str, Any],
+) -> str:
+    registration = read_pg0_registration("systalyze")
+    password = registration.pop("_password")
+    try:
+        binding = normalize_pg0_binding(
+            registration,
+            "operation-recovery exact drain pg0 binding",
+        )
+        if (
+            binding
+            != plan["rollback_backup"]["source_authority"]["binding"]
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery exact drain pg0 binding differs"
+            )
+        return (
+            f"postgresql://{quote(binding['user'], safe='')}:"
+            f"{quote(password, safe='')}@localhost/"
+            f"{quote(binding['database'], safe='')}?"
+            f"host={quote(binding['socket_dir'], safe='')}&"
+            f"port={binding['port']}"
+        )
+    finally:
+        password = ""
+
+
+def _operation_recovery_assert_exact_backup(
+    plan: Mapping[str, Any],
+) -> None:
+    observed = _regular_file_digest(
+        plan["rollback_backup_path"],
+        "exact drain rollback backup",
+    )
+    expected = plan["rollback_backup"]["artifact_sha256"]
+    if not hmac.compare_digest(observed, expected):
+        raise OperationRecoveryError(
+            "operation-recovery exact drain rollback backup differs"
+        )
+
+
+def _operation_recovery_exact_status_is_terminal(
+    status: Mapping[str, Any],
+) -> bool:
+    return (
+        not status["selected_status_counts"].get("pending", 0)
+        and not status["selected_status_counts"].get("processing", 0)
+        and not any(
+            item["status"] == "processing"
+            for item in status["outside_nonterminal_counts"]
+        )
+    )
+
+
+def _operation_recovery_finalize_exact_application(
+    *,
+    plan: Mapping[str, Any],
+    candidate: Mapping[str, Any],
+    authorization: Mapping[str, Any],
+    journal: Mapping[str, Any],
+    terminal: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    if not _operation_recovery_exact_status_is_terminal(terminal):
+        raise OperationRecoveryError(
+            "exact drain worker stopped before terminal state"
+        )
+    write_private(plan["status_artifact_path"], terminal)
+    application = _operation_recovery_exact_receipt(
+        {
+            "schema_version": 1,
+            "kind": "operation-recovery-exact-drain-application-receipt",
+            "plan_digest": plan["plan_digest"],
+            "candidate_release": candidate,
+            "authorization_receipt_digest": authorization[
+                "receipt_digest"
+            ],
+            "application_journal_digest": journal["receipt_digest"],
+            "worker_runtime_digest": plan["worker_runtime_digest"],
+            "provider_policy_digest": plan["provider_policy_digest"],
+            "terminal_status_digest": terminal["status_digest"],
+            "selected_status_counts": terminal["selected_status_counts"],
+            "outside_nonterminal_counts": terminal[
+                "outside_nonterminal_counts"
+            ],
+            "worker_pid": journal["worker_pid"],
+            "worker_start_time": journal["worker_start_time"],
+            "worker_attempt": journal["worker_attempt"],
+            "started_at": journal["started_at"],
+            "completed_at": int(time.time()),
+        }
+    )
+    write_private(plan["application_receipt_path"], application)
+    return application
+
+
+def operation_recovery_drain_apply_command(args: argparse.Namespace) -> int:
+    candidate = _operation_recovery_candidate(args)
+    plan = verify_exact_drain_plan(
+        _operation_recovery_read_private_json(args.plan, "exact drain plan"),
+        allow_expired=True,
+    )
+    if (
+        not hmac.compare_digest(args.approval_digest, plan["plan_digest"])
+        or candidate != plan["candidate_release"]
+    ):
+        raise OperationRecoveryError("exact drain approval differs")
+    provider_policy_digest, provider_policy = (
+        _operation_recovery_exact_provider_policy_evidence(
+            args.provider_policy
+        )
+    )
+    profile_environment = _operation_recovery_profile_environment()
+    if (
+        provider_policy_digest != plan["provider_policy_digest"]
+        or exact_drain_effective_profile_digest(
+            provider_policy,
+            profile_environment,
+        )
+        != plan["effective_profile_digest"]
+        or _operation_recovery_exact_runtime_digest(args)
+        != plan["worker_runtime_digest"]
+    ):
+        raise OperationRecoveryError("exact drain runtime authority drifted")
+    authorization_path = Path(plan["authorization_receipt_path"])
+    application_path = Path(plan["application_receipt_path"])
+    verification_path = Path(plan["verification_receipt_path"])
+    manager = _portable_manager(args)
+    with _operation_recovery_lock(manager):
+        with manager._lock():
+            application_value = (
+                _operation_recovery_read_private_json(
+                    application_path,
+                    "exact drain application record",
+                )
+                if application_path.exists()
+                else None
+            )
+            journal_resume = (
+                isinstance(application_value, Mapping)
+                and application_value.get("kind")
+                == "operation-recovery-exact-drain-application-journal"
+            )
+            authorization_only = (
+                application_value is None and authorization_path.exists()
+            )
+            if application_value is not None and not journal_resume:
+                authorization = _operation_recovery_exact_authorization(plan)
+                terminal_status = verify_exact_drain_status(
+                    _operation_recovery_read_private_json(
+                        plan["status_artifact_path"],
+                        "exact drain terminal status",
+                    ),
+                    plan=plan,
+                )
+                application = _operation_recovery_exact_application(
+                    application_value,
+                    plan=plan,
+                    authorization=authorization,
+                    terminal_status=terminal_status,
+                )
+                return _print_result(
+                    {
+                        "status": "terminal",
+                        "plan_digest": plan["plan_digest"],
+                        "application_receipt_digest": application[
+                            "receipt_digest"
+                        ],
+                        "selected_status_counts": terminal_status[
+                            "selected_status_counts"
+                        ],
+                        "outside_nonterminal_counts": terminal_status[
+                            "outside_nonterminal_counts"
+                        ],
+                    }
+                )
+            if journal_resume:
+                authorization = _operation_recovery_exact_authorization(plan)
+                journal = _operation_recovery_exact_journal(
+                    application_value,
+                    plan=plan,
+                    authorization=authorization,
+                )
+                if _operation_recovery_exact_journal_worker_active(journal):
+                    raise OperationRecoveryError(
+                        "exact drain worker remains active"
+                    )
+            else:
+                if authorization_only:
+                    authorization = _operation_recovery_exact_authorization(
+                        plan
+                    )
+                else:
+                    verify_exact_drain_plan(plan)
+                    if application_path.exists() or verification_path.exists():
+                        raise OperationRecoveryError(
+                            "exact drain receipt state is incomplete"
+                        )
+                    authorization = None
+                journal = None
+            _assert_recovery_services_stopped(manager)
+            _operation_recovery_assert_exact_backup(plan)
+            before = asyncio.run(
+                _operation_recovery_read_exact_drain_status(args, plan)
+            )
+            outside_processing = any(
+                item["status"] == "processing"
+                for item in before["outside_nonterminal_counts"]
+            )
+            fresh_preconditions = (
+                before["generation_before"] == plan["pre_generation"]
+                and before["selected_status_counts"] == {"pending": 43}
+            )
+            if (
+                before["preserved_status_counts"] != {"completed": 5}
+                or outside_processing
+                or (not journal_resume and not fresh_preconditions)
+                or verification_path.exists()
+            ):
+                raise OperationRecoveryError(
+                    "exact drain live preconditions differ"
+                )
+            if authorization is None:
+                authorized_at = int(time.time())
+                authorization = verify_exact_drain_authorization_receipt(
+                    _operation_recovery_exact_receipt(
+                        {
+                            "schema_version": 1,
+                            "kind": (
+                                "operation-recovery-exact-drain-"
+                                "authorization-receipt"
+                            ),
+                            "plan_digest": plan["plan_digest"],
+                            "approval_digest": args.approval_digest,
+                            "candidate_release": candidate,
+                            "provider_policy_digest": plan[
+                                "provider_policy_digest"
+                            ],
+                            "worker_runtime_digest": plan[
+                                "worker_runtime_digest"
+                            ],
+                            "authorized_at": authorized_at,
+                        }
+                    ),
+                    plan=plan,
+                )
+                write_private(
+                    plan["authorization_receipt_path"],
+                    authorization,
+                    create_only=True,
+                )
+            if journal_resume and _operation_recovery_exact_status_is_terminal(
+                before
+            ):
+                application = _operation_recovery_finalize_exact_application(
+                    plan=plan,
+                    candidate=candidate,
+                    authorization=authorization,
+                    journal=journal,
+                    terminal=before,
+                )
+                return _print_result(
+                    {
+                        "status": "terminal",
+                        "plan_digest": plan["plan_digest"],
+                        "application_receipt_digest": application[
+                            "receipt_digest"
+                        ],
+                        "selected_status_counts": before[
+                            "selected_status_counts"
+                        ],
+                        "outside_nonterminal_counts": before[
+                            "outside_nonterminal_counts"
+                        ],
+                    }
+                )
+            wrapper = Path(__file__).resolve().parent / (
+                "hindsight-exact-drain-worker"
+            )
+            if (
+                journal_resume
+                and journal["worker_attempt"]
+                >= plan["worker_max_attempts"]
+            ):
+                raise OperationRecoveryError(
+                    "exact drain worker attempt ceiling reached"
+                )
+            command = [
+                str(
+                    _operation_recovery_exact_worker_interpreter(
+                        args.worker_runtime
+                    )
+                ),
+                str(wrapper),
+                "--plan",
+                str(Path(args.plan).resolve(strict=True)),
+                "--provider-policy",
+                str(Path(args.provider_policy).resolve(strict=True)),
+                "--provider-runtime-root",
+                str(Path(args.provider_runtime_root).resolve(strict=True)),
+                "--worker-runtime",
+                str(Path(args.worker_runtime).resolve(strict=True)),
+            ]
+            if journal_resume:
+                command.append("--resume")
+            start_read, start_write = os.pipe()
+            process: subprocess.Popen[bytes] | None = None
+            try:
+                environment = _operation_recovery_exact_worker_environment(
+                    profile_environment,
+                    database_url=_operation_recovery_exact_database_url(plan),
+                    start_gate_descriptor=start_read,
+                )
+                process = subprocess.Popen(
+                    command,
+                    cwd="/",
+                    env=environment,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    pass_fds=(start_read,),
+                )
+                os.close(start_read)
+                start_read = -1
+                worker_start_time = _process_start_time(process.pid)
+                if worker_start_time is None:
+                    raise OperationRecoveryError(
+                        "exact drain worker identity is unavailable"
+                    )
+                if _operation_recovery_candidate(args) != candidate:
+                    raise OperationRecoveryError(
+                        "exact drain candidate drifted before worker start"
+                    )
+                if journal_resume:
+                    current_journal = _operation_recovery_exact_journal(
+                        _operation_recovery_read_private_json(
+                            application_path,
+                            "exact drain application journal",
+                        ),
+                        plan=plan,
+                        authorization=authorization,
+                    )
+                    if current_journal["receipt_digest"] != journal[
+                        "receipt_digest"
+                    ]:
+                        raise OperationRecoveryError(
+                            "exact drain application journal drifted"
+                        )
+                elif application_path.exists():
+                    raise OperationRecoveryError(
+                        "exact drain application journal appeared"
+                    )
+                worker_attempt = (
+                    journal["worker_attempt"] + 1
+                    if journal_resume
+                    else 1
+                )
+                journal = _operation_recovery_exact_receipt(
+                    {
+                        "schema_version": 1,
+                        "kind": (
+                            "operation-recovery-exact-drain-"
+                            "application-journal"
+                        ),
+                        "plan_digest": plan["plan_digest"],
+                        "authorization_receipt_digest": authorization[
+                            "receipt_digest"
+                        ],
+                        "started_at": authorization["authorized_at"],
+                        "worker_pid": process.pid,
+                        "worker_start_time": worker_start_time,
+                        "worker_attempt": worker_attempt,
+                    }
+                )
+                write_private(
+                    plan["application_receipt_path"],
+                    journal,
+                    create_only=not journal_resume,
+                )
+                if os.write(start_write, b"1") != 1:
+                    raise OperationRecoveryError(
+                        "exact drain worker start gate failed"
+                    )
+                os.close(start_write)
+                start_write = -1
+                returncode = process.wait()
+            except BaseException:
+                if process is not None and process.poll() is None:
+                    process.kill()
+                if process is not None:
+                    process.wait()
+                raise
+            finally:
+                if start_read >= 0:
+                    os.close(start_read)
+                if start_write >= 0:
+                    os.close(start_write)
+            if returncode != 0:
+                raise OperationRecoveryError("exact drain worker failed")
+            terminal = asyncio.run(
+                _operation_recovery_read_exact_drain_status(args, plan)
+            )
+            application = _operation_recovery_finalize_exact_application(
+                plan=plan,
+                candidate=candidate,
+                authorization=authorization,
+                journal=journal,
+                terminal=terminal,
+            )
+    return _print_result(
+        {
+            "status": "terminal",
+            "plan_digest": plan["plan_digest"],
+            "application_receipt_digest": application["receipt_digest"],
+            "selected_status_counts": terminal["selected_status_counts"],
+            "outside_nonterminal_counts": terminal[
+                "outside_nonterminal_counts"
+            ],
+        }
+    )
+
+
+def _operation_recovery_exact_verification(
+    value: Any,
+    *,
+    plan: Mapping[str, Any],
+    application: Mapping[str, Any],
+    live: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise OperationRecoveryError(
+            "exact drain verification receipt is invalid"
+        )
+    required = {
+        "schema_version",
+        "kind",
+        "plan_digest",
+        "application_receipt_digest",
+        "terminal_status_digest",
+        "selected_status_counts",
+        "preserved_status_counts",
+        "outside_nonterminal_counts",
+        "successful",
+        "verified_at",
+        "receipt_digest",
+    }
+    if set(value) != required:
+        raise OperationRecoveryError(
+            "exact drain verification receipt is invalid"
+        )
+    body = {key: value[key] for key in required if key != "receipt_digest"}
+    if (
+        value.get("schema_version") != 1
+        or value.get("kind")
+        != "operation-recovery-exact-drain-verification-receipt"
+        or value.get("plan_digest") != plan["plan_digest"]
+        or value.get("application_receipt_digest")
+        != application["receipt_digest"]
+        or value.get("terminal_status_digest")
+        != application["terminal_status_digest"]
+        or value.get("selected_status_counts")
+        != {"completed": 43}
+        or value.get("selected_status_counts")
+        != live["selected_status_counts"]
+        or value.get("preserved_status_counts")
+        != {"completed": 5}
+        or value.get("preserved_status_counts")
+        != live["preserved_status_counts"]
+        or value.get("outside_nonterminal_counts")
+        != live["outside_nonterminal_counts"]
+        or any(
+            item.get("status") == "processing"
+            for item in value.get("outside_nonterminal_counts", [])
+        )
+        or value.get("successful") is not True
+        or type(value.get("verified_at")) is not int
+        or value["verified_at"] < application["completed_at"]
+        or value.get("receipt_digest") != digest(body)
+    ):
+        raise OperationRecoveryError(
+            "exact drain verification receipt is invalid"
+        )
+    return dict(value)
+
+
+def _operation_recovery_drain_verify_locked(
+    args: argparse.Namespace,
+    plan: Mapping[str, Any],
+) -> int:
+    authorization = _operation_recovery_exact_authorization(plan)
+    terminal_status = verify_exact_drain_status(
+        _operation_recovery_read_private_json(
+            plan["status_artifact_path"],
+            "exact drain terminal status",
+        ),
+        plan=plan,
+    )
+    application = _operation_recovery_exact_application(
+        _operation_recovery_read_private_json(
+            plan["application_receipt_path"],
+            "exact drain application receipt",
+        ),
+        plan=plan,
+        authorization=authorization,
+        terminal_status=terminal_status,
+    )
+    live = asyncio.run(_operation_recovery_read_exact_drain_status(args, plan))
+    successful = (
+        live["selected_status_counts"] == {"completed": 43}
+        and live["preserved_status_counts"] == {"completed": 5}
+        and not any(
+            item["status"] == "processing"
+            for item in live["outside_nonterminal_counts"]
+        )
+    )
+    body = {
+        "schema_version": 1,
+        "kind": "operation-recovery-exact-drain-verification-receipt",
+        "plan_digest": plan["plan_digest"],
+        "application_receipt_digest": application["receipt_digest"],
+        "terminal_status_digest": application["terminal_status_digest"],
+        "selected_status_counts": live["selected_status_counts"],
+        "preserved_status_counts": live["preserved_status_counts"],
+        "outside_nonterminal_counts": live["outside_nonterminal_counts"],
+        "successful": successful,
+        "verified_at": int(time.time()),
+    }
+    if not successful:
+        raise OperationRecoveryError(
+            "exact drain selected operations did not all complete"
+        )
+    receipt = _operation_recovery_exact_receipt(body)
+    verification_path = Path(plan["verification_receipt_path"])
+    if verification_path.exists():
+        existing = _operation_recovery_exact_verification(
+            _operation_recovery_read_private_json(
+                verification_path,
+                "exact drain verification receipt",
+            ),
+            plan=plan,
+            application=application,
+            live=live,
+        )
+        return _print_result(
+            {
+                "status": "verified",
+                "plan_digest": plan["plan_digest"],
+                "receipt_digest": existing["receipt_digest"],
+                "selected_status_counts": existing[
+                    "selected_status_counts"
+                ],
+                "outside_nonterminal_counts": existing[
+                    "outside_nonterminal_counts"
+                ],
+            }
+        )
+    write_private(
+        verification_path,
+        receipt,
+        create_only=True,
+    )
+    return _print_result(
+        {
+            "status": "verified",
+            "plan_digest": plan["plan_digest"],
+            "receipt_digest": receipt["receipt_digest"],
+            "selected_status_counts": live["selected_status_counts"],
+            "outside_nonterminal_counts": live[
+                "outside_nonterminal_counts"
+            ],
+        }
+    )
+
+
+def operation_recovery_drain_verify_command(args: argparse.Namespace) -> int:
+    candidate = _operation_recovery_candidate(args)
+    plan = verify_exact_drain_plan(
+        _operation_recovery_read_private_json(args.plan, "exact drain plan"),
+        allow_expired=True,
+    )
+    if candidate != plan["candidate_release"]:
+        raise OperationRecoveryError("exact drain candidate differs")
+    manager = _portable_manager(args)
+    with _operation_recovery_lock(manager):
+        with manager._lock():
+            return _operation_recovery_drain_verify_locked(args, plan)
+
+
 def operation_recovery_status_command(args: argparse.Namespace) -> int:
     _operation_recovery_candidate(args)
     plan = verify_requeue_plan(
@@ -9523,6 +10670,56 @@ def parser() -> argparse.ArgumentParser:
         run=operation_recovery_claim_release_rollback_command
     )
 
+    recovery_drain = operation_recovery_commands.add_parser("drain")
+    recovery_drain_commands = recovery_drain.add_subparsers(
+        dest="operation_recovery_drain_command",
+        required=True,
+    )
+    recovery_drain_plan = recovery_drain_commands.add_parser("plan")
+    add_operation_recovery_authority(recovery_drain_plan)
+    recovery_drain_plan.add_argument("--cohort", required=True)
+    recovery_drain_plan.add_argument("--snapshot", required=True)
+    recovery_drain_plan.add_argument(
+        "--rollback-backup-evidence", required=True
+    )
+    recovery_drain_plan.add_argument("--rollback-backup", required=True)
+    recovery_drain_plan.add_argument("--provider-policy", required=True)
+    recovery_drain_plan.add_argument("--provider-runtime-root", required=True)
+    recovery_drain_plan.add_argument("--worker-runtime", required=True)
+    recovery_drain_plan.add_argument("--authorization-receipt", required=True)
+    recovery_drain_plan.add_argument("--application-receipt", required=True)
+    recovery_drain_plan.add_argument("--status-artifact", required=True)
+    recovery_drain_plan.add_argument("--verification-receipt", required=True)
+    recovery_drain_plan.add_argument("--output", required=True)
+    recovery_drain_plan.set_defaults(
+        run=operation_recovery_drain_plan_command
+    )
+
+    recovery_drain_apply = recovery_drain_commands.add_parser("apply")
+    add_operation_recovery_authority(recovery_drain_apply)
+    recovery_drain_apply.add_argument("--plan", required=True)
+    recovery_drain_apply.add_argument("--approval-digest", required=True)
+    recovery_drain_apply.add_argument("--provider-policy", required=True)
+    recovery_drain_apply.add_argument("--provider-runtime-root", required=True)
+    recovery_drain_apply.add_argument("--worker-runtime", required=True)
+    recovery_drain_apply.set_defaults(
+        run=operation_recovery_drain_apply_command
+    )
+
+    recovery_drain_status = recovery_drain_commands.add_parser("status")
+    add_operation_recovery_authority(recovery_drain_status)
+    recovery_drain_status.add_argument("--plan", required=True)
+    recovery_drain_status.set_defaults(
+        run=operation_recovery_drain_status_command
+    )
+
+    recovery_drain_verify = recovery_drain_commands.add_parser("verify")
+    add_operation_recovery_authority(recovery_drain_verify)
+    recovery_drain_verify.add_argument("--plan", required=True)
+    recovery_drain_verify.set_defaults(
+        run=operation_recovery_drain_verify_command
+    )
+
     recovery_plan = operation_recovery_commands.add_parser("plan")
     add_operation_recovery_authority(recovery_plan)
     recovery_plan.add_argument("--cohort", required=True)
@@ -10072,6 +11269,7 @@ def main() -> int:
         MigrationError,
         PlanError,
         PortableInstallError,
+        ProviderRuntimeCompatibilityError,
         ReplayError,
         OperationRecoveryError,
         StrictJsonError,

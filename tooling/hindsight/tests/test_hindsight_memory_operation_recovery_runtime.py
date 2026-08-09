@@ -1,6 +1,6 @@
 from contextlib import asynccontextmanager
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 import asyncio
 import hashlib
 import os
@@ -23,10 +23,12 @@ from hindsight_memory_control_plane.operation_recovery_runtime import (  # noqa:
     QUEUE_BLOCKER_GUARD_CONTRACT_VERSION,
     QUEUE_BLOCKER_PREDICATE,
     CLAIM_RELEASE_EVIDENCE_QUERY,
+    ExactDrainClaimAdapter,
     SAFE_OPERATION_QUERY,
     apply_requeue_transaction,
     assert_connected_live_database,
     connect_verified_local_postgres,
+    install_exact_drain_runtime_guards,
     live_row_digest,
     read_global_queue_blockers,
     read_claim_release_evidence,
@@ -83,6 +85,336 @@ class FakeConnection:
 
 
 class OperationRecoveryRuntimeTest(unittest.TestCase):
+    def test_exact_drain_resume_allows_only_a_bound_expired_plan(self):
+        verified = {
+            "plan_digest": "a" * 64,
+            "selected_operations": [],
+            "live_snapshot": {"operations": []},
+            "worker_max_retries": 3,
+        }
+        with patch(
+            "hindsight_memory_control_plane.operation_recovery_runtime."
+            "verify_exact_drain_plan",
+            return_value=verified,
+        ) as verify:
+            ExactDrainClaimAdapter({}, resume=True)
+        verify.assert_called_once_with({}, allow_expired=True)
+
+    def test_exact_drain_initial_guard_rejects_the_wrong_database_identity(self):
+        adapter = object.__new__(ExactDrainClaimAdapter)
+        adapter._plan = {
+            "pre_generation": "systalyze:public:123",
+            "installation_authority": {
+                "postgres_system_identifier": "7659746962107358086",
+            },
+            "rollback_backup": {
+                "source_authority": {
+                    "binding": {
+                        "database": "hindsight",
+                        "user": "hindsight",
+                        "data_dir": "/private/tmp/expected-pg-data",
+                        "port": 54329,
+                    }
+                }
+            },
+        }
+        adapter._selected = {}
+
+        class WrongDatabase:
+            async def fetchrow(self, _query):
+                return {
+                    "database": "hindsight",
+                    "database_user": "hindsight",
+                    "data_directory": "/private/tmp/other-pg-data",
+                    "port": 54329,
+                    "address": None,
+                    "system_identifier": "7659746962107358086",
+                }
+
+        with (
+            patch(
+                "hindsight_memory_control_plane.operation_recovery_runtime.read_generation",
+                new=AsyncMock(return_value="systalyze:public:123"),
+            ),
+            patch(
+                "hindsight_memory_control_plane.operation_recovery_runtime.read_safe_operation_rows",
+                new=AsyncMock(return_value=[]),
+            ),
+            self.assertRaisesRegex(
+                OperationRecoveryError,
+                "database identity differs",
+            ),
+        ):
+            asyncio.run(adapter._verify_initial_state(WrongDatabase()))
+
+    def test_exact_drain_guards_disable_global_startup_and_parent_mutations(self):
+        events = []
+
+        class Adapter:
+            async def claim_tasks(self, *arguments, **keywords):
+                events.append(("claim", arguments, keywords))
+                return ["selected"]
+
+            async def recover_own_tasks(self, backend):
+                events.append(("exact-recovery", backend))
+                return 0
+
+            async def schedule_retry(
+                self, backend, operation_id, retry_at, error_message, schema
+            ):
+                events.append(
+                    (
+                        "exact-retry",
+                        backend,
+                        operation_id,
+                        retry_at,
+                        error_message,
+                        schema,
+                    )
+                )
+
+            async def defer_operation(
+                self, backend, operation_id, exec_date, reason, schema
+            ):
+                events.append(
+                    (
+                        "exact-defer",
+                        backend,
+                        operation_id,
+                        exec_date,
+                        reason,
+                        schema,
+                    )
+                )
+
+            async def mark_completed(self, backend, operation_id, schema):
+                events.append(
+                    ("exact-complete", backend, operation_id, schema)
+                )
+
+            async def mark_failed(
+                self, backend, operation_id, error_message, schema
+            ):
+                events.append(
+                    (
+                        "exact-fail",
+                        backend,
+                        operation_id,
+                        error_message,
+                        schema,
+                    )
+                )
+
+        class PostgreSQLOps:
+            async def claim_tasks(self, *arguments, **keywords):
+                raise AssertionError("upstream claim seam remained active")
+
+        class WorkerPoller:
+            _backend = "exact-backend"
+
+            async def _scan_active_schemas(self, schemas):
+                events.append(("upstream-scan", schemas))
+                return set(schemas)
+
+            async def recover_own_tasks(self):
+                events.append(("global-recovery",))
+                return 99
+
+            async def _maybe_update_parent_operation(self, *arguments):
+                events.append(("poller-parent", arguments))
+
+        class MemoryEngine:
+            async def _get_backend(self):
+                return "exact-backend"
+
+            async def _maybe_update_parent_operation(self, *arguments):
+                events.append(("engine-parent", arguments))
+
+        install_exact_drain_runtime_guards(
+            PostgreSQLOps,
+            WorkerPoller,
+            MemoryEngine,
+            Adapter(),
+        )
+
+        async def exercise():
+            claimed = await PostgreSQLOps().claim_tasks(
+                "connection",
+                "public.async_operations",
+                "worker",
+                {},
+                1,
+            )
+            active = await WorkerPoller()._scan_active_schemas(
+                ["tenant-a", None, "tenant-b"]
+            )
+            recovered = await WorkerPoller().recover_own_tasks()
+            retried = await WorkerPoller()._schedule_retry(
+                "operation", "retry-at", "safe-error", None
+            )
+            deferred = await WorkerPoller()._defer_operation(
+                "operation", "exec-date", "safe-reason", "public"
+            )
+            completed = await WorkerPoller()._mark_completed(
+                "operation", None
+            )
+            failed = await WorkerPoller()._mark_failed(
+                "operation", "safe-error", "public"
+            )
+            engine_completed = await MemoryEngine()._mark_operation_completed(
+                "operation"
+            )
+            engine_failed = await MemoryEngine()._mark_operation_failed(
+                "operation", "safe-error", "safe-traceback"
+            )
+            consolidation_completed = await MemoryEngine()._mark_operation_completed_and_fire_webhook(
+                "operation",
+                "engineering",
+                "completed",
+                {"observations_created": 1},
+                "public",
+            )
+            consolidation_failed = await MemoryEngine()._mark_operation_completed_and_fire_webhook(
+                "operation",
+                "engineering",
+                "failed",
+                None,
+                "public",
+                "consolidation failure",
+            )
+            poller_parent = await WorkerPoller()._maybe_update_parent_operation(
+                "child",
+                None,
+                "connection",
+            )
+            engine_parent = await MemoryEngine()._maybe_update_parent_operation(
+                "child",
+                "connection",
+            )
+            return (
+                claimed,
+                active,
+                recovered,
+                retried,
+                deferred,
+                completed,
+                failed,
+                engine_completed,
+                engine_failed,
+                consolidation_completed,
+                consolidation_failed,
+                poller_parent,
+                engine_parent,
+            )
+
+        (
+            claimed,
+            active,
+            recovered,
+            retried,
+            deferred,
+            completed,
+            failed,
+            engine_completed,
+            engine_failed,
+            consolidation_completed,
+            consolidation_failed,
+            poller_parent,
+            engine_parent,
+        ) = asyncio.run(exercise())
+        self.assertEqual(claimed, ["selected"])
+        self.assertEqual(active, {None})
+        self.assertEqual(recovered, 0)
+        self.assertIsNone(retried)
+        self.assertIsNone(deferred)
+        self.assertIsNone(completed)
+        self.assertIsNone(failed)
+        self.assertIsNone(engine_completed)
+        self.assertIsNone(engine_failed)
+        self.assertIsNone(consolidation_completed)
+        self.assertIsNone(consolidation_failed)
+        self.assertIn(
+            (
+                "exact-retry",
+                "exact-backend",
+                "operation",
+                "retry-at",
+                "safe-error",
+                None,
+            ),
+            events,
+        )
+        self.assertIn(
+            ("exact-complete", "exact-backend", "operation", None),
+            events,
+        )
+        self.assertIn(
+            (
+                "exact-fail",
+                "exact-backend",
+                "operation",
+                "safe-error",
+                "public",
+            ),
+            events,
+        )
+        self.assertIn(
+            ("exact-complete", "exact-backend", "operation", None),
+            events,
+        )
+        self.assertIn(
+            (
+                "exact-fail",
+                "exact-backend",
+                "operation",
+                "safe-error\n\nTraceback:\nsafe-traceback",
+                None,
+            ),
+            events,
+        )
+        self.assertIn(
+            ("exact-complete", "exact-backend", "operation", "public"),
+            events,
+        )
+        self.assertIn(
+            (
+                "exact-fail",
+                "exact-backend",
+                "operation",
+                "consolidation failure",
+                "public",
+            ),
+            events,
+        )
+        self.assertIn(
+            (
+                "exact-defer",
+                "exact-backend",
+                "operation",
+                "exec-date",
+                "safe-reason",
+                "public",
+            ),
+            events,
+        )
+        self.assertIsNone(poller_parent)
+        self.assertIsNone(engine_parent)
+        self.assertEqual(
+            [event[0] for event in events],
+            [
+                "claim",
+                "exact-recovery",
+                "exact-retry",
+                "exact-defer",
+                "exact-complete",
+                "exact-fail",
+                "exact-complete",
+                "exact-fail",
+                "exact-complete",
+                "exact-fail",
+            ],
+        )
+
     def test_live_identity_accepts_verified_unix_socket_connection(self):
         with tempfile.TemporaryDirectory() as temporary:
             data_dir = Path(temporary).resolve()

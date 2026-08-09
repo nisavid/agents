@@ -28,12 +28,14 @@ from hindsight_memory_control_plane.operation_recovery_runtime import (  # noqa:
     apply_requeue_transaction,
     assert_connected_live_database,
     connect_verified_local_postgres,
+    exact_drain_worker_interpreter_path,
     install_exact_drain_runtime_guards,
     live_row_digest,
     read_global_queue_blockers,
     read_claim_release_evidence,
     read_snapshot,
     rollback_requeue_transaction,
+    _exact_drain_interpreter_evidence,
 )
 from hindsight_memory_control_plane.operation_recovery import (  # noqa: E402
     OperationRecoveryError,
@@ -85,6 +87,45 @@ class FakeConnection:
 
 
 class OperationRecoveryRuntimeTest(unittest.TestCase):
+    def test_exact_drain_interpreter_evidence_resolves_version_alias_parent(self):
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+            root = Path(directory).resolve(strict=True)
+            canonical = root / "cpython-3.13.14" / "bin"
+            canonical.mkdir(parents=True)
+            interpreter = canonical / "python3.13"
+            interpreter.write_bytes(b"trusted-interpreter")
+            interpreter.chmod(0o500)
+            alias = root / "cpython-3.13"
+            alias.symlink_to(canonical.parent, target_is_directory=True)
+
+            venv = root / "venv"
+            (venv / "bin").mkdir(parents=True)
+            (venv / "pyvenv.cfg").write_text("home = test\n", encoding="utf-8")
+            (venv / "bin" / "python").symlink_to(
+                alias / "bin" / "python3.13"
+            )
+            (venv / "bin" / "python3").symlink_to("python")
+            worker = venv / "bin" / "hindsight-worker"
+            worker.write_text(
+                f"#!{venv / 'bin' / 'python3'}\n",
+                encoding="utf-8",
+            )
+            worker.chmod(0o500)
+
+            evidence = _exact_drain_interpreter_evidence(
+                exact_drain_worker_interpreter_path(worker)
+            )
+
+        self.assertEqual(evidence["resolved_path"], str(interpreter))
+        self.assertEqual(
+            evidence["resolved_parent_alias_path"],
+            str(alias / "bin" / "python3.13"),
+        )
+        self.assertEqual(
+            evidence["resolved_sha256"],
+            hashlib.sha256(b"trusted-interpreter").hexdigest(),
+        )
+
     def test_exact_drain_resume_allows_only_a_bound_expired_plan(self):
         verified = {
             "plan_digest": "a" * 64,

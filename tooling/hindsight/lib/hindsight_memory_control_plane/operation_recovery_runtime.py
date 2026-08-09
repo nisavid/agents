@@ -1077,13 +1077,17 @@ def _exact_drain_interpreter_evidence(interpreter: Path) -> dict[str, str]:
         seen.add(current)
         metadata = current.lstat()
         if not stat.S_ISLNK(metadata.st_mode):
-            if not stat.S_ISREG(metadata.st_mode):
+            canonical = current.resolve(strict=True)
+            canonical_metadata = canonical.lstat()
+            if not stat.S_ISREG(canonical_metadata.st_mode):
                 raise OperationRecoveryError(
                     "exact drain worker interpreter is invalid"
                 )
-            evidence["resolved_path"] = str(current)
+            if canonical != current:
+                evidence["resolved_parent_alias_path"] = str(current)
+            evidence["resolved_path"] = str(canonical)
             evidence["resolved_sha256"] = _exact_drain_file_digest(
-                current,
+                canonical,
                 "exact drain worker interpreter",
             )
             return evidence

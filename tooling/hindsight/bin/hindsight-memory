@@ -8468,7 +8468,7 @@ def _operation_recovery_exact_database_url(
             )
         return (
             f"postgresql://{quote(binding['user'], safe='')}:"
-            f"{quote(password, safe='')}@localhost/"
+            f"{quote(password, safe='')}@/"
             f"{quote(binding['database'], safe='')}?"
             f"host={quote(binding['socket_dir'], safe='')}&"
             f"port={binding['port']}"

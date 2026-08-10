@@ -739,6 +739,49 @@ class OperationRecoveryCliTest(unittest.TestCase):
         self.assertEqual(observed.returncode, 0, observed.stderr)
         self.assertEqual(observed.stdout.strip(), expected_text_encoding)
 
+    def test_exact_drain_database_url_selects_verified_unix_socket(self):
+        build = self.controller["_operation_recovery_exact_database_url"]
+        globals_ = build.__globals__
+        binding = {
+            "pid": 123,
+            "socket_dir": "/private/tmp/hindsight socket",
+            "socket_path": (
+                "/private/tmp/hindsight socket/.s.PGSQL.54329"
+            ),
+            "port": 54329,
+            "user": "hindsight user",
+            "database": "hindsight/database",
+        }
+        plan = {
+            "rollback_backup": {
+                "source_authority": {"binding": binding}
+            }
+        }
+        replacements = {
+            "read_pg0_registration": lambda _name: {
+                **binding,
+                "_password": "secret/word",
+            },
+            "normalize_pg0_binding": lambda registration, _label: dict(
+                registration
+            ),
+        }
+        originals = {key: globals_[key] for key in replacements}
+        globals_.update(replacements)
+        try:
+            observed = build(plan)
+        finally:
+            globals_.update(originals)
+
+        self.assertEqual(
+            observed,
+            (
+                "postgresql://hindsight%20user:secret%2Fword@/"
+                "hindsight%2Fdatabase?"
+                "host=%2Fprivate%2Ftmp%2Fhindsight%20socket&port=54329"
+            ),
+        )
+
     def test_exact_drain_worker_uses_the_venv_interpreter_path(self):
         resolve = self.controller[
             "_operation_recovery_exact_worker_interpreter"

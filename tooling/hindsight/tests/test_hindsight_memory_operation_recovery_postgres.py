@@ -7,6 +7,7 @@ import getpass
 import hashlib
 import json
 import os
+import runpy
 import subprocess
 import sys
 import tempfile
@@ -221,6 +222,64 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
             )
         finally:
             await connection.close()
+
+    def test_exact_drain_database_url_connects_through_unix_socket(self):
+        controller = runpy.run_path(str(ROOT / "bin" / "hindsight-memory"))
+        build = controller["_operation_recovery_exact_database_url"]
+        globals_ = build.__globals__
+        binding = {
+            "pid": int(
+                (self.data_dir / "postmaster.pid")
+                .read_text(encoding="utf-8")
+                .splitlines()[0]
+            ),
+            "socket_dir": str(self.socket_dir),
+            "socket_path": str(
+                self.socket_dir / f".s.PGSQL.{self.port}"
+            ),
+            "port": self.port,
+            "user": self.user,
+            "database": "postgres",
+        }
+        plan = {
+            "rollback_backup": {
+                "source_authority": {"binding": binding}
+            }
+        }
+        replacements = {
+            "read_pg0_registration": lambda _name: {
+                **binding,
+                "_password": "unused-trust-password",
+            },
+            "normalize_pg0_binding": lambda registration, _label: dict(
+                registration
+            ),
+        }
+        originals = {key: globals_[key] for key in replacements}
+        globals_.update(replacements)
+        try:
+            database_url = build(plan)
+        finally:
+            globals_.update(originals)
+
+        async def exercise():
+            import asyncpg
+
+            connection = await asyncpg.connect(database_url, timeout=5)
+            try:
+                self.assertIsNone(
+                    await connection.fetchval(
+                        "SELECT inet_server_addr()::text"
+                    )
+                )
+                self.assertEqual(
+                    await connection.fetchval("SHOW port"),
+                    str(self.port),
+                )
+            finally:
+                await connection.close()
+
+        asyncio.run(exercise())
 
     @staticmethod
     async def _insert_operation(
@@ -686,6 +745,14 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
                             {},
                             2,
                         )
+                    adapter.claim_committed(
+                        [
+                            SimpleNamespace(
+                                operation_id=str(row["operation_id"])
+                            )
+                            for row in claimed
+                        ]
+                    )
                     claimed_ids.update(str(row["operation_id"]) for row in claimed)
                     if attempt == 0:
                         await self._insert_operation(
@@ -1030,6 +1097,14 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
                         {},
                         2,
                     )
+                adapter.claim_committed(
+                    [
+                        SimpleNamespace(
+                            operation_id=str(row["operation_id"])
+                        )
+                        for row in first
+                    ]
+                )
                 claimed = {str(row["operation_id"]) for row in first}
                 unstarted = next(
                     item["operation_id"]
@@ -1272,6 +1347,14 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
                         {"consolidation": 1},
                         0,
                     )
+                adapter.claim_committed(
+                    [
+                        SimpleNamespace(
+                            operation_id=str(row["operation_id"])
+                        )
+                        for row in claimed
+                    ]
+                )
                 self.assertEqual(len(claimed), 1)
                 operation_id = str(claimed[0]["operation_id"])
                 await adapter.schedule_retry(
@@ -1306,6 +1389,14 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
                         {"consolidation": 1},
                         0,
                     )
+                resumed.claim_committed(
+                    [
+                        SimpleNamespace(
+                            operation_id=str(row["operation_id"])
+                        )
+                        for row in claimed_again
+                    ]
+                )
                 self.assertEqual(
                     [str(row["operation_id"]) for row in claimed_again],
                     [operation_id],
@@ -1377,6 +1468,12 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
                     {},
                     1,
                 )
+            adapter.claim_committed(
+                [
+                    SimpleNamespace(operation_id=str(row["operation_id"]))
+                    for row in claimed
+                ]
+            )
             operation_id = str(claimed[0]["operation_id"])
             locked = asyncio.Event()
             release = asyncio.Event()

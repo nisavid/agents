@@ -1,4 +1,5 @@
 from copy import deepcopy
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -18,6 +19,7 @@ from hindsight_memory_control_plane.operation_recovery import (  # noqa: E402
     create_cohort_manifest,
     create_global_queue_blocker_classification,
     create_live_snapshot,
+    create_post_abort_recovery_plan,
     create_requeue_plan,
     normalize_pg0_binding,
     verify_cohort_manifest,
@@ -25,6 +27,7 @@ from hindsight_memory_control_plane.operation_recovery import (  # noqa: E402
     verify_exact_drain_authorization_receipt,
     verify_global_queue_blocker_classification,
     verify_live_snapshot,
+    verify_post_abort_recovery_plan,
     verify_requeue_plan,
 )
 
@@ -309,6 +312,214 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 observed_at=1_785_461_000,
             )
         )
+
+    def drain_plan(self) -> dict:
+        return dict(
+            recovery_contract.create_exact_drain_plan(
+                self.cohort(),
+                self.drain_snapshot(),
+                candidate_release=release_identity(),
+                rollback_backup=drain_backup_evidence(),
+                rollback_backup_path="/private/tmp/drain-backup.age",
+                provider_policy_digest="9" * 64,
+                effective_profile_digest="7" * 64,
+                worker_runtime_digest="8" * 64,
+                authorization_receipt_path=(
+                    "/private/tmp/drain-authorization.json"
+                ),
+                application_receipt_path=(
+                    "/private/tmp/drain-application.json"
+                ),
+                status_artifact_path="/private/tmp/drain-status.json",
+                verification_receipt_path=(
+                    "/private/tmp/drain-verification.json"
+                ),
+                created_at=1_785_462_000,
+            )
+        )
+
+    def post_abort_snapshot(self, reference_plan=None) -> dict:
+        reference_plan = reference_plan or self.drain_plan()
+        rows = operation_rows()
+        completed = {0, 1, 42, 43, 46}
+        selected_ids = {
+            item["operation_id"]
+            for item in reference_plan["selected_operations"]
+        }
+        worker_id = (
+            "operation-recovery-exact-drain-"
+            f"{reference_plan['plan_digest'][:12]}"
+        )
+        worker_digest = hashlib.sha256(worker_id.encode("utf-8")).hexdigest()
+        selected_positions = [
+            index
+            for index, row in enumerate(rows)
+            if row["operation_id"] in selected_ids
+        ]
+        selected_retain_positions = [
+            index
+            for index in selected_positions
+            if rows[index]["operation_type"] == "retain"
+        ]
+        selected_refresh_positions = [
+            index
+            for index in selected_positions
+            if rows[index]["operation_type"] == "refresh_mental_model"
+        ]
+        failed_position = selected_retain_positions[-1]
+        processing_positions = set(
+            selected_retain_positions[:12] + selected_refresh_positions
+        )
+        for index, row in enumerate(rows):
+            if index in completed:
+                row["status"] = "completed"
+                row["completed_at"] = "2026-07-29T13:00:02Z"
+            elif index in processing_positions:
+                row["status"] = "processing"
+                row["worker_id_present"] = True
+                row["worker_id_digest"] = worker_digest
+                row["claimed_at"] = "2026-08-10T10:01:15.000000Z"
+            elif index == failed_position:
+                row["status"] = "failed"
+                row["completed_at"] = "2026-08-10T15:36:45.000000Z"
+                row["retry_count"] = 3
+                row["error_category"] = "unknown"
+                row["error_digest"] = "6" * 64
+        return dict(
+            create_live_snapshot(
+                self.cohort(),
+                rows,
+                generation_before="systalyze:public:81678",
+                generation_after="systalyze:public:81678",
+                installation_authority=installation_authority(),
+                observed_at=1_786_390_181,
+            )
+        )
+
+    def test_post_abort_plan_binds_exact_stopped_worker_and_failed_rows(self):
+        reference = self.drain_plan()
+        snapshot = self.post_abort_snapshot(reference)
+        planned_at = 1_786_390_500
+        backup = rollback_backup_evidence()
+        backup["source_authority"]["generation_before"] = (
+            "systalyze:public:81678"
+        )
+        backup["source_authority"]["generation_after"] = (
+            "systalyze:public:81678"
+        )
+        backup["source_authority_digest"] = digest(
+            backup["source_authority"]
+        )
+
+        plan = create_post_abort_recovery_plan(
+            reference,
+            snapshot,
+            candidate_release={
+                "source_commit": "4" * 40,
+                "version": "2026.08.10+4444444.operation-recovery.17",
+                "release_digest": "5" * 64,
+            },
+            rollback_backup=backup,
+            rollback_encryption=rollback_encryption(),
+            rollback_backup_path="/private/tmp/post-abort-backup.age",
+            rollback_bundle_path="/private/tmp/post-abort-bundle.age",
+            authorization_receipt_path=(
+                "/private/tmp/post-abort-authorization.json"
+            ),
+            application_receipt_path=(
+                "/private/tmp/post-abort-application.json"
+            ),
+            verification_receipt_path=(
+                "/private/tmp/post-abort-verification.json"
+            ),
+            rollback_receipt_path="/private/tmp/post-abort-rollback.json",
+            created_at=planned_at,
+        )
+
+        self.assertEqual(
+            plan["kind"],
+            "operation-recovery-exact-drain-post-abort-plan",
+        )
+        self.assertEqual(plan["authority"], "unapproved-plan")
+        self.assertIs(plan["mutation_authorized"], False)
+        self.assertEqual(plan["reference_plan_digest"], reference["plan_digest"])
+        self.assertEqual(plan["selected_operation_count"], 15)
+        self.assertEqual(
+            plan["selected_status_counts"],
+            {"failed": 1, "processing": 14},
+        )
+        self.assertEqual(
+            plan["selected_type_counts"],
+            {"refresh_mental_model": 2, "retain": 13},
+        )
+        self.assertEqual(
+            plan["preserved_status_counts"],
+            {"completed": 5, "pending": 28},
+        )
+        self.assertEqual(plan["expires_at"], planned_at + 86_400)
+        self.assertEqual(plan["evidence_max_age_seconds"], 3_600)
+        self.assertEqual(plan["transaction_timeout_seconds"], 120)
+        self.assertEqual(
+            verify_post_abort_recovery_plan(plan, now=planned_at),
+            plan,
+        )
+        serialized = json.dumps(plan, sort_keys=True)
+        self.assertNotIn('"task_payload":', serialized)
+        self.assertNotIn('"worker_id":', serialized)
+        self.assertNotIn('"error_message":', serialized)
+        self.assertNotIn('"result_metadata":', serialized)
+
+    def test_post_abort_plan_rejects_a_different_processing_owner(self):
+        reference = self.drain_plan()
+        snapshot = self.post_abort_snapshot(reference)
+        processing = next(
+            item
+            for item in snapshot["operations"]
+            if item["current_status"] == "processing"
+        )
+        processing["worker_id_digest"] = "0" * 64
+        processing["row_digest"] = digest(
+            {
+                key: value
+                for key, value in processing.items()
+                if key != "row_digest"
+            }
+        )
+        snapshot_body = {
+            key: value
+            for key, value in snapshot.items()
+            if key != "snapshot_digest"
+        }
+        snapshot["snapshot_digest"] = digest(snapshot_body)
+        backup = rollback_backup_evidence()
+        backup["source_authority"]["generation_before"] = (
+            "systalyze:public:81678"
+        )
+        backup["source_authority"]["generation_after"] = (
+            "systalyze:public:81678"
+        )
+        backup["source_authority_digest"] = digest(
+            backup["source_authority"]
+        )
+
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "post-abort row set is invalid",
+        ):
+            create_post_abort_recovery_plan(
+                reference,
+                snapshot,
+                candidate_release=release_identity(),
+                rollback_backup=backup,
+                rollback_encryption=rollback_encryption(),
+                rollback_backup_path="/private/tmp/post-abort-backup.age",
+                rollback_bundle_path="/private/tmp/post-abort-bundle.age",
+                authorization_receipt_path="/private/tmp/post-abort-auth.json",
+                application_receipt_path="/private/tmp/post-abort-app.json",
+                verification_receipt_path="/private/tmp/post-abort-verify.json",
+                rollback_receipt_path="/private/tmp/post-abort-rollback.json",
+                created_at=1_786_390_500,
+            )
 
     def test_exact_drain_plan_binds_the_43_pending_operations(self):
         planned_at = 1_785_462_000

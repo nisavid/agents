@@ -58,6 +58,39 @@ class OperationRecoveryCliTest(unittest.TestCase):
     def setUpClass(cls):
         cls.controller = runpy.run_path(str(ROOT / "bin" / "hindsight-memory"))
 
+    def _post_abort_plan(self, root: Path) -> dict:
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        reference = fixtures.drain_plan()
+        snapshot = fixtures.post_abort_snapshot(reference)
+        backup = recovery_fixtures.rollback_backup_evidence()
+        backup["source_authority"]["generation_before"] = snapshot[
+            "generation_before"
+        ]
+        backup["source_authority"]["generation_after"] = snapshot[
+            "generation_after"
+        ]
+        backup["source_authority_digest"] = self.controller["digest"](
+            backup["source_authority"]
+        )
+        return self.controller["create_post_abort_recovery_plan"](
+            reference,
+            snapshot,
+            candidate_release={
+                "source_commit": "4" * 40,
+                "version": "2026.08.10+4444444.operation-recovery.17",
+                "release_digest": "5" * 64,
+            },
+            rollback_backup=backup,
+            rollback_encryption=recovery_fixtures.rollback_encryption(),
+            rollback_backup_path=str(root / "backup.age"),
+            rollback_bundle_path=str(root / "bundle.age"),
+            authorization_receipt_path=str(root / "authorization.json"),
+            application_receipt_path=str(root / "application.json"),
+            verification_receipt_path=str(root / "verification.json"),
+            rollback_receipt_path=str(root / "rollback.json"),
+            created_at=snapshot["observed_at"],
+        )
+
     def test_exact_drain_cli_exposes_plan_apply_monitor_status_and_verify(self):
         parser = self.controller["parser"]()
         authority = [
@@ -135,6 +168,715 @@ class OperationRecoveryCliTest(unittest.TestCase):
                 ]
             )
             self.assertIs(parsed.run, self.controller[function])
+
+    def test_post_abort_cli_exposes_plan_apply_status_verify_and_rollback(self):
+        parser = self.controller["parser"]()
+        authority = [
+            "--config",
+            "/private/tmp/config.json",
+            "--candidate-release-root",
+            "/private/tmp/candidate",
+            "--candidate-release-identity",
+            "/private/tmp/candidate.json",
+        ]
+        plan = parser.parse_args(
+            [
+                "operation-recovery",
+                "drain",
+                "post-abort",
+                "plan",
+                *authority,
+                "--reference-plan",
+                "/private/tmp/reference-plan.json",
+                "--snapshot",
+                "/private/tmp/live-snapshot.json",
+                "--rollback-backup-evidence",
+                "/private/tmp/backup.json",
+                "--rollback-backup",
+                "/private/tmp/backup.dump.age",
+                "--age",
+                "/private/tmp/age",
+                "--rollback-recipient",
+                "age1example",
+                "--rollback-bundle",
+                "/private/tmp/bundle.age",
+                "--authorization-receipt",
+                "/private/tmp/authorization.json",
+                "--application-receipt",
+                "/private/tmp/application.json",
+                "--verification-receipt",
+                "/private/tmp/verification.json",
+                "--rollback-receipt",
+                "/private/tmp/rollback.json",
+                "--output",
+                "/private/tmp/plan.json",
+            ]
+        )
+        self.assertIs(
+            plan.run,
+            self.controller["operation_recovery_post_abort_plan_command"],
+        )
+        for command, extra, function in (
+            (
+                "apply",
+                [
+                    "--approval-digest",
+                    "a" * 64,
+                    "--age",
+                    "/private/tmp/age",
+                    "--age-identity",
+                    "/private/tmp/age-key.txt",
+                    "--rollback-recipient",
+                    "age1example",
+                ],
+                "operation_recovery_post_abort_apply_command",
+            ),
+            ("status", [], "operation_recovery_post_abort_status_command"),
+            ("verify", [], "operation_recovery_post_abort_verify_command"),
+            (
+                "rollback",
+                [
+                    "--approval-digest",
+                    "b" * 64,
+                    "--age",
+                    "/private/tmp/age",
+                    "--age-identity",
+                    "/private/tmp/age-key.txt",
+                ],
+                "operation_recovery_post_abort_rollback_command",
+            ),
+        ):
+            parsed = parser.parse_args(
+                [
+                    "operation-recovery",
+                    "drain",
+                    "post-abort",
+                    command,
+                    *authority,
+                    "--plan",
+                    "/private/tmp/plan.json",
+                    *extra,
+                ]
+            )
+            self.assertIs(parsed.run, self.controller[function])
+
+    def test_post_abort_and_exact_drain_commands_share_process_lock_order(self):
+        script = r'''
+import asyncio
+from pathlib import Path
+import runpy
+import sys
+import time
+from types import SimpleNamespace
+
+controller = runpy.run_path(sys.argv[1])
+mode = sys.argv[2]
+root = Path(sys.argv[3])
+candidate = {"source_commit": "4" * 40, "version": "test", "release_digest": "5" * 64}
+expires_at = int(time.time()) + 5
+
+class Manager:
+    config = SimpleNamespace(state_root=root)
+    def _lock(self):
+        return controller["_operation_recovery_install_lock"](
+            self,
+            expires_at=expires_at,
+        )
+
+manager = Manager()
+if mode == "exact":
+    plan = {
+        "candidate_release": candidate,
+        "plan_digest": "a" * 64,
+        "expires_at": expires_at,
+        "pre_generation": "systalyze:public:1",
+        "selected_operation_count": 43,
+        "application_receipt_path": str(root / "missing-application.json"),
+        "status_artifact_path": str(root / "status.json"),
+    }
+    command = controller["operation_recovery_drain_status_command"]
+    globals_ = command.__globals__
+    async def status(_args, _plan):
+        await asyncio.sleep(0.25)
+        return {
+            "selected_status_counts": {"pending": 43},
+            "preserved_status_counts": {"completed": 5},
+            "outside_nonterminal_counts": [],
+            "status_digest": "b" * 64,
+            "generation_before": plan["pre_generation"],
+        }
+    globals_.update({
+        "_operation_recovery_candidate": lambda _args: candidate,
+        "verify_exact_drain_plan": lambda _value, **_kwargs: plan,
+        "_operation_recovery_read_private_json": lambda _path, _label: plan,
+        "_portable_manager": lambda _args: manager,
+        "_operation_recovery_read_exact_drain_status": status,
+        "write_private": lambda *_args, **_kwargs: None,
+        "_print_result": lambda _value: 0,
+    })
+else:
+    plan = {
+        "candidate_release": candidate,
+        "plan_digest": "c" * 64,
+        "transaction_timeout_seconds": 5,
+        "installation_authority": {"digest": "test"},
+        "application_receipt_path": str(root / "application.json"),
+        "verification_receipt_path": str(root / "verification.json"),
+        "selected_operation_count": 15,
+    }
+    application = {
+        "kind": "operation-recovery-application-receipt",
+        "post_generation": "systalyze:public:2",
+        "receipt_digest": "d" * 64,
+        "applied_at": 1,
+    }
+    command = controller["operation_recovery_post_abort_verify_command"]
+    globals_ = command.__globals__
+    async def verify_live(*_args):
+        await asyncio.sleep(0.05)
+        return {
+            "generation": application["post_generation"],
+            "selected_operation_count": 15,
+            "selected_status_counts": {"pending": 15},
+            "cohort_operation_count": 48,
+        }
+    globals_.update({
+        "_operation_recovery_candidate": lambda _args: candidate,
+        "verify_post_abort_recovery_plan": lambda _value, **_kwargs: plan,
+        "_operation_recovery_read_private_json": lambda _path, _label: application,
+        "_operation_recovery_validate_application": lambda _value, **_kwargs: application,
+        "_portable_manager": lambda _args: manager,
+        "_operation_recovery_authority": lambda _args, **_kwargs: plan["installation_authority"],
+        "_operation_recovery_post_abort_verify_live": verify_live,
+        "write_private": lambda *_args, **_kwargs: None,
+        "_print_result": lambda _value: 0,
+    })
+
+raise SystemExit(command(SimpleNamespace(plan="plan.json")))
+'''
+        with tempfile.TemporaryDirectory(
+            dir="/private/tmp",
+            prefix="post-abort-process-locks-",
+        ) as directory:
+            root = Path(directory)
+            root.chmod(0o700)
+            controller_path = str(ROOT / "bin" / "hindsight-memory")
+            exact = subprocess.Popen(
+                [sys.executable, "-c", script, controller_path, "exact", directory],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            time.sleep(0.05)
+            post_abort = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    script,
+                    controller_path,
+                    "post-abort",
+                    directory,
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            exact_output = exact.communicate(timeout=4)
+            post_abort_output = post_abort.communicate(timeout=4)
+
+        self.assertEqual(exact.returncode, 0, exact_output)
+        self.assertEqual(post_abort.returncode, 0, post_abort_output)
+
+    def test_post_abort_apply_replays_final_and_journal_receipts_without_preimage(self):
+        command = self.controller["operation_recovery_post_abort_apply_command"]
+        globals_ = command.__globals__
+        with tempfile.TemporaryDirectory(
+            dir="/private/tmp",
+            prefix="post-abort-apply-resume-",
+        ) as directory:
+            root = Path(directory)
+            root.chmod(0o700)
+            plan = self._post_abort_plan(root)
+            application_path = Path(plan["application_receipt_path"])
+            application_path.touch(mode=0o600)
+            application = {
+                "kind": "operation-recovery-application-receipt",
+                "pre_generation": plan["pre_generation"],
+                "post_generation": self.controller[
+                    "_operation_recovery_next_generation"
+                ](plan["pre_generation"]),
+                "receipt_digest": "a" * 64,
+            }
+            journal = {
+                **application,
+                "kind": "operation-recovery-application-journal",
+                "receipt_digest": "b" * 64,
+            }
+            current = {"application": application}
+            writes = []
+            lock_events = []
+
+            class Manager:
+                pass
+
+            class Tracked:
+                def __init__(self, name):
+                    self.name = name
+
+                def __enter__(self):
+                    lock_events.append(f"{self.name}-enter")
+
+                def __exit__(self, *_arguments):
+                    lock_events.append(f"{self.name}-exit")
+
+            async def fail_prepare(*_args, **_kwargs):
+                self.fail("idempotent apply must not recapture the preimage")
+
+            async def fail_apply(*_args, **_kwargs):
+                self.fail("idempotent apply must not mutate the database")
+
+            async def verify_live(*_args, **_kwargs):
+                return {
+                    "generation": application["post_generation"],
+                    "selected_operation_count": plan[
+                        "selected_operation_count"
+                    ],
+                    "selected_status_counts": {
+                        "pending": plan["selected_operation_count"]
+                    },
+                    "cohort_operation_count": 48,
+                }
+
+            replacements = {
+                "verify_post_abort_recovery_plan": (
+                    lambda _value, **_kwargs: plan
+                ),
+                "_operation_recovery_candidate": (
+                    lambda _args: plan["candidate_release"]
+                ),
+                "_operation_recovery_read_private_json": (
+                    lambda path, _label: (
+                        plan
+                        if str(path) == "plan.json"
+                        else current["application"]
+                    )
+                ),
+                "_portable_manager": lambda _args: Manager(),
+                "_operation_recovery_precommit_artifacts": (
+                    lambda: nullcontext(
+                        {"mutation_attempted": False, "created": []}
+                    )
+                ),
+                "_operation_recovery_install_lock": (
+                    lambda _manager, **_kwargs: Tracked("installer")
+                ),
+                "_operation_recovery_lock": (
+                    lambda _manager, **_kwargs: Tracked("recovery")
+                ),
+                "_operation_recovery_authority": (
+                    lambda _args, **_kwargs: plan["installation_authority"]
+                ),
+                "_operation_recovery_validate_application": (
+                    lambda _value, **_kwargs: application
+                ),
+                "_operation_recovery_validate_journal": (
+                    lambda _value, *, plan: journal
+                ),
+                "_operation_recovery_post_abort_verify_live": verify_live,
+                "_operation_recovery_prepare_apply": fail_prepare,
+                "_operation_recovery_post_abort_apply": fail_apply,
+                "_operation_recovery_finalize_journal": (
+                    lambda _value: application
+                ),
+                "write_private": (
+                    lambda path, value, **_kwargs: writes.append(
+                        (str(path), value)
+                    )
+                ),
+                "_print_result": lambda value: value,
+            }
+            originals = {key: globals_[key] for key in replacements}
+            globals_.update(replacements)
+            args = SimpleNamespace(
+                plan="plan.json",
+                approval_digest=plan["plan_digest"],
+            )
+            try:
+                result = command(args)
+                current["application"] = journal
+                recovered = command(args)
+            finally:
+                globals_.update(originals)
+
+        self.assertEqual(result["status"], "already-applied")
+        self.assertEqual(recovered["status"], "recovered-applied")
+        self.assertEqual(writes, [(str(application_path), application)])
+        self.assertEqual(
+            lock_events,
+            [
+                "recovery-enter",
+                "installer-enter",
+                "installer-exit",
+                "recovery-exit",
+            ]
+            * 2,
+        )
+
+    def test_post_abort_apply_rechecks_candidate_under_lock(self):
+        command = self.controller["operation_recovery_post_abort_apply_command"]
+        globals_ = command.__globals__
+        with tempfile.TemporaryDirectory(
+            dir="/private/tmp",
+            prefix="post-abort-apply-candidate-",
+        ) as directory:
+            root = Path(directory)
+            root.chmod(0o700)
+            plan = self._post_abort_plan(root)
+            drifted = {**plan["candidate_release"], "release_digest": "0" * 64}
+            candidates = iter((plan["candidate_release"], drifted))
+
+            class Manager:
+                pass
+
+            replacements = {
+                "verify_post_abort_recovery_plan": (
+                    lambda _value, **_kwargs: plan
+                ),
+                "_operation_recovery_candidate": lambda _args: next(candidates),
+                "_operation_recovery_read_private_json": (
+                    lambda _path, _label: plan
+                ),
+                "_portable_manager": lambda _args: Manager(),
+                "_operation_recovery_precommit_artifacts": (
+                    lambda: nullcontext(
+                        {"mutation_attempted": False, "created": []}
+                    )
+                ),
+                "_operation_recovery_install_lock": (
+                    lambda _manager, **_kwargs: nullcontext()
+                ),
+                "_operation_recovery_lock": (
+                    lambda _manager, **_kwargs: nullcontext()
+                ),
+            }
+            originals = {key: globals_[key] for key in replacements}
+            globals_.update(replacements)
+            try:
+                with self.assertRaisesRegex(Exception, "candidate drifted"):
+                    command(
+                        SimpleNamespace(
+                            plan="plan.json",
+                            approval_digest=plan["plan_digest"],
+                        )
+                    )
+            finally:
+                globals_.update(originals)
+
+    def test_post_abort_rollback_rechecks_candidate_under_lock(self):
+        command = self.controller[
+            "operation_recovery_post_abort_rollback_command"
+        ]
+        globals_ = command.__globals__
+        with tempfile.TemporaryDirectory(
+            dir="/private/tmp",
+            prefix="post-abort-rollback-candidate-",
+        ) as directory:
+            root = Path(directory)
+            root.chmod(0o700)
+            plan = self._post_abort_plan(root)
+            application = {
+                "receipt_digest": "a" * 64,
+                "post_generation": "systalyze:public:81679",
+            }
+            drifted = {**plan["candidate_release"], "release_digest": "0" * 64}
+            candidates = iter((plan["candidate_release"], drifted))
+            bundle = {
+                "ciphertext_base64": base64.b64encode(b"ciphertext").decode(
+                    "ascii"
+                )
+            }
+            preimage = {
+                "schema_version": 1,
+                "kind": "operation-recovery-selected-row-preimage",
+                "plan_digest": plan["plan_digest"],
+                "rows": [],
+            }
+
+            class Manager:
+                def _lock(self):
+                    return nullcontext()
+
+            async def fail_connect(*_args, **_kwargs):
+                self.fail("candidate drift must prevent database rollback")
+
+            documents = {
+                "plan.json": plan,
+                plan["application_receipt_path"]: application,
+            }
+            replacements = {
+                "verify_post_abort_recovery_plan": (
+                    lambda _value, **_kwargs: plan
+                ),
+                "_operation_recovery_candidate": lambda _args: next(candidates),
+                "_operation_recovery_read_private_json": (
+                    lambda path, _label: documents[str(path)]
+                ),
+                "_operation_recovery_validate_application": (
+                    lambda _value, **_kwargs: application
+                ),
+                "_operation_recovery_rollback_approval": (
+                    lambda _plan, _application: "b" * 64
+                ),
+                "_operation_recovery_validate_bundle": lambda _plan: bundle,
+                "_operation_recovery_tool": lambda _path, _key: Path("/dev/null"),
+                "_operation_recovery_rollback_identity_path": (
+                    lambda _path: Path("/dev/null")
+                ),
+                "_age_decrypt_ciphertext": (
+                    lambda **_kwargs: json.dumps(preimage).encode("utf-8")
+                ),
+                "_portable_manager": lambda _args: Manager(),
+                "_operation_recovery_lock": (
+                    lambda _manager, **_kwargs: nullcontext()
+                ),
+                "_operation_recovery_install_lock": (
+                    lambda _manager, **_kwargs: nullcontext()
+                ),
+                "_operation_recovery_connect_live": fail_connect,
+            }
+            originals = {key: globals_[key] for key in replacements}
+            globals_.update(replacements)
+            try:
+                with self.assertRaisesRegex(Exception, "candidate drifted"):
+                    command(
+                        SimpleNamespace(
+                            plan="plan.json",
+                            approval_digest="b" * 64,
+                            age="/dev/null",
+                            age_identity="/dev/null",
+                        )
+                    )
+            finally:
+                globals_.update(originals)
+
+    def test_post_abort_rollback_receipt_revalidates_without_decryption(self):
+        command = self.controller[
+            "operation_recovery_post_abort_rollback_command"
+        ]
+        globals_ = command.__globals__
+        with tempfile.TemporaryDirectory(
+            dir="/private/tmp",
+            prefix="post-abort-rollback-repeat-",
+        ) as directory:
+            root = Path(directory)
+            root.chmod(0o700)
+            plan = self._post_abort_plan(root)
+            application = {
+                "receipt_digest": "a" * 64,
+                "post_generation": "systalyze:public:81679",
+            }
+            receipt = {
+                "kind": "operation-recovery-rollback-receipt",
+                "pre_generation": "systalyze:public:81679",
+                "post_generation": "systalyze:public:81680",
+                "receipt_digest": "c" * 64,
+            }
+            Path(plan["rollback_receipt_path"]).touch(mode=0o600)
+            documents = {
+                "plan.json": plan,
+                plan["application_receipt_path"]: application,
+                plan["rollback_receipt_path"]: receipt,
+            }
+
+            class Manager:
+                pass
+
+            class Connection:
+                async def close(self):
+                    return None
+
+            async def connect(*_args, **_kwargs):
+                return Connection()
+
+            async def verify_transaction(*_args, **kwargs):
+                self.assertIsNone(kwargs["preimage"])
+                return receipt["pre_generation"], receipt["post_generation"]
+
+            def fail_decrypt(*_args, **_kwargs):
+                self.fail("final rollback verification must not decrypt preimage")
+
+            replacements = {
+                "verify_post_abort_recovery_plan": (
+                    lambda _value, **_kwargs: plan
+                ),
+                "_operation_recovery_candidate": (
+                    lambda _args: plan["candidate_release"]
+                ),
+                "_operation_recovery_read_private_json": (
+                    lambda path, _label: documents[str(path)]
+                ),
+                "_operation_recovery_validate_application": (
+                    lambda _value, **_kwargs: application
+                ),
+                "_operation_recovery_rollback_approval": (
+                    lambda _plan, _application: "b" * 64
+                ),
+                "_portable_manager": lambda _args: Manager(),
+                "_operation_recovery_lock": (
+                    lambda _manager, **_kwargs: nullcontext()
+                ),
+                "_operation_recovery_install_lock": (
+                    lambda _manager, **_kwargs: nullcontext()
+                ),
+                "_operation_recovery_authority": (
+                    lambda _args, **_kwargs: plan["installation_authority"]
+                ),
+                "_operation_recovery_validate_rollback_receipt": (
+                    lambda _value, **_kwargs: receipt
+                ),
+                "_operation_recovery_validate_bundle": fail_decrypt,
+                "_age_decrypt_ciphertext": fail_decrypt,
+                "_operation_recovery_connect_live": connect,
+                "rollback_post_abort_recovery_transaction": verify_transaction,
+                "_print_result": lambda value: value,
+            }
+            originals = {key: globals_[key] for key in replacements}
+            globals_.update(replacements)
+            try:
+                result = command(
+                    SimpleNamespace(
+                        plan="plan.json",
+                        approval_digest="b" * 64,
+                    )
+                )
+            finally:
+                globals_.update(originals)
+
+        self.assertEqual(result["status"], "already-rolled-back")
+        self.assertEqual(result["receipt_digest"], "c" * 64)
+
+    def test_post_abort_status_validates_verification_and_reports_rollback(self):
+        command = self.controller["operation_recovery_post_abort_status_command"]
+        globals_ = command.__globals__
+        with tempfile.TemporaryDirectory(
+            dir="/private/tmp",
+            prefix="post-abort-status-",
+        ) as directory:
+            root = Path(directory)
+            root.chmod(0o700)
+            plan = self._post_abort_plan(root)
+            Path(plan["application_receipt_path"]).touch(mode=0o600)
+            Path(plan["verification_receipt_path"]).touch(mode=0o600)
+            application = {
+                "receipt_digest": "a" * 64,
+                "pre_generation": plan["pre_generation"],
+                "post_generation": "systalyze:public:81679",
+            }
+            documents = {
+                "plan.json": plan,
+                plan["application_receipt_path"]: {
+                    "kind": "operation-recovery-application-receipt"
+                },
+                plan["verification_receipt_path"]: {},
+            }
+            replacements = {
+                "verify_post_abort_recovery_plan": (
+                    lambda _value, **_kwargs: plan
+                ),
+                "_operation_recovery_candidate": (
+                    lambda _args: plan["candidate_release"]
+                ),
+                "_operation_recovery_read_private_json": (
+                    lambda path, _label: documents[str(path)]
+                ),
+                "_operation_recovery_validate_application": (
+                    lambda _value, **_kwargs: application
+                ),
+                "_operation_recovery_post_abort_validate_verification": (
+                    Mock(side_effect=self.controller["OperationRecoveryError"](
+                        "invalid verification"
+                    ))
+                ),
+                "_print_result": lambda value: value,
+            }
+            originals = {key: globals_[key] for key in replacements}
+            globals_.update(replacements)
+            try:
+                with self.assertRaisesRegex(Exception, "invalid verification"):
+                    command(SimpleNamespace(plan="plan.json"))
+            finally:
+                globals_.update(originals)
+
+            Path(plan["verification_receipt_path"]).unlink()
+            Path(plan["rollback_receipt_path"]).touch(mode=0o600)
+            documents[plan["rollback_receipt_path"]] = {
+                "kind": "operation-recovery-rollback-receipt"
+            }
+            rollback = {"receipt_digest": "c" * 64}
+            replacements[
+                "_operation_recovery_validate_rollback_receipt"
+            ] = lambda _value, **_kwargs: rollback
+            originals = {key: globals_[key] for key in replacements}
+            globals_.update(replacements)
+            try:
+                result = command(SimpleNamespace(plan="plan.json"))
+            finally:
+                globals_.update(originals)
+
+        self.assertEqual(result["status"], "rolled-back")
+        self.assertEqual(result["rollback_receipt_digest"], "c" * 64)
+
+    def test_post_abort_status_rejects_non_object_lifecycle_artifacts(self):
+        command = self.controller["operation_recovery_post_abort_status_command"]
+        globals_ = command.__globals__
+        error = self.controller["OperationRecoveryError"]
+        with tempfile.TemporaryDirectory(
+            dir="/private/tmp",
+            prefix="post-abort-non-object-",
+        ) as directory:
+            root = Path(directory)
+            root.chmod(0o700)
+            plan = self._post_abort_plan(root)
+            application_path = Path(plan["application_receipt_path"])
+            application_path.touch(mode=0o600)
+            documents = {"plan.json": plan, str(application_path): []}
+            application = {"receipt_digest": "a" * 64}
+            replacements = {
+                "verify_post_abort_recovery_plan": (
+                    lambda _value, **_kwargs: plan
+                ),
+                "_operation_recovery_candidate": (
+                    lambda _args: plan["candidate_release"]
+                ),
+                "_operation_recovery_read_private_json": (
+                    lambda path, _label: documents[str(path)]
+                ),
+                "_operation_recovery_validate_journal": (
+                    Mock(side_effect=error("closed application artifact"))
+                ),
+                "_operation_recovery_validate_application": (
+                    lambda _value, **_kwargs: application
+                ),
+                "_operation_recovery_validate_rollback_journal": (
+                    Mock(side_effect=error("closed rollback artifact"))
+                ),
+            }
+            originals = {key: globals_[key] for key in replacements}
+            globals_.update(replacements)
+            try:
+                with self.assertRaisesRegex(error, "closed application"):
+                    command(SimpleNamespace(plan="plan.json"))
+
+                documents[str(application_path)] = {
+                    "kind": "operation-recovery-application-receipt"
+                }
+                rollback_path = Path(plan["rollback_receipt_path"])
+                rollback_path.touch(mode=0o600)
+                documents[str(rollback_path)] = []
+                with self.assertRaisesRegex(error, "closed rollback"):
+                    command(SimpleNamespace(plan="plan.json"))
+            finally:
+                globals_.update(originals)
 
     def test_exact_drain_journal_tracks_the_live_child_identity(self):
         start_time = self.controller["_process_start_time"](os.getpid())

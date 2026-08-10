@@ -31,6 +31,7 @@ from .operation_recovery import (
     OperationRecoveryError,
     verify_exact_drain_plan,
     verify_exact_drain_status,
+    verify_post_abort_recovery_plan,
 )
 from .canonical import StrictJsonError, digest, strict_json_loads
 from .provider_runtime import ProviderRuntimePolicy
@@ -3437,6 +3438,493 @@ async def apply_requeue_transaction(
         generation_before,
         f"{profile_id}:{schema}:{generation_after_value}",
     )
+
+
+async def apply_post_abort_recovery_transaction(
+    connection: Any,
+    *,
+    profile_id: str,
+    schema: str,
+    bank_id: str,
+    plan: Mapping[str, Any],
+    on_mutation_attempt: Callable[[], None] | None = None,
+) -> tuple[str, str]:
+    """Reset only the exact stopped-drain rows in one serializable CAS."""
+    verified = verify_post_abort_recovery_plan(plan)
+    if profile_id != "systalyze" or schema != "public" or bank_id != "engineering":
+        raise OperationRecoveryError(
+            "operation-recovery post-abort target is invalid"
+        )
+    quoted_schema = _quoted_identifier(schema, "database schema")
+    quoted_generation = _quoted_identifier(
+        GENERATION_TABLE,
+        "migration generation table",
+    )
+    selected = {
+        item["operation_id"]: item for item in verified["selected_operations"]
+    }
+    snapshot = {
+        item["operation_id"]: item
+        for item in verified["live_snapshot"]["operations"]
+    }
+    selected_identifiers = [uuid.UUID(value) for value in selected]
+    expires_at = verified["expires_at"]
+    transaction_expires_at = min(
+        expires_at,
+        int(time.time()) + verified["transaction_timeout_seconds"],
+    )
+    _assert_transaction_deadline(expires_at)
+    async with connection.transaction(isolation="serializable"):
+        await _configure_transaction_deadline(
+            connection,
+            transaction_expires_at,
+            start_transaction_timeout=True,
+        )
+        generation_value = await connection.fetchval(
+            f"""
+            SELECT generation
+            FROM {quoted_schema}.{quoted_generation}
+            WHERE singleton
+            FOR UPDATE
+            """
+        )
+        if type(generation_value) is not int:
+            raise OperationRecoveryError("migration generation is unavailable")
+        generation_before = f"{profile_id}:{schema}:{generation_value}"
+        if generation_before != verified["pre_generation"]:
+            raise OperationRecoveryError(
+                "operation-recovery post-abort generation drifted"
+            )
+        if await read_generation(connection, schema, profile_id) != generation_before:
+            raise OperationRecoveryError(
+                "operation-recovery post-abort generation authority differs"
+            )
+        competing_connections = await connection.fetchval(
+            """
+            SELECT count(*)
+            FROM pg_catalog.pg_stat_activity
+            WHERE datname = current_database()
+              AND pid <> pg_backend_pid()
+            """
+        )
+        if competing_connections != 0:
+            raise OperationRecoveryError(
+                "operation-recovery post-abort requires exclusive database access"
+            )
+        unexpected_blocker = await connection.fetchval(
+            f"""
+            SELECT EXISTS (
+                SELECT 1
+                FROM {quoted_schema}.async_operations
+                WHERE (
+                    status = 'processing'
+                    AND NOT (operation_id = ANY($1::uuid[]))
+                ) OR (
+                    status IN ('pending', 'failed', 'cancelled')
+                    AND (worker_id IS NOT NULL OR claimed_at IS NOT NULL)
+                    AND NOT (operation_id = ANY($1::uuid[]))
+                )
+            )
+            """,
+            selected_identifiers,
+        )
+        if unexpected_blocker is not False:
+            raise OperationRecoveryError(
+                "operation-recovery post-abort queue guard differs"
+            )
+        rows = await read_safe_operation_rows(
+            connection,
+            schema=schema,
+            bank_id=bank_id,
+            operation_ids=list(snapshot),
+            lock_clause="FOR UPDATE",
+        )
+        rows_by_id = {row["operation_id"]: row for row in rows}
+        if set(rows_by_id) != set(snapshot) or any(
+            live_row_digest(rows_by_id[operation_id])
+            != snapshot[operation_id]["row_digest"]
+            for operation_id in snapshot
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery post-abort cohort drifted"
+            )
+        before = {key: dict(value) for key, value in rows_by_id.items()}
+        await _configure_transaction_deadline(
+            connection,
+            transaction_expires_at,
+        )
+        if on_mutation_attempt is not None:
+            on_mutation_attempt()
+        result = await connection.execute(
+            f"""
+            UPDATE {quoted_schema}.async_operations
+            SET status = 'pending',
+                error_message = CASE
+                    WHEN status = 'failed' THEN NULL ELSE error_message END,
+                completed_at = CASE
+                    WHEN status = 'failed' THEN NULL ELSE completed_at END,
+                next_retry_at = CASE
+                    WHEN status = 'failed' THEN NULL ELSE next_retry_at END,
+                retry_count = CASE
+                    WHEN status = 'failed' THEN 0 ELSE retry_count END,
+                worker_id = NULL,
+                claimed_at = NULL,
+                updated_at = NOW()
+            WHERE operation_id = ANY($1::uuid[])
+              AND bank_id = $2
+              AND (
+                    (status = 'processing'
+                     AND encode(
+                         sha256(convert_to(worker_id, 'UTF8')),
+                         'hex'
+                     ) = $3)
+                    OR (status = 'failed'
+                        AND worker_id IS NULL
+                        AND claimed_at IS NULL)
+              )
+            """,
+            selected_identifiers,
+            bank_id,
+            verified["reference_worker_id_digest"],
+        )
+        if result != f"UPDATE {len(selected)}":
+            raise OperationRecoveryError(
+                "operation-recovery post-abort row count differs"
+            )
+        generation_after_value = await connection.fetchval(
+            f"""
+            SELECT generation
+            FROM {quoted_schema}.{quoted_generation}
+            WHERE singleton
+            """
+        )
+        if generation_after_value != generation_value + 1:
+            raise OperationRecoveryError(
+                "operation-recovery post-abort generation did not advance once"
+            )
+        post_rows = await read_safe_operation_rows(
+            connection,
+            schema=schema,
+            bank_id=bank_id,
+            operation_ids=list(snapshot),
+        )
+        post = {row["operation_id"]: row for row in post_rows}
+        if set(post) != set(snapshot):
+            raise OperationRecoveryError(
+                "operation-recovery post-abort post-state is incomplete"
+            )
+        for operation_id, prior in before.items():
+            after = post[operation_id]
+            item = selected.get(operation_id)
+            if item is None:
+                if live_row_digest(after) != live_row_digest(prior):
+                    raise OperationRecoveryError(
+                        "operation-recovery post-abort preserved row changed"
+                    )
+                continue
+            if (
+                after["status"] != "pending"
+                or after["worker_id_present"]
+                or after["worker_id_digest"] is not None
+                or after["claimed_at"] is not None
+                or after["task_payload_digest"] != item["task_payload_digest"]
+                or after["result_metadata_digest"]
+                != prior["result_metadata_digest"]
+                or after["updated_at"] == prior["updated_at"]
+            ):
+                raise OperationRecoveryError(
+                    "operation-recovery post-abort post-state differs"
+                )
+            if item["expected_status"] == "processing" and any(
+                after[key] != prior[key]
+                for key in (
+                    "completed_at",
+                    "retry_count",
+                    "next_retry_at",
+                    "error_category",
+                    "error_digest",
+                )
+            ):
+                raise OperationRecoveryError(
+                    "operation-recovery post-abort processing row differs"
+                )
+            if item["expected_status"] == "failed" and (
+                after["completed_at"] is not None
+                or after["retry_count"] != 0
+                or after["next_retry_at"] is not None
+                or after["error_category"] != "none"
+                or after["error_digest"] is not None
+            ):
+                raise OperationRecoveryError(
+                    "operation-recovery post-abort failed row differs"
+                )
+        await _configure_transaction_deadline(
+            connection,
+            transaction_expires_at,
+        )
+        _assert_transaction_deadline(transaction_expires_at)
+    return (
+        generation_before,
+        f"{profile_id}:{schema}:{generation_after_value}",
+    )
+
+
+async def rollback_post_abort_recovery_transaction(
+    connection: Any,
+    *,
+    profile_id: str,
+    schema: str,
+    bank_id: str,
+    plan: Mapping[str, Any],
+    application: Mapping[str, Any],
+    rollback_record: Mapping[str, Any],
+    preimage: Sequence[Mapping[str, Any]] | None,
+) -> tuple[str, str]:
+    """Restore the exact post-abort preimage before any row is reclaimed."""
+    verified = verify_post_abort_recovery_plan(plan, allow_expired=True)
+    if profile_id != "systalyze" or schema != "public" or bank_id != "engineering":
+        raise OperationRecoveryError(
+            "operation-recovery post-abort rollback target is invalid"
+        )
+    quoted_schema = _quoted_identifier(schema, "database schema")
+    quoted_generation = _quoted_identifier(
+        GENERATION_TABLE,
+        "migration generation table",
+    )
+    selected = {
+        item["operation_id"]: item for item in verified["selected_operations"]
+    }
+    snapshot = {
+        item["operation_id"]: item
+        for item in verified["live_snapshot"]["operations"]
+    }
+    preimage_by_id = (
+        {item["operation_id"]: dict(item) for item in preimage}
+        if preimage is not None
+        else None
+    )
+    if preimage_by_id is not None and set(preimage_by_id) != set(selected):
+        raise OperationRecoveryError(
+            "operation-recovery post-abort rollback preimage row set differs"
+        )
+    rollback_rows = []
+    if preimage_by_id is not None:
+        for operation_id in sorted(selected):
+            item = selected[operation_id]
+            row = preimage_by_id[operation_id]
+            if (
+                row.get("status") != item["expected_status"]
+                or row.get("status") not in {"processing", "failed"}
+                or row.get("task_payload_digest") != item["task_payload_digest"]
+            ):
+                raise OperationRecoveryError(
+                    "operation-recovery post-abort rollback preimage differs"
+                )
+            rollback_rows.append(
+                {
+                    "operation_id": operation_id,
+                    "status": row["status"],
+                    "error_message": row.get("error_message"),
+                    "completed_at": row.get("completed_at"),
+                    "next_retry_at": row.get("next_retry_at"),
+                    "worker_id": row.get("worker_id"),
+                    "claimed_at": row.get("claimed_at"),
+                    "retry_count": row.get("retry_count"),
+                    "updated_at": row.get("updated_at"),
+                }
+            )
+    transaction_expires_at = (
+        int(time.time()) + verified["transaction_timeout_seconds"]
+    )
+    async with connection.transaction(isolation="serializable"):
+        await _configure_transaction_deadline(
+            connection,
+            transaction_expires_at,
+            start_transaction_timeout=True,
+        )
+        generation_value = await connection.fetchval(
+            f"""
+            SELECT generation
+            FROM {quoted_schema}.{quoted_generation}
+            WHERE singleton
+            FOR UPDATE
+            """
+        )
+        if type(generation_value) is not int:
+            raise OperationRecoveryError("migration generation is unavailable")
+        generation_before = f"{profile_id}:{schema}:{generation_value}"
+        if (
+            rollback_record.get("pre_generation")
+            != application.get("post_generation")
+            or generation_before
+            not in {
+                rollback_record.get("pre_generation"),
+                rollback_record.get("post_generation"),
+            }
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery post-abort rollback generation drifted"
+            )
+        competing_connections = await connection.fetchval(
+            """
+            SELECT count(*)
+            FROM pg_catalog.pg_stat_activity
+            WHERE datname = current_database()
+              AND pid <> pg_backend_pid()
+            """
+        )
+        if competing_connections != 0:
+            raise OperationRecoveryError(
+                "operation-recovery post-abort rollback requires exclusive "
+                "database access"
+            )
+        await _configure_transaction_deadline(
+            connection,
+            transaction_expires_at,
+        )
+        rows = await read_safe_operation_rows(
+            connection,
+            schema=schema,
+            bank_id=bank_id,
+            operation_ids=list(snapshot),
+            lock_clause="FOR UPDATE",
+        )
+        rows_by_id = {row["operation_id"]: row for row in rows}
+        if set(rows_by_id) != set(snapshot):
+            raise OperationRecoveryError(
+                "operation-recovery post-abort rollback cohort differs"
+            )
+        if generation_before == rollback_record.get("post_generation"):
+            if any(
+                live_row_digest(rows_by_id[operation_id])
+                != snapshot[operation_id]["row_digest"]
+                for operation_id in snapshot
+            ):
+                raise OperationRecoveryError(
+                    "operation-recovery post-abort rollback state differs"
+                )
+            return (
+                rollback_record["pre_generation"],
+                rollback_record["post_generation"],
+            )
+        if preimage_by_id is None:
+            raise OperationRecoveryError(
+                "operation-recovery post-abort rollback preimage is required"
+            )
+        for operation_id, row in rows_by_id.items():
+            item = selected.get(operation_id)
+            if item is None:
+                if live_row_digest(row) != snapshot[operation_id]["row_digest"]:
+                    raise OperationRecoveryError(
+                        "operation-recovery post-abort rollback preserved row "
+                        "changed"
+                    )
+                continue
+            before = snapshot[operation_id]
+            if (
+                row["status"] != "pending"
+                or row["worker_id_present"]
+                or row["worker_id_digest"] is not None
+                or row["claimed_at"] is not None
+                or row["task_payload_digest"] != item["task_payload_digest"]
+                or row["result_metadata_digest"]
+                != before["result_metadata_digest"]
+            ):
+                raise OperationRecoveryError(
+                    "operation-recovery post-abort rollback is no longer safe"
+                )
+            if item["expected_status"] == "processing" and (
+                row["retry_count"] != before["retry_count"]
+                or row["completed_at"] != before["completed_at"]
+                or row["next_retry_at"] != before["next_retry_at"]
+                or row["error_digest"] != before["error_digest"]
+            ):
+                raise OperationRecoveryError(
+                    "operation-recovery post-abort rollback is no longer safe"
+                )
+            if item["expected_status"] == "failed" and (
+                row["retry_count"] != 0
+                or row["completed_at"] is not None
+                or row["next_retry_at"] is not None
+                or row["error_category"] != "none"
+                or row["error_digest"] is not None
+            ):
+                raise OperationRecoveryError(
+                    "operation-recovery post-abort rollback is no longer safe"
+                )
+        await _configure_transaction_deadline(
+            connection,
+            transaction_expires_at,
+        )
+        result = await connection.execute(
+            f"""
+            UPDATE {quoted_schema}.async_operations AS target
+            SET status = source.status,
+                error_message = source.error_message,
+                completed_at = source.completed_at,
+                next_retry_at = source.next_retry_at,
+                worker_id = source.worker_id,
+                claimed_at = source.claimed_at,
+                retry_count = source.retry_count,
+                updated_at = source.updated_at
+            FROM jsonb_to_recordset($1::jsonb) AS source(
+                operation_id uuid,
+                status text,
+                error_message text,
+                completed_at timestamptz,
+                next_retry_at timestamptz,
+                worker_id text,
+                claimed_at timestamptz,
+                retry_count integer,
+                updated_at timestamptz
+            )
+            WHERE target.operation_id = source.operation_id
+              AND target.bank_id = $2
+              AND target.status = 'pending'
+            """,
+            json.dumps(rollback_rows),
+            bank_id,
+        )
+        if result != f"UPDATE {len(selected)}":
+            raise OperationRecoveryError(
+                "operation-recovery post-abort rollback row count differs"
+            )
+        generation_after_value = await connection.fetchval(
+            f"""
+            SELECT generation
+            FROM {quoted_schema}.{quoted_generation}
+            WHERE singleton
+            """
+        )
+        generation_after = f"{profile_id}:{schema}:{generation_after_value}"
+        if (
+            generation_after_value != generation_value + 1
+            or generation_after != rollback_record.get("post_generation")
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery post-abort rollback generation differs"
+            )
+        post_rows = await read_safe_operation_rows(
+            connection,
+            schema=schema,
+            bank_id=bank_id,
+            operation_ids=list(snapshot),
+        )
+        post = {row["operation_id"]: row for row in post_rows}
+        if set(post) != set(snapshot) or any(
+            live_row_digest(post[operation_id])
+            != snapshot[operation_id]["row_digest"]
+            for operation_id in snapshot
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery post-abort rollback verification differs"
+            )
+        await _configure_transaction_deadline(
+            connection,
+            transaction_expires_at,
+        )
+        _assert_transaction_deadline(transaction_expires_at)
+    return generation_before, generation_after
 
 
 async def apply_claim_release_transaction(

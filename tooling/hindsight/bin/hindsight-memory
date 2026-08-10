@@ -168,6 +168,7 @@ from hindsight_memory_control_plane.operation_recovery import (  # noqa: E402
     create_exact_drain_plan,
     create_global_queue_blocker_classification,
     create_live_snapshot,
+    create_post_abort_recovery_plan,
     create_requeue_plan,
     normalize_pg0_binding,
     verify_cohort_manifest,
@@ -177,6 +178,7 @@ from hindsight_memory_control_plane.operation_recovery import (  # noqa: E402
     verify_exact_drain_status,
     verify_global_queue_blocker_classification,
     verify_live_snapshot,
+    verify_post_abort_recovery_plan,
     verify_requeue_plan,
 )
 from hindsight_memory_control_plane.operation_recovery_runtime import (  # noqa: E402
@@ -185,6 +187,7 @@ from hindsight_memory_control_plane.operation_recovery_runtime import (  # noqa:
     QUEUE_BLOCKER_GUARD_CONTRACT_DIGEST,
     QUEUE_BLOCKER_GUARD_CONTRACT_VERSION,
     apply_claim_release_transaction,
+    apply_post_abort_recovery_transaction,
     apply_requeue_transaction,
     assert_connected_live_database,
     connect_verified_local_postgres,
@@ -204,6 +207,7 @@ from hindsight_memory_control_plane.operation_recovery_runtime import (  # noqa:
     read_selected_preimage,
     read_snapshot as read_operation_recovery_snapshot,
     rollback_claim_release_transaction,
+    rollback_post_abort_recovery_transaction,
     rollback_requeue_transaction,
     validate_exact_drain_provider_policy,
 )
@@ -9289,6 +9293,1029 @@ def operation_recovery_drain_verify_command(args: argparse.Namespace) -> int:
             return _operation_recovery_drain_verify_locked(args, plan)
 
 
+def operation_recovery_post_abort_plan_command(args: argparse.Namespace) -> int:
+    candidate_before = _operation_recovery_candidate(args)
+    reference = verify_exact_drain_plan(
+        _operation_recovery_read_private_json(
+            args.reference_plan,
+            "reference exact drain plan",
+        ),
+        allow_expired=True,
+    )
+    snapshot = verify_live_snapshot(
+        _operation_recovery_read_private_json(
+            args.snapshot,
+            "post-abort live snapshot",
+        )
+    )
+    rollback_backup = _operation_recovery_read_private_json(
+        args.rollback_backup_evidence,
+        "post-abort rollback backup evidence",
+    )
+    if not isinstance(rollback_backup, Mapping):
+        raise OperationRecoveryError(
+            "operation-recovery post-abort backup evidence is invalid"
+        )
+    age = _operation_recovery_tool(Path(args.age), "age")
+    encryption = _operation_recovery_rollback_encryption(
+        args.rollback_recipient
+    )
+    source_authority = rollback_backup.get("source_authority", {})
+    if (
+        str(age) != encryption["age_path"]
+        or not isinstance(source_authority, Mapping)
+        or rollback_backup.get("toolchain_digest")
+        != _operation_recovery_toolchain_digest()
+        or _regular_file_digest(
+            args.rollback_backup,
+            "post-abort rollback backup",
+        )
+        != rollback_backup.get("artifact_sha256")
+        or source_authority.get("generation_before")
+        != snapshot["generation_before"]
+        or source_authority.get("generation_after")
+        != snapshot["generation_after"]
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery post-abort backup authority differs"
+        )
+    plan = create_post_abort_recovery_plan(
+        reference,
+        snapshot,
+        candidate_release=candidate_before,
+        rollback_backup=rollback_backup,
+        rollback_encryption=encryption,
+        rollback_backup_path=args.rollback_backup,
+        rollback_bundle_path=args.rollback_bundle,
+        authorization_receipt_path=args.authorization_receipt,
+        application_receipt_path=args.application_receipt,
+        verification_receipt_path=args.verification_receipt,
+        rollback_receipt_path=args.rollback_receipt,
+    )
+    current_binding = read_pg0_registration("systalyze")
+    current_binding.pop("_password")
+    current_binding = normalize_pg0_binding(
+        current_binding,
+        "post-abort current pg0 binding",
+    )
+    if source_authority.get("binding") != current_binding:
+        raise OperationRecoveryError(
+            "operation-recovery post-abort backup binding drifted"
+        )
+    output_path = Path(args.output)
+    normalized_output = unicodedata.normalize(
+        "NFD",
+        str(output_path.resolve(strict=False)).casefold(),
+    )
+    reserved = {
+        unicodedata.normalize(
+            "NFD",
+            str(Path(value).resolve(strict=False)).casefold(),
+        )
+        for key, value in plan.items()
+        if key.endswith("_path") and isinstance(value, str)
+    }
+    if normalized_output in reserved:
+        raise OperationRecoveryError(
+            "operation-recovery post-abort plan path aliases an artifact"
+        )
+    if _operation_recovery_candidate(args) != candidate_before:
+        raise OperationRecoveryError(
+            "operation-recovery candidate drifted during post-abort planning"
+        )
+    write_private(output_path, plan, create_only=True)
+    return _print_result(
+        {
+            "status": "planned",
+            "authority": plan["authority"],
+            "mutation_authorized": plan["mutation_authorized"],
+            "plan_digest": plan["plan_digest"],
+            "expires_at": plan["expires_at"],
+            "selected_operation_count": plan["selected_operation_count"],
+            "selected_status_counts": plan["selected_status_counts"],
+            "selected_type_counts": plan["selected_type_counts"],
+            "output": str(output_path.resolve()),
+        }
+    )
+
+
+def operation_recovery_post_abort_status_command(args: argparse.Namespace) -> int:
+    candidate = _operation_recovery_candidate(args)
+    plan = verify_post_abort_recovery_plan(
+        _operation_recovery_read_private_json(args.plan, "post-abort plan"),
+        allow_expired=True,
+    )
+    if candidate != plan["candidate_release"]:
+        raise OperationRecoveryError("post-abort candidate differs")
+    result = {
+        "status": "awaiting-approval",
+        "plan_digest": plan["plan_digest"],
+        "expires_at": plan["expires_at"],
+        "expired": int(time.time()) >= plan["expires_at"],
+        "selected_operation_count": plan["selected_operation_count"],
+        "selected_status_counts": plan["selected_status_counts"],
+    }
+    application = None
+    application_path = Path(plan["application_receipt_path"])
+    verification_path = Path(plan["verification_receipt_path"])
+    rollback_path = Path(plan["rollback_receipt_path"])
+    rollback_value = (
+        _operation_recovery_read_private_json(
+            rollback_path,
+            "post-abort rollback record",
+        )
+        if rollback_path.exists()
+        else None
+    )
+    if application_path.exists():
+        application_value = _operation_recovery_read_private_json(
+            application_path,
+            "post-abort application record",
+        )
+        if (
+            isinstance(application_value, Mapping)
+            and application_value.get("kind")
+            == "operation-recovery-application-receipt"
+        ):
+            application = _operation_recovery_validate_application(
+                application_value,
+                plan=plan,
+                require_artifacts=not (
+                    isinstance(rollback_value, Mapping)
+                    and rollback_value.get("kind")
+                    == "operation-recovery-rollback-receipt"
+                ),
+            )
+            result.update(
+                {
+                    "status": "applied",
+                    "application_receipt_digest": application[
+                        "receipt_digest"
+                    ],
+                    "rollback_approval_digest": (
+                        _operation_recovery_rollback_approval(
+                            plan,
+                            application,
+                        )
+                    ),
+                }
+            )
+        else:
+            _operation_recovery_validate_journal(application_value, plan=plan)
+            if verification_path.exists() or rollback_path.exists():
+                raise OperationRecoveryError(
+                    "operation-recovery post-abort lifecycle is invalid"
+                )
+            result["status"] = "interrupted"
+    elif verification_path.exists() or rollback_path.exists():
+        raise OperationRecoveryError(
+            "operation-recovery post-abort lifecycle is invalid"
+        )
+    if application is not None and verification_path.exists():
+        verification = _operation_recovery_post_abort_validate_verification(
+            _operation_recovery_read_private_json(
+                verification_path,
+                "post-abort verification receipt",
+            ),
+            plan=plan,
+            application=application,
+            authority=plan["installation_authority"],
+        )
+        result.update(
+            {
+                "status": "verified",
+                "verification_receipt_digest": verification[
+                    "receipt_digest"
+                ],
+            }
+        )
+    if application is not None and rollback_path.exists():
+        if (
+            isinstance(rollback_value, Mapping)
+            and rollback_value.get("kind")
+            == "operation-recovery-rollback-receipt"
+        ):
+            rollback = _operation_recovery_validate_rollback_receipt(
+                rollback_value,
+                plan=plan,
+                application=application,
+            )
+            result.update(
+                {
+                    "status": "rolled-back",
+                    "rollback_receipt_digest": rollback["receipt_digest"],
+                }
+            )
+        else:
+            rollback = _operation_recovery_validate_rollback_journal(
+                rollback_value,
+                plan=plan,
+                application=application,
+            )
+            result.update(
+                {
+                    "status": "rollback-interrupted",
+                    "rollback_journal_digest": rollback["receipt_digest"],
+                }
+            )
+    return _print_result(result)
+
+
+async def _operation_recovery_post_abort_apply(
+    args: argparse.Namespace,
+    plan: Mapping[str, Any],
+    precommit: dict[str, Any],
+) -> tuple[str, str]:
+    connection = await _operation_recovery_connect_live(args, readonly=False)
+    try:
+        return await apply_post_abort_recovery_transaction(
+            connection,
+            profile_id="systalyze",
+            schema="public",
+            bank_id="engineering",
+            plan=plan,
+            on_mutation_attempt=lambda: precommit.__setitem__(
+                "mutation_attempted",
+                True,
+            ),
+        )
+    finally:
+        await connection.close()
+
+
+def operation_recovery_post_abort_apply_command(args: argparse.Namespace) -> int:
+    candidate = _operation_recovery_candidate(args)
+    plan = verify_post_abort_recovery_plan(
+        _operation_recovery_read_private_json(args.plan, "post-abort plan"),
+        allow_expired=True,
+    )
+    if (
+        not hmac.compare_digest(args.approval_digest, plan["plan_digest"])
+        or candidate != plan["candidate_release"]
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery post-abort apply approval differs"
+        )
+    manager = _portable_manager(args)
+    lock_expires_at = plan["expires_at"]
+    if Path(plan["application_receipt_path"]).exists():
+        lock_expires_at = int(time.time()) + plan[
+            "transaction_timeout_seconds"
+        ]
+    with _operation_recovery_precommit_artifacts() as precommit, (
+        _operation_recovery_lock(
+            manager,
+            expires_at=lock_expires_at,
+        )
+    ), _operation_recovery_install_lock(
+        manager,
+        expires_at=lock_expires_at,
+    ):
+        locked_plan = verify_post_abort_recovery_plan(
+            _operation_recovery_read_private_json(
+                args.plan,
+                "post-abort plan",
+            ),
+            allow_expired=True,
+        )
+        if locked_plan != plan:
+            raise OperationRecoveryError(
+                "operation-recovery post-abort plan changed while locking"
+            )
+        if _operation_recovery_candidate(args) != candidate:
+            raise OperationRecoveryError(
+                "operation-recovery candidate drifted before post-abort apply"
+            )
+        authority = _operation_recovery_authority(
+            args,
+            postgres_system_identifier=(
+                EXPECTED_OPERATION_RECOVERY_INSTALLATION[
+                    "postgres_system_identifier"
+                ]
+            ),
+            lock_installer=False,
+        )
+        if authority != plan["installation_authority"]:
+            raise OperationRecoveryError(
+                "operation-recovery post-abort authority drifted"
+            )
+        application_path = Path(plan["application_receipt_path"])
+        journal = None
+        if application_path.exists():
+            existing = _operation_recovery_read_private_json(
+                application_path,
+                "post-abort application record",
+            )
+            if (
+                isinstance(existing, Mapping)
+                and existing.get("kind")
+                == "operation-recovery-application-receipt"
+            ):
+                application = _operation_recovery_validate_application(
+                    existing,
+                    plan=plan,
+                )
+                if Path(plan["rollback_receipt_path"]).exists():
+                    raise OperationRecoveryError(
+                        "operation-recovery post-abort was rolled back"
+                    )
+                evidence = asyncio.run(
+                    _operation_recovery_post_abort_verify_live(
+                        args,
+                        plan,
+                        application,
+                    )
+                )
+                return _print_result(
+                    {
+                        "status": "already-applied",
+                        "plan_digest": plan["plan_digest"],
+                        "pre_generation": application["pre_generation"],
+                        "post_generation": application["post_generation"],
+                        "application_receipt_digest": application[
+                            "receipt_digest"
+                        ],
+                        **evidence,
+                    }
+                )
+            journal = _operation_recovery_validate_journal(
+                existing,
+                plan=plan,
+            )
+            if Path(plan["rollback_receipt_path"]).exists():
+                raise OperationRecoveryError(
+                    "operation-recovery post-abort lifecycle is invalid"
+                )
+            try:
+                evidence = asyncio.run(
+                    _operation_recovery_post_abort_verify_live(
+                        args,
+                        plan,
+                        journal,
+                    )
+                )
+            except OperationRecoveryError:
+                try:
+                    asyncio.run(
+                        _operation_recovery_post_abort_verify_pre_live(
+                            args,
+                            plan,
+                        )
+                    )
+                except OperationRecoveryError as pre_error:
+                    raise OperationRecoveryError(
+                        "operation-recovery post-abort journal state differs"
+                    ) from pre_error
+            else:
+                application = _operation_recovery_finalize_journal(journal)
+                write_private(application_path, application)
+                return _print_result(
+                    {
+                        "status": "recovered-applied",
+                        "plan_digest": plan["plan_digest"],
+                        "pre_generation": application["pre_generation"],
+                        "post_generation": application["post_generation"],
+                        "application_receipt_digest": application[
+                            "receipt_digest"
+                        ],
+                        **evidence,
+                    }
+                )
+        else:
+            verify_post_abort_recovery_plan(plan)
+            if Path(plan["authorization_receipt_path"]).exists():
+                authorization = _operation_recovery_validate_authorization(plan)
+            else:
+                authorization = {
+                    "schema_version": 1,
+                    "kind": "operation-recovery-authorization-receipt",
+                    "plan_digest": plan["plan_digest"],
+                    "approval_digest": args.approval_digest,
+                    "candidate_release_digest": candidate["release_digest"],
+                    "authorized_at": int(time.time()),
+                }
+                authorization["receipt_digest"] = digest(authorization)
+                write_private(
+                    plan["authorization_receipt_path"],
+                    authorization,
+                    create_only=True,
+                )
+                precommit["created"].append(
+                    (
+                        plan["authorization_receipt_path"],
+                        _operation_recovery_artifact_identity(
+                            plan["authorization_receipt_path"]
+                        ),
+                    )
+                )
+
+        bundle_existed = Path(plan["rollback_bundle_path"]).exists()
+        bundle = asyncio.run(_operation_recovery_prepare_apply(args, plan))
+        if not bundle_existed:
+            precommit["created"].append(
+                (
+                    plan["rollback_bundle_path"],
+                    _operation_recovery_artifact_identity(
+                        plan["rollback_bundle_path"]
+                    ),
+                )
+            )
+        if journal is None:
+            backup_digest = _operation_recovery_planned_backup_digest(plan)
+            journal_body = {
+                "schema_version": 1,
+                "kind": "operation-recovery-application-journal",
+                "plan_digest": plan["plan_digest"],
+                "authorization_receipt_digest": authorization[
+                    "receipt_digest"
+                ],
+                "rollback_bundle_digest": bundle["ciphertext_sha256"],
+                "rollback_backup_digest": backup_digest,
+                "pre_generation": plan["pre_generation"],
+                "post_generation": _operation_recovery_next_generation(
+                    plan["pre_generation"]
+                ),
+                "selected_operation_count": plan[
+                    "selected_operation_count"
+                ],
+                "installation_authority_digest": digest(authority),
+                "applied_at": int(time.time()),
+            }
+            journal = {**journal_body, "receipt_digest": digest(journal_body)}
+            write_private(application_path, journal, create_only=True)
+            precommit["created"].append(
+                (
+                    str(application_path),
+                    _operation_recovery_artifact_identity(
+                        str(application_path)
+                    ),
+                )
+            )
+        verify_post_abort_recovery_plan(plan)
+        if _operation_recovery_candidate(args) != candidate:
+            raise OperationRecoveryError(
+                "operation-recovery candidate drifted before post-abort mutation"
+            )
+        before, after = asyncio.run(
+            _operation_recovery_post_abort_apply(args, plan, precommit)
+        )
+        post_authority = _operation_recovery_authority(
+            args,
+            postgres_system_identifier=(
+                EXPECTED_OPERATION_RECOVERY_INSTALLATION[
+                    "postgres_system_identifier"
+                ]
+            ),
+            lock_installer=False,
+        )
+        if post_authority != authority:
+            raise OperationRecoveryError(
+                "operation-recovery post-abort authority changed"
+            )
+        if before != journal["pre_generation"] or after != journal["post_generation"]:
+            raise OperationRecoveryError(
+                "operation-recovery post-abort generation differs"
+            )
+        application = _operation_recovery_finalize_journal(journal)
+        write_private(application_path, application)
+    return _print_result(
+        {
+            "status": "applied",
+            "plan_digest": plan["plan_digest"],
+            "pre_generation": before,
+            "post_generation": after,
+            "application_receipt_digest": application["receipt_digest"],
+        }
+    )
+
+
+async def _operation_recovery_post_abort_verify_live(
+    args: argparse.Namespace,
+    plan: Mapping[str, Any],
+    application: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    connection = await _operation_recovery_connect_live(args, readonly=True)
+    try:
+        generation_before, generation_after, rows = (
+            await read_operation_recovery_snapshot(
+                connection,
+                profile_id="systalyze",
+                schema="public",
+                bank_id="engineering",
+                operation_ids=[
+                    item["operation_id"]
+                    for item in plan["live_snapshot"]["operations"]
+                ],
+            )
+        )
+    finally:
+        await connection.close()
+    if (
+        generation_before != generation_after
+        or generation_before != application["post_generation"]
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery post-abort verification generation differs"
+        )
+    before_by_id = {
+        item["operation_id"]: item
+        for item in plan["live_snapshot"]["operations"]
+    }
+    selected = {
+        item["operation_id"]: item for item in plan["selected_operations"]
+    }
+    after_by_id = {row["operation_id"]: row for row in rows}
+    if set(after_by_id) != set(before_by_id):
+        raise OperationRecoveryError(
+            "operation-recovery post-abort verification cohort differs"
+        )
+    for operation_id, before in before_by_id.items():
+        after = after_by_id[operation_id]
+        item = selected.get(operation_id)
+        if item is None:
+            if live_row_digest(after) != before["row_digest"]:
+                raise OperationRecoveryError(
+                    "operation-recovery post-abort preserved row changed"
+                )
+            continue
+        if (
+            after["status"] != "pending"
+            or after["worker_id_present"]
+            or after["worker_id_digest"] is not None
+            or after["claimed_at"] is not None
+            or after["updated_at"] == before["updated_at"]
+            or after["task_payload_digest"] != item["task_payload_digest"]
+            or after["result_metadata_digest"]
+            != before["result_metadata_digest"]
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery post-abort verification differs"
+            )
+        if item["expected_status"] == "processing" and any(
+            after[key] != before[key]
+            for key in (
+                "completed_at",
+                "retry_count",
+                "next_retry_at",
+                "error_category",
+                "error_digest",
+            )
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery post-abort processing verification differs"
+            )
+        if item["expected_status"] == "failed" and (
+            after["completed_at"] is not None
+            or after["retry_count"] != 0
+            or after["next_retry_at"] is not None
+            or after["error_category"] != "none"
+            or after["error_digest"] is not None
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery post-abort failed verification differs"
+            )
+    return {
+        "generation": generation_before,
+        "selected_operation_count": len(selected),
+        "selected_status_counts": {"pending": len(selected)},
+        "cohort_operation_count": len(after_by_id),
+    }
+
+
+async def _operation_recovery_post_abort_verify_pre_live(
+    args: argparse.Namespace,
+    plan: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    connection = await _operation_recovery_connect_live(args, readonly=True)
+    try:
+        generation_before, generation_after, rows = (
+            await read_operation_recovery_snapshot(
+                connection,
+                profile_id="systalyze",
+                schema="public",
+                bank_id="engineering",
+                operation_ids=[
+                    item["operation_id"]
+                    for item in plan["live_snapshot"]["operations"]
+                ],
+            )
+        )
+    finally:
+        await connection.close()
+    snapshot = {
+        item["operation_id"]: item
+        for item in plan["live_snapshot"]["operations"]
+    }
+    live = {row["operation_id"]: row for row in rows}
+    if (
+        generation_before != generation_after
+        or generation_before != plan["pre_generation"]
+        or set(live) != set(snapshot)
+        or any(
+            live_row_digest(live[operation_id])
+            != snapshot[operation_id]["row_digest"]
+            for operation_id in snapshot
+        )
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery post-abort pre-state differs"
+        )
+    return {
+        "generation": generation_before,
+        "cohort_operation_count": len(live),
+    }
+
+
+def _operation_recovery_post_abort_validate_verification(
+    value: Any,
+    *,
+    plan: Mapping[str, Any],
+    application: Mapping[str, Any],
+    authority: Mapping[str, Any],
+    evidence: Mapping[str, Any] | None = None,
+) -> Mapping[str, Any]:
+    required = {
+        "schema_version",
+        "kind",
+        "plan_digest",
+        "application_receipt_digest",
+        "installation_authority_digest",
+        "evidence",
+        "verified_at",
+        "receipt_digest",
+    }
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != required
+        or value.get("schema_version") != 1
+        or value.get("kind")
+        != "operation-recovery-post-abort-verification-receipt"
+        or value.get("plan_digest") != plan["plan_digest"]
+        or value.get("application_receipt_digest")
+        != application["receipt_digest"]
+        or value.get("installation_authority_digest") != digest(authority)
+        or not isinstance(value.get("evidence"), Mapping)
+        or set(value["evidence"])
+        != {
+            "generation",
+            "selected_operation_count",
+            "selected_status_counts",
+            "cohort_operation_count",
+        }
+        or value["evidence"].get("generation")
+        != application["post_generation"]
+        or value["evidence"].get("selected_operation_count")
+        != plan["selected_operation_count"]
+        or value["evidence"].get("selected_status_counts")
+        != {"pending": plan["selected_operation_count"]}
+        or value["evidence"].get("cohort_operation_count") != 48
+        or (evidence is not None and value["evidence"] != evidence)
+        or type(value.get("verified_at")) is not int
+        or value["verified_at"] < application["applied_at"]
+        or value.get("receipt_digest")
+        != _operation_recovery_receipt_digest(value)
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery post-abort verification receipt is invalid"
+        )
+    return dict(value)
+
+
+def operation_recovery_post_abort_verify_command(args: argparse.Namespace) -> int:
+    candidate = _operation_recovery_candidate(args)
+    plan = verify_post_abort_recovery_plan(
+        _operation_recovery_read_private_json(args.plan, "post-abort plan"),
+        allow_expired=True,
+    )
+    if candidate != plan["candidate_release"]:
+        raise OperationRecoveryError("post-abort candidate differs")
+    application_value = _operation_recovery_read_private_json(
+        plan["application_receipt_path"],
+        "post-abort application record",
+    )
+    is_journal = (
+        isinstance(application_value, Mapping)
+        and application_value.get("kind")
+        == "operation-recovery-application-journal"
+    )
+    application = (
+        _operation_recovery_validate_journal(application_value, plan=plan)
+        if is_journal
+        else _operation_recovery_validate_application(
+            application_value,
+            plan=plan,
+        )
+    )
+    manager = _portable_manager(args)
+    lock_expires_at = int(time.time()) + plan["transaction_timeout_seconds"]
+    with _operation_recovery_lock(
+        manager,
+        expires_at=lock_expires_at,
+    ), _operation_recovery_install_lock(
+        manager,
+        expires_at=lock_expires_at,
+    ):
+        if _operation_recovery_candidate(args) != candidate:
+            raise OperationRecoveryError(
+                "operation-recovery candidate drifted before post-abort verify"
+            )
+        authority = _operation_recovery_authority(
+            args,
+            postgres_system_identifier=(
+                EXPECTED_OPERATION_RECOVERY_INSTALLATION[
+                    "postgres_system_identifier"
+                ]
+            ),
+            lock_installer=False,
+        )
+        if authority != plan["installation_authority"]:
+            raise OperationRecoveryError(
+                "operation-recovery post-abort authority drifted"
+            )
+        evidence = asyncio.run(
+            _operation_recovery_post_abort_verify_live(
+                args,
+                plan,
+                application,
+            )
+        )
+        if is_journal:
+            application = _operation_recovery_finalize_journal(application)
+            write_private(plan["application_receipt_path"], application)
+        verification_path = Path(plan["verification_receipt_path"])
+        if verification_path.exists():
+            receipt = _operation_recovery_post_abort_validate_verification(
+                _operation_recovery_read_private_json(
+                    verification_path,
+                    "post-abort verification receipt",
+                ),
+                plan=plan,
+                application=application,
+                authority=authority,
+                evidence=evidence,
+            )
+            return _print_result(
+                {
+                    "status": "verified",
+                    "plan_digest": plan["plan_digest"],
+                    "receipt_digest": receipt["receipt_digest"],
+                    **evidence,
+                }
+            )
+        body = {
+            "schema_version": 1,
+            "kind": "operation-recovery-post-abort-verification-receipt",
+            "plan_digest": plan["plan_digest"],
+            "application_receipt_digest": application["receipt_digest"],
+            "installation_authority_digest": digest(authority),
+            "evidence": evidence,
+            "verified_at": int(time.time()),
+        }
+        receipt = {**body, "receipt_digest": digest(body)}
+        write_private(verification_path, receipt, create_only=True)
+    return _print_result(
+        {
+            "status": "verified",
+            "plan_digest": plan["plan_digest"],
+            "receipt_digest": receipt["receipt_digest"],
+            **evidence,
+        }
+    )
+
+
+def operation_recovery_post_abort_rollback_command(args: argparse.Namespace) -> int:
+    candidate = _operation_recovery_candidate(args)
+    plan = verify_post_abort_recovery_plan(
+        _operation_recovery_read_private_json(args.plan, "post-abort plan"),
+        allow_expired=True,
+    )
+    application_value = _operation_recovery_read_private_json(
+        plan["application_receipt_path"],
+        "post-abort application receipt",
+    )
+    application = _operation_recovery_validate_application(
+        application_value,
+        plan=plan,
+        require_artifacts=False,
+    )
+    if (
+        candidate != plan["candidate_release"]
+        or not hmac.compare_digest(
+            args.approval_digest,
+            _operation_recovery_rollback_approval(plan, application),
+        )
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery post-abort rollback approval differs"
+        )
+    manager = _portable_manager(args)
+    lock_expires_at = int(time.time()) + plan["transaction_timeout_seconds"]
+    with _operation_recovery_lock(
+        manager,
+        expires_at=lock_expires_at,
+    ), _operation_recovery_install_lock(
+        manager,
+        expires_at=lock_expires_at,
+    ):
+        locked_plan = verify_post_abort_recovery_plan(
+            _operation_recovery_read_private_json(args.plan, "post-abort plan"),
+            allow_expired=True,
+        )
+        locked_application_value = _operation_recovery_read_private_json(
+            plan["application_receipt_path"],
+            "post-abort application receipt",
+        )
+        if locked_plan != plan or locked_application_value != application_value:
+            raise OperationRecoveryError(
+                "operation-recovery post-abort authority changed while locking"
+            )
+        if _operation_recovery_candidate(args) != candidate:
+            raise OperationRecoveryError(
+                "operation-recovery candidate drifted before post-abort rollback"
+            )
+        authority = _operation_recovery_authority(
+            args,
+            postgres_system_identifier=(
+                EXPECTED_OPERATION_RECOVERY_INSTALLATION[
+                    "postgres_system_identifier"
+                ]
+            ),
+            lock_installer=False,
+        )
+        if authority != plan["installation_authority"]:
+            raise OperationRecoveryError(
+                "operation-recovery post-abort rollback authority drifted"
+            )
+        rollback_path = Path(plan["rollback_receipt_path"])
+        if rollback_path.exists():
+            existing = _operation_recovery_read_private_json(
+                rollback_path,
+                "post-abort rollback record",
+            )
+            if (
+                isinstance(existing, Mapping)
+                and existing.get("kind")
+                == "operation-recovery-rollback-receipt"
+            ):
+                application = _operation_recovery_validate_application(
+                    locked_application_value,
+                    plan=plan,
+                    require_artifacts=False,
+                )
+                receipt = _operation_recovery_validate_rollback_receipt(
+                    existing,
+                    plan=plan,
+                    application=application,
+                )
+                if _operation_recovery_candidate(args) != candidate:
+                    raise OperationRecoveryError(
+                        "operation-recovery candidate drifted before rollback "
+                        "verification"
+                    )
+
+                async def verify_rollback() -> tuple[str, str]:
+                    connection = await _operation_recovery_connect_live(
+                        args,
+                        readonly=False,
+                    )
+                    try:
+                        return await rollback_post_abort_recovery_transaction(
+                            connection,
+                            profile_id="systalyze",
+                            schema="public",
+                            bank_id="engineering",
+                            plan=plan,
+                            application=application,
+                            rollback_record=receipt,
+                            preimage=None,
+                        )
+                    finally:
+                        await connection.close()
+
+                before, after = asyncio.run(verify_rollback())
+                if (
+                    before != receipt["pre_generation"]
+                    or after != receipt["post_generation"]
+                ):
+                    raise OperationRecoveryError(
+                        "operation-recovery post-abort rollback generation differs"
+                    )
+                return _print_result(
+                    {
+                        "status": "already-rolled-back",
+                        "plan_digest": plan["plan_digest"],
+                        "pre_generation": receipt["pre_generation"],
+                        "post_generation": receipt["post_generation"],
+                        "receipt_digest": receipt["receipt_digest"],
+                    }
+                )
+            application = _operation_recovery_validate_application(
+                locked_application_value,
+                plan=plan,
+            )
+            journal = _operation_recovery_validate_rollback_journal(
+                existing,
+                plan=plan,
+                application=application,
+            )
+        else:
+            application = _operation_recovery_validate_application(
+                locked_application_value,
+                plan=plan,
+            )
+            journal_body = {
+                "schema_version": 1,
+                "kind": "operation-recovery-rollback-journal",
+                "plan_digest": plan["plan_digest"],
+                "application_receipt_digest": application["receipt_digest"],
+                "pre_generation": application["post_generation"],
+                "post_generation": _operation_recovery_next_generation(
+                    application["post_generation"]
+                ),
+                "selected_operation_count": plan[
+                    "selected_operation_count"
+                ],
+                "installation_authority_digest": digest(authority),
+                "recorded_at": int(time.time()),
+            }
+            journal = {**journal_body, "receipt_digest": digest(journal_body)}
+            write_private(rollback_path, journal, create_only=True)
+
+        envelope = _operation_recovery_validate_bundle(plan)
+        ciphertext = b""
+        plaintext = b""
+        try:
+            ciphertext = base64.b64decode(
+                envelope["ciphertext_base64"],
+                validate=True,
+            )
+            plaintext = _age_decrypt_ciphertext(
+                age_path=_operation_recovery_tool(Path(args.age), "age"),
+                age_identity_path=_operation_recovery_rollback_identity_path(
+                    args.age_identity
+                ),
+                ciphertext=ciphertext,
+            )
+            bundle = strict_json_loads(plaintext)
+        finally:
+            ciphertext = b""
+            plaintext = b""
+        if (
+            not isinstance(bundle, Mapping)
+            or set(bundle)
+            != {"schema_version", "kind", "plan_digest", "rows"}
+            or bundle.get("schema_version") != 1
+            or bundle.get("kind")
+            != "operation-recovery-selected-row-preimage"
+            or bundle.get("plan_digest") != plan["plan_digest"]
+            or not isinstance(bundle.get("rows"), list)
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery post-abort rollback preimage is invalid"
+            )
+
+        if _operation_recovery_candidate(args) != candidate:
+            raise OperationRecoveryError(
+                "operation-recovery candidate drifted before rollback mutation"
+            )
+
+        async def rollback() -> tuple[str, str]:
+            connection = await _operation_recovery_connect_live(
+                args,
+                readonly=False,
+            )
+            try:
+                return await rollback_post_abort_recovery_transaction(
+                    connection,
+                    profile_id="systalyze",
+                    schema="public",
+                    bank_id="engineering",
+                    plan=plan,
+                    application=application,
+                    rollback_record=journal,
+                    preimage=bundle["rows"],
+                )
+            finally:
+                await connection.close()
+
+        before, after = asyncio.run(rollback())
+        if before != journal["pre_generation"] or after != journal["post_generation"]:
+            raise OperationRecoveryError(
+                "operation-recovery post-abort rollback generation differs"
+            )
+        receipt = _operation_recovery_finalize_rollback_journal(journal)
+        write_private(rollback_path, receipt)
+    return _print_result(
+        {
+            "status": "rolled-back",
+            "plan_digest": plan["plan_digest"],
+            "pre_generation": before,
+            "post_generation": after,
+            "receipt_digest": receipt["receipt_digest"],
+        }
+    )
+
+
 def operation_recovery_status_command(args: argparse.Namespace) -> int:
     _operation_recovery_candidate(args)
     plan = verify_requeue_plan(
@@ -9761,6 +10788,7 @@ def _operation_recovery_validate_application(
     value: Any,
     *,
     plan: Mapping[str, Any],
+    require_artifacts: bool = True,
 ) -> dict[str, Any]:
     required = {
         "schema_version",
@@ -9776,9 +10804,17 @@ def _operation_recovery_validate_application(
         "applied_at",
         "receipt_digest",
     }
-    authorization = _operation_recovery_validate_authorization(plan)
-    bundle = _operation_recovery_validate_bundle(plan)
-    backup_digest = _operation_recovery_planned_backup_digest(plan)
+    authorization_digest = None
+    bundle_digest = None
+    backup_digest = plan["rollback_backup"]["artifact_sha256"]
+    if require_artifacts:
+        authorization_digest = _operation_recovery_validate_authorization(plan)[
+            "receipt_digest"
+        ]
+        bundle_digest = _operation_recovery_validate_bundle(plan)[
+            "ciphertext_sha256"
+        ]
+        backup_digest = _operation_recovery_planned_backup_digest(plan)
     if (
         not isinstance(value, Mapping)
         or set(value) != required
@@ -9792,10 +10828,15 @@ def _operation_recovery_validate_application(
         != plan["selected_operation_count"]
         or value.get("installation_authority_digest")
         != digest(plan["installation_authority"])
-        or value.get("authorization_receipt_digest")
-        != authorization["receipt_digest"]
-        or value.get("rollback_bundle_digest")
-        != bundle["ciphertext_sha256"]
+        or (
+            authorization_digest is not None
+            and value.get("authorization_receipt_digest")
+            != authorization_digest
+        )
+        or (
+            bundle_digest is not None
+            and value.get("rollback_bundle_digest") != bundle_digest
+        )
         or value.get("rollback_backup_digest") != backup_digest
         or re.fullmatch(
             r"[0-9a-f]{64}",
@@ -11085,6 +12126,87 @@ def parser() -> argparse.ArgumentParser:
     recovery_drain_verify.add_argument("--plan", required=True)
     recovery_drain_verify.set_defaults(
         run=operation_recovery_drain_verify_command
+    )
+
+    recovery_post_abort = recovery_drain_commands.add_parser("post-abort")
+    recovery_post_abort_commands = recovery_post_abort.add_subparsers(
+        dest="operation_recovery_post_abort_command",
+        required=True,
+    )
+
+    recovery_post_abort_plan = recovery_post_abort_commands.add_parser("plan")
+    add_operation_recovery_authority(recovery_post_abort_plan)
+    recovery_post_abort_plan.add_argument("--reference-plan", required=True)
+    recovery_post_abort_plan.add_argument("--snapshot", required=True)
+    recovery_post_abort_plan.add_argument(
+        "--rollback-backup-evidence", required=True
+    )
+    recovery_post_abort_plan.add_argument("--rollback-backup", required=True)
+    recovery_post_abort_plan.add_argument("--age", required=True)
+    recovery_post_abort_plan.add_argument(
+        "--rollback-recipient", required=True
+    )
+    recovery_post_abort_plan.add_argument("--rollback-bundle", required=True)
+    recovery_post_abort_plan.add_argument(
+        "--authorization-receipt", required=True
+    )
+    recovery_post_abort_plan.add_argument(
+        "--application-receipt", required=True
+    )
+    recovery_post_abort_plan.add_argument(
+        "--verification-receipt", required=True
+    )
+    recovery_post_abort_plan.add_argument("--rollback-receipt", required=True)
+    recovery_post_abort_plan.add_argument("--output", required=True)
+    recovery_post_abort_plan.set_defaults(
+        run=operation_recovery_post_abort_plan_command
+    )
+
+    recovery_post_abort_apply = recovery_post_abort_commands.add_parser("apply")
+    add_operation_recovery_authority(recovery_post_abort_apply)
+    recovery_post_abort_apply.add_argument("--plan", required=True)
+    recovery_post_abort_apply.add_argument("--approval-digest", required=True)
+    recovery_post_abort_apply.add_argument("--age", required=True)
+    recovery_post_abort_apply.add_argument("--age-identity", required=True)
+    recovery_post_abort_apply.add_argument(
+        "--rollback-recipient", required=True
+    )
+    recovery_post_abort_apply.set_defaults(
+        run=operation_recovery_post_abort_apply_command
+    )
+
+    recovery_post_abort_status = recovery_post_abort_commands.add_parser(
+        "status"
+    )
+    add_operation_recovery_authority(recovery_post_abort_status)
+    recovery_post_abort_status.add_argument("--plan", required=True)
+    recovery_post_abort_status.set_defaults(
+        run=operation_recovery_post_abort_status_command
+    )
+
+    recovery_post_abort_verify = recovery_post_abort_commands.add_parser(
+        "verify"
+    )
+    add_operation_recovery_authority(recovery_post_abort_verify)
+    recovery_post_abort_verify.add_argument("--plan", required=True)
+    recovery_post_abort_verify.set_defaults(
+        run=operation_recovery_post_abort_verify_command
+    )
+
+    recovery_post_abort_rollback = recovery_post_abort_commands.add_parser(
+        "rollback"
+    )
+    add_operation_recovery_authority(recovery_post_abort_rollback)
+    recovery_post_abort_rollback.add_argument("--plan", required=True)
+    recovery_post_abort_rollback.add_argument(
+        "--approval-digest", required=True
+    )
+    recovery_post_abort_rollback.add_argument("--age", required=True)
+    recovery_post_abort_rollback.add_argument(
+        "--age-identity", required=True
+    )
+    recovery_post_abort_rollback.set_defaults(
+        run=operation_recovery_post_abort_rollback_command
     )
 
     recovery_plan = operation_recovery_commands.add_parser("plan")

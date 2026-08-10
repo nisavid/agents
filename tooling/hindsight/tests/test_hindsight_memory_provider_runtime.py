@@ -7,6 +7,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import subprocess
 import sys
 import threading
 import types
@@ -185,7 +186,10 @@ class ProviderRuntimePolicyTest(unittest.TestCase):
 
         from hindsight_api.engine.llm_wrapper import LLMProvider
 
-        self.assertEqual(metadata.version("hindsight-api"), "0.8.4")
+        self.assertIn(
+            metadata.version("hindsight-api"),
+            provider_runtime.SUPPORTED_HINDSIGHT_VERSIONS,
+        )
         example = json.loads(
             (HINDSIGHT_ROOT / "examples/provider-runtime-policy.json").read_text()
         )
@@ -478,6 +482,7 @@ class HindsightProviderAdapterTest(unittest.TestCase):
         *,
         policy_value: dict[str, object] | None = None,
         homes: dict[str, str] | None = None,
+        hindsight_version: str = "0.8.4",
     ):
         modules, *classes = self.runtime_modules()
         homes = homes or {
@@ -487,13 +492,94 @@ class HindsightProviderAdapterTest(unittest.TestCase):
         adapter = HindsightProviderAdapter(
             ProviderRuntimePolicy.load(policy_value or policy_data()),
             credential_resolver=homes.__getitem__,
-            version_resolver=lambda: "0.8.4",
+            version_resolver=lambda: hindsight_version,
         )
         patcher = mock.patch.dict(sys.modules, modules)
         patcher.start()
         self.addCleanup(patcher.stop)
         self.assertTrue(adapter.install())
         return classes
+
+    def test_install_supports_real_hindsight_090_provider_interfaces(self) -> None:
+        value = policy_data()
+        value["hindsight_version"] = "0.9.0"
+        fallback = value["members"][2]
+        fallback["identity"] = {
+            "provider": "mock",
+            "model": "mock-model",
+            "base_url": "",
+            "credential_marker": None,
+        }
+        worker_python = (
+            Path.home()
+            / ".local/share/uv/tools/hindsight-api/bin/python3"
+        )
+        script = """
+import asyncio
+import importlib.metadata
+import json
+import socket
+import sys
+
+def reject_network(*_args, **_kwargs):
+    raise RuntimeError("network use is forbidden in compatibility test")
+
+socket.socket.connect = reject_network
+socket.create_connection = reject_network
+sys.path.insert(0, sys.argv[1])
+from hindsight_memory_control_plane.provider_runtime import (
+    HindsightProviderAdapter,
+    ProviderRuntimePolicy,
+)
+if importlib.metadata.version("hindsight-api") != "0.9.0":
+    raise RuntimeError("real Hindsight test runtime differs")
+policy = ProviderRuntimePolicy.load(json.loads(sys.argv[2]))
+HindsightProviderAdapter(
+    policy,
+    credential_resolver=lambda _locator: "/private/tmp/unread-oauth-home",
+).install()
+from hindsight_api.engine.llm_wrapper import LLMProvider
+member = LLMProvider(
+    provider="mock",
+    api_key="",
+    base_url="",
+    model="mock-model",
+)
+result = asyncio.run(
+    member.call(
+        [{"role": "user", "content": "compatibility probe"}],
+        scope="retain",
+        skip_validation=True,
+    )
+)
+if result != "mock response":
+    raise RuntimeError("real Hindsight dispatch differs")
+print("accepted")
+"""
+        result = subprocess.run(
+            [
+                str(worker_python),
+                "-I",
+                "-c",
+                script,
+                str(LIB),
+                json.dumps(value, sort_keys=True),
+            ],
+            check=False,
+            cwd="/",
+            env={
+                "HOME": str(Path.home()),
+                "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+                "PYTHONDONTWRITEBYTECODE": "1",
+            },
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "accepted")
 
     def test_install_resolves_independent_oauth_homes_and_exact_provider_policy(self) -> None:
         LLMProvider, CodexLLM, _MultiLLMProvider = self.install()

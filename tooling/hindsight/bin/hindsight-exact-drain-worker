@@ -35,8 +35,10 @@ from hindsight_memory_control_plane.operation_recovery_runtime import (  # noqa:
     ExactDrainClaimAdapter,
     EXACT_DRAIN_PROFILE_ENVIRONMENT_KEYS,
     exact_drain_effective_profile_digest,
+    exact_drain_platform_environment,
     exact_drain_runtime_evidence,
     exact_drain_worker_id,
+    install_exact_drain_candidate_imports,
     install_exact_drain_runtime_guards,
     validate_exact_drain_provider_policy,
 )
@@ -127,6 +129,7 @@ def main() -> int:
     runtime_digest, provider_bootstrap = exact_drain_runtime_evidence(
         args.worker_runtime,
         args.provider_runtime_root,
+        LIB / "hindsight_api",
     )
     provider_policy_bytes = _private_bytes(
         args.provider_policy,
@@ -168,6 +171,7 @@ def main() -> int:
     ):
         raise OperationRecoveryError("exact drain start gate differs")
     expected_environment = {
+        **exact_drain_platform_environment(),
         "HOME": str(Path.home()),
         "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
         "PYTHONDONTWRITEBYTECODE": "1",
@@ -221,6 +225,8 @@ def main() -> int:
         os.close(start_descriptor)
     if start_signal != b"1":
         raise OperationRecoveryError("exact drain start was not authorized")
+
+    install_exact_drain_candidate_imports(args.worker_runtime, LIB)
 
     provider_globals = {
         "__builtins__": __builtins__,

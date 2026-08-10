@@ -45,7 +45,7 @@ IDENTITY_KEYS = {"provider", "model", "base_url", "credential_marker"}
 CREDENTIAL_KEYS = {"mode", "locator"}
 PRIORITY_KEYS = {"default", "reflect", "retain", "consolidation"}
 IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}\Z")
-SUPPORTED_HINDSIGHT_VERSIONS = frozenset({"0.8.4"})
+SUPPORTED_HINDSIGHT_VERSIONS = frozenset({"0.8.4", "0.9.0"})
 SUPPORTED_RUNTIME_PROVIDERS_084 = frozenset(
     {
         "anthropic",

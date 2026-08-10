@@ -20,6 +20,9 @@ from types import SimpleNamespace
 from tooling.hindsight.tests import (
     test_hindsight_memory_operation_recovery as recovery_fixtures,
 )
+from tooling.hindsight.lib.hindsight_memory_control_plane import (
+    operation_recovery_runtime,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -177,6 +180,9 @@ class OperationRecoveryCliTest(unittest.TestCase):
                 "_operation_recovery_exact_runtime_digest": (
                     lambda _args: "8" * 64
                 ),
+                "_operation_recovery_validate_exact_worker_provider_runtime": (
+                    lambda _policy, _worker_runtime: None
+                ),
                 "write_private": (
                     lambda path, value, *, create_only: written.update(
                         {str(path): (value, create_only)}
@@ -292,14 +298,33 @@ class OperationRecoveryCliTest(unittest.TestCase):
             environment["HINDSIGHT_EXACT_DRAIN_START_FD"],
             "9",
         )
+        expected_text_encoding = f"0x{os.geteuid():X}:0x0:0x0"
+        self.assertEqual(
+            environment.get("__CF_USER_TEXT_ENCODING"),
+            expected_text_encoding,
+        )
+        observed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import os; print(os.environ['__CF_USER_TEXT_ENCODING'])",
+            ],
+            check=False,
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(observed.returncode, 0, observed.stderr)
+        self.assertEqual(observed.stdout.strip(), expected_text_encoding)
 
     def test_exact_drain_worker_uses_the_venv_interpreter_path(self):
         resolve = self.controller[
             "_operation_recovery_exact_worker_interpreter"
         ]
-        worker = Path(
-            "/Users/ivan/.local/share/uv/tools/hindsight-api/bin/"
-            "hindsight-worker"
+        worker = (
+            Path.home()
+            / ".local/share/uv/tools/hindsight-api/bin/hindsight-worker"
         )
         interpreter = resolve(worker)
         self.assertEqual(interpreter, worker.parent / "python3")
@@ -312,6 +337,405 @@ class OperationRecoveryCliTest(unittest.TestCase):
             text=True,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_exact_drain_candidate_import_path_ignores_external_startup_hooks(self):
+        with tempfile.TemporaryDirectory(
+            dir="/private/tmp",
+            prefix="exact-drain-isolated-import-",
+        ) as directory:
+            root = Path(directory)
+            root.chmod(0o700)
+            bin_dir = root / "bin"
+            bin_dir.mkdir(mode=0o700)
+            interpreter = bin_dir / "python3"
+            interpreter.write_text("synthetic interpreter\n", encoding="utf-8")
+            interpreter.chmod(0o700)
+            worker = bin_dir / "hindsight-worker"
+            worker.write_text(f"#!{interpreter}\n", encoding="utf-8")
+            worker.chmod(0o700)
+            (root / "pyvenv.cfg").write_text("home = /private/tmp\n")
+            (root / "pyvenv.cfg").chmod(0o600)
+            external = root / "lib" / "python3.13" / "site-packages"
+            external.mkdir(parents=True, mode=0o700)
+            marker = root / "startup-hook-ran"
+            external_marker = root / "external-hindsight-loaded"
+            (external / "sitecustomize.py").write_text(
+                f"from pathlib import Path; Path({str(marker)!r}).touch()\n",
+                encoding="utf-8",
+            )
+            (external / "hostile.pth").write_text(
+                f"import pathlib; pathlib.Path({str(marker)!r}).touch()\n",
+                encoding="utf-8",
+            )
+            external_package = external / "hindsight_api"
+            external_package.mkdir(mode=0o700)
+            (external_package / "__init__.py").write_text(
+                "from pathlib import Path\n"
+                f"Path({str(external_marker)!r}).touch()\n",
+                encoding="utf-8",
+            )
+            candidate = root / "candidate-lib"
+            candidate_package = candidate / "hindsight_api"
+            candidate_package.mkdir(parents=True, mode=0o700)
+            (candidate_package / "__init__.py").write_text(
+                "CANDIDATE = True\n",
+                encoding="utf-8",
+            )
+            script = (
+                "import importlib, pathlib; "
+                "from tooling.hindsight.lib.hindsight_memory_control_plane "
+                "import operation_recovery_runtime as runtime; "
+                f"runtime.install_exact_drain_candidate_imports({str(worker)!r}, "
+                f"{str(candidate)!r}); "
+                "module = importlib.import_module('hindsight_api'); "
+                "print(pathlib.Path(module.__file__).resolve())"
+            )
+            environment = dict(os.environ)
+            environment.pop("PYTHONPATH", None)
+            result = subprocess.run(
+                [sys.executable, "-S", "-c", script],
+                check=False,
+                cwd=str(Path(__file__).resolve().parents[3]),
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                Path(result.stdout.strip()),
+                candidate_package / "__init__.py",
+            )
+            self.assertFalse(marker.exists())
+            self.assertFalse(external_marker.exists())
+
+    def test_exact_drain_candidate_import_path_rejects_preloaded_hindsight(self):
+        install = getattr(
+            operation_recovery_runtime,
+            "install_exact_drain_candidate_imports",
+        )
+        previous = sys.modules.get("hindsight_api")
+        sys.modules["hindsight_api"] = SimpleNamespace()
+        try:
+            with self.assertRaisesRegex(
+                Exception,
+                "Hindsight module was preloaded",
+            ):
+                install("/private/tmp/hindsight-worker", "/private/tmp/lib")
+        finally:
+            if previous is None:
+                sys.modules.pop("hindsight_api", None)
+            else:
+                sys.modules["hindsight_api"] = previous
+
+    def test_exact_drain_policy_version_matches_the_worker_runtime(self):
+        validate = self.controller[
+            "_operation_recovery_validate_exact_worker_provider_runtime"
+        ]
+        worker = (
+            Path.home()
+            / ".local/share/uv/tools/hindsight-api/bin/hindsight-worker"
+        )
+        runtime_package = (
+            Path.home()
+            / ".local/share/uv/tools/hindsight-api/lib/python3.13/"
+            "site-packages/hindsight_api"
+        )
+        policy_path = (
+            Path.home()
+            / ".config/hindsight-control-plane/provider-runtime-policy.json"
+        )
+        policy = self.controller["ProviderRuntimePolicy"].load(
+            self.controller["strict_json_loads"](
+                policy_path.read_text(encoding="utf-8")
+            )
+        )
+        actual_version = self.controller[
+            "exact_drain_worker_hindsight_version"
+        ](worker, runtime_package)
+        mismatched_version = (
+            "0.0.0"
+            if actual_version == policy.hindsight_version
+            else policy.hindsight_version
+        )
+
+        globals_ = validate.__globals__
+        original = globals_["exact_drain_worker_hindsight_version"]
+        globals_["exact_drain_worker_hindsight_version"] = (
+            lambda _worker, _runtime_package: actual_version
+        )
+        try:
+            with self.assertRaisesRegex(
+                Exception,
+                "provider policy version differs from worker runtime",
+            ):
+                validate(
+                    replace(policy, hindsight_version=mismatched_version),
+                    worker,
+                )
+            validate(replace(policy, hindsight_version=actual_version), worker)
+            globals_["exact_drain_worker_hindsight_version"] = (
+                lambda _worker, _runtime_package: "99.0.0"
+            )
+            with self.assertRaisesRegex(
+                Exception,
+                "worker Hindsight version is unsupported",
+            ):
+                validate(
+                    replace(policy, hindsight_version="99.0.0"),
+                    worker,
+                )
+        finally:
+            globals_["exact_drain_worker_hindsight_version"] = original
+
+    def test_exact_drain_version_evidence_does_not_execute_the_worker(self):
+        read_version = self.controller[
+            "exact_drain_worker_hindsight_version"
+        ]
+        with tempfile.TemporaryDirectory(
+            dir="/private/tmp",
+            prefix="exact-drain-version-",
+        ) as directory:
+            root = Path(directory)
+            root.chmod(0o700)
+            bin_dir = root / "bin"
+            bin_dir.mkdir(mode=0o700)
+            worker = bin_dir / "hindsight-worker"
+            interpreter = bin_dir / "python3"
+            marker = root / "interpreter-ran"
+            interpreter.write_text(
+                "#!/bin/sh\n"
+                f"touch {marker}\n"
+                "printf '0.9.0\\n'\n",
+                encoding="utf-8",
+            )
+            interpreter.chmod(0o700)
+            worker.write_text(
+                f"#!{interpreter}\n",
+                encoding="utf-8",
+            )
+            worker.chmod(0o700)
+            (root / "pyvenv.cfg").write_text("home = /private/tmp\n")
+            (root / "pyvenv.cfg").chmod(0o600)
+            metadata = (
+                root
+                / "lib"
+                / "python3.13"
+                / "site-packages"
+                / "hindsight_api-0.9.0.dist-info"
+                / "METADATA"
+            )
+            metadata.parent.mkdir(parents=True, mode=0o700)
+            metadata.write_text(
+                "Metadata-Version: 2.4\n"
+                "Name: hindsight-api\n"
+                "Version: 0.9.0\n",
+                encoding="utf-8",
+            )
+            metadata.chmod(0o600)
+            (metadata.parent.parent / "hindsight_api").mkdir(mode=0o700)
+
+            runtime_package = metadata.parent.parent / "hindsight_api"
+            self.assertEqual(
+                read_version(worker, runtime_package),
+                "0.9.0",
+            )
+            self.assertFalse(marker.exists())
+
+    def test_exact_drain_runtime_binds_the_immutable_candidate_package_tree(self):
+        runtime_digest = self.controller["exact_drain_runtime_digest"]
+        with tempfile.TemporaryDirectory(
+            dir="/private/tmp",
+            prefix="exact-drain-runtime-",
+        ) as directory:
+            root = Path(directory)
+            root.chmod(0o700)
+            bin_dir = root / "bin"
+            bin_dir.mkdir(mode=0o700)
+            worker = bin_dir / "hindsight-worker"
+            interpreter = bin_dir / "python3"
+            interpreter.write_text("synthetic interpreter\n", encoding="utf-8")
+            interpreter.chmod(0o700)
+            worker.write_text(f"#!{interpreter}\n", encoding="utf-8")
+            worker.chmod(0o700)
+            (root / "pyvenv.cfg").write_text("home = /private/tmp\n")
+            (root / "pyvenv.cfg").chmod(0o600)
+            site_packages = root / "candidate-lib"
+            metadata = (
+                site_packages
+                / "hindsight_api-0.9.0.dist-info"
+                / "METADATA"
+            )
+            metadata.parent.mkdir(parents=True, mode=0o700)
+            metadata.write_text(
+                "Metadata-Version: 2.4\n"
+                "Name: hindsight-api\n"
+                "Version: 0.9.0\n",
+                encoding="utf-8",
+            )
+            metadata.chmod(0o600)
+            package = site_packages / "hindsight_api"
+            package.mkdir(mode=0o700)
+            source = package / "__init__.py"
+            source.write_text("VERSION = 1\n", encoding="utf-8")
+            source.chmod(0o600)
+            provider_root = root / "provider-runtime"
+            provider_root.mkdir(mode=0o700)
+            for name in ("sitecustomize.py", "hindsight_llm_failover.py"):
+                path = provider_root / name
+                path.write_text(f"# synthetic {name}\n", encoding="utf-8")
+                path.chmod(0o600)
+            external_package = (
+                root
+                / "lib"
+                / "python3.13"
+                / "site-packages"
+                / "hindsight_api"
+            )
+            external_package.mkdir(parents=True, mode=0o700)
+            external_source = external_package / "__init__.py"
+            external_source.write_text("EXTERNAL = 1\n", encoding="utf-8")
+            external_source.chmod(0o600)
+
+            before = runtime_digest(worker, provider_root, package)
+            external_source.write_text("EXTERNAL = 2\n", encoding="utf-8")
+            after_external_drift = runtime_digest(
+                worker,
+                provider_root,
+                package,
+            )
+            bytecode = package / "__pycache__" / "extra.cpython-313.pyc"
+            bytecode.parent.mkdir(mode=0o700)
+            bytecode.write_bytes(b"synthetic importable bytecode")
+            bytecode.chmod(0o600)
+            after = runtime_digest(worker, provider_root, package)
+
+            self.assertEqual(before, after_external_drift)
+            self.assertNotEqual(before, after)
+            for position in range(2048):
+                entry = package / f"entry-{position:04d}.py"
+                entry.touch(mode=0o600)
+            with self.assertRaisesRegex(Exception, "too many entries"):
+                runtime_digest(worker, provider_root, package)
+
+    def test_exact_drain_metadata_ceiling_precedes_file_read(self):
+        read_version = self.controller[
+            "exact_drain_worker_hindsight_version"
+        ]
+        read_file = read_version.__globals__["_exact_drain_file_bytes"]
+        runtime_globals = read_file.__globals__
+        with tempfile.TemporaryDirectory(
+            dir="/private/tmp",
+            prefix="exact-drain-metadata-",
+        ) as directory:
+            metadata = Path(directory) / "METADATA"
+            metadata.touch(mode=0o600)
+            with metadata.open("r+b") as stream:
+                stream.truncate(1024 * 1024 + 1)
+            original_read = runtime_globals["os"].read
+
+            def reject_read(*_args, **_kwargs):
+                raise AssertionError("oversized metadata was read")
+
+            runtime_globals["os"].read = reject_read
+            try:
+                with self.assertRaisesRegex(Exception, "too large"):
+                    read_file(
+                        metadata,
+                        "exact drain worker Hindsight metadata",
+                        max_bytes=1024 * 1024,
+                    )
+            finally:
+                runtime_globals["os"].read = original_read
+
+    def test_exact_drain_streams_sparse_package_artifact_digest(self):
+        runtime_digest = self.controller["exact_drain_runtime_digest"]
+        runtime_globals = runtime_digest.__globals__
+        with tempfile.TemporaryDirectory(
+            dir="/private/tmp",
+            prefix="exact-drain-sparse-runtime-",
+        ) as directory:
+            root = Path(directory)
+            root.chmod(0o700)
+            bin_dir = root / "bin"
+            bin_dir.mkdir(mode=0o700)
+            worker = bin_dir / "hindsight-worker"
+            interpreter = bin_dir / "python3"
+            interpreter.write_text("synthetic interpreter\n", encoding="utf-8")
+            interpreter.chmod(0o700)
+            worker.write_text(f"#!{interpreter}\n", encoding="utf-8")
+            worker.chmod(0o700)
+            (root / "pyvenv.cfg").write_text("home = /private/tmp\n")
+            (root / "pyvenv.cfg").chmod(0o600)
+            site_packages = root / "lib" / "python3.13" / "site-packages"
+            metadata = (
+                site_packages
+                / "hindsight_api-0.9.0.dist-info"
+                / "METADATA"
+            )
+            metadata.parent.mkdir(parents=True, mode=0o700)
+            metadata.write_text(
+                "Metadata-Version: 2.4\n"
+                "Name: hindsight-api\n"
+                "Version: 0.9.0\n",
+                encoding="utf-8",
+            )
+            metadata.chmod(0o600)
+            package = site_packages / "hindsight_api"
+            package.mkdir(mode=0o700)
+            sparse = package / "native.so"
+            sparse.touch(mode=0o600)
+            with sparse.open("r+b") as stream:
+                stream.truncate(16 * 1024 * 1024)
+            provider_root = root / "provider-runtime"
+            provider_root.mkdir(mode=0o700)
+            for name in ("sitecustomize.py", "hindsight_llm_failover.py"):
+                path = provider_root / name
+                path.write_text(f"# synthetic {name}\n", encoding="utf-8")
+                path.chmod(0o600)
+            original_file_bytes = runtime_globals["_exact_drain_file_bytes"]
+
+            def reject_sparse_materialization(path, label, **kwargs):
+                if Path(path) == sparse:
+                    raise AssertionError("sparse package artifact was materialized")
+                return original_file_bytes(path, label, **kwargs)
+
+            runtime_globals["_exact_drain_file_bytes"] = (
+                reject_sparse_materialization
+            )
+            try:
+                observed = runtime_digest(worker, provider_root, package)
+            finally:
+                runtime_globals["_exact_drain_file_bytes"] = original_file_bytes
+
+            self.assertRegex(observed, r"^[0-9a-f]{64}$")
+            original_total_ceiling = runtime_globals[
+                "EXACT_DRAIN_MAX_PACKAGE_TOTAL_BYTES"
+            ]
+            original_file_ceiling = runtime_globals[
+                "EXACT_DRAIN_MAX_PACKAGE_FILE_BYTES"
+            ]
+            runtime_globals["EXACT_DRAIN_MAX_PACKAGE_TOTAL_BYTES"] = (
+                8 * 1024 * 1024
+            )
+            runtime_globals["EXACT_DRAIN_MAX_PACKAGE_FILE_BYTES"] = (
+                32 * 1024 * 1024
+            )
+            try:
+                with self.assertRaisesRegex(Exception, "too large"):
+                    runtime_digest(worker, provider_root, package)
+            finally:
+                runtime_globals["EXACT_DRAIN_MAX_PACKAGE_TOTAL_BYTES"] = (
+                    original_total_ceiling
+                )
+                runtime_globals["EXACT_DRAIN_MAX_PACKAGE_FILE_BYTES"] = (
+                    original_file_ceiling
+                )
+            with sparse.open("r+b") as stream:
+                stream.truncate(16 * 1024 * 1024 + 1)
+            with self.assertRaisesRegex(Exception, "too large"):
+                runtime_digest(worker, provider_root, package)
 
     def test_exact_drain_provider_policy_must_be_the_canonical_home_policy(self):
         validate = self.controller[
@@ -1098,6 +1522,9 @@ class OperationRecoveryCliTest(unittest.TestCase):
                 "_operation_recovery_exact_runtime_digest": (
                     lambda _args: plan["worker_runtime_digest"]
                 ),
+                "_operation_recovery_validate_exact_worker_provider_runtime": (
+                    lambda _policy, _worker_runtime: None
+                ),
                 "_portable_manager": lambda _args: Manager(),
                 "_operation_recovery_lock": lambda _manager: nullcontext(),
                 "_assert_recovery_services_stopped": (
@@ -1165,10 +1592,13 @@ class OperationRecoveryCliTest(unittest.TestCase):
                 "status_digest": "6" * 64,
             }
 
+            observed_commands = []
+
             class Process:
                 pid = 4242
 
-                def __init__(self, *_arguments, **keywords):
+                def __init__(self, arguments, **keywords):
+                    observed_commands.append(arguments)
                     self._gate = os.dup(keywords["pass_fds"][0])
                     self._returncode = None
 
@@ -1208,6 +1638,9 @@ class OperationRecoveryCliTest(unittest.TestCase):
                 ),
                 "_operation_recovery_exact_runtime_digest": (
                     lambda _args: plan["worker_runtime_digest"]
+                ),
+                "_operation_recovery_validate_exact_worker_provider_runtime": (
+                    lambda _policy, _worker_runtime: None
                 ),
                 "_portable_manager": lambda _args: Manager(),
                 "_operation_recovery_lock": lambda _manager: nullcontext(),
@@ -1256,6 +1689,10 @@ class OperationRecoveryCliTest(unittest.TestCase):
             self.assertEqual(
                 journal["kind"],
                 "operation-recovery-exact-drain-application-journal",
+            )
+            self.assertEqual(
+                observed_commands[0][:2],
+                ["/private/tmp/python", "-S"],
             )
             self.assertFalse(Path(plan["status_artifact_path"]).exists())
 
@@ -1369,6 +1806,9 @@ class OperationRecoveryCliTest(unittest.TestCase):
                 ),
                 "_operation_recovery_exact_runtime_digest": (
                     lambda _args: plan["worker_runtime_digest"]
+                ),
+                "_operation_recovery_validate_exact_worker_provider_runtime": (
+                    lambda _policy, _worker_runtime: None
                 ),
                 "_portable_manager": lambda _args: Manager(),
                 "_operation_recovery_lock": lambda _manager: nullcontext(),

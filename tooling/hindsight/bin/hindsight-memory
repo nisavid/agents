@@ -159,6 +159,7 @@ from hindsight_memory_control_plane.portable_install import (  # noqa: E402
 from hindsight_memory_control_plane.provider_runtime import (  # noqa: E402
     ProviderRuntimeCompatibilityError,
     ProviderRuntimePolicy,
+    SUPPORTED_HINDSIGHT_VERSIONS,
 )
 from hindsight_memory_control_plane.operation_recovery import (  # noqa: E402
     OperationRecoveryError,
@@ -188,7 +189,9 @@ from hindsight_memory_control_plane.operation_recovery_runtime import (  # noqa:
     assert_connected_live_database,
     connect_verified_local_postgres,
     exact_drain_effective_profile_digest,
+    exact_drain_platform_environment,
     exact_drain_runtime_digest,
+    exact_drain_worker_hindsight_version,
     exact_drain_worker_interpreter_path,
     exact_drain_worker_id,
     live_row_digest,
@@ -7851,10 +7854,31 @@ def _operation_recovery_exact_provider_policy(path: str | Path) -> str:
     return policy_digest
 
 
+def _operation_recovery_validate_exact_worker_provider_runtime(
+    policy: ProviderRuntimePolicy,
+    worker_runtime: str | Path,
+) -> None:
+    worker_version = exact_drain_worker_hindsight_version(
+        worker_runtime,
+        LIB / "hindsight_api",
+    )
+    if worker_version not in SUPPORTED_HINDSIGHT_VERSIONS:
+        raise OperationRecoveryError(
+            "operation-recovery exact drain worker Hindsight version is "
+            "unsupported"
+        )
+    if worker_version != policy.hindsight_version:
+        raise OperationRecoveryError(
+            "operation-recovery exact drain provider policy version differs "
+            "from worker runtime"
+        )
+
+
 def _operation_recovery_exact_runtime_digest(args: argparse.Namespace) -> str:
     return exact_drain_runtime_digest(
         args.worker_runtime,
         args.provider_runtime_root,
+        LIB / "hindsight_api",
     )
 
 
@@ -7877,6 +7901,10 @@ def operation_recovery_drain_plan_command(args: argparse.Namespace) -> int:
         _operation_recovery_exact_provider_policy_evidence(
             args.provider_policy
         )
+    )
+    _operation_recovery_validate_exact_worker_provider_runtime(
+        provider_policy,
+        args.worker_runtime,
     )
     effective_profile_digest = exact_drain_effective_profile_digest(
         provider_policy,
@@ -8314,6 +8342,7 @@ def _operation_recovery_exact_worker_environment(
     }
     environment.update(
         {
+            **exact_drain_platform_environment(),
             "HOME": str(Path.home()),
             "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
             "PYTHONDONTWRITEBYTECODE": "1",
@@ -8455,6 +8484,10 @@ def operation_recovery_drain_apply_command(args: argparse.Namespace) -> int:
         _operation_recovery_exact_provider_policy_evidence(
             args.provider_policy
         )
+    )
+    _operation_recovery_validate_exact_worker_provider_runtime(
+        provider_policy,
+        args.worker_runtime,
     )
     profile_environment = _operation_recovery_profile_environment()
     if (
@@ -8637,6 +8670,7 @@ def operation_recovery_drain_apply_command(args: argparse.Namespace) -> int:
                         args.worker_runtime
                     )
                 ),
+                "-S",
                 str(wrapper),
                 "--plan",
                 str(Path(args.plan).resolve(strict=True)),

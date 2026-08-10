@@ -19,6 +19,7 @@ import re
 import socket
 import stat
 import struct
+import sys
 import time
 import uuid
 from typing import Any
@@ -91,6 +92,16 @@ EXACT_DRAIN_OAUTH_LOCATORS = {
     "alt1-codex": "oauth-home:alt1",
     "alt2-codex": "oauth-home:alt2",
 }
+EXACT_DRAIN_MAX_PACKAGE_ENTRIES = 2048
+EXACT_DRAIN_MAX_PACKAGE_FILE_BYTES = 16 * 1024 * 1024
+EXACT_DRAIN_MAX_PACKAGE_TOTAL_BYTES = 128 * 1024 * 1024
+
+
+def exact_drain_platform_environment() -> dict[str, str]:
+    """Return OS-owned variables injected across the worker exec boundary."""
+    return {
+        "__CF_USER_TEXT_ENCODING": f"0x{os.geteuid():X}:0x0:0x0",
+    }
 
 
 def validate_exact_drain_provider_policy(
@@ -977,7 +988,12 @@ def install_exact_drain_runtime_guards(
     )
 
 
-def _exact_drain_file_bytes(path: Path, label: str) -> bytes:
+def _exact_drain_file_bytes(
+    path: Path,
+    label: str,
+    *,
+    max_bytes: int | None = None,
+) -> bytes:
     descriptor = -1
     try:
         resolved = path.resolve(strict=True)
@@ -1004,10 +1020,24 @@ def _exact_drain_file_bytes(path: Path, label: str) -> bytes:
     ):
         os.close(descriptor)
         raise OperationRecoveryError(f"{label} is untrusted")
+    if max_bytes is not None and before.st_size > max_bytes:
+        os.close(descriptor)
+        descriptor = -1
+        raise OperationRecoveryError(f"{label} is too large")
     chunks: list[bytes] = []
+    total = 0
     try:
-        while chunk := os.read(descriptor, 1024 * 1024):
+        while True:
+            read_size = 1024 * 1024
+            if max_bytes is not None:
+                read_size = min(read_size, max_bytes + 1 - total)
+            chunk = os.read(descriptor, read_size)
+            if not chunk:
+                break
             chunks.append(chunk)
+            total += len(chunk)
+            if max_bytes is not None and total > max_bytes:
+                raise OperationRecoveryError(f"{label} is too large")
         after = os.fstat(descriptor)
         current = path.lstat()
     except OSError as error:
@@ -1024,8 +1054,128 @@ def _exact_drain_file_bytes(path: Path, label: str) -> bytes:
     return b"".join(chunks)
 
 
-def _exact_drain_file_digest(path: Path, label: str) -> str:
-    return hashlib.sha256(_exact_drain_file_bytes(path, label)).hexdigest()
+def _exact_drain_file_digest_evidence(
+    path: Path,
+    label: str,
+    *,
+    max_bytes: int | None = None,
+) -> tuple[str, int]:
+    descriptor = -1
+    try:
+        resolved = path.resolve(strict=True)
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        before = os.fstat(descriptor)
+        observed = path.lstat()
+    except OSError as error:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise OperationRecoveryError(f"{label} is unavailable") from error
+    if (
+        path != resolved
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_uid != os.geteuid()
+        or before.st_mode & 0o022
+        or before.st_nlink != 1
+        or (before.st_dev, before.st_ino)
+        != (observed.st_dev, observed.st_ino)
+    ):
+        os.close(descriptor)
+        raise OperationRecoveryError(f"{label} is untrusted")
+    if max_bytes is not None and before.st_size > max_bytes:
+        os.close(descriptor)
+        descriptor = -1
+        raise OperationRecoveryError(f"{label} is too large")
+    hasher = hashlib.sha256()
+    total = 0
+    try:
+        while True:
+            read_size = 1024 * 1024
+            if max_bytes is not None:
+                read_size = min(read_size, max_bytes + 1 - total)
+            chunk = os.read(descriptor, read_size)
+            if not chunk:
+                break
+            hasher.update(chunk)
+            total += len(chunk)
+            if max_bytes is not None and total > max_bytes:
+                raise OperationRecoveryError(f"{label} is too large")
+        after = os.fstat(descriptor)
+        current = path.lstat()
+    except OSError as error:
+        raise OperationRecoveryError(f"{label} is unreadable") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if (
+        (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+        != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        or (after.st_dev, after.st_ino) != (current.st_dev, current.st_ino)
+    ):
+        raise OperationRecoveryError(f"{label} changed while reading")
+    return hasher.hexdigest(), after.st_size
+
+
+def _exact_drain_file_digest(
+    path: Path,
+    label: str,
+    *,
+    max_bytes: int | None = None,
+) -> str:
+    file_digest, _file_size = _exact_drain_file_digest_evidence(
+        path,
+        label,
+        max_bytes=max_bytes,
+    )
+    return file_digest
+
+
+def _exact_drain_trusted_directory(path: Path, label: str) -> None:
+    try:
+        resolved = path.resolve(strict=True)
+        metadata = path.lstat()
+    except OSError as error:
+        raise OperationRecoveryError(f"{label} is unavailable") from error
+    if (
+        path != resolved
+        or not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_mode & 0o022
+    ):
+        raise OperationRecoveryError(f"{label} is untrusted")
+
+
+def _exact_drain_package_entries(package_root: Path) -> list[Path]:
+    pending = [package_root]
+    entries: list[Path] = []
+    while pending:
+        directory = pending.pop()
+        _exact_drain_trusted_directory(
+            directory,
+            "exact drain upstream worker package directory",
+        )
+        try:
+            with os.scandir(directory) as scanner:
+                for entry in scanner:
+                    if len(entries) >= EXACT_DRAIN_MAX_PACKAGE_ENTRIES:
+                        raise OperationRecoveryError(
+                            "exact drain upstream worker runtime has too many entries"
+                        )
+                    path = Path(entry.path)
+                    entries.append(path)
+                    if not entry.is_symlink() and entry.is_dir(
+                        follow_symlinks=False
+                    ):
+                        pending.append(path)
+        except OSError as error:
+            raise OperationRecoveryError(
+                "exact drain upstream worker runtime is unavailable"
+            ) from error
+    return sorted(entries)
 
 
 def exact_drain_worker_interpreter_path(
@@ -1042,6 +1192,7 @@ def exact_drain_worker_interpreter_path(
             _exact_drain_file_bytes(
                 worker_path,
                 "exact drain worker entrypoint",
+                max_bytes=1024 * 1024,
             )
             .splitlines()[0]
             .decode("utf-8")
@@ -1063,6 +1214,193 @@ def exact_drain_worker_interpreter_path(
             "exact drain worker interpreter is invalid"
         )
     return interpreter
+
+
+def exact_drain_worker_site_packages_path(
+    worker_runtime: str | Path,
+) -> Path:
+    """Return the trusted dependency directory without processing startup hooks."""
+    worker_path = Path(worker_runtime)
+    exact_drain_worker_interpreter_path(worker_path)
+    library = worker_path.parent.parent / "lib"
+    _exact_drain_trusted_directory(
+        library,
+        "exact drain worker library",
+    )
+    try:
+        with os.scandir(library) as scanner:
+            python_libraries = [
+                Path(entry.path)
+                for entry in scanner
+                if (
+                    not entry.is_symlink()
+                    and entry.is_dir(follow_symlinks=False)
+                    and re.fullmatch(r"python[0-9]+\.[0-9]+", entry.name)
+                )
+            ]
+    except OSError as error:
+        raise OperationRecoveryError(
+            "exact drain worker dependency directory is unavailable"
+        ) from error
+    if len(python_libraries) != 1:
+        raise OperationRecoveryError(
+            "exact drain worker dependency directory is unavailable"
+        )
+    _exact_drain_trusted_directory(
+        python_libraries[0],
+        "exact drain worker Python library",
+    )
+    site_packages = python_libraries[0] / "site-packages"
+    _exact_drain_trusted_directory(
+        site_packages,
+        "exact drain worker dependency directory",
+    )
+    return site_packages
+
+
+def install_exact_drain_candidate_imports(
+    worker_runtime: str | Path,
+    candidate_library: str | Path,
+) -> Path:
+    """Install candidate-first imports without executing external site hooks."""
+    if any(
+        name == "hindsight_api" or name.startswith("hindsight_api.")
+        for name in sys.modules
+    ):
+        raise OperationRecoveryError(
+            "exact drain Hindsight module was preloaded"
+        )
+    candidate_root = Path(candidate_library)
+    if not candidate_root.is_absolute():
+        raise OperationRecoveryError(
+            "exact drain candidate library is unavailable"
+        )
+    _exact_drain_trusted_directory(
+        candidate_root,
+        "exact drain candidate library",
+    )
+    candidate_package = candidate_root / "hindsight_api"
+    _exact_drain_trusted_directory(
+        candidate_package,
+        "exact drain candidate Hindsight package",
+    )
+    dependency_root = exact_drain_worker_site_packages_path(worker_runtime)
+    if dependency_root == candidate_root:
+        raise OperationRecoveryError(
+            "exact drain worker dependency directory is invalid"
+        )
+    candidate_text = str(candidate_root)
+    dependency_text = str(dependency_root)
+    sys.path[:] = [
+        candidate_text,
+        *(
+            entry
+            for entry in sys.path
+            if entry not in {candidate_text, dependency_text}
+        ),
+        dependency_text,
+    ]
+    spec = importlib.util.find_spec("hindsight_api")
+    try:
+        origin = Path(spec.origin).resolve(strict=True)
+        search_locations = tuple(
+            Path(location).resolve(strict=True)
+            for location in spec.submodule_search_locations
+        )
+        origin.relative_to(candidate_package)
+    except (AttributeError, OSError, TypeError, ValueError) as error:
+        raise OperationRecoveryError(
+            "exact drain candidate Hindsight import differs"
+        ) from error
+    if search_locations != (candidate_package,):
+        raise OperationRecoveryError(
+            "exact drain candidate Hindsight import differs"
+        )
+    return dependency_root
+
+
+def _exact_drain_runtime_distribution_metadata(
+    worker_runtime: str | Path,
+    runtime_package_root: str | Path,
+) -> tuple[str, bytes, Path]:
+    """Read immutable candidate runtime metadata without executing Python."""
+    worker_path = Path(worker_runtime)
+    exact_drain_worker_interpreter_path(worker_path)
+    package_root = Path(runtime_package_root)
+    if not package_root.is_absolute() or package_root.name != "hindsight_api":
+        raise OperationRecoveryError(
+            "exact drain worker Hindsight package is unavailable"
+        )
+    site_packages = package_root.parent
+    _exact_drain_trusted_directory(
+        site_packages,
+        "exact drain candidate library",
+    )
+    try:
+        distributions = tuple(site_packages.glob("hindsight_api-*.dist-info"))
+    except OSError as error:
+        raise OperationRecoveryError(
+            "exact drain worker Hindsight version is unavailable"
+        ) from error
+    if (
+        len(distributions) != 1
+        or not distributions[0].is_dir()
+        or distributions[0].is_symlink()
+    ):
+        raise OperationRecoveryError(
+            "exact drain worker Hindsight version is unavailable"
+        )
+    _exact_drain_trusted_directory(
+        distributions[0],
+        "exact drain worker Hindsight metadata directory",
+    )
+    metadata_body = _exact_drain_file_bytes(
+        distributions[0] / "METADATA",
+        "exact drain worker Hindsight metadata",
+        max_bytes=1024 * 1024,
+    )
+    name_values = []
+    version_values = []
+    for line in metadata_body.splitlines():
+        if line.startswith(b"Name: "):
+            name_values.append(line.removeprefix(b"Name: "))
+        elif line.startswith(b"Version: "):
+            version_values.append(line.removeprefix(b"Version: "))
+    try:
+        version = version_values[0].decode("ascii")
+    except (IndexError, UnicodeDecodeError) as error:
+        raise OperationRecoveryError(
+            "exact drain worker Hindsight version is unavailable"
+        ) from error
+    if (
+        name_values != [b"hindsight-api"]
+        or len(version_values) != 1
+        or re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z.+!_-]{0,63}", version)
+        is None
+        or distributions[0].name != f"hindsight_api-{version}.dist-info"
+    ):
+        raise OperationRecoveryError(
+            "exact drain worker Hindsight version is unavailable"
+        )
+    _exact_drain_trusted_directory(
+        package_root,
+        "exact drain candidate Hindsight package",
+    )
+    return version, metadata_body, package_root
+
+
+def exact_drain_worker_hindsight_version(
+    worker_runtime: str | Path,
+    runtime_package_root: str | Path,
+) -> str:
+    """Read the immutable candidate Hindsight package version."""
+    version, _metadata_body, _package_root = (
+        _exact_drain_runtime_distribution_metadata(
+            worker_runtime,
+            runtime_package_root,
+        )
+    )
+    return version
 
 
 def _exact_drain_interpreter_evidence(interpreter: Path) -> dict[str, str]:
@@ -1108,6 +1446,7 @@ def _exact_drain_interpreter_evidence(interpreter: Path) -> dict[str, str]:
 def exact_drain_runtime_evidence(
     worker_runtime: str | Path,
     provider_runtime_root: str | Path,
+    runtime_package_root: str | Path,
 ) -> tuple[str, bytes]:
     """Bind runtime sources and retain prevalidated provider bootstrap bytes."""
     worker_path = Path(worker_runtime)
@@ -1127,34 +1466,67 @@ def exact_drain_runtime_evidence(
         worker_path.parent.parent / "pyvenv.cfg",
         "exact drain worker venv configuration",
     )
+    sources["worker-dependency-directory"] = digest(
+        {"path": str(exact_drain_worker_site_packages_path(worker_path))}
+    )
+    _version, distribution_metadata, package_root = (
+        _exact_drain_runtime_distribution_metadata(
+            worker_path,
+            runtime_package_root,
+        )
+    )
+    sources["worker-hindsight-distribution-metadata"] = hashlib.sha256(
+        distribution_metadata
+    ).hexdigest()
     provider_sources = {
         name: _exact_drain_file_bytes(
             provider_root / name,
             f"exact drain provider runtime {name}",
+            max_bytes=1024 * 1024,
         )
         for name in ("sitecustomize.py", "hindsight_llm_failover.py")
     }
     for name, source in provider_sources.items():
         sources[f"provider/{name}"] = hashlib.sha256(source).hexdigest()
-    spec = importlib.util.find_spec("hindsight_api")
-    locations = None if spec is None else spec.submodule_search_locations
-    if not locations or len(locations) != 1:
-        raise OperationRecoveryError(
-            "exact drain upstream worker runtime is unavailable"
-        )
-    package_root = Path(next(iter(locations))).resolve(strict=True)
-    package_sources = sorted(package_root.rglob("*.py"))
-    if not package_sources:
-        raise OperationRecoveryError(
-            "exact drain upstream worker runtime is unavailable"
-        )
-    for path in package_sources:
+    package_entries = _exact_drain_package_entries(package_root)
+    package_file_count = 0
+    package_total_bytes = 0
+    for path in package_entries:
         relative = path.relative_to(package_root).as_posix()
-        sources[f"upstream/hindsight_api/{relative}"] = (
-            _exact_drain_file_digest(
-                path,
-                f"exact drain upstream module {relative}",
+        if path.is_symlink():
+            raise OperationRecoveryError(
+                "exact drain upstream worker runtime is untrusted"
             )
+        if path.is_dir():
+            _exact_drain_trusted_directory(
+                path,
+                f"exact drain upstream directory {relative}",
+            )
+            sources[f"upstream-directory/hindsight_api/{relative}"] = digest(
+                {"kind": "directory"}
+            )
+            continue
+        if not path.is_file():
+            raise OperationRecoveryError(
+                "exact drain upstream worker runtime is untrusted"
+            )
+        package_file_count += 1
+        remaining_bytes = (
+            EXACT_DRAIN_MAX_PACKAGE_TOTAL_BYTES - package_total_bytes
+        )
+        artifact_digest, artifact_size = _exact_drain_file_digest_evidence(
+            path,
+            f"exact drain upstream artifact {relative}",
+            max_bytes=min(
+                EXACT_DRAIN_MAX_PACKAGE_FILE_BYTES,
+                remaining_bytes,
+            ),
+        )
+        package_total_bytes += artifact_size
+        sources[f"upstream/hindsight_api/{relative}"] = artifact_digest
+    if package_file_count == 0:
+        raise OperationRecoveryError(
+            "exact drain upstream worker runtime is unavailable"
         )
     return digest(sources), provider_sources["sitecustomize.py"]
 
@@ -1162,11 +1534,13 @@ def exact_drain_runtime_evidence(
 def exact_drain_runtime_digest(
     worker_runtime: str | Path,
     provider_runtime_root: str | Path,
+    runtime_package_root: str | Path,
 ) -> str:
     """Bind the worker entrypoint, claim seam, and provider patch sources."""
     runtime_digest, _provider_bootstrap = exact_drain_runtime_evidence(
         worker_runtime,
         provider_runtime_root,
+        runtime_package_root,
     )
     return runtime_digest
 

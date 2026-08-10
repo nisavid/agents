@@ -91,6 +91,80 @@ class FakeConnection:
 
 
 class OperationRecoveryRuntimeTest(unittest.TestCase):
+    def test_exact_drain_public_claim_parses_only_capacity_bound_rows(self):
+        first_id = "00000000-0000-4000-8000-000000000001"
+        later_id = "00000000-0000-4000-8000-000000000002"
+
+        class UnchosenPayload(dict):
+            def __iter__(self):
+                raise AssertionError("unchosen task payload was parsed")
+
+            def keys(self):
+                raise AssertionError("unchosen task payload was parsed")
+
+        adapter = object.__new__(ExactDrainClaimAdapter)
+        adapter._worker_id = "exact-worker"
+        adapter._worker_digest = hashlib.sha256(b"exact-worker").hexdigest()
+        adapter._terminal_reconciliation = False
+        adapter._initial_guard_complete = True
+        adapter._verify_unstarted_state = AsyncMock()
+        adapter._selected = {
+            first_id: {
+                "operation_type": "retain",
+                "task_payload_digest": "a" * 64,
+            },
+            later_id: {
+                "operation_type": "retain",
+                "task_payload_digest": "b" * 64,
+            },
+        }
+        adapter._started_ids = set()
+        adapter._max_retries = 3
+        adapter._identifiers = [first_id, later_id]
+
+        class Connection:
+            async def execute(self, query, *_arguments):
+                return "UPDATE 1" if query.lstrip().startswith("UPDATE") else "SET"
+
+            async def fetch(self, _query, *_arguments):
+                return [
+                    {
+                        "operation_id": first_id,
+                        "operation_type": "retain",
+                        "task_payload": {
+                            "operation_id": first_id,
+                            "bank_id": "engineering",
+                            "type": "batch_retain",
+                        },
+                        "retry_count": 0,
+                        "worker_id_digest": None,
+                        "task_payload_digest": "a" * 64,
+                    },
+                    {
+                        "operation_id": later_id,
+                        "operation_type": "retain",
+                        "task_payload": UnchosenPayload(),
+                        "retry_count": 0,
+                        "worker_id_digest": None,
+                        "task_payload_digest": "b" * 64,
+                    },
+                ]
+
+        claimed = asyncio.run(
+            adapter.claim_tasks(
+                Connection(),
+                '"public".async_operations',
+                "exact-worker",
+                {},
+                1,
+            )
+        )
+
+        self.assertEqual(
+            [str(row["operation_id"]) for row in claimed],
+            [first_id],
+        )
+
     def test_runtime_guard_rejects_missing_progress_seams(self):
         class MissingWorkerPoller:
             pass

@@ -103,6 +103,34 @@ PROVIDER_POOL_TIMEOUT_SECONDS = 20.0
 PROVIDER_WRITE_TIMEOUT_SECONDS = 60.0
 _CODEX_ENVIRONMENT_LOCK = threading.Lock()
 _EXACT_DRAIN_PROGRESS_RECORDER: Any | None = None
+_CODEX_MODELS_WITHOUT_REASONING_SUMMARY = frozenset(
+    {"gpt-5.3-codex-spark"}
+)
+
+
+class _CodexRequestCompatibilityClient:
+    """Project supported Codex request shapes at the HTTP client boundary."""
+
+    def __init__(self, delegate: Any) -> None:
+        self._delegate = delegate
+
+    async def post(self, url: Any, **kwargs: Any) -> Any:
+        payload = kwargs.get("json")
+        if isinstance(payload, Mapping):
+            reasoning = payload.get("reasoning")
+            if isinstance(reasoning, Mapping) and "summary" in reasoning:
+                projected = dict(payload)
+                projected_reasoning = dict(reasoning)
+                projected_reasoning.pop("summary")
+                projected["reasoning"] = projected_reasoning
+                kwargs = {**kwargs, "json": projected}
+        return await self._delegate.post(url, **kwargs)
+
+    async def aclose(self) -> Any:
+        return await self._delegate.aclose()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._delegate, name)
 
 
 def set_exact_drain_progress_recorder(recorder: Any | None) -> None:
@@ -616,6 +644,18 @@ class HindsightProviderAdapter:
                         reasoning_effort=reasoning_effort,
                         **kwargs,
                     )
+                    if (
+                        managed_member_id is not None
+                        and model in _CODEX_MODELS_WITHOUT_REASONING_SUMMARY
+                    ):
+                        client = getattr(instance, "_client", None)
+                        if not callable(getattr(client, "post", None)) or not callable(
+                            getattr(client, "aclose", None)
+                        ):
+                            raise ProviderRuntimeCompatibilityError(
+                                "supported Codex HTTP client is unavailable"
+                            )
+                        instance._client = _CodexRequestCompatibilityClient(client)
                 except Exception:
                     if managed_member_id is None:
                         raise

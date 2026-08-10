@@ -473,10 +473,48 @@ class HindsightProviderAdapterTest(unittest.TestCase):
                     return await self.operation(**kwargs)
                 return kwargs
 
+        class CodexClient:
+            def __init__(self) -> None:
+                self.requests = []
+
+            async def post(self, url, **kwargs):
+                self.requests.append((url, kwargs))
+                return "accepted"
+
+            async def aclose(self):
+                return None
+
         class CodexLLM:
-            def __init__(self, **kwargs) -> None:
+            def __init__(
+                self,
+                reasoning_effort="low",
+                **kwargs,
+            ) -> None:
                 self.codex_home = os.environ.get("CODEX_HOME")
-                self.kwargs = kwargs
+                self.kwargs = {
+                    **kwargs,
+                    "reasoning_effort": reasoning_effort,
+                }
+                self.model = kwargs["model"]
+                self.reasoning_effort = reasoning_effort
+                self.reasoning_summary = "auto"
+                self._client = CodexClient()
+                self.original_client = self._client
+
+            async def call(self):
+                return await self._client.post(
+                    "https://chatgpt.com/backend-api/codex/responses",
+                    json={
+                        "model": self.model,
+                        "reasoning": {
+                            "effort": self.reasoning_effort,
+                            "summary": self.reasoning_summary,
+                        },
+                    },
+                )
+
+            async def cleanup(self):
+                await self._client.aclose()
 
         class MultiLLMProvider:
             def __init__(self) -> None:
@@ -653,6 +691,14 @@ print("accepted")
         self.assertEqual(personal.codex_home, "/tmp/personal-codex")
         self.assertEqual(personal.kwargs["reasoning_effort"], "xhigh")
         self.assertEqual(work.codex_home, "/tmp/work-codex")
+        self.assertIs(personal._client, personal.original_client)
+        self.assertIs(work._client, work.original_client)
+        self.assertEqual(asyncio.run(personal.call()), "accepted")
+        _url, request = personal._client.requests[0]
+        self.assertEqual(
+            request["json"]["reasoning"],
+            {"effort": "xhigh", "summary": "auto"},
+        )
 
         fallback = LLMProvider(
             provider="lmstudio",
@@ -706,6 +752,29 @@ print("accepted")
                 "alt1": "/tmp/alt1-codex",
                 "alt2": "/tmp/alt2-codex",
             },
+        )
+
+    def test_managed_codex_53_omits_unsupported_reasoning_summary(self) -> None:
+        value = policy_data()
+        for member in value["members"]:
+            if member["identity"]["provider"] == "openai-codex":
+                member["identity"]["model"] = "gpt-5.3-codex-spark"
+        _LLMProvider, CodexLLM, _MultiLLMProvider = self.install(
+            policy_value=value,
+        )
+        member = CodexLLM(
+            provider="openai-codex",
+            api_key="provider-policy:personal",
+            base_url="",
+            model="gpt-5.3-codex-spark",
+            reasoning_effort="low",
+        )
+
+        self.assertEqual(asyncio.run(member.call()), "accepted")
+        _url, request = member._client.requests[0]
+        self.assertEqual(
+            request["json"]["reasoning"],
+            {"effort": "low"},
         )
 
     def test_reinstalling_the_same_policy_is_an_idempotent_noop(self) -> None:

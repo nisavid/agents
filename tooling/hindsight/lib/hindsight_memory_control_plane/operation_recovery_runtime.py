@@ -2616,8 +2616,9 @@ class ExactDrainClaimAdapter:
                 raise OperationRecoveryError(
                     "operation-recovery exact drain claim row drifted"
                 )
-            row["task_payload"] = self._canonical_task_payload(row)
         chosen = self._choose_rows(safe_rows, reserved_limits, shared_limit)
+        for row in chosen:
+            row["task_payload"] = self._canonical_task_payload(row)
         if not chosen:
             self._initial_guard_complete = True
             statuses = await connection.fetch(

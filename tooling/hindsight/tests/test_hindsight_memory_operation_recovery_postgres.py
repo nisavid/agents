@@ -549,6 +549,7 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
         embedded_schema_mismatch=False,
         embedded_tenant_mismatch=False,
         embedded_api_key_mismatch=False,
+        embedded_mismatch_position=2,
     ):
         await self._reset(connection)
         operation_types = ["retain"] * 42 + ["refresh_mental_model"] * 4 + [
@@ -571,17 +572,20 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
                         "cohort": position,
                         "operation_id": (
                             "ffffffff-ffff-4fff-8fff-ffffffffffff"
-                            if embedded_operation_id_mismatch and position == 2
+                            if embedded_operation_id_mismatch
+                            and position == embedded_mismatch_position
                             else operation_id
                         ),
                         "bank_id": (
                             "codex"
-                            if embedded_bank_id_mismatch and position == 2
+                            if embedded_bank_id_mismatch
+                            and position == embedded_mismatch_position
                             else "engineering"
                         ),
                         "type": (
                             "graph_maintenance"
-                            if embedded_type_mismatch and position == 2
+                            if embedded_type_mismatch
+                            and position == embedded_mismatch_position
                             else
                             "batch_retain"
                             if operation_type == "retain"
@@ -589,17 +593,20 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
                         ),
                         **(
                             {"_schema": "foreign_schema"}
-                            if embedded_schema_mismatch and position == 2
+                            if embedded_schema_mismatch
+                            and position == embedded_mismatch_position
                             else {}
                         ),
                         **(
                             {"_tenant_id": "foreign-tenant"}
-                            if embedded_tenant_mismatch and position == 2
+                            if embedded_tenant_mismatch
+                            and position == embedded_mismatch_position
                             else {}
                         ),
                         **(
                             {"_api_key_id": "foreign-api-key"}
-                            if embedded_api_key_mismatch and position == 2
+                            if embedded_api_key_mismatch
+                            and position == embedded_mismatch_position
                             else {}
                         ),
                     }
@@ -844,6 +851,69 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
                         [],
                     )
                 self.assertEqual(completion_signals, 1)
+            finally:
+                await connection.close()
+
+        asyncio.run(exercise())
+
+    def test_exact_drain_claim_validates_embedded_target_at_claim_capacity(self):
+        async def exercise():
+            connection = await self._connect()
+            try:
+                plan, _cohort_ids, _unexpected_id = await self._exact_drain_case(
+                    connection,
+                    embedded_bank_id_mismatch=True,
+                    embedded_mismatch_position=3,
+                )
+                adapter = ExactDrainClaimAdapter(plan)
+                await self._bind_disposable_exact_drain_identity(
+                    adapter,
+                    connection,
+                )
+                worker_id = exact_drain_worker_id(plan["plan_digest"])
+
+                async with connection.transaction():
+                    first = await adapter.claim_tasks(
+                        connection,
+                        '"public".async_operations',
+                        worker_id,
+                        {},
+                        1,
+                    )
+                self.assertEqual(
+                    [str(row["operation_id"]) for row in first],
+                    ["00000000-0000-4000-8000-000000000003"],
+                )
+                adapter.claim_committed(
+                    [
+                        SimpleNamespace(
+                            operation_id=str(first[0]["operation_id"])
+                        )
+                    ]
+                )
+                await connection.execute(
+                    """
+                    UPDATE public.async_operations
+                    SET status = 'completed',
+                        completed_at = NOW(),
+                        updated_at = NOW()
+                    WHERE operation_id = $1::uuid
+                    """,
+                    str(first[0]["operation_id"]),
+                )
+
+                with self.assertRaisesRegex(
+                    OperationRecoveryError,
+                    "task payload target differs",
+                ):
+                    async with connection.transaction():
+                        await adapter.claim_tasks(
+                            connection,
+                            '"public".async_operations',
+                            worker_id,
+                            {},
+                            1,
+                        )
             finally:
                 await connection.close()
 

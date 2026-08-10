@@ -1,14 +1,18 @@
 from contextlib import asynccontextmanager
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 import asyncio
 import hashlib
 import os
+import signal
 import socket
+import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
+from types import SimpleNamespace
 import unittest
 
 
@@ -87,6 +91,402 @@ class FakeConnection:
 
 
 class OperationRecoveryRuntimeTest(unittest.TestCase):
+    def test_runtime_guard_rejects_missing_progress_seams(self):
+        class MissingWorkerPoller:
+            pass
+
+        with self.assertRaisesRegex(
+            Exception,
+            "required worker progress seam is unavailable",
+        ):
+            install_exact_drain_runtime_guards(
+                type("PostgreSQLOps", (), {}),
+                MissingWorkerPoller,
+                type("MemoryEngine", (), {}),
+                object(),
+            )
+
+    def test_runtime_guard_records_claim_only_after_upstream_commit_seam(self):
+        committed = []
+        task = type("Task", (), {"operation_id": "operation-1"})()
+
+        class Adapter:
+            def claim_committed(self, tasks):
+                committed.extend(tasks)
+
+        class PostgreSQLOps:
+            pass
+
+        class WorkerPoller:
+            async def _execute_task_inner(self, _task, _holder):
+                return None
+
+            async def _claim_batch_for_schema_inner(
+                self,
+                _schema,
+                _reserved_limits,
+                _shared_limit,
+            ):
+                return [task]
+
+            async def _claim_batch_for_schema(self, schema, reserved, shared):
+                return await self._claim_batch_for_schema_inner(
+                    schema, reserved, shared
+                )
+
+        class MemoryEngine:
+            pass
+
+        install_exact_drain_runtime_guards(
+            PostgreSQLOps,
+            WorkerPoller,
+            MemoryEngine,
+            Adapter(),
+        )
+        result = asyncio.run(
+            WorkerPoller()._claim_batch_for_schema_inner(None, {}, 1)
+        )
+
+        self.assertEqual(result, [task])
+        self.assertEqual(committed, [task])
+
+    def test_public_claim_does_not_swallow_post_commit_progress_failure(self):
+        operation_id = "00000000-0000-4000-8000-000000000001"
+        task = type("Task", (), {"operation_id": operation_id})()
+        recorder = Mock()
+        recorder.task_stage.side_effect = RuntimeError("progress failed")
+        aborts = []
+        adapter = object.__new__(ExactDrainClaimAdapter)
+        adapter._selected = {operation_id: {}}
+        adapter._started_ids = set()
+        adapter._pending_progress_stages = {}
+        adapter._progress_recorder = recorder
+        adapter._completion_callback = lambda: aborts.append(True)
+
+        class WorkerPoller:
+            def __init__(self):
+                self._shutdown = asyncio.Event()
+
+            async def _execute_task_inner(self, _task, _holder):
+                return None
+
+            async def _claim_batch_for_schema_inner(
+                self,
+                _schema,
+                _reserved_limits,
+                _shared_limit,
+            ):
+                return [task]
+
+            async def _claim_batch_for_schema(self, schema, reserved, shared):
+                try:
+                    return await self._claim_batch_for_schema_inner(
+                        schema, reserved, shared
+                    )
+                except Exception:
+                    return []
+
+            async def claim_batch(self):
+                return await self._claim_batch_for_schema(None, {}, 1)
+
+            async def run(self):
+                while not self._shutdown.is_set():
+                    try:
+                        await self.claim_batch()
+                    except Exception:
+                        await asyncio.sleep(0)
+
+        install_exact_drain_runtime_guards(
+            type("PostgreSQLOps", (), {}),
+            WorkerPoller,
+            type("MemoryEngine", (), {}),
+            adapter,
+        )
+
+        poller = WorkerPoller()
+        asyncio.run(asyncio.wait_for(poller.run(), timeout=1))
+        self.assertEqual(adapter._started_ids, {operation_id})
+        self.assertTrue(poller._shutdown.is_set())
+        self.assertEqual(aborts, [True])
+
+    def test_runtime_guard_projects_upstream_stage_holder_changes(self):
+        stages = []
+
+        class Adapter:
+            def record_upstream_stage(self, operation_id, stage):
+                stages.append((operation_id, stage))
+
+        class PostgreSQLOps:
+            pass
+
+        class WorkerPoller:
+            async def _claim_batch_for_schema_inner(
+                self,
+                _schema,
+                _reserved_limits,
+                _shared_limit,
+            ):
+                return []
+
+            async def _claim_batch_for_schema(self, schema, reserved, shared):
+                return await self._claim_batch_for_schema_inner(
+                    schema, reserved, shared
+                )
+
+            async def _execute_task_inner(self, task, holder):
+                holder.stage = "retain.phase1.resolve"
+                await asyncio.sleep(0.6)
+                holder.stage = "llm.codex.retain.attempt=1/1"
+                return "done"
+
+        class MemoryEngine:
+            pass
+
+        install_exact_drain_runtime_guards(
+            PostgreSQLOps,
+            WorkerPoller,
+            MemoryEngine,
+            Adapter(),
+        )
+
+        async def exercise():
+            task = type("Task", (), {"operation_id": "operation-1"})()
+            holder = type("Holder", (), {"stage": "queued.retain"})()
+            return await WorkerPoller()._execute_task_inner(task, holder)
+
+        self.assertEqual(asyncio.run(exercise()), "done")
+        self.assertEqual(
+            stages,
+            [
+                ("operation-1", "queued.retain"),
+                ("operation-1", "retain.phase1.resolve"),
+                ("operation-1", "llm.codex.retain.attempt=1/1"),
+            ],
+        )
+
+    def test_sigterm_runs_the_exact_release_seam(self):
+        try:
+            import hindsight_api.worker.main  # noqa: F401
+            import hindsight_api.worker.poller  # noqa: F401
+        except ImportError as error:
+            raise unittest.SkipTest(
+                "hindsight_api worker runtime is unavailable"
+            ) from error
+        script = textwrap.dedent(
+            f"""
+            import asyncio
+            import sys
+
+            sys.path.insert(0, {str(LIB)!r})
+            from hindsight_memory_control_plane.operation_recovery_runtime import install_exact_drain_runtime_guards
+            from hindsight_api.worker.main import _install_shutdown_signal_handlers
+            from hindsight_api.worker.poller import WorkerPoller as UpstreamWorkerPoller
+
+            released = []
+
+            class Adapter:
+                async def release_own_tasks(self, backend):
+                    released.append(backend)
+                    return 2
+
+            class PostgreSQLOps:
+                pass
+
+            class WorkerPoller(UpstreamWorkerPoller):
+                pass
+
+            class MemoryEngine:
+                pass
+
+            install_exact_drain_runtime_guards(
+                PostgreSQLOps,
+                WorkerPoller,
+                MemoryEngine,
+                Adapter(),
+            )
+
+            async def exercise():
+                poller = object.__new__(WorkerPoller)
+                poller._backend = "exact-backend"
+                poller._worker_id = "exact-worker"
+                poller._shutdown = asyncio.Event()
+                poller._in_flight_lock = asyncio.Lock()
+                poller._in_flight_count = 0
+                poller._active_tasks = {{}}
+                shutdown = asyncio.Event()
+                loop = asyncio.get_running_loop()
+                if not _install_shutdown_signal_handlers(loop, shutdown.set):
+                    raise RuntimeError("signal handlers unavailable")
+                print("READY", flush=True)
+                await shutdown.wait()
+                await poller.shutdown_graceful(timeout=0.01)
+                print(f"RELEASED={{released!r}}", flush=True)
+
+            asyncio.run(exercise())
+            """
+        )
+        process = subprocess.Popen(
+            [sys.executable, "-c", script],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            ready = []
+            reader = threading.Thread(
+                target=lambda: ready.append(process.stdout.readline())
+            )
+            reader.daemon = True
+            reader.start()
+            reader.join(timeout=10)
+            self.assertFalse(reader.is_alive(), "worker never reported READY")
+            self.assertEqual(ready[0].strip(), "READY")
+            os.kill(process.pid, signal.SIGTERM)
+            stdout, stderr = process.communicate(timeout=10)
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=10)
+        self.assertEqual(process.returncode, 0, stderr)
+        self.assertIn("RELEASED=['exact-backend']", stdout)
+
+    def test_exact_drain_resume_reconciles_terminal_progress(self):
+        adapter = object.__new__(ExactDrainClaimAdapter)
+        recorder = Mock()
+        operation_id = "00000000-0000-4000-8000-000000000001"
+        adapter._plan = {
+            "pre_generation": "systalyze:public:123",
+            "installation_authority": {
+                "postgres_system_identifier": "7659746962107358086",
+            },
+            "rollback_backup": {
+                "source_authority": {
+                    "binding": {
+                        "database": "hindsight",
+                        "user": "hindsight",
+                        "data_dir": "/private/tmp",
+                        "port": 54329,
+                    }
+                }
+            },
+        }
+        adapter._selected = {
+            operation_id: {
+                "operation_type": "retain",
+                "task_payload_digest": "a" * 64,
+                "row_digest": "b" * 64,
+            }
+        }
+        adapter._preserved = {}
+        adapter._resume = True
+        adapter._terminal_reconciliation = True
+        adapter._worker_digest = "c" * 64
+        adapter._started_ids = set()
+        adapter._progress_recorder = recorder
+
+        class Connection:
+            async def fetchrow(self, _query):
+                return {
+                    "database": "hindsight",
+                    "database_user": "hindsight",
+                    "data_directory": "/private/tmp",
+                    "port": 54329,
+                    "address": None,
+                    "system_identifier": "7659746962107358086",
+                }
+
+        row = {
+            "operation_id": operation_id,
+            "operation_type": "retain",
+            "task_payload_digest": "a" * 64,
+            "worker_id_digest": "c" * 64,
+            "status": "completed",
+        }
+        with (
+            patch(
+                "hindsight_memory_control_plane.operation_recovery_runtime."
+                "read_generation",
+                new=AsyncMock(return_value="systalyze:public:124"),
+            ),
+            patch(
+                "hindsight_memory_control_plane.operation_recovery_runtime."
+                "read_safe_operation_rows",
+                new=AsyncMock(return_value=[row]),
+            ),
+            patch(
+                "hindsight_memory_control_plane.operation_recovery_runtime."
+                "live_row_digest",
+                return_value="d" * 64,
+            ),
+        ):
+            asyncio.run(adapter._verify_initial_state(Connection()))
+
+        recorder.task_stage.assert_not_called()
+        adapter._flush_pending_progress_stages()
+        recorder.task_stage.assert_called_once_with(
+            operation_id,
+            status="completed",
+            stage="resume-completed",
+        )
+        row["status"] = "pending"
+        with (
+            patch(
+                "hindsight_memory_control_plane.operation_recovery_runtime."
+                "read_generation",
+                new=AsyncMock(return_value="systalyze:public:124"),
+            ),
+            patch(
+                "hindsight_memory_control_plane.operation_recovery_runtime."
+                "read_safe_operation_rows",
+                new=AsyncMock(return_value=[row]),
+            ),
+            patch(
+                "hindsight_memory_control_plane.operation_recovery_runtime."
+                "live_row_digest",
+                return_value="d" * 64,
+            ),
+            self.assertRaisesRegex(
+                OperationRecoveryError,
+                "terminal reconciliation state differs",
+            ),
+        ):
+            asyncio.run(adapter._verify_initial_state(Connection()))
+
+    def test_terminal_reconciliation_rechecks_before_every_no_work_claim(self):
+        adapter = object.__new__(ExactDrainClaimAdapter)
+        adapter._worker_id = "exact-worker"
+        adapter._terminal_reconciliation = True
+        adapter._terminal_reconciliation_ready = False
+        adapter._initial_guard_complete = True
+        adapter._verify_initial_state = AsyncMock(
+            side_effect=OperationRecoveryError(
+                "operation-recovery terminal reconciliation state differs"
+            )
+        )
+        connection = SimpleNamespace(
+            execute=AsyncMock(return_value="SET"),
+            fetch=AsyncMock(),
+        )
+
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "terminal reconciliation state differs",
+        ):
+            asyncio.run(
+                adapter.claim_tasks(
+                    connection,
+                    '"public".async_operations',
+                    "exact-worker",
+                    {},
+                    1,
+                )
+            )
+
+        adapter._verify_initial_state.assert_awaited_once_with(connection)
+        connection.fetch.assert_not_awaited()
+        self.assertFalse(adapter._terminal_reconciliation_ready)
+
     def test_exact_drain_interpreter_evidence_resolves_version_alias_parent(self):
         with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
             root = Path(directory).resolve(strict=True)
@@ -200,6 +600,10 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
                 events.append(("exact-recovery", backend))
                 return 0
 
+            async def release_own_tasks(self, backend):
+                events.append(("exact-release", backend))
+                return 2
+
             async def schedule_retry(
                 self, backend, operation_id, retry_at, error_message, schema
             ):
@@ -253,12 +657,32 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         class WorkerPoller:
             _backend = "exact-backend"
 
+            async def _execute_task_inner(self, _task, _holder):
+                return None
+
+            async def _claim_batch_for_schema_inner(
+                self,
+                _schema,
+                _reserved_limits,
+                _shared_limit,
+            ):
+                return []
+
+            async def _claim_batch_for_schema(self, schema, reserved, shared):
+                return await self._claim_batch_for_schema_inner(
+                    schema, reserved, shared
+                )
+
             async def _scan_active_schemas(self, schemas):
                 events.append(("upstream-scan", schemas))
                 return set(schemas)
 
             async def recover_own_tasks(self):
                 events.append(("global-recovery",))
+                return 99
+
+            async def release_own_tasks(self):
+                events.append(("global-release",))
                 return 99
 
             async def _maybe_update_parent_operation(self, *arguments):
@@ -290,6 +714,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
                 ["tenant-a", None, "tenant-b"]
             )
             recovered = await WorkerPoller().recover_own_tasks()
+            released = await WorkerPoller().release_own_tasks()
             retried = await WorkerPoller()._schedule_retry(
                 "operation", "retry-at", "safe-error", None
             )
@@ -336,6 +761,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
                 claimed,
                 active,
                 recovered,
+                released,
                 retried,
                 deferred,
                 completed,
@@ -352,6 +778,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
             claimed,
             active,
             recovered,
+            released,
             retried,
             deferred,
             completed,
@@ -366,6 +793,9 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         self.assertEqual(claimed, ["selected"])
         self.assertEqual(active, {None})
         self.assertEqual(recovered, 0)
+        self.assertEqual(released, 2)
+        self.assertIn(("exact-release", "exact-backend"), events)
+        self.assertNotIn(("global-release",), events)
         self.assertIsNone(retried)
         self.assertIsNone(deferred)
         self.assertIsNone(completed)
@@ -445,6 +875,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
             [
                 "claim",
                 "exact-recovery",
+                "exact-release",
                 "exact-retry",
                 "exact-defer",
                 "exact-complete",

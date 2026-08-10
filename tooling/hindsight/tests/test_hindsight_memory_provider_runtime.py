@@ -7,8 +7,10 @@ import json
 import logging
 import os
 from pathlib import Path
+import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import types
 import unittest
@@ -24,6 +26,10 @@ from hindsight_memory_control_plane.provider_runtime import (  # noqa: E402
     HindsightProviderAdapter,
     ProviderRuntimeCompatibilityError,
     ProviderRuntimePolicy,
+)
+from hindsight_memory_control_plane.operation_recovery_progress import (  # noqa: E402
+    ExactDrainProgressRecorder,
+    read_exact_drain_progress,
 )
 
 
@@ -47,7 +53,7 @@ def policy_data() -> dict[str, object]:
                     "locator": "oauth-home:personal",
                 },
                 "timeout_seconds": None,
-                "max_retries": None,
+                "max_retries": 0,
                 "max_concurrent": None,
                 "operation_priorities": {
                     "default": 0,
@@ -70,7 +76,7 @@ def policy_data() -> dict[str, object]:
                     "locator": "oauth-home:work",
                 },
                 "timeout_seconds": None,
-                "max_retries": None,
+                "max_retries": 0,
                 "max_concurrent": None,
                 "operation_priorities": {
                     "default": 0,
@@ -89,8 +95,8 @@ def policy_data() -> dict[str, object]:
                     "credential_marker": None,
                 },
                 "credential": {"mode": "none", "locator": None},
-                "timeout_seconds": 300,
-                "max_retries": 1,
+                "timeout_seconds": 1200,
+                "max_retries": 0,
                 "max_concurrent": 1,
                 "operation_priorities": {
                     "default": 0,
@@ -401,6 +407,29 @@ class ProviderRuntimePolicyTest(unittest.TestCase):
 
 
 class HindsightProviderAdapterTest(unittest.TestCase):
+    def test_disconnected_fallback_uses_split_connect_and_read_budgets(self) -> None:
+        import httpx
+
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+        timeout = provider_runtime._split_timeout(1200)
+
+        async def request() -> None:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                with self.assertRaises(httpx.ConnectError):
+                    await client.get(f"http://127.0.0.1:{port}/v1")
+
+        try:
+            asyncio.run(request())
+        finally:
+            listener.close()
+
+        self.assertEqual(timeout.connect, 20)
+        self.assertEqual(timeout.pool, 20)
+        self.assertEqual(timeout.write, 60)
+        self.assertEqual(timeout.read, 1200)
+
     def runtime_modules(self):
         class Client:
             def __init__(self, timeout: int) -> None:
@@ -638,11 +667,16 @@ print("accepted")
             model="private-fallback-model",
         )
 
-        self.assertEqual((fallback.timeout, fallback.max_retries), (300, 1))
-        self.assertEqual(fallback._provider_impl._client.timeout, 300)
+        self.assertEqual(fallback.max_retries, 0)
+        self.assertEqual(fallback.timeout, 1200)
+        self.assertEqual(fallback._provider_impl.timeout, 1200)
+        self.assertEqual(fallback._provider_impl._client.timeout.connect, 20)
+        self.assertEqual(fallback._provider_impl._client.timeout.pool, 20)
+        self.assertEqual(fallback._provider_impl._client.timeout.write, 60)
+        self.assertEqual(fallback._provider_impl._client.timeout.read, 1200)
         self.assertEqual((nearby.timeout, nearby.max_retries), (30, 7))
         self.assertEqual(
-            asyncio.run(fallback.call(max_retries=7))["max_retries"], 1
+            asyncio.run(fallback.call(max_retries=7))["max_retries"], 0
         )
         self.assertEqual(
             asyncio.run(nearby.call(max_retries=7))["max_retries"], 7
@@ -871,7 +905,7 @@ print("accepted")
         self.assertNotIn("credential-secret-must-not-be-logged", "\n".join(logs.output))
         self.assertNotIn("inf", "\n".join(logs.output).lower())
 
-    def test_round_robin_rotates_four_codex_accounts_and_hatchery(self) -> None:
+    def test_round_robin_rotates_only_the_primary_codex_tier(self) -> None:
         _LLMProvider, _CodexLLM, MultiLLMProvider = self.install(
             policy_value=four_codex_policy_data(),
             homes=four_codex_homes(),
@@ -902,22 +936,25 @@ print("accepted")
 
         self.assertEqual(
             observed,
-            ["work", "personal", "alt1", "alt2", "fallback", "work"],
+            ["work", "personal", "alt1", "alt2", "work", "personal"],
         )
+        self.assertEqual(fallback.calls, 0)
 
-    def test_round_robin_hatchery_failure_wraps_to_codex_once(self) -> None:
+    def test_round_robin_uses_hatchery_only_after_all_codex_members_fail(self) -> None:
         _LLMProvider, _CodexLLM, MultiLLMProvider = self.install(
             policy_value=four_codex_policy_data(),
             homes=four_codex_homes(),
         )
 
         codex_members = four_codex_members()
+        for member in codex_members.values():
+            member.result = ConnectionError("codex unavailable")
         fallback = StaticMember(
             "lmstudio",
             "private-fallback-model",
             "http://inference.example.test:13305/v1",
             "",
-            ConnectionError("fallback offline"),
+            "fallback",
         )
         provider = MultiLLMProvider()
         provider._strategy.mode = "round-robin"
@@ -929,12 +966,11 @@ print("accepted")
             codex_members["alt1"],
         ]
 
-        self.assertEqual(asyncio.run(provider._dispatch("call")), "work")
-        self.assertEqual(asyncio.run(provider._dispatch("call")), "personal")
-        self.assertEqual(asyncio.run(provider._dispatch("call")), "alt1")
-        self.assertEqual(asyncio.run(provider._dispatch("call")), "alt2")
         with self.assertLogs("test-provider-runtime", level="WARNING"):
-            self.assertEqual(asyncio.run(provider._dispatch("call")), "work")
+            self.assertEqual(asyncio.run(provider._dispatch("call")), "fallback")
+
+        codex_members["personal"].result = "personal"
+        self.assertEqual(asyncio.run(provider._dispatch("call")), "personal")
 
         self.assertEqual(
             (
@@ -944,7 +980,7 @@ print("accepted")
                 codex_members["alt2"].calls,
                 fallback.calls,
             ),
-            (2, 1, 1, 1, 1),
+            (1, 2, 1, 1, 1),
         )
 
     def test_usage_limit_reset_hint_is_capped_to_the_probe_cooldown(self) -> None:
@@ -971,6 +1007,81 @@ print("accepted")
             ),
             1_300,
         )
+
+    def test_long_running_provider_progress_is_queryable_before_completion(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+            progress_path = Path(directory) / "progress.json"
+            recorder = ExactDrainProgressRecorder(
+                path=progress_path,
+                plan_digest="a" * 64,
+                worker_pid=os.getpid(),
+                worker_start_time="darwin:1000:1",
+                worker_attempt=1,
+                selected_operations=[
+                    {
+                        "operation_id": "00000000-0000-4000-8000-000000000001",
+                        "operation_type": "retain",
+                        "row_digest": "b" * 64,
+                    }
+                ],
+            )
+            provider_runtime.set_exact_drain_progress_recorder(recorder)
+            self.addCleanup(
+                provider_runtime.set_exact_drain_progress_recorder,
+                None,
+            )
+            _LLMProvider, _CodexLLM, MultiLLMProvider = self.install(
+                policy_value=four_codex_policy_data(),
+                homes=four_codex_homes(),
+            )
+            members = four_codex_members()
+            started = asyncio.Event()
+            release = asyncio.Event()
+
+            async def long_call(**_kwargs):
+                started.set()
+                await release.wait()
+                return "work"
+
+            members["work"].call = long_call
+            fallback = StaticMember(
+                "lmstudio",
+                "private-fallback-model",
+                "http://inference.example.test:13305/v1",
+                "",
+                "fallback",
+            )
+            provider = MultiLLMProvider()
+            provider._strategy.mode = "round-robin"
+            provider._members = [*members.values(), fallback]
+
+            async def scenario():
+                pending = asyncio.create_task(
+                    provider._dispatch("call", scope="retain_extract_facts")
+                )
+                await started.wait()
+                active = read_exact_drain_progress(
+                    progress_path,
+                    plan_digest="a" * 64,
+                )
+                release.set()
+                result = await pending
+                finished = read_exact_drain_progress(
+                    progress_path,
+                    plan_digest="a" * 64,
+                )
+                return active, result, finished
+
+            active, result, finished = asyncio.run(scenario())
+
+        self.assertEqual(result, "work")
+        self.assertEqual(
+            active["active_provider_requests"][0]["provider_id"],
+            "work",
+        )
+        self.assertEqual(active["provider_counters"][0]["started"], 1)
+        self.assertEqual(finished["active_provider_requests"], [])
+        self.assertEqual(finished["provider_counters"][0]["succeeded"], 1)
 
     def test_fallback_verification_timeout_does_not_block_startup(self) -> None:
         _LLMProvider, _CodexLLM, MultiLLMProvider = self.install()

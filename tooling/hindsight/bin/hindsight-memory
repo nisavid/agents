@@ -193,7 +193,6 @@ from hindsight_memory_control_plane.operation_recovery_runtime import (  # noqa:
     exact_drain_runtime_digest,
     exact_drain_worker_hindsight_version,
     exact_drain_worker_interpreter_path,
-    exact_drain_worker_id,
     live_row_digest,
     read_claim_release_evidence,
     read_claim_release_preimage,
@@ -207,6 +206,10 @@ from hindsight_memory_control_plane.operation_recovery_runtime import (  # noqa:
     rollback_claim_release_transaction,
     rollback_requeue_transaction,
     validate_exact_drain_provider_policy,
+)
+from hindsight_memory_control_plane.operation_recovery_progress import (  # noqa: E402
+    exact_drain_progress_archive_path,
+    read_exact_drain_progress,
 )
 from hindsight_memory_control_plane.harness_persistence import (  # noqa: E402
     HarnessPersistenceError,
@@ -7957,6 +7960,34 @@ def operation_recovery_drain_plan_command(args: argparse.Namespace) -> int:
         status_artifact_path=args.status_artifact,
         verification_receipt_path=args.verification_receipt,
     )
+    normalized_output = unicodedata.normalize(
+        "NFD", str(output_path.resolve(strict=False)).casefold()
+    )
+    reserved_paths = {
+        unicodedata.normalize(
+            "NFD",
+            str(Path(value).resolve(strict=False)).casefold(),
+        )
+        for key, value in plan.items()
+        if key.endswith("_path") and isinstance(value, str)
+    }
+    reserved_paths.update(
+        unicodedata.normalize(
+            "NFD",
+            str(path.resolve(strict=False)).casefold(),
+        )
+        for path in (
+            exact_drain_progress_archive_path(
+                Path(plan["progress_artifact_path"]),
+                attempt,
+            )
+            for attempt in range(1, plan["worker_max_attempts"] + 1)
+        )
+    )
+    if normalized_output in reserved_paths:
+        raise OperationRecoveryError(
+            "operation-recovery exact drain plan path aliases an artifact"
+        )
     if _operation_recovery_candidate(args) != candidate_before:
         raise OperationRecoveryError(
             "operation-recovery candidate drifted during exact drain planning"
@@ -8041,6 +8072,7 @@ def _operation_recovery_exact_application(
         "worker_runtime_digest",
         "provider_policy_digest",
         "terminal_status_digest",
+        "terminal_progress_digest",
         "selected_status_counts",
         "outside_nonterminal_counts",
         "worker_pid",
@@ -8083,6 +8115,9 @@ def _operation_recovery_exact_application(
         or value.get("provider_policy_digest") != plan["provider_policy_digest"]
         or value.get("terminal_status_digest")
         != terminal_status["status_digest"]
+        or not isinstance(value.get("terminal_progress_digest"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", value["terminal_progress_digest"])
+        is None
         or value.get("selected_status_counts")
         != terminal_status["selected_status_counts"]
         or value.get("selected_status_counts", {}).get("pending", 0)
@@ -8097,7 +8132,9 @@ def _operation_recovery_exact_application(
         or value["worker_start_time"]
         != " ".join(value["worker_start_time"].split())
         or type(value.get("worker_attempt")) is not int
-        or not 1 <= value["worker_attempt"] <= plan["worker_max_attempts"]
+        or not 1
+        <= value["worker_attempt"]
+        <= plan["worker_max_attempts"] + 1
         or any(
             item.get("status") == "processing"
             for item in value.get("outside_nonterminal_counts", [])
@@ -8162,7 +8199,9 @@ def _operation_recovery_exact_journal(
         or value["worker_start_time"]
         != " ".join(value["worker_start_time"].split())
         or type(value.get("worker_attempt")) is not int
-        or not 1 <= value["worker_attempt"] <= plan["worker_max_attempts"]
+        or not 1
+        <= value["worker_attempt"]
+        <= plan["worker_max_attempts"] + 1
         or value.get("receipt_digest") != digest(body)
     ):
         raise OperationRecoveryError("exact drain application journal is invalid")
@@ -8178,6 +8217,43 @@ def _operation_recovery_exact_journal_worker_active(
             journal["worker_start_time"],
         )
     )
+
+
+def _operation_recovery_exact_next_worker_attempt(
+    plan: Mapping[str, Any],
+    journal: Mapping[str, Any],
+    *,
+    terminal_reconciliation: bool = False,
+) -> int:
+    """Reuse a journaled attempt only when progress proves bootstrap never began."""
+    progress_path = Path(plan["progress_artifact_path"])
+    journal_attempt = journal["worker_attempt"]
+    if not progress_path.exists():
+        if journal_attempt != 1:
+            raise OperationRecoveryError(
+                "exact drain progress state is incomplete"
+            )
+        next_attempt = 1
+    else:
+        progress = read_exact_drain_progress(
+            progress_path,
+            plan_digest=plan["plan_digest"],
+        )
+        progress_attempt = progress["worker_attempt"]
+        if progress_attempt == journal_attempt:
+            next_attempt = journal_attempt + 1
+        elif progress_attempt == journal_attempt - 1:
+            next_attempt = journal_attempt
+        else:
+            raise OperationRecoveryError(
+                "exact drain progress attempt differs"
+            )
+    maximum = plan["worker_max_attempts"] + int(terminal_reconciliation)
+    if next_attempt > maximum:
+        raise OperationRecoveryError(
+            "exact drain worker attempt ceiling reached"
+        )
+    return next_attempt
 
 
 def operation_recovery_drain_status_command(args: argparse.Namespace) -> int:
@@ -8428,6 +8504,58 @@ def _operation_recovery_exact_status_is_terminal(
     )
 
 
+def _operation_recovery_assert_terminal_progress(
+    *,
+    plan: Mapping[str, Any],
+    journal: Mapping[str, Any],
+    terminal: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    progress = read_exact_drain_progress(
+        Path(plan["progress_artifact_path"]),
+        plan_digest=plan["plan_digest"],
+    )
+    expected_tasks = {
+        (item["operation_id"], item["operation_type"], item["row_digest"])
+        for item in plan["selected_operations"]
+    }
+    observed_tasks = {
+        (item["operation_id"], item["operation_type"], item["row_digest"])
+        for item in progress["tasks"]
+    }
+    if (
+        any(
+            progress[key] != journal[key]
+            for key in ("worker_pid", "worker_start_time", "worker_attempt")
+        )
+        or progress["selected_status_counts"]
+        != terminal["selected_status_counts"]
+        or progress["active_provider_requests"]
+        or observed_tasks != expected_tasks
+    ):
+        raise OperationRecoveryError("exact drain terminal progress differs")
+    return progress
+
+
+def _operation_recovery_read_monitor_progress(
+    plan: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    """Tolerate a bounded race with the worker's atomic progress replacement."""
+    for attempt in range(3):
+        try:
+            return read_exact_drain_progress(
+                Path(plan["progress_artifact_path"]),
+                plan_digest=plan["plan_digest"],
+            )
+        except OperationRecoveryError as error:
+            if (
+                str(error) != "exact drain progress changed while reading"
+                or attempt == 2
+            ):
+                raise
+            time.sleep(0.01)
+    raise AssertionError("unreachable")
+
+
 def _operation_recovery_finalize_exact_application(
     *,
     plan: Mapping[str, Any],
@@ -8440,6 +8568,11 @@ def _operation_recovery_finalize_exact_application(
         raise OperationRecoveryError(
             "exact drain worker stopped before terminal state"
         )
+    progress = _operation_recovery_assert_terminal_progress(
+        plan=plan,
+        journal=journal,
+        terminal=terminal,
+    )
     write_private(plan["status_artifact_path"], terminal)
     application = _operation_recovery_exact_receipt(
         {
@@ -8454,6 +8587,7 @@ def _operation_recovery_finalize_exact_application(
             "worker_runtime_digest": plan["worker_runtime_digest"],
             "provider_policy_digest": plan["provider_policy_digest"],
             "terminal_status_digest": terminal["status_digest"],
+            "terminal_progress_digest": progress["progress_digest"],
             "selected_status_counts": terminal["selected_status_counts"],
             "outside_nonterminal_counts": terminal[
                 "outside_nonterminal_counts"
@@ -8503,6 +8637,7 @@ def operation_recovery_drain_apply_command(args: argparse.Namespace) -> int:
         raise OperationRecoveryError("exact drain runtime authority drifted")
     authorization_path = Path(plan["authorization_receipt_path"])
     application_path = Path(plan["application_receipt_path"])
+    progress_path = Path(plan["progress_artifact_path"])
     verification_path = Path(plan["verification_receipt_path"])
     manager = _portable_manager(args)
     with _operation_recovery_lock(manager):
@@ -8566,12 +8701,20 @@ def operation_recovery_drain_apply_command(args: argparse.Namespace) -> int:
                     )
             else:
                 if authorization_only:
+                    if progress_path.exists():
+                        raise OperationRecoveryError(
+                            "exact drain receipt state is incomplete"
+                        )
                     authorization = _operation_recovery_exact_authorization(
                         plan
                     )
                 else:
                     verify_exact_drain_plan(plan)
-                    if application_path.exists() or verification_path.exists():
+                    if (
+                        application_path.exists()
+                        or progress_path.exists()
+                        or verification_path.exists()
+                    ):
                         raise OperationRecoveryError(
                             "exact drain receipt state is incomplete"
                         )
@@ -8588,10 +8731,12 @@ def operation_recovery_drain_apply_command(args: argparse.Namespace) -> int:
             )
             fresh_preconditions = (
                 before["generation_before"] == plan["pre_generation"]
-                and before["selected_status_counts"] == {"pending": 43}
+                and before["selected_status_counts"]
+                == {"pending": plan["selected_operation_count"]}
             )
             if (
-                before["preserved_status_counts"] != {"completed": 5}
+                before["preserved_status_counts"]
+                != plan["preserved_status_counts"]
                 or outside_processing
                 or (not journal_resume and not fresh_preconditions)
                 or verification_path.exists()
@@ -8631,39 +8776,56 @@ def operation_recovery_drain_apply_command(args: argparse.Namespace) -> int:
             if journal_resume and _operation_recovery_exact_status_is_terminal(
                 before
             ):
-                application = _operation_recovery_finalize_exact_application(
-                    plan=plan,
-                    candidate=candidate,
-                    authorization=authorization,
-                    journal=journal,
-                    terminal=before,
-                )
-                return _print_result(
-                    {
-                        "status": "terminal",
-                        "plan_digest": plan["plan_digest"],
-                        "application_receipt_digest": application[
-                            "receipt_digest"
-                        ],
-                        "selected_status_counts": before[
-                            "selected_status_counts"
-                        ],
-                        "outside_nonterminal_counts": before[
-                            "outside_nonterminal_counts"
-                        ],
-                    }
-                )
+                try:
+                    _operation_recovery_assert_terminal_progress(
+                        plan=plan,
+                        journal=journal,
+                        terminal=before,
+                    )
+                except OperationRecoveryError:
+                    if journal["worker_attempt"] >= (
+                        plan["worker_max_attempts"] + 1
+                    ):
+                        raise
+                else:
+                    application = _operation_recovery_finalize_exact_application(
+                        plan=plan,
+                        candidate=candidate,
+                        authorization=authorization,
+                        journal=journal,
+                        terminal=before,
+                    )
+                    return _print_result(
+                        {
+                            "status": "terminal",
+                            "plan_digest": plan["plan_digest"],
+                            "application_receipt_digest": application[
+                                "receipt_digest"
+                            ],
+                            "selected_status_counts": before[
+                                "selected_status_counts"
+                            ],
+                            "outside_nonterminal_counts": before[
+                                "outside_nonterminal_counts"
+                            ],
+                        }
+                    )
             wrapper = Path(__file__).resolve().parent / (
                 "hindsight-exact-drain-worker"
             )
-            if (
+            terminal_reconciliation = bool(
                 journal_resume
-                and journal["worker_attempt"]
-                >= plan["worker_max_attempts"]
-            ):
-                raise OperationRecoveryError(
-                    "exact drain worker attempt ceiling reached"
+                and _operation_recovery_exact_status_is_terminal(before)
+            )
+            worker_attempt = (
+                _operation_recovery_exact_next_worker_attempt(
+                    plan,
+                    journal,
+                    terminal_reconciliation=terminal_reconciliation,
                 )
+                if journal_resume
+                else 1
+            )
             command = [
                 str(
                     _operation_recovery_exact_worker_interpreter(
@@ -8683,6 +8845,8 @@ def operation_recovery_drain_apply_command(args: argparse.Namespace) -> int:
             ]
             if journal_resume:
                 command.append("--resume")
+            if terminal_reconciliation:
+                command.append("--terminal-reconciliation")
             start_read, start_write = os.pipe()
             process: subprocess.Popen[bytes] | None = None
             try:
@@ -8730,11 +8894,6 @@ def operation_recovery_drain_apply_command(args: argparse.Namespace) -> int:
                     raise OperationRecoveryError(
                         "exact drain application journal appeared"
                     )
-                worker_attempt = (
-                    journal["worker_attempt"] + 1
-                    if journal_resume
-                    else 1
-                )
                 journal = _operation_recovery_exact_receipt(
                     {
                         "schema_version": 1,
@@ -8800,6 +8959,158 @@ def operation_recovery_drain_apply_command(args: argparse.Namespace) -> int:
     )
 
 
+def operation_recovery_drain_monitor_command(args: argparse.Namespace) -> int:
+    candidate = _operation_recovery_candidate(args)
+    plan = verify_exact_drain_plan(
+        _operation_recovery_read_private_json(args.plan, "exact drain plan"),
+        allow_expired=True,
+    )
+    if candidate != plan["candidate_release"]:
+        raise OperationRecoveryError("exact drain candidate differs")
+    progress_path = Path(plan["progress_artifact_path"])
+    application_path = Path(plan["application_receipt_path"])
+    if not progress_path.exists() and not application_path.exists():
+        return _print_result(
+            {
+                "status": "not-started",
+                "plan_digest": plan["plan_digest"],
+            }
+        )
+    # Apply writes the application journal before opening the start gate below;
+    # hindsight-exact-drain-worker creates progress only after reading that gate.
+    if progress_path.exists() != application_path.exists():
+        if application_path.exists():
+            authorization = _operation_recovery_exact_authorization(plan)
+            journal_value = _operation_recovery_read_private_json(
+                application_path,
+                "exact drain application record",
+            )
+            if (
+                isinstance(journal_value, Mapping)
+                and journal_value.get("kind")
+                == "operation-recovery-exact-drain-application-journal"
+            ):
+                journal = _operation_recovery_exact_journal(
+                    journal_value,
+                    plan=plan,
+                    authorization=authorization,
+                )
+                if _operation_recovery_exact_journal_worker_active(journal):
+                    return _print_result(
+                        {
+                            "status": "starting",
+                            "plan_digest": plan["plan_digest"],
+                            "worker_attempt": journal["worker_attempt"],
+                        }
+                    )
+        raise OperationRecoveryError("exact drain progress state is incomplete")
+    progress = _operation_recovery_read_monitor_progress(plan)
+    authorization = _operation_recovery_exact_authorization(plan)
+    application_value = _operation_recovery_read_private_json(
+        plan["application_receipt_path"],
+        "exact drain application record",
+    )
+    if isinstance(application_value, Mapping) and application_value.get("kind") == (
+        "operation-recovery-exact-drain-application-journal"
+    ):
+        application = _operation_recovery_exact_journal(
+            application_value,
+            plan=plan,
+            authorization=authorization,
+        )
+        terminal_status = None
+    else:
+        terminal_status = verify_exact_drain_status(
+            _operation_recovery_read_private_json(
+                plan["status_artifact_path"],
+                "exact drain terminal status",
+            ),
+            plan=plan,
+        )
+        application = _operation_recovery_exact_application(
+            application_value,
+            plan=plan,
+            authorization=authorization,
+            terminal_status=terminal_status,
+        )
+    if any(
+        progress[key] != application[key]
+        for key in ("worker_pid", "worker_start_time", "worker_attempt")
+    ):
+        raise OperationRecoveryError("exact drain progress identity differs")
+    if terminal_status is None:
+        monitor_status = (
+            "running"
+            if _operation_recovery_exact_journal_worker_active(application)
+            else "interrupted"
+        )
+    else:
+        if (
+            progress["selected_status_counts"]
+            != terminal_status["selected_status_counts"]
+            or progress["active_provider_requests"]
+            or progress["progress_digest"]
+            != application["terminal_progress_digest"]
+        ):
+            raise OperationRecoveryError(
+                "exact drain terminal progress differs"
+            )
+        monitor_status = "terminal"
+    expected_tasks = {
+        (
+            item["operation_id"],
+            item["operation_type"],
+            item["row_digest"],
+        )
+        for item in plan["selected_operations"]
+    }
+    observed_tasks = {
+        (
+            item["operation_id"],
+            item["operation_type"],
+            item["row_digest"],
+        )
+        for item in progress["tasks"]
+    }
+    if observed_tasks != expected_tasks:
+        raise OperationRecoveryError("exact drain progress task set differs")
+    return _print_result(
+        {
+            "status": monitor_status,
+            "plan_digest": plan["plan_digest"],
+            "worker_attempt": progress["worker_attempt"],
+            "started_at": progress["started_at"],
+            "observed_at": progress["observed_at"],
+            "last_progress_at": progress["last_progress_at"],
+            "selected_status_counts": (
+                progress["selected_status_counts"]
+                if terminal_status is None
+                else terminal_status["selected_status_counts"]
+            ),
+            "tasks": progress["tasks"],
+            "provider_counters": progress["provider_counters"],
+            "active_provider_requests": progress[
+                "active_provider_requests"
+            ],
+            "cooldowns": progress["cooldowns"],
+            "prior_attempts": progress["prior_attempts"],
+            "progress_digest": progress["progress_digest"],
+            **(
+                {}
+                if terminal_status is None
+                else {
+                    "outside_nonterminal_counts": terminal_status[
+                        "outside_nonterminal_counts"
+                    ],
+                    "terminal_status_digest": terminal_status[
+                        "status_digest"
+                    ],
+                }
+            ),
+        }
+    )
+
+
 def _operation_recovery_exact_verification(
     value: Any,
     *,
@@ -8817,6 +9128,7 @@ def _operation_recovery_exact_verification(
         "plan_digest",
         "application_receipt_digest",
         "terminal_status_digest",
+        "terminal_progress_digest",
         "selected_status_counts",
         "preserved_status_counts",
         "outside_nonterminal_counts",
@@ -8838,12 +9150,14 @@ def _operation_recovery_exact_verification(
         != application["receipt_digest"]
         or value.get("terminal_status_digest")
         != application["terminal_status_digest"]
+        or value.get("terminal_progress_digest")
+        != application["terminal_progress_digest"]
         or value.get("selected_status_counts")
-        != {"completed": 43}
+        != {"completed": plan["selected_operation_count"]}
         or value.get("selected_status_counts")
         != live["selected_status_counts"]
         or value.get("preserved_status_counts")
-        != {"completed": 5}
+        != plan["preserved_status_counts"]
         or value.get("preserved_status_counts")
         != live["preserved_status_counts"]
         or value.get("outside_nonterminal_counts")
@@ -8884,10 +9198,18 @@ def _operation_recovery_drain_verify_locked(
         authorization=authorization,
         terminal_status=terminal_status,
     )
+    progress = read_exact_drain_progress(
+        Path(plan["progress_artifact_path"]),
+        plan_digest=plan["plan_digest"],
+    )
+    if progress["progress_digest"] != application["terminal_progress_digest"]:
+        raise OperationRecoveryError("exact drain terminal progress differs")
     live = asyncio.run(_operation_recovery_read_exact_drain_status(args, plan))
     successful = (
-        live["selected_status_counts"] == {"completed": 43}
-        and live["preserved_status_counts"] == {"completed": 5}
+        live["selected_status_counts"]
+        == {"completed": plan["selected_operation_count"]}
+        and live["preserved_status_counts"]
+        == plan["preserved_status_counts"]
         and not any(
             item["status"] == "processing"
             for item in live["outside_nonterminal_counts"]
@@ -8899,6 +9221,7 @@ def _operation_recovery_drain_verify_locked(
         "plan_digest": plan["plan_digest"],
         "application_receipt_digest": application["receipt_digest"],
         "terminal_status_digest": application["terminal_status_digest"],
+        "terminal_progress_digest": application["terminal_progress_digest"],
         "selected_status_counts": live["selected_status_counts"],
         "preserved_status_counts": live["preserved_status_counts"],
         "outside_nonterminal_counts": live["outside_nonterminal_counts"],
@@ -10748,6 +11071,13 @@ def parser() -> argparse.ArgumentParser:
     recovery_drain_status.add_argument("--plan", required=True)
     recovery_drain_status.set_defaults(
         run=operation_recovery_drain_status_command
+    )
+
+    recovery_drain_monitor = recovery_drain_commands.add_parser("monitor")
+    add_operation_recovery_authority(recovery_drain_monitor)
+    recovery_drain_monitor.add_argument("--plan", required=True)
+    recovery_drain_monitor.set_defaults(
+        run=operation_recovery_drain_monitor_command
     )
 
     recovery_drain_verify = recovery_drain_commands.add_parser("verify")

@@ -21,7 +21,7 @@
         "locator": "oauth-home:personal"
       },
       "timeout_seconds": null,
-      "max_retries": null,
+      "max_retries": 0,
       "max_concurrent": null,
       "operation_priorities": {
         "default": 0,
@@ -44,7 +44,7 @@
         "locator": "oauth-home:work"
       },
       "timeout_seconds": null,
-      "max_retries": null,
+      "max_retries": 0,
       "max_concurrent": null,
       "operation_priorities": {
         "default": 0,
@@ -66,8 +66,8 @@
         "mode": "none",
         "locator": null
       },
-      "timeout_seconds": 300,
-      "max_retries": 1,
+      "timeout_seconds": 1200,
+      "max_retries": 0,
       "max_concurrent": 1,
       "operation_priorities": {
         "default": 0,

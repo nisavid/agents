@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from types import SimpleNamespace
 import unittest
 
 
@@ -776,6 +777,173 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
                         [],
                     )
                 self.assertEqual(completion_signals, 1)
+            finally:
+                await connection.close()
+
+        asyncio.run(exercise())
+
+    def test_exact_drain_shutdown_releases_only_exact_owned_rows(self):
+        async def exercise():
+            connection = await self._connect()
+            try:
+                plan, cohort_ids, unexpected_id = await self._exact_drain_case(
+                    connection
+                )
+                adapter = ExactDrainClaimAdapter(plan)
+                await self._bind_disposable_exact_drain_identity(
+                    adapter,
+                    connection,
+                )
+                worker_id = exact_drain_worker_id(plan["plan_digest"])
+
+                class Backend:
+                    @asynccontextmanager
+                    async def acquire(self):
+                        yield connection
+
+                async with connection.transaction():
+                    claimed = await adapter.claim_tasks(
+                        connection,
+                        '"public".async_operations',
+                        worker_id,
+                        {},
+                        2,
+                    )
+                adapter.claim_committed(
+                    [
+                        SimpleNamespace(operation_id=str(row["operation_id"]))
+                        for row in claimed
+                    ]
+                )
+                selected_ids = [str(row["operation_id"]) for row in claimed]
+                preserved_ids = sorted(
+                    set(cohort_ids)
+                    - {
+                        item["operation_id"]
+                        for item in plan["selected_operations"]
+                    }
+                )
+                before_untouched = {
+                    row["operation_id"]: live_row_digest(row)
+                    for row in await read_safe_operation_rows(
+                        connection,
+                        schema="public",
+                        bank_id="engineering",
+                        operation_ids=[*preserved_ids, unexpected_id],
+                    )
+                }
+
+                released = await adapter.release_own_tasks(Backend())
+
+                released_rows = await connection.fetch(
+                    """
+                    SELECT operation_id::text AS operation_id,
+                           status,
+                           worker_id,
+                           claimed_at,
+                           retry_count,
+                           encode(
+                               sha256(convert_to(task_payload::text, 'UTF8')),
+                               'hex'
+                           ) AS task_payload_digest
+                    FROM public.async_operations
+                    WHERE operation_id = ANY($1::uuid[])
+                    ORDER BY operation_id
+                    """,
+                    selected_ids,
+                )
+                after_untouched = {
+                    row["operation_id"]: live_row_digest(row)
+                    for row in await read_safe_operation_rows(
+                        connection,
+                        schema="public",
+                        bank_id="engineering",
+                        operation_ids=[*preserved_ids, unexpected_id],
+                    )
+                }
+
+                self.assertEqual(released, 2)
+                for row in released_rows:
+                    item = next(
+                        item
+                        for item in plan["selected_operations"]
+                        if item["operation_id"] == row["operation_id"]
+                    )
+                    self.assertEqual(row["status"], "pending")
+                    self.assertIsNone(row["worker_id"])
+                    self.assertIsNone(row["claimed_at"])
+                    self.assertEqual(row["retry_count"], 0)
+                    self.assertEqual(
+                        row["task_payload_digest"],
+                        item["task_payload_digest"],
+                    )
+                self.assertEqual(after_untouched, before_untouched)
+            finally:
+                await connection.close()
+
+        asyncio.run(exercise())
+
+    def test_exact_drain_shutdown_rejects_unexpected_owned_row(self):
+        async def exercise():
+            connection = await self._connect()
+            try:
+                plan, _cohort_ids, unexpected_id = await self._exact_drain_case(
+                    connection
+                )
+                adapter = ExactDrainClaimAdapter(plan)
+                await self._bind_disposable_exact_drain_identity(
+                    adapter,
+                    connection,
+                )
+                worker_id = exact_drain_worker_id(plan["plan_digest"])
+
+                class Backend:
+                    @asynccontextmanager
+                    async def acquire(self):
+                        yield connection
+
+                async with connection.transaction():
+                    claimed = await adapter.claim_tasks(
+                        connection,
+                        '"public".async_operations',
+                        worker_id,
+                        {},
+                        2,
+                    )
+                adapter.claim_committed(
+                    [
+                        SimpleNamespace(operation_id=str(row["operation_id"]))
+                        for row in claimed
+                    ]
+                )
+                await connection.execute(
+                    """
+                    UPDATE public.async_operations
+                    SET status = 'processing',
+                        worker_id = $1,
+                        claimed_at = NOW(),
+                        updated_at = NOW()
+                    WHERE operation_id = $2::uuid
+                    """,
+                    worker_id,
+                    unexpected_id,
+                )
+
+                with self.assertRaisesRegex(
+                    OperationRecoveryError,
+                    "shutdown row drifted",
+                ):
+                    await adapter.release_own_tasks(Backend())
+                unexpected = await connection.fetchrow(
+                    """
+                    SELECT status, worker_id
+                    FROM public.async_operations
+                    WHERE operation_id = $1::uuid
+                    """,
+                    unexpected_id,
+                )
+                self.assertEqual(unexpected["status"], "processing")
+                self.assertEqual(unexpected["worker_id"], worker_id)
             finally:
                 await connection.close()
 

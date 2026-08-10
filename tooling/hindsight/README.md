@@ -239,13 +239,16 @@ timeout, and retry mechanics. Consumers supply the closed policy shape shown in
 The policy contains OAuth-home locators, never resolved paths or credential
 values.
 
-The Hindsight strategy selects linear failover or round-robin request starts.
-Both modes use the policy's declared member order and try each member at most
-once per request. Round-robin wraps from the last member to the first. A
+The Hindsight strategy selects linear failover or tiered round-robin request
+starts. Both modes use the policy's declared member order and try each member at
+most once per request. Round-robin rotates only across quota-managed OAuth-home
+members, then tries the remaining members as an ordered fallback tier. A
 provider-reported usage reset is a hint, not a durable exclusion: the runtime
 caps it to `default_usage_limit_cooldown_seconds` and probes the account again.
-Startup verification is bounded independently of member request timeouts, so an
-offline fallback cannot prevent the API from starting.
+Member request timeouts use independent connect, pool, write, and read budgets;
+the policy's `timeout_seconds` is the long read budget. Startup verification is
+bounded independently, so an offline fallback cannot prevent the API from
+starting.
 
 The repository policy is a schema example, not a deployable failover chain.
 Its `example.invalid` endpoint is deliberately non-routable. Consumers must
@@ -266,6 +269,31 @@ startup. Installation fails before changing Hindsight classes unless the
 installed `hindsight-api` version and the policy both name an adapter-supported
 version. The current adapter supports `0.8.4` and `0.9.0`; supporting another
 release requires an explicit compatibility update and contract tests.
+
+### Exact-drain progress
+
+An approved detached operation-recovery drain exposes durable, payload-free
+progress without taking the apply or portable-manager locks:
+
+```sh
+hindsight-memory operation-recovery drain monitor \
+  --config "$HINDSIGHT_INSTALLATION_CONFIG" \
+  --candidate-release-root "$CANDIDATE_RELEASE_ROOT" \
+  --candidate-release-identity "$CANDIDATE_RELEASE_IDENTITY" \
+  --plan "$EXACT_DRAIN_PLAN"
+```
+
+Before a worker has started, the command returns `not-started`. After the
+application journal is durable but before the worker creates progress, it
+returns `starting`. During and after an attempt it authenticates the application
+journal, worker PID and process start identity, plan-selected task set, current
+progress artifact, and archived prior-attempt evidence. It reports `running`
+only while that exact process identity is live, `interrupted` after an
+interrupted attempt, and `terminal` for an authenticated completed application.
+Task stages, provider attempt counters, active request ages, cooldown
+categories, prior-attempt evidence, and artifact digests are included. Prompts,
+responses, error text, credentials, task payloads, and raw worker IDs are not
+projected.
 
 The legacy launchd label and manifest are migration bindings, not evidence that
 a legacy installation exists. A fresh installation still supplies a distinct

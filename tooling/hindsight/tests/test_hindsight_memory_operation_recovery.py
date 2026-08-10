@@ -341,6 +341,36 @@ class OperationRecoveryContractTest(unittest.TestCase):
         self.assertEqual(plan["preserved_status_counts"], {"completed": 5})
         self.assertEqual(plan["pre_generation"], "systalyze:public:124")
         self.assertEqual(
+            plan["progress_artifact_path"],
+            "/private/tmp/drain-progress.json",
+        )
+        self.assertEqual(
+            recovery_contract.verify_exact_drain_plan(plan, now=planned_at),
+            plan,
+        )
+
+    def test_exact_drain_plan_binds_only_the_pending_remainder(self):
+        planned_at = 1_785_462_000
+        plan = recovery_contract.create_exact_drain_plan(
+            self.cohort(),
+            self.drain_snapshot(completed_positions={0, 1, 2, 42, 43, 46}),
+            candidate_release=release_identity(),
+            rollback_backup=drain_backup_evidence(),
+            rollback_backup_path="/private/tmp/remainder-backup.age",
+            provider_policy_digest="9" * 64,
+            effective_profile_digest="7" * 64,
+            worker_runtime_digest="8" * 64,
+            authorization_receipt_path="/private/tmp/remainder-authorization.json",
+            application_receipt_path="/private/tmp/remainder-application.json",
+            status_artifact_path="/private/tmp/remainder-status.json",
+            verification_receipt_path="/private/tmp/remainder-verification.json",
+            created_at=planned_at,
+        )
+
+        self.assertEqual(plan["selected_operation_count"], 42)
+        self.assertEqual(plan["selected_status_counts"], {"pending": 42})
+        self.assertEqual(plan["preserved_status_counts"], {"completed": 6})
+        self.assertEqual(
             recovery_contract.verify_exact_drain_plan(plan, now=planned_at),
             plan,
         )
@@ -349,33 +379,6 @@ class OperationRecoveryContractTest(unittest.TestCase):
         self.assertNotIn('"worker_id":', serialized)
         self.assertNotIn('"error_message":', serialized)
         self.assertNotIn('"result_metadata":', serialized)
-
-        incomplete = self.drain_snapshot(
-            completed_positions={0, 1, 2, 42, 43, 46}
-        )
-        with self.assertRaisesRegex(
-            OperationRecoveryError,
-            "exact drain pending set is invalid",
-        ):
-            recovery_contract.create_exact_drain_plan(
-                self.cohort(),
-                incomplete,
-                candidate_release=release_identity(),
-                rollback_backup=drain_backup_evidence(),
-                rollback_backup_path="/private/tmp/drain-backup.age",
-                provider_policy_digest="9" * 64,
-                effective_profile_digest="7" * 64,
-                worker_runtime_digest="8" * 64,
-                authorization_receipt_path=(
-                    "/private/tmp/drain-authorization.json"
-                ),
-                application_receipt_path="/private/tmp/drain-application.json",
-                status_artifact_path="/private/tmp/drain-status.json",
-                verification_receipt_path=(
-                    "/private/tmp/drain-verification.json"
-                ),
-                created_at=planned_at,
-            )
 
     def test_exact_drain_worker_requires_the_exact_authorization_receipt(self):
         now = int(__import__("time").time())

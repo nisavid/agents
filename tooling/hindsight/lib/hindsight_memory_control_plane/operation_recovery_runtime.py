@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 import hashlib
 import importlib.util
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -25,7 +26,6 @@ import uuid
 from typing import Any
 
 from .operation_recovery import (
-    EXACT_DRAIN_WORKER_MAX_RETRIES,
     EXPECTED_CLAIM_RELEASE_ROW_COUNT,
     EXPECTED_OPERATION_COUNTS,
     OperationRecoveryError,
@@ -95,6 +95,7 @@ EXACT_DRAIN_OAUTH_LOCATORS = {
 EXACT_DRAIN_MAX_PACKAGE_ENTRIES = 2048
 EXACT_DRAIN_MAX_PACKAGE_FILE_BYTES = 16 * 1024 * 1024
 EXACT_DRAIN_MAX_PACKAGE_TOTAL_BYTES = 128 * 1024 * 1024
+LOGGER = logging.getLogger(__name__)
 
 
 def exact_drain_platform_environment() -> dict[str, str]:
@@ -110,7 +111,8 @@ def validate_exact_drain_provider_policy(
     """Require the exact four-Codex then Hatchery provider authority."""
     members = {member.id: member for member in policy.members}
     if (
-        policy.failover_order != EXACT_DRAIN_PROVIDER_ORDER
+        policy.default_usage_limit_cooldown_seconds != 300
+        or policy.failover_order != EXACT_DRAIN_PROVIDER_ORDER
         or set(members) != set(EXACT_DRAIN_PROVIDER_ORDER)
         or any(
             members[member_id].identity.provider != "openai-codex"
@@ -119,6 +121,8 @@ def validate_exact_drain_provider_policy(
             != f"provider-policy:{member_id}"
             or members[member_id].credential_mode != "oauth-home"
             or members[member_id].credential_locator != locator
+            or members[member_id].quota_cooldown is not True
+            or members[member_id].max_retries != 0
             for member_id, locator in EXACT_DRAIN_OAUTH_LOCATORS.items()
         )
         or members["hatchery"].identity.provider != "lmstudio"
@@ -127,6 +131,9 @@ def validate_exact_drain_provider_policy(
         or members["hatchery"].identity.credential_marker is not None
         or members["hatchery"].credential_mode != "none"
         or members["hatchery"].credential_locator is not None
+        or members["hatchery"].timeout_seconds != 1200
+        or members["hatchery"].max_retries != 0
+        or members["hatchery"].max_concurrent != 1
     ):
         raise OperationRecoveryError(
             "operation-recovery exact drain provider policy differs"
@@ -834,6 +841,30 @@ def install_exact_drain_runtime_guards(
 ) -> None:
     """Restrict upstream worker lifecycle seams to the exact drain cohort."""
 
+    upstream_execute_task_inner = getattr(
+        worker_poller_type,
+        "_execute_task_inner",
+        None,
+    )
+    upstream_claim_batch_inner = getattr(
+        worker_poller_type,
+        "_claim_batch_for_schema_inner",
+        None,
+    )
+    upstream_claim_batch = getattr(
+        worker_poller_type,
+        "_claim_batch_for_schema",
+        None,
+    )
+    if (
+        not callable(upstream_execute_task_inner)
+        or not callable(upstream_claim_batch_inner)
+        or not callable(upstream_claim_batch)
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery required worker progress seam is unavailable"
+        )
+
     async def claim_tasks(_ops: Any, *args: Any, **kwargs: Any) -> Any:
         return await adapter.claim_tasks(*args, **kwargs)
 
@@ -851,6 +882,96 @@ def install_exact_drain_runtime_guards(
 
     async def recover_exact_tasks(poller: Any) -> int:
         return await adapter.recover_own_tasks(poller._backend)
+
+    async def release_exact_tasks(poller: Any) -> int:
+        return await adapter.release_own_tasks(poller._backend)
+
+    async def execute_exact_task_inner(
+        poller: Any,
+        task: Any,
+        holder: Any | None = None,
+    ) -> Any:
+        execution = asyncio.create_task(
+            upstream_execute_task_inner(poller, task, holder)
+        )
+        last_stage: str | None = None
+        try:
+            while True:
+                stage = getattr(holder, "stage", None)
+                if isinstance(stage, str) and stage != last_stage:
+                    adapter.record_upstream_stage(task.operation_id, stage)
+                    last_stage = stage
+                done, _pending = await asyncio.wait(
+                    {execution},
+                    timeout=0.25,
+                )
+                if done:
+                    stage = getattr(holder, "stage", None)
+                    if isinstance(stage, str) and stage != last_stage:
+                        adapter.record_upstream_stage(task.operation_id, stage)
+                    return await execution
+        finally:
+            if not execution.done():
+                execution.cancel()
+                try:
+                    done, _pending = await asyncio.wait(
+                        {execution},
+                        timeout=5.0,
+                    )
+                    if not done:
+                        LOGGER.error(
+                            "exact drain task ignored cancellation during shutdown"
+                        )
+                    else:
+                        await execution
+                except asyncio.CancelledError:
+                    current = asyncio.current_task()
+                    if current is not None and current.cancelling():
+                        raise
+                    LOGGER.warning(
+                        "exact drain child task cancelled during cleanup"
+                    )
+                except BaseException as error:
+                    LOGGER.warning(
+                        "exact drain task cleanup ended with %s",
+                        type(error).__name__,
+                    )
+
+    async def claim_exact_batch(
+        poller: Any,
+        schema: str | None,
+        reserved_limits: Mapping[str, int],
+        shared_limit: int,
+    ) -> Any:
+        tasks = await upstream_claim_batch_inner(
+            poller,
+            schema,
+            reserved_limits,
+            shared_limit,
+        )
+        try:
+            adapter.claim_committed(tasks)
+        except Exception:
+            shutdown = getattr(poller, "_shutdown", None)
+            shutdown_set = getattr(shutdown, "set", None)
+            if callable(shutdown_set):
+                shutdown_set()
+            adapter.abort_after_committed_claim_failure()
+            raise
+        return tasks
+
+    async def claim_exact_batch_public(
+        poller: Any,
+        schema: str | None,
+        reserved_limits: Mapping[str, int],
+        shared_limit: int,
+    ) -> Any:
+        """Do not convert a committed-claim evidence failure into an empty poll."""
+        return await poller._claim_batch_for_schema_inner(
+            schema,
+            reserved_limits,
+            shared_limit,
+        )
 
     async def schedule_exact_retry(
         poller: Any,
@@ -969,6 +1090,10 @@ def install_exact_drain_runtime_guards(
     postgresql_ops_type.claim_tasks = claim_tasks
     worker_poller_type._scan_active_schemas = scan_active_schemas
     worker_poller_type.recover_own_tasks = recover_exact_tasks
+    worker_poller_type.release_own_tasks = release_exact_tasks
+    worker_poller_type._execute_task_inner = execute_exact_task_inner
+    worker_poller_type._claim_batch_for_schema_inner = claim_exact_batch
+    worker_poller_type._claim_batch_for_schema = claim_exact_batch_public
     worker_poller_type._schedule_retry = schedule_exact_retry
     worker_poller_type._defer_operation = defer_exact_operation
     worker_poller_type._mark_completed = mark_exact_completed
@@ -1567,8 +1692,16 @@ class ExactDrainClaimAdapter:
         plan: Mapping[str, Any],
         *,
         completion_callback: Callable[[], None] | None = None,
+        progress_recorder: Any | None = None,
         resume: bool = False,
+        terminal_reconciliation: bool = False,
     ):
+        if type(terminal_reconciliation) is not bool or (
+            terminal_reconciliation and not resume
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery terminal reconciliation is invalid"
+            )
         verified = verify_exact_drain_plan(plan, allow_expired=resume)
         self._plan = verified
         self._selected = {
@@ -1593,10 +1726,94 @@ class ExactDrainClaimAdapter:
         self._initial_guard_complete = False
         self._started_ids: set[str] = set()
         self._resume = resume
+        self._terminal_reconciliation = terminal_reconciliation
+        self._terminal_reconciliation_ready = False
         self._completion_callback = completion_callback
         self._completion_signalled = False
+        self._progress_recorder = progress_recorder
+        self._pending_progress_stages: dict[str, tuple[str, str]] = {}
+
+    def _record_task_stage(
+        self,
+        operation_id: str,
+        *,
+        status: str,
+        stage: str,
+    ) -> None:
+        if self._progress_recorder is not None:
+            self._progress_recorder.task_stage(
+                operation_id,
+                status=status,
+                stage=stage,
+            )
+
+    def record_upstream_stage(self, operation_id: str, stage: str) -> None:
+        """Project the upstream payload-free StageHolder breadcrumb."""
+        if not isinstance(stage, str):
+            raise OperationRecoveryError(
+                "operation-recovery exact drain task stage is invalid"
+            )
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/=-]{0,127}", stage):
+            safe_stage = stage
+        else:
+            safe_stage = f"upstream:{hashlib.sha256(stage.encode('utf-8')).hexdigest()[:16]}"
+        if self._progress_recorder is not None:
+            self._progress_recorder.task_processing_stage(
+                operation_id,
+                stage=safe_stage,
+            )
+
+    def claim_committed(self, tasks: Sequence[Any]) -> None:
+        """Record task ownership only after the upstream claim transaction commits."""
+        for task in tasks:
+            operation_id = str(getattr(task, "operation_id", ""))
+            if operation_id not in self._selected:
+                raise OperationRecoveryError(
+                    "operation-recovery committed claim is outside plan"
+                )
+        self._started_ids.update(str(task.operation_id) for task in tasks)
+        self._flush_pending_progress_stages()
+        for task in tasks:
+            operation_id = str(task.operation_id)
+            self._record_task_stage(
+                operation_id,
+                status="processing",
+                stage="claimed",
+            )
+        if (
+            self._terminal_reconciliation_ready
+            and not self._completion_signalled
+            and self._completion_callback is not None
+        ):
+            self._completion_signalled = True
+            self._completion_callback()
+
+    def abort_after_committed_claim_failure(self) -> None:
+        """Stop the capsule so graceful shutdown releases committed claims."""
+        if self._completion_callback is not None:
+            self._completion_callback()
+
+    def _stage_after_commit(
+        self,
+        operation_id: str,
+        *,
+        status: str,
+        stage: str,
+    ) -> None:
+        self._pending_progress_stages[operation_id] = (status, stage)
+
+    def _flush_pending_progress_stages(self) -> None:
+        pending = self._pending_progress_stages
+        self._pending_progress_stages = {}
+        for operation_id, (status, stage) in pending.items():
+            self._record_task_stage(
+                operation_id,
+                status=status,
+                stage=stage,
+            )
 
     async def _verify_initial_state(self, connection: Any) -> None:
+        self._pending_progress_stages = {}
         identity = _mapping(
             await connection.fetchrow(
                 """
@@ -1660,6 +1877,12 @@ class ExactDrainClaimAdapter:
             item = self._selected.get(row["operation_id"])
             exact = item is not None and live_row_digest(row) == item["row_digest"]
             if exact:
+                if self._resume:
+                    self._stage_after_commit(
+                        row["operation_id"],
+                        status="pending",
+                        stage="resume-pending",
+                    )
                 continue
             if (
                 item is None
@@ -1674,6 +1897,23 @@ class ExactDrainClaimAdapter:
                     "operation-recovery exact drain selected row drifted"
                 )
             self._started_ids.add(row["operation_id"])
+            self._stage_after_commit(
+                row["operation_id"],
+                status=row["status"],
+                stage=(
+                    "retrying"
+                    if row["status"] == "pending"
+                    else f"resume-{row['status']}"
+                ),
+            )
+        if getattr(self, "_terminal_reconciliation", False) and any(
+            row["operation_id"] in self._selected
+            and row["status"] not in {"completed", "failed", "cancelled"}
+            for row in rows
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery terminal reconciliation state differs"
+            )
 
     async def recover_own_tasks(self, backend: Any) -> int:
         """Recover only exact-plan rows owned by an interrupted capsule."""
@@ -1718,7 +1958,6 @@ class ExactDrainClaimAdapter:
                 identifiers = [row["operation_id"] for row in rows]
                 if not identifiers:
                     self._initial_guard_complete = True
-                    return 0
                 retryable = [
                     row["operation_id"]
                     for row in rows
@@ -1770,7 +2009,91 @@ class ExactDrainClaimAdapter:
                     )
                 self._started_ids.update(str(value) for value in identifiers)
                 self._initial_guard_complete = True
-                return len(identifiers)
+        self._flush_pending_progress_stages()
+        for identifier in retryable:
+            self._record_task_stage(
+                str(identifier),
+                status="pending",
+                stage="recovered",
+            )
+        for identifier in exhausted:
+            self._record_task_stage(
+                str(identifier),
+                status="failed",
+                stage="retry-ceiling",
+            )
+        return len(identifiers)
+
+    async def release_own_tasks(self, backend: Any) -> int:
+        """Release only exact-plan rows owned by this worker on shutdown."""
+        async with backend.acquire() as connection:
+            async with connection.transaction(isolation="serializable"):
+                await self._verify_unstarted_state(connection)
+                rows = [
+                    _mapping(row)
+                    for row in await connection.fetch(
+                        """
+                        SELECT operation_id::text AS operation_id,
+                               bank_id,
+                               operation_type,
+                               retry_count,
+                               encode(
+                                   sha256(convert_to(task_payload::text, 'UTF8')),
+                                   'hex'
+                               ) AS task_payload_digest
+                        FROM public.async_operations
+                        WHERE status = 'processing'
+                          AND worker_id = $1
+                        ORDER BY operation_id
+                        FOR UPDATE
+                        """,
+                        self._worker_id,
+                    )
+                ]
+                for row in rows:
+                    item = self._selected.get(row["operation_id"])
+                    if (
+                        item is None
+                        or row["bank_id"] != "engineering"
+                        or row["operation_type"] != item["operation_type"]
+                        or row["task_payload_digest"]
+                        != item["task_payload_digest"]
+                        or type(row["retry_count"]) is not int
+                        or row["retry_count"] < 0
+                        or row["retry_count"] > self._max_retries
+                    ):
+                        raise OperationRecoveryError(
+                            "operation-recovery exact drain shutdown row drifted"
+                        )
+                identifiers = [uuid.UUID(row["operation_id"]) for row in rows]
+                result = await connection.execute(
+                    """
+                    UPDATE public.async_operations
+                    SET status = 'pending',
+                        worker_id = NULL,
+                        claimed_at = NULL,
+                        updated_at = NOW()
+                    WHERE operation_id = ANY($1::uuid[])
+                      AND bank_id = 'engineering'
+                      AND status = 'processing'
+                      AND worker_id = $2
+                    """,
+                    identifiers,
+                    self._worker_id,
+                )
+                if result != f"UPDATE {len(identifiers)}":
+                    raise OperationRecoveryError(
+                        "operation-recovery exact drain shutdown count differs"
+                    )
+                self._started_ids.update(row["operation_id"] for row in rows)
+                self._initial_guard_complete = True
+        for row in rows:
+            self._record_task_stage(
+                row["operation_id"],
+                status="pending",
+                stage="released",
+            )
+        return len(rows)
 
     async def _verify_unstarted_state(self, connection: Any) -> None:
         preserved_rows = await read_safe_operation_rows(
@@ -1931,6 +2254,19 @@ class ExactDrainClaimAdapter:
                     )
                 self._started_ids.add(str(identifier))
                 self._initial_guard_complete = True
+        self._record_task_stage(
+            str(identifier),
+            status=(
+                "failed"
+                if row["retry_count"] >= self._max_retries
+                else "pending"
+            ),
+            stage=(
+                "retry-ceiling"
+                if row["retry_count"] >= self._max_retries
+                else "retrying"
+            ),
+        )
 
     async def schedule_retry(
         self,
@@ -1997,6 +2333,7 @@ class ExactDrainClaimAdapter:
             raise OperationRecoveryError(
                 "operation-recovery exact drain terminal row is outside plan"
             )
+        observed_status: str | None = None
         async with backend.acquire() as connection:
             async with connection.transaction(isolation="serializable"):
                 await self._verify_unstarted_state(connection)
@@ -2031,12 +2368,12 @@ class ExactDrainClaimAdapter:
                 if row["status"] in {"completed", "failed", "cancelled"}:
                     self._started_ids.add(str(identifier))
                     self._initial_guard_complete = True
-                    return
-                if row["status"] != "processing":
+                    observed_status = row["status"]
+                elif row["status"] != "processing":
                     raise OperationRecoveryError(
                         "operation-recovery exact drain terminal row drifted"
                     )
-                if error_message is None:
+                elif error_message is None:
                     result = await connection.execute(
                         """
                         UPDATE public.async_operations
@@ -2051,6 +2388,7 @@ class ExactDrainClaimAdapter:
                         identifier,
                         self._worker_id,
                     )
+                    observed_status = "completed"
                 else:
                     result = await connection.execute(
                         """
@@ -2068,12 +2406,22 @@ class ExactDrainClaimAdapter:
                         error_message[:5000],
                         self._worker_id,
                     )
-                if result != "UPDATE 1":
+                    observed_status = "failed"
+                if observed_status not in {"completed", "failed", "cancelled"}:
+                    raise OperationRecoveryError(
+                        "operation-recovery exact drain terminal status differs"
+                    )
+                if row["status"] == "processing" and result != "UPDATE 1":
                     raise OperationRecoveryError(
                         "operation-recovery exact drain terminal count differs"
                     )
                 self._started_ids.add(str(identifier))
                 self._initial_guard_complete = True
+        self._record_task_stage(
+            str(identifier),
+            status=observed_status,
+            stage=observed_status,
+        )
 
     async def mark_completed(
         self,
@@ -2209,11 +2557,16 @@ class ExactDrainClaimAdapter:
                 "operation-recovery exact drain worker identity differs"
             )
         capacity = self._claim_capacity(reserved_limits, shared_limit)
-        if capacity == 0:
-            return []
         await connection.execute(
             "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"
         )
+        if self._terminal_reconciliation:
+            await self._verify_initial_state(connection)
+            self._initial_guard_complete = True
+            self._terminal_reconciliation_ready = True
+            return []
+        if capacity == 0:
+            return []
         if not self._initial_guard_complete:
             await self._verify_initial_state(connection)
         else:
@@ -2325,7 +2678,6 @@ class ExactDrainClaimAdapter:
             raise OperationRecoveryError(
                 "operation-recovery exact drain claim row count differs"
             )
-        self._started_ids.update(str(row["operation_id"]) for row in chosen)
         self._initial_guard_complete = True
         return chosen
 

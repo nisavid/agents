@@ -42,9 +42,13 @@ from hindsight_memory_control_plane.operation_recovery_runtime import (  # noqa:
     install_exact_drain_runtime_guards,
     validate_exact_drain_provider_policy,
 )
+from hindsight_memory_control_plane.operation_recovery_progress import (  # noqa: E402
+    create_exact_drain_progress_recorder,
+)
 from hindsight_memory_control_plane.provider_runtime import (  # noqa: E402
     ProviderRuntimeCompatibilityError,
     ProviderRuntimePolicy,
+    set_exact_drain_progress_recorder,
 )
 
 
@@ -100,18 +104,23 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--provider-runtime-root", required=True)
     result.add_argument("--worker-runtime", required=True)
     result.add_argument("--resume", action="store_true")
+    result.add_argument("--terminal-reconciliation", action="store_true")
     return result
 
 
 def main() -> int:
     args = parser().parse_args()
+    if args.terminal_reconciliation and not args.resume:
+        raise OperationRecoveryError(
+            "exact drain terminal reconciliation is invalid"
+        )
     plan = verify_exact_drain_plan(
         strict_json_loads(
             _private_bytes(args.plan, "exact drain plan").decode("utf-8")
         ),
         allow_expired=args.resume,
     )
-    verify_exact_drain_authorization_receipt(
+    authorization = verify_exact_drain_authorization_receipt(
         strict_json_loads(
             _private_bytes(
                 plan["authorization_receipt_path"],
@@ -226,6 +235,19 @@ def main() -> int:
     if start_signal != b"1":
         raise OperationRecoveryError("exact drain start was not authorized")
 
+    progress_recorder = create_exact_drain_progress_recorder(
+        plan=plan,
+        authorization=authorization,
+        journal=strict_json_loads(
+            _private_bytes(
+                plan["application_receipt_path"],
+                "exact drain application journal",
+            ).decode("utf-8")
+        ),
+        terminal_reconciliation=args.terminal_reconciliation,
+    )
+    set_exact_drain_progress_recorder(progress_recorder)
+
     install_exact_drain_candidate_imports(args.worker_runtime, LIB)
 
     provider_globals = {
@@ -290,7 +312,9 @@ def main() -> int:
     adapter = ExactDrainClaimAdapter(
         plan,
         completion_callback=complete,
+        progress_recorder=progress_recorder,
         resume=args.resume,
+        terminal_reconciliation=args.terminal_reconciliation,
     )
     from hindsight_api import MemoryEngine
     from hindsight_api.engine.db.ops_postgresql import PostgreSQLOps

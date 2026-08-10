@@ -33,12 +33,6 @@ EXPECTED_CLAIM_RELEASE_PAIR_COUNTS = {
     ("codex", "retain"): 37,
     ("engineering", "refresh_mental_model"): 6,
 }
-EXPECTED_EXACT_DRAIN_PENDING_COUNT = 43
-EXPECTED_EXACT_DRAIN_TYPE_COUNTS = {
-    "retain": 40,
-    "refresh_mental_model": 2,
-    "consolidation": 1,
-}
 EXACT_DRAIN_WORKER_MAX_RETRIES = 3
 EXACT_DRAIN_WORKER_MAX_ATTEMPTS = 4
 OPERATION_STATUSES = (
@@ -48,6 +42,26 @@ OPERATION_STATUSES = (
     "failed",
     "cancelled",
 )
+
+
+def exact_drain_progress_archive_path(
+    progress_path: Path,
+    worker_attempt: int,
+) -> Path:
+    """Derive the reserved immutable evidence path for one prior attempt."""
+    if type(worker_attempt) is not int or worker_attempt < 1:
+        raise OperationRecoveryError("exact drain prior attempt is invalid")
+    return progress_path.with_name(
+        f"{progress_path.stem}.attempt-{worker_attempt}{progress_path.suffix}"
+    )
+
+
+def _exact_drain_archive_paths(progress_path: str) -> set[str]:
+    path = Path(progress_path)
+    return {
+        str(exact_drain_progress_archive_path(path, attempt))
+        for attempt in range(1, EXACT_DRAIN_WORKER_MAX_ATTEMPTS + 1)
+    }
 ERROR_CATEGORIES = frozenset(
     {
         "none",
@@ -292,6 +306,7 @@ EXACT_DRAIN_PLAN_KEYS = frozenset(
         "worker_max_retries",
         "authorization_receipt_path",
         "application_receipt_path",
+        "progress_artifact_path",
         "status_artifact_path",
         "verification_receipt_path",
         "created_at",
@@ -1765,22 +1780,22 @@ def create_exact_drain_plan(
     snapshot = verify_live_snapshot(live_snapshot_value)
     selected = _exact_drain_selected(snapshot)
     selected_type_counts = _exact_drain_type_counts(selected)
-    expected_status_counts = {
-        "pending": EXPECTED_EXACT_DRAIN_PENDING_COUNT,
-        "processing": 0,
-        "completed": sum(EXPECTED_OPERATION_COUNTS.values())
-        - EXPECTED_EXACT_DRAIN_PENDING_COUNT,
-        "failed": 0,
-        "cancelled": 0,
-    }
     cohort_by_id = {
         item["operation_id"]: item for item in cohort["operations"]
     }
     if (
         snapshot["cohort_digest"] != cohort["cohort_digest"]
-        or snapshot["status_counts"] != expected_status_counts
-        or len(selected) != EXPECTED_EXACT_DRAIN_PENDING_COUNT
-        or selected_type_counts != EXPECTED_EXACT_DRAIN_TYPE_COUNTS
+        or not selected
+        or snapshot["status_counts"].get("pending") != len(selected)
+        or snapshot["status_counts"].get("processing")
+        or snapshot["status_counts"].get("failed")
+        or snapshot["status_counts"].get("cancelled")
+        or snapshot["status_counts"].get("completed", 0) + len(selected)
+        != sum(EXPECTED_OPERATION_COUNTS.values())
+        or any(
+            count > EXPECTED_OPERATION_COUNTS[operation_type]
+            for operation_type, count in selected_type_counts.items()
+        )
         or set(cohort_by_id)
         != {item["operation_id"] for item in snapshot["operations"]}
         or any(
@@ -1790,10 +1805,7 @@ def create_exact_drain_plan(
             != cohort_by_id[item["operation_id"]]["task_payload_digest"]
             for item in snapshot["operations"]
         )
-        or any(
-            item["expected_status"] != "pending"
-            for item in selected
-        )
+        or any(item["expected_status"] != "pending" for item in selected)
     ):
         raise OperationRecoveryError(
             "operation-recovery exact drain pending set is invalid"
@@ -1818,6 +1830,18 @@ def create_exact_drain_plan(
         raise OperationRecoveryError(
             "operation-recovery exact drain backup identity differs"
         )
+    status_path = _absolute_path(
+        status_artifact_path,
+        "operation-recovery exact drain status path",
+    )
+    status_name = Path(status_path).name
+    if "status" not in status_name or "progress" in status_name:
+        raise OperationRecoveryError(
+            "operation-recovery exact drain status path is invalid"
+        )
+    progress_path = str(
+        Path(status_path).with_name(status_name.replace("status", "progress", 1))
+    )
     artifact_paths = {
         "rollback_backup_path": _absolute_path(
             rollback_backup_path,
@@ -1831,21 +1855,28 @@ def create_exact_drain_plan(
             application_receipt_path,
             "operation-recovery exact drain application path",
         ),
-        "status_artifact_path": _absolute_path(
-            status_artifact_path,
-            "operation-recovery exact drain status path",
+        "progress_artifact_path": _absolute_path(
+            progress_path,
+            "operation-recovery exact drain progress path",
         ),
+        "status_artifact_path": status_path,
         "verification_receipt_path": _absolute_path(
             verification_receipt_path,
             "operation-recovery exact drain verification path",
         ),
     }
-    if len(
-        {
-            unicodedata.normalize("NFD", value.casefold())
-            for value in artifact_paths.values()
-        }
-    ) != len(artifact_paths):
+    normalized_artifacts = {
+        unicodedata.normalize("NFD", value.casefold())
+        for value in artifact_paths.values()
+    }
+    normalized_archives = {
+        unicodedata.normalize("NFD", value.casefold())
+        for value in _exact_drain_archive_paths(progress_path)
+    }
+    if (
+        len(normalized_artifacts) != len(artifact_paths)
+        or normalized_artifacts & normalized_archives
+    ):
         raise OperationRecoveryError(
             "operation-recovery exact drain artifact paths must be distinct"
         )
@@ -1958,6 +1989,7 @@ def verify_exact_drain_plan(
     preserved = _count_map(
         plan["preserved_status_counts"],
         "exact drain preserved status counts",
+        minimum=0,
     )
     created_at = _integer(plan["created_at"], "exact drain plan created-at")
     expires_at = _integer(plan["expires_at"], "exact drain plan expires-at")
@@ -1988,6 +2020,10 @@ def verify_exact_drain_plan(
             plan["application_receipt_path"],
             "operation-recovery exact drain application path",
         ),
+        "progress_artifact_path": _absolute_path(
+            plan["progress_artifact_path"],
+            "operation-recovery exact drain progress path",
+        ),
         "status_artifact_path": _absolute_path(
             plan["status_artifact_path"],
             "operation-recovery exact drain status path",
@@ -1997,6 +2033,16 @@ def verify_exact_drain_plan(
             "operation-recovery exact drain verification path",
         ),
     }
+    status_name = Path(artifact_paths["status_artifact_path"]).name
+    expected_progress_path = (
+        None
+        if "status" not in status_name or "progress" in status_name
+        else str(
+            Path(artifact_paths["status_artifact_path"]).with_name(
+                status_name.replace("status", "progress", 1)
+            )
+        )
+    )
     if (
         plan.get("schema_version") != 1
         or plan.get("kind") != "operation-recovery-exact-drain-plan"
@@ -2004,29 +2050,33 @@ def verify_exact_drain_plan(
         or plan.get("authority") != "unapproved-plan"
         or plan.get("mutation_authorized") is not False
         or selected != expected_selected
-        or len(selected) != EXPECTED_EXACT_DRAIN_PENDING_COUNT
+        or not selected
         or len({item["operation_id"] for item in selected}) != len(selected)
         or selected
         != sorted(selected, key=lambda item: item["operation_id"])
         or plan.get("selected_operation_count") != len(selected)
-        or status_counts != {"pending": EXPECTED_EXACT_DRAIN_PENDING_COUNT}
-        or type_counts != EXPECTED_EXACT_DRAIN_TYPE_COUNTS
+        or status_counts != {"pending": len(selected)}
         or type_counts != selected_type_counts
-        or preserved != {"completed": 5}
-        or snapshot["status_counts"]
-        != {
-            "pending": 43,
-            "processing": 0,
-            "completed": 5,
-            "failed": 0,
-            "cancelled": 0,
-        }
+        or preserved
+        != {"completed": snapshot["status_counts"].get("completed", 0)}
+        or snapshot["status_counts"].get("pending") != len(selected)
+        or snapshot["status_counts"].get("processing")
+        or snapshot["status_counts"].get("failed")
+        or snapshot["status_counts"].get("cancelled")
+        or snapshot["status_counts"].get("completed", 0) + len(selected)
+        != sum(EXPECTED_OPERATION_COUNTS.values())
+        or any(
+            count > EXPECTED_OPERATION_COUNTS[operation_type]
+            for operation_type, count in type_counts.items()
+        )
         or plan.get("selected_row_set_digest")
         != _exact_drain_row_set_digest(selected)
         or plan.get("worker_max_retries")
         != EXACT_DRAIN_WORKER_MAX_RETRIES
         or plan.get("worker_max_attempts")
         != EXACT_DRAIN_WORKER_MAX_ATTEMPTS
+        or artifact_paths["progress_artifact_path"]
+        != expected_progress_path
         or plan.get("cohort_digest") != cohort["cohort_digest"]
         or plan.get("snapshot_digest") != snapshot["snapshot_digest"]
         or snapshot["cohort_digest"] != cohort["cohort_digest"]
@@ -2048,6 +2098,16 @@ def verify_exact_drain_plan(
             }
         )
         != len(artifact_paths)
+        or {
+            unicodedata.normalize("NFD", value.casefold())
+            for value in artifact_paths.values()
+        }
+        & {
+            unicodedata.normalize("NFD", value.casefold())
+            for value in _exact_drain_archive_paths(
+                artifact_paths["progress_artifact_path"]
+            )
+        }
     ):
         raise OperationRecoveryError(
             "operation-recovery exact drain plan is invalid"
@@ -2205,6 +2265,7 @@ def verify_exact_drain_status(
     preserved_counts = _count_map(
         status["preserved_status_counts"],
         "exact drain preserved status counts",
+        minimum=0,
     )
     outside_value = status["outside_nonterminal_counts"]
     if not isinstance(outside_value, list):
@@ -2271,7 +2332,7 @@ def verify_exact_drain_status(
         or set(selected_counts) - set(OPERATION_STATUSES)
         or sum(selected_counts.values())
         != verified_plan["selected_operation_count"]
-        or preserved_counts != {"completed": 5}
+        or preserved_counts != verified_plan["preserved_status_counts"]
         or outside
         != sorted(
             outside,
@@ -2380,13 +2441,18 @@ def _queue_blocker(
     return {**checked, "row_digest": row_digest}
 
 
-def _count_map(value: Any, label: str) -> dict[str, int]:
+def _count_map(
+    value: Any,
+    label: str,
+    *,
+    minimum: int = 1,
+) -> dict[str, int]:
     if not isinstance(value, Mapping):
         raise OperationRecoveryError(f"{label} is invalid")
     checked = {}
     for key, count in value.items():
         text = _text(key, f"{label} key", maximum=256)
-        checked[text] = _integer(count, f"{label} count", minimum=1)
+        checked[text] = _integer(count, f"{label} count", minimum=minimum)
     if list(checked) != sorted(checked):
         raise OperationRecoveryError(f"{label} is invalid")
     return checked

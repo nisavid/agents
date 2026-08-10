@@ -24,6 +24,27 @@ class ProviderRuntimeCompatibilityError(RuntimeError):
     """The provider policy cannot be applied safely to this runtime."""
 
 
+def _is_timeout_exception(error: BaseException) -> bool:
+    """Recognize explicit timeouts, including wrapped transport failures."""
+    try:
+        import httpx
+    except ImportError:
+        timeout_types: tuple[type[BaseException], ...] = (TimeoutError,)
+    else:
+        timeout_types = (TimeoutError, httpx.TimeoutException)
+
+    current: BaseException | None = error
+    observed: set[int] = set()
+    while current is not None and id(current) not in observed:
+        observed.add(id(current))
+        if isinstance(current, asyncio.CancelledError):
+            return False
+        if isinstance(current, timeout_types):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 POLICY_KEYS = {
     "schema_version",
     "hindsight_version",
@@ -77,7 +98,17 @@ SUPPORTED_RUNTIME_PROVIDERS_084 = frozenset(
     }
 )
 STARTUP_LLM_VERIFICATION_TIMEOUT_SECONDS = 10.0
+PROVIDER_CONNECT_TIMEOUT_SECONDS = 20.0
+PROVIDER_POOL_TIMEOUT_SECONDS = 20.0
+PROVIDER_WRITE_TIMEOUT_SECONDS = 60.0
 _CODEX_ENVIRONMENT_LOCK = threading.Lock()
+_EXACT_DRAIN_PROGRESS_RECORDER: Any | None = None
+
+
+def set_exact_drain_progress_recorder(recorder: Any | None) -> None:
+    """Install the run-owned payload-free recorder before provider activation."""
+    global _EXACT_DRAIN_PROGRESS_RECORDER
+    _EXACT_DRAIN_PROGRESS_RECORDER = recorder
 
 
 def _closed(value: Mapping[str, Any], keys: set[str], label: str) -> None:
@@ -155,6 +186,21 @@ def _optional_bounded_int(
     if value is None:
         return None
     return _bounded_int(value, label, low, high)
+
+
+def _split_timeout(timeout_seconds: int) -> Any:
+    try:
+        import httpx
+    except ImportError as error:
+        raise ProviderRuntimeCompatibilityError(
+            "split provider timeouts require httpx"
+        ) from error
+    return httpx.Timeout(
+        float(timeout_seconds),
+        connect=min(PROVIDER_CONNECT_TIMEOUT_SECONDS, timeout_seconds),
+        pool=min(PROVIDER_POOL_TIMEOUT_SECONDS, timeout_seconds),
+        write=min(PROVIDER_WRITE_TIMEOUT_SECONDS, timeout_seconds),
+    )
 
 
 @dataclass(frozen=True)
@@ -418,7 +464,7 @@ def _load_member(value: Any) -> ProviderMemberPolicy:
         credential_mode=mode,
         credential_locator=locator,
         timeout_seconds=_optional_bounded_int(
-            value["timeout_seconds"], "timeout_seconds", 1, 600
+            value["timeout_seconds"], "timeout_seconds", 1, 3600
         ),
         max_retries=_optional_bounded_int(
             value["max_retries"], "max_retries", 0, 10
@@ -760,6 +806,10 @@ class _ProviderRuntime:
         self._resolved_oauth_homes: dict[str, Path] = {}
         self._oauth_home_owners: dict[Path, str] = {}
 
+    @property
+    def _progress_recorder(self) -> Any | None:
+        return _EXACT_DRAIN_PROGRESS_RECORDER
+
     def prepare(self, runtime_member: Any) -> None:
         member = self.policy.match(runtime_member)
         if member is None:
@@ -774,7 +824,7 @@ class _ProviderRuntime:
             client = getattr(provider_impl, "_client", None)
             if client is not None and hasattr(client, "with_options"):
                 provider_impl._client = client.with_options(
-                    timeout=member.timeout_seconds
+                    timeout=_split_timeout(member.timeout_seconds)
                 )
 
     @contextmanager
@@ -887,6 +937,8 @@ class _ProviderRuntime:
             self._quota_probes_in_flight.discard(member_id)
             if not usage_limited:
                 self._cooldowns.pop(member_id, None)
+                if self._progress_recorder is not None:
+                    self._progress_recorder.clear_cooldown(member_id)
 
     async def dispatch(
         self,
@@ -918,12 +970,27 @@ class _ProviderRuntime:
         if strategy_mode == "failover":
             member_order = self.policy.failover_order
         elif strategy_mode == "round-robin":
+            primary_order = tuple(
+                member_id
+                for member_id in self.policy.failover_order
+                if self.policy.member(member_id).credential_mode == "oauth-home"
+                and self.policy.member(member_id).quota_cooldown
+            )
+            fallback_order = tuple(
+                member_id
+                for member_id in self.policy.failover_order
+                if member_id not in primary_order
+            )
+            if not primary_order:
+                primary_order = self.policy.failover_order
+                fallback_order = ()
             with self._rotation_lock:
-                start = self._rotation_index % len(self.policy.failover_order)
+                start = self._rotation_index % len(primary_order)
                 self._rotation_index += 1
             member_order = (
-                self.policy.failover_order[start:]
-                + self.policy.failover_order[:start]
+                primary_order[start:]
+                + primary_order[:start]
+                + fallback_order
             )
         else:
             raise ProviderRuntimeCompatibilityError(
@@ -932,6 +999,7 @@ class _ProviderRuntime:
 
         last_exc: BaseException | None = None
         attempted = 0
+        prior_failed_provider: str | None = None
         for member_id in member_order:
             member_policy = self.policy.member(member_id)
             now = self._clock()
@@ -942,12 +1010,36 @@ class _ProviderRuntime:
                     continue
             attempted += 1
             usage_limited = False
+            request_digest = None
+            progress_recorder = self._progress_recorder
+            if progress_recorder is not None:
+                if prior_failed_provider is not None:
+                    progress_recorder.provider_failed_over(
+                        prior_failed_provider
+                    )
+                    prior_failed_provider = None
+                request_digest = progress_recorder.provider_started(
+                    member_id,
+                    retry_attempt=1,
+                    scope=str(kwargs.get("scope", "")),
+                )
             try:
-                return await getattr(by_id[member_id], method_name)(**kwargs)
+                result = await getattr(by_id[member_id], method_name)(**kwargs)
             except BaseException as exc:
-                if not should_failover(exc):
+                failover = should_failover(exc)
+                if progress_recorder is not None and request_digest is not None:
+                    progress_recorder.provider_finished(
+                        request_digest,
+                        outcome=(
+                            "timed_out"
+                            if _is_timeout_exception(exc)
+                            else "failed"
+                        ),
+                    )
+                if not failover:
                     raise
                 last_exc = exc
+                prior_failed_provider = member_id
                 if member_policy.quota_cooldown:
                     reset = _usage_limit_reset_at(
                         exc,
@@ -959,6 +1051,12 @@ class _ProviderRuntime:
                         with self._cooldown_lock:
                             self._cooldowns[member_id] = max(
                                 reset, self._cooldowns.get(member_id, 0.0)
+                            )
+                        if progress_recorder is not None:
+                            progress_recorder.cooldown(
+                                member_id,
+                                until=reset,
+                                reason="usage_limit",
                             )
                         self._logger.warning(
                             "LLM account %s reached its usage limit; "
@@ -972,6 +1070,13 @@ class _ProviderRuntime:
                     method_name,
                     type(exc).__name__,
                 )
+            else:
+                if progress_recorder is not None and request_digest is not None:
+                    progress_recorder.provider_finished(
+                        request_digest,
+                        outcome="succeeded",
+                    )
+                return result
             finally:
                 if quota_probe:
                     self._finish_quota_probe(

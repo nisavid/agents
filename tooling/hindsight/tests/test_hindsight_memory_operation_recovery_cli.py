@@ -771,6 +771,114 @@ class OperationRecoveryCliTest(unittest.TestCase):
                     "verify-body" in events or "status-write" in events
                 )
 
+    def test_exact_drain_status_reuses_the_outer_installer_lock(self):
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        plan = self.controller["create_exact_drain_plan"](
+            fixtures.cohort(),
+            fixtures.drain_snapshot(),
+            candidate_release=recovery_fixtures.release_identity(),
+            rollback_backup=recovery_fixtures.drain_backup_evidence(),
+            rollback_backup_path="/private/tmp/backup.age",
+            provider_policy_digest="9" * 64,
+            effective_profile_digest="7" * 64,
+            worker_runtime_digest="8" * 64,
+            authorization_receipt_path="/private/tmp/auth.json",
+            application_receipt_path="/private/tmp/application.json",
+            status_artifact_path="/private/tmp/status.json",
+            verification_receipt_path="/private/tmp/verify.json",
+            created_at=int(time.time()),
+        )
+        installer_lock_active = False
+        installer_lock_entries = 0
+        authority_lock_modes = []
+
+        class InstallerLock:
+            def __enter__(self):
+                nonlocal installer_lock_active, installer_lock_entries
+                if installer_lock_active:
+                    raise AssertionError("recursive installer lock")
+                installer_lock_active = True
+                installer_lock_entries += 1
+
+            def __exit__(self, *_arguments):
+                nonlocal installer_lock_active
+                installer_lock_active = False
+
+        class Manager:
+            def _lock(self):
+                return InstallerLock()
+
+        class Connection:
+            async def fetchval(self, _query):
+                return plan["installation_authority"][
+                    "postgres_system_identifier"
+                ]
+
+            async def close(self):
+                return None
+
+        async def connect(_args):
+            return Connection()
+
+        async def read_status(*_arguments, **_keywords):
+            return {
+                "generation_before": plan["pre_generation"],
+                "selected_status_counts": {"pending": 43},
+                "preserved_status_counts": {"completed": 5},
+                "outside_nonterminal_counts": [],
+                "status_digest": "6" * 64,
+            }
+
+        manager = Manager()
+
+        def authority(
+            _args,
+            *,
+            postgres_system_identifier,
+            lock_installer=True,
+        ):
+            self.assertEqual(
+                postgres_system_identifier,
+                plan["installation_authority"][
+                    "postgres_system_identifier"
+                ],
+            )
+            authority_lock_modes.append(lock_installer)
+            if lock_installer:
+                with manager._lock():
+                    pass
+            return plan["installation_authority"]
+
+        command = self.controller[
+            "operation_recovery_drain_status_command"
+        ]
+        globals_ = command.__globals__
+        replacements = {
+            "_operation_recovery_candidate": (
+                lambda _args: plan["candidate_release"]
+            ),
+            "_operation_recovery_read_private_json": (
+                lambda _path, _label: plan
+            ),
+            "_portable_manager": lambda _args: manager,
+            "_operation_recovery_lock": lambda _manager: nullcontext(),
+            "_operation_recovery_connect_live": connect,
+            "_operation_recovery_authority": authority,
+            "read_exact_drain_status": read_status,
+            "write_private": lambda *_arguments, **_keywords: None,
+            "_print_result": lambda value: value,
+        }
+        originals = {key: globals_[key] for key in replacements}
+        globals_.update(replacements)
+        try:
+            result = command(SimpleNamespace(plan="plan.json"))
+        finally:
+            globals_.update(originals)
+
+        self.assertEqual(result["status"], "awaiting-approval")
+        self.assertEqual(installer_lock_entries, 1)
+        self.assertEqual(authority_lock_modes, [False, False])
+
     def test_exact_drain_verification_receipt_is_idempotent(self):
         fixtures = recovery_fixtures.OperationRecoveryContractTest()
         now = int(time.time())

@@ -7951,6 +7951,7 @@ async def _operation_recovery_read_exact_drain_status(
     args: argparse.Namespace,
     plan: Mapping[str, Any],
 ) -> Mapping[str, Any]:
+    """Read exact-drain state while the caller holds the installer lock."""
     connection = await _operation_recovery_connect_live(args)
     try:
         system_identifier_before = await connection.fetchval(
@@ -7959,6 +7960,7 @@ async def _operation_recovery_read_exact_drain_status(
         authority_before = _operation_recovery_authority(
             args,
             postgres_system_identifier=system_identifier_before,
+            lock_installer=False,
         )
         status_value = await read_exact_drain_status(
             connection,
@@ -7972,6 +7974,7 @@ async def _operation_recovery_read_exact_drain_status(
         authority_after = _operation_recovery_authority(
             args,
             postgres_system_identifier=system_identifier_after,
+            lock_installer=False,
         )
         if (
             authority_before != authority_after

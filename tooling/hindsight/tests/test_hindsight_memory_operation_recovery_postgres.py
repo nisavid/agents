@@ -704,14 +704,15 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
         )
         return plan, cohort_ids, unexpected_id
 
-    async def _post_abort_case(self, connection):
+    async def _post_abort_case(self, connection, *, schema_version=4):
         reference, cohort_ids, unexpected_id = await self._exact_drain_case(
             connection
         )
         selected = reference["selected_operations"]
+        processing_count = {2: 4, 3: 3, 4: 2}[schema_version]
         processing = [
             item for item in selected if item["operation_type"] == "retain"
-        ][:3]
+        ][:processing_count]
         processing_ids = [item["operation_id"] for item in processing]
         worker_id = exact_drain_worker_id(reference["plan_digest"])
         await connection.execute(
@@ -754,37 +755,130 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
         rollback["source_authority_digest"] = recovery_fixtures.digest(
             rollback["source_authority"]
         )
-        plan = create_post_abort_recovery_plan(
-            reference,
-            snapshot,
-            candidate_release={
-                "source_commit": "4" * 40,
-                "version": "2026.08.10+4444444.operation-recovery.17",
-                "release_digest": "5" * 64,
-            },
-            rollback_backup=rollback,
-            rollback_encryption=recovery_fixtures.rollback_encryption(),
-            rollback_backup_path="/private/tmp/post-abort-backup.age",
-            rollback_bundle_path="/private/tmp/post-abort-bundle.age",
-            authorization_receipt_path=(
-                "/private/tmp/post-abort-authorization.json"
-            ),
-            application_receipt_path=(
-                "/private/tmp/post-abort-application.json"
-            ),
-            verification_receipt_path=(
-                "/private/tmp/post-abort-verification.json"
-            ),
-            rollback_receipt_path="/private/tmp/post-abort-rollback.json",
-            reference_application_authorization=(
-                recovery_fixtures.exact_drain_authorization(reference)
-            ),
-            reference_application_journal=(
-                recovery_fixtures.exact_drain_application_journal(reference)
-            ),
-            reference_application_progress_digest="c" * 64,
-            created_at=int(time.time()),
-        )
+        candidate = {
+            "source_commit": "4" * 40,
+            "version": "2026.08.10+4444444.operation-recovery.17",
+            "release_digest": "5" * 64,
+        }
+        authorization = recovery_fixtures.exact_drain_authorization(reference)
+        journal = recovery_fixtures.exact_drain_application_journal(reference)
+        created_at = int(time.time())
+        if schema_version == 4:
+            plan = create_post_abort_recovery_plan(
+                reference,
+                snapshot,
+                candidate_release=candidate,
+                rollback_backup=rollback,
+                rollback_encryption=recovery_fixtures.rollback_encryption(),
+                rollback_backup_path="/private/tmp/post-abort-backup.age",
+                rollback_bundle_path="/private/tmp/post-abort-bundle.age",
+                authorization_receipt_path=(
+                    "/private/tmp/post-abort-authorization.json"
+                ),
+                application_receipt_path=(
+                    "/private/tmp/post-abort-application.json"
+                ),
+                verification_receipt_path=(
+                    "/private/tmp/post-abort-verification.json"
+                ),
+                rollback_receipt_path="/private/tmp/post-abort-rollback.json",
+                reference_application_authorization=authorization,
+                reference_application_journal=journal,
+                reference_application_progress_digest="c" * 64,
+                created_at=created_at,
+            )
+        else:
+            selected_operations = [
+                {
+                    "operation_id": item["operation_id"],
+                    "operation_type": item["operation_type"],
+                    "expected_status": item["current_status"],
+                    "row_digest": item["row_digest"],
+                    "task_payload_digest": item["task_payload_digest"],
+                }
+                for item in snapshot["operations"]
+                if item["current_status"] == "processing"
+            ]
+            body = {
+                "schema_version": schema_version,
+                "kind": "operation-recovery-exact-drain-post-abort-plan",
+                "action": "recover-exact-drain-post-abort",
+                "authority": "unapproved-plan",
+                "mutation_authorized": False,
+                "candidate_release": candidate,
+                "installation_authority": snapshot["installation_authority"],
+                "reference_plan": reference,
+                "reference_plan_digest": reference["plan_digest"],
+                "reference_worker_id_digest": hashlib.sha256(
+                    worker_id.encode("utf-8")
+                ).hexdigest(),
+                "reference_application_authorization": authorization,
+                "reference_application_authorization_digest": authorization[
+                    "receipt_digest"
+                ],
+                "reference_application_journal": journal,
+                "reference_application_journal_digest": journal[
+                    "receipt_digest"
+                ],
+                **(
+                    {"reference_application_progress_digest": "c" * 64}
+                    if schema_version == 3
+                    else {}
+                ),
+                "live_snapshot": snapshot,
+                "cohort_digest": snapshot["cohort_digest"],
+                "snapshot_digest": snapshot["snapshot_digest"],
+                "pre_generation": snapshot["generation_before"],
+                "evidence_observed_at": snapshot["observed_at"],
+                "evidence_max_age_seconds": 3_600,
+                "transaction_timeout_seconds": 120,
+                "selected_operations": selected_operations,
+                "selected_operation_count": processing_count,
+                "selected_status_counts": {"processing": processing_count},
+                "selected_type_counts": {"retain": processing_count},
+                "selected_row_set_digest": recovery_fixtures.digest(
+                    [
+                        {
+                            "operation_id": item["operation_id"],
+                            "row_digest": item["row_digest"],
+                            "task_payload_digest": item[
+                                "task_payload_digest"
+                            ],
+                        }
+                        for item in selected_operations
+                    ]
+                ),
+                "preserved_status_counts": {
+                    "completed": 5,
+                    "pending": 43 - processing_count,
+                },
+                "rollback_backup": rollback,
+                "rollback_encryption": recovery_fixtures.rollback_encryption(),
+                "rollback_backup_path": (
+                    f"/private/tmp/post-abort-v{schema_version}-backup.age"
+                ),
+                "rollback_bundle_path": (
+                    f"/private/tmp/post-abort-v{schema_version}-bundle.age"
+                ),
+                "authorization_receipt_path": (
+                    f"/private/tmp/post-abort-v{schema_version}-authorization.json"
+                ),
+                "application_receipt_path": (
+                    f"/private/tmp/post-abort-v{schema_version}-application.json"
+                ),
+                "verification_receipt_path": (
+                    f"/private/tmp/post-abort-v{schema_version}-verification.json"
+                ),
+                "rollback_receipt_path": (
+                    f"/private/tmp/post-abort-v{schema_version}-rollback.json"
+                ),
+                "created_at": created_at,
+                "expires_at": created_at + 86_400,
+            }
+            plan = {
+                **body,
+                "plan_digest": recovery_fixtures.digest(body),
+            }
         return plan, cohort_ids, processing_ids, unexpected_id
 
     async def _legacy_post_abort_case(self, connection):
@@ -1199,6 +1293,16 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
                     unexpected_id,
                 ) = await self._post_abort_case(connection)
                 selected_ids = set(processing_ids)
+                self.assertEqual(plan["schema_version"], 4)
+                self.assertEqual(plan["selected_operation_count"], 2)
+                self.assertEqual(
+                    plan["selected_status_counts"],
+                    {"processing": 2},
+                )
+                self.assertEqual(
+                    plan["preserved_status_counts"],
+                    {"completed": 5, "pending": 41},
+                )
                 before = {
                     row["operation_id"]: row
                     for row in await read_safe_operation_rows(
@@ -1251,7 +1355,7 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
                             after[operation_id][key],
                             before[operation_id][key],
                         )
-                self.assertEqual(len(set(cohort_ids) - selected_ids), 45)
+                self.assertEqual(len(set(cohort_ids) - selected_ids), 46)
                 for operation_id in set(cohort_ids) - selected_ids:
                     self.assertEqual(
                         live_row_digest(after[operation_id]),
@@ -1489,6 +1593,129 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
 
         asyncio.run(exercise())
 
+    def test_post_abort_v2_and_v3_apply_and_rollback_remain_compatible(self):
+        async def exercise():
+            connection = await self._connect()
+            try:
+                for schema_version in (2, 3):
+                    with self.subTest(schema_version=schema_version):
+                        plan, cohort_ids, selected_ids, unexpected_id = (
+                            await self._post_abort_case(
+                                connection,
+                                schema_version=schema_version,
+                            )
+                        )
+                        operation_ids = [*cohort_ids, unexpected_id]
+                        before = {
+                            row["operation_id"]: row
+                            for row in await read_safe_operation_rows(
+                                connection,
+                                schema="public",
+                                bank_id="engineering",
+                                operation_ids=operation_ids,
+                            )
+                        }
+                        preimage = await read_selected_preimage(
+                            connection,
+                            schema="public",
+                            selected_operations=plan["selected_operations"],
+                        )
+
+                        generation_before, generation_after = (
+                            await apply_post_abort_recovery_transaction(
+                                connection,
+                                profile_id="systalyze",
+                                schema="public",
+                                bank_id="engineering",
+                                plan=plan,
+                            )
+                        )
+                        applied = {
+                            row["operation_id"]: row
+                            for row in await read_safe_operation_rows(
+                                connection,
+                                schema="public",
+                                bank_id="engineering",
+                                operation_ids=operation_ids,
+                            )
+                        }
+                        self.assertEqual(
+                            generation_before,
+                            "systalyze:public:123",
+                        )
+                        self.assertEqual(
+                            generation_after,
+                            "systalyze:public:124",
+                        )
+                        self.assertEqual(
+                            {
+                                operation_id: applied[operation_id]["status"]
+                                for operation_id in selected_ids
+                            },
+                            {
+                                operation_id: "pending"
+                                for operation_id in selected_ids
+                            },
+                        )
+                        self.assertEqual(
+                            {
+                                operation_id: live_row_digest(row)
+                                for operation_id, row in applied.items()
+                                if operation_id not in selected_ids
+                            },
+                            {
+                                operation_id: live_row_digest(row)
+                                for operation_id, row in before.items()
+                                if operation_id not in selected_ids
+                            },
+                        )
+
+                        rollback_before, rollback_after = (
+                            await rollback_post_abort_recovery_transaction(
+                                connection,
+                                profile_id="systalyze",
+                                schema="public",
+                                bank_id="engineering",
+                                plan=plan,
+                                application={
+                                    "post_generation": generation_after
+                                },
+                                rollback_record={
+                                    "pre_generation": generation_after,
+                                    "post_generation": "systalyze:public:125",
+                                },
+                                preimage=preimage,
+                            )
+                        )
+                        restored = {
+                            row["operation_id"]: row
+                            for row in await read_safe_operation_rows(
+                                connection,
+                                schema="public",
+                                bank_id="engineering",
+                                operation_ids=operation_ids,
+                            )
+                        }
+                        self.assertEqual(rollback_before, generation_after)
+                        self.assertEqual(
+                            rollback_after,
+                            "systalyze:public:125",
+                        )
+                        self.assertEqual(
+                            {
+                                operation_id: live_row_digest(row)
+                                for operation_id, row in restored.items()
+                            },
+                            {
+                                operation_id: live_row_digest(row)
+                                for operation_id, row in before.items()
+                            },
+                        )
+            finally:
+                await connection.close()
+
+        asyncio.run(exercise())
+
     def test_post_abort_rollback_times_out_while_generation_is_locked(self):
         async def exercise():
             connection = await self._connect()
@@ -1615,7 +1842,7 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
 
         asyncio.run(exercise())
 
-    def test_post_abort_v3_rejects_bound_row_and_generation_drift(self):
+    def test_post_abort_v4_rejects_bound_row_and_generation_drift(self):
         async def exercise():
             connection = await self._connect()
             try:
@@ -1635,6 +1862,12 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
                     "payload": (
                         """UPDATE public.async_operations
                         SET task_payload = '{"memory": "drifted"}'::jsonb
+                        WHERE operation_id = $1::uuid""",
+                        "cohort drifted",
+                    ),
+                    "nonclaim-state": (
+                        """UPDATE public.async_operations
+                        SET retry_count = retry_count + 1
                         WHERE operation_id = $1::uuid""",
                         "cohort drifted",
                     ),

@@ -68,6 +68,9 @@ POST_ABORT_V2_PRESERVED_STATUS_COUNTS = {"completed": 5, "pending": 39}
 POST_ABORT_V3_SELECTED_STATUS_COUNTS = {"processing": 3}
 POST_ABORT_V3_SELECTED_TYPE_COUNTS = {"retain": 3}
 POST_ABORT_V3_PRESERVED_STATUS_COUNTS = {"completed": 5, "pending": 40}
+POST_ABORT_V4_SELECTED_STATUS_COUNTS = {"processing": 2}
+POST_ABORT_V4_SELECTED_TYPE_COUNTS = {"retain": 2}
+POST_ABORT_V4_PRESERVED_STATUS_COUNTS = {"completed": 5, "pending": 41}
 OPERATION_STATUSES = (
     "pending",
     "processing",
@@ -411,6 +414,7 @@ POST_ABORT_PLAN_V2_KEYS = POST_ABORT_PLAN_V1_KEYS | frozenset(
 POST_ABORT_PLAN_V3_KEYS = POST_ABORT_PLAN_V2_KEYS | frozenset(
     {"reference_application_progress_digest"}
 )
+POST_ABORT_PLAN_V4_KEYS = POST_ABORT_PLAN_V3_KEYS
 POST_ABORT_REFERENCE_JOURNAL_KEYS = frozenset(
     {
         "schema_version",
@@ -2583,7 +2587,11 @@ def _post_abort_contract(
         else (
             POST_ABORT_V2_SELECTED_STATUS_COUNTS
             if schema_version == 2
-            else POST_ABORT_V3_SELECTED_STATUS_COUNTS
+            else (
+                POST_ABORT_V3_SELECTED_STATUS_COUNTS
+                if schema_version == 3
+                else POST_ABORT_V4_SELECTED_STATUS_COUNTS
+            )
         )
     )
     expected_type_counts = (
@@ -2592,7 +2600,11 @@ def _post_abort_contract(
         else (
             POST_ABORT_V2_SELECTED_TYPE_COUNTS
             if schema_version == 2
-            else POST_ABORT_V3_SELECTED_TYPE_COUNTS
+            else (
+                POST_ABORT_V3_SELECTED_TYPE_COUNTS
+                if schema_version == 3
+                else POST_ABORT_V4_SELECTED_TYPE_COUNTS
+            )
         )
     )
     expected_preserved_status_counts = (
@@ -2601,7 +2613,11 @@ def _post_abort_contract(
         else (
             POST_ABORT_V2_PRESERVED_STATUS_COUNTS
             if schema_version == 2
-            else POST_ABORT_V3_PRESERVED_STATUS_COUNTS
+            else (
+                POST_ABORT_V3_PRESERVED_STATUS_COUNTS
+                if schema_version == 3
+                else POST_ABORT_V4_PRESERVED_STATUS_COUNTS
+            )
         )
     )
     if (
@@ -2717,7 +2733,7 @@ def create_post_abort_recovery_plan(
         selected_status_counts,
         selected_type_counts,
         preserved_status_counts,
-    ) = _post_abort_contract(reference, snapshot, schema_version=3)
+    ) = _post_abort_contract(reference, snapshot, schema_version=4)
     authority = snapshot["installation_authority"]
     backup = _backup(
         rollback_backup,
@@ -2788,7 +2804,7 @@ def create_post_abort_recovery_plan(
             "operation-recovery post-abort evidence is stale"
         )
     body = {
-        "schema_version": 3,
+        "schema_version": 4,
         "kind": "operation-recovery-exact-drain-post-abort-plan",
         "action": "recover-exact-drain-post-abort",
         "authority": "unapproved-plan",
@@ -2841,7 +2857,7 @@ def verify_post_abort_recovery_plan(
             "operation-recovery post-abort plan is invalid"
         )
     schema_version = normalized.get("schema_version")
-    if type(schema_version) is not int or schema_version not in {1, 2, 3}:
+    if type(schema_version) is not int or schema_version not in {1, 2, 3, 4}:
         raise OperationRecoveryError(
             "operation-recovery post-abort plan is invalid"
         )
@@ -2853,7 +2869,11 @@ def verify_post_abort_recovery_plan(
             else (
                 POST_ABORT_PLAN_V2_KEYS
                 if schema_version == 2
-                else POST_ABORT_PLAN_V3_KEYS
+                else (
+                    POST_ABORT_PLAN_V3_KEYS
+                    if schema_version == 3
+                    else POST_ABORT_PLAN_V4_KEYS
+                )
             )
         ),
         "operation-recovery post-abort plan",
@@ -2882,7 +2902,7 @@ def verify_post_abort_recovery_plan(
     )
     reference_progress_digest = (
         None
-        if schema_version != 3
+        if schema_version not in {3, 4}
         else _sha(
             plan["reference_application_progress_digest"],
             "post-abort reference application progress digest",
@@ -3065,7 +3085,7 @@ def verify_post_abort_recovery_plan(
                 ),
                 **(
                     {}
-                    if schema_version != 3
+                    if schema_version not in {3, 4}
                     else {
                         "reference_application_progress_digest": (
                             reference_progress_digest

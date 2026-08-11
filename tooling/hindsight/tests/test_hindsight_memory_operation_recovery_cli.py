@@ -115,7 +115,7 @@ class OperationRecoveryCliTest(unittest.TestCase):
         reference = fixtures.drain_plan()
         snapshot = fixtures.post_abort_snapshot(
             reference,
-            current_interrupted_subset=True,
+            interrupted_processing_count=2,
             observed_at=int(time.time()),
         )
         backup = recovery_fixtures.rollback_backup_evidence()
@@ -916,7 +916,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
         self.assertEqual(result["status"], "rolled-back")
         self.assertEqual(result["rollback_receipt_digest"], "c" * 64)
 
-    def test_post_abort_verify_command_seals_v3_plan_bound_evidence(self):
+    def test_post_abort_verify_command_seals_v4_plan_bound_evidence(self):
         command = self.controller[
             "operation_recovery_post_abort_verify_command"
         ]
@@ -939,8 +939,8 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             }
             evidence = {
                 "generation": application["post_generation"],
-                "selected_operation_count": 3,
-                "selected_status_counts": {"pending": 3},
+                "selected_operation_count": 2,
+                "selected_status_counts": {"pending": 2},
                 "cohort_operation_count": 48,
             }
             documents = {
@@ -990,7 +990,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 globals_.update(originals)
 
             self.assertEqual(result["status"], "verified")
-            self.assertEqual(result["selected_operation_count"], 3)
+            self.assertEqual(result["selected_operation_count"], 2)
             receipt, create_only = written[plan["verification_receipt_path"]]
             self.assertIs(create_only, True)
             self.assertEqual(receipt["plan_digest"], plan["plan_digest"])
@@ -1885,7 +1885,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 globals_.update(originals)
             self.assertEqual(writes, [])
 
-    def test_post_abort_plan_command_emits_exact_current_v3_subset(self):
+    def test_post_abort_plan_command_emits_exact_current_v4_subset(self):
         command = self.controller[
             "operation_recovery_post_abort_plan_command"
         ]
@@ -1894,7 +1894,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
         reference = fixtures.drain_plan()
         snapshot = fixtures.post_abort_snapshot(
             reference,
-            current_interrupted_subset=True,
+            interrupted_processing_count=2,
             observed_at=int(time.time()),
         )
         with tempfile.TemporaryDirectory(
@@ -2021,10 +2021,10 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
 
             self.assertEqual(result["status"], "planned")
             self.assertEqual(result["authority"], "unapproved-plan")
-            self.assertEqual(result["selected_operation_count"], 3)
+            self.assertEqual(result["selected_operation_count"], 2)
             plan, create_only = written[args.output]
             self.assertIs(create_only, True)
-            self.assertEqual(plan["schema_version"], 3)
+            self.assertEqual(plan["schema_version"], 4)
             self.assertEqual(
                 plan["reference_application_authorization"],
                 authorization,
@@ -2042,11 +2042,11 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 plan["reference_application_progress_digest"],
                 "c" * 64,
             )
-            self.assertEqual(plan["selected_status_counts"], {"processing": 3})
-            self.assertEqual(plan["selected_type_counts"], {"retain": 3})
+            self.assertEqual(plan["selected_status_counts"], {"processing": 2})
+            self.assertEqual(plan["selected_type_counts"], {"retain": 2})
             self.assertEqual(
                 plan["preserved_status_counts"],
-                {"completed": 5, "pending": 40},
+                {"completed": 5, "pending": 41},
             )
             serialized = json.dumps(plan, sort_keys=True)
             self.assertNotIn('"task_payload":', serialized)

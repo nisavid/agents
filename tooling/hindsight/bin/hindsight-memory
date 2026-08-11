@@ -8237,7 +8237,7 @@ def _operation_recovery_post_abort_assert_reference_worker_stopped(
     plan: Mapping[str, Any],
 ) -> None:
     if (
-        plan["schema_version"] in {2, 3}
+        plan["schema_version"] in {2, 3, 4}
         and _operation_recovery_exact_journal_worker_active(
             plan["reference_application_journal"]
         )
@@ -8261,7 +8261,7 @@ def _operation_recovery_post_abort_assert_reference_source_stopped(
         authorization != plan["reference_application_authorization"]
         or journal != plan["reference_application_journal"]
         or (
-            plan["schema_version"] == 3
+            plan["schema_version"] in {3, 4}
             and _operation_recovery_post_abort_reference_progress_digest(
                 plan["reference_plan"],
                 journal,

@@ -162,6 +162,7 @@ from hindsight_memory_control_plane.provider_runtime import (  # noqa: E402
     SUPPORTED_HINDSIGHT_VERSIONS,
 )
 from hindsight_memory_control_plane.operation_recovery import (  # noqa: E402
+    EXACT_DRAIN_TRANSACTION_TIMEOUT_SECONDS,
     OperationRecoveryError,
     create_claim_release_plan,
     create_cohort_manifest,
@@ -186,6 +187,8 @@ from hindsight_memory_control_plane.operation_recovery_runtime import (  # noqa:
     EXACT_DRAIN_PROFILE_ENVIRONMENT_KEYS,
     QUEUE_BLOCKER_GUARD_CONTRACT_DIGEST,
     QUEUE_BLOCKER_GUARD_CONTRACT_VERSION,
+    ExactDrainClaimAdapter,
+    exact_drain_candidate_provider_root,
     apply_claim_release_transaction,
     apply_post_abort_recovery_transaction,
     apply_requeue_transaction,
@@ -194,9 +197,12 @@ from hindsight_memory_control_plane.operation_recovery_runtime import (  # noqa:
     exact_drain_effective_profile_digest,
     exact_drain_platform_environment,
     exact_drain_runtime_digest,
+    exact_drain_start_message,
+    exact_drain_worker_id,
     exact_drain_worker_hindsight_version,
     exact_drain_worker_interpreter_path,
     live_row_digest,
+    process_start_time,
     read_claim_release_evidence,
     read_claim_release_preimage,
     read_global_queue_blockers,
@@ -212,6 +218,7 @@ from hindsight_memory_control_plane.operation_recovery_runtime import (  # noqa:
     validate_exact_drain_provider_policy,
 )
 from hindsight_memory_control_plane.operation_recovery_progress import (  # noqa: E402
+    create_exact_drain_progress_recorder,
     exact_drain_progress_archive_path,
     read_exact_drain_progress,
 )
@@ -1916,85 +1923,7 @@ def _process_running(pid: int) -> bool:
 
 
 def _process_start_time(pid: int) -> str | None:
-    if sys.platform == "darwin":
-
-        class ProcBsdInfo(ctypes.Structure):
-            _fields_ = [
-                ("pbi_flags", ctypes.c_uint32),
-                ("pbi_status", ctypes.c_uint32),
-                ("pbi_xstatus", ctypes.c_uint32),
-                ("pbi_pid", ctypes.c_uint32),
-                ("pbi_ppid", ctypes.c_uint32),
-                ("pbi_uid", ctypes.c_uint32),
-                ("pbi_gid", ctypes.c_uint32),
-                ("pbi_ruid", ctypes.c_uint32),
-                ("pbi_rgid", ctypes.c_uint32),
-                ("pbi_svuid", ctypes.c_uint32),
-                ("pbi_svgid", ctypes.c_uint32),
-                ("pbi_rfu_1", ctypes.c_uint32),
-                ("pbi_comm", ctypes.c_char * 16),
-                ("pbi_name", ctypes.c_char * 32),
-                ("pbi_nfiles", ctypes.c_uint32),
-                ("pbi_pgid", ctypes.c_uint32),
-                ("pbi_pjobc", ctypes.c_uint32),
-                ("e_tdev", ctypes.c_uint32),
-                ("e_tpgid", ctypes.c_uint32),
-                ("pbi_nice", ctypes.c_int32),
-                ("pbi_start_tvsec", ctypes.c_uint64),
-                ("pbi_start_tvusec", ctypes.c_uint64),
-            ]
-
-        try:
-            libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
-            proc_pidinfo = libproc.proc_pidinfo
-            proc_pidinfo.argtypes = [
-                ctypes.c_int,
-                ctypes.c_int,
-                ctypes.c_uint64,
-                ctypes.c_void_p,
-                ctypes.c_int,
-            ]
-            proc_pidinfo.restype = ctypes.c_int
-            info = ProcBsdInfo()
-            result = proc_pidinfo(
-                pid,
-                3,  # PROC_PIDTBSDINFO
-                0,
-                ctypes.byref(info),
-                ctypes.sizeof(info),
-            )
-        except (AttributeError, OSError):
-            pass
-        else:
-            if result == ctypes.sizeof(info):
-                return f"darwin:{info.pbi_start_tvsec}:{info.pbi_start_tvusec}"
-
-    proc_stat = Path(f"/proc/{pid}/stat")
-    try:
-        raw_stat = proc_stat.read_text(encoding="ascii")
-        fields = raw_stat.rsplit(")", 1)[1].split()
-        start_ticks = fields[19]
-    except (FileNotFoundError, IndexError, OSError, UnicodeDecodeError):
-        pass
-    else:
-        return f"linux:{start_ticks}"
-
-    try:
-        result = subprocess.run(
-            ["/bin/ps", "-o", "lstart=", "-p", str(pid)],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=1.0,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if result.returncode != 0:
-        return None
-    value = " ".join(result.stdout.split())
-    if not value or len(value) > 128:
-        return None
-    return value
+    return process_start_time(pid)
 
 
 def _process_identity_matches(identity: BrokerProcessIdentity) -> bool:
@@ -7881,11 +7810,16 @@ def _operation_recovery_validate_exact_worker_provider_runtime(
         )
 
 
-def _operation_recovery_exact_runtime_digest(args: argparse.Namespace) -> str:
+def _operation_recovery_exact_runtime_digest(
+    args: argparse.Namespace,
+    *,
+    schema_version: int = 2,
+) -> str:
     return exact_drain_runtime_digest(
         args.worker_runtime,
         args.provider_runtime_root,
         LIB / "hindsight_api",
+        schema_version=schema_version,
     )
 
 
@@ -7917,7 +7851,10 @@ def operation_recovery_drain_plan_command(args: argparse.Namespace) -> int:
         provider_policy,
         _operation_recovery_profile_environment(),
     )
-    worker_runtime_digest = _operation_recovery_exact_runtime_digest(args)
+    worker_runtime_digest = _operation_recovery_exact_runtime_digest(
+        args,
+        schema_version=2,
+    )
     output_path = Path(args.output)
     artifact_paths = [
         args.rollback_backup,
@@ -8260,6 +8197,53 @@ def _operation_recovery_exact_next_worker_attempt(
     return next_attempt
 
 
+def _operation_recovery_exact_execution_lease_projection(
+    plan: Mapping[str, Any],
+    authorization: Mapping[str, Any] | None,
+    *,
+    now: int | None = None,
+) -> Mapping[str, Any]:
+    if plan.get("schema_version") != 2:
+        return {}
+    observed_at = int(time.time()) if now is None else now
+    if authorization is None:
+        return {
+            "expires_at": plan["expires_at"],
+            "execution_lease_status": "not-authorized",
+            "execution_lease_started_at": None,
+            "execution_lease_expires_at": None,
+            "execution_lease_remaining_seconds": None,
+        }
+    started_at = authorization["authorized_at"]
+    expires_at = started_at + plan["execution_lease_seconds"]
+    return {
+        "expires_at": plan["expires_at"],
+        "execution_lease_status": (
+            "active" if observed_at < expires_at else "expired"
+        ),
+        "execution_lease_started_at": started_at,
+        "execution_lease_expires_at": expires_at,
+        "execution_lease_remaining_seconds": max(0, expires_at - observed_at),
+    }
+
+
+def _operation_recovery_assert_exact_execution_lease(
+    plan: Mapping[str, Any],
+    authorization: Mapping[str, Any],
+    *,
+    now: int | None = None,
+) -> int | None:
+    if plan.get("schema_version") != 2:
+        return None
+    observed_at = int(time.time()) if now is None else now
+    expires_at = (
+        authorization["authorized_at"] + plan["execution_lease_seconds"]
+    )
+    if observed_at >= expires_at:
+        raise OperationRecoveryError("exact drain execution lease expired")
+    return expires_at
+
+
 def operation_recovery_drain_status_command(args: argparse.Namespace) -> int:
     candidate = _operation_recovery_candidate(args)
     plan = verify_exact_drain_plan(
@@ -8271,11 +8255,22 @@ def operation_recovery_drain_status_command(args: argparse.Namespace) -> int:
     manager = _portable_manager(args)
     with _operation_recovery_lock(manager):
         with manager._lock():
+            authorization = (
+                _operation_recovery_exact_authorization(plan)
+                if plan.get("schema_version") == 2
+                and Path(plan["authorization_receipt_path"]).exists()
+                else None
+            )
             live = asyncio.run(
                 _operation_recovery_read_exact_drain_status(args, plan)
             )
             result = {
-                "status": "awaiting-approval",
+                "status": (
+                    "authorization-only"
+                    if plan.get("schema_version") == 2
+                    and authorization is not None
+                    else "awaiting-approval"
+                ),
                 "plan_digest": plan["plan_digest"],
                 "expires_at": plan["expires_at"],
                 "expired": int(time.time()) >= plan["expires_at"],
@@ -8298,9 +8293,10 @@ def operation_recovery_drain_status_command(args: argparse.Namespace) -> int:
                 if application_value.get("kind") == (
                     "operation-recovery-exact-drain-application-journal"
                 ):
-                    authorization = _operation_recovery_exact_authorization(
-                        plan
-                    )
+                    if authorization is None:
+                        authorization = _operation_recovery_exact_authorization(
+                            plan
+                        )
                     journal = _operation_recovery_exact_journal(
                         application_value,
                         plan=plan,
@@ -8315,9 +8311,10 @@ def operation_recovery_drain_status_command(args: argparse.Namespace) -> int:
                         else "interrupted"
                     )
                 else:
-                    authorization = _operation_recovery_exact_authorization(
-                        plan
-                    )
+                    if authorization is None:
+                        authorization = _operation_recovery_exact_authorization(
+                            plan
+                        )
                     terminal_status = verify_exact_drain_status(
                         _operation_recovery_read_private_json(
                             plan["status_artifact_path"],
@@ -8335,6 +8332,12 @@ def operation_recovery_drain_status_command(args: argparse.Namespace) -> int:
                     result["application_receipt_digest"] = application[
                         "receipt_digest"
                     ]
+            result.update(
+                _operation_recovery_exact_execution_lease_projection(
+                    plan,
+                    authorization,
+                )
+            )
     return _print_result(result)
 
 
@@ -8399,6 +8402,8 @@ def _operation_recovery_exact_worker_environment(
     *,
     database_url: str,
     start_gate_descriptor: int,
+    plan_digest: str,
+    authorization_receipt_digest: str,
 ) -> dict[str, str]:
     if (
         not isinstance(database_url, str)
@@ -8414,6 +8419,18 @@ def _operation_recovery_exact_worker_environment(
     ):
         raise OperationRecoveryError(
             "operation-recovery exact drain start gate is invalid"
+        )
+    if (
+        not isinstance(plan_digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", plan_digest) is None
+        or not isinstance(authorization_receipt_digest, str)
+        or re.fullmatch(
+            r"[0-9a-f]{64}", authorization_receipt_digest
+        )
+        is None
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery exact drain worker identity is invalid"
         )
     environment = {
         key: inherited[key]
@@ -8431,6 +8448,14 @@ def _operation_recovery_exact_worker_environment(
             "HINDSIGHT_EXACT_DRAIN_START_FD": str(
                 start_gate_descriptor
             ),
+            "HINDSIGHT_EXACT_DRAIN_PLAN_DIGEST": plan_digest,
+            "HINDSIGHT_EXACT_DRAIN_AUTHORIZATION_RECEIPT_DIGEST": (
+                authorization_receipt_digest
+            ),
+        }
+    )
+    environment.update(
+        {
             "HINDSIGHT_API_WORKER_MAX_SLOTS": "2",
             "HINDSIGHT_API_WORKER_CONSOLIDATION_RESERVED_SLOTS": "1",
             "HINDSIGHT_API_WORKER_RETAIN_RESERVED_SLOTS": "0",
@@ -8506,6 +8531,75 @@ def _operation_recovery_exact_status_is_terminal(
             for item in status["outside_nonterminal_counts"]
         )
     )
+
+
+def _operation_recovery_assert_terminal_snapshot(
+    prelaunch: Mapping[str, Any],
+    observed: Mapping[str, Any],
+) -> None:
+    generation_keys = ("generation_before", "generation_after")
+    if any(observed.get(key) != prelaunch.get(key) for key in generation_keys):
+        raise OperationRecoveryError(
+            "operation-recovery terminal generation evidence differs"
+        )
+    state_keys = (
+        "selected_operation_count",
+        "selected_status_counts",
+        "preserved_status_counts",
+        "outside_nonterminal_counts",
+    )
+    if any(observed.get(key) != prelaunch.get(key) for key in state_keys):
+        raise OperationRecoveryError(
+            "operation-recovery terminal status evidence differs"
+        )
+
+
+async def _operation_recovery_reconcile_terminal_progress(
+    args: argparse.Namespace,
+    *,
+    plan: Mapping[str, Any],
+    authorization: Mapping[str, Any],
+    journal: Mapping[str, Any],
+    terminal: Mapping[str, Any],
+) -> None:
+    connection = await _operation_recovery_connect_live(args, readonly=True)
+    adapter = ExactDrainClaimAdapter(
+        plan,
+        resume=True,
+        terminal_reconciliation=True,
+        terminal_status_evidence={
+            "generation": terminal["generation_before"],
+            "observed_at": terminal["observed_at"],
+            "status_digest": terminal["status_digest"],
+        },
+        authorization=authorization,
+    )
+    try:
+        async with connection.transaction(
+            isolation="serializable",
+            readonly=True,
+        ):
+            tasks = await adapter.claim_tasks(
+                connection,
+                "public.async_operations",
+                exact_drain_worker_id(plan["plan_digest"]),
+                {},
+                1,
+            )
+            if tasks:
+                raise OperationRecoveryError(
+                    "exact drain terminal reconciliation attempted work"
+                )
+        progress_recorder = create_exact_drain_progress_recorder(
+            plan=plan,
+            authorization=authorization,
+            journal=journal,
+            terminal_reconciliation=True,
+        )
+        adapter.bind_terminal_progress_recorder(progress_recorder)
+        adapter.claim_committed(tasks)
+    finally:
+        await connection.close()
 
 
 def _operation_recovery_assert_terminal_progress(
@@ -8618,27 +8712,6 @@ def operation_recovery_drain_apply_command(args: argparse.Namespace) -> int:
         or candidate != plan["candidate_release"]
     ):
         raise OperationRecoveryError("exact drain approval differs")
-    provider_policy_digest, provider_policy = (
-        _operation_recovery_exact_provider_policy_evidence(
-            args.provider_policy
-        )
-    )
-    _operation_recovery_validate_exact_worker_provider_runtime(
-        provider_policy,
-        args.worker_runtime,
-    )
-    profile_environment = _operation_recovery_profile_environment()
-    if (
-        provider_policy_digest != plan["provider_policy_digest"]
-        or exact_drain_effective_profile_digest(
-            provider_policy,
-            profile_environment,
-        )
-        != plan["effective_profile_digest"]
-        or _operation_recovery_exact_runtime_digest(args)
-        != plan["worker_runtime_digest"]
-    ):
-        raise OperationRecoveryError("exact drain runtime authority drifted")
     authorization_path = Path(plan["authorization_receipt_path"])
     application_path = Path(plan["application_receipt_path"])
     progress_path = Path(plan["progress_artifact_path"])
@@ -8748,6 +8821,43 @@ def operation_recovery_drain_apply_command(args: argparse.Namespace) -> int:
                 raise OperationRecoveryError(
                     "exact drain live preconditions differ"
                 )
+            terminal_reconciliation = bool(
+                journal_resume
+                and _operation_recovery_exact_status_is_terminal(before)
+            )
+            profile_environment: Mapping[str, str] = {}
+            if not terminal_reconciliation:
+                if authorization is not None:
+                    _operation_recovery_assert_exact_execution_lease(
+                        plan,
+                        authorization,
+                    )
+                provider_policy_digest, provider_policy = (
+                    _operation_recovery_exact_provider_policy_evidence(
+                        args.provider_policy
+                    )
+                )
+                _operation_recovery_validate_exact_worker_provider_runtime(
+                    provider_policy,
+                    args.worker_runtime,
+                )
+                profile_environment = _operation_recovery_profile_environment()
+                if (
+                    provider_policy_digest != plan["provider_policy_digest"]
+                    or exact_drain_effective_profile_digest(
+                        provider_policy,
+                        profile_environment,
+                    )
+                    != plan["effective_profile_digest"]
+                    or _operation_recovery_exact_runtime_digest(
+                        args,
+                        schema_version=plan["schema_version"],
+                    )
+                    != plan["worker_runtime_digest"]
+                ):
+                    raise OperationRecoveryError(
+                        "exact drain runtime authority drifted"
+                    )
             if authorization is None:
                 authorized_at = int(time.time())
                 authorization = verify_exact_drain_authorization_receipt(
@@ -8814,18 +8924,88 @@ def operation_recovery_drain_apply_command(args: argparse.Namespace) -> int:
                             ],
                         }
                     )
+            if terminal_reconciliation:
+                if _operation_recovery_candidate(args) != candidate:
+                    raise OperationRecoveryError(
+                        "operation-recovery candidate drifted before terminal "
+                        "reconciliation"
+                    )
+                worker_attempt = _operation_recovery_exact_next_worker_attempt(
+                    plan,
+                    journal,
+                    terminal_reconciliation=True,
+                )
+                worker_start_time = _process_start_time(os.getpid())
+                if worker_start_time is None:
+                    raise OperationRecoveryError(
+                        "exact drain controller identity is unavailable"
+                    )
+                journal = _operation_recovery_exact_receipt(
+                    {
+                        "schema_version": 1,
+                        "kind": (
+                            "operation-recovery-exact-drain-"
+                            "application-journal"
+                        ),
+                        "plan_digest": plan["plan_digest"],
+                        "authorization_receipt_digest": authorization[
+                            "receipt_digest"
+                        ],
+                        "started_at": authorization["authorized_at"],
+                        "worker_pid": os.getpid(),
+                        "worker_start_time": worker_start_time,
+                        "worker_attempt": worker_attempt,
+                    }
+                )
+                write_private(plan["application_receipt_path"], journal)
+                asyncio.run(
+                    _operation_recovery_reconcile_terminal_progress(
+                        args,
+                        plan=plan,
+                        authorization=authorization,
+                        journal=journal,
+                        terminal=before,
+                    )
+                )
+                terminal = asyncio.run(
+                    _operation_recovery_read_exact_drain_status(args, plan)
+                )
+                _operation_recovery_assert_terminal_snapshot(before, terminal)
+                application = _operation_recovery_finalize_exact_application(
+                    plan=plan,
+                    candidate=candidate,
+                    authorization=authorization,
+                    journal=journal,
+                    terminal=terminal,
+                )
+                return _print_result(
+                    {
+                        "status": "terminal",
+                        "plan_digest": plan["plan_digest"],
+                        "application_receipt_digest": application[
+                            "receipt_digest"
+                        ],
+                        "selected_status_counts": terminal[
+                            "selected_status_counts"
+                        ],
+                        "outside_nonterminal_counts": terminal[
+                            "outside_nonterminal_counts"
+                        ],
+                    }
+                )
+            execution_deadline = (
+                _operation_recovery_assert_exact_execution_lease(
+                    plan,
+                    authorization,
+                )
+            )
             wrapper = Path(__file__).resolve().parent / (
                 "hindsight-exact-drain-worker"
-            )
-            terminal_reconciliation = bool(
-                journal_resume
-                and _operation_recovery_exact_status_is_terminal(before)
             )
             worker_attempt = (
                 _operation_recovery_exact_next_worker_attempt(
                     plan,
                     journal,
-                    terminal_reconciliation=terminal_reconciliation,
                 )
                 if journal_resume
                 else 1
@@ -8843,21 +9023,34 @@ def operation_recovery_drain_apply_command(args: argparse.Namespace) -> int:
                 "--provider-policy",
                 str(Path(args.provider_policy).resolve(strict=True)),
                 "--provider-runtime-root",
-                str(Path(args.provider_runtime_root).resolve(strict=True)),
+                str(
+                    Path(args.provider_runtime_root).resolve(strict=True)
+                    if plan["schema_version"] == 1
+                    else exact_drain_candidate_provider_root(LIB)
+                ),
                 "--worker-runtime",
                 str(Path(args.worker_runtime).resolve(strict=True)),
             ]
             if journal_resume:
                 command.append("--resume")
-            if terminal_reconciliation:
-                command.append("--terminal-reconciliation")
             start_read, start_write = os.pipe()
             process: subprocess.Popen[bytes] | None = None
+            worker_start_time: str | None = None
+            child_sigterm_sent = False
+            execution_lease_expired = False
             try:
+                _operation_recovery_assert_exact_execution_lease(
+                    plan,
+                    authorization,
+                )
                 environment = _operation_recovery_exact_worker_environment(
                     profile_environment,
                     database_url=_operation_recovery_exact_database_url(plan),
                     start_gate_descriptor=start_read,
+                    plan_digest=plan["plan_digest"],
+                    authorization_receipt_digest=authorization[
+                        "receipt_digest"
+                    ],
                 )
                 process = subprocess.Popen(
                     command,
@@ -8920,29 +9113,95 @@ def operation_recovery_drain_apply_command(args: argparse.Namespace) -> int:
                     journal,
                     create_only=not journal_resume,
                 )
-                if os.write(start_write, b"1") != 1:
+                execution_deadline = (
+                    _operation_recovery_assert_exact_execution_lease(
+                        plan,
+                        authorization,
+                    )
+                )
+                start_message = exact_drain_start_message(
+                    plan["plan_digest"],
+                    authorization["receipt_digest"],
+                    journal["receipt_digest"],
+                )
+                if os.write(start_write, start_message) != len(start_message):
                     raise OperationRecoveryError(
                         "exact drain worker start gate failed"
                     )
                 os.close(start_write)
                 start_write = -1
-                returncode = process.wait()
+                if execution_deadline is None:
+                    returncode = process.wait()
+                else:
+                    remaining_seconds = execution_deadline - time.time()
+                    if remaining_seconds <= 0:
+                        raise subprocess.TimeoutExpired(command, 0)
+                    try:
+                        returncode = process.wait(timeout=remaining_seconds)
+                    except subprocess.TimeoutExpired:
+                        execution_lease_expired = True
+                        if not _process_identity_matches(
+                            BrokerProcessIdentity(
+                                process.pid,
+                                worker_start_time,
+                            )
+                        ):
+                            raise OperationRecoveryError(
+                                "exact drain worker identity drifted at lease expiry"
+                            )
+                        process.send_signal(signal.SIGTERM)
+                        child_sigterm_sent = True
+                        try:
+                            returncode = process.wait(
+                                timeout=(
+                                    plan["transaction_timeout_seconds"]
+                                    if plan.get("schema_version") == 2
+                                    else EXACT_DRAIN_TRANSACTION_TIMEOUT_SECONDS
+                                )
+                            )
+                        except subprocess.TimeoutExpired as error:
+                            raise OperationRecoveryError(
+                                "exact drain worker was interrupted but remained "
+                                "active after lease expiry"
+                            ) from error
             except BaseException:
-                if process is not None and process.poll() is None:
-                    process.kill()
-                if process is not None:
-                    process.wait()
+                if (
+                    process is not None
+                    and process.poll() is None
+                    and not child_sigterm_sent
+                    and worker_start_time is not None
+                    and _process_identity_matches(
+                        BrokerProcessIdentity(process.pid, worker_start_time)
+                    )
+                ):
+                    process.send_signal(signal.SIGTERM)
+                    child_sigterm_sent = True
+                    try:
+                        process.wait(
+                            timeout=plan.get(
+                                "transaction_timeout_seconds",
+                                120,
+                            )
+                        )
+                    except subprocess.TimeoutExpired:
+                        pass
                 raise
             finally:
                 if start_read >= 0:
                     os.close(start_read)
                 if start_write >= 0:
                     os.close(start_write)
-            if returncode != 0:
+            if returncode != 0 and not execution_lease_expired:
                 raise OperationRecoveryError("exact drain worker failed")
             terminal = asyncio.run(
                 _operation_recovery_read_exact_drain_status(args, plan)
             )
+            if execution_lease_expired and not (
+                _operation_recovery_exact_status_is_terminal(terminal)
+            ):
+                raise OperationRecoveryError(
+                    "exact drain worker was interrupted at execution lease expiry"
+                )
             application = _operation_recovery_finalize_exact_application(
                 plan=plan,
                 candidate=candidate,
@@ -8973,18 +9232,40 @@ def operation_recovery_drain_monitor_command(args: argparse.Namespace) -> int:
         raise OperationRecoveryError("exact drain candidate differs")
     progress_path = Path(plan["progress_artifact_path"])
     application_path = Path(plan["application_receipt_path"])
+    authorization = None
+    if (
+        progress_path.exists()
+        or application_path.exists()
+        or (
+            plan.get("schema_version") == 2
+            and Path(plan["authorization_receipt_path"]).exists()
+        )
+    ):
+        authorization = _operation_recovery_exact_authorization(plan)
     if not progress_path.exists() and not application_path.exists():
         return _print_result(
             {
-                "status": "not-started",
+                "status": (
+                    "authorization-only"
+                    if plan.get("schema_version") == 2
+                    and authorization is not None
+                    else "not-started"
+                ),
                 "plan_digest": plan["plan_digest"],
+                **_operation_recovery_exact_execution_lease_projection(
+                    plan,
+                    authorization,
+                ),
             }
         )
     # Apply writes the application journal before opening the start gate below;
     # hindsight-exact-drain-worker creates progress only after reading that gate.
     if progress_path.exists() != application_path.exists():
         if application_path.exists():
-            authorization = _operation_recovery_exact_authorization(plan)
+            if authorization is None:
+                raise OperationRecoveryError(
+                    "exact drain authorization receipt is unavailable"
+                )
             journal_value = _operation_recovery_read_private_json(
                 application_path,
                 "exact drain application record",
@@ -9005,11 +9286,18 @@ def operation_recovery_drain_monitor_command(args: argparse.Namespace) -> int:
                             "status": "starting",
                             "plan_digest": plan["plan_digest"],
                             "worker_attempt": journal["worker_attempt"],
+                            **_operation_recovery_exact_execution_lease_projection(
+                                plan,
+                                authorization,
+                            ),
                         }
                     )
         raise OperationRecoveryError("exact drain progress state is incomplete")
     progress = _operation_recovery_read_monitor_progress(plan)
-    authorization = _operation_recovery_exact_authorization(plan)
+    if authorization is None:
+        raise OperationRecoveryError(
+            "exact drain authorization receipt is unavailable"
+        )
     application_value = _operation_recovery_read_private_json(
         plan["application_receipt_path"],
         "exact drain application record",
@@ -9099,6 +9387,10 @@ def operation_recovery_drain_monitor_command(args: argparse.Namespace) -> int:
             "cooldowns": progress["cooldowns"],
             "prior_attempts": progress["prior_attempts"],
             "progress_digest": progress["progress_digest"],
+            **_operation_recovery_exact_execution_lease_projection(
+                plan,
+                authorization,
+            ),
             **(
                 {}
                 if terminal_status is None

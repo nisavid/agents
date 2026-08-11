@@ -3,6 +3,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 import asyncio
 import hashlib
+import json
 import os
 import signal
 import socket
@@ -15,6 +16,9 @@ import time
 from types import SimpleNamespace
 import unittest
 
+from tooling.hindsight.tests import (
+    test_hindsight_memory_operation_recovery as recovery_fixtures,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 LIB = ROOT / "lib"
@@ -91,6 +95,220 @@ class FakeConnection:
 
 
 class OperationRecoveryRuntimeTest(unittest.TestCase):
+    def test_consumed_v2_authorization_starts_adapter_after_approval_expiry(self):
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        now = int(time.time())
+        planned_at = now - 86_401
+        plan = fixtures.drain_plan(
+            snapshot=fixtures.drain_snapshot(observed_at=planned_at),
+            created_at=planned_at,
+        )
+        authorization = recovery_fixtures.exact_drain_authorization(
+            plan,
+            authorized_at=plan["expires_at"] - 1,
+        )
+        authorization_bytes = json.dumps(
+            authorization,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+
+        adapter = ExactDrainClaimAdapter(
+            plan,
+            authorization=authorization,
+            clock=lambda: now,
+        )
+
+        self.assertEqual(
+            adapter._execution_deadline,
+            authorization["authorized_at"] + 86_400,
+        )
+        self.assertEqual(
+            json.dumps(
+                authorization,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode(),
+            authorization_bytes,
+        )
+
+    def test_legacy_v1_unresumed_adapter_still_rejects_expired_approval(self):
+        fixture = json.loads(
+            (
+                ROOT
+                / "tests"
+                / "fixtures"
+                / "legacy_exact_drain_plans.json"
+            ).read_text(encoding="utf-8")
+        )["exact"]
+
+        with self.assertRaisesRegex(OperationRecoveryError, "plan expired"):
+            ExactDrainClaimAdapter(fixture)
+
+    def test_legacy_v1_terminal_reconciliation_bounds_public_claim_waits(self):
+        fixture = json.loads(
+            (
+                ROOT
+                / "tests"
+                / "fixtures"
+                / "legacy_exact_drain_plans.json"
+            ).read_text(encoding="utf-8")
+        )["exact"]
+        adapter = ExactDrainClaimAdapter(
+            fixture,
+            resume=True,
+            terminal_reconciliation=True,
+        )
+        adapter._verify_initial_state = AsyncMock()
+
+        class Connection:
+            def __init__(self):
+                self.timeouts = []
+
+            async def execute(self, *_arguments):
+                return "SET"
+
+            async def fetchval(self, query, value):
+                self.timeouts.append((query, value))
+
+        connection = Connection()
+        tasks = asyncio.run(
+            adapter.claim_tasks(
+                connection,
+                "public.async_operations",
+                adapter._worker_id,
+                {},
+                1,
+            )
+        )
+
+        self.assertEqual(tasks, [])
+        self.assertEqual(
+            [value for _query, value in connection.timeouts],
+            ["120000ms", "120000ms", "120000ms"],
+        )
+
+    def test_terminal_reconciliation_constructs_at_execution_lease_boundary(self):
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        planned_at = int(time.time())
+        plan = fixtures.drain_plan(
+            snapshot=fixtures.drain_snapshot(observed_at=planned_at),
+            created_at=planned_at,
+        )
+        authorization = recovery_fixtures.exact_drain_authorization(
+            plan,
+            authorized_at=planned_at,
+        )
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "terminal status evidence is required",
+        ):
+            ExactDrainClaimAdapter(
+                plan,
+                authorization=authorization,
+                resume=True,
+                terminal_reconciliation=True,
+                clock=lambda: planned_at + 86_400,
+            )
+
+        adapter = ExactDrainClaimAdapter(
+            plan,
+            authorization=authorization,
+            resume=True,
+            terminal_reconciliation=True,
+            terminal_status_evidence={
+                "generation": plan["pre_generation"],
+                "observed_at": planned_at,
+                "status_digest": "6" * 64,
+            },
+            clock=lambda: planned_at + 86_400,
+        )
+
+        self.assertTrue(adapter._terminal_reconciliation)
+        self.assertEqual(adapter._execution_deadline, planned_at + 86_400)
+
+    def test_exact_drain_public_claim_rejects_the_execution_lease_boundary(self):
+        adapter = object.__new__(ExactDrainClaimAdapter)
+        adapter._worker_id = "exact-worker"
+        adapter._execution_deadline = 86_500
+        adapter._clock = lambda: 86_500
+
+        class Connection:
+            async def execute(self, *_args, **_kwargs):
+                raise AssertionError("expired exact drain touched PostgreSQL")
+
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "execution lease expired",
+        ):
+            asyncio.run(
+                adapter.claim_tasks(
+                    Connection(),
+                    '"public".async_operations',
+                    "exact-worker",
+                    {},
+                    1,
+                )
+            )
+
+    def test_exact_drain_public_claim_bounds_database_waits_to_120_seconds(self):
+        adapter = object.__new__(ExactDrainClaimAdapter)
+        adapter._worker_id = "exact-worker"
+        adapter._execution_deadline = 86_500
+        adapter._transaction_timeout_seconds = 120
+        adapter._clock = lambda: 100
+        adapter._terminal_reconciliation = False
+        adapter._initial_guard_complete = True
+        adapter._verify_unstarted_state = AsyncMock()
+        adapter._selected = {}
+        adapter._started_ids = set()
+        adapter._max_retries = 3
+        adapter._identifiers = []
+        adapter._completion_signalled = False
+        adapter._completion_callback = None
+
+        class Connection:
+            def __init__(self):
+                self.timeouts = []
+
+            async def execute(self, _query, *_arguments):
+                return "SET"
+
+            async def fetchval(self, query, value):
+                self.timeouts.append((query, value))
+
+            async def fetch(self, *_args, **_kwargs):
+                return []
+
+        connection = Connection()
+        asyncio.run(
+            adapter.claim_tasks(
+                connection,
+                '"public".async_operations',
+                "exact-worker",
+                {},
+                1,
+            )
+        )
+
+        self.assertEqual(
+            connection.timeouts,
+            [
+                (
+                    "SELECT pg_catalog.set_config('transaction_timeout', $1, true)",
+                    "120000ms",
+                ),
+                (
+                    "SELECT pg_catalog.set_config('lock_timeout', $1, true)",
+                    "120000ms",
+                ),
+                (
+                    "SELECT pg_catalog.set_config('statement_timeout', $1, true)",
+                    "120000ms",
+                ),
+            ],
+        )
+
     def test_exact_drain_public_claim_parses_only_capacity_bound_rows(self):
         first_id = "00000000-0000-4000-8000-000000000001"
         later_id = "00000000-0000-4000-8000-000000000002"
@@ -527,6 +745,130 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         ):
             asyncio.run(adapter._verify_initial_state(Connection()))
 
+    def test_terminal_public_claim_binds_prelaunch_generation_and_status(self):
+        adapter = object.__new__(ExactDrainClaimAdapter)
+        operation_id = "00000000-0000-4000-8000-000000000001"
+        adapter._plan = {
+            "plan_digest": "1" * 64,
+            "pre_generation": "systalyze:public:123",
+            "installation_authority": {
+                "postgres_system_identifier": "7659746962107358086",
+            },
+            "rollback_backup": {
+                "source_authority": {
+                    "binding": {
+                        "database": "hindsight",
+                        "user": "hindsight",
+                        "data_dir": "/private/tmp",
+                        "port": 54329,
+                    }
+                }
+            },
+        }
+        adapter._selected = {
+            operation_id: {
+                "operation_type": "retain",
+                "task_payload_digest": "a" * 64,
+                "row_digest": "b" * 64,
+            }
+        }
+        adapter._preserved = {}
+        adapter._identifiers = []
+        adapter._resume = True
+        adapter._terminal_reconciliation = True
+        adapter._worker_id = "exact-worker"
+        adapter._worker_digest = "c" * 64
+        adapter._started_ids = set()
+        adapter._progress_recorder = None
+        adapter._pending_progress_stages = {}
+        adapter._transaction_timeout_seconds = None
+        adapter._execution_deadline = None
+        adapter._initial_guard_complete = False
+        adapter._terminal_reconciliation_ready = False
+        adapter._completion_signalled = False
+        adapter._completion_callback = None
+        status_body = {
+            "schema_version": 1,
+            "kind": "operation-recovery-exact-drain-status",
+            "plan_digest": "1" * 64,
+            "generation_before": "systalyze:public:123",
+            "generation_after": "systalyze:public:123",
+            "selected_operation_count": 1,
+            "selected_status_counts": {"completed": 1},
+            "preserved_status_counts": {},
+            "outside_nonterminal_counts": [],
+            "observed_at": 1_000,
+        }
+        adapter._terminal_status_evidence = {
+            "generation": "systalyze:public:123",
+            "observed_at": 1_000,
+            "status_digest": recovery_fixtures.digest(status_body),
+        }
+
+        class Connection:
+            async def execute(self, *_arguments):
+                return "SET"
+
+            async def fetchrow(self, _query):
+                return {
+                    "database": "hindsight",
+                    "database_user": "hindsight",
+                    "data_directory": "/private/tmp",
+                    "port": 54329,
+                    "address": None,
+                    "system_identifier": "7659746962107358086",
+                }
+
+            async def fetch(self, *_arguments):
+                return []
+
+        row = {
+            "operation_id": operation_id,
+            "operation_type": "retain",
+            "task_payload_digest": "a" * 64,
+            "worker_id_digest": "c" * 64,
+            "status": "completed",
+        }
+
+        async def claim(generation):
+            with (
+                patch(
+                    "hindsight_memory_control_plane.operation_recovery_runtime."
+                    "read_generation",
+                    new=AsyncMock(return_value=generation),
+                ),
+                patch(
+                    "hindsight_memory_control_plane.operation_recovery_runtime."
+                    "read_safe_operation_rows",
+                    new=AsyncMock(return_value=[row]),
+                ),
+                patch(
+                    "hindsight_memory_control_plane.operation_recovery_runtime."
+                    "live_row_digest",
+                    return_value="d" * 64,
+                ),
+            ):
+                return await adapter.claim_tasks(
+                    Connection(),
+                    "public.async_operations",
+                    "exact-worker",
+                    {},
+                    1,
+                )
+
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "terminal generation evidence differs",
+        ):
+            asyncio.run(claim("systalyze:public:124"))
+
+        row["status"] = "failed"
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "terminal status evidence differs",
+        ):
+            asyncio.run(claim("systalyze:public:123"))
+
     def test_terminal_reconciliation_rechecks_before_every_no_work_claim(self):
         adapter = object.__new__(ExactDrainClaimAdapter)
         adapter._worker_id = "exact-worker"
@@ -560,6 +902,248 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         adapter._verify_initial_state.assert_awaited_once_with(connection)
         connection.fetch.assert_not_awaited()
         self.assertFalse(adapter._terminal_reconciliation_ready)
+
+    def test_expired_terminal_reconciliation_claims_no_tasks_or_provider_work(self):
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        planned_at = int(time.time())
+        plan = fixtures.drain_plan(
+            snapshot=fixtures.drain_snapshot(observed_at=planned_at),
+            created_at=planned_at,
+        )
+        authorization = recovery_fixtures.exact_drain_authorization(
+            plan,
+            authorized_at=planned_at,
+        )
+        completed = []
+        adapter = ExactDrainClaimAdapter(
+            plan,
+            authorization=authorization,
+            resume=True,
+            terminal_reconciliation=True,
+            terminal_status_evidence={
+                "generation": plan["pre_generation"],
+                "observed_at": planned_at,
+                "status_digest": "6" * 64,
+            },
+            completion_callback=lambda: completed.append(True),
+            clock=lambda: planned_at + 86_401,
+        )
+        adapter._verify_initial_state = AsyncMock()
+
+        class Connection:
+            def __init__(self):
+                self.statements = []
+                self.timeouts = []
+
+            async def execute(self, statement, *_arguments):
+                self.statements.append(statement)
+                return "SET"
+
+            async def fetchval(self, statement, value):
+                self.timeouts.append((statement, value))
+
+            async def fetch(self, *_arguments, **_keywords):
+                raise AssertionError("terminal reconciliation selected claim rows")
+
+        connection = Connection()
+        tasks = asyncio.run(
+            adapter.claim_tasks(
+                connection,
+                '"public".async_operations',
+                adapter._worker_id,
+                {},
+                1,
+            )
+        )
+        adapter.claim_committed(tasks)
+
+        self.assertEqual(tasks, [])
+        self.assertEqual(
+            connection.statements,
+            ["SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"],
+        )
+        self.assertEqual(len(connection.timeouts), 3)
+        adapter._verify_initial_state.assert_awaited_once_with(connection)
+        self.assertEqual(completed, [True])
+
+    def test_expired_terminal_reconciliation_recovery_is_read_only(self):
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        planned_at = int(time.time())
+        plan = fixtures.drain_plan(
+            snapshot=fixtures.drain_snapshot(observed_at=planned_at),
+            created_at=planned_at,
+        )
+        authorization = recovery_fixtures.exact_drain_authorization(
+            plan,
+            authorized_at=planned_at,
+        )
+        adapter = ExactDrainClaimAdapter(
+            plan,
+            authorization=authorization,
+            resume=True,
+            terminal_reconciliation=True,
+            terminal_status_evidence={
+                "generation": plan["pre_generation"],
+                "observed_at": planned_at,
+                "status_digest": "6" * 64,
+            },
+            clock=lambda: planned_at + 86_401,
+        )
+        adapter._verify_initial_state = AsyncMock()
+
+        class Connection:
+            @asynccontextmanager
+            async def transaction(self, **_arguments):
+                yield
+
+            async def fetchval(self, *_arguments):
+                return None
+
+            async def fetch(self, *_arguments, **_keywords):
+                raise AssertionError("terminal reconciliation recovered rows")
+
+            async def execute(self, *_arguments, **_keywords):
+                raise AssertionError("terminal reconciliation mutated rows")
+
+        class Backend:
+            @asynccontextmanager
+            async def acquire(self):
+                yield Connection()
+
+        recovered = asyncio.run(adapter.recover_own_tasks(Backend()))
+
+        self.assertEqual(recovered, 0)
+        adapter._verify_initial_state.assert_awaited_once()
+
+    def test_terminal_reconciliation_rejects_public_task_mutations(self):
+        adapter = object.__new__(ExactDrainClaimAdapter)
+        adapter._terminal_reconciliation = True
+        adapter._execution_deadline = 86_500
+        adapter._clock = lambda: 100
+
+        class Backend:
+            def acquire(self):
+                raise AssertionError("terminal reconciliation acquired PostgreSQL")
+
+        operation_id = "00000000-0000-4000-8000-000000000001"
+        invocations = {
+            "retry": lambda: adapter.schedule_retry(
+                Backend(), operation_id, object(), "provider failure", "public"
+            ),
+            "defer": lambda: adapter.defer_operation(
+                Backend(), operation_id, object(), "capacity", "public"
+            ),
+            "complete": lambda: adapter.mark_completed(
+                Backend(), operation_id, "public"
+            ),
+            "fail": lambda: adapter.mark_failed(
+                Backend(), operation_id, "provider failure", "public"
+            ),
+        }
+        for name, invoke in invocations.items():
+            with (
+                self.subTest(name=name),
+                self.assertRaisesRegex(
+                    OperationRecoveryError,
+                    "terminal reconciliation cannot mutate",
+                ),
+            ):
+                asyncio.run(invoke())
+
+    def test_exact_drain_public_mutation_seams_configure_timeouts_before_reads(self):
+        operation_id = "00000000-0000-4000-8000-000000000001"
+
+        class Configured(RuntimeError):
+            pass
+
+        class Connection:
+            @asynccontextmanager
+            async def transaction(self, **_arguments):
+                yield
+
+        class Backend:
+            @asynccontextmanager
+            async def acquire(self):
+                yield Connection()
+
+        invocations = {
+            "recover": lambda adapter: adapter.recover_own_tasks(Backend()),
+            "release": lambda adapter: adapter.release_own_tasks(Backend()),
+            "retry": lambda adapter: adapter.schedule_retry(
+                Backend(), operation_id, object(), "failure", "public"
+            ),
+            "defer": lambda adapter: adapter.defer_operation(
+                Backend(), operation_id, object(), "capacity", "public"
+            ),
+            "complete": lambda adapter: adapter.mark_completed(
+                Backend(), operation_id, "public"
+            ),
+            "fail": lambda adapter: adapter.mark_failed(
+                Backend(), operation_id, "failure", "public"
+            ),
+        }
+        for name, invoke in invocations.items():
+            with self.subTest(name=name):
+                adapter = object.__new__(ExactDrainClaimAdapter)
+                adapter._resume = True
+                adapter._terminal_reconciliation = False
+                adapter._execution_deadline = None
+                adapter._selected = {
+                    operation_id: {
+                        "operation_type": "retain",
+                        "task_payload_digest": "a" * 64,
+                    }
+                }
+                adapter._configure_mutation_transaction = AsyncMock(
+                    side_effect=Configured
+                )
+
+                with self.assertRaises(Configured):
+                    asyncio.run(invoke(adapter))
+
+                adapter._configure_mutation_transaction.assert_awaited_once()
+
+    def test_exact_drain_release_uses_one_post_lease_cleanup_deadline(self):
+        now = [100]
+        configured = []
+        adapter = object.__new__(ExactDrainClaimAdapter)
+        adapter._terminal_reconciliation = False
+        adapter._execution_deadline = 100
+        adapter._transaction_timeout_seconds = 120
+        adapter._cleanup_deadline = None
+        adapter._clock = lambda: now[0]
+        adapter._worker_id = "exact-worker"
+        adapter._selected = {}
+        adapter._started_ids = set()
+        adapter._initial_guard_complete = True
+        adapter._verify_unstarted_state = AsyncMock()
+
+        class Connection:
+            @asynccontextmanager
+            async def transaction(self, **_arguments):
+                yield
+
+            async def fetchval(self, query, value):
+                configured.append((query, value))
+
+            async def fetch(self, *_args, **_kwargs):
+                return []
+
+            async def execute(self, *_args, **_kwargs):
+                return "UPDATE 0"
+
+        class Backend:
+            @asynccontextmanager
+            async def acquire(self):
+                yield Connection()
+
+        self.assertEqual(asyncio.run(adapter.release_own_tasks(Backend())), 0)
+        now[0] = 150
+        self.assertEqual(asyncio.run(adapter.release_own_tasks(Backend())), 0)
+
+        self.assertEqual(configured[0][1], "120000ms")
+        self.assertEqual(configured[3][1], "70000ms")
+        self.assertEqual(adapter._cleanup_deadline, 220)
 
     def test_exact_drain_interpreter_evidence_resolves_version_alias_parent(self):
         with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
@@ -614,6 +1198,44 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         ) as verify:
             ExactDrainClaimAdapter({}, resume=True)
         verify.assert_called_once_with({}, allow_expired=True)
+
+    def test_exact_drain_resume_keeps_the_original_authorization_deadline(self):
+        verified = {
+            "schema_version": 2,
+            "plan_digest": "a" * 64,
+            "selected_operations": [],
+            "live_snapshot": {"operations": []},
+            "worker_max_retries": 3,
+            "execution_lease_seconds": 86_400,
+            "transaction_timeout_seconds": 120,
+        }
+        authorization = {"authorized_at": 100}
+        with (
+            patch(
+                "hindsight_memory_control_plane.operation_recovery_runtime."
+                "verify_exact_drain_plan",
+                return_value=verified,
+            ),
+            patch(
+                "hindsight_memory_control_plane.operation_recovery_runtime."
+                "verify_exact_drain_authorization_receipt",
+                return_value=authorization,
+            ),
+        ):
+            started = ExactDrainClaimAdapter(
+                {},
+                authorization=authorization,
+                clock=lambda: 200,
+            )
+            resumed = ExactDrainClaimAdapter(
+                {},
+                authorization=authorization,
+                clock=lambda: 300,
+                resume=True,
+            )
+
+        self.assertEqual(started._execution_deadline, 86_500)
+        self.assertEqual(resumed._execution_deadline, 86_500)
 
     def test_exact_drain_initial_guard_rejects_the_wrong_database_identity(self):
         adapter = object.__new__(ExactDrainClaimAdapter)

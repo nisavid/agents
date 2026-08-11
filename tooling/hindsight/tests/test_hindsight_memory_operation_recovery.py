@@ -157,6 +157,22 @@ def release_identity() -> dict:
     }
 
 
+def exact_drain_authorization(plan: dict, *, authorized_at: int | None = None) -> dict:
+    body = {
+        "schema_version": 1,
+        "kind": "operation-recovery-exact-drain-authorization-receipt",
+        "plan_digest": plan["plan_digest"],
+        "approval_digest": plan["plan_digest"],
+        "candidate_release": plan["candidate_release"],
+        "provider_policy_digest": plan["provider_policy_digest"],
+        "worker_runtime_digest": plan["worker_runtime_digest"],
+        "authorized_at": (
+            plan["created_at"] if authorized_at is None else authorized_at
+        ),
+    }
+    return {**body, "receipt_digest": digest(body)}
+
+
 def rollback_encryption() -> dict:
     return {
         "recipient": "age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
@@ -291,6 +307,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
         self,
         *,
         completed_positions: set[int] | None = None,
+        observed_at: int = 1_785_461_000,
     ) -> dict:
         rows = operation_rows()
         completed_positions = (
@@ -309,15 +326,20 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 generation_before="systalyze:public:124",
                 generation_after="systalyze:public:124",
                 installation_authority=installation_authority(),
-                observed_at=1_785_461_000,
+                observed_at=observed_at,
             )
         )
 
-    def drain_plan(self) -> dict:
+    def drain_plan(
+        self,
+        *,
+        snapshot: dict | None = None,
+        created_at: int = 1_785_462_000,
+    ) -> dict:
         return dict(
             recovery_contract.create_exact_drain_plan(
                 self.cohort(),
-                self.drain_snapshot(),
+                snapshot or self.drain_snapshot(),
                 candidate_release=release_identity(),
                 rollback_backup=drain_backup_evidence(),
                 rollback_backup_path="/private/tmp/drain-backup.age",
@@ -334,9 +356,135 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 verification_receipt_path=(
                     "/private/tmp/drain-verification.json"
                 ),
-                created_at=1_785_462_000,
+                created_at=created_at,
             )
         )
+
+    def test_exact_drain_plan_separates_approval_evidence_transaction_and_lease(self):
+        snapshot = self.drain_snapshot()
+        planned_at = 1_785_462_000
+
+        plan = self.drain_plan(snapshot=snapshot, created_at=planned_at)
+
+        self.assertEqual(plan["schema_version"], 2)
+        self.assertEqual(plan["expires_at"], planned_at + 86_400)
+        self.assertEqual(plan["evidence_observed_at"], snapshot["observed_at"])
+        self.assertEqual(plan["evidence_max_age_seconds"], 3_600)
+        self.assertEqual(plan["transaction_timeout_seconds"], 120)
+        self.assertEqual(plan["execution_lease_seconds"], 86_400)
+        self.assertEqual(
+            recovery_contract.verify_exact_drain_plan(plan, now=planned_at),
+            plan,
+        )
+
+    def test_exact_drain_consumed_authorization_survives_approval_expiry(self):
+        plan = self.drain_plan()
+        authorization = exact_drain_authorization(
+            plan,
+            authorized_at=plan["expires_at"] - 1,
+        )
+
+        with self.assertRaisesRegex(OperationRecoveryError, "plan expired"):
+            recovery_contract.verify_exact_drain_plan(
+                plan,
+                now=plan["expires_at"],
+            )
+
+        self.assertEqual(
+            verify_exact_drain_authorization_receipt(
+                authorization,
+                plan=plan,
+            ),
+            authorization,
+        )
+
+    def test_exact_drain_plan_rejects_stale_planning_evidence(self):
+        snapshot = self.drain_snapshot()
+
+        with self.assertRaisesRegex(OperationRecoveryError, "evidence is stale"):
+            self.drain_plan(
+                snapshot=snapshot,
+                created_at=snapshot["observed_at"] + 3_601,
+            )
+
+    def test_exact_drain_plan_accepts_evidence_at_the_3600_second_boundary(self):
+        snapshot = self.drain_snapshot()
+
+        plan = self.drain_plan(
+            snapshot=snapshot,
+            created_at=snapshot["observed_at"] + 3_600,
+        )
+
+        self.assertEqual(plan["evidence_max_age_seconds"], 3_600)
+
+    def test_exact_drain_plan_rejects_future_planning_evidence(self):
+        snapshot = self.drain_snapshot()
+
+        with self.assertRaisesRegex(OperationRecoveryError, "evidence is stale"):
+            self.drain_plan(
+                snapshot=snapshot,
+                created_at=snapshot["observed_at"] - 1,
+            )
+
+    def test_exact_drain_verifier_accepts_the_deployed_legacy_plan_shape(self):
+        fixtures = json.loads(
+            (
+                ROOT
+                / "tests"
+                / "fixtures"
+                / "legacy_exact_drain_plans.json"
+            ).read_text(encoding="utf-8")
+        )
+        legacy = fixtures["exact"]
+        post_abort = fixtures["post_abort"]
+
+        self.assertEqual(
+            recovery_contract.verify_exact_drain_plan(
+                legacy,
+                now=legacy["created_at"],
+            ),
+            legacy,
+        )
+        self.assertEqual(post_abort["reference_plan"], legacy)
+        self.assertEqual(
+            verify_post_abort_recovery_plan(
+                post_abort,
+                now=post_abort["created_at"],
+            ),
+            post_abort,
+        )
+
+    def test_exact_drain_verifier_rejects_non_objects_and_boolean_schema(self):
+        for value in ([], None, 17, "exact-drain-plan"):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(
+                    OperationRecoveryError,
+                    "exact drain plan is invalid",
+                ),
+            ):
+                recovery_contract.verify_exact_drain_plan(value)
+
+        legacy = json.loads(
+            (
+                ROOT
+                / "tests"
+                / "fixtures"
+                / "legacy_exact_drain_plans.json"
+            ).read_text(encoding="utf-8")
+        )["exact"]
+        legacy["schema_version"] = True
+        legacy["plan_digest"] = digest(
+            {key: value for key, value in legacy.items() if key != "plan_digest"}
+        )
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "exact drain plan is invalid",
+        ):
+            recovery_contract.verify_exact_drain_plan(
+                legacy,
+                now=legacy["created_at"],
+            )
 
     def post_abort_snapshot(self, reference_plan=None) -> dict:
         reference_plan = reference_plan or self.drain_plan()
@@ -593,9 +741,10 @@ class OperationRecoveryContractTest(unittest.TestCase):
 
     def test_exact_drain_worker_requires_the_exact_authorization_receipt(self):
         now = int(__import__("time").time())
+        snapshot = self.drain_snapshot(observed_at=now)
         plan = recovery_contract.create_exact_drain_plan(
             self.cohort(),
-            self.drain_snapshot(),
+            snapshot,
             candidate_release=release_identity(),
             rollback_backup=drain_backup_evidence(),
             rollback_backup_path="/private/tmp/drain-backup.age",

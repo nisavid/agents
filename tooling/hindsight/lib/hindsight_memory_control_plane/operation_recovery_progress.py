@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import hmac
 import json
 import math
 import os
@@ -558,15 +559,16 @@ class ExactDrainProgressRecorder:
             self._persist(now)
 
 
-def create_exact_drain_progress_recorder(
+def verify_exact_drain_application_journal(
     *,
     plan: Mapping[str, Any],
     authorization: Mapping[str, Any],
     journal: Mapping[str, Any],
     terminal_reconciliation: bool = False,
-    clock: Callable[[], float] = time.time,
-) -> ExactDrainProgressRecorder:
-    """Create a progress recorder only for this authenticated worker attempt."""
+    expected_receipt_digest: str | None = None,
+    expected_worker_start_time: str | None = None,
+) -> dict[str, Any]:
+    """Verify one exact worker attempt before activating progress or runtime."""
     journal_keys = {
         "schema_version",
         "kind",
@@ -612,8 +614,38 @@ def create_exact_drain_progress_recorder(
             and not 1 <= worker_attempt <= maximum_attempt
         )
         or journal.get("receipt_digest") != digest(body)
+        or (
+            expected_receipt_digest is not None
+            and journal.get("receipt_digest") != expected_receipt_digest
+        )
+        or (
+            expected_worker_start_time is not None
+            and not hmac.compare_digest(
+                journal["worker_start_time"],
+                expected_worker_start_time,
+            )
+        )
     ):
         raise OperationRecoveryError("exact drain application journal is invalid")
+    return dict(journal)
+
+
+def create_exact_drain_progress_recorder(
+    *,
+    plan: Mapping[str, Any],
+    authorization: Mapping[str, Any],
+    journal: Mapping[str, Any],
+    terminal_reconciliation: bool = False,
+    clock: Callable[[], float] = time.time,
+) -> ExactDrainProgressRecorder:
+    """Create a progress recorder only for this authenticated worker attempt."""
+    journal = verify_exact_drain_application_journal(
+        plan=plan,
+        authorization=authorization,
+        journal=journal,
+        terminal_reconciliation=terminal_reconciliation,
+    )
+    worker_attempt = journal["worker_attempt"]
     progress_path = Path(plan["progress_artifact_path"])
     prior_attempts: list[dict[str, Any]] = []
     initial_tasks: Sequence[Mapping[str, Any]] | None = None

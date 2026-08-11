@@ -10,6 +10,7 @@ import os
 import signal
 import stat
 import sys
+import time
 from pathlib import Path
 
 
@@ -34,24 +35,25 @@ from hindsight_memory_control_plane.operation_recovery import (  # noqa: E402
 from hindsight_memory_control_plane.operation_recovery_runtime import (  # noqa: E402
     ExactDrainClaimAdapter,
     EXACT_DRAIN_PROFILE_ENVIRONMENT_KEYS,
+    exact_drain_candidate_provider_root,
     exact_drain_effective_profile_digest,
     exact_drain_platform_environment,
     exact_drain_runtime_evidence,
+    EXACT_DRAIN_START_MESSAGE_BYTES,
     exact_drain_worker_id,
     install_exact_drain_candidate_imports,
     install_exact_drain_runtime_guards,
+    process_start_time,
     validate_exact_drain_provider_policy,
+    validate_exact_drain_dependency_spec,
+    validate_exact_drain_candidate_release_import,
+    validate_exact_drain_import_origins,
+    verify_exact_drain_start_message,
 )
 from hindsight_memory_control_plane.operation_recovery_progress import (  # noqa: E402
     create_exact_drain_progress_recorder,
+    verify_exact_drain_application_journal,
 )
-from hindsight_memory_control_plane.provider_runtime import (  # noqa: E402
-    ProviderRuntimeCompatibilityError,
-    ProviderRuntimePolicy,
-    set_exact_drain_progress_recorder,
-)
-
-
 def _private_bytes(value: str | Path, label: str) -> bytes:
     path = Path(value)
     if not path.is_absolute():
@@ -104,21 +106,108 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--provider-runtime-root", required=True)
     result.add_argument("--worker-runtime", required=True)
     result.add_argument("--resume", action="store_true")
-    result.add_argument("--terminal-reconciliation", action="store_true")
     return result
+
+
+def _validated_start_gate() -> tuple[int, str]:
+    descriptor_value = os.environ.get("HINDSIGHT_EXACT_DRAIN_START_FD", "")
+    try:
+        descriptor = int(descriptor_value)
+        metadata = os.fstat(descriptor)
+    except (OSError, TypeError, ValueError) as error:
+        raise OperationRecoveryError(
+            "exact drain start gate is unavailable"
+        ) from error
+    if descriptor < 0 or not stat.S_ISFIFO(metadata.st_mode):
+        raise OperationRecoveryError("exact drain start gate differs")
+    return descriptor, descriptor_value
+
+
+def _validate_worker_environment(
+    start_descriptor_value: str,
+    *,
+    plan_digest: str,
+    authorization_receipt_digest: str,
+) -> None:
+    expected_environment = {
+        **exact_drain_platform_environment(),
+        "HOME": str(Path.home()),
+        "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONPATH": str(LIB),
+        "HINDSIGHT_EXACT_DRAIN_START_FD": start_descriptor_value,
+        "HINDSIGHT_EXACT_DRAIN_PLAN_DIGEST": plan_digest,
+        "HINDSIGHT_EXACT_DRAIN_AUTHORIZATION_RECEIPT_DIGEST": (
+            authorization_receipt_digest
+        ),
+    }
+    expected_environment.update(
+        {
+            "HINDSIGHT_API_WORKER_MAX_SLOTS": "2",
+            "HINDSIGHT_API_WORKER_CONSOLIDATION_RESERVED_SLOTS": "1",
+            "HINDSIGHT_API_WORKER_RETAIN_RESERVED_SLOTS": "0",
+            "HINDSIGHT_API_WORKER_FILE_CONVERT_RETAIN_RESERVED_SLOTS": "0",
+            "HINDSIGHT_API_WORKER_REFRESH_MENTAL_MODEL_RESERVED_SLOTS": "0",
+            "HINDSIGHT_API_WORKER_GRAPH_MAINTENANCE_RESERVED_SLOTS": "0",
+            "HINDSIGHT_API_WORKER_IMPORT_DOCUMENTS_RESERVED_SLOTS": "0",
+            "HINDSIGHT_API_RETAIN_MAX_CONCURRENT": "1",
+            "HINDSIGHT_API_OPERATION_RETENTION_DAYS": "0",
+            "HINDSIGHT_API_AUDIT_LOG_RETENTION_DAYS": "0",
+            "HINDSIGHT_API_LLM_TRACE_RETENTION_DAYS": "0",
+            "HINDSIGHT_API_CONSOLIDATION_RECONCILE_INTERVAL_SECONDS": "0",
+            "HINDSIGHT_API_MENTAL_MODEL_REFRESH_TICK_SECONDS": "0",
+            "HINDSIGHT_CODEX_TERMINAL_AUTH_COOLDOWN_SECONDS": "300",
+            "HINDSIGHT_EMBEDDING_FAILOVER_ORDER": (
+                "work-codex,personal-codex,alt1-codex,alt2-codex"
+            ),
+        }
+    )
+    allowed_environment = set(expected_environment) | {
+        "HINDSIGHT_API_DATABASE_URL",
+        "LC_CTYPE",
+    }
+    allowed_environment.update(EXACT_DRAIN_PROFILE_ENVIRONMENT_KEYS)
+    if (
+        any(
+            os.environ.get(key) != value
+            for key, value in expected_environment.items()
+        )
+        or set(os.environ) - allowed_environment
+        or not os.environ.get("HINDSIGHT_API_DATABASE_URL", "").startswith(
+            "postgresql://"
+        )
+    ):
+        raise OperationRecoveryError("exact drain worker environment differs")
+
+
+def _read_start_gate(descriptor: int) -> bytes:
+    body = bytearray()
+    try:
+        while len(body) <= EXACT_DRAIN_START_MESSAGE_BYTES:
+            chunk = os.read(
+                descriptor,
+                EXACT_DRAIN_START_MESSAGE_BYTES + 1 - len(body),
+            )
+            if not chunk:
+                break
+            body.extend(chunk)
+    except OSError as error:
+        raise OperationRecoveryError(
+            "exact drain start gate is unavailable"
+        ) from error
+    finally:
+        os.close(descriptor)
+    return bytes(body)
 
 
 def main() -> int:
     args = parser().parse_args()
-    if args.terminal_reconciliation and not args.resume:
-        raise OperationRecoveryError(
-            "exact drain terminal reconciliation is invalid"
-        )
+    plan_value = strict_json_loads(
+        _private_bytes(args.plan, "exact drain plan").decode("utf-8")
+    )
     plan = verify_exact_drain_plan(
-        strict_json_loads(
-            _private_bytes(args.plan, "exact drain plan").decode("utf-8")
-        ),
-        allow_expired=args.resume,
+        plan_value,
+        allow_expired=True,
     )
     authorization = verify_exact_drain_authorization_receipt(
         strict_json_loads(
@@ -129,6 +218,50 @@ def main() -> int:
         ),
         plan=plan,
     )
+    if plan["schema_version"] == 1 and not args.resume:
+        plan = verify_exact_drain_plan(plan_value)
+    if (
+        plan["schema_version"] == 2
+        and time.time()
+        >= authorization["authorized_at"] + plan["execution_lease_seconds"]
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery exact drain execution lease expired"
+        )
+    start_descriptor, start_descriptor_value = _validated_start_gate()
+    _validate_worker_environment(
+        start_descriptor_value,
+        plan_digest=plan["plan_digest"],
+        authorization_receipt_digest=authorization["receipt_digest"],
+    )
+    journal_digest = verify_exact_drain_start_message(
+        _read_start_gate(start_descriptor),
+        plan_digest=plan["plan_digest"],
+        authorization_receipt_digest=authorization["receipt_digest"],
+    )
+    current_start_time = process_start_time(os.getpid())
+    if current_start_time is None:
+        raise OperationRecoveryError(
+            "exact drain worker process identity is unavailable"
+        )
+    journal = verify_exact_drain_application_journal(
+        plan=plan,
+        authorization=authorization,
+        journal=strict_json_loads(
+            _private_bytes(
+                plan["application_receipt_path"],
+                "exact drain application journal",
+            ).decode("utf-8")
+        ),
+        expected_receipt_digest=journal_digest,
+        expected_worker_start_time=current_start_time,
+    )
+    from hindsight_memory_control_plane.provider_runtime import (
+        ProviderRuntimeCompatibilityError,
+        ProviderRuntimePolicy,
+        set_exact_drain_progress_recorder,
+    )
+
     canonical_policy = (
         Path.home()
         / ".config"
@@ -139,6 +272,7 @@ def main() -> int:
         args.worker_runtime,
         args.provider_runtime_root,
         LIB / "hindsight_api",
+        schema_version=plan["schema_version"],
     )
     provider_policy_bytes = _private_bytes(
         args.provider_policy,
@@ -163,63 +297,6 @@ def main() -> int:
         or runtime_digest != plan["worker_runtime_digest"]
     ):
         raise OperationRecoveryError("exact drain runtime authority drifted")
-    start_descriptor_value = os.environ.get(
-        "HINDSIGHT_EXACT_DRAIN_START_FD",
-        "",
-    )
-    try:
-        start_descriptor = int(start_descriptor_value)
-        start_metadata = os.fstat(start_descriptor)
-    except (OSError, TypeError, ValueError) as error:
-        raise OperationRecoveryError(
-            "exact drain start gate is unavailable"
-        ) from error
-    if (
-        start_descriptor < 0
-        or not stat.S_ISFIFO(start_metadata.st_mode)
-    ):
-        raise OperationRecoveryError("exact drain start gate differs")
-    expected_environment = {
-        **exact_drain_platform_environment(),
-        "HOME": str(Path.home()),
-        "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-        "PYTHONDONTWRITEBYTECODE": "1",
-        "PYTHONPATH": str(LIB),
-        "HINDSIGHT_EXACT_DRAIN_START_FD": start_descriptor_value,
-        "HINDSIGHT_API_WORKER_MAX_SLOTS": "2",
-        "HINDSIGHT_API_WORKER_CONSOLIDATION_RESERVED_SLOTS": "1",
-        "HINDSIGHT_API_WORKER_RETAIN_RESERVED_SLOTS": "0",
-        "HINDSIGHT_API_WORKER_FILE_CONVERT_RETAIN_RESERVED_SLOTS": "0",
-        "HINDSIGHT_API_WORKER_REFRESH_MENTAL_MODEL_RESERVED_SLOTS": "0",
-        "HINDSIGHT_API_WORKER_GRAPH_MAINTENANCE_RESERVED_SLOTS": "0",
-        "HINDSIGHT_API_WORKER_IMPORT_DOCUMENTS_RESERVED_SLOTS": "0",
-        "HINDSIGHT_API_RETAIN_MAX_CONCURRENT": "1",
-        "HINDSIGHT_API_OPERATION_RETENTION_DAYS": "0",
-        "HINDSIGHT_API_AUDIT_LOG_RETENTION_DAYS": "0",
-        "HINDSIGHT_API_LLM_TRACE_RETENTION_DAYS": "0",
-        "HINDSIGHT_API_CONSOLIDATION_RECONCILE_INTERVAL_SECONDS": "0",
-        "HINDSIGHT_API_MENTAL_MODEL_REFRESH_TICK_SECONDS": "0",
-        "HINDSIGHT_CODEX_TERMINAL_AUTH_COOLDOWN_SECONDS": "300",
-        "HINDSIGHT_EMBEDDING_FAILOVER_ORDER": (
-            "work-codex,personal-codex,alt1-codex,alt2-codex"
-        ),
-    }
-    allowed_environment = (
-        set(EXACT_DRAIN_PROFILE_ENVIRONMENT_KEYS)
-        | set(expected_environment)
-        | {"HINDSIGHT_API_DATABASE_URL", "LC_CTYPE"}
-    )
-    if (
-        any(
-            os.environ.get(key) != value
-            for key, value in expected_environment.items()
-        )
-        or set(os.environ) - allowed_environment
-        or not os.environ.get("HINDSIGHT_API_DATABASE_URL", "").startswith(
-            "postgresql://"
-        )
-    ):
-        raise OperationRecoveryError("exact drain worker environment differs")
     if (
         exact_drain_effective_profile_digest(
             provider_policy,
@@ -228,32 +305,30 @@ def main() -> int:
         != plan["effective_profile_digest"]
     ):
         raise OperationRecoveryError("exact drain LLM profile differs")
-    try:
-        start_signal = os.read(start_descriptor, 2)
-    finally:
-        os.close(start_descriptor)
-    if start_signal != b"1":
-        raise OperationRecoveryError("exact drain start was not authorized")
-
     progress_recorder = create_exact_drain_progress_recorder(
         plan=plan,
         authorization=authorization,
-        journal=strict_json_loads(
-            _private_bytes(
-                plan["application_receipt_path"],
-                "exact drain application journal",
-            ).decode("utf-8")
-        ),
-        terminal_reconciliation=args.terminal_reconciliation,
+        journal=journal,
+        terminal_reconciliation=False,
     )
     set_exact_drain_progress_recorder(progress_recorder)
 
     install_exact_drain_candidate_imports(args.worker_runtime, LIB)
+    if plan["schema_version"] == 2:
+        validate_exact_drain_dependency_spec(
+            "asyncpg",
+            args.worker_runtime,
+        )
 
     provider_globals = {
         "__builtins__": __builtins__,
         "__file__": str(
-            Path(args.provider_runtime_root) / "sitecustomize.py"
+            (
+                Path(args.provider_runtime_root)
+                if plan["schema_version"] == 1
+                else exact_drain_candidate_provider_root(LIB)
+            )
+            / "sitecustomize.py"
         ),
         "__name__": "_hindsight_exact_provider_bootstrap",
     }
@@ -283,6 +358,23 @@ def main() -> int:
         ),
         provider_globals,
     )
+    candidate_release_root = validate_exact_drain_candidate_release_import(
+        LIB
+    )
+    normal_release_resolver = provider_globals.get(
+        "_resolve_active_release"
+    )
+    if not callable(normal_release_resolver):
+        raise OperationRecoveryError(
+            "exact drain provider release resolver differs"
+        )
+
+    def resolve_detached_candidate(_install_root: Path) -> Path:
+        return candidate_release_root
+
+    provider_globals["_resolve_active_release"] = resolve_detached_candidate
+    if plan["schema_version"] == 2:
+        validate_exact_drain_import_origins(args.worker_runtime, LIB)
     original_protected_reader = provider_globals.get(
         "_read_protected_file"
     )
@@ -305,6 +397,8 @@ def main() -> int:
         ),
         provider_globals,
     )
+    if plan["schema_version"] == 2:
+        validate_exact_drain_import_origins(args.worker_runtime, LIB)
 
     def complete() -> None:
         os.kill(os.getpid(), signal.SIGTERM)
@@ -314,12 +408,15 @@ def main() -> int:
         completion_callback=complete,
         progress_recorder=progress_recorder,
         resume=args.resume,
-        terminal_reconciliation=args.terminal_reconciliation,
+        authorization=authorization,
     )
     from hindsight_api import MemoryEngine
     from hindsight_api.engine.db.ops_postgresql import PostgreSQLOps
     from hindsight_api.worker.main import main as worker_main
     from hindsight_api.worker.poller import WorkerPoller
+
+    if plan["schema_version"] == 2:
+        validate_exact_drain_import_origins(args.worker_runtime, LIB)
 
     install_exact_drain_runtime_guards(
         PostgreSQLOps,

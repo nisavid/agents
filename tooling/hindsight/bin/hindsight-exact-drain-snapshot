@@ -1,0 +1,44 @@
+#!/usr/bin/env python3
+"""Assemble provider code into a candidate exact-drain runtime snapshot."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+LIB = Path(__file__).resolve().parents[1] / "lib"
+sys.path.insert(0, str(LIB))
+
+from hindsight_memory_control_plane.operation_recovery import (
+    OperationRecoveryError,
+)
+from hindsight_memory_control_plane.operation_recovery_runtime import (
+    assemble_exact_drain_candidate_runtime_snapshot,
+)
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(prog="hindsight-exact-drain-snapshot")
+    result.add_argument("--provider-runtime-root", required=True)
+    result.add_argument("--candidate-library", required=True)
+    return result
+
+
+def main() -> int:
+    args = parser().parse_args()
+    result = assemble_exact_drain_candidate_runtime_snapshot(
+        Path(args.provider_runtime_root).resolve(strict=True),
+        Path(args.candidate_library).resolve(strict=True),
+    )
+    print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (OSError, OperationRecoveryError) as error:
+        print(f"hindsight-exact-drain-snapshot: {error}", file=sys.stderr)
+        raise SystemExit(2) from None

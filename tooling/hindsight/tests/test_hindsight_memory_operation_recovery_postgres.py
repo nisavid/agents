@@ -70,6 +70,14 @@ COMPLETED_AT = "2026-07-29T13:00:00.000000Z"
 class OperationRecoveryPostgresTest(unittest.TestCase):
     """Exercise the capsule's mutation policy against disposable PostgreSQL."""
 
+    @staticmethod
+    def _exact_drain_adapter(plan, **kwargs):
+        return ExactDrainClaimAdapter(
+            plan,
+            authorization=recovery_fixtures.exact_drain_authorization(plan),
+            **kwargs,
+        )
+
     @classmethod
     def setUpClass(cls):
         postgres_bin_value = os.environ.get(POSTGRES_BIN_ENV)
@@ -835,7 +843,7 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
                     nonlocal completion_signals
                     completion_signals += 1
 
-                adapter = ExactDrainClaimAdapter(
+                adapter = self._exact_drain_adapter(
                     plan,
                     completion_callback=completed,
                 )
@@ -955,6 +963,93 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
                     )
                 self.assertEqual(completion_signals, 1)
             finally:
+                await connection.close()
+
+        asyncio.run(exercise())
+
+    def test_exact_drain_claim_sets_real_postgres_transaction_wait_limits(self):
+        async def exercise():
+            connection = await self._connect()
+            try:
+                plan, _cohort_ids, _unexpected_id = await self._exact_drain_case(
+                    connection
+                )
+                adapter = self._exact_drain_adapter(plan)
+                await self._bind_disposable_exact_drain_identity(
+                    adapter,
+                    connection,
+                )
+                async with connection.transaction():
+                    claimed = await adapter.claim_tasks(
+                        connection,
+                        '"public".async_operations',
+                        exact_drain_worker_id(plan["plan_digest"]),
+                        {},
+                        0,
+                    )
+                    settings = {
+                        name: await connection.fetchval(
+                            "SELECT current_setting($1)",
+                            name,
+                        )
+                        for name in (
+                            "transaction_timeout",
+                            "lock_timeout",
+                            "statement_timeout",
+                        )
+                    }
+                self.assertEqual(claimed, [])
+                self.assertEqual(
+                    settings,
+                    {
+                        "transaction_timeout": "2min",
+                        "lock_timeout": "2min",
+                        "statement_timeout": "2min",
+                    },
+                )
+            finally:
+                await connection.close()
+
+        asyncio.run(exercise())
+
+    def test_exact_drain_claim_times_out_while_a_cohort_row_is_locked(self):
+        async def exercise():
+            connection = await self._connect()
+            blocker = await self._connect()
+            try:
+                plan, cohort_ids, _unexpected_id = await self._exact_drain_case(
+                    connection
+                )
+                adapter = self._exact_drain_adapter(plan)
+                adapter._transaction_timeout_seconds = 1
+                await self._bind_disposable_exact_drain_identity(
+                    adapter,
+                    connection,
+                )
+                worker_id = exact_drain_worker_id(plan["plan_digest"])
+                async with blocker.transaction():
+                    await blocker.fetchval(
+                        "SELECT operation_id FROM public.async_operations "
+                        "WHERE operation_id = $1::uuid FOR UPDATE",
+                        cohort_ids[0],
+                    )
+                    started = time.monotonic()
+                    transaction = connection.transaction()
+                    await transaction.start()
+                    with self.assertRaisesRegex(
+                        Exception,
+                        "timeout|canceling statement|closed",
+                    ):
+                        await adapter.claim_tasks(
+                            connection,
+                            '"public".async_operations',
+                            worker_id,
+                            {},
+                            1,
+                        )
+                    self.assertLess(time.monotonic() - started, 3)
+            finally:
+                await blocker.close()
                 await connection.close()
 
         asyncio.run(exercise())
@@ -1272,7 +1367,7 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
                     embedded_bank_id_mismatch=True,
                     embedded_mismatch_position=3,
                 )
-                adapter = ExactDrainClaimAdapter(plan)
+                adapter = self._exact_drain_adapter(plan)
                 await self._bind_disposable_exact_drain_identity(
                     adapter,
                     connection,
@@ -1333,7 +1428,7 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
                 plan, cohort_ids, unexpected_id = await self._exact_drain_case(
                     connection
                 )
-                adapter = ExactDrainClaimAdapter(plan)
+                adapter = self._exact_drain_adapter(plan)
                 await self._bind_disposable_exact_drain_identity(
                     adapter,
                     connection,
@@ -1434,7 +1529,7 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
                 plan, _cohort_ids, unexpected_id = await self._exact_drain_case(
                     connection
                 )
-                adapter = ExactDrainClaimAdapter(plan)
+                adapter = self._exact_drain_adapter(plan)
                 await self._bind_disposable_exact_drain_identity(
                     adapter,
                     connection,
@@ -1512,7 +1607,7 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
                                 **mismatch,
                             )
                         )
-                        adapter = ExactDrainClaimAdapter(plan)
+                        adapter = self._exact_drain_adapter(plan)
                         await self._bind_disposable_exact_drain_identity(
                             adapter,
                             connection,
@@ -1560,7 +1655,7 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
                 plan, _cohort_ids, _unexpected_id = (
                     await self._exact_drain_case(connection)
                 )
-                adapter = ExactDrainClaimAdapter(plan)
+                adapter = self._exact_drain_adapter(plan)
                 await self._bind_disposable_exact_drain_identity(
                     adapter,
                     connection,
@@ -1694,7 +1789,7 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
                     for operation_id in cohort_ids
                     if operation_id not in selected
                 )
-                adapter = ExactDrainClaimAdapter(plan)
+                adapter = self._exact_drain_adapter(plan)
                 await self._bind_disposable_exact_drain_identity(
                     adapter,
                     connection,
@@ -1748,7 +1843,7 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
                     for operation_id in cohort_ids
                     if operation_id not in selected
                 )
-                adapter = ExactDrainClaimAdapter(plan)
+                adapter = self._exact_drain_adapter(plan)
                 await self._bind_disposable_exact_drain_identity(
                     adapter,
                     connection,
@@ -1805,7 +1900,7 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
                     await self._exact_drain_case(connection)
                 )
                 worker_id = exact_drain_worker_id(plan["plan_digest"])
-                adapter = ExactDrainClaimAdapter(plan)
+                adapter = self._exact_drain_adapter(plan)
                 await self._bind_disposable_exact_drain_identity(
                     adapter,
                     connection,
@@ -1852,7 +1947,7 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
                 self.assertIsNotNone(pending["claimed_at"])
                 self.assertEqual(pending["retry_count"], 1)
 
-                resumed = ExactDrainClaimAdapter(plan, resume=True)
+                resumed = self._exact_drain_adapter(plan, resume=True)
                 await self._bind_disposable_exact_drain_identity(
                     resumed,
                     connection,
@@ -1931,7 +2026,7 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
                 for operation_id in cohort_ids
                 if operation_id not in selected
             )
-            adapter = ExactDrainClaimAdapter(plan)
+            adapter = self._exact_drain_adapter(plan)
             await self._bind_disposable_exact_drain_identity(
                 adapter,
                 connection,
@@ -2050,7 +2145,7 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
                     selected_id,
                     worker_id,
                 )
-                adapter = ExactDrainClaimAdapter(plan, resume=True)
+                adapter = self._exact_drain_adapter(plan, resume=True)
                 await self._bind_disposable_exact_drain_identity(
                     adapter,
                     connection,
@@ -2101,7 +2196,7 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
                     "updated_at = NOW() WHERE operation_id = $1::uuid",
                     selected_id,
                 )
-                adapter = ExactDrainClaimAdapter(plan, resume=True)
+                adapter = self._exact_drain_adapter(plan, resume=True)
                 await self._bind_disposable_exact_drain_identity(
                     adapter,
                     connection,
@@ -2140,7 +2235,7 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
                     worker_id,
                     plan["worker_max_retries"],
                 )
-                adapter = ExactDrainClaimAdapter(plan, resume=True)
+                adapter = self._exact_drain_adapter(plan, resume=True)
                 await self._bind_disposable_exact_drain_identity(
                     adapter,
                     connection,

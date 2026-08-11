@@ -270,12 +270,48 @@ installed `hindsight-api` version and the policy both name an adapter-supported
 version. The current adapter supports `0.8.4` and `0.9.0`; supporting another
 release requires an explicit compatibility update and contract tests.
 
-### Exact-drain progress
+### Exact-drain candidate runtime snapshot
 
-An approved detached operation-recovery drain exposes durable, payload-free
-progress without taking the apply or portable-manager locks:
+Release assembly must copy the exact provider runtime sources into the
+candidate before the portable installer computes the candidate release
+manifest:
 
 ```sh
+tooling/hindsight/bin/hindsight-exact-drain-snapshot \
+  --provider-runtime-root "$PROVIDER_RUNTIME_ROOT" \
+  --candidate-library "$RELEASE_ROOT/lib"
+```
+
+The helper creates `lib/exact_drain_runtime/` once, copies only
+`sitecustomize.py` and `hindsight_llm_failover.py`, and writes their canonical
+payload-free manifest. Release assembly then supplies that completed release
+root to `hindsight-portable-install`; the existing release manifest seals the
+snapshot bytes. A current exact-drain plan reads and executes only these
+candidate provider sources. Provider policy and credential material remain
+external protected data and are never copied into the candidate snapshot.
+
+The managed exact-drain worker runtime is a separate trusted authority. For a
+current plan, planning, apply, and the gated child each stream-hash the complete
+canonical worker `site-packages` tree, including relative paths, entry types,
+permission modes, sizes, and regular-file contents. The worker starts with
+`-S`, so bound `.pth` files are inert. Symlinks, unsupported entries, tree
+changes, missing files, additions, content changes, permission changes, and
+imports outside the exact candidate, dependency, or Python runtime roots fail
+closed. Legacy exact-drain plans retain their original evidence algorithm.
+
+### Exact-drain progress
+
+Exact-drain `status` and `monitor` expose payload-free lifecycle evidence.
+`status` reads the live database under the operation-recovery and portable
+manager locks. `monitor` reads durable progress without taking those locks:
+
+```sh
+hindsight-memory operation-recovery drain status \
+  --config "$HINDSIGHT_INSTALLATION_CONFIG" \
+  --candidate-release-root "$CANDIDATE_RELEASE_ROOT" \
+  --candidate-release-identity "$CANDIDATE_RELEASE_IDENTITY" \
+  --plan "$EXACT_DRAIN_PLAN"
+
 hindsight-memory operation-recovery drain monitor \
   --config "$HINDSIGHT_INSTALLATION_CONFIG" \
   --candidate-release-root "$CANDIDATE_RELEASE_ROOT" \
@@ -283,17 +319,26 @@ hindsight-memory operation-recovery drain monitor \
   --plan "$EXACT_DRAIN_PLAN"
 ```
 
-Before a worker has started, the command returns `not-started`. After the
-application journal is durable but before the worker creates progress, it
-returns `starting`. During and after an attempt it authenticates the application
+For a current exact-drain plan, both commands keep top-level `expires_at` as
+the approval expiry and include `execution_lease_status`,
+`execution_lease_started_at`, `execution_lease_expires_at`, and
+`execution_lease_remaining_seconds`. Before authorization, the lease status is
+`not-authorized` and the other three lease values are null. A durably consumed
+authorization without an application journal is `authorization-only`. Once
+authorized, the lease status is `active` until its deadline and `expired`
+afterward; remaining seconds clamp to zero.
+
+Before authorization, `monitor` returns `not-started`. After the application
+journal is durable but before the worker creates progress, it returns
+`starting`. During and after an attempt it authenticates the application
 journal, worker PID and process start identity, plan-selected task set, current
 progress artifact, and archived prior-attempt evidence. It reports `running`
 only while that exact process identity is live, `interrupted` after an
 interrupted attempt, and `terminal` for an authenticated completed application.
 Task stages, provider attempt counters, active request ages, cooldown
-categories, prior-attempt evidence, and artifact digests are included. Prompts,
-responses, error text, credentials, task payloads, and raw worker IDs are not
-projected.
+categories, prior-attempt evidence, and artifact digests are included. Neither
+command exposes prompts, responses, error text, database URLs, credentials,
+provider secrets, task payloads, or raw worker IDs.
 
 The legacy launchd label and manifest are migration bindings, not evidence that
 a legacy installation exists. A fresh installation still supplies a distinct

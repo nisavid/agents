@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Mapping, Sequence
+import ctypes
 from datetime import datetime, timezone
 import hashlib
 import importlib.util
@@ -20,21 +21,26 @@ import re
 import socket
 import stat
 import struct
+import subprocess
 import sys
 import time
 import uuid
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .operation_recovery import (
+    EXACT_DRAIN_TRANSACTION_TIMEOUT_SECONDS,
     EXPECTED_CLAIM_RELEASE_ROW_COUNT,
     EXPECTED_OPERATION_COUNTS,
     OperationRecoveryError,
+    verify_exact_drain_authorization_receipt,
     verify_exact_drain_plan,
     verify_exact_drain_status,
     verify_post_abort_recovery_plan,
 )
 from .canonical import StrictJsonError, digest, strict_json_loads
-from .provider_runtime import ProviderRuntimePolicy
+
+if TYPE_CHECKING:
+    from .provider_runtime import ProviderRuntimePolicy
 
 
 IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,62}\Z")
@@ -96,6 +102,18 @@ EXACT_DRAIN_OAUTH_LOCATORS = {
 EXACT_DRAIN_MAX_PACKAGE_ENTRIES = 2048
 EXACT_DRAIN_MAX_PACKAGE_FILE_BYTES = 16 * 1024 * 1024
 EXACT_DRAIN_MAX_PACKAGE_TOTAL_BYTES = 128 * 1024 * 1024
+EXACT_DRAIN_MAX_DEPENDENCY_ENTRIES = 100_000
+EXACT_DRAIN_MAX_DEPENDENCY_FILE_BYTES = 512 * 1024 * 1024
+EXACT_DRAIN_MAX_DEPENDENCY_TOTAL_BYTES = 4 * 1024 * 1024 * 1024
+EXACT_DRAIN_CANDIDATE_RUNTIME_DIRECTORY = "exact_drain_runtime"
+EXACT_DRAIN_PROVIDER_SOURCE_NAMES = (
+    "sitecustomize.py",
+    "hindsight_llm_failover.py",
+)
+EXACT_DRAIN_START_MESSAGE_PREFIX = b"exact-drain-start-v1 "
+EXACT_DRAIN_START_MESSAGE_BYTES = (
+    len(EXACT_DRAIN_START_MESSAGE_PREFIX) + (64 * 3) + 3
+)
 LOGGER = logging.getLogger(__name__)
 
 
@@ -104,6 +122,145 @@ def exact_drain_platform_environment() -> dict[str, str]:
     return {
         "__CF_USER_TEXT_ENCODING": f"0x{os.geteuid():X}:0x0:0x0",
     }
+
+
+def process_start_time(pid: int) -> str | None:
+    """Return the cross-platform process start token used by exact journals."""
+    if type(pid) is not int or pid <= 1:
+        return None
+    if sys.platform == "darwin":
+
+        class ProcBsdInfo(ctypes.Structure):
+            _fields_ = [
+                ("pbi_flags", ctypes.c_uint32),
+                ("pbi_status", ctypes.c_uint32),
+                ("pbi_xstatus", ctypes.c_uint32),
+                ("pbi_pid", ctypes.c_uint32),
+                ("pbi_ppid", ctypes.c_uint32),
+                ("pbi_uid", ctypes.c_uint32),
+                ("pbi_gid", ctypes.c_uint32),
+                ("pbi_ruid", ctypes.c_uint32),
+                ("pbi_rgid", ctypes.c_uint32),
+                ("pbi_svuid", ctypes.c_uint32),
+                ("pbi_svgid", ctypes.c_uint32),
+                ("pbi_rfu_1", ctypes.c_uint32),
+                ("pbi_comm", ctypes.c_char * 16),
+                ("pbi_name", ctypes.c_char * 32),
+                ("pbi_nfiles", ctypes.c_uint32),
+                ("pbi_pgid", ctypes.c_uint32),
+                ("pbi_pjobc", ctypes.c_uint32),
+                ("e_tdev", ctypes.c_uint32),
+                ("e_tpgid", ctypes.c_uint32),
+                ("pbi_nice", ctypes.c_int32),
+                ("pbi_start_tvsec", ctypes.c_uint64),
+                ("pbi_start_tvusec", ctypes.c_uint64),
+            ]
+
+        try:
+            libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+            proc_pidinfo = libproc.proc_pidinfo
+            proc_pidinfo.argtypes = [
+                ctypes.c_int,
+                ctypes.c_int,
+                ctypes.c_uint64,
+                ctypes.c_void_p,
+                ctypes.c_int,
+            ]
+            proc_pidinfo.restype = ctypes.c_int
+            info = ProcBsdInfo()
+            result = proc_pidinfo(
+                pid,
+                3,
+                0,
+                ctypes.byref(info),
+                ctypes.sizeof(info),
+            )
+        except (AttributeError, OSError):
+            pass
+        else:
+            if result == ctypes.sizeof(info):
+                return (
+                    f"darwin:{info.pbi_start_tvsec}:"
+                    f"{info.pbi_start_tvusec}"
+                )
+
+    try:
+        raw_stat = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+        start_ticks = raw_stat.rsplit(")", 1)[1].split()[19]
+    except (FileNotFoundError, IndexError, OSError, UnicodeDecodeError):
+        pass
+    else:
+        return f"linux:{start_ticks}"
+
+    try:
+        result = subprocess.run(
+            ["/bin/ps", "-o", "lstart=", "-p", str(pid)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    value = " ".join(result.stdout.split())
+    if not value or len(value) > 128:
+        return None
+    return value
+
+
+def exact_drain_start_message(
+    plan_digest: str,
+    authorization_receipt_digest: str,
+    application_journal_digest: str,
+) -> bytes:
+    """Return the one canonical parent-to-child start authorization."""
+    values = (
+        plan_digest,
+        authorization_receipt_digest,
+        application_journal_digest,
+    )
+    if any(
+        not isinstance(value, str)
+        or re.fullmatch(r"[0-9a-f]{64}", value) is None
+        for value in values
+    ):
+        raise OperationRecoveryError("exact drain start authority is invalid")
+    return (
+        EXACT_DRAIN_START_MESSAGE_PREFIX
+        + b" ".join(value.encode("ascii") for value in values)
+        + b"\n"
+    )
+
+
+def verify_exact_drain_start_message(
+    value: bytes,
+    *,
+    plan_digest: str,
+    authorization_receipt_digest: str,
+) -> str:
+    """Verify a bounded canonical gate message and return its journal digest."""
+    if not isinstance(value, bytes) or len(value) != EXACT_DRAIN_START_MESSAGE_BYTES:
+        raise OperationRecoveryError("exact drain start was not authorized")
+    prefix = EXACT_DRAIN_START_MESSAGE_PREFIX
+    if not value.startswith(prefix) or not value.endswith(b"\n"):
+        raise OperationRecoveryError("exact drain start was not authorized")
+    parts = value[len(prefix) : -1].split(b" ")
+    try:
+        decoded = tuple(part.decode("ascii") for part in parts)
+    except UnicodeDecodeError as error:
+        raise OperationRecoveryError(
+            "exact drain start was not authorized"
+        ) from error
+    if (
+        len(decoded) != 3
+        or exact_drain_start_message(*decoded) != value
+        or decoded[0] != plan_digest
+        or decoded[1] != authorization_receipt_digest
+    ):
+        raise OperationRecoveryError("exact drain start was not authorized")
+    return decoded[2]
 
 
 def validate_exact_drain_provider_policy(
@@ -1384,6 +1541,291 @@ def exact_drain_worker_site_packages_path(
     return site_packages
 
 
+def _exact_drain_dependency_entries(root: Path) -> list[Path]:
+    pending = [root]
+    entries: list[Path] = []
+    while pending:
+        directory = pending.pop()
+        _exact_drain_trusted_directory(
+            directory,
+            "exact drain worker dependency directory",
+        )
+        try:
+            children = sorted(
+                (Path(entry.path) for entry in os.scandir(directory)),
+                key=lambda path: path.name,
+            )
+        except OSError as error:
+            raise OperationRecoveryError(
+                "exact drain worker dependency closure is unavailable"
+            ) from error
+        for path in children:
+            if len(entries) >= EXACT_DRAIN_MAX_DEPENDENCY_ENTRIES:
+                raise OperationRecoveryError(
+                    "exact drain worker dependency closure has too many entries"
+                )
+            try:
+                metadata = path.lstat()
+            except OSError as error:
+                raise OperationRecoveryError(
+                    "exact drain worker dependency closure is unavailable"
+                ) from error
+            if stat.S_ISLNK(metadata.st_mode):
+                raise OperationRecoveryError(
+                    "exact drain worker dependency closure contains a symlink"
+                )
+            if stat.S_ISDIR(metadata.st_mode):
+                pending.append(path)
+            elif not stat.S_ISREG(metadata.st_mode):
+                raise OperationRecoveryError(
+                    "exact drain worker dependency closure contains an "
+                    "unsupported entry"
+                )
+            entries.append(path)
+    return sorted(entries, key=lambda path: path.relative_to(root).as_posix())
+
+
+def exact_drain_dependency_manifest(
+    worker_runtime: str | Path,
+) -> dict[str, Any]:
+    """Stream-hash the complete external worker dependency authority."""
+    root = exact_drain_worker_site_packages_path(worker_runtime)
+    entries = _exact_drain_dependency_entries(root)
+    hasher = hashlib.sha256()
+    total_bytes = 0
+    file_count = 0
+    directory_count = 0
+    for path in entries:
+        relative = path.relative_to(root).as_posix()
+        metadata = path.lstat()
+        mode = stat.S_IMODE(metadata.st_mode)
+        if stat.S_ISDIR(metadata.st_mode):
+            _exact_drain_trusted_directory(
+                path,
+                f"exact drain worker dependency directory {relative}",
+            )
+            entry = {
+                "kind": "directory",
+                "mode": mode,
+                "path": relative,
+            }
+            directory_count += 1
+        elif stat.S_ISREG(metadata.st_mode):
+            remaining = EXACT_DRAIN_MAX_DEPENDENCY_TOTAL_BYTES - total_bytes
+            artifact_digest, artifact_size = (
+                _exact_drain_file_digest_evidence(
+                    path,
+                    f"exact drain worker dependency artifact {relative}",
+                    max_bytes=min(
+                        EXACT_DRAIN_MAX_DEPENDENCY_FILE_BYTES,
+                        remaining,
+                    ),
+                )
+            )
+            total_bytes += artifact_size
+            entry = {
+                "kind": "file",
+                "mode": mode,
+                "path": relative,
+                "sha256": artifact_digest,
+                "size": artifact_size,
+            }
+            file_count += 1
+        else:
+            raise OperationRecoveryError(
+                "exact drain worker dependency closure contains an "
+                "unsupported entry"
+            )
+        hasher.update(
+            json.dumps(
+                entry,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        hasher.update(b"\n")
+    if file_count == 0:
+        raise OperationRecoveryError(
+            "exact drain worker dependency closure is unavailable"
+        )
+    if _exact_drain_dependency_entries(root) != entries:
+        raise OperationRecoveryError(
+            "exact drain worker dependency closure changed while reading"
+        )
+    return {
+        "schema_version": 1,
+        "root": str(root),
+        "entry_count": len(entries),
+        "file_count": file_count,
+        "directory_count": directory_count,
+        "total_bytes": total_bytes,
+        "entries_digest": hasher.hexdigest(),
+    }
+
+
+def exact_drain_candidate_provider_root(
+    candidate_library: str | Path,
+) -> Path:
+    root = (
+        Path(candidate_library)
+        / EXACT_DRAIN_CANDIDATE_RUNTIME_DIRECTORY
+        / "provider"
+    )
+    if not root.is_absolute():
+        raise OperationRecoveryError(
+            "exact drain candidate provider runtime is unavailable"
+        )
+    return root
+
+
+def _write_exact_drain_snapshot_file(path: Path, body: bytes) -> None:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        position = 0
+        while position < len(body):
+            position += os.write(descriptor, body[position:])
+        os.fsync(descriptor)
+    except OSError as error:
+        raise OperationRecoveryError(
+            "exact drain candidate runtime snapshot is unavailable"
+        ) from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def assemble_exact_drain_candidate_runtime_snapshot(
+    provider_runtime_root: str | Path,
+    candidate_library: str | Path,
+) -> dict[str, Any]:
+    """Copy the two executable provider sources into a release source tree."""
+    source_root = Path(provider_runtime_root)
+    library = Path(candidate_library)
+    if not source_root.is_absolute() or not library.is_absolute():
+        raise OperationRecoveryError(
+            "exact drain candidate runtime snapshot paths must be absolute"
+        )
+    _exact_drain_trusted_directory(
+        library,
+        "exact drain candidate library",
+    )
+    source_bodies = {
+        name: _exact_drain_file_bytes(
+            source_root / name,
+            f"exact drain provider runtime {name}",
+            max_bytes=1024 * 1024,
+        )
+        for name in EXACT_DRAIN_PROVIDER_SOURCE_NAMES
+    }
+    runtime_root = library / EXACT_DRAIN_CANDIDATE_RUNTIME_DIRECTORY
+    provider_root = exact_drain_candidate_provider_root(library)
+    try:
+        runtime_root.mkdir(mode=0o700)
+        provider_root.mkdir(mode=0o700)
+    except OSError as error:
+        raise OperationRecoveryError(
+            "exact drain candidate runtime snapshot already exists"
+        ) from error
+    sources = [
+        {
+            "path": f"provider/{name}",
+            "sha256": hashlib.sha256(source_bodies[name]).hexdigest(),
+            "size": len(source_bodies[name]),
+        }
+        for name in EXACT_DRAIN_PROVIDER_SOURCE_NAMES
+    ]
+    manifest = {
+        "schema_version": 1,
+        "kind": "exact-drain-candidate-runtime-snapshot",
+        "sources": sources,
+    }
+    for name, body in source_bodies.items():
+        _write_exact_drain_snapshot_file(provider_root / name, body)
+    manifest_body = (
+        json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    ).encode("utf-8")
+    _write_exact_drain_snapshot_file(runtime_root / "manifest.json", manifest_body)
+    return {**manifest, "snapshot_digest": digest(manifest)}
+
+
+def verify_exact_drain_candidate_runtime_snapshot(
+    candidate_library: str | Path,
+) -> tuple[dict[str, Any], dict[str, bytes]]:
+    """Verify the closed provider-code snapshot sealed into a candidate."""
+    library = Path(candidate_library)
+    runtime_root = library / EXACT_DRAIN_CANDIDATE_RUNTIME_DIRECTORY
+    provider_root = exact_drain_candidate_provider_root(library)
+    _exact_drain_trusted_directory(
+        runtime_root,
+        "exact drain candidate runtime snapshot",
+    )
+    _exact_drain_trusted_directory(
+        provider_root,
+        "exact drain candidate provider runtime",
+    )
+    try:
+        runtime_names = {path.name for path in runtime_root.iterdir()}
+        provider_names = {path.name for path in provider_root.iterdir()}
+    except OSError as error:
+        raise OperationRecoveryError(
+            "exact drain candidate runtime snapshot is unavailable"
+        ) from error
+    if runtime_names != {"manifest.json", "provider"} or provider_names != set(
+        EXACT_DRAIN_PROVIDER_SOURCE_NAMES
+    ):
+        raise OperationRecoveryError(
+            "exact drain candidate runtime snapshot differs"
+        )
+    manifest_body = _exact_drain_file_bytes(
+        runtime_root / "manifest.json",
+        "exact drain candidate runtime snapshot manifest",
+        max_bytes=64 * 1024,
+    )
+    try:
+        manifest = strict_json_loads(manifest_body)
+    except (StrictJsonError, UnicodeDecodeError) as error:
+        raise OperationRecoveryError(
+            "exact drain candidate runtime snapshot differs"
+        ) from error
+    sources = {
+        name: _exact_drain_file_bytes(
+            provider_root / name,
+            f"exact drain provider runtime {name}",
+            max_bytes=1024 * 1024,
+        )
+        for name in EXACT_DRAIN_PROVIDER_SOURCE_NAMES
+    }
+    expected = {
+        "schema_version": 1,
+        "kind": "exact-drain-candidate-runtime-snapshot",
+        "sources": [
+            {
+                "path": f"provider/{name}",
+                "sha256": hashlib.sha256(sources[name]).hexdigest(),
+                "size": len(sources[name]),
+            }
+            for name in EXACT_DRAIN_PROVIDER_SOURCE_NAMES
+        ],
+    }
+    if manifest != expected or manifest_body != (
+        json.dumps(expected, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8"):
+        raise OperationRecoveryError(
+            "exact drain candidate runtime snapshot differs"
+        )
+    return {**expected, "snapshot_digest": digest(expected)}, sources
+
+
 def install_exact_drain_candidate_imports(
     worker_runtime: str | Path,
     candidate_library: str | Path,
@@ -1417,13 +1859,29 @@ def install_exact_drain_candidate_imports(
         )
     candidate_text = str(candidate_root)
     dependency_text = str(dependency_root)
+    try:
+        standard_library_root = Path(sys.base_prefix).resolve(strict=True)
+    except OSError as error:
+        raise OperationRecoveryError(
+            "exact drain trusted Python runtime is unavailable"
+        ) from error
+    trusted_runtime_entries: list[str] = []
+    for entry in sys.path:
+        if not entry or entry in {candidate_text, dependency_text}:
+            continue
+        try:
+            resolved = Path(entry).resolve(strict=True)
+            resolved.relative_to(standard_library_root)
+        except (OSError, ValueError):
+            continue
+        if "site-packages" in resolved.parts or "dist-packages" in resolved.parts:
+            continue
+        text = str(resolved)
+        if text not in trusted_runtime_entries:
+            trusted_runtime_entries.append(text)
     sys.path[:] = [
         candidate_text,
-        *(
-            entry
-            for entry in sys.path
-            if entry not in {candidate_text, dependency_text}
-        ),
+        *trusted_runtime_entries,
         dependency_text,
     ]
     spec = importlib.util.find_spec("hindsight_api")
@@ -1443,6 +1901,138 @@ def install_exact_drain_candidate_imports(
             "exact drain candidate Hindsight import differs"
         )
     return dependency_root
+
+
+def validate_exact_drain_import_origins(
+    worker_runtime: str | Path,
+    candidate_library: str | Path,
+) -> None:
+    """Reject loaded code outside candidate, dependency, or Python roots."""
+    dependency_root = exact_drain_worker_site_packages_path(worker_runtime)
+    candidate_root = Path(candidate_library).resolve(strict=True)
+    release_root = candidate_root.parent.resolve(strict=True)
+    python_root = Path(sys.base_prefix).resolve(strict=True)
+    allowed_candidate_names = {
+        "hindsight_api",
+        "hindsight_memory_control_plane",
+        "hindsight_llm_failover",
+        "sitecustomize",
+    }
+    for name, module in tuple(sys.modules.items()):
+        raw_path = getattr(module, "__file__", None)
+        if not isinstance(raw_path, str):
+            continue
+        try:
+            path = Path(raw_path).resolve(strict=True)
+        except OSError as error:
+            raise OperationRecoveryError(
+                "exact drain loaded module origin is unavailable"
+            ) from error
+        try:
+            path.relative_to(dependency_root)
+            continue
+        except ValueError:
+            pass
+        try:
+            path.relative_to(python_root)
+            continue
+        except ValueError:
+            pass
+        try:
+            path.relative_to(candidate_root)
+        except ValueError:
+            pass
+        else:
+            if name.split(".", 1)[0] in allowed_candidate_names:
+                continue
+            raise OperationRecoveryError(
+                "exact drain candidate dependency shadow differs"
+            )
+        try:
+            path.relative_to(release_root)
+        except ValueError as error:
+            raise OperationRecoveryError(
+                "exact drain loaded module origin differs"
+            ) from error
+        if name != "__main__":
+            raise OperationRecoveryError(
+                "exact drain loaded module origin differs"
+            )
+
+
+def validate_exact_drain_dependency_spec(
+    name: str,
+    worker_runtime: str | Path,
+) -> None:
+    """Prove one required dependency resolves only from the closed root."""
+    dependency_root = exact_drain_worker_site_packages_path(worker_runtime)
+    spec = importlib.util.find_spec(name)
+    try:
+        origin = Path(spec.origin).resolve(strict=True)
+        origin.relative_to(dependency_root)
+        locations = tuple(
+            Path(value).resolve(strict=True)
+            for value in (spec.submodule_search_locations or ())
+        )
+    except (AttributeError, OSError, TypeError, ValueError) as error:
+        raise OperationRecoveryError(
+            f"exact drain dependency {name} origin differs"
+        ) from error
+    if locations and any(
+        location != dependency_root / name for location in locations
+    ):
+        raise OperationRecoveryError(
+            f"exact drain dependency {name} origin differs"
+        )
+
+
+def validate_exact_drain_candidate_release_import(
+    candidate_library: str | Path,
+) -> Path:
+    """Return the detached candidate only when Hindsight resolves inside it."""
+    library = Path(candidate_library)
+    if not library.is_absolute():
+        raise OperationRecoveryError(
+            "exact drain candidate release import differs"
+        )
+    try:
+        library = library.resolve(strict=True)
+        release = library.parent.resolve(strict=True)
+        first_import = Path(sys.path[0]).resolve(strict=True)
+    except (IndexError, OSError) as error:
+        raise OperationRecoveryError(
+            "exact drain candidate release import differs"
+        ) from error
+    _exact_drain_trusted_directory(
+        release,
+        "exact drain detached candidate release",
+    )
+    _exact_drain_trusted_directory(
+        library,
+        "exact drain detached candidate library",
+    )
+    package = library / "hindsight_api"
+    _exact_drain_trusted_directory(
+        package,
+        "exact drain candidate Hindsight package",
+    )
+    spec = importlib.util.find_spec("hindsight_api")
+    try:
+        origin = Path(spec.origin).resolve(strict=True)
+        locations = tuple(
+            Path(value).resolve(strict=True)
+            for value in spec.submodule_search_locations
+        )
+        origin.relative_to(package)
+    except (AttributeError, OSError, TypeError, ValueError) as error:
+        raise OperationRecoveryError(
+            "exact drain candidate release import differs"
+        ) from error
+    if first_import != library or locations != (package,):
+        raise OperationRecoveryError(
+            "exact drain candidate release import differs"
+        )
+    return release
 
 
 def _exact_drain_runtime_distribution_metadata(
@@ -1529,6 +2119,109 @@ def exact_drain_worker_hindsight_version(
     return version
 
 
+def _exact_drain_asyncpg_runtime_evidence(
+    worker_runtime: str | Path,
+) -> dict[str, str]:
+    """Bind the exact asyncpg distribution and code imported by the worker."""
+    site_packages = exact_drain_worker_site_packages_path(worker_runtime)
+    try:
+        distributions = tuple(site_packages.glob("asyncpg-*.dist-info"))
+    except OSError as error:
+        raise OperationRecoveryError(
+            "exact drain worker asyncpg dependency is unavailable"
+        ) from error
+    if (
+        len(distributions) != 1
+        or not distributions[0].is_dir()
+        or distributions[0].is_symlink()
+    ):
+        raise OperationRecoveryError(
+            "exact drain worker asyncpg dependency is unavailable"
+        )
+    _exact_drain_trusted_directory(
+        distributions[0],
+        "exact drain worker asyncpg metadata directory",
+    )
+    metadata = _exact_drain_file_bytes(
+        distributions[0] / "METADATA",
+        "exact drain worker asyncpg metadata",
+        max_bytes=1024 * 1024,
+    )
+    names = [
+        line.removeprefix(b"Name: ")
+        for line in metadata.splitlines()
+        if line.startswith(b"Name: ")
+    ]
+    versions = [
+        line.removeprefix(b"Version: ")
+        for line in metadata.splitlines()
+        if line.startswith(b"Version: ")
+    ]
+    try:
+        version = versions[0].decode("ascii")
+    except (IndexError, UnicodeDecodeError) as error:
+        raise OperationRecoveryError(
+            "exact drain worker asyncpg dependency is unavailable"
+        ) from error
+    if (
+        names != [b"asyncpg"]
+        or len(versions) != 1
+        or re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z.+!_-]{0,63}", version)
+        is None
+        or distributions[0].name != f"asyncpg-{version}.dist-info"
+    ):
+        raise OperationRecoveryError(
+            "exact drain worker asyncpg dependency is unavailable"
+        )
+    package_root = site_packages / "asyncpg"
+    _exact_drain_trusted_directory(
+        package_root,
+        "exact drain worker asyncpg package",
+    )
+    evidence = {
+        "dependency/asyncpg/distribution-metadata": hashlib.sha256(
+            metadata
+        ).hexdigest()
+    }
+    file_count = 0
+    total_bytes = 0
+    for path in _exact_drain_package_entries(package_root):
+        relative = path.relative_to(package_root).as_posix()
+        if path.is_symlink():
+            raise OperationRecoveryError(
+                "exact drain worker asyncpg dependency is untrusted"
+            )
+        if path.is_dir():
+            _exact_drain_trusted_directory(
+                path,
+                f"exact drain worker asyncpg directory {relative}",
+            )
+            evidence[f"dependency-directory/asyncpg/{relative}"] = digest(
+                {"kind": "directory"}
+            )
+            continue
+        if not path.is_file():
+            raise OperationRecoveryError(
+                "exact drain worker asyncpg dependency is untrusted"
+            )
+        file_count += 1
+        artifact_digest, artifact_size = _exact_drain_file_digest_evidence(
+            path,
+            f"exact drain worker asyncpg artifact {relative}",
+            max_bytes=min(
+                EXACT_DRAIN_MAX_PACKAGE_FILE_BYTES,
+                EXACT_DRAIN_MAX_PACKAGE_TOTAL_BYTES - total_bytes,
+            ),
+        )
+        total_bytes += artifact_size
+        evidence[f"dependency/asyncpg/{relative}"] = artifact_digest
+    if file_count == 0:
+        raise OperationRecoveryError(
+            "exact drain worker asyncpg dependency is unavailable"
+        )
+    return evidence
+
+
 def _exact_drain_interpreter_evidence(interpreter: Path) -> dict[str, str]:
     evidence: dict[str, str] = {"launch_path": str(interpreter)}
     current = interpreter
@@ -1573,11 +2266,19 @@ def exact_drain_runtime_evidence(
     worker_runtime: str | Path,
     provider_runtime_root: str | Path,
     runtime_package_root: str | Path,
+    *,
+    schema_version: int = 2,
 ) -> tuple[str, bytes]:
     """Bind runtime sources and retain prevalidated provider bootstrap bytes."""
+    if type(schema_version) is not int or schema_version not in {1, 2}:
+        raise OperationRecoveryError(
+            "exact drain runtime evidence schema version is invalid"
+        )
     worker_path = Path(worker_runtime)
     provider_root = Path(provider_runtime_root)
-    if not worker_path.is_absolute() or not provider_root.is_absolute():
+    if not worker_path.is_absolute() or (
+        schema_version == 1 and not provider_root.is_absolute()
+    ):
         raise OperationRecoveryError("exact drain runtime paths must be absolute")
     sources: dict[str, str] = {
         "worker-entrypoint": _exact_drain_file_digest(
@@ -1592,9 +2293,14 @@ def exact_drain_runtime_evidence(
         worker_path.parent.parent / "pyvenv.cfg",
         "exact drain worker venv configuration",
     )
-    sources["worker-dependency-directory"] = digest(
-        {"path": str(exact_drain_worker_site_packages_path(worker_path))}
-    )
+    if schema_version == 1:
+        sources["worker-dependency-directory"] = digest(
+            {"path": str(exact_drain_worker_site_packages_path(worker_path))}
+        )
+    else:
+        sources["worker-dependency-manifest"] = digest(
+            exact_drain_dependency_manifest(worker_path)
+        )
     _version, distribution_metadata, package_root = (
         _exact_drain_runtime_distribution_metadata(
             worker_path,
@@ -1604,14 +2310,24 @@ def exact_drain_runtime_evidence(
     sources["worker-hindsight-distribution-metadata"] = hashlib.sha256(
         distribution_metadata
     ).hexdigest()
-    provider_sources = {
-        name: _exact_drain_file_bytes(
-            provider_root / name,
-            f"exact drain provider runtime {name}",
-            max_bytes=1024 * 1024,
+    if schema_version == 1:
+        provider_sources = {
+            name: _exact_drain_file_bytes(
+                provider_root / name,
+                f"exact drain provider runtime {name}",
+                max_bytes=1024 * 1024,
+            )
+            for name in EXACT_DRAIN_PROVIDER_SOURCE_NAMES
+        }
+    else:
+        snapshot, provider_sources = (
+            verify_exact_drain_candidate_runtime_snapshot(
+                package_root.parent
+            )
         )
-        for name in ("sitecustomize.py", "hindsight_llm_failover.py")
-    }
+        sources["candidate-runtime-snapshot"] = snapshot[
+            "snapshot_digest"
+        ]
     for name, source in provider_sources.items():
         sources[f"provider/{name}"] = hashlib.sha256(source).hexdigest()
     package_entries = _exact_drain_package_entries(package_root)
@@ -1661,12 +2377,15 @@ def exact_drain_runtime_digest(
     worker_runtime: str | Path,
     provider_runtime_root: str | Path,
     runtime_package_root: str | Path,
+    *,
+    schema_version: int = 2,
 ) -> str:
     """Bind the worker entrypoint, claim seam, and provider patch sources."""
     runtime_digest, _provider_bootstrap = exact_drain_runtime_evidence(
         worker_runtime,
         provider_runtime_root,
         runtime_package_root,
+        schema_version=schema_version,
     )
     return runtime_digest
 
@@ -1696,6 +2415,9 @@ class ExactDrainClaimAdapter:
         progress_recorder: Any | None = None,
         resume: bool = False,
         terminal_reconciliation: bool = False,
+        terminal_status_evidence: Mapping[str, Any] | None = None,
+        authorization: Mapping[str, Any] | None = None,
+        clock: Callable[[], float] = time.time,
     ):
         if type(terminal_reconciliation) is not bool or (
             terminal_reconciliation and not resume
@@ -1703,7 +2425,69 @@ class ExactDrainClaimAdapter:
             raise OperationRecoveryError(
                 "operation-recovery terminal reconciliation is invalid"
             )
-        verified = verify_exact_drain_plan(plan, allow_expired=resume)
+        if terminal_status_evidence is not None:
+            terminal_status_evidence = _mapping(terminal_status_evidence)
+            if (
+                not terminal_reconciliation
+                or set(terminal_status_evidence)
+                != {"generation", "observed_at", "status_digest"}
+                or not isinstance(
+                    terminal_status_evidence.get("generation"), str
+                )
+                or not re.fullmatch(
+                    r"systalyze:public:[1-9][0-9]*",
+                    terminal_status_evidence["generation"],
+                )
+                or type(terminal_status_evidence.get("observed_at")) is not int
+                or terminal_status_evidence["observed_at"] < 0
+                or not isinstance(
+                    terminal_status_evidence.get("status_digest"), str
+                )
+                or not re.fullmatch(
+                    r"[0-9a-f]{64}",
+                    terminal_status_evidence["status_digest"],
+                )
+            ):
+                raise OperationRecoveryError(
+                    "operation-recovery terminal status evidence is invalid"
+                )
+        verified = verify_exact_drain_plan(plan, allow_expired=True)
+        if (
+            terminal_reconciliation
+            and verified.get("schema_version") == 2
+            and terminal_status_evidence is None
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery terminal status evidence is required"
+            )
+        self._clock = clock
+        if verified.get("schema_version") == 2:
+            if authorization is None:
+                raise OperationRecoveryError(
+                    "operation-recovery exact drain authorization is required"
+                )
+            checked_authorization = verify_exact_drain_authorization_receipt(
+                authorization,
+                plan=verified,
+            )
+            self._execution_deadline = (
+                checked_authorization["authorized_at"]
+                + verified["execution_lease_seconds"]
+            )
+            self._transaction_timeout_seconds = verified[
+                "transaction_timeout_seconds"
+            ]
+        else:
+            if not resume:
+                verified = verify_exact_drain_plan(plan)
+            self._execution_deadline = None
+            self._transaction_timeout_seconds = (
+                EXACT_DRAIN_TRANSACTION_TIMEOUT_SECONDS
+                if terminal_reconciliation
+                else None
+            )
+        self._cleanup_deadline: float | None = None
+        self._terminal_reconciliation_deadline: float | None = None
         self._plan = verified
         self._selected = {
             item["operation_id"]: item
@@ -1728,11 +2512,14 @@ class ExactDrainClaimAdapter:
         self._started_ids: set[str] = set()
         self._resume = resume
         self._terminal_reconciliation = terminal_reconciliation
+        self._terminal_status_evidence = terminal_status_evidence
         self._terminal_reconciliation_ready = False
         self._completion_callback = completion_callback
         self._completion_signalled = False
         self._progress_recorder = progress_recorder
         self._pending_progress_stages: dict[str, tuple[str, str]] = {}
+        if not terminal_reconciliation:
+            self._assert_execution_lease()
 
     def _record_task_stage(
         self,
@@ -1746,6 +2533,76 @@ class ExactDrainClaimAdapter:
                 operation_id,
                 status=status,
                 stage=stage,
+            )
+
+    def _assert_execution_lease(self) -> None:
+        deadline = getattr(self, "_execution_deadline", None)
+        if deadline is not None and getattr(self, "_clock", time.time)() >= deadline:
+            raise OperationRecoveryError(
+                "operation-recovery exact drain execution lease expired"
+            )
+
+    def _assert_claim_capable_mutation(self) -> None:
+        if getattr(self, "_terminal_reconciliation", False):
+            raise OperationRecoveryError(
+                "operation-recovery terminal reconciliation cannot mutate"
+            )
+        self._assert_execution_lease()
+
+    async def _configure_mutation_transaction(
+        self,
+        connection: Any,
+        *,
+        allow_expired_cleanup: bool = False,
+    ) -> None:
+        timeout_seconds = getattr(self, "_transaction_timeout_seconds", None)
+        if timeout_seconds is None:
+            return
+        observed_at = getattr(self, "_clock", time.time)()
+        execution_deadline = getattr(self, "_execution_deadline", None)
+        if (
+            getattr(self, "_terminal_reconciliation", False)
+            and execution_deadline is not None
+            and observed_at >= execution_deadline
+        ):
+            reconciliation_deadline = getattr(
+                self,
+                "_terminal_reconciliation_deadline",
+                None,
+            )
+            if reconciliation_deadline is None:
+                reconciliation_deadline = observed_at + timeout_seconds
+                self._terminal_reconciliation_deadline = reconciliation_deadline
+            deadline = reconciliation_deadline
+        elif (
+            allow_expired_cleanup
+            and execution_deadline is not None
+            and observed_at >= execution_deadline
+        ):
+            cleanup_deadline = getattr(self, "_cleanup_deadline", None)
+            if cleanup_deadline is None:
+                cleanup_deadline = observed_at + timeout_seconds
+                self._cleanup_deadline = cleanup_deadline
+            deadline = cleanup_deadline
+        else:
+            self._assert_execution_lease()
+            deadline = observed_at + timeout_seconds
+            if execution_deadline is not None:
+                deadline = min(deadline, execution_deadline)
+        remaining_ms = int((deadline - observed_at) * 1000)
+        if remaining_ms <= 0:
+            raise OperationRecoveryError(
+                "operation-recovery exact drain transaction timeout expired"
+            )
+        timeout = f"{remaining_ms}ms"
+        for name in (
+            "transaction_timeout",
+            "lock_timeout",
+            "statement_timeout",
+        ):
+            await connection.fetchval(
+                f"SELECT pg_catalog.set_config('{name}', $1, true)",
+                timeout,
             )
 
     def record_upstream_stage(self, operation_id: str, stage: str) -> None:
@@ -1788,6 +2645,19 @@ class ExactDrainClaimAdapter:
         ):
             self._completion_signalled = True
             self._completion_callback()
+
+    def bind_terminal_progress_recorder(self, progress_recorder: Any) -> None:
+        """Publish terminal progress only after its read-only guard commits."""
+        if (
+            not self._terminal_reconciliation
+            or not self._terminal_reconciliation_ready
+            or self._progress_recorder is not None
+            or progress_recorder is None
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery terminal progress binding is invalid"
+            )
+        self._progress_recorder = progress_recorder
 
     def abort_after_committed_claim_failure(self) -> None:
         """Stop the capsule so graceful shutdown releases committed claims."""
@@ -1852,6 +2722,18 @@ class ExactDrainClaimAdapter:
                 "operation-recovery exact drain database identity differs"
             )
         generation = await read_generation(connection, "public", "systalyze")
+        terminal_status_evidence = getattr(
+            self,
+            "_terminal_status_evidence",
+            None,
+        )
+        if (
+            terminal_status_evidence is not None
+            and generation != terminal_status_evidence["generation"]
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery terminal generation evidence differs"
+            )
         if not self._resume and generation != self._plan["pre_generation"]:
             raise OperationRecoveryError(
                 "operation-recovery exact drain generation drifted"
@@ -1861,7 +2743,9 @@ class ExactDrainClaimAdapter:
             schema="public",
             bank_id="engineering",
             operation_ids=[*self._selected, *self._preserved],
-            lock_clause="FOR SHARE",
+            lock_clause=(
+                "" if self._terminal_reconciliation else "FOR SHARE"
+            ),
         )
         if len(rows) != len(self._selected) + len(self._preserved):
             raise OperationRecoveryError(
@@ -1915,14 +2799,97 @@ class ExactDrainClaimAdapter:
             raise OperationRecoveryError(
                 "operation-recovery terminal reconciliation state differs"
             )
+        if terminal_status_evidence is not None:
+            outside_rows = await connection.fetch(
+                """
+                SELECT bank_id,
+                       operation_type,
+                       status,
+                       count(*)::bigint AS operation_count
+                FROM public.async_operations
+                WHERE operation_id != ALL($1::uuid[])
+                  AND status IN ('pending', 'processing')
+                GROUP BY bank_id, operation_type, status
+                ORDER BY bank_id, operation_type, status
+                """,
+                self._identifiers,
+            )
+            selected_status_counts = {
+                status: sum(
+                    row["operation_id"] in self._selected
+                    and row["status"] == status
+                    for row in rows
+                )
+                for status in (
+                    "pending",
+                    "processing",
+                    "completed",
+                    "failed",
+                    "cancelled",
+                )
+            }
+            selected_status_counts = {
+                key: value
+                for key, value in selected_status_counts.items()
+                if value
+            }
+            preserved_status_counts = {
+                status: sum(
+                    row["operation_id"] in self._preserved
+                    and row["status"] == status
+                    for row in rows
+                )
+                for status in (
+                    "pending",
+                    "processing",
+                    "completed",
+                    "failed",
+                    "cancelled",
+                )
+            }
+            preserved_status_counts = {
+                key: value
+                for key, value in preserved_status_counts.items()
+                if value
+            }
+            body = {
+                "schema_version": 1,
+                "kind": "operation-recovery-exact-drain-status",
+                "plan_digest": self._plan["plan_digest"],
+                "generation_before": generation,
+                "generation_after": generation,
+                "selected_operation_count": len(self._selected),
+                "selected_status_counts": selected_status_counts,
+                "preserved_status_counts": preserved_status_counts,
+                "outside_nonterminal_counts": [
+                    {
+                        "bank_id": row["bank_id"],
+                        "operation_type": row["operation_type"],
+                        "status": row["status"],
+                        "operation_count": row["operation_count"],
+                    }
+                    for row in outside_rows
+                ],
+                "observed_at": terminal_status_evidence["observed_at"],
+            }
+            if digest(body) != terminal_status_evidence["status_digest"]:
+                raise OperationRecoveryError(
+                    "operation-recovery terminal status evidence differs"
+                )
 
     async def recover_own_tasks(self, backend: Any) -> int:
         """Recover only exact-plan rows owned by an interrupted capsule."""
         if not self._resume:
             return 0
+        if not self._terminal_reconciliation:
+            self._assert_execution_lease()
         async with backend.acquire() as connection:
             async with connection.transaction(isolation="serializable"):
+                await self._configure_mutation_transaction(connection)
                 await self._verify_initial_state(connection)
+                if self._terminal_reconciliation:
+                    self._initial_guard_complete = True
+                    return 0
                 rows = await connection.fetch(
                     """
                     SELECT operation_id,
@@ -2029,6 +2996,13 @@ class ExactDrainClaimAdapter:
         """Release only exact-plan rows owned by this worker on shutdown."""
         async with backend.acquire() as connection:
             async with connection.transaction(isolation="serializable"):
+                await self._configure_mutation_transaction(
+                    connection,
+                    allow_expired_cleanup=True,
+                )
+                if self._terminal_reconciliation:
+                    await self._verify_initial_state(connection)
+                    return 0
                 await self._verify_unstarted_state(connection)
                 rows = [
                     _mapping(row)
@@ -2143,6 +3117,7 @@ class ExactDrainClaimAdapter:
         error_message: str | None,
         schema: str | None,
     ) -> None:
+        self._assert_claim_capable_mutation()
         if schema not in {None, "public"}:
             raise OperationRecoveryError(
                 "operation-recovery exact drain public schema is unavailable"
@@ -2160,6 +3135,7 @@ class ExactDrainClaimAdapter:
             )
         async with backend.acquire() as connection:
             async with connection.transaction(isolation="serializable"):
+                await self._configure_mutation_transaction(connection)
                 await self._verify_unstarted_state(connection)
                 row_value = await connection.fetchrow(
                     """
@@ -2319,6 +3295,7 @@ class ExactDrainClaimAdapter:
         *,
         error_message: str | None,
     ) -> None:
+        self._assert_claim_capable_mutation()
         if schema not in {None, "public"}:
             raise OperationRecoveryError(
                 "operation-recovery exact drain public schema is unavailable"
@@ -2337,6 +3314,7 @@ class ExactDrainClaimAdapter:
         observed_status: str | None = None
         async with backend.acquire() as connection:
             async with connection.transaction(isolation="serializable"):
+                await self._configure_mutation_transaction(connection)
                 await self._verify_unstarted_state(connection)
                 row_value = await connection.fetchrow(
                     """
@@ -2548,6 +3526,8 @@ class ExactDrainClaimAdapter:
         consolidation_bank_priority: Mapping[str, int] | None = None,
     ) -> list[Mapping[str, Any]]:
         """Claim only plan-selected rows through the upstream public seam."""
+        if not getattr(self, "_terminal_reconciliation", False):
+            self._assert_execution_lease()
         del consolidation_bank_priority
         if table not in self._ALLOWED_TABLES:
             raise OperationRecoveryError(
@@ -2561,6 +3541,7 @@ class ExactDrainClaimAdapter:
         await connection.execute(
             "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"
         )
+        await self._configure_mutation_transaction(connection)
         if self._terminal_reconciliation:
             await self._verify_initial_state(connection)
             self._initial_guard_complete = True

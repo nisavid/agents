@@ -35,6 +35,10 @@ EXPECTED_CLAIM_RELEASE_PAIR_COUNTS = {
 }
 EXACT_DRAIN_WORKER_MAX_RETRIES = 3
 EXACT_DRAIN_WORKER_MAX_ATTEMPTS = 4
+EXACT_DRAIN_APPROVAL_LIFETIME_SECONDS = 86_400
+EXACT_DRAIN_EVIDENCE_MAX_AGE_SECONDS = 3_600
+EXACT_DRAIN_TRANSACTION_TIMEOUT_SECONDS = 120
+EXACT_DRAIN_EXECUTION_LEASE_SECONDS = 86_400
 POST_ABORT_PLAN_LIFETIME_SECONDS = 86_400
 POST_ABORT_EVIDENCE_MAX_AGE_SECONDS = 3_600
 POST_ABORT_TRANSACTION_TIMEOUT_SECONDS = 120
@@ -321,6 +325,14 @@ EXACT_DRAIN_PLAN_KEYS = frozenset(
         "created_at",
         "expires_at",
         "plan_digest",
+    }
+)
+EXACT_DRAIN_PLAN_V2_KEYS = EXACT_DRAIN_PLAN_KEYS | frozenset(
+    {
+        "evidence_observed_at",
+        "evidence_max_age_seconds",
+        "transaction_timeout_seconds",
+        "execution_lease_seconds",
     }
 )
 POST_ABORT_PLAN_KEYS = frozenset(
@@ -1932,8 +1944,17 @@ def create_exact_drain_plan(
         if created_at is None
         else _integer(created_at, "exact drain plan created-at")
     )
+    evidence_observed_at = snapshot["observed_at"]
+    if (
+        evidence_observed_at > planned_at
+        or planned_at - evidence_observed_at
+        > EXACT_DRAIN_EVIDENCE_MAX_AGE_SECONDS
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery exact drain evidence is stale"
+        )
     body = {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": "operation-recovery-exact-drain-plan",
         "action": "drain-exact-operation-cohort",
         "authority": "unapproved-plan",
@@ -1969,8 +1990,12 @@ def create_exact_drain_plan(
         ),
         "worker_max_attempts": EXACT_DRAIN_WORKER_MAX_ATTEMPTS,
         "worker_max_retries": EXACT_DRAIN_WORKER_MAX_RETRIES,
+        "evidence_observed_at": evidence_observed_at,
+        "evidence_max_age_seconds": EXACT_DRAIN_EVIDENCE_MAX_AGE_SECONDS,
+        "transaction_timeout_seconds": EXACT_DRAIN_TRANSACTION_TIMEOUT_SECONDS,
+        "execution_lease_seconds": EXACT_DRAIN_EXECUTION_LEASE_SECONDS,
         "created_at": planned_at,
-        "expires_at": planned_at + MAX_PLAN_LIFETIME_SECONDS,
+        "expires_at": planned_at + EXACT_DRAIN_APPROVAL_LIFETIME_SECONDS,
     }
     return {**body, "plan_digest": digest(body)}
 
@@ -1981,9 +2006,23 @@ def verify_exact_drain_plan(
     now: int | None = None,
     allow_expired: bool = False,
 ) -> Mapping[str, Any]:
+    normalized = _normalized(value)
+    if not isinstance(normalized, Mapping):
+        raise OperationRecoveryError(
+            "operation-recovery exact drain plan is invalid"
+        )
+    schema_version = normalized.get("schema_version")
+    if type(schema_version) is not int or schema_version not in {1, 2}:
+        raise OperationRecoveryError(
+            "operation-recovery exact drain plan is invalid"
+        )
     plan = _closed(
-        _normalized(value),
-        EXACT_DRAIN_PLAN_KEYS,
+        normalized,
+        (
+            EXACT_DRAIN_PLAN_KEYS
+            if schema_version == 1
+            else EXACT_DRAIN_PLAN_V2_KEYS
+        ),
         "operation-recovery exact drain plan",
     )
     cohort = verify_cohort_manifest(plan["cohort"])
@@ -2047,6 +2086,28 @@ def verify_exact_drain_plan(
     )
     if not allow_expired and observed_at >= expires_at:
         raise OperationRecoveryError("operation-recovery exact drain plan expired")
+    if schema_version == 2:
+        evidence_observed_at = _integer(
+            plan["evidence_observed_at"],
+            "exact drain evidence observed-at",
+        )
+        evidence_max_age_seconds = _integer(
+            plan["evidence_max_age_seconds"],
+            "exact drain evidence maximum age",
+        )
+        transaction_timeout_seconds = _integer(
+            plan["transaction_timeout_seconds"],
+            "exact drain transaction timeout",
+        )
+        execution_lease_seconds = _integer(
+            plan["execution_lease_seconds"],
+            "exact drain execution lease",
+        )
+    else:
+        evidence_observed_at = None
+        evidence_max_age_seconds = None
+        transaction_timeout_seconds = None
+        execution_lease_seconds = None
     backup = _backup(
         plan["rollback_backup"],
         "operation-recovery exact drain backup",
@@ -2091,7 +2152,7 @@ def verify_exact_drain_plan(
         )
     )
     if (
-        plan.get("schema_version") != 1
+        schema_version not in {1, 2}
         or plan.get("kind") != "operation-recovery-exact-drain-plan"
         or plan.get("action") != "drain-exact-operation-cohort"
         or plan.get("authority") != "unapproved-plan"
@@ -2137,7 +2198,27 @@ def verify_exact_drain_plan(
         != snapshot["generation_before"]
         or source_authority["generation_after"]
         != snapshot["generation_after"]
-        or expires_at - created_at != MAX_PLAN_LIFETIME_SECONDS
+        or expires_at - created_at
+        != (
+            MAX_PLAN_LIFETIME_SECONDS
+            if schema_version == 1
+            else EXACT_DRAIN_APPROVAL_LIFETIME_SECONDS
+        )
+        or (
+            schema_version == 2
+            and (
+                evidence_observed_at != snapshot["observed_at"]
+                or evidence_max_age_seconds
+                != EXACT_DRAIN_EVIDENCE_MAX_AGE_SECONDS
+                or transaction_timeout_seconds
+                != EXACT_DRAIN_TRANSACTION_TIMEOUT_SECONDS
+                or execution_lease_seconds
+                != EXACT_DRAIN_EXECUTION_LEASE_SECONDS
+                or evidence_observed_at > created_at
+                or created_at - evidence_observed_at
+                > evidence_max_age_seconds
+            )
+        )
         or len(
             {
                 unicodedata.normalize("NFD", value.casefold())
@@ -2160,7 +2241,7 @@ def verify_exact_drain_plan(
             "operation-recovery exact drain plan is invalid"
         )
     body = {
-        "schema_version": 1,
+        "schema_version": schema_version,
         "kind": "operation-recovery-exact-drain-plan",
         "action": "drain-exact-operation-cohort",
         "authority": "unapproved-plan",
@@ -2197,6 +2278,16 @@ def verify_exact_drain_plan(
         ),
         "worker_max_attempts": EXACT_DRAIN_WORKER_MAX_ATTEMPTS,
         "worker_max_retries": EXACT_DRAIN_WORKER_MAX_RETRIES,
+        **(
+            {}
+            if schema_version == 1
+            else {
+                "evidence_observed_at": evidence_observed_at,
+                "evidence_max_age_seconds": evidence_max_age_seconds,
+                "transaction_timeout_seconds": transaction_timeout_seconds,
+                "execution_lease_seconds": execution_lease_seconds,
+            }
+        ),
         "created_at": created_at,
         "expires_at": expires_at,
     }

@@ -710,9 +710,22 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
         )
         selected = reference["selected_operations"]
         processing_count = {2: 4, 3: 3, 4: 2}[schema_version]
-        processing = [
-            item for item in selected if item["operation_type"] == "retain"
-        ][:processing_count]
+        processing = (
+            [
+                next(
+                    item
+                    for item in selected
+                    if item["operation_type"] == operation_type
+                )
+                for operation_type in ("retain", "consolidation")
+            ]
+            if schema_version == 4
+            else [
+                item
+                for item in selected
+                if item["operation_type"] == "retain"
+            ][:processing_count]
+        )
         processing_ids = [item["operation_id"] for item in processing]
         worker_id = exact_drain_worker_id(reference["plan_digest"])
         await connection.execute(
@@ -727,6 +740,17 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
             worker_id,
             processing_ids,
         )
+        if schema_version == 4:
+            consolidation_id = next(
+                item["operation_id"]
+                for item in processing
+                if item["operation_type"] == "consolidation"
+            )
+            await connection.execute(
+                "UPDATE public.async_operations SET retry_count = 3 "
+                "WHERE operation_id = $1::uuid",
+                consolidation_id,
+            )
         await connection.execute(
             "UPDATE public.hindsight_migration_generation "
             "SET generation = 123 WHERE singleton"
@@ -1300,6 +1324,10 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
                     {"processing": 2},
                 )
                 self.assertEqual(
+                    plan["selected_type_counts"],
+                    {"retain": 1, "consolidation": 1},
+                )
+                self.assertEqual(
                     plan["preserved_status_counts"],
                     {"completed": 5, "pending": 41},
                 )
@@ -1312,6 +1340,16 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
                         operation_ids=[*cohort_ids, unexpected_id],
                     )
                 }
+                selected_before = {
+                    before[operation_id]["operation_type"]: before[
+                        operation_id
+                    ]["retry_count"]
+                    for operation_id in processing_ids
+                }
+                self.assertEqual(
+                    selected_before,
+                    {"retain": 0, "consolidation": 3},
+                )
 
                 generation_before, generation_after = (
                     await apply_post_abort_recovery_transaction(

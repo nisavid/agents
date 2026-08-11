@@ -115,7 +115,7 @@ class OperationRecoveryCliTest(unittest.TestCase):
         reference = fixtures.drain_plan()
         snapshot = fixtures.post_abort_snapshot(
             reference,
-            interrupted_processing_count=2,
+            interrupted_operation_types=("retain", "consolidation"),
             observed_at=int(time.time()),
         )
         backup = recovery_fixtures.rollback_backup_evidence()
@@ -1894,7 +1894,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
         reference = fixtures.drain_plan()
         snapshot = fixtures.post_abort_snapshot(
             reference,
-            interrupted_processing_count=2,
+            interrupted_operation_types=("retain", "consolidation"),
             observed_at=int(time.time()),
         )
         with tempfile.TemporaryDirectory(
@@ -2043,7 +2043,10 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 "c" * 64,
             )
             self.assertEqual(plan["selected_status_counts"], {"processing": 2})
-            self.assertEqual(plan["selected_type_counts"], {"retain": 2})
+            self.assertEqual(
+                plan["selected_type_counts"],
+                {"retain": 1, "consolidation": 1},
+            )
             self.assertEqual(
                 plan["preserved_status_counts"],
                 {"completed": 5, "pending": 41},

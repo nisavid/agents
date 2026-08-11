@@ -559,6 +559,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
         *,
         current_interrupted_subset: bool = False,
         interrupted_processing_count: int | None = None,
+        interrupted_operation_types: tuple[str, ...] | None = None,
         observed_at: int = 1_786_390_181,
     ) -> dict:
         reference_plan = reference_plan or self.drain_plan()
@@ -592,20 +593,34 @@ class OperationRecoveryContractTest(unittest.TestCase):
             None
             if current_interrupted_subset
             or interrupted_processing_count is not None
+            or interrupted_operation_types is not None
             else selected_retain_positions[-1]
         )
-        processing_positions = set(
-            selected_retain_positions[
-                : (
-                    interrupted_processing_count
-                    if interrupted_processing_count is not None
-                    else 3
+        if interrupted_operation_types is None:
+            processing_positions = set(
+                selected_retain_positions[
+                    : (
+                        interrupted_processing_count
+                        if interrupted_processing_count is not None
+                        else 3
+                    )
+                ]
+                if current_interrupted_subset
+                or interrupted_processing_count is not None
+                else selected_retain_positions[:12]
+                + selected_refresh_positions
+            )
+        else:
+            remaining_positions = list(selected_positions)
+            processing_positions = set()
+            for operation_type in interrupted_operation_types:
+                position = next(
+                    position
+                    for position in remaining_positions
+                    if rows[position]["operation_type"] == operation_type
                 )
-            ]
-            if current_interrupted_subset
-            or interrupted_processing_count is not None
-            else selected_retain_positions[:12] + selected_refresh_positions
-        )
+                remaining_positions.remove(position)
+                processing_positions.add(position)
         for index, row in enumerate(rows):
             if index in completed:
                 row["status"] = "completed"
@@ -615,6 +630,12 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 row["worker_id_present"] = True
                 row["worker_id_digest"] = worker_digest
                 row["claimed_at"] = "2026-08-10T10:01:15.000000Z"
+                if (
+                    interrupted_operation_types
+                    == ("retain", "consolidation")
+                    and row["operation_type"] == "consolidation"
+                ):
+                    row["retry_count"] = 3
             elif index == failed_position:
                 row["status"] = "failed"
                 row["completed_at"] = "2026-08-10T15:36:45.000000Z"
@@ -829,11 +850,11 @@ class OperationRecoveryContractTest(unittest.TestCase):
             plan,
         )
 
-    def test_post_abort_v4_plan_derives_exact_two_interrupted_retains(self):
+    def test_post_abort_v4_plan_derives_exact_retain_and_consolidation(self):
         reference = self.drain_plan()
         snapshot = self.post_abort_snapshot(
             reference,
-            interrupted_processing_count=2,
+            interrupted_operation_types=("retain", "consolidation"),
         )
         backup = rollback_backup_evidence()
         backup["source_authority"]["generation_before"] = (
@@ -892,7 +913,18 @@ class OperationRecoveryContractTest(unittest.TestCase):
         )
         self.assertEqual(plan["selected_operation_count"], 2)
         self.assertEqual(plan["selected_status_counts"], {"processing": 2})
-        self.assertEqual(plan["selected_type_counts"], {"retain": 2})
+        self.assertEqual(
+            plan["selected_type_counts"],
+            {"retain": 1, "consolidation": 1},
+        )
+        self.assertEqual(
+            {
+                item["operation_type"]: item["retry_count"]
+                for item in plan["live_snapshot"]["operations"]
+                if item["current_status"] == "processing"
+            },
+            {"retain": 0, "consolidation": 3},
+        )
         self.assertEqual(
             plan["preserved_status_counts"],
             {"completed": 5, "pending": 41},
@@ -906,7 +938,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
         reference = self.drain_plan()
         snapshot = self.post_abort_snapshot(
             reference,
-            interrupted_processing_count=2,
+            interrupted_operation_types=("retain", "consolidation"),
         )
         processing = next(
             item
@@ -968,7 +1000,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
         reference = self.drain_plan()
         base = self.post_abort_snapshot(
             reference,
-            interrupted_processing_count=2,
+            interrupted_operation_types=("retain", "consolidation"),
         )
         worker_digest = next(
             item["worker_id_digest"]
@@ -1059,6 +1091,66 @@ class OperationRecoveryContractTest(unittest.TestCase):
         )
         refresh_row["operation_type"] = "refresh_mental_model"
 
+        two_retains = deepcopy(base)
+        consolidation_row = next(
+            item
+            for item in two_retains["operations"]
+            if item["current_status"] == "processing"
+            and item["operation_type"] == "consolidation"
+        )
+        replacement_retain = next(
+            item
+            for item in two_retains["operations"]
+            if item["current_status"] == "pending"
+            and item["operation_type"] == "retain"
+        )
+        consolidation_row.update(
+            {
+                "current_status": "pending",
+                "worker_id_present": False,
+                "worker_id_digest": None,
+                "claimed_at": None,
+            }
+        )
+        replacement_retain.update(
+            {
+                "current_status": "processing",
+                "worker_id_present": True,
+                "worker_id_digest": worker_digest,
+                "claimed_at": "2026-08-10T10:05:30.000000Z",
+            }
+        )
+
+        retain_and_refresh = deepcopy(base)
+        replaced_consolidation = next(
+            item
+            for item in retain_and_refresh["operations"]
+            if item["current_status"] == "processing"
+            and item["operation_type"] == "consolidation"
+        )
+        replacement_refresh = next(
+            item
+            for item in retain_and_refresh["operations"]
+            if item["current_status"] == "pending"
+            and item["operation_type"] == "refresh_mental_model"
+        )
+        replaced_consolidation.update(
+            {
+                "current_status": "pending",
+                "worker_id_present": False,
+                "worker_id_digest": None,
+                "claimed_at": None,
+            }
+        )
+        replacement_refresh.update(
+            {
+                "current_status": "processing",
+                "worker_id_present": True,
+                "worker_id_digest": worker_digest,
+                "claimed_at": "2026-08-10T10:05:45.000000Z",
+            }
+        )
+
         completed = deepcopy(base)
         completed_row = next(
             item
@@ -1097,6 +1189,16 @@ class OperationRecoveryContractTest(unittest.TestCase):
             "second-processing": reseal(second, second_row),
             "failed": reseal(failed, failed_row),
             "refresh": reseal(refresh, refresh_row),
+            "two-retains": reseal(
+                two_retains,
+                consolidation_row,
+                replacement_retain,
+            ),
+            "retain-and-refresh": reseal(
+                retain_and_refresh,
+                replaced_consolidation,
+                replacement_refresh,
+            ),
             "changed-completed": reseal(completed, completed_row),
             "claimed-pending": reseal(
                 claimed_pending,
@@ -1150,7 +1252,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
         reference = self.drain_plan()
         snapshot = self.post_abort_snapshot(
             reference,
-            interrupted_processing_count=2,
+            interrupted_operation_types=("retain", "consolidation"),
         )
         backup = rollback_backup_evidence()
         backup["source_authority"]["generation_before"] = snapshot[
@@ -1228,11 +1330,132 @@ class OperationRecoveryContractTest(unittest.TestCase):
                     now=plan["created_at"],
                 )
 
+    def test_post_abort_v4_requires_exact_type_specific_retry_vector(self):
+        reference = self.drain_plan()
+        snapshot = self.post_abort_snapshot(
+            reference,
+            interrupted_operation_types=("retain", "consolidation"),
+        )
+        backup = rollback_backup_evidence()
+        backup["source_authority"]["generation_before"] = snapshot[
+            "generation_before"
+        ]
+        backup["source_authority"]["generation_after"] = snapshot[
+            "generation_after"
+        ]
+        backup["source_authority_digest"] = digest(
+            backup["source_authority"]
+        )
+
+        def create(candidate_snapshot):
+            return dict(
+                create_post_abort_recovery_plan(
+                    reference,
+                    candidate_snapshot,
+                    candidate_release=release_identity(),
+                    rollback_backup=backup,
+                    rollback_encryption=rollback_encryption(),
+                    rollback_backup_path="/private/tmp/retry-backup.age",
+                    rollback_bundle_path="/private/tmp/retry-bundle.age",
+                    authorization_receipt_path="/private/tmp/retry-auth.json",
+                    application_receipt_path="/private/tmp/retry-app.json",
+                    verification_receipt_path="/private/tmp/retry-verify.json",
+                    rollback_receipt_path="/private/tmp/retry-rollback.json",
+                    reference_application_authorization=(
+                        exact_drain_authorization(reference)
+                    ),
+                    reference_application_journal=(
+                        exact_drain_application_journal(reference)
+                    ),
+                    reference_application_progress_digest="c" * 64,
+                    created_at=1_786_390_500,
+                )
+            )
+
+        valid_plan = create(snapshot)
+
+        def resealed_snapshot(retry_by_type):
+            changed = deepcopy(snapshot)
+            for row in changed["operations"]:
+                if row["current_status"] != "processing":
+                    continue
+                row["retry_count"] = retry_by_type[row["operation_type"]]
+                row["row_digest"] = digest(
+                    {
+                        key: value
+                        for key, value in row.items()
+                        if key != "row_digest"
+                    }
+                )
+            changed["snapshot_digest"] = digest(
+                {
+                    key: value
+                    for key, value in changed.items()
+                    if key != "snapshot_digest"
+                }
+            )
+            return changed
+
+        def resealed_plan(changed_snapshot):
+            changed = deepcopy(valid_plan)
+            changed["live_snapshot"] = changed_snapshot
+            changed["snapshot_digest"] = changed_snapshot["snapshot_digest"]
+            rows = {
+                row["operation_id"]: row
+                for row in changed_snapshot["operations"]
+            }
+            for item in changed["selected_operations"]:
+                item["row_digest"] = rows[item["operation_id"]]["row_digest"]
+            changed["selected_row_set_digest"] = digest(
+                [
+                    {
+                        "operation_id": item["operation_id"],
+                        "row_digest": item["row_digest"],
+                        "task_payload_digest": item[
+                            "task_payload_digest"
+                        ],
+                    }
+                    for item in changed["selected_operations"]
+                ]
+            )
+            changed["plan_digest"] = digest(
+                {
+                    key: value
+                    for key, value in changed.items()
+                    if key != "plan_digest"
+                }
+            )
+            return changed
+
+        cases = {
+            "retain-retry-one": {"retain": 1, "consolidation": 3},
+            "consolidation-retry-two": {"retain": 0, "consolidation": 2},
+            "swapped": {"retain": 3, "consolidation": 0},
+        }
+        for label, retry_by_type in cases.items():
+            changed_snapshot = resealed_snapshot(retry_by_type)
+            with (
+                self.subTest(contract="create", vector=label),
+                self.assertRaisesRegex(
+                    OperationRecoveryError,
+                    "post-abort row set is invalid",
+                ),
+            ):
+                create(changed_snapshot)
+            with (
+                self.subTest(contract="verify", vector=label),
+                self.assertRaises(OperationRecoveryError),
+            ):
+                verify_post_abort_recovery_plan(
+                    resealed_plan(changed_snapshot),
+                    now=valid_plan["created_at"],
+                )
+
     def test_post_abort_v2_verifier_rejects_forged_reference_authority(self):
         reference = self.drain_plan()
         snapshot = self.post_abort_snapshot(
             reference,
-            interrupted_processing_count=2,
+            interrupted_operation_types=("retain", "consolidation"),
         )
         backup = rollback_backup_evidence()
         backup["source_authority"]["generation_before"] = snapshot[

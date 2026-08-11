@@ -69,7 +69,8 @@ POST_ABORT_V3_SELECTED_STATUS_COUNTS = {"processing": 3}
 POST_ABORT_V3_SELECTED_TYPE_COUNTS = {"retain": 3}
 POST_ABORT_V3_PRESERVED_STATUS_COUNTS = {"completed": 5, "pending": 40}
 POST_ABORT_V4_SELECTED_STATUS_COUNTS = {"processing": 2}
-POST_ABORT_V4_SELECTED_TYPE_COUNTS = {"retain": 2}
+POST_ABORT_V4_SELECTED_TYPE_COUNTS = {"consolidation": 1, "retain": 1}
+POST_ABORT_V4_SELECTED_RETRY_COUNTS = {"consolidation": 3, "retain": 0}
 POST_ABORT_V4_PRESERVED_STATUS_COUNTS = {"completed": 5, "pending": 41}
 OPERATION_STATUSES = (
     "pending",
@@ -2629,6 +2630,16 @@ def _post_abort_contract(
         or not selected
         or selected_status_counts != expected_status_counts
         or selected_type_counts != expected_type_counts
+        or (
+            schema_version == 4
+            and any(
+                item["retry_count"]
+                != POST_ABORT_V4_SELECTED_RETRY_COUNTS.get(
+                    item["operation_type"]
+                )
+                for item in processing
+            )
+        )
         or preserved_status_counts != expected_preserved_status_counts
         or snapshot["status_counts"].get("cancelled", 0)
         or snapshot["generation_before"] != snapshot["generation_after"]

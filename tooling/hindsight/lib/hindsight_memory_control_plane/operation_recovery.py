@@ -48,6 +48,9 @@ POST_ABORT_SELECTED_TYPE_COUNTS = {
     "retain": 13,
 }
 POST_ABORT_PRESERVED_STATUS_COUNTS = {"completed": 5, "pending": 28}
+POST_ABORT_V2_SELECTED_STATUS_COUNTS = {"processing": 4}
+POST_ABORT_V2_SELECTED_TYPE_COUNTS = {"retain": 4}
+POST_ABORT_V2_PRESERVED_STATUS_COUNTS = {"completed": 5, "pending": 39}
 OPERATION_STATUSES = (
     "pending",
     "processing",
@@ -335,7 +338,7 @@ EXACT_DRAIN_PLAN_V2_KEYS = EXACT_DRAIN_PLAN_KEYS | frozenset(
         "execution_lease_seconds",
     }
 )
-POST_ABORT_PLAN_KEYS = frozenset(
+POST_ABORT_PLAN_V1_KEYS = frozenset(
     {
         "schema_version",
         "kind",
@@ -371,6 +374,27 @@ POST_ABORT_PLAN_KEYS = frozenset(
         "created_at",
         "expires_at",
         "plan_digest",
+    }
+)
+POST_ABORT_PLAN_V2_KEYS = POST_ABORT_PLAN_V1_KEYS | frozenset(
+    {
+        "reference_application_authorization",
+        "reference_application_authorization_digest",
+        "reference_application_journal",
+        "reference_application_journal_digest",
+    }
+)
+POST_ABORT_REFERENCE_JOURNAL_KEYS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "plan_digest",
+        "authorization_receipt_digest",
+        "started_at",
+        "worker_pid",
+        "worker_start_time",
+        "worker_attempt",
+        "receipt_digest",
     }
 )
 QUEUE_BLOCKER_INPUT_KEYS = frozenset(
@@ -2309,6 +2333,91 @@ def _post_abort_worker_digest(reference_plan_digest: str) -> str:
     ).hexdigest()
 
 
+def _post_abort_reference_application_journal(
+    value: Any,
+    reference_plan: Mapping[str, Any],
+    reference_authorization: Mapping[str, Any],
+) -> dict[str, Any]:
+    journal = _closed(
+        _normalized(value),
+        POST_ABORT_REFERENCE_JOURNAL_KEYS,
+        "post-abort reference application journal",
+    )
+    body = {
+        "schema_version": _integer(
+            journal["schema_version"],
+            "post-abort reference journal schema version",
+        ),
+        "kind": _text(
+            journal["kind"],
+            "post-abort reference journal kind",
+            maximum=128,
+        ),
+        "plan_digest": _sha(
+            journal["plan_digest"],
+            "post-abort reference journal plan digest",
+        ),
+        "authorization_receipt_digest": _sha(
+            journal["authorization_receipt_digest"],
+            "post-abort reference authorization digest",
+        ),
+        "started_at": _integer(
+            journal["started_at"],
+            "post-abort reference journal started-at",
+        ),
+        "worker_pid": _integer(
+            journal["worker_pid"],
+            "post-abort reference journal worker pid",
+        ),
+        "worker_start_time": _text(
+            journal["worker_start_time"],
+            "post-abort reference journal worker start time",
+            maximum=128,
+        ),
+        "worker_attempt": _integer(
+            journal["worker_attempt"],
+            "post-abort reference journal worker attempt",
+        ),
+    }
+    receipt_digest = _sha(
+        journal["receipt_digest"],
+        "post-abort reference journal digest",
+    )
+    if (
+        body["schema_version"] != 1
+        or body["kind"]
+        != "operation-recovery-exact-drain-application-journal"
+        or body["plan_digest"] != reference_plan["plan_digest"]
+        or body["authorization_receipt_digest"]
+        != reference_authorization["receipt_digest"]
+        or body["started_at"] != reference_authorization["authorized_at"]
+        or not 1 <= body["worker_pid"] <= (1 << 31) - 1
+        or not body["worker_start_time"]
+        or body["worker_start_time"]
+        != " ".join(body["worker_start_time"].split())
+        or not 1
+        <= body["worker_attempt"]
+        <= reference_plan["worker_max_attempts"] + 1
+        or receipt_digest != digest(body)
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery post-abort reference journal is invalid"
+        )
+    return {**body, "receipt_digest": receipt_digest}
+
+
+def _post_abort_reference_application_authorization(
+    value: Any,
+    reference_plan: Mapping[str, Any],
+) -> dict[str, Any]:
+    return dict(
+        verify_exact_drain_authorization_receipt(
+            value,
+            plan=reference_plan,
+        )
+    )
+
+
 def _post_abort_selected(
     snapshot: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
@@ -2342,12 +2451,26 @@ def _post_abort_type_counts(
 def _post_abort_contract(
     reference_plan: Mapping[str, Any],
     snapshot: Mapping[str, Any],
-) -> tuple[list[dict[str, Any]], str]:
+    *,
+    schema_version: int,
+) -> tuple[
+    list[dict[str, Any]],
+    str,
+    dict[str, int],
+    dict[str, int],
+    dict[str, int],
+]:
     selected = _post_abort_selected(snapshot)
     selected_status_counts = {
         status: sum(item["expected_status"] == status for item in selected)
         for status in ("failed", "processing")
     }
+    if schema_version == 2:
+        selected_status_counts = {
+            status: count
+            for status, count in selected_status_counts.items()
+            if count
+        }
     selected_type_counts = _post_abort_type_counts(selected)
     reference_selected = {
         item["operation_id"]: item
@@ -2374,20 +2497,38 @@ def _post_abort_contract(
     ]
     preserved_ids = set(current) - selected_ids
     reference_preserved_ids = set(reference_snapshot) - set(reference_selected)
+    preserved_status_counts = {
+        status: snapshot["status_counts"].get(status, 0)
+        for status in ("completed", "pending")
+        if snapshot["status_counts"].get(status, 0)
+    }
+    expected_status_counts = (
+        POST_ABORT_SELECTED_STATUS_COUNTS
+        if schema_version == 1
+        else POST_ABORT_V2_SELECTED_STATUS_COUNTS
+    )
+    expected_type_counts = (
+        POST_ABORT_SELECTED_TYPE_COUNTS
+        if schema_version == 1
+        else POST_ABORT_V2_SELECTED_TYPE_COUNTS
+    )
+    expected_preserved_status_counts = (
+        POST_ABORT_PRESERVED_STATUS_COUNTS
+        if schema_version == 1
+        else POST_ABORT_V2_PRESERVED_STATUS_COUNTS
+    )
     if (
         reference_plan["selected_operation_count"] != 43
         or reference_plan["selected_status_counts"] != {"pending": 43}
         or reference_plan["preserved_status_counts"] != {"completed": 5}
         or snapshot["cohort_digest"] != reference_plan["cohort_digest"]
         or set(current) != set(reference_snapshot)
-        or selected_status_counts != POST_ABORT_SELECTED_STATUS_COUNTS
-        or selected_type_counts != POST_ABORT_SELECTED_TYPE_COUNTS
-        or {
-            status: snapshot["status_counts"].get(status, 0)
-            for status in ("completed", "pending")
-        }
-        != POST_ABORT_PRESERVED_STATUS_COUNTS
+        or not selected
+        or selected_status_counts != expected_status_counts
+        or selected_type_counts != expected_type_counts
+        or preserved_status_counts != expected_preserved_status_counts
         or snapshot["status_counts"].get("cancelled", 0)
+        or snapshot["generation_before"] != snapshot["generation_after"]
         or any(item["operation_id"] not in reference_selected for item in selected)
         or any(
             item["worker_id_present"] is not True
@@ -2415,6 +2556,15 @@ def _post_abort_contract(
         )
         or any(
             current[operation_id]["current_status"] != "pending"
+            or (
+                schema_version == 2
+                and (
+                    current[operation_id]["worker_id_present"]
+                    or current[operation_id]["worker_id_digest"] is not None
+                    or current[operation_id]["claimed_at"] is not None
+                    or current[operation_id]["completed_at"] is not None
+                )
+            )
             for operation_id in set(reference_selected) - selected_ids
         )
         or any(
@@ -2428,7 +2578,13 @@ def _post_abort_contract(
         raise OperationRecoveryError(
             "operation-recovery post-abort row set is invalid"
         )
-    return selected, worker_digest
+    return (
+        selected,
+        worker_digest,
+        selected_status_counts,
+        selected_type_counts,
+        preserved_status_counts,
+    )
 
 
 def create_post_abort_recovery_plan(
@@ -2444,6 +2600,8 @@ def create_post_abort_recovery_plan(
     application_receipt_path: str,
     verification_receipt_path: str,
     rollback_receipt_path: str,
+    reference_application_authorization: Mapping[str, Any],
+    reference_application_journal: Mapping[str, Any],
     created_at: int | None = None,
 ) -> Mapping[str, Any]:
     """Plan the exact stopped-worker cleanup without mutating operations."""
@@ -2452,7 +2610,22 @@ def create_post_abort_recovery_plan(
         allow_expired=True,
     )
     snapshot = verify_live_snapshot(live_snapshot_value)
-    selected, worker_digest = _post_abort_contract(reference, snapshot)
+    reference_authorization = _post_abort_reference_application_authorization(
+        reference_application_authorization,
+        reference,
+    )
+    reference_journal = _post_abort_reference_application_journal(
+        reference_application_journal,
+        reference,
+        reference_authorization,
+    )
+    (
+        selected,
+        worker_digest,
+        selected_status_counts,
+        selected_type_counts,
+        preserved_status_counts,
+    ) = _post_abort_contract(reference, snapshot, schema_version=2)
     authority = snapshot["installation_authority"]
     backup = _backup(
         rollback_backup,
@@ -2523,7 +2696,7 @@ def create_post_abort_recovery_plan(
             "operation-recovery post-abort evidence is stale"
         )
     body = {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": "operation-recovery-exact-drain-post-abort-plan",
         "action": "recover-exact-drain-post-abort",
         "authority": "unapproved-plan",
@@ -2533,6 +2706,14 @@ def create_post_abort_recovery_plan(
         "reference_plan": reference,
         "reference_plan_digest": reference["plan_digest"],
         "reference_worker_id_digest": worker_digest,
+        "reference_application_authorization": reference_authorization,
+        "reference_application_authorization_digest": (
+            reference_authorization["receipt_digest"]
+        ),
+        "reference_application_journal": reference_journal,
+        "reference_application_journal_digest": reference_journal[
+            "receipt_digest"
+        ],
         "live_snapshot": snapshot,
         "cohort_digest": snapshot["cohort_digest"],
         "snapshot_digest": snapshot["snapshot_digest"],
@@ -2542,10 +2723,10 @@ def create_post_abort_recovery_plan(
         "transaction_timeout_seconds": POST_ABORT_TRANSACTION_TIMEOUT_SECONDS,
         "selected_operations": selected,
         "selected_operation_count": len(selected),
-        "selected_status_counts": dict(POST_ABORT_SELECTED_STATUS_COUNTS),
-        "selected_type_counts": dict(POST_ABORT_SELECTED_TYPE_COUNTS),
+        "selected_status_counts": selected_status_counts,
+        "selected_type_counts": selected_type_counts,
         "selected_row_set_digest": _exact_drain_row_set_digest(selected),
-        "preserved_status_counts": dict(POST_ABORT_PRESERVED_STATUS_COUNTS),
+        "preserved_status_counts": preserved_status_counts,
         "rollback_backup": backup,
         "rollback_encryption": encryption,
         **artifact_paths,
@@ -2561,9 +2742,23 @@ def verify_post_abort_recovery_plan(
     now: int | None = None,
     allow_expired: bool = False,
 ) -> Mapping[str, Any]:
+    normalized = _normalized(value)
+    if not isinstance(normalized, Mapping):
+        raise OperationRecoveryError(
+            "operation-recovery post-abort plan is invalid"
+        )
+    schema_version = normalized.get("schema_version")
+    if type(schema_version) is not int or schema_version not in {1, 2}:
+        raise OperationRecoveryError(
+            "operation-recovery post-abort plan is invalid"
+        )
     plan = _closed(
-        _normalized(value),
-        POST_ABORT_PLAN_KEYS,
+        normalized,
+        (
+            POST_ABORT_PLAN_V1_KEYS
+            if schema_version == 1
+            else POST_ABORT_PLAN_V2_KEYS
+        ),
         "operation-recovery post-abort plan",
     )
     reference = verify_exact_drain_plan(
@@ -2571,7 +2766,34 @@ def verify_post_abort_recovery_plan(
         allow_expired=True,
     )
     snapshot = verify_live_snapshot(plan["live_snapshot"])
-    expected_selected, worker_digest = _post_abort_contract(reference, snapshot)
+    reference_authorization = (
+        None
+        if schema_version == 1
+        else _post_abort_reference_application_authorization(
+            plan["reference_application_authorization"],
+            reference,
+        )
+    )
+    reference_journal = (
+        None
+        if schema_version == 1
+        else _post_abort_reference_application_journal(
+            plan["reference_application_journal"],
+            reference,
+            reference_authorization,
+        )
+    )
+    (
+        expected_selected,
+        worker_digest,
+        expected_status_counts,
+        expected_type_counts,
+        expected_preserved_status_counts,
+    ) = _post_abort_contract(
+        reference,
+        snapshot,
+        schema_version=schema_version,
+    )
     selected_value = plan["selected_operations"]
     if not isinstance(selected_value, list):
         raise OperationRecoveryError(
@@ -2651,7 +2873,7 @@ def verify_post_abort_recovery_plan(
         "post-abort evidence observed-at",
     )
     if (
-        plan["schema_version"] != 1
+        plan["schema_version"] != schema_version
         or plan["kind"]
         != "operation-recovery-exact-drain-post-abort-plan"
         or plan["action"] != "recover-exact-drain-post-abort"
@@ -2662,6 +2884,16 @@ def verify_post_abort_recovery_plan(
         or authority != snapshot["installation_authority"]
         or plan["reference_plan_digest"] != reference["plan_digest"]
         or plan["reference_worker_id_digest"] != worker_digest
+        or (
+            schema_version == 2
+            and plan["reference_application_authorization_digest"]
+            != reference_authorization["receipt_digest"]
+        )
+        or (
+            schema_version == 2
+            and plan["reference_application_journal_digest"]
+            != reference_journal["receipt_digest"]
+        )
         or plan["cohort_digest"] != snapshot["cohort_digest"]
         or plan["snapshot_digest"] != snapshot["snapshot_digest"]
         or plan["pre_generation"] != snapshot["generation_before"]
@@ -2676,9 +2908,9 @@ def verify_post_abort_recovery_plan(
         or snapshot["generation_before"] != snapshot["generation_after"]
         or selected != expected_selected
         or plan["selected_operation_count"] != len(selected)
-        or status_counts != POST_ABORT_SELECTED_STATUS_COUNTS
-        or type_counts != POST_ABORT_SELECTED_TYPE_COUNTS
-        or preserved != POST_ABORT_PRESERVED_STATUS_COUNTS
+        or status_counts != expected_status_counts
+        or type_counts != expected_type_counts
+        or preserved != expected_preserved_status_counts
         or plan["selected_row_set_digest"]
         != _exact_drain_row_set_digest(selected)
         or backup["postgres_system_identifier"]
@@ -2700,7 +2932,7 @@ def verify_post_abort_recovery_plan(
             "operation-recovery post-abort plan is invalid"
         )
     body = {
-        "schema_version": 1,
+        "schema_version": schema_version,
         "kind": "operation-recovery-exact-drain-post-abort-plan",
         "action": "recover-exact-drain-post-abort",
         "authority": "unapproved-plan",
@@ -2710,6 +2942,24 @@ def verify_post_abort_recovery_plan(
         "reference_plan": reference,
         "reference_plan_digest": reference["plan_digest"],
         "reference_worker_id_digest": worker_digest,
+        **(
+            {}
+            if schema_version == 1
+            else {
+                "reference_application_authorization": (
+                    reference_authorization
+                ),
+                "reference_application_authorization_digest": _sha(
+                    plan["reference_application_authorization_digest"],
+                    "post-abort reference application authorization digest",
+                ),
+                "reference_application_journal": reference_journal,
+                "reference_application_journal_digest": _sha(
+                    plan["reference_application_journal_digest"],
+                    "post-abort reference application journal digest",
+                ),
+            }
+        ),
         "live_snapshot": snapshot,
         "cohort_digest": snapshot["cohort_digest"],
         "snapshot_digest": snapshot["snapshot_digest"],

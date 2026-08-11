@@ -4784,6 +4784,7 @@ def _assert_recovery_services_stopped(
         "/hindsight-api",
         "hindsight_api",
         "hindsight-worker",
+        "hindsight-exact-drain-worker",
         "hindsight-memory broker",
         "hindsight-memory sidecar",
         "hindsight-memory service",
@@ -8160,6 +8161,58 @@ def _operation_recovery_exact_journal_worker_active(
     )
 
 
+def _operation_recovery_post_abort_reference_artifacts(
+    reference_plan: Mapping[str, Any],
+) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+    authorization = _operation_recovery_exact_authorization(reference_plan)
+    journal = _operation_recovery_exact_journal(
+        _operation_recovery_read_private_json(
+            reference_plan["application_receipt_path"],
+            "reference exact drain application journal",
+        ),
+        plan=reference_plan,
+        authorization=authorization,
+    )
+    return authorization, journal
+
+
+def _operation_recovery_post_abort_assert_reference_worker_stopped(
+    plan: Mapping[str, Any],
+) -> None:
+    if (
+        plan["schema_version"] == 2
+        and _operation_recovery_exact_journal_worker_active(
+            plan["reference_application_journal"]
+        )
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery reference exact drain worker remains active"
+        )
+
+
+def _operation_recovery_post_abort_assert_reference_source_stopped(
+    plan: Mapping[str, Any],
+) -> None:
+    if plan["schema_version"] == 1:
+        return
+    authorization, journal = (
+        _operation_recovery_post_abort_reference_artifacts(
+            plan["reference_plan"]
+        )
+    )
+    if (
+        authorization != plan["reference_application_authorization"]
+        or journal != plan["reference_application_journal"]
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery reference exact drain artifacts drifted"
+        )
+    if _operation_recovery_exact_journal_worker_active(journal):
+        raise OperationRecoveryError(
+            "operation-recovery reference exact drain worker remains active"
+        )
+
+
 def _operation_recovery_exact_next_worker_attempt(
     plan: Mapping[str, Any],
     journal: Mapping[str, Any],
@@ -9594,6 +9647,16 @@ def operation_recovery_post_abort_plan_command(args: argparse.Namespace) -> int:
         ),
         allow_expired=True,
     )
+    (
+        reference_authorization,
+        reference_journal,
+    ) = _operation_recovery_post_abort_reference_artifacts(
+        reference,
+    )
+    if _operation_recovery_exact_journal_worker_active(reference_journal):
+        raise OperationRecoveryError(
+            "operation-recovery reference exact drain worker remains active"
+        )
     snapshot = verify_live_snapshot(
         _operation_recovery_read_private_json(
             args.snapshot,
@@ -9643,6 +9706,8 @@ def operation_recovery_post_abort_plan_command(args: argparse.Namespace) -> int:
         application_receipt_path=args.application_receipt,
         verification_receipt_path=args.verification_receipt,
         rollback_receipt_path=args.rollback_receipt,
+        reference_application_authorization=reference_authorization,
+        reference_application_journal=reference_journal,
     )
     current_binding = read_pg0_registration("systalyze")
     current_binding.pop("_password")
@@ -9675,6 +9740,20 @@ def operation_recovery_post_abort_plan_command(args: argparse.Namespace) -> int:
         raise OperationRecoveryError(
             "operation-recovery candidate drifted during post-abort planning"
         )
+    (
+        current_reference_authorization,
+        current_reference_journal,
+    ) = _operation_recovery_post_abort_reference_artifacts(
+        reference,
+    )
+    if (
+        current_reference_authorization != reference_authorization
+        or current_reference_journal != reference_journal
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery reference exact drain artifacts drifted"
+        )
+    _operation_recovery_post_abort_assert_reference_worker_stopped(plan)
     write_private(output_path, plan, create_only=True)
     return _print_result(
         {
@@ -9930,6 +10009,9 @@ def operation_recovery_post_abort_apply_command(args: argparse.Namespace) -> int
                         **evidence,
                     }
                 )
+            _operation_recovery_post_abort_assert_reference_source_stopped(
+                plan
+            )
             journal = _operation_recovery_validate_journal(
                 existing,
                 plan=plan,
@@ -9974,6 +10056,9 @@ def operation_recovery_post_abort_apply_command(args: argparse.Namespace) -> int
                     }
                 )
         else:
+            _operation_recovery_post_abort_assert_reference_source_stopped(
+                plan
+            )
             verify_post_abort_recovery_plan(plan)
             if Path(plan["authorization_receipt_path"]).exists():
                 authorization = _operation_recovery_validate_authorization(plan)
@@ -10048,6 +10133,7 @@ def operation_recovery_post_abort_apply_command(args: argparse.Namespace) -> int
             raise OperationRecoveryError(
                 "operation-recovery candidate drifted before post-abort mutation"
             )
+        _operation_recovery_post_abort_assert_reference_source_stopped(plan)
         before, after = asyncio.run(
             _operation_recovery_post_abort_apply(args, plan, precommit)
         )

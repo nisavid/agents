@@ -173,6 +173,21 @@ def exact_drain_authorization(plan: dict, *, authorized_at: int | None = None) -
     return {**body, "receipt_digest": digest(body)}
 
 
+def exact_drain_application_journal(plan: dict) -> dict:
+    authorization = exact_drain_authorization(plan)
+    body = {
+        "schema_version": 1,
+        "kind": "operation-recovery-exact-drain-application-journal",
+        "plan_digest": plan["plan_digest"],
+        "authorization_receipt_digest": authorization["receipt_digest"],
+        "started_at": authorization["authorized_at"],
+        "worker_pid": 4242,
+        "worker_start_time": "dead-exact-drain-worker",
+        "worker_attempt": 1,
+    }
+    return {**body, "receipt_digest": digest(body)}
+
+
 def rollback_encryption() -> dict:
     return {
         "recipient": "age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
@@ -486,7 +501,13 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 now=legacy["created_at"],
             )
 
-    def post_abort_snapshot(self, reference_plan=None) -> dict:
+    def post_abort_snapshot(
+        self,
+        reference_plan=None,
+        *,
+        current_interrupted_subset: bool = False,
+        observed_at: int = 1_786_390_181,
+    ) -> dict:
         reference_plan = reference_plan or self.drain_plan()
         rows = operation_rows()
         completed = {0, 1, 42, 43, 46}
@@ -514,9 +535,15 @@ class OperationRecoveryContractTest(unittest.TestCase):
             for index in selected_positions
             if rows[index]["operation_type"] == "refresh_mental_model"
         ]
-        failed_position = selected_retain_positions[-1]
+        failed_position = (
+            None
+            if current_interrupted_subset
+            else selected_retain_positions[-1]
+        )
         processing_positions = set(
-            selected_retain_positions[:12] + selected_refresh_positions
+            selected_retain_positions[:4]
+            if current_interrupted_subset
+            else selected_retain_positions[:12] + selected_refresh_positions
         )
         for index, row in enumerate(rows):
             if index in completed:
@@ -540,14 +567,16 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 generation_before="systalyze:public:81678",
                 generation_after="systalyze:public:81678",
                 installation_authority=installation_authority(),
-                observed_at=1_786_390_181,
+                observed_at=observed_at,
             )
         )
 
-    def test_post_abort_plan_binds_exact_stopped_worker_and_failed_rows(self):
+    def test_post_abort_v2_plan_derives_current_interrupted_subset(self):
         reference = self.drain_plan()
-        snapshot = self.post_abort_snapshot(reference)
-        planned_at = 1_786_390_500
+        snapshot = self.post_abort_snapshot(
+            reference,
+            current_interrupted_subset=True,
+        )
         backup = rollback_backup_evidence()
         backup["source_authority"]["generation_before"] = (
             "systalyze:public:81678"
@@ -562,64 +591,60 @@ class OperationRecoveryContractTest(unittest.TestCase):
         plan = create_post_abort_recovery_plan(
             reference,
             snapshot,
-            candidate_release={
-                "source_commit": "4" * 40,
-                "version": "2026.08.10+4444444.operation-recovery.17",
-                "release_digest": "5" * 64,
-            },
+            candidate_release=release_identity(),
             rollback_backup=backup,
             rollback_encryption=rollback_encryption(),
-            rollback_backup_path="/private/tmp/post-abort-backup.age",
-            rollback_bundle_path="/private/tmp/post-abort-bundle.age",
-            authorization_receipt_path=(
-                "/private/tmp/post-abort-authorization.json"
+            rollback_backup_path="/private/tmp/current-post-abort-backup.age",
+            rollback_bundle_path="/private/tmp/current-post-abort-bundle.age",
+            authorization_receipt_path="/private/tmp/current-post-abort-auth.json",
+            application_receipt_path="/private/tmp/current-post-abort-app.json",
+            verification_receipt_path="/private/tmp/current-post-abort-verify.json",
+            rollback_receipt_path="/private/tmp/current-post-abort-rollback.json",
+            reference_application_authorization=(
+                exact_drain_authorization(reference)
             ),
-            application_receipt_path=(
-                "/private/tmp/post-abort-application.json"
+            reference_application_journal=(
+                exact_drain_application_journal(reference)
             ),
-            verification_receipt_path=(
-                "/private/tmp/post-abort-verification.json"
-            ),
-            rollback_receipt_path="/private/tmp/post-abort-rollback.json",
-            created_at=planned_at,
+            created_at=1_786_390_500,
         )
 
+        expected_ids = {
+            item["operation_id"]
+            for item in snapshot["operations"]
+            if item["current_status"] == "processing"
+        }
+        self.assertEqual(plan["schema_version"], 2)
         self.assertEqual(
-            plan["kind"],
-            "operation-recovery-exact-drain-post-abort-plan",
-        )
-        self.assertEqual(plan["authority"], "unapproved-plan")
-        self.assertIs(plan["mutation_authorized"], False)
-        self.assertEqual(plan["reference_plan_digest"], reference["plan_digest"])
-        self.assertEqual(plan["selected_operation_count"], 15)
-        self.assertEqual(
-            plan["selected_status_counts"],
-            {"failed": 1, "processing": 14},
+            plan["reference_application_authorization"],
+            exact_drain_authorization(reference),
         )
         self.assertEqual(
-            plan["selected_type_counts"],
-            {"refresh_mental_model": 2, "retain": 13},
+            plan["reference_application_authorization_digest"],
+            exact_drain_authorization(reference)["receipt_digest"],
         )
+        self.assertEqual(
+            {item["operation_id"] for item in plan["selected_operations"]},
+            expected_ids,
+        )
+        self.assertEqual(plan["selected_operation_count"], 4)
+        self.assertEqual(plan["selected_status_counts"], {"processing": 4})
+        self.assertEqual(plan["selected_type_counts"], {"retain": 4})
         self.assertEqual(
             plan["preserved_status_counts"],
-            {"completed": 5, "pending": 28},
+            {"completed": 5, "pending": 39},
         )
-        self.assertEqual(plan["expires_at"], planned_at + 86_400)
-        self.assertEqual(plan["evidence_max_age_seconds"], 3_600)
-        self.assertEqual(plan["transaction_timeout_seconds"], 120)
         self.assertEqual(
-            verify_post_abort_recovery_plan(plan, now=planned_at),
+            verify_post_abort_recovery_plan(plan, now=plan["created_at"]),
             plan,
         )
-        serialized = json.dumps(plan, sort_keys=True)
-        self.assertNotIn('"task_payload":', serialized)
-        self.assertNotIn('"worker_id":', serialized)
-        self.assertNotIn('"error_message":', serialized)
-        self.assertNotIn('"result_metadata":', serialized)
 
     def test_post_abort_plan_rejects_a_different_processing_owner(self):
         reference = self.drain_plan()
-        snapshot = self.post_abort_snapshot(reference)
+        snapshot = self.post_abort_snapshot(
+            reference,
+            current_interrupted_subset=True,
+        )
         processing = next(
             item
             for item in snapshot["operations"]
@@ -666,8 +691,381 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 application_receipt_path="/private/tmp/post-abort-app.json",
                 verification_receipt_path="/private/tmp/post-abort-verify.json",
                 rollback_receipt_path="/private/tmp/post-abort-rollback.json",
+                reference_application_authorization=(
+                    exact_drain_authorization(reference)
+                ),
+                reference_application_journal=(
+                    exact_drain_application_journal(reference)
+                ),
                 created_at=1_786_390_500,
             )
+
+    def test_post_abort_v2_planner_rejects_non_exact_current_shapes(self):
+        reference = self.drain_plan()
+        base = self.post_abort_snapshot(
+            reference,
+            current_interrupted_subset=True,
+        )
+        worker_digest = next(
+            item["worker_id_digest"]
+            for item in base["operations"]
+            if item["current_status"] == "processing"
+        )
+
+        def reseal(snapshot, *changed_rows):
+            for row in changed_rows:
+                row_body = {
+                    key: value
+                    for key, value in row.items()
+                    if key != "row_digest"
+                }
+                row["row_digest"] = digest(row_body)
+            snapshot["operations"].sort(
+                key=lambda item: item["operation_id"]
+            )
+            snapshot["status_counts"] = {
+                status: sum(
+                    item["current_status"] == status
+                    for item in snapshot["operations"]
+                )
+                for status in recovery_contract.OPERATION_STATUSES
+            }
+            snapshot_body = {
+                key: value
+                for key, value in snapshot.items()
+                if key != "snapshot_digest"
+            }
+            snapshot["snapshot_digest"] = digest(snapshot_body)
+            return snapshot
+
+        fifth = deepcopy(base)
+        fifth_row = next(
+            item
+            for item in fifth["operations"]
+            if item["current_status"] == "pending"
+        )
+        fifth_row.update(
+            {
+                "current_status": "processing",
+                "worker_id_present": True,
+                "worker_id_digest": worker_digest,
+                "claimed_at": "2026-08-10T10:02:00.000000Z",
+            }
+        )
+
+        failed = deepcopy(base)
+        failed_row = next(
+            item
+            for item in failed["operations"]
+            if item["current_status"] == "processing"
+        )
+        failed_row.update(
+            {
+                "current_status": "failed",
+                "completed_at": "2026-08-10T10:03:00.000000Z",
+                "retry_count": 3,
+                "worker_id_present": False,
+                "worker_id_digest": None,
+                "claimed_at": None,
+                "error_category": "unknown",
+                "error_digest": "6" * 64,
+            }
+        )
+
+        refresh = deepcopy(base)
+        refresh_row = next(
+            item
+            for item in refresh["operations"]
+            if item["current_status"] == "processing"
+        )
+        refresh_row["operation_type"] = "refresh_mental_model"
+
+        completed = deepcopy(base)
+        completed_row = next(
+            item
+            for item in completed["operations"]
+            if item["current_status"] == "completed"
+        )
+        completed_row["updated_at"] = "2026-08-10T10:04:00.000000Z"
+
+        claimed_pending = deepcopy(base)
+        claimed_pending_row = next(
+            item
+            for item in claimed_pending["operations"]
+            if item["current_status"] == "pending"
+        )
+        claimed_pending_row.update(
+            {
+                "worker_id_present": True,
+                "worker_id_digest": worker_digest,
+                "claimed_at": "2026-08-10T10:05:00.000000Z",
+            }
+        )
+
+        nonreference = deepcopy(base)
+        nonreference_row = nonreference["operations"][0]
+        nonreference_row["operation_id"] = (
+            "ffffffff-ffff-4fff-8fff-ffffffffffff"
+        )
+
+        wrong_cohort = deepcopy(base)
+        wrong_cohort["cohort_digest"] = "0" * 64
+
+        cases = {
+            "fifth-processing": reseal(fifth, fifth_row),
+            "failed": reseal(failed, failed_row),
+            "refresh": reseal(refresh, refresh_row),
+            "changed-completed": reseal(completed, completed_row),
+            "claimed-pending": reseal(
+                claimed_pending,
+                claimed_pending_row,
+            ),
+            "nonreference-membership": reseal(
+                nonreference,
+                nonreference_row,
+            ),
+            "wrong-cohort": reseal(wrong_cohort),
+        }
+        for label, snapshot in cases.items():
+            backup = rollback_backup_evidence()
+            backup["source_authority"]["generation_before"] = snapshot[
+                "generation_before"
+            ]
+            backup["source_authority"]["generation_after"] = snapshot[
+                "generation_after"
+            ]
+            backup["source_authority_digest"] = digest(
+                backup["source_authority"]
+            )
+            with (
+                self.subTest(shape=label),
+                self.assertRaisesRegex(
+                    OperationRecoveryError,
+                    "post-abort row set is invalid",
+                ),
+            ):
+                create_post_abort_recovery_plan(
+                    reference,
+                    snapshot,
+                    candidate_release=release_identity(),
+                    rollback_backup=backup,
+                    rollback_encryption=rollback_encryption(),
+                    rollback_backup_path="/private/tmp/reject-backup.age",
+                    rollback_bundle_path="/private/tmp/reject-bundle.age",
+                    authorization_receipt_path="/private/tmp/reject-auth.json",
+                    application_receipt_path="/private/tmp/reject-app.json",
+                    verification_receipt_path="/private/tmp/reject-verify.json",
+                    rollback_receipt_path="/private/tmp/reject-rollback.json",
+                    reference_application_authorization=(
+                        exact_drain_authorization(reference)
+                    ),
+                    reference_application_journal=(
+                        exact_drain_application_journal(reference)
+                    ),
+                    created_at=1_786_390_500,
+                )
+
+    def test_post_abort_v2_verifier_rejects_schema_and_bound_set_tampering(self):
+        reference = self.drain_plan()
+        snapshot = self.post_abort_snapshot(
+            reference,
+            current_interrupted_subset=True,
+        )
+        backup = rollback_backup_evidence()
+        backup["source_authority"]["generation_before"] = snapshot[
+            "generation_before"
+        ]
+        backup["source_authority"]["generation_after"] = snapshot[
+            "generation_after"
+        ]
+        backup["source_authority_digest"] = digest(
+            backup["source_authority"]
+        )
+        plan = dict(
+            create_post_abort_recovery_plan(
+                reference,
+                snapshot,
+                candidate_release=release_identity(),
+                rollback_backup=backup,
+                rollback_encryption=rollback_encryption(),
+                rollback_backup_path="/private/tmp/tamper-backup.age",
+                rollback_bundle_path="/private/tmp/tamper-bundle.age",
+                authorization_receipt_path="/private/tmp/tamper-auth.json",
+                application_receipt_path="/private/tmp/tamper-app.json",
+                verification_receipt_path="/private/tmp/tamper-verify.json",
+                rollback_receipt_path="/private/tmp/tamper-rollback.json",
+                reference_application_authorization=(
+                    exact_drain_authorization(reference)
+                ),
+                reference_application_journal=(
+                    exact_drain_application_journal(reference)
+                ),
+                created_at=1_786_390_500,
+            )
+        )
+
+        def reseal(candidate):
+            body = {
+                key: value
+                for key, value in candidate.items()
+                if key != "plan_digest"
+            }
+            candidate["plan_digest"] = digest(body)
+            return candidate
+
+        boolean_schema = deepcopy(plan)
+        boolean_schema["schema_version"] = True
+        unsupported_schema = deepcopy(plan)
+        unsupported_schema["schema_version"] = 3
+        selected = deepcopy(plan)
+        selected["selected_operations"][0]["row_digest"] = "0" * 64
+        count = deepcopy(plan)
+        count["selected_operation_count"] = 5
+        row_set = deepcopy(plan)
+        row_set["selected_row_set_digest"] = "0" * 64
+        plan_digest = deepcopy(plan)
+        plan_digest["plan_digest"] = "0" * 64
+        cases = {
+            "boolean-schema": boolean_schema,
+            "unsupported-schema": unsupported_schema,
+            "selected": reseal(selected),
+            "count": reseal(count),
+            "row-set-digest": reseal(row_set),
+            "plan-digest": plan_digest,
+        }
+        for label, candidate in cases.items():
+            with (
+                self.subTest(tamper=label),
+                self.assertRaises(OperationRecoveryError),
+            ):
+                verify_post_abort_recovery_plan(
+                    candidate,
+                    now=plan["created_at"],
+                )
+
+    def test_post_abort_v2_verifier_rejects_forged_reference_authority(self):
+        reference = self.drain_plan()
+        snapshot = self.post_abort_snapshot(
+            reference,
+            current_interrupted_subset=True,
+        )
+        backup = rollback_backup_evidence()
+        backup["source_authority"]["generation_before"] = snapshot[
+            "generation_before"
+        ]
+        backup["source_authority"]["generation_after"] = snapshot[
+            "generation_after"
+        ]
+        backup["source_authority_digest"] = digest(
+            backup["source_authority"]
+        )
+        plan = dict(
+            create_post_abort_recovery_plan(
+                reference,
+                snapshot,
+                candidate_release=release_identity(),
+                rollback_backup=backup,
+                rollback_encryption=rollback_encryption(),
+                rollback_backup_path="/private/tmp/authority-backup.age",
+                rollback_bundle_path="/private/tmp/authority-bundle.age",
+                authorization_receipt_path="/private/tmp/authority-auth.json",
+                application_receipt_path="/private/tmp/authority-app.json",
+                verification_receipt_path="/private/tmp/authority-verify.json",
+                rollback_receipt_path="/private/tmp/authority-rollback.json",
+                reference_application_authorization=(
+                    exact_drain_authorization(reference)
+                ),
+                reference_application_journal=(
+                    exact_drain_application_journal(reference)
+                ),
+                created_at=1_786_390_500,
+            )
+        )
+
+        def reseal(candidate, *, authorization=False):
+            journal = candidate["reference_application_journal"]
+            if authorization:
+                receipt = candidate["reference_application_authorization"]
+                receipt["receipt_digest"] = digest(
+                    {
+                        key: value
+                        for key, value in receipt.items()
+                        if key != "receipt_digest"
+                    }
+                )
+                candidate["reference_application_authorization_digest"] = (
+                    receipt["receipt_digest"]
+                )
+                journal["authorization_receipt_digest"] = receipt[
+                    "receipt_digest"
+                ]
+            journal["receipt_digest"] = digest(
+                {
+                    key: value
+                    for key, value in journal.items()
+                    if key != "receipt_digest"
+                }
+            )
+            candidate["reference_application_journal_digest"] = journal[
+                "receipt_digest"
+            ]
+            candidate["plan_digest"] = digest(
+                {
+                    key: value
+                    for key, value in candidate.items()
+                    if key != "plan_digest"
+                }
+            )
+            return candidate
+
+        forged_authorization = deepcopy(plan)
+        forged_authorization["reference_application_authorization"][
+            "candidate_release"
+        ]["release_digest"] = "0" * 64
+        started_at = deepcopy(plan)
+        started_at["reference_application_journal"]["started_at"] += 1
+        whitespace_start = deepcopy(plan)
+        whitespace_start["reference_application_journal"][
+            "worker_start_time"
+        ] = " dead-exact-drain-worker  "
+        invalid_pid = deepcopy(plan)
+        invalid_pid["reference_application_journal"]["worker_pid"] = (
+            2_147_483_648
+        )
+        invalid_attempt = deepcopy(plan)
+        invalid_attempt["reference_application_journal"]["worker_attempt"] = 6
+        invalid_receipt = deepcopy(plan)
+        invalid_receipt["reference_application_journal"][
+            "receipt_digest"
+        ] = "0" * 64
+        invalid_receipt["reference_application_journal_digest"] = "0" * 64
+        invalid_receipt["plan_digest"] = digest(
+            {
+                key: value
+                for key, value in invalid_receipt.items()
+                if key != "plan_digest"
+            }
+        )
+        cases = {
+            "forged-authorization": reseal(
+                forged_authorization,
+                authorization=True,
+            ),
+            "started-at": reseal(started_at),
+            "worker-start-time": reseal(whitespace_start),
+            "worker-pid": reseal(invalid_pid),
+            "worker-attempt": reseal(invalid_attempt),
+            "journal-receipt": invalid_receipt,
+        }
+        for label, candidate in cases.items():
+            with (
+                self.subTest(forgery=label),
+                self.assertRaises(OperationRecoveryError),
+            ):
+                verify_post_abort_recovery_plan(
+                    candidate,
+                    now=plan["created_at"],
+                )
 
     def test_exact_drain_plan_binds_the_43_pending_operations(self):
         planned_at = 1_785_462_000

@@ -711,18 +711,8 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
         selected = reference["selected_operations"]
         processing = [
             item for item in selected if item["operation_type"] == "retain"
-        ][:12] + [
-            item
-            for item in selected
-            if item["operation_type"] == "refresh_mental_model"
-        ]
+        ][:4]
         processing_ids = [item["operation_id"] for item in processing]
-        failed = next(
-            item
-            for item in reversed(selected)
-            if item["operation_type"] == "retain"
-            and item["operation_id"] not in processing_ids
-        )
         worker_id = exact_drain_worker_id(reference["plan_digest"])
         await connection.execute(
             """
@@ -735,18 +725,6 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
             """,
             worker_id,
             processing_ids,
-        )
-        await connection.execute(
-            """
-            UPDATE public.async_operations
-            SET status = 'failed',
-                retry_count = 3,
-                error_message = 'post-abort terminal failure secret',
-                completed_at = '2026-08-10T15:36:45Z',
-                updated_at = '2026-08-10T15:36:45Z'
-            WHERE operation_id = $1::uuid
-            """,
-            failed["operation_id"],
         )
         await connection.execute(
             "UPDATE public.hindsight_migration_generation "
@@ -798,9 +776,164 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
                 "/private/tmp/post-abort-verification.json"
             ),
             rollback_receipt_path="/private/tmp/post-abort-rollback.json",
+            reference_application_authorization=(
+                recovery_fixtures.exact_drain_authorization(reference)
+            ),
+            reference_application_journal=(
+                recovery_fixtures.exact_drain_application_journal(reference)
+            ),
             created_at=int(time.time()),
         )
-        return plan, cohort_ids, processing_ids, failed["operation_id"], unexpected_id
+        return plan, cohort_ids, processing_ids, unexpected_id
+
+    async def _legacy_post_abort_case(self, connection):
+        reference, cohort_ids, unexpected_id = await self._exact_drain_case(
+            connection
+        )
+        selected = reference["selected_operations"]
+        processing = [
+            item for item in selected if item["operation_type"] == "retain"
+        ][:12] + [
+            item
+            for item in selected
+            if item["operation_type"] == "refresh_mental_model"
+        ]
+        processing_ids = [item["operation_id"] for item in processing]
+        failed = next(
+            item
+            for item in reversed(selected)
+            if item["operation_type"] == "retain"
+            and item["operation_id"] not in processing_ids
+        )
+        worker_id = exact_drain_worker_id(reference["plan_digest"])
+        await connection.execute(
+            """
+            UPDATE public.async_operations
+            SET status = 'processing',
+                worker_id = $1,
+                claimed_at = '2026-08-10T10:01:15Z',
+                updated_at = '2026-08-10T10:01:15Z'
+            WHERE operation_id = ANY($2::uuid[])
+            """,
+            worker_id,
+            processing_ids,
+        )
+        await connection.execute(
+            """
+            UPDATE public.async_operations
+            SET status = 'failed',
+                retry_count = 3,
+                error_message = 'legacy post-abort failure secret',
+                completed_at = '2026-08-10T15:36:45Z',
+                updated_at = '2026-08-10T15:36:45Z'
+            WHERE operation_id = $1::uuid
+            """,
+            failed["operation_id"],
+        )
+        await connection.execute(
+            "UPDATE public.hindsight_migration_generation "
+            "SET generation = 123 WHERE singleton"
+        )
+        live_rows = await read_safe_operation_rows(
+            connection,
+            schema="public",
+            bank_id="engineering",
+            operation_ids=cohort_ids,
+        )
+        observed_at = int(time.time())
+        snapshot = create_live_snapshot(
+            reference["cohort"],
+            live_rows,
+            generation_before="systalyze:public:123",
+            generation_after="systalyze:public:123",
+            installation_authority=recovery_fixtures.installation_authority(),
+            observed_at=observed_at,
+        )
+        rollback = recovery_fixtures.rollback_backup_evidence()
+        rollback["source_authority"]["generation_before"] = (
+            "systalyze:public:123"
+        )
+        rollback["source_authority"]["generation_after"] = (
+            "systalyze:public:123"
+        )
+        rollback["source_authority_digest"] = recovery_fixtures.digest(
+            rollback["source_authority"]
+        )
+        selected_operations = [
+            {
+                "operation_id": item["operation_id"],
+                "operation_type": item["operation_type"],
+                "expected_status": item["current_status"],
+                "row_digest": item["row_digest"],
+                "task_payload_digest": item["task_payload_digest"],
+            }
+            for item in snapshot["operations"]
+            if item["current_status"] in {"processing", "failed"}
+        ]
+        candidate = {
+            "source_commit": "4" * 40,
+            "version": "2026.08.10+4444444.operation-recovery.17",
+            "release_digest": "5" * 64,
+        }
+        body = {
+            "schema_version": 1,
+            "kind": "operation-recovery-exact-drain-post-abort-plan",
+            "action": "recover-exact-drain-post-abort",
+            "authority": "unapproved-plan",
+            "mutation_authorized": False,
+            "candidate_release": candidate,
+            "installation_authority": snapshot["installation_authority"],
+            "reference_plan": reference,
+            "reference_plan_digest": reference["plan_digest"],
+            "reference_worker_id_digest": hashlib.sha256(
+                worker_id.encode("utf-8")
+            ).hexdigest(),
+            "live_snapshot": snapshot,
+            "cohort_digest": snapshot["cohort_digest"],
+            "snapshot_digest": snapshot["snapshot_digest"],
+            "pre_generation": snapshot["generation_before"],
+            "evidence_observed_at": observed_at,
+            "evidence_max_age_seconds": 3_600,
+            "transaction_timeout_seconds": 120,
+            "selected_operations": selected_operations,
+            "selected_operation_count": 15,
+            "selected_status_counts": {"failed": 1, "processing": 14},
+            "selected_type_counts": {
+                "refresh_mental_model": 2,
+                "retain": 13,
+            },
+            "selected_row_set_digest": recovery_fixtures.digest(
+                [
+                    {
+                        "operation_id": item["operation_id"],
+                        "row_digest": item["row_digest"],
+                        "task_payload_digest": item[
+                            "task_payload_digest"
+                        ],
+                    }
+                    for item in selected_operations
+                ]
+            ),
+            "preserved_status_counts": {"completed": 5, "pending": 28},
+            "rollback_backup": rollback,
+            "rollback_encryption": recovery_fixtures.rollback_encryption(),
+            "rollback_backup_path": "/private/tmp/legacy-post-abort-backup.age",
+            "rollback_bundle_path": "/private/tmp/legacy-post-abort-bundle.age",
+            "authorization_receipt_path": "/private/tmp/legacy-post-abort-auth.json",
+            "application_receipt_path": "/private/tmp/legacy-post-abort-app.json",
+            "verification_receipt_path": "/private/tmp/legacy-post-abort-verify.json",
+            "rollback_receipt_path": "/private/tmp/legacy-post-abort-rollback.json",
+            "created_at": observed_at,
+            "expires_at": observed_at + 86_400,
+        }
+        plan = {**body, "plan_digest": recovery_fixtures.digest(body)}
+        return (
+            plan,
+            cohort_ids,
+            processing_ids,
+            failed["operation_id"],
+            unexpected_id,
+        )
 
     @staticmethod
     async def _bind_disposable_exact_drain_identity(adapter, connection):
@@ -1062,10 +1195,9 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
                     plan,
                     cohort_ids,
                     processing_ids,
-                    failed_id,
                     unexpected_id,
                 ) = await self._post_abort_case(connection)
-                selected_ids = set(processing_ids) | {failed_id}
+                selected_ids = set(processing_ids)
                 before = {
                     row["operation_id"]: row
                     for row in await read_safe_operation_rows(
@@ -1101,23 +1233,24 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
                     self.assertEqual(after[operation_id]["status"], "pending")
                     self.assertFalse(after[operation_id]["worker_id_present"])
                     self.assertIsNone(after[operation_id]["claimed_at"])
-                    self.assertEqual(
-                        after[operation_id]["retry_count"],
-                        before[operation_id]["retry_count"],
-                    )
-                    self.assertEqual(
-                        after[operation_id]["task_payload_digest"],
-                        before[operation_id]["task_payload_digest"],
-                    )
-                self.assertEqual(after[failed_id]["status"], "pending")
-                self.assertEqual(after[failed_id]["retry_count"], 0)
-                self.assertIsNone(after[failed_id]["completed_at"])
-                self.assertEqual(after[failed_id]["error_category"], "none")
-                self.assertIsNone(after[failed_id]["error_digest"])
-                self.assertEqual(
-                    after[failed_id]["task_payload_digest"],
-                    before[failed_id]["task_payload_digest"],
-                )
+                    for key in (
+                        "bank_id",
+                        "operation_type",
+                        "created_at",
+                        "completed_at",
+                        "retry_count",
+                        "next_retry_at",
+                        "task_payload_present",
+                        "task_payload_digest",
+                        "result_metadata_digest",
+                        "error_category",
+                        "error_digest",
+                    ):
+                        self.assertEqual(
+                            after[operation_id][key],
+                            before[operation_id][key],
+                        )
+                self.assertEqual(len(set(cohort_ids) - selected_ids), 44)
                 for operation_id in set(cohort_ids) - selected_ids:
                     self.assertEqual(
                         live_row_digest(after[operation_id]),
@@ -1136,7 +1269,7 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
         async def exercise():
             connection = await self._connect()
             try:
-                plan, cohort_ids, _processing_ids, _failed_id, _unexpected_id = (
+                plan, cohort_ids, _processing_ids, _unexpected_id = (
                     await self._post_abort_case(connection)
                 )
                 before = {
@@ -1232,6 +1365,129 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
 
         asyncio.run(exercise())
 
+    def test_legacy_post_abort_apply_and_rollback_under_controlled_clock(self):
+        async def exercise():
+            connection = await self._connect()
+            try:
+                (
+                    plan,
+                    cohort_ids,
+                    _processing_ids,
+                    _failed_id,
+                    unexpected_id,
+                ) = await self._legacy_post_abort_case(connection)
+                operation_ids = [*cohort_ids, unexpected_id]
+                before = {
+                    row["operation_id"]: row
+                    for row in await read_safe_operation_rows(
+                        connection,
+                        schema="public",
+                        bank_id="engineering",
+                        operation_ids=operation_ids,
+                    )
+                }
+                preimage = await read_selected_preimage(
+                    connection,
+                    schema="public",
+                    selected_operations=plan["selected_operations"],
+                )
+                with patch.object(
+                    recovery_fixtures.recovery_contract.time,
+                    "time",
+                    return_value=plan["created_at"] + 10,
+                ):
+                    generation_before, generation_after = (
+                        await apply_post_abort_recovery_transaction(
+                            connection,
+                            profile_id="systalyze",
+                            schema="public",
+                            bank_id="engineering",
+                            plan=plan,
+                        )
+                    )
+                selected_ids = {
+                    item["operation_id"]
+                    for item in plan["selected_operations"]
+                }
+                applied = {
+                    row["operation_id"]: row
+                    for row in await read_safe_operation_rows(
+                        connection,
+                        schema="public",
+                        bank_id="engineering",
+                        operation_ids=operation_ids,
+                    )
+                }
+                self.assertEqual(generation_before, "systalyze:public:123")
+                self.assertEqual(generation_after, "systalyze:public:124")
+                self.assertEqual(
+                    {
+                        operation_id: row["status"]
+                        for operation_id, row in applied.items()
+                        if operation_id in selected_ids
+                    },
+                    {operation_id: "pending" for operation_id in selected_ids},
+                )
+                self.assertEqual(
+                    {
+                        operation_id: live_row_digest(row)
+                        for operation_id, row in applied.items()
+                        if operation_id not in selected_ids
+                    },
+                    {
+                        operation_id: live_row_digest(row)
+                        for operation_id, row in before.items()
+                        if operation_id not in selected_ids
+                    },
+                )
+                application = {"post_generation": generation_after}
+                rollback_record = {
+                    "pre_generation": generation_after,
+                    "post_generation": "systalyze:public:125",
+                }
+                with patch.object(
+                    recovery_fixtures.recovery_contract.time,
+                    "time",
+                    return_value=plan["expires_at"] + 10,
+                ):
+                    rollback_before, rollback_after = (
+                        await rollback_post_abort_recovery_transaction(
+                            connection,
+                            profile_id="systalyze",
+                            schema="public",
+                            bank_id="engineering",
+                            plan=plan,
+                            application=application,
+                            rollback_record=rollback_record,
+                            preimage=preimage,
+                        )
+                    )
+                restored = {
+                    row["operation_id"]: row
+                    for row in await read_safe_operation_rows(
+                        connection,
+                        schema="public",
+                        bank_id="engineering",
+                        operation_ids=operation_ids,
+                    )
+                }
+                self.assertEqual(rollback_before, "systalyze:public:124")
+                self.assertEqual(rollback_after, "systalyze:public:125")
+                self.assertEqual(
+                    {
+                        operation_id: live_row_digest(row)
+                        for operation_id, row in restored.items()
+                    },
+                    {
+                        operation_id: live_row_digest(row)
+                        for operation_id, row in before.items()
+                    },
+                )
+            finally:
+                await connection.close()
+
+        asyncio.run(exercise())
+
     def test_post_abort_rollback_times_out_while_generation_is_locked(self):
         async def exercise():
             connection = await self._connect()
@@ -1242,7 +1498,7 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
                     "POST_ABORT_TRANSACTION_TIMEOUT_SECONDS",
                     1,
                 ):
-                    plan, _cohort_ids, _processing_ids, _failed_id, _unexpected = (
+                    plan, _cohort_ids, _processing_ids, _unexpected = (
                         await self._post_abort_case(connection)
                     )
                     preimage = await read_selected_preimage(
@@ -1272,7 +1528,7 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
                         started = time.monotonic()
                         with self.assertRaisesRegex(
                             Exception,
-                            "timeout|canceling statement",
+                            "timeout|canceling statement|closed",
                         ):
                             await rollback_post_abort_recovery_transaction(
                                 connection,
@@ -1296,7 +1552,7 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
         async def exercise():
             connection = await self._connect()
             try:
-                plan, cohort_ids, _processing_ids, _failed_id, unexpected_id = (
+                plan, cohort_ids, _processing_ids, unexpected_id = (
                     await self._post_abort_case(connection)
                 )
                 await connection.execute(
@@ -1352,6 +1608,104 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
                         "public.hindsight_migration_generation WHERE singleton"
                     ),
                     123,
+                )
+            finally:
+                await connection.close()
+
+        asyncio.run(exercise())
+
+    def test_post_abort_v2_rejects_bound_row_and_generation_drift(self):
+        async def exercise():
+            connection = await self._connect()
+            try:
+                cases = {
+                    "ownership": (
+                        """UPDATE public.async_operations
+                        SET worker_id = 'different-worker'
+                        WHERE operation_id = $1::uuid""",
+                        "cohort drifted",
+                    ),
+                    "type": (
+                        """UPDATE public.async_operations
+                        SET operation_type = 'consolidation'
+                        WHERE operation_id = $1::uuid""",
+                        "cohort drifted",
+                    ),
+                    "payload": (
+                        """UPDATE public.async_operations
+                        SET task_payload = '{"memory": "drifted"}'::jsonb
+                        WHERE operation_id = $1::uuid""",
+                        "cohort drifted",
+                    ),
+                }
+                for label, (statement, message) in cases.items():
+                    with self.subTest(drift=label):
+                        plan, cohort_ids, _processing_ids, _unexpected_id = (
+                            await self._post_abort_case(connection)
+                        )
+                        selected_id = plan["selected_operations"][0][
+                            "operation_id"
+                        ]
+                        await connection.execute(statement, selected_id)
+                        await connection.execute(
+                            "UPDATE public.hindsight_migration_generation "
+                            "SET generation = 123 WHERE singleton"
+                        )
+                        before = {
+                            row["operation_id"]: live_row_digest(row)
+                            for row in await read_safe_operation_rows(
+                                connection,
+                                schema="public",
+                                bank_id="engineering",
+                                operation_ids=cohort_ids,
+                            )
+                        }
+                        with self.assertRaisesRegex(
+                            OperationRecoveryError,
+                            message,
+                        ):
+                            await apply_post_abort_recovery_transaction(
+                                connection,
+                                profile_id="systalyze",
+                                schema="public",
+                                bank_id="engineering",
+                                plan=plan,
+                            )
+                        after = {
+                            row["operation_id"]: live_row_digest(row)
+                            for row in await read_safe_operation_rows(
+                                connection,
+                                schema="public",
+                                bank_id="engineering",
+                                operation_ids=cohort_ids,
+                            )
+                        }
+                        self.assertEqual(after, before)
+
+                plan, _cohort_ids, _processing_ids, _unexpected_id = (
+                    await self._post_abort_case(connection)
+                )
+                await connection.execute(
+                    "UPDATE public.hindsight_migration_generation "
+                    "SET generation = 124 WHERE singleton"
+                )
+                with self.assertRaisesRegex(
+                    OperationRecoveryError,
+                    "generation drifted",
+                ):
+                    await apply_post_abort_recovery_transaction(
+                        connection,
+                        profile_id="systalyze",
+                        schema="public",
+                        bank_id="engineering",
+                        plan=plan,
+                    )
+                self.assertEqual(
+                    await connection.fetchval(
+                        "SELECT generation FROM "
+                        "public.hindsight_migration_generation WHERE singleton"
+                    ),
+                    124,
                 )
             finally:
                 await connection.close()

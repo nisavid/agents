@@ -10,13 +10,15 @@ import runpy
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 import unittest
-from contextlib import asynccontextmanager, nullcontext
+from contextlib import asynccontextmanager, ExitStack, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
@@ -39,6 +41,25 @@ from tooling.hindsight.lib.hindsight_memory_control_plane.operation_recovery_pro
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _copy_patchable_entity_resolver(candidate_library: Path) -> Path:
+    package_spec = importlib.util.find_spec("hindsight_api")
+    if package_spec is None or package_spec.origin is None:
+        raise unittest.SkipTest("hindsight_api candidate source is unavailable")
+    source = Path(package_spec.origin).parent / "engine" / "entity_resolver.py"
+    if not source.is_file():
+        raise unittest.SkipTest("hindsight_api entity resolver is unavailable")
+    target = (
+        candidate_library
+        / "hindsight_api"
+        / "engine"
+        / "entity_resolver.py"
+    )
+    target.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    shutil.copyfile(source, target)
+    target.chmod(0o600)
+    return target
 
 
 async def _locked_status(events, plan):
@@ -129,6 +150,7 @@ class OperationRecoveryCliTest(unittest.TestCase):
             reference_application_journal=(
                 recovery_fixtures.exact_drain_application_journal(reference)
             ),
+            reference_application_progress_digest="c" * 64,
             created_at=snapshot["observed_at"],
         )
 
@@ -541,6 +563,9 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                     lambda _value, *, plan: journal
                 ),
                 "_operation_recovery_post_abort_verify_live": verify_live,
+                "_operation_recovery_post_abort_reference_progress_digest": (
+                    lambda _reference_plan, _reference_journal: "c" * 64
+                ),
                 "_operation_recovery_prepare_apply": fail_prepare,
                 "_operation_recovery_post_abort_apply": fail_apply,
                 "_operation_recovery_finalize_journal": (
@@ -891,7 +916,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
         self.assertEqual(result["status"], "rolled-back")
         self.assertEqual(result["rollback_receipt_digest"], "c" * 64)
 
-    def test_post_abort_verify_command_seals_v2_plan_bound_evidence(self):
+    def test_post_abort_verify_command_seals_v3_plan_bound_evidence(self):
         command = self.controller[
             "operation_recovery_post_abort_verify_command"
         ]
@@ -914,8 +939,8 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             }
             evidence = {
                 "generation": application["post_generation"],
-                "selected_operation_count": 4,
-                "selected_status_counts": {"pending": 4},
+                "selected_operation_count": 3,
+                "selected_status_counts": {"pending": 3},
                 "cohort_operation_count": 48,
             }
             documents = {
@@ -965,7 +990,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 globals_.update(originals)
 
             self.assertEqual(result["status"], "verified")
-            self.assertEqual(result["selected_operation_count"], 4)
+            self.assertEqual(result["selected_operation_count"], 3)
             receipt, create_only = written[plan["verification_receipt_path"]]
             self.assertIs(create_only, True)
             self.assertEqual(receipt["plan_digest"], plan["plan_digest"])
@@ -1666,6 +1691,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 "backup": backup,
             }
             written = {}
+            runtime_schemas = []
             candidate = recovery_fixtures.release_identity()
             replacements = {
                 "_operation_recovery_candidate": lambda _args: candidate,
@@ -1679,8 +1705,13 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 "exact_drain_effective_profile_digest": (
                     lambda _policy, _environment: "7" * 64
                 ),
+                "_operation_recovery_exact_phase_repair_snapshot": (
+                    lambda: "6" * 64
+                ),
                 "_operation_recovery_exact_runtime_digest": (
-                    lambda _args, *, schema_version=2: "8" * 64
+                    lambda _args, *, schema_version=3: (
+                        runtime_schemas.append(schema_version) or "8" * 64
+                    )
                 ),
                 "_operation_recovery_validate_exact_worker_provider_runtime": (
                     lambda _policy, _worker_runtime: None
@@ -1716,9 +1747,11 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             self.assertEqual(result["status"], "planned")
             self.assertEqual(result["authority"], "unapproved-plan")
             self.assertEqual(result["selected_operation_count"], 43)
+            self.assertEqual(runtime_schemas, [3])
             plan, create_only = written[args.output]
             self.assertIs(create_only, True)
             self.assertIs(plan["mutation_authorized"], False)
+            self.assertEqual(plan["schema_version"], 3)
             serialized = json.dumps(plan, sort_keys=True)
             self.assertNotIn('"task_payload":', serialized)
             self.assertNotIn('"worker_id":', serialized)
@@ -1765,7 +1798,94 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 globals_.update(originals)
             self.assertEqual(written, {})
 
-    def test_post_abort_plan_command_emits_exact_current_v2_subset(self):
+    def test_exact_drain_plan_rejects_unpatched_legacy_candidate_snapshot(self):
+        command = self.controller["operation_recovery_drain_plan_command"]
+        globals_ = command.__globals__
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        with tempfile.TemporaryDirectory(
+            dir="/private/tmp",
+            prefix="exact-drain-legacy-snapshot-plan-",
+        ) as directory:
+            root = Path(directory)
+            root.chmod(0o700)
+            candidate_library = root / "candidate-lib"
+            provider_root = (
+                candidate_library / "exact_drain_runtime" / "provider"
+            )
+            provider_root.mkdir(parents=True, mode=0o700)
+            sources = []
+            for name in ("sitecustomize.py", "hindsight_llm_failover.py"):
+                body = f"# legacy {name}\n".encode()
+                path = provider_root / name
+                path.write_bytes(body)
+                path.chmod(0o600)
+                sources.append(
+                    {
+                        "path": f"provider/{name}",
+                        "sha256": hashlib.sha256(body).hexdigest(),
+                        "size": len(body),
+                    }
+                )
+            manifest = {
+                "schema_version": 1,
+                "kind": "exact-drain-candidate-runtime-snapshot",
+                "sources": sources,
+            }
+            manifest_path = provider_root.parent / "manifest.json"
+            manifest_path.write_text(
+                json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+                + "\n",
+                encoding="utf-8",
+            )
+            manifest_path.chmod(0o600)
+            documents = {
+                "cohort": fixtures.cohort(),
+                "snapshot": fixtures.drain_snapshot(
+                    observed_at=int(time.time())
+                ),
+                "backup": recovery_fixtures.drain_backup_evidence(),
+            }
+            writes = []
+            replacements = {
+                "LIB": candidate_library,
+                "_operation_recovery_candidate": (
+                    lambda _args: recovery_fixtures.release_identity()
+                ),
+                "_operation_recovery_read_private_json": (
+                    lambda path, _label: documents[str(path)]
+                ),
+                "_operation_recovery_exact_provider_policy_evidence": (
+                    lambda _path: self.fail("provider policy was activated")
+                ),
+                "write_private": lambda *_args, **_kwargs: writes.append(True),
+            }
+            originals = {key: globals_[key] for key in replacements}
+            globals_.update(replacements)
+            args = SimpleNamespace(
+                cohort="cohort",
+                snapshot="snapshot",
+                rollback_backup_evidence="backup",
+                rollback_backup=str(root / "rollback.age"),
+                provider_policy=str(root / "providers.json"),
+                provider_runtime_root=str(root / "provider-runtime"),
+                worker_runtime=str(root / "hindsight-worker"),
+                authorization_receipt=str(root / "authorization.json"),
+                application_receipt=str(root / "application.json"),
+                status_artifact=str(root / "status.json"),
+                verification_receipt=str(root / "verification.json"),
+                output=str(root / "plan.json"),
+            )
+            try:
+                with self.assertRaisesRegex(
+                    Exception,
+                    "phase repair candidate snapshot is required",
+                ):
+                    command(args)
+            finally:
+                globals_.update(originals)
+            self.assertEqual(writes, [])
+
+    def test_post_abort_plan_command_emits_exact_current_v3_subset(self):
         command = self.controller[
             "operation_recovery_post_abort_plan_command"
         ]
@@ -1835,6 +1955,21 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 "_password": "not-observable",
             }
             worker_active = Mock(return_value=False)
+            progress_value = {
+                "plan_digest": reference["plan_digest"],
+                "progress_digest": "c" * 64,
+                "worker_pid": journal["worker_pid"],
+                "worker_start_time": journal["worker_start_time"],
+                "worker_attempt": journal["worker_attempt"],
+                "tasks": [
+                    {
+                        "operation_id": item["operation_id"],
+                        "operation_type": item["operation_type"],
+                        "row_digest": item["row_digest"],
+                    }
+                    for item in reference["selected_operations"]
+                ],
+            }
             replacements = {
                 "_operation_recovery_candidate": lambda _args: candidate,
                 "_operation_recovery_read_private_json": (
@@ -1851,6 +1986,9 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 ),
                 "_operation_recovery_exact_journal_worker_active": (
                     worker_active
+                ),
+                "read_exact_drain_progress": (
+                    lambda _path, *, plan_digest: dict(progress_value)
                 ),
                 "read_pg0_registration": lambda _profile: dict(registration),
                 "write_private": (
@@ -1883,10 +2021,10 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
 
             self.assertEqual(result["status"], "planned")
             self.assertEqual(result["authority"], "unapproved-plan")
-            self.assertEqual(result["selected_operation_count"], 4)
+            self.assertEqual(result["selected_operation_count"], 3)
             plan, create_only = written[args.output]
             self.assertIs(create_only, True)
-            self.assertEqual(plan["schema_version"], 2)
+            self.assertEqual(plan["schema_version"], 3)
             self.assertEqual(
                 plan["reference_application_authorization"],
                 authorization,
@@ -1900,16 +2038,87 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 plan["reference_application_journal_digest"],
                 journal["receipt_digest"],
             )
-            self.assertEqual(plan["selected_status_counts"], {"processing": 4})
-            self.assertEqual(plan["selected_type_counts"], {"retain": 4})
+            self.assertEqual(
+                plan["reference_application_progress_digest"],
+                "c" * 64,
+            )
+            self.assertEqual(plan["selected_status_counts"], {"processing": 3})
+            self.assertEqual(plan["selected_type_counts"], {"retain": 3})
             self.assertEqual(
                 plan["preserved_status_counts"],
-                {"completed": 5, "pending": 39},
+                {"completed": 5, "pending": 40},
             )
             serialized = json.dumps(plan, sort_keys=True)
             self.assertNotIn('"task_payload":', serialized)
             self.assertNotIn('"worker_id":', serialized)
             self.assertNotIn('"error_message":', serialized)
+
+            for label, changed_tasks in (
+                (
+                    "foreign",
+                    [
+                        {
+                            **progress_value["tasks"][0],
+                            "operation_id": "ffffffff-ffff-4fff-8fff-ffffffffffff",
+                        },
+                        *progress_value["tasks"][1:],
+                    ],
+                ),
+                ("depleted", progress_value["tasks"][:-1]),
+            ):
+                with self.subTest(progress=label):
+                    progress_value["tasks"] = changed_tasks
+                    progress_value["progress_digest"] = self.controller[
+                        "digest"
+                    ](
+                        {
+                            key: value
+                            for key, value in progress_value.items()
+                            if key != "progress_digest"
+                        }
+                    )
+                    written.clear()
+                    globals_.update(replacements)
+                    try:
+                        with self.assertRaisesRegex(
+                            Exception,
+                            "reference exact drain progress differs",
+                        ):
+                            command(args)
+                    finally:
+                        globals_.update(originals)
+                    self.assertEqual(written, {})
+
+            progress_value["tasks"] = [
+                {
+                    "operation_id": item["operation_id"],
+                    "operation_type": item["operation_type"],
+                    "row_digest": item["row_digest"],
+                }
+                for item in reference["selected_operations"]
+            ]
+            for field, value in (
+                ("worker_pid", journal["worker_pid"] + 1),
+                ("worker_start_time", "foreign-worker-start"),
+                ("worker_attempt", journal["worker_attempt"] + 1),
+            ):
+                original = progress_value[field]
+                progress_value[field] = value
+                written.clear()
+                globals_.update(replacements)
+                try:
+                    with (
+                        self.subTest(progress_identity=field),
+                        self.assertRaisesRegex(
+                            Exception,
+                            "reference exact drain progress differs",
+                        ),
+                    ):
+                        command(args)
+                finally:
+                    globals_.update(originals)
+                    progress_value[field] = original
+                self.assertEqual(written, {})
 
             worker_active.return_value = True
             written.clear()
@@ -2412,6 +2621,8 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             source = package / "__init__.py"
             source.write_text("VERSION = 1\n", encoding="utf-8")
             source.chmod(0o600)
+            resolver = _copy_patchable_entity_resolver(site_packages)
+            original_resolver = resolver.read_bytes()
             provider_root = root / "provider-runtime"
             provider_root.mkdir(mode=0o700)
             for name in ("sitecustomize.py", "hindsight_llm_failover.py"):
@@ -2426,6 +2637,34 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 )
             )
             self.assertRegex(snapshot["snapshot_digest"], r"^[0-9a-f]{64}$")
+            self.assertEqual(snapshot["schema_version"], 2)
+            patched_resolver = resolver.read_text(encoding="utf-8")
+            self.assertNotEqual(resolver.read_bytes(), original_resolver)
+            trigram_source = patched_resolver.split(
+                "    async def _resolve_entities_batch_trigram(",
+                1,
+            )[1].split(
+                "    async def _resolve_entities_batch_oracle_fuzzy(",
+                1,
+            )[0]
+            self.assertNotIn(
+                "SELECT e.id, e.canonical_name, e.metadata, e.last_seen, e.mention_count,",
+                trigram_source,
+            )
+            self.assertIn(
+                "WHERE ec.entity_id_1 = ANY($1::uuid[])\n"
+                "                   AND ec.entity_id_2 = ANY($1::uuid[])",
+                trigram_source,
+            )
+            self.assertIn(
+                "retain.phase1.candidates.exact.", trigram_source
+            )
+            self.assertIn(
+                "retain.phase1.candidates.fuzzy.", trigram_source
+            )
+            self.assertIn("retain.phase1.cooccurrence", trigram_source)
+            self.assertIn("retain.phase1.scoring", trigram_source)
+            self.assertIn("timeout=120.0", trigram_source)
             candidate_provider_root = (
                 site_packages / "exact_drain_runtime" / "provider"
             )
@@ -2604,6 +2843,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             provider_root.mkdir(mode=0o700)
             candidate_library = root / "candidate-lib"
             candidate_library.mkdir(mode=0o700)
+            resolver = _copy_patchable_entity_resolver(candidate_library)
             for name in ("sitecustomize.py", "hindsight_llm_failover.py"):
                 source = provider_root / name
                 source.write_text(f"# exact {name}\n", encoding="utf-8")
@@ -2629,6 +2869,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 "exact-drain-candidate-runtime-snapshot",
             )
             self.assertRegex(value["snapshot_digest"], r"^[0-9a-f]{64}$")
+            self.assertEqual(value["schema_version"], 2)
             self.assertNotIn(str(provider_root), result.stdout)
             verified, sources = (
                 operation_recovery_runtime.
@@ -2641,6 +2882,13 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 value["snapshot_digest"],
             )
             self.assertEqual(set(sources), {"sitecustomize.py", "hindsight_llm_failover.py"})
+            resolver_bytes = resolver.read_bytes()
+            resolver.write_bytes(resolver_bytes + b"# drift\n")
+            with self.assertRaisesRegex(Exception, "snapshot differs"):
+                operation_recovery_runtime.verify_exact_drain_candidate_runtime_snapshot(
+                    candidate_library
+                )
+            resolver.write_bytes(resolver_bytes)
             repeated = subprocess.run(
                 command,
                 check=False,
@@ -2660,6 +2908,966 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 operation_recovery_runtime.verify_exact_drain_candidate_runtime_snapshot(
                     candidate_library
                 )
+
+    def test_exact_drain_snapshot_recovers_source_commit_after_manifest(self):
+        with tempfile.TemporaryDirectory(
+            dir="/private/tmp",
+            prefix="exact-drain-snapshot-recovery-",
+        ) as directory:
+            root = Path(directory)
+            root.chmod(0o700)
+            provider_root = root / "provider-runtime"
+            provider_root.mkdir(mode=0o700)
+            candidate_library = root / "candidate-lib"
+            candidate_library.mkdir(mode=0o700)
+            resolver = _copy_patchable_entity_resolver(candidate_library)
+            original = resolver.read_bytes()
+            for name in ("sitecustomize.py", "hindsight_llm_failover.py"):
+                source = provider_root / name
+                source.write_text(f"# exact {name}\n", encoding="utf-8")
+                source.chmod(0o600)
+
+            with (
+                patch.object(
+                    operation_recovery_runtime.os,
+                    "replace",
+                    side_effect=OSError("simulated source commit interruption"),
+                ),
+                self.assertRaisesRegex(Exception, "snapshot is unavailable"),
+            ):
+                operation_recovery_runtime.assemble_exact_drain_candidate_runtime_snapshot(
+                    provider_root,
+                    candidate_library,
+                )
+
+            self.assertEqual(resolver.read_bytes(), original)
+            self.assertTrue(
+                (candidate_library / "exact_drain_runtime" / "manifest.json").is_file()
+            )
+            recovered = (
+                operation_recovery_runtime.
+                assemble_exact_drain_candidate_runtime_snapshot(
+                    provider_root,
+                    candidate_library,
+                )
+            )
+            self.assertEqual(recovered["schema_version"], 2)
+            self.assertNotEqual(resolver.read_bytes(), original)
+            with self.assertRaisesRegex(Exception, "already exists"):
+                operation_recovery_runtime.assemble_exact_drain_candidate_runtime_snapshot(
+                    provider_root,
+                    candidate_library,
+                )
+
+    def test_exact_drain_snapshot_file_failure_never_publishes_partial_root(self):
+        with tempfile.TemporaryDirectory(
+            dir="/private/tmp",
+            prefix="exact-drain-snapshot-atomic-",
+        ) as directory:
+            root = Path(directory)
+            root.chmod(0o700)
+            provider_root = root / "provider-runtime"
+            provider_root.mkdir(mode=0o700)
+            candidate_library = root / "candidate-lib"
+            candidate_library.mkdir(mode=0o700)
+            resolver = _copy_patchable_entity_resolver(candidate_library)
+            original = resolver.read_bytes()
+            for name in ("sitecustomize.py", "hindsight_llm_failover.py"):
+                source = provider_root / name
+                source.write_text(f"# exact {name}\n", encoding="utf-8")
+                source.chmod(0o600)
+
+            write_snapshot_file = (
+                operation_recovery_runtime._write_exact_drain_snapshot_file
+            )
+            failed = False
+
+            def fail_first_provider_file(path, body):
+                nonlocal failed
+                if not failed and Path(path).name == "sitecustomize.py":
+                    failed = True
+                    raise operation_recovery_runtime.OperationRecoveryError(
+                        "exact drain candidate runtime snapshot is unavailable"
+                    )
+                return write_snapshot_file(path, body)
+
+            with (
+                patch.object(
+                    operation_recovery_runtime,
+                    "_write_exact_drain_snapshot_file",
+                    side_effect=fail_first_provider_file,
+                ),
+                self.assertRaisesRegex(Exception, "snapshot is unavailable"),
+            ):
+                operation_recovery_runtime.assemble_exact_drain_candidate_runtime_snapshot(
+                    provider_root,
+                    candidate_library,
+                )
+
+            self.assertFalse(
+                (candidate_library / "exact_drain_runtime").exists()
+            )
+            self.assertEqual(resolver.read_bytes(), original)
+            recovered = (
+                operation_recovery_runtime.
+                assemble_exact_drain_candidate_runtime_snapshot(
+                    provider_root,
+                    candidate_library,
+                )
+            )
+            self.assertEqual(recovered["schema_version"], 2)
+
+    def test_exact_drain_snapshot_failure_boundaries_are_retryable(self):
+        for boundary in (
+            "mkdir",
+            "manifest",
+            "publish",
+            "publish-fsync",
+            "source-fsync",
+        ):
+            with (
+                self.subTest(boundary=boundary),
+                tempfile.TemporaryDirectory(
+                    dir="/private/tmp",
+                    prefix=f"exact-drain-snapshot-{boundary}-",
+                ) as directory,
+            ):
+                root = Path(directory)
+                root.chmod(0o700)
+                provider_root = root / "provider-runtime"
+                provider_root.mkdir(mode=0o700)
+                candidate_library = root / "candidate-lib"
+                candidate_library.mkdir(mode=0o700)
+                resolver = _copy_patchable_entity_resolver(candidate_library)
+                original = resolver.read_bytes()
+                for name in (
+                    "sitecustomize.py",
+                    "hindsight_llm_failover.py",
+                ):
+                    source = provider_root / name
+                    source.write_text(
+                        f"# exact {name}\n",
+                        encoding="utf-8",
+                    )
+                    source.chmod(0o600)
+
+                failed = False
+                with ExitStack() as stack:
+                    if boundary == "mkdir":
+                        mkdir = Path.mkdir
+
+                        def fault_mkdir(
+                            path,
+                            *args,
+                            _mkdir=mkdir,
+                            **kwargs,
+                        ):
+                            nonlocal failed
+                            if (
+                                not failed
+                                and path.name
+                                == ".exact_drain_runtime.staging"
+                            ):
+                                failed = True
+                                raise OSError("simulated mkdir interruption")
+                            return _mkdir(path, *args, **kwargs)
+
+                        stack.enter_context(
+                            patch.object(Path, "mkdir", new=fault_mkdir)
+                        )
+                    elif boundary == "manifest":
+                        writer = operation_recovery_runtime._write_exact_drain_snapshot_file
+
+                        def fault_manifest(path, body, _writer=writer):
+                            nonlocal failed
+                            if not failed and Path(path).name == "manifest.json":
+                                failed = True
+                                raise operation_recovery_runtime.OperationRecoveryError(
+                                    "exact drain candidate runtime snapshot is unavailable"
+                                )
+                            return _writer(path, body)
+
+                        stack.enter_context(
+                            patch.object(
+                                operation_recovery_runtime,
+                                "_write_exact_drain_snapshot_file",
+                                side_effect=fault_manifest,
+                            )
+                        )
+                    elif boundary == "publish":
+                        stack.enter_context(
+                            patch.object(
+                                operation_recovery_runtime,
+                                "_publish_exact_drain_snapshot_directory",
+                                side_effect=operation_recovery_runtime.OperationRecoveryError(
+                                    "exact drain candidate runtime snapshot is unavailable"
+                                ),
+                            )
+                        )
+                    elif boundary == "publish-fsync":
+                        fsync_directory = (
+                            operation_recovery_runtime._fsync_exact_drain_directory
+                        )
+
+                        def fault_publish_fsync(
+                            path,
+                            _candidate_library=candidate_library,
+                            _fsync_directory=fsync_directory,
+                        ):
+                            nonlocal failed
+                            if (
+                                not failed
+                                and Path(path) == _candidate_library
+                            ):
+                                failed = True
+                                raise operation_recovery_runtime.OperationRecoveryError(
+                                    "exact drain candidate runtime snapshot is unavailable"
+                                )
+                            return _fsync_directory(path)
+
+                        stack.enter_context(
+                            patch.object(
+                                operation_recovery_runtime,
+                                "_fsync_exact_drain_directory",
+                                side_effect=fault_publish_fsync,
+                            )
+                        )
+                    else:
+                        fsync = operation_recovery_runtime.os.fsync
+
+                        def fault_source_fsync(descriptor, _fsync=fsync):
+                            nonlocal failed
+                            if (
+                                not failed
+                                and stat.S_ISDIR(
+                                    os.fstat(descriptor).st_mode
+                                )
+                            ):
+                                failed = True
+                                raise OSError("simulated source fsync interruption")
+                            return _fsync(descriptor)
+
+                        stack.enter_context(
+                            patch.object(
+                                operation_recovery_runtime,
+                                "_fsync_exact_drain_directory",
+                                return_value=None,
+                            )
+                        )
+                        stack.enter_context(
+                            patch.object(
+                                operation_recovery_runtime.os,
+                                "fsync",
+                                side_effect=fault_source_fsync,
+                            )
+                        )
+
+                    with self.assertRaisesRegex(
+                        Exception,
+                        "snapshot is unavailable",
+                    ):
+                        operation_recovery_runtime.assemble_exact_drain_candidate_runtime_snapshot(
+                            provider_root,
+                            candidate_library,
+                        )
+
+                recovered = operation_recovery_runtime.assemble_exact_drain_candidate_runtime_snapshot(
+                    provider_root,
+                    candidate_library,
+                )
+                self.assertEqual(recovered["schema_version"], 2)
+                self.assertNotEqual(resolver.read_bytes(), original)
+                self.assertFalse(
+                    (
+                        candidate_library
+                        / ".exact_drain_runtime.recovery"
+                    ).exists()
+                )
+                with self.assertRaisesRegex(Exception, "already exists"):
+                    operation_recovery_runtime.assemble_exact_drain_candidate_runtime_snapshot(
+                        provider_root,
+                        candidate_library,
+                    )
+
+    def test_exact_drain_snapshot_recovers_after_final_marker_unlink_fsync(self):
+        with tempfile.TemporaryDirectory(
+            dir="/private/tmp",
+            prefix="exact-drain-snapshot-finalize-fsync-",
+        ) as directory:
+            root = Path(directory)
+            root.chmod(0o700)
+            provider_root = root / "provider-runtime"
+            provider_root.mkdir(mode=0o700)
+            candidate_library = root / "candidate-lib"
+            candidate_library.mkdir(mode=0o700)
+            resolver = _copy_patchable_entity_resolver(candidate_library)
+            for name in ("sitecustomize.py", "hindsight_llm_failover.py"):
+                source = provider_root / name
+                source.write_text(f"# exact {name}\n", encoding="utf-8")
+                source.chmod(0o600)
+
+            fsync_directory = (
+                operation_recovery_runtime._fsync_exact_drain_directory
+            )
+            library_fsyncs = 0
+
+            def fail_final_library_fsync(path):
+                nonlocal library_fsyncs
+                if Path(path) == candidate_library:
+                    library_fsyncs += 1
+                    if library_fsyncs == 3:
+                        raise operation_recovery_runtime.OperationRecoveryError(
+                            "exact drain candidate runtime snapshot is unavailable"
+                        )
+                return fsync_directory(path)
+
+            with (
+                patch.object(
+                    operation_recovery_runtime,
+                    "_fsync_exact_drain_directory",
+                    side_effect=fail_final_library_fsync,
+                ),
+                self.assertRaisesRegex(Exception, "snapshot is unavailable"),
+            ):
+                operation_recovery_runtime.assemble_exact_drain_candidate_runtime_snapshot(
+                    provider_root,
+                    candidate_library,
+                )
+
+            recovery_path = (
+                candidate_library / ".exact_drain_runtime.recovery"
+            )
+            self.assertTrue(recovery_path.is_file())
+            patched = resolver.read_bytes()
+
+            provider_source = provider_root / "sitecustomize.py"
+            provider_body = provider_source.read_bytes()
+            provider_source.write_bytes(provider_body + b"# foreign\n")
+            with self.assertRaisesRegex(Exception, "snapshot differs"):
+                operation_recovery_runtime.assemble_exact_drain_candidate_runtime_snapshot(
+                    provider_root,
+                    candidate_library,
+                )
+            provider_source.write_bytes(provider_body)
+
+            resolver.write_bytes(patched + b"# drift\n")
+            with self.assertRaisesRegex(Exception, "snapshot differs"):
+                operation_recovery_runtime.assemble_exact_drain_candidate_runtime_snapshot(
+                    provider_root,
+                    candidate_library,
+                )
+            resolver.write_bytes(patched)
+
+            recovered = operation_recovery_runtime.assemble_exact_drain_candidate_runtime_snapshot(
+                provider_root,
+                candidate_library,
+            )
+            self.assertEqual(recovered["schema_version"], 2)
+            self.assertFalse(recovery_path.exists())
+
+    def test_exact_drain_recovery_marker_partial_write_is_retryable(self):
+        with tempfile.TemporaryDirectory(
+            dir="/private/tmp",
+            prefix="exact-drain-marker-partial-write-",
+        ) as directory:
+            root = Path(directory)
+            root.chmod(0o700)
+            provider_root = root / "provider-runtime"
+            provider_root.mkdir(mode=0o700)
+            candidate_library = root / "candidate-lib"
+            candidate_library.mkdir(mode=0o700)
+            resolver = _copy_patchable_entity_resolver(candidate_library)
+            original = resolver.read_bytes()
+            for name in ("sitecustomize.py", "hindsight_llm_failover.py"):
+                source = provider_root / name
+                source.write_text(f"# exact {name}\n", encoding="utf-8")
+                source.chmod(0o600)
+
+            recovery_path = (
+                candidate_library / ".exact_drain_runtime.recovery"
+            )
+            recovery_staging = recovery_path.with_name(
+                f".{recovery_path.name}.staging"
+            )
+            original_open = operation_recovery_runtime.os.open
+            original_write = operation_recovery_runtime.os.write
+            marker_descriptor = None
+            wrote_partial = False
+
+            def observe_marker_open(path, flags, *arguments):
+                nonlocal marker_descriptor
+                descriptor = original_open(path, flags, *arguments)
+                if Path(path) in {recovery_path, recovery_staging}:
+                    marker_descriptor = descriptor
+                return descriptor
+
+            def fault_marker_write(descriptor, body):
+                nonlocal wrote_partial
+                if descriptor == marker_descriptor:
+                    if wrote_partial:
+                        raise OSError("simulated partial marker write")
+                    wrote_partial = True
+                    return original_write(
+                        descriptor,
+                        body[: max(1, len(body) // 2)],
+                    )
+                return original_write(descriptor, body)
+
+            with (
+                patch.object(
+                    operation_recovery_runtime.os,
+                    "open",
+                    side_effect=observe_marker_open,
+                ),
+                patch.object(
+                    operation_recovery_runtime.os,
+                    "write",
+                    side_effect=fault_marker_write,
+                ),
+                self.assertRaisesRegex(Exception, "snapshot is unavailable"),
+            ):
+                operation_recovery_runtime.assemble_exact_drain_candidate_runtime_snapshot(
+                    provider_root,
+                    candidate_library,
+                )
+
+            self.assertTrue(wrote_partial)
+            self.assertFalse(recovery_path.exists())
+            self.assertEqual(resolver.read_bytes(), original)
+            recovered = operation_recovery_runtime.assemble_exact_drain_candidate_runtime_snapshot(
+                provider_root,
+                candidate_library,
+            )
+            self.assertEqual(recovered["schema_version"], 2)
+            self.assertNotEqual(resolver.read_bytes(), original)
+
+    def test_exact_drain_recovery_marker_fault_matrix_is_retryable(self):
+        for branch in ("fresh", "existing-runtime"):
+            for fault in ("after-create", "partial-write", "fsync"):
+                with (
+                    self.subTest(branch=branch, fault=fault),
+                    tempfile.TemporaryDirectory(
+                        dir="/private/tmp",
+                        prefix=f"exact-drain-marker-{branch}-{fault}-",
+                    ) as directory,
+                ):
+                    root = Path(directory)
+                    root.chmod(0o700)
+                    provider_root = root / "provider-runtime"
+                    provider_root.mkdir(mode=0o700)
+                    candidate_library = root / "candidate-lib"
+                    candidate_library.mkdir(mode=0o700)
+                    resolver = _copy_patchable_entity_resolver(
+                        candidate_library
+                    )
+                    original = resolver.read_bytes()
+                    for name in (
+                        "sitecustomize.py",
+                        "hindsight_llm_failover.py",
+                    ):
+                        source = provider_root / name
+                        source.write_text(
+                            f"# exact {name}\n",
+                            encoding="utf-8",
+                        )
+                        source.chmod(0o600)
+
+                    recovery_path = (
+                        candidate_library
+                        / ".exact_drain_runtime.recovery"
+                    )
+                    recovery_staging = recovery_path.with_name(
+                        f".{recovery_path.name}.staging"
+                    )
+                    if branch == "existing-runtime":
+                        with (
+                            patch.object(
+                                operation_recovery_runtime,
+                                "_write_exact_drain_snapshot_recovery_file",
+                                side_effect=operation_recovery_runtime.OperationRecoveryError(
+                                    "exact drain candidate runtime snapshot is unavailable"
+                                ),
+                            ),
+                            self.assertRaisesRegex(
+                                Exception,
+                                "snapshot is unavailable",
+                            ),
+                        ):
+                            operation_recovery_runtime.assemble_exact_drain_candidate_runtime_snapshot(
+                                provider_root,
+                                candidate_library,
+                            )
+                        self.assertTrue(
+                            (
+                                candidate_library / "exact_drain_runtime"
+                            ).is_dir()
+                        )
+
+                    original_open = operation_recovery_runtime.os.open
+                    original_write = operation_recovery_runtime.os.write
+                    original_fsync = operation_recovery_runtime.os.fsync
+                    marker_state = {"descriptor": None}
+                    partial_written = False
+                    faulted = False
+
+                    def fault_marker_open(
+                        path,
+                        flags,
+                        *arguments,
+                        _original_open=original_open,
+                        _recovery_staging=recovery_staging,
+                        _fault=fault,
+                        _marker_state=marker_state,
+                    ):
+                        nonlocal faulted
+                        descriptor = _original_open(path, flags, *arguments)
+                        if Path(path) == _recovery_staging:
+                            _marker_state["descriptor"] = descriptor
+                            if _fault == "after-create" and not faulted:
+                                faulted = True
+                                os.close(descriptor)
+                                raise OSError(
+                                    "simulated marker create interruption"
+                                )
+                        return descriptor
+
+                    def fault_marker_write(
+                        descriptor,
+                        body,
+                        _fault=fault,
+                        _original_write=original_write,
+                        _marker_state=marker_state,
+                    ):
+                        nonlocal partial_written, faulted
+                        if (
+                            _fault == "partial-write"
+                            and descriptor == _marker_state["descriptor"]
+                        ):
+                            if partial_written and not faulted:
+                                faulted = True
+                                raise OSError(
+                                    "simulated partial marker write"
+                                )
+                            partial_written = True
+                            return _original_write(
+                                descriptor,
+                                body[: max(1, len(body) // 2)],
+                            )
+                        return _original_write(descriptor, body)
+
+                    def fault_marker_fsync(
+                        descriptor,
+                        _fault=fault,
+                        _original_fsync=original_fsync,
+                        _marker_state=marker_state,
+                    ):
+                        nonlocal faulted
+                        if (
+                            _fault == "fsync"
+                            and descriptor == _marker_state["descriptor"]
+                            and not faulted
+                        ):
+                            faulted = True
+                            raise OSError("simulated marker fsync interruption")
+                        return _original_fsync(descriptor)
+
+                    with (
+                        patch.object(
+                            operation_recovery_runtime.os,
+                            "open",
+                            side_effect=fault_marker_open,
+                        ),
+                        patch.object(
+                            operation_recovery_runtime.os,
+                            "write",
+                            side_effect=fault_marker_write,
+                        ),
+                        patch.object(
+                            operation_recovery_runtime.os,
+                            "fsync",
+                            side_effect=fault_marker_fsync,
+                        ),
+                        self.assertRaisesRegex(
+                            Exception,
+                            "snapshot is unavailable",
+                        ),
+                    ):
+                        operation_recovery_runtime.assemble_exact_drain_candidate_runtime_snapshot(
+                            provider_root,
+                            candidate_library,
+                        )
+
+                    self.assertTrue(faulted)
+                    self.assertFalse(recovery_path.exists())
+                    self.assertFalse(recovery_staging.exists())
+                    self.assertEqual(resolver.read_bytes(), original)
+                    recovered = operation_recovery_runtime.assemble_exact_drain_candidate_runtime_snapshot(
+                        provider_root,
+                        candidate_library,
+                    )
+                    self.assertEqual(recovered["schema_version"], 2)
+                    self.assertNotEqual(resolver.read_bytes(), original)
+
+    def test_exact_drain_recovery_marker_restoration_faults_are_retryable(self):
+        for fault in ("after-create", "partial-write", "fsync"):
+            with (
+                self.subTest(fault=fault),
+                tempfile.TemporaryDirectory(
+                    dir="/private/tmp",
+                    prefix=f"exact-drain-marker-restore-{fault}-",
+                ) as directory,
+            ):
+                root = Path(directory)
+                root.chmod(0o700)
+                provider_root = root / "provider-runtime"
+                provider_root.mkdir(mode=0o700)
+                candidate_library = root / "candidate-lib"
+                candidate_library.mkdir(mode=0o700)
+                resolver = _copy_patchable_entity_resolver(candidate_library)
+                original = resolver.read_bytes()
+                for name in (
+                    "sitecustomize.py",
+                    "hindsight_llm_failover.py",
+                ):
+                    source = provider_root / name
+                    source.write_text(
+                        f"# exact {name}\n",
+                        encoding="utf-8",
+                    )
+                    source.chmod(0o600)
+
+                with (
+                    patch.object(
+                        operation_recovery_runtime,
+                        "_finalize_exact_drain_snapshot_recovery",
+                        side_effect=operation_recovery_runtime.OperationRecoveryError(
+                            "exact drain candidate runtime snapshot is unavailable"
+                        ),
+                    ),
+                    self.assertRaisesRegex(
+                        Exception,
+                        "snapshot is unavailable",
+                    ),
+                ):
+                    operation_recovery_runtime.assemble_exact_drain_candidate_runtime_snapshot(
+                        provider_root,
+                        candidate_library,
+                    )
+
+                self.assertNotEqual(resolver.read_bytes(), original)
+                recovery_path = (
+                    candidate_library / ".exact_drain_runtime.recovery"
+                )
+                recovery_staging = recovery_path.with_name(
+                    f".{recovery_path.name}.staging"
+                )
+                self.assertTrue(recovery_path.is_file())
+
+                original_open = operation_recovery_runtime.os.open
+                original_write = operation_recovery_runtime.os.write
+                original_fsync = operation_recovery_runtime.os.fsync
+                fsync_directory = (
+                    operation_recovery_runtime._fsync_exact_drain_directory
+                )
+                marker_state = {"descriptor": None}
+                partial_written = False
+                marker_faulted = False
+                finalize_faulted = False
+
+                def fault_marker_open(
+                    path,
+                    flags,
+                    *arguments,
+                    _original_open=original_open,
+                    _recovery_staging=recovery_staging,
+                    _fault=fault,
+                    _marker_state=marker_state,
+                ):
+                    nonlocal marker_faulted
+                    descriptor = _original_open(path, flags, *arguments)
+                    if Path(path) == _recovery_staging:
+                        _marker_state["descriptor"] = descriptor
+                        if _fault == "after-create" and not marker_faulted:
+                            marker_faulted = True
+                            os.close(descriptor)
+                            raise OSError(
+                                "simulated restoration create interruption"
+                            )
+                    return descriptor
+
+                def fault_marker_write(
+                    descriptor,
+                    body,
+                    _fault=fault,
+                    _original_write=original_write,
+                    _marker_state=marker_state,
+                ):
+                    nonlocal partial_written, marker_faulted
+                    if (
+                        _fault == "partial-write"
+                        and descriptor == _marker_state["descriptor"]
+                    ):
+                        if partial_written and not marker_faulted:
+                            marker_faulted = True
+                            raise OSError(
+                                "simulated partial restoration marker"
+                            )
+                        partial_written = True
+                        return _original_write(
+                            descriptor,
+                            body[: max(1, len(body) // 2)],
+                        )
+                    return _original_write(descriptor, body)
+
+                def fault_marker_fsync(
+                    descriptor,
+                    _fault=fault,
+                    _original_fsync=original_fsync,
+                    _marker_state=marker_state,
+                ):
+                    nonlocal marker_faulted
+                    if (
+                        _fault == "fsync"
+                        and descriptor == _marker_state["descriptor"]
+                        and not marker_faulted
+                    ):
+                        marker_faulted = True
+                        raise OSError("simulated restoration marker fsync")
+                    return _original_fsync(descriptor)
+
+                def fault_finalize_fsync(
+                    path,
+                    _candidate_library=candidate_library,
+                    _fsync_directory=fsync_directory,
+                ):
+                    nonlocal finalize_faulted
+                    if (
+                        Path(path) == _candidate_library
+                        and not finalize_faulted
+                    ):
+                        finalize_faulted = True
+                        raise operation_recovery_runtime.OperationRecoveryError(
+                            "exact drain candidate runtime snapshot is unavailable"
+                        )
+                    return _fsync_directory(path)
+
+                with (
+                    patch.object(
+                        operation_recovery_runtime.os,
+                        "open",
+                        side_effect=fault_marker_open,
+                    ),
+                    patch.object(
+                        operation_recovery_runtime.os,
+                        "write",
+                        side_effect=fault_marker_write,
+                    ),
+                    patch.object(
+                        operation_recovery_runtime.os,
+                        "fsync",
+                        side_effect=fault_marker_fsync,
+                    ),
+                    patch.object(
+                        operation_recovery_runtime,
+                        "_fsync_exact_drain_directory",
+                        side_effect=fault_finalize_fsync,
+                    ),
+                    self.assertRaisesRegex(
+                        Exception,
+                        "snapshot is unavailable",
+                    ),
+                ):
+                    operation_recovery_runtime.assemble_exact_drain_candidate_runtime_snapshot(
+                        provider_root,
+                        candidate_library,
+                    )
+
+                self.assertTrue(finalize_faulted)
+                self.assertTrue(marker_faulted)
+                self.assertFalse(recovery_staging.exists())
+                self.assertTrue(recovery_path.is_file())
+                recovery_body = recovery_path.read_bytes()
+                recovery_path.write_bytes(b"{}\n")
+                with self.assertRaisesRegex(Exception, "snapshot differs"):
+                    operation_recovery_runtime.assemble_exact_drain_candidate_runtime_snapshot(
+                        provider_root,
+                        candidate_library,
+                    )
+                recovery_path.write_bytes(recovery_body)
+                recovered = operation_recovery_runtime.assemble_exact_drain_candidate_runtime_snapshot(
+                    provider_root,
+                    candidate_library,
+                )
+                self.assertEqual(recovered["schema_version"], 2)
+                self.assertFalse(recovery_path.exists())
+
+    def test_exact_drain_phase_repair_preserves_trigram_resolution_behavior(self):
+        package_spec = importlib.util.find_spec("hindsight_api")
+        if package_spec is None or package_spec.origin is None:
+            raise unittest.SkipTest("hindsight_api candidate source is unavailable")
+        installed_package = Path(package_spec.origin).parent
+        dependency_root = installed_package.parent
+        with tempfile.TemporaryDirectory(
+            dir="/private/tmp",
+            prefix="exact-drain-resolver-behavior-",
+        ) as directory:
+            root = Path(directory)
+            root.chmod(0o700)
+            candidate_library = root / "candidate-lib"
+            candidate_library.mkdir(mode=0o700)
+            shutil.copytree(
+                installed_package,
+                candidate_library / "hindsight_api",
+            )
+            provider_root = root / "provider-runtime"
+            provider_root.mkdir(mode=0o700)
+            for name in ("sitecustomize.py", "hindsight_llm_failover.py"):
+                source = provider_root / name
+                source.write_text(f"# exact {name}\n", encoding="utf-8")
+                source.chmod(0o600)
+            operation_recovery_runtime.assemble_exact_drain_candidate_runtime_snapshot(
+                provider_root,
+                candidate_library,
+            )
+            script = textwrap.dedent(
+                f"""
+                import asyncio
+                import json
+                import sys
+                from datetime import UTC, datetime
+
+                sys.path[:0] = [{str(candidate_library)!r}, {str(dependency_root)!r}]
+                from hindsight_api.engine.entity_resolver import EntityResolver
+
+                class Transaction:
+                    async def __aenter__(self):
+                        return self
+                    async def __aexit__(self, *_arguments):
+                        return False
+
+                class CandidateRow(dict):
+                    def __getitem__(self, key):
+                        if key in {{"metadata", "mention_count"}}:
+                            raise AssertionError("unused candidate field decoded")
+                        return super().__getitem__(key)
+
+                class ExternalEdge:
+                    def __getitem__(self, _key):
+                        raise AssertionError("noncandidate edge decoded")
+
+                class Connection:
+                    def __init__(self, now):
+                        self.now = now
+                        self.execute_calls = []
+                    def transaction(self):
+                        return Transaction()
+                    async def execute(self, query):
+                        if query not in {{
+                            "SET TRANSACTION READ ONLY",
+                            "SET LOCAL statement_timeout = '120s'",
+                        }}:
+                            raise AssertionError("server transaction guard differs")
+                        self.execute_calls.append(query)
+                    async def fetch(self, query, *arguments, timeout):
+                        if timeout != 120.0:
+                            raise AssertionError("client deadline differs")
+                        if "entity_cooccurrences" in query:
+                            if " OR " in query:
+                                return [ExternalEdge()]
+                            if " AND " not in query:
+                                raise AssertionError("cooccurrence scope differs")
+                            return [
+                                {{"entity_id_1": "alice-id", "entity_id_2": "bob-id"}}
+                            ]
+                        if "metadata" in query or "mention_count" in query:
+                            raise AssertionError("unused candidate projection fetched")
+                        return [
+                            CandidateRow(
+                                id=("alice-id" if text == "Alicee" else "bob-id"),
+                                canonical_name=("Alice" if text == "Alicee" else "Bob"),
+                                last_seen=self.now,
+                                query_text=text,
+                            )
+                            for text in arguments[1]
+                        ]
+
+                def projection(values):
+                    return [
+                        (item.entity_id, item.canonical_name, item.entity_kind)
+                        for item in values
+                    ]
+
+                async def exercise():
+                    now = datetime(2026, 8, 11, 12, 0, tzinfo=UTC)
+                    entities = [
+                        {{"text": "Alicee", "nearby_entities": [{{"text": "Bob"}}]}},
+                        {{"text": "Bob", "nearby_entities": [{{"text": "Alicee"}}]}},
+                    ]
+                    expected_resolver = EntityResolver(pool=None)
+                    expected = await expected_resolver._resolve_from_candidates(
+                        Connection(now),
+                        "engineering",
+                        entities,
+                        now,
+                        {{
+                            "Alicee": [("alice-id", "Alice", {{"large": "x" * 1000}}, now, 99)],
+                            "Bob": [("bob-id", "Bob", {{"large": "x" * 1000}}, now, 99)],
+                        }},
+                        {{"alice-id": {{"bob"}}, "bob-id": {{"alicee"}}}},
+                    )
+                    expected_stats = [
+                        (item.entity_id, item.event_date.isoformat())
+                        for item in expected_resolver._pending_stats[
+                            expected_resolver._task_key()
+                        ]
+                    ]
+                    resolver = EntityResolver(pool=None)
+                    actual_connection = Connection(now)
+                    actual = await resolver._resolve_entities_batch_trigram(
+                        actual_connection,
+                        "engineering",
+                        entities,
+                        now,
+                    )
+                    actual_stats = [
+                        (item.entity_id, item.event_date.isoformat())
+                        for item in resolver._pending_stats[resolver._task_key()]
+                    ]
+                    return {{
+                        "expected": projection(expected),
+                        "actual": projection(actual),
+                        "expected_stats": expected_stats,
+                        "actual_stats": actual_stats,
+                        "execute_calls": actual_connection.execute_calls,
+                    }}
+
+                print(json.dumps(asyncio.run(exercise()), sort_keys=True))
+                """
+            )
+            result = subprocess.run(
+                [sys.executable, "-S", "-c", script],
+                check=False,
+                cwd="/",
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            observed = json.loads(result.stdout)
+            self.assertEqual(observed["actual"], observed["expected"])
+            self.assertEqual(
+                observed["actual_stats"],
+                observed["expected_stats"],
+            )
+            self.assertEqual(
+                observed["execute_calls"],
+                [
+                    "SET TRANSACTION READ ONLY",
+                    "SET LOCAL statement_timeout = '120s'",
+                ]
+                * 2,
+            )
 
     def test_exact_drain_metadata_ceiling_precedes_file_read(self):
         read_version = self.controller[
@@ -2726,6 +3934,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             metadata.chmod(0o600)
             package = site_packages / "hindsight_api"
             package.mkdir(mode=0o700)
+            _copy_patchable_entity_resolver(site_packages)
             sparse = package / "native.so"
             sparse.touch(mode=0o600)
             with sparse.open("r+b") as stream:
@@ -4108,6 +5317,9 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 "_operation_recovery_exact_journal_worker_active": (
                     worker_active
                 ),
+                "_operation_recovery_post_abort_reference_progress_digest": (
+                    lambda _reference_plan, _reference_journal: "c" * 64
+                ),
                 "_operation_recovery_authority": authority,
                 "_operation_recovery_prepare_apply": forbidden,
                 "_operation_recovery_post_abort_apply": forbidden,
@@ -4193,13 +5405,20 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 "authorization": (
                     source_authorization,
                     authorization_journal,
+                    "c" * 64,
                 ),
                 "journal": (
                     plan["reference_application_authorization"],
                     source_journal,
+                    "c" * 64,
+                ),
+                "progress": (
+                    plan["reference_application_authorization"],
+                    plan["reference_application_journal"],
+                    "d" * 64,
                 ),
             }
-            for label, (authorization, journal) in cases.items():
+            for label, (authorization, journal, progress_digest) in cases.items():
                 lock_state = {"recovery": False, "install": False}
 
                 class TrackedLock:
@@ -4256,6 +5475,10 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                     ),
                     "_operation_recovery_exact_journal_worker_active": (
                         lambda _journal: False
+                    ),
+                    "_operation_recovery_post_abort_reference_progress_digest": (
+                        lambda _reference_plan, _reference_journal,
+                        value=progress_digest: value
                     ),
                     "_operation_recovery_authority": authority,
                     "_operation_recovery_prepare_apply": forbidden,
@@ -4366,6 +5589,9 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 ),
                 "_operation_recovery_exact_journal_worker_active": (
                     lambda _journal: False
+                ),
+                "_operation_recovery_post_abort_reference_progress_digest": (
+                    lambda _reference_plan, _reference_journal: "c" * 64
                 ),
                 "_operation_recovery_authority": (
                     lambda _args, **_kwargs: plan[

@@ -34,6 +34,7 @@ from hindsight_memory_control_plane.operation_recovery import (  # noqa: E402
 )
 from hindsight_memory_control_plane.operation_recovery_runtime import (  # noqa: E402
     ExactDrainClaimAdapter,
+    ExactDrainWorkerMainShutdownBridge,
     EXACT_DRAIN_PROFILE_ENVIRONMENT_KEYS,
     exact_drain_candidate_provider_root,
     exact_drain_effective_profile_digest,
@@ -221,7 +222,7 @@ def main() -> int:
     if plan["schema_version"] == 1 and not args.resume:
         plan = verify_exact_drain_plan(plan_value)
     if (
-        plan["schema_version"] == 2
+        plan["schema_version"] in {2, 3}
         and time.time()
         >= authorization["authorized_at"] + plan["execution_lease_seconds"]
     ):
@@ -314,7 +315,7 @@ def main() -> int:
     set_exact_drain_progress_recorder(progress_recorder)
 
     install_exact_drain_candidate_imports(args.worker_runtime, LIB)
-    if plan["schema_version"] == 2:
+    if plan["schema_version"] in {2, 3}:
         validate_exact_drain_dependency_spec(
             "asyncpg",
             args.worker_runtime,
@@ -373,7 +374,7 @@ def main() -> int:
         return candidate_release_root
 
     provider_globals["_resolve_active_release"] = resolve_detached_candidate
-    if plan["schema_version"] == 2:
+    if plan["schema_version"] in {2, 3}:
         validate_exact_drain_import_origins(args.worker_runtime, LIB)
     original_protected_reader = provider_globals.get(
         "_read_protected_file"
@@ -397,7 +398,7 @@ def main() -> int:
         ),
         provider_globals,
     )
-    if plan["schema_version"] == 2:
+    if plan["schema_version"] in {2, 3}:
         validate_exact_drain_import_origins(args.worker_runtime, LIB)
 
     def complete() -> None:
@@ -412,34 +413,36 @@ def main() -> int:
     )
     from hindsight_api import MemoryEngine
     from hindsight_api.engine.db.ops_postgresql import PostgreSQLOps
-    from hindsight_api.worker.main import main as worker_main
+    from hindsight_api.worker import main as worker_main_module
     from hindsight_api.worker.poller import WorkerPoller
 
-    if plan["schema_version"] == 2:
+    if plan["schema_version"] in {2, 3}:
         validate_exact_drain_import_origins(args.worker_runtime, LIB)
 
-    install_exact_drain_runtime_guards(
-        PostgreSQLOps,
-        WorkerPoller,
-        MemoryEngine,
-        adapter,
-    )
-    sys.argv = [
-        "hindsight-worker",
-        "--worker-id",
-        exact_drain_worker_id(plan["plan_digest"]),
-        "--poll-interval",
-        "250",
-        "--max-retries",
-        str(plan["worker_max_retries"]),
-        "--http-host",
-        "127.0.0.1",
-        "--http-port",
-        "0",
-        "--log-level",
-        "info",
-    ]
-    worker_main()
+    with ExactDrainWorkerMainShutdownBridge(worker_main_module) as shutdown:
+        install_exact_drain_runtime_guards(
+            PostgreSQLOps,
+            WorkerPoller,
+            MemoryEngine,
+            adapter,
+            request_worker_shutdown=shutdown.request,
+        )
+        sys.argv = [
+            "hindsight-worker",
+            "--worker-id",
+            exact_drain_worker_id(plan["plan_digest"]),
+            "--poll-interval",
+            "250",
+            "--max-retries",
+            str(plan["worker_max_retries"]),
+            "--http-host",
+            "127.0.0.1",
+            "--http-port",
+            "0",
+            "--log-level",
+            "info",
+        ]
+        worker_main_module.main()
     return 0
 
 

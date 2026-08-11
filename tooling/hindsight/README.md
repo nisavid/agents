@@ -282,13 +282,23 @@ tooling/hindsight/bin/hindsight-exact-drain-snapshot \
   --candidate-library "$RELEASE_ROOT/lib"
 ```
 
-The helper creates `lib/exact_drain_runtime/` once, copies only
-`sitecustomize.py` and `hindsight_llm_failover.py`, and writes their canonical
-payload-free manifest. Release assembly then supplies that completed release
-root to `hindsight-portable-install`; the existing release manifest seals the
-snapshot bytes. A current exact-drain plan reads and executes only these
-candidate provider sources. Provider policy and credential material remain
-external protected data and are never copied into the candidate snapshot.
+The helper creates `lib/exact_drain_runtime/` once. It copies only
+`sitecustomize.py` and `hindsight_llm_failover.py`, applies the exact bounded
+Phase 1 entity-resolver overlay to the detached candidate, and writes a
+canonical payload-free manifest for the provider and original/patched resolver
+bytes. The overlay removes unused PostgreSQL candidate columns, fetches only
+the candidate-induced cooccurrence graph, emits observational candidate and
+cooccurrence breadcrumbs, and bounds both server and client query waits. It is
+not a durable Phase 1 checkpoint or replay receipt.
+
+Release assembly runs this helper before `hindsight-portable-install`; the
+existing release manifest then seals the completed snapshot and patched
+candidate bytes. Assembly fails closed on unsupported or changed resolver
+source. An interruption after the snapshot manifest but before the atomic
+source replacement is retryable from the sealed original/patched evidence. A
+current exact-drain plan reads and executes only these candidate provider and
+Hindsight sources. Provider policy and credential material remain external
+protected data and are never copied into the candidate snapshot.
 
 The managed exact-drain worker runtime is a separate trusted authority. For a
 current plan, planning, apply, and the gated child each stream-hash the complete

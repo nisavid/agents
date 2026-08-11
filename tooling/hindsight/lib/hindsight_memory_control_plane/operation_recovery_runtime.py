@@ -18,6 +18,7 @@ import logging
 import os
 from pathlib import Path
 import re
+import shutil
 import socket
 import stat
 import struct
@@ -25,9 +26,11 @@ import subprocess
 import sys
 import time
 import uuid
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Self
 
 from .operation_recovery import (
+    EXACT_DRAIN_PHASE_ONE_STATEMENT_TIMEOUT_SECONDS,
+    EXACT_DRAIN_PHASE_REPAIR_CONTRACT_DIGEST,
     EXACT_DRAIN_TRANSACTION_TIMEOUT_SECONDS,
     EXPECTED_CLAIM_RELEASE_ROW_COUNT,
     EXPECTED_OPERATION_COUNTS,
@@ -106,10 +109,14 @@ EXACT_DRAIN_MAX_DEPENDENCY_ENTRIES = 100_000
 EXACT_DRAIN_MAX_DEPENDENCY_FILE_BYTES = 512 * 1024 * 1024
 EXACT_DRAIN_MAX_DEPENDENCY_TOTAL_BYTES = 4 * 1024 * 1024 * 1024
 EXACT_DRAIN_CANDIDATE_RUNTIME_DIRECTORY = "exact_drain_runtime"
+EXACT_DRAIN_CANDIDATE_RESOLVER_PATH = Path(
+    "hindsight_api/engine/entity_resolver.py"
+)
 EXACT_DRAIN_PROVIDER_SOURCE_NAMES = (
     "sitecustomize.py",
     "hindsight_llm_failover.py",
 )
+EXACT_DRAIN_TASK_CANCELLATION_TIMEOUT_SECONDS = 5.0
 EXACT_DRAIN_START_MESSAGE_PREFIX = b"exact-drain-start-v1 "
 EXACT_DRAIN_START_MESSAGE_BYTES = (
     len(EXACT_DRAIN_START_MESSAGE_PREFIX) + (64 * 3) + 3
@@ -991,11 +998,63 @@ def exact_drain_worker_id(plan_digest: str) -> str:
     return f"operation-recovery-exact-drain-{plan_digest[:12]}"
 
 
+class ExactDrainWorkerMainShutdownBridge:
+    """Bind an internal exact-drain stop to worker-main's graceful event."""
+
+    def __init__(self, worker_main_module: Any) -> None:
+        installer = getattr(
+            worker_main_module,
+            "_install_shutdown_signal_handlers",
+            None,
+        )
+        if not callable(installer):
+            raise OperationRecoveryError(
+                "exact drain worker shutdown handler seam is unavailable"
+            )
+        self._module = worker_main_module
+        self._upstream_installer = installer
+        self._handler: Callable[[], None] | None = None
+        self._requested = False
+
+    def __enter__(self) -> Self:
+        self._module._install_shutdown_signal_handlers = self.install
+        return self
+
+    def __exit__(self, *_arguments: object) -> None:
+        self._module._install_shutdown_signal_handlers = (
+            self._upstream_installer
+        )
+
+    def install(self, loop: Any, handler: Callable[[], None]) -> bool:
+        if self._handler is not None or not callable(handler):
+            raise OperationRecoveryError(
+                "exact drain worker shutdown handler was rebound"
+            )
+        self._handler = handler
+
+        def external_request() -> None:
+            self._requested = True
+            handler()
+
+        return bool(self._upstream_installer(loop, external_request))
+
+    def request(self) -> None:
+        if self._handler is None:
+            raise OperationRecoveryError(
+                "exact drain worker shutdown handler is unavailable"
+            )
+        if not self._requested:
+            self._requested = True
+            self._handler()
+
+
 def install_exact_drain_runtime_guards(
     postgresql_ops_type: type[Any],
     worker_poller_type: type[Any],
     memory_engine_type: type[Any],
     adapter: Any,
+    *,
+    request_worker_shutdown: Callable[[], None] | None = None,
 ) -> None:
     """Restrict upstream worker lifecycle seams to the exact drain cohort."""
 
@@ -1014,6 +1073,16 @@ def install_exact_drain_runtime_guards(
         "_claim_batch_for_schema",
         None,
     )
+    upstream_cleanup_task = getattr(
+        worker_poller_type,
+        "_cleanup_task",
+        None,
+    )
+    upstream_shutdown_graceful = getattr(
+        worker_poller_type,
+        "shutdown_graceful",
+        None,
+    )
     if (
         not callable(upstream_execute_task_inner)
         or not callable(upstream_claim_batch_inner)
@@ -1021,6 +1090,21 @@ def install_exact_drain_runtime_guards(
     ):
         raise OperationRecoveryError(
             "operation-recovery required worker progress seam is unavailable"
+        )
+
+    claim_release_disabled = False
+    worker_shutdown_requested = False
+    phase_one_timeout_seconds = getattr(
+        adapter,
+        "phase_one_timeout_seconds",
+        None,
+    )
+    if phase_one_timeout_seconds is not None and (
+        type(phase_one_timeout_seconds) not in {int, float}
+        or phase_one_timeout_seconds <= 0
+    ):
+        raise OperationRecoveryError(
+            "exact drain phase-one timeout authority is invalid"
         )
 
     async def claim_tasks(_ops: Any, *args: Any, **kwargs: Any) -> Any:
@@ -1041,23 +1125,98 @@ def install_exact_drain_runtime_guards(
     async def recover_exact_tasks(poller: Any) -> int:
         return await adapter.recover_own_tasks(poller._backend)
 
+    async def suppress_upstream_processing_reclaim(
+        _poller: Any,
+        _schema: str | None,
+        *,
+        operation_id: str | None = None,
+    ) -> int:
+        del operation_id
+        return 0
+
+    def claim_lifecycle_lock(poller: Any) -> asyncio.Lock:
+        lock = getattr(poller, "_exact_drain_claim_lifecycle_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            poller._exact_drain_claim_lifecycle_lock = lock
+        if not isinstance(lock, asyncio.Lock):
+            raise OperationRecoveryError(
+                "exact drain claim lifecycle seam is unavailable"
+            )
+        return lock
+
     async def release_exact_tasks(poller: Any) -> int:
-        return await adapter.release_own_tasks(poller._backend)
+        async with claim_lifecycle_lock(poller):
+            if claim_release_disabled:
+                raise OperationRecoveryError(
+                    "exact drain claim release is disabled after failed quiescence"
+                )
+            active_tasks = getattr(poller, "_active_tasks", {})
+            if not isinstance(active_tasks, Mapping) or any(
+                not getattr(item, "bg_task", None).done()
+                for item in active_tasks.values()
+            ):
+                raise OperationRecoveryError(
+                    "exact drain claim release requires worker quiescence"
+                )
+            return await adapter.release_own_tasks(poller._backend)
+
+    def request_exact_worker_shutdown(poller: Any) -> None:
+        nonlocal claim_release_disabled, worker_shutdown_requested
+        shutdown = getattr(poller, "_shutdown", None)
+        shutdown_set = getattr(shutdown, "set", None)
+        if not callable(shutdown_set) or not callable(
+            request_worker_shutdown
+        ):
+            claim_release_disabled = True
+            raise OperationRecoveryError(
+                "exact drain worker shutdown seam is unavailable"
+            )
+        shutdown_set()
+        if not worker_shutdown_requested:
+            worker_shutdown_requested = True
+            request_worker_shutdown()
 
     async def execute_exact_task_inner(
         poller: Any,
         task: Any,
         holder: Any | None = None,
     ) -> Any:
+        nonlocal claim_release_disabled
         execution = asyncio.create_task(
             upstream_execute_task_inner(poller, task, holder)
         )
         last_stage: str | None = None
+        phase_one_deadline: float | None = None
         try:
             while True:
                 stage = getattr(holder, "stage", None)
+                if (
+                    phase_one_timeout_seconds is not None
+                    and isinstance(stage, str)
+                    and stage.startswith("retain.phase1.")
+                ):
+                    now = time.monotonic()
+                    if phase_one_deadline is None:
+                        phase_one_deadline = (
+                            now + phase_one_timeout_seconds
+                        )
+                    if now >= phase_one_deadline:
+                        request_exact_worker_shutdown(poller)
+                        raise OperationRecoveryError(
+                            "exact drain retain phase one exceeded its deadline"
+                        )
+                else:
+                    phase_one_deadline = None
                 if isinstance(stage, str) and stage != last_stage:
-                    adapter.record_upstream_stage(task.operation_id, stage)
+                    try:
+                        adapter.record_upstream_stage(
+                            task.operation_id,
+                            stage,
+                        )
+                    except BaseException:
+                        request_exact_worker_shutdown(poller)
+                        raise
                     last_stage = stage
                 done, _pending = await asyncio.wait(
                     {execution},
@@ -1066,22 +1225,34 @@ def install_exact_drain_runtime_guards(
                 if done:
                     stage = getattr(holder, "stage", None)
                     if isinstance(stage, str) and stage != last_stage:
-                        adapter.record_upstream_stage(task.operation_id, stage)
+                        try:
+                            adapter.record_upstream_stage(
+                                task.operation_id,
+                                stage,
+                            )
+                        except BaseException:
+                            request_exact_worker_shutdown(poller)
+                            raise
                     return await execution
+        except asyncio.CancelledError:
+            raise
+        except BaseException:
+            request_exact_worker_shutdown(poller)
+            raise
         finally:
             if not execution.done():
                 execution.cancel()
                 try:
                     done, _pending = await asyncio.wait(
                         {execution},
-                        timeout=5.0,
+                        timeout=EXACT_DRAIN_TASK_CANCELLATION_TIMEOUT_SECONDS,
                     )
                     if not done:
-                        LOGGER.error(
-                            "exact drain task ignored cancellation during shutdown"
+                        claim_release_disabled = True
+                        raise OperationRecoveryError(
+                            "exact drain task did not quiesce after cancellation"
                         )
-                    else:
-                        await execution
+                    await execution
                 except asyncio.CancelledError:
                     current = asyncio.current_task()
                     if current is not None and current.cancelling():
@@ -1090,6 +1261,8 @@ def install_exact_drain_runtime_guards(
                         "exact drain child task cancelled during cleanup"
                     )
                 except BaseException as error:
+                    if isinstance(error, OperationRecoveryError):
+                        raise
                     LOGGER.warning(
                         "exact drain task cleanup ended with %s",
                         type(error).__name__,
@@ -1101,22 +1274,28 @@ def install_exact_drain_runtime_guards(
         reserved_limits: Mapping[str, int],
         shared_limit: int,
     ) -> Any:
-        tasks = await upstream_claim_batch_inner(
-            poller,
-            schema,
-            reserved_limits,
-            shared_limit,
-        )
-        try:
-            adapter.claim_committed(tasks)
-        except Exception:
+        async with claim_lifecycle_lock(poller):
             shutdown = getattr(poller, "_shutdown", None)
-            shutdown_set = getattr(shutdown, "set", None)
-            if callable(shutdown_set):
-                shutdown_set()
-            adapter.abort_after_committed_claim_failure()
-            raise
-        return tasks
+            shutdown_is_set = getattr(shutdown, "is_set", None)
+            if callable(shutdown_is_set) and shutdown_is_set():
+                return []
+            tasks = await upstream_claim_batch_inner(
+                poller,
+                schema,
+                reserved_limits,
+                shared_limit,
+            )
+            try:
+                adapter.claim_committed(tasks)
+            except Exception:
+                shutdown_set = getattr(shutdown, "set", None)
+                if callable(shutdown_set):
+                    shutdown_set()
+                adapter.abort_after_committed_claim_failure()
+                raise
+            if callable(shutdown_is_set) and shutdown_is_set():
+                return []
+            return tasks
 
     async def claim_exact_batch_public(
         poller: Any,
@@ -1130,6 +1309,81 @@ def install_exact_drain_runtime_guards(
             reserved_limits,
             shared_limit,
         )
+
+    def record_exact_task_error(
+        poller: Any,
+        error: BaseException,
+    ) -> None:
+        errors = getattr(poller, "_exact_drain_task_errors", None)
+        if errors is None:
+            errors = []
+            poller._exact_drain_task_errors = errors
+        errors.append(error)
+
+    def consume_exact_task_result(poller: Any, task: asyncio.Task[Any]) -> None:
+        consumed = getattr(poller, "_exact_drain_consumed_tasks", None)
+        if consumed is None:
+            consumed = set()
+            poller._exact_drain_consumed_tasks = consumed
+        if task in consumed or not task.done():
+            return
+        consumed.add(task)
+        try:
+            error = task.exception()
+        except asyncio.CancelledError:
+            return
+        if error is None:
+            return
+        record_exact_task_error(poller, error)
+
+    async def cleanup_exact_task(
+        poller: Any,
+        operation_id: str,
+        operation_type: str,
+    ) -> None:
+        active_tasks = getattr(poller, "_active_tasks", {})
+        info = active_tasks.get(operation_id)
+        task = getattr(info, "bg_task", None)
+        if isinstance(task, asyncio.Task):
+            consume_exact_task_result(poller, task)
+        await upstream_cleanup_task(poller, operation_id, operation_type)
+
+    async def shutdown_exact_worker(
+        poller: Any,
+        timeout: float = 30.0,
+    ) -> None:
+        if not callable(upstream_shutdown_graceful):
+            raise OperationRecoveryError(
+                "exact drain worker graceful shutdown seam is unavailable"
+            )
+        active_tasks = getattr(poller, "_active_tasks", {})
+        observed_tasks = [
+            info.bg_task
+            for info in active_tasks.values()
+            if isinstance(getattr(info, "bg_task", None), asyncio.Task)
+        ]
+        upstream_error: BaseException | None = None
+        try:
+            graceful_timeout = timeout
+            if worker_shutdown_requested:
+                graceful_timeout = max(
+                    timeout,
+                    EXACT_DRAIN_TASK_CANCELLATION_TIMEOUT_SECONDS + 0.5,
+                )
+            await upstream_shutdown_graceful(
+                poller,
+                timeout=graceful_timeout,
+            )
+        except BaseException as error:
+            upstream_error = error
+        for task in observed_tasks:
+            consume_exact_task_result(poller, task)
+        await asyncio.sleep(0)
+        if upstream_error is not None:
+            raise upstream_error
+        task_errors = getattr(poller, "_exact_drain_task_errors", ())
+        if task_errors:
+            raise task_errors[0]
 
     async def schedule_exact_retry(
         poller: Any,
@@ -1178,12 +1432,19 @@ def install_exact_drain_runtime_guards(
         error_message: str,
         schema: str | None,
     ) -> None:
-        await adapter.mark_failed(
-            poller._backend,
-            operation_id,
-            error_message,
-            schema,
-        )
+        try:
+            await adapter.mark_failed(
+                poller._backend,
+                operation_id,
+                error_message,
+                schema,
+            )
+        except asyncio.CancelledError:
+            raise
+        except BaseException as error:
+            record_exact_task_error(poller, error)
+            request_exact_worker_shutdown(poller)
+            raise
 
     async def engine_mark_exact_completed(
         engine: Any,
@@ -1249,9 +1510,15 @@ def install_exact_drain_runtime_guards(
     worker_poller_type._scan_active_schemas = scan_active_schemas
     worker_poller_type.recover_own_tasks = recover_exact_tasks
     worker_poller_type.release_own_tasks = release_exact_tasks
+    worker_poller_type._reclaim_own_processing_tasks = (
+        suppress_upstream_processing_reclaim
+    )
     worker_poller_type._execute_task_inner = execute_exact_task_inner
     worker_poller_type._claim_batch_for_schema_inner = claim_exact_batch
     worker_poller_type._claim_batch_for_schema = claim_exact_batch_public
+    if callable(upstream_cleanup_task):
+        worker_poller_type._cleanup_task = cleanup_exact_task
+    worker_poller_type.shutdown_graceful = shutdown_exact_worker
     worker_poller_type._schedule_retry = schedule_exact_retry
     worker_poller_type._defer_operation = defer_exact_operation
     worker_poller_type._mark_completed = mark_exact_completed
@@ -1703,11 +1970,472 @@ def _write_exact_drain_snapshot_file(path: Path, body: bytes) -> None:
             os.close(descriptor)
 
 
+def _replace_exact_drain_source_fragment(
+    source: str,
+    old: str,
+    new: str,
+    label: str,
+) -> str:
+    if source.count(old) != 1:
+        raise OperationRecoveryError(
+            f"exact drain candidate {label} source differs"
+        )
+    return source.replace(old, new)
+
+
+def _patch_exact_drain_entity_resolver(source: bytes) -> bytes:
+    """Return the exact bounded Phase-1 resolver overlay for Hindsight 0.9."""
+    if EXACT_DRAIN_PHASE_ONE_STATEMENT_TIMEOUT_SECONDS != 120:
+        raise OperationRecoveryError(
+            "exact drain phase-one statement timeout authority differs"
+        )
+    try:
+        text = source.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise OperationRecoveryError(
+            "exact drain candidate entity resolver source differs"
+        ) from error
+    start = "    async def _resolve_entities_batch_trigram("
+    end = "    async def _resolve_entities_batch_oracle_fuzzy("
+    if text.count(start) != 1 or text.count(end) != 1:
+        raise OperationRecoveryError(
+            "exact drain candidate entity resolver source differs"
+        )
+    prefix, remainder = text.split(start, 1)
+    trigram, suffix = remainder.split(end, 1)
+    trigram = start + trigram
+    trigram = _replace_exact_drain_source_fragment(
+        trigram,
+        """        Reduces DB data transfer from 165K rows to ~5-20 rows per entity.
+        \"\"\"
+        entity_texts = list(set(e[\"text\"] for e in entities_data))
+""",
+        """        Reduces DB data transfer from 165K rows to ~5-20 rows per entity.
+        \"\"\"
+
+        async def _bounded_phase1_fetch(stage: str, *arguments):
+            set_stage(stage)
+            async with conn.transaction():
+                await conn.execute("SET TRANSACTION READ ONLY")
+                await conn.execute(
+                    \"SET LOCAL statement_timeout = '120s'\"
+                )
+                return await conn.fetch(*arguments, timeout=120.0)
+
+        entity_texts = list(set(e[\"text\"] for e in entities_data))
+""",
+        "entity resolver deadline",
+    )
+    trigram = _replace_exact_drain_source_fragment(
+        trigram,
+        "SELECT e.id, e.canonical_name, e.metadata, e.last_seen, e.mention_count,\n"
+        "                           q.query_text",
+        "SELECT e.id, e.canonical_name, e.last_seen, q.query_text",
+        "exact candidate projection",
+    )
+    trigram = _replace_exact_drain_source_fragment(
+        trigram,
+        "SELECT c.id, c.canonical_name, c.metadata, c.last_seen, c.mention_count,\n"
+        "                           q.query_text",
+        "SELECT c.id, c.canonical_name, c.last_seen, q.query_text",
+        "fuzzy candidate projection",
+    )
+    trigram = _replace_exact_drain_source_fragment(
+        trigram,
+        "SELECT e.id, e.canonical_name, e.metadata, e.last_seen, e.mention_count\n"
+        "                        FROM",
+        "SELECT e.id, e.canonical_name, e.last_seen\n"
+        "                        FROM",
+        "fuzzy candidate lateral projection",
+    )
+    trigram = _replace_exact_drain_source_fragment(
+        trigram,
+        """        for entity_text_batch in self._chunked(label_texts, self.entity_resolution_batch_size):
+""",
+        """        label_batch_count = (
+            len(label_texts) + self.entity_resolution_batch_size - 1
+        ) // self.entity_resolution_batch_size
+        for label_batch_index, entity_text_batch in enumerate(
+            self._chunked(label_texts, self.entity_resolution_batch_size),
+            start=1,
+        ):
+""",
+        "exact candidate batch",
+    )
+    trigram = _replace_exact_drain_source_fragment(
+        trigram,
+        """        for entity_text_batch in self._chunked(fuzzy_texts, self.entity_resolution_batch_size):
+""",
+        """        fuzzy_batch_count = (
+            len(fuzzy_texts) + self.entity_resolution_batch_size - 1
+        ) // self.entity_resolution_batch_size
+        for fuzzy_batch_index, entity_text_batch in enumerate(
+            self._chunked(fuzzy_texts, self.entity_resolution_batch_size),
+            start=1,
+        ):
+""",
+        "fuzzy candidate batch",
+    )
+    if trigram.count("await conn.fetch(\n") != 3:
+        raise OperationRecoveryError(
+            "exact drain candidate entity resolver query source differs"
+        )
+    trigram = trigram.replace(
+        "await conn.fetch(\n",
+        "await _bounded_phase1_fetch(\n"
+        "                    f\"retain.phase1.candidates.exact.\"\n"
+        "                    f\"{label_batch_index}/{label_batch_count}\",\n",
+        1,
+    )
+    trigram = trigram.replace(
+        "await conn.fetch(\n",
+        "await _bounded_phase1_fetch(\n"
+        "                    f\"retain.phase1.candidates.fuzzy.\"\n"
+        "                    f\"{fuzzy_batch_index}/{fuzzy_batch_count}\",\n",
+        1,
+    )
+    trigram = trigram.replace(
+        "await conn.fetch(\n",
+        "await _bounded_phase1_fetch(\n"
+        "                \"retain.phase1.cooccurrence\",\n",
+        1,
+    )
+    trigram = _replace_exact_drain_source_fragment(
+        trigram,
+        "(row[\"id\"], row[\"canonical_name\"], row[\"metadata\"], "
+        "row[\"last_seen\"], row[\"mention_count\"])",
+        "(row[\"id\"], row[\"canonical_name\"], row[\"last_seen\"])",
+        "candidate tuple",
+    )
+    trigram = _replace_exact_drain_source_fragment(
+        trigram,
+        "WHERE ec.entity_id_1 = ANY($1::uuid[])\n"
+        "                   OR ec.entity_id_2 = ANY($1::uuid[])",
+        "WHERE ec.entity_id_1 = ANY($1::uuid[])\n"
+        "                   AND ec.entity_id_2 = ANY($1::uuid[])",
+        "cooccurrence predicate",
+    )
+    trigram = _replace_exact_drain_source_fragment(
+        trigram,
+        "        return await self._resolve_from_candidates(\n",
+        "        set_stage(\"retain.phase1.scoring\")\n"
+        "        return await self._resolve_from_candidates(\n",
+        "candidate scoring breadcrumb",
+    )
+    text = prefix + trigram + end + suffix
+    text = _replace_exact_drain_source_fragment(
+        text,
+        "from .retain.types import ResolvedEntity\n",
+        "from ..worker.stage import set_stage\n"
+        "from .retain.types import ResolvedEntity\n",
+        "stage import",
+    )
+    text = _replace_exact_drain_source_fragment(
+        text,
+        """        candidate[1],
+    )
+
+
+class EntityResolver:
+""",
+        """        candidate[1],
+    )
+
+
+def _resolution_candidate_fields(candidate: tuple) -> tuple[Any, str, datetime | None]:
+    if len(candidate) == 3:
+        return candidate
+    if len(candidate) == 5:
+        return candidate[0], candidate[1], candidate[3]
+    raise RuntimeError(\"Entity resolution candidate shape is invalid\")
+
+
+class EntityResolver:
+""",
+        "candidate normalization",
+    )
+    text = _replace_exact_drain_source_fragment(
+        text,
+        """                for candidate_id, canonical_name, metadata, last_seen, mention_count in candidates:
+                    if canonical_name.lower() == entity_text_lower:
+""",
+        """                for candidate in candidates:
+                    candidate_id, canonical_name, last_seen = _resolution_candidate_fields(candidate)
+                    if canonical_name.lower() == entity_text_lower:
+""",
+        "label candidate iteration",
+    )
+    text = _replace_exact_drain_source_fragment(
+        text,
+        """            for candidate_id, canonical_name, metadata, last_seen, mention_count in candidates:
+                # Hand the loop back periodically so /health (and every other task
+""",
+        """            for candidate in candidates:
+                candidate_id, canonical_name, last_seen = _resolution_candidate_fields(candidate)
+                # Hand the loop back periodically so /health (and every other task
+""",
+        "scoring candidate iteration",
+    )
+    try:
+        compile(text, "hindsight_api/engine/entity_resolver.py", "exec")
+    except SyntaxError as error:
+        raise OperationRecoveryError(
+            "exact drain patched entity resolver source is invalid"
+        ) from error
+    return text.encode("utf-8")
+
+
+def _atomic_replace_exact_drain_candidate_source(
+    path: Path,
+    *,
+    expected: bytes,
+    replacement: bytes,
+) -> None:
+    temporary = path.with_name(f".{path.name}.exact-drain.tmp")
+    try:
+        if temporary.exists():
+            metadata = temporary.lstat()
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or metadata.st_mode & 0o022
+                or metadata.st_nlink != 1
+            ):
+                raise OperationRecoveryError(
+                    "exact drain candidate source staging is untrusted"
+                )
+            temporary.unlink()
+        _write_exact_drain_snapshot_file(temporary, replacement)
+        if _exact_drain_file_bytes(
+            path,
+            "exact drain candidate entity resolver",
+            max_bytes=1024 * 1024,
+        ) != expected:
+            raise OperationRecoveryError(
+                "exact drain candidate entity resolver changed"
+            )
+        os.replace(temporary, path)
+        descriptor = os.open(
+            path.parent,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0),
+        )
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError as error:
+        raise OperationRecoveryError(
+            "exact drain candidate runtime snapshot is unavailable"
+        ) from error
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _fsync_exact_drain_directory(path: Path) -> None:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0),
+        )
+        os.fsync(descriptor)
+    except OSError as error:
+        raise OperationRecoveryError(
+            "exact drain candidate runtime snapshot is unavailable"
+        ) from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _publish_exact_drain_snapshot_directory(
+    staging: Path,
+    target: Path,
+) -> None:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            target.parent,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0),
+        )
+        library = ctypes.CDLL(None, use_errno=True)
+        if sys.platform == "darwin":
+            rename = library.renameatx_np
+            exclusive = 0x00000004
+        else:
+            rename = library.renameat2
+            exclusive = 0x00000001
+        rename.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        rename.restype = ctypes.c_int
+        if (
+            rename(
+                descriptor,
+                os.fsencode(staging.name),
+                descriptor,
+                os.fsencode(target.name),
+                exclusive,
+            )
+            != 0
+        ):
+            error_number = ctypes.get_errno()
+            raise OSError(error_number, os.strerror(error_number), target)
+    except (AttributeError, OSError) as error:
+        raise OperationRecoveryError(
+            "exact drain candidate runtime snapshot is unavailable"
+        ) from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    _fsync_exact_drain_directory(target.parent)
+
+
+def _remove_exact_drain_snapshot_staging(path: Path) -> None:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise OperationRecoveryError(
+            "exact drain candidate runtime snapshot is unavailable"
+        ) from error
+    if (
+        path.resolve(strict=True) != path
+        or not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_mode & 0o077
+    ):
+        raise OperationRecoveryError(
+            "exact drain candidate runtime snapshot staging is untrusted"
+        )
+    try:
+        shutil.rmtree(path)
+    except OSError as error:
+        raise OperationRecoveryError(
+            "exact drain candidate runtime snapshot is unavailable"
+        ) from error
+
+
+def _exact_drain_snapshot_recovery_body(
+    snapshot: Mapping[str, Any],
+    patched_resolver: bytes,
+) -> bytes:
+    value = {
+        "schema_version": 1,
+        "kind": "exact-drain-candidate-runtime-snapshot-recovery",
+        "snapshot_digest": snapshot["snapshot_digest"],
+        "patched_resolver_sha256": hashlib.sha256(
+            patched_resolver
+        ).hexdigest(),
+    }
+    return (
+        json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+
+
+def _remove_exact_drain_snapshot_recovery_staging(path: Path) -> None:
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise OperationRecoveryError(
+            "exact drain candidate runtime snapshot is unavailable"
+        ) from error
+    if (
+        path.resolve(strict=True) != path
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_mode & 0o077
+        or metadata.st_nlink != 1
+    ):
+        raise OperationRecoveryError(
+            "exact drain candidate snapshot recovery staging is untrusted"
+        )
+    try:
+        path.unlink()
+    except OSError as error:
+        raise OperationRecoveryError(
+            "exact drain candidate runtime snapshot is unavailable"
+        ) from error
+
+
+def _write_exact_drain_snapshot_recovery_file(
+    path: Path,
+    body: bytes,
+) -> None:
+    staging = path.with_name(f".{path.name}.staging")
+    _remove_exact_drain_snapshot_recovery_staging(staging)
+    try:
+        _write_exact_drain_snapshot_file(staging, body)
+        _publish_exact_drain_snapshot_directory(staging, path)
+    finally:
+        _remove_exact_drain_snapshot_recovery_staging(staging)
+
+
+def _finalize_exact_drain_snapshot_recovery(
+    recovery_path: Path,
+    library: Path,
+    recovery_body: bytes,
+) -> None:
+    try:
+        recovery_path.unlink()
+        _fsync_exact_drain_directory(library)
+    except (OSError, OperationRecoveryError) as error:
+        try:
+            if not recovery_path.exists():
+                _write_exact_drain_snapshot_recovery_file(
+                    recovery_path,
+                    recovery_body,
+                )
+            elif _exact_drain_file_bytes(
+                recovery_path,
+                "exact drain candidate snapshot recovery",
+                max_bytes=1024,
+            ) != recovery_body:
+                raise OperationRecoveryError(
+                    "exact drain candidate runtime snapshot differs"
+                )
+            _fsync_exact_drain_directory(library)
+        except (OSError, OperationRecoveryError) as recovery_error:
+            if not recovery_path.exists():
+                try:
+                    _write_exact_drain_snapshot_recovery_file(
+                        recovery_path,
+                        recovery_body,
+                    )
+                    _fsync_exact_drain_directory(library)
+                except (OSError, OperationRecoveryError) as retry_error:
+                    raise OperationRecoveryError(
+                        "exact drain candidate runtime snapshot is unavailable"
+                    ) from retry_error
+            raise OperationRecoveryError(
+                "exact drain candidate runtime snapshot is unavailable"
+            ) from recovery_error
+        if isinstance(error, OperationRecoveryError):
+            raise
+        raise OperationRecoveryError(
+            "exact drain candidate runtime snapshot is unavailable"
+        ) from error
+
+
 def assemble_exact_drain_candidate_runtime_snapshot(
     provider_runtime_root: str | Path,
     candidate_library: str | Path,
 ) -> dict[str, Any]:
-    """Copy the two executable provider sources into a release source tree."""
+    """Seal provider sources and the bounded Phase-1 patch into a candidate."""
     source_root = Path(provider_runtime_root)
     library = Path(candidate_library)
     if not source_root.is_absolute() or not library.is_absolute():
@@ -1726,16 +2454,109 @@ def assemble_exact_drain_candidate_runtime_snapshot(
         )
         for name in EXACT_DRAIN_PROVIDER_SOURCE_NAMES
     }
+    resolver_path = library / EXACT_DRAIN_CANDIDATE_RESOLVER_PATH
+    resolver_source = _exact_drain_file_bytes(
+        resolver_path,
+        "exact drain candidate entity resolver",
+        max_bytes=1024 * 1024,
+    )
     runtime_root = library / EXACT_DRAIN_CANDIDATE_RUNTIME_DIRECTORY
-    provider_root = exact_drain_candidate_provider_root(library)
+    staging_root = library / f".{EXACT_DRAIN_CANDIDATE_RUNTIME_DIRECTORY}.staging"
+    recovery_path = library / f".{EXACT_DRAIN_CANDIDATE_RUNTIME_DIRECTORY}.recovery"
+    if runtime_root.exists():
+        snapshot, sealed_sources, original_resolver, patched_resolver = (
+            _verify_exact_drain_candidate_runtime_snapshot(
+                library,
+                require_candidate_patch=False,
+            )
+        )
+        if snapshot["schema_version"] != 2:
+            raise OperationRecoveryError(
+                "exact drain candidate runtime snapshot already exists"
+            )
+        if sealed_sources != source_bodies:
+            raise OperationRecoveryError(
+                "exact drain candidate runtime snapshot differs"
+            )
+        if resolver_source == patched_resolver:
+            if not recovery_path.exists():
+                raise OperationRecoveryError(
+                    "exact drain candidate runtime snapshot already exists"
+                )
+            if _exact_drain_file_bytes(
+                recovery_path,
+                "exact drain candidate snapshot recovery",
+                max_bytes=1024,
+            ) != _exact_drain_snapshot_recovery_body(
+                snapshot,
+                patched_resolver,
+            ):
+                raise OperationRecoveryError(
+                    "exact drain candidate runtime snapshot differs"
+                )
+            _finalize_exact_drain_snapshot_recovery(
+                recovery_path,
+                library,
+                _exact_drain_snapshot_recovery_body(
+                    snapshot,
+                    patched_resolver,
+                ),
+            )
+            verified, _sources = verify_exact_drain_candidate_runtime_snapshot(
+                library
+            )
+            return verified
+        if resolver_source != original_resolver:
+            raise OperationRecoveryError(
+                "exact drain candidate runtime snapshot differs"
+            )
+        recovery_body = _exact_drain_snapshot_recovery_body(
+            snapshot,
+            patched_resolver,
+        )
+        if recovery_path.exists():
+            if _exact_drain_file_bytes(
+                recovery_path,
+                "exact drain candidate snapshot recovery",
+                max_bytes=1024,
+            ) != recovery_body:
+                raise OperationRecoveryError(
+                    "exact drain candidate runtime snapshot differs"
+                )
+        else:
+            _write_exact_drain_snapshot_recovery_file(
+                recovery_path,
+                recovery_body,
+            )
+            _fsync_exact_drain_directory(library)
+        _atomic_replace_exact_drain_candidate_source(
+            resolver_path,
+            expected=original_resolver,
+            replacement=patched_resolver,
+        )
+        _finalize_exact_drain_snapshot_recovery(
+            recovery_path,
+            library,
+            recovery_body,
+        )
+        verified, _sources = verify_exact_drain_candidate_runtime_snapshot(
+            library
+        )
+        return verified
+    patched_resolver = _patch_exact_drain_entity_resolver(resolver_source)
+    _remove_exact_drain_snapshot_staging(staging_root)
+    staged_provider_root = staging_root / "provider"
+    staged_hindsight_root = staging_root / "hindsight"
     try:
-        runtime_root.mkdir(mode=0o700)
-        provider_root.mkdir(mode=0o700)
+        staging_root.mkdir(mode=0o700)
+        staged_provider_root.mkdir(mode=0o700)
+        staged_hindsight_root.mkdir(mode=0o700)
     except OSError as error:
+        _remove_exact_drain_snapshot_staging(staging_root)
         raise OperationRecoveryError(
-            "exact drain candidate runtime snapshot already exists"
+            "exact drain candidate runtime snapshot is unavailable"
         ) from error
-    sources = [
+    provider_evidence = [
         {
             "path": f"provider/{name}",
             "sha256": hashlib.sha256(source_bodies[name]).hexdigest(),
@@ -1744,27 +2565,94 @@ def assemble_exact_drain_candidate_runtime_snapshot(
         for name in EXACT_DRAIN_PROVIDER_SOURCE_NAMES
     ]
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "kind": "exact-drain-candidate-runtime-snapshot",
-        "sources": sources,
+        "sources": provider_evidence,
+        "candidate_patch": {
+            "path": EXACT_DRAIN_CANDIDATE_RESOLVER_PATH.as_posix(),
+            "original": {
+                "path": "hindsight/entity_resolver.original.py",
+                "sha256": hashlib.sha256(resolver_source).hexdigest(),
+                "size": len(resolver_source),
+            },
+            "patched": {
+                "path": "hindsight/entity_resolver.py",
+                "sha256": hashlib.sha256(patched_resolver).hexdigest(),
+                "size": len(patched_resolver),
+            },
+        },
     }
-    for name, body in source_bodies.items():
-        _write_exact_drain_snapshot_file(provider_root / name, body)
-    manifest_body = (
-        json.dumps(manifest, sort_keys=True, separators=(",", ":"))
-        + "\n"
-    ).encode("utf-8")
-    _write_exact_drain_snapshot_file(runtime_root / "manifest.json", manifest_body)
-    return {**manifest, "snapshot_digest": digest(manifest)}
+    try:
+        for name, body in source_bodies.items():
+            _write_exact_drain_snapshot_file(staged_provider_root / name, body)
+        _write_exact_drain_snapshot_file(
+            staged_hindsight_root / "entity_resolver.original.py",
+            resolver_source,
+        )
+        _write_exact_drain_snapshot_file(
+            staged_hindsight_root / "entity_resolver.py",
+            patched_resolver,
+        )
+        manifest_body = (
+            json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+            + "\n"
+        ).encode("utf-8")
+        _write_exact_drain_snapshot_file(
+            staging_root / "manifest.json",
+            manifest_body,
+        )
+        staged_snapshot, staged_sources, _original, _patched = (
+            _verify_exact_drain_candidate_runtime_snapshot(
+                library,
+                require_candidate_patch=False,
+                runtime_root_override=staging_root,
+            )
+        )
+        if staged_sources != source_bodies:
+            raise OperationRecoveryError(
+                "exact drain candidate runtime snapshot differs"
+            )
+        _publish_exact_drain_snapshot_directory(staging_root, runtime_root)
+        recovery_body = _exact_drain_snapshot_recovery_body(
+            staged_snapshot,
+            patched_resolver,
+        )
+        _write_exact_drain_snapshot_recovery_file(
+            recovery_path,
+            recovery_body,
+        )
+        _fsync_exact_drain_directory(library)
+        _atomic_replace_exact_drain_candidate_source(
+            resolver_path,
+            expected=resolver_source,
+            replacement=patched_resolver,
+        )
+        _finalize_exact_drain_snapshot_recovery(
+            recovery_path,
+            library,
+            recovery_body,
+        )
+        verified, _sources = verify_exact_drain_candidate_runtime_snapshot(
+            library
+        )
+        return verified
+    finally:
+        _remove_exact_drain_snapshot_staging(staging_root)
 
 
-def verify_exact_drain_candidate_runtime_snapshot(
+def _verify_exact_drain_candidate_runtime_snapshot(
     candidate_library: str | Path,
-) -> tuple[dict[str, Any], dict[str, bytes]]:
-    """Verify the closed provider-code snapshot sealed into a candidate."""
+    *,
+    require_candidate_patch: bool,
+    runtime_root_override: Path | None = None,
+) -> tuple[dict[str, Any], dict[str, bytes], bytes | None, bytes | None]:
     library = Path(candidate_library)
-    runtime_root = library / EXACT_DRAIN_CANDIDATE_RUNTIME_DIRECTORY
-    provider_root = exact_drain_candidate_provider_root(library)
+    runtime_root = (
+        library / EXACT_DRAIN_CANDIDATE_RUNTIME_DIRECTORY
+        if runtime_root_override is None
+        else runtime_root_override
+    )
+    provider_root = runtime_root / "provider"
     _exact_drain_trusted_directory(
         runtime_root,
         "exact drain candidate runtime snapshot",
@@ -1773,19 +2661,6 @@ def verify_exact_drain_candidate_runtime_snapshot(
         provider_root,
         "exact drain candidate provider runtime",
     )
-    try:
-        runtime_names = {path.name for path in runtime_root.iterdir()}
-        provider_names = {path.name for path in provider_root.iterdir()}
-    except OSError as error:
-        raise OperationRecoveryError(
-            "exact drain candidate runtime snapshot is unavailable"
-        ) from error
-    if runtime_names != {"manifest.json", "provider"} or provider_names != set(
-        EXACT_DRAIN_PROVIDER_SOURCE_NAMES
-    ):
-        raise OperationRecoveryError(
-            "exact drain candidate runtime snapshot differs"
-        )
     manifest_body = _exact_drain_file_bytes(
         runtime_root / "manifest.json",
         "exact drain candidate runtime snapshot manifest",
@@ -1797,6 +2672,20 @@ def verify_exact_drain_candidate_runtime_snapshot(
         raise OperationRecoveryError(
             "exact drain candidate runtime snapshot differs"
         ) from error
+    if not isinstance(manifest, Mapping) or type(
+        manifest.get("schema_version")
+    ) is not int:
+        raise OperationRecoveryError(
+            "exact drain candidate runtime snapshot differs"
+        )
+    schema_version = manifest["schema_version"]
+    try:
+        runtime_names = {path.name for path in runtime_root.iterdir()}
+        provider_names = {path.name for path in provider_root.iterdir()}
+    except OSError as error:
+        raise OperationRecoveryError(
+            "exact drain candidate runtime snapshot is unavailable"
+        ) from error
     sources = {
         name: _exact_drain_file_bytes(
             provider_root / name,
@@ -1805,25 +2694,118 @@ def verify_exact_drain_candidate_runtime_snapshot(
         )
         for name in EXACT_DRAIN_PROVIDER_SOURCE_NAMES
     }
-    expected = {
-        "schema_version": 1,
-        "kind": "exact-drain-candidate-runtime-snapshot",
-        "sources": [
-            {
-                "path": f"provider/{name}",
-                "sha256": hashlib.sha256(sources[name]).hexdigest(),
-                "size": len(sources[name]),
-            }
-            for name in EXACT_DRAIN_PROVIDER_SOURCE_NAMES
-        ],
-    }
+    provider_evidence = [
+        {
+            "path": f"provider/{name}",
+            "sha256": hashlib.sha256(sources[name]).hexdigest(),
+            "size": len(sources[name]),
+        }
+        for name in EXACT_DRAIN_PROVIDER_SOURCE_NAMES
+    ]
+    original_resolver: bytes | None = None
+    patched_resolver: bytes | None = None
+    if schema_version == 1:
+        expected = {
+            "schema_version": 1,
+            "kind": "exact-drain-candidate-runtime-snapshot",
+            "sources": provider_evidence,
+        }
+        if runtime_names != {"manifest.json", "provider"}:
+            raise OperationRecoveryError(
+                "exact drain candidate runtime snapshot differs"
+            )
+    elif schema_version == 2:
+        hindsight_root = runtime_root / "hindsight"
+        _exact_drain_trusted_directory(
+            hindsight_root,
+            "exact drain candidate Hindsight source snapshot",
+        )
+        try:
+            hindsight_names = {path.name for path in hindsight_root.iterdir()}
+        except OSError as error:
+            raise OperationRecoveryError(
+                "exact drain candidate runtime snapshot is unavailable"
+            ) from error
+        if runtime_names != {"manifest.json", "provider", "hindsight"} or (
+            hindsight_names
+            != {"entity_resolver.original.py", "entity_resolver.py"}
+        ):
+            raise OperationRecoveryError(
+                "exact drain candidate runtime snapshot differs"
+            )
+        original_resolver = _exact_drain_file_bytes(
+            hindsight_root / "entity_resolver.original.py",
+            "exact drain original entity resolver snapshot",
+            max_bytes=1024 * 1024,
+        )
+        patched_resolver = _exact_drain_file_bytes(
+            hindsight_root / "entity_resolver.py",
+            "exact drain patched entity resolver snapshot",
+            max_bytes=1024 * 1024,
+        )
+        if _patch_exact_drain_entity_resolver(original_resolver) != patched_resolver:
+            raise OperationRecoveryError(
+                "exact drain candidate runtime snapshot differs"
+            )
+        expected = {
+            "schema_version": 2,
+            "kind": "exact-drain-candidate-runtime-snapshot",
+            "sources": provider_evidence,
+            "candidate_patch": {
+                "path": EXACT_DRAIN_CANDIDATE_RESOLVER_PATH.as_posix(),
+                "original": {
+                    "path": "hindsight/entity_resolver.original.py",
+                    "sha256": hashlib.sha256(original_resolver).hexdigest(),
+                    "size": len(original_resolver),
+                },
+                "patched": {
+                    "path": "hindsight/entity_resolver.py",
+                    "sha256": hashlib.sha256(patched_resolver).hexdigest(),
+                    "size": len(patched_resolver),
+                },
+            },
+        }
+        if require_candidate_patch and _exact_drain_file_bytes(
+            library / EXACT_DRAIN_CANDIDATE_RESOLVER_PATH,
+            "exact drain candidate entity resolver",
+            max_bytes=1024 * 1024,
+        ) != patched_resolver:
+            raise OperationRecoveryError(
+                "exact drain candidate runtime snapshot differs"
+            )
+    else:
+        raise OperationRecoveryError(
+            "exact drain candidate runtime snapshot differs"
+        )
+    if provider_names != set(EXACT_DRAIN_PROVIDER_SOURCE_NAMES):
+        raise OperationRecoveryError(
+            "exact drain candidate runtime snapshot differs"
+        )
     if manifest != expected or manifest_body != (
         json.dumps(expected, sort_keys=True, separators=(",", ":")) + "\n"
     ).encode("utf-8"):
         raise OperationRecoveryError(
             "exact drain candidate runtime snapshot differs"
         )
-    return {**expected, "snapshot_digest": digest(expected)}, sources
+    return (
+        {**expected, "snapshot_digest": digest(expected)},
+        sources,
+        original_resolver,
+        patched_resolver,
+    )
+
+
+def verify_exact_drain_candidate_runtime_snapshot(
+    candidate_library: str | Path,
+) -> tuple[dict[str, Any], dict[str, bytes]]:
+    """Verify the closed provider/code snapshot sealed into a candidate."""
+    snapshot, sources, _original, _patched = (
+        _verify_exact_drain_candidate_runtime_snapshot(
+            candidate_library,
+            require_candidate_patch=True,
+        )
+    )
+    return snapshot, sources
 
 
 def install_exact_drain_candidate_imports(
@@ -2267,10 +3249,10 @@ def exact_drain_runtime_evidence(
     provider_runtime_root: str | Path,
     runtime_package_root: str | Path,
     *,
-    schema_version: int = 2,
+    schema_version: int = 3,
 ) -> tuple[str, bytes]:
     """Bind runtime sources and retain prevalidated provider bootstrap bytes."""
-    if type(schema_version) is not int or schema_version not in {1, 2}:
+    if type(schema_version) is not int or schema_version not in {1, 2, 3}:
         raise OperationRecoveryError(
             "exact drain runtime evidence schema version is invalid"
         )
@@ -2328,6 +3310,14 @@ def exact_drain_runtime_evidence(
         sources["candidate-runtime-snapshot"] = snapshot[
             "snapshot_digest"
         ]
+        if schema_version == 3:
+            if snapshot["schema_version"] != 2:
+                raise OperationRecoveryError(
+                    "exact drain phase repair candidate snapshot is required"
+                )
+            sources["phase-repair-contract"] = (
+                EXACT_DRAIN_PHASE_REPAIR_CONTRACT_DIGEST
+            )
     for name, source in provider_sources.items():
         sources[f"provider/{name}"] = hashlib.sha256(source).hexdigest()
     package_entries = _exact_drain_package_entries(package_root)
@@ -2378,7 +3368,7 @@ def exact_drain_runtime_digest(
     provider_runtime_root: str | Path,
     runtime_package_root: str | Path,
     *,
-    schema_version: int = 2,
+    schema_version: int = 3,
 ) -> str:
     """Bind the worker entrypoint, claim seam, and provider patch sources."""
     runtime_digest, _provider_bootstrap = exact_drain_runtime_evidence(
@@ -2454,14 +3444,14 @@ class ExactDrainClaimAdapter:
         verified = verify_exact_drain_plan(plan, allow_expired=True)
         if (
             terminal_reconciliation
-            and verified.get("schema_version") == 2
+            and verified.get("schema_version") in {2, 3}
             and terminal_status_evidence is None
         ):
             raise OperationRecoveryError(
                 "operation-recovery terminal status evidence is required"
             )
         self._clock = clock
-        if verified.get("schema_version") == 2:
+        if verified.get("schema_version") in {2, 3}:
             if authorization is None:
                 raise OperationRecoveryError(
                     "operation-recovery exact drain authorization is required"
@@ -2486,6 +3476,16 @@ class ExactDrainClaimAdapter:
                 if terminal_reconciliation
                 else None
             )
+        self.phase_one_timeout_seconds = (
+            verified["phase_one_timeout_seconds"]
+            if verified.get("schema_version") == 3
+            else None
+        )
+        self.phase_one_statement_timeout_seconds = (
+            verified["phase_one_statement_timeout_seconds"]
+            if verified.get("schema_version") == 3
+            else None
+        )
         self._cleanup_deadline: float | None = None
         self._terminal_reconciliation_deadline: float | None = None
         self._plan = verified

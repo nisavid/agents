@@ -32,6 +32,7 @@ from hindsight_memory_control_plane.operation_recovery_runtime import (  # noqa:
     QUEUE_BLOCKER_PREDICATE,
     CLAIM_RELEASE_EVIDENCE_QUERY,
     ExactDrainClaimAdapter,
+    ExactDrainWorkerMainShutdownBridge,
     SAFE_OPERATION_QUERY,
     apply_requeue_transaction,
     assert_connected_live_database,
@@ -398,6 +399,39 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
                 object(),
             )
 
+    def test_shutdown_bridge_deduplicates_internal_request_after_signal(self):
+        external_handlers = []
+        worker_callbacks = []
+
+        def install_signal_handlers(_loop, handler):
+            external_handlers.append(handler)
+            return True
+
+        worker_main = SimpleNamespace(
+            _install_shutdown_signal_handlers=install_signal_handlers,
+        )
+        bridge = ExactDrainWorkerMainShutdownBridge(worker_main)
+        with bridge:
+            self.assertTrue(
+                worker_main._install_shutdown_signal_handlers(
+                    object(),
+                    lambda: worker_callbacks.append("shutdown"),
+                )
+            )
+            external_handlers[0]()
+            bridge.request()
+            self.assertEqual(worker_callbacks, ["shutdown"])
+            external_handlers[0]()
+            self.assertEqual(
+                worker_callbacks,
+                ["shutdown", "shutdown"],
+            )
+            bridge.request()
+            self.assertEqual(
+                worker_callbacks,
+                ["shutdown", "shutdown"],
+            )
+
     def test_runtime_guard_records_claim_only_after_upstream_commit_seam(self):
         committed = []
         task = type("Task", (), {"operation_id": "operation-1"})()
@@ -441,6 +475,449 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
 
         self.assertEqual(result, [task])
         self.assertEqual(committed, [task])
+
+    def test_exact_terminal_failure_never_uses_upstream_sql_reclaim(self):
+        try:
+            from hindsight_api.worker.poller import ClaimedTask
+            from hindsight_api.worker.poller import (
+                WorkerPoller as UpstreamWorkerPoller,
+            )
+        except ImportError as error:
+            raise unittest.SkipTest(
+                "hindsight_api worker runtime is unavailable"
+            ) from error
+
+        row = {"status": "processing"}
+        sql_calls = []
+        recovery_calls = []
+        shutdown_requests = []
+
+        class Connection:
+            async def execute(self, query, *_arguments):
+                sql_calls.append(query)
+                row["status"] = "pending"
+                return "UPDATE 1"
+
+            async def fetch(self, query, *_arguments):
+                sql_calls.append(query)
+                return []
+
+        class Backend:
+            @asynccontextmanager
+            async def acquire(self):
+                yield Connection()
+
+        class Adapter:
+            def record_upstream_stage(self, _operation_id, _stage):
+                return None
+
+            async def mark_failed(self, *_arguments):
+                raise RuntimeError("exact terminal write failed")
+
+            async def recover_own_tasks(self, _backend):
+                recovery_calls.append("recover")
+                return 0
+
+            async def release_own_tasks(self, _backend):
+                recovery_calls.append("release")
+                return 0
+
+        class PostgreSQLOps:
+            pass
+
+        class WorkerPoller(UpstreamWorkerPoller):
+            async def _run_executor(self, _task, _task_type):
+                raise RuntimeError("executor failed")
+
+        class MemoryEngine:
+            pass
+
+        install_exact_drain_runtime_guards(
+            PostgreSQLOps,
+            WorkerPoller,
+            MemoryEngine,
+            Adapter(),
+            request_worker_shutdown=lambda: shutdown_requests.append(True),
+        )
+
+        async def exercise():
+            poller = object.__new__(WorkerPoller)
+            poller._backend = Backend()
+            poller._worker_id = "exact-worker"
+            poller._max_retries = 3
+            poller._shutdown = asyncio.Event()
+            poller._active_tasks = {}
+            task = ClaimedTask(
+                operation_id="operation-1",
+                task_dict={
+                    "type": "retain",
+                    "operation_type": "retain",
+                    "bank_id": "engineering",
+                },
+                schema=None,
+            )
+            holder = SimpleNamespace(stage="queued.retain")
+            await poller._execute_task_inner(task, holder)
+            await poller.recover_own_tasks()
+            await poller.release_own_tasks()
+
+        asyncio.run(exercise())
+        self.assertEqual(sql_calls, [])
+        self.assertEqual(row, {"status": "processing"})
+        self.assertEqual(recovery_calls, ["recover", "release"])
+        self.assertEqual(shutdown_requests, [True])
+
+    def test_swallowed_exact_terminal_failures_surface_after_public_shutdown(self):
+        try:
+            from hindsight_api.worker.poller import ClaimedTask
+            from hindsight_api.worker.poller import (
+                WorkerPoller as UpstreamWorkerPoller,
+            )
+        except ImportError as error:
+            raise unittest.SkipTest(
+                "hindsight_api worker runtime is unavailable"
+            ) from error
+
+        for failure_mode in ("terminal-write", "post-commit-progress"):
+            with self.subTest(failure_mode=failure_mode):
+                row = {"status": "processing"}
+                events = []
+                sql_calls = []
+                shutdown_requested = asyncio.Event()
+                sibling_quiesced = asyncio.Event()
+                expected_error = (
+                    "exact terminal write failed"
+                    if failure_mode == "terminal-write"
+                    else "terminal progress recorder failed"
+                )
+
+                class Backend:
+                    @asynccontextmanager
+                    async def acquire(self, _sql_calls=sql_calls):
+                        _sql_calls.append("acquire")
+                        raise AssertionError("upstream SQL reclaim executed")
+                        yield
+
+                class Adapter:
+                    def record_upstream_stage(self, _operation_id, _stage):
+                        return None
+
+                    async def mark_completed(
+                        self,
+                        _backend,
+                        operation_id,
+                        _schema,
+                        _events=events,
+                    ):
+                        _events.append(("completed", operation_id))
+
+                    async def mark_failed(
+                        self,
+                        *_arguments,
+                        _failure_mode=failure_mode,
+                        _row=row,
+                        _events=events,
+                        _expected_error=expected_error,
+                    ):
+                        if _failure_mode == "post-commit-progress":
+                            _row["status"] = "failed"
+                            _events.append(("terminal", "committed"))
+                        raise RuntimeError(_expected_error)
+
+                    async def release_own_tasks(
+                        self,
+                        _backend,
+                        _sibling_quiesced=sibling_quiesced,
+                        _events=events,
+                        _row=row,
+                    ):
+                        if not _sibling_quiesced.is_set():
+                            raise AssertionError(
+                                "exact release preceded sibling quiescence"
+                            )
+                        _events.append(("release", _row["status"]))
+                        if _row["status"] == "processing":
+                            _row["status"] = "pending"
+                            return 1
+                        return 0
+
+                class PostgreSQLOps:
+                    pass
+
+                class WorkerPoller(UpstreamWorkerPoller):
+                    async def _run_executor(
+                        self,
+                        task,
+                        _task_type,
+                        _sibling_quiesced=sibling_quiesced,
+                        _events=events,
+                    ):
+                        if task.operation_id == "operation-a":
+                            raise RuntimeError("executor failed")
+                        try:
+                            await self._shutdown.wait()
+                        finally:
+                            _sibling_quiesced.set()
+                            _events.append(("sibling", "quiesced"))
+
+                    async def _cleanup_task(
+                        self,
+                        operation_id,
+                        operation_type,
+                        _events=events,
+                    ):
+                        _events.append(("cleanup", operation_id))
+                        await super()._cleanup_task(
+                            operation_id,
+                            operation_type,
+                        )
+
+                class MemoryEngine:
+                    pass
+
+                def request_shutdown(
+                    _events=events,
+                    _shutdown_requested=shutdown_requested,
+                ):
+                    _events.append(("shutdown", "requested"))
+                    _shutdown_requested.set()
+
+                install_exact_drain_runtime_guards(
+                    PostgreSQLOps,
+                    WorkerPoller,
+                    MemoryEngine,
+                    Adapter(),
+                    request_worker_shutdown=request_shutdown,
+                )
+
+                async def exercise(
+                    _shutdown_requested=shutdown_requested,
+                    _expected_error=expected_error,
+                ):
+                    poller = object.__new__(WorkerPoller)
+                    poller._backend = Backend()
+                    poller._worker_id = "exact-worker"
+                    poller._shutdown = asyncio.Event()
+                    poller._in_flight_lock = asyncio.Lock()
+                    poller._in_flight_count = 0
+                    poller._in_flight_by_type = {}
+                    poller._active_tasks = {}
+                    sibling = ClaimedTask(
+                        operation_id="operation-b",
+                        task_dict={
+                            "type": "retain",
+                            "operation_type": "retain",
+                            "bank_id": "engineering",
+                        },
+                        schema=None,
+                    )
+                    failing = ClaimedTask(
+                        operation_id="operation-a",
+                        task_dict={
+                            "type": "retain",
+                            "operation_type": "retain",
+                            "bank_id": "engineering",
+                        },
+                        schema=None,
+                    )
+                    await poller.execute_task(sibling)
+                    await asyncio.sleep(0)
+                    await poller.execute_task(failing)
+                    try:
+                        await asyncio.wait_for(
+                            _shutdown_requested.wait(),
+                            timeout=0.5,
+                        )
+                        self.assertTrue(poller._shutdown.is_set())
+                        with self.assertRaisesRegex(
+                            RuntimeError,
+                            _expected_error,
+                        ):
+                            await poller.shutdown_graceful(timeout=0.25)
+                        self.assertEqual(
+                            await poller._claim_batch_for_schema_inner(
+                                None,
+                                {},
+                                1,
+                            ),
+                            [],
+                        )
+                    finally:
+                        for info in list(poller._active_tasks.values()):
+                            if not info.bg_task.done():
+                                info.bg_task.cancel()
+                        await asyncio.gather(
+                            *[
+                                info.bg_task
+                                for info in poller._active_tasks.values()
+                            ],
+                            return_exceptions=True,
+                        )
+
+                asyncio.run(exercise())
+                self.assertEqual(sql_calls, [])
+                self.assertEqual(
+                    [event for event in events if event[0] == "shutdown"],
+                    [("shutdown", "requested")],
+                )
+                self.assertLess(
+                    events.index(("shutdown", "requested")),
+                    events.index(("cleanup", "operation-a")),
+                )
+                self.assertLess(
+                    events.index(("sibling", "quiesced")),
+                    next(
+                        index
+                        for index, event in enumerate(events)
+                        if event[0] == "release"
+                    ),
+                )
+                self.assertEqual(
+                    row["status"],
+                    (
+                        "pending"
+                        if failure_mode == "terminal-write"
+                        else "failed"
+                    ),
+                )
+
+    def test_cancelled_exact_terminal_mutation_does_not_request_shutdown(self):
+        shutdown_requests = []
+
+        class Adapter:
+            def record_upstream_stage(self, _operation_id, _stage):
+                return None
+
+            async def mark_failed(self, *_arguments):
+                raise asyncio.CancelledError
+
+        class WorkerPoller:
+            def __init__(self):
+                self._backend = "exact-backend"
+                self._shutdown = asyncio.Event()
+
+            async def _execute_task_inner(self, task, _holder):
+                await self._mark_failed(
+                    task.operation_id,
+                    "cancelled",
+                    None,
+                )
+
+            async def _claim_batch_for_schema_inner(self, *_arguments):
+                return []
+
+            async def _claim_batch_for_schema(self, schema, reserved, shared):
+                return await self._claim_batch_for_schema_inner(
+                    schema,
+                    reserved,
+                    shared,
+                )
+
+        install_exact_drain_runtime_guards(
+            type("PostgreSQLOps", (), {}),
+            WorkerPoller,
+            type("MemoryEngine", (), {}),
+            Adapter(),
+            request_worker_shutdown=lambda: shutdown_requests.append(True),
+        )
+
+        async def exercise():
+            poller = WorkerPoller()
+            with self.assertRaises(asyncio.CancelledError):
+                await poller._execute_task_inner(
+                    SimpleNamespace(operation_id="operation-1"),
+                    SimpleNamespace(stage="queued.retain"),
+                )
+            self.assertFalse(poller._shutdown.is_set())
+            self.assertFalse(
+                hasattr(poller, "_exact_drain_task_errors")
+            )
+
+        asyncio.run(exercise())
+        self.assertEqual(shutdown_requests, [])
+
+    def test_shutdown_serializes_with_a_committing_claim(self):
+        events = []
+        claim_entered = asyncio.Event()
+        allow_claim_commit = asyncio.Event()
+        task = type("Task", (), {"operation_id": "operation-1"})()
+
+        class Adapter:
+            def claim_committed(self, tasks):
+                events.append(("committed", list(tasks)))
+
+            async def release_own_tasks(self, _backend):
+                events.append(("released", [task]))
+                return 1
+
+        class PostgreSQLOps:
+            pass
+
+        class WorkerPoller:
+            def __init__(self):
+                self._backend = "exact-backend"
+                self._shutdown = asyncio.Event()
+                self._active_tasks = {}
+
+            async def _execute_task_inner(self, _task, _holder):
+                return None
+
+            async def _claim_batch_for_schema_inner(
+                self,
+                _schema,
+                _reserved_limits,
+                _shared_limit,
+            ):
+                claim_entered.set()
+                await allow_claim_commit.wait()
+                return [task]
+
+            async def _claim_batch_for_schema(self, schema, reserved, shared):
+                return await self._claim_batch_for_schema_inner(
+                    schema,
+                    reserved,
+                    shared,
+                )
+
+            async def shutdown_graceful(self, timeout=30.0):
+                del timeout
+                self._shutdown.set()
+                await self.release_own_tasks()
+
+        class MemoryEngine:
+            pass
+
+        install_exact_drain_runtime_guards(
+            PostgreSQLOps,
+            WorkerPoller,
+            MemoryEngine,
+            Adapter(),
+        )
+
+        async def exercise():
+            poller = WorkerPoller()
+            claim = asyncio.create_task(
+                poller._claim_batch_for_schema_inner(None, {}, 1)
+            )
+            await asyncio.wait_for(claim_entered.wait(), timeout=1.0)
+            shutdown = asyncio.create_task(
+                poller.shutdown_graceful(timeout=0.25)
+            )
+            await asyncio.wait_for(poller._shutdown.wait(), timeout=1.0)
+            await asyncio.sleep(0)
+            self.assertFalse(shutdown.done())
+            allow_claim_commit.set()
+            self.assertEqual(await claim, [])
+            await shutdown
+
+        asyncio.run(exercise())
+        self.assertEqual(
+            events,
+            [
+                ("committed", [task]),
+                ("released", [task]),
+            ],
+        )
 
     def test_public_claim_does_not_swallow_post_commit_progress_failure(self):
         operation_id = "00000000-0000-4000-8000-000000000001"
@@ -555,6 +1032,770 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
                 ("operation-1", "llm.codex.retain.attempt=1/1"),
             ],
         )
+
+    def test_runtime_guard_bounds_retain_phase_one_after_breadcrumb(self):
+        events = []
+
+        class Adapter:
+            phase_one_timeout_seconds = 0.001
+
+            def record_upstream_stage(self, _operation_id, _stage):
+                return None
+
+        class PostgreSQLOps:
+            pass
+
+        class WorkerPoller:
+            _backend = "exact-backend"
+
+            def __init__(self):
+                self._shutdown = asyncio.Event()
+
+            async def _claim_batch_for_schema_inner(
+                self,
+                _schema,
+                _reserved_limits,
+                _shared_limit,
+            ):
+                return []
+
+            async def _claim_batch_for_schema(self, schema, reserved, shared):
+                return await self._claim_batch_for_schema_inner(
+                    schema, reserved, shared
+                )
+
+            async def _execute_task_inner(self, _task, holder):
+                holder.stage = "retain.phase1.candidates"
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    events.append("cancelled")
+
+        class MemoryEngine:
+            pass
+
+        install_exact_drain_runtime_guards(
+            PostgreSQLOps,
+            WorkerPoller,
+            MemoryEngine,
+            Adapter(),
+            request_worker_shutdown=lambda: events.append("shutdown"),
+        )
+
+        async def exercise():
+            task = type("Task", (), {"operation_id": "operation-1"})()
+            holder = type("Holder", (), {"stage": "queued.retain"})()
+            return await WorkerPoller()._execute_task_inner(task, holder)
+
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "retain phase one exceeded its deadline",
+        ):
+            asyncio.run(exercise())
+        self.assertEqual(events, ["shutdown", "cancelled"])
+
+    def test_phase_one_timeout_never_releases_before_task_quiescence(self):
+        release_calls = []
+
+        class Adapter:
+            phase_one_timeout_seconds = 0.001
+
+            def record_upstream_stage(self, _operation_id, _stage):
+                return None
+
+            async def release_own_tasks(self, _backend):
+                release_calls.append(True)
+                return 1
+
+        class PostgreSQLOps:
+            pass
+
+        class WorkerPoller:
+            _backend = "exact-backend"
+
+            def __init__(self):
+                self._shutdown = asyncio.Event()
+
+            async def _claim_batch_for_schema_inner(
+                self,
+                _schema,
+                _reserved_limits,
+                _shared_limit,
+            ):
+                return []
+
+            async def _claim_batch_for_schema(self, schema, reserved, shared):
+                return await self._claim_batch_for_schema_inner(
+                    schema, reserved, shared
+                )
+
+            async def _execute_task_inner(self, _task, holder):
+                holder.stage = "retain.phase1.cooccurrence"
+                ignored = False
+                while True:
+                    try:
+                        await asyncio.Event().wait()
+                    except asyncio.CancelledError:
+                        if ignored:
+                            raise
+                        ignored = True
+
+        class MemoryEngine:
+            pass
+
+        guard_globals = install_exact_drain_runtime_guards.__globals__
+        original_cancellation_timeout = guard_globals[
+            "EXACT_DRAIN_TASK_CANCELLATION_TIMEOUT_SECONDS"
+        ]
+        guard_globals["EXACT_DRAIN_TASK_CANCELLATION_TIMEOUT_SECONDS"] = 0.0
+        try:
+            install_exact_drain_runtime_guards(
+                PostgreSQLOps,
+                WorkerPoller,
+                MemoryEngine,
+                Adapter(),
+                request_worker_shutdown=lambda: release_calls.append(
+                    "shutdown"
+                ),
+            )
+
+            async def exercise():
+                poller = WorkerPoller()
+                task = type("Task", (), {"operation_id": "operation-1"})()
+                holder = type("Holder", (), {"stage": "queued.retain"})()
+                with self.assertRaisesRegex(
+                    OperationRecoveryError,
+                    "did not quiesce",
+                ):
+                    await poller._execute_task_inner(task, holder)
+                with self.assertRaisesRegex(
+                    OperationRecoveryError,
+                    "claim release is disabled",
+                ):
+                    await poller.release_own_tasks()
+
+            asyncio.run(exercise())
+            self.assertEqual(release_calls, ["shutdown"])
+        finally:
+            guard_globals["EXACT_DRAIN_TASK_CANCELLATION_TIMEOUT_SECONDS"] = (
+                original_cancellation_timeout
+            )
+
+    def test_public_shutdown_never_releases_a_child_ignoring_cancellation(self):
+        release_calls = []
+        shutdown_requested = asyncio.Event()
+        child_tasks = []
+
+        class Adapter:
+            phase_one_timeout_seconds = 0.001
+
+            def record_upstream_stage(self, _operation_id, _stage):
+                return None
+
+            async def release_own_tasks(self, _backend):
+                release_calls.append(True)
+                return 1
+
+        class PostgreSQLOps:
+            pass
+
+        class WorkerPoller:
+            def __init__(self):
+                self._backend = "exact-backend"
+                self._shutdown = asyncio.Event()
+                self._active_tasks = {}
+
+            async def _claim_batch_for_schema_inner(
+                self,
+                _schema,
+                _reserved_limits,
+                _shared_limit,
+            ):
+                return []
+
+            async def _claim_batch_for_schema(self, schema, reserved, shared):
+                return await self._claim_batch_for_schema_inner(
+                    schema,
+                    reserved,
+                    shared,
+                )
+
+            async def _execute_task_inner(self, _task, holder):
+                holder.stage = "retain.phase1.cooccurrence"
+                child_tasks.append(asyncio.current_task())
+                ignored = False
+                while True:
+                    try:
+                        await asyncio.Event().wait()
+                    except asyncio.CancelledError:
+                        if ignored:
+                            raise
+                        ignored = True
+
+            async def shutdown_graceful(self, timeout=30.0):
+                self._shutdown.set()
+                tasks = [info.bg_task for info in self._active_tasks.values()]
+                _done, pending = await asyncio.wait(tasks, timeout=timeout)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    await asyncio.wait(pending, timeout=0.1)
+                await self.release_own_tasks()
+
+        class MemoryEngine:
+            pass
+
+        guard_globals = install_exact_drain_runtime_guards.__globals__
+        original_cancellation_timeout = guard_globals[
+            "EXACT_DRAIN_TASK_CANCELLATION_TIMEOUT_SECONDS"
+        ]
+        guard_globals["EXACT_DRAIN_TASK_CANCELLATION_TIMEOUT_SECONDS"] = 0.01
+        try:
+            install_exact_drain_runtime_guards(
+                PostgreSQLOps,
+                WorkerPoller,
+                MemoryEngine,
+                Adapter(),
+                request_worker_shutdown=shutdown_requested.set,
+            )
+
+            async def exercise():
+                poller = WorkerPoller()
+                task = type("Task", (), {"operation_id": "operation-1"})()
+                holder = type("Holder", (), {"stage": "queued.retain"})()
+                execution = asyncio.create_task(
+                    poller._execute_task_inner(task, holder)
+                )
+                poller._active_tasks = {
+                    task.operation_id: SimpleNamespace(bg_task=execution),
+                }
+                await asyncio.wait_for(shutdown_requested.wait(), timeout=1.0)
+                with self.assertRaisesRegex(
+                    OperationRecoveryError,
+                    "claim release is disabled",
+                ):
+                    await poller.shutdown_graceful(timeout=0.0)
+                for child in child_tasks:
+                    if child is not None and not child.done():
+                        child.cancel()
+                if child_tasks:
+                    await asyncio.gather(*child_tasks, return_exceptions=True)
+
+            asyncio.run(exercise())
+            self.assertEqual(release_calls, [])
+        finally:
+            guard_globals["EXACT_DRAIN_TASK_CANCELLATION_TIMEOUT_SECONDS"] = (
+                original_cancellation_timeout
+            )
+
+    def test_phase_one_deadline_quiesces_shuts_down_and_releases_owned_row(self):
+        try:
+            from hindsight_api.worker import main as worker_main_module
+            from hindsight_api.worker.poller import ClaimedTask
+            from hindsight_api.worker.poller import (
+                WorkerPoller as UpstreamWorkerPoller,
+            )
+        except ImportError as error:
+            raise unittest.SkipTest(
+                "hindsight_api worker runtime is unavailable"
+            ) from error
+
+        events = []
+        row = {"status": "processing"}
+        task_quiesced = asyncio.Event()
+        worker_main_shutdown = asyncio.Event()
+
+        class Adapter:
+            phase_one_timeout_seconds = 0.001
+
+            def record_upstream_stage(self, _operation_id, stage):
+                events.append(("stage", stage))
+
+            async def recover_own_tasks(self, _backend):
+                events.append(("recover", row["status"]))
+                return 0
+
+            async def release_own_tasks(self, _backend):
+                if not task_quiesced.is_set():
+                    raise AssertionError("owned row released before task quiescence")
+                if row["status"] != "processing":
+                    return 0
+                row["status"] = "pending"
+                events.append(("release", "pending"))
+                return 1
+
+        class PostgreSQLOps:
+            pass
+
+        class WorkerPoller(UpstreamWorkerPoller):
+            async def claim_batch(self):
+                if any(event[0] == "release" for event in events):
+                    raise AssertionError("claim attempted after exact release")
+                if not getattr(self, "_test_delivered", False):
+                    self._test_delivered = True
+                    events.append(("claim", row["status"]))
+                    return [
+                        ClaimedTask(
+                            operation_id="operation-1",
+                            task_dict={
+                                "type": "retain",
+                                "operation_type": "retain",
+                                "bank_id": "engineering",
+                            },
+                            schema=None,
+                        )
+                    ]
+                return []
+
+            async def _log_progress_if_due(self):
+                return None
+
+            async def _execute_task_inner(self, _task, holder):
+                holder.stage = "retain.phase1.cooccurrence"
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    task_quiesced.set()
+                events.append(("provider", "after-quiescence"))
+
+        class MemoryEngine:
+            pass
+
+        shutdown_bridge = ExactDrainWorkerMainShutdownBridge(
+            worker_main_module
+        )
+
+        async def exercise():
+            loop = asyncio.get_running_loop()
+            installed = worker_main_module._install_shutdown_signal_handlers(
+                loop,
+                worker_main_shutdown.set,
+            )
+            poller = object.__new__(WorkerPoller)
+            poller._backend = "exact-backend"
+            poller._worker_id = "exact-worker"
+            poller._shutdown = asyncio.Event()
+            poller._poll_interval_ms = 1
+            poller._slot_reservations = {}
+            poller._max_slots = 1
+            poller._in_flight_lock = asyncio.Lock()
+            poller._in_flight_count = 0
+            poller._in_flight_by_type = {}
+            poller._active_tasks = {}
+            try:
+                poller_task = asyncio.create_task(poller.run())
+                await asyncio.wait_for(
+                    worker_main_shutdown.wait(),
+                    timeout=1.0,
+                )
+                with self.assertRaisesRegex(
+                    OperationRecoveryError,
+                    "retain phase one exceeded its deadline",
+                ):
+                    await poller.shutdown_graceful(timeout=0.25)
+                await asyncio.wait_for(poller_task, timeout=1.0)
+                await asyncio.sleep(0)
+                return poller
+            finally:
+                if installed:
+                    loop.remove_signal_handler(signal.SIGINT)
+                    loop.remove_signal_handler(signal.SIGTERM)
+
+        with shutdown_bridge:
+            install_exact_drain_runtime_guards(
+                PostgreSQLOps,
+                WorkerPoller,
+                MemoryEngine,
+                Adapter(),
+                request_worker_shutdown=shutdown_bridge.request,
+            )
+            poller = asyncio.run(exercise())
+        self.assertTrue(poller._shutdown.is_set())
+        self.assertEqual(row["status"], "pending")
+        self.assertIn(("release", "pending"), events)
+        self.assertNotIn(("provider", "after-quiescence"), events)
+
+    def test_phase_one_deadline_quiesces_sibling_before_owned_row_release(self):
+        try:
+            from hindsight_api.worker.poller import ClaimedTask
+            from hindsight_api.worker.poller import (
+                WorkerPoller as UpstreamWorkerPoller,
+            )
+        except ImportError as error:
+            raise unittest.SkipTest(
+                "hindsight_api worker runtime is unavailable"
+            ) from error
+
+        rows = {
+            "operation-a": "processing",
+            "operation-b": "processing",
+        }
+        quiesced = {operation_id: asyncio.Event() for operation_id in rows}
+        events = []
+        worker_main_shutdown = asyncio.Event()
+
+        class Adapter:
+            phase_one_timeout_seconds = 0.001
+
+            def record_upstream_stage(self, _operation_id, _stage):
+                return None
+
+            async def recover_own_tasks(self, _backend):
+                return 0
+
+            async def release_own_tasks(self, _backend):
+                if not all(event.is_set() for event in quiesced.values()):
+                    raise AssertionError(
+                        "owned rows released while a sibling task could write"
+                    )
+                for operation_id in rows:
+                    rows[operation_id] = "pending"
+                events.append("release")
+                return 2
+
+        class PostgreSQLOps:
+            pass
+
+        class WorkerPoller(UpstreamWorkerPoller):
+            async def claim_batch(self):
+                if self._shutdown.is_set():
+                    raise AssertionError("claim attempted after shutdown")
+                if getattr(self, "_test_delivered", False):
+                    return []
+                self._test_delivered = True
+                return [
+                    ClaimedTask(
+                        operation_id=operation_id,
+                        task_dict={
+                            "type": "retain",
+                            "operation_type": "retain",
+                            "bank_id": "engineering",
+                        },
+                        schema=None,
+                    )
+                    for operation_id in rows
+                ]
+
+            async def _log_progress_if_due(self):
+                return None
+
+            async def _execute_task_inner(self, task, holder):
+                if task.operation_id == "operation-a":
+                    holder.stage = "retain.phase1.cooccurrence"
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    quiesced[task.operation_id].set()
+                events.append(("provider", task.operation_id))
+
+        class MemoryEngine:
+            pass
+
+        install_exact_drain_runtime_guards(
+            PostgreSQLOps,
+            WorkerPoller,
+            MemoryEngine,
+            Adapter(),
+            request_worker_shutdown=worker_main_shutdown.set,
+        )
+
+        async def exercise():
+            poller = object.__new__(WorkerPoller)
+            poller._backend = "exact-backend"
+            poller._worker_id = "exact-worker"
+            poller._shutdown = asyncio.Event()
+            poller._poll_interval_ms = 1
+            poller._slot_reservations = {}
+            poller._max_slots = 2
+            poller._in_flight_lock = asyncio.Lock()
+            poller._in_flight_count = 0
+            poller._in_flight_by_type = {}
+            poller._active_tasks = {}
+            poller_task = asyncio.create_task(poller.run())
+            await asyncio.wait_for(
+                worker_main_shutdown.wait(),
+                timeout=1.0,
+            )
+            self.assertNotIn("release", events)
+            with self.assertRaisesRegex(
+                OperationRecoveryError,
+                "retain phase one exceeded its deadline",
+            ):
+                await poller.shutdown_graceful(timeout=30.0)
+            await asyncio.wait_for(poller_task, timeout=1.0)
+
+        asyncio.run(exercise())
+        self.assertEqual(rows, {
+            "operation-a": "pending",
+            "operation-b": "pending",
+        })
+        self.assertEqual(events, ["release"])
+
+    def test_phase_one_recorder_failure_shuts_down_releases_then_surfaces(self):
+        events = []
+        shutdown_requested = asyncio.Event()
+
+        class Adapter:
+            phase_one_timeout_seconds = 30.0
+
+            def record_upstream_stage(self, _operation_id, stage):
+                events.append(("stage", stage))
+                if stage == "retain.phase1.candidates":
+                    raise RuntimeError("progress recorder failed")
+
+            async def release_own_tasks(self, _backend):
+                events.append(("release", "owned"))
+                return 1
+
+        class PostgreSQLOps:
+            pass
+
+        class WorkerPoller:
+            def __init__(self):
+                self._backend = "exact-backend"
+                self._shutdown = asyncio.Event()
+                self._active_tasks = {}
+
+            async def _claim_batch_for_schema_inner(
+                self,
+                _schema,
+                _reserved_limits,
+                _shared_limit,
+            ):
+                events.append(("claim", "upstream"))
+                return []
+
+            async def _claim_batch_for_schema(self, schema, reserved, shared):
+                return await self._claim_batch_for_schema_inner(
+                    schema,
+                    reserved,
+                    shared,
+                )
+
+            async def _execute_task_inner(self, _task, holder):
+                holder.stage = "retain.phase1.candidates"
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    events.append(("child", "quiesced"))
+
+            async def shutdown_graceful(self, timeout=30.0):
+                del timeout
+                self._shutdown.set()
+                tasks = [info.bg_task for info in self._active_tasks.values()]
+                await asyncio.gather(*tasks, return_exceptions=True)
+                await self.release_own_tasks()
+
+        class MemoryEngine:
+            pass
+
+        install_exact_drain_runtime_guards(
+            PostgreSQLOps,
+            WorkerPoller,
+            MemoryEngine,
+            Adapter(),
+            request_worker_shutdown=lambda: (
+                events.append(("shutdown", "requested")),
+                shutdown_requested.set(),
+            ),
+        )
+
+        async def exercise():
+            poller = WorkerPoller()
+            task = type("Task", (), {"operation_id": "operation-1"})()
+            holder = type("Holder", (), {"stage": "queued.retain"})()
+            execution = asyncio.create_task(
+                poller._execute_task_inner(task, holder)
+            )
+            poller._active_tasks = {
+                task.operation_id: SimpleNamespace(bg_task=execution),
+            }
+            await asyncio.wait_for(shutdown_requested.wait(), timeout=1.0)
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "progress recorder failed",
+            ):
+                await poller.shutdown_graceful(timeout=0.25)
+            self.assertEqual(
+                await poller._claim_batch_for_schema_inner(None, {}, 1),
+                [],
+            )
+
+        asyncio.run(exercise())
+        self.assertEqual(
+            [event for event in events if event[0] == "shutdown"],
+            [("shutdown", "requested")],
+        )
+        self.assertLess(
+            events.index(("shutdown", "requested")),
+            events.index(("child", "quiesced")),
+        )
+        self.assertLess(
+            events.index(("child", "quiesced")),
+            events.index(("release", "owned")),
+        )
+        self.assertNotIn(("claim", "upstream"), events)
+
+    def test_escaped_upstream_failure_quiesces_sibling_before_release(self):
+        events = []
+        shutdown_requested = asyncio.Event()
+
+        class Adapter:
+            def record_upstream_stage(self, _operation_id, stage):
+                events.append(("stage", stage))
+
+            async def release_own_tasks(self, _backend):
+                events.append(("release", "owned"))
+                return 2
+
+        class PostgreSQLOps:
+            pass
+
+        class WorkerPoller:
+            def __init__(self):
+                self._backend = "exact-backend"
+                self._shutdown = asyncio.Event()
+                self._active_tasks = {}
+
+            async def _claim_batch_for_schema_inner(
+                self,
+                _schema,
+                _reserved_limits,
+                _shared_limit,
+            ):
+                return []
+
+            async def _claim_batch_for_schema(self, schema, reserved, shared):
+                return await self._claim_batch_for_schema_inner(
+                    schema,
+                    reserved,
+                    shared,
+                )
+
+            async def _execute_task_inner(self, task, holder):
+                holder.stage = "executor.retain"
+                if task.operation_id == "operation-a":
+                    raise RuntimeError("exact retry mutation failed")
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    events.append(("child", task.operation_id))
+
+            async def shutdown_graceful(self, timeout=30.0):
+                del timeout
+                self._shutdown.set()
+                await asyncio.sleep(0)
+                tasks = [info.bg_task for info in self._active_tasks.values()]
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                await self.release_own_tasks()
+
+        class MemoryEngine:
+            pass
+
+        install_exact_drain_runtime_guards(
+            PostgreSQLOps,
+            WorkerPoller,
+            MemoryEngine,
+            Adapter(),
+            request_worker_shutdown=lambda: (
+                events.append(("shutdown", "requested")),
+                shutdown_requested.set(),
+            ),
+        )
+
+        async def exercise():
+            poller = WorkerPoller()
+            holder_a = SimpleNamespace(stage="queued.retain")
+            holder_b = SimpleNamespace(stage="queued.retain")
+            task_a = SimpleNamespace(operation_id="operation-a")
+            task_b = SimpleNamespace(operation_id="operation-b")
+            execution_a = asyncio.create_task(
+                poller._execute_task_inner(task_a, holder_a)
+            )
+            execution_b = asyncio.create_task(
+                poller._execute_task_inner(task_b, holder_b)
+            )
+            poller._active_tasks = {
+                task_a.operation_id: SimpleNamespace(bg_task=execution_a),
+                task_b.operation_id: SimpleNamespace(bg_task=execution_b),
+            }
+            try:
+                await asyncio.wait_for(shutdown_requested.wait(), timeout=0.5)
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "exact retry mutation failed",
+                ):
+                    await poller.shutdown_graceful(timeout=0.25)
+            finally:
+                for execution in (execution_a, execution_b):
+                    if not execution.done():
+                        execution.cancel()
+                await asyncio.gather(
+                    execution_a,
+                    execution_b,
+                    return_exceptions=True,
+                )
+
+        asyncio.run(exercise())
+        self.assertEqual(
+            [event for event in events if event[0] == "shutdown"],
+            [("shutdown", "requested")],
+        )
+        self.assertLess(
+            events.index(("child", "operation-b")),
+            events.index(("release", "owned")),
+        )
+
+    def test_normal_task_cancellation_does_not_request_worker_shutdown(self):
+        shutdown_requests = []
+
+        class Adapter:
+            def record_upstream_stage(self, _operation_id, _stage):
+                return None
+
+        class WorkerPoller:
+            def __init__(self):
+                self._shutdown = asyncio.Event()
+
+            async def _claim_batch_for_schema_inner(self, *_arguments):
+                return []
+
+            async def _claim_batch_for_schema(self, schema, reserved, shared):
+                return await self._claim_batch_for_schema_inner(
+                    schema,
+                    reserved,
+                    shared,
+                )
+
+            async def _execute_task_inner(self, _task, _holder):
+                await asyncio.Event().wait()
+
+        install_exact_drain_runtime_guards(
+            type("PostgreSQLOps", (), {}),
+            WorkerPoller,
+            type("MemoryEngine", (), {}),
+            Adapter(),
+            request_worker_shutdown=lambda: shutdown_requests.append(True),
+        )
+
+        async def exercise():
+            poller = WorkerPoller()
+            task = asyncio.create_task(
+                poller._execute_task_inner(
+                    SimpleNamespace(operation_id="operation-1"),
+                    SimpleNamespace(stage="queued.retain"),
+                )
+            )
+            await asyncio.sleep(0)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(exercise())
+        self.assertEqual(shutdown_requests, [])
 
     def test_sigterm_runs_the_exact_release_seam(self):
         try:

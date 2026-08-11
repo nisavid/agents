@@ -711,7 +711,7 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
         selected = reference["selected_operations"]
         processing = [
             item for item in selected if item["operation_type"] == "retain"
-        ][:4]
+        ][:3]
         processing_ids = [item["operation_id"] for item in processing]
         worker_id = exact_drain_worker_id(reference["plan_digest"])
         await connection.execute(
@@ -782,6 +782,7 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
             reference_application_journal=(
                 recovery_fixtures.exact_drain_application_journal(reference)
             ),
+            reference_application_progress_digest="c" * 64,
             created_at=int(time.time()),
         )
         return plan, cohort_ids, processing_ids, unexpected_id
@@ -1250,7 +1251,7 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
                             after[operation_id][key],
                             before[operation_id][key],
                         )
-                self.assertEqual(len(set(cohort_ids) - selected_ids), 44)
+                self.assertEqual(len(set(cohort_ids) - selected_ids), 45)
                 for operation_id in set(cohort_ids) - selected_ids:
                     self.assertEqual(
                         live_row_digest(after[operation_id]),
@@ -1614,7 +1615,7 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
 
         asyncio.run(exercise())
 
-    def test_post_abort_v2_rejects_bound_row_and_generation_drift(self):
+    def test_post_abort_v3_rejects_bound_row_and_generation_drift(self):
         async def exercise():
             connection = await self._connect()
             try:

@@ -216,6 +216,7 @@ from hindsight_memory_control_plane.operation_recovery_runtime import (  # noqa:
     rollback_post_abort_recovery_transaction,
     rollback_requeue_transaction,
     validate_exact_drain_provider_policy,
+    verify_exact_drain_candidate_runtime_snapshot,
 )
 from hindsight_memory_control_plane.operation_recovery_progress import (  # noqa: E402
     create_exact_drain_progress_recorder,
@@ -7814,7 +7815,7 @@ def _operation_recovery_validate_exact_worker_provider_runtime(
 def _operation_recovery_exact_runtime_digest(
     args: argparse.Namespace,
     *,
-    schema_version: int = 2,
+    schema_version: int = 3,
 ) -> str:
     return exact_drain_runtime_digest(
         args.worker_runtime,
@@ -7822,6 +7823,15 @@ def _operation_recovery_exact_runtime_digest(
         LIB / "hindsight_api",
         schema_version=schema_version,
     )
+
+
+def _operation_recovery_exact_phase_repair_snapshot() -> str:
+    snapshot, _sources = verify_exact_drain_candidate_runtime_snapshot(LIB)
+    if snapshot.get("schema_version") != 2:
+        raise OperationRecoveryError(
+            "exact drain phase repair candidate snapshot is required"
+        )
+    return snapshot["snapshot_digest"]
 
 
 def operation_recovery_drain_plan_command(args: argparse.Namespace) -> int:
@@ -7839,6 +7849,7 @@ def operation_recovery_drain_plan_command(args: argparse.Namespace) -> int:
         args.rollback_backup_evidence,
         "exact drain rollback backup evidence",
     )
+    _operation_recovery_exact_phase_repair_snapshot()
     provider_policy_digest, provider_policy = (
         _operation_recovery_exact_provider_policy_evidence(
             args.provider_policy
@@ -7854,7 +7865,7 @@ def operation_recovery_drain_plan_command(args: argparse.Namespace) -> int:
     )
     worker_runtime_digest = _operation_recovery_exact_runtime_digest(
         args,
-        schema_version=2,
+        schema_version=3,
     )
     output_path = Path(args.output)
     artifact_paths = [
@@ -8176,11 +8187,57 @@ def _operation_recovery_post_abort_reference_artifacts(
     return authorization, journal
 
 
+def _operation_recovery_post_abort_reference_progress_digest(
+    reference_plan: Mapping[str, Any],
+    reference_journal: Mapping[str, Any],
+) -> str:
+    progress = read_exact_drain_progress(
+        Path(reference_plan["progress_artifact_path"]),
+        plan_digest=reference_plan["plan_digest"],
+    )
+    expected_tasks = {
+        item["operation_id"]: (
+            item["operation_type"],
+            item["row_digest"],
+        )
+        for item in reference_plan["selected_operations"]
+    }
+    progress_tasks = progress.get("tasks")
+    observed_tasks: dict[str, tuple[Any, Any]] = {}
+    if isinstance(progress_tasks, list):
+        for item in progress_tasks:
+            if not isinstance(item, Mapping):
+                break
+            operation_id = item.get("operation_id")
+            if not isinstance(operation_id, str) or operation_id in observed_tasks:
+                break
+            observed_tasks[operation_id] = (
+                item.get("operation_type"),
+                item.get("row_digest"),
+            )
+    if (
+        progress.get("plan_digest") != reference_plan["plan_digest"]
+        or progress.get("worker_pid") != reference_journal["worker_pid"]
+        or not isinstance(progress.get("worker_start_time"), str)
+        or not hmac.compare_digest(
+            progress["worker_start_time"],
+            reference_journal["worker_start_time"],
+        )
+        or progress.get("worker_attempt") != reference_journal["worker_attempt"]
+        or len(observed_tasks) != len(progress_tasks or ())
+        or observed_tasks != expected_tasks
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery reference exact drain progress differs"
+        )
+    return progress["progress_digest"]
+
+
 def _operation_recovery_post_abort_assert_reference_worker_stopped(
     plan: Mapping[str, Any],
 ) -> None:
     if (
-        plan["schema_version"] == 2
+        plan["schema_version"] in {2, 3}
         and _operation_recovery_exact_journal_worker_active(
             plan["reference_application_journal"]
         )
@@ -8203,6 +8260,14 @@ def _operation_recovery_post_abort_assert_reference_source_stopped(
     if (
         authorization != plan["reference_application_authorization"]
         or journal != plan["reference_application_journal"]
+        or (
+            plan["schema_version"] == 3
+            and _operation_recovery_post_abort_reference_progress_digest(
+                plan["reference_plan"],
+                journal,
+            )
+            != plan["reference_application_progress_digest"]
+        )
     ):
         raise OperationRecoveryError(
             "operation-recovery reference exact drain artifacts drifted"
@@ -8256,7 +8321,7 @@ def _operation_recovery_exact_execution_lease_projection(
     *,
     now: int | None = None,
 ) -> Mapping[str, Any]:
-    if plan.get("schema_version") != 2:
+    if plan.get("schema_version") not in {2, 3}:
         return {}
     observed_at = int(time.time()) if now is None else now
     if authorization is None:
@@ -8286,7 +8351,7 @@ def _operation_recovery_assert_exact_execution_lease(
     *,
     now: int | None = None,
 ) -> int | None:
-    if plan.get("schema_version") != 2:
+    if plan.get("schema_version") not in {2, 3}:
         return None
     observed_at = int(time.time()) if now is None else now
     expires_at = (
@@ -8310,7 +8375,7 @@ def operation_recovery_drain_status_command(args: argparse.Namespace) -> int:
         with manager._lock():
             authorization = (
                 _operation_recovery_exact_authorization(plan)
-                if plan.get("schema_version") == 2
+                if plan.get("schema_version") in {2, 3}
                 and Path(plan["authorization_receipt_path"]).exists()
                 else None
             )
@@ -8320,7 +8385,7 @@ def operation_recovery_drain_status_command(args: argparse.Namespace) -> int:
             result = {
                 "status": (
                     "authorization-only"
-                    if plan.get("schema_version") == 2
+                    if plan.get("schema_version") in {2, 3}
                     and authorization is not None
                     else "awaiting-approval"
                 ),
@@ -8885,6 +8950,10 @@ def operation_recovery_drain_apply_command(args: argparse.Namespace) -> int:
                         plan,
                         authorization,
                     )
+                runtime_digest = _operation_recovery_exact_runtime_digest(
+                    args,
+                    schema_version=plan["schema_version"],
+                )
                 provider_policy_digest, provider_policy = (
                     _operation_recovery_exact_provider_policy_evidence(
                         args.provider_policy
@@ -8902,11 +8971,7 @@ def operation_recovery_drain_apply_command(args: argparse.Namespace) -> int:
                         profile_environment,
                     )
                     != plan["effective_profile_digest"]
-                    or _operation_recovery_exact_runtime_digest(
-                        args,
-                        schema_version=plan["schema_version"],
-                    )
-                    != plan["worker_runtime_digest"]
+                    or runtime_digest != plan["worker_runtime_digest"]
                 ):
                     raise OperationRecoveryError(
                         "exact drain runtime authority drifted"
@@ -9208,7 +9273,7 @@ def operation_recovery_drain_apply_command(args: argparse.Namespace) -> int:
                             returncode = process.wait(
                                 timeout=(
                                     plan["transaction_timeout_seconds"]
-                                    if plan.get("schema_version") == 2
+                                    if plan.get("schema_version") in {2, 3}
                                     else EXACT_DRAIN_TRANSACTION_TIMEOUT_SECONDS
                                 )
                             )
@@ -9290,7 +9355,7 @@ def operation_recovery_drain_monitor_command(args: argparse.Namespace) -> int:
         progress_path.exists()
         or application_path.exists()
         or (
-            plan.get("schema_version") == 2
+            plan.get("schema_version") in {2, 3}
             and Path(plan["authorization_receipt_path"]).exists()
         )
     ):
@@ -9300,7 +9365,7 @@ def operation_recovery_drain_monitor_command(args: argparse.Namespace) -> int:
             {
                 "status": (
                     "authorization-only"
-                    if plan.get("schema_version") == 2
+                    if plan.get("schema_version") in {2, 3}
                     and authorization is not None
                     else "not-started"
                 ),
@@ -9653,6 +9718,12 @@ def operation_recovery_post_abort_plan_command(args: argparse.Namespace) -> int:
     ) = _operation_recovery_post_abort_reference_artifacts(
         reference,
     )
+    reference_progress_digest = (
+        _operation_recovery_post_abort_reference_progress_digest(
+            reference,
+            reference_journal,
+        )
+    )
     if _operation_recovery_exact_journal_worker_active(reference_journal):
         raise OperationRecoveryError(
             "operation-recovery reference exact drain worker remains active"
@@ -9708,6 +9779,7 @@ def operation_recovery_post_abort_plan_command(args: argparse.Namespace) -> int:
         rollback_receipt_path=args.rollback_receipt,
         reference_application_authorization=reference_authorization,
         reference_application_journal=reference_journal,
+        reference_application_progress_digest=reference_progress_digest,
     )
     current_binding = read_pg0_registration("systalyze")
     current_binding.pop("_password")
@@ -9746,9 +9818,16 @@ def operation_recovery_post_abort_plan_command(args: argparse.Namespace) -> int:
     ) = _operation_recovery_post_abort_reference_artifacts(
         reference,
     )
+    current_reference_progress_digest = (
+        _operation_recovery_post_abort_reference_progress_digest(
+            reference,
+            current_reference_journal,
+        )
+    )
     if (
         current_reference_authorization != reference_authorization
         or current_reference_journal != reference_journal
+        or current_reference_progress_digest != reference_progress_digest
     ):
         raise OperationRecoveryError(
             "operation-recovery reference exact drain artifacts drifted"

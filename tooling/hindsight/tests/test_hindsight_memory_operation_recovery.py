@@ -381,16 +381,68 @@ class OperationRecoveryContractTest(unittest.TestCase):
 
         plan = self.drain_plan(snapshot=snapshot, created_at=planned_at)
 
-        self.assertEqual(plan["schema_version"], 2)
+        self.assertEqual(plan["schema_version"], 3)
         self.assertEqual(plan["expires_at"], planned_at + 86_400)
         self.assertEqual(plan["evidence_observed_at"], snapshot["observed_at"])
         self.assertEqual(plan["evidence_max_age_seconds"], 3_600)
         self.assertEqual(plan["transaction_timeout_seconds"], 120)
         self.assertEqual(plan["execution_lease_seconds"], 86_400)
+        self.assertEqual(plan["phase_one_statement_timeout_seconds"], 120)
+        self.assertEqual(plan["phase_one_timeout_seconds"], 3_600)
+        self.assertEqual(
+            plan["phase_repair_contract_digest"],
+            recovery_contract.EXACT_DRAIN_PHASE_REPAIR_CONTRACT_DIGEST,
+        )
         self.assertEqual(
             recovery_contract.verify_exact_drain_plan(plan, now=planned_at),
             plan,
         )
+
+    def test_exact_drain_verifier_preserves_prior_v2_contract(self):
+        current = self.drain_plan()
+        body = {
+            key: value
+            for key, value in current.items()
+            if key
+            not in {
+                "plan_digest",
+                "phase_one_statement_timeout_seconds",
+                "phase_one_timeout_seconds",
+                "phase_repair_contract_digest",
+            }
+        }
+        body["schema_version"] = 2
+        prior = {**body, "plan_digest": digest(body)}
+
+        self.assertEqual(
+            recovery_contract.verify_exact_drain_plan(
+                prior,
+                now=prior["created_at"],
+            ),
+            prior,
+        )
+
+    def test_exact_drain_v3_phase_repair_contract_is_closed(self):
+        plan = self.drain_plan()
+        for key, value in (
+            ("phase_one_statement_timeout_seconds", 121),
+            ("phase_one_timeout_seconds", 3_601),
+            ("phase_repair_contract_digest", "0" * 64),
+        ):
+            with self.subTest(key=key):
+                changed = dict(plan)
+                changed[key] = value
+                body = {
+                    item_key: item_value
+                    for item_key, item_value in changed.items()
+                    if item_key != "plan_digest"
+                }
+                changed["plan_digest"] = digest(body)
+                with self.assertRaises(OperationRecoveryError):
+                    recovery_contract.verify_exact_drain_plan(
+                        changed,
+                        now=changed["created_at"],
+                    )
 
     def test_exact_drain_consumed_authorization_survives_approval_expiry(self):
         plan = self.drain_plan()
@@ -506,6 +558,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
         reference_plan=None,
         *,
         current_interrupted_subset: bool = False,
+        interrupted_processing_count: int | None = None,
         observed_at: int = 1_786_390_181,
     ) -> dict:
         reference_plan = reference_plan or self.drain_plan()
@@ -538,11 +591,19 @@ class OperationRecoveryContractTest(unittest.TestCase):
         failed_position = (
             None
             if current_interrupted_subset
+            or interrupted_processing_count is not None
             else selected_retain_positions[-1]
         )
         processing_positions = set(
-            selected_retain_positions[:4]
+            selected_retain_positions[
+                : (
+                    interrupted_processing_count
+                    if interrupted_processing_count is not None
+                    else 3
+                )
+            ]
             if current_interrupted_subset
+            or interrupted_processing_count is not None
             else selected_retain_positions[:12] + selected_refresh_positions
         )
         for index, row in enumerate(rows):
@@ -571,7 +632,105 @@ class OperationRecoveryContractTest(unittest.TestCase):
             )
         )
 
-    def test_post_abort_v2_plan_derives_current_interrupted_subset(self):
+    def prior_v2_post_abort_plan(self) -> dict:
+        reference = self.drain_plan()
+        snapshot = self.post_abort_snapshot(
+            reference,
+            interrupted_processing_count=4,
+        )
+        authorization = exact_drain_authorization(reference)
+        journal = exact_drain_application_journal(reference)
+        selected = [
+            {
+                "operation_id": item["operation_id"],
+                "operation_type": item["operation_type"],
+                "expected_status": item["current_status"],
+                "row_digest": item["row_digest"],
+                "task_payload_digest": item["task_payload_digest"],
+            }
+            for item in snapshot["operations"]
+            if item["current_status"] == "processing"
+        ]
+        backup = rollback_backup_evidence()
+        backup["source_authority"]["generation_before"] = snapshot[
+            "generation_before"
+        ]
+        backup["source_authority"]["generation_after"] = snapshot[
+            "generation_after"
+        ]
+        backup["source_authority_digest"] = digest(
+            backup["source_authority"]
+        )
+        body = {
+            "schema_version": 2,
+            "kind": "operation-recovery-exact-drain-post-abort-plan",
+            "action": "recover-exact-drain-post-abort",
+            "authority": "unapproved-plan",
+            "mutation_authorized": False,
+            "candidate_release": release_identity(),
+            "installation_authority": snapshot["installation_authority"],
+            "reference_plan": reference,
+            "reference_plan_digest": reference["plan_digest"],
+            "reference_worker_id_digest": next(
+                item["worker_id_digest"]
+                for item in snapshot["operations"]
+                if item["current_status"] == "processing"
+            ),
+            "reference_application_authorization": authorization,
+            "reference_application_authorization_digest": authorization[
+                "receipt_digest"
+            ],
+            "reference_application_journal": journal,
+            "reference_application_journal_digest": journal["receipt_digest"],
+            "live_snapshot": snapshot,
+            "cohort_digest": snapshot["cohort_digest"],
+            "snapshot_digest": snapshot["snapshot_digest"],
+            "pre_generation": snapshot["generation_before"],
+            "evidence_observed_at": snapshot["observed_at"],
+            "evidence_max_age_seconds": 3_600,
+            "transaction_timeout_seconds": 120,
+            "selected_operations": selected,
+            "selected_operation_count": 4,
+            "selected_status_counts": {"processing": 4},
+            "selected_type_counts": {"retain": 4},
+            "selected_row_set_digest": digest(
+                [
+                    {
+                        "operation_id": item["operation_id"],
+                        "row_digest": item["row_digest"],
+                        "task_payload_digest": item[
+                            "task_payload_digest"
+                        ],
+                    }
+                    for item in selected
+                ]
+            ),
+            "preserved_status_counts": {"completed": 5, "pending": 39},
+            "rollback_backup": backup,
+            "rollback_encryption": rollback_encryption(),
+            "rollback_backup_path": "/private/tmp/v2-backup.age",
+            "rollback_bundle_path": "/private/tmp/v2-bundle.age",
+            "authorization_receipt_path": "/private/tmp/v2-auth.json",
+            "application_receipt_path": "/private/tmp/v2-app.json",
+            "verification_receipt_path": "/private/tmp/v2-verify.json",
+            "rollback_receipt_path": "/private/tmp/v2-rollback.json",
+            "created_at": 1_786_390_500,
+            "expires_at": 1_786_476_900,
+        }
+        return {**body, "plan_digest": digest(body)}
+
+    def test_prior_post_abort_v2_plan_remains_verifiable(self):
+        plan = self.prior_v2_post_abort_plan()
+
+        self.assertEqual(
+            verify_post_abort_recovery_plan(
+                plan,
+                now=1_786_390_500,
+            ),
+            plan,
+        )
+
+    def test_post_abort_v3_plan_derives_exact_three_interrupted_retains(self):
         reference = self.drain_plan()
         snapshot = self.post_abort_snapshot(
             reference,
@@ -606,6 +765,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
             reference_application_journal=(
                 exact_drain_application_journal(reference)
             ),
+            reference_application_progress_digest="c" * 64,
             created_at=1_786_390_500,
         )
 
@@ -614,7 +774,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
             for item in snapshot["operations"]
             if item["current_status"] == "processing"
         }
-        self.assertEqual(plan["schema_version"], 2)
+        self.assertEqual(plan["schema_version"], 3)
         self.assertEqual(
             plan["reference_application_authorization"],
             exact_drain_authorization(reference),
@@ -624,15 +784,19 @@ class OperationRecoveryContractTest(unittest.TestCase):
             exact_drain_authorization(reference)["receipt_digest"],
         )
         self.assertEqual(
+            plan["reference_application_progress_digest"],
+            "c" * 64,
+        )
+        self.assertEqual(
             {item["operation_id"] for item in plan["selected_operations"]},
             expected_ids,
         )
-        self.assertEqual(plan["selected_operation_count"], 4)
-        self.assertEqual(plan["selected_status_counts"], {"processing": 4})
-        self.assertEqual(plan["selected_type_counts"], {"retain": 4})
+        self.assertEqual(plan["selected_operation_count"], 3)
+        self.assertEqual(plan["selected_status_counts"], {"processing": 3})
+        self.assertEqual(plan["selected_type_counts"], {"retain": 3})
         self.assertEqual(
             plan["preserved_status_counts"],
-            {"completed": 5, "pending": 39},
+            {"completed": 5, "pending": 40},
         )
         self.assertEqual(
             verify_post_abort_recovery_plan(plan, now=plan["created_at"]),
@@ -697,10 +861,11 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 reference_application_journal=(
                     exact_drain_application_journal(reference)
                 ),
+                reference_application_progress_digest="c" * 64,
                 created_at=1_786_390_500,
             )
 
-    def test_post_abort_v2_planner_rejects_non_exact_current_shapes(self):
+    def test_post_abort_v3_planner_rejects_non_exact_current_shapes(self):
         reference = self.drain_plan()
         base = self.post_abort_snapshot(
             reference,
@@ -738,18 +903,33 @@ class OperationRecoveryContractTest(unittest.TestCase):
             snapshot["snapshot_digest"] = digest(snapshot_body)
             return snapshot
 
-        fifth = deepcopy(base)
-        fifth_row = next(
+        fourth = deepcopy(base)
+        fourth_row = next(
             item
-            for item in fifth["operations"]
+            for item in fourth["operations"]
             if item["current_status"] == "pending"
         )
-        fifth_row.update(
+        fourth_row.update(
             {
                 "current_status": "processing",
                 "worker_id_present": True,
                 "worker_id_digest": worker_digest,
                 "claimed_at": "2026-08-10T10:02:00.000000Z",
+            }
+        )
+
+        second = deepcopy(base)
+        second_row = next(
+            item
+            for item in second["operations"]
+            if item["current_status"] == "processing"
+        )
+        second_row.update(
+            {
+                "current_status": "pending",
+                "worker_id_present": False,
+                "worker_id_digest": None,
+                "claimed_at": None,
             }
         )
 
@@ -810,9 +990,12 @@ class OperationRecoveryContractTest(unittest.TestCase):
 
         wrong_cohort = deepcopy(base)
         wrong_cohort["cohort_digest"] = "0" * 64
+        wrong_generation = deepcopy(base)
+        wrong_generation["generation_after"] = "systalyze:public:81679"
 
         cases = {
-            "fifth-processing": reseal(fifth, fifth_row),
+            "fourth-processing": reseal(fourth, fourth_row),
+            "second-processing": reseal(second, second_row),
             "failed": reseal(failed, failed_row),
             "refresh": reseal(refresh, refresh_row),
             "changed-completed": reseal(completed, completed_row),
@@ -825,6 +1008,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 nonreference_row,
             ),
             "wrong-cohort": reseal(wrong_cohort),
+            "wrong-generation": reseal(wrong_generation),
         }
         for label, snapshot in cases.items():
             backup = rollback_backup_evidence()
@@ -839,10 +1023,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
             )
             with (
                 self.subTest(shape=label),
-                self.assertRaisesRegex(
-                    OperationRecoveryError,
-                    "post-abort row set is invalid",
-                ),
+                self.assertRaises(OperationRecoveryError),
             ):
                 create_post_abort_recovery_plan(
                     reference,
@@ -862,10 +1043,11 @@ class OperationRecoveryContractTest(unittest.TestCase):
                     reference_application_journal=(
                         exact_drain_application_journal(reference)
                     ),
+                    reference_application_progress_digest="c" * 64,
                     created_at=1_786_390_500,
                 )
 
-    def test_post_abort_v2_verifier_rejects_schema_and_bound_set_tampering(self):
+    def test_post_abort_v3_verifier_rejects_schema_and_bound_set_tampering(self):
         reference = self.drain_plan()
         snapshot = self.post_abort_snapshot(
             reference,
@@ -900,6 +1082,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 reference_application_journal=(
                     exact_drain_application_journal(reference)
                 ),
+                reference_application_progress_digest="c" * 64,
                 created_at=1_786_390_500,
             )
         )
@@ -916,7 +1099,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
         boolean_schema = deepcopy(plan)
         boolean_schema["schema_version"] = True
         unsupported_schema = deepcopy(plan)
-        unsupported_schema["schema_version"] = 3
+        unsupported_schema["schema_version"] = 4
         selected = deepcopy(plan)
         selected["selected_operations"][0]["row_digest"] = "0" * 64
         count = deepcopy(plan)
@@ -978,6 +1161,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 reference_application_journal=(
                     exact_drain_application_journal(reference)
                 ),
+                reference_application_progress_digest="c" * 64,
                 created_at=1_786_390_500,
             )
         )

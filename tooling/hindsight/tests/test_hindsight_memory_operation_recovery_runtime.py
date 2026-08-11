@@ -51,6 +51,11 @@ from hindsight_memory_control_plane.operation_recovery import (  # noqa: E402
 )
 
 
+class _RunCapableWorkerPoller:
+    async def run(self):
+        raise AssertionError("test worker poller run seam was not configured")
+
+
 class FakeConnection:
     def __init__(self) -> None:
         self.transaction_arguments = None
@@ -385,7 +390,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         )
 
     def test_runtime_guard_rejects_missing_progress_seams(self):
-        class MissingWorkerPoller:
+        class MissingWorkerPoller(_RunCapableWorkerPoller):
             pass
 
         with self.assertRaisesRegex(
@@ -395,6 +400,28 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
             install_exact_drain_runtime_guards(
                 type("PostgreSQLOps", (), {}),
                 MissingWorkerPoller,
+                type("MemoryEngine", (), {}),
+                object(),
+            )
+
+    def test_runtime_guard_rejects_missing_poller_lifecycle_seam(self):
+        class MissingRunWorkerPoller:
+            async def _execute_task_inner(self, _task, _holder):
+                return None
+
+            async def _claim_batch_for_schema_inner(self, *_arguments):
+                return []
+
+            async def _claim_batch_for_schema(self, *_arguments):
+                return []
+
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "required worker lifecycle seam is unavailable",
+        ):
+            install_exact_drain_runtime_guards(
+                type("PostgreSQLOps", (), {}),
+                MissingRunWorkerPoller,
                 type("MemoryEngine", (), {}),
                 object(),
             )
@@ -432,6 +459,263 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
                 ["shutdown", "shutdown"],
             )
 
+    def test_startup_recovery_failure_requests_worker_main_shutdown(self):
+        try:
+            from hindsight_api.worker.poller import (
+                WorkerPoller as UpstreamWorkerPoller,
+            )
+        except ImportError as error:
+            raise unittest.SkipTest(
+                "hindsight_api worker runtime is unavailable"
+            ) from error
+
+        worker_main_shutdown = asyncio.Event()
+
+        class Adapter:
+            phase_one_timeout_seconds = 3600
+
+            async def recover_own_tasks(self, _backend):
+                raise OperationRecoveryError("startup recovery failed")
+
+        class PostgreSQLOps:
+            pass
+
+        class WorkerPoller(UpstreamWorkerPoller):
+            pass
+
+        class MemoryEngine:
+            pass
+
+        install_exact_drain_runtime_guards(
+            PostgreSQLOps,
+            WorkerPoller,
+            MemoryEngine,
+            Adapter(),
+            request_worker_shutdown=worker_main_shutdown.set,
+        )
+
+        async def exercise():
+            poller = object.__new__(WorkerPoller)
+            poller._backend = "exact-backend"
+            poller._shutdown = asyncio.Event()
+            poller_task = asyncio.create_task(poller.run())
+            try:
+                try:
+                    await asyncio.wait_for(
+                        worker_main_shutdown.wait(),
+                        timeout=0.25,
+                    )
+                    requested = True
+                except asyncio.TimeoutError:
+                    requested = False
+                result = (await asyncio.gather(
+                    poller_task,
+                    return_exceptions=True,
+                ))[0]
+                return requested, result
+            finally:
+                if not poller_task.done():
+                    poller_task.cancel()
+                    await asyncio.gather(
+                        poller_task,
+                        return_exceptions=True,
+                    )
+
+        requested, result = asyncio.run(exercise())
+        self.assertTrue(requested)
+        self.assertIsNone(result)
+
+    def test_poller_failure_is_consumed_and_surfaces_after_release_failure(self):
+        shutdown_requested = asyncio.Event()
+
+        class Adapter:
+            phase_one_timeout_seconds = 3600
+
+        class WorkerPoller:
+            def __init__(self):
+                self._shutdown = asyncio.Event()
+
+            async def run(self):
+                raise OperationRecoveryError("startup recovery failed")
+
+            async def shutdown_graceful(self, timeout=30.0):
+                del timeout
+                raise OperationRecoveryError("release failed")
+
+            async def _execute_task_inner(self, _task, _holder):
+                return None
+
+            async def _claim_batch_for_schema_inner(self, *_arguments):
+                return []
+
+            async def _claim_batch_for_schema(self, *_arguments):
+                return []
+
+        install_exact_drain_runtime_guards(
+            type("PostgreSQLOps", (), {}),
+            WorkerPoller,
+            type("MemoryEngine", (), {}),
+            Adapter(),
+            request_worker_shutdown=shutdown_requested.set,
+        )
+
+        async def exercise():
+            poller = WorkerPoller()
+            poller_task = asyncio.create_task(poller.run())
+            await asyncio.wait_for(shutdown_requested.wait(), timeout=0.25)
+            try:
+                await poller.shutdown_graceful(timeout=0.25)
+            except OperationRecoveryError as error:
+                shutdown_error = error
+            else:
+                shutdown_error = None
+            poller_result = (await asyncio.gather(
+                poller_task,
+                return_exceptions=True,
+            ))[0]
+            return shutdown_error, poller_result
+
+        shutdown_error, poller_result = asyncio.run(exercise())
+        self.assertIsInstance(shutdown_error, OperationRecoveryError)
+        self.assertEqual(str(shutdown_error), "startup recovery failed")
+        self.assertIsInstance(
+            shutdown_error.__cause__,
+            OperationRecoveryError,
+        )
+        self.assertEqual(str(shutdown_error.__cause__), "release failed")
+        self.assertIsNone(poller_result)
+
+    def test_premature_poller_return_requests_worker_main_shutdown(self):
+        shutdown_requests = []
+
+        class Adapter:
+            phase_one_timeout_seconds = 3600
+
+        class WorkerPoller:
+            def __init__(self):
+                self._shutdown = asyncio.Event()
+
+            async def run(self):
+                return "stopped"
+
+            async def shutdown_graceful(self, timeout=30.0):
+                del timeout
+
+            async def _execute_task_inner(self, _task, _holder):
+                return None
+
+            async def _claim_batch_for_schema_inner(self, *_arguments):
+                return []
+
+            async def _claim_batch_for_schema(self, *_arguments):
+                return []
+
+        install_exact_drain_runtime_guards(
+            type("PostgreSQLOps", (), {}),
+            WorkerPoller,
+            type("MemoryEngine", (), {}),
+            Adapter(),
+            request_worker_shutdown=lambda: shutdown_requests.append(True),
+        )
+
+        poller = WorkerPoller()
+        self.assertIsNone(asyncio.run(poller.run()))
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "poller stopped unexpectedly",
+        ):
+            asyncio.run(poller.shutdown_graceful())
+        self.assertTrue(poller._shutdown.is_set())
+        self.assertEqual(shutdown_requests, [True])
+
+    def test_poller_return_after_shutdown_does_not_request_again(self):
+        shutdown_requests = []
+
+        class Adapter:
+            phase_one_timeout_seconds = 3600
+
+        class WorkerPoller:
+            def __init__(self):
+                self._shutdown = asyncio.Event()
+                self._shutdown.set()
+
+            async def run(self):
+                return "stopped"
+
+            async def _execute_task_inner(self, _task, _holder):
+                return None
+
+            async def _claim_batch_for_schema_inner(self, *_arguments):
+                return []
+
+            async def _claim_batch_for_schema(self, *_arguments):
+                return []
+
+        install_exact_drain_runtime_guards(
+            type("PostgreSQLOps", (), {}),
+            WorkerPoller,
+            type("MemoryEngine", (), {}),
+            Adapter(),
+            request_worker_shutdown=lambda: shutdown_requests.append(True),
+        )
+
+        poller = WorkerPoller()
+        self.assertEqual(asyncio.run(poller.run()), "stopped")
+        self.assertEqual(shutdown_requests, [])
+
+    def test_poller_cancellation_does_not_request_worker_main_shutdown(self):
+        try:
+            from hindsight_api.worker.poller import (
+                WorkerPoller as UpstreamWorkerPoller,
+            )
+        except ImportError as error:
+            raise unittest.SkipTest(
+                "hindsight_api worker runtime is unavailable"
+            ) from error
+
+        shutdown_requests = []
+        started = asyncio.Event()
+
+        class Adapter:
+            phase_one_timeout_seconds = 3600
+
+            async def recover_own_tasks(self, _backend):
+                return 0
+
+        class WorkerPoller(UpstreamWorkerPoller):
+            async def claim_batch(self):
+                started.set()
+                await asyncio.Event().wait()
+                return []
+
+        install_exact_drain_runtime_guards(
+            type("PostgreSQLOps", (), {}),
+            WorkerPoller,
+            type("MemoryEngine", (), {}),
+            Adapter(),
+            request_worker_shutdown=lambda: shutdown_requests.append(True),
+        )
+
+        async def exercise():
+            poller = object.__new__(WorkerPoller)
+            poller._backend = "exact-backend"
+            poller._shutdown = asyncio.Event()
+            poller._slot_reservations = {}
+            poller._max_slots = 1
+            poller._worker_id = "exact-worker"
+            poller._poll_interval_ms = 250
+            task = asyncio.create_task(poller.run())
+            await asyncio.wait_for(started.wait(), timeout=0.25)
+            task.cancel()
+            result = (await asyncio.gather(task, return_exceptions=True))[0]
+            return poller, result
+
+        poller, result = asyncio.run(exercise())
+        self.assertIsNone(result)
+        self.assertFalse(poller._shutdown.is_set())
+        self.assertEqual(shutdown_requests, [])
+        self.assertFalse(hasattr(poller, "_exact_drain_task_errors"))
+
     def test_runtime_guard_records_claim_only_after_upstream_commit_seam(self):
         committed = []
         task = type("Task", (), {"operation_id": "operation-1"})()
@@ -443,7 +727,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         class PostgreSQLOps:
             pass
 
-        class WorkerPoller:
+        class WorkerPoller(_RunCapableWorkerPoller):
             async def _execute_task_inner(self, _task, _holder):
                 return None
 
@@ -791,7 +1075,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
             async def mark_failed(self, *_arguments):
                 raise asyncio.CancelledError
 
-        class WorkerPoller:
+        class WorkerPoller(_RunCapableWorkerPoller):
             def __init__(self):
                 self._backend = "exact-backend"
                 self._shutdown = asyncio.Event()
@@ -853,7 +1137,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         class PostgreSQLOps:
             pass
 
-        class WorkerPoller:
+        class WorkerPoller(_RunCapableWorkerPoller):
             def __init__(self):
                 self._backend = "exact-backend"
                 self._shutdown = asyncio.Event()
@@ -932,7 +1216,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         adapter._progress_recorder = recorder
         adapter._completion_callback = lambda: aborts.append(True)
 
-        class WorkerPoller:
+        class WorkerPoller(_RunCapableWorkerPoller):
             def __init__(self):
                 self._shutdown = asyncio.Event()
 
@@ -970,6 +1254,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
             WorkerPoller,
             type("MemoryEngine", (), {}),
             adapter,
+            request_worker_shutdown=lambda: None,
         )
 
         poller = WorkerPoller()
@@ -988,7 +1273,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         class PostgreSQLOps:
             pass
 
-        class WorkerPoller:
+        class WorkerPoller(_RunCapableWorkerPoller):
             async def _claim_batch_for_schema_inner(
                 self,
                 _schema,
@@ -1045,7 +1330,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         class PostgreSQLOps:
             pass
 
-        class WorkerPoller:
+        class WorkerPoller(_RunCapableWorkerPoller):
             _backend = "exact-backend"
 
             def __init__(self):
@@ -1110,7 +1395,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         class PostgreSQLOps:
             pass
 
-        class WorkerPoller:
+        class WorkerPoller(_RunCapableWorkerPoller):
             _backend = "exact-backend"
 
             def __init__(self):
@@ -1199,7 +1484,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         class PostgreSQLOps:
             pass
 
-        class WorkerPoller:
+        class WorkerPoller(_RunCapableWorkerPoller):
             def __init__(self):
                 self._backend = "exact-backend"
                 self._shutdown = asyncio.Event()
@@ -1550,7 +1835,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         class PostgreSQLOps:
             pass
 
-        class WorkerPoller:
+        class WorkerPoller(_RunCapableWorkerPoller):
             def __init__(self):
                 self._backend = "exact-backend"
                 self._shutdown = asyncio.Event()
@@ -1651,7 +1936,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         class PostgreSQLOps:
             pass
 
-        class WorkerPoller:
+        class WorkerPoller(_RunCapableWorkerPoller):
             def __init__(self):
                 self._backend = "exact-backend"
                 self._shutdown = asyncio.Event()
@@ -1756,7 +2041,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
             def record_upstream_stage(self, _operation_id, _stage):
                 return None
 
-        class WorkerPoller:
+        class WorkerPoller(_RunCapableWorkerPoller):
             def __init__(self):
                 self._shutdown = asyncio.Event()
 
@@ -2591,7 +2876,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
             async def claim_tasks(self, *arguments, **keywords):
                 raise AssertionError("upstream claim seam remained active")
 
-        class WorkerPoller:
+        class WorkerPoller(_RunCapableWorkerPoller):
             _backend = "exact-backend"
 
             async def _execute_task_inner(self, _task, _holder):

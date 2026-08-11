@@ -1083,6 +1083,11 @@ def install_exact_drain_runtime_guards(
         "shutdown_graceful",
         None,
     )
+    upstream_run = getattr(worker_poller_type, "run", None)
+    if not callable(upstream_run):
+        raise OperationRecoveryError(
+            "operation-recovery required worker lifecycle seam is unavailable"
+        )
     if (
         not callable(upstream_execute_task_inner)
         or not callable(upstream_claim_batch_inner)
@@ -1320,6 +1325,28 @@ def install_exact_drain_runtime_guards(
             poller._exact_drain_task_errors = errors
         errors.append(error)
 
+    async def run_exact_worker(poller: Any) -> Any:
+        try:
+            result = await upstream_run(poller)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # noqa: BLE001 - exact worker boundary
+            poller._exact_drain_poller_error = error
+            request_exact_worker_shutdown(poller)
+            return None
+        current = asyncio.current_task()
+        if current is not None and current.cancelling():
+            return result
+        shutdown = getattr(poller, "_shutdown", None)
+        shutdown_is_set = getattr(shutdown, "is_set", None)
+        if not callable(shutdown_is_set) or not shutdown_is_set():
+            poller._exact_drain_poller_error = OperationRecoveryError(
+                "exact drain worker poller stopped unexpectedly"
+            )
+            request_exact_worker_shutdown(poller)
+            return None
+        return result
+
     def consume_exact_task_result(poller: Any, task: asyncio.Task[Any]) -> None:
         consumed = getattr(poller, "_exact_drain_consumed_tasks", None)
         if consumed is None:
@@ -1379,6 +1406,11 @@ def install_exact_drain_runtime_guards(
         for task in observed_tasks:
             consume_exact_task_result(poller, task)
         await asyncio.sleep(0)
+        poller_error = getattr(poller, "_exact_drain_poller_error", None)
+        if isinstance(poller_error, BaseException):
+            if upstream_error is not None:
+                raise poller_error from upstream_error
+            raise poller_error
         if upstream_error is not None:
             raise upstream_error
         task_errors = getattr(poller, "_exact_drain_task_errors", ())
@@ -1507,6 +1539,7 @@ def install_exact_drain_runtime_guards(
         return None
 
     postgresql_ops_type.claim_tasks = claim_tasks
+    worker_poller_type.run = run_exact_worker
     worker_poller_type._scan_active_schemas = scan_active_schemas
     worker_poller_type.recover_own_tasks = recover_exact_tasks
     worker_poller_type.release_own_tasks = release_exact_tasks

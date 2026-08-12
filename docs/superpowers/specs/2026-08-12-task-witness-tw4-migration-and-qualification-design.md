@@ -241,6 +241,7 @@ class-specific endpoint projection. B1 exposes these functions:
 ```python
 def prepare_bridge_transition(
     request: BridgeTransitionRequest,
+    staging_root: Path,
 ) -> PreparedBridgeTransition: ...
 
 def stage_bridge_transition(
@@ -258,6 +259,7 @@ plan, ordinary `DeploymentAuthorizationFacts`, and these closed facts:
 @dataclass(frozen=True)
 class BridgeTransitionAuthorizationFacts:
     canonical_root: Path
+    staging_root: Path
     effective_uid: int
     plan_sha256: str
     deployment_authorization_facts_sha256: str
@@ -282,11 +284,16 @@ canonical exact unsigned receipt projection with both `migration` and
 `content_sha256` omitted. Controller and client later remove those two fields
 from the final receipt and recompute that core, validate the authorization-
 backed migration projection independently, and validate the ordinary final
-`content_sha256` over the complete unsigned receipt. Preparation descriptor-
-reads the manifest once but does not accept transition authorization. Staging
-reparses the ordinary deployer authorization, descriptor-reads and validates
-both external files, requires the manifest digest observed during preparation,
-and copies their exact bytes create-new into the private stage.
+`content_sha256` over the complete unsigned receipt. Bridge preparation
+normalizes and validates the prospective absolute `staging_root` without
+creating it, derives the exact rollback receipt and every other stage-root-
+dependent active-receipt field, and binds both the root and resulting core in
+the returned facts. It descriptor-reads the manifest once but does not accept
+transition authorization. Staging requires its `staging_root` argument to
+equal the authorization-bound preparation root, reparses the ordinary deployer
+authorization, descriptor-reads and validates both external files, requires
+the manifest digest and active-receipt core observed during preparation, and
+copies their exact bytes create-new into the private stage.
 
 `ActivationRequest.deployment` admits `BridgeTransitionRequest`; its
 `authorization_raw` remains the ordinary deployer authorization. Activation,
@@ -328,10 +335,11 @@ digest. It is not a public installation request or a legacy-schema registry.
 
 ### Hop 2: B1 to TW4
 
-1. Exact B1 prepares the exact TW4 through its current-shaped outbound surface,
-   validating the detached release manifest and strict endpoint projection and
-   returning the plan and authorization facts. The external deployer then
-   issues the fresh bridge-transition authorization, which B1 validates before
+1. Exact B1 prepares the exact TW4 and one prospective private stage root
+   through its current-shaped outbound surface, validating the detached release
+   manifest and strict endpoint projection and returning the plan and
+   authorization facts. The external deployer then issues the fresh bridge-
+   transition authorization, which B1 validates for that same root before
    creating the stage.
 2. B1 validates the old active B1 epoch and the current candidate TW4 epoch
    independently. Only the exact bridge transition may cross this schema
@@ -733,15 +741,17 @@ evidence.
    validate the real detached release manifest from the two host receipts and
    canonical review. Revalidate stale-candidate, evidence, promotion-delta,
    final-identity, plan, transaction, and endpoint rejection.
-13. In the bound isolated deployment root, complete `F5 -> B1`, prepare TW4
-   through active B1, and obtain that endpoint's exact plan and authorization
-   facts. The external deployer then issues one transaction-bound
+13. In the bound isolated deployment root, complete `F5 -> B1`, select the
+   prospective private stage root, prepare TW4 through active B1, and obtain
+   that endpoint's exact plan and authorization facts. The external deployer
+   then issues one transaction-bound
    `isolated-rehearsal` authorization from those facts; stage and activate
    `B1 -> TW4`; and validate its retained terminal result, resulting TW4 active
    receipt, endpoint profile, and unchanged release identities. Next validate
    public-release promotion. In the live deployment root, independently
-   complete `F5 -> B1`, prepare TW4 through active B1, and obtain the live plan
-   and facts. The external deployer then issues the distinct transaction-bound
+   complete `F5 -> B1`, select its separate prospective private stage root,
+   prepare TW4 through active B1, and obtain the live plan and facts. The
+   external deployer then issues the distinct transaction-bound
    `live-migration` authorization from those facts and the completed rehearsal
    evidence; stage and activate `B1 -> TW4` through the exact staged B1
    controller.

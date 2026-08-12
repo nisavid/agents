@@ -851,9 +851,7 @@ Each receipt binds:
 
 - the frozen qualification-candidate commit, tree, source-shape record, and
   computed control/source/test closure;
-- the raw bridge-identity and provenance-proof digests and each independently
-  validated F5/B1 commit, tree, plugin-subtree, controller, policy, and client
-  identity;
+- one exact `bridge_history` projection, defined below;
 - the raw suite-inventory digest and ordered aggregate identities;
 - exactly one target, either macOS arm64 or Linux x86_64;
 - the raw platform-profile and runtime-closure evidence digests;
@@ -864,6 +862,20 @@ Each receipt binds:
   stderr digests and lengths, and terminal result; and
 - one terminal `qualified` disposition only when every required entry passes
   on unchanged candidate, platform, runtime, and tool bindings.
+
+`bridge_history` is an object containing exactly
+`bridge_identity_sha256`, `bridge_provenance_sha256`, `freeze5`, and `bridge`.
+The two digest fields are SHA-256 of the exact raw candidate-owned bridge
+identity record and provenance proof. `bridge_provenance_sha256` also equals
+the identity record's `provenance_sha256`. `freeze5` and `bridge` each contain
+exactly `repository_id`, `commit_sha1`, `tree_sha1`,
+`plugin_subtree_sha256`, `controller_sha256`, `policy_sha256`,
+`client_sha256`, and `source_mode`; each is byte-for-byte the canonical JSON
+projection of the correspondingly named identity object in the validated
+bridge identity record. The runner independently validates the record, proof,
+historical snapshots, and reconstructed plugin subtrees before copying this
+projection into the receipt. No TW4 identity or receipt digest appears inside
+`bridge_history`.
 
 A host receipt makes no claim about the other host, review independence,
 public-release eligibility, or final promotion identity.
@@ -908,6 +920,10 @@ The manifest binds:
 - the frozen qualification-candidate identity and suite-inventory digest;
 - a closed target map containing exactly one macOS arm64 receipt digest and one
   Linux x86_64 receipt digest;
+- one exact `bridge_history` projection that is byte-identical in both host
+  receipts and in the manifest and that the final validator independently
+  validates against the candidate-owned identity record, provenance proof,
+  historical snapshots, and reconstructed F5/B1 plugin subtrees;
 - the canonical review-evidence bundle digest plus its model, topology,
   execution, adjudication, and unchanged-verification identities;
 - each host receipt's exact successful `migration-freeze5-to-bridge` and
@@ -917,8 +933,6 @@ The manifest binds:
   results, not exact-final rehearsal authority;
 - the exact final public-release commit and tree;
 - the exact F5/B1/TW4 migration edge and B1 retained-history identity;
-- the exact candidate-owned bridge-identity-record and provenance-proof
-  digests;
 - the complete promotion delta from the qualified candidate; and
 - the terminal `release-qualified` disposition.
 

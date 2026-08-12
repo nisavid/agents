@@ -475,9 +475,21 @@ The endpoint document has contract
 `execution_class` matches the request; `target` is exactly `macos-arm64` or
 `linux-x86_64` and matches the platform profile; `deployment_root` is the
 canonical deployment root; and `mode` is integer `448` (`0o700`).
-`retained_receipts` is the
-nonempty sequence-ascending list of exact objects
-`{"sequence":N,"sha256":DIGEST}` and ends with the starting active receipt.
+`retained_receipts` is the complete oldest-to-newest deployment-receipt chain
+validated by the immutable B1 controller's strict retained-chain parser. It is
+a nonempty list of exact objects `{"sequence":N,"sha256":DIGEST}` with first
+sequence `1`, each next sequence exactly one greater, and last sequence equal
+to the starting active receipt's sequence. The first receipt has no prior
+digest; every later receipt's `prior_receipt_sha256` equals the preceding list
+digest; and the last digest is the starting active receipt. The parser requires
+exact raw bytes for every named deployment receipt and paired rollback receipt
+under the private canonical-root-relative `receipts` directory, a directory
+inventory of exactly twice the final sequence, unique receipt and rollback
+digests, no cycles, and complete class-specific authorization, policy, source,
+selector, control-preimage, runtime, trust-history, and manual-target ancestry
+coherence at every edge. `DIGEST` is SHA-256 of the exact deployment-receipt
+bytes. The endpoint projection is rejected unless a second strict parse yields
+the identical complete list; no suffix or singleton substitution is admitted.
 `retained_results` is the path-sorted list of exact objects
 `{"path":RELATIVE,"sha256":DIGEST}` from the closed retained transaction-result
 baseline. If the canonical-root-relative `transaction-results` directory is

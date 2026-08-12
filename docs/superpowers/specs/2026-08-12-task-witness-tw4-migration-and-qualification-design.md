@@ -99,11 +99,14 @@ that already produces `task-witness-deployer-authorization-v1` from Task
 Witness's public `DeploymentAuthorizationFacts` issues one detached,
 transaction-bound `task-witness-bridge-transition-authorization-v1` after B1,
 the final TW4 release, and the detached release manifest all have immutable
-identities. `plugins/task-witness/controller/task_witness_deploy.py` validates
-both contracts and projects them into receipts; the client validates the
-retained projection. The controller, client, bridge, and candidate never issue
-authorization. This is a new purpose under the existing external deployer
-authority, not a signer or trust root.
+identities. The exact B1 version of
+`plugins/task-witness/controller/task_witness_deploy.py` alone validates the raw
+transition contract during prepare, stage, activation, and recovery and
+projects it into the successful TW4 receipt. The TW4 controller and client
+validate only that retained projection. `validate_task_witness.py` does not
+consume or validate transition authorization. The controller, client, bridge,
+and candidate never issue authorization. This is a new purpose under the
+existing external deployer authority, not a signer or trust root.
 
 The transition authorization binds exact B1 active-receipt, controller,
 policy, source, and retained-chain identities; exact TW4 commit, tree,
@@ -390,8 +393,12 @@ identity. No digest may be patched forward.
 The validator rejects target duplication, missing target, receipt reuse,
 candidate or inventory disagreement, runtime/profile/shim drift, incomplete or
 degraded review, noncanonical artifacts, unknown bridge identity, changed
-semantic bytes, stale manifest or transition authorization, or a manifest
-inside the candidate tree.
+semantic bytes, stale manifest, or a manifest inside the candidate tree.
+
+Separately, exact B1 rejects a stale or disagreeing transition authorization
+before staging or recovery mutation. TW4 controller and client reject a stale,
+unknown, or inconsistent retained migration projection. Neither operation is a
+final-release-validator responsibility.
 
 Qualification and manifest validation are read-only. They do not install,
 publish, mutate Git, contact a provider, create users, or infer missing
@@ -419,9 +426,10 @@ evidence.
    enabling the runner terminal.
 8. Emit one create-new host receipt and verify it independently.
 9. Add detached-manifest parsing, canonical review-evidence validation, and the
-   exact public-release promotion check. Pin rejection of a manifest or
-   transition authorization made stale by any candidate, evidence,
-   promotion-delta, final-identity, plan, or transaction change.
+   exact public-release promotion check. Pin final-validator rejection of a
+   manifest made stale by any candidate, evidence, promotion-delta, or
+   final-identity change. Pin stale plan, transaction, endpoint, and
+   authorization rejection in B1's transition tests instead.
 10. Rebaseline source-shape and package inventories only after all preceding
    bytes freeze.
 11. Run bootstrap Sol High review, both native host qualifications, install and

@@ -457,9 +457,10 @@ evidence.
    authorization fixtures. These are TDD inputs, not release evidence.
 4. Freeze B1's complete bytes, record its exact immutable identities, replace
    identity-shape fixtures with exact-value regressions.
-5. Implement the TW4 candidate's exact B1/F5 retained allowlist, qualification
-   runner terminal, fixed suite inventory, host-receipt parser, detached-
-   manifest validator, and metadata-only promotion validator.
+5. Implement the TW4 candidate's exact B1/F5 retained allowlist, fixed suite-
+   inventory parser, closed executor plumbing, host-receipt parser, detached-
+   manifest validator, and metadata-only promotion validator. Keep receipt
+   emission deliberately unreachable at this step.
 6. Add exact retained F5/B1/TW4 controller and client validation plus K.1
    coexistence. Every recovery audit must understand the policy epoch and
    receipt schema for the retained suffix before mutation.
@@ -468,7 +469,8 @@ evidence.
    successor slice. The tests exercise the production contract but make no
    release claim.
 8. Freeze the suite-inventory parser, exact ordered IDs, closed execution
-   selector, and exact counts before enabling the runner terminal.
+   selector, exact counts, and every required vertical before enabling the
+   runner terminal and create-new receipt publication.
 9. Rebaseline source-shape and package inventories, then freeze the complete
    ineligible TW4 qualification candidate. No candidate byte changes after
    this point without invalidating every dependent artifact.

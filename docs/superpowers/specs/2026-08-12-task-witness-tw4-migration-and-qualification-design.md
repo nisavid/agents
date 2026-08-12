@@ -227,8 +227,11 @@ The following fail before stage creation or live mutation:
 - F5 preparing a modified or reissued bridge identity;
 - B1 preparing an unsupported legacy, publisher-channel, or exact-release
   migration through its inbound surface;
-- B1 preparing any current-schema candidate without the exact detached
-  release manifest and one-use bridge-transition authorization;
+- B1 preparing any current-schema candidate without the exact detached release
+  manifest or strict endpoint projection;
+- B1 staging or activating any current-schema candidate without the fresh
+  one-use bridge-transition authorization issued from that exact plan and
+  authorization facts;
 - a caller passing a dataclass instance across a freshly loaded module
   boundary; and
 - a recovery path that selects the live, candidate, or current controller in

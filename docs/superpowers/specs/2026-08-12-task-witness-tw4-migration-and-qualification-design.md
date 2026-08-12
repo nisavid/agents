@@ -382,7 +382,8 @@ The manifest binds:
   execution, adjudication, and unchanged-verification identities;
 - each host receipt's exact successful `migration-freeze5-to-bridge` and
   `migration-bridge-to-tw4` entry result, including its expected and observed
-  count and terminal-output digest;
+  count, exit status, bounded stdout digest and length, bounded stderr digest
+  and length, and terminal result;
 - the exact final public-release commit and tree;
 - the exact F5/B1/TW4 migration edge and B1 retained-history identity;
 - the complete promotion delta from the qualified candidate; and

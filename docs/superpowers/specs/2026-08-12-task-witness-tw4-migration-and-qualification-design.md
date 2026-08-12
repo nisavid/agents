@@ -139,8 +139,9 @@ policy, source, and retained-chain identities; exact TW4 commit, tree,
 source-evidence, control-set, and public-release identities; the exact
 validated release-manifest digest; the deployment plan and authorization-facts
 digests; the expected active-receipt core digest; the execution class; and the
-one-use transaction digest. The core is the exact deterministic active-receipt
-projection with only the new migration projection omitted. An
+one-use transaction digest. The core is the exact deterministic unsigned
+active-receipt projection with both the new `migration` projection and the
+final `content_sha256` omitted. An
 `isolated-rehearsal` authorization additionally binds a canonical endpoint
 projection containing the target, deployment-root path, device, inode, owner,
 mode, starting B1 active-receipt digest, retained-chain digest, platform-
@@ -179,10 +180,11 @@ and authorization facts bind the manifest digest, strict endpoint projection,
 and expected active-receipt core; the external transition authorization binds
 those exact facts, plan, and transaction; then the stage receipt, activation
 intent, and journal bind the authorization's raw digest as well. The final
-active receipt joins the unchanged core with the exact class-shaped migration
-projection, including the authorization digest. No preauthorization fact binds
-the final receipt digest. Activation reopens and revalidates those exact staged
-bytes before journal creation.
+active receipt joins the unchanged unsigned core with the exact class-shaped
+migration projection, including the authorization digest, and only then
+computes the ordinary `content_sha256` over every unsigned final field. No
+preauthorization fact binds the final content or receipt digest. Activation
+reopens and revalidates those exact staged bytes before journal creation.
 
 Recovery reads only the staged copies. It accepts the authorization's same
 transaction digest as continuation of that exact in-progress journal; this is
@@ -273,13 +275,15 @@ class PreparedBridgeTransition:
 
 The active and candidate endpoint digests cover every exact identity named by
 the transition-authorization contract. The expected active-receipt core is the
-canonical exact receipt projection with only `migration` omitted; controller
-and client later recompute that core and validate the authorization-backed
-migration projection independently. Preparation descriptor-reads the manifest
-once but does not accept transition authorization. Staging reparses the
-ordinary deployer authorization, descriptor-reads and validates both external
-files, requires the manifest digest observed during preparation, and copies
-their exact bytes create-new into the private stage.
+canonical exact unsigned receipt projection with both `migration` and
+`content_sha256` omitted. Controller and client later remove those two fields
+from the final receipt and recompute that core, validate the authorization-
+backed migration projection independently, and validate the ordinary final
+`content_sha256` over the complete unsigned receipt. Preparation descriptor-
+reads the manifest once but does not accept transition authorization. Staging
+reparses the ordinary deployer authorization, descriptor-reads and validates
+both external files, requires the manifest digest observed during preparation,
+and copies their exact bytes create-new into the private stage.
 
 `ActivationRequest.deployment` admits `BridgeTransitionRequest`; its
 `authorization_raw` remains the ordinary deployer authorization. Activation,

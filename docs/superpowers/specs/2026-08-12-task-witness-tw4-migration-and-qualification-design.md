@@ -127,12 +127,21 @@ has exactly `repository_id`, `commit_sha1`, `tree_sha1`,
 `client_sha256`, and `source_mode`. `repository_id` is exactly
 `nisavid/agents`; `source_mode` is exactly `harness_snapshot`; commit and tree
 values are 40-character lowercase Git object IDs; and every SHA-256 is 64
-lowercase hex characters. `plugin_subtree_sha256` uses the existing
-`task-witness-plugin-subtree-v1` framing: SHA-256 of canonical JSON
-`{"contract":"task-witness-plugin-subtree-v1","entries":ENTRIES}`, where
-`ENTRIES` is the exact path-sorted directory/file projection produced by the
-controller's bounded candidate-tree snapshot. Controller, policy, and client
-digests are SHA-256 of their exact raw file bytes. `allowed_edges` is exactly
+lowercase hex characters. `plugin_subtree_sha256` uses the
+`task-witness-plugin-subtree-v1` framing: SHA-256 of canonical JSON for an
+object containing exactly `contract` and `entries`, with `contract` equal to
+`task-witness-plugin-subtree-v1`. `entries` contains every descendant of the
+plugin root exactly once, excludes the root itself, and is strictly sorted by
+`path`. A directory entry contains exactly
+`{"kind":"directory","path":RELATIVE}`. A file entry contains exactly
+`{"kind":"file","length":N,"path":RELATIVE,"sha256":DIGEST}`, where `N`
+is the nonnegative non-Boolean raw byte length and `DIGEST` is SHA-256 of those
+exact raw bytes. `RELATIVE` is a nonempty slash-separated plugin-root-relative
+path with no empty, `.` or `..` component. Symlinks and special files are
+forbidden. Canonical JSON uses UTF-8, sorted object keys, no insignificant
+whitespace, no trailing newline, no duplicate keys, and no nonfinite value.
+Controller, policy, and client digests are SHA-256 of their exact raw file
+bytes. `allowed_edges` is exactly
 `[{"from":"freeze5","source_mode":"harness_snapshot","to":"bridge"}]`.
 Exact identity values freeze only after B1 freezes. The record contains no TW4
 commit, tree, or artifact digest and therefore creates no self-reference.

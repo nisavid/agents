@@ -93,6 +93,22 @@ Current TW4 retains an exact, closed B1/F5 allowlist for historical validation.
 The allowlist admits only the frozen identities. A well-formed but unlisted
 legacy receipt, bridge, controller, or policy fails closed.
 
+B1 does not hardcode its successor digest. That would create a digest cycle
+because TW4 must retain B1's exact identity. Instead, the existing
+deployer/operator authorization owner issues one detached, transaction-bound
+`task-witness-bridge-transition-authorization-v1` after B1, the final TW4
+release, and the detached release manifest all have immutable identities. This
+is a new authorization purpose under the existing authority, not a signer or
+trust root.
+
+The transition authorization binds exact B1 active-receipt, controller,
+policy, source, and retained-chain identities; exact TW4 commit, tree,
+source-evidence, control-set, and public-release identities; the exact
+validated release-manifest digest; the deployment plan and authorization-facts
+digests; and the one-use transaction digest. B1 rejects a missing, reused,
+wrong-purpose, or disagreeing authorization before stage creation. A merely
+current-schema-compatible candidate is never sufficient.
+
 ### B1's two surfaces
 
 B1 has two explicit, disjoint surfaces:
@@ -135,8 +151,9 @@ digest. It is not a public installation request or a legacy-schema registry.
 
 ### Hop 2: B1 to TW4
 
-1. Exact B1 prepares and stages TW4 through its current-shaped outbound
-   surface.
+1. Exact B1 validates the detached release manifest and fresh bridge-transition
+   authorization, then prepares and stages the exact authorized TW4 through
+   its current-shaped outbound surface.
 2. B1 validates the old active B1 epoch and the current candidate TW4 epoch
    independently. Only the exact bridge transition may cross this schema
    boundary.
@@ -157,6 +174,8 @@ The following fail before stage creation or live mutation:
 - F5 preparing a modified or reissued bridge identity;
 - B1 preparing an unsupported legacy, publisher-channel, or exact-release
   migration through its inbound surface;
+- B1 preparing any current-schema candidate without the exact detached
+  release manifest and one-use bridge-transition authorization;
 - a caller passing a dataclass instance across a freshly loaded module
   boundary; and
 - a recovery path that selects the live, candidate, or current controller in
@@ -294,6 +313,7 @@ The manifest binds:
 - the canonical review-evidence bundle digest plus its model, topology,
   execution, adjudication, and unchanged-verification identities;
 - the exact final public-release commit and tree;
+- the exact F5/B1/TW4 migration edge and B1 retained-history identity;
 - the complete promotion delta from the qualified candidate; and
 - the terminal `release-qualified` disposition.
 
@@ -344,7 +364,10 @@ evidence.
 ## Implementation And TDD Order
 
 1. Freeze direct `F5 -> TW4` rejection plus B1 identity-shape, predecessor,
-   schema-surface, and allowlist REDs. Do not assert a not-yet-built digest.
+   schema-surface, allowlist, detached-manifest endpoint, and bridge-transition
+   authorization REDs. Do not assert a not-yet-built digest. At this stage B1
+   validates only the authorization-bound manifest identity and endpoint; the
+   final validator later owns the host and review evidence inside the manifest.
 2. Build B1's F5-compatible inbound stage and prove bounded `F5 -> B1`
    success and rejection through staged F5.
 3. Build B1's current outbound stage and prove bounded `B1 -> TW4` success and

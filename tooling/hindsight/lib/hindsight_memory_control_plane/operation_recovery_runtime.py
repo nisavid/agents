@@ -1111,6 +1111,22 @@ def install_exact_drain_runtime_guards(
         raise OperationRecoveryError(
             "exact drain phase-one timeout authority is invalid"
         )
+    phase_one_statement_timeout_seconds = getattr(
+        adapter,
+        "phase_one_statement_timeout_seconds",
+        None,
+    )
+    if phase_one_statement_timeout_seconds is not None and (
+        type(phase_one_statement_timeout_seconds) not in {int, float}
+        or phase_one_statement_timeout_seconds <= 0
+    ):
+        raise OperationRecoveryError(
+            "exact drain phase-one statement-timeout authority is invalid"
+        )
+    task_cancellation_timeout_seconds = max(
+        EXACT_DRAIN_TASK_CANCELLATION_TIMEOUT_SECONDS,
+        phase_one_statement_timeout_seconds or 0,
+    )
 
     async def claim_tasks(_ops: Any, *args: Any, **kwargs: Any) -> Any:
         return await adapter.claim_tasks(*args, **kwargs)
@@ -1248,11 +1264,30 @@ def install_exact_drain_runtime_guards(
             if not execution.done():
                 execution.cancel()
                 try:
+                    cancellation_timeout_seconds = (
+                        EXACT_DRAIN_TASK_CANCELLATION_TIMEOUT_SECONDS
+                    )
+                    stage = getattr(holder, "stage", None)
+                    if (
+                        phase_one_statement_timeout_seconds is not None
+                        and isinstance(stage, str)
+                        and stage.startswith("retain.phase1.")
+                    ):
+                        cancellation_timeout_seconds = (
+                            task_cancellation_timeout_seconds
+                        )
                     done, _pending = await asyncio.wait(
                         {execution},
-                        timeout=EXACT_DRAIN_TASK_CANCELLATION_TIMEOUT_SECONDS,
+                        timeout=cancellation_timeout_seconds,
                     )
                     if not done:
+                        try:
+                            adapter.record_upstream_stage(
+                                task.operation_id,
+                                "failure.nonquiescent",
+                            )
+                        except BaseException:
+                            pass
                         claim_release_disabled = True
                         raise OperationRecoveryError(
                             "exact drain task did not quiesce after cancellation"
@@ -1379,6 +1414,7 @@ def install_exact_drain_runtime_guards(
         poller: Any,
         timeout: float = 30.0,
     ) -> None:
+        nonlocal claim_release_disabled
         if not callable(upstream_shutdown_graceful):
             raise OperationRecoveryError(
                 "exact drain worker graceful shutdown seam is unavailable"
@@ -1389,13 +1425,25 @@ def install_exact_drain_runtime_guards(
             for info in active_tasks.values()
             if isinstance(getattr(info, "bg_task", None), asyncio.Task)
         ]
+        if not worker_shutdown_requested:
+            shutdown = getattr(poller, "_shutdown", None)
+            shutdown_set = getattr(shutdown, "set", None)
+            if not callable(shutdown_set):
+                claim_release_disabled = True
+                raise OperationRecoveryError(
+                    "exact drain worker shutdown seam is unavailable"
+                )
+            shutdown_set()
+            for task in observed_tasks:
+                if not task.done():
+                    task.cancel()
         upstream_error: BaseException | None = None
         try:
             graceful_timeout = timeout
-            if worker_shutdown_requested:
+            if observed_tasks:
                 graceful_timeout = max(
                     timeout,
-                    EXACT_DRAIN_TASK_CANCELLATION_TIMEOUT_SECONDS + 0.5,
+                    task_cancellation_timeout_seconds + 0.5,
                 )
             await upstream_shutdown_graceful(
                 poller,
@@ -1474,6 +1522,13 @@ def install_exact_drain_runtime_guards(
         except asyncio.CancelledError:
             raise
         except BaseException as error:
+            try:
+                adapter.record_upstream_stage(
+                    operation_id,
+                    "failure.terminal-state",
+                )
+            except BaseException:
+                pass
             record_exact_task_error(poller, error)
             request_exact_worker_shutdown(poller)
             raise

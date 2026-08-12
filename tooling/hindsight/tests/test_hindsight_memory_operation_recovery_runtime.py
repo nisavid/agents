@@ -883,8 +883,13 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
                         yield
 
                 class Adapter:
-                    def record_upstream_stage(self, _operation_id, _stage):
-                        return None
+                    def record_upstream_stage(
+                        self,
+                        operation_id,
+                        stage,
+                        _events=events,
+                    ):
+                        _events.append(("stage", operation_id, stage))
 
                     async def mark_completed(
                         self,
@@ -1064,6 +1069,375 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
                         else "failed"
                     ),
                 )
+                self.assertIn(
+                    (
+                        "stage",
+                        "operation-a",
+                        "failure.terminal-state",
+                    ),
+                    events,
+                )
+
+    def test_phase_one_shutdown_waits_for_plan_bound_statement_cancellation(self):
+        shutdown_requests = []
+
+        class Adapter:
+            phase_one_timeout_seconds = 0.001
+            phase_one_statement_timeout_seconds = 0.05
+
+            def record_upstream_stage(self, _operation_id, _stage):
+                return None
+
+        class WorkerPoller(_RunCapableWorkerPoller):
+            def __init__(self):
+                self._shutdown = asyncio.Event()
+
+            async def _execute_task_inner(self, _task, holder):
+                holder.stage = "retain.phase1.candidates.fuzzy.1/2"
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    await asyncio.sleep(0.02)
+
+            async def _claim_batch_for_schema_inner(self, *_arguments):
+                return []
+
+            async def _claim_batch_for_schema(self, schema, reserved, shared):
+                return await self._claim_batch_for_schema_inner(
+                    schema,
+                    reserved,
+                    shared,
+                )
+
+        guard_globals = install_exact_drain_runtime_guards.__globals__
+        original_cancellation_timeout = guard_globals[
+            "EXACT_DRAIN_TASK_CANCELLATION_TIMEOUT_SECONDS"
+        ]
+        guard_globals["EXACT_DRAIN_TASK_CANCELLATION_TIMEOUT_SECONDS"] = 0.01
+        try:
+            install_exact_drain_runtime_guards(
+                type("PostgreSQLOps", (), {}),
+                WorkerPoller,
+                type("MemoryEngine", (), {}),
+                Adapter(),
+                request_worker_shutdown=lambda: shutdown_requests.append(True),
+            )
+
+            async def exercise():
+                poller = WorkerPoller()
+                with self.assertRaisesRegex(
+                    OperationRecoveryError,
+                    "retain phase one exceeded its deadline",
+                ):
+                    await poller._execute_task_inner(
+                        SimpleNamespace(operation_id="operation-1"),
+                        SimpleNamespace(stage="queued.retain"),
+                    )
+
+            asyncio.run(exercise())
+        finally:
+            guard_globals["EXACT_DRAIN_TASK_CANCELLATION_TIMEOUT_SECONDS"] = (
+                original_cancellation_timeout
+            )
+        self.assertEqual(shutdown_requests, [True])
+
+    def test_public_shutdown_waits_for_plan_bound_phase_one_quiescence(self):
+        try:
+            from hindsight_api.worker.poller import ClaimedTask
+            from hindsight_api.worker.poller import (
+                WorkerPoller as UpstreamWorkerPoller,
+            )
+        except ImportError as error:
+            raise unittest.SkipTest(
+                "hindsight_api worker runtime is unavailable"
+            ) from error
+
+        row = {"status": "processing"}
+        task_quiesced = asyncio.Event()
+        shutdown_requested = asyncio.Event()
+
+        class Adapter:
+            phase_one_timeout_seconds = 0.001
+            phase_one_statement_timeout_seconds = 0.6
+
+            def record_upstream_stage(self, _operation_id, _stage):
+                return None
+
+            async def recover_own_tasks(self, _backend):
+                return 0
+
+            async def release_own_tasks(self, _backend):
+                if not task_quiesced.is_set():
+                    raise AssertionError("claim released before task quiescence")
+                row["status"] = "pending"
+                return 1
+
+        class WorkerPoller(UpstreamWorkerPoller):
+            async def claim_batch(self):
+                if getattr(self, "_test_delivered", False):
+                    return []
+                self._test_delivered = True
+                return [
+                    ClaimedTask(
+                        operation_id="operation-1",
+                        task_dict={
+                            "type": "retain",
+                            "operation_type": "retain",
+                            "bank_id": "engineering",
+                        },
+                        schema=None,
+                    )
+                ]
+
+            async def _log_progress_if_due(self):
+                return None
+
+            async def _execute_task_inner(self, _task, holder):
+                holder.stage = "retain.phase1.candidates.fuzzy.1/2"
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    await asyncio.sleep(0.55)
+                    task_quiesced.set()
+
+        guard_globals = install_exact_drain_runtime_guards.__globals__
+        original_cancellation_timeout = guard_globals[
+            "EXACT_DRAIN_TASK_CANCELLATION_TIMEOUT_SECONDS"
+        ]
+        guard_globals["EXACT_DRAIN_TASK_CANCELLATION_TIMEOUT_SECONDS"] = 0.01
+        try:
+            install_exact_drain_runtime_guards(
+                type("PostgreSQLOps", (), {}),
+                WorkerPoller,
+                type("MemoryEngine", (), {}),
+                Adapter(),
+                request_worker_shutdown=shutdown_requested.set,
+            )
+
+            async def exercise():
+                poller = object.__new__(WorkerPoller)
+                poller._backend = "exact-backend"
+                poller._worker_id = "exact-worker"
+                poller._shutdown = asyncio.Event()
+                poller._poll_interval_ms = 1
+                poller._slot_reservations = {}
+                poller._max_slots = 1
+                poller._in_flight_lock = asyncio.Lock()
+                poller._in_flight_count = 0
+                poller._in_flight_by_type = {}
+                poller._active_tasks = {}
+                poller_task = asyncio.create_task(poller.run())
+                await asyncio.wait_for(shutdown_requested.wait(), timeout=1.0)
+                with self.assertRaisesRegex(
+                    OperationRecoveryError,
+                    "retain phase one exceeded its deadline",
+                ):
+                    await poller.shutdown_graceful(timeout=0.0)
+                await asyncio.wait_for(poller_task, timeout=1.0)
+
+            with patch(
+                "hindsight_api.worker.poller._CANCEL_DRAIN_TIMEOUT",
+                0.005,
+            ):
+                asyncio.run(exercise())
+        finally:
+            guard_globals["EXACT_DRAIN_TASK_CANCELLATION_TIMEOUT_SECONDS"] = (
+                original_cancellation_timeout
+            )
+        self.assertTrue(task_quiesced.is_set())
+        self.assertEqual(row, {"status": "pending"})
+
+    def test_external_shutdown_waits_for_phase_one_quiescence(self):
+        nested_quiesced = asyncio.Event()
+        release_observations = []
+
+        class Adapter:
+            phase_one_timeout_seconds = 60.0
+            phase_one_statement_timeout_seconds = 0.05
+
+            def record_upstream_stage(self, _operation_id, _stage):
+                return None
+
+            async def release_own_tasks(self, _backend):
+                release_observations.append(nested_quiesced.is_set())
+                return 1
+
+        class WorkerPoller(_RunCapableWorkerPoller):
+            def __init__(self):
+                self._backend = "exact-backend"
+                self._shutdown = asyncio.Event()
+                self._active_tasks = {}
+
+            async def _execute_task_inner(self, _task, holder):
+                holder.stage = "retain.phase1.blocked"
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    await asyncio.sleep(0.02)
+                    nested_quiesced.set()
+
+            async def _claim_batch_for_schema_inner(self, *_arguments):
+                return []
+
+            async def _claim_batch_for_schema(self, schema, reserved, shared):
+                return await self._claim_batch_for_schema_inner(
+                    schema,
+                    reserved,
+                    shared,
+                )
+
+            async def shutdown_graceful(self, timeout=30.0):
+                self._shutdown.set()
+                tasks = [
+                    info.bg_task
+                    for info in self._active_tasks.values()
+                ]
+                _done, pending = await asyncio.wait(tasks, timeout=timeout)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    await asyncio.wait(pending, timeout=0.005)
+                await self.release_own_tasks()
+
+        guard_globals = install_exact_drain_runtime_guards.__globals__
+        original_cancellation_timeout = guard_globals[
+            "EXACT_DRAIN_TASK_CANCELLATION_TIMEOUT_SECONDS"
+        ]
+        guard_globals["EXACT_DRAIN_TASK_CANCELLATION_TIMEOUT_SECONDS"] = 0.01
+        try:
+            install_exact_drain_runtime_guards(
+                type("PostgreSQLOps", (), {}),
+                WorkerPoller,
+                type("MemoryEngine", (), {}),
+                Adapter(),
+                request_worker_shutdown=lambda: None,
+            )
+
+            async def exercise():
+                poller = WorkerPoller()
+                operation = SimpleNamespace(operation_id="operation-1")
+                holder = SimpleNamespace(stage="queued.retain")
+                outer = asyncio.create_task(
+                    poller._execute_task_inner(operation, holder)
+                )
+                poller._active_tasks = {
+                    operation.operation_id: SimpleNamespace(bg_task=outer)
+                }
+                await asyncio.sleep(0)
+                await poller.shutdown_graceful(timeout=0.0)
+                await asyncio.gather(outer, return_exceptions=True)
+
+            asyncio.run(exercise())
+        finally:
+            guard_globals["EXACT_DRAIN_TASK_CANCELLATION_TIMEOUT_SECONDS"] = (
+                original_cancellation_timeout
+            )
+        self.assertEqual(release_observations, [True])
+
+    def test_public_shutdown_never_releases_a_nonquiescent_phase_one_task(self):
+        shutdown_requests = []
+        nested_tasks = []
+        release_observations = []
+
+        class Adapter:
+            phase_one_timeout_seconds = 60.0
+            phase_one_statement_timeout_seconds = 0.05
+
+            def record_upstream_stage(self, _operation_id, _stage):
+                return None
+
+            async def release_own_tasks(self, _backend):
+                release_observations.append(
+                    [task.done() for task in nested_tasks]
+                )
+                return 1
+
+        class WorkerPoller(_RunCapableWorkerPoller):
+            def __init__(self):
+                self._backend = "exact-backend"
+                self._shutdown = asyncio.Event()
+                self._active_tasks = {}
+
+            async def _execute_task_inner(self, _task, holder):
+                holder.stage = "retain.phase1.blocked"
+                nested_tasks.append(asyncio.current_task())
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    await asyncio.Event().wait()
+
+            async def _claim_batch_for_schema_inner(self, *_arguments):
+                return []
+
+            async def _claim_batch_for_schema(self, schema, reserved, shared):
+                return await self._claim_batch_for_schema_inner(
+                    schema,
+                    reserved,
+                    shared,
+                )
+
+            async def shutdown_graceful(self, timeout=30.0):
+                self._shutdown.set()
+                tasks = [
+                    info.bg_task
+                    for info in self._active_tasks.values()
+                ]
+                _done, pending = await asyncio.wait(tasks, timeout=timeout)
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    await asyncio.wait(pending, timeout=0.01)
+                await self.release_own_tasks()
+
+        guard_globals = install_exact_drain_runtime_guards.__globals__
+        original_cancellation_timeout = guard_globals[
+            "EXACT_DRAIN_TASK_CANCELLATION_TIMEOUT_SECONDS"
+        ]
+        guard_globals["EXACT_DRAIN_TASK_CANCELLATION_TIMEOUT_SECONDS"] = 0.01
+        try:
+            install_exact_drain_runtime_guards(
+                type("PostgreSQLOps", (), {}),
+                WorkerPoller,
+                type("MemoryEngine", (), {}),
+                Adapter(),
+                request_worker_shutdown=lambda: shutdown_requests.append(True),
+            )
+
+            async def exercise():
+                poller = WorkerPoller()
+                operation = SimpleNamespace(operation_id="operation-1")
+                holder = SimpleNamespace(stage="queued.retain")
+                outer = asyncio.create_task(
+                    poller._execute_task_inner(operation, holder)
+                )
+                poller._active_tasks = {
+                    operation.operation_id: SimpleNamespace(bg_task=outer)
+                }
+                try:
+                    await asyncio.sleep(0)
+                    with self.assertRaisesRegex(
+                        OperationRecoveryError,
+                        "claim release is disabled after failed quiescence",
+                    ):
+                        await poller.shutdown_graceful(timeout=0.0)
+                finally:
+                    for task in nested_tasks:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(
+                        *nested_tasks,
+                        return_exceptions=True,
+                    )
+                    if not outer.done():
+                        outer.cancel()
+                    await asyncio.gather(outer, return_exceptions=True)
+
+            asyncio.run(exercise())
+        finally:
+            guard_globals["EXACT_DRAIN_TASK_CANCELLATION_TIMEOUT_SECONDS"] = (
+                original_cancellation_timeout
+            )
+        self.assertEqual(release_observations, [])
 
     def test_cancelled_exact_terminal_mutation_does_not_request_shutdown(self):
         shutdown_requests = []
@@ -1381,12 +1755,13 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
 
     def test_phase_one_timeout_never_releases_before_task_quiescence(self):
         release_calls = []
+        stages = []
 
         class Adapter:
             phase_one_timeout_seconds = 0.001
 
-            def record_upstream_stage(self, _operation_id, _stage):
-                return None
+            def record_upstream_stage(self, operation_id, stage):
+                stages.append((operation_id, stage))
 
             async def release_own_tasks(self, _backend):
                 release_calls.append(True)
@@ -1461,6 +1836,10 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
 
             asyncio.run(exercise())
             self.assertEqual(release_calls, ["shutdown"])
+            self.assertIn(
+                ("operation-1", "failure.nonquiescent"),
+                stages,
+            )
         finally:
             guard_globals["EXACT_DRAIN_TASK_CANCELLATION_TIMEOUT_SECONDS"] = (
                 original_cancellation_timeout

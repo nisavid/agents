@@ -432,6 +432,9 @@ class ExactDrainProgressRecorder:
             task = self._tasks.get(operation_id)
             if task is None:
                 raise OperationRecoveryError("exact drain progress task is outside plan")
+            prior_task = dict(task)
+            prior_observed_at = self._observed_at
+            prior_last_progress_at = self._last_progress_at
             now = self._now()
             task.update(
                 status=status,
@@ -440,7 +443,14 @@ class ExactDrainProgressRecorder:
                 last_progress_at=now,
             )
             self._last_progress_at = now
-            self._persist(now)
+            try:
+                self._persist(now)
+            except BaseException:
+                task.clear()
+                task.update(prior_task)
+                self._observed_at = prior_observed_at
+                self._last_progress_at = prior_last_progress_at
+                raise
 
     def task_processing_stage(self, operation_id: str, *, stage: str) -> None:
         """Update a live breadcrumb without reviving a terminal or released task."""

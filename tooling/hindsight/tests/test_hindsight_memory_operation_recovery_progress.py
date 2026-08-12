@@ -162,6 +162,63 @@ class ExactDrainProgressTest(unittest.TestCase):
         self.assertEqual(progress["selected_status_counts"], {"completed": 1})
         self.assertEqual(progress["tasks"][0]["stage"], "completed")
 
+    def test_terminal_persist_failure_restores_processing_breadcrumb(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+            path = Path(directory) / "exact-drain-progress.json"
+            recorder = ExactDrainProgressRecorder(
+                path=path,
+                plan_digest="a" * 64,
+                worker_pid=1234,
+                worker_start_time="darwin:1000:1",
+                worker_attempt=1,
+                selected_operations=[
+                    {
+                        "operation_id": "00000000-0000-4000-8000-000000000001",
+                        "operation_type": "retain",
+                        "row_digest": "b" * 64,
+                    }
+                ],
+                clock=lambda: 1000.0,
+            )
+            operation_id = "00000000-0000-4000-8000-000000000001"
+            recorder.task_stage(
+                operation_id,
+                status="processing",
+                stage="claimed",
+            )
+            original_persist = recorder._persist
+            failures_remaining = 1
+
+            def fail_terminal_persist_once(observed_at: float) -> None:
+                nonlocal failures_remaining
+                if failures_remaining:
+                    failures_remaining -= 1
+                    raise OSError("terminal progress persist failed")
+                original_persist(observed_at)
+
+            with patch.object(recorder, "_persist", fail_terminal_persist_once):
+                with self.assertRaisesRegex(
+                    OSError,
+                    "terminal progress persist failed",
+                ):
+                    recorder.task_stage(
+                        operation_id,
+                        status="failed",
+                        stage="failed",
+                    )
+                recorder.task_processing_stage(
+                    operation_id,
+                    stage="failure.terminal-state",
+                )
+            progress = read_exact_drain_progress(
+                path,
+                plan_digest="a" * 64,
+                now=1001.0,
+            )
+
+        self.assertEqual(progress["selected_status_counts"], {"processing": 1})
+        self.assertEqual(progress["tasks"][0]["stage"], "failure.terminal-state")
+
     def test_resume_archives_prior_attempt_and_carries_task_state(self) -> None:
         with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
             path = Path(directory) / "exact-drain-progress.json"

@@ -350,6 +350,17 @@ categories, prior-attempt evidence, and artifact digests are included. Neither
 command exposes prompts, responses, error text, database URLs, credentials,
 provider secrets, task payloads, or raw worker IDs.
 
+If an exact task cannot persist its terminal state, progress records the closed
+payload-free stage `failure.terminal-state` before requesting worker shutdown.
+If a cancelled task does not quiesce within its plan-bound Phase 1 statement
+timeout, it records `failure.nonquiescent` and leaves the
+claim intact for guarded recovery. Phase 1 cancellation waits for that bounded
+database interval before deciding that release is unsafe. Public graceful
+shutdown retains one polling interval of scheduling grace beyond the same
+bound. External signals stop new claims, cancel the tracked task wrappers, and
+then use that same bounded wait; shutdown never releases a claim while task code
+may still advance.
+
 The legacy launchd label and manifest are migration bindings, not evidence that
 a legacy installation exists. A fresh installation still supplies a distinct
 legacy label and the absolute path where that legacy manifest would exist; the

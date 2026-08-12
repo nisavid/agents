@@ -119,9 +119,11 @@ legacy receipt, bridge, controller, or policy fails closed.
 The TW4 candidate owns the single reviewable allowlist source at
 `release/task-witness/tw4-bridge-identity.json`, with contract
 `task-witness-tw4-bridge-identity-v1`. Its root has exactly
-`schema_version`, `contract`, `freeze5`, `bridge`, `allowed_edges`, and
-`content_sha256`. `schema_version` is integer `1`; `content_sha256` is the
-digest of the canonical object with that field omitted. Each identity object
+`schema_version`, `contract`, `freeze5`, `bridge`, `allowed_edges`,
+`provenance_sha256`, and `content_sha256`. `schema_version` is integer `1`;
+`provenance_sha256` is SHA-256 of the exact raw provenance-proof file defined
+below; and `content_sha256` is the digest of the canonical object with that
+field omitted. Each identity object
 has exactly `repository_id`, `commit_sha1`, `tree_sha1`,
 `plugin_subtree_sha256`, `controller_sha256`, `policy_sha256`,
 `client_sha256`, and `source_mode`. `repository_id` is exactly
@@ -161,6 +163,43 @@ suite driver, both host receipts, canonical review, and detached release
 manifest bind all four raw snapshot files. The bridge snapshot is added only
 after B1 freezes and before the TW4 qualification candidate freezes.
 
+The same candidate owns the canonical provenance proof at
+`release/task-witness/tw4-bridge-provenance.json`, with contract
+`task-witness-tw4-bridge-provenance-v1`. Its root has exactly
+`schema_version`, `contract`, `repository_id`, `freeze5`, `bridge`, `objects`,
+and `content_sha256`. `schema_version` is integer `1`; `repository_id` is
+exactly `nisavid/agents`; `freeze5` and `bridge` each contain exactly
+`commit_sha1` and `tree_sha1` and equal the corresponding identity-record
+values; and `content_sha256` hashes the canonical object with that field
+omitted. `objects` is a strictly SHA-1-sorted, unique list of exact objects
+`{"type":TYPE,"sha1":SHA1,"raw_base64":BASE64}`. `TYPE` is exactly `commit`
+or `tree`; `BASE64` is canonical padded RFC 4648 base64 without whitespace;
+and `SHA1` equals SHA-1 of ASCII `TYPE`, one space, the decimal decoded byte
+length, one NUL byte, and the decoded raw payload.
+
+The proof contains exactly the two named commit objects and the minimal union
+of tree objects needed to walk each commit's root through
+`plugins/task-witness` and recursively enumerate every directory below that
+plugin root. It contains no blob or unrelated tree object. A commit payload has
+exactly one `tree` header naming its recorded root tree. The bridge commit has
+exactly one `parent` header naming the exact F5 commit. A tree payload is the
+unambiguous repetition of ASCII octal mode, one space, a nonempty basename,
+one NUL byte, and a 20-byte object ID, in Git tree order. Each traversed
+directory uses mode `40000`; every plugin file uses `100644` or `100755`;
+symlink, submodule, duplicate, slash-containing, dot, and dot-dot names reject.
+
+For every plugin file entry, the validator selects the one candidate-bound raw
+file from the nine stable paths and three identity-specific role snapshots,
+computes SHA-1 over ASCII `blob`, one space, its decimal byte length, one NUL,
+and the exact bytes, and requires that object ID and file mode to match the tree
+entry. It then recomputes the path/kind/length/SHA-256 subtree projection and
+requires the identity record's `plugin_subtree_sha256`. This proves each
+recorded commit-to-root-tree-to-plugin-tree-to-file binding without an ambient
+object database. The source-stage validator, suite driver, native runner, and
+final-release validator independently parse the same proof and require its raw
+SHA-256 to equal the identity record. The proof contains no TW4 identity or
+identity-record digest and introduces no cycle.
+
 The suite driver reconstructs a historical plugin root only inside its private
 temporary directory. It copies the nine byte-stable paths above from the
 unchanged current candidate, then overlays the three role files selected by the
@@ -170,10 +209,9 @@ path and follows no symlink. Before executing either root, it uses the same
 bounded candidate-tree projection to require the exact
 `plugin_subtree_sha256`, controller, policy, and client digests from the bridge
 identity record. Qualification therefore needs no ambient Git object, network
-fetch, branch, tag, archive, or unreviewed historical checkout. The record's
-commit and tree IDs remain provenance claims validated when the record and
-detached final manifest are created; the native host executes only the exact
-candidate-bound bytes whose identities it independently recomputes.
+fetch, branch, tag, archive, or unreviewed historical checkout. Each native
+host validates the candidate-bound provenance proof before executing only the
+exact reconstructed bytes.
 
 The external deployer and final validator consume that canonical record from
 the immutable TW4 candidate. Generated controller and client constants must
@@ -439,36 +477,44 @@ a nonempty slash-separated canonical-root-relative path with no empty, `.` or
 `content_sha256` hashes the canonical object with that field omitted.
 
 The externally issued transition authorization has contract
-`task-witness-bridge-transition-authorization-v1`. Both class variants contain
+`task-witness-bridge-transition-authorization-v1`. Its common field set is
 exactly `schema_version`, `contract`, `purpose`, `execution_class`,
 `canonical_root`, `staging_root`, `effective_uid`, `plan_sha256`,
 `maintenance_transaction_sha256`, `deployment_authorization_sha256`,
 `expected_active_receipt_core_sha256`, `bridge_identity_sha256`,
 `release_manifest_sha256`, `endpoint_projection_sha256`, and
-`content_sha256`; `purpose` is exactly `bridge-transition`. The
-`maintenance_transaction_sha256` is the one-use pre-stage transaction identity
-already supplied by `DeploymentRequest`; the later activation transaction ID
-is derived normally from the verified stage and is not preauthorized.
+`content_sha256`. The `isolated-rehearsal` variant contains exactly that set;
+the `live-migration` variant contains exactly that set plus
+`prior_rehearsal`. `schema_version` is integer `1`; `purpose` is exactly
+`bridge-transition`; `execution_class` names the variant; `canonical_root` and
+`staging_root` are normalized absolute path strings equal to preparation facts;
+and `content_sha256` hashes the complete class-shaped object with that field
+omitted. `maintenance_transaction_sha256` is the one-use pre-stage transaction
+identity already supplied by `DeploymentRequest`; the later activation
+transaction ID is derived normally from the verified stage and is not
+preauthorized.
 
-The `live-migration` variant additionally requires `prior_rehearsal`, an exact
+The live variant's `prior_rehearsal` is an exact
 object containing `endpoint_projection_sha256`, `transaction_sha256`,
 `terminal_result_sha256`, and `active_receipt_sha256` from the completed
-isolated rehearsal. The `isolated-rehearsal` variant forbids that key. The
+isolated rehearsal. The isolated variant forbids that key. The
 authorization's `deployment_authorization_sha256` must equal both the predicted
 ordinary authorization digest in preparation facts and the exact raw ordinary
 authorization supplied at staging.
 
 The final deployment receipt's `migration` object has contract
-`task-witness-bridge-migration-projection-v1` and, for both variants, exactly
+`task-witness-bridge-migration-projection-v1`. Its common field set is exactly
 `schema_version`, `contract`, `edge`, `purpose`, `execution_class`,
 `maintenance_transaction_sha256`, `deployment_authorization_sha256`,
 `transition_authorization_sha256`, `expected_active_receipt_core_sha256`,
 `bridge_identity_sha256`, `release_manifest_sha256`, and
-`endpoint_projection_sha256`. `edge` is exactly
-`{"from":"freeze5","to":"tw4","via":"bridge"}` and `purpose` is exactly
-`bridge-transition`. The live variant additionally requires the exact
-`prior_rehearsal` object from its authorization; the isolated variant forbids
-it. The receipt's ordinary `authorization.sha256` must equal
+`endpoint_projection_sha256`. The isolated variant contains exactly that set;
+the live variant contains exactly that set plus the exact `prior_rehearsal`
+object from its authorization. `schema_version` is integer `1`; `edge` is
+exactly `{"from":"freeze5","to":"tw4","via":"bridge"}`; `purpose` is
+exactly `bridge-transition`; and `execution_class` names the variant. The
+isolated variant forbids `prior_rehearsal`. The receipt's ordinary
+`authorization.sha256` must equal
 `deployment_authorization_sha256`, and the recomputed unsigned nonmigration
 core must equal `expected_active_receipt_core_sha256`.
 
@@ -476,11 +522,15 @@ A bridge stage classification is exactly
 `{"outcome":"authorized-bridge-transition","reason":"exact-bridge-transition-authorization"}`
 and otherwise uses the complete-control artifact/preimage program. Its
 activation intent keeps transaction class `control-set-maintenance` and adds
-exactly one `bridge_transition` object containing `execution_class`,
+exactly one class-shaped `bridge_transition` object. Its common field set is
+exactly `execution_class`,
 `maintenance_transaction_sha256`, `deployment_authorization_sha256`,
 `transition_authorization_sha256`, `expected_active_receipt_core_sha256`,
 `bridge_identity_sha256`, `release_manifest_sha256`, and
-`endpoint_projection_sha256`. The activation transaction ID covers that object.
+`endpoint_projection_sha256`. The isolated variant contains exactly that set
+and forbids `prior_rehearsal`; the live variant contains exactly that set plus
+the authorization's exact `prior_rehearsal`. The activation transaction ID
+covers that object.
 Every bridge journal generation carries it unchanged. Ordinary complete-control
 intents and journals forbid it. Recovery requires equality among the original
 bridge request, verified stage evidence, receipt projection, intent, and live
@@ -762,6 +812,9 @@ Each receipt binds:
 
 - the frozen qualification-candidate commit, tree, source-shape record, and
   computed control/source/test closure;
+- the raw bridge-identity and provenance-proof digests and each independently
+  validated F5/B1 commit, tree, plugin-subtree, controller, policy, and client
+  identity;
 - the raw suite-inventory digest and ordered aggregate identities;
 - exactly one target, either macOS arm64 or Linux x86_64;
 - the raw platform-profile and runtime-closure evidence digests;
@@ -825,7 +878,8 @@ The manifest binds:
   results, not exact-final rehearsal authority;
 - the exact final public-release commit and tree;
 - the exact F5/B1/TW4 migration edge and B1 retained-history identity;
-- the exact candidate-owned bridge-identity-record digest;
+- the exact candidate-owned bridge-identity-record and provenance-proof
+  digests;
 - the complete promotion delta from the qualified candidate; and
 - the terminal `release-qualified` disposition.
 
@@ -876,7 +930,8 @@ identity. No digest may be patched forward.
 The validator rejects target duplication, missing target, receipt reuse,
 candidate or inventory disagreement, runtime/profile/shim drift, incomplete or
 degraded review, noncanonical artifacts, unknown bridge identity, changed
-semantic bytes, stale manifest, or a manifest inside the candidate tree.
+semantic bytes, an incomplete or disagreeing Git-object provenance proof, stale
+manifest, or a manifest inside the candidate tree.
 
 Separately, exact B1 rejects a stale or disagreeing transition authorization
 before staging or recovery mutation. TW4 controller and client reject a stale,
@@ -900,9 +955,10 @@ evidence.
    and recovery behavior with canonical test-owned manifest and transition-
    authorization fixtures. These are TDD inputs, not release evidence.
 4. Freeze B1's complete bytes, create the canonical candidate-owned bridge-
-   identity record and four candidate-owned historical snapshot files from its
-   and F5's exact immutable identities, and replace identity-shape fixtures with
-   exact-value and reconstructed-subtree regressions.
+   identity record, minimal Git-object provenance proof, and four historical
+   snapshot files from its and F5's exact immutable identities, and replace
+   identity-shape fixtures with exact-value, commit/tree proof, and
+   reconstructed-subtree regressions.
 5. Implement the TW4 candidate's record-derived B1/F5 compiled allowlist and
    exact record and snapshot parity checks, fixed suite-
    inventory parser, single reviewed suite driver, closed ID-to-selector table,

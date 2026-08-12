@@ -366,7 +366,11 @@ No executable, policy, test, suite inventory, source shape input, documentation
 contract, or other semantic byte may change. The final validator independently
 reconstructs the allowed delta, verifies both Git identities and every bound
 artifact, and rejects any extra change. A semantic repair creates a new
-qualification candidate and invalidates both host receipts and review evidence.
+qualification candidate and invalidates both host receipts, review evidence,
+the detached manifest, and every unconsumed transition authorization derived
+from it. Any qualification-candidate, promotion-delta, or final-release
+identity change requires fresh dependent artifacts and a fresh transaction
+identity. No digest may be patched forward.
 
 ## Validation And Failure Rules
 
@@ -382,7 +386,8 @@ qualification candidate and invalidates both host receipts and review evidence.
 The validator rejects target duplication, missing target, receipt reuse,
 candidate or inventory disagreement, runtime/profile/shim drift, incomplete or
 degraded review, noncanonical artifacts, unknown bridge identity, changed
-semantic bytes, or a manifest inside the candidate tree.
+semantic bytes, stale manifest or transition authorization, or a manifest
+inside the candidate tree.
 
 Qualification and manifest validation are read-only. They do not install,
 publish, mutate Git, contact a provider, create users, or infer missing
@@ -410,7 +415,9 @@ evidence.
    enabling the runner terminal.
 8. Emit one create-new host receipt and verify it independently.
 9. Add detached-manifest parsing, canonical review-evidence validation, and the
-   exact public-release promotion check.
+   exact public-release promotion check. Pin rejection of a manifest or
+   transition authorization made stale by any candidate, evidence,
+   promotion-delta, final-identity, plan, or transaction change.
 10. Rebaseline source-shape and package inventories only after all preceding
    bytes freeze.
 11. Run bootstrap Sol High review, both native host qualifications, install and

@@ -350,18 +350,20 @@ evidence.
 3. Build B1's current outbound stage and prove bounded `B1 -> TW4` success and
    rejection through staged B1.
 4. Freeze B1's complete bytes, record its exact immutable identities, replace
-   identity-shape fixtures with exact-value regressions, then run both hops'
-   full crash and recovery matrices.
-5. Add retained F5/B1/TW4 controller and client validation, K.1 coexistence,
-   and manual rollback across the retained chain.
-6. Freeze the suite-inventory parser and closed execution selector before
+   identity-shape fixtures with exact-value regressions.
+5. Add exact retained F5/B1/TW4 controller and client validation plus K.1
+   coexistence. Every recovery audit must understand the policy epoch and
+   receipt schema for the retained suffix before mutation.
+6. Run both hops' full crash and recovery matrices, then prove manual rollback
+   across the retained chain as a focused successor slice.
+7. Freeze the suite-inventory parser and closed execution selector before
    enabling the runner terminal.
-7. Emit one create-new host receipt and verify it independently.
-8. Add detached-manifest parsing, canonical review-evidence validation, and the
+8. Emit one create-new host receipt and verify it independently.
+9. Add detached-manifest parsing, canonical review-evidence validation, and the
    exact public-release promotion check.
-9. Rebaseline source-shape and package inventories only after all preceding
+10. Rebaseline source-shape and package inventories only after all preceding
    bytes freeze.
-10. Run bootstrap Sol High review, both native host qualifications, install and
+11. Run bootstrap Sol High review, both native host qualifications, install and
    validate the canonical Rolecasting/Tricritical issuer chain, run its fresh
    re-review, validate the final manifest, and perform public-release promotion
    in that order.

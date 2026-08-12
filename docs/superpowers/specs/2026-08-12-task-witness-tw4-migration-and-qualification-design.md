@@ -496,15 +496,18 @@ evidence.
    validate the real detached release manifest from the two host receipts and
    canonical review. Revalidate stale-candidate, evidence, promotion-delta,
    final-identity, plan, transaction, and endpoint rejection.
-13. Have the external deployer issue one transaction-bound
-   `isolated-rehearsal` authorization and run the exact-final `F5 -> B1 -> TW4`
-   transition in its bound isolated deployment root. Validate its exact
-   retained terminal result, resulting TW4 active receipt, endpoint profile,
-   and unchanged release identities. Then validate public-release promotion,
-   have the external deployer issue a distinct transaction-bound
-   `live-migration` authorization that binds the completed rehearsal, and
-   perform the live migration through the two exact staged-prior-controller
-   paths.
+13. In the bound isolated deployment root, complete `F5 -> B1`, prepare TW4
+   through active B1, and obtain that endpoint's exact plan and authorization
+   facts. The external deployer then issues one transaction-bound
+   `isolated-rehearsal` authorization from those facts; stage and activate
+   `B1 -> TW4`; and validate its retained terminal result, resulting TW4 active
+   receipt, endpoint profile, and unchanged release identities. Next validate
+   public-release promotion. In the live deployment root, independently
+   complete `F5 -> B1`, prepare TW4 through active B1, and obtain the live plan
+   and facts. The external deployer then issues the distinct transaction-bound
+   `live-migration` authorization from those facts and the completed rehearsal
+   evidence; stage and activate `B1 -> TW4` through the exact staged B1
+   controller.
 
 ## Acceptance
 

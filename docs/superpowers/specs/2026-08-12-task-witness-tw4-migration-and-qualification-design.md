@@ -96,10 +96,11 @@ legacy receipt, bridge, controller, or policy fails closed.
 B1 does not hardcode its successor digest. That would create a digest cycle
 because TW4 must retain B1's exact identity. Instead, the external deployer
 that already produces `task-witness-deployer-authorization-v1` from Task
-Witness's public `DeploymentAuthorizationFacts` issues one detached,
-transaction-bound `task-witness-bridge-transition-authorization-v1` after B1,
-the final TW4 release, and the detached release manifest all have immutable
-identities. The exact B1 version of
+Witness's public `DeploymentAuthorizationFacts` issues detached, one-use,
+transaction-bound `task-witness-bridge-transition-authorization-v1` records
+after B1, the final TW4 release, and the detached release manifest all have
+immutable identities. Each record has an exact execution class of either
+`isolated-rehearsal` or `live-migration`. The exact B1 version of
 `plugins/task-witness/controller/task_witness_deploy.py` alone validates the raw
 transition contract during stage, activation, and recovery and projects it
 into the successful TW4 receipt. Preparation validates the candidate, manifest,
@@ -114,19 +115,29 @@ The transition authorization binds exact B1 active-receipt, controller,
 policy, source, and retained-chain identities; exact TW4 commit, tree,
 source-evidence, control-set, and public-release identities; the exact
 validated release-manifest digest; the deployment plan and authorization-facts
-digests; and the one-use transaction digest. B1 rejects a missing, reused,
-wrong-purpose, or disagreeing authorization before stage creation. A merely
-current-schema-compatible candidate is never sufficient.
+digests; the execution class; and the one-use transaction digest. An
+`isolated-rehearsal` authorization additionally binds the exact external host-
+receipt digest and a canonical endpoint projection containing the target,
+deployment-root path, device, inode, owner, mode, starting B1 active-receipt
+digest, retained-chain digest, platform-profile digest, and runtime-closure
+digest. A `live-migration` authorization additionally binds the completed
+rehearsal's endpoint-projection digest, transaction digest, exact retained
+terminal-result digest, and exact resulting TW4 active-receipt digest. B1
+rejects a missing, reused, wrong-class, wrong-purpose, or disagreeing
+authorization before stage creation. A merely current-schema-compatible
+candidate is never sufficient.
 
 Tests may construct canonical, explicitly test-owned manifest and transition-
 authorization fixtures to exercise this closed parser and transaction program
 before release evidence exists. Such fixtures are never retained as release
 evidence, never enter a host receipt or detached release manifest, and cannot
-authorize a live installation. The external deployer issues the one live
-transition authorization only after the real B1 identity, final TW4 identity,
+authorize a live installation. After the real B1 identity, final TW4 identity,
 host receipts, canonical review evidence, and detached release manifest have
-all frozen. This separates executable TDD from release authority without
-creating a second production purpose or weakening the live contract.
+all frozen, the external deployer first issues one rehearsal authorization for
+an isolated endpoint. Only after validating its exact successful retained
+result and resulting active receipt does it issue the distinct live
+authorization that binds that completed rehearsal. This separates executable
+TDD from release authority without creating a second issuer or trust root.
 
 Staging descriptor-reads and copies the exact canonical manifest and transition
 authorization into private, create-new stage files named
@@ -485,13 +496,15 @@ evidence.
    validate the real detached release manifest from the two host receipts and
    canonical review. Revalidate stale-candidate, evidence, promotion-delta,
    final-identity, plan, transaction, and endpoint rejection.
-13. Validate public-release promotion, have the external deployer issue one
-   fresh transaction-bound live authorization, and perform the live
-   `F5 -> B1 -> TW4` migration through the two exact staged-prior-controller
-   paths. There is no separate release rehearsal authorization: the exact
-   two-hop and full-crash qualification verticals already ran in isolated roots
-   on both native hosts, and their successful results are closed by the host
-   receipts and detached manifest.
+13. Have the external deployer issue one transaction-bound
+   `isolated-rehearsal` authorization and run the exact-final `F5 -> B1 -> TW4`
+   transition in its bound isolated deployment root. Validate its exact
+   retained terminal result, resulting TW4 active receipt, endpoint profile,
+   and unchanged release identities. Then validate public-release promotion,
+   have the external deployer issue a distinct transaction-bound
+   `live-migration` authorization that binds the completed rehearsal, and
+   perform the live migration through the two exact staged-prior-controller
+   paths.
 
 ## Acceptance
 

@@ -3933,6 +3933,24 @@ class ExactDrainClaimAdapter:
                 timeout,
             )
 
+    @asynccontextmanager
+    async def _serializable_mutation_transaction(
+        self,
+        connection: Any,
+        *,
+        allow_expired_cleanup: bool = False,
+    ):
+        """Open a bounded SERIALIZABLE transaction through the public DB seam."""
+        async with connection.transaction():
+            await connection.execute(
+                "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"
+            )
+            await self._configure_mutation_transaction(
+                connection,
+                allow_expired_cleanup=allow_expired_cleanup,
+            )
+            yield
+
     def record_upstream_stage(self, operation_id: str, stage: str) -> None:
         """Project the upstream payload-free StageHolder breadcrumb."""
         if not isinstance(stage, str):
@@ -4212,8 +4230,7 @@ class ExactDrainClaimAdapter:
         if not self._terminal_reconciliation:
             self._assert_execution_lease()
         async with self._mutation_connection(backend) as connection:
-            async with connection.transaction(isolation="serializable"):
-                await self._configure_mutation_transaction(connection)
+            async with self._serializable_mutation_transaction(connection):
                 await self._verify_initial_state(connection)
                 if self._terminal_reconciliation:
                     self._initial_guard_complete = True
@@ -4323,11 +4340,10 @@ class ExactDrainClaimAdapter:
     async def release_own_tasks(self, backend: Any) -> int:
         """Release only exact-plan rows owned by this worker on shutdown."""
         async with self._mutation_connection(backend) as connection:
-            async with connection.transaction(isolation="serializable"):
-                await self._configure_mutation_transaction(
-                    connection,
-                    allow_expired_cleanup=True,
-                )
+            async with self._serializable_mutation_transaction(
+                connection,
+                allow_expired_cleanup=True,
+            ):
                 if self._terminal_reconciliation:
                     await self._verify_initial_state(connection)
                     return 0
@@ -4462,8 +4478,7 @@ class ExactDrainClaimAdapter:
                 "operation-recovery exact drain retry row is outside plan"
             )
         async with self._mutation_connection(backend) as connection:
-            async with connection.transaction(isolation="serializable"):
-                await self._configure_mutation_transaction(connection)
+            async with self._serializable_mutation_transaction(connection):
                 await self._verify_unstarted_state(connection)
                 row_value = await connection.fetchrow(
                     """
@@ -4641,8 +4656,7 @@ class ExactDrainClaimAdapter:
             )
         observed_status: str | None = None
         async with self._mutation_connection(backend) as connection:
-            async with connection.transaction(isolation="serializable"):
-                await self._configure_mutation_transaction(connection)
+            async with self._serializable_mutation_transaction(connection):
                 await self._verify_unstarted_state(connection)
                 row_value = await connection.fetchrow(
                     """

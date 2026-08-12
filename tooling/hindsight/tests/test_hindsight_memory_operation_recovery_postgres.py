@@ -2757,6 +2757,7 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
     def test_exact_drain_terminal_write_uses_reserved_pool_connection(self):
         async def exercise():
             import asyncpg
+            from hindsight_api.engine.db.postgresql import PostgresConnection
 
             connection = await self._connect()
             pool = await asyncpg.create_pool(
@@ -2769,8 +2770,10 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
             )
 
             class Backend:
-                def acquire(self):
-                    return pool.acquire(timeout=0.05)
+                @asynccontextmanager
+                async def acquire(self):
+                    async with pool.acquire(timeout=0.05) as connection:
+                        yield PostgresConnection(connection)
 
             backend = Backend()
             adapter = None

@@ -617,6 +617,82 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
             ],
         )
 
+    def test_reserved_hindsight_connection_terminalizes_exact_row(self):
+        try:
+            from hindsight_api.engine.db.postgresql import PostgresConnection
+        except ImportError as error:
+            raise unittest.SkipTest(
+                "hindsight_api PostgreSQL runtime is unavailable"
+            ) from error
+
+        adapter = self._current_exact_drain_adapter()
+        operation_id, selected = next(iter(adapter._selected.items()))
+        adapter._started_ids.add(operation_id)
+        adapter._verify_unstarted_state = AsyncMock()
+        adapter._configure_mutation_transaction = AsyncMock()
+        row = {
+            "operation_type": selected["operation_type"],
+            "status": "processing",
+            "worker_id": adapter._worker_id,
+            "task_payload_digest": selected["task_payload_digest"],
+        }
+        statements = []
+
+        class Transaction:
+            async def __aenter__(self):
+                return None
+
+            async def __aexit__(self, *_arguments):
+                return None
+
+        class RawConnection:
+            def transaction(self):
+                return Transaction()
+
+            async def fetchrow(self, *_arguments, **_keywords):
+                return dict(row)
+
+            async def execute(self, *_arguments, **_keywords):
+                statement = _arguments[0]
+                statements.append(statement)
+                if "UPDATE public.async_operations" in statement:
+                    row["status"] = "failed"
+                    return "UPDATE 1"
+                return "SET"
+
+        connection = PostgresConnection(RawConnection())
+
+        class Context:
+            async def __aenter__(self):
+                return connection
+
+            async def __aexit__(self, *_arguments):
+                return None
+
+        class Backend:
+            def acquire(self):
+                return Context()
+
+        async def exercise():
+            backend = Backend()
+            await adapter.reserve_control_connection(backend)
+            try:
+                await adapter.mark_failed(
+                    backend,
+                    operation_id,
+                    "provider request failed",
+                    "public",
+                )
+            finally:
+                await adapter.close_control_connection()
+
+        asyncio.run(exercise())
+        self.assertEqual(row["status"], "failed")
+        self.assertEqual(
+            statements[0],
+            "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+        )
+
     def test_closed_control_connection_never_falls_back_to_worker_pool(self):
         adapter = self._current_exact_drain_adapter()
 
@@ -3300,9 +3376,11 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         )
         adapter._verify_initial_state = AsyncMock()
 
+        statements = []
+
         class Connection:
             @asynccontextmanager
-            async def transaction(self, **_arguments):
+            async def transaction(self):
                 yield
 
             async def fetchval(self, *_arguments):
@@ -3311,8 +3389,11 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
             async def fetch(self, *_arguments, **_keywords):
                 raise AssertionError("terminal reconciliation recovered rows")
 
-            async def execute(self, *_arguments, **_keywords):
-                raise AssertionError("terminal reconciliation mutated rows")
+            async def execute(self, statement, *_arguments, **_keywords):
+                statements.append(statement)
+                if statement != "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE":
+                    raise AssertionError("terminal reconciliation mutated rows")
+                return "SET"
 
         class Backend:
             @asynccontextmanager
@@ -3323,6 +3404,10 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
 
         self.assertEqual(recovered, 0)
         adapter._verify_initial_state.assert_awaited_once()
+        self.assertEqual(
+            statements,
+            ["SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"],
+        )
 
     def test_terminal_reconciliation_rejects_public_task_mutations(self):
         adapter = object.__new__(ExactDrainClaimAdapter)
@@ -3365,10 +3450,16 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         class Configured(RuntimeError):
             pass
 
+        statements = []
+
         class Connection:
             @asynccontextmanager
-            async def transaction(self, **_arguments):
+            async def transaction(self):
                 yield
+
+            async def execute(self, statement, *_arguments, **_keywords):
+                statements.append(statement)
+                return "SET"
 
         class Backend:
             @asynccontextmanager
@@ -3412,6 +3503,14 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
                     asyncio.run(invoke(adapter))
 
                 adapter._configure_mutation_transaction.assert_awaited_once()
+
+        self.assertEqual(
+            statements,
+            [
+                "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"
+                for _name in invocations
+            ],
+        )
 
     def test_exact_drain_release_uses_one_post_lease_cleanup_deadline(self):
         now = [100]

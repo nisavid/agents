@@ -1,6 +1,7 @@
 # Task Witness TW4 Migration And Qualification Design
 
-Status: accepted design checkpoint, 2026-08-12
+Status: proposed written checkpoint; product choices accepted 2026-08-12,
+pending explicit written-spec approval
 
 This document amends the Task Witness canonical client design for the TW4
 cross-version migration and release-qualification boundary. The canonical
@@ -137,7 +138,9 @@ The transition authorization binds exact B1 active-receipt, controller,
 policy, source, and retained-chain identities; exact TW4 commit, tree,
 source-evidence, control-set, and public-release identities; the exact
 validated release-manifest digest; the deployment plan and authorization-facts
-digests; the execution class; and the one-use transaction digest. An
+digests; the expected active-receipt core digest; the execution class; and the
+one-use transaction digest. The core is the exact deterministic active-receipt
+projection with only the new migration projection omitted. An
 `isolated-rehearsal` authorization additionally binds a canonical endpoint
 projection containing the target, deployment-root path, device, inode, owner,
 mode, starting B1 active-receipt digest, retained-chain digest, platform-
@@ -172,11 +175,14 @@ authorization into private, create-new stage files named
 `bridge-transition-manifest.json` and
 `bridge-transition-authorization.json`. The plan, authorization facts, stage
 receipt, activation intent, and journal use an acyclic binding order: the plan
-and authorization facts bind the manifest digest and strict endpoint
-projection; the external transition authorization binds those exact facts,
-plan, and transaction; then the stage receipt, activation intent, and journal
-bind the authorization's raw digest as well. Activation reopens and revalidates
-those exact staged bytes before journal creation.
+and authorization facts bind the manifest digest, strict endpoint projection,
+and expected active-receipt core; the external transition authorization binds
+those exact facts, plan, and transaction; then the stage receipt, activation
+intent, and journal bind the authorization's raw digest as well. The final
+active receipt joins the unchanged core with the exact class-shaped migration
+projection, including the authorization digest. No preauthorization fact binds
+the final receipt digest. Activation reopens and revalidates those exact staged
+bytes before journal creation.
 
 Recovery reads only the staged copies. It accepts the authorization's same
 transaction digest as continuation of that exact in-progress journal; this is
@@ -251,7 +257,7 @@ class BridgeTransitionAuthorizationFacts:
     plan_sha256: str
     deployment_authorization_facts_sha256: str
     maintenance_transaction_sha256: str
-    expected_active_receipt_sha256: str
+    expected_active_receipt_core_sha256: str
     active_endpoint_sha256: str
     candidate_endpoint_sha256: str
     release_manifest_sha256: str
@@ -266,11 +272,14 @@ class PreparedBridgeTransition:
 ```
 
 The active and candidate endpoint digests cover every exact identity named by
-the transition-authorization contract. Preparation descriptor-reads the
-manifest once but does not accept transition authorization. Staging reparses
-the ordinary deployer authorization, descriptor-reads and validates both
-external files, requires the manifest digest observed during preparation, and
-copies their exact bytes create-new into the private stage.
+the transition-authorization contract. The expected active-receipt core is the
+canonical exact receipt projection with only `migration` omitted; controller
+and client later recompute that core and validate the authorization-backed
+migration projection independently. Preparation descriptor-reads the manifest
+once but does not accept transition authorization. Staging reparses the
+ordinary deployer authorization, descriptor-reads and validates both external
+files, requires the manifest digest observed during preparation, and copies
+their exact bytes create-new into the private stage.
 
 `ActivationRequest.deployment` admits `BridgeTransitionRequest`; its
 `authorization_raw` remains the ordinary deployer authorization. Activation,

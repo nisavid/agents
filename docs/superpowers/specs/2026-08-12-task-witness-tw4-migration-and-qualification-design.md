@@ -116,28 +116,34 @@ policy, source, and retained-chain identities; exact TW4 commit, tree,
 source-evidence, control-set, and public-release identities; the exact
 validated release-manifest digest; the deployment plan and authorization-facts
 digests; the execution class; and the one-use transaction digest. An
-`isolated-rehearsal` authorization additionally binds the exact external host-
-receipt digest and a canonical endpoint projection containing the target,
-deployment-root path, device, inode, owner, mode, starting B1 active-receipt
-digest, retained-chain digest, platform-profile digest, and runtime-closure
-digest. A `live-migration` authorization additionally binds the completed
-rehearsal's endpoint-projection digest, transaction digest, exact retained
-terminal-result digest, and exact resulting TW4 active-receipt digest. B1
+`isolated-rehearsal` authorization additionally binds a canonical endpoint
+projection containing the target, deployment-root path, device, inode, owner,
+mode, starting B1 active-receipt digest, retained-chain digest, platform-
+profile digest, and runtime-closure digest. Its common release-manifest digest
+transitively binds both qualified host receipts without introducing a receipt-
+authorization cycle. A `live-migration` authorization additionally binds the
+completed rehearsal's endpoint-projection digest, transaction digest, exact
+retained terminal-result digest, and exact resulting TW4 active-receipt digest. B1
 rejects a missing, reused, wrong-class, wrong-purpose, or disagreeing
 authorization before stage creation. A merely current-schema-compatible
 candidate is never sufficient.
 
 Tests may construct canonical, explicitly test-owned manifest and transition-
 authorization fixtures to exercise this closed parser and transaction program
-before release evidence exists. Such fixtures are never retained as release
-evidence, never enter a host receipt or detached release manifest, and cannot
-authorize a live installation. After the real B1 identity, final TW4 identity,
-host receipts, canonical review evidence, and detached release manifest have
-all frozen, the external deployer first issues one rehearsal authorization for
-an isolated endpoint. Only after validating its exact successful retained
-result and resulting active receipt does it issue the distinct live
-authorization that binds that completed rehearsal. This separates executable
-TDD from release authority without creating a second issuer or trust root.
+before release evidence exists. Their raw fixture bytes and claimed authority
+are never promoted into a host receipt or detached release manifest and cannot
+authorize a live installation. A host receipt does record the ordinary bounded
+test result for each migration vertical; that result qualifies the frozen
+program and crash matrix, not an exact-final deployment transaction. After the
+real B1 identity, final TW4 identity, host receipts, canonical review evidence,
+and detached release manifest have all frozen, the external deployer first
+issues one exact-final rehearsal authorization for an isolated endpoint. Only
+after validating its exact successful retained result and resulting active
+receipt does it issue the distinct live authorization that binds that completed
+rehearsal. The exact-final rehearsal is a post-qualification deployment gate;
+it is not retroactively inserted into the already validated release manifest.
+This separates executable TDD, release qualification, and live deployment
+authority without creating a second issuer or trust root.
 
 Staging descriptor-reads and copies the exact canonical manifest and transition
 authorization into private, create-new stage files named
@@ -159,9 +165,10 @@ the F5/B1 edge, manifest digest, authorization digest, purpose, execution
 class, transaction, and exact endpoint identities. For `live-migration`, the
 projection also retains the exact rehearsal endpoint-projection, transaction,
 terminal-result, and resulting-active-receipt digests from the authorization.
-For `isolated-rehearsal`, those prior-rehearsal fields are forbidden. Later
-controller and client validation requires the exact class-shaped retained
-projection without reopening the external stage, manifest, or rehearsal root.
+For `isolated-rehearsal`, those prior-rehearsal fields are forbidden and its
+exact endpoint projection is required. Later controller and client validation
+requires the exact class-shaped retained projection without reopening the
+external stage, manifest, host receipts, or rehearsal root.
 
 ### B1's two surfaces
 
@@ -401,7 +408,8 @@ The manifest binds:
 - each host receipt's exact successful `migration-freeze5-to-bridge` and
   `migration-bridge-to-tw4` entry result, including its expected and observed
   count, exit status, bounded stdout digest and length, bounded stderr digest
-  and length, and terminal result;
+  and length, and terminal result; these are migration-program qualification
+  results, not exact-final rehearsal authority;
 - the exact final public-release commit and tree;
 - the exact F5/B1/TW4 migration edge and B1 retained-history identity;
 - the complete promotion delta from the qualified candidate; and

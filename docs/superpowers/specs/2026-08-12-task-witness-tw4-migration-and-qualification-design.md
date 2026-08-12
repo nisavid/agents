@@ -380,6 +380,9 @@ The manifest binds:
   Linux x86_64 receipt digest;
 - the canonical review-evidence bundle digest plus its model, topology,
   execution, adjudication, and unchanged-verification identities;
+- each host receipt's exact successful `migration-freeze5-to-bridge` and
+  `migration-bridge-to-tw4` entry result, including its expected and observed
+  count and terminal-output digest;
 - the exact final public-release commit and tree;
 - the exact F5/B1/TW4 migration edge and B1 retained-history identity;
 - the complete promotion delta from the qualified candidate; and
@@ -481,12 +484,13 @@ evidence.
    validate the real detached release manifest from the two host receipts and
    canonical review. Revalidate stale-candidate, evidence, promotion-delta,
    final-identity, plan, transaction, and endpoint rejection.
-13. Have the external deployer issue one transaction-bound rehearsal
-   authorization, run the exact transition in an isolated deployment root,
-   and consume it there. If candidate, manifest, and final identities remain
-   unchanged, issue a distinct one-use live authorization, validate public-
-   release promotion, and perform the live `F5 -> B1 -> TW4` migration through
-   the two exact staged-prior-controller paths.
+13. Validate public-release promotion, have the external deployer issue one
+   fresh transaction-bound live authorization, and perform the live
+   `F5 -> B1 -> TW4` migration through the two exact staged-prior-controller
+   paths. There is no separate release rehearsal authorization: the exact
+   two-hop and full-crash qualification verticals already ran in isolated roots
+   on both native hosts, and their successful results are closed by the host
+   receipts and detached manifest.
 
 ## Acceptance
 

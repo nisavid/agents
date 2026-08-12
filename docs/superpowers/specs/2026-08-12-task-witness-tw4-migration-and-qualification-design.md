@@ -255,9 +255,12 @@ public-release eligibility, or final promotion identity.
 
 The accepted cooperative trust model uses existing owners:
 
-- `choosing-agent-models` selects and proves `gpt-5.6-sol` at `high`;
-- Rolecasting's native adapter freezes the dispatch plan and issues the model,
-  topology, and one execution-result receipt per dispatch;
+- Rolecasting owns model and topology authority. Its `choosing-agent-models`
+  skill supplies the policy for selecting `gpt-5.6-sol` at `high`, but does not
+  issue or authenticate a receipt;
+- Rolecasting's native adapter applies that policy, authenticates the selected
+  executor, freezes the dispatch plan, and alone issues the authoritative
+  model, topology, and one execution-result receipt per dispatch;
 - Tricritical `review` proves the required independent critic set and exact raw
   reports;
 - Tricritical `adjudicate` independently grades and disposes every finding;

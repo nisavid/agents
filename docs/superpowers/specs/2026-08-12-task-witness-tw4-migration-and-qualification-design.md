@@ -65,9 +65,10 @@ and client `778186f6a460655a8b390c831e05c233171236898663ad4155bd45695597c6cf`.
 B1 and TW4 receive exact identities only when their implementation bytes
 freeze; no mutable branch or release label can substitute for them.
 
-The only allowed edges are `F5 -> B1` and `B1 -> TW4`. `F5 -> TW4` rejects
-before staging or live mutation. No other predecessor may use B1's migration
-surface.
+The only authorized, stageable edges are `F5 -> B1` and `B1 -> TW4`.
+`F5 -> TW4` rejects during preparation because exact F5 cannot parse the
+current 27-contract candidate policy. No other predecessor may use B1's
+migration surface.
 
 ### Bridge identity
 
@@ -290,10 +291,16 @@ digest. It is not a public installation request or a legacy-schema registry.
 
 ### Hop 1: F5 to B1
 
-1. Exact F5 prepares and stages B1 under F5-compatible policy and receipt
-   schemas.
-2. The candidate is proven to be exact B1, including its frozen predecessor
-   allowlist and dual-surface controls.
+1. Exact F5 read-only prepares B1 under F5-compatible policy and receipt
+   schemas. Because F5 is immutable and predates B1's frozen digest, this step
+   proves compatibility, not exact-successor exclusivity.
+2. The existing external deployer compares the prepared plan, every planned
+   artifact digest, source and policy projections, and authorization facts to
+   the frozen exact B1 identity. It issues ordinary
+   `task-witness-deployer-authorization-v1` bytes only on exact equality. F5
+   reparses those bytes against the same plan and facts before creating the
+   stage. A modified, reissued, or wrong-predecessor candidate receives no
+   authorization and cannot create a stage.
 3. F5 executes the existing complete-control replacement program.
 4. Every process-loss cut recovers through a freshly loaded exact staged F5
    controller. The live B1 controller may dispatch recovery, but it rebuilds
@@ -327,8 +334,8 @@ digest. It is not a public installation request or a legacy-schema registry.
 The following fail before stage creation or live mutation:
 
 - F5 preparing or activating a current-schema TW4 candidate;
-- an unlisted predecessor preparing B1;
-- F5 preparing a modified or reissued bridge identity;
+- an unlisted predecessor requesting ordinary deployer authorization for B1;
+- a modified or reissued bridge requesting ordinary F5 authorization;
 - B1 preparing an unsupported legacy, publisher-channel, or exact-release
   migration through its inbound surface;
 - B1 preparing any current-schema candidate without the exact detached release
@@ -382,8 +389,8 @@ It contains:
 
 - `schema_version` and `contract`;
 - one ordered, uniquely identified entry per suite or platform vertical;
-- a closed executor selector and literal argument vector with no shell
-  interpolation;
+- one exact selector into a reviewed candidate-owned suite driver, with no
+  inventory-selected script, module, executable, or shell interpolation;
 - target applicability from the exact set `macos-arm64` and `linux-x86_64`;
 - phase, expected terminal, and exact expected test or scenario count; and
 - ordered aggregate entry and count identities.
@@ -423,7 +430,13 @@ Each entry has exactly these fields:
 
 ```json
 {
-  "argv": [],
+  "argv": [
+    "-I",
+    "-B",
+    "scripts/run_task_witness_qualification_suite.py",
+    "--suite",
+    "client-common"
+  ],
   "executor": {"kind": "qualified-cpython"},
   "expected_count": 1,
   "expected_terminal": "passed",
@@ -433,26 +446,63 @@ Each entry has exactly these fields:
 }
 ```
 
-`argv` is an ordered list of nonempty NUL-free literal strings and omits the
-executable itself. `expected_count` is a positive integer. The exact phase
-vocabulary is `common`, `portable-vertical`, and `platform-vertical`; entries
-1–6, 7–14, and 15–16 respectively use those values. The only terminal value in
-v1 is `passed`. A target list is a nonempty unique subsequence of the fixed
-order `macos-arm64`, `linux-x86_64`; entries 1–14 select both, entry 15 selects
-only macOS, and entry 16 selects only Linux.
-
-The executor object is exactly one of:
+Every executor object is exactly:
 
 ```json
 {"kind": "qualified-cpython"}
-{"kind": "recorded-system-tool", "tool_id": "git"}
-{"kind": "literal-rendered-shim"}
 ```
 
-For `recorded-system-tool`, `tool_id` is exactly one of
-`environment-clearer`, `git`, or `posix-shell`; other executor variants forbid
-`tool_id`. The runner fixes the candidate root as the working directory and
-constructs the closed environment; neither is selectable by an entry.
+It forbids every extra field. For entry `ID`, `argv` is exactly
+`["-I", "-B", "scripts/run_task_witness_qualification_suite.py",
+"--suite", ID]`. The ID must equal the entry's `id`. No other token, option,
+path, module, environment assignment, or argument is representable. The runner
+also owns the complete ordered ID-to-`argv`, phase, and target projection and
+rejects disagreement rather than trusting the inventory to define it.
+
+The candidate-owned `scripts/run_task_witness_qualification_suite.py` is part
+of the reviewed and source-shaped closure. Its CLI accepts exactly `--suite`
+plus one fixed ID and dispatches through one closed in-code ID table. The table
+owns each exact test selector, validator, migration scenario, platform
+vertical, and expected result-counting adapter. It exposes no generic path,
+module, command, tool, or environment input. It invokes Python-backed work
+through its already-qualified `sys.executable` without a shell. The
+`literal-rendered-shim` branch alone directly executes the exact candidate
+rendered shim in the driver-owned fixed install scenario; the inventory cannot
+name or alter that path. The platform profile still records
+`environment-clearer`, `git`, and `posix-shell` as outer-runner qualification
+evidence, but no suite entry or driver selector can dispatch through them.
+
+On success, the suite driver writes exactly one canonical JSON object to
+stdout, no trailing newline, and nothing to stderr. The object has exactly:
+
+```json
+{
+  "contract": "task-witness-tw4-suite-result-v1",
+  "detail_stderr_length": 0,
+  "detail_stderr_sha256": "<sha256>",
+  "detail_stdout_length": 0,
+  "detail_stdout_sha256": "<sha256>",
+  "id": "client-common",
+  "observed_count": 1,
+  "schema_version": 1,
+  "terminal": "passed"
+}
+```
+
+The driver captures underlying stdout and stderr within fixed byte bounds and
+binds their lengths and digests in this result. It emits no successful result
+and exits nonzero if dispatch, execution, counting, output bounds, or terminal
+validation fails. The outer runner parses the canonical result, requires its
+ID and `observed_count` to match the inventory entry and `expected_count`, and
+records both the result projection and the driver's raw exit/stdout/stderr
+identity in the host receipt.
+
+`expected_count` is a positive integer. The exact phase vocabulary is
+`common`, `portable-vertical`, and `platform-vertical`; entries 1–6, 7–14, and
+15–16 respectively use those values. The only terminal value in v1 is
+`passed`. A target list is a nonempty unique subsequence of the fixed order
+`macos-arm64`, `linux-x86_64`; entries 1–14 select both, entry 15 selects only
+macOS, and entry 16 selects only Linux.
 
 `entries_sha256` is SHA-256 of canonical JSON bytes for the exact ordered
 `entries` list. `counts_sha256` is SHA-256 of canonical JSON bytes for the
@@ -463,10 +513,10 @@ no insignificant whitespace, no duplicate keys, and no nonfinite number. The
 candidate file ends with no newline because the canonical byte encoder does
 not emit one.
 
-The executor selector is closed to the qualified CPython executable, a
-recorded canonical system tool, or the literal rendered shim. Entries cannot
-choose an environment, working directory, credential, network authority, or
-unregistered executable.
+The executor selector is closed to the qualified CPython executable and the
+single reviewed suite driver. Entries cannot choose an environment, working
+directory, credential, network authority, system-tool dispatcher, shell,
+script, module, command, or unregistered executable.
 
 The inventory contains the complete common process, envelope, drift,
 activation, deployment, recovery, rollback, package, and release-validation
@@ -479,11 +529,11 @@ on both required targets.
 The inventory owns no host observation, runtime provenance, reviewer result,
 release disposition, or final candidate identity. This avoids a digest cycle.
 
-The `qualification-runner-contract` selector names an explicit nonrecursive
-parser/preflight unit-test set. It must not select a test that invokes a
-successful qualification runner, directly or through discovery. End-to-end
-runner success is exercised only by the outer native-host qualification and is
-not recursively selected from inside its own inventory.
+The suite driver's `qualification-runner-contract` branch names an explicit
+nonrecursive parser/preflight unit-test set. It must not select a test that
+invokes a successful qualification runner, directly or through discovery.
+End-to-end runner success is exercised only by the outer native-host
+qualification and is not recursively selected from inside its own inventory.
 
 ### Native-host qualification receipt
 
@@ -642,9 +692,10 @@ evidence.
 4. Freeze B1's complete bytes, record its exact immutable identities, replace
    identity-shape fixtures with exact-value regressions.
 5. Implement the TW4 candidate's exact B1/F5 retained allowlist, fixed suite-
-   inventory parser, closed executor plumbing, host-receipt parser, detached-
-   manifest validator, and metadata-only promotion validator. Keep receipt
-   emission deliberately unreachable at this step.
+   inventory parser, single reviewed suite driver, closed ID-to-selector table,
+   suite-result parser, host-receipt parser, detached-manifest validator, and
+   metadata-only promotion validator. Keep receipt emission deliberately
+   unreachable at this step.
 6. Add exact retained F5/B1/TW4 controller and client validation plus K.1
    coexistence. Every recovery audit must understand the policy epoch and
    receipt schema for the retained suffix before mutation.
@@ -652,9 +703,10 @@ evidence.
    authority, then prove manual rollback across the retained chain as a focused
    successor slice. The tests exercise the production contract but make no
    release claim.
-8. Freeze the suite-inventory parser, exact ordered IDs, closed execution
-   selector, exact counts, and every required vertical before enabling the
-   runner terminal and create-new receipt publication.
+8. Freeze the suite-inventory parser, exact ordered IDs, suite-driver bytes,
+   closed ID-to-selector table, suite-result parser, exact counts, and every
+   required vertical before enabling the runner terminal and create-new
+   receipt publication.
 9. Rebaseline source-shape and package inventories, then freeze the complete
    ineligible TW4 qualification candidate. No candidate byte changes after
    this point without invalidating every dependent artifact.

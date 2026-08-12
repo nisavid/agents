@@ -14,6 +14,7 @@ import tempfile
 import textwrap
 import threading
 import time
+import tracemalloc
 from types import SimpleNamespace
 import unittest
 
@@ -46,6 +47,7 @@ from hindsight_memory_control_plane.operation_recovery_runtime import (  # noqa:
     read_snapshot,
     rollback_requeue_transaction,
     _exact_drain_interpreter_evidence,
+    _postgres_safe_error_text,
 )
 from hindsight_memory_control_plane.operation_recovery import (  # noqa: E402
     OperationRecoveryError,
@@ -110,6 +112,22 @@ class FakeConnection:
 
 
 class OperationRecoveryRuntimeTest(unittest.TestCase):
+    def test_postgres_safe_error_text_bounds_work_before_encoding(self):
+        prefix = "x" * 100 + "\x00\ud800" + "y" * 4898
+        value = prefix + "z" * 5_000_000
+
+        tracemalloc.start()
+        try:
+            result = _postgres_safe_error_text(value)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        self.assertEqual(len(result), 5000)
+        self.assertNotIn("\x00", result)
+        self.assertEqual(result[100:102], "\ufffd?")
+        self.assertLess(peak, 1_000_000)
+
     @staticmethod
     def _initialize_unreserved_control_lifecycle(adapter):
         adapter._control_backend = None
@@ -635,6 +653,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
             "status": "processing",
             "worker_id": adapter._worker_id,
             "task_payload_digest": selected["task_payload_digest"],
+            "error_message": None,
         }
         statements = []
 
@@ -656,7 +675,11 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
                 statement = _arguments[0]
                 statements.append(statement)
                 if "UPDATE public.async_operations" in statement:
+                    error_message = _arguments[2]
+                    if "\x00" in error_message:
+                        raise ValueError("PostgreSQL text cannot contain NUL")
                     row["status"] = "failed"
+                    row["error_message"] = error_message
                     return "UPDATE 1"
                 return "SET"
 
@@ -680,7 +703,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
                 await adapter.mark_failed(
                     backend,
                     operation_id,
-                    "provider request failed",
+                    "provider\x00request failed",
                     "public",
                 )
             finally:
@@ -688,6 +711,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
 
         asyncio.run(exercise())
         self.assertEqual(row["status"], "failed")
+        self.assertEqual(row["error_message"], "provider�request failed")
         self.assertEqual(
             statements[0],
             "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",

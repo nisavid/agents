@@ -2,7 +2,7 @@ from pathlib import Path
 import asyncio
 from contextlib import asynccontextmanager
 from copy import deepcopy
-from datetime import datetime
+from datetime import datetime, timezone
 import getpass
 import hashlib
 import json
@@ -2827,6 +2827,138 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
                     adapter,
                     "close_control_connection",
                 ):
+                    await adapter.close_control_connection()
+                await pool.close()
+                await connection.close()
+
+        asyncio.run(exercise())
+
+    def test_exact_drain_terminal_failure_survives_retrying_sibling(self):
+        async def exercise():
+            import asyncpg
+            from hindsight_api.engine.db.postgresql import PostgresConnection
+
+            connection = await self._connect()
+            pool = await asyncpg.create_pool(
+                host=str(self.socket_dir),
+                port=self.port,
+                user=self.user,
+                database="postgres",
+                min_size=1,
+                max_size=1,
+            )
+
+            class Backend:
+                @asynccontextmanager
+                async def acquire(self):
+                    async with pool.acquire(timeout=0.05) as acquired:
+                        yield PostgresConnection(acquired)
+
+            backend = Backend()
+            adapter = None
+            try:
+                plan, _cohort_ids, _unexpected_id = (
+                    await self._exact_drain_case(connection)
+                )
+                adapter = self._exact_drain_adapter(plan)
+                await self._bind_disposable_exact_drain_identity(
+                    adapter,
+                    connection,
+                )
+                worker_id = exact_drain_worker_id(plan["plan_digest"])
+                async with connection.transaction():
+                    claimed = await adapter.claim_tasks(
+                        connection,
+                        '"public".async_operations',
+                        worker_id,
+                        {"consolidation": 1, "retain": 1},
+                        0,
+                    )
+                adapter.claim_committed(
+                    [
+                        SimpleNamespace(
+                            operation_id=str(row["operation_id"])
+                        )
+                        for row in claimed
+                    ]
+                )
+                consolidation_id = str(
+                    next(
+                        row["operation_id"]
+                        for row in claimed
+                        if row["operation_type"] == "consolidation"
+                    )
+                )
+                retain_id = str(
+                    next(
+                        row["operation_id"]
+                        for row in claimed
+                        if row["operation_type"] == "retain"
+                    )
+                )
+
+                await adapter.reserve_control_connection(backend)
+                await adapter.schedule_retry(
+                    backend,
+                    retain_id,
+                    datetime(2026, 1, 1, tzinfo=timezone.utc),
+                    "provider\x00retry",
+                    "public",
+                )
+                await connection.execute(
+                    "UPDATE public.async_operations SET retry_count = 3 "
+                    "WHERE operation_id = $1::uuid",
+                    consolidation_id,
+                )
+                await adapter.mark_failed(
+                    backend,
+                    consolidation_id,
+                    "provider\x00terminal failure",
+                    "public",
+                )
+
+                rows = {
+                    str(row["operation_id"]): row
+                    for row in await connection.fetch(
+                        "SELECT operation_id, status, retry_count, "
+                        "error_message, worker_id, completed_at, "
+                        "CASE WHEN next_retry_at IS NULL THEN NULL ELSE "
+                        "to_char(next_retry_at AT TIME ZONE 'UTC', "
+                        "'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') END "
+                        "AS next_retry_at "
+                        "FROM public.async_operations "
+                        "WHERE operation_id = ANY($1::uuid[])",
+                        [retain_id, consolidation_id],
+                    )
+                }
+                self.assertEqual(rows[retain_id]["status"], "pending")
+                self.assertEqual(rows[retain_id]["retry_count"], 1)
+                self.assertEqual(
+                    rows[retain_id]["error_message"],
+                    "provider�retry",
+                )
+                self.assertEqual(
+                    rows[retain_id]["next_retry_at"],
+                    "2026-01-01T00:00:00.000000Z",
+                )
+                self.assertEqual(
+                    rows[consolidation_id]["status"], "failed"
+                )
+                self.assertEqual(
+                    rows[consolidation_id]["retry_count"], 3
+                )
+                self.assertEqual(
+                    rows[consolidation_id]["error_message"],
+                    "provider�terminal failure",
+                )
+                self.assertEqual(
+                    rows[consolidation_id]["worker_id"], worker_id
+                )
+                self.assertIsNotNone(
+                    rows[consolidation_id]["completed_at"]
+                )
+            finally:
+                if adapter is not None:
                     await adapter.close_control_connection()
                 await pool.close()
                 await connection.close()

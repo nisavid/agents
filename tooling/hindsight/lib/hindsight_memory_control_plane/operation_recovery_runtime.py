@@ -646,6 +646,16 @@ def _mapping(row: Any) -> dict[str, Any]:
         ) from None
 
 
+def _postgres_safe_error_text(value: str) -> str:
+    """Keep exact-drain diagnostics writable as PostgreSQL UTF-8 text."""
+    return (
+        value[:5000]
+        .encode("utf-8", errors="replace")
+        .decode("utf-8")
+        .replace("\x00", "\ufffd")
+    )
+
+
 def _read_private_json(path: Path, label: str) -> dict[str, Any]:
     if not path.is_absolute():
         raise OperationRecoveryError(f"{label} must be absolute")
@@ -4565,7 +4575,7 @@ class ExactDrainClaimAdapter:
                         """,
                         identifier,
                         next_retry_at,
-                        error_message[:5000],
+                        _postgres_safe_error_text(error_message),
                         self._worker_id,
                     )
                 if result != "UPDATE 1":
@@ -4724,7 +4734,7 @@ class ExactDrainClaimAdapter:
                           AND worker_id = $3
                         """,
                         identifier,
-                        error_message[:5000],
+                        _postgres_safe_error_text(error_message),
                         self._worker_id,
                     )
                     observed_status = "failed"

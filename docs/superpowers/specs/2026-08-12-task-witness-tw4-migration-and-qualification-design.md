@@ -109,6 +109,26 @@ digests; and the one-use transaction digest. B1 rejects a missing, reused,
 wrong-purpose, or disagreeing authorization before stage creation. A merely
 current-schema-compatible candidate is never sufficient.
 
+Staging descriptor-reads and copies the exact canonical manifest and transition
+authorization into private, create-new stage files named
+`bridge-transition-manifest.json` and
+`bridge-transition-authorization.json`. The plan, authorization facts, stage
+receipt, activation intent, and journal use an acyclic binding order: the plan
+and authorization facts bind the manifest digest and strict endpoint
+projection; the external transition authorization binds those exact facts,
+plan, and transaction; then the stage receipt, activation intent, and journal
+bind the authorization's raw digest as well. Activation reopens and revalidates
+those exact staged bytes before journal creation.
+
+Recovery reads only the staged copies. It accepts the authorization's same
+transaction digest as continuation of that exact in-progress journal; this is
+not a second use. The same authorization with another transaction, plan, stage,
+candidate, or active B1 identity is reuse and rejects before mutation. A
+successful TW4 deployment receipt retains a closed migration projection with
+the F5/B1 edge, manifest digest, authorization digest, purpose, transaction,
+and exact endpoint identities. Later controller and client validation uses
+that retained projection without reopening the external stage or manifest.
+
 ### B1's two surfaces
 
 B1 has two explicit, disjoint surfaces:
@@ -159,8 +179,9 @@ digest. It is not a public installation request or a legacy-schema registry.
    boundary.
 3. B1 executes the existing complete-control replacement program.
 4. Every process-loss cut recovers through a freshly loaded exact staged B1
-   controller. Recovery reconstructs B1-module `SourceEvidence` variants from
-   primitive bytes and never reads the external candidate.
+   controller. Recovery reconstructs B1-module `SourceEvidence` variants and
+   transition authority from exact staged primitive bytes and never reads the
+   external candidate, manifest, or authorization source.
 5. Acceptance leaves a current-schema TW4 active receipt and the retained
    F5/B1/TW4 chain. Rejection restores exact B1 and removes only
    transaction-owned TW4 authority.
@@ -198,6 +219,12 @@ Both hops reuse the complete-control crash program and prove the same cuts:
 At every cut, the test proves the exact executor module identity, journal and
 stage stability, selector prefix, retained chain, smoke count, result bytes,
 and transaction-owned cleanup.
+
+Hop-two tests additionally cut after each transition-evidence stage write and
+parent synchronization; remove or replace each staged file; replay the same
+authorization for the same live journal; attempt reuse with another transaction
+or endpoint; and prove the successful retained migration projection remains
+client- and controller-valid after the external stage disappears.
 
 ## Qualification Artifacts
 

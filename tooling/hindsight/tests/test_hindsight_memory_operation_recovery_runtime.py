@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+from builtins import BaseExceptionGroup
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 import asyncio
@@ -56,6 +57,14 @@ class _RunCapableWorkerPoller:
         raise AssertionError("test worker poller run seam was not configured")
 
 
+class _ControlConnectionAdapterMixin:
+    async def reserve_control_connection(self, _backend):
+        return None
+
+    async def close_control_connection(self):
+        return None
+
+
 class FakeConnection:
     def __init__(self) -> None:
         self.transaction_arguments = None
@@ -101,6 +110,32 @@ class FakeConnection:
 
 
 class OperationRecoveryRuntimeTest(unittest.TestCase):
+    @staticmethod
+    def _initialize_unreserved_control_lifecycle(adapter):
+        adapter._control_backend = None
+        adapter._control_connection_context = None
+        adapter._control_connection = None
+        adapter._control_connection_state = "never-reserved"
+        adapter._control_connection_state_lock = asyncio.Lock()
+        adapter._control_connection_use_lock = asyncio.Lock()
+        return adapter
+
+    @staticmethod
+    def _current_exact_drain_adapter():
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        planned_at = int(time.time())
+        plan = fixtures.drain_plan(
+            snapshot=fixtures.drain_snapshot(observed_at=planned_at),
+            created_at=planned_at,
+        )
+        return ExactDrainClaimAdapter(
+            plan,
+            authorization=recovery_fixtures.exact_drain_authorization(
+                plan,
+                authorized_at=planned_at,
+            ),
+        )
+
     def test_consumed_v2_authorization_starts_adapter_after_approval_expiry(self):
         fixtures = recovery_fixtures.OperationRecoveryContractTest()
         now = int(time.time())
@@ -471,7 +506,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
 
         worker_main_shutdown = asyncio.Event()
 
-        class Adapter:
+        class Adapter(_ControlConnectionAdapterMixin):
             phase_one_timeout_seconds = 3600
 
             async def recover_own_tasks(self, _backend):
@@ -525,10 +560,302 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         self.assertTrue(requested)
         self.assertIsNone(result)
 
+    def test_runtime_reserves_control_connection_before_polling_and_closes_last(self):
+        events = []
+
+        class Adapter(_ControlConnectionAdapterMixin):
+            phase_one_timeout_seconds = 3600
+
+            async def reserve_control_connection(self, backend):
+                events.append(("reserve", backend))
+
+            async def close_control_connection(self):
+                events.append(("close", None))
+
+        class WorkerPoller:
+            def __init__(self):
+                self._backend = "exact-backend"
+                self._shutdown = asyncio.Event()
+
+            async def run(self):
+                events.append(("poll", self._backend))
+                self._shutdown.set()
+
+            async def shutdown_graceful(self, timeout=30.0):
+                events.append(("shutdown", timeout))
+
+            async def _execute_task_inner(self, _task, _holder):
+                return None
+
+            async def _claim_batch_for_schema_inner(self, *_arguments):
+                return []
+
+            async def _claim_batch_for_schema(self, *_arguments):
+                return []
+
+        install_exact_drain_runtime_guards(
+            type("PostgreSQLOps", (), {}),
+            WorkerPoller,
+            type("MemoryEngine", (), {}),
+            Adapter(),
+            request_worker_shutdown=lambda: None,
+        )
+
+        async def exercise():
+            poller = WorkerPoller()
+            await poller.run()
+            await poller.shutdown_graceful(timeout=0.25)
+
+        asyncio.run(exercise())
+        self.assertEqual(
+            events,
+            [
+                ("reserve", "exact-backend"),
+                ("poll", "exact-backend"),
+                ("shutdown", 0.25),
+                ("close", None),
+            ],
+        )
+
+    def test_closed_control_connection_never_falls_back_to_worker_pool(self):
+        adapter = self._current_exact_drain_adapter()
+
+        class Context:
+            async def __aenter__(self):
+                return object()
+
+            async def __aexit__(self, *_arguments):
+                return None
+
+        class Backend:
+            def __init__(self):
+                self.acquisitions = 0
+
+            def acquire(self):
+                self.acquisitions += 1
+                return Context()
+
+        async def exercise():
+            backend = Backend()
+            await adapter.reserve_control_connection(backend)
+            await adapter.close_control_connection()
+            with self.assertRaisesRegex(
+                OperationRecoveryError,
+                "control connection",
+            ):
+                async with adapter._mutation_connection(backend):
+                    pass
+            return backend.acquisitions
+
+        self.assertEqual(asyncio.run(exercise()), 1)
+
+    def test_malformed_closed_control_lifecycle_never_falls_back(self):
+        adapter = object.__new__(ExactDrainClaimAdapter)
+        adapter._control_connection_state = "closed"
+
+        class Backend:
+            def __init__(self):
+                self.acquisitions = 0
+
+            @asynccontextmanager
+            async def acquire(self):
+                self.acquisitions += 1
+                yield object()
+
+        async def exercise():
+            backend = Backend()
+            with self.assertRaisesRegex(
+                OperationRecoveryError,
+                "control connection",
+            ):
+                async with adapter._mutation_connection(backend):
+                    pass
+            return backend.acquisitions
+
+        self.assertEqual(asyncio.run(exercise()), 0)
+
+    def test_missing_control_lifecycle_state_never_falls_back(self):
+        adapter = object.__new__(ExactDrainClaimAdapter)
+        adapter._control_backend = None
+        adapter._control_connection_context = None
+        adapter._control_connection = None
+        adapter._control_connection_state_lock = asyncio.Lock()
+        adapter._control_connection_use_lock = asyncio.Lock()
+
+        class Backend:
+            def __init__(self):
+                self.acquisitions = 0
+
+            @asynccontextmanager
+            async def acquire(self):
+                self.acquisitions += 1
+                yield object()
+
+        async def exercise():
+            backend = Backend()
+            with self.assertRaisesRegex(
+                OperationRecoveryError,
+                "control connection",
+            ):
+                async with adapter._mutation_connection(backend):
+                    pass
+            return backend.acquisitions
+
+        self.assertEqual(asyncio.run(exercise()), 0)
+
+    def test_inconsistent_control_lifecycle_never_falls_back(self):
+        malformed = {
+            "unknown-state": ("unknown", None, None, None),
+            "unreserved-with-backend": (
+                "never-reserved",
+                object(),
+                None,
+                None,
+            ),
+            "reserved-without-context": (
+                "reserved",
+                object(),
+                None,
+                object(),
+            ),
+            "closed-with-connection": (
+                "closed",
+                None,
+                None,
+                object(),
+            ),
+            "poisoned-without-context": (
+                "poisoned",
+                object(),
+                None,
+                None,
+            ),
+        }
+
+        class Backend:
+            def __init__(self):
+                self.acquisitions = 0
+
+            @asynccontextmanager
+            async def acquire(self):
+                self.acquisitions += 1
+                yield object()
+
+        async def exercise(values):
+            adapter = object.__new__(ExactDrainClaimAdapter)
+            (
+                adapter._control_connection_state,
+                adapter._control_backend,
+                adapter._control_connection_context,
+                adapter._control_connection,
+            ) = values
+            adapter._control_connection_state_lock = asyncio.Lock()
+            adapter._control_connection_use_lock = asyncio.Lock()
+            backend = Backend()
+            with self.assertRaisesRegex(
+                OperationRecoveryError,
+                "control connection",
+            ):
+                async with adapter._mutation_connection(backend):
+                    pass
+            return backend.acquisitions
+
+        for name, values in malformed.items():
+            with self.subTest(name=name):
+                self.assertEqual(asyncio.run(exercise(values)), 0)
+
+    def test_failed_control_connection_release_stays_poisoned_until_retried(self):
+        adapter = self._current_exact_drain_adapter()
+
+        class Context:
+            def __init__(self):
+                self.exits = 0
+
+            async def __aenter__(self):
+                return object()
+
+            async def __aexit__(self, *_arguments):
+                self.exits += 1
+                if self.exits == 1:
+                    raise RuntimeError("release failed")
+                return None
+
+        context = Context()
+
+        class Backend:
+            def __init__(self):
+                self.acquisitions = 0
+
+            def acquire(self):
+                self.acquisitions += 1
+                return context
+
+        async def exercise():
+            backend = Backend()
+            await adapter.reserve_control_connection(backend)
+            with self.assertRaisesRegex(RuntimeError, "release failed"):
+                await adapter.close_control_connection()
+            with self.assertRaisesRegex(
+                OperationRecoveryError,
+                "control connection",
+            ):
+                async with adapter._mutation_connection(backend):
+                    pass
+            await adapter.close_control_connection()
+            return backend.acquisitions, context.exits
+
+        self.assertEqual(asyncio.run(exercise()), (1, 2))
+
+    def test_cancelled_control_connection_close_remains_retryable(self):
+        adapter = self._current_exact_drain_adapter()
+        mutation_entered = asyncio.Event()
+        release_mutation = asyncio.Event()
+
+        class Context:
+            def __init__(self):
+                self.exits = 0
+
+            async def __aenter__(self):
+                return object()
+
+            async def __aexit__(self, *_arguments):
+                self.exits += 1
+                return None
+
+        context = Context()
+
+        class Backend:
+            def acquire(self):
+                return context
+
+        async def exercise():
+            backend = Backend()
+            await adapter.reserve_control_connection(backend)
+
+            async def hold_mutation():
+                async with adapter._mutation_connection(backend):
+                    mutation_entered.set()
+                    await release_mutation.wait()
+
+            mutation = asyncio.create_task(hold_mutation())
+            await mutation_entered.wait()
+            close = asyncio.create_task(adapter.close_control_connection())
+            while adapter._control_connection_state != "closing":
+                await asyncio.sleep(0)
+            close.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await close
+            release_mutation.set()
+            await mutation
+            await adapter.close_control_connection()
+            return adapter._control_connection_state, context.exits
+
+        self.assertEqual(asyncio.run(exercise()), ("closed", 1))
+
     def test_poller_failure_is_consumed_and_surfaces_after_release_failure(self):
         shutdown_requested = asyncio.Event()
 
-        class Adapter:
+        class Adapter(_ControlConnectionAdapterMixin):
             phase_one_timeout_seconds = 3600
 
         class WorkerPoller:
@@ -583,12 +910,81 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
             OperationRecoveryError,
         )
         self.assertEqual(str(shutdown_error.__cause__), "release failed")
+
+    def test_shutdown_reports_primary_and_control_connection_failures(self):
+        shutdown_requested = asyncio.Event()
+
+        class Adapter(_ControlConnectionAdapterMixin):
+            phase_one_timeout_seconds = 3600
+
+            async def close_control_connection(self):
+                raise OperationRecoveryError("control release failed")
+
+        class WorkerPoller:
+            def __init__(self):
+                self._shutdown = asyncio.Event()
+
+            async def run(self):
+                raise OperationRecoveryError("startup recovery failed")
+
+            async def shutdown_graceful(self, timeout=30.0):
+                del timeout
+                raise OperationRecoveryError("row release failed")
+
+            async def _execute_task_inner(self, _task, _holder):
+                return None
+
+            async def _claim_batch_for_schema_inner(self, *_arguments):
+                return []
+
+            async def _claim_batch_for_schema(self, *_arguments):
+                return []
+
+        install_exact_drain_runtime_guards(
+            type("PostgreSQLOps", (), {}),
+            WorkerPoller,
+            type("MemoryEngine", (), {}),
+            Adapter(),
+            request_worker_shutdown=shutdown_requested.set,
+        )
+
+        async def exercise():
+            poller = WorkerPoller()
+            poller_task = asyncio.create_task(poller.run())
+            await asyncio.wait_for(shutdown_requested.wait(), timeout=0.25)
+            try:
+                await poller.shutdown_graceful(timeout=0.25)
+            except BaseException as error:
+                shutdown_error = error
+            else:
+                shutdown_error = None
+            poller_result = (await asyncio.gather(
+                poller_task,
+                return_exceptions=True,
+            ))[0]
+            return shutdown_error, poller_result
+
+        shutdown_error, poller_result = asyncio.run(exercise())
+        self.assertIsInstance(shutdown_error, BaseExceptionGroup)
+        self.assertEqual(
+            [str(error) for error in shutdown_error.exceptions],
+            ["startup recovery failed", "control release failed"],
+        )
+        self.assertIsInstance(
+            shutdown_error.exceptions[0].__cause__,
+            OperationRecoveryError,
+        )
+        self.assertEqual(
+            str(shutdown_error.exceptions[0].__cause__),
+            "row release failed",
+        )
+        self.assertIsNone(poller_result)
         self.assertIsNone(poller_result)
 
     def test_premature_poller_return_requests_worker_main_shutdown(self):
         shutdown_requests = []
 
-        class Adapter:
+        class Adapter(_ControlConnectionAdapterMixin):
             phase_one_timeout_seconds = 3600
 
         class WorkerPoller:
@@ -631,7 +1027,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
     def test_poller_return_after_shutdown_does_not_request_again(self):
         shutdown_requests = []
 
-        class Adapter:
+        class Adapter(_ControlConnectionAdapterMixin):
             phase_one_timeout_seconds = 3600
 
         class WorkerPoller:
@@ -676,7 +1072,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         shutdown_requests = []
         started = asyncio.Event()
 
-        class Adapter:
+        class Adapter(_ControlConnectionAdapterMixin):
             phase_one_timeout_seconds = 3600
 
             async def recover_own_tasks(self, _backend):
@@ -720,7 +1116,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         committed = []
         task = type("Task", (), {"operation_id": "operation-1"})()
 
-        class Adapter:
+        class Adapter(_ControlConnectionAdapterMixin):
             def claim_committed(self, tasks):
                 committed.extend(tasks)
 
@@ -791,7 +1187,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
             async def acquire(self):
                 yield Connection()
 
-        class Adapter:
+        class Adapter(_ControlConnectionAdapterMixin):
             def record_upstream_stage(self, _operation_id, _stage):
                 return None
 
@@ -882,7 +1278,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
                         raise AssertionError("upstream SQL reclaim executed")
                         yield
 
-                class Adapter:
+                class Adapter(_ControlConnectionAdapterMixin):
                     def record_upstream_stage(
                         self,
                         operation_id,
@@ -1081,7 +1477,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
     def test_phase_one_shutdown_waits_for_plan_bound_statement_cancellation(self):
         shutdown_requests = []
 
-        class Adapter:
+        class Adapter(_ControlConnectionAdapterMixin):
             phase_one_timeout_seconds = 0.001
             phase_one_statement_timeout_seconds = 0.05
 
@@ -1156,7 +1552,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         task_quiesced = asyncio.Event()
         shutdown_requested = asyncio.Event()
 
-        class Adapter:
+        class Adapter(_ControlConnectionAdapterMixin):
             phase_one_timeout_seconds = 0.001
             phase_one_statement_timeout_seconds = 0.6
 
@@ -1251,7 +1647,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         nested_quiesced = asyncio.Event()
         release_observations = []
 
-        class Adapter:
+        class Adapter(_ControlConnectionAdapterMixin):
             phase_one_timeout_seconds = 60.0
             phase_one_statement_timeout_seconds = 0.05
 
@@ -1339,7 +1735,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         nested_tasks = []
         release_observations = []
 
-        class Adapter:
+        class Adapter(_ControlConnectionAdapterMixin):
             phase_one_timeout_seconds = 60.0
             phase_one_statement_timeout_seconds = 0.05
 
@@ -1442,7 +1838,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
     def test_cancelled_exact_terminal_mutation_does_not_request_shutdown(self):
         shutdown_requests = []
 
-        class Adapter:
+        class Adapter(_ControlConnectionAdapterMixin):
             def record_upstream_stage(self, _operation_id, _stage):
                 return None
 
@@ -1500,7 +1896,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         allow_claim_commit = asyncio.Event()
         task = type("Task", (), {"operation_id": "operation-1"})()
 
-        class Adapter:
+        class Adapter(_ControlConnectionAdapterMixin):
             def claim_committed(self, tasks):
                 events.append(("committed", list(tasks)))
 
@@ -1589,6 +1985,8 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         adapter._pending_progress_stages = {}
         adapter._progress_recorder = recorder
         adapter._completion_callback = lambda: aborts.append(True)
+        adapter.reserve_control_connection = AsyncMock()
+        adapter.close_control_connection = AsyncMock()
 
         class WorkerPoller(_RunCapableWorkerPoller):
             def __init__(self):
@@ -1640,7 +2038,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
     def test_runtime_guard_projects_upstream_stage_holder_changes(self):
         stages = []
 
-        class Adapter:
+        class Adapter(_ControlConnectionAdapterMixin):
             def record_upstream_stage(self, operation_id, stage):
                 stages.append((operation_id, stage))
 
@@ -1695,7 +2093,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
     def test_runtime_guard_bounds_retain_phase_one_after_breadcrumb(self):
         events = []
 
-        class Adapter:
+        class Adapter(_ControlConnectionAdapterMixin):
             phase_one_timeout_seconds = 0.001
 
             def record_upstream_stage(self, _operation_id, _stage):
@@ -1757,7 +2155,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         release_calls = []
         stages = []
 
-        class Adapter:
+        class Adapter(_ControlConnectionAdapterMixin):
             phase_one_timeout_seconds = 0.001
 
             def record_upstream_stage(self, operation_id, stage):
@@ -1850,7 +2248,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         shutdown_requested = asyncio.Event()
         child_tasks = []
 
-        class Adapter:
+        class Adapter(_ControlConnectionAdapterMixin):
             phase_one_timeout_seconds = 0.001
 
             def record_upstream_stage(self, _operation_id, _stage):
@@ -1969,7 +2367,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         task_quiesced = asyncio.Event()
         worker_main_shutdown = asyncio.Event()
 
-        class Adapter:
+        class Adapter(_ControlConnectionAdapterMixin):
             phase_one_timeout_seconds = 0.001
 
             def record_upstream_stage(self, _operation_id, stage):
@@ -2098,7 +2496,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         events = []
         worker_main_shutdown = asyncio.Event()
 
-        class Adapter:
+        class Adapter(_ControlConnectionAdapterMixin):
             phase_one_timeout_seconds = 0.001
 
             def record_upstream_stage(self, _operation_id, _stage):
@@ -2199,7 +2597,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         events = []
         shutdown_requested = asyncio.Event()
 
-        class Adapter:
+        class Adapter(_ControlConnectionAdapterMixin):
             phase_one_timeout_seconds = 30.0
 
             def record_upstream_stage(self, _operation_id, stage):
@@ -2304,7 +2702,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         events = []
         shutdown_requested = asyncio.Event()
 
-        class Adapter:
+        class Adapter(_ControlConnectionAdapterMixin):
             def record_upstream_stage(self, _operation_id, stage):
                 events.append(("stage", stage))
 
@@ -2416,7 +2814,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
     def test_normal_task_cancellation_does_not_request_worker_shutdown(self):
         shutdown_requests = []
 
-        class Adapter:
+        class Adapter(_ControlConnectionAdapterMixin):
             def record_upstream_stage(self, _operation_id, _stage):
                 return None
 
@@ -2482,6 +2880,12 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
             released = []
 
             class Adapter:
+                async def reserve_control_connection(self, _backend):
+                    return None
+
+                async def close_control_connection(self):
+                    return None
+
                 async def release_own_tasks(self, backend):
                     released.append(backend)
                     return 2
@@ -3002,6 +3406,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
                 adapter._configure_mutation_transaction = AsyncMock(
                     side_effect=Configured
                 )
+                self._initialize_unreserved_control_lifecycle(adapter)
 
                 with self.assertRaises(Configured):
                     asyncio.run(invoke(adapter))
@@ -3022,6 +3427,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         adapter._started_ids = set()
         adapter._initial_guard_complete = True
         adapter._verify_unstarted_state = AsyncMock()
+        self._initialize_unreserved_control_lifecycle(adapter)
 
         class Connection:
             @asynccontextmanager
@@ -3192,7 +3598,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
     def test_exact_drain_guards_disable_global_startup_and_parent_mutations(self):
         events = []
 
-        class Adapter:
+        class Adapter(_ControlConnectionAdapterMixin):
             async def claim_tasks(self, *arguments, **keywords):
                 events.append(("claim", arguments, keywords))
                 return ["selected"]

@@ -8,7 +8,9 @@ the closed, payload-free evidence consumed by :mod:`operation_recovery`.
 from __future__ import annotations
 
 import asyncio
+from builtins import BaseExceptionGroup
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import asynccontextmanager
 import ctypes
 from datetime import datetime, timezone
 import hashlib
@@ -1362,6 +1364,18 @@ def install_exact_drain_runtime_guards(
 
     async def run_exact_worker(poller: Any) -> Any:
         try:
+            reserve_control_connection = getattr(
+                adapter,
+                "reserve_control_connection",
+                None,
+            )
+            if not callable(reserve_control_connection):
+                raise OperationRecoveryError(
+                    "exact drain control connection seam is unavailable"
+                )
+            await reserve_control_connection(
+                getattr(poller, "_backend", None)
+            )
             result = await upstream_run(poller)
         except asyncio.CancelledError:
             raise
@@ -1451,19 +1465,46 @@ def install_exact_drain_runtime_guards(
             )
         except BaseException as error:
             upstream_error = error
+        control_error: BaseException | None = None
+        close_control_connection = getattr(
+            adapter,
+            "close_control_connection",
+            None,
+        )
+        if not callable(close_control_connection):
+            control_error = OperationRecoveryError(
+                "exact drain control connection seam is unavailable"
+            )
+        else:
+            try:
+                await close_control_connection()
+            except BaseException as error:
+                control_error = error
         for task in observed_tasks:
             consume_exact_task_result(poller, task)
         await asyncio.sleep(0)
         poller_error = getattr(poller, "_exact_drain_poller_error", None)
+        primary_error: BaseException | None = None
         if isinstance(poller_error, BaseException):
             if upstream_error is not None:
-                raise poller_error from upstream_error
-            raise poller_error
-        if upstream_error is not None:
-            raise upstream_error
-        task_errors = getattr(poller, "_exact_drain_task_errors", ())
-        if task_errors:
-            raise task_errors[0]
+                poller_error.__cause__ = upstream_error
+                poller_error.__suppress_context__ = True
+            primary_error = poller_error
+        elif upstream_error is not None:
+            primary_error = upstream_error
+        else:
+            task_errors = getattr(poller, "_exact_drain_task_errors", ())
+            if task_errors:
+                primary_error = task_errors[0]
+        if primary_error is not None and control_error is not None:
+            raise BaseExceptionGroup(
+                "exact drain worker shutdown failed",
+                [primary_error, control_error],
+            )
+        if primary_error is not None:
+            raise primary_error
+        if control_error is not None:
+            raise control_error
 
     async def schedule_exact_retry(
         poller: Any,
@@ -3606,8 +3647,207 @@ class ExactDrainClaimAdapter:
         self._completion_signalled = False
         self._progress_recorder = progress_recorder
         self._pending_progress_stages: dict[str, tuple[str, str]] = {}
+        self._control_backend: Any | None = None
+        self._control_connection_context: Any | None = None
+        self._control_connection: Any | None = None
+        self._control_connection_state = "never-reserved"
+        self._control_connection_state_lock = asyncio.Lock()
+        self._control_connection_use_lock = asyncio.Lock()
         if not terminal_reconciliation:
             self._assert_execution_lease()
+
+    def _validated_control_connection_lifecycle(
+        self,
+    ) -> tuple[str, asyncio.Lock, asyncio.Lock]:
+        unavailable = object()
+        state = getattr(self, "_control_connection_state", unavailable)
+        state_lock = getattr(
+            self,
+            "_control_connection_state_lock",
+            unavailable,
+        )
+        use_lock = getattr(
+            self,
+            "_control_connection_use_lock",
+            unavailable,
+        )
+        backend = getattr(self, "_control_backend", unavailable)
+        context = getattr(
+            self,
+            "_control_connection_context",
+            unavailable,
+        )
+        connection = getattr(self, "_control_connection", unavailable)
+        if not isinstance(state_lock, asyncio.Lock) or not isinstance(
+            use_lock,
+            asyncio.Lock,
+        ):
+            raise OperationRecoveryError(
+                "exact drain control connection lifecycle seam is unavailable"
+            )
+        if any(
+            value is unavailable
+            for value in (backend, context, connection)
+        ):
+            raise OperationRecoveryError(
+                "exact drain control connection lifecycle seam is unavailable"
+            )
+        if state in {"never-reserved", "closed"}:
+            valid = backend is None and context is None and connection is None
+        elif state in {"reserved", "closing"}:
+            valid = (
+                backend is not None
+                and context is not None
+                and connection is not None
+            )
+        elif state == "poisoned":
+            valid = backend is not None and context is not None
+        else:
+            valid = False
+        if not valid:
+            raise OperationRecoveryError(
+                "exact drain control connection lifecycle state is invalid"
+            )
+        return state, state_lock, use_lock
+
+    async def reserve_control_connection(self, backend: Any) -> None:
+        """Hold one worker-pool connection outside task query fan-out."""
+        _, state_lock, _ = self._validated_control_connection_lifecycle()
+        async with state_lock:
+            state, observed_state_lock, _ = (
+                self._validated_control_connection_lifecycle()
+            )
+            if observed_state_lock is not state_lock:
+                raise OperationRecoveryError(
+                    "exact drain control connection lifecycle seam changed"
+                )
+            if state == "reserved":
+                if self._control_backend is backend:
+                    return
+                raise OperationRecoveryError(
+                    "exact drain control connection backend differs"
+                )
+            if state != "never-reserved":
+                raise OperationRecoveryError(
+                    "exact drain control connection state differs"
+                )
+            try:
+                context = backend.acquire()
+                enter = context.__aenter__
+                exit_context = context.__aexit__
+            except (AttributeError, TypeError) as error:
+                raise OperationRecoveryError(
+                    "exact drain control connection seam is unavailable"
+                ) from error
+            try:
+                connection = await enter()
+            except BaseException:
+                raise
+            if connection is None or not callable(exit_context):
+                try:
+                    await exit_context(None, None, None)
+                except BaseException:
+                    self._control_backend = backend
+                    self._control_connection_context = context
+                    self._control_connection = connection
+                    self._control_connection_state = "poisoned"
+                    raise
+                self._control_connection_state = "closed"
+                raise OperationRecoveryError(
+                    "exact drain control connection seam is unavailable"
+                )
+            self._control_backend = backend
+            self._control_connection_context = context
+            self._control_connection = connection
+            self._control_connection_state = "reserved"
+
+    async def close_control_connection(self) -> None:
+        """Release the reserved connection only after graceful row release."""
+        _, state_lock, use_lock = self._validated_control_connection_lifecycle()
+        async with state_lock:
+            state, observed_state_lock, observed_use_lock = (
+                self._validated_control_connection_lifecycle()
+            )
+            if (
+                observed_state_lock is not state_lock
+                or observed_use_lock is not use_lock
+            ):
+                raise OperationRecoveryError(
+                    "exact drain control connection lifecycle seam changed"
+                )
+            if state == "closed":
+                return
+            if state == "never-reserved":
+                self._control_connection_state = "closed"
+                return
+            if state not in {"reserved", "poisoned"}:
+                raise OperationRecoveryError(
+                    "exact drain control connection state differs"
+                )
+            self._control_connection_state = "closing"
+            acquired = False
+            try:
+                await use_lock.acquire()
+                acquired = True
+                context = self._control_connection_context
+                if context is None:
+                    raise OperationRecoveryError(
+                        "exact drain control connection seam is unavailable"
+                    )
+                try:
+                    await context.__aexit__(None, None, None)
+                except BaseException:
+                    self._control_connection_state = "poisoned"
+                    raise
+                self._control_backend = None
+                self._control_connection_context = None
+                self._control_connection = None
+                self._control_connection_state = "closed"
+            except BaseException:
+                if not acquired and self._control_connection_state == "closing":
+                    self._control_connection_state = state
+                raise
+            finally:
+                if acquired:
+                    use_lock.release()
+
+    @asynccontextmanager
+    async def _mutation_connection(self, backend: Any):
+        _, state_lock, use_lock = self._validated_control_connection_lifecycle()
+        async with state_lock:
+            state, observed_state_lock, observed_use_lock = (
+                self._validated_control_connection_lifecycle()
+            )
+            if (
+                observed_state_lock is not state_lock
+                or observed_use_lock is not use_lock
+            ):
+                raise OperationRecoveryError(
+                    "exact drain control connection lifecycle seam changed"
+                )
+            if state not in {"never-reserved", "reserved"}:
+                raise OperationRecoveryError(
+                    "exact drain control connection is unavailable"
+                )
+            connection = self._control_connection
+            if state == "reserved":
+                if connection is None:
+                    raise OperationRecoveryError(
+                        "exact drain control connection is unavailable"
+                    )
+                if self._control_backend is not backend:
+                    raise OperationRecoveryError(
+                        "exact drain control connection backend differs"
+                    )
+                await use_lock.acquire()
+        if state == "never-reserved":
+            async with backend.acquire() as fallback:
+                yield fallback
+            return
+        try:
+            yield connection
+        finally:
+            use_lock.release()
 
     def _record_task_stage(
         self,
@@ -3971,7 +4211,7 @@ class ExactDrainClaimAdapter:
             return 0
         if not self._terminal_reconciliation:
             self._assert_execution_lease()
-        async with backend.acquire() as connection:
+        async with self._mutation_connection(backend) as connection:
             async with connection.transaction(isolation="serializable"):
                 await self._configure_mutation_transaction(connection)
                 await self._verify_initial_state(connection)
@@ -4082,7 +4322,7 @@ class ExactDrainClaimAdapter:
 
     async def release_own_tasks(self, backend: Any) -> int:
         """Release only exact-plan rows owned by this worker on shutdown."""
-        async with backend.acquire() as connection:
+        async with self._mutation_connection(backend) as connection:
             async with connection.transaction(isolation="serializable"):
                 await self._configure_mutation_transaction(
                     connection,
@@ -4221,7 +4461,7 @@ class ExactDrainClaimAdapter:
             raise OperationRecoveryError(
                 "operation-recovery exact drain retry row is outside plan"
             )
-        async with backend.acquire() as connection:
+        async with self._mutation_connection(backend) as connection:
             async with connection.transaction(isolation="serializable"):
                 await self._configure_mutation_transaction(connection)
                 await self._verify_unstarted_state(connection)
@@ -4400,7 +4640,7 @@ class ExactDrainClaimAdapter:
                 "operation-recovery exact drain terminal row is outside plan"
             )
         observed_status: str | None = None
-        async with backend.acquire() as connection:
+        async with self._mutation_connection(backend) as connection:
             async with connection.transaction(isolation="serializable"):
                 await self._configure_mutation_transaction(connection)
                 await self._verify_unstarted_state(connection)

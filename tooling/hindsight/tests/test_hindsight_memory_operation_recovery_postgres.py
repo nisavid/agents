@@ -2754,6 +2754,82 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
             self._exact_drain_terminal_transition_lock_case(failed=True)
         )
 
+    def test_exact_drain_terminal_write_uses_reserved_pool_connection(self):
+        async def exercise():
+            import asyncpg
+
+            connection = await self._connect()
+            pool = await asyncpg.create_pool(
+                host=str(self.socket_dir),
+                port=self.port,
+                user=self.user,
+                database="postgres",
+                min_size=1,
+                max_size=1,
+            )
+
+            class Backend:
+                def acquire(self):
+                    return pool.acquire(timeout=0.05)
+
+            backend = Backend()
+            adapter = None
+            try:
+                plan, _cohort_ids, _unexpected_id = (
+                    await self._exact_drain_case(connection)
+                )
+                adapter = self._exact_drain_adapter(plan)
+                await self._bind_disposable_exact_drain_identity(
+                    adapter,
+                    connection,
+                )
+                worker_id = exact_drain_worker_id(plan["plan_digest"])
+                async with connection.transaction():
+                    claimed = await adapter.claim_tasks(
+                        connection,
+                        '"public".async_operations',
+                        worker_id,
+                        {},
+                        1,
+                    )
+                adapter.claim_committed(
+                    [
+                        SimpleNamespace(
+                            operation_id=str(row["operation_id"])
+                        )
+                        for row in claimed
+                    ]
+                )
+                operation_id = str(claimed[0]["operation_id"])
+
+                await adapter.reserve_control_connection(backend)
+                await adapter.mark_failed(
+                    backend,
+                    operation_id,
+                    "provider query timed out",
+                    "public",
+                )
+
+                terminal = await connection.fetchrow(
+                    "SELECT status, worker_id, completed_at "
+                    "FROM public.async_operations "
+                    "WHERE operation_id = $1::uuid",
+                    operation_id,
+                )
+                self.assertEqual(terminal["status"], "failed")
+                self.assertEqual(terminal["worker_id"], worker_id)
+                self.assertIsNotNone(terminal["completed_at"])
+            finally:
+                if adapter is not None and hasattr(
+                    adapter,
+                    "close_control_connection",
+                ):
+                    await adapter.close_control_connection()
+                await pool.close()
+                await connection.close()
+
+        asyncio.run(exercise())
+
     def test_exact_drain_resume_recovers_only_its_owned_processing_rows(self):
         async def exercise():
             connection = await self._connect()

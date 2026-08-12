@@ -155,9 +155,13 @@ transaction digest as continuation of that exact in-progress journal; this is
 not a second use. The same authorization with another transaction, plan, stage,
 candidate, or active B1 identity is reuse and rejects before mutation. A
 successful TW4 deployment receipt retains a closed migration projection with
-the F5/B1 edge, manifest digest, authorization digest, purpose, transaction,
-and exact endpoint identities. Later controller and client validation uses
-that retained projection without reopening the external stage or manifest.
+the F5/B1 edge, manifest digest, authorization digest, purpose, execution
+class, transaction, and exact endpoint identities. For `live-migration`, the
+projection also retains the exact rehearsal endpoint-projection, transaction,
+terminal-result, and resulting-active-receipt digests from the authorization.
+For `isolated-rehearsal`, those prior-rehearsal fields are forbidden. Later
+controller and client validation requires the exact class-shaped retained
+projection without reopening the external stage, manifest, or rehearsal root.
 
 ### B1's two surfaces
 

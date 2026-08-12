@@ -82,6 +82,27 @@ frozen identity binds:
 - the exact legacy inbound and current outbound request/stage contracts; and
 - the exact migration purpose and supported source mode.
 
+B1's tree construction is closed. Its policy and client are the exact F5
+bytes, preserving the installed 26-contract epoch and old receipt consumer.
+Its controller starts from the current SourceEvidence-capable controller and
+adds only the closed F5 inbound, bridge-transition, and retained-history
+behavior in this design. These nine paths remain byte-identical across F5,
+B1, and the current candidate:
+
+- `.claude-plugin/plugin.json`;
+- `.codex-plugin/plugin.json`;
+- `client/task_witness_shim.sh.in`;
+- `launcher/task_witness_launch.py`;
+- `runtime/bundle_io.py`;
+- `runtime/canonical.py`;
+- `runtime/task_witness.py`;
+- `runtime/trust.py`; and
+- `smoke/task_witness_smoke_validator.py`.
+
+No 26/27-contract union policy or dual-schema client is introduced. B1's
+controller alone treats its installed policy and receipt as the exact F5 epoch
+while separately validating the current 27-contract TW4 candidate epoch.
+
 The first bridge supports the proven `harness_snapshot` source mode. Publisher
 channel and exact-release migrations require an independently designed bridge;
 they do not fall back to harness sentinels.
@@ -186,6 +207,78 @@ B1 has two explicit, disjoint surfaces:
 B1 does not expose a general schema union. Its inbound adapter accepts only the
 exact F5 identity and primitive legacy harness fields. Its ordinary public
 deployment request remains current-shaped for `B1 -> TW4`.
+
+### Public bridge-transition seam
+
+B1 adds one closed public carrier without changing ordinary deployment APIs:
+
+```python
+@dataclass(frozen=True)
+class BridgeTransitionRequest:
+    deployment: DeploymentRequest
+    release_manifest_path: Path
+    endpoint_projection_raw: bytes
+    execution_class: str
+```
+
+`execution_class` is exactly `isolated-rehearsal` or `live-migration`.
+`release_manifest_path` is an absolute regular non-symlink path outside both
+Git trees. `endpoint_projection_raw` is exact canonical JSON for the
+class-specific endpoint projection. B1 exposes these functions:
+
+```python
+def prepare_bridge_transition(
+    request: BridgeTransitionRequest,
+) -> PreparedBridgeTransition: ...
+
+def stage_bridge_transition(
+    request: BridgeTransitionRequest,
+    deployment_authorization_raw: bytes,
+    transition_authorization_path: Path,
+    staging_root: Path,
+) -> StagedDeployment: ...
+```
+
+`PreparedBridgeTransition` contains the ordinary routine or complete-control
+plan, ordinary `DeploymentAuthorizationFacts`, and these closed facts:
+
+```python
+@dataclass(frozen=True)
+class BridgeTransitionAuthorizationFacts:
+    canonical_root: Path
+    effective_uid: int
+    plan_sha256: str
+    deployment_authorization_facts_sha256: str
+    maintenance_transaction_sha256: str
+    expected_active_receipt_sha256: str
+    active_endpoint_sha256: str
+    candidate_endpoint_sha256: str
+    release_manifest_sha256: str
+    endpoint_projection_sha256: str
+    execution_class: str
+
+@dataclass(frozen=True)
+class PreparedBridgeTransition:
+    plan: RoutineDeploymentPlan | ControlSetDeploymentPlan
+    authorization_facts: DeploymentAuthorizationFacts
+    transition_authorization_facts: BridgeTransitionAuthorizationFacts
+```
+
+The active and candidate endpoint digests cover every exact identity named by
+the transition-authorization contract. Preparation descriptor-reads the
+manifest once but does not accept transition authorization. Staging reparses
+the ordinary deployer authorization, descriptor-reads and validates both
+external files, requires the manifest digest observed during preparation, and
+copies their exact bytes create-new into the private stage.
+
+`ActivationRequest.deployment` admits `BridgeTransitionRequest`; its
+`authorization_raw` remains the ordinary deployer authorization. Activation,
+recovery, and result reconciliation read the manifest and transition
+authorization only from the verified stage. They never reread either external
+path. `ActivationRequest`, `RecoveryRequest`, and
+`ResultReconciliationRequest` keep their existing public names and shapes.
+No bridge field is added to `DeploymentRequest`, and `stage_deployment` never
+accepts bridge-transition authority.
 
 The inbound recovery adapter is named `Freeze5RecoveryRequest`. It exists only
 inside exact B1 recovery dispatch and carries F5's primitive
@@ -315,6 +408,61 @@ counts freeze with the implementation bytes:
 15. `macos-acl`
 16. `linux-process-supervision`
 
+The root has exactly `schema_version`, `contract`, `entries`, and `aggregates`.
+`schema_version` is integer `1`; `contract` is
+`task-witness-tw4-suite-inventory-v1`; `entries` is the exact 16-element
+ordered list; and `aggregates` has exactly `counts_sha256`, `entries_sha256`,
+`entry_count`, and `expected_count_total`. `entry_count` is integer `16`.
+The runner exposes the pure public seam
+`parse_suite_inventory(value: object) -> dict[str, Any]` beside its existing
+platform-profile and runtime-closure parsers. Adding this parser does not make
+receipt publication reachable; `main()` stays at the explicit unsettled
+suite/receipt failure until every entry selector, count, and vertical freezes.
+
+Each entry has exactly these fields:
+
+```json
+{
+  "argv": [],
+  "executor": {"kind": "qualified-cpython"},
+  "expected_count": 1,
+  "expected_terminal": "passed",
+  "id": "client-common",
+  "phase": "common",
+  "targets": ["macos-arm64", "linux-x86_64"]
+}
+```
+
+`argv` is an ordered list of nonempty NUL-free literal strings and omits the
+executable itself. `expected_count` is a positive integer. The exact phase
+vocabulary is `common`, `portable-vertical`, and `platform-vertical`; entries
+1–6, 7–14, and 15–16 respectively use those values. The only terminal value in
+v1 is `passed`. A target list is a nonempty unique subsequence of the fixed
+order `macos-arm64`, `linux-x86_64`; entries 1–14 select both, entry 15 selects
+only macOS, and entry 16 selects only Linux.
+
+The executor object is exactly one of:
+
+```json
+{"kind": "qualified-cpython"}
+{"kind": "recorded-system-tool", "tool_id": "git"}
+{"kind": "literal-rendered-shim"}
+```
+
+For `recorded-system-tool`, `tool_id` is exactly one of
+`environment-clearer`, `git`, or `posix-shell`; other executor variants forbid
+`tool_id`. The runner fixes the candidate root as the working directory and
+constructs the closed environment; neither is selectable by an entry.
+
+`entries_sha256` is SHA-256 of canonical JSON bytes for the exact ordered
+`entries` list. `counts_sha256` is SHA-256 of canonical JSON bytes for the
+ordered list of objects `{"expected_count": N, "id": ID}` projected from those
+entries. `entry_count` equals the list length, and `expected_count_total` is the
+exact sum of all entry counts. Canonical JSON uses UTF-8, sorted object keys,
+no insignificant whitespace, no duplicate keys, and no nonfinite number. The
+candidate file ends with no newline because the canonical byte encoder does
+not emit one.
+
 The executor selector is closed to the qualified CPython executable, a
 recorded canonical system tool, or the literal rendered shim. Entries cannot
 choose an environment, working directory, credential, network authority, or
@@ -330,6 +478,12 @@ on both required targets.
 
 The inventory owns no host observation, runtime provenance, reviewer result,
 release disposition, or final candidate identity. This avoids a digest cycle.
+
+The `qualification-runner-contract` selector names an explicit nonrecursive
+parser/preflight unit-test set. It must not select a test that invokes a
+successful qualification runner, directly or through discovery. End-to-end
+runner success is exercised only by the outer native-host qualification and is
+not recursively selected from inside its own inventory.
 
 ### Native-host qualification receipt
 

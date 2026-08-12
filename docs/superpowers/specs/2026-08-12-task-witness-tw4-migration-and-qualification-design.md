@@ -479,9 +479,27 @@ canonical deployment root; and `mode` is integer `448` (`0o700`).
 nonempty sequence-ascending list of exact objects
 `{"sequence":N,"sha256":DIGEST}` and ends with the starting active receipt.
 `retained_results` is the path-sorted list of exact objects
-`{"path":RELATIVE,"sha256":DIGEST}` from the closed K.1 baseline. Each path is
-a nonempty slash-separated canonical-root-relative path with no empty, `.` or
-`..` component and names exactly one closed inventory entry.
+`{"path":RELATIVE,"sha256":DIGEST}` from the closed retained transaction-result
+baseline. If the canonical-root-relative `transaction-results` directory is
+absent, the list is empty. If present, it is a real current-owner integer-mode
+`448` (`0o700`) directory with no permissive ACL and is nonempty. Every entry
+is exactly `sha256-TRANSACTION.json`, where `TRANSACTION` is 64 lowercase hex,
+and therefore has path `transaction-results/sha256-TRANSACTION.json`. It is a
+current-owner regular non-symlink single-link integer-mode `384` (`0o600`) file
+of at most 1,048,576 raw bytes. Its exact raw bytes must pass the immutable B1
+controller's strict class-discriminated activation-journal parser. The parsed
+journal's contract is `task-witness-activation-transaction-v1`; transaction
+class is exactly `routine-payload`, `control-set-maintenance`, or
+`manual-exact-target-rollback`; transaction ID equals `TRANSACTION`; canonical
+root and effective UID equal the endpoint; phase is `terminal`; terminal result
+is present; and outcome is not `recovery-required`. The parser also recomputes
+the journal's ordinary `content_sha256`, activation-intent transaction ID,
+class-specific inner bindings, phase coherence, and terminal-result coherence;
+no common-envelope-only parse is sufficient. `DIGEST` is SHA-256 of the exact
+raw journal bytes.
+Temporary names, extra entries, empty published directories, aliases, and
+invalid terminal journals reject. The inventory is captured twice with stable
+directory and file identities before the endpoint projection is accepted.
 `content_sha256` hashes the canonical object with that field omitted.
 
 The externally issued transition authorization has contract
@@ -626,7 +644,8 @@ Both hops reuse the complete-control crash program and prove the same cuts:
 - reverse replacement after rejection;
 - rollback smoke before return and after durable acceptance;
 - rollback-receipt and candidate-receipt cleanup;
-- terminal result retention, journal unlink, and K.1 reconciliation; and
+- terminal result retention, journal unlink, and exact retained-result
+  reconciliation; and
 - recovery interrupted at each recovery mutation.
 
 At every cut, the test proves the exact executor module identity, journal and
@@ -973,9 +992,9 @@ evidence.
    suite-result parser, host-receipt parser, detached-manifest validator, and
    metadata-only promotion validator. Keep receipt emission deliberately
    unreachable at this step.
-6. Add exact retained F5/B1/TW4 controller and client validation plus K.1
-   coexistence. Every recovery audit must understand the policy epoch and
-   receipt schema for the retained suffix before mutation.
+6. Add exact retained F5/B1/TW4 controller and client validation plus closed
+   retained-result coexistence. Every recovery audit must understand the policy
+   epoch and receipt schema for the retained suffix before mutation.
 7. Run both hops' full crash and recovery matrices with test-owned fixture
    authority, then prove manual rollback across the retained chain as a focused
    successor slice. The tests exercise the production contract but make no

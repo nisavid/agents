@@ -428,12 +428,20 @@ backed migration projection independently, and validate the ordinary final
 normalizes and validates the prospective absolute `staging_root` without
 creating it, derives the exact rollback receipt and every other stage-root-
 dependent active-receipt field, and binds both the root and resulting core in
-the returned facts. The ordinary authorization document is fully deterministic
-from `DeploymentAuthorizationFacts` and the existing exact purpose: preparation
+the returned facts. The ordinary authorization purpose is selected exactly as
+follows. An approval-required source transition whose reason is `downgrade`,
+`exact-release-pin`, or `source-authority` uses `source-boundary-change`, even
+when the plan is complete-control. Otherwise a `ControlSetDeploymentPlan` uses
+`complete-control-set-maintenance`, and a `RoutineDeploymentPlan` uses
+`routine-compatible-forward`. No other plan, outcome, reason, or purpose is
+admitted. The ordinary authorization document is fully deterministic from
+`DeploymentAuthorizationFacts` and that selected purpose: preparation
 canonically renders that one expected document in memory, records only its raw
 SHA-256, and neither returns nor writes the bytes. This prediction does not
-authorize anything. The predicted raw and content digests supply the ordinary
-`authorization` binding inside the expected active-receipt core. Preparation
+authorize anything. Staging recomputes the same purpose from the verified plan
+and classification rather than trusting either authorization to choose it. The
+predicted raw and content digests supply the ordinary `authorization` binding
+inside the expected active-receipt core. Preparation
 descriptor-reads the manifest once but does not accept transition
 authorization. Staging requires its `staging_root` argument to
 equal the authorization-bound preparation root, strictly parses the externally

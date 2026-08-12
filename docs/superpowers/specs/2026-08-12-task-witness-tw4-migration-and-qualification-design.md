@@ -124,11 +124,47 @@ The TW4 candidate owns the single reviewable allowlist source at
 digest of the canonical object with that field omitted. Each identity object
 has exactly `repository_id`, `commit_sha1`, `tree_sha1`,
 `plugin_subtree_sha256`, `controller_sha256`, `policy_sha256`,
-`client_sha256`, `control_surface_sha256`, `receipt_schema_epoch`, and
-`source_mode`. `allowed_edges` is exactly
+`client_sha256`, and `source_mode`. `repository_id` is exactly
+`nisavid/agents`; `source_mode` is exactly `harness_snapshot`; commit and tree
+values are 40-character lowercase Git object IDs; and every SHA-256 is 64
+lowercase hex characters. `plugin_subtree_sha256` uses the existing
+`task-witness-plugin-subtree-v1` framing: SHA-256 of canonical JSON
+`{"contract":"task-witness-plugin-subtree-v1","entries":ENTRIES}`, where
+`ENTRIES` is the exact path-sorted directory/file projection produced by the
+controller's bounded candidate-tree snapshot. Controller, policy, and client
+digests are SHA-256 of their exact raw file bytes. `allowed_edges` is exactly
 `[{"from":"freeze5","source_mode":"harness_snapshot","to":"bridge"}]`.
 Exact identity values freeze only after B1 freezes. The record contains no TW4
 commit, tree, or artifact digest and therefore creates no self-reference.
+
+The immutable TW4 qualification candidate also owns the exact historical bytes
+needed to execute both migration verticals. They appear at these fixed paths:
+
+- `release/task-witness/migration/freeze5/controller/task_witness_deploy.py`;
+- `release/task-witness/migration/freeze5/controller/policy.json`;
+- `release/task-witness/migration/freeze5/client/task_witness_client.py`; and
+- `release/task-witness/migration/bridge/controller/task_witness_deploy.py`.
+
+The F5 snapshot files are exact raw copies of the frozen F5 controller, policy,
+and client. The bridge snapshot is the exact frozen B1 controller; B1 reuses the
+F5 policy and client. The candidate's source-shape record, package closure,
+suite driver, both host receipts, canonical review, and detached release
+manifest bind all four raw snapshot files. The bridge snapshot is added only
+after B1 freezes and before the TW4 qualification candidate freezes.
+
+The suite driver reconstructs a historical plugin root only inside its private
+temporary directory. It copies the nine byte-stable paths above from the
+unchanged current candidate, then overlays the three role files selected by the
+fixed identity: the F5 controller, policy, and client for the F5 root; or the B1
+controller plus F5 policy and client for the B1 root. It admits no other input
+path and follows no symlink. Before executing either root, it uses the same
+bounded candidate-tree projection to require the exact
+`plugin_subtree_sha256`, controller, policy, and client digests from the bridge
+identity record. Qualification therefore needs no ambient Git object, network
+fetch, branch, tag, archive, or unreviewed historical checkout. The record's
+commit and tree IDs remain provenance claims validated when the record and
+detached final manifest are created; the native host executes only the exact
+candidate-bound bytes whose identities it independently recomputes.
 
 The external deployer and final validator consume that canonical record from
 the immutable TW4 candidate. Generated controller and client constants must
@@ -160,15 +196,17 @@ existing external deployer authority, not a signer or trust root.
 The transition authorization binds exact B1 active-receipt, controller,
 policy, source, and retained-chain identities; exact TW4 commit, tree,
 source-evidence, control-set, and public-release identities; the exact bridge-
-identity-record and validated release-manifest digests; the deployment plan and
-authorization-facts digests; the expected active-receipt core digest; the
-execution class; and the one-use transaction digest. The core is the exact
+identity-record and validated release-manifest digests; the deployment plan,
+expected ordinary deployment-authorization, and active-receipt core digests;
+the execution class; and the one-use maintenance-transaction digest. The core
+is the exact
 deterministic unsigned active-receipt projection with both the new `migration`
 projection and the final `content_sha256` omitted. An
 `isolated-rehearsal` authorization additionally binds a canonical endpoint
 projection containing the target, deployment-root path, device, inode, owner,
-mode, starting B1 active-receipt digest, retained-chain digest, platform-
-profile digest, and runtime-closure digest. Its common release-manifest digest
+mode, starting B1 active-receipt digest, exact ordered retained-receipt and
+retained-result digest lists, platform-profile digest, and runtime-closure
+digest. Its common release-manifest digest
 transitively binds both qualified host receipts without introducing a receipt-
 authorization cycle. A `live-migration` authorization additionally binds the
 completed rehearsal's endpoint-projection digest, transaction digest, exact
@@ -213,8 +251,9 @@ Those two files are stage-only evidence, never `StagedArtifact` values and
 never candidates for installation under the canonical root. Bridge stage JSON
 adds exactly one `transition_evidence` object containing exactly `manifest` and
 `authorization`. Each value is an exact staged-file binding with
-`relative_path`, absolute `path`, `length`, `sha256`, current owner, and mode
-`0600`. The relative paths are exactly the two names above. A bridge stage
+`relative_path`, absolute `path`, `length`, `sha256`, current owner, and integer
+mode `384` (`0o600`). The relative paths are exactly the two names above. A
+bridge stage
 omitting, adding, swapping, or aliasing either binding rejects; a non-bridge
 stage containing `transition_evidence` rejects.
 
@@ -274,9 +313,12 @@ class BridgeTransitionRequest:
 ```
 
 `execution_class` is exactly `isolated-rehearsal` or `live-migration`.
-`release_manifest_path` is an absolute regular non-symlink path outside both
-Git trees. `endpoint_projection_raw` is exact canonical JSON for the
-class-specific endpoint projection. B1 exposes these functions:
+`release_manifest_path` is an absolute regular non-symlink path disjoint from
+the candidate root, canonical deployment root, and prospective staging root.
+B1 can enforce those runtime boundaries; final-release validation separately
+proves the detached manifest is outside both immutable Git trees.
+`endpoint_projection_raw` is exact canonical JSON for the class-specific
+endpoint projection. B1 exposes these functions:
 
 ```python
 def prepare_bridge_transition(
@@ -302,11 +344,9 @@ class BridgeTransitionAuthorizationFacts:
     staging_root: Path
     effective_uid: int
     plan_sha256: str
-    deployment_authorization_facts_sha256: str
     maintenance_transaction_sha256: str
+    expected_deployment_authorization_sha256: str
     expected_active_receipt_core_sha256: str
-    active_endpoint_sha256: str
-    candidate_endpoint_sha256: str
     bridge_identity_sha256: str
     release_manifest_sha256: str
     endpoint_projection_sha256: str
@@ -331,9 +371,9 @@ For bridge stages only, both `StagedDeployment` and `VerifiedDeploymentStage`
 add `transition_evidence: tuple[StagedTransitionEvidence, ...]`; its exact role
 order is `manifest`, `authorization`. Ordinary values expose the empty tuple.
 
-The active and candidate endpoint digests cover every exact identity named by
-the transition-authorization contract. The expected active-receipt core is the
-canonical exact unsigned receipt projection with both `migration` and
+The ordinary deployment plan and authorization bind the active and candidate
+deployment identities. The expected active-receipt core is the canonical exact
+unsigned receipt projection with both `migration` and
 `content_sha256` omitted. Controller and client later remove those two fields
 from the final receipt and recompute that core, validate the authorization-
 backed migration projection independently, and validate the ordinary final
@@ -341,12 +381,19 @@ backed migration projection independently, and validate the ordinary final
 normalizes and validates the prospective absolute `staging_root` without
 creating it, derives the exact rollback receipt and every other stage-root-
 dependent active-receipt field, and binds both the root and resulting core in
-the returned facts. It descriptor-reads the manifest once but does not accept
-transition authorization. Staging requires its `staging_root` argument to
-equal the authorization-bound preparation root, reparses the ordinary deployer
-authorization, descriptor-reads and validates both external files, requires
-the manifest digest and active-receipt core observed during preparation, and
-copies their exact bytes create-new into the private stage.
+the returned facts. The ordinary authorization document is fully deterministic
+from `DeploymentAuthorizationFacts` and the existing exact purpose: preparation
+canonically renders that one expected document in memory, records only its raw
+SHA-256, and neither returns nor writes the bytes. This prediction does not
+authorize anything. The predicted raw and content digests supply the ordinary
+`authorization` binding inside the expected active-receipt core. Preparation
+descriptor-reads the manifest once but does not accept transition
+authorization. Staging requires its `staging_root` argument to
+equal the authorization-bound preparation root, strictly parses the externally
+supplied ordinary deployer authorization, requires its raw bytes and SHA-256 to
+equal the predicted document, descriptor-reads and validates both external
+files, requires the manifest digest and active-receipt core observed during
+preparation, and copies their exact bytes create-new into the private stage.
 
 `ActivationRequest.deployment` admits `BridgeTransitionRequest`; its
 `authorization_raw` remains the ordinary deployer authorization. Activation,
@@ -356,6 +403,79 @@ path. `ActivationRequest`, `RecoveryRequest`, and
 `ResultReconciliationRequest` keep their existing public names and shapes.
 No bridge field is added to `DeploymentRequest`, and `stage_deployment` never
 accepts bridge-transition authority.
+
+### Closed transition documents
+
+All documents in this section use canonical JSON and reject every omitted,
+extra, duplicate, mistyped, noncanonical, or nonfinite value. Every digest is
+64 lowercase hex; every UID, device, inode, mode, sequence, and length is a
+nonnegative non-Boolean integer.
+
+The endpoint document has contract
+`task-witness-bridge-endpoint-projection-v1` and exactly
+`schema_version`, `contract`, `execution_class`, `target`, `deployment_root`,
+`device`, `inode`, `owner`, `mode`, `starting_active_receipt_sha256`,
+`retained_receipts`, `retained_results`, `platform_profile_sha256`,
+`runtime_closure_sha256`, and `content_sha256`. `schema_version` is `1`;
+`execution_class` matches the request; `target` is exactly `macos-arm64` or
+`linux-x86_64` and matches the platform profile; `deployment_root` is the
+canonical deployment root; and `mode` is integer `448` (`0o700`).
+`retained_receipts` is the
+nonempty sequence-ascending list of exact objects
+`{"sequence":N,"sha256":DIGEST}` and ends with the starting active receipt.
+`retained_results` is the path-sorted list of exact objects
+`{"path":RELATIVE,"sha256":DIGEST}` from the closed K.1 baseline. Each path is
+a nonempty slash-separated canonical-root-relative path with no empty, `.` or
+`..` component and names exactly one closed inventory entry.
+`content_sha256` hashes the canonical object with that field omitted.
+
+The externally issued transition authorization has contract
+`task-witness-bridge-transition-authorization-v1`. Both class variants contain
+exactly `schema_version`, `contract`, `purpose`, `execution_class`,
+`canonical_root`, `staging_root`, `effective_uid`, `plan_sha256`,
+`maintenance_transaction_sha256`, `deployment_authorization_sha256`,
+`expected_active_receipt_core_sha256`, `bridge_identity_sha256`,
+`release_manifest_sha256`, `endpoint_projection_sha256`, and
+`content_sha256`; `purpose` is exactly `bridge-transition`. The
+`maintenance_transaction_sha256` is the one-use pre-stage transaction identity
+already supplied by `DeploymentRequest`; the later activation transaction ID
+is derived normally from the verified stage and is not preauthorized.
+
+The `live-migration` variant additionally requires `prior_rehearsal`, an exact
+object containing `endpoint_projection_sha256`, `transaction_sha256`,
+`terminal_result_sha256`, and `active_receipt_sha256` from the completed
+isolated rehearsal. The `isolated-rehearsal` variant forbids that key. The
+authorization's `deployment_authorization_sha256` must equal both the predicted
+ordinary authorization digest in preparation facts and the exact raw ordinary
+authorization supplied at staging.
+
+The final deployment receipt's `migration` object has contract
+`task-witness-bridge-migration-projection-v1` and, for both variants, exactly
+`schema_version`, `contract`, `edge`, `purpose`, `execution_class`,
+`maintenance_transaction_sha256`, `deployment_authorization_sha256`,
+`transition_authorization_sha256`, `expected_active_receipt_core_sha256`,
+`bridge_identity_sha256`, `release_manifest_sha256`, and
+`endpoint_projection_sha256`. `edge` is exactly
+`{"from":"freeze5","to":"tw4","via":"bridge"}` and `purpose` is exactly
+`bridge-transition`. The live variant additionally requires the exact
+`prior_rehearsal` object from its authorization; the isolated variant forbids
+it. The receipt's ordinary `authorization.sha256` must equal
+`deployment_authorization_sha256`, and the recomputed unsigned nonmigration
+core must equal `expected_active_receipt_core_sha256`.
+
+A bridge stage classification is exactly
+`{"outcome":"authorized-bridge-transition","reason":"exact-bridge-transition-authorization"}`
+and otherwise uses the complete-control artifact/preimage program. Its
+activation intent keeps transaction class `control-set-maintenance` and adds
+exactly one `bridge_transition` object containing `execution_class`,
+`maintenance_transaction_sha256`, `deployment_authorization_sha256`,
+`transition_authorization_sha256`, `expected_active_receipt_core_sha256`,
+`bridge_identity_sha256`, `release_manifest_sha256`, and
+`endpoint_projection_sha256`. The activation transaction ID covers that object.
+Every bridge journal generation carries it unchanged. Ordinary complete-control
+intents and journals forbid it. Recovery requires equality among the original
+bridge request, verified stage evidence, receipt projection, intent, and live
+journal before mutation.
 
 The inbound recovery adapter is named `Freeze5RecoveryRequest`. It exists only
 inside exact B1 recovery dispatch and carries F5's primitive
@@ -399,9 +519,12 @@ digest. It is not a public installation request or a legacy-schema registry.
    boundary.
 3. B1 executes the existing complete-control replacement program.
 4. Every process-loss cut recovers through a freshly loaded exact staged B1
-   controller. Recovery reconstructs B1-module `SourceEvidence` variants and
-   transition authority from exact staged primitive bytes and never reads the
-   external candidate, manifest, or authorization source.
+   controller. Recovery reconstructs B1-module `DeploymentRequest`,
+   `SourceEvidence`, and `BridgeTransitionRequest` objects from the original
+   `ActivationRequest`'s exact primitive raw bytes without dereferencing its
+   candidate or external paths. It obtains manifest and transition authority
+   only from the verified stage and never reads the external candidate,
+   manifest, or authorization source.
 5. Acceptance leaves a current-schema TW4 active receipt and the retained
    F5/B1/TW4 chain. Rejection restores exact B1 and removes only
    transaction-owned TW4 authority.
@@ -768,10 +891,11 @@ evidence.
    and recovery behavior with canonical test-owned manifest and transition-
    authorization fixtures. These are TDD inputs, not release evidence.
 4. Freeze B1's complete bytes, create the canonical candidate-owned bridge-
-   identity record from its and F5's exact immutable identities, and replace
-   identity-shape fixtures with exact-value regressions.
+   identity record and four candidate-owned historical snapshot files from its
+   and F5's exact immutable identities, and replace identity-shape fixtures with
+   exact-value and reconstructed-subtree regressions.
 5. Implement the TW4 candidate's record-derived B1/F5 compiled allowlist and
-   exact record parity checks, fixed suite-
+   exact record and snapshot parity checks, fixed suite-
    inventory parser, single reviewed suite driver, closed ID-to-selector table,
    suite-result parser, host-receipt parser, detached-manifest validator, and
    metadata-only promotion validator. Keep receipt emission deliberately

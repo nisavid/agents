@@ -116,6 +116,16 @@ digests; and the one-use transaction digest. B1 rejects a missing, reused,
 wrong-purpose, or disagreeing authorization before stage creation. A merely
 current-schema-compatible candidate is never sufficient.
 
+Tests may construct canonical, explicitly test-owned manifest and transition-
+authorization fixtures to exercise this closed parser and transaction program
+before release evidence exists. Such fixtures are never retained as release
+evidence, never enter a host receipt or detached release manifest, and cannot
+authorize a live installation. The external deployer issues the one live
+transition authorization only after the real B1 identity, final TW4 identity,
+host receipts, canonical review evidence, and detached release manifest have
+all frozen. This separates executable TDD from release authority without
+creating a second production purpose or weakening the live contract.
+
 Staging descriptor-reads and copies the exact canonical manifest and transition
 authorization into private, create-new stage files named
 `bridge-transition-manifest.json` and
@@ -255,6 +265,26 @@ It contains:
 - target applicability from the exact set `macos-arm64` and `linux-x86_64`;
 - phase, expected terminal, and exact expected test or scenario count; and
 - ordered aggregate entry and count identities.
+
+The ordered suite IDs are fixed as follows; selectors and exact expected
+counts freeze with the implementation bytes:
+
+1. `client-common`
+2. `deployment-common`
+3. `package-contract`
+4. `qualification-runner-contract`
+5. `task-witness-source-stage`
+6. `public-release-source-stage`
+7. `forward-update`
+8. `authorized-downgrade-and-manual-rollback`
+9. `candidate-rejection-rollback`
+10. `candidate-source-disappearance`
+11. `provider-cache-deletion-and-movement`
+12. `literal-rendered-shim`
+13. `migration-freeze5-to-bridge`
+14. `migration-bridge-to-tw4`
+15. `macos-acl`
+16. `linux-process-supervision`
 
 The executor selector is closed to the qualified CPython executable, a
 recorded canonical system tool, or the literal rendered shim. Entries cannot
@@ -413,29 +443,39 @@ evidence.
    final validator later owns the host and review evidence inside the manifest.
 2. Build B1's F5-compatible inbound stage and prove bounded `F5 -> B1`
    success and rejection through staged F5.
-3. Build B1's current outbound stage and prove bounded `B1 -> TW4` success and
-   rejection through staged B1.
+3. Build B1's current outbound stage and prove its parser, stage, state-program,
+   and recovery behavior with canonical test-owned manifest and transition-
+   authorization fixtures. These are TDD inputs, not release evidence.
 4. Freeze B1's complete bytes, record its exact immutable identities, replace
    identity-shape fixtures with exact-value regressions.
-5. Add exact retained F5/B1/TW4 controller and client validation plus K.1
+5. Implement the TW4 candidate's exact B1/F5 retained allowlist, qualification
+   runner terminal, fixed suite inventory, host-receipt parser, detached-
+   manifest validator, and metadata-only promotion validator.
+6. Add exact retained F5/B1/TW4 controller and client validation plus K.1
    coexistence. Every recovery audit must understand the policy epoch and
    receipt schema for the retained suffix before mutation.
-6. Run both hops' full crash and recovery matrices, then prove manual rollback
-   across the retained chain as a focused successor slice.
-7. Freeze the suite-inventory parser and closed execution selector before
-   enabling the runner terminal.
-8. Emit one create-new host receipt and verify it independently.
-9. Add detached-manifest parsing, canonical review-evidence validation, and the
-   exact public-release promotion check. Pin final-validator rejection of a
-   manifest made stale by any candidate, evidence, promotion-delta, or
-   final-identity change. Pin stale plan, transaction, endpoint, and
-   authorization rejection in B1's transition tests instead.
-10. Rebaseline source-shape and package inventories only after all preceding
-   bytes freeze.
-11. Run bootstrap Sol High review, both native host qualifications, install and
-   validate the canonical Rolecasting/Tricritical issuer chain, run its fresh
-   re-review, validate the final manifest, and perform public-release promotion
-   in that order.
+7. Run both hops' full crash and recovery matrices with test-owned fixture
+   authority, then prove manual rollback across the retained chain as a focused
+   successor slice. The tests exercise the production contract but make no
+   release claim.
+8. Freeze the suite-inventory parser, exact ordered IDs, closed execution
+   selector, and exact counts before enabling the runner terminal.
+9. Rebaseline source-shape and package inventories, then freeze the complete
+   ineligible TW4 qualification candidate. No candidate byte changes after
+   this point without invalidating every dependent artifact.
+10. Emit and independently verify one create-new receipt on each native host.
+11. Run the bootstrap review, install the canonical Rolecasting/Tricritical
+   issuer chain, and rerun the required fresh unchanged-candidate review.
+12. Construct the deterministic metadata-only final successor and create and
+   validate the real detached release manifest from the two host receipts and
+   canonical review. Revalidate stale-candidate, evidence, promotion-delta,
+   final-identity, plan, transaction, and endpoint rejection.
+13. Have the external deployer issue one transaction-bound rehearsal
+   authorization, run the exact transition in an isolated deployment root,
+   and consume it there. If candidate, manifest, and final identities remain
+   unchanged, issue a distinct one-use live authorization, validate public-
+   release promotion, and perform the live `F5 -> B1 -> TW4` migration through
+   the two exact staged-prior-controller paths.
 
 ## Acceptance
 

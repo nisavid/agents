@@ -116,6 +116,29 @@ Current TW4 retains an exact, closed B1/F5 allowlist for historical validation.
 The allowlist admits only the frozen identities. A well-formed but unlisted
 legacy receipt, bridge, controller, or policy fails closed.
 
+The TW4 candidate owns the single reviewable allowlist source at
+`release/task-witness/tw4-bridge-identity.json`, with contract
+`task-witness-tw4-bridge-identity-v1`. Its root has exactly
+`schema_version`, `contract`, `freeze5`, `bridge`, `allowed_edges`, and
+`content_sha256`. `schema_version` is integer `1`; `content_sha256` is the
+digest of the canonical object with that field omitted. Each identity object
+has exactly `repository_id`, `commit_sha1`, `tree_sha1`,
+`plugin_subtree_sha256`, `controller_sha256`, `policy_sha256`,
+`client_sha256`, `control_surface_sha256`, `receipt_schema_epoch`, and
+`source_mode`. `allowed_edges` is exactly
+`[{"from":"freeze5","source_mode":"harness_snapshot","to":"bridge"}]`.
+Exact identity values freeze only after B1 freezes. The record contains no TW4
+commit, tree, or artifact digest and therefore creates no self-reference.
+
+The external deployer and final validator consume that canonical record from
+the immutable TW4 candidate. Generated controller and client constants must
+exactly reproduce its F5/B1 identity projections and raw record digest during
+source-stage and package validation. Runtime controller and client validation
+uses only those compiled constants; it never reopens a checkout or record. The
+record is not B1 authority, cannot authorize either migration edge, and is not
+review evidence. The detached release manifest and final TW4 receipt migration
+projection both bind its raw digest.
+
 B1 does not hardcode its successor digest. That would create a digest cycle
 because TW4 must retain B1's exact identity. Instead, the external deployer
 that already produces `task-witness-deployer-authorization-v1` from Task
@@ -136,12 +159,12 @@ existing external deployer authority, not a signer or trust root.
 
 The transition authorization binds exact B1 active-receipt, controller,
 policy, source, and retained-chain identities; exact TW4 commit, tree,
-source-evidence, control-set, and public-release identities; the exact
-validated release-manifest digest; the deployment plan and authorization-facts
-digests; the expected active-receipt core digest; the execution class; and the
-one-use transaction digest. The core is the exact deterministic unsigned
-active-receipt projection with both the new `migration` projection and the
-final `content_sha256` omitted. An
+source-evidence, control-set, and public-release identities; the exact bridge-
+identity-record and validated release-manifest digests; the deployment plan and
+authorization-facts digests; the expected active-receipt core digest; the
+execution class; and the one-use transaction digest. The core is the exact
+deterministic unsigned active-receipt projection with both the new `migration`
+projection and the final `content_sha256` omitted. An
 `isolated-rehearsal` authorization additionally binds a canonical endpoint
 projection containing the target, deployment-root path, device, inode, owner,
 mode, starting B1 active-receipt digest, retained-chain digest, platform-
@@ -186,12 +209,29 @@ computes the ordinary `content_sha256` over every unsigned final field. No
 preauthorization fact binds the final content or receipt digest. Activation
 reopens and revalidates those exact staged bytes before journal creation.
 
+Those two files are stage-only evidence, never `StagedArtifact` values and
+never candidates for installation under the canonical root. Bridge stage JSON
+adds exactly one `transition_evidence` object containing exactly `manifest` and
+`authorization`. Each value is an exact staged-file binding with
+`relative_path`, absolute `path`, `length`, `sha256`, current owner, and mode
+`0600`. The relative paths are exactly the two names above. A bridge stage
+omitting, adding, swapping, or aliasing either binding rejects; a non-bridge
+stage containing `transition_evidence` rejects.
+
+`StagedDeployment` and `VerifiedDeploymentStage` expose the two values as an
+ordered tuple of frozen `StagedTransitionEvidence` objects. Independent stage
+verification descriptor-opens each file beneath the private stage root,
+requires a regular non-symlink current-owner single-link `0600` file with exact
+bytes, rechecks its identity, and includes it in the closed private-stage
+inventory. It does not synthesize an `installed` binding. Activation, recovery,
+and reconciliation accept transition evidence only from this verified tuple.
+
 Recovery reads only the staged copies. It accepts the authorization's same
 transaction digest as continuation of that exact in-progress journal; this is
 not a second use. The same authorization with another transaction, plan, stage,
 candidate, or active B1 identity is reuse and rejects before mutation. A
 successful TW4 deployment receipt retains a closed migration projection with
-the F5/B1 edge, manifest digest, authorization digest,
+the F5/B1 edge, `bridge_identity_sha256`, manifest digest, authorization digest,
 `expected_active_receipt_core_sha256`, purpose, execution class, transaction,
 and exact endpoint identities. The retained core digest must equal the core
 recomputed from the final receipt after removing `migration` and
@@ -267,6 +307,7 @@ class BridgeTransitionAuthorizationFacts:
     expected_active_receipt_core_sha256: str
     active_endpoint_sha256: str
     candidate_endpoint_sha256: str
+    bridge_identity_sha256: str
     release_manifest_sha256: str
     endpoint_projection_sha256: str
     execution_class: str
@@ -276,7 +317,19 @@ class PreparedBridgeTransition:
     plan: RoutineDeploymentPlan | ControlSetDeploymentPlan
     authorization_facts: DeploymentAuthorizationFacts
     transition_authorization_facts: BridgeTransitionAuthorizationFacts
+
+@dataclass(frozen=True)
+class StagedTransitionEvidence:
+    role: str
+    relative_path: str
+    staged_path: Path
+    raw: bytes
+    staged: Mapping[str, Any]
 ```
+
+For bridge stages only, both `StagedDeployment` and `VerifiedDeploymentStage`
+add `transition_evidence: tuple[StagedTransitionEvidence, ...]`; its exact role
+order is `manifest`, `authorization`. Ordinary values expose the empty tuple.
 
 The active and candidate endpoint digests cover every exact identity named by
 the transition-authorization contract. The expected active-receipt core is the
@@ -640,6 +693,7 @@ The manifest binds:
   results, not exact-final rehearsal authority;
 - the exact final public-release commit and tree;
 - the exact F5/B1/TW4 migration edge and B1 retained-history identity;
+- the exact candidate-owned bridge-identity-record digest;
 - the complete promotion delta from the qualified candidate; and
 - the terminal `release-qualified` disposition.
 
@@ -713,9 +767,11 @@ evidence.
 3. Build B1's current outbound stage and prove its parser, stage, state-program,
    and recovery behavior with canonical test-owned manifest and transition-
    authorization fixtures. These are TDD inputs, not release evidence.
-4. Freeze B1's complete bytes, record its exact immutable identities, replace
+4. Freeze B1's complete bytes, create the canonical candidate-owned bridge-
+   identity record from its and F5's exact immutable identities, and replace
    identity-shape fixtures with exact-value regressions.
-5. Implement the TW4 candidate's exact B1/F5 retained allowlist, fixed suite-
+5. Implement the TW4 candidate's record-derived B1/F5 compiled allowlist and
+   exact record parity checks, fixed suite-
    inventory parser, single reviewed suite driver, closed ID-to-selector table,
    suite-result parser, host-receipt parser, detached-manifest validator, and
    metadata-only promotion validator. Keep receipt emission deliberately

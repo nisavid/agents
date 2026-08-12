@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Any, Self
 from .operation_recovery import (
     EXACT_DRAIN_PHASE_ONE_STATEMENT_TIMEOUT_SECONDS,
     EXACT_DRAIN_PHASE_REPAIR_CONTRACT_DIGEST,
+    EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V2_DIGEST,
     EXACT_DRAIN_TRANSACTION_TIMEOUT_SECONDS,
     EXPECTED_CLAIM_RELEASE_ROW_COUNT,
     EXPECTED_OPERATION_COUNTS,
@@ -113,6 +114,9 @@ EXACT_DRAIN_MAX_DEPENDENCY_TOTAL_BYTES = 4 * 1024 * 1024 * 1024
 EXACT_DRAIN_CANDIDATE_RUNTIME_DIRECTORY = "exact_drain_runtime"
 EXACT_DRAIN_CANDIDATE_RESOLVER_PATH = Path(
     "hindsight_api/engine/entity_resolver.py"
+)
+EXACT_DRAIN_CANDIDATE_POSTGRESQL_OPS_PATH = Path(
+    "hindsight_api/engine/db/ops_postgresql.py"
 )
 EXACT_DRAIN_PROVIDER_SOURCE_NAMES = (
     "sitecustomize.py",
@@ -2122,7 +2126,11 @@ def _replace_exact_drain_source_fragment(
     return source.replace(old, new)
 
 
-def _patch_exact_drain_entity_resolver(source: bytes) -> bytes:
+def _patch_exact_drain_entity_resolver(
+    source: bytes,
+    *,
+    legacy_entity_schema: bool = False,
+) -> bytes:
     """Return the exact bounded Phase-1 resolver overlay for Hindsight 0.9."""
     if EXACT_DRAIN_PHASE_ONE_STATEMENT_TIMEOUT_SECONDS != 120:
         raise OperationRecoveryError(
@@ -2187,6 +2195,13 @@ def _patch_exact_drain_entity_resolver(source: bytes) -> bytes:
         "                        FROM",
         "fuzzy candidate lateral projection",
     )
+    if legacy_entity_schema:
+        trigram = _replace_exact_drain_source_fragment(
+            trigram,
+            "                          AND e.entity_kind != 'label'\n",
+            "",
+            "legacy entity schema fuzzy predicate",
+        )
     trigram = _replace_exact_drain_source_fragment(
         trigram,
         """        for entity_text_batch in self._chunked(label_texts, self.entity_resolution_batch_size):
@@ -2320,6 +2335,44 @@ class EntityResolver:
     except SyntaxError as error:
         raise OperationRecoveryError(
             "exact drain patched entity resolver source is invalid"
+        ) from error
+    return text.encode("utf-8")
+
+
+def _patch_exact_drain_postgresql_ops(source: bytes) -> bytes:
+    """Keep candidate entity writes compatible with the bound legacy schema."""
+    try:
+        text = source.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise OperationRecoveryError(
+            "exact drain candidate PostgreSQL ops source differs"
+        ) from error
+    text = _replace_exact_drain_source_fragment(
+        text,
+        "INSERT INTO {table} (bank_id, canonical_name, first_seen, "
+        "last_seen, mention_count, entity_kind)\n"
+        "            SELECT $1, name, COALESCE(event_date, now()), "
+        "COALESCE(event_date, now()), 0, kind",
+        "INSERT INTO {table} (bank_id, canonical_name, first_seen, "
+        "last_seen, mention_count)\n"
+        "            SELECT $1, name, COALESCE(event_date, now()), "
+        "COALESCE(event_date, now()), 0",
+        "legacy entity insert",
+    )
+    text = _replace_exact_drain_source_fragment(
+        text,
+        "INSERT INTO {table} (id, bank_id, canonical_name, entity_kind)\n"
+        "            SELECT t.entity_id, $1, t.canonical_name, "
+        "t.entity_kind",
+        "INSERT INTO {table} (id, bank_id, canonical_name)\n"
+        "            SELECT t.entity_id, $1, t.canonical_name",
+        "legacy entity reassertion",
+    )
+    try:
+        compile(text, "hindsight_api/engine/db/ops_postgresql.py", "exec")
+    except SyntaxError as error:
+        raise OperationRecoveryError(
+            "exact drain patched PostgreSQL ops source is invalid"
         ) from error
     return text.encode("utf-8")
 
@@ -2469,16 +2522,29 @@ def _remove_exact_drain_snapshot_staging(path: Path) -> None:
 
 def _exact_drain_snapshot_recovery_body(
     snapshot: Mapping[str, Any],
-    patched_resolver: bytes,
+    patched_sources: Mapping[str, bytes],
 ) -> bytes:
-    value = {
-        "schema_version": 1,
-        "kind": "exact-drain-candidate-runtime-snapshot-recovery",
-        "snapshot_digest": snapshot["snapshot_digest"],
-        "patched_resolver_sha256": hashlib.sha256(
-            patched_resolver
-        ).hexdigest(),
-    }
+    if snapshot["schema_version"] == 2:
+        value = {
+            "schema_version": 1,
+            "kind": "exact-drain-candidate-runtime-snapshot-recovery",
+            "snapshot_digest": snapshot["snapshot_digest"],
+            "patched_resolver_sha256": hashlib.sha256(
+                patched_sources[
+                    EXACT_DRAIN_CANDIDATE_RESOLVER_PATH.as_posix()
+                ]
+            ).hexdigest(),
+        }
+    else:
+        value = {
+            "schema_version": 2,
+            "kind": "exact-drain-candidate-runtime-snapshot-recovery",
+            "snapshot_digest": snapshot["snapshot_digest"],
+            "patched_source_digests": {
+                path: hashlib.sha256(body).hexdigest()
+                for path, body in sorted(patched_sources.items())
+            },
+        }
     return (
         json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
     ).encode("utf-8")
@@ -2599,17 +2665,29 @@ def assemble_exact_drain_candidate_runtime_snapshot(
         "exact drain candidate entity resolver",
         max_bytes=1024 * 1024,
     )
+    postgresql_ops_path = library / EXACT_DRAIN_CANDIDATE_POSTGRESQL_OPS_PATH
+    postgresql_ops_source = _exact_drain_file_bytes(
+        postgresql_ops_path,
+        "exact drain candidate PostgreSQL ops",
+        max_bytes=1024 * 1024,
+    )
+    candidate_sources = {
+        EXACT_DRAIN_CANDIDATE_RESOLVER_PATH.as_posix(): resolver_source,
+        EXACT_DRAIN_CANDIDATE_POSTGRESQL_OPS_PATH.as_posix(): (
+            postgresql_ops_source
+        ),
+    }
     runtime_root = library / EXACT_DRAIN_CANDIDATE_RUNTIME_DIRECTORY
     staging_root = library / f".{EXACT_DRAIN_CANDIDATE_RUNTIME_DIRECTORY}.staging"
     recovery_path = library / f".{EXACT_DRAIN_CANDIDATE_RUNTIME_DIRECTORY}.recovery"
     if runtime_root.exists():
-        snapshot, sealed_sources, original_resolver, patched_resolver = (
+        snapshot, sealed_sources, original_sources, patched_sources = (
             _verify_exact_drain_candidate_runtime_snapshot(
                 library,
                 require_candidate_patch=False,
             )
         )
-        if snapshot["schema_version"] != 2:
+        if snapshot["schema_version"] not in {2, 3}:
             raise OperationRecoveryError(
                 "exact drain candidate runtime snapshot already exists"
             )
@@ -2617,7 +2695,16 @@ def assemble_exact_drain_candidate_runtime_snapshot(
             raise OperationRecoveryError(
                 "exact drain candidate runtime snapshot differs"
             )
-        if resolver_source == patched_resolver:
+        current_sources = {
+            EXACT_DRAIN_CANDIDATE_RESOLVER_PATH.as_posix(): resolver_source,
+            EXACT_DRAIN_CANDIDATE_POSTGRESQL_OPS_PATH.as_posix(): (
+                postgresql_ops_source
+            ),
+        }
+        if all(
+            current_sources[path] == patched
+            for path, patched in patched_sources.items()
+        ):
             if not recovery_path.exists():
                 raise OperationRecoveryError(
                     "exact drain candidate runtime snapshot already exists"
@@ -2628,7 +2715,7 @@ def assemble_exact_drain_candidate_runtime_snapshot(
                 max_bytes=1024,
             ) != _exact_drain_snapshot_recovery_body(
                 snapshot,
-                patched_resolver,
+                patched_sources,
             ):
                 raise OperationRecoveryError(
                     "exact drain candidate runtime snapshot differs"
@@ -2638,20 +2725,23 @@ def assemble_exact_drain_candidate_runtime_snapshot(
                 library,
                 _exact_drain_snapshot_recovery_body(
                     snapshot,
-                    patched_resolver,
+                    patched_sources,
                 ),
             )
             verified, _sources = verify_exact_drain_candidate_runtime_snapshot(
                 library
             )
             return verified
-        if resolver_source != original_resolver:
+        if any(
+            current_sources[path] not in {original_sources[path], patched}
+            for path, patched in patched_sources.items()
+        ):
             raise OperationRecoveryError(
                 "exact drain candidate runtime snapshot differs"
             )
         recovery_body = _exact_drain_snapshot_recovery_body(
             snapshot,
-            patched_resolver,
+            patched_sources,
         )
         if recovery_path.exists():
             if _exact_drain_file_bytes(
@@ -2668,11 +2758,14 @@ def assemble_exact_drain_candidate_runtime_snapshot(
                 recovery_body,
             )
             _fsync_exact_drain_directory(library)
-        _atomic_replace_exact_drain_candidate_source(
-            resolver_path,
-            expected=original_resolver,
-            replacement=patched_resolver,
-        )
+        for relative, replacement in patched_sources.items():
+            if current_sources[relative] == replacement:
+                continue
+            _atomic_replace_exact_drain_candidate_source(
+                library / relative,
+                expected=original_sources[relative],
+                replacement=replacement,
+            )
         _finalize_exact_drain_snapshot_recovery(
             recovery_path,
             library,
@@ -2682,7 +2775,17 @@ def assemble_exact_drain_candidate_runtime_snapshot(
             library
         )
         return verified
-    patched_resolver = _patch_exact_drain_entity_resolver(resolver_source)
+    patched_sources = {
+        EXACT_DRAIN_CANDIDATE_RESOLVER_PATH.as_posix(): (
+            _patch_exact_drain_entity_resolver(
+                resolver_source,
+                legacy_entity_schema=True,
+            )
+        ),
+        EXACT_DRAIN_CANDIDATE_POSTGRESQL_OPS_PATH.as_posix(): (
+            _patch_exact_drain_postgresql_ops(postgresql_ops_source)
+        ),
+    }
     _remove_exact_drain_snapshot_staging(staging_root)
     staged_provider_root = staging_root / "provider"
     staged_hindsight_root = staging_root / "hindsight"
@@ -2703,35 +2806,48 @@ def assemble_exact_drain_candidate_runtime_snapshot(
         }
         for name in EXACT_DRAIN_PROVIDER_SOURCE_NAMES
     ]
+    candidate_patch_evidence = []
+    for relative, original in candidate_sources.items():
+        snapshot_name = (
+            "entity_resolver"
+            if relative == EXACT_DRAIN_CANDIDATE_RESOLVER_PATH.as_posix()
+            else "ops_postgresql"
+        )
+        patched = patched_sources[relative]
+        candidate_patch_evidence.append(
+            {
+                "path": relative,
+                "original": {
+                    "path": f"hindsight/{snapshot_name}.original.py",
+                    "sha256": hashlib.sha256(original).hexdigest(),
+                    "size": len(original),
+                },
+                "patched": {
+                    "path": f"hindsight/{snapshot_name}.py",
+                    "sha256": hashlib.sha256(patched).hexdigest(),
+                    "size": len(patched),
+                },
+            }
+        )
     manifest = {
-        "schema_version": 2,
+        "schema_version": 3,
         "kind": "exact-drain-candidate-runtime-snapshot",
         "sources": provider_evidence,
-        "candidate_patch": {
-            "path": EXACT_DRAIN_CANDIDATE_RESOLVER_PATH.as_posix(),
-            "original": {
-                "path": "hindsight/entity_resolver.original.py",
-                "sha256": hashlib.sha256(resolver_source).hexdigest(),
-                "size": len(resolver_source),
-            },
-            "patched": {
-                "path": "hindsight/entity_resolver.py",
-                "sha256": hashlib.sha256(patched_resolver).hexdigest(),
-                "size": len(patched_resolver),
-            },
-        },
+        "candidate_patches": candidate_patch_evidence,
     }
     try:
         for name, body in source_bodies.items():
             _write_exact_drain_snapshot_file(staged_provider_root / name, body)
-        _write_exact_drain_snapshot_file(
-            staged_hindsight_root / "entity_resolver.original.py",
-            resolver_source,
-        )
-        _write_exact_drain_snapshot_file(
-            staged_hindsight_root / "entity_resolver.py",
-            patched_resolver,
-        )
+        for evidence in candidate_patch_evidence:
+            relative = evidence["path"]
+            _write_exact_drain_snapshot_file(
+                staging_root / evidence["original"]["path"],
+                candidate_sources[relative],
+            )
+            _write_exact_drain_snapshot_file(
+                staging_root / evidence["patched"]["path"],
+                patched_sources[relative],
+            )
         manifest_body = (
             json.dumps(manifest, sort_keys=True, separators=(",", ":"))
             + "\n"
@@ -2754,18 +2870,19 @@ def assemble_exact_drain_candidate_runtime_snapshot(
         _publish_exact_drain_snapshot_directory(staging_root, runtime_root)
         recovery_body = _exact_drain_snapshot_recovery_body(
             staged_snapshot,
-            patched_resolver,
+            patched_sources,
         )
         _write_exact_drain_snapshot_recovery_file(
             recovery_path,
             recovery_body,
         )
         _fsync_exact_drain_directory(library)
-        _atomic_replace_exact_drain_candidate_source(
-            resolver_path,
-            expected=resolver_source,
-            replacement=patched_resolver,
-        )
+        for relative, replacement in patched_sources.items():
+            _atomic_replace_exact_drain_candidate_source(
+                library / relative,
+                expected=candidate_sources[relative],
+                replacement=replacement,
+            )
         _finalize_exact_drain_snapshot_recovery(
             recovery_path,
             library,
@@ -2784,7 +2901,12 @@ def _verify_exact_drain_candidate_runtime_snapshot(
     *,
     require_candidate_patch: bool,
     runtime_root_override: Path | None = None,
-) -> tuple[dict[str, Any], dict[str, bytes], bytes | None, bytes | None]:
+) -> tuple[
+    dict[str, Any],
+    dict[str, bytes],
+    dict[str, bytes],
+    dict[str, bytes],
+]:
     library = Path(candidate_library)
     runtime_root = (
         library / EXACT_DRAIN_CANDIDATE_RUNTIME_DIRECTORY
@@ -2841,8 +2963,8 @@ def _verify_exact_drain_candidate_runtime_snapshot(
         }
         for name in EXACT_DRAIN_PROVIDER_SOURCE_NAMES
     ]
-    original_resolver: bytes | None = None
-    patched_resolver: bytes | None = None
+    original_sources: dict[str, bytes] = {}
+    patched_sources: dict[str, bytes] = {}
     if schema_version == 1:
         expected = {
             "schema_version": 1,
@@ -2886,6 +3008,12 @@ def _verify_exact_drain_candidate_runtime_snapshot(
             raise OperationRecoveryError(
                 "exact drain candidate runtime snapshot differs"
             )
+        original_sources[EXACT_DRAIN_CANDIDATE_RESOLVER_PATH.as_posix()] = (
+            original_resolver
+        )
+        patched_sources[EXACT_DRAIN_CANDIDATE_RESOLVER_PATH.as_posix()] = (
+            patched_resolver
+        )
         expected = {
             "schema_version": 2,
             "kind": "exact-drain-candidate-runtime-snapshot",
@@ -2912,6 +3040,95 @@ def _verify_exact_drain_candidate_runtime_snapshot(
             raise OperationRecoveryError(
                 "exact drain candidate runtime snapshot differs"
             )
+    elif schema_version == 3:
+        hindsight_root = runtime_root / "hindsight"
+        _exact_drain_trusted_directory(
+            hindsight_root,
+            "exact drain candidate Hindsight source snapshot",
+        )
+        try:
+            hindsight_names = {path.name for path in hindsight_root.iterdir()}
+        except OSError as error:
+            raise OperationRecoveryError(
+                "exact drain candidate runtime snapshot is unavailable"
+            ) from error
+        expected_names = {
+            "entity_resolver.original.py",
+            "entity_resolver.py",
+            "ops_postgresql.original.py",
+            "ops_postgresql.py",
+        }
+        if runtime_names != {"manifest.json", "provider", "hindsight"} or (
+            hindsight_names != expected_names
+        ):
+            raise OperationRecoveryError(
+                "exact drain candidate runtime snapshot differs"
+            )
+        patch_specs = (
+            (
+                EXACT_DRAIN_CANDIDATE_RESOLVER_PATH,
+                "entity_resolver",
+                lambda source: _patch_exact_drain_entity_resolver(
+                    source,
+                    legacy_entity_schema=True,
+                ),
+                "entity resolver",
+            ),
+            (
+                EXACT_DRAIN_CANDIDATE_POSTGRESQL_OPS_PATH,
+                "ops_postgresql",
+                _patch_exact_drain_postgresql_ops,
+                "PostgreSQL ops",
+            ),
+        )
+        candidate_patch_evidence = []
+        for relative_path, snapshot_name, patcher, label in patch_specs:
+            relative = relative_path.as_posix()
+            original = _exact_drain_file_bytes(
+                hindsight_root / f"{snapshot_name}.original.py",
+                f"exact drain original {label} snapshot",
+                max_bytes=1024 * 1024,
+            )
+            patched = _exact_drain_file_bytes(
+                hindsight_root / f"{snapshot_name}.py",
+                f"exact drain patched {label} snapshot",
+                max_bytes=1024 * 1024,
+            )
+            if patcher(original) != patched:
+                raise OperationRecoveryError(
+                    "exact drain candidate runtime snapshot differs"
+                )
+            original_sources[relative] = original
+            patched_sources[relative] = patched
+            candidate_patch_evidence.append(
+                {
+                    "path": relative,
+                    "original": {
+                        "path": f"hindsight/{snapshot_name}.original.py",
+                        "sha256": hashlib.sha256(original).hexdigest(),
+                        "size": len(original),
+                    },
+                    "patched": {
+                        "path": f"hindsight/{snapshot_name}.py",
+                        "sha256": hashlib.sha256(patched).hexdigest(),
+                        "size": len(patched),
+                    },
+                }
+            )
+            if require_candidate_patch and _exact_drain_file_bytes(
+                library / relative_path,
+                f"exact drain candidate {label}",
+                max_bytes=1024 * 1024,
+            ) != patched:
+                raise OperationRecoveryError(
+                    "exact drain candidate runtime snapshot differs"
+                )
+        expected = {
+            "schema_version": 3,
+            "kind": "exact-drain-candidate-runtime-snapshot",
+            "sources": provider_evidence,
+            "candidate_patches": candidate_patch_evidence,
+        }
     else:
         raise OperationRecoveryError(
             "exact drain candidate runtime snapshot differs"
@@ -2929,8 +3146,8 @@ def _verify_exact_drain_candidate_runtime_snapshot(
     return (
         {**expected, "snapshot_digest": digest(expected)},
         sources,
-        original_resolver,
-        patched_resolver,
+        original_sources,
+        patched_sources,
     )
 
 
@@ -3388,10 +3605,10 @@ def exact_drain_runtime_evidence(
     provider_runtime_root: str | Path,
     runtime_package_root: str | Path,
     *,
-    schema_version: int = 3,
+    schema_version: int = 4,
 ) -> tuple[str, bytes]:
     """Bind runtime sources and retain prevalidated provider bootstrap bytes."""
-    if type(schema_version) is not int or schema_version not in {1, 2, 3}:
+    if type(schema_version) is not int or schema_version not in {1, 2, 3, 4}:
         raise OperationRecoveryError(
             "exact drain runtime evidence schema version is invalid"
         )
@@ -3457,6 +3674,14 @@ def exact_drain_runtime_evidence(
             sources["phase-repair-contract"] = (
                 EXACT_DRAIN_PHASE_REPAIR_CONTRACT_DIGEST
             )
+        elif schema_version == 4:
+            if snapshot["schema_version"] != 3:
+                raise OperationRecoveryError(
+                    "exact drain legacy-schema repair snapshot is required"
+                )
+            sources["phase-repair-contract"] = (
+                EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V2_DIGEST
+            )
     for name, source in provider_sources.items():
         sources[f"provider/{name}"] = hashlib.sha256(source).hexdigest()
     package_entries = _exact_drain_package_entries(package_root)
@@ -3507,7 +3732,7 @@ def exact_drain_runtime_digest(
     provider_runtime_root: str | Path,
     runtime_package_root: str | Path,
     *,
-    schema_version: int = 3,
+    schema_version: int = 4,
 ) -> str:
     """Bind the worker entrypoint, claim seam, and provider patch sources."""
     runtime_digest, _provider_bootstrap = exact_drain_runtime_evidence(
@@ -3583,14 +3808,14 @@ class ExactDrainClaimAdapter:
         verified = verify_exact_drain_plan(plan, allow_expired=True)
         if (
             terminal_reconciliation
-            and verified.get("schema_version") in {2, 3}
+            and verified.get("schema_version") in {2, 3, 4}
             and terminal_status_evidence is None
         ):
             raise OperationRecoveryError(
                 "operation-recovery terminal status evidence is required"
             )
         self._clock = clock
-        if verified.get("schema_version") in {2, 3}:
+        if verified.get("schema_version") in {2, 3, 4}:
             if authorization is None:
                 raise OperationRecoveryError(
                     "operation-recovery exact drain authorization is required"
@@ -3617,12 +3842,12 @@ class ExactDrainClaimAdapter:
             )
         self.phase_one_timeout_seconds = (
             verified["phase_one_timeout_seconds"]
-            if verified.get("schema_version") == 3
+            if verified.get("schema_version") in {3, 4}
             else None
         )
         self.phase_one_statement_timeout_seconds = (
             verified["phase_one_statement_timeout_seconds"]
-            if verified.get("schema_version") == 3
+            if verified.get("schema_version") in {3, 4}
             else None
         )
         self._cleanup_deadline: float | None = None
@@ -3959,6 +4184,12 @@ class ExactDrainClaimAdapter:
                 connection,
                 allow_expired_cleanup=allow_expired_cleanup,
             )
+            if not getattr(self, "_terminal_reconciliation", False):
+                await connection.execute(
+                    "SELECT generation FROM "
+                    "public.hindsight_migration_generation "
+                    "WHERE singleton FOR UPDATE"
+                )
             yield
 
     def record_upstream_stage(self, operation_id: str, stage: str) -> None:

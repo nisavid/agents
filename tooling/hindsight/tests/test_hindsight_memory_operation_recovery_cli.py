@@ -59,6 +59,11 @@ def _copy_patchable_entity_resolver(candidate_library: Path) -> Path:
     target.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
     shutil.copyfile(source, target)
     target.chmod(0o600)
+    ops_source = source.parent / "db" / "ops_postgresql.py"
+    ops_target = target.parent / "db" / "ops_postgresql.py"
+    ops_target.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    shutil.copyfile(ops_source, ops_target)
+    ops_target.chmod(0o600)
     return target
 
 
@@ -1709,7 +1714,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                     lambda: "6" * 64
                 ),
                 "_operation_recovery_exact_runtime_digest": (
-                    lambda _args, *, schema_version=3: (
+                    lambda _args, *, schema_version=4: (
                         runtime_schemas.append(schema_version) or "8" * 64
                     )
                 ),
@@ -1747,11 +1752,11 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             self.assertEqual(result["status"], "planned")
             self.assertEqual(result["authority"], "unapproved-plan")
             self.assertEqual(result["selected_operation_count"], 43)
-            self.assertEqual(runtime_schemas, [3])
+            self.assertEqual(runtime_schemas, [4])
             plan, create_only = written[args.output]
             self.assertIs(create_only, True)
             self.assertIs(plan["mutation_authorized"], False)
-            self.assertEqual(plan["schema_version"], 3)
+            self.assertEqual(plan["schema_version"], 4)
             serialized = json.dumps(plan, sort_keys=True)
             self.assertNotIn('"task_payload":', serialized)
             self.assertNotIn('"worker_id":', serialized)
@@ -1878,7 +1883,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             try:
                 with self.assertRaisesRegex(
                     Exception,
-                    "phase repair candidate snapshot is required",
+                    "legacy-schema repair snapshot is required",
                 ):
                     command(args)
             finally:
@@ -2640,7 +2645,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 )
             )
             self.assertRegex(snapshot["snapshot_digest"], r"^[0-9a-f]{64}$")
-            self.assertEqual(snapshot["schema_version"], 2)
+            self.assertEqual(snapshot["schema_version"], 3)
             patched_resolver = resolver.read_text(encoding="utf-8")
             self.assertNotEqual(resolver.read_bytes(), original_resolver)
             trigram_source = patched_resolver.split(
@@ -2872,7 +2877,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 "exact-drain-candidate-runtime-snapshot",
             )
             self.assertRegex(value["snapshot_digest"], r"^[0-9a-f]{64}$")
-            self.assertEqual(value["schema_version"], 2)
+            self.assertEqual(value["schema_version"], 3)
             self.assertNotIn(str(provider_root), result.stdout)
             verified, sources = (
                 operation_recovery_runtime.
@@ -2954,7 +2959,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                     candidate_library,
                 )
             )
-            self.assertEqual(recovered["schema_version"], 2)
+            self.assertEqual(recovered["schema_version"], 3)
             self.assertNotEqual(resolver.read_bytes(), original)
             with self.assertRaisesRegex(Exception, "already exists"):
                 operation_recovery_runtime.assemble_exact_drain_candidate_runtime_snapshot(
@@ -3018,7 +3023,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                     candidate_library,
                 )
             )
-            self.assertEqual(recovered["schema_version"], 2)
+            self.assertEqual(recovered["schema_version"], 3)
 
     def test_exact_drain_snapshot_failure_boundaries_are_retryable(self):
         for boundary in (
@@ -3178,7 +3183,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                     provider_root,
                     candidate_library,
                 )
-                self.assertEqual(recovered["schema_version"], 2)
+                self.assertEqual(recovered["schema_version"], 3)
                 self.assertNotEqual(resolver.read_bytes(), original)
                 self.assertFalse(
                     (
@@ -3265,7 +3270,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 provider_root,
                 candidate_library,
             )
-            self.assertEqual(recovered["schema_version"], 2)
+            self.assertEqual(recovered["schema_version"], 3)
             self.assertFalse(recovery_path.exists())
 
     def test_exact_drain_recovery_marker_partial_write_is_retryable(self):
@@ -3341,7 +3346,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 provider_root,
                 candidate_library,
             )
-            self.assertEqual(recovered["schema_version"], 2)
+            self.assertEqual(recovered["schema_version"], 3)
             self.assertNotEqual(resolver.read_bytes(), original)
 
     def test_exact_drain_recovery_marker_fault_matrix_is_retryable(self):
@@ -3508,7 +3513,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                         provider_root,
                         candidate_library,
                     )
-                    self.assertEqual(recovered["schema_version"], 2)
+                    self.assertEqual(recovered["schema_version"], 3)
                     self.assertNotEqual(resolver.read_bytes(), original)
 
     def test_exact_drain_recovery_marker_restoration_faults_are_retryable(self):
@@ -3701,7 +3706,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                     provider_root,
                     candidate_library,
                 )
-                self.assertEqual(recovered["schema_version"], 2)
+                self.assertEqual(recovered["schema_version"], 3)
                 self.assertFalse(recovery_path.exists())
 
     def test_exact_drain_phase_repair_preserves_trigram_resolution_behavior(self):

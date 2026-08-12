@@ -1,6 +1,6 @@
 from pathlib import Path
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from copy import deepcopy
 from datetime import datetime, timezone
 import getpass
@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import runpy
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -41,6 +42,7 @@ from hindsight_memory_control_plane.operation_recovery_runtime import (  # noqa:
     ExactDrainClaimAdapter,
     QUEUE_BLOCKER_GUARD_CONTRACT_DIGEST,
     QUEUE_BLOCKER_GUARD_CONTRACT_VERSION,
+    assemble_exact_drain_candidate_runtime_snapshot,
     apply_claim_release_transaction,
     apply_requeue_transaction,
     apply_post_abort_recovery_transaction,
@@ -231,6 +233,30 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
                 AFTER INSERT OR UPDATE OR DELETE ON public.async_operations
                 FOR EACH STATEMENT
                 EXECUTE FUNCTION public.bump_hindsight_migration_generation();
+                CREATE EXTENSION IF NOT EXISTS pg_trgm;
+                CREATE TABLE public.entities (
+                    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+                    bank_id text NOT NULL,
+                    canonical_name text NOT NULL,
+                    metadata jsonb,
+                    first_seen timestamptz,
+                    last_seen timestamptz,
+                    mention_count integer NOT NULL DEFAULT 0
+                );
+                CREATE TABLE public.entity_cooccurrences (
+                    entity_id_1 uuid NOT NULL,
+                    entity_id_2 uuid NOT NULL
+                );
+                CREATE TRIGGER hindsight_migration_generation_bump
+                AFTER INSERT OR UPDATE OR DELETE ON public.entities
+                FOR EACH STATEMENT
+                EXECUTE FUNCTION public.bump_hindsight_migration_generation();
+                CREATE TRIGGER hindsight_migration_generation_bump
+                AFTER INSERT OR UPDATE OR DELETE ON public.entity_cooccurrences
+                FOR EACH STATEMENT
+                EXECUTE FUNCTION public.bump_hindsight_migration_generation();
+                CREATE UNIQUE INDEX entities_bank_lower_name_unique
+                ON public.entities (bank_id, LOWER(canonical_name));
                 """
             )
         finally:
@@ -293,6 +319,136 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
                 await connection.close()
 
         asyncio.run(exercise())
+
+    def test_exact_drain_resolver_supports_the_bound_legacy_entity_schema(self):
+        try:
+            import hindsight_api
+        except ImportError as error:
+            raise unittest.SkipTest("hindsight_api is unavailable") from error
+
+        async def prepare():
+            connection = await self._connect()
+            try:
+                await connection.execute(
+                    "TRUNCATE public.entity_cooccurrences, public.entities"
+                )
+                await connection.execute(
+                    "INSERT INTO public.entities ("
+                    "id, bank_id, canonical_name, metadata, first_seen, "
+                    "last_seen, mention_count) VALUES ("
+                    "'00000000-0000-4000-8000-000000000101', "
+                    "'engineering', 'Alice', '{}'::jsonb, NOW(), NOW(), 1)"
+                )
+            finally:
+                await connection.close()
+
+        asyncio.run(prepare())
+
+        installed_package = Path(hindsight_api.__file__).parent
+        dependency_root = installed_package.parent
+        with tempfile.TemporaryDirectory(
+            prefix="exact-drain-legacy-entities-",
+            dir="/private/tmp",
+        ) as directory:
+            candidate_library = Path(directory) / "lib"
+            candidate_package = candidate_library / "hindsight_api"
+            shutil.copytree(installed_package, candidate_package)
+            provider_root = Path(directory) / "provider"
+            provider_root.mkdir(mode=0o700)
+            for name in ("sitecustomize.py", "hindsight_llm_failover.py"):
+                (provider_root / name).write_text(
+                    f"# synthetic {name}\n",
+                    encoding="utf-8",
+                )
+            snapshot = assemble_exact_drain_candidate_runtime_snapshot(
+                provider_root,
+                candidate_library,
+            )
+            self.assertEqual(snapshot["schema_version"], 3)
+            script = """
+import asyncio
+import json
+import sys
+from datetime import UTC, datetime
+from uuid import UUID
+
+sys.path[:0] = [sys.argv[1], sys.argv[2]]
+import asyncpg
+from hindsight_api.engine.db.postgresql import PostgresConnection
+from hindsight_api.engine.db.ops_postgresql import PostgreSQLOps
+from hindsight_api.engine.entity_resolver import EntityResolver
+
+async def exercise():
+    raw = await asyncpg.connect(
+        host=sys.argv[3], port=int(sys.argv[4]), user=sys.argv[5],
+        database='postgres', timeout=5,
+    )
+    try:
+        resolver = EntityResolver(pool=None)
+        result = await resolver._resolve_entities_batch_trigram(
+            PostgresConnection(raw),
+            'engineering',
+            [{'text': 'Alicee', 'nearby_entities': []}],
+            datetime(2026, 8, 12, tzinfo=UTC),
+        )
+        ops = PostgreSQLOps()
+        inserted = await ops.bulk_insert_entities(
+            PostgresConnection(raw),
+            'public.entities',
+            'engineering',
+            ['Bob'],
+            [datetime(2026, 8, 12, tzinfo=UTC)],
+            ['regular'],
+        )
+        reasserted_id = UUID('00000000-0000-4000-8000-000000000102')
+        await ops.bulk_reassert_entities(
+            PostgresConnection(raw),
+            'public.entities',
+            'engineering',
+            [reasserted_id],
+            ['Carol'],
+            ['regular'],
+        )
+        reasserted = await raw.fetchval(
+            'SELECT canonical_name FROM public.entities WHERE id = $1',
+            reasserted_id,
+        )
+        print(json.dumps({
+            'count': len(result),
+            'entity_id': str(result[0].entity_id),
+            'inserted': len(inserted),
+            'reasserted': reasserted,
+        }))
+    finally:
+        await raw.close()
+
+asyncio.run(exercise())
+"""
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    script,
+                    str(candidate_library),
+                    str(dependency_root),
+                    str(self.socket_dir),
+                    str(self.port),
+                    self.user,
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                json.loads(result.stdout),
+                {
+                    "count": 1,
+                    "entity_id": "00000000-0000-4000-8000-000000000101",
+                    "inserted": 1,
+                    "reasserted": "Carol",
+                },
+            )
 
     @staticmethod
     async def _insert_operation(
@@ -2961,6 +3117,145 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
                 if adapter is not None:
                     await adapter.close_control_connection()
                 await pool.close()
+                await connection.close()
+
+        asyncio.run(exercise())
+
+    def test_exact_drain_terminal_write_serializes_on_generation_row_lock(self):
+        async def exercise():
+            import asyncpg
+            from hindsight_api.engine.db.postgresql import PostgresConnection
+
+            connection = await self._connect()
+            concurrent = await self._connect()
+            pool = await asyncpg.create_pool(
+                host=str(self.socket_dir),
+                port=self.port,
+                user=self.user,
+                database="postgres",
+                min_size=1,
+                max_size=1,
+            )
+            snapshot_established = asyncio.Event()
+            release_terminal_write = asyncio.Event()
+            paused = False
+
+            class PausingConnection:
+                def __init__(self, wrapped):
+                    self._wrapped = wrapped
+
+                def __getattr__(self, name):
+                    return getattr(self._wrapped, name)
+
+                async def fetch(self, query, *arguments):
+                    nonlocal paused
+                    rows = await self._wrapped.fetch(query, *arguments)
+                    if "FOR SHARE" in query and not paused:
+                        paused = True
+                        snapshot_established.set()
+                        await release_terminal_write.wait()
+                    return rows
+
+            class Backend:
+                @asynccontextmanager
+                async def acquire(self):
+                    async with pool.acquire(timeout=0.5) as acquired:
+                        yield PausingConnection(
+                            PostgresConnection(acquired)
+                        )
+
+            backend = Backend()
+            adapter = None
+            terminal_write = None
+            concurrent_generation = None
+            try:
+                plan, _cohort_ids, _unexpected_id = (
+                    await self._exact_drain_case(connection)
+                )
+                adapter = self._exact_drain_adapter(plan)
+                await self._bind_disposable_exact_drain_identity(
+                    adapter,
+                    connection,
+                )
+                worker_id = exact_drain_worker_id(plan["plan_digest"])
+                async with connection.transaction():
+                    claimed = await adapter.claim_tasks(
+                        connection,
+                        '"public".async_operations',
+                        worker_id,
+                        {"consolidation": 1},
+                        0,
+                    )
+                adapter.claim_committed(
+                    [
+                        SimpleNamespace(
+                            operation_id=str(row["operation_id"])
+                        )
+                        for row in claimed
+                    ]
+                )
+                operation_id = str(claimed[0]["operation_id"])
+
+                await adapter.reserve_control_connection(backend)
+                terminal_write = asyncio.create_task(
+                    adapter.mark_failed(
+                        backend,
+                        operation_id,
+                        "provider failure",
+                        "public",
+                    )
+                )
+                await asyncio.wait_for(snapshot_established.wait(), timeout=2)
+                concurrent_pid = await concurrent.fetchval(
+                    "SELECT pg_backend_pid()"
+                )
+                concurrent_generation = asyncio.create_task(
+                    concurrent.execute(
+                        "UPDATE public.hindsight_migration_generation "
+                        "SET generation = generation + 1 WHERE singleton"
+                    )
+                )
+                lock_wait_deadline = time.monotonic() + 2
+                while True:
+                    wait_event_type = await connection.fetchval(
+                        "SELECT wait_event_type FROM pg_stat_activity "
+                        "WHERE pid = $1",
+                        concurrent_pid,
+                    )
+                    if wait_event_type == "Lock":
+                        break
+                    if time.monotonic() >= lock_wait_deadline:
+                        self.fail(
+                            "concurrent generation writer did not wait "
+                            "on the terminal transaction lock"
+                        )
+                    await asyncio.sleep(0.01)
+                release_terminal_write.set()
+                await terminal_write
+                await concurrent_generation
+
+                terminal = await connection.fetchrow(
+                    "SELECT status, worker_id, completed_at "
+                    "FROM public.async_operations "
+                    "WHERE operation_id = $1::uuid",
+                    operation_id,
+                )
+                self.assertEqual(terminal["status"], "failed")
+                self.assertEqual(terminal["worker_id"], worker_id)
+                self.assertIsNotNone(terminal["completed_at"])
+            finally:
+                release_terminal_write.set()
+                for task in (terminal_write, concurrent_generation):
+                    if task is None:
+                        continue
+                    if not task.done():
+                        task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await task
+                if adapter is not None:
+                    await adapter.close_control_connection()
+                await pool.close()
+                await concurrent.close()
                 await connection.close()
 
         asyncio.run(exercise())

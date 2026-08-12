@@ -7815,7 +7815,7 @@ def _operation_recovery_validate_exact_worker_provider_runtime(
 def _operation_recovery_exact_runtime_digest(
     args: argparse.Namespace,
     *,
-    schema_version: int = 3,
+    schema_version: int = 4,
 ) -> str:
     return exact_drain_runtime_digest(
         args.worker_runtime,
@@ -7827,9 +7827,9 @@ def _operation_recovery_exact_runtime_digest(
 
 def _operation_recovery_exact_phase_repair_snapshot() -> str:
     snapshot, _sources = verify_exact_drain_candidate_runtime_snapshot(LIB)
-    if snapshot.get("schema_version") != 2:
+    if snapshot.get("schema_version") != 3:
         raise OperationRecoveryError(
-            "exact drain phase repair candidate snapshot is required"
+            "exact drain legacy-schema repair snapshot is required"
         )
     return snapshot["snapshot_digest"]
 
@@ -7865,7 +7865,7 @@ def operation_recovery_drain_plan_command(args: argparse.Namespace) -> int:
     )
     worker_runtime_digest = _operation_recovery_exact_runtime_digest(
         args,
-        schema_version=3,
+        schema_version=4,
     )
     output_path = Path(args.output)
     artifact_paths = [
@@ -8321,7 +8321,7 @@ def _operation_recovery_exact_execution_lease_projection(
     *,
     now: int | None = None,
 ) -> Mapping[str, Any]:
-    if plan.get("schema_version") not in {2, 3}:
+    if plan.get("schema_version") not in {2, 3, 4}:
         return {}
     observed_at = int(time.time()) if now is None else now
     if authorization is None:
@@ -8351,7 +8351,7 @@ def _operation_recovery_assert_exact_execution_lease(
     *,
     now: int | None = None,
 ) -> int | None:
-    if plan.get("schema_version") not in {2, 3}:
+    if plan.get("schema_version") not in {2, 3, 4}:
         return None
     observed_at = int(time.time()) if now is None else now
     expires_at = (
@@ -8375,7 +8375,7 @@ def operation_recovery_drain_status_command(args: argparse.Namespace) -> int:
         with manager._lock():
             authorization = (
                 _operation_recovery_exact_authorization(plan)
-                if plan.get("schema_version") in {2, 3}
+                if plan.get("schema_version") in {2, 3, 4}
                 and Path(plan["authorization_receipt_path"]).exists()
                 else None
             )
@@ -8385,7 +8385,7 @@ def operation_recovery_drain_status_command(args: argparse.Namespace) -> int:
             result = {
                 "status": (
                     "authorization-only"
-                    if plan.get("schema_version") in {2, 3}
+                    if plan.get("schema_version") in {2, 3, 4}
                     and authorization is not None
                     else "awaiting-approval"
                 ),
@@ -9273,7 +9273,7 @@ def operation_recovery_drain_apply_command(args: argparse.Namespace) -> int:
                             returncode = process.wait(
                                 timeout=(
                                     plan["transaction_timeout_seconds"]
-                                    if plan.get("schema_version") in {2, 3}
+                                    if plan.get("schema_version") in {2, 3, 4}
                                     else EXACT_DRAIN_TRANSACTION_TIMEOUT_SECONDS
                                 )
                             )
@@ -9355,7 +9355,7 @@ def operation_recovery_drain_monitor_command(args: argparse.Namespace) -> int:
         progress_path.exists()
         or application_path.exists()
         or (
-            plan.get("schema_version") in {2, 3}
+            plan.get("schema_version") in {2, 3, 4}
             and Path(plan["authorization_receipt_path"]).exists()
         )
     ):
@@ -9365,7 +9365,7 @@ def operation_recovery_drain_monitor_command(args: argparse.Namespace) -> int:
             {
                 "status": (
                     "authorization-only"
-                    if plan.get("schema_version") in {2, 3}
+                    if plan.get("schema_version") in {2, 3, 4}
                     and authorization is not None
                     else "not-started"
                 ),

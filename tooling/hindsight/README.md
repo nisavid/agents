@@ -284,21 +284,27 @@ tooling/hindsight/bin/hindsight-exact-drain-snapshot \
 
 The helper creates `lib/exact_drain_runtime/` once. It copies only
 `sitecustomize.py` and `hindsight_llm_failover.py`, applies the exact bounded
-Phase 1 entity-resolver overlay to the detached candidate, and writes a
-canonical payload-free manifest for the provider and original/patched resolver
-bytes. The overlay removes unused PostgreSQL candidate columns, fetches only
-the candidate-induced cooccurrence graph, emits observational candidate and
-cooccurrence breadcrumbs, and bounds both server and client query waits. It is
-not a durable Phase 1 checkpoint or replay receipt.
+Phase 1 entity-resolver and PostgreSQL-write overlays to the detached
+candidate, and writes a canonical payload-free manifest for the provider and
+both original/patched Hindsight sources. The resolver overlay removes unused
+PostgreSQL candidate columns, fetches only the candidate-induced cooccurrence
+graph, emits observational candidate and cooccurrence breadcrumbs, and bounds
+both server and client query waits. The write overlay keeps entity insert and
+reassertion compatible with the bound pre-`entity_kind` database schema. These
+overlays are not a durable Phase 1 checkpoint or replay receipt.
 
 Release assembly runs this helper before `hindsight-portable-install`; the
 existing release manifest then seals the completed snapshot and patched
-candidate bytes. Assembly fails closed on unsupported or changed resolver
-source. An interruption after the snapshot manifest but before the atomic
-source replacement is retryable from the sealed original/patched evidence. A
-current exact-drain plan reads and executes only these candidate provider and
-Hindsight sources. Provider policy and credential material remain external
-protected data and are never copied into the candidate snapshot.
+candidate bytes. Assembly fails closed on unsupported or changed resolver or
+PostgreSQL-write source. An interruption after the snapshot manifest but before
+either atomic source replacement is retryable from the sealed original/patched
+evidence. A current exact-drain plan binds this legacy-schema repair contract
+and reads and executes only these candidate provider and Hindsight sources.
+Exact operation-state mutations also lock the singleton migration-generation
+row in their bounded serializable transaction, so terminal writes cannot race
+another generation-triggered operation commit. Provider policy and credential
+material remain external protected data and are never copied into the candidate
+snapshot.
 
 The managed exact-drain worker runtime is a separate trusted authority. For a
 current plan, planning, apply, and the gated child each stream-hash the complete

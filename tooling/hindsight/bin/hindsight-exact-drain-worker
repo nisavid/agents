@@ -222,7 +222,7 @@ def main() -> int:
     if plan["schema_version"] == 1 and not args.resume:
         plan = verify_exact_drain_plan(plan_value)
     if (
-        plan["schema_version"] in {2, 3}
+        plan["schema_version"] in {2, 3, 4}
         and time.time()
         >= authorization["authorized_at"] + plan["execution_lease_seconds"]
     ):
@@ -315,7 +315,7 @@ def main() -> int:
     set_exact_drain_progress_recorder(progress_recorder)
 
     install_exact_drain_candidate_imports(args.worker_runtime, LIB)
-    if plan["schema_version"] in {2, 3}:
+    if plan["schema_version"] in {2, 3, 4}:
         validate_exact_drain_dependency_spec(
             "asyncpg",
             args.worker_runtime,
@@ -374,7 +374,7 @@ def main() -> int:
         return candidate_release_root
 
     provider_globals["_resolve_active_release"] = resolve_detached_candidate
-    if plan["schema_version"] in {2, 3}:
+    if plan["schema_version"] in {2, 3, 4}:
         validate_exact_drain_import_origins(args.worker_runtime, LIB)
     original_protected_reader = provider_globals.get(
         "_read_protected_file"
@@ -398,7 +398,7 @@ def main() -> int:
         ),
         provider_globals,
     )
-    if plan["schema_version"] in {2, 3}:
+    if plan["schema_version"] in {2, 3, 4}:
         validate_exact_drain_import_origins(args.worker_runtime, LIB)
 
     def complete() -> None:
@@ -416,7 +416,7 @@ def main() -> int:
     from hindsight_api.worker import main as worker_main_module
     from hindsight_api.worker.poller import WorkerPoller
 
-    if plan["schema_version"] in {2, 3}:
+    if plan["schema_version"] in {2, 3, 4}:
         validate_exact_drain_import_origins(args.worker_runtime, LIB)
 
     with ExactDrainWorkerMainShutdownBridge(worker_main_module) as shutdown:

@@ -101,9 +101,11 @@ transaction-bound `task-witness-bridge-transition-authorization-v1` after B1,
 the final TW4 release, and the detached release manifest all have immutable
 identities. The exact B1 version of
 `plugins/task-witness/controller/task_witness_deploy.py` alone validates the raw
-transition contract during prepare, stage, activation, and recovery and
-projects it into the successful TW4 receipt. The TW4 controller and client
-validate only that retained projection. `validate_task_witness.py` does not
+transition contract during stage, activation, and recovery and projects it
+into the successful TW4 receipt. Preparation validates the candidate, manifest,
+and strict endpoint projection, then returns the plan and authorization facts
+that the external deployer must bind. The TW4 controller and client validate
+only the retained transition projection. `validate_task_witness.py` does not
 consume or validate transition authorization. The controller, client, bridge,
 and candidate never issue authorization. This is a new purpose under the
 existing external deployer authority, not a signer or trust root.
@@ -188,9 +190,11 @@ digest. It is not a public installation request or a legacy-schema registry.
 
 ### Hop 2: B1 to TW4
 
-1. Exact B1 validates the detached release manifest and fresh bridge-transition
-   authorization, then prepares and stages the exact authorized TW4 through
-   its current-shaped outbound surface.
+1. Exact B1 prepares the exact TW4 through its current-shaped outbound surface,
+   validating the detached release manifest and strict endpoint projection and
+   returning the plan and authorization facts. The external deployer then
+   issues the fresh bridge-transition authorization, which B1 validates before
+   creating the stage.
 2. B1 validates the old active B1 epoch and the current candidate TW4 epoch
    independently. Only the exact bridge transition may cross this schema
    boundary.
@@ -395,9 +399,14 @@ After all evidence is complete, the final public-release identity may differ
 only by the mechanically checked promotion delta:
 
 - set the Task Witness registration's `production_eligible` value to `true`;
-- add the exact Task Witness marketplace route; and
-- update only generated release records whose values are deterministic
-  consequences of those two changes.
+- add the exact Task Witness marketplace route.
+
+The v1 promotion delta has exactly those two changed paths:
+`release/task-witness/public-release-registration.json` and
+`.claude-plugin/marketplace.json`. No generated release record is rewritten or
+added. The candidate's source-shape record remains byte-identical; final mode
+first validates that candidate record against the candidate tree, then applies
+the closed two-path projection and rejects every other final-tree difference.
 
 No executable, policy, test, suite inventory, source shape input, documentation
 contract, or other semantic byte may change. The final validator independently

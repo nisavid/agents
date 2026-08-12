@@ -94,12 +94,16 @@ The allowlist admits only the frozen identities. A well-formed but unlisted
 legacy receipt, bridge, controller, or policy fails closed.
 
 B1 does not hardcode its successor digest. That would create a digest cycle
-because TW4 must retain B1's exact identity. Instead, the existing
-deployer/operator authorization owner issues one detached, transaction-bound
-`task-witness-bridge-transition-authorization-v1` after B1, the final TW4
-release, and the detached release manifest all have immutable identities. This
-is a new authorization purpose under the existing authority, not a signer or
-trust root.
+because TW4 must retain B1's exact identity. Instead, the external deployer
+that already produces `task-witness-deployer-authorization-v1` from Task
+Witness's public `DeploymentAuthorizationFacts` issues one detached,
+transaction-bound `task-witness-bridge-transition-authorization-v1` after B1,
+the final TW4 release, and the detached release manifest all have immutable
+identities. `plugins/task-witness/controller/task_witness_deploy.py` validates
+both contracts and projects them into receipts; the client validates the
+retained projection. The controller, client, bridge, and candidate never issue
+authorization. This is a new purpose under the existing external deployer
+authority, not a signer or trust root.
 
 The transition authorization binds exact B1 active-receipt, controller,
 policy, source, and retained-chain identities; exact TW4 commit, tree,

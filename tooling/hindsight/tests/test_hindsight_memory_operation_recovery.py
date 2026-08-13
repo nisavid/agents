@@ -381,17 +381,23 @@ class OperationRecoveryContractTest(unittest.TestCase):
 
         plan = self.drain_plan(snapshot=snapshot, created_at=planned_at)
 
-        self.assertEqual(plan["schema_version"], 5)
+        self.assertEqual(plan["schema_version"], 6)
         self.assertEqual(plan["expires_at"], planned_at + 86_400)
         self.assertEqual(plan["evidence_observed_at"], snapshot["observed_at"])
         self.assertEqual(plan["evidence_max_age_seconds"], 3_600)
         self.assertEqual(plan["transaction_timeout_seconds"], 120)
         self.assertEqual(plan["execution_lease_seconds"], 86_400)
         self.assertEqual(plan["phase_one_statement_timeout_seconds"], 120)
+        self.assertEqual(plan["phase_one_client_timeout_seconds"], 125)
         self.assertEqual(plan["phase_one_timeout_seconds"], 3_600)
         self.assertEqual(
             plan["phase_repair_contract_digest"],
-            recovery_contract.EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V3_DIGEST,
+            recovery_contract.EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V4_DIGEST,
+        )
+        self.assertEqual(plan["progress_schema_version"], 2)
+        self.assertEqual(
+            plan["failure_evidence_contract_digest"],
+            recovery_contract.EXACT_DRAIN_FAILURE_EVIDENCE_CONTRACT_DIGEST,
         )
         self.assertEqual(
             recovery_contract.verify_exact_drain_plan(plan, now=planned_at),
@@ -409,6 +415,9 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 "phase_one_statement_timeout_seconds",
                 "phase_one_timeout_seconds",
                 "phase_repair_contract_digest",
+                "phase_one_client_timeout_seconds",
+                "progress_schema_version",
+                "failure_evidence_contract_digest",
             }
         }
         body["schema_version"] = 2
@@ -425,7 +434,15 @@ class OperationRecoveryContractTest(unittest.TestCase):
     def test_exact_drain_verifier_preserves_prior_v3_contract(self):
         current = self.drain_plan()
         body = {
-            key: value for key, value in current.items() if key != "plan_digest"
+            key: value
+            for key, value in current.items()
+            if key
+            not in {
+                "plan_digest",
+                "phase_one_client_timeout_seconds",
+                "progress_schema_version",
+                "failure_evidence_contract_digest",
+            }
         }
         body["schema_version"] = 3
         body["phase_repair_contract_digest"] = (
@@ -444,7 +461,15 @@ class OperationRecoveryContractTest(unittest.TestCase):
     def test_exact_drain_verifier_preserves_prior_v4_contract(self):
         current = self.drain_plan()
         body = {
-            key: value for key, value in current.items() if key != "plan_digest"
+            key: value
+            for key, value in current.items()
+            if key
+            not in {
+                "plan_digest",
+                "phase_one_client_timeout_seconds",
+                "progress_schema_version",
+                "failure_evidence_contract_digest",
+            }
         }
         body["schema_version"] = 4
         body["phase_repair_contract_digest"] = (
@@ -460,12 +485,42 @@ class OperationRecoveryContractTest(unittest.TestCase):
             prior,
         )
 
-    def test_exact_drain_v5_phase_repair_contract_is_closed(self):
+    def test_exact_drain_verifier_preserves_prior_v5_contract(self):
+        current = self.drain_plan()
+        body = {
+            key: value
+            for key, value in current.items()
+            if key
+            not in {
+                "plan_digest",
+                "phase_one_client_timeout_seconds",
+                "progress_schema_version",
+                "failure_evidence_contract_digest",
+            }
+        }
+        body["schema_version"] = 5
+        body["phase_repair_contract_digest"] = (
+            recovery_contract.EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V3_DIGEST
+        )
+        prior = {**body, "plan_digest": digest(body)}
+
+        self.assertEqual(
+            recovery_contract.verify_exact_drain_plan(
+                prior,
+                now=prior["created_at"],
+            ),
+            prior,
+        )
+
+    def test_exact_drain_v6_failure_evidence_contract_is_closed(self):
         plan = self.drain_plan()
         for key, value in (
             ("phase_one_statement_timeout_seconds", 121),
+            ("phase_one_client_timeout_seconds", 124),
             ("phase_one_timeout_seconds", 3_601),
             ("phase_repair_contract_digest", "0" * 64),
+            ("progress_schema_version", 1),
+            ("failure_evidence_contract_digest", "0" * 64),
         ):
             with self.subTest(key=key):
                 changed = dict(plan)
@@ -602,7 +657,16 @@ class OperationRecoveryContractTest(unittest.TestCase):
     ) -> dict:
         reference_plan = reference_plan or self.drain_plan()
         rows = operation_rows()
-        completed = {0, 1, 42, 43, 46}
+        reference_snapshot = {
+            item["operation_id"]: item
+            for item in reference_plan["live_snapshot"]["operations"]
+        }
+        completed = {
+            index
+            for index, row in enumerate(rows)
+            if reference_snapshot[row["operation_id"]]["current_status"]
+            == "completed"
+        }
         selected_ids = {
             item["operation_id"]
             for item in reference_plan["selected_operations"]
@@ -844,6 +908,68 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 }
             )
         for item in [completed_consolidation, *failed_rows]:
+            item["row_digest"] = digest(
+                {key: value for key, value in item.items() if key != "row_digest"}
+            )
+        snapshot["operations"].sort(key=lambda item: item["operation_id"])
+        snapshot["status_counts"] = {
+            status: sum(
+                item["current_status"] == status
+                for item in snapshot["operations"]
+            )
+            for status in recovery_contract.OPERATION_STATUSES
+        }
+        snapshot["snapshot_digest"] = digest(
+            {
+                key: value
+                for key, value in snapshot.items()
+                if key != "snapshot_digest"
+            }
+        )
+        return snapshot
+
+    def post_abort_v6_snapshot(
+        self,
+        reference_plan,
+        *,
+        observed_at: int = 1_786_390_181,
+    ) -> dict:
+        snapshot = self.post_abort_snapshot(
+            reference_plan,
+            interrupted_processing_count=1,
+            observed_at=observed_at,
+        )
+        worker_digest = hashlib.sha256(
+            (
+                "operation-recovery-exact-drain-"
+                f"{reference_plan['plan_digest'][:12]}"
+            ).encode("utf-8")
+        ).hexdigest()
+        failed_rows = [
+            item
+            for item in snapshot["operations"]
+            if item["operation_id"]
+            in {
+                selected["operation_id"]
+                for selected in reference_plan["selected_operations"]
+            }
+            and item["operation_type"] == "retain"
+            and item["current_status"] == "pending"
+        ][:3]
+        for item in failed_rows:
+            item.update(
+                {
+                    "current_status": "failed",
+                    "completed_at": "2026-08-13T15:20:00.000000Z",
+                    "retry_count": 3,
+                    "result_metadata_digest": "b" * 64,
+                    "error_category": "none",
+                    "error_digest": None,
+                    "worker_id_present": True,
+                    "worker_id_digest": worker_digest,
+                    "claimed_at": "2026-08-13T08:00:00.000000Z",
+                }
+            )
             item["row_digest"] = digest(
                 {key: value for key, value in item.items() if key != "row_digest"}
             )
@@ -1171,6 +1297,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 exact_drain_application_journal(reference)
             ),
             reference_application_progress_digest="c" * 64,
+            schema_version=5,
             created_at=1_786_390_500,
         )
 
@@ -1223,6 +1350,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
                     exact_drain_application_journal(reference)
                 ),
                 reference_application_progress_digest="c" * 64,
+                schema_version=5,
                 created_at=1_786_390_500,
             )
 
@@ -1311,6 +1439,103 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 ),
             ):
                 create(snapshot)
+
+    def test_post_abort_v6_plan_binds_three_blank_failures_and_one_processing(self):
+        reference = self.drain_plan(
+            snapshot=self.drain_snapshot(
+                completed_positions={0, 1, 42, 43, 46, 47},
+                observed_at=1_786_390_000,
+            ),
+            created_at=1_786_390_001,
+        )
+        snapshot = self.post_abort_v6_snapshot(reference)
+        backup = rollback_backup_evidence()
+        backup["source_authority"]["generation_before"] = snapshot[
+            "generation_before"
+        ]
+        backup["source_authority"]["generation_after"] = snapshot[
+            "generation_after"
+        ]
+        backup["source_authority_digest"] = digest(backup["source_authority"])
+
+        def create(value):
+            return create_post_abort_recovery_plan(
+                reference,
+                value,
+                candidate_release=release_identity(),
+                rollback_backup=backup,
+                rollback_encryption=rollback_encryption(),
+                rollback_backup_path="/private/tmp/v6-backup.age",
+                rollback_bundle_path="/private/tmp/v6-bundle.age",
+                authorization_receipt_path="/private/tmp/v6-auth.json",
+                application_receipt_path="/private/tmp/v6-app.json",
+                verification_receipt_path="/private/tmp/v6-verify.json",
+                rollback_receipt_path="/private/tmp/v6-rollback.json",
+                reference_application_authorization=(
+                    exact_drain_authorization(reference)
+                ),
+                reference_application_journal=(
+                    exact_drain_application_journal(reference)
+                ),
+                reference_application_progress_digest="d" * 64,
+                created_at=1_786_390_500,
+            )
+
+        plan = create(snapshot)
+        self.assertEqual(plan["schema_version"], 6)
+        self.assertEqual(plan["reference_plan"]["selected_operation_count"], 42)
+        self.assertEqual(plan["selected_operation_count"], 4)
+        self.assertEqual(
+            plan["selected_status_counts"],
+            {"failed": 3, "processing": 1},
+        )
+        self.assertEqual(plan["selected_type_counts"], {"retain": 4})
+        self.assertEqual(
+            plan["preserved_status_counts"],
+            {"completed": 6, "pending": 38},
+        )
+        self.assertEqual(
+            verify_post_abort_recovery_plan(plan, now=plan["created_at"]),
+            plan,
+        )
+
+        for label, updates in (
+            ("retry-count", {"retry_count": 2}),
+            (
+                "error-evidence",
+                {
+                    "error_category": "provider_transport",
+                    "error_digest": "f" * 64,
+                },
+            ),
+        ):
+            with self.subTest(drift=label):
+                changed = deepcopy(snapshot)
+                failed = next(
+                    item
+                    for item in changed["operations"]
+                    if item["current_status"] == "failed"
+                )
+                failed.update(updates)
+                failed["row_digest"] = digest(
+                    {
+                        key: item_value
+                        for key, item_value in failed.items()
+                        if key != "row_digest"
+                    }
+                )
+                changed["snapshot_digest"] = digest(
+                    {
+                        key: item_value
+                        for key, item_value in changed.items()
+                        if key != "snapshot_digest"
+                    }
+                )
+                with self.assertRaisesRegex(
+                    OperationRecoveryError,
+                    "post-abort row set is invalid",
+                ):
+                    create(changed)
 
     def test_post_abort_plan_rejects_a_different_processing_owner(self):
         reference = self.drain_plan()

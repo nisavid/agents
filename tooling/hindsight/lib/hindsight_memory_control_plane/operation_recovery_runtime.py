@@ -31,10 +31,12 @@ import uuid
 from typing import TYPE_CHECKING, Any, Self
 
 from .operation_recovery import (
+    EXACT_DRAIN_PHASE_ONE_CLIENT_TIMEOUT_SECONDS,
     EXACT_DRAIN_PHASE_ONE_STATEMENT_TIMEOUT_SECONDS,
     EXACT_DRAIN_PHASE_REPAIR_CONTRACT_DIGEST,
     EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V2_DIGEST,
     EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V3_DIGEST,
+    EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V4_DIGEST,
     EXACT_DRAIN_TRANSACTION_TIMEOUT_SECONDS,
     EXPECTED_CLAIM_RELEASE_ROW_COUNT,
     EXPECTED_OPERATION_COUNTS,
@@ -119,6 +121,12 @@ EXACT_DRAIN_CANDIDATE_RESOLVER_PATH = Path(
 EXACT_DRAIN_CANDIDATE_POSTGRESQL_OPS_PATH = Path(
     "hindsight_api/engine/db/ops_postgresql.py"
 )
+EXACT_DRAIN_CANDIDATE_MEMORY_ENGINE_PATH = Path(
+    "hindsight_api/engine/memory_engine.py"
+)
+EXACT_DRAIN_CANDIDATE_POLLER_PATH = Path(
+    "hindsight_api/worker/poller.py"
+)
 EXACT_DRAIN_PROVIDER_SOURCE_NAMES = (
     "sitecustomize.py",
     "hindsight_llm_failover.py",
@@ -141,6 +149,26 @@ EXACT_DRAIN_TRANSPORT_ERROR = re.compile(
     re.IGNORECASE,
 )
 EXACT_DRAIN_FUZZY_QUERY_BATCH_SIZE = 10
+EXACT_DRAIN_CHECKPOINT_PROJECTION = """
+    CASE WHEN result_metadata->>'facts_committed' = 'true'
+         THEN TRUE ELSE FALSE END AS checkpoint_facts_committed,
+    CASE WHEN jsonb_typeof(result_metadata->'facts_committed_document_ids') = 'array'
+         THEN jsonb_array_length(result_metadata->'facts_committed_document_ids')
+         ELSE 0 END AS checkpoint_committed_document_count,
+    CASE WHEN COALESCE(result_metadata->>'unit_ids_count', '') ~ '^[0-9]{1,9}$'
+         THEN (result_metadata->>'unit_ids_count')::integer
+         ELSE 0 END AS checkpoint_unit_ids_count,
+    left(COALESCE(result_metadata->'progress'->>'stage', 'unavailable'), 128)
+         AS checkpoint_stage,
+    CASE WHEN COALESCE(result_metadata->'progress'->>'processed', '')
+                   ~ '^[0-9]{1,9}$'
+         THEN (result_metadata->'progress'->>'processed')::integer
+         ELSE 0 END AS checkpoint_processed,
+    CASE WHEN COALESCE(result_metadata->'progress'->>'total', '')
+                   ~ '^[0-9]{1,9}$'
+         THEN (result_metadata->'progress'->>'total')::integer
+         ELSE 0 END AS checkpoint_total
+""".strip()
 LOGGER = logging.getLogger(__name__)
 
 
@@ -681,6 +709,97 @@ def _postgres_safe_error_text(value: str) -> str:
         .decode("utf-8")
         .replace("\x00", "\ufffd")
     )
+
+
+def _exact_drain_failure_evidence(
+    error_message: str,
+    *,
+    retryable: bool,
+    category_override: str | None = None,
+) -> dict[str, Any]:
+    if category_override not in {
+        None,
+        "retry_ceiling",
+        "terminal_state_persistence",
+        "nonquiescent_shutdown",
+    }:
+        raise OperationRecoveryError(
+            "exact drain failure category is invalid"
+        )
+    safe_error = _postgres_safe_error_text(error_message)
+    status_match = re.search(
+        r"(?:client|server)\s+error\s+['\"]?([45][0-9]{2})\b|"
+        r"(?:status|error)(?:_code|\s+code)?[ =:'\"]+([45][0-9]{2})\b",
+        safe_error,
+        re.IGNORECASE,
+    )
+    http_status = (
+        None
+        if status_match is None
+        else int(status_match.group(1) or status_match.group(2))
+    )
+    lowered = safe_error.casefold()
+    if category_override is not None:
+        category = category_override
+    elif http_status == 400:
+        category = "provider_bad_request"
+    elif EXACT_DRAIN_AUTHENTICATION_ERROR.search(safe_error) is not None:
+        category = "provider_authentication"
+    elif EXACT_DRAIN_CAPACITY_ERROR.search(safe_error) is not None:
+        category = "provider_capacity"
+    elif "timeouterror" in lowered or "statement timeout" in lowered:
+        category = "phase_one_timeout"
+    elif EXACT_DRAIN_TRANSPORT_ERROR.search(safe_error) is not None:
+        category = "provider_transport"
+    elif not safe_error:
+        category = "unclassified_empty"
+    else:
+        category = "operation_error"
+    return {
+        "category": category,
+        "retryable": retryable,
+        "http_status": http_status,
+        "error_digest": hashlib.sha256(safe_error.encode("utf-8")).hexdigest(),
+    }
+
+
+def _exact_drain_checkpoint_evidence(
+    row: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    names = {
+        "facts_committed": "checkpoint_facts_committed",
+        "committed_document_count": "checkpoint_committed_document_count",
+        "unit_ids_count": "checkpoint_unit_ids_count",
+        "stage": "checkpoint_stage",
+        "processed": "checkpoint_processed",
+        "total": "checkpoint_total",
+    }
+    if not any(name in row for name in names.values()):
+        return None
+    values = {key: row.get(name) for key, name in names.items()}
+    stage = values["stage"]
+    if not isinstance(stage, str) or not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9._:/=-]{0,127}", stage
+    ):
+        stage = "unavailable"
+    for key in (
+        "committed_document_count",
+        "unit_ids_count",
+        "processed",
+        "total",
+    ):
+        value = values[key]
+        if type(value) is not int or value < 0:
+            values[key] = 0
+    values["processed"] = min(values["processed"], values["total"])
+    return {
+        "facts_committed": values["facts_committed"] is True,
+        "committed_document_count": values["committed_document_count"],
+        "unit_ids_count": values["unit_ids_count"],
+        "stage": stage,
+        "processed": values["processed"],
+        "total": values["total"],
+    }
 
 
 def _read_private_json(path: Path, label: str) -> dict[str, Any]:
@@ -1237,6 +1356,25 @@ def install_exact_drain_runtime_guards(
             worker_shutdown_requested = True
             request_worker_shutdown()
 
+    def record_runtime_failure(
+        operation_id: str,
+        *,
+        stage: str,
+        category: str,
+        error: BaseException,
+    ) -> None:
+        recorder = getattr(adapter, "record_upstream_failure", None)
+        if callable(recorder):
+            recorder(
+                operation_id,
+                stage=stage,
+                category=category,
+                retryable=False,
+                error_message=error,
+            )
+            return
+        adapter.record_upstream_stage(operation_id, stage)
+
     async def execute_exact_task_inner(
         poller: Any,
         task: Any,
@@ -1320,17 +1458,23 @@ def install_exact_drain_runtime_guards(
                         timeout=cancellation_timeout_seconds,
                     )
                     if not done:
-                        try:
-                            adapter.record_upstream_stage(
-                                task.operation_id,
-                                "failure.nonquiescent",
-                            )
-                        except BaseException:
-                            pass
-                        claim_release_disabled = True
-                        raise OperationRecoveryError(
+                        error = OperationRecoveryError(
                             "exact drain task did not quiesce after cancellation"
                         )
+                        try:
+                            record_runtime_failure(
+                                task.operation_id,
+                                stage="failure.nonquiescent",
+                                category="nonquiescent_shutdown",
+                                error=error,
+                            )
+                        except BaseException as evidence_error:
+                            LOGGER.warning(
+                                "exact drain nonquiescent evidence failed with %s",
+                                type(evidence_error).__name__,
+                            )
+                        claim_release_disabled = True
+                        raise error
                     await execution
                 except asyncio.CancelledError:
                     current = asyncio.current_task()
@@ -1610,12 +1754,17 @@ def install_exact_drain_runtime_guards(
             raise
         except BaseException as error:
             try:
-                adapter.record_upstream_stage(
+                record_runtime_failure(
                     operation_id,
-                    "failure.terminal-state",
+                    stage="failure.terminal-state",
+                    category="terminal_state_persistence",
+                    error=error,
                 )
-            except BaseException:
-                pass
+            except BaseException as evidence_error:
+                LOGGER.warning(
+                    "exact drain terminal failure evidence failed with %s",
+                    type(evidence_error).__name__,
+                )
             record_exact_task_error(poller, error)
             request_exact_worker_shutdown(poller)
             raise
@@ -2165,7 +2314,10 @@ def _patch_exact_drain_entity_resolver(
     candidate_query_batch_size: int | None = None,
 ) -> bytes:
     """Return the exact bounded Phase-1 resolver overlay for Hindsight 0.9."""
-    if EXACT_DRAIN_PHASE_ONE_STATEMENT_TIMEOUT_SECONDS != 120:
+    if (
+        EXACT_DRAIN_PHASE_ONE_STATEMENT_TIMEOUT_SECONDS != 120
+        or EXACT_DRAIN_PHASE_ONE_CLIENT_TIMEOUT_SECONDS != 125
+    ):
         raise OperationRecoveryError(
             "exact drain phase-one statement timeout authority differs"
         )
@@ -2207,7 +2359,7 @@ def _patch_exact_drain_entity_resolver(
                 await conn.execute(
                     \"SET LOCAL statement_timeout = '120s'\"
                 )
-                return await conn.fetch(*arguments, timeout=120.0)
+                return await conn.fetch(*arguments, timeout=125.0)
 
         entity_texts = list(set(e[\"text\"] for e in entities_data))
 """,
@@ -2426,6 +2578,125 @@ def _patch_exact_drain_postgresql_ops(source: bytes) -> bytes:
     except SyntaxError as error:
         raise OperationRecoveryError(
             "exact drain patched PostgreSQL ops source is invalid"
+        ) from error
+    return text.encode("utf-8")
+
+
+def _patch_exact_drain_memory_engine(source: bytes) -> bytes:
+    """Preserve task error type and stop retrying deterministic HTTP 400s."""
+    try:
+        text = source.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise OperationRecoveryError(
+            "exact drain candidate memory engine source differs"
+        ) from error
+    text = _replace_exact_drain_source_fragment(
+        text,
+        "def _is_non_retryable_task_error(e: Exception) -> bool:\n"
+        "    \"\"\"Classify deterministic task failures that should skip worker retry.\"\"\"\n"
+        "    return (\n"
+        "        isinstance(e, asyncpg.exceptions.IntegrityConstraintViolationError)\n",
+        "def _operation_recovery_task_error_message(e: Exception) -> str:\n"
+        "    message = str(e)\n"
+        "    name = type(e).__name__\n"
+        "    return f\"{name}: {message}\" if message else name\n\n\n"
+        "def _operation_recovery_http_status(e: Exception) -> int | None:\n"
+        "    seen = set()\n"
+        "    candidate = e\n"
+        "    while candidate is not None and id(candidate) not in seen:\n"
+        "        seen.add(id(candidate))\n"
+        "        response = getattr(candidate, 'response', None)\n"
+        "        status = getattr(response, 'status_code', None)\n"
+        "        if not isinstance(status, int):\n"
+        "            status = getattr(candidate, 'status_code', None)\n"
+        "        if isinstance(status, int):\n"
+        "            return status\n"
+        "        candidate = candidate.__cause__ or candidate.__context__\n"
+        "    return None\n\n\n"
+        "def _is_non_retryable_task_error(e: Exception) -> bool:\n"
+        "    \"\"\"Classify deterministic task failures that should skip worker retry.\"\"\"\n"
+        "    return (\n"
+        "        _operation_recovery_http_status(e) == 400\n"
+        "        or isinstance(e, asyncpg.exceptions.IntegrityConstraintViolationError)\n",
+        "typed deterministic task error",
+    )
+    for old, new, label in (
+        (
+            "await self._mark_operation_failed(operation_id, str(e), error_traceback)",
+            (
+                "await self._mark_operation_failed(\n"
+                "                            operation_id,\n"
+                "                            _operation_recovery_task_error_message(e),\n"
+                "                            error_traceback,\n"
+                "                        )"
+            ),
+            "typed task terminal error",
+        ),
+        (
+            "                            message=str(e),",
+            "                            message=_operation_recovery_task_error_message(e),",
+            "typed task retry error",
+        ),
+    ):
+        expected_count = 2
+        if text.count(old) != expected_count:
+            raise OperationRecoveryError(
+                f"exact drain candidate {label} source differs"
+            )
+        text = text.replace(old, new)
+    try:
+        compile(text, "hindsight_api/engine/memory_engine.py", "exec")
+    except SyntaxError as error:
+        raise OperationRecoveryError(
+            "exact drain patched memory engine source is invalid"
+        ) from error
+    return text.encode("utf-8")
+
+
+def _patch_exact_drain_poller(source: bytes) -> bytes:
+    """Keep exception type when the upstream poller records a final failure."""
+    try:
+        text = source.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise OperationRecoveryError(
+            "exact drain candidate poller source differs"
+        ) from error
+    text = _replace_exact_drain_source_fragment(
+        text,
+        "def _wall_timeout_for(task_type: str) -> float | None:\n",
+        "def _operation_recovery_task_error_message(e: Exception) -> str:\n"
+        "    message = str(e)\n"
+        "    name = type(e).__name__\n"
+        "    return f\"{name}: {message}\" if message else name\n\n\n"
+        "def _wall_timeout_for(task_type: str) -> float | None:\n",
+        "poller typed error helper",
+    )
+    text = _replace_exact_drain_source_fragment(
+        text,
+        "await self._schedule_retry(task.operation_id, e.retry_at, str(e), task.schema)",
+        "await self._schedule_retry(\n"
+        "                task.operation_id,\n"
+        "                e.retry_at,\n"
+        "                _operation_recovery_task_error_message(e),\n"
+        "                task.schema,\n"
+        "            )",
+        "poller typed retry error",
+    )
+    text = _replace_exact_drain_source_fragment(
+        text,
+        "await self._mark_failed(task.operation_id, str(e), task.schema)",
+        "await self._mark_failed(\n"
+        "                    task.operation_id,\n"
+        "                    _operation_recovery_task_error_message(e),\n"
+        "                    task.schema,\n"
+        "                )",
+        "poller typed terminal error",
+    )
+    try:
+        compile(text, "hindsight_api/worker/poller.py", "exec")
+    except SyntaxError as error:
+        raise OperationRecoveryError(
+            "exact drain patched poller source is invalid"
         ) from error
     return text.encode("utf-8")
 
@@ -2724,11 +2995,27 @@ def assemble_exact_drain_candidate_runtime_snapshot(
         "exact drain candidate PostgreSQL ops",
         max_bytes=1024 * 1024,
     )
+    memory_engine_path = library / EXACT_DRAIN_CANDIDATE_MEMORY_ENGINE_PATH
+    memory_engine_source = _exact_drain_file_bytes(
+        memory_engine_path,
+        "exact drain candidate memory engine",
+        max_bytes=1024 * 1024,
+    )
+    poller_path = library / EXACT_DRAIN_CANDIDATE_POLLER_PATH
+    poller_source = _exact_drain_file_bytes(
+        poller_path,
+        "exact drain candidate poller",
+        max_bytes=1024 * 1024,
+    )
     candidate_sources = {
         EXACT_DRAIN_CANDIDATE_RESOLVER_PATH.as_posix(): resolver_source,
         EXACT_DRAIN_CANDIDATE_POSTGRESQL_OPS_PATH.as_posix(): (
             postgresql_ops_source
         ),
+        EXACT_DRAIN_CANDIDATE_MEMORY_ENGINE_PATH.as_posix(): (
+            memory_engine_source
+        ),
+        EXACT_DRAIN_CANDIDATE_POLLER_PATH.as_posix(): poller_source,
     }
     runtime_root = library / EXACT_DRAIN_CANDIDATE_RUNTIME_DIRECTORY
     staging_root = library / f".{EXACT_DRAIN_CANDIDATE_RUNTIME_DIRECTORY}.staging"
@@ -2740,7 +3027,7 @@ def assemble_exact_drain_candidate_runtime_snapshot(
                 require_candidate_patch=False,
             )
         )
-        if snapshot["schema_version"] not in {2, 3, 4}:
+        if snapshot["schema_version"] not in {2, 3, 4, 5}:
             raise OperationRecoveryError(
                 "exact drain candidate runtime snapshot already exists"
             )
@@ -2753,6 +3040,10 @@ def assemble_exact_drain_candidate_runtime_snapshot(
             EXACT_DRAIN_CANDIDATE_POSTGRESQL_OPS_PATH.as_posix(): (
                 postgresql_ops_source
             ),
+            EXACT_DRAIN_CANDIDATE_MEMORY_ENGINE_PATH.as_posix(): (
+                memory_engine_source
+            ),
+            EXACT_DRAIN_CANDIDATE_POLLER_PATH.as_posix(): poller_source,
         }
         if all(
             current_sources[path] == patched
@@ -2841,6 +3132,12 @@ def assemble_exact_drain_candidate_runtime_snapshot(
         EXACT_DRAIN_CANDIDATE_POSTGRESQL_OPS_PATH.as_posix(): (
             _patch_exact_drain_postgresql_ops(postgresql_ops_source)
         ),
+        EXACT_DRAIN_CANDIDATE_MEMORY_ENGINE_PATH.as_posix(): (
+            _patch_exact_drain_memory_engine(memory_engine_source)
+        ),
+        EXACT_DRAIN_CANDIDATE_POLLER_PATH.as_posix(): (
+            _patch_exact_drain_poller(poller_source)
+        ),
     }
     _remove_exact_drain_snapshot_staging(staging_root)
     staged_provider_root = staging_root / "provider"
@@ -2864,11 +3161,12 @@ def assemble_exact_drain_candidate_runtime_snapshot(
     ]
     candidate_patch_evidence = []
     for relative, original in candidate_sources.items():
-        snapshot_name = (
-            "entity_resolver"
-            if relative == EXACT_DRAIN_CANDIDATE_RESOLVER_PATH.as_posix()
-            else "ops_postgresql"
-        )
+        snapshot_name = {
+            EXACT_DRAIN_CANDIDATE_RESOLVER_PATH.as_posix(): "entity_resolver",
+            EXACT_DRAIN_CANDIDATE_POSTGRESQL_OPS_PATH.as_posix(): "ops_postgresql",
+            EXACT_DRAIN_CANDIDATE_MEMORY_ENGINE_PATH.as_posix(): "memory_engine",
+            EXACT_DRAIN_CANDIDATE_POLLER_PATH.as_posix(): "poller",
+        }[relative]
         patched = patched_sources[relative]
         candidate_patch_evidence.append(
             {
@@ -2886,7 +3184,7 @@ def assemble_exact_drain_candidate_runtime_snapshot(
             }
         )
     manifest = {
-        "schema_version": 4,
+        "schema_version": 5,
         "kind": "exact-drain-candidate-runtime-snapshot",
         "sources": provider_evidence,
         "candidate_patches": candidate_patch_evidence,
@@ -3096,7 +3394,7 @@ def _verify_exact_drain_candidate_runtime_snapshot(
             raise OperationRecoveryError(
                 "exact drain candidate runtime snapshot differs"
             )
-    elif schema_version in {3, 4}:
+    elif schema_version in {3, 4, 5}:
         hindsight_root = runtime_root / "hindsight"
         _exact_drain_trusted_directory(
             hindsight_root,
@@ -3114,13 +3412,20 @@ def _verify_exact_drain_candidate_runtime_snapshot(
             "ops_postgresql.original.py",
             "ops_postgresql.py",
         }
+        if schema_version == 5:
+            expected_names |= {
+                "memory_engine.original.py",
+                "memory_engine.py",
+                "poller.original.py",
+                "poller.py",
+            }
         if runtime_names != {"manifest.json", "provider", "hindsight"} or (
             hindsight_names != expected_names
         ):
             raise OperationRecoveryError(
                 "exact drain candidate runtime snapshot differs"
             )
-        patch_specs = (
+        patch_specs = [
             (
                 EXACT_DRAIN_CANDIDATE_RESOLVER_PATH,
                 "entity_resolver",
@@ -3141,7 +3446,24 @@ def _verify_exact_drain_candidate_runtime_snapshot(
                 _patch_exact_drain_postgresql_ops,
                 "PostgreSQL ops",
             ),
-        )
+        ]
+        if schema_version == 5:
+            patch_specs.extend(
+                [
+                    (
+                        EXACT_DRAIN_CANDIDATE_MEMORY_ENGINE_PATH,
+                        "memory_engine",
+                        _patch_exact_drain_memory_engine,
+                        "memory engine",
+                    ),
+                    (
+                        EXACT_DRAIN_CANDIDATE_POLLER_PATH,
+                        "poller",
+                        _patch_exact_drain_poller,
+                        "poller",
+                    ),
+                ]
+            )
         candidate_patch_evidence = []
         for relative_path, snapshot_name, patcher, label in patch_specs:
             relative = relative_path.as_posix()
@@ -3666,10 +3988,10 @@ def exact_drain_runtime_evidence(
     provider_runtime_root: str | Path,
     runtime_package_root: str | Path,
     *,
-    schema_version: int = 5,
+    schema_version: int = 6,
 ) -> tuple[str, bytes]:
     """Bind runtime sources and retain prevalidated provider bootstrap bytes."""
-    if type(schema_version) is not int or schema_version not in {1, 2, 3, 4, 5}:
+    if type(schema_version) is not int or schema_version not in {1, 2, 3, 4, 5, 6}:
         raise OperationRecoveryError(
             "exact drain runtime evidence schema version is invalid"
         )
@@ -3751,6 +4073,14 @@ def exact_drain_runtime_evidence(
             sources["phase-repair-contract"] = (
                 EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V3_DIGEST
             )
+        elif schema_version == 6:
+            if snapshot["schema_version"] != 5:
+                raise OperationRecoveryError(
+                    "exact drain failure-evidence repair snapshot is required"
+                )
+            sources["phase-repair-contract"] = (
+                EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V4_DIGEST
+            )
     for name, source in provider_sources.items():
         sources[f"provider/{name}"] = hashlib.sha256(source).hexdigest()
     package_entries = _exact_drain_package_entries(package_root)
@@ -3801,7 +4131,7 @@ def exact_drain_runtime_digest(
     provider_runtime_root: str | Path,
     runtime_package_root: str | Path,
     *,
-    schema_version: int = 5,
+    schema_version: int = 6,
 ) -> str:
     """Bind the worker entrypoint, claim seam, and provider patch sources."""
     runtime_digest, _provider_bootstrap = exact_drain_runtime_evidence(
@@ -3877,14 +4207,14 @@ class ExactDrainClaimAdapter:
         verified = verify_exact_drain_plan(plan, allow_expired=True)
         if (
             terminal_reconciliation
-            and verified.get("schema_version") in {2, 3, 4, 5}
+            and verified.get("schema_version") in {2, 3, 4, 5, 6}
             and terminal_status_evidence is None
         ):
             raise OperationRecoveryError(
                 "operation-recovery terminal status evidence is required"
             )
         self._clock = clock
-        if verified.get("schema_version") in {2, 3, 4, 5}:
+        if verified.get("schema_version") in {2, 3, 4, 5, 6}:
             if authorization is None:
                 raise OperationRecoveryError(
                     "operation-recovery exact drain authorization is required"
@@ -3911,12 +4241,12 @@ class ExactDrainClaimAdapter:
             )
         self.phase_one_timeout_seconds = (
             verified["phase_one_timeout_seconds"]
-            if verified.get("schema_version") in {3, 4, 5}
+            if verified.get("schema_version") in {3, 4, 5, 6}
             else None
         )
         self.phase_one_statement_timeout_seconds = (
             verified["phase_one_statement_timeout_seconds"]
-            if verified.get("schema_version") in {3, 4, 5}
+            if verified.get("schema_version") in {3, 4, 5, 6}
             else None
         )
         self._cleanup_deadline: float | None = None
@@ -4167,6 +4497,32 @@ class ExactDrainClaimAdapter:
                 stage=stage,
             )
 
+    def _record_task_outcome(
+        self,
+        operation_id: str,
+        *,
+        status: str,
+        stage: str,
+        failure: Mapping[str, Any] | None,
+        checkpoint: Mapping[str, Any] | None,
+    ) -> None:
+        if self._progress_recorder is None:
+            return
+        if self._plan.get("progress_schema_version") == 2:
+            self._progress_recorder.task_outcome(
+                operation_id,
+                status=status,
+                stage=stage,
+                failure=failure,
+                checkpoint=checkpoint,
+            )
+            return
+        self._progress_recorder.task_stage(
+            operation_id,
+            status=status,
+            stage=stage,
+        )
+
     def _assert_execution_lease(self) -> None:
         deadline = getattr(self, "_execution_deadline", None)
         if deadline is not None and getattr(self, "_clock", time.time)() >= deadline:
@@ -4276,6 +4632,41 @@ class ExactDrainClaimAdapter:
                 operation_id,
                 stage=safe_stage,
             )
+
+    def record_upstream_failure(
+        self,
+        operation_id: str,
+        *,
+        stage: str,
+        category: str,
+        retryable: bool,
+        error_message: BaseException,
+    ) -> None:
+        """Persist one payload-free runtime cause without changing DB state."""
+        if not isinstance(error_message, BaseException):
+            raise OperationRecoveryError(
+                "operation-recovery exact drain runtime failure is invalid"
+            )
+        if self._progress_recorder is None:
+            return
+        if self._plan.get("progress_schema_version") != 2:
+            self.record_upstream_stage(operation_id, stage)
+            return
+        message = str(error_message)
+        typed_message = (
+            f"{type(error_message).__name__}: {message}"
+            if message
+            else type(error_message).__name__
+        )
+        self._progress_recorder.task_runtime_failure(
+            operation_id,
+            stage=stage,
+            failure=_exact_drain_failure_evidence(
+                typed_message,
+                retryable=retryable,
+                category_override=category,
+            ),
+        )
 
     def claim_committed(self, tasks: Sequence[Any]) -> None:
         """Record task ownership only after the upstream claim transaction commits."""
@@ -4545,11 +4936,14 @@ class ExactDrainClaimAdapter:
                 if self._terminal_reconciliation:
                     self._initial_guard_complete = True
                     return 0
-                rows = await connection.fetch(
-                    """
+                rows = [
+                    _mapping(row)
+                    for row in await connection.fetch(
+                        f"""
                     SELECT operation_id,
                            operation_type,
                            retry_count,
+                           {EXACT_DRAIN_CHECKPOINT_PROJECTION},
                            encode(
                                sha256(convert_to(task_payload::text, 'UTF8')),
                                'hex'
@@ -4562,12 +4956,12 @@ class ExactDrainClaimAdapter:
                       AND task_payload IS NOT NULL
                     ORDER BY operation_id
                     FOR UPDATE
-                    """,
-                    self._identifiers,
-                    self._worker_id,
-                )
-                for row_value in rows:
-                    row = _mapping(row_value)
+                        """,
+                        self._identifiers,
+                        self._worker_id,
+                    )
+                ]
+                for row in rows:
                     item = self._selected.get(str(row["operation_id"]))
                     if (
                         item is None
@@ -4640,10 +5034,21 @@ class ExactDrainClaimAdapter:
                 stage="recovered",
             )
         for identifier in exhausted:
-            self._record_task_stage(
+            row = next(
+                item
+                for item in rows
+                if item["operation_id"] == identifier
+            )
+            self._record_task_outcome(
                 str(identifier),
                 status="failed",
                 stage="retry-ceiling",
+                failure=_exact_drain_failure_evidence(
+                    "operation-recovery exact drain retry ceiling reached",
+                    retryable=False,
+                    category_override="retry_ceiling",
+                ),
+                checkpoint=_exact_drain_checkpoint_evidence(row),
             )
         return len(identifiers)
 
@@ -4791,12 +5196,13 @@ class ExactDrainClaimAdapter:
             async with self._serializable_mutation_transaction(connection):
                 await self._verify_unstarted_state(connection)
                 row_value = await connection.fetchrow(
-                    """
+                    f"""
                     SELECT operation_id::text AS operation_id,
                            operation_type,
                            status,
                            worker_id,
                            retry_count,
+                           {EXACT_DRAIN_CHECKPOINT_PROJECTION},
                            encode(
                                sha256(convert_to(task_payload::text, 'UTF8')),
                                'hex'
@@ -4884,18 +5290,28 @@ class ExactDrainClaimAdapter:
                     )
                 self._started_ids.add(str(identifier))
                 self._initial_guard_complete = True
-        self._record_task_stage(
+        retry_ceiling = row["retry_count"] >= self._max_retries
+        failure_message = (
+            "operation-recovery exact drain retry ceiling reached"
+            if retry_ceiling and error_message is None
+            else error_message
+        )
+        self._record_task_outcome(
             str(identifier),
-            status=(
-                "failed"
-                if row["retry_count"] >= self._max_retries
-                else "pending"
+            status="failed" if retry_ceiling else "pending",
+            stage="retry-ceiling" if retry_ceiling else "retrying",
+            failure=(
+                None
+                if failure_message is None
+                else _exact_drain_failure_evidence(
+                    failure_message,
+                    retryable=not retry_ceiling,
+                    category_override=(
+                        "retry_ceiling" if retry_ceiling else None
+                    ),
+                )
             ),
-            stage=(
-                "retry-ceiling"
-                if row["retry_count"] >= self._max_retries
-                else "retrying"
-            ),
+            checkpoint=_exact_drain_checkpoint_evidence(row),
         )
 
     async def schedule_retry(
@@ -4969,10 +5385,11 @@ class ExactDrainClaimAdapter:
             async with self._serializable_mutation_transaction(connection):
                 await self._verify_unstarted_state(connection)
                 row_value = await connection.fetchrow(
-                    """
+                    f"""
                     SELECT operation_type,
                            status,
                            worker_id,
+                           {EXACT_DRAIN_CHECKPOINT_PROJECTION},
                            encode(
                                sha256(convert_to(task_payload::text, 'UTF8')),
                                'hex'
@@ -5048,10 +5465,19 @@ class ExactDrainClaimAdapter:
                     )
                 self._started_ids.add(str(identifier))
                 self._initial_guard_complete = True
-        self._record_task_stage(
+        self._record_task_outcome(
             str(identifier),
             status=observed_status,
             stage=observed_status,
+            failure=(
+                None
+                if error_message is None
+                else _exact_drain_failure_evidence(
+                    error_message,
+                    retryable=False,
+                )
+            ),
+            checkpoint=_exact_drain_checkpoint_evidence(row),
         )
 
     async def mark_completed(
@@ -6192,7 +6618,7 @@ async def apply_post_abort_recovery_transaction(
             "worker_id IS NOT NULL "
             "AND encode(sha256(convert_to(worker_id, 'UTF8')), 'hex') = $3 "
             "AND claimed_at IS NOT NULL"
-            if verified["schema_version"] == 5
+            if verified["schema_version"] in {5, 6}
             else "worker_id IS NULL AND claimed_at IS NULL"
         )
         result = await connection.execute(

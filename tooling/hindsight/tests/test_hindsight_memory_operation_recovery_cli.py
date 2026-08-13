@@ -1,4 +1,5 @@
 import asyncio
+import ast
 import base64
 from copy import deepcopy
 from dataclasses import replace
@@ -60,10 +61,22 @@ def _copy_patchable_entity_resolver(candidate_library: Path) -> Path:
     shutil.copyfile(source, target)
     target.chmod(0o600)
     ops_source = source.parent / "db" / "ops_postgresql.py"
+    if not ops_source.is_file():
+        raise unittest.SkipTest("hindsight_api PostgreSQL ops source is unavailable")
     ops_target = target.parent / "db" / "ops_postgresql.py"
     ops_target.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
     shutil.copyfile(ops_source, ops_target)
     ops_target.chmod(0o600)
+    for relative in ("engine/memory_engine.py", "worker/poller.py"):
+        source_path = Path(package_spec.origin).parent / relative
+        if not source_path.is_file():
+            raise unittest.SkipTest(
+                f"hindsight_api {relative} source is unavailable"
+            )
+        target_path = candidate_library / "hindsight_api" / relative
+        target_path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        shutil.copyfile(source_path, target_path)
+        target_path.chmod(0o600)
     return target
 
 
@@ -1346,12 +1359,38 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 worker_start_time=start_time,
                 worker_attempt=1,
                 selected_operations=plan["selected_operations"],
+                progress_schema_version=plan.get("progress_schema_version", 1),
                 clock=lambda: 1000.0,
             )
             active_request = recorder.provider_started(
                 "work-codex",
                 retry_attempt=1,
                 scope="retain_extract_facts",
+            )
+            diagnostic_operation = plan["selected_operations"][0]["operation_id"]
+            recorder.task_stage(
+                diagnostic_operation,
+                status="processing",
+                stage="retain.phase1.candidates.fuzzy.1",
+            )
+            recorder.task_outcome(
+                diagnostic_operation,
+                status="pending",
+                stage="retrying",
+                failure={
+                    "category": "phase_one_timeout",
+                    "retryable": True,
+                    "http_status": None,
+                    "error_digest": "e" * 64,
+                },
+                checkpoint={
+                    "facts_committed": True,
+                    "committed_document_count": 1,
+                    "unit_ids_count": 29,
+                    "stage": "storing",
+                    "processed": 14,
+                    "total": 14,
+                },
             )
             captured = {}
             documents = {
@@ -1421,6 +1460,9 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                         "terminal_progress_digest": read_exact_drain_progress(
                             Path(plan["progress_artifact_path"]),
                             plan_digest=plan["plan_digest"],
+                            progress_schema_version=plan.get(
+                                "progress_schema_version", 1
+                            ),
                         )["progress_digest"],
                         "selected_status_counts": {"completed": 43},
                         "outside_nonterminal_counts": [],
@@ -1442,6 +1484,11 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                     active_request,
                     outcome="succeeded",
                 )
+                recorder.task_stage(
+                    diagnostic_operation,
+                    status="processing",
+                    stage="claimed",
+                )
                 for item in plan["selected_operations"]:
                     recorder.task_stage(
                         item["operation_id"],
@@ -1460,6 +1507,9 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                         "terminal_progress_digest": read_exact_drain_progress(
                             Path(plan["progress_artifact_path"]),
                             plan_digest=plan["plan_digest"],
+                            progress_schema_version=plan.get(
+                                "progress_schema_version", 1
+                            ),
                         )["progress_digest"],
                     }
                 )
@@ -1484,7 +1534,35 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
 
         self.assertEqual(result, 0)
         self.assertEqual(captured["status"], "running")
-        self.assertEqual(captured["selected_status_counts"], {"pending": 43})
+        self.assertEqual(
+            captured["selected_status_counts"],
+            {"pending": 42, "retrying": 1},
+        )
+        diagnostic = next(
+            item
+            for item in captured["tasks"]
+            if item["operation_id"] == diagnostic_operation
+        )
+        self.assertEqual(
+            diagnostic["failure"],
+            {
+                "category": "phase_one_timeout",
+                "retryable": True,
+                "http_status": None,
+                "error_digest": "e" * 64,
+            },
+        )
+        self.assertEqual(
+            diagnostic["checkpoint"]["committed_document_count"],
+            1,
+        )
+        self.assertEqual(diagnostic["checkpoint"]["unit_ids_count"], 29)
+        self.assertEqual(diagnostic["checkpoint"]["processed"], 14)
+        self.assertEqual(diagnostic["checkpoint"]["total"], 14)
+        diagnostic_output = json.dumps(captured, sort_keys=True)
+        self.assertNotIn("raw provider response", diagnostic_output)
+        self.assertNotIn("task payload", diagnostic_output)
+        self.assertNotIn("error_message", diagnostic_output)
         self.assertEqual(
             captured["active_provider_requests"][0]["provider_id"],
             "work-codex",
@@ -1715,7 +1793,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                     lambda: "6" * 64
                 ),
                 "_operation_recovery_exact_runtime_digest": (
-                    lambda _args, *, schema_version=4: (
+                    lambda _args, *, schema_version=6: (
                         runtime_schemas.append(schema_version) or "8" * 64
                     )
                 ),
@@ -1753,11 +1831,11 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             self.assertEqual(result["status"], "planned")
             self.assertEqual(result["authority"], "unapproved-plan")
             self.assertEqual(result["selected_operation_count"], 43)
-            self.assertEqual(runtime_schemas, [5])
+            self.assertEqual(runtime_schemas, [6])
             plan, create_only = written[args.output]
             self.assertIs(create_only, True)
             self.assertIs(plan["mutation_authorized"], False)
-            self.assertEqual(plan["schema_version"], 5)
+            self.assertEqual(plan["schema_version"], 6)
             serialized = json.dumps(plan, sort_keys=True)
             self.assertNotIn('"task_payload":', serialized)
             self.assertNotIn('"worker_id":', serialized)
@@ -1884,21 +1962,27 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             try:
                 with self.assertRaisesRegex(
                     Exception,
-                    "query-batch repair snapshot is required",
+            "failure-evidence repair snapshot is required",
                 ):
                     command(args)
             finally:
                 globals_.update(originals)
             self.assertEqual(writes, [])
 
-    def test_post_abort_plan_command_emits_exact_current_v5_subset(self):
+    def test_post_abort_plan_command_emits_exact_current_v6_subset(self):
         command = self.controller[
             "operation_recovery_post_abort_plan_command"
         ]
         globals_ = command.__globals__
         fixtures = recovery_fixtures.OperationRecoveryContractTest()
-        reference = fixtures.drain_plan()
-        snapshot = fixtures.post_abort_v5_snapshot(
+        reference = fixtures.drain_plan(
+            snapshot=fixtures.drain_snapshot(
+                completed_positions={0, 1, 42, 43, 46, 47},
+                observed_at=1_786_390_000,
+            ),
+            created_at=1_786_390_001,
+        )
+        snapshot = fixtures.post_abort_v6_snapshot(
             reference,
             observed_at=int(time.time()),
         )
@@ -1993,7 +2077,9 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                     worker_active
                 ),
                 "read_exact_drain_progress": (
-                    lambda _path, *, plan_digest: dict(progress_value)
+                    lambda _path, *, plan_digest, progress_schema_version=1: dict(
+                        progress_value
+                    )
                 ),
                 "read_pg0_registration": lambda _profile: dict(registration),
                 "write_private": (
@@ -2026,10 +2112,10 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
 
             self.assertEqual(result["status"], "planned")
             self.assertEqual(result["authority"], "unapproved-plan")
-            self.assertEqual(result["selected_operation_count"], 5)
+            self.assertEqual(result["selected_operation_count"], 4)
             plan, create_only = written[args.output]
             self.assertIs(create_only, True)
-            self.assertEqual(plan["schema_version"], 5)
+            self.assertEqual(plan["schema_version"], 6)
             self.assertEqual(
                 plan["reference_application_authorization"],
                 authorization,
@@ -2049,15 +2135,15 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             )
             self.assertEqual(
                 plan["selected_status_counts"],
-                {"failed": 4, "processing": 1},
+                {"failed": 3, "processing": 1},
             )
             self.assertEqual(
                 plan["selected_type_counts"],
-                {"retain": 5},
+                {"retain": 4},
             )
             self.assertEqual(
                 plan["preserved_status_counts"],
-                {"completed": 6, "pending": 37},
+                {"completed": 6, "pending": 38},
             )
             serialized = json.dumps(plan, sort_keys=True)
             self.assertNotIn('"task_payload":', serialized)
@@ -2648,7 +2734,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 )
             )
             self.assertRegex(snapshot["snapshot_digest"], r"^[0-9a-f]{64}$")
-            self.assertEqual(snapshot["schema_version"], 4)
+            self.assertEqual(snapshot["schema_version"], 5)
             patched_resolver = resolver.read_text(encoding="utf-8")
             self.assertNotEqual(resolver.read_bytes(), original_resolver)
             trigram_source = patched_resolver.split(
@@ -2675,7 +2761,83 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             )
             self.assertIn("retain.phase1.cooccurrence", trigram_source)
             self.assertIn("retain.phase1.scoring", trigram_source)
-            self.assertIn("timeout=120.0", trigram_source)
+            self.assertIn("timeout=125.0", trigram_source)
+            memory_engine_source = (
+                site_packages / "hindsight_api" / "engine" / "memory_engine.py"
+            ).read_text(encoding="utf-8")
+            poller_source = (
+                site_packages / "hindsight_api" / "worker" / "poller.py"
+            ).read_text(encoding="utf-8")
+            self.assertIn(
+                "_operation_recovery_http_status(e) == 400",
+                memory_engine_source,
+            )
+            self.assertIn(
+                "_operation_recovery_task_error_message(e)",
+                memory_engine_source,
+            )
+            self.assertIn(
+                "_operation_recovery_task_error_message(e)",
+                poller_source,
+            )
+            memory_tree = ast.parse(memory_engine_source)
+            diagnostic_functions = ast.Module(
+                body=[
+                    node
+                    for node in memory_tree.body
+                    if isinstance(node, ast.FunctionDef)
+                    and node.name
+                    in {
+                        "_operation_recovery_task_error_message",
+                        "_operation_recovery_http_status",
+                        "_is_non_retryable_task_error",
+                    }
+                ],
+                type_ignores=[],
+            )
+            httpx = importlib.import_module("httpx")
+            asyncpg = importlib.import_module("asyncpg")
+            diagnostic_namespace = {
+                "httpx": httpx,
+                "asyncpg": asyncpg,
+                "_is_oracledb_integrity_error": lambda _error: False,
+                "_is_invalid_embedding_dimension_error": lambda _error: False,
+            }
+            exec(
+                compile(
+                    diagnostic_functions,
+                    "candidate-memory-engine-diagnostics",
+                    "exec",
+                ),
+                diagnostic_namespace,
+            )
+            request = httpx.Request("POST", "https://provider.invalid/v1")
+            response = httpx.Response(400, request=request)
+            bad_request = httpx.HTTPStatusError(
+                "provider rejected request",
+                request=request,
+                response=response,
+            )
+            self.assertTrue(
+                diagnostic_namespace["_is_non_retryable_task_error"](
+                    bad_request
+                )
+            )
+            class OpenAIStyleBadRequest(Exception):
+                def __init__(self):
+                    self.response = SimpleNamespace(status_code=400)
+
+            self.assertTrue(
+                diagnostic_namespace["_is_non_retryable_task_error"](
+                    OpenAIStyleBadRequest()
+                )
+            )
+            self.assertEqual(
+                diagnostic_namespace[
+                    "_operation_recovery_task_error_message"
+                ](TimeoutError()),
+                "TimeoutError",
+            )
             candidate_provider_root = (
                 site_packages / "exact_drain_runtime" / "provider"
             )
@@ -2880,7 +3042,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 "exact-drain-candidate-runtime-snapshot",
             )
             self.assertRegex(value["snapshot_digest"], r"^[0-9a-f]{64}$")
-            self.assertEqual(value["schema_version"], 4)
+            self.assertEqual(value["schema_version"], 5)
             self.assertNotIn(str(provider_root), result.stdout)
             verified, sources = (
                 operation_recovery_runtime.
@@ -2962,7 +3124,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                     candidate_library,
                 )
             )
-            self.assertEqual(recovered["schema_version"], 4)
+            self.assertEqual(recovered["schema_version"], 5)
             self.assertNotEqual(resolver.read_bytes(), original)
             with self.assertRaisesRegex(Exception, "already exists"):
                 operation_recovery_runtime.assemble_exact_drain_candidate_runtime_snapshot(
@@ -3026,7 +3188,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                     candidate_library,
                 )
             )
-            self.assertEqual(recovered["schema_version"], 4)
+            self.assertEqual(recovered["schema_version"], 5)
 
     def test_exact_drain_snapshot_failure_boundaries_are_retryable(self):
         for boundary in (
@@ -3186,7 +3348,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                     provider_root,
                     candidate_library,
                 )
-                self.assertEqual(recovered["schema_version"], 4)
+                self.assertEqual(recovered["schema_version"], 5)
                 self.assertNotEqual(resolver.read_bytes(), original)
                 self.assertFalse(
                     (
@@ -3273,7 +3435,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 provider_root,
                 candidate_library,
             )
-            self.assertEqual(recovered["schema_version"], 4)
+            self.assertEqual(recovered["schema_version"], 5)
             self.assertFalse(recovery_path.exists())
 
     def test_exact_drain_recovery_marker_partial_write_is_retryable(self):
@@ -3349,7 +3511,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 provider_root,
                 candidate_library,
             )
-            self.assertEqual(recovered["schema_version"], 4)
+            self.assertEqual(recovered["schema_version"], 5)
             self.assertNotEqual(resolver.read_bytes(), original)
 
     def test_exact_drain_recovery_marker_fault_matrix_is_retryable(self):
@@ -3516,7 +3678,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                         provider_root,
                         candidate_library,
                     )
-                    self.assertEqual(recovered["schema_version"], 4)
+                    self.assertEqual(recovered["schema_version"], 5)
                     self.assertNotEqual(resolver.read_bytes(), original)
 
     def test_exact_drain_recovery_marker_restoration_faults_are_retryable(self):
@@ -3709,7 +3871,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                     provider_root,
                     candidate_library,
                 )
-                self.assertEqual(recovered["schema_version"], 4)
+                self.assertEqual(recovered["schema_version"], 5)
                 self.assertFalse(recovery_path.exists())
 
     def test_exact_drain_phase_repair_preserves_trigram_resolution_behavior(self):
@@ -3781,7 +3943,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                             raise AssertionError("server transaction guard differs")
                         self.execute_calls.append(query)
                     async def fetch(self, query, *arguments, timeout):
-                        if timeout != 120.0:
+                        if timeout != 125.0:
                             raise AssertionError("client deadline differs")
                         if "entity_cooccurrences" in query:
                             if " OR " in query:
@@ -5871,6 +6033,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 worker_start_time=journal_body["worker_start_time"],
                 worker_attempt=journal_body["worker_attempt"],
                 selected_operations=plan["selected_operations"],
+                progress_schema_version=plan.get("progress_schema_version", 1),
                 clock=lambda: float(now),
             )
             for item in plan["selected_operations"]:
@@ -5882,6 +6045,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             terminal_progress_digest = read_exact_drain_progress(
                 Path(plan["progress_artifact_path"]),
                 plan_digest=plan["plan_digest"],
+                progress_schema_version=plan.get("progress_schema_version", 1),
             )["progress_digest"]
             application = make_receipt(
                 {
@@ -7066,6 +7230,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 worker_start_time=journal["worker_start_time"],
                 worker_attempt=1,
                 selected_operations=plan["selected_operations"],
+                progress_schema_version=plan.get("progress_schema_version", 1),
                 clock=lambda: float(now),
             )
             provider_policy_path = root / "providers.json"

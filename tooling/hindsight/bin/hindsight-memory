@@ -7815,7 +7815,7 @@ def _operation_recovery_validate_exact_worker_provider_runtime(
 def _operation_recovery_exact_runtime_digest(
     args: argparse.Namespace,
     *,
-    schema_version: int = 5,
+    schema_version: int = 6,
 ) -> str:
     return exact_drain_runtime_digest(
         args.worker_runtime,
@@ -7827,9 +7827,9 @@ def _operation_recovery_exact_runtime_digest(
 
 def _operation_recovery_exact_phase_repair_snapshot() -> str:
     snapshot, _sources = verify_exact_drain_candidate_runtime_snapshot(LIB)
-    if snapshot.get("schema_version") != 4:
+    if snapshot.get("schema_version") != 5:
         raise OperationRecoveryError(
-            "exact drain query-batch repair snapshot is required"
+            "exact drain failure-evidence repair snapshot is required"
         )
     return snapshot["snapshot_digest"]
 
@@ -7865,7 +7865,7 @@ def operation_recovery_drain_plan_command(args: argparse.Namespace) -> int:
     )
     worker_runtime_digest = _operation_recovery_exact_runtime_digest(
         args,
-        schema_version=5,
+        schema_version=6,
     )
     output_path = Path(args.output)
     artifact_paths = [
@@ -8194,6 +8194,7 @@ def _operation_recovery_post_abort_reference_progress_digest(
     progress = read_exact_drain_progress(
         Path(reference_plan["progress_artifact_path"]),
         plan_digest=reference_plan["plan_digest"],
+        progress_schema_version=reference_plan.get("progress_schema_version", 1),
     )
     expected_tasks = {
         item["operation_id"]: (
@@ -8237,7 +8238,7 @@ def _operation_recovery_post_abort_assert_reference_worker_stopped(
     plan: Mapping[str, Any],
 ) -> None:
     if (
-        plan["schema_version"] in {2, 3, 4, 5}
+        plan["schema_version"] in {2, 3, 4, 5, 6}
         and _operation_recovery_exact_journal_worker_active(
             plan["reference_application_journal"]
         )
@@ -8261,7 +8262,7 @@ def _operation_recovery_post_abort_assert_reference_source_stopped(
         authorization != plan["reference_application_authorization"]
         or journal != plan["reference_application_journal"]
         or (
-            plan["schema_version"] in {3, 4, 5}
+            plan["schema_version"] in {3, 4, 5, 6}
             and _operation_recovery_post_abort_reference_progress_digest(
                 plan["reference_plan"],
                 journal,
@@ -8297,6 +8298,7 @@ def _operation_recovery_exact_next_worker_attempt(
         progress = read_exact_drain_progress(
             progress_path,
             plan_digest=plan["plan_digest"],
+            progress_schema_version=plan.get("progress_schema_version", 1),
         )
         progress_attempt = progress["worker_attempt"]
         if progress_attempt == journal_attempt:
@@ -8321,7 +8323,7 @@ def _operation_recovery_exact_execution_lease_projection(
     *,
     now: int | None = None,
 ) -> Mapping[str, Any]:
-    if plan.get("schema_version") not in {2, 3, 4, 5}:
+    if plan.get("schema_version") not in {2, 3, 4, 5, 6}:
         return {}
     observed_at = int(time.time()) if now is None else now
     if authorization is None:
@@ -8351,7 +8353,7 @@ def _operation_recovery_assert_exact_execution_lease(
     *,
     now: int | None = None,
 ) -> int | None:
-    if plan.get("schema_version") not in {2, 3, 4, 5}:
+    if plan.get("schema_version") not in {2, 3, 4, 5, 6}:
         return None
     observed_at = int(time.time()) if now is None else now
     expires_at = (
@@ -8375,7 +8377,7 @@ def operation_recovery_drain_status_command(args: argparse.Namespace) -> int:
         with manager._lock():
             authorization = (
                 _operation_recovery_exact_authorization(plan)
-                if plan.get("schema_version") in {2, 3, 4, 5}
+                if plan.get("schema_version") in {2, 3, 4, 5, 6}
                 and Path(plan["authorization_receipt_path"]).exists()
                 else None
             )
@@ -8385,7 +8387,7 @@ def operation_recovery_drain_status_command(args: argparse.Namespace) -> int:
             result = {
                 "status": (
                     "authorization-only"
-                    if plan.get("schema_version") in {2, 3, 4, 5}
+                    if plan.get("schema_version") in {2, 3, 4, 5, 6}
                     and authorization is not None
                     else "awaiting-approval"
                 ),
@@ -8729,6 +8731,7 @@ def _operation_recovery_assert_terminal_progress(
     progress = read_exact_drain_progress(
         Path(plan["progress_artifact_path"]),
         plan_digest=plan["plan_digest"],
+        progress_schema_version=plan.get("progress_schema_version", 1),
     )
     expected_tasks = {
         (item["operation_id"], item["operation_type"], item["row_digest"])
@@ -8761,6 +8764,7 @@ def _operation_recovery_read_monitor_progress(
             return read_exact_drain_progress(
                 Path(plan["progress_artifact_path"]),
                 plan_digest=plan["plan_digest"],
+                progress_schema_version=plan.get("progress_schema_version", 1),
             )
         except OperationRecoveryError as error:
             if (
@@ -9273,7 +9277,7 @@ def operation_recovery_drain_apply_command(args: argparse.Namespace) -> int:
                             returncode = process.wait(
                                 timeout=(
                                     plan["transaction_timeout_seconds"]
-                                    if plan.get("schema_version") in {2, 3, 4, 5}
+                                    if plan.get("schema_version") in {2, 3, 4, 5, 6}
                                     else EXACT_DRAIN_TRANSACTION_TIMEOUT_SECONDS
                                 )
                             )
@@ -9355,7 +9359,7 @@ def operation_recovery_drain_monitor_command(args: argparse.Namespace) -> int:
         progress_path.exists()
         or application_path.exists()
         or (
-            plan.get("schema_version") in {2, 3, 4, 5}
+            plan.get("schema_version") in {2, 3, 4, 5, 6}
             and Path(plan["authorization_receipt_path"]).exists()
         )
     ):
@@ -9365,7 +9369,7 @@ def operation_recovery_drain_monitor_command(args: argparse.Namespace) -> int:
             {
                 "status": (
                     "authorization-only"
-                    if plan.get("schema_version") in {2, 3, 4, 5}
+                    if plan.get("schema_version") in {2, 3, 4, 5, 6}
                     and authorization is not None
                     else "not-started"
                 ),
@@ -9615,6 +9619,7 @@ def _operation_recovery_drain_verify_locked(
     progress = read_exact_drain_progress(
         Path(plan["progress_artifact_path"]),
         plan_digest=plan["plan_digest"],
+        progress_schema_version=plan.get("progress_schema_version", 1),
     )
     if progress["progress_digest"] != application["terminal_progress_digest"]:
         raise OperationRecoveryError("exact drain terminal progress differs")

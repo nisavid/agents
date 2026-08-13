@@ -289,7 +289,8 @@ candidate, and writes a canonical payload-free manifest for the provider and
 both original/patched Hindsight sources. The resolver overlay removes unused
 PostgreSQL candidate columns, fetches only the candidate-induced cooccurrence
 graph, emits observational candidate and cooccurrence breadcrumbs, and bounds
-both server and client query waits. Fuzzy candidate lookup is sealed to at
+the server query wait to 120 seconds and the client wait to 125 seconds, so a
+server cancellation can finish before the client deadline. Fuzzy candidate lookup is sealed to at
 most ten candidate names per query, so a large retain cannot concentrate the
 whole candidate set in one PostgreSQL request. The write overlay keeps entity
 insert and reassertion compatible with the bound pre-`entity_kind` database
@@ -309,9 +310,11 @@ material remain external protected data and are never copied into the candidate
 snapshot.
 
 Current exact-drain workers route transport, connection, availability, and
-timeout failures through the plan-bound retry counter. The third retry seals a
-terminal failure; no transient failure bypasses that ceiling or creates an
-unbounded retry loop.
+timeout failures through the plan-bound retry counter. Deterministic provider
+HTTP 400 responses fail immediately instead of consuming the same request
+again. The third transient retry seals a terminal failure; no transient failure
+bypasses that ceiling or creates an unbounded retry loop. Candidate error
+records retain the exception type even when the exception text is empty.
 
 The managed exact-drain worker runtime is a separate trusted authority. For a
 current plan, planning, apply, and the gated child each stream-hash the complete
@@ -363,16 +366,25 @@ categories, prior-attempt evidence, and artifact digests are included. Neither
 command exposes prompts, responses, error text, database URLs, credentials,
 provider secrets, task payloads, or raw worker IDs.
 
+Current progress also records a closed failure category, retryability, optional
+HTTP status, and a digest of the bounded database-safe error. A closed
+checkpoint projection reports only whether facts committed, committed document
+and unit counts, and the last stored stage/counts. These fields let an operator
+distinguish a provider rejection from a Phase 1 timeout and see committed work
+without disclosing entity names, document IDs, payloads, results, or error text.
+Legacy progress remains on its original schema and output contract.
+
 If an exact task cannot persist its terminal state, progress records the closed
-payload-free stage `failure.terminal-state` before requesting worker shutdown.
-If a cancelled task does not quiesce within its plan-bound Phase 1 statement
-timeout, it records `failure.nonquiescent` and leaves the
-claim intact for guarded recovery. Phase 1 cancellation waits for that bounded
-database interval before deciding that release is unsafe. Public graceful
-shutdown retains one polling interval of scheduling grace beyond the same
-bound. External signals stop new claims, cancel the tracked task wrappers, and
-then use that same bounded wait; shutdown never releases a claim while task code
-may still advance.
+stage `failure.terminal-state` and failure category
+`terminal_state_persistence` before requesting worker shutdown. If a cancelled
+task does not quiesce within its plan-bound Phase 1 statement timeout, it records
+`failure.nonquiescent` with category `nonquiescent_shutdown` and leaves the claim
+intact for guarded recovery. Both records retain the last committed checkpoint
+without exposing error text. Phase 1 cancellation waits for that bounded database
+interval before deciding that release is unsafe. Public graceful shutdown retains
+one polling interval of scheduling grace beyond the same bound. External signals
+stop new claims, cancel the tracked task wrappers, and then use that same bounded
+wait; shutdown never releases a claim while task code may still advance.
 
 The legacy launchd label and manifest are migration bindings, not evidence that
 a legacy installation exists. A fresh installation still supplies a distinct

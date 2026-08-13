@@ -21,6 +21,146 @@ from tooling.hindsight.lib.hindsight_memory_control_plane.operation_recovery imp
 
 
 class ExactDrainProgressTest(unittest.TestCase):
+    def test_v2_progress_exposes_only_closed_failure_and_checkpoint_evidence(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+            path = Path(directory) / "exact-drain-progress.json"
+            operation_id = "00000000-0000-4000-8000-000000000001"
+            recorder = ExactDrainProgressRecorder(
+                path=path,
+                plan_digest="a" * 64,
+                worker_pid=1234,
+                worker_start_time="darwin:1000:1",
+                worker_attempt=1,
+                selected_operations=[
+                    {
+                        "operation_id": operation_id,
+                        "operation_type": "retain",
+                        "row_digest": "b" * 64,
+                    }
+                ],
+                progress_schema_version=2,
+                clock=lambda: 1000.0,
+            )
+            recorder.task_stage(
+                operation_id,
+                status="processing",
+                stage="retain.phase1.candidates.fuzzy.2/3",
+            )
+            recorder.task_outcome(
+                operation_id,
+                status="failed",
+                stage="failed",
+                failure={
+                    "category": "phase_one_timeout",
+                    "retryable": False,
+                    "http_status": None,
+                    "error_digest": "c" * 64,
+                },
+                checkpoint={
+                    "facts_committed": True,
+                    "committed_document_count": 1,
+                    "unit_ids_count": 29,
+                    "stage": "storing",
+                    "processed": 14,
+                    "total": 14,
+                },
+            )
+            progress = read_exact_drain_progress(
+                path,
+                plan_digest="a" * 64,
+                progress_schema_version=2,
+                now=1001.0,
+            )
+            raw = path.read_text(encoding="utf-8")
+
+        task = progress["tasks"][0]
+        self.assertEqual(task["failure_stage"], "retain.phase1.candidates.fuzzy.2/3")
+        self.assertEqual(
+            task["failure"],
+            {
+                "category": "phase_one_timeout",
+                "retryable": False,
+                "http_status": None,
+                "error_digest": "c" * 64,
+            },
+        )
+        self.assertTrue(task["checkpoint"]["facts_committed"])
+        self.assertEqual(task["checkpoint"]["committed_document_count"], 1)
+        self.assertEqual(task["checkpoint"]["unit_ids_count"], 29)
+        self.assertEqual(task["checkpoint"]["stage"], "storing")
+        self.assertEqual(task["checkpoint"]["processed"], 14)
+        self.assertEqual(task["checkpoint"]["total"], 14)
+        self.assertRegex(task["checkpoint"]["checkpoint_digest"], r"^[0-9a-f]{64}$")
+        for forbidden in ("raw timeout text", "prompt", "response_body", "credential"):
+            self.assertNotIn(forbidden, raw.lower())
+
+    def test_v2_runtime_failure_preserves_the_last_committed_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+            path = Path(directory) / "exact-drain-progress.json"
+            operation_id = "00000000-0000-4000-8000-000000000001"
+            recorder = ExactDrainProgressRecorder(
+                path=path,
+                plan_digest="a" * 64,
+                worker_pid=1234,
+                worker_start_time="darwin:1000:1",
+                worker_attempt=1,
+                selected_operations=[
+                    {
+                        "operation_id": operation_id,
+                        "operation_type": "retain",
+                        "row_digest": "b" * 64,
+                    }
+                ],
+                progress_schema_version=2,
+                clock=lambda: 1000.0,
+            )
+            recorder.task_stage(
+                operation_id,
+                status="processing",
+                stage="retain.phase2.storing",
+            )
+            recorder.task_outcome(
+                operation_id,
+                status="processing",
+                stage="retain.phase2.committed",
+                failure=None,
+                checkpoint={
+                    "facts_committed": True,
+                    "committed_document_count": 1,
+                    "unit_ids_count": 29,
+                    "stage": "storing",
+                    "processed": 14,
+                    "total": 14,
+                },
+            )
+            recorder.task_runtime_failure(
+                operation_id,
+                stage="failure.terminal-state",
+                failure={
+                    "category": "terminal_state_persistence",
+                    "retryable": False,
+                    "http_status": None,
+                    "error_digest": "c" * 64,
+                },
+            )
+            progress = read_exact_drain_progress(
+                path,
+                plan_digest="a" * 64,
+                progress_schema_version=2,
+                now=1001.0,
+            )
+
+        task = progress["tasks"][0]
+        self.assertEqual(task["status"], "processing")
+        self.assertEqual(task["stage"], "failure.terminal-state")
+        self.assertEqual(task["failure_stage"], "retain.phase2.committed")
+        self.assertEqual(
+            task["failure"]["category"],
+            "terminal_state_persistence",
+        )
+        self.assertTrue(task["checkpoint"]["facts_committed"])
+        self.assertEqual(task["checkpoint"]["processed"], 14)
+
     def test_create_only_commit_survives_post_rename_interruption(self) -> None:
         with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
             path = Path(directory) / "archive.json"

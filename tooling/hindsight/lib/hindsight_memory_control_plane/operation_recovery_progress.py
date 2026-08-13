@@ -43,6 +43,20 @@ SCOPE_CATEGORIES = frozenset(
     {"retain", "consolidation", "reflect", "default"}
 )
 PROVIDER_OUTCOMES = frozenset({"succeeded", "failed", "timed_out"})
+FAILURE_CATEGORIES = frozenset(
+    {
+        "phase_one_timeout",
+        "provider_bad_request",
+        "provider_authentication",
+        "provider_capacity",
+        "provider_transport",
+        "retry_ceiling",
+        "terminal_state_persistence",
+        "nonquiescent_shutdown",
+        "operation_error",
+        "unclassified_empty",
+    }
+)
 
 
 def _sha(value: Any, label: str) -> str:
@@ -82,6 +96,93 @@ def _identifier(value: Any, label: str) -> str:
     if not isinstance(value, str) or IDENTIFIER.fullmatch(value) is None:
         raise OperationRecoveryError(f"{label} is invalid")
     return value
+
+
+def _validated_failure(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    keys = {"category", "retryable", "http_status", "error_digest"}
+    if not isinstance(value, Mapping) or set(value) != keys:
+        raise OperationRecoveryError("exact drain failure evidence is invalid")
+    category = value.get("category")
+    retryable = value.get("retryable")
+    http_status = value.get("http_status")
+    if (
+        category not in FAILURE_CATEGORIES
+        or type(retryable) is not bool
+        or (
+            http_status is not None
+            and (type(http_status) is not int or not 400 <= http_status <= 599)
+        )
+    ):
+        raise OperationRecoveryError("exact drain failure evidence is invalid")
+    return {
+        "category": category,
+        "retryable": retryable,
+        "http_status": http_status,
+        "error_digest": _sha(
+            value.get("error_digest"),
+            "exact drain failure error digest",
+        ),
+    }
+
+
+def _validated_checkpoint(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    body_keys = {
+        "facts_committed",
+        "committed_document_count",
+        "unit_ids_count",
+        "stage",
+        "processed",
+        "total",
+    }
+    if not isinstance(value, Mapping) or frozenset(value) not in {
+        frozenset(body_keys),
+        frozenset(body_keys | {"checkpoint_digest"}),
+    }:
+        raise OperationRecoveryError("exact drain checkpoint evidence is invalid")
+    stage = value.get("stage")
+    if (
+        type(value.get("facts_committed")) is not bool
+        or not isinstance(stage, str)
+        or STAGE.fullmatch(stage) is None
+    ):
+        raise OperationRecoveryError("exact drain checkpoint evidence is invalid")
+    body = {
+        "facts_committed": value["facts_committed"],
+        "committed_document_count": _count(
+            value.get("committed_document_count"),
+            "exact drain committed document count",
+        ),
+        "unit_ids_count": _count(
+            value.get("unit_ids_count"),
+            "exact drain committed unit count",
+        ),
+        "stage": stage,
+        "processed": _count(
+            value.get("processed"),
+            "exact drain checkpoint processed count",
+        ),
+        "total": _count(
+            value.get("total"),
+            "exact drain checkpoint total count",
+        ),
+    }
+    if body["processed"] > body["total"]:
+        raise OperationRecoveryError("exact drain checkpoint evidence is invalid")
+    checkpoint_digest = digest(body)
+    if (
+        "checkpoint_digest" in value
+        and _sha(
+            value.get("checkpoint_digest"),
+            "exact drain checkpoint digest",
+        )
+        != checkpoint_digest
+    ):
+        raise OperationRecoveryError("exact drain checkpoint digest differs")
+    return {**body, "checkpoint_digest": checkpoint_digest}
 
 
 def _trusted_parent(path: Path) -> None:
@@ -263,6 +364,7 @@ class ExactDrainProgressRecorder:
         selected_operations: Sequence[Mapping[str, Any]],
         prior_attempts: Sequence[Mapping[str, Any]] = (),
         initial_tasks: Sequence[Mapping[str, Any]] | None = None,
+        progress_schema_version: int = 1,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self.path = path
@@ -276,6 +378,11 @@ class ExactDrainProgressRecorder:
         self.worker_pid = worker_pid
         self.worker_start_time = worker_start_time
         self.worker_attempt = worker_attempt
+        if progress_schema_version not in {1, 2}:
+            raise OperationRecoveryError(
+                "exact drain progress schema version is invalid"
+            )
+        self.progress_schema_version = progress_schema_version
         self._clock = clock
         self._lock = threading.RLock()
         self._sequence = 0
@@ -318,6 +425,15 @@ class ExactDrainProgressRecorder:
                 "total_started_at": started_at,
                 "stage_started_at": started_at,
                 "last_progress_at": started_at,
+                **(
+                    {}
+                    if progress_schema_version == 1
+                    else {
+                        "failure_stage": None,
+                        "failure": None,
+                        "checkpoint": None,
+                    }
+                ),
             }
             previous = initial_by_id.get(operation_id)
             if previous is not None:
@@ -335,6 +451,12 @@ class ExactDrainProgressRecorder:
                     stage_started_at=previous["stage_started_at"],
                     last_progress_at=previous["last_progress_at"],
                 )
+                if progress_schema_version == 2:
+                    task.update(
+                        failure_stage=previous["failure_stage"],
+                        failure=previous["failure"],
+                        checkpoint=previous["checkpoint"],
+                    )
             self._tasks[operation_id] = task
         if set(initial_by_id) - set(self._tasks):
             raise OperationRecoveryError("exact drain prior task set differs")
@@ -388,7 +510,7 @@ class ExactDrainProgressRecorder:
             )
             counts[summary_status] = counts.get(summary_status, 0) + 1
         return {
-            "schema_version": 1,
+            "schema_version": self.progress_schema_version,
             "kind": "operation-recovery-exact-drain-progress",
             "plan_digest": self.plan_digest,
             "worker_pid": self.worker_pid,
@@ -470,6 +592,108 @@ class ExactDrainProgressRecorder:
             )
             self._last_progress_at = now
             self._persist(now)
+
+    def task_outcome(
+        self,
+        operation_id: str,
+        *,
+        status: str,
+        stage: str,
+        failure: Mapping[str, Any] | None,
+        checkpoint: Mapping[str, Any] | None,
+    ) -> None:
+        """Persist one closed failure/checkpoint projection without raw content."""
+        if self.progress_schema_version != 2:
+            raise OperationRecoveryError(
+                "exact drain failure evidence schema is unavailable"
+            )
+        if (
+            status not in TASK_STATUSES
+            or not isinstance(stage, str)
+            or STAGE.fullmatch(stage) is None
+        ):
+            raise OperationRecoveryError(
+                "exact drain progress task outcome is invalid"
+            )
+        checked_failure = _validated_failure(failure)
+        checked_checkpoint = _validated_checkpoint(checkpoint)
+        with self._lock:
+            task = self._tasks.get(operation_id)
+            if task is None:
+                raise OperationRecoveryError(
+                    "exact drain progress task is outside plan"
+                )
+            failure_stage = task["stage"] if checked_failure is not None else None
+            prior_task = dict(task)
+            prior_observed_at = self._observed_at
+            prior_last_progress_at = self._last_progress_at
+            now = self._now()
+            task.update(
+                status=status,
+                stage=stage,
+                stage_started_at=now,
+                last_progress_at=now,
+                failure_stage=failure_stage,
+                failure=checked_failure,
+                checkpoint=checked_checkpoint,
+            )
+            self._last_progress_at = now
+            try:
+                self._persist(now)
+            except BaseException:
+                task.clear()
+                task.update(prior_task)
+                self._observed_at = prior_observed_at
+                self._last_progress_at = prior_last_progress_at
+                raise
+
+    def task_runtime_failure(
+        self,
+        operation_id: str,
+        *,
+        stage: str,
+        failure: Mapping[str, Any],
+    ) -> None:
+        """Record a worker/runtime failure while preserving DB checkpoint evidence."""
+        if self.progress_schema_version != 2:
+            raise OperationRecoveryError(
+                "exact drain failure evidence schema is unavailable"
+            )
+        if not isinstance(stage, str) or STAGE.fullmatch(stage) is None:
+            raise OperationRecoveryError(
+                "exact drain progress runtime failure is invalid"
+            )
+        checked_failure = _validated_failure(failure)
+        if checked_failure is None:
+            raise OperationRecoveryError(
+                "exact drain progress runtime failure is invalid"
+            )
+        with self._lock:
+            task = self._tasks.get(operation_id)
+            if task is None or task["status"] != "processing":
+                raise OperationRecoveryError(
+                    "exact drain progress runtime failure is invalid"
+                )
+            prior_task = dict(task)
+            prior_observed_at = self._observed_at
+            prior_last_progress_at = self._last_progress_at
+            now = self._now()
+            task.update(
+                stage=stage,
+                stage_started_at=now,
+                last_progress_at=now,
+                failure_stage=task["stage"],
+                failure=checked_failure,
+            )
+            self._last_progress_at = now
+            try:
+                self._persist(now)
+            except BaseException:
+                task.clear()
+                task.update(prior_task)
+                self._observed_at = prior_observed_at
+                self._last_progress_at = prior_last_progress_at
+                raise
 
     def provider_started(
         self,
@@ -672,6 +896,9 @@ def create_exact_drain_progress_recorder(
         previous = _validated_progress(
             _read_private(progress_path),
             plan["plan_digest"],
+            progress_schema_version=(
+                plan.get("progress_schema_version", 1)
+            ),
         )
         if previous["worker_attempt"] != worker_attempt - 1:
             raise OperationRecoveryError(
@@ -707,6 +934,9 @@ def create_exact_drain_progress_recorder(
             archived = _validated_progress(
                 _read_private(archive_path),
                 plan["plan_digest"],
+                progress_schema_version=(
+                    plan.get("progress_schema_version", 1)
+                ),
             )
             if archived["progress_digest"] != previous["progress_digest"]:
                 raise OperationRecoveryError(
@@ -724,11 +954,17 @@ def create_exact_drain_progress_recorder(
         selected_operations=plan["selected_operations"],
         prior_attempts=prior_attempts,
         initial_tasks=initial_tasks,
+        progress_schema_version=plan.get("progress_schema_version", 1),
         clock=clock,
     )
 
 
-def _validated_progress(value: Mapping[str, Any], plan_digest: str) -> dict[str, Any]:
+def _validated_progress(
+    value: Mapping[str, Any],
+    plan_digest: str,
+    *,
+    progress_schema_version: int = 1,
+) -> dict[str, Any]:
     expected_keys = {
         "schema_version",
         "kind",
@@ -749,7 +985,8 @@ def _validated_progress(value: Mapping[str, Any], plan_digest: str) -> dict[str,
     }
     if (
         set(value) != expected_keys
-        or value.get("schema_version") != 1
+        or value.get("schema_version") != progress_schema_version
+        or progress_schema_version not in {1, 2}
         or value.get("kind") != "operation-recovery-exact-drain-progress"
         or value.get("plan_digest") != _sha(plan_digest, "exact drain plan digest")
     ):
@@ -804,6 +1041,8 @@ def _validated_progress(value: Mapping[str, Any], plan_digest: str) -> dict[str,
         "stage_started_at",
         "last_progress_at",
     }
+    if progress_schema_version == 2:
+        task_keys |= {"failure_stage", "failure", "checkpoint"}
     tasks = result.get("tasks")
     if not isinstance(tasks, list):
         raise OperationRecoveryError("exact drain progress tasks are invalid")
@@ -828,6 +1067,23 @@ def _validated_progress(value: Mapping[str, Any], plan_digest: str) -> dict[str,
             raise OperationRecoveryError("exact drain progress task is invalid")
         if not isinstance(stage, str) or STAGE.fullmatch(stage) is None:
             raise OperationRecoveryError("exact drain progress task stage is invalid")
+        if progress_schema_version == 2:
+            failure_stage = item.get("failure_stage")
+            failure = _validated_failure(item.get("failure"))
+            _validated_checkpoint(item.get("checkpoint"))
+            if (
+                (failure is None) != (failure_stage is None)
+                or (
+                    failure_stage is not None
+                    and (
+                        not isinstance(failure_stage, str)
+                        or STAGE.fullmatch(failure_stage) is None
+                    )
+                )
+            ):
+                raise OperationRecoveryError(
+                    "exact drain progress failure evidence is invalid"
+                )
         total_started_at = _timestamp(
             item.get("total_started_at"), "exact drain task start"
         )
@@ -964,9 +1220,14 @@ def read_exact_drain_progress(
     path: Path,
     *,
     plan_digest: str,
+    progress_schema_version: int = 1,
     now: float | None = None,
 ) -> Mapping[str, Any]:
-    value = _validated_progress(_read_private(path), plan_digest)
+    value = _validated_progress(
+        _read_private(path),
+        plan_digest,
+        progress_schema_version=progress_schema_version,
+    )
     progress_digest = value["progress_digest"]
     observed_now = float(time.time() if now is None else now)
     prior_attempts = []
@@ -978,6 +1239,7 @@ def read_exact_drain_progress(
         archived = _validated_progress(
             _read_private(archive_path),
             plan_digest,
+            progress_schema_version=progress_schema_version,
         )
         if (
             archived["worker_attempt"] != reference["worker_attempt"]

@@ -27,6 +27,7 @@ LIB = ROOT / "lib"
 if str(LIB) not in sys.path:
     sys.path.insert(0, str(LIB))
 
+from hindsight_memory_control_plane import operation_recovery_runtime  # noqa: E402
 from hindsight_memory_control_plane.operation_recovery_runtime import (  # noqa: E402
     GLOBAL_QUEUE_BLOCKER_QUERY,
     QUEUE_BLOCKER_GUARD_CONTRACT_DIGEST,
@@ -716,6 +717,207 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
             statements[0],
             "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
         )
+
+    def test_terminal_failure_records_closed_cause_and_committed_checkpoint(self):
+        adapter = self._current_exact_drain_adapter()
+        adapter._plan = {**adapter._plan, "progress_schema_version": 2}
+        operation_id, selected = next(iter(adapter._selected.items()))
+        adapter._started_ids.add(operation_id)
+        adapter._verify_unstarted_state = AsyncMock()
+        adapter._configure_mutation_transaction = AsyncMock()
+        outcomes = []
+
+        class Recorder:
+            def task_stage(self, *arguments, **keywords):
+                outcomes.append(("legacy", arguments, keywords))
+
+            def task_outcome(self, *arguments, **keywords):
+                outcomes.append(("outcome", arguments, keywords))
+
+        adapter._progress_recorder = Recorder()
+        row = {
+            "operation_type": selected["operation_type"],
+            "status": "processing",
+            "worker_id": adapter._worker_id,
+            "task_payload_digest": selected["task_payload_digest"],
+            "checkpoint_facts_committed": True,
+            "checkpoint_committed_document_count": 1,
+            "checkpoint_unit_ids_count": 29,
+            "checkpoint_stage": "storing",
+            "checkpoint_processed": 14,
+            "checkpoint_total": 14,
+        }
+
+        class Transaction:
+            async def __aenter__(self):
+                return None
+
+            async def __aexit__(self, *_arguments):
+                return None
+
+        class Connection:
+            def transaction(self):
+                return Transaction()
+
+            async def fetchrow(self, *_arguments):
+                return dict(row)
+
+            async def execute(self, statement, *_arguments):
+                if "UPDATE public.async_operations" in statement:
+                    row["status"] = "failed"
+                    return "UPDATE 1"
+                return "SET"
+
+        class Context:
+            async def __aenter__(self):
+                return Connection()
+
+            async def __aexit__(self, *_arguments):
+                return None
+
+        class Backend:
+            def acquire(self):
+                return Context()
+
+        asyncio.run(
+            adapter.mark_failed(
+                Backend(),
+                operation_id,
+                "TimeoutError",
+                "public",
+            )
+        )
+
+        self.assertEqual(len(outcomes), 1)
+        kind, arguments, evidence = outcomes[0]
+        self.assertEqual(kind, "outcome")
+        self.assertEqual(arguments, (operation_id,))
+        self.assertEqual(evidence["status"], "failed")
+        self.assertEqual(evidence["stage"], "failed")
+        self.assertEqual(
+            evidence["failure"],
+            {
+                "category": "phase_one_timeout",
+                "retryable": False,
+                "http_status": None,
+                "error_digest": hashlib.sha256(b"TimeoutError").hexdigest(),
+            },
+        )
+        self.assertEqual(
+            evidence["checkpoint"],
+            {
+                "facts_committed": True,
+                "committed_document_count": 1,
+                "unit_ids_count": 29,
+                "stage": "storing",
+                "processed": 14,
+                "total": 14,
+            },
+        )
+
+    def test_failure_evidence_classifies_provider_bad_request_without_url_port(self):
+        classify = operation_recovery_runtime._exact_drain_failure_evidence
+        bad_request = classify(
+            "Client error '400 Bad Request' for url 'https://api.example/v1'",
+            retryable=False,
+        )
+        transport = classify(
+            "ConnectError for url 'https://api.example:443/v1'",
+            retryable=True,
+        )
+        openai_bad_request = classify(
+            "BadRequestError: Error code: 400 - invalid request",
+            retryable=False,
+        )
+
+        self.assertEqual(bad_request["category"], "provider_bad_request")
+        self.assertEqual(bad_request["http_status"], 400)
+        self.assertIs(bad_request["retryable"], False)
+        self.assertEqual(transport["category"], "provider_transport")
+        self.assertIsNone(transport["http_status"])
+        self.assertIs(transport["retryable"], True)
+        self.assertEqual(
+            openai_bad_request["category"],
+            "provider_bad_request",
+        )
+        self.assertEqual(openai_bad_request["http_status"], 400)
+
+    def test_retry_ceiling_records_the_terminal_disposition(self):
+        adapter = self._current_exact_drain_adapter()
+        adapter._plan = {**adapter._plan, "progress_schema_version": 2}
+        operation_id, selected = next(iter(adapter._selected.items()))
+        adapter._started_ids.add(operation_id)
+        adapter._verify_unstarted_state = AsyncMock()
+        adapter._configure_mutation_transaction = AsyncMock()
+        outcomes = []
+
+        class Recorder:
+            def task_outcome(self, *arguments, **keywords):
+                outcomes.append((arguments, keywords))
+
+        adapter._progress_recorder = Recorder()
+        row = {
+            "operation_type": selected["operation_type"],
+            "status": "processing",
+            "worker_id": adapter._worker_id,
+            "retry_count": adapter._max_retries,
+            "task_payload_digest": selected["task_payload_digest"],
+            "checkpoint_facts_committed": False,
+            "checkpoint_committed_document_count": 0,
+            "checkpoint_unit_ids_count": 0,
+            "checkpoint_stage": "unavailable",
+            "checkpoint_processed": 0,
+            "checkpoint_total": 0,
+        }
+
+        class Transaction:
+            async def __aenter__(self):
+                return None
+
+            async def __aexit__(self, *_arguments):
+                return None
+
+        class Connection:
+            def transaction(self):
+                return Transaction()
+
+            async def fetchrow(self, *_arguments):
+                return dict(row)
+
+            async def execute(self, statement, *_arguments):
+                if "UPDATE public.async_operations" in statement:
+                    row["status"] = "failed"
+                    return "UPDATE 1"
+                return "SET"
+
+        class Context:
+            async def __aenter__(self):
+                return Connection()
+
+            async def __aexit__(self, *_arguments):
+                return None
+
+        class Backend:
+            def acquire(self):
+                return Context()
+
+        asyncio.run(
+            adapter.schedule_retry(
+                Backend(),
+                operation_id,
+                None,
+                "ConnectError: provider unavailable",
+                "public",
+            )
+        )
+
+        self.assertEqual(len(outcomes), 1)
+        arguments, evidence = outcomes[0]
+        self.assertEqual(arguments, (operation_id,))
+        self.assertEqual(evidence["status"], "failed")
+        self.assertEqual(evidence["stage"], "retry-ceiling")
+        self.assertEqual(evidence["failure"]["category"], "retry_ceiling")
+        self.assertIs(evidence["failure"]["retryable"], False)
 
     def test_closed_control_connection_never_falls_back_to_worker_pool(self):
         adapter = self._current_exact_drain_adapter()
@@ -1488,6 +1690,27 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
                     ):
                         _events.append(("stage", operation_id, stage))
 
+                    def record_upstream_failure(
+                        self,
+                        operation_id,
+                        *,
+                        stage,
+                        category,
+                        retryable,
+                        error_message,
+                        _events=events,
+                    ):
+                        _events.append(
+                            (
+                                "failure",
+                                operation_id,
+                                stage,
+                                category,
+                                retryable,
+                                type(error_message).__name__,
+                            )
+                        )
+
                     async def mark_completed(
                         self,
                         _backend,
@@ -1668,9 +1891,12 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
                 )
                 self.assertIn(
                     (
-                        "stage",
+                        "failure",
                         "operation-a",
                         "failure.terminal-state",
+                        "terminal_state_persistence",
+                        False,
+                        "RuntimeError",
                     ),
                     events,
                 )
@@ -2355,12 +2581,32 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
     def test_phase_one_timeout_never_releases_before_task_quiescence(self):
         release_calls = []
         stages = []
+        failures = []
 
         class Adapter(_ControlConnectionAdapterMixin):
             phase_one_timeout_seconds = 0.001
 
             def record_upstream_stage(self, operation_id, stage):
                 stages.append((operation_id, stage))
+
+            def record_upstream_failure(
+                self,
+                operation_id,
+                *,
+                stage,
+                category,
+                retryable,
+                error_message,
+            ):
+                failures.append(
+                    (
+                        operation_id,
+                        stage,
+                        category,
+                        retryable,
+                        type(error_message).__name__,
+                    )
+                )
 
             async def release_own_tasks(self, _backend):
                 release_calls.append(True)
@@ -2435,9 +2681,17 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
 
             asyncio.run(exercise())
             self.assertEqual(release_calls, ["shutdown"])
-            self.assertIn(
-                ("operation-1", "failure.nonquiescent"),
-                stages,
+            self.assertEqual(
+                failures,
+                [
+                    (
+                        "operation-1",
+                        "failure.nonquiescent",
+                        "nonquiescent_shutdown",
+                        False,
+                        "OperationRecoveryError",
+                    )
+                ],
             )
         finally:
             guard_globals["EXACT_DRAIN_TASK_CANCELLATION_TIMEOUT_SECONDS"] = (

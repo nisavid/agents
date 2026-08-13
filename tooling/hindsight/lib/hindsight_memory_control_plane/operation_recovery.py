@@ -63,6 +63,16 @@ EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V2 = {
 EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V2_DIGEST = digest(
     EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V2
 )
+EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V3 = {
+    **EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V2,
+    "schema_version": 3,
+    "candidate_runtime_snapshot_schema_version": 4,
+    "fuzzy_candidate_query_batch_size": 10,
+    "transient_failure_disposition": "plan-bounded-retry",
+}
+EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V3_DIGEST = digest(
+    EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V3
+)
 POST_ABORT_PLAN_LIFETIME_SECONDS = 86_400
 POST_ABORT_EVIDENCE_MAX_AGE_SECONDS = 3_600
 POST_ABORT_TRANSACTION_TIMEOUT_SECONDS = 120
@@ -82,6 +92,37 @@ POST_ABORT_V4_SELECTED_STATUS_COUNTS = {"processing": 2}
 POST_ABORT_V4_SELECTED_TYPE_COUNTS = {"consolidation": 1, "retain": 1}
 POST_ABORT_V4_SELECTED_RETRY_COUNTS = {"consolidation": 3, "retain": 0}
 POST_ABORT_V4_PRESERVED_STATUS_COUNTS = {"completed": 5, "pending": 41}
+POST_ABORT_V5_SELECTED_STATUS_COUNTS = {"failed": 4, "processing": 1}
+POST_ABORT_V5_SELECTED_TYPE_COUNTS = {"retain": 5}
+POST_ABORT_V5_FAILED_RETRY_COUNTS = (0, 2, 2, 3)
+POST_ABORT_V5_PRESERVED_STATUS_COUNTS = {"completed": 6, "pending": 37}
+POST_ABORT_CONTRACTS = {
+    1: (
+        POST_ABORT_SELECTED_STATUS_COUNTS,
+        POST_ABORT_SELECTED_TYPE_COUNTS,
+        POST_ABORT_PRESERVED_STATUS_COUNTS,
+    ),
+    2: (
+        POST_ABORT_V2_SELECTED_STATUS_COUNTS,
+        POST_ABORT_V2_SELECTED_TYPE_COUNTS,
+        POST_ABORT_V2_PRESERVED_STATUS_COUNTS,
+    ),
+    3: (
+        POST_ABORT_V3_SELECTED_STATUS_COUNTS,
+        POST_ABORT_V3_SELECTED_TYPE_COUNTS,
+        POST_ABORT_V3_PRESERVED_STATUS_COUNTS,
+    ),
+    4: (
+        POST_ABORT_V4_SELECTED_STATUS_COUNTS,
+        POST_ABORT_V4_SELECTED_TYPE_COUNTS,
+        POST_ABORT_V4_PRESERVED_STATUS_COUNTS,
+    ),
+    5: (
+        POST_ABORT_V5_SELECTED_STATUS_COUNTS,
+        POST_ABORT_V5_SELECTED_TYPE_COUNTS,
+        POST_ABORT_V5_PRESERVED_STATUS_COUNTS,
+    ),
+}
 OPERATION_STATUSES = (
     "pending",
     "processing",
@@ -377,6 +418,7 @@ EXACT_DRAIN_PLAN_V3_KEYS = EXACT_DRAIN_PLAN_V2_KEYS | frozenset(
     }
 )
 EXACT_DRAIN_PLAN_V4_KEYS = EXACT_DRAIN_PLAN_V3_KEYS
+EXACT_DRAIN_PLAN_V5_KEYS = EXACT_DRAIN_PLAN_V4_KEYS
 POST_ABORT_PLAN_V1_KEYS = frozenset(
     {
         "schema_version",
@@ -427,6 +469,7 @@ POST_ABORT_PLAN_V3_KEYS = POST_ABORT_PLAN_V2_KEYS | frozenset(
     {"reference_application_progress_digest"}
 )
 POST_ABORT_PLAN_V4_KEYS = POST_ABORT_PLAN_V3_KEYS
+POST_ABORT_PLAN_V5_KEYS = POST_ABORT_PLAN_V4_KEYS
 POST_ABORT_REFERENCE_JOURNAL_KEYS = frozenset(
     {
         "schema_version",
@@ -2021,7 +2064,7 @@ def create_exact_drain_plan(
             "operation-recovery exact drain evidence is stale"
         )
     body = {
-        "schema_version": 4,
+        "schema_version": 5,
         "kind": "operation-recovery-exact-drain-plan",
         "action": "drain-exact-operation-cohort",
         "authority": "unapproved-plan",
@@ -2066,7 +2109,7 @@ def create_exact_drain_plan(
         ),
         "phase_one_timeout_seconds": EXACT_DRAIN_PHASE_ONE_TIMEOUT_SECONDS,
         "phase_repair_contract_digest": (
-            EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V2_DIGEST
+            EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V3_DIGEST
         ),
         "created_at": planned_at,
         "expires_at": planned_at + EXACT_DRAIN_APPROVAL_LIFETIME_SECONDS,
@@ -2086,7 +2129,7 @@ def verify_exact_drain_plan(
             "operation-recovery exact drain plan is invalid"
         )
     schema_version = normalized.get("schema_version")
-    if type(schema_version) is not int or schema_version not in {1, 2, 3, 4}:
+    if type(schema_version) is not int or schema_version not in {1, 2, 3, 4, 5}:
         raise OperationRecoveryError(
             "operation-recovery exact drain plan is invalid"
         )
@@ -2097,6 +2140,7 @@ def verify_exact_drain_plan(
             2: EXACT_DRAIN_PLAN_V2_KEYS,
             3: EXACT_DRAIN_PLAN_V3_KEYS,
             4: EXACT_DRAIN_PLAN_V4_KEYS,
+            5: EXACT_DRAIN_PLAN_V5_KEYS,
         }[schema_version],
         "operation-recovery exact drain plan",
     )
@@ -2161,7 +2205,7 @@ def verify_exact_drain_plan(
     )
     if not allow_expired and observed_at >= expires_at:
         raise OperationRecoveryError("operation-recovery exact drain plan expired")
-    if schema_version in {2, 3, 4}:
+    if schema_version in {2, 3, 4, 5}:
         evidence_observed_at = _integer(
             plan["evidence_observed_at"],
             "exact drain evidence observed-at",
@@ -2183,7 +2227,7 @@ def verify_exact_drain_plan(
         evidence_max_age_seconds = None
         transaction_timeout_seconds = None
         execution_lease_seconds = None
-    if schema_version in {3, 4}:
+    if schema_version in {3, 4, 5}:
         phase_one_statement_timeout_seconds = _integer(
             plan["phase_one_statement_timeout_seconds"],
             "exact drain phase-one statement timeout",
@@ -2244,7 +2288,7 @@ def verify_exact_drain_plan(
         )
     )
     if (
-        schema_version not in {1, 2, 3, 4}
+        schema_version not in {1, 2, 3, 4, 5}
         or plan.get("kind") != "operation-recovery-exact-drain-plan"
         or plan.get("action") != "drain-exact-operation-cohort"
         or plan.get("authority") != "unapproved-plan"
@@ -2297,7 +2341,7 @@ def verify_exact_drain_plan(
             else EXACT_DRAIN_APPROVAL_LIFETIME_SECONDS
         )
         or (
-            schema_version in {2, 3, 4}
+            schema_version in {2, 3, 4, 5}
             and (
                 evidence_observed_at != snapshot["observed_at"]
                 or evidence_max_age_seconds
@@ -2312,7 +2356,7 @@ def verify_exact_drain_plan(
             )
         )
         or (
-            schema_version in {3, 4}
+            schema_version in {3, 4, 5}
             and (
                 phase_one_statement_timeout_seconds
                 != EXACT_DRAIN_PHASE_ONE_STATEMENT_TIMEOUT_SECONDS
@@ -2320,9 +2364,11 @@ def verify_exact_drain_plan(
                 != EXACT_DRAIN_PHASE_ONE_TIMEOUT_SECONDS
                 or phase_repair_contract_digest
                 != (
-                    EXACT_DRAIN_PHASE_REPAIR_CONTRACT_DIGEST
-                    if schema_version == 3
-                    else EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V2_DIGEST
+                    {
+                        3: EXACT_DRAIN_PHASE_REPAIR_CONTRACT_DIGEST,
+                        4: EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V2_DIGEST,
+                        5: EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V3_DIGEST,
+                    }[schema_version]
                 )
             )
         )
@@ -2397,7 +2443,7 @@ def verify_exact_drain_plan(
         ),
         **(
             {}
-            if schema_version not in {3, 4}
+            if schema_version not in {3, 4, 5}
             else {
                 "phase_one_statement_timeout_seconds": (
                     phase_one_statement_timeout_seconds
@@ -2544,6 +2590,22 @@ def _post_abort_type_counts(
     }
 
 
+def _post_abort_v5_completed_selected_matches(
+    item: Mapping[str, Any],
+) -> bool:
+    return (
+        item["current_status"] == "completed"
+        and item["operation_type"] == "consolidation"
+        and item["retry_count"] == 3
+        and not item["worker_id_present"]
+        and item["worker_id_digest"] is None
+        and item["claimed_at"] is None
+        and item["completed_at"] is not None
+        and item["error_category"] == "none"
+        and item["error_digest"] is None
+    )
+
+
 def _post_abort_contract(
     reference_plan: Mapping[str, Any],
     snapshot: Mapping[str, Any],
@@ -2598,45 +2660,16 @@ def _post_abort_contract(
         for status in ("completed", "pending")
         if snapshot["status_counts"].get(status, 0)
     }
-    expected_status_counts = (
-        POST_ABORT_SELECTED_STATUS_COUNTS
-        if schema_version == 1
-        else (
-            POST_ABORT_V2_SELECTED_STATUS_COUNTS
-            if schema_version == 2
-            else (
-                POST_ABORT_V3_SELECTED_STATUS_COUNTS
-                if schema_version == 3
-                else POST_ABORT_V4_SELECTED_STATUS_COUNTS
-            )
-        )
-    )
-    expected_type_counts = (
-        POST_ABORT_SELECTED_TYPE_COUNTS
-        if schema_version == 1
-        else (
-            POST_ABORT_V2_SELECTED_TYPE_COUNTS
-            if schema_version == 2
-            else (
-                POST_ABORT_V3_SELECTED_TYPE_COUNTS
-                if schema_version == 3
-                else POST_ABORT_V4_SELECTED_TYPE_COUNTS
-            )
-        )
-    )
-    expected_preserved_status_counts = (
-        POST_ABORT_PRESERVED_STATUS_COUNTS
-        if schema_version == 1
-        else (
-            POST_ABORT_V2_PRESERVED_STATUS_COUNTS
-            if schema_version == 2
-            else (
-                POST_ABORT_V3_PRESERVED_STATUS_COUNTS
-                if schema_version == 3
-                else POST_ABORT_V4_PRESERVED_STATUS_COUNTS
-            )
-        )
-    )
+    try:
+        (
+            expected_status_counts,
+            expected_type_counts,
+            expected_preserved_status_counts,
+        ) = POST_ABORT_CONTRACTS[schema_version]
+    except KeyError as error:
+        raise OperationRecoveryError(
+            "operation-recovery post-abort schema is invalid"
+        ) from error
     if (
         reference_plan["selected_operation_count"] != 43
         or reference_plan["selected_status_counts"] != {"pending": 43}
@@ -2654,6 +2687,20 @@ def _post_abort_contract(
                     item["operation_type"]
                 )
                 for item in processing
+            )
+        )
+        or (
+            schema_version == 5
+            and (
+                any(item["retry_count"] != 0 for item in processing)
+                or tuple(sorted(item["retry_count"] for item in failed))
+                != POST_ABORT_V5_FAILED_RETRY_COUNTS
+                or any(
+                    item["operation_type"] != "retain"
+                    or item["error_category"] != "provider_transport"
+                    or item["error_digest"] is None
+                    for item in failed
+                )
             )
         )
         or preserved_status_counts != expected_preserved_status_counts
@@ -2685,17 +2732,34 @@ def _post_abort_contract(
             for operation_id in reference_preserved_ids
         )
         or any(
-            current[operation_id]["current_status"] != "pending"
-            or (
-                schema_version != 1
-                and (
-                    current[operation_id]["worker_id_present"]
-                    or current[operation_id]["worker_id_digest"] is not None
-                    or current[operation_id]["claimed_at"] is not None
-                    or current[operation_id]["completed_at"] is not None
+            (
+                current[operation_id]["current_status"] != "pending"
+                or (
+                    schema_version != 1
+                    and (
+                        current[operation_id]["worker_id_present"]
+                        or current[operation_id]["worker_id_digest"] is not None
+                        or current[operation_id]["claimed_at"] is not None
+                        or current[operation_id]["completed_at"] is not None
+                    )
                 )
             )
+            if not (
+                schema_version == 5
+                and _post_abort_v5_completed_selected_matches(
+                    current[operation_id]
+                )
+            )
+            else False
             for operation_id in set(reference_selected) - selected_ids
+        )
+        or (
+            schema_version == 5
+            and sum(
+                current[operation_id]["current_status"] == "completed"
+                for operation_id in set(reference_selected) - selected_ids
+            )
+            != 1
         )
         or any(
             current[operation_id]["operation_type"]
@@ -2733,6 +2797,7 @@ def create_post_abort_recovery_plan(
     reference_application_authorization: Mapping[str, Any],
     reference_application_journal: Mapping[str, Any],
     reference_application_progress_digest: str,
+    schema_version: int = 5,
     created_at: int | None = None,
 ) -> Mapping[str, Any]:
     """Plan the exact stopped-worker cleanup without mutating operations."""
@@ -2754,13 +2819,21 @@ def create_post_abort_recovery_plan(
         reference_application_progress_digest,
         "post-abort reference application progress digest",
     )
+    if schema_version not in {4, 5}:
+        raise OperationRecoveryError(
+            "operation-recovery post-abort creation schema is invalid"
+        )
     (
         selected,
         worker_digest,
         selected_status_counts,
         selected_type_counts,
         preserved_status_counts,
-    ) = _post_abort_contract(reference, snapshot, schema_version=4)
+    ) = _post_abort_contract(
+        reference,
+        snapshot,
+        schema_version=schema_version,
+    )
     authority = snapshot["installation_authority"]
     backup = _backup(
         rollback_backup,
@@ -2831,7 +2904,7 @@ def create_post_abort_recovery_plan(
             "operation-recovery post-abort evidence is stale"
         )
     body = {
-        "schema_version": 4,
+        "schema_version": schema_version,
         "kind": "operation-recovery-exact-drain-post-abort-plan",
         "action": "recover-exact-drain-post-abort",
         "authority": "unapproved-plan",
@@ -2884,7 +2957,7 @@ def verify_post_abort_recovery_plan(
             "operation-recovery post-abort plan is invalid"
         )
     schema_version = normalized.get("schema_version")
-    if type(schema_version) is not int or schema_version not in {1, 2, 3, 4}:
+    if type(schema_version) is not int or schema_version not in {1, 2, 3, 4, 5}:
         raise OperationRecoveryError(
             "operation-recovery post-abort plan is invalid"
         )
@@ -2899,7 +2972,11 @@ def verify_post_abort_recovery_plan(
                 else (
                     POST_ABORT_PLAN_V3_KEYS
                     if schema_version == 3
-                    else POST_ABORT_PLAN_V4_KEYS
+                    else (
+                        POST_ABORT_PLAN_V4_KEYS
+                        if schema_version == 4
+                        else POST_ABORT_PLAN_V5_KEYS
+                    )
                 )
             )
         ),
@@ -2929,7 +3006,7 @@ def verify_post_abort_recovery_plan(
     )
     reference_progress_digest = (
         None
-        if schema_version not in {3, 4}
+        if schema_version not in {3, 4, 5}
         else _sha(
             plan["reference_application_progress_digest"],
             "post-abort reference application progress digest",
@@ -3112,7 +3189,7 @@ def verify_post_abort_recovery_plan(
                 ),
                 **(
                     {}
-                    if schema_version not in {3, 4}
+                    if schema_version not in {3, 4, 5}
                     else {
                         "reference_application_progress_digest": (
                             reference_progress_digest

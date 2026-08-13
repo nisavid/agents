@@ -34,6 +34,7 @@ from .operation_recovery import (
     EXACT_DRAIN_PHASE_ONE_STATEMENT_TIMEOUT_SECONDS,
     EXACT_DRAIN_PHASE_REPAIR_CONTRACT_DIGEST,
     EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V2_DIGEST,
+    EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V3_DIGEST,
     EXACT_DRAIN_TRANSACTION_TIMEOUT_SECONDS,
     EXPECTED_CLAIM_RELEASE_ROW_COUNT,
     EXPECTED_OPERATION_COUNTS,
@@ -127,7 +128,29 @@ EXACT_DRAIN_START_MESSAGE_PREFIX = b"exact-drain-start-v1 "
 EXACT_DRAIN_START_MESSAGE_BYTES = (
     len(EXACT_DRAIN_START_MESSAGE_PREFIX) + (64 * 3) + 3
 )
+EXACT_DRAIN_AUTHENTICATION_ERROR = re.compile(
+    r"auth|credential|token|unauthori[sz]ed|forbidden|401|403",
+    re.IGNORECASE,
+)
+EXACT_DRAIN_CAPACITY_ERROR = re.compile(
+    r"capacity|quota|rate.?limit|usage.?limit|429|exhaust",
+    re.IGNORECASE,
+)
+EXACT_DRAIN_TRANSPORT_ERROR = re.compile(
+    r"connect|network|timeout|transport|unavailable|hatchery|502|503|504",
+    re.IGNORECASE,
+)
+EXACT_DRAIN_FUZZY_QUERY_BATCH_SIZE = 10
 LOGGER = logging.getLogger(__name__)
+
+
+def _exact_drain_error_is_transient(error_message: Any) -> bool:
+    return (
+        isinstance(error_message, str)
+        and EXACT_DRAIN_AUTHENTICATION_ERROR.search(error_message) is None
+        and EXACT_DRAIN_CAPACITY_ERROR.search(error_message) is None
+        and EXACT_DRAIN_TRANSPORT_ERROR.search(error_message) is not None
+    )
 
 
 def exact_drain_platform_environment() -> dict[str, str]:
@@ -1568,12 +1591,21 @@ def install_exact_drain_runtime_guards(
         schema: str | None,
     ) -> None:
         try:
-            await adapter.mark_failed(
-                poller._backend,
-                operation_id,
-                error_message,
-                schema,
-            )
+            if _exact_drain_error_is_transient(error_message):
+                await adapter.schedule_retry(
+                    poller._backend,
+                    operation_id,
+                    datetime.now(timezone.utc),
+                    error_message,
+                    schema,
+                )
+            else:
+                await adapter.mark_failed(
+                    poller._backend,
+                    operation_id,
+                    error_message,
+                    schema,
+                )
         except asyncio.CancelledError:
             raise
         except BaseException as error:
@@ -2130,11 +2162,19 @@ def _patch_exact_drain_entity_resolver(
     source: bytes,
     *,
     legacy_entity_schema: bool = False,
+    candidate_query_batch_size: int | None = None,
 ) -> bytes:
     """Return the exact bounded Phase-1 resolver overlay for Hindsight 0.9."""
     if EXACT_DRAIN_PHASE_ONE_STATEMENT_TIMEOUT_SECONDS != 120:
         raise OperationRecoveryError(
             "exact drain phase-one statement timeout authority differs"
+        )
+    if candidate_query_batch_size not in {
+        None,
+        EXACT_DRAIN_FUZZY_QUERY_BATCH_SIZE,
+    }:
+        raise OperationRecoveryError(
+            "exact drain candidate query batch authority differs"
         )
     try:
         text = source.decode("utf-8")
@@ -2216,10 +2256,7 @@ def _patch_exact_drain_entity_resolver(
 """,
         "exact candidate batch",
     )
-    trigram = _replace_exact_drain_source_fragment(
-        trigram,
-        """        for entity_text_batch in self._chunked(fuzzy_texts, self.entity_resolution_batch_size):
-""",
+    fuzzy_batch_replacement = (
         """        fuzzy_batch_count = (
             len(fuzzy_texts) + self.entity_resolution_batch_size - 1
         ) // self.entity_resolution_batch_size
@@ -2227,7 +2264,23 @@ def _patch_exact_drain_entity_resolver(
             self._chunked(fuzzy_texts, self.entity_resolution_batch_size),
             start=1,
         ):
+"""
+        if candidate_query_batch_size is None
+        else f"""        fuzzy_query_batch_size = {candidate_query_batch_size}
+        fuzzy_batch_count = (
+            len(fuzzy_texts) + fuzzy_query_batch_size - 1
+        ) // fuzzy_query_batch_size
+        for fuzzy_batch_index, entity_text_batch in enumerate(
+            self._chunked(fuzzy_texts, fuzzy_query_batch_size),
+            start=1,
+        ):
+"""
+    )
+    trigram = _replace_exact_drain_source_fragment(
+        trigram,
+        """        for entity_text_batch in self._chunked(fuzzy_texts, self.entity_resolution_batch_size):
 """,
+        fuzzy_batch_replacement,
         "fuzzy candidate batch",
     )
     if trigram.count("await conn.fetch(\n") != 3:
@@ -2687,7 +2740,7 @@ def assemble_exact_drain_candidate_runtime_snapshot(
                 require_candidate_patch=False,
             )
         )
-        if snapshot["schema_version"] not in {2, 3}:
+        if snapshot["schema_version"] not in {2, 3, 4}:
             raise OperationRecoveryError(
                 "exact drain candidate runtime snapshot already exists"
             )
@@ -2780,6 +2833,9 @@ def assemble_exact_drain_candidate_runtime_snapshot(
             _patch_exact_drain_entity_resolver(
                 resolver_source,
                 legacy_entity_schema=True,
+                candidate_query_batch_size=(
+                    EXACT_DRAIN_FUZZY_QUERY_BATCH_SIZE
+                ),
             )
         ),
         EXACT_DRAIN_CANDIDATE_POSTGRESQL_OPS_PATH.as_posix(): (
@@ -2830,7 +2886,7 @@ def assemble_exact_drain_candidate_runtime_snapshot(
             }
         )
     manifest = {
-        "schema_version": 3,
+        "schema_version": 4,
         "kind": "exact-drain-candidate-runtime-snapshot",
         "sources": provider_evidence,
         "candidate_patches": candidate_patch_evidence,
@@ -3040,7 +3096,7 @@ def _verify_exact_drain_candidate_runtime_snapshot(
             raise OperationRecoveryError(
                 "exact drain candidate runtime snapshot differs"
             )
-    elif schema_version == 3:
+    elif schema_version in {3, 4}:
         hindsight_root = runtime_root / "hindsight"
         _exact_drain_trusted_directory(
             hindsight_root,
@@ -3071,6 +3127,11 @@ def _verify_exact_drain_candidate_runtime_snapshot(
                 lambda source: _patch_exact_drain_entity_resolver(
                     source,
                     legacy_entity_schema=True,
+                    candidate_query_batch_size=(
+                        None
+                        if schema_version == 3
+                        else EXACT_DRAIN_FUZZY_QUERY_BATCH_SIZE
+                    ),
                 ),
                 "entity resolver",
             ),
@@ -3124,7 +3185,7 @@ def _verify_exact_drain_candidate_runtime_snapshot(
                     "exact drain candidate runtime snapshot differs"
                 )
         expected = {
-            "schema_version": 3,
+            "schema_version": schema_version,
             "kind": "exact-drain-candidate-runtime-snapshot",
             "sources": provider_evidence,
             "candidate_patches": candidate_patch_evidence,
@@ -3605,10 +3666,10 @@ def exact_drain_runtime_evidence(
     provider_runtime_root: str | Path,
     runtime_package_root: str | Path,
     *,
-    schema_version: int = 4,
+    schema_version: int = 5,
 ) -> tuple[str, bytes]:
     """Bind runtime sources and retain prevalidated provider bootstrap bytes."""
-    if type(schema_version) is not int or schema_version not in {1, 2, 3, 4}:
+    if type(schema_version) is not int or schema_version not in {1, 2, 3, 4, 5}:
         raise OperationRecoveryError(
             "exact drain runtime evidence schema version is invalid"
         )
@@ -3682,6 +3743,14 @@ def exact_drain_runtime_evidence(
             sources["phase-repair-contract"] = (
                 EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V2_DIGEST
             )
+        elif schema_version == 5:
+            if snapshot["schema_version"] != 4:
+                raise OperationRecoveryError(
+                    "exact drain query-batch repair snapshot is required"
+                )
+            sources["phase-repair-contract"] = (
+                EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V3_DIGEST
+            )
     for name, source in provider_sources.items():
         sources[f"provider/{name}"] = hashlib.sha256(source).hexdigest()
     package_entries = _exact_drain_package_entries(package_root)
@@ -3732,7 +3801,7 @@ def exact_drain_runtime_digest(
     provider_runtime_root: str | Path,
     runtime_package_root: str | Path,
     *,
-    schema_version: int = 4,
+    schema_version: int = 5,
 ) -> str:
     """Bind the worker entrypoint, claim seam, and provider patch sources."""
     runtime_digest, _provider_bootstrap = exact_drain_runtime_evidence(
@@ -3808,14 +3877,14 @@ class ExactDrainClaimAdapter:
         verified = verify_exact_drain_plan(plan, allow_expired=True)
         if (
             terminal_reconciliation
-            and verified.get("schema_version") in {2, 3, 4}
+            and verified.get("schema_version") in {2, 3, 4, 5}
             and terminal_status_evidence is None
         ):
             raise OperationRecoveryError(
                 "operation-recovery terminal status evidence is required"
             )
         self._clock = clock
-        if verified.get("schema_version") in {2, 3, 4}:
+        if verified.get("schema_version") in {2, 3, 4, 5}:
             if authorization is None:
                 raise OperationRecoveryError(
                     "operation-recovery exact drain authorization is required"
@@ -3842,12 +3911,12 @@ class ExactDrainClaimAdapter:
             )
         self.phase_one_timeout_seconds = (
             verified["phase_one_timeout_seconds"]
-            if verified.get("schema_version") in {3, 4}
+            if verified.get("schema_version") in {3, 4, 5}
             else None
         )
         self.phase_one_statement_timeout_seconds = (
             verified["phase_one_statement_timeout_seconds"]
-            if verified.get("schema_version") in {3, 4}
+            if verified.get("schema_version") in {3, 4, 5}
             else None
         )
         self._cleanup_deadline: float | None = None

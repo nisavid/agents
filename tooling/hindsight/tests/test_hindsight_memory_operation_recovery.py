@@ -381,7 +381,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
 
         plan = self.drain_plan(snapshot=snapshot, created_at=planned_at)
 
-        self.assertEqual(plan["schema_version"], 4)
+        self.assertEqual(plan["schema_version"], 5)
         self.assertEqual(plan["expires_at"], planned_at + 86_400)
         self.assertEqual(plan["evidence_observed_at"], snapshot["observed_at"])
         self.assertEqual(plan["evidence_max_age_seconds"], 3_600)
@@ -391,7 +391,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
         self.assertEqual(plan["phase_one_timeout_seconds"], 3_600)
         self.assertEqual(
             plan["phase_repair_contract_digest"],
-            recovery_contract.EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V2_DIGEST,
+            recovery_contract.EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V3_DIGEST,
         )
         self.assertEqual(
             recovery_contract.verify_exact_drain_plan(plan, now=planned_at),
@@ -441,7 +441,26 @@ class OperationRecoveryContractTest(unittest.TestCase):
             prior,
         )
 
-    def test_exact_drain_v4_phase_repair_contract_is_closed(self):
+    def test_exact_drain_verifier_preserves_prior_v4_contract(self):
+        current = self.drain_plan()
+        body = {
+            key: value for key, value in current.items() if key != "plan_digest"
+        }
+        body["schema_version"] = 4
+        body["phase_repair_contract_digest"] = (
+            recovery_contract.EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V2_DIGEST
+        )
+        prior = {**body, "plan_digest": digest(body)}
+
+        self.assertEqual(
+            recovery_contract.verify_exact_drain_plan(
+                prior,
+                now=prior["created_at"],
+            ),
+            prior,
+        )
+
+    def test_exact_drain_v5_phase_repair_contract_is_closed(self):
         plan = self.drain_plan()
         for key, value in (
             ("phase_one_statement_timeout_seconds", 121),
@@ -759,6 +778,79 @@ class OperationRecoveryContractTest(unittest.TestCase):
         }
         return {**body, "plan_digest": digest(body)}
 
+    def post_abort_v5_snapshot(
+        self,
+        reference_plan=None,
+        *,
+        observed_at: int = 1_786_390_181,
+    ) -> dict:
+        reference_plan = reference_plan or self.drain_plan()
+        snapshot = self.post_abort_snapshot(
+            reference_plan,
+            interrupted_processing_count=1,
+            observed_at=observed_at,
+        )
+        reference_selected = {
+            item["operation_id"]
+            for item in reference_plan["selected_operations"]
+        }
+        completed_consolidation = next(
+            item
+            for item in snapshot["operations"]
+            if item["operation_id"] in reference_selected
+            and item["operation_type"] == "consolidation"
+            and item["current_status"] == "pending"
+        )
+        completed_consolidation.update(
+            {
+                "current_status": "completed",
+                "completed_at": "2026-08-13T03:00:00.000000Z",
+                "retry_count": 3,
+                "result_metadata_digest": "a" * 64,
+            }
+        )
+        failed_rows = [
+            item
+            for item in snapshot["operations"]
+            if item["operation_id"] in reference_selected
+            and item["operation_type"] == "retain"
+            and item["current_status"] == "pending"
+        ][:4]
+        for position, (item, retry_count) in enumerate(
+            zip(failed_rows, (0, 3, 2, 2), strict=True),
+            start=1,
+        ):
+            item.update(
+                {
+                    "current_status": "failed",
+                    "completed_at": "2026-08-13T03:10:00.000000Z",
+                    "retry_count": retry_count,
+                    "result_metadata_digest": f"{700 + position:064x}",
+                    "error_category": "provider_transport",
+                    "error_digest": f"{800 + position:064x}",
+                }
+            )
+        for item in [completed_consolidation, *failed_rows]:
+            item["row_digest"] = digest(
+                {key: value for key, value in item.items() if key != "row_digest"}
+            )
+        snapshot["operations"].sort(key=lambda item: item["operation_id"])
+        snapshot["status_counts"] = {
+            status: sum(
+                item["current_status"] == status
+                for item in snapshot["operations"]
+            )
+            for status in recovery_contract.OPERATION_STATUSES
+        }
+        snapshot["snapshot_digest"] = digest(
+            {
+                key: value
+                for key, value in snapshot.items()
+                if key != "snapshot_digest"
+            }
+        )
+        return snapshot
+
     def prior_v3_post_abort_plan(self) -> dict:
         reference = self.drain_plan()
         snapshot = self.post_abort_snapshot(
@@ -905,6 +997,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 exact_drain_application_journal(reference)
             ),
             reference_application_progress_digest="c" * 64,
+            schema_version=4,
             created_at=1_786_390_500,
         )
 
@@ -952,6 +1045,226 @@ class OperationRecoveryContractTest(unittest.TestCase):
             verify_post_abort_recovery_plan(plan, now=plan["created_at"]),
             plan,
         )
+
+    def test_post_abort_v5_plan_derives_four_failed_and_one_processing_retain(self):
+        reference = self.drain_plan()
+        snapshot = self.post_abort_snapshot(
+            reference,
+            interrupted_processing_count=1,
+        )
+        reference_selected = {
+            item["operation_id"] for item in reference["selected_operations"]
+        }
+        completed_consolidation = next(
+            item
+            for item in snapshot["operations"]
+            if item["operation_id"] in reference_selected
+            and item["operation_type"] == "consolidation"
+            and item["current_status"] == "pending"
+        )
+        completed_consolidation.update(
+            {
+                "current_status": "completed",
+                "completed_at": "2026-08-13T03:00:00.000000Z",
+                "retry_count": 3,
+                "result_metadata_digest": "a" * 64,
+            }
+        )
+        failed_retries = (0, 3, 2, 2)
+        failed_rows = [
+            item
+            for item in snapshot["operations"]
+            if item["operation_id"] in reference_selected
+            and item["operation_type"] == "retain"
+            and item["current_status"] == "pending"
+        ][:4]
+        for position, (item, retry_count) in enumerate(
+            zip(failed_rows, failed_retries, strict=True),
+            start=1,
+        ):
+            item.update(
+                {
+                    "current_status": "failed",
+                    "completed_at": "2026-08-13T03:10:00.000000Z",
+                    "retry_count": retry_count,
+                    "result_metadata_digest": f"{700 + position:064x}",
+                    "error_category": "provider_transport",
+                    "error_digest": f"{800 + position:064x}",
+                }
+            )
+        for item in [completed_consolidation, *failed_rows]:
+            item["row_digest"] = digest(
+                {
+                    key: value
+                    for key, value in item.items()
+                    if key != "row_digest"
+                }
+            )
+        snapshot["operations"].sort(key=lambda item: item["operation_id"])
+        snapshot["status_counts"] = {
+            status: sum(
+                item["current_status"] == status
+                for item in snapshot["operations"]
+            )
+            for status in recovery_contract.OPERATION_STATUSES
+        }
+        snapshot["snapshot_digest"] = digest(
+            {
+                key: value
+                for key, value in snapshot.items()
+                if key != "snapshot_digest"
+            }
+        )
+        backup = rollback_backup_evidence()
+        backup["source_authority"]["generation_before"] = snapshot[
+            "generation_before"
+        ]
+        backup["source_authority"]["generation_after"] = snapshot[
+            "generation_after"
+        ]
+        backup["source_authority_digest"] = digest(
+            backup["source_authority"]
+        )
+
+        plan = create_post_abort_recovery_plan(
+            reference,
+            snapshot,
+            candidate_release=release_identity(),
+            rollback_backup=backup,
+            rollback_encryption=rollback_encryption(),
+            rollback_backup_path="/private/tmp/v5-backup.age",
+            rollback_bundle_path="/private/tmp/v5-bundle.age",
+            authorization_receipt_path="/private/tmp/v5-auth.json",
+            application_receipt_path="/private/tmp/v5-app.json",
+            verification_receipt_path="/private/tmp/v5-verify.json",
+            rollback_receipt_path="/private/tmp/v5-rollback.json",
+            reference_application_authorization=(
+                exact_drain_authorization(reference)
+            ),
+            reference_application_journal=(
+                exact_drain_application_journal(reference)
+            ),
+            reference_application_progress_digest="c" * 64,
+            created_at=1_786_390_500,
+        )
+
+        self.assertEqual(plan["schema_version"], 5)
+        self.assertEqual(plan["selected_operation_count"], 5)
+        self.assertEqual(
+            plan["selected_status_counts"],
+            {"failed": 4, "processing": 1},
+        )
+        self.assertEqual(plan["selected_type_counts"], {"retain": 5})
+        self.assertEqual(
+            plan["preserved_status_counts"],
+            {"completed": 6, "pending": 37},
+        )
+        self.assertEqual(
+            verify_post_abort_recovery_plan(plan, now=plan["created_at"]),
+            plan,
+        )
+
+    def test_post_abort_v5_rejects_failure_and_completion_shape_drift(self):
+        reference = self.drain_plan()
+
+        def create(snapshot):
+            backup = rollback_backup_evidence()
+            backup["source_authority"]["generation_before"] = snapshot[
+                "generation_before"
+            ]
+            backup["source_authority"]["generation_after"] = snapshot[
+                "generation_after"
+            ]
+            backup["source_authority_digest"] = digest(
+                backup["source_authority"]
+            )
+            return create_post_abort_recovery_plan(
+                reference,
+                snapshot,
+                candidate_release=release_identity(),
+                rollback_backup=backup,
+                rollback_encryption=rollback_encryption(),
+                rollback_backup_path="/private/tmp/v5-drift-backup.age",
+                rollback_bundle_path="/private/tmp/v5-drift-bundle.age",
+                authorization_receipt_path="/private/tmp/v5-drift-auth.json",
+                application_receipt_path="/private/tmp/v5-drift-app.json",
+                verification_receipt_path="/private/tmp/v5-drift-verify.json",
+                rollback_receipt_path="/private/tmp/v5-drift-rollback.json",
+                reference_application_authorization=(
+                    exact_drain_authorization(reference)
+                ),
+                reference_application_journal=(
+                    exact_drain_application_journal(reference)
+                ),
+                reference_application_progress_digest="c" * 64,
+                created_at=1_786_390_500,
+            )
+
+        cases = {}
+        retry_drift = self.post_abort_v5_snapshot(reference)
+        retry_row = next(
+            item
+            for item in retry_drift["operations"]
+            if item["current_status"] == "failed" and item["retry_count"] == 0
+        )
+        retry_row["retry_count"] = 1
+        cases["retry-vector"] = retry_drift
+        category_drift = self.post_abort_v5_snapshot(reference)
+        next(
+            item
+            for item in category_drift["operations"]
+            if item["current_status"] == "failed"
+        )["error_category"] = "internal"
+        cases["error-category"] = category_drift
+        completion_drift = self.post_abort_v5_snapshot(reference)
+        completed = next(
+            item
+            for item in completion_drift["operations"]
+            if item["operation_type"] == "consolidation"
+            and item["operation_id"]
+            in {row["operation_id"] for row in reference["selected_operations"]}
+            and item["current_status"] == "completed"
+        )
+        completed.update(
+            {
+                "current_status": "pending",
+                "completed_at": None,
+                "retry_count": 0,
+            }
+        )
+        cases["completed-consolidation"] = completion_drift
+
+        for label, snapshot in cases.items():
+            for item in snapshot["operations"]:
+                item["row_digest"] = digest(
+                    {
+                        key: value
+                        for key, value in item.items()
+                        if key != "row_digest"
+                    }
+                )
+            snapshot["status_counts"] = {
+                status: sum(
+                    item["current_status"] == status
+                    for item in snapshot["operations"]
+                )
+                for status in recovery_contract.OPERATION_STATUSES
+            }
+            snapshot["snapshot_digest"] = digest(
+                {
+                    key: value
+                    for key, value in snapshot.items()
+                    if key != "snapshot_digest"
+                }
+            )
+            with (
+                self.subTest(drift=label),
+                self.assertRaisesRegex(
+                    OperationRecoveryError,
+                    "post-abort row set is invalid",
+                ),
+            ):
+                create(snapshot)
 
     def test_post_abort_plan_rejects_a_different_processing_owner(self):
         reference = self.drain_plan()
@@ -1012,6 +1325,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
                     exact_drain_application_journal(reference)
                 ),
                 reference_application_progress_digest="c" * 64,
+                schema_version=4,
                 created_at=1_786_390_500,
             )
 
@@ -1264,6 +1578,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
                         exact_drain_application_journal(reference)
                     ),
                     reference_application_progress_digest="c" * 64,
+                    schema_version=4,
                     created_at=1_786_390_500,
                 )
 
@@ -1303,6 +1618,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
                     exact_drain_application_journal(reference)
                 ),
                 reference_application_progress_digest="c" * 64,
+                schema_version=4,
                 created_at=1_786_390_500,
             )
         )
@@ -1387,6 +1703,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
                         exact_drain_application_journal(reference)
                     ),
                     reference_application_progress_digest="c" * 64,
+                    schema_version=4,
                     created_at=1_786_390_500,
                 )
             )
@@ -1506,6 +1823,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
                     exact_drain_application_journal(reference)
                 ),
                 reference_application_progress_digest="c" * 64,
+                schema_version=4,
                 created_at=1_786_390_500,
             )
         )

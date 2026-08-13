@@ -1347,6 +1347,107 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         self.assertEqual(recovery_calls, ["recover", "release"])
         self.assertEqual(shutdown_requests, [True])
 
+    def test_transient_terminal_failure_consumes_exact_retry_budget(self):
+        events = []
+
+        class Adapter(_ControlConnectionAdapterMixin):
+            async def schedule_retry(
+                self,
+                backend,
+                operation_id,
+                retry_at,
+                error_message,
+                schema,
+            ):
+                events.append(
+                    (
+                        "retry",
+                        backend,
+                        operation_id,
+                        retry_at,
+                        error_message,
+                        schema,
+                    )
+                )
+
+            async def mark_failed(self, *arguments):
+                events.append(("failed", *arguments))
+
+        class WorkerPoller(_RunCapableWorkerPoller):
+            _backend = "exact-backend"
+
+            async def _execute_task_inner(self, _task, _holder):
+                return None
+
+            async def _claim_batch_for_schema_inner(
+                self,
+                _schema,
+                _reserved_limits,
+                _shared_limit,
+            ):
+                return []
+
+            async def _claim_batch_for_schema(self, schema, reserved, shared):
+                return await self._claim_batch_for_schema_inner(
+                    schema, reserved, shared
+                )
+
+        install_exact_drain_runtime_guards(
+            type("PostgreSQLOps", (), {}),
+            WorkerPoller,
+            type("MemoryEngine", (), {}),
+            Adapter(),
+        )
+
+        asyncio.run(
+            WorkerPoller()._mark_failed(
+                "operation-1",
+                "canceling statement due to statement timeout",
+                "public",
+            )
+        )
+        asyncio.run(
+            WorkerPoller()._mark_failed(
+                "operation-2",
+                "entity payload is invalid",
+                "public",
+            )
+        )
+        asyncio.run(
+            WorkerPoller()._mark_failed(
+                "operation-3",
+                "401 unauthorized while opening provider connection",
+                "public",
+            )
+        )
+
+        self.assertEqual(len(events), 3)
+        self.assertEqual(events[0][:3], ("retry", "exact-backend", "operation-1"))
+        self.assertEqual(
+            events[0][4:],
+            ("canceling statement due to statement timeout", "public"),
+        )
+        self.assertEqual(
+            events[1],
+            (
+                "failed",
+                "exact-backend",
+                "operation-2",
+                "entity payload is invalid",
+                "public",
+            ),
+        )
+        self.assertEqual(
+            events[2],
+            (
+                "failed",
+                "exact-backend",
+                "operation-3",
+                "401 unauthorized while opening provider connection",
+                "public",
+            ),
+        )
+
     def test_swallowed_exact_terminal_failures_surface_after_public_shutdown(self):
         try:
             from hindsight_api.worker.poller import ClaimedTask

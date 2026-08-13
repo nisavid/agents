@@ -289,9 +289,11 @@ candidate, and writes a canonical payload-free manifest for the provider and
 both original/patched Hindsight sources. The resolver overlay removes unused
 PostgreSQL candidate columns, fetches only the candidate-induced cooccurrence
 graph, emits observational candidate and cooccurrence breadcrumbs, and bounds
-both server and client query waits. The write overlay keeps entity insert and
-reassertion compatible with the bound pre-`entity_kind` database schema. These
-overlays are not a durable Phase 1 checkpoint or replay receipt.
+both server and client query waits. Fuzzy candidate lookup is sealed to at
+most ten candidate names per query, so a large retain cannot concentrate the
+whole candidate set in one PostgreSQL request. The write overlay keeps entity
+insert and reassertion compatible with the bound pre-`entity_kind` database
+schema. These overlays are not a durable Phase 1 checkpoint or replay receipt.
 
 Release assembly runs this helper before `hindsight-portable-install`; the
 existing release manifest then seals the completed snapshot and patched
@@ -305,6 +307,11 @@ row in their bounded serializable transaction, so terminal writes cannot race
 another generation-triggered operation commit. Provider policy and credential
 material remain external protected data and are never copied into the candidate
 snapshot.
+
+Current exact-drain workers route transport, connection, availability, and
+timeout failures through the plan-bound retry counter. The third retry seals a
+terminal failure; no transient failure bypasses that ceiling or creates an
+unbounded retry loop.
 
 The managed exact-drain worker runtime is a separate trusted authority. For a
 current plan, planning, apply, and the gated child each stream-hash the complete

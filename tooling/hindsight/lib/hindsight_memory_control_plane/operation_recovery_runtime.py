@@ -6188,6 +6188,13 @@ async def apply_post_abort_recovery_transaction(
         )
         if on_mutation_attempt is not None:
             on_mutation_attempt()
+        failed_owner_predicate = (
+            "worker_id IS NOT NULL "
+            "AND encode(sha256(convert_to(worker_id, 'UTF8')), 'hex') = $3 "
+            "AND claimed_at IS NOT NULL"
+            if verified["schema_version"] == 5
+            else "worker_id IS NULL AND claimed_at IS NULL"
+        )
         result = await connection.execute(
             f"""
             UPDATE {quoted_schema}.async_operations
@@ -6212,8 +6219,7 @@ async def apply_post_abort_recovery_transaction(
                          'hex'
                      ) = $3)
                     OR (status = 'failed'
-                        AND worker_id IS NULL
-                        AND claimed_at IS NULL)
+                        AND {failed_owner_predicate})
               )
             """,
             selected_identifiers,

@@ -924,12 +924,15 @@ asyncio.run(exercise())
                     UPDATE public.async_operations
                     SET status = 'failed', retry_count = $2,
                         error_message = 'provider transport timeout',
+                        worker_id = $3,
+                        claimed_at = '2026-08-13T02:14:10Z',
                         completed_at = '2026-08-13T03:10:00Z',
                         updated_at = '2026-08-13T03:10:00Z'
                     WHERE operation_id = $1::uuid
                     """,
                     operation_id,
                     retry_count,
+                    worker_id,
                 )
             completed_consolidation_id = next(
                 item["operation_id"]
@@ -940,11 +943,14 @@ asyncio.run(exercise())
                 """
                 UPDATE public.async_operations
                 SET status = 'completed', retry_count = 3,
+                    worker_id = $2,
+                    claimed_at = '2026-08-12T18:42:14Z',
                     completed_at = '2026-08-13T03:00:00Z',
                     updated_at = '2026-08-13T03:00:00Z'
                 WHERE operation_id = $1::uuid
                 """,
                 completed_consolidation_id,
+                worker_id,
             )
             processing_ids.extend(remaining_retain_ids)
         await connection.execute(

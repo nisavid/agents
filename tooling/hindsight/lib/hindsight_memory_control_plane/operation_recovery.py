@@ -2592,14 +2592,16 @@ def _post_abort_type_counts(
 
 def _post_abort_v5_completed_selected_matches(
     item: Mapping[str, Any],
+    *,
+    worker_digest: str,
 ) -> bool:
     return (
         item["current_status"] == "completed"
         and item["operation_type"] == "consolidation"
         and item["retry_count"] == 3
-        and not item["worker_id_present"]
-        and item["worker_id_digest"] is None
-        and item["claimed_at"] is None
+        and item["worker_id_present"] is True
+        and item["worker_id_digest"] == worker_digest
+        and item["claimed_at"] is not None
         and item["completed_at"] is not None
         and item["error_category"] == "none"
         and item["error_digest"] is None
@@ -2717,10 +2719,19 @@ def _post_abort_contract(
             for item in processing
         )
         or any(
-            item["worker_id_present"]
-            or item["worker_id_digest"] is not None
-            or item["claimed_at"] is not None
-            or item["completed_at"] is None
+            (
+                item["worker_id_present"] is not True
+                or item["worker_id_digest"] != worker_digest
+                or item["claimed_at"] is None
+                or item["completed_at"] is None
+            )
+            if schema_version == 5
+            else (
+                item["worker_id_present"]
+                or item["worker_id_digest"] is not None
+                or item["claimed_at"] is not None
+                or item["completed_at"] is None
+            )
             for item in failed
         )
         or preserved_ids
@@ -2747,7 +2758,8 @@ def _post_abort_contract(
             if not (
                 schema_version == 5
                 and _post_abort_v5_completed_selected_matches(
-                    current[operation_id]
+                    current[operation_id],
+                    worker_digest=worker_digest,
                 )
             )
             else False

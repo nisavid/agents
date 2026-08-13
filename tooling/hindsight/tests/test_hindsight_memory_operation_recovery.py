@@ -807,6 +807,14 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 "completed_at": "2026-08-13T03:00:00.000000Z",
                 "retry_count": 3,
                 "result_metadata_digest": "a" * 64,
+                "worker_id_present": True,
+                "worker_id_digest": hashlib.sha256(
+                    (
+                        "operation-recovery-exact-drain-"
+                        f"{reference_plan['plan_digest'][:12]}"
+                    ).encode("utf-8")
+                ).hexdigest(),
+                "claimed_at": "2026-08-12T18:42:14.000000Z",
             }
         )
         failed_rows = [
@@ -828,6 +836,11 @@ class OperationRecoveryContractTest(unittest.TestCase):
                     "result_metadata_digest": f"{700 + position:064x}",
                     "error_category": "provider_transport",
                     "error_digest": f"{800 + position:064x}",
+                    "worker_id_present": True,
+                    "worker_id_digest": completed_consolidation[
+                        "worker_id_digest"
+                    ],
+                    "claimed_at": "2026-08-13T02:14:10.000000Z",
                 }
             )
         for item in [completed_consolidation, *failed_rows]:
@@ -1068,6 +1081,14 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 "completed_at": "2026-08-13T03:00:00.000000Z",
                 "retry_count": 3,
                 "result_metadata_digest": "a" * 64,
+                "worker_id_present": True,
+                "worker_id_digest": hashlib.sha256(
+                    (
+                        "operation-recovery-exact-drain-"
+                        f"{reference['plan_digest'][:12]}"
+                    ).encode("utf-8")
+                ).hexdigest(),
+                "claimed_at": "2026-08-12T18:42:14.000000Z",
             }
         )
         failed_retries = (0, 3, 2, 2)
@@ -1090,6 +1111,11 @@ class OperationRecoveryContractTest(unittest.TestCase):
                     "result_metadata_digest": f"{700 + position:064x}",
                     "error_category": "provider_transport",
                     "error_digest": f"{800 + position:064x}",
+                    "worker_id_present": True,
+                    "worker_id_digest": completed_consolidation[
+                        "worker_id_digest"
+                    ],
+                    "claimed_at": "2026-08-13T02:14:10.000000Z",
                 }
             )
         for item in [completed_consolidation, *failed_rows]:
@@ -1233,6 +1259,26 @@ class OperationRecoveryContractTest(unittest.TestCase):
             }
         )
         cases["completed-consolidation"] = completion_drift
+        failed_owner_drift = self.post_abort_v5_snapshot(reference)
+        next(
+            item
+            for item in failed_owner_drift["operations"]
+            if item["current_status"] == "failed"
+        )["worker_id_digest"] = "0" * 64
+        cases["failed-owner"] = failed_owner_drift
+        completed_owner_drift = self.post_abort_v5_snapshot(reference)
+        next(
+            item
+            for item in completed_owner_drift["operations"]
+            if item["operation_type"] == "consolidation"
+            and item["current_status"] == "completed"
+            and item["operation_id"]
+            in {
+                row["operation_id"]
+                for row in reference["selected_operations"]
+            }
+        )["claimed_at"] = None
+        cases["completed-owner"] = completed_owner_drift
 
         for label, snapshot in cases.items():
             for item in snapshot["operations"]:

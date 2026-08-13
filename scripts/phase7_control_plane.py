@@ -166,8 +166,21 @@ def build_new_draft_argv(
     title: str,
     body_template: Path,
     review_input: Path,
+    review_mode: str,
+    selected_specialists: list[str],
 ) -> list[str]:
     """Build the exact executable new-draft publisher argv once."""
+    if review_mode not in {"required", "not-required"}:
+        raise ControlPlaneError("review mode must be required or not-required")
+    if (
+        not isinstance(selected_specialists, list)
+        or not all(
+            isinstance(specialist, str) and specialist
+            for specialist in selected_specialists
+        )
+        or selected_specialists != sorted(set(selected_specialists))
+    ):
+        raise ControlPlaneError("selected review specialists must be sorted and unique")
     return [
         sys.executable,
         str(publisher),
@@ -191,6 +204,10 @@ def build_new_draft_argv(
         str(body_template),
         "--review-input",
         str(review_input),
+        "--review-mode",
+        review_mode,
+        "--selected-specialists",
+        canonical_bytes(selected_specialists).decode("utf-8"),
     ]
 
 

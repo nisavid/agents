@@ -310,6 +310,10 @@ class Phase7ControlPlaneTests(unittest.TestCase):
             sha(expected_body),
             "--review-input",
             str(input_path),
+            "--review-mode",
+            "not-required",
+            "--selected-specialists",
+            "[]",
         ]
         if operation == "ready":
             arguments = [sys.executable, str(PUBLISHER), "ready", *common]
@@ -361,6 +365,8 @@ class Phase7ControlPlaneTests(unittest.TestCase):
             title=title,
             body_template=template,
             review_input=input_path,
+            review_mode="not-required",
+            selected_specialists=[],
         )
         validation_body = self.root / "validator-body.md"
         validation_body.write_text(

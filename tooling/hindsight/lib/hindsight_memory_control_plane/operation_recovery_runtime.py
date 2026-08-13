@@ -6618,7 +6618,7 @@ async def apply_post_abort_recovery_transaction(
             "worker_id IS NOT NULL "
             "AND encode(sha256(convert_to(worker_id, 'UTF8')), 'hex') = $3 "
             "AND claimed_at IS NOT NULL"
-            if verified["schema_version"] in {5, 6}
+            if verified["schema_version"] in {5, 6, 7}
             else "worker_id IS NULL AND claimed_at IS NULL"
         )
         result = await connection.execute(
@@ -6646,11 +6646,19 @@ async def apply_post_abort_recovery_transaction(
                      ) = $3)
                     OR (status = 'failed'
                         AND {failed_owner_predicate})
+                    OR (status = 'pending'
+                        AND $4
+                        AND encode(
+                            sha256(convert_to(worker_id, 'UTF8')),
+                            'hex'
+                        ) = $3
+                        AND claimed_at IS NOT NULL)
               )
             """,
             selected_identifiers,
             bank_id,
             verified["reference_worker_id_digest"],
+            verified["schema_version"] == 7,
         )
         if result != f"UPDATE {len(selected)}":
             raise OperationRecoveryError(
@@ -6712,6 +6720,19 @@ async def apply_post_abort_recovery_transaction(
             ):
                 raise OperationRecoveryError(
                     "operation-recovery post-abort processing row differs"
+                )
+            if item["expected_status"] == "pending" and any(
+                after[key] != prior[key]
+                for key in (
+                    "completed_at",
+                    "retry_count",
+                    "next_retry_at",
+                    "error_category",
+                    "error_digest",
+                )
+            ):
+                raise OperationRecoveryError(
+                    "operation-recovery post-abort pending row differs"
                 )
             if item["expected_status"] == "failed" and (
                 after["completed_at"] is not None
@@ -6777,9 +6798,12 @@ async def rollback_post_abort_recovery_transaction(
         for operation_id in sorted(selected):
             item = selected[operation_id]
             row = preimage_by_id[operation_id]
+            allowed_preimage_statuses = {"processing", "failed"}
+            if verified["schema_version"] == 7:
+                allowed_preimage_statuses.add("pending")
             if (
                 row.get("status") != item["expected_status"]
-                or row.get("status") not in {"processing", "failed"}
+                or row.get("status") not in allowed_preimage_statuses
                 or row.get("task_payload_digest") != item["task_payload_digest"]
             ):
                 raise OperationRecoveryError(
@@ -6902,6 +6926,16 @@ async def rollback_post_abort_recovery_transaction(
                 row["retry_count"] != before["retry_count"]
                 or row["completed_at"] != before["completed_at"]
                 or row["next_retry_at"] != before["next_retry_at"]
+                or row["error_digest"] != before["error_digest"]
+            ):
+                raise OperationRecoveryError(
+                    "operation-recovery post-abort rollback is no longer safe"
+                )
+            if item["expected_status"] == "pending" and (
+                row["retry_count"] != before["retry_count"]
+                or row["completed_at"] != before["completed_at"]
+                or row["next_retry_at"] != before["next_retry_at"]
+                or row["error_category"] != before["error_category"]
                 or row["error_digest"] != before["error_digest"]
             ):
                 raise OperationRecoveryError(

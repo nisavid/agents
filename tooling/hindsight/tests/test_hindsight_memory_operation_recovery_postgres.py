@@ -874,12 +874,12 @@ asyncio.run(exercise())
             connection,
             completed_positions=(
                 {0, 1, 42, 43, 46, 47}
-                if schema_version == 6
+                if schema_version in {6, 7}
                 else None
             ),
         )
         selected = reference["selected_operations"]
-        processing_count = {2: 4, 3: 3, 4: 2, 5: 1, 6: 1}[
+        processing_count = {2: 4, 3: 3, 4: 2, 5: 1, 6: 1, 7: 1}[
             schema_version
         ]
         processing = (
@@ -969,7 +969,7 @@ asyncio.run(exercise())
                 worker_id,
             )
             processing_ids.extend(remaining_retain_ids)
-        elif schema_version == 6:
+        elif schema_version in {6, 7}:
             remaining_retain_ids = [
                 item["operation_id"]
                 for item in selected
@@ -991,6 +991,26 @@ asyncio.run(exercise())
                 worker_id,
             )
             processing_ids.extend(remaining_retain_ids)
+            if schema_version == 7:
+                pending_id = next(
+                    item["operation_id"]
+                    for item in selected
+                    if item["operation_type"] == "retain"
+                    and item["operation_id"] not in processing_ids
+                )
+                await connection.execute(
+                    """
+                    UPDATE public.async_operations
+                    SET retry_count = 1,
+                        worker_id = $2,
+                        claimed_at = '2026-08-13T18:11:57Z',
+                        updated_at = '2026-08-13T18:11:57Z'
+                    WHERE operation_id = $1::uuid
+                    """,
+                    pending_id,
+                    worker_id,
+                )
+                processing_ids.append(pending_id)
         await connection.execute(
             "UPDATE public.hindsight_migration_generation "
             "SET generation = 123 WHERE singleton"
@@ -1027,7 +1047,7 @@ asyncio.run(exercise())
         authorization = recovery_fixtures.exact_drain_authorization(reference)
         journal = recovery_fixtures.exact_drain_application_journal(reference)
         created_at = int(time.time())
-        if schema_version in {4, 5, 6}:
+        if schema_version in {4, 5, 6, 7}:
             plan = create_post_abort_recovery_plan(
                 reference,
                 snapshot,
@@ -1845,6 +1865,120 @@ asyncio.run(exercise())
                     live_row_digest(after[unexpected_id]),
                     live_row_digest(before[unexpected_id]),
                 )
+                rollback_generations = (
+                    await rollback_post_abort_recovery_transaction(
+                        connection,
+                        profile_id="systalyze",
+                        schema="public",
+                        bank_id="engineering",
+                        plan=plan,
+                        application={
+                            "post_generation": "systalyze:public:124"
+                        },
+                        rollback_record={
+                            "pre_generation": "systalyze:public:124",
+                            "post_generation": "systalyze:public:125",
+                        },
+                        preimage=preimage,
+                    )
+                )
+                restored = {
+                    row["operation_id"]: row
+                    for row in await read_safe_operation_rows(
+                        connection,
+                        schema="public",
+                        bank_id="engineering",
+                        operation_ids=[*cohort_ids, unexpected_id],
+                    )
+                }
+                self.assertEqual(
+                    rollback_generations,
+                    ("systalyze:public:124", "systalyze:public:125"),
+                )
+                self.assertEqual(
+                    {
+                        operation_id: live_row_digest(row)
+                        for operation_id, row in restored.items()
+                    },
+                    {
+                        operation_id: live_row_digest(row)
+                        for operation_id, row in before.items()
+                    },
+                )
+            finally:
+                await connection.close()
+
+        asyncio.run(exercise())
+
+    def test_post_abort_v7_resets_owned_pending_and_preserves_forty_three(self):
+        async def exercise():
+            connection = await self._connect()
+            try:
+                plan, cohort_ids, selected_ids, unexpected_id = (
+                    await self._post_abort_case(connection, schema_version=7)
+                )
+                before = {
+                    row["operation_id"]: row
+                    for row in await read_safe_operation_rows(
+                        connection,
+                        schema="public",
+                        bank_id="engineering",
+                        operation_ids=[*cohort_ids, unexpected_id],
+                    )
+                }
+                preimage = await read_selected_preimage(
+                    connection,
+                    schema="public",
+                    selected_operations=plan["selected_operations"],
+                )
+                pending_id = next(
+                    item["operation_id"]
+                    for item in plan["selected_operations"]
+                    if item["expected_status"] == "pending"
+                )
+
+                generations = await apply_post_abort_recovery_transaction(
+                    connection,
+                    profile_id="systalyze",
+                    schema="public",
+                    bank_id="engineering",
+                    plan=plan,
+                )
+                after = {
+                    row["operation_id"]: row
+                    for row in await read_safe_operation_rows(
+                        connection,
+                        schema="public",
+                        bank_id="engineering",
+                        operation_ids=[*cohort_ids, unexpected_id],
+                    )
+                }
+                self.assertEqual(plan["schema_version"], 7)
+                self.assertEqual(len(selected_ids), 5)
+                self.assertEqual(
+                    generations,
+                    ("systalyze:public:123", "systalyze:public:124"),
+                )
+                self.assertEqual(after[pending_id]["status"], "pending")
+                self.assertFalse(after[pending_id]["worker_id_present"])
+                self.assertIsNone(after[pending_id]["claimed_at"])
+                self.assertEqual(after[pending_id]["retry_count"], 1)
+                self.assertEqual(
+                    after[pending_id]["result_metadata_digest"],
+                    before[pending_id]["result_metadata_digest"],
+                )
+                preserved_ids = set(cohort_ids) - set(selected_ids)
+                self.assertEqual(len(preserved_ids), 43)
+                for operation_id in preserved_ids:
+                    self.assertEqual(
+                        live_row_digest(after[operation_id]),
+                        live_row_digest(before[operation_id]),
+                    )
+                self.assertEqual(
+                    live_row_digest(after[unexpected_id]),
+                    live_row_digest(before[unexpected_id]),
+                )
+
                 rollback_generations = (
                     await rollback_post_abort_recovery_transaction(
                         connection,

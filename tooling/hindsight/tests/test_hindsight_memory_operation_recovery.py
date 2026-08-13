@@ -990,6 +990,54 @@ class OperationRecoveryContractTest(unittest.TestCase):
         )
         return snapshot
 
+    def post_abort_v7_snapshot(
+        self,
+        reference_plan,
+        *,
+        observed_at: int = 1_786_390_181,
+    ) -> dict:
+        snapshot = self.post_abort_v6_snapshot(
+            reference_plan,
+            observed_at=observed_at,
+        )
+        worker_digest = hashlib.sha256(
+            (
+                "operation-recovery-exact-drain-"
+                f"{reference_plan['plan_digest'][:12]}"
+            ).encode("utf-8")
+        ).hexdigest()
+        selected_ids = {
+            item["operation_id"]
+            for item in reference_plan["selected_operations"]
+        }
+        retrying = next(
+            item
+            for item in snapshot["operations"]
+            if item["operation_id"] in selected_ids
+            and item["current_status"] == "pending"
+            and item["operation_type"] == "retain"
+            and not item["worker_id_present"]
+        )
+        retrying.update(
+            {
+                "retry_count": 1,
+                "worker_id_present": True,
+                "worker_id_digest": worker_digest,
+                "claimed_at": "2026-08-13T18:11:57.247329Z",
+            }
+        )
+        retrying["row_digest"] = digest(
+            {key: value for key, value in retrying.items() if key != "row_digest"}
+        )
+        snapshot["snapshot_digest"] = digest(
+            {
+                key: value
+                for key, value in snapshot.items()
+                if key != "snapshot_digest"
+            }
+        )
+        return snapshot
+
     def prior_v3_post_abort_plan(self) -> dict:
         reference = self.drain_plan()
         snapshot = self.post_abort_snapshot(
@@ -1478,6 +1526,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
                     exact_drain_application_journal(reference)
                 ),
                 reference_application_progress_digest="d" * 64,
+                schema_version=6,
                 created_at=1_786_390_500,
             )
 
@@ -1536,6 +1585,89 @@ class OperationRecoveryContractTest(unittest.TestCase):
                     "post-abort row set is invalid",
                 ):
                     create(changed)
+
+    def test_post_abort_v7_plan_binds_owned_pending_retry(self):
+        reference = self.drain_plan(
+            snapshot=self.drain_snapshot(
+                completed_positions={0, 1, 42, 43, 46, 47},
+                observed_at=1_786_390_000,
+            ),
+            created_at=1_786_390_001,
+        )
+        snapshot = self.post_abort_v7_snapshot(reference)
+        backup = rollback_backup_evidence()
+        backup["source_authority"]["generation_before"] = snapshot[
+            "generation_before"
+        ]
+        backup["source_authority"]["generation_after"] = snapshot[
+            "generation_after"
+        ]
+        backup["source_authority_digest"] = digest(backup["source_authority"])
+
+        def create(value):
+            return create_post_abort_recovery_plan(
+                reference,
+                value,
+                candidate_release=release_identity(),
+                rollback_backup=backup,
+                rollback_encryption=rollback_encryption(),
+                rollback_backup_path="/private/tmp/v7-backup.age",
+                rollback_bundle_path="/private/tmp/v7-bundle.age",
+                authorization_receipt_path="/private/tmp/v7-auth.json",
+                application_receipt_path="/private/tmp/v7-app.json",
+                verification_receipt_path="/private/tmp/v7-verify.json",
+                rollback_receipt_path="/private/tmp/v7-rollback.json",
+                reference_application_authorization=(
+                    exact_drain_authorization(reference)
+                ),
+                reference_application_journal=(
+                    exact_drain_application_journal(reference)
+                ),
+                reference_application_progress_digest="d" * 64,
+                schema_version=7,
+                created_at=1_786_390_500,
+            )
+
+        plan = create(snapshot)
+        self.assertEqual(plan["schema_version"], 7)
+        self.assertEqual(plan["selected_operation_count"], 5)
+        self.assertEqual(
+            plan["selected_status_counts"],
+            {"failed": 3, "pending": 1, "processing": 1},
+        )
+        self.assertEqual(plan["selected_type_counts"], {"retain": 5})
+        self.assertEqual(
+            plan["preserved_status_counts"],
+            {"completed": 6, "pending": 37},
+        )
+        self.assertEqual(
+            verify_post_abort_recovery_plan(plan, now=plan["created_at"]),
+            plan,
+        )
+
+        changed = deepcopy(snapshot)
+        retrying = next(
+            item
+            for item in changed["operations"]
+            if item["current_status"] == "pending"
+            and item["worker_id_present"]
+        )
+        retrying["retry_count"] = 2
+        retrying["row_digest"] = digest(
+            {key: value for key, value in retrying.items() if key != "row_digest"}
+        )
+        changed["snapshot_digest"] = digest(
+            {
+                key: value
+                for key, value in changed.items()
+                if key != "snapshot_digest"
+            }
+        )
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "post-abort row set is invalid",
+        ):
+            create(changed)
 
     def test_post_abort_plan_rejects_a_different_processing_owner(self):
         reference = self.drain_plan()

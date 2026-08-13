@@ -8238,7 +8238,7 @@ def _operation_recovery_post_abort_assert_reference_worker_stopped(
     plan: Mapping[str, Any],
 ) -> None:
     if (
-        plan["schema_version"] in {2, 3, 4, 5, 6}
+        plan["schema_version"] in {2, 3, 4, 5, 6, 7}
         and _operation_recovery_exact_journal_worker_active(
             plan["reference_application_journal"]
         )
@@ -8262,7 +8262,7 @@ def _operation_recovery_post_abort_assert_reference_source_stopped(
         authorization != plan["reference_application_authorization"]
         or journal != plan["reference_application_journal"]
         or (
-            plan["schema_version"] in {3, 4, 5, 6}
+            plan["schema_version"] in {3, 4, 5, 6, 7}
             and _operation_recovery_post_abort_reference_progress_digest(
                 plan["reference_plan"],
                 journal,
@@ -10325,6 +10325,19 @@ async def _operation_recovery_post_abort_verify_live(
         ):
             raise OperationRecoveryError(
                 "operation-recovery post-abort processing verification differs"
+            )
+        if item["expected_status"] == "pending" and any(
+            after[key] != before[key]
+            for key in (
+                "completed_at",
+                "retry_count",
+                "next_retry_at",
+                "error_category",
+                "error_digest",
+            )
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery post-abort pending verification differs"
             )
         if item["expected_status"] == "failed" and (
             after["completed_at"] is not None

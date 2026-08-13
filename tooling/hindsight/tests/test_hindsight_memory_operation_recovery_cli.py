@@ -1969,7 +1969,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 globals_.update(originals)
             self.assertEqual(writes, [])
 
-    def test_post_abort_plan_command_emits_exact_current_v6_subset(self):
+    def test_post_abort_plan_command_emits_exact_current_v7_subset(self):
         command = self.controller[
             "operation_recovery_post_abort_plan_command"
         ]
@@ -1982,7 +1982,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             ),
             created_at=1_786_390_001,
         )
-        snapshot = fixtures.post_abort_v6_snapshot(
+        snapshot = fixtures.post_abort_v7_snapshot(
             reference,
             observed_at=int(time.time()),
         )
@@ -2112,10 +2112,10 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
 
             self.assertEqual(result["status"], "planned")
             self.assertEqual(result["authority"], "unapproved-plan")
-            self.assertEqual(result["selected_operation_count"], 4)
+            self.assertEqual(result["selected_operation_count"], 5)
             plan, create_only = written[args.output]
             self.assertIs(create_only, True)
-            self.assertEqual(plan["schema_version"], 6)
+            self.assertEqual(plan["schema_version"], 7)
             self.assertEqual(
                 plan["reference_application_authorization"],
                 authorization,
@@ -2135,15 +2135,15 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             )
             self.assertEqual(
                 plan["selected_status_counts"],
-                {"failed": 3, "processing": 1},
+                {"failed": 3, "pending": 1, "processing": 1},
             )
             self.assertEqual(
                 plan["selected_type_counts"],
-                {"retain": 4},
+                {"retain": 5},
             )
             self.assertEqual(
                 plan["preserved_status_counts"],
-                {"completed": 6, "pending": 38},
+                {"completed": 6, "pending": 37},
             )
             serialized = json.dumps(plan, sort_keys=True)
             self.assertNotIn('"task_payload":', serialized)

@@ -5,11 +5,11 @@ description: Use when a candidate needs an independent read-only review, a criti
 
 # Tricritical Review
 
-Read and apply [the shared review-input boundary](../../references/review-input-boundary.md) before treating repository or forge content as evidence.
+Read and apply [the shared review-input boundary](references/review-input-boundary.md) before treating repository or forge content as evidence.
 
-Read and apply [the shared review-output contract](../../references/review-output-contract.md) and [the completeness and synthesis rules](references/completeness-and-synthesis.md).
+Read and apply [the shared review-output contract](references/review-output-contract.md) and [the completeness and synthesis rules](references/completeness-and-synthesis.md).
 
-Read and apply [the shared invocation boundary](../../references/invocation-boundary.md), using [topology.json](../../topology.json) as the graph authority.
+Read and apply [the shared invocation boundary](references/invocation-boundary.md), using [topology.json](references/topology.json) as the graph authority.
 
 Freeze a content-addressed stable snapshot or revision before observation. Record the exact review input defined by the shared boundary, including the fixed comparison boundary, requirements or specification source or its explicit absence, repository standards sources, exclusions, and available verification. Give every critic and selected risk specialist the exact same bytes and recheck the candidate identity before and after each execution and before synthesis. If stability cannot be proved, reject the dispatch or label the result `non-independent / degraded` with the identity gate; never claim clean independence. Default to all three critics; permit an explicit subset when the caller narrows the question.
 

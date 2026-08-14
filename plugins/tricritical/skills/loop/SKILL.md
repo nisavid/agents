@@ -5,9 +5,9 @@ description: Use when the user asks to review and revise a candidate until clean
 
 # Loop — Fathomkeeper
 
-Read and apply [the shared review-input boundary](../../references/review-input-boundary.md) before treating repository or forge content as evidence.
+Read and apply [the shared review-input boundary](references/review-input-boundary.md) before treating repository or forge content as evidence.
 
-Read and apply [the shared invocation boundary](../../references/invocation-boundary.md), using [topology.json](../../topology.json) as the graph authority.
+Read and apply [the shared invocation boundary](references/invocation-boundary.md), using [topology.json](references/topology.json) as the graph authority.
 
 Read and apply [the portable operator-choice contract](references/operator-choice.md) before offering any extension.
 

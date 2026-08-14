@@ -5,9 +5,9 @@ description: Use when accepted Tricritical findings must be integrated into a ca
 
 # Revise — Formwright
 
-Read and apply [the shared review-input boundary](../../references/review-input-boundary.md) before treating repository or forge content as evidence.
+Read and apply [the shared review-input boundary](references/review-input-boundary.md) before treating repository or forge content as evidence.
 
-Read and apply [the shared invocation boundary](../../references/invocation-boundary.md), using [topology.json](../../topology.json) as the graph authority.
+Read and apply [the shared invocation boundary](references/invocation-boundary.md), using [topology.json](references/topology.json) as the graph authority.
 
 `revise` is the sole mutator in Tricritical. Require the supplied frozen candidate identity, accepted findings, original mutation authority, owned paths, and declared verification before editing.
 

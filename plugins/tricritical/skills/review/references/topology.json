@@ -1,0 +1,71 @@
+{
+  "schema_version": 2,
+  "skills": {
+    "review": {
+      "role": "coordinator",
+      "mutates_directly": false,
+      "can_cause_mutation": false,
+      "requires_original_mutation_authority": false,
+      "repeats": false,
+      "requires": [
+        "adapter:model-selection-receipt",
+        "adapter:rolecasting-invocation-topology-receipt"
+      ],
+      "calls": ["intent", "runtime", "structure"]
+    },
+    "intent": {
+      "role": "critic",
+      "mutates_directly": false,
+      "can_cause_mutation": false,
+      "requires_original_mutation_authority": false,
+      "repeats": false,
+      "requires": [],
+      "calls": []
+    },
+    "runtime": {
+      "role": "critic",
+      "mutates_directly": false,
+      "can_cause_mutation": false,
+      "requires_original_mutation_authority": false,
+      "repeats": false,
+      "requires": [],
+      "calls": []
+    },
+    "structure": {
+      "role": "critic",
+      "mutates_directly": false,
+      "can_cause_mutation": false,
+      "requires_original_mutation_authority": false,
+      "repeats": false,
+      "requires": [],
+      "calls": []
+    },
+    "adjudicate": {
+      "role": "adjudicator",
+      "mutates_directly": false,
+      "can_cause_mutation": false,
+      "requires_original_mutation_authority": false,
+      "repeats": false,
+      "requires": [],
+      "calls": []
+    },
+    "revise": {
+      "role": "reviser",
+      "mutates_directly": true,
+      "can_cause_mutation": true,
+      "requires_original_mutation_authority": true,
+      "repeats": false,
+      "requires": [],
+      "calls": []
+    },
+    "loop": {
+      "role": "loop",
+      "mutates_directly": false,
+      "can_cause_mutation": true,
+      "requires_original_mutation_authority": true,
+      "repeats": true,
+      "requires": [],
+      "calls": ["review", "adjudicate", "revise"]
+    }
+  }
+}

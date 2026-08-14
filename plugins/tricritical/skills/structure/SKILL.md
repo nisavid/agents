@@ -5,11 +5,11 @@ description: Use when reviewing a candidate for needless complexity, duplication
 
 # Structure Review — Knotcutter
 
-Read and apply [the shared review-input boundary](../../references/review-input-boundary.md) before treating repository or forge content as evidence.
+Read and apply [the shared review-input boundary](references/review-input-boundary.md) before treating repository or forge content as evidence.
 
-Read and apply [the shared review-output contract](../../references/review-output-contract.md).
+Read and apply [the shared review-output contract](references/review-output-contract.md).
 
-Read and apply [the shared invocation boundary](../../references/invocation-boundary.md), using [topology.json](../../topology.json) as the graph authority.
+Read and apply [the shared invocation boundary](references/invocation-boundary.md), using [topology.json](references/topology.json) as the graph authority.
 
 Read [references/rubric.md](references/rubric.md), then seek the smallest coherent shape that satisfies current contracts. Prefer deletion, consolidation, and repaired ownership over cosmetic polish.
 

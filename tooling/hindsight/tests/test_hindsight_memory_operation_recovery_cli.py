@@ -1793,7 +1793,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                     lambda: "6" * 64
                 ),
                 "_operation_recovery_exact_runtime_digest": (
-                    lambda _args, *, schema_version=6: (
+                    lambda _args, *, schema_version=7: (
                         runtime_schemas.append(schema_version) or "8" * 64
                     )
                 ),
@@ -1831,11 +1831,11 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             self.assertEqual(result["status"], "planned")
             self.assertEqual(result["authority"], "unapproved-plan")
             self.assertEqual(result["selected_operation_count"], 43)
-            self.assertEqual(runtime_schemas, [6])
+            self.assertEqual(runtime_schemas, [7])
             plan, create_only = written[args.output]
             self.assertIs(create_only, True)
             self.assertIs(plan["mutation_authorized"], False)
-            self.assertEqual(plan["schema_version"], 6)
+            self.assertEqual(plan["schema_version"], 7)
             serialized = json.dumps(plan, sort_keys=True)
             self.assertNotIn('"task_payload":', serialized)
             self.assertNotIn('"worker_id":', serialized)
@@ -1969,7 +1969,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 globals_.update(originals)
             self.assertEqual(writes, [])
 
-    def test_post_abort_plan_command_emits_exact_current_v7_subset(self):
+    def test_post_abort_plan_command_emits_exact_current_v8_subset(self):
         command = self.controller[
             "operation_recovery_post_abort_plan_command"
         ]
@@ -1982,7 +1982,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             ),
             created_at=1_786_390_001,
         )
-        snapshot = fixtures.post_abort_v7_snapshot(
+        snapshot = fixtures.post_abort_v8_snapshot(
             reference,
             observed_at=int(time.time()),
         )
@@ -2112,10 +2112,10 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
 
             self.assertEqual(result["status"], "planned")
             self.assertEqual(result["authority"], "unapproved-plan")
-            self.assertEqual(result["selected_operation_count"], 5)
+            self.assertEqual(result["selected_operation_count"], 2)
             plan, create_only = written[args.output]
             self.assertIs(create_only, True)
-            self.assertEqual(plan["schema_version"], 7)
+            self.assertEqual(plan["schema_version"], 8)
             self.assertEqual(
                 plan["reference_application_authorization"],
                 authorization,
@@ -2135,15 +2135,15 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             )
             self.assertEqual(
                 plan["selected_status_counts"],
-                {"failed": 3, "pending": 1, "processing": 1},
+                {"failed": 1, "processing": 1},
             )
             self.assertEqual(
                 plan["selected_type_counts"],
-                {"retain": 5},
+                {"retain": 2},
             )
             self.assertEqual(
                 plan["preserved_status_counts"],
-                {"completed": 6, "pending": 37},
+                {"completed": 6, "pending": 40},
             )
             serialized = json.dumps(plan, sort_keys=True)
             self.assertNotIn('"task_payload":', serialized)
@@ -2734,7 +2734,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 )
             )
             self.assertRegex(snapshot["snapshot_digest"], r"^[0-9a-f]{64}$")
-            self.assertEqual(snapshot["schema_version"], 5)
+            self.assertEqual(snapshot["schema_version"], 6)
             patched_resolver = resolver.read_text(encoding="utf-8")
             self.assertNotEqual(resolver.read_bytes(), original_resolver)
             trigram_source = patched_resolver.split(
@@ -2750,9 +2750,10 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             )
             self.assertIn(
                 "WHERE ec.entity_id_1 = ANY($1::uuid[])\n"
-                "                   AND ec.entity_id_2 = ANY($1::uuid[])",
+                "                           AND ec.entity_id_2 = ANY($2::uuid[])",
                 trigram_source,
             )
+            self.assertIn("cooccurrence_batch_size = 128", trigram_source)
             self.assertIn(
                 "retain.phase1.candidates.exact.", trigram_source
             )
@@ -3042,7 +3043,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 "exact-drain-candidate-runtime-snapshot",
             )
             self.assertRegex(value["snapshot_digest"], r"^[0-9a-f]{64}$")
-            self.assertEqual(value["schema_version"], 5)
+            self.assertEqual(value["schema_version"], 6)
             self.assertNotIn(str(provider_root), result.stdout)
             verified, sources = (
                 operation_recovery_runtime.
@@ -3124,7 +3125,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                     candidate_library,
                 )
             )
-            self.assertEqual(recovered["schema_version"], 5)
+            self.assertEqual(recovered["schema_version"], 6)
             self.assertNotEqual(resolver.read_bytes(), original)
             with self.assertRaisesRegex(Exception, "already exists"):
                 operation_recovery_runtime.assemble_exact_drain_candidate_runtime_snapshot(
@@ -3188,7 +3189,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                     candidate_library,
                 )
             )
-            self.assertEqual(recovered["schema_version"], 5)
+            self.assertEqual(recovered["schema_version"], 6)
 
     def test_exact_drain_snapshot_failure_boundaries_are_retryable(self):
         for boundary in (
@@ -3348,7 +3349,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                     provider_root,
                     candidate_library,
                 )
-                self.assertEqual(recovered["schema_version"], 5)
+                self.assertEqual(recovered["schema_version"], 6)
                 self.assertNotEqual(resolver.read_bytes(), original)
                 self.assertFalse(
                     (
@@ -3435,7 +3436,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 provider_root,
                 candidate_library,
             )
-            self.assertEqual(recovered["schema_version"], 5)
+            self.assertEqual(recovered["schema_version"], 6)
             self.assertFalse(recovery_path.exists())
 
     def test_exact_drain_recovery_marker_partial_write_is_retryable(self):
@@ -3511,7 +3512,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 provider_root,
                 candidate_library,
             )
-            self.assertEqual(recovered["schema_version"], 5)
+            self.assertEqual(recovered["schema_version"], 6)
             self.assertNotEqual(resolver.read_bytes(), original)
 
     def test_exact_drain_recovery_marker_fault_matrix_is_retryable(self):
@@ -3678,7 +3679,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                         provider_root,
                         candidate_library,
                     )
-                    self.assertEqual(recovered["schema_version"], 5)
+                    self.assertEqual(recovered["schema_version"], 6)
                     self.assertNotEqual(resolver.read_bytes(), original)
 
     def test_exact_drain_recovery_marker_restoration_faults_are_retryable(self):
@@ -3871,7 +3872,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                     provider_root,
                     candidate_library,
                 )
-                self.assertEqual(recovered["schema_version"], 5)
+                self.assertEqual(recovered["schema_version"], 6)
                 self.assertFalse(recovery_path.exists())
 
     def test_exact_drain_phase_repair_preserves_trigram_resolution_behavior(self):
@@ -3933,6 +3934,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                         self.now = now
                         self.execute_calls = []
                         self.query_batch_sizes = []
+                        self.cooccurrence_batch_sizes = []
                     def transaction(self):
                         return Transaction()
                     async def execute(self, query):
@@ -3950,6 +3952,17 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                                 return [ExternalEdge()]
                             if " AND " not in query:
                                 raise AssertionError("cooccurrence scope differs")
+                            self.cooccurrence_batch_sizes.append(
+                                len(arguments[0])
+                            )
+                            if len(arguments) != 2:
+                                raise AssertionError(
+                                    "cooccurrence candidate authority is unbounded"
+                                )
+                            if len(arguments[1]) != 257:
+                                raise AssertionError(
+                                    "cooccurrence candidate set differs"
+                                )
                             return [
                                 {{"entity_id_1": "alice-id", "entity_id_2": "bob-id"}}
                             ]
@@ -3991,7 +4004,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                         {{"text": "Bob", "nearby_entities": [{{"text": "Alicee"}}]}},
                     ] + [
                         {{"text": f"Entity{{position:02d}}x", "nearby_entities": []}}
-                        for position in range(23)
+                        for position in range(255)
                     ]
                     candidates = {{
                         entity["text"]: [
@@ -4047,6 +4060,9 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                         "actual_stats": actual_stats,
                         "execute_calls": actual_connection.execute_calls,
                         "query_batch_sizes": actual_connection.query_batch_sizes,
+                        "cooccurrence_batch_sizes": (
+                            actual_connection.cooccurrence_batch_sizes
+                        ),
                     }}
 
                 print(json.dumps(asyncio.run(exercise()), sort_keys=True))
@@ -4074,9 +4090,16 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                     "SET TRANSACTION READ ONLY",
                     "SET LOCAL statement_timeout = '120s'",
                 ]
-                * 4,
+                * 29,
             )
-            self.assertEqual(observed["query_batch_sizes"], [10, 10, 5])
+            self.assertEqual(
+                observed["query_batch_sizes"],
+                [10] * 25 + [7],
+            )
+            self.assertEqual(
+                observed["cooccurrence_batch_sizes"],
+                [128, 128, 1],
+            )
 
     def test_exact_drain_metadata_ceiling_precedes_file_read(self):
         read_version = self.controller[
@@ -6362,6 +6385,92 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 globals_.update(originals)
             self.assertEqual(provider_activation, [])
 
+    def test_exact_drain_controller_signal_scope_forwards_to_exact_child(self):
+        scope = self.controller[
+            "_operation_recovery_exact_child_signal_scope"
+        ]
+        globals_ = scope.__wrapped__.__globals__
+        installed = {}
+        restored = []
+        forwarded = []
+
+        class Process:
+            pid = 4242
+
+            @staticmethod
+            def poll():
+                return None
+
+            @staticmethod
+            def send_signal(signum):
+                forwarded.append(signum)
+
+        def install(signum, handler):
+            if handler in {"prior-int", "prior-term"}:
+                restored.append((signum, handler))
+            else:
+                installed[signum] = handler
+
+        previous_match = globals_["_process_identity_matches"]
+        globals_["_process_identity_matches"] = lambda identity: (
+            identity.pid == 4242 and identity.start_time == "start-token"
+        )
+        try:
+            with (
+                patch.object(
+                    signal,
+                    "getsignal",
+                    side_effect=lambda signum: {
+                        signal.SIGINT: "prior-int",
+                        signal.SIGTERM: "prior-term",
+                    }[signum],
+                ),
+                patch.object(signal, "signal", side_effect=install),
+                scope(Process(), "start-token") as state,
+                self.assertRaisesRegex(Exception, "interrupted"),
+            ):
+                installed[signal.SIGTERM](signal.SIGTERM, None)
+        finally:
+            globals_["_process_identity_matches"] = previous_match
+
+        self.assertTrue(state.forwarded)
+        self.assertEqual(forwarded, [signal.SIGTERM])
+        self.assertEqual(
+            restored,
+            [
+                (signal.SIGINT, "prior-int"),
+                (signal.SIGTERM, "prior-term"),
+            ],
+        )
+
+    def test_exact_drain_controller_blocks_signals_until_child_scope_is_ready(self):
+        block = self.controller[
+            "_operation_recovery_exact_child_signal_block"
+        ]
+        calls = []
+        prior = {signal.SIGUSR1}
+
+        with (
+            patch.object(
+                signal,
+                "pthread_sigmask",
+                side_effect=lambda how, signals: (
+                    calls.append((how, set(signals))) or prior
+                ),
+            ),
+            block(),
+        ):
+            calls.append(("child-scope-ready", set()))
+
+        self.assertEqual(
+            calls,
+            [
+                (signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM}),
+                ("child-scope-ready", set()),
+                (signal.SIG_SETMASK, prior),
+            ],
+        )
+
     def test_exact_drain_zero_exit_keeps_nonterminal_journal_resumable(self):
         fixtures = recovery_fixtures.OperationRecoveryContractTest()
         now = int(time.time())
@@ -6718,8 +6827,8 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 globals_.update(originals)
 
         self.assertEqual(signals, [signal.SIGTERM])
-        self.assertEqual(len(wait_timeouts), 2)
-        self.assertEqual(wait_timeouts[1], 120)
+        self.assertEqual(len(wait_timeouts), 3)
+        self.assertEqual(wait_timeouts[1:], [120, 120])
         self.assertEqual(
             journal["kind"],
             "operation-recovery-exact-drain-application-journal",

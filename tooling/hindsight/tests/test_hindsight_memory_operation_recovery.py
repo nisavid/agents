@@ -381,7 +381,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
 
         plan = self.drain_plan(snapshot=snapshot, created_at=planned_at)
 
-        self.assertEqual(plan["schema_version"], 6)
+        self.assertEqual(plan["schema_version"], 7)
         self.assertEqual(plan["expires_at"], planned_at + 86_400)
         self.assertEqual(plan["evidence_observed_at"], snapshot["observed_at"])
         self.assertEqual(plan["evidence_max_age_seconds"], 3_600)
@@ -392,7 +392,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
         self.assertEqual(plan["phase_one_timeout_seconds"], 3_600)
         self.assertEqual(
             plan["phase_repair_contract_digest"],
-            recovery_contract.EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V4_DIGEST,
+            recovery_contract.EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V5_DIGEST,
         )
         self.assertEqual(plan["progress_schema_version"], 2)
         self.assertEqual(
@@ -1038,6 +1038,81 @@ class OperationRecoveryContractTest(unittest.TestCase):
         )
         return snapshot
 
+    def post_abort_v8_snapshot(
+        self,
+        reference_plan,
+        *,
+        observed_at: int = 1_786_390_181,
+    ) -> dict:
+        snapshot = self.post_abort_snapshot(
+            reference_plan,
+            interrupted_processing_count=1,
+            observed_at=observed_at,
+        )
+        worker_digest = hashlib.sha256(
+            (
+                "operation-recovery-exact-drain-"
+                f"{reference_plan['plan_digest'][:12]}"
+            ).encode()
+        ).hexdigest()
+        processing = next(
+            item
+            for item in snapshot["operations"]
+            if item["current_status"] == "processing"
+        )
+        processing.update(
+            {
+                "retry_count": 1,
+                "error_category": "provider_transport",
+                "error_digest": "1" * 64,
+                "result_metadata_digest": "2" * 64,
+            }
+        )
+        failed = next(
+            item
+            for item in snapshot["operations"]
+            if item["operation_id"]
+            in {
+                selected["operation_id"]
+                for selected in reference_plan["selected_operations"]
+            }
+            and item["current_status"] == "pending"
+            and item["operation_type"] == "retain"
+        )
+        failed.update(
+            {
+                "current_status": "failed",
+                "retry_count": 3,
+                "worker_id_present": True,
+                "worker_id_digest": worker_digest,
+                "claimed_at": "2026-08-14T01:49:50.000000Z",
+                "completed_at": "2026-08-14T02:49:32.000000Z",
+                "error_category": "unknown",
+                "error_digest": "3" * 64,
+                "result_metadata_digest": "4" * 64,
+            }
+        )
+        for item in (processing, failed):
+            item["row_digest"] = digest(
+                {key: value for key, value in item.items() if key != "row_digest"}
+            )
+        snapshot["operations"].sort(key=lambda item: item["operation_id"])
+        snapshot["status_counts"] = {
+            status: sum(
+                item["current_status"] == status
+                for item in snapshot["operations"]
+            )
+            for status in recovery_contract.OPERATION_STATUSES
+        }
+        snapshot["snapshot_digest"] = digest(
+            {
+                key: value
+                for key, value in snapshot.items()
+                if key != "snapshot_digest"
+            }
+        )
+        return snapshot
+
     def prior_v3_post_abort_plan(self) -> dict:
         reference = self.drain_plan()
         snapshot = self.post_abort_snapshot(
@@ -1667,7 +1742,107 @@ class OperationRecoveryContractTest(unittest.TestCase):
             OperationRecoveryError,
             "post-abort row set is invalid",
         ):
-            create(changed)
+                    create(changed)
+
+    def test_post_abort_v8_plan_binds_failed_and_processing_retries(self):
+        reference = self.drain_plan(
+            snapshot=self.drain_snapshot(
+                completed_positions={0, 1, 42, 43, 46, 47},
+                observed_at=1_786_390_000,
+            ),
+            created_at=1_786_390_001,
+        )
+        snapshot = self.post_abort_v8_snapshot(reference)
+        backup = rollback_backup_evidence()
+        backup["source_authority"]["generation_before"] = snapshot[
+            "generation_before"
+        ]
+        backup["source_authority"]["generation_after"] = snapshot[
+            "generation_after"
+        ]
+        backup["source_authority_digest"] = digest(backup["source_authority"])
+
+        def create(value):
+            return create_post_abort_recovery_plan(
+                reference,
+                value,
+                candidate_release=release_identity(),
+                rollback_backup=backup,
+                rollback_encryption=rollback_encryption(),
+                rollback_backup_path="/private/tmp/v8-backup.age",
+                rollback_bundle_path="/private/tmp/v8-bundle.age",
+                authorization_receipt_path="/private/tmp/v8-auth.json",
+                application_receipt_path="/private/tmp/v8-app.json",
+                verification_receipt_path="/private/tmp/v8-verify.json",
+                rollback_receipt_path="/private/tmp/v8-rollback.json",
+                reference_application_authorization=(
+                    exact_drain_authorization(reference)
+                ),
+                reference_application_journal=(
+                    exact_drain_application_journal(reference)
+                ),
+                reference_application_progress_digest="d" * 64,
+                schema_version=8,
+                created_at=1_786_390_500,
+            )
+
+        plan = create(snapshot)
+
+        self.assertEqual(plan["schema_version"], 8)
+        self.assertEqual(plan["selected_operation_count"], 2)
+        self.assertEqual(
+            plan["selected_status_counts"],
+            {"failed": 1, "processing": 1},
+        )
+        self.assertEqual(plan["selected_type_counts"], {"retain": 2})
+        self.assertEqual(
+            plan["preserved_status_counts"],
+            {"completed": 6, "pending": 40},
+        )
+        self.assertEqual(
+            verify_post_abort_recovery_plan(plan, now=plan["created_at"]),
+            plan,
+        )
+
+        for label, status, updates in (
+            ("processing-retry", "processing", {"retry_count": 0}),
+            (
+                "processing-category",
+                "processing",
+                {"error_category": "unknown"},
+            ),
+            ("processing-error-digest", "processing", {"error_digest": None}),
+            ("failed-retry", "failed", {"retry_count": 2}),
+            (
+                "failed-category",
+                "failed",
+                {"error_category": "provider_transport"},
+            ),
+            ("failed-error-digest", "failed", {"error_digest": None}),
+        ):
+            with self.subTest(drift=label):
+                changed = deepcopy(snapshot)
+                row = next(
+                    item
+                    for item in changed["operations"]
+                    if item["current_status"] == status
+                )
+                row.update(updates)
+                row["row_digest"] = digest(
+                    {key: value for key, value in row.items() if key != "row_digest"}
+                )
+                changed["snapshot_digest"] = digest(
+                    {
+                        key: value
+                        for key, value in changed.items()
+                        if key != "snapshot_digest"
+                    }
+                )
+                with self.assertRaisesRegex(
+                    OperationRecoveryError,
+                    "invalid",
+                ):
+                    create(changed)
 
     def test_post_abort_plan_rejects_a_different_processing_owner(self):
         reference = self.drain_plan()

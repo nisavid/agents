@@ -288,13 +288,15 @@ Phase 1 entity-resolver and PostgreSQL-write overlays to the detached
 candidate, and writes a canonical payload-free manifest for the provider and
 both original/patched Hindsight sources. The resolver overlay removes unused
 PostgreSQL candidate columns, fetches only the candidate-induced cooccurrence
-graph, emits observational candidate and cooccurrence breadcrumbs, and bounds
-the server query wait to 120 seconds and the client wait to 125 seconds, so a
-server cancellation can finish before the client deadline. Fuzzy candidate lookup is sealed to at
-most ten candidate names per query, so a large retain cannot concentrate the
-whole candidate set in one PostgreSQL request. The write overlay keeps entity
-insert and reassertion compatible with the bound pre-`entity_kind` database
-schema. These overlays are not a durable Phase 1 checkpoint or replay receipt.
+graph in deterministic 128-ID first-endpoint batches, emits observational
+candidate and cooccurrence breadcrumbs, and bounds each server query wait to
+120 seconds and each client wait to 125 seconds, so a server cancellation can
+finish before the client deadline. Fuzzy candidate lookup is sealed to at most
+ten candidate names per query, so a large retain cannot concentrate either
+candidate lookup or cooccurrence traversal in one PostgreSQL request. The write
+overlay keeps entity insert and reassertion compatible with the bound
+pre-`entity_kind` database schema. These overlays are not a durable Phase 1
+checkpoint or replay receipt.
 
 Release assembly runs this helper before `hindsight-portable-install`; the
 existing release manifest then seals the completed snapshot and patched

@@ -1882,6 +1882,40 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 globals_.update(originals)
             self.assertEqual(written, {})
 
+    def test_exact_drain_plan_requires_current_cooccurrence_snapshot(self):
+        helper = self.controller[
+            "_operation_recovery_exact_phase_repair_snapshot"
+        ]
+        globals_ = helper.__globals__
+        original = globals_["verify_exact_drain_candidate_runtime_snapshot"]
+        try:
+            globals_["verify_exact_drain_candidate_runtime_snapshot"] = (
+                lambda _library: (
+                    {
+                        "schema_version": 6,
+                        "snapshot_digest": "a" * 64,
+                    },
+                    {},
+                )
+            )
+            self.assertEqual(helper(), "a" * 64)
+            globals_["verify_exact_drain_candidate_runtime_snapshot"] = (
+                lambda _library: (
+                    {
+                        "schema_version": 5,
+                        "snapshot_digest": "b" * 64,
+                    },
+                    {},
+                )
+            )
+            with self.assertRaisesRegex(
+                Exception,
+                "cooccurrence-batch repair snapshot is required",
+            ):
+                helper()
+        finally:
+            globals_["verify_exact_drain_candidate_runtime_snapshot"] = original
+
     def test_exact_drain_plan_rejects_unpatched_legacy_candidate_snapshot(self):
         command = self.controller["operation_recovery_drain_plan_command"]
         globals_ = command.__globals__
@@ -1962,7 +1996,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             try:
                 with self.assertRaisesRegex(
                     Exception,
-            "failure-evidence repair snapshot is required",
+                    "cooccurrence-batch repair snapshot is required",
                 ):
                     command(args)
             finally:

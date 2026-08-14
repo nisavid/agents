@@ -7883,9 +7883,9 @@ def _operation_recovery_exact_runtime_digest(
 
 def _operation_recovery_exact_phase_repair_snapshot() -> str:
     snapshot, _sources = verify_exact_drain_candidate_runtime_snapshot(LIB)
-    if snapshot.get("schema_version") != 5:
+    if snapshot.get("schema_version") != 6:
         raise OperationRecoveryError(
-            "exact drain failure-evidence repair snapshot is required"
+            "exact drain cooccurrence-batch repair snapshot is required"
         )
     return snapshot["snapshot_digest"]
 

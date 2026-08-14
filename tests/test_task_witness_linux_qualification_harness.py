@@ -433,15 +433,13 @@ class TaskWitnessLinuxQualificationHarnessTests(unittest.TestCase):
                     library_path=root,
                 )
 
-    def test_statically_linked_is_only_valid_for_exact_retained_loader_self_trace(
+    def test_retained_loader_self_trace_accepts_empty_dynamic_sentinel(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root)
             retained_loader = root / "ld-linux-x86-64.so.2"
-            other = root / "other-loader"
-            retained_loader.write_bytes(b"loader")
-            other.write_bytes(b"other")
+            self.write_elf(retained_loader, [], dynamic=True)
             statically_linked = subprocess.CompletedProcess(
                 args=[],
                 returncode=0,
@@ -452,35 +450,167 @@ class TaskWitnessLinuxQualificationHarnessTests(unittest.TestCase):
                 self.helper,
                 "run",
                 return_value=statically_linked,
+            ) as run:
+                result = self.helper.ldd_dependency_bindings(
+                    retained_loader,
+                    1001,
+                    1001,
+                    [],
+                    tracer=retained_loader,
+                    library_path=root,
+                )
+
+            self.assertEqual(result[:4], ({}, {}, {}, {}))
+            self.assertEqual(result[4], "statically linked\n")
+            run.assert_called_once_with(
+                self.helper.unprivileged_argv(
+                    1001,
+                    1001,
+                    [
+                        str(retained_loader),
+                        "--inhibit-cache",
+                        "--library-path",
+                        str(root),
+                        "--list",
+                        str(retained_loader),
+                    ],
+                    home="/nonexistent-task-witness-ldd-home",
+                ),
+                check=False,
+            )
+
+    def test_dependency_free_dynamic_shared_object_accepts_empty_ldd_trace(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            shared_object = root / "_contextvars.cpython-313-x86_64-linux-gnu.so"
+            retained_loader = root / "ld-linux-x86-64.so.2"
+            self.write_elf(shared_object, [], dynamic=True)
+            retained_loader.write_bytes(b"retained-loader")
+            statically_linked = subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout="\tstatically linked\n",
+                stderr="",
+            )
+
+            for name, tracer, trace_argv in (
+                ("host-ldd", None, ["/usr/bin/ldd", str(shared_object)]),
+                (
+                    "retained-loader",
+                    retained_loader,
+                    [
+                        str(retained_loader),
+                        "--inhibit-cache",
+                        "--library-path",
+                        str(root),
+                        "--list",
+                        str(shared_object),
+                    ],
+                ),
             ):
-                self.assertEqual(
-                    self.helper.ldd_dependency_bindings(
-                        retained_loader,
+                with (
+                    self.subTest(name=name),
+                    mock.patch.object(
+                        self.helper,
+                        "run",
+                        return_value=statically_linked,
+                    ) as run,
+                ):
+                    result = self.helper.ldd_dependency_bindings(
+                        shared_object,
                         1001,
                         1001,
                         [],
-                        tracer=retained_loader,
-                        library_path=root,
-                    )[:4],
-                    ({}, {}, {}, {}),
+                        tracer=tracer,
+                        library_path=root if tracer is not None else None,
+                    )
+                self.assertEqual(result[:4], ({}, {}, {}, {}))
+                self.assertEqual(result[4], "\tstatically linked\n")
+                run.assert_called_once_with(
+                    self.helper.unprivileged_argv(
+                        1001,
+                        1001,
+                        trace_argv,
+                        home="/nonexistent-task-witness-ldd-home",
+                    ),
+                    check=False,
                 )
-                for name, path, expected, tracer in (
-                    ("host-ldd", retained_loader, [], None),
-                    ("different-tracer", retained_loader, [], other),
-                    ("claimed-needed", retained_loader, ["libc.so.6"], retained_loader),
+
+    def test_empty_ldd_trace_requires_dependency_free_dynamic_shared_object(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            shared_object = root / "shared-object.so"
+            static_elf = root / "static-elf"
+            interpreted_elf = root / "interpreted-elf"
+            malformed_elf = root / "malformed-elf"
+            self.write_elf(shared_object, [], dynamic=True)
+            self.write_elf(static_elf, [])
+            self.write_elf(
+                interpreted_elf,
+                ["/lib64/ld-linux-x86-64.so.2"],
+                dynamic=True,
+            )
+            malformed_elf.write_bytes(b"\x7fELFmalformed")
+            clean = subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout="statically linked\n",
+                stderr="",
+            )
+            nonzero = subprocess.CompletedProcess(
+                args=[],
+                returncode=1,
+                stdout="statically linked\n",
+                stderr="",
+            )
+            stderr = subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout="statically linked\n",
+                stderr="unexpected\n",
+            )
+            extra_row = subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout="statically linked\nlinux-vdso.so.1 (0x1)\n",
+                stderr="",
+            )
+
+            for name, path, expected, process in (
+                ("no-pt-dynamic", static_elf, [], clean),
+                ("has-interpreter", interpreted_elf, [], clean),
+                ("claimed-needed", shared_object, ["libc.so.6"], clean),
+                ("nonzero", shared_object, [], nonzero),
+                ("stderr", shared_object, [], stderr),
+                ("extra-row", shared_object, [], extra_row),
+                ("malformed-elf", malformed_elf, [], clean),
+            ):
+                with (
+                    self.subTest(name=name),
+                    mock.patch.object(self.helper, "run", return_value=process),
+                    self.assertRaises(self.helper.PreparationError),
                 ):
-                    with (
-                        self.subTest(name=name),
-                        self.assertRaises(self.helper.PreparationError),
-                    ):
-                        self.helper.ldd_dependency_bindings(
-                            path,
-                            1001,
-                            1001,
-                            expected,
-                            tracer=tracer,
-                            library_path=root if tracer is not None else None,
-                        )
+                    self.helper.ldd_dependency_bindings(
+                        path,
+                        1001,
+                        1001,
+                        expected,
+                    )
+
+            for tracer, library_path in ((root / "loader", None), (None, root)):
+                with self.assertRaises(self.helper.PreparationError):
+                    self.helper.ldd_dependency_bindings(
+                        shared_object,
+                        1001,
+                        1001,
+                        [],
+                        tracer=tracer,
+                        library_path=library_path,
+                    )
 
     def test_loader_needed_edges_stay_separate_from_labeled_recursive_graph(
         self,
@@ -1383,6 +1513,43 @@ class TaskWitnessLinuxQualificationHarnessTests(unittest.TestCase):
                         {},
                         {},
                         {},
+                        {},
+                        "\tstatically linked\n",
+                    ),
+                ),
+            ):
+                dependency_free_audit = self.helper.audit_runtime_elf_dependencies(
+                    shared_object,
+                    runtime_root,
+                    retained_loader,
+                    host_loader,
+                    1001,
+                    1001,
+                )
+            self.assertEqual(
+                dependency_free_audit["trace_disposition"],
+                "dependency-free-dynamic-elf",
+            )
+            self.assertEqual(dependency_free_audit["resolved_paths"], [])
+
+            with (
+                mock.patch.object(
+                    self.helper,
+                    "patchelf_interpreter",
+                    return_value=None,
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "patchelf_needed",
+                    return_value=[],
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "ldd_dependency_bindings",
+                    return_value=(
+                        {},
+                        {},
+                        {},
                         {"/lib64/ld-linux-x86-64.so.2": retained_loader},
                         "loader trace\n",
                     ),
@@ -1397,6 +1564,10 @@ class TaskWitnessLinuxQualificationHarnessTests(unittest.TestCase):
                     1001,
                 )
             self.assertIsNone(audit["interpreter"])
+            self.assertEqual(
+                audit["trace_disposition"],
+                "resolved-dynamic-dependency-closure",
+            )
 
             with (
                 mock.patch.object(

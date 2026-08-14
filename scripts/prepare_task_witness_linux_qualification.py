@@ -950,13 +950,14 @@ def ldd_dependency_bindings(
     )
     output = process.stdout + process.stderr
     if process.stdout.strip() == "statically linked":
-        if (
-            tracer is not None
-            and path == tracer
-            and process.returncode == 0
-            and not expected
-            and not process.stderr
-        ):
+        clean_empty_trace = (
+            process.returncode == 0 and not expected and not process.stderr
+        )
+        dependency_free_dynamic_object = False
+        if clean_empty_trace:
+            is_dynamic, interpreter = elf_program_headers(path)
+            dependency_free_dynamic_object = is_dynamic and interpreter is None
+        if clean_empty_trace and dependency_free_dynamic_object:
             return {}, {}, {}, {}, output
         raise PreparationError(
             f"dynamic dependency inspection disagrees for {path}: {output}"
@@ -1800,6 +1801,11 @@ def audit_runtime_elf_dependencies(
             "library_path": str(retained_interpreter.parent),
             "inhibit_cache": True,
         },
+        "trace_disposition": (
+            "dependency-free-dynamic-elf"
+            if output.strip() == "statically linked"
+            else "resolved-dynamic-dependency-closure"
+        ),
         "trace_sha256": hashlib.sha256(output.encode("utf-8")).hexdigest(),
         "needed_bindings": [
             {

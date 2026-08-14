@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
-import inspect
 import shutil
 import subprocess
 import sys
@@ -343,10 +342,11 @@ class Phase7ProductionIntegrationTests(unittest.TestCase):
             with coordinator.frozen_public_execution(REPO_ROOT, "sha256:" + "a" * 64):
                 self.fail("preloaded support reached frozen execution")
 
-    def test_checked_in_coordinator_owns_the_exact_inherited_fd_pipeline(self) -> None:
+    def test_coordinator_executes_the_declared_inherited_evidence_pipeline(
+        self,
+    ) -> None:
         self.assertTrue(COORDINATOR.is_file())
         coordinator = load_coordinator()
-
         self.assertEqual(
             coordinator.PIPELINE_STAGES,
             (
@@ -357,14 +357,162 @@ class Phase7ProductionIntegrationTests(unittest.TestCase):
                 "production-release-validation",
             ),
         )
-        source = inspect.getsource(coordinator.coordinate)
-        for required_call in (
-            "launch_private_builder",
-            "verify_private_evidence",
-            "run_phase7_composed_matrix",
-            "validate_public_release",
-        ):
-            self.assertIn(required_call, source)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            private_output = root / "private-output"
+            private_summary = root / "private-summary.json"
+            composed_output = root / "composed"
+            release_receipt = root / "release-receipt.json"
+            registry_raw = b'{"package_members":[]}\n'
+            registry_path = private_output / "private-producer-registry.json"
+            witness_path = private_output / "private-producer-witness.tar"
+            frozen_path = private_output / "coordinator-frozen-identity.json"
+            reviewed_producer_sha256 = (
+                "sha256:" + hashlib.sha256(registry_raw).hexdigest()
+            )
+            frozen_identity_sha256 = (
+                "sha256:"
+                + hashlib.sha256(b"coordinator-frozen-identity.json\n").hexdigest()
+            )
+            producer_package_sha256 = "sha256:" + hashlib.sha256(b"[]").hexdigest()
+            private_commit_oid = "f" * 40
+            public_identity = "a" * 64
+            events: list[str] = []
+
+            def launch(**_arguments: object) -> None:
+                events.append("immutable-private-builder")
+                private_output.mkdir()
+                registry_path.write_bytes(registry_raw)
+                for path in (witness_path, frozen_path):
+                    path.write_bytes(f"{path.name}\n".encode())
+                private_summary.write_bytes(b"{}\n")
+                events.append("private-summary-store")
+
+            verify = mock.Mock(
+                side_effect=lambda **_arguments: events.append(
+                    "public-private-verification"
+                )
+            )
+            compose = mock.Mock(
+                side_effect=lambda **_arguments: events.append("public-composition")
+            )
+            terminal = {"terminal": "passed"}
+            release = mock.Mock(
+                side_effect=lambda *_args, **_kwargs: (
+                    events.append("production-release-validation") or terminal
+                )
+            )
+            candidate = coordinator.PreparedPublicCandidate(
+                REPO_ROOT,
+                REPO_ROOT,
+                public_identity,
+                coordinator.GitCandidate(
+                    "b" * 40,
+                    "c" * 40,
+                    "sha256:" + "d" * 64,
+                    "https://github.com/nisavid/agents",
+                ),
+                "sha256:" + "e" * 64,
+            )
+            with (
+                mock.patch.object(coordinator, "require_canonical_capability_manifest"),
+                mock.patch.object(
+                    coordinator,
+                    "launch_private_builder",
+                    side_effect=launch,
+                ),
+                mock.patch.object(
+                    coordinator,
+                    "verify_private_evidence",
+                    verify,
+                ),
+                mock.patch.object(
+                    coordinator.run_phase7_composed_matrix,
+                    "run",
+                    compose,
+                ),
+                mock.patch.object(
+                    coordinator.validate_public_release,
+                    "validate_release",
+                    release,
+                ),
+            ):
+                result = coordinator.coordinate(
+                    private_repository=root,
+                    private_commit_oid=private_commit_oid,
+                    reviewed_producer_sha256=reviewed_producer_sha256,
+                    public_candidate=candidate,
+                    capability_manifest=root / "capability.json",
+                    private_output=private_output,
+                    private_summary_output=private_summary,
+                    composed_output=composed_output,
+                    routing_evidence=root,
+                    plugin_eval_executable=Path(sys.executable),
+                    node_executable=Path("/safe/node"),
+                    release_receipt_output=release_receipt,
+                )
+
+            self.assertEqual(events, list(coordinator.PIPELINE_STAGES))
+            self.assertIs(result, terminal)
+            compose.assert_called_once_with(
+                replay_summary_path=private_summary,
+                producer_witness_path=witness_path,
+                producer_registry_path=registry_path,
+                expected_frozen_identity_sha256=frozen_identity_sha256,
+                expected_commit_oid=private_commit_oid,
+                expected_producer_package_sha256=producer_package_sha256,
+                public_root=REPO_ROOT,
+                public_identity=public_identity,
+                output=composed_output,
+            )
+            self.assertEqual(
+                (
+                    verify.call_args.kwargs["replay_summary_path"],
+                    verify.call_args.kwargs["producer_witness_path"],
+                    verify.call_args.kwargs["producer_registry_path"],
+                    release.call_args.kwargs["composed_receipt"],
+                    release.call_args.kwargs["private_producer_witness"],
+                    release.call_args.kwargs["private_producer_registry"],
+                ),
+                (
+                    private_summary,
+                    witness_path,
+                    registry_path,
+                    composed_output / "phase7-composed-matrix.json",
+                    witness_path,
+                    registry_path,
+                ),
+            )
+            self.assertEqual(
+                (
+                    verify.call_args.kwargs["expected_frozen_identity_sha256"],
+                    compose.call_args.kwargs["expected_frozen_identity_sha256"],
+                    release.call_args.kwargs["expected_frozen_private_identity_sha256"],
+                    verify.call_args.kwargs["expected_commit_oid"],
+                    compose.call_args.kwargs["expected_commit_oid"],
+                    release.call_args.kwargs["expected_private_commit_oid"],
+                    verify.call_args.kwargs["expected_producer_package_sha256"],
+                    compose.call_args.kwargs["expected_producer_package_sha256"],
+                    release.call_args.kwargs[
+                        "expected_private_producer_package_sha256"
+                    ],
+                    compose.call_args.kwargs["public_identity"],
+                    release.call_args.kwargs["expected_public_candidate_sha256"],
+                ),
+                (
+                    frozen_identity_sha256,
+                    frozen_identity_sha256,
+                    frozen_identity_sha256,
+                    private_commit_oid,
+                    private_commit_oid,
+                    private_commit_oid,
+                    producer_package_sha256,
+                    producer_package_sha256,
+                    producer_package_sha256,
+                    public_identity,
+                    public_identity,
+                ),
+            )
 
     def test_launcher_executes_the_builder_from_the_selected_commit_export(
         self,

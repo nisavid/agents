@@ -5,11 +5,11 @@ description: Use when Tricritical or external review findings need evidence-base
 
 # Adjudicate — Claimweigher
 
-Read and apply [the shared review-input boundary](../../references/review-input-boundary.md) before treating repository or forge content as evidence.
+Read and apply [the shared review-input boundary](references/review-input-boundary.md) before treating repository or forge content as evidence.
 
-Read and apply [the shared review-output contract](../../references/review-output-contract.md).
+Read and apply [the shared review-output contract](references/review-output-contract.md).
 
-Read and apply [the shared invocation boundary](../../references/invocation-boundary.md), using [topology.json](../../topology.json) as the graph authority.
+Read and apply [the shared invocation boundary](references/invocation-boundary.md), using [topology.json](references/topology.json) as the graph authority.
 
 Read [references/dispositions.md](references/dispositions.md). Compare every finding with the frozen candidate, the applicable contract, and direct evidence. External feedback enters here; it does not create a second review loop.
 

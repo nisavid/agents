@@ -145,14 +145,15 @@ SHARED_INPUT_BOUNDARY_PATH = "references/review-input-boundary.md"
 SHARED_OUTPUT_CONTRACT_PATH = "references/review-output-contract.md"
 SHARED_INVOCATION_BOUNDARY_PATH = "references/invocation-boundary.md"
 SHARED_INPUT_BOUNDARY_LINK = (
-    "[the shared review-input boundary](../../references/review-input-boundary.md)"
+    "[the shared review-input boundary](references/review-input-boundary.md)"
 )
 SHARED_OUTPUT_CONTRACT_LINK = (
-    "[the shared review-output contract](../../references/review-output-contract.md)"
+    "[the shared review-output contract](references/review-output-contract.md)"
 )
 SHARED_INVOCATION_BOUNDARY_LINK = (
-    "[the shared invocation boundary](../../references/invocation-boundary.md)"
+    "[the shared invocation boundary](references/invocation-boundary.md)"
 )
+SKILL_LOCAL_TOPOLOGY_LINK = "[topology.json](references/topology.json)"
 REVIEW_COMPLETENESS_LINK = (
     "[the completeness and synthesis rules](references/completeness-and-synthesis.md)"
 )
@@ -937,7 +938,6 @@ def validate_manifests(root: Path) -> dict:
     discovered = discover_direct_skills(root)
     if discovered != tuple(sorted(CORE_SKILLS)):
         fail("Agent Plugins direct-child skill inventory drift")
-    validate_skill_resource_links(root, discovered)
     changelog = read_regular_file(root, "CHANGELOG.md")
     headings = re.findall(r"^##\s+(.+?)\s*$", changelog, re.M)
     if not headings or headings[0] != codex["version"]:
@@ -945,7 +945,7 @@ def validate_manifests(root: Path) -> dict:
     return codex
 
 
-def expected_skill_files(skill: str) -> set[str]:
+def authored_skill_files(skill: str) -> set[str]:
     files = {"SKILL.md", "agents/openai.yaml"}
     if skill == "review":
         files.add("references/completeness-and-synthesis.md")
@@ -962,6 +962,43 @@ def expected_skill_files(skill: str) -> set[str]:
             }
         )
     return files
+
+
+def expected_skill_files(skill: str) -> set[str]:
+    return authored_skill_files(skill) | set(skill_local_projection_sources(skill))
+
+
+def skill_local_projection_sources(skill: str) -> dict[str, str]:
+    """Return generated skill-local path to canonical package source mappings."""
+    if skill not in CORE_SKILLS:
+        raise ValueError(f"unknown Tricritical skill: {skill}")
+    projections = {
+        "references/invocation-boundary.md": SHARED_INVOCATION_BOUNDARY_PATH,
+        "references/review-input-boundary.md": SHARED_INPUT_BOUNDARY_PATH,
+        "references/topology.json": "topology.json",
+    }
+    if skill in REVIEW_OUTPUT_SKILLS:
+        projections["references/review-output-contract.md"] = (
+            SHARED_OUTPUT_CONTRACT_PATH
+        )
+    return dict(sorted(projections.items()))
+
+
+def validate_skill_local_projections(root: Path) -> None:
+    """Require generated installed-skill resources to equal canonical sources."""
+    for skill in CORE_SKILLS:
+        for local_path, source_path in skill_local_projection_sources(skill).items():
+            projection_path = f"skills/{skill}/{local_path}"
+            try:
+                projection = read_regular_bytes(root, projection_path)
+            except (FileNotFoundError, ValueError) as error:
+                fail(f"skill-local projection is missing: {projection_path}")
+                raise AssertionError("unreachable") from error
+            if projection != read_regular_bytes(root, source_path):
+                fail(
+                    "skill-local projection drift: "
+                    f"{projection_path} differs from {source_path}"
+                )
 
 
 def expected_plugin_tree() -> tuple[set[str], set[str]]:
@@ -1096,8 +1133,14 @@ def validate_public_skill_boundaries(root: Path, skill: str) -> None:
     expected_output_links = 1 if skill in REVIEW_OUTPUT_SKILLS else 0
     if content.count(SHARED_OUTPUT_CONTRACT_LINK) != expected_output_links:
         fail(f"{skill} does not preserve the shared review-output contract link")
+    if content.count(SKILL_LOCAL_TOPOLOGY_LINK) != 1:
+        fail(f"{skill} must load the skill-local topology projection exactly once")
     bundle = resolve_candidate_skill_bundle(root, skill)
-    if SHARED_INVOCATION_BOUNDARY_PATH not in bundle or "topology.json" not in bundle:
+    prefix = f"skills/{skill}/references"
+    if (
+        f"{prefix}/invocation-boundary.md" not in bundle
+        or f"{prefix}/topology.json" not in bundle
+    ):
         fail(f"{skill} bundle omits invocation policy or graph authority")
 
 
@@ -1133,6 +1176,22 @@ def semantic_skill_paths() -> tuple[str, ...]:
     }
     for skill in CORE_SKILLS:
         for relative_path in expected_skill_files(skill):
+            if relative_path.endswith(".md") or relative_path in (
+                "references/topology.json",
+            ):
+                paths.add(f"skills/{skill}/{relative_path}")
+    return tuple(sorted(paths))
+
+
+def authored_semantic_skill_paths() -> tuple[str, ...]:
+    """Return authored semantic sources, excluding generated projections."""
+    paths = {
+        SHARED_INPUT_BOUNDARY_PATH,
+        SHARED_OUTPUT_CONTRACT_PATH,
+        SHARED_INVOCATION_BOUNDARY_PATH,
+    }
+    for skill in CORE_SKILLS:
+        for relative_path in authored_skill_files(skill):
             if relative_path.endswith(".md"):
                 paths.add(f"skills/{skill}/{relative_path}")
     return tuple(sorted(paths))
@@ -1209,10 +1268,13 @@ def validate_portability(root: Path) -> None:
 
 def validate_adapters(root: Path) -> None:
     for persona, skill in PERSONA_SKILLS.items():
-        content = read_regular_file(root, f"agents/{persona}.md")
+        try:
+            content = read_regular_file(root, f"agents/{persona}.md")
+        except (FileNotFoundError, ValueError):
+            fail("component inventory differs from the supported surface")
         if content != expected_agent_content(persona, skill):
             fail("adapter contract must be an exact minimal one-skill forwarder")
-    for relative_path in semantic_skill_paths():
+    for relative_path in authored_semantic_skill_paths():
         content = read_regular_file(root, relative_path)
         if "$tricritical:" in content:
             fail("semantic skill files must use unqualified portable edges")
@@ -1241,7 +1303,12 @@ def validate_adapters(root: Path) -> None:
         "AskUserQuestion": {claude_adapter_path},
     }
     expected_files, _ = expected_plugin_tree()
-    for relative_path in expected_files:
+    generated_projections = {
+        f"skills/{skill}/{local_path}"
+        for skill in CORE_SKILLS
+        for local_path in skill_local_projection_sources(skill)
+    }
+    for relative_path in expected_files - generated_projections:
         content = read_regular_file(root, relative_path)
         for token, allowed_paths in allowed_api_paths.items():
             if token in content and relative_path not in allowed_paths:
@@ -1865,13 +1932,17 @@ def validate(repo_root: Path) -> None:
 
             validate_marketplace(repository_root)
             codex_manifest = validate_manifests(root)
-            validate_inventory(root)
             topology = load_authority_topology(root)
             validate_prompt_pairing(root, codex_manifest)
-            validate_input_boundaries(root)
             validate_adapters(root)
-            validate_task_witness_provider(root)
             validate_authority_topology(root, topology)
+            load_json_document(root, "evals/corpus.json", "eval corpus")
+            load_json_document(root, CONTENT_LOCK_PATH, "semantic content lock")
+            validate_skill_local_projections(root)
+            validate_inventory(root)
+            validate_skill_resource_links(root, tuple(sorted(CORE_SKILLS)))
+            validate_input_boundaries(root)
+            validate_task_witness_provider(root)
             validate_eval_corpus(root)
             validate_portability(root)
             validate_content_lock(root)
@@ -1900,6 +1971,11 @@ def validate(repo_root: Path) -> None:
 
 def write_content_lock(repo_root: Path) -> None:
     _, root = locate_roots(repo_root)
+    for skill in CORE_SKILLS:
+        for local_path, source_path in skill_local_projection_sources(skill).items():
+            projection_path = root / "skills" / skill / local_path
+            projection_path.parent.mkdir(parents=True, exist_ok=True)
+            projection_path.write_bytes(read_regular_bytes(root, source_path))
     lock_path = root / CONTENT_LOCK_PATH
     lock_path.write_text(
         json.dumps(content_lock_document(root), indent=2) + "\n",

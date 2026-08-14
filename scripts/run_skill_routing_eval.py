@@ -307,6 +307,23 @@ def require_string(value: Any, label: str) -> str:
     return value
 
 
+def reviewed_credential_provenance(value: Any) -> str:
+    """Return one reviewed provenance descriptor without retaining raw input."""
+
+    source = require_string(value, "Claude init apiKeySource")
+    if source == "fixture":
+        return "fixture"
+    if source == "none":
+        return "none"
+    if source == "ANTHROPIC_API_KEY":
+        return "ANTHROPIC_API_KEY"
+    if source == "apiKeyHelper":
+        return "apiKeyHelper"
+    if source == "/login managed key":
+        return "/login managed key"
+    raise RoutingError("Claude init apiKeySource is not a reviewed descriptor")
+
+
 def nonnegative_int(value: Any, label: str) -> int:
     require(type(value) is int and value >= 0, f"{label} must be a nonnegative integer")
     return value
@@ -774,7 +791,7 @@ def observe_route(
     cli_version = require_string(
         init["claude_code_version"], "Claude init claude_code_version"
     )
-    api_key_source = require_string(init["apiKeySource"], "Claude init apiKeySource")
+    credential_provenance = reviewed_credential_provenance(init["apiKeySource"])
     if expected_claude_version is not None:
         require(
             cli_version == expected_claude_version,
@@ -860,7 +877,7 @@ def observe_route(
             "cwd": init["cwd"],
             "model": init_model,
             "claude_code_version": cli_version,
-            "apiKeySource": api_key_source,
+            "apiKeySource": credential_provenance,
         },
         "assistant_message_ids": assistant_ids,
         "assistant_models": assistant_models,
@@ -1166,6 +1183,14 @@ def load_or_create_state(output: Path, run_contract: dict[str, Any]) -> dict[str
     return state
 
 
+def observed_credential_provenance(observation: dict[str, Any]) -> str:
+    """Revalidate the reviewed descriptor at every evidence projection."""
+
+    init = observation.get("init")
+    require(isinstance(init, dict), "routing observation init is malformed")
+    return reviewed_credential_provenance(init["apiKeySource"])
+
+
 def identity_document(
     case: RoutingCase, stream: bytes, observation: dict[str, Any]
 ) -> dict[str, Any]:
@@ -1178,7 +1203,7 @@ def identity_document(
         "assistant_models": observation["assistant_models"],
         "init_model": observation["init"]["model"],
         "claude_code_version": observation["init"]["claude_code_version"],
-        "apiKeySource": observation["init"]["apiKeySource"],
+        "apiKeySource": observed_credential_provenance(observation),
         "cwd": observation["init"]["cwd"],
         "usage": observation["usage"],
         "total_cost_usd": observation["total_cost_usd"],
@@ -1356,7 +1381,7 @@ def execute_case(
         "init_model": observation["init"]["model"],
         "assistant_models": observation["assistant_models"],
         "claude_code_version": observation["init"]["claude_code_version"],
-        "apiKeySource": observation["init"]["apiKeySource"],
+        "apiKeySource": observed_credential_provenance(observation),
         "usage": observation["usage"],
         "total_cost_usd": observation["total_cost_usd"],
     }
@@ -1465,7 +1490,7 @@ def validate_checkpoint(
         "init_model": observation["init"]["model"],
         "assistant_models": observation["assistant_models"],
         "claude_code_version": observation["init"]["claude_code_version"],
-        "apiKeySource": observation["init"]["apiKeySource"],
+        "apiKeySource": observed_credential_provenance(observation),
         "usage": observation["usage"],
         "total_cost_usd": observation["total_cost_usd"],
     }

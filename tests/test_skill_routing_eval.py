@@ -415,6 +415,84 @@ def test_observed_route_requires_exact_model_usage_cost_and_selected_skill(
         )
 
 
+@pytest.mark.parametrize(
+    "source",
+    ("fixture", "none", "ANTHROPIC_API_KEY", "apiKeyHelper", "/login managed key"),
+)
+def test_observed_route_retains_only_reviewed_credential_provenance_descriptors(
+    tmp_path: Path, source: str
+):
+    runner = load_runner()
+    case = runner.RoutingCase(
+        "case", "trigger", "mergecraft:graphite", "query", ("graphite",)
+    )
+    events = [
+        json.loads(line)
+        for line in runner.fixture_stream(case, ["graphite"], tmp_path).splitlines()
+    ]
+    events[0]["apiKeySource"] = source
+    stream = b"\n".join(runner.canonical(event) for event in events) + b"\n"
+
+    observation = runner.observe_route(
+        stream,
+        case,
+        ["graphite"],
+        expected_cwd=tmp_path,
+        expected_claude_version="fixture-1",
+        expected_model="fixture-model",
+    )
+
+    assert observation["init"]["apiKeySource"] == source
+
+
+@pytest.mark.parametrize(
+    "source", ("unreviewed-source", "ghp_123456789012345678901234567890")
+)
+def test_observed_route_rejects_unreviewed_credential_provenance_descriptors(
+    tmp_path: Path, source: str
+):
+    runner = load_runner()
+    case = runner.RoutingCase(
+        "case", "trigger", "mergecraft:graphite", "query", ("graphite",)
+    )
+    events = [
+        json.loads(line)
+        for line in runner.fixture_stream(case, ["graphite"], tmp_path).splitlines()
+    ]
+    events[0]["apiKeySource"] = source
+    stream = b"\n".join(runner.canonical(event) for event in events) + b"\n"
+
+    with pytest.raises(runner.RoutingError, match="apiKeySource"):
+        runner.observe_route(
+            stream,
+            case,
+            ["graphite"],
+            expected_cwd=tmp_path,
+            expected_claude_version="fixture-1",
+            expected_model="fixture-model",
+        )
+
+
+def test_identity_document_revalidates_credential_provenance_descriptor(tmp_path: Path):
+    runner = load_runner()
+    case = runner.RoutingCase(
+        "case", "trigger", "mergecraft:graphite", "query", ("graphite",)
+    )
+    stream = runner.fixture_stream(case, ["graphite"], tmp_path)
+    observation = runner.observe_route(
+        stream,
+        case,
+        ["graphite"],
+        expected_cwd=tmp_path,
+        expected_claude_version="fixture-1",
+        expected_model="fixture-model",
+    )
+    observation["init"]["apiKeySource"] = "unreviewed-source"
+
+    with pytest.raises(runner.RoutingError, match="apiKeySource"):
+        runner.identity_document(case, stream, observation)
+
+
 @pytest.mark.parametrize("alias", ("sonnet", "opus", "claude-test"))
 def test_observed_route_rejects_nonexact_requested_and_observed_model_identity(
     tmp_path: Path, alias: str

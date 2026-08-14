@@ -1324,20 +1324,20 @@ class CreateReviewablePrTests(ReviewablePrFixture):
         self.assertIs(transition.call_args.kwargs["preimage"], post_review)
 
     def test_candidate_secret_blocks_before_create_without_echoing_value(self) -> None:
-        secret = "ghp_123456789012345678901234567890"
-        # This test-only credential shape must reach the candidate gate so the test
-        # can prove that production diagnostics never store or echo its value.
-        # codeql[py/clear-text-storage-sensitive-data]
-        self.template_path.write_text(
-            self.template + f"\nCredential: {secret}\n", encoding="utf-8"
-        )
+        credential_shape = "ghp_123456789012345678901234567890"
+        template = self.template + f"\nCredential: {credential_shape}\n"
 
-        with self.assertRaisesRegex(
-            CREATE.PublicationError, "publication is blocked"
-        ) as raised:
+        with (
+            mock.patch.object(Path, "read_bytes", return_value=template.encode()),
+            mock.patch.object(CREATE, "_create") as create,
+            self.assertRaisesRegex(
+                CREATE.PublicationError, "publication is blocked"
+            ) as raised,
+        ):
             self.publish()
 
-        self.assertNotIn(secret, str(raised.exception))
+        create.assert_not_called()
+        self.assertNotIn(credential_shape, str(raised.exception))
 
     def test_create_always_drafts_after_empty_exact_preflight(self) -> None:
         completed = subprocess.CompletedProcess([], 0, self.url, "")

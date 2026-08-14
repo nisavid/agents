@@ -28,7 +28,7 @@ import struct
 import subprocess
 import sys
 import zipfile
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from email.parser import BytesParser
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -861,34 +861,505 @@ def unprivileged_argv(
     ]
 
 
-def ldd_paths(path: Path, uid: int, gid: int) -> tuple[list[Path], str]:
+def validate_needed_name(value: str) -> str:
+    if (
+        not value
+        or value in {".", ".."}
+        or "/" in value
+        or "\\" in value
+        or len(value.encode("utf-8")) > 255
+        or any(ord(character) < 33 or ord(character) > 126 for character in value)
+    ):
+        raise PreparationError(f"ELF DT_NEEDED name is unsafe: {value!r}")
+    return value
+
+
+def patchelf_needed(path: Path) -> list[str]:
+    process = run(["/usr/bin/patchelf", "--print-needed", str(path)], check=False)
+    if process.returncode != 0 or process.stderr:
+        raise PreparationError(f"patchelf needed inspection failed for {path}")
+    values = process.stdout.splitlines()
+    if any(value != value.strip() for value in values):
+        raise PreparationError(f"patchelf needed inspection is malformed for {path}")
+    needed = [validate_needed_name(value) for value in values]
+    if len(set(needed)) != len(needed):
+        raise PreparationError(f"ELF has duplicate DT_NEEDED names: {path}")
+    return needed
+
+
+def resolve_ldd_regular(path: Path, label: str) -> Path:
+    try:
+        resolved = require_absolute(path, label).resolve(strict=True)
+        metadata = resolved.lstat()
+    except OSError as error:
+        raise PreparationError(f"{label} is unavailable") from error
+    if not stat.S_ISREG(metadata.st_mode) or resolved.is_symlink():
+        raise PreparationError(f"{label} is not regular")
+    return resolved
+
+
+def ldd_dependency_bindings(
+    path: Path,
+    uid: int,
+    gid: int,
+    expected_needed: list[str],
+    *,
+    tracer: Path | None = None,
+    library_path: Path | None = None,
+) -> tuple[
+    dict[str, Path],
+    dict[str, Path],
+    dict[str, Path],
+    dict[str, Path],
+    str,
+]:
+    expected = [validate_needed_name(value) for value in expected_needed]
+    if len(set(expected)) != len(expected):
+        raise PreparationError(f"expected DT_NEEDED names are ambiguous for {path}")
+    if (tracer is None) != (library_path is None):
+        raise PreparationError("dependency tracer configuration is incomplete")
+    if tracer is None:
+        trace_argv = ["/usr/bin/ldd", str(path)]
+    else:
+        tracer = require_absolute(tracer, "dependency tracer")
+        library_path = require_absolute(library_path, "dependency library path")
+        trace_argv = [
+            str(tracer),
+            "--inhibit-cache",
+            "--library-path",
+            str(library_path),
+            "--list",
+            str(path),
+        ]
     process = run(
         unprivileged_argv(
             uid,
             gid,
-            ["/usr/bin/ldd", str(path)],
+            trace_argv,
             home="/nonexistent-task-witness-ldd-home",
         ),
         check=False,
     )
     output = process.stdout + process.stderr
-    if "not a dynamic executable" in output or "statically linked" in output:
-        return [], output
-    if process.returncode != 0 or "not found" in output:
+    if process.stdout.strip() == "statically linked":
+        if (
+            tracer is not None
+            and path == tracer
+            and process.returncode == 0
+            and not expected
+            and not process.stderr
+        ):
+            return {}, {}, {}, {}, output
+        raise PreparationError(
+            f"dynamic dependency inspection disagrees for {path}: {output}"
+        )
+    if process.stdout.strip() == "not a dynamic executable":
+        raise PreparationError(
+            f"dynamic dependency inspection disagrees for {path}: {output}"
+        )
+    if process.returncode != 0 or process.stderr:
         raise PreparationError(
             f"dynamic dependency inspection failed for {path}: {output}"
         )
-    paths: set[Path] = set()
-    for line in output.splitlines():
-        line = line.strip()
-        if "=>" in line:
-            _name, resolved = line.split("=>", 1)
-            candidate = resolved.strip().split(" ", 1)[0]
+
+    labeled: dict[str, Path] = {}
+    auxiliary: dict[str, Path] = {}
+    virtual_seen = False
+    main_object_seen = False
+    for raw_line in process.stdout.splitlines():
+        line = raw_line.strip()
+        if line.startswith("(0x") and line.endswith(")"):
+            if tracer is None or main_object_seen:
+                raise PreparationError(
+                    f"loader trace has an invalid main object row for {path}"
+                )
+            try:
+                int(line[1:-1], 0)
+            except ValueError as error:
+                raise PreparationError(
+                    f"loader trace has a malformed main object address for {path}"
+                ) from error
+            main_object_seen = True
+            continue
+        head, separator, address = line.rpartition(" (")
+        if (
+            not line
+            or not separator
+            or not address.endswith(")")
+            or not address[:-1].startswith("0x")
+        ):
+            raise PreparationError(f"ldd output is malformed for {path}: {raw_line}")
+        try:
+            int(address[:-1], 0)
+        except ValueError as error:
+            raise PreparationError(
+                f"ldd output has a malformed address for {path}: {raw_line}"
+            ) from error
+
+        if " => " in head:
+            requested, marker, resolved = head.partition(" => ")
+            if not marker or " => " in resolved:
+                raise PreparationError(
+                    f"ldd dependency row is ambiguous for {path}: {raw_line}"
+                )
+            if resolved == "not found":
+                raise PreparationError(
+                    f"ldd left a dependency unresolved for {path}: {requested}"
+                )
+            if requested.startswith("/"):
+                requested_path = str(
+                    require_absolute(Path(requested), "ldd auxiliary path")
+                )
+                if requested_path in auxiliary:
+                    raise PreparationError(
+                        f"ldd repeats an auxiliary loader binding for {path}"
+                    )
+                auxiliary[requested_path] = resolve_ldd_regular(
+                    Path(resolved),
+                    "ldd auxiliary loader resolution",
+                )
+            else:
+                requested = validate_needed_name(requested)
+                if requested in labeled:
+                    raise PreparationError(
+                        f"ldd repeats a dependency binding for {path}: {requested}"
+                    )
+                labeled[requested] = resolve_ldd_regular(
+                    Path(resolved),
+                    f"ldd dependency resolution for {requested}",
+                )
+        elif head == "linux-vdso.so.1":
+            if virtual_seen:
+                raise PreparationError(f"ldd repeats the virtual DSO for {path}")
+            virtual_seen = True
+        elif head.startswith("/"):
+            requested_path = str(require_absolute(Path(head), "ldd auxiliary path"))
+            if requested_path in auxiliary:
+                raise PreparationError(
+                    f"ldd repeats an auxiliary loader binding for {path}"
+                )
+            resolved_path = resolve_ldd_regular(
+                Path(requested_path),
+                "ldd auxiliary loader resolution",
+            )
+            auxiliary[requested_path] = resolved_path
         else:
-            candidate = line.split(" ", 1)[0]
-        if candidate.startswith("/"):
-            paths.add(Path(candidate).resolve())
-    return sorted(paths), output
+            raise PreparationError(
+                f"ldd output has a misleading row for {path}: {raw_line}"
+            )
+
+    direct: dict[str, Path] = {}
+    loader_needed: dict[str, Path] = {}
+    for requested_name in expected:
+        labeled_source = labeled.get(requested_name)
+        loader_sources = {
+            source
+            for requested_path, source in auxiliary.items()
+            if Path(requested_path).name == requested_name
+        }
+        if labeled_source is not None and loader_sources:
+            raise PreparationError(
+                f"ldd has ambiguous direct dependency bindings for {path}: "
+                f"{requested_name}"
+            )
+        if labeled_source is not None:
+            direct[requested_name] = labeled_source
+        elif len(loader_sources) == 1:
+            loader_needed[requested_name] = next(iter(loader_sources))
+        else:
+            raise PreparationError(
+                f"ldd is missing a direct dependency binding for {path}: "
+                f"{requested_name}"
+            )
+    transitive = {
+        requested_name: source
+        for requested_name, source in labeled.items()
+        if requested_name not in direct
+    }
+    overlap = set(direct) & set(transitive)
+    if overlap:
+        raise PreparationError(
+            f"ldd direct and transitive labels overlap for {path}: {sorted(overlap)}"
+        )
+    if len(auxiliary) > 1:
+        raise PreparationError(f"ldd has ambiguous auxiliary loader rows for {path}")
+    return direct, loader_needed, transitive, auxiliary, output
+
+
+def validate_dependency_alias_inventory(
+    requested_aliases: set[str],
+    observed_aliases: set[str],
+    label: str,
+) -> None:
+    missing = sorted(requested_aliases - observed_aliases)
+    extra = sorted(observed_aliases - requested_aliases)
+    if missing or extra:
+        raise PreparationError(
+            f"{label} dependency alias inventory disagrees: "
+            f"missing={missing}, extra={extra}"
+        )
+
+
+def labeled_dependency_graph_row(
+    path: Path,
+    direct_aliases: Iterable[str],
+    transitive_aliases: Iterable[str],
+) -> dict[str, Any]:
+    direct = {validate_needed_name(value) for value in direct_aliases}
+    transitive = {validate_needed_name(value) for value in transitive_aliases}
+    overlap = direct & transitive
+    if overlap:
+        raise PreparationError(
+            f"labeled dependency graph row overlaps for {path}: {sorted(overlap)}"
+        )
+    return {
+        "path": str(require_absolute(path, "labeled dependency graph path")),
+        "direct_aliases": sorted(direct),
+        "observed_aliases": sorted(direct | transitive),
+    }
+
+
+def validate_dependency_graph(
+    rows: list[dict[str, Any]],
+    loader_root: Path,
+    label: str,
+) -> None:
+    loader_root = require_absolute(loader_root, "loader root")
+    rows_by_path: dict[Path, dict[str, Any]] = {}
+    for row in rows:
+        path = require_absolute(Path(row["path"]), f"{label} dependency row path")
+        if path in rows_by_path:
+            raise PreparationError(f"{label} repeats dependency row: {path}")
+        direct = {validate_needed_name(value) for value in row["direct_aliases"]}
+        observed = {validate_needed_name(value) for value in row["observed_aliases"]}
+        rows_by_path[path] = {
+            "path": path,
+            "direct_aliases": direct,
+            "observed_aliases": observed,
+        }
+
+    for row in rows_by_path.values():
+        reachable: set[str] = set()
+        already_loaded = (
+            {row["path"].name} if row["path"].parent == loader_root else set()
+        )
+        pending = list(row["direct_aliases"])
+        while pending:
+            requested_name = pending.pop()
+            if requested_name in reachable or requested_name in already_loaded:
+                continue
+            dependency_path = loader_root / requested_name
+            dependency_row = rows_by_path.get(dependency_path)
+            if dependency_row is None:
+                raise PreparationError(
+                    f"{label} has no retained row for {requested_name} from "
+                    f"{row['path']}"
+                )
+            reachable.add(requested_name)
+            pending.extend(dependency_row["direct_aliases"] - reachable)
+        validate_dependency_alias_inventory(
+            reachable,
+            row["observed_aliases"],
+            f"{label} for {row['path']}",
+        )
+
+
+def retain_dependency_alias(
+    loader_root: Path,
+    requested_name: str,
+    source: Path,
+) -> Path:
+    requested_name = validate_needed_name(requested_name)
+    loader_root = require_absolute(loader_root, "loader root")
+    source = require_absolute(source, "loader dependency source")
+    destination = loader_root / requested_name
+
+    source_descriptor = os.open(source, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        source_metadata = os.fstat(source_descriptor)
+        if (
+            not stat.S_ISREG(source_metadata.st_mode)
+            or source_metadata.st_uid != os.geteuid()
+            or source_metadata.st_mode & 0o022
+        ):
+            raise PreparationError("loader dependency source disposition is unsafe")
+        chunks: list[bytes] = []
+        while chunk := os.read(source_descriptor, 1024 * 1024):
+            chunks.append(chunk)
+        raw = b"".join(chunks)
+        if stable_file_binding(os.fstat(source_descriptor)) != stable_file_binding(
+            source_metadata
+        ):
+            raise PreparationError("loader dependency source changed while reading")
+    finally:
+        os.close(source_descriptor)
+
+    root_descriptor = os.open(
+        loader_root,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+    )
+    try:
+        try:
+            destination_descriptor = os.open(
+                requested_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                0o555,
+                dir_fd=root_descriptor,
+            )
+        except FileExistsError:
+            destination_descriptor = os.open(
+                requested_name,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=root_descriptor,
+            )
+            try:
+                destination_metadata = os.fstat(destination_descriptor)
+                retained_chunks: list[bytes] = []
+                while chunk := os.read(destination_descriptor, 1024 * 1024):
+                    retained_chunks.append(chunk)
+                if (
+                    not stat.S_ISREG(destination_metadata.st_mode)
+                    or destination_metadata.st_nlink != 1
+                    or destination_metadata.st_uid != os.geteuid()
+                    or destination_metadata.st_gid != os.getegid()
+                    or destination_metadata.st_mode & 0o222
+                    or stable_file_binding(os.fstat(destination_descriptor))
+                    != stable_file_binding(destination_metadata)
+                    or b"".join(retained_chunks) != raw
+                ):
+                    raise PreparationError(
+                        f"loader dependency alias collision for {requested_name}"
+                    )
+            finally:
+                os.close(destination_descriptor)
+        else:
+            try:
+                os.fchmod(destination_descriptor, 0o555)
+                offset = 0
+                while offset < len(raw):
+                    offset += os.write(destination_descriptor, raw[offset:])
+                os.fsync(destination_descriptor)
+                destination_metadata = os.fstat(destination_descriptor)
+                if (
+                    not stat.S_ISREG(destination_metadata.st_mode)
+                    or destination_metadata.st_nlink != 1
+                    or destination_metadata.st_uid != os.geteuid()
+                    or destination_metadata.st_gid != os.getegid()
+                    or stat.S_IMODE(destination_metadata.st_mode) != 0o555
+                    or destination_metadata.st_size != len(raw)
+                ):
+                    raise PreparationError(
+                        f"retained loader dependency is unsafe: {requested_name}"
+                    )
+            finally:
+                os.close(destination_descriptor)
+            os.fsync(root_descriptor)
+    finally:
+        os.close(root_descriptor)
+    return destination
+
+
+def retain_dependency_binding(
+    bindings: dict[str, dict[str, Any]],
+    loader_root: Path,
+    requested_name: str,
+    source: Path,
+    *,
+    requested_path: str | None = None,
+) -> tuple[Path, bool]:
+    requested_name = validate_needed_name(requested_name)
+    destination = loader_root / requested_name
+    source_digest = sha256_file(source)
+    prior = bindings.get(requested_name)
+    if source == destination:
+        if (
+            prior is None
+            or prior["retained_path"] != str(destination)
+            or prior["source_sha256"] != source_digest
+            or prior["retained_copy_sha256"] != source_digest
+        ):
+            raise PreparationError(
+                f"retained loader alias lacks an exact source binding: {requested_name}"
+            )
+        if requested_path is not None:
+            prior["requested_path"] = requested_path
+        return destination, False
+    if prior is not None and (
+        prior["resolved_source"] != str(source)
+        or prior["source_sha256"] != source_digest
+    ):
+        raise PreparationError(
+            f"loader dependency alias is ambiguous: {requested_name}"
+        )
+    if prior is None and destination.exists():
+        raise PreparationError(
+            f"loader dependency alias exists without a binding: {requested_name}"
+        )
+    if prior is not None and not destination.exists():
+        raise PreparationError(
+            f"bound loader dependency alias disappeared: {requested_name}"
+        )
+    destination = retain_dependency_alias(loader_root, requested_name, source)
+    retained_digest = sha256_file(destination)
+    if retained_digest != source_digest:
+        raise PreparationError(
+            f"retained loader dependency bytes disagree: {requested_name}"
+        )
+    details = dict(prior or {})
+    details.update(
+        {
+            "requested_name": requested_name,
+            "resolved_source": str(source),
+            "retained_path": str(destination),
+            "source_sha256": source_digest,
+            "retained_copy_sha256": retained_digest,
+        }
+    )
+    if requested_path is not None:
+        details["requested_path"] = requested_path
+    bindings[requested_name] = details
+    return destination, prior is None
+
+
+def finalize_dependency_bindings(
+    bindings: dict[str, dict[str, Any]],
+    loader_root: Path,
+) -> dict[str, dict[str, Any]]:
+    loader_root = require_absolute(loader_root, "loader root")
+    try:
+        retained_names = {path.name for path in loader_root.iterdir()}
+    except OSError as error:
+        raise PreparationError("retained loader inventory is unavailable") from error
+    if retained_names != set(bindings):
+        raise PreparationError("retained loader inventory disagrees with its bindings")
+
+    finalized: dict[str, dict[str, Any]] = {}
+    for requested_name in sorted(bindings):
+        details = dict(bindings[requested_name])
+        retained_path = loader_root / validate_needed_name(requested_name)
+        try:
+            metadata = retained_path.lstat()
+        except OSError as error:
+            raise PreparationError(
+                f"retained loader dependency is unavailable: {requested_name}"
+            ) from error
+        if (
+            details.get("requested_name") != requested_name
+            or details.get("retained_path") != str(retained_path)
+            or details.get("retained_copy_sha256") != details.get("source_sha256")
+            or not stat.S_ISREG(metadata.st_mode)
+            or retained_path.is_symlink()
+            or metadata.st_nlink != 1
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_gid != os.getegid()
+            or metadata.st_mode & 0o222
+        ):
+            raise PreparationError(
+                f"retained loader dependency binding is invalid: {requested_name}"
+            )
+        details["sealed_sha256"] = sha256_file(retained_path)
+        finalized[requested_name] = details
+    return finalized
 
 
 def elf_program_headers(path: Path) -> tuple[bool, str | None]:
@@ -1028,12 +1499,20 @@ def audit_runtime_elf_dependencies(
         or not retained_interpreter.is_relative_to(runtime_root)
         or not stat.S_ISREG(retained_metadata.st_mode)
         or retained_interpreter.is_symlink()
+        or retained_metadata.st_nlink != 1
+        or retained_metadata.st_uid != os.geteuid()
+        or retained_metadata.st_gid != os.getegid()
+        or retained_metadata.st_mode & 0o222
         or not ldd_loader_artifact.is_absolute()
         or ldd_loader_artifact.is_relative_to(runtime_root)
         or not stat.S_ISREG(loader_metadata.st_mode)
         or ldd_loader_artifact.is_symlink()
     ):
         raise PreparationError("the approved dynamic loader binding is invalid")
+    retained_loader_sha256 = sha256_file(retained_interpreter)
+    source_loader_sha256 = sha256_file(ldd_loader_artifact)
+    if retained_loader_sha256 != source_loader_sha256:
+        raise PreparationError("the retained dynamic loader bytes disagree")
 
     interpreter = patchelf_interpreter(path)
     if interpreter is not None:
@@ -1045,24 +1524,119 @@ def audit_runtime_elf_dependencies(
         ):
             raise PreparationError(f"runtime ELF has an unapproved interpreter: {path}")
 
-    dependencies, output = ldd_paths(path, uid, gid)
-    external = [
-        str(dependency)
-        for dependency in dependencies
-        if not dependency.is_relative_to(runtime_root)
-        and dependency != ldd_loader_artifact
+    requested_needed = patchelf_needed(path)
+    (
+        needed_bindings,
+        loader_needed_bindings,
+        transitive_bindings,
+        auxiliary_bindings,
+        output,
+    ) = ldd_dependency_bindings(
+        path,
+        uid,
+        gid,
+        requested_needed,
+        tracer=retained_interpreter,
+        library_path=retained_interpreter.parent,
+    )
+    dependencies = sorted(
+        set(needed_bindings.values())
+        | set(loader_needed_bindings.values())
+        | set(transitive_bindings.values())
+        | set(auxiliary_bindings.values())
+    )
+    loader_root = retained_interpreter.parent
+    mislabeled = [
+        {
+            "requested_name": requested_name,
+            "resolved_path": str(resolved_path),
+            "expected_path": str(loader_root / requested_name),
+        }
+        for requested_name, resolved_path in {
+            **needed_bindings,
+            **transitive_bindings,
+        }.items()
+        if resolved_path != loader_root / requested_name
     ]
-    if external:
+    if mislabeled:
         raise PreparationError(
-            f"runtime ELF still resolves outside the closure: {path}: {external}"
+            f"runtime ELF label does not resolve to its retained alias: "
+            f"{path}: {mislabeled}"
+        )
+    unapproved_auxiliary = [
+        {
+            "requested_path": requested_path,
+            "resolved_path": str(resolved_path),
+        }
+        for requested_path, resolved_path in auxiliary_bindings.items()
+        if Path(requested_path).name != retained_interpreter.name
+        or resolved_path != retained_interpreter
+    ]
+    if unapproved_auxiliary:
+        raise PreparationError(
+            f"runtime ELF has an unapproved auxiliary loader binding: "
+            f"{path}: {unapproved_auxiliary}"
+        )
+    loader_needed_audit: list[dict[str, Any]] = []
+    for requested_name, resolved_path in loader_needed_bindings.items():
+        requested_paths = [
+            requested_path
+            for requested_path, auxiliary_path in auxiliary_bindings.items()
+            if Path(requested_path).name == requested_name
+            and auxiliary_path == resolved_path
+        ]
+        if (
+            requested_name != retained_interpreter.name
+            or resolved_path != retained_interpreter
+            or len(requested_paths) != 1
+        ):
+            raise PreparationError(
+                f"runtime ELF loader-needed binding is invalid: "
+                f"{path}: {requested_name}"
+            )
+        loader_needed_audit.append(
+            {
+                "requested_name": requested_name,
+                "requested_path": requested_paths[0],
+                "resolved_path": str(resolved_path),
+                "retained_sha256": retained_loader_sha256,
+                "source_path": str(ldd_loader_artifact),
+                "source_sha256": source_loader_sha256,
+            }
         )
     return {
         "path": str(path),
         "interpreter": interpreter,
-        "ldd_loader_artifact": (
-            str(ldd_loader_artifact) if ldd_loader_artifact in dependencies else None
-        ),
-        "ldd_sha256": hashlib.sha256(output.encode("utf-8")).hexdigest(),
+        "trace_loader": {
+            "path": str(retained_interpreter),
+            "sha256": retained_loader_sha256,
+            "library_path": str(retained_interpreter.parent),
+            "inhibit_cache": True,
+        },
+        "trace_sha256": hashlib.sha256(output.encode("utf-8")).hexdigest(),
+        "needed_bindings": [
+            {
+                "requested_name": requested_name,
+                "resolved_path": str(needed_bindings[requested_name]),
+            }
+            for requested_name in requested_needed
+            if requested_name in needed_bindings
+        ],
+        "loader_needed_bindings": loader_needed_audit,
+        "transitive_bindings": [
+            {
+                "requested_name": requested_name,
+                "resolved_path": str(resolved_path),
+            }
+            for requested_name, resolved_path in sorted(transitive_bindings.items())
+        ],
+        "auxiliary_loader_bindings": [
+            {
+                "requested_path": requested_path,
+                "resolved_path": str(resolved_path),
+            }
+            for requested_path, resolved_path in sorted(auxiliary_bindings.items())
+        ],
         "resolved_paths": [str(dependency) for dependency in dependencies],
     }
 
@@ -1111,6 +1685,8 @@ def seal_runtime(args: argparse.Namespace) -> None:
     loader_root.mkdir(parents=True, exist_ok=False)
 
     copied: dict[str, dict[str, Any]] = {}
+    loader_binding: tuple[str, Path] | None = None
+    dependency_graph_rows: list[dict[str, Any]] = []
     pending = dynamic_elf_files(runtime_root)
     inspected: set[Path] = set()
     while pending:
@@ -1118,39 +1694,77 @@ def seal_runtime(args: argparse.Namespace) -> None:
         if item in inspected:
             continue
         inspected.add(item)
-        dependencies, _output = ldd_paths(
+        requested_needed = patchelf_needed(item)
+        retained_loader_item = (
+            loader_binding is not None and item == loader_root / loader_binding[0]
+        )
+        (
+            needed_bindings,
+            loader_needed_bindings,
+            transitive_bindings,
+            auxiliary_bindings,
+            _output,
+        ) = ldd_dependency_bindings(
             item,
             args.inspection_uid,
             args.inspection_gid,
+            requested_needed,
+            tracer=item if retained_loader_item else None,
+            library_path=loader_root if retained_loader_item else None,
         )
-        for source in dependencies:
-            if source.is_relative_to(runtime_root):
-                continue
-            destination = loader_root / source.name
-            source_digest = sha256_file(source)
-            if destination.exists():
-                if sha256_file(destination) != source_digest:
-                    raise PreparationError(
-                        f"loader dependency basename collision for {source.name}"
-                    )
-            else:
-                shutil.copy2(source, destination, follow_symlinks=True)
+        dependency_graph_rows.append(
+            labeled_dependency_graph_row(
+                item,
+                needed_bindings,
+                transitive_bindings,
+            )
+        )
+        for requested_name, source in {
+            **needed_bindings,
+            **loader_needed_bindings,
+            **transitive_bindings,
+        }.items():
+            destination, created = retain_dependency_binding(
+                copied,
+                loader_root,
+                requested_name,
+                source,
+            )
+            if created:
                 pending.append(destination)
-            copied[str(source)] = {
-                "retained_path": str(destination),
-                "sha256": source_digest,
-            }
+        for requested_path, source in auxiliary_bindings.items():
+            requested_name = validate_needed_name(Path(requested_path).name)
+            prior = copied.get(requested_name)
+            loader_source = (
+                Path(prior["resolved_source"])
+                if source == loader_root / requested_name and prior is not None
+                else source
+            )
+            observed_loader = (requested_name, loader_source)
+            if loader_binding is not None and loader_binding != observed_loader:
+                raise PreparationError("the Linux dynamic loader binding is ambiguous")
+            loader_binding = observed_loader
+            destination, created = retain_dependency_binding(
+                copied,
+                loader_root,
+                requested_name,
+                source,
+                requested_path=requested_path,
+            )
+            if created:
+                pending.append(destination)
 
-    loader_bindings = [
-        (Path(source), Path(details["retained_path"]))
-        for source, details in copied.items()
-        if Path(source).name.startswith("ld-linux")
-    ]
-    if len(loader_bindings) != 1:
+    validate_dependency_graph(
+        dependency_graph_rows,
+        loader_root,
+        "pre-rewrite recursive closure",
+    )
+    if loader_binding is None:
         raise PreparationError("exactly one Linux dynamic loader must be retained")
-    ldd_loader_artifact, retained_interpreter = loader_bindings[0]
+    loader_name, ldd_loader_artifact = loader_binding
+    retained_interpreter = loader_root / loader_name
     for item in dynamic_elf_files(runtime_root):
-        if item.parent == loader_root and item.name.startswith("ld-linux"):
+        if item == retained_interpreter:
             continue
         interpreter = patchelf_interpreter(item)
         run(
@@ -1162,7 +1776,7 @@ def seal_runtime(args: argparse.Namespace) -> None:
             ]
         )
         if interpreter is not None:
-            if Path(interpreter).name != ldd_loader_artifact.name:
+            if Path(interpreter).name != loader_name:
                 raise PreparationError(f"no retained interpreter for {item}")
             run(
                 [
@@ -1173,6 +1787,7 @@ def seal_runtime(args: argparse.Namespace) -> None:
                 ]
             )
 
+    copied = finalize_dependency_bindings(copied, loader_root)
     dependency_audit = [
         audit_runtime_elf_dependencies(
             item,
@@ -1184,6 +1799,18 @@ def seal_runtime(args: argparse.Namespace) -> None:
         )
         for item in dynamic_elf_files(runtime_root)
     ]
+    validate_dependency_graph(
+        [
+            labeled_dependency_graph_row(
+                Path(row["path"]),
+                (binding["requested_name"] for binding in row["needed_bindings"]),
+                (binding["requested_name"] for binding in row["transitive_bindings"]),
+            )
+            for row in dependency_audit
+        ],
+        loader_root,
+        "post-rewrite recursive closure",
+    )
 
     pyyaml_after = finalize_installed_wheel(site_packages, pyyaml_before)
     native_paths = {
@@ -1293,7 +1920,10 @@ def seal_runtime(args: argparse.Namespace) -> None:
                 ],
             },
             "transformation": {
-                "copy_semantics": "archive-dereference-symlinks",
+                "runtime_copy_semantics": "archive-dereference-symlinks",
+                "loader_dependency_copy_semantics": (
+                    "create-new-write-disabled-regular-files-at-dt-needed-aliases"
+                ),
                 "patchelf_version": patchelf_version,
                 "retained_loader_dependencies": copied,
                 "runtime_root": str(runtime_root),

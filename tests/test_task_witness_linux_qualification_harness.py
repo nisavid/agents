@@ -221,6 +221,618 @@ class TaskWitnessLinuxQualificationHarnessTests(unittest.TestCase):
             ):
                 self.helper.dynamic_elf_files(root)
 
+    def test_ldd_bindings_preserve_a_needed_soname_alias_for_regular_copy(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            executable = root / "runtime" / "lib" / "_bz2.so"
+            executable.parent.mkdir(parents=True)
+            executable.write_bytes(b"elf")
+            source = root / "host" / "libbz2.so.1.0.4"
+            loader = root / "host" / "ld-linux-x86-64.so.2"
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"libbz2-bytes")
+            loader.write_bytes(b"loader-bytes")
+            process = subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout=(
+                    f"libbz2.so.1.0 => {source} (0x0000000000000001)\n"
+                    f"{loader} (0x0000000000000002)\n"
+                ),
+                stderr="",
+            )
+
+            with mock.patch.object(self.helper, "run", return_value=process):
+                needed, loader_needed, transitive, auxiliary, _output = (
+                    self.helper.ldd_dependency_bindings(
+                        executable,
+                        1001,
+                        1001,
+                        ["libbz2.so.1.0"],
+                    )
+                )
+
+            self.assertEqual(needed, {"libbz2.so.1.0": source.resolve()})
+            self.assertEqual(loader_needed, {})
+            self.assertEqual(transitive, {})
+            self.assertEqual(auxiliary, {str(loader): loader.resolve()})
+            retained_root = root / "retained"
+            retained_root.mkdir()
+            destination = self.helper.retain_dependency_alias(
+                retained_root,
+                "libbz2.so.1.0",
+                source,
+            )
+            self.assertEqual(destination.name, "libbz2.so.1.0")
+            self.assertEqual(destination.read_bytes(), source.read_bytes())
+            self.assertFalse(destination.is_symlink())
+            self.assertTrue(destination.is_file())
+            self.assertEqual(destination.stat().st_mode & 0o222, 0)
+
+    def test_patchelf_needed_rejects_unsafe_or_ambiguous_names(self) -> None:
+        target = Path("/tmp/task-witness-needed-fixture")
+        cases = {
+            "parent-traversal": "../libescape.so\n",
+            "slash": "nested/libescape.so\n",
+            "absolute": "/lib/libescape.so\n",
+            "duplicate": "libsame.so\nlibsame.so\n",
+        }
+        for name, stdout in cases.items():
+            process = subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout=stdout,
+                stderr="",
+            )
+            with (
+                self.subTest(name=name),
+                mock.patch.object(self.helper, "run", return_value=process),
+                self.assertRaises(self.helper.PreparationError),
+            ):
+                self.helper.patchelf_needed(target)
+
+    def test_ldd_bindings_support_transitive_rows_and_loader_needed_names(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            target = root / "apt"
+            direct = root / "libapt.so.1"
+            transitive = root / "libz.so.1"
+            loader = root / "ld-linux-x86-64.so.2"
+            for path in (target, direct, transitive, loader):
+                path.write_bytes(b"fixture")
+            process = subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout=(
+                    f"libapt.so.1 => {direct} (0x1)\n"
+                    f"{loader} (0x2)\n"
+                    f"libz.so.1 => {transitive} (0x3)\n"
+                ),
+                stderr="",
+            )
+
+            with mock.patch.object(self.helper, "run", return_value=process):
+                (
+                    direct_bindings,
+                    loader_needed_bindings,
+                    transitive_bindings,
+                    auxiliary,
+                    _output,
+                ) = self.helper.ldd_dependency_bindings(
+                    target,
+                    1001,
+                    1001,
+                    ["libapt.so.1", "ld-linux-x86-64.so.2"],
+                )
+
+            self.assertEqual(
+                direct_bindings,
+                {
+                    "libapt.so.1": direct.resolve(),
+                },
+            )
+            self.assertEqual(
+                loader_needed_bindings,
+                {"ld-linux-x86-64.so.2": loader.resolve()},
+            )
+            self.assertEqual(
+                transitive_bindings,
+                {"libz.so.1": transitive.resolve()},
+            )
+            self.assertEqual(auxiliary, {str(loader): loader.resolve()})
+            self.helper.validate_dependency_alias_inventory(
+                {"libapt.so.1", "ld-linux-x86-64.so.2", "libz.so.1"},
+                set(direct_bindings)
+                | set(loader_needed_bindings)
+                | set(transitive_bindings),
+                "fixture",
+            )
+
+    def test_retained_loader_trace_separates_loader_needed_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            target = root / "libc.so.6"
+            direct = root / "libc-helper.so.1"
+            retained_loader = root / "ld-linux-x86-64.so.2"
+            for path in (target, direct, retained_loader):
+                path.write_bytes(b"fixture")
+            process = subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout=(
+                    "\t (0x1)\n"
+                    f"libc-helper.so.1 => {direct} (0x2)\n"
+                    f"/lib64/ld-linux-x86-64.so.2 => {retained_loader} (0x3)\n"
+                    "linux-vdso.so.1 (0x4)\n"
+                ),
+                stderr="",
+            )
+
+            with mock.patch.object(self.helper, "run", return_value=process) as run:
+                direct_bindings, loader_needed, transitive, auxiliary, _output = (
+                    self.helper.ldd_dependency_bindings(
+                        target,
+                        1001,
+                        1001,
+                        ["libc-helper.so.1", "ld-linux-x86-64.so.2"],
+                        tracer=retained_loader,
+                        library_path=root,
+                    )
+                )
+
+            self.assertEqual(
+                direct_bindings,
+                {"libc-helper.so.1": direct.resolve()},
+            )
+            self.assertEqual(
+                loader_needed,
+                {"ld-linux-x86-64.so.2": retained_loader.resolve()},
+            )
+            self.assertEqual(transitive, {})
+            self.assertEqual(
+                auxiliary,
+                {"/lib64/ld-linux-x86-64.so.2": retained_loader.resolve()},
+            )
+            run.assert_called_once_with(
+                self.helper.unprivileged_argv(
+                    1001,
+                    1001,
+                    [
+                        str(retained_loader),
+                        "--inhibit-cache",
+                        "--library-path",
+                        str(root),
+                        "--list",
+                        str(target),
+                    ],
+                    home="/nonexistent-task-witness-ldd-home",
+                ),
+                check=False,
+            )
+
+            repeated_main = subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout="\t (0x1)\n\t (0x2)\n",
+                stderr="",
+            )
+            with (
+                mock.patch.object(self.helper, "run", return_value=repeated_main),
+                self.assertRaises(self.helper.PreparationError),
+            ):
+                self.helper.ldd_dependency_bindings(
+                    target,
+                    1001,
+                    1001,
+                    [],
+                    tracer=retained_loader,
+                    library_path=root,
+                )
+
+    def test_statically_linked_is_only_valid_for_exact_retained_loader_self_trace(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            retained_loader = root / "ld-linux-x86-64.so.2"
+            other = root / "other-loader"
+            retained_loader.write_bytes(b"loader")
+            other.write_bytes(b"other")
+            statically_linked = subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout="statically linked\n",
+                stderr="",
+            )
+            with mock.patch.object(
+                self.helper,
+                "run",
+                return_value=statically_linked,
+            ):
+                self.assertEqual(
+                    self.helper.ldd_dependency_bindings(
+                        retained_loader,
+                        1001,
+                        1001,
+                        [],
+                        tracer=retained_loader,
+                        library_path=root,
+                    )[:4],
+                    ({}, {}, {}, {}),
+                )
+                for name, path, expected, tracer in (
+                    ("host-ldd", retained_loader, [], None),
+                    ("different-tracer", retained_loader, [], other),
+                    ("claimed-needed", retained_loader, ["libc.so.6"], retained_loader),
+                ):
+                    with (
+                        self.subTest(name=name),
+                        self.assertRaises(self.helper.PreparationError),
+                    ):
+                        self.helper.ldd_dependency_bindings(
+                            path,
+                            1001,
+                            1001,
+                            expected,
+                            tracer=tracer,
+                            library_path=root if tracer is not None else None,
+                        )
+
+    def test_loader_needed_edges_stay_separate_from_labeled_recursive_graph(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            root_elf = root / "runtime" / "bin" / "python"
+            loader_root = root / "runtime" / "lib" / "task-witness-loader"
+            retained_libc = loader_root / "libc.so.6"
+            retained_loader = loader_root / "ld-linux-x86-64.so.2"
+            host_libc = root / "host" / "libc.so.6"
+            host_loader = root / "host" / "ld-linux-x86-64.so.2"
+            for path in (
+                root_elf,
+                retained_libc,
+                retained_loader,
+                host_libc,
+                host_loader,
+            ):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"fixture")
+
+            processes = [
+                subprocess.CompletedProcess(
+                    args=[],
+                    returncode=0,
+                    stdout=(f"libc.so.6 => {host_libc} (0x1)\n{host_loader} (0x2)\n"),
+                    stderr="",
+                ),
+                subprocess.CompletedProcess(
+                    args=[],
+                    returncode=0,
+                    stdout=f"{host_loader} (0x1)\n",
+                    stderr="",
+                ),
+                subprocess.CompletedProcess(
+                    args=[],
+                    returncode=0,
+                    stdout=(
+                        "\t (0x1)\n"
+                        f"libc.so.6 => {retained_libc} (0x2)\n"
+                        f"/lib64/ld-linux-x86-64.so.2 => {retained_loader} (0x3)\n"
+                        "linux-vdso.so.1 (0x4)\n"
+                    ),
+                    stderr="",
+                ),
+                subprocess.CompletedProcess(
+                    args=[],
+                    returncode=0,
+                    stdout=(
+                        "\t (0x1)\n"
+                        f"/lib64/ld-linux-x86-64.so.2 => {retained_loader} (0x2)\n"
+                        "linux-vdso.so.1 (0x3)\n"
+                    ),
+                    stderr="",
+                ),
+            ]
+            with mock.patch.object(self.helper, "run", side_effect=processes):
+                pre_root = self.helper.ldd_dependency_bindings(
+                    root_elf,
+                    1001,
+                    1001,
+                    ["libc.so.6"],
+                )
+                pre_libc = self.helper.ldd_dependency_bindings(
+                    retained_libc,
+                    1001,
+                    1001,
+                    ["ld-linux-x86-64.so.2"],
+                )
+                post_root = self.helper.ldd_dependency_bindings(
+                    root_elf,
+                    1001,
+                    1001,
+                    ["libc.so.6"],
+                    tracer=retained_loader,
+                    library_path=loader_root,
+                )
+                post_libc = self.helper.ldd_dependency_bindings(
+                    retained_libc,
+                    1001,
+                    1001,
+                    ["ld-linux-x86-64.so.2"],
+                    tracer=retained_loader,
+                    library_path=loader_root,
+                )
+
+            self.assertEqual(pre_root[0], {"libc.so.6": host_libc.resolve()})
+            self.assertEqual(pre_root[1], {})
+            self.assertEqual(
+                pre_root[3],
+                {str(host_loader): host_loader.resolve()},
+            )
+            self.assertEqual(
+                pre_libc[1],
+                {"ld-linux-x86-64.so.2": host_loader.resolve()},
+            )
+            self.assertEqual(post_root[0], {"libc.so.6": retained_libc.resolve()})
+            self.assertEqual(post_root[1], {})
+            self.assertEqual(
+                post_root[3],
+                {"/lib64/ld-linux-x86-64.so.2": retained_loader.resolve()},
+            )
+            self.assertEqual(
+                post_libc[1],
+                {"ld-linux-x86-64.so.2": retained_loader.resolve()},
+            )
+
+            for name, root_bindings, libc_bindings in (
+                ("pre-rewrite", pre_root, pre_libc),
+                ("post-rewrite", post_root, post_libc),
+            ):
+                with self.subTest(name=name):
+                    rows = [
+                        self.helper.labeled_dependency_graph_row(
+                            root_elf,
+                            root_bindings[0],
+                            root_bindings[2],
+                        ),
+                        self.helper.labeled_dependency_graph_row(
+                            retained_libc,
+                            libc_bindings[0],
+                            libc_bindings[2],
+                        ),
+                        self.helper.labeled_dependency_graph_row(
+                            retained_loader,
+                            [],
+                            [],
+                        ),
+                    ]
+                    self.helper.validate_dependency_graph(
+                        rows,
+                        loader_root,
+                        name,
+                    )
+
+    def test_ldd_bindings_reject_unresolved_missing_and_ambiguous_rows(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            target = root / "target.so"
+            target.write_bytes(b"elf")
+            source = root / "libgood.so.1.2"
+            other = root / "libother.so.9"
+            loader = root / "ld-linux.so"
+            source.write_bytes(b"good")
+            other.write_bytes(b"other")
+            loader.write_bytes(b"loader")
+            cases = {
+                "unresolved": "libgood.so.1 => not found\n",
+                "missing": f"{loader} (0x1)\n",
+                "ambiguous": (
+                    f"libgood.so.1 => {source} (0x1)\nlibgood.so.1 => {other} (0x2)\n"
+                ),
+                "misleading-label": (
+                    f"libgood.so.1 => {source} (0x1)\nlibother.so.9 (0x2)\n"
+                ),
+            }
+            for name, stdout in cases.items():
+                process = subprocess.CompletedProcess(
+                    args=[],
+                    returncode=0,
+                    stdout=stdout,
+                    stderr="",
+                )
+                with (
+                    self.subTest(name=name),
+                    mock.patch.object(self.helper, "run", return_value=process),
+                    self.assertRaises(self.helper.PreparationError),
+                ):
+                    self.helper.ldd_dependency_bindings(
+                        target,
+                        1001,
+                        1001,
+                        ["libgood.so.1"],
+                    )
+
+    def test_recursive_dependency_graph_rejects_missing_and_misleading_rows(
+        self,
+    ) -> None:
+        loader_root = Path("/tmp/task-witness-loader-fixture")
+        root_path = Path("/tmp/task-witness-runtime/bin/python")
+        unrelated_root = Path("/tmp/task-witness-runtime/bin/unrelated")
+        rows = [
+            {
+                "path": str(root_path),
+                "direct_aliases": ["libdirect.so"],
+                "observed_aliases": ["libdirect.so", "libtransitive.so"],
+            },
+            {
+                "path": str(loader_root / "libdirect.so"),
+                "direct_aliases": ["libtransitive.so"],
+                "observed_aliases": ["libtransitive.so"],
+            },
+            {
+                "path": str(loader_root / "libtransitive.so"),
+                "direct_aliases": [],
+                "observed_aliases": [],
+            },
+            {
+                "path": str(unrelated_root),
+                "direct_aliases": ["libunrelated.so"],
+                "observed_aliases": ["libunrelated.so"],
+            },
+            {
+                "path": str(loader_root / "libunrelated.so"),
+                "direct_aliases": [],
+                "observed_aliases": [],
+            },
+        ]
+        self.helper.validate_dependency_graph(rows, loader_root, "fixture")
+
+        misleading = [dict(row) for row in rows]
+        misleading[0]["observed_aliases"] = [
+            "libdirect.so",
+            "libtransitive.so",
+            "libunrelated.so",
+        ]
+        with self.assertRaises(self.helper.PreparationError):
+            self.helper.validate_dependency_graph(
+                misleading,
+                loader_root,
+                "fixture",
+            )
+
+        with self.assertRaises(self.helper.PreparationError):
+            self.helper.validate_dependency_graph(
+                [
+                    {
+                        "path": str(root_path),
+                        "direct_aliases": ["libmissing.so"],
+                        "observed_aliases": ["libmissing.so"],
+                    }
+                ],
+                loader_root,
+                "fixture",
+            )
+
+    def test_retained_alias_rejects_conflicting_source_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            retained_root = root / "retained"
+            retained_root.mkdir()
+            bindings = {}
+            first = root / "libfirst.so.1.2"
+            second = root / "libsecond.so.1.3"
+            first.write_bytes(b"first")
+            second.write_bytes(b"second")
+            destination, created = self.helper.retain_dependency_binding(
+                bindings,
+                retained_root,
+                "libshared.so.1",
+                first,
+            )
+            self.assertTrue(created)
+            self.assertEqual(destination.name, "libshared.so.1")
+            with self.assertRaises(self.helper.PreparationError):
+                self.helper.retain_dependency_binding(
+                    bindings,
+                    retained_root,
+                    "libshared.so.1",
+                    second,
+                )
+
+    def test_retained_binding_copies_internal_sources_and_rejects_origin_drift(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            internal = root / "runtime" / "lib" / "libpython3.13.so.1.0"
+            loader_root = root / "runtime" / "lib" / "task-witness-loader"
+            same_bytes_elsewhere = root / "host" / "libpython3.13.so.1.0"
+            internal.parent.mkdir(parents=True)
+            loader_root.mkdir()
+            same_bytes_elsewhere.parent.mkdir()
+            internal.write_bytes(b"libpython")
+            same_bytes_elsewhere.write_bytes(b"libpython")
+            bindings = {}
+
+            destination, created = self.helper.retain_dependency_binding(
+                bindings,
+                loader_root,
+                "libpython3.13.so.1.0",
+                internal,
+            )
+            self.assertTrue(created)
+            self.assertEqual(destination.read_bytes(), internal.read_bytes())
+            retained, created_again = self.helper.retain_dependency_binding(
+                bindings,
+                loader_root,
+                "libpython3.13.so.1.0",
+                destination,
+            )
+            self.assertEqual(retained, destination)
+            self.assertFalse(created_again)
+            with self.assertRaises(self.helper.PreparationError):
+                self.helper.retain_dependency_binding(
+                    bindings,
+                    loader_root,
+                    "libpython3.13.so.1.0",
+                    same_bytes_elsewhere,
+                )
+
+    def test_finalized_binding_separates_copy_and_sealed_digests_and_rejects_tamper(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            loader_root = root / "loader"
+            loader_root.mkdir()
+            source = root / "libfixture.so.1.2"
+            source.write_bytes(b"source-bytes")
+            bindings = {}
+            retained, _created = self.helper.retain_dependency_binding(
+                bindings,
+                loader_root,
+                "libfixture.so.1",
+                source,
+            )
+            copy_digest = hashlib.sha256(b"source-bytes").hexdigest()
+            self.assertEqual(
+                bindings["libfixture.so.1"]["retained_copy_sha256"],
+                copy_digest,
+            )
+
+            retained.chmod(0o755)
+            retained.write_bytes(b"sealed-bytes")
+            retained.chmod(0o555)
+            finalized = self.helper.finalize_dependency_bindings(
+                bindings,
+                loader_root,
+            )
+            self.assertEqual(
+                finalized["libfixture.so.1"]["retained_copy_sha256"],
+                copy_digest,
+            )
+            self.assertEqual(
+                finalized["libfixture.so.1"]["sealed_sha256"],
+                hashlib.sha256(b"sealed-bytes").hexdigest(),
+            )
+
+            retained.chmod(0o755)
+            with self.assertRaises(self.helper.PreparationError):
+                self.helper.finalize_dependency_bindings(bindings, loader_root)
+            retained.chmod(0o555)
+            unexpected = loader_root / "libunexpected.so"
+            unexpected.write_bytes(b"unexpected")
+            unexpected.chmod(0o555)
+            with self.assertRaises(self.helper.PreparationError):
+                self.helper.finalize_dependency_bindings(bindings, loader_root)
+
     def test_dependency_audit_accepts_only_the_exact_host_loader_artifact(
         self,
     ) -> None:
@@ -241,6 +853,7 @@ class TaskWitnessLinuxQualificationHarnessTests(unittest.TestCase):
             ):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(b"fixture")
+            retained_loader.chmod(0o555)
 
             with (
                 mock.patch.object(
@@ -250,8 +863,19 @@ class TaskWitnessLinuxQualificationHarnessTests(unittest.TestCase):
                 ),
                 mock.patch.object(
                     self.helper,
-                    "ldd_paths",
-                    return_value=([host_loader, internal_library], "ldd trace\n"),
+                    "patchelf_needed",
+                    return_value=["libc.so.6"],
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "ldd_dependency_bindings",
+                    return_value=(
+                        {"libc.so.6": internal_library},
+                        {},
+                        {},
+                        {"/lib64/ld-linux-x86-64.so.2": retained_loader},
+                        "loader trace\n",
+                    ),
                 ),
             ):
                 audit = self.helper.audit_runtime_elf_dependencies(
@@ -264,10 +888,110 @@ class TaskWitnessLinuxQualificationHarnessTests(unittest.TestCase):
                 )
 
             self.assertEqual(audit["interpreter"], str(retained_loader))
-            self.assertEqual(audit["ldd_loader_artifact"], str(host_loader))
+            self.assertEqual(
+                audit["trace_loader"],
+                {
+                    "path": str(retained_loader),
+                    "sha256": hashlib.sha256(b"fixture").hexdigest(),
+                    "library_path": str(retained_loader.parent),
+                    "inhibit_cache": True,
+                },
+            )
             self.assertEqual(
                 audit["resolved_paths"],
-                [str(host_loader), str(internal_library)],
+                sorted([str(retained_loader), str(internal_library)]),
+            )
+            self.assertEqual(
+                audit["needed_bindings"],
+                [
+                    {
+                        "requested_name": "libc.so.6",
+                        "resolved_path": str(internal_library),
+                    }
+                ],
+            )
+            self.assertEqual(audit["transitive_bindings"], [])
+            self.assertEqual(audit["loader_needed_bindings"], [])
+            self.assertEqual(
+                audit["auxiliary_loader_bindings"],
+                [
+                    {
+                        "requested_path": "/lib64/ld-linux-x86-64.so.2",
+                        "resolved_path": str(retained_loader),
+                    }
+                ],
+            )
+
+    def test_dependency_audit_binds_loader_needed_to_the_retained_tracer(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            runtime_root = root / "runtime"
+            libc = runtime_root / "lib" / "libc.so.6"
+            retained_loader = (
+                runtime_root / "lib" / "task-witness-loader" / "ld-linux-x86-64.so.2"
+            )
+            host_loader = root / "host" / "ld-linux-x86-64.so.2"
+            for path in (libc, retained_loader, host_loader):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"loader-fixture")
+            retained_loader.chmod(0o555)
+            trace = mock.Mock(
+                return_value=(
+                    {},
+                    {"ld-linux-x86-64.so.2": retained_loader},
+                    {},
+                    {"/lib64/ld-linux-x86-64.so.2": retained_loader},
+                    "retained loader trace\n",
+                )
+            )
+
+            with (
+                mock.patch.object(
+                    self.helper,
+                    "patchelf_interpreter",
+                    return_value=None,
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "patchelf_needed",
+                    return_value=["ld-linux-x86-64.so.2"],
+                ),
+                mock.patch.object(self.helper, "ldd_dependency_bindings", trace),
+            ):
+                audit = self.helper.audit_runtime_elf_dependencies(
+                    libc,
+                    runtime_root,
+                    retained_loader,
+                    host_loader,
+                    1001,
+                    1001,
+                )
+
+            digest = hashlib.sha256(b"loader-fixture").hexdigest()
+            self.assertEqual(
+                audit["loader_needed_bindings"],
+                [
+                    {
+                        "requested_name": "ld-linux-x86-64.so.2",
+                        "requested_path": "/lib64/ld-linux-x86-64.so.2",
+                        "resolved_path": str(retained_loader),
+                        "retained_sha256": digest,
+                        "source_path": str(host_loader),
+                        "source_sha256": digest,
+                    }
+                ],
+            )
+            self.assertEqual(audit["needed_bindings"], [])
+            self.assertEqual(audit["resolved_paths"], [str(retained_loader)])
+            trace.assert_called_once_with(
+                libc,
+                1001,
+                1001,
+                ["ld-linux-x86-64.so.2"],
+                tracer=retained_loader,
+                library_path=retained_loader.parent,
             )
 
     def test_dependency_audit_rejects_bad_interpreters_and_other_externals(
@@ -292,23 +1016,28 @@ class TaskWitnessLinuxQualificationHarnessTests(unittest.TestCase):
             ):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(b"fixture")
+            retained_loader.chmod(0o555)
 
             cases = {
                 "relative-interpreter": (
                     "lib/task-witness-loader/ld-linux-x86-64.so.2",
-                    [host_loader],
+                    {},
                 ),
-                "external-interpreter": (str(host_loader), [host_loader]),
+                "external-interpreter": (str(host_loader), {}),
                 "unapproved-internal-interpreter": (
                     str(other_internal_loader),
-                    [host_loader],
+                    {},
                 ),
                 "external-library": (
                     str(retained_loader),
-                    [host_loader, external_library],
+                    {"libc.so.6": external_library},
+                ),
+                "labeled-exact-loader-artifact": (
+                    str(retained_loader),
+                    {"ld-linux-x86-64.so.2": host_loader},
                 ),
             }
-            for name, (interpreter, dependencies) in cases.items():
+            for name, (interpreter, needed) in cases.items():
                 with (
                     self.subTest(name=name),
                     mock.patch.object(
@@ -318,8 +1047,19 @@ class TaskWitnessLinuxQualificationHarnessTests(unittest.TestCase):
                     ),
                     mock.patch.object(
                         self.helper,
-                        "ldd_paths",
-                        return_value=(dependencies, "ldd trace\n"),
+                        "patchelf_needed",
+                        return_value=list(needed),
+                    ),
+                    mock.patch.object(
+                        self.helper,
+                        "ldd_dependency_bindings",
+                        return_value=(
+                            needed,
+                            {},
+                            {},
+                            {"/lib64/ld-linux-x86-64.so.2": retained_loader},
+                            "loader trace\n",
+                        ),
                     ),
                     self.assertRaises(self.helper.PreparationError),
                 ):
@@ -341,8 +1081,14 @@ class TaskWitnessLinuxQualificationHarnessTests(unittest.TestCase):
                 ),
                 mock.patch.object(
                     self.helper,
-                    "ldd_paths",
-                    return_value=([host_loader], "ldd trace\n"),
+                    "ldd_dependency_bindings",
+                    return_value=(
+                        {},
+                        {},
+                        {},
+                        {"/lib64/ld-linux-x86-64.so.2": retained_loader},
+                        "loader trace\n",
+                    ),
                 ),
                 self.assertRaises(self.helper.PreparationError),
             ):
@@ -367,8 +1113,17 @@ class TaskWitnessLinuxQualificationHarnessTests(unittest.TestCase):
             for path in (executable, retained_loader, host_loader):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(b"fixture")
+            retained_loader.chmod(0o555)
 
-            ldd = mock.Mock(return_value=([host_loader], "ldd trace\n"))
+            ldd = mock.Mock(
+                return_value=(
+                    {},
+                    {},
+                    {},
+                    {"/lib64/ld-linux-x86-64.so.2": retained_loader},
+                    "loader trace\n",
+                )
+            )
             with (
                 mock.patch.object(
                     self.helper,
@@ -377,7 +1132,7 @@ class TaskWitnessLinuxQualificationHarnessTests(unittest.TestCase):
                         "interpreter inspection failed"
                     ),
                 ),
-                mock.patch.object(self.helper, "ldd_paths", ldd),
+                mock.patch.object(self.helper, "ldd_dependency_bindings", ldd),
                 self.assertRaises(self.helper.PreparationError),
             ):
                 self.helper.audit_runtime_elf_dependencies(
@@ -410,6 +1165,7 @@ class TaskWitnessLinuxQualificationHarnessTests(unittest.TestCase):
             ):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(b"fixture")
+            retained_loader.chmod(0o555)
 
             with (
                 mock.patch.object(
@@ -419,8 +1175,19 @@ class TaskWitnessLinuxQualificationHarnessTests(unittest.TestCase):
                 ),
                 mock.patch.object(
                     self.helper,
-                    "ldd_paths",
-                    return_value=([host_loader], "ldd trace\n"),
+                    "patchelf_needed",
+                    return_value=[],
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "ldd_dependency_bindings",
+                    return_value=(
+                        {},
+                        {},
+                        {},
+                        {"/lib64/ld-linux-x86-64.so.2": retained_loader},
+                        "loader trace\n",
+                    ),
                 ),
             ):
                 audit = self.helper.audit_runtime_elf_dependencies(
@@ -441,8 +1208,52 @@ class TaskWitnessLinuxQualificationHarnessTests(unittest.TestCase):
                 ),
                 mock.patch.object(
                     self.helper,
-                    "ldd_paths",
-                    return_value=([lookalike_loader], "ldd trace\n"),
+                    "patchelf_needed",
+                    return_value=[],
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "ldd_dependency_bindings",
+                    return_value=(
+                        {},
+                        {},
+                        {},
+                        {"/lib64/ld-linux-x86-64.so.2": lookalike_loader},
+                        "loader trace\n",
+                    ),
+                ),
+                self.assertRaises(self.helper.PreparationError),
+            ):
+                self.helper.audit_runtime_elf_dependencies(
+                    shared_object,
+                    runtime_root,
+                    retained_loader,
+                    host_loader,
+                    1001,
+                    1001,
+                )
+
+            with (
+                mock.patch.object(
+                    self.helper,
+                    "patchelf_interpreter",
+                    return_value=None,
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "patchelf_needed",
+                    return_value=[],
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "ldd_dependency_bindings",
+                    return_value=(
+                        {},
+                        {},
+                        {},
+                        {"/lib64/not-the-approved-loader.so": retained_loader},
+                        "loader trace\n",
+                    ),
                 ),
                 self.assertRaises(self.helper.PreparationError),
             ):

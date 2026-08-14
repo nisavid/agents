@@ -111,6 +111,182 @@ class TaskWitnessLinuxQualificationHarnessTests(unittest.TestCase):
                 self.helper.write_create_new(path, {"new": True})
             self.assertEqual(path.read_bytes(), b"existing")
 
+    @unittest.skipUnless(
+        sys.platform.startswith("linux") and hasattr(os, "pipe2"),
+        "requires the Linux filesystem-probe surface",
+    )
+    def test_filesystem_probes_observe_the_child_session_and_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            probe_root = Path(raw_root) / "filesystem-probes"
+
+            results = self.helper.filesystem_probes(probe_root)
+
+            self.assertTrue(results["process-session"])
+            self.assertEqual(sorted(results), self.helper.FILESYSTEM_SEMANTICS)
+            self.assertFalse(probe_root.exists())
+
+    @unittest.skipUnless(
+        sys.platform.startswith("linux") and hasattr(os, "pipe2"),
+        "requires the Linux filesystem-probe surface",
+    )
+    def test_filesystem_probes_cleanup_when_child_session_probe_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            probe_root = Path(raw_root) / "filesystem-probes"
+
+            with (
+                mock.patch.object(
+                    self.helper.os,
+                    "getsid",
+                    side_effect=OSError("session unavailable"),
+                ),
+                self.assertRaisesRegex(
+                    self.helper.PreparationError,
+                    "process session probe failed",
+                ),
+            ):
+                self.helper.filesystem_probes(probe_root)
+
+            self.assertFalse(probe_root.exists())
+
+    @unittest.skipUnless(
+        sys.platform.startswith("linux") and hasattr(os, "pipe2"),
+        "requires the Linux filesystem-probe surface",
+    )
+    def test_filesystem_probes_cleanup_after_parent_session_read_failure(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            probe_root = Path(raw_root) / "filesystem-probes"
+            descriptors: list[int] = []
+            children: list[int] = []
+            pipe2 = self.helper.os.pipe2
+            fork = self.helper.os.fork
+
+            def observe_pipe2(flags: int) -> tuple[int, int]:
+                observed = pipe2(flags)
+                descriptors.extend(observed)
+                return observed
+
+            def observe_fork() -> int:
+                observed = fork()
+                if observed > 0:
+                    children.append(observed)
+                return observed
+
+            with (
+                mock.patch.object(
+                    self.helper.os,
+                    "pipe2",
+                    side_effect=observe_pipe2,
+                ),
+                mock.patch.object(
+                    self.helper.os,
+                    "fork",
+                    side_effect=observe_fork,
+                ),
+                mock.patch.object(
+                    self.helper.os,
+                    "read",
+                    side_effect=OSError("parent read failed"),
+                ),
+                self.assertRaisesRegex(OSError, "parent read failed"),
+            ):
+                self.helper.filesystem_probes(probe_root)
+
+            self.assertEqual(len(descriptors), 2)
+            for descriptor in descriptors:
+                with self.assertRaises(OSError) as caught:
+                    os.fstat(descriptor)
+                self.assertEqual(caught.exception.errno, self.helper.errno.EBADF)
+            self.assertEqual(len(children), 1)
+            with self.assertRaises(ChildProcessError):
+                os.waitpid(children[0], os.WNOHANG)
+            self.assertFalse(probe_root.exists())
+
+    @unittest.skipUnless(
+        sys.platform.startswith("linux") and hasattr(os, "pipe2"),
+        "requires the Linux filesystem-probe surface",
+    )
+    def test_filesystem_probes_do_not_retry_a_transferred_close(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            probe_root = Path(raw_root) / "filesystem-probes"
+            parent = os.getpid()
+            descriptors: list[int] = []
+            children: list[int] = []
+            replacements: list[int] = []
+            pipe2 = self.helper.os.pipe2
+            fork = self.helper.os.fork
+            close = self.helper.os.close
+
+            def observe_pipe2(flags: int) -> tuple[int, int]:
+                observed = pipe2(flags)
+                descriptors.extend(observed)
+                return observed
+
+            def observe_fork() -> int:
+                observed = fork()
+                if observed > 0:
+                    children.append(observed)
+                return observed
+
+            def interrupt_parent_write_close(descriptor: int) -> None:
+                if (
+                    os.getpid() == parent
+                    and len(descriptors) == 2
+                    and descriptor == descriptors[1]
+                    and not replacements
+                ):
+                    close(descriptor)
+                    replacement = os.open(
+                        "/dev/null",
+                        os.O_RDONLY | os.O_CLOEXEC,
+                    )
+                    replacements.append(replacement)
+                    if replacement != descriptor:
+                        raise AssertionError("closed descriptor was not reused")
+                    raise InterruptedError(
+                        self.helper.errno.EINTR,
+                        "parent close interrupted",
+                    )
+                close(descriptor)
+
+            try:
+                with (
+                    mock.patch.object(
+                        self.helper.os,
+                        "pipe2",
+                        side_effect=observe_pipe2,
+                    ),
+                    mock.patch.object(
+                        self.helper.os,
+                        "fork",
+                        side_effect=observe_fork,
+                    ),
+                    mock.patch.object(
+                        self.helper.os,
+                        "close",
+                        side_effect=interrupt_parent_write_close,
+                    ),
+                    self.assertRaisesRegex(
+                        InterruptedError,
+                        "parent close interrupted",
+                    ),
+                ):
+                    self.helper.filesystem_probes(probe_root)
+
+                self.assertEqual(replacements, [descriptors[1]])
+                os.fstat(replacements[0])
+                self.assertEqual(len(children), 1)
+                with self.assertRaises(ChildProcessError):
+                    os.waitpid(children[0], os.WNOHANG)
+                self.assertFalse(probe_root.exists())
+            finally:
+                for descriptor in replacements:
+                    try:
+                        close(descriptor)
+                    except OSError:
+                        pass
+
     def test_runtime_inventory_roles_main_and_loader_files(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root)

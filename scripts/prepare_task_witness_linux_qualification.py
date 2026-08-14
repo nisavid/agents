@@ -2265,21 +2265,65 @@ def filesystem_probes(root: Path) -> dict[str, Any]:
             raise PreparationError("passwd database probe failed")
         results["passwd-database"] = entry.pw_name
 
-        read_descriptor, write_descriptor = os.pipe2(os.O_CLOEXEC)
-        child = os.fork()
-        if child == 0:
-            try:
-                os.close(read_descriptor)
-                session = os.setsid()
-                os.write(write_descriptor, str(session).encode("ascii"))
-                os._exit(0)
-            except (OSError, ValueError):
-                os._exit(127)
-        os.close(write_descriptor)
-        session_raw = os.read(read_descriptor, 64)
-        os.close(read_descriptor)
-        _pid, status_value = os.waitpid(child, 0)
-        if status_value != 0 or int(session_raw) != child:
+        read_descriptor = -1
+        write_descriptor = -1
+        child = -1
+        session_child = -1
+        try:
+            read_descriptor, write_descriptor = os.pipe2(os.O_CLOEXEC)
+            child = os.fork()
+            if child == 0:
+                try:
+                    os.close(read_descriptor)
+                    os.setsid()
+                    session = os.getsid(0)
+                    os.write(write_descriptor, str(session).encode("ascii"))
+                    os._exit(0)
+                except (OSError, ValueError):
+                    os._exit(127)
+            session_child = child
+            parent_write_descriptor = write_descriptor
+            write_descriptor = -1
+            os.close(parent_write_descriptor)
+            session_raw = os.read(read_descriptor, 64)
+            parent_read_descriptor = read_descriptor
+            read_descriptor = -1
+            os.close(parent_read_descriptor)
+            waited, status_value = os.waitpid(child, 0)
+            if waited != child:
+                raise PreparationError("process session child observation failed")
+            child = -1
+        finally:
+            probe_failed = sys.exc_info()[0] is not None
+            cleanup_errors: list[OSError] = []
+            for descriptor in (read_descriptor, write_descriptor):
+                if descriptor >= 0:
+                    try:
+                        os.close(descriptor)
+                    except OSError as error:
+                        if error.errno != errno.EBADF:
+                            cleanup_errors.append(error)
+            if child > 0:
+                while True:
+                    try:
+                        waited, _status = os.waitpid(child, 0)
+                    except InterruptedError:
+                        continue
+                    except ChildProcessError:
+                        break
+                    except OSError as error:
+                        cleanup_errors.append(error)
+                        break
+                    if waited != child:
+                        cleanup_errors.append(
+                            OSError(errno.ECHILD, "session child was not reaped")
+                        )
+                    break
+            if cleanup_errors and not probe_failed:
+                raise PreparationError(
+                    "process session cleanup failed"
+                ) from cleanup_errors[0]
+        if status_value != 0 or int(session_raw) != session_child:
             raise PreparationError("process session probe failed")
         results["process-session"] = True
 

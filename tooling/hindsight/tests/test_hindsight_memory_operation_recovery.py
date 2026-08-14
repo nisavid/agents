@@ -1165,6 +1165,108 @@ class OperationRecoveryContractTest(unittest.TestCase):
         )
         return snapshot
 
+    def post_abort_v9_snapshot(
+        self,
+        reference_plan,
+        *,
+        observed_at: int = 1_786_390_181,
+    ) -> dict:
+        snapshot = self.post_abort_v8_snapshot(
+            reference_plan,
+            observed_at=observed_at,
+        )
+        worker_digest = hashlib.sha256(
+            (
+                "operation-recovery-exact-drain-"
+                f"{reference_plan['plan_digest'][:12]}"
+            ).encode()
+        ).hexdigest()
+        reference_selected = {
+            item["operation_id"]
+            for item in reference_plan["selected_operations"]
+        }
+        processing = next(
+            item
+            for item in snapshot["operations"]
+            if item["current_status"] == "processing"
+        )
+        processing["retry_count"] = 3
+        processing["row_digest"] = digest(
+            {
+                key: value
+                for key, value in processing.items()
+                if key != "row_digest"
+            }
+        )
+        completed = next(
+            item
+            for item in snapshot["operations"]
+            if item["operation_id"] in reference_selected
+            and item["current_status"] == "pending"
+            and item["operation_type"] == "retain"
+        )
+        completed.update(
+            {
+                "current_status": "completed",
+                "retry_count": 3,
+                "worker_id_present": True,
+                "worker_id_digest": worker_digest,
+                "claimed_at": "2026-08-14T10:51:06.925194Z",
+                "completed_at": "2026-08-14T11:10:50.017320Z",
+                "error_category": "provider_transport",
+                "error_digest": "5" * 64,
+                "result_metadata_digest": "6" * 64,
+            }
+        )
+        completed["row_digest"] = digest(
+            {
+                key: value
+                for key, value in completed.items()
+                if key != "row_digest"
+            }
+        )
+        retrying = next(
+            item
+            for item in snapshot["operations"]
+            if item["operation_id"] in reference_selected
+            and item["current_status"] == "pending"
+            and item["operation_type"] == "retain"
+        )
+        retrying.update(
+            {
+                "retry_count": 3,
+                "worker_id_present": True,
+                "worker_id_digest": worker_digest,
+                "claimed_at": "2026-08-14T13:44:36.057801Z",
+                "error_category": "provider_transport",
+                "error_digest": "7" * 64,
+                "result_metadata_digest": "8" * 64,
+            }
+        )
+        retrying["row_digest"] = digest(
+            {
+                key: value
+                for key, value in retrying.items()
+                if key != "row_digest"
+            }
+        )
+        snapshot["operations"].sort(key=lambda item: item["operation_id"])
+        snapshot["status_counts"] = {
+            status: sum(
+                item["current_status"] == status
+                for item in snapshot["operations"]
+            )
+            for status in recovery_contract.OPERATION_STATUSES
+        }
+        snapshot["snapshot_digest"] = digest(
+            {
+                key: value
+                for key, value in snapshot.items()
+                if key != "snapshot_digest"
+            }
+        )
+        return snapshot
+
     def prior_v3_post_abort_plan(self) -> dict:
         reference = self.drain_plan()
         snapshot = self.post_abort_snapshot(
@@ -1882,6 +1984,146 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 row.update(updates)
                 row["row_digest"] = digest(
                     {key: value for key, value in row.items() if key != "row_digest"}
+                )
+                changed["snapshot_digest"] = digest(
+                    {
+                        key: value
+                        for key, value in changed.items()
+                        if key != "snapshot_digest"
+                    }
+                )
+                with self.assertRaisesRegex(
+                    OperationRecoveryError,
+                    "invalid",
+                ):
+                    create(changed)
+
+    def test_post_abort_v9_plan_preserves_completed_checkpoint(self):
+        reference = self.drain_plan(
+            snapshot=self.drain_snapshot(
+                completed_positions={0, 1, 42, 43, 46, 47},
+                observed_at=1_786_390_000,
+            ),
+            created_at=1_786_390_001,
+        )
+        snapshot = self.post_abort_v9_snapshot(reference)
+        backup = rollback_backup_evidence()
+        backup["source_authority"]["generation_before"] = snapshot[
+            "generation_before"
+        ]
+        backup["source_authority"]["generation_after"] = snapshot[
+            "generation_after"
+        ]
+        backup["source_authority_digest"] = digest(backup["source_authority"])
+
+        def create(value):
+            return create_post_abort_recovery_plan(
+                reference,
+                value,
+                candidate_release=release_identity(),
+                rollback_backup=backup,
+                rollback_encryption=rollback_encryption(),
+                rollback_backup_path="/private/tmp/v9-backup.age",
+                rollback_bundle_path="/private/tmp/v9-bundle.age",
+                authorization_receipt_path="/private/tmp/v9-auth.json",
+                application_receipt_path="/private/tmp/v9-app.json",
+                verification_receipt_path="/private/tmp/v9-verify.json",
+                rollback_receipt_path="/private/tmp/v9-rollback.json",
+                reference_application_authorization=(
+                    exact_drain_authorization(reference)
+                ),
+                reference_application_journal=(
+                    exact_drain_application_journal(reference)
+                ),
+                reference_application_progress_digest="e" * 64,
+                schema_version=9,
+                created_at=1_786_390_500,
+            )
+
+        plan = create(snapshot)
+        self.assertEqual(plan["schema_version"], 9)
+        self.assertEqual(plan["selected_operation_count"], 3)
+        self.assertEqual(
+            plan["selected_status_counts"],
+            {"failed": 1, "pending": 1, "processing": 1},
+        )
+        self.assertEqual(plan["selected_type_counts"], {"retain": 3})
+        self.assertEqual(
+            plan["preserved_status_counts"],
+            {"completed": 7, "pending": 38},
+        )
+        self.assertEqual(
+            verify_post_abort_recovery_plan(plan, now=plan["created_at"]),
+            plan,
+        )
+
+        for label, status, updates in (
+            ("processing-retry", "processing", {"retry_count": 1}),
+            ("pending-retry", "pending", {"retry_count": 2}),
+            (
+                "pending-category",
+                "pending",
+                {"error_category": "unknown"},
+            ),
+            ("pending-error-digest", "pending", {"error_digest": None}),
+        ):
+            with self.subTest(drift=label):
+                changed = deepcopy(snapshot)
+                row = next(
+                    item
+                    for item in changed["operations"]
+                    if item["current_status"] == status
+                    and (status != "pending" or item["worker_id_present"])
+                )
+                row.update(updates)
+                row["row_digest"] = digest(
+                    {
+                        key: value
+                        for key, value in row.items()
+                        if key != "row_digest"
+                    }
+                )
+                changed["snapshot_digest"] = digest(
+                    {
+                        key: value
+                        for key, value in changed.items()
+                        if key != "snapshot_digest"
+                    }
+                )
+                with self.assertRaisesRegex(
+                    OperationRecoveryError,
+                    "invalid",
+                ):
+                    create(changed)
+
+        for label, updates in (
+            ("completed-retry", {"retry_count": 2}),
+            ("completed-category", {"error_category": "unknown"}),
+            ("completed-error-digest", {"error_digest": None}),
+            ("completed-owner", {"worker_id_digest": "7" * 64}),
+            ("completed-at", {"completed_at": None}),
+        ):
+            with self.subTest(drift=label):
+                changed = deepcopy(snapshot)
+                row = next(
+                    item
+                    for item in changed["operations"]
+                    if item["current_status"] == "completed"
+                    and item["worker_id_digest"]
+                    == hashlib.sha256(
+                        (
+                            "operation-recovery-exact-drain-"
+                            f"{reference['plan_digest'][:12]}"
+                        ).encode()
+                    ).hexdigest()
+                )
+                row.update(updates)
+                row["row_digest"] = digest(
+                    {
+                        key: value
+                        for key, value in row.items()
+                        if key != "row_digest"
+                    }
                 )
                 changed["snapshot_digest"] = digest(
                     {

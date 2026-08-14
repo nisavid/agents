@@ -876,14 +876,21 @@ asyncio.run(exercise())
             connection,
             completed_positions=(
                 {0, 1, 42, 43, 46, 47}
-                if schema_version in {6, 7, 8}
+                if schema_version in {6, 7, 8, 9}
                 else None
             ),
         )
         selected = reference["selected_operations"]
-        processing_count = {2: 4, 3: 3, 4: 2, 5: 1, 6: 1, 7: 1, 8: 1}[
-            schema_version
-        ]
+        processing_count = {
+            2: 4,
+            3: 3,
+            4: 2,
+            5: 1,
+            6: 1,
+            7: 1,
+            8: 1,
+            9: 1,
+        }[schema_version]
         processing = (
             [
                 next(
@@ -925,7 +932,7 @@ asyncio.run(exercise())
                 "WHERE operation_id = $1::uuid",
                 consolidation_id,
             )
-        elif schema_version == 8:
+        elif schema_version in {8, 9}:
             processing_id = processing_ids[0]
             await connection.execute(
                 """
@@ -936,6 +943,12 @@ asyncio.run(exercise())
                 """,
                 processing_id,
             )
+            if schema_version == 9:
+                await connection.execute(
+                    "UPDATE public.async_operations SET retry_count = 3 "
+                    "WHERE operation_id = $1::uuid",
+                    processing_id,
+                )
             failed_id = next(
                 item["operation_id"]
                 for item in selected
@@ -957,6 +970,48 @@ asyncio.run(exercise())
                 worker_id,
             )
             processing_ids.append(failed_id)
+            if schema_version == 9:
+                completed_id = next(
+                    item["operation_id"]
+                    for item in selected
+                    if item["operation_type"] == "retain"
+                    and item["operation_id"] not in processing_ids
+                )
+                await connection.execute(
+                    """
+                    UPDATE public.async_operations
+                    SET status = 'completed', retry_count = 3,
+                        error_message = 'provider transport timeout',
+                        worker_id = $2,
+                        claimed_at = '2026-08-14T10:51:06Z',
+                        completed_at = '2026-08-14T11:10:50Z',
+                        updated_at = '2026-08-14T11:10:50Z'
+                    WHERE operation_id = $1::uuid
+                    """,
+                    completed_id,
+                    worker_id,
+                )
+                pending_id = next(
+                    item["operation_id"]
+                    for item in selected
+                    if item["operation_type"] == "retain"
+                    and item["operation_id"] not in processing_ids
+                    and item["operation_id"] != completed_id
+                )
+                await connection.execute(
+                    """
+                    UPDATE public.async_operations
+                    SET retry_count = 3,
+                        error_message = 'provider transport timeout',
+                        worker_id = $2,
+                        claimed_at = '2026-08-14T13:44:36Z',
+                        updated_at = '2026-08-14T13:44:36Z'
+                    WHERE operation_id = $1::uuid
+                    """,
+                    pending_id,
+                    worker_id,
+                )
+                processing_ids.append(pending_id)
         elif schema_version == 5:
             remaining_retain_ids = [
                 item["operation_id"]
@@ -1081,7 +1136,7 @@ asyncio.run(exercise())
         authorization = recovery_fixtures.exact_drain_authorization(reference)
         journal = recovery_fixtures.exact_drain_application_journal(reference)
         created_at = int(time.time())
-        if schema_version in {4, 5, 6, 7, 8}:
+        if schema_version in {4, 5, 6, 7, 8, 9}:
             plan = create_post_abort_recovery_plan(
                 reference,
                 snapshot,
@@ -2186,6 +2241,79 @@ asyncio.run(exercise())
                         operation_id: live_row_digest(row)
                         for operation_id, row in before.items()
                     },
+                )
+            finally:
+                await connection.close()
+
+        asyncio.run(exercise())
+
+    def test_post_abort_v9_preserves_completed_checkpoint(self):
+        async def exercise():
+            connection = await self._connect()
+            try:
+                plan, cohort_ids, selected_ids, unexpected_id = (
+                    await self._post_abort_case(connection, schema_version=9)
+                )
+                before = {
+                    row["operation_id"]: row
+                    for row in await read_safe_operation_rows(
+                        connection,
+                        schema="public",
+                        bank_id="engineering",
+                        operation_ids=[*cohort_ids, unexpected_id],
+                    )
+                }
+                completed_by_worker = [
+                    row
+                    for operation_id, row in before.items()
+                    if operation_id in cohort_ids
+                    and row["status"] == "completed"
+                    and row["worker_id_digest"]
+                    == plan["reference_worker_id_digest"]
+                ]
+                self.assertEqual(plan["schema_version"], 9)
+                self.assertEqual(len(selected_ids), 3)
+                self.assertEqual(len(completed_by_worker), 1)
+                completed_id = completed_by_worker[0]["operation_id"]
+
+                generations = await apply_post_abort_recovery_transaction(
+                    connection,
+                    profile_id="systalyze",
+                    schema="public",
+                    bank_id="engineering",
+                    plan=plan,
+                )
+                after = {
+                    row["operation_id"]: row
+                    for row in await read_safe_operation_rows(
+                        connection,
+                        schema="public",
+                        bank_id="engineering",
+                        operation_ids=[*cohort_ids, unexpected_id],
+                    )
+                }
+                self.assertEqual(
+                    generations,
+                    ("systalyze:public:123", "systalyze:public:124"),
+                )
+                self.assertEqual(
+                    live_row_digest(after[completed_id]),
+                    live_row_digest(before[completed_id]),
+                )
+                for operation_id in selected_ids:
+                    self.assertEqual(after[operation_id]["status"], "pending")
+                    self.assertFalse(after[operation_id]["worker_id_present"])
+                    self.assertIsNone(after[operation_id]["claimed_at"])
+                preserved_ids = set(cohort_ids) - set(selected_ids)
+                self.assertEqual(len(preserved_ids), 45)
+                for operation_id in preserved_ids:
+                    self.assertEqual(
+                        live_row_digest(after[operation_id]),
+                        live_row_digest(before[operation_id]),
+                    )
+                self.assertEqual(
+                    live_row_digest(after[unexpected_id]),
+                    live_row_digest(before[unexpected_id]),
                 )
             finally:
                 await connection.close()

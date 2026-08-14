@@ -6950,7 +6950,7 @@ async def apply_post_abort_recovery_transaction(
             "worker_id IS NOT NULL "
             "AND encode(sha256(convert_to(worker_id, 'UTF8')), 'hex') = $3 "
             "AND claimed_at IS NOT NULL"
-            if verified["schema_version"] in {5, 6, 7, 8}
+            if verified["schema_version"] in {5, 6, 7, 8, 9}
             else "worker_id IS NULL AND claimed_at IS NULL"
         )
         result = await connection.execute(
@@ -6990,7 +6990,7 @@ async def apply_post_abort_recovery_transaction(
             selected_identifiers,
             bank_id,
             verified["reference_worker_id_digest"],
-            verified["schema_version"] == 7,
+            verified["schema_version"] in {7, 9},
         )
         if result != f"UPDATE {len(selected)}":
             raise OperationRecoveryError(

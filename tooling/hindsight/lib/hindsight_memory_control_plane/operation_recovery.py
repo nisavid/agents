@@ -179,6 +179,16 @@ POST_ABORT_V8_SELECTED_TYPE_COUNTS = {"retain": 2}
 POST_ABORT_V8_FAILED_RETRY_COUNTS = (3,)
 POST_ABORT_V8_PROCESSING_RETRY_COUNTS = (1,)
 POST_ABORT_V8_PRESERVED_STATUS_COUNTS = {"completed": 6, "pending": 40}
+POST_ABORT_V9_SELECTED_STATUS_COUNTS = {
+    "failed": 1,
+    "pending": 1,
+    "processing": 1,
+}
+POST_ABORT_V9_SELECTED_TYPE_COUNTS = {"retain": 3}
+POST_ABORT_V9_FAILED_RETRY_COUNTS = POST_ABORT_V8_FAILED_RETRY_COUNTS
+POST_ABORT_V9_PENDING_RETRY_COUNTS = (3,)
+POST_ABORT_V9_PROCESSING_RETRY_COUNTS = (3,)
+POST_ABORT_V9_PRESERVED_STATUS_COUNTS = {"completed": 7, "pending": 38}
 POST_ABORT_CONTRACTS = {
     1: (
         POST_ABORT_SELECTED_STATUS_COUNTS,
@@ -219,6 +229,11 @@ POST_ABORT_CONTRACTS = {
         POST_ABORT_V8_SELECTED_STATUS_COUNTS,
         POST_ABORT_V8_SELECTED_TYPE_COUNTS,
         POST_ABORT_V8_PRESERVED_STATUS_COUNTS,
+    ),
+    9: (
+        POST_ABORT_V9_SELECTED_STATUS_COUNTS,
+        POST_ABORT_V9_SELECTED_TYPE_COUNTS,
+        POST_ABORT_V9_PRESERVED_STATUS_COUNTS,
     ),
 }
 OPERATION_STATUSES = (
@@ -581,6 +596,7 @@ POST_ABORT_PLAN_V5_KEYS = POST_ABORT_PLAN_V4_KEYS
 POST_ABORT_PLAN_V6_KEYS = POST_ABORT_PLAN_V5_KEYS
 POST_ABORT_PLAN_V7_KEYS = POST_ABORT_PLAN_V6_KEYS
 POST_ABORT_PLAN_V8_KEYS = POST_ABORT_PLAN_V7_KEYS
+POST_ABORT_PLAN_V9_KEYS = POST_ABORT_PLAN_V8_KEYS
 POST_ABORT_REFERENCE_JOURNAL_KEYS = frozenset(
     {
         "schema_version",
@@ -2781,6 +2797,24 @@ def _post_abort_v5_completed_selected_matches(
     )
 
 
+def _post_abort_v9_completed_selected_matches(
+    item: Mapping[str, Any],
+    *,
+    worker_digest: str,
+) -> bool:
+    return (
+        item["current_status"] == "completed"
+        and item["operation_type"] == "retain"
+        and item["retry_count"] == 3
+        and item["worker_id_present"] is True
+        and item["worker_id_digest"] == worker_digest
+        and item["claimed_at"] is not None
+        and item["completed_at"] is not None
+        and item["error_category"] == "provider_transport"
+        and item["error_digest"] is not None
+    )
+
+
 def _post_abort_contract(
     reference_plan: Mapping[str, Any],
     snapshot: Mapping[str, Any],
@@ -2795,7 +2829,7 @@ def _post_abort_contract(
 ]:
     worker_digest = _post_abort_worker_digest(reference_plan["plan_digest"])
     selected = _post_abort_selected(snapshot)
-    if schema_version == 7:
+    if schema_version in {7, 9}:
         selected.extend(
             {
                 "operation_id": item["operation_id"],
@@ -2815,7 +2849,7 @@ def _post_abort_contract(
         status: sum(item["expected_status"] == status for item in selected)
         for status in (
             ("failed", "pending", "processing")
-            if schema_version == 7
+            if schema_version in {7, 9}
             else ("failed", "processing")
         )
     }
@@ -2861,7 +2895,7 @@ def _post_abort_contract(
         for status in ("completed", "pending")
         if snapshot["status_counts"].get(status, 0)
     }
-    if schema_version == 7:
+    if schema_version in {7, 9}:
         preserved_status_counts["pending"] -= len(pending)
     try:
         (
@@ -2875,11 +2909,11 @@ def _post_abort_contract(
         ) from error
     if (
         reference_plan["selected_operation_count"]
-        != (42 if schema_version in {6, 7, 8} else 43)
+        != (42 if schema_version in {6, 7, 8, 9} else 43)
         or reference_plan["selected_status_counts"]
-        != {"pending": 42 if schema_version in {6, 7, 8} else 43}
+        != {"pending": 42 if schema_version in {6, 7, 8, 9} else 43}
         or reference_plan["preserved_status_counts"]
-        != {"completed": 6 if schema_version in {6, 7, 8} else 5}
+        != {"completed": 6 if schema_version in {6, 7, 8, 9} else 5}
         or snapshot["cohort_digest"] != reference_plan["cohort_digest"]
         or set(current) != set(reference_snapshot)
         or not selected
@@ -2940,12 +2974,20 @@ def _post_abort_contract(
             )
         )
         or (
-            schema_version == 8
+            schema_version in {8, 9}
             and (
                 tuple(sorted(item["retry_count"] for item in processing))
-                != POST_ABORT_V8_PROCESSING_RETRY_COUNTS
+                != (
+                    POST_ABORT_V8_PROCESSING_RETRY_COUNTS
+                    if schema_version == 8
+                    else POST_ABORT_V9_PROCESSING_RETRY_COUNTS
+                )
                 or tuple(sorted(item["retry_count"] for item in failed))
-                != POST_ABORT_V8_FAILED_RETRY_COUNTS
+                != (
+                    POST_ABORT_V8_FAILED_RETRY_COUNTS
+                    if schema_version == 8
+                    else POST_ABORT_V9_FAILED_RETRY_COUNTS
+                )
                 or any(
                     item["operation_type"] != "retain"
                     or item["error_category"] != "provider_transport"
@@ -2960,6 +3002,19 @@ def _post_abort_contract(
                 )
             )
         )
+        or (
+            schema_version == 9
+            and (
+                tuple(sorted(item["retry_count"] for item in pending))
+                != POST_ABORT_V9_PENDING_RETRY_COUNTS
+                or any(
+                    item["operation_type"] != "retain"
+                    or item["error_category"] != "provider_transport"
+                    or item["error_digest"] is None
+                    for item in pending
+                )
+            )
+        )
         or preserved_status_counts != expected_preserved_status_counts
         or snapshot["status_counts"].get("cancelled", 0)
         or snapshot["generation_before"] != snapshot["generation_after"]
@@ -2970,7 +3025,7 @@ def _post_abort_contract(
             or item["claimed_at"] is None
             or item["completed_at"] is not None
             or (
-                schema_version != 8
+                schema_version not in {8, 9}
                 and (
                     item["error_category"] != "none"
                     or item["error_digest"] is not None
@@ -2992,7 +3047,7 @@ def _post_abort_contract(
                 or item["claimed_at"] is None
                 or item["completed_at"] is None
             )
-            if schema_version in {5, 6, 7, 8}
+            if schema_version in {5, 6, 7, 8, 9}
             else (
                 item["worker_id_present"]
                 or item["worker_id_digest"] is not None
@@ -3023,10 +3078,19 @@ def _post_abort_contract(
                 )
             )
             if not (
-                schema_version == 5
-                and _post_abort_v5_completed_selected_matches(
-                    current[operation_id],
-                    worker_digest=worker_digest,
+                (
+                    schema_version == 5
+                    and _post_abort_v5_completed_selected_matches(
+                        current[operation_id],
+                        worker_digest=worker_digest,
+                    )
+                )
+                or (
+                    schema_version == 9
+                    and _post_abort_v9_completed_selected_matches(
+                        current[operation_id],
+                        worker_digest=worker_digest,
+                    )
                 )
             )
             else False
@@ -3036,6 +3100,17 @@ def _post_abort_contract(
             schema_version == 5
             and sum(
                 current[operation_id]["current_status"] == "completed"
+                for operation_id in set(reference_selected) - selected_ids
+            )
+            != 1
+        )
+        or (
+            schema_version == 9
+            and sum(
+                _post_abort_v9_completed_selected_matches(
+                    current[operation_id],
+                    worker_digest=worker_digest,
+                )
                 for operation_id in set(reference_selected) - selected_ids
             )
             != 1
@@ -3076,7 +3151,7 @@ def create_post_abort_recovery_plan(
     reference_application_authorization: Mapping[str, Any],
     reference_application_journal: Mapping[str, Any],
     reference_application_progress_digest: str,
-    schema_version: int = 8,
+    schema_version: int = 9,
     created_at: int | None = None,
 ) -> Mapping[str, Any]:
     """Plan the exact stopped-worker cleanup without mutating operations."""
@@ -3098,7 +3173,7 @@ def create_post_abort_recovery_plan(
         reference_application_progress_digest,
         "post-abort reference application progress digest",
     )
-    if schema_version not in {4, 5, 6, 7, 8}:
+    if schema_version not in {4, 5, 6, 7, 8, 9}:
         raise OperationRecoveryError(
             "operation-recovery post-abort creation schema is invalid"
         )
@@ -3236,7 +3311,17 @@ def verify_post_abort_recovery_plan(
             "operation-recovery post-abort plan is invalid"
         )
     schema_version = normalized.get("schema_version")
-    if type(schema_version) is not int or schema_version not in {1, 2, 3, 4, 5, 6, 7, 8}:
+    if type(schema_version) is not int or schema_version not in {
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+    }:
         raise OperationRecoveryError(
             "operation-recovery post-abort plan is invalid"
         )
@@ -3251,6 +3336,7 @@ def verify_post_abort_recovery_plan(
             6: POST_ABORT_PLAN_V6_KEYS,
             7: POST_ABORT_PLAN_V7_KEYS,
             8: POST_ABORT_PLAN_V8_KEYS,
+            9: POST_ABORT_PLAN_V9_KEYS,
         }[schema_version],
         "operation-recovery post-abort plan",
     )
@@ -3278,7 +3364,7 @@ def verify_post_abort_recovery_plan(
     )
     reference_progress_digest = (
         None
-        if schema_version not in {3, 4, 5, 6, 7, 8}
+        if schema_version not in {3, 4, 5, 6, 7, 8, 9}
         else _sha(
             plan["reference_application_progress_digest"],
             "post-abort reference application progress digest",
@@ -3461,7 +3547,7 @@ def verify_post_abort_recovery_plan(
                 ),
                 **(
                     {}
-                    if schema_version not in {3, 4, 5, 6, 7, 8}
+                    if schema_version not in {3, 4, 5, 6, 7, 8, 9}
                     else {
                         "reference_application_progress_digest": (
                             reference_progress_digest

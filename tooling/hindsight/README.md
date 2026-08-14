@@ -322,6 +322,10 @@ again. The third transient retry seals a terminal failure; no transient failure
 bypasses that ceiling or creates an unbounded retry loop. Candidate error
 records retain the exception type even when the exception text is empty.
 
+Post-abort recovery preserves every completed exact-drain checkpoint. A current
+recovery plan selects only the reference worker's failed, owned-pending, and
+processing rows; completed rows and all other cohort rows remain digest-exact.
+
 The managed exact-drain worker runtime is a separate trusted authority. For a
 current plan, planning, apply, and the gated child each stream-hash the complete
 canonical worker `site-packages` tree, including relative paths, entry types,

@@ -1,0 +1,399 @@
+name: Task Witness Linux x86_64 qualification
+
+on:
+  push:
+    branches:
+      - ivan/task-witness-linux-qualification-harness
+    paths:
+      - .github/workflows/task-witness-linux-qualification.yml
+      - scripts/prepare_task_witness_linux_qualification.py
+      - tests/test_task_witness_linux_qualification_harness.py
+
+permissions:
+  contents: read
+
+concurrency:
+  group: task-witness-linux-qualification-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  qualify:
+    if: >-
+      ${{ vars.TASK_WITNESS_LINUX_QUALIFICATION_CANDIDATE ==
+          '5b0e5697d3e632add5a9395e03b37363be353c73' &&
+          vars.TASK_WITNESS_LINUX_QUALIFICATION_HARNESS == github.sha }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      CANDIDATE_SHA: 5b0e5697d3e632add5a9395e03b37363be353c73
+      CANDIDATE_ROOT: /opt/task-witness/candidate
+      EVIDENCE_ROOT: /opt/task-witness/evidence
+      QUALIFICATION_HOME: /home/task-witness-qualification
+      QUALIFICATION_USER: task-witness-qualification
+      PYYAML_VERSION: 6.0.3
+      PYYAML_WHEEL_FILENAME: >-
+        pyyaml-6.0.3-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
+      PYYAML_WHEEL_SHA256: 0f29edc409a6392443abf94b9cf89ce99889a1dd5376d94316ae5145dfedd5d6
+      PYYAML_WHEEL_URL: >-
+        https://files.pythonhosted.org/packages/74/27/e5b8f34d02d9995b80abcef563ea1f8b56d20134d8f4e5e81733b1feceb2/pyyaml-6.0.3-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
+      RUNTIME_ROOT: /opt/task-witness/runtime
+      RUNTIME_SITE_PACKAGES: /opt/task-witness/runtime/lib/python3.13/site-packages
+      RUNTIME_VERSION: 3.13.7
+      SETUP_PYTHON_ACTION_SHA: ece7cb06caefa5fff74198d8649806c4678c61a1
+    steps:
+      - name: Check out operator-owned harness
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          path: harness
+          persist-credentials: false
+
+      - name: Check out the exact frozen candidate
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          repository: nisavid/agents
+          ref: 5b0e5697d3e632add5a9395e03b37363be353c73
+          fetch-depth: 0
+          path: candidate-stage
+          persist-credentials: false
+
+      - name: Provision exact CPython source runtime
+        id: python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6
+        with:
+          python-version: 3.13.7
+          check-latest: false
+
+      - name: Verify harness and candidate inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 -m unittest \
+            harness/tests/test_task_witness_linux_qualification_harness.py
+          harness_sha=$(/usr/bin/git -C harness rev-parse HEAD^{commit})
+          test "$harness_sha" = "$GITHUB_SHA"
+          candidate_sha=$(
+            /usr/bin/git -C candidate-stage rev-parse HEAD^{commit}
+          )
+          test "$candidate_sha" = "$CANDIDATE_SHA"
+          /usr/bin/git -C candidate-stage diff --quiet
+          /usr/bin/git -C candidate-stage diff --cached --quiet
+          test -z "$(/usr/bin/git -C candidate-stage status --porcelain)"
+
+      - name: Provision immutable roots and qualification identity
+        id: provision
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo /usr/bin/apt-get update
+          sudo /usr/bin/apt-get install --yes --no-install-recommends patchelf
+
+          source_python='${{ steps.python.outputs.python-path }}'
+          source_root=$(/usr/bin/dirname "$(/usr/bin/dirname "$source_python")")
+          runtime_relative=${source_python#"$source_root"/}
+          test "$runtime_relative" != "$source_python"
+          /usr/bin/python3 -I -B \
+            harness/scripts/prepare_task_witness_linux_qualification.py \
+            verify-runtime-source \
+            --root "$source_root" \
+            --executable "$source_python"
+
+          sudo /usr/sbin/useradd \
+            --create-home \
+            --home-dir "$QUALIFICATION_HOME" \
+            --shell /usr/sbin/nologin \
+            --user-group \
+            "$QUALIFICATION_USER"
+          sudo /usr/bin/chmod 0700 "$QUALIFICATION_HOME"
+          qual_uid=$(/usr/bin/id -u "$QUALIFICATION_USER")
+          qual_gid=$(/usr/bin/id -g "$QUALIFICATION_USER")
+
+          sudo /usr/bin/setpriv \
+            --reuid="$qual_uid" \
+            --regid="$qual_gid" \
+            --clear-groups \
+            --inh-caps=-all \
+            --ambient-caps=-all \
+            --bounding-set=-all \
+            --no-new-privs \
+            --reset-env \
+            /usr/bin/env -i \
+              HOME="$QUALIFICATION_HOME" \
+              LANG=C.UTF-8 \
+              LC_ALL=C.UTF-8 \
+              PATH=/usr/bin:/bin \
+              TZ=UTC \
+              /usr/bin/curl \
+                --fail \
+                --location \
+                --proto '=https' \
+                --show-error \
+                --silent \
+                --tlsv1.2 \
+                --output "$QUALIFICATION_HOME/$PYYAML_WHEEL_FILENAME" \
+                "$PYYAML_WHEEL_URL"
+          observed_wheel_sha=$(
+            sudo /usr/bin/sha256sum \
+              "$QUALIFICATION_HOME/$PYYAML_WHEEL_FILENAME" \
+              | /usr/bin/cut -d ' ' -f 1
+          )
+          test "$observed_wheel_sha" = "$PYYAML_WHEEL_SHA256"
+
+          sudo /usr/bin/mkdir -p /opt/task-witness
+          sudo /usr/bin/mkdir /opt/task-witness/bootstrap
+          sudo /usr/bin/mv \
+            "$QUALIFICATION_HOME/$PYYAML_WHEEL_FILENAME" \
+            "/opt/task-witness/bootstrap/$PYYAML_WHEEL_FILENAME"
+          sudo /usr/bin/chown root:root \
+            "/opt/task-witness/bootstrap/$PYYAML_WHEEL_FILENAME"
+          sudo /usr/bin/chmod 0444 \
+            "/opt/task-witness/bootstrap/$PYYAML_WHEEL_FILENAME"
+          sudo /usr/bin/cp -a -- "$GITHUB_WORKSPACE/candidate-stage" "$CANDIDATE_ROOT"
+          /usr/bin/mkdir "$RUNNER_TEMP/task-witness-runtime-stage"
+          /usr/bin/cp -aL -- \
+            "$source_root"/. \
+            "$RUNNER_TEMP/task-witness-runtime-stage"/
+          sudo /usr/bin/mv \
+            "$RUNNER_TEMP/task-witness-runtime-stage" \
+            "$RUNTIME_ROOT"
+
+          runtime_executable="$RUNTIME_ROOT/$runtime_relative"
+          test -f "$runtime_executable"
+          test -d "$RUNTIME_SITE_PACKAGES"
+          echo "runtime_executable=$runtime_executable" >> "$GITHUB_OUTPUT"
+          echo "source_root=$source_root" >> "$GITHUB_OUTPUT"
+
+          sudo /usr/bin/chown -R "$qual_uid":"$qual_gid" "$RUNTIME_ROOT"
+          sudo /usr/bin/setpriv \
+            --reuid="$qual_uid" \
+            --regid="$qual_gid" \
+            --clear-groups \
+            --inh-caps=-all \
+            --ambient-caps=-all \
+            --bounding-set=-all \
+            --no-new-privs \
+            --reset-env \
+            /usr/bin/env -i \
+              HOME="$QUALIFICATION_HOME" \
+              LANG=C.UTF-8 \
+              LC_ALL=C.UTF-8 \
+              PATH=/usr/bin:/bin \
+              TZ=UTC \
+              /usr/bin/python3 -I -B \
+                "$GITHUB_WORKSPACE/harness/scripts/prepare_task_witness_linux_qualification.py" \
+                install-wheel \
+                --runtime-root "$RUNTIME_ROOT" \
+                --site-packages "$RUNTIME_SITE_PACKAGES" \
+                --wheel "/opt/task-witness/bootstrap/$PYYAML_WHEEL_FILENAME"
+          sudo /usr/bin/chown -R root:root "$RUNTIME_ROOT"
+          sudo /usr/bin/find "$RUNTIME_ROOT" -type d -exec /usr/bin/chmod go-w {} +
+          sudo /usr/bin/find "$RUNTIME_ROOT" -type f -exec /usr/bin/chmod go-w {} +
+
+          sudo /usr/bin/python3 -I -B \
+            harness/scripts/prepare_task_witness_linux_qualification.py \
+            capture-context \
+            --output /opt/task-witness/github-actions-context.json
+          sudo /usr/bin/python3 -I -B \
+            harness/scripts/prepare_task_witness_linux_qualification.py \
+            seal-runtime \
+            --runtime-root "$RUNTIME_ROOT" \
+            --runtime-executable "$runtime_executable" \
+            --site-packages "$RUNTIME_SITE_PACKAGES" \
+            --dependency-wheel "/opt/task-witness/bootstrap/$PYYAML_WHEEL_FILENAME" \
+            --audit-output /opt/task-witness/runtime-transformation-audit.json \
+            --source-root "$source_root" \
+            --runtime-version "$RUNTIME_VERSION" \
+            --setup-python-action-sha "$SETUP_PYTHON_ACTION_SHA" \
+            --pyyaml-version "$PYYAML_VERSION" \
+            --pyyaml-wheel-url "$PYYAML_WHEEL_URL" \
+            --inspection-uid "$qual_uid" \
+            --inspection-gid "$qual_gid"
+
+          sudo /usr/bin/chown -R root:root \
+            "$CANDIDATE_ROOT" \
+            "$RUNTIME_ROOT" \
+            /opt/task-witness/github-actions-context.json \
+            /opt/task-witness/runtime-transformation-audit.json \
+            /opt/task-witness/bootstrap
+          sudo /usr/bin/find "$CANDIDATE_ROOT" "$RUNTIME_ROOT" \
+            -type d -exec /usr/bin/chmod go-w {} +
+          sudo /usr/bin/find "$CANDIDATE_ROOT" "$RUNTIME_ROOT" \
+            -type f -exec /usr/bin/chmod go-w {} +
+          sudo /usr/bin/chmod 0444 \
+            /opt/task-witness/github-actions-context.json \
+            /opt/task-witness/runtime-transformation-audit.json
+
+      - name: Audit the unprivileged native host and filesystem
+        shell: bash
+        run: |
+          set -euo pipefail
+          qual_uid=$(/usr/bin/id -u "$QUALIFICATION_USER")
+          qual_gid=$(/usr/bin/id -g "$QUALIFICATION_USER")
+          sudo /usr/bin/setpriv \
+            --reuid="$qual_uid" \
+            --regid="$qual_gid" \
+            --clear-groups \
+            --inh-caps=-all \
+            --ambient-caps=-all \
+            --bounding-set=-all \
+            --no-new-privs \
+            --reset-env \
+            /usr/bin/env -i \
+              HOME="$QUALIFICATION_HOME" \
+              LANG=C.UTF-8 \
+              LC_ALL=C.UTF-8 \
+              PATH=/usr/bin:/bin \
+              TZ=UTC \
+              /usr/bin/python3 -I -B \
+              "$GITHUB_WORKSPACE/harness/scripts/prepare_task_witness_linux_qualification.py" \
+              probe-host \
+              --context /opt/task-witness/github-actions-context.json \
+              --output-dir "$QUALIFICATION_HOME/host-audit"
+
+      - name: Build and freeze canonical qualification inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo /usr/bin/python3 -I -B \
+            harness/scripts/prepare_task_witness_linux_qualification.py \
+            build-evidence \
+            --candidate-root "$CANDIDATE_ROOT" \
+            --candidate-sha "$CANDIDATE_SHA" \
+            --runtime-root "$RUNTIME_ROOT" \
+            --runtime-executable '${{ steps.provision.outputs.runtime_executable }}' \
+            --runtime-audit /opt/task-witness/runtime-transformation-audit.json \
+            --context /opt/task-witness/github-actions-context.json \
+            --host-audit-root "$QUALIFICATION_HOME/host-audit" \
+            --output-dir "$EVIDENCE_ROOT"
+          sudo /usr/bin/chown -R root:root "$EVIDENCE_ROOT"
+          sudo /usr/bin/find "$EVIDENCE_ROOT" -type d -exec /usr/bin/chmod 0555 {} +
+          sudo /usr/bin/find "$EVIDENCE_ROOT" -type f -exec /usr/bin/chmod 0444 {} +
+
+      - name: Run Linux qualification as the no-capability passwd user
+        shell: bash
+        run: |
+          set -euo pipefail
+          qual_uid=$(/usr/bin/id -u "$QUALIFICATION_USER")
+          qual_gid=$(/usr/bin/id -g "$QUALIFICATION_USER")
+          sudo /usr/bin/setpriv \
+            --reuid="$qual_uid" \
+            --regid="$qual_gid" \
+            --clear-groups \
+            --inh-caps=-all \
+            --ambient-caps=-all \
+            --bounding-set=-all \
+            --no-new-privs \
+            --reset-env \
+            /usr/bin/mkdir -m 0700 "$QUALIFICATION_HOME/receipts"
+          set +e
+          sudo /usr/bin/setpriv \
+            --reuid="$qual_uid" \
+            --regid="$qual_gid" \
+            --clear-groups \
+            --inh-caps=-all \
+            --ambient-caps=-all \
+            --bounding-set=-all \
+            --no-new-privs \
+            --reset-env \
+            /usr/bin/env -i \
+              HOME="$QUALIFICATION_HOME" \
+              LANG=C.UTF-8 \
+              LC_ALL=C.UTF-8 \
+              PATH=/usr/bin:/bin \
+              TZ=UTC \
+              /usr/bin/sh -c \
+                'exec "$@" >"$HOME/receipts/runner.stdout" 2>"$HOME/receipts/runner.stderr"' \
+                task-witness-runner \
+                '${{ steps.provision.outputs.runtime_executable }}' \
+                -I -B \
+                "$CANDIDATE_ROOT/scripts/run_task_witness_qualification.py" \
+                --candidate-root "$CANDIDATE_ROOT" \
+                --runtime-executable '${{ steps.provision.outputs.runtime_executable }}' \
+                --runtime-closure-evidence "$EVIDENCE_ROOT/runtime-closure-evidence.json" \
+                --platform-profile "$EVIDENCE_ROOT/platform-profile.json" \
+                --receipt-output "$QUALIFICATION_HOME/receipts/linux-x86_64.json"
+          status=$?
+          set -e
+          echo "$status" | sudo /usr/bin/tee \
+            "$QUALIFICATION_HOME/receipts/runner.status" >/dev/null
+          test "$status" -eq 0
+
+      - name: Independently validate the emitted receipt
+        shell: bash
+        run: |
+          set -euo pipefail
+          qual_uid=$(/usr/bin/id -u "$QUALIFICATION_USER")
+          qual_gid=$(/usr/bin/id -g "$QUALIFICATION_USER")
+          sudo /usr/bin/setpriv \
+            --reuid="$qual_uid" \
+            --regid="$qual_gid" \
+            --clear-groups \
+            --inh-caps=-all \
+            --ambient-caps=-all \
+            --bounding-set=-all \
+            --no-new-privs \
+            --reset-env \
+            /usr/bin/env -i \
+              HOME="$QUALIFICATION_HOME" \
+              LANG=C.UTF-8 \
+              LC_ALL=C.UTF-8 \
+              PATH=/usr/bin:/bin \
+              TZ=UTC \
+              /usr/bin/sh -c \
+                'exec "$@" >"$HOME/receipts/validator.stdout" 2>"$HOME/receipts/validator.stderr"' \
+                task-witness-validator \
+                '${{ steps.provision.outputs.runtime_executable }}' \
+                -I -B \
+                "$CANDIDATE_ROOT/scripts/validate_task_witness.py" \
+                "$CANDIDATE_ROOT" \
+                --qualification "$QUALIFICATION_HOME/receipts/linux-x86_64.json"
+
+      - name: Collect receipts and cooperative audit records
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact_root="$RUNNER_TEMP/task-witness-linux-qualification"
+          sudo /usr/bin/mkdir -p "$artifact_root"
+          for source in \
+            "$EVIDENCE_ROOT" \
+            "$QUALIFICATION_HOME/host-audit" \
+            "$QUALIFICATION_HOME/receipts" \
+            /opt/task-witness/github-actions-context.json \
+            /opt/task-witness/runtime-transformation-audit.json \
+            /opt/task-witness/bootstrap
+          do
+            if sudo /usr/bin/test -e "$source"; then
+              sudo /usr/bin/cp -a "$source" "$artifact_root"/
+            fi
+          done
+          sudo /usr/bin/chown -R "$USER":"$(/usr/bin/id -gn)" "$artifact_root"
+          manifest="$RUNNER_TEMP/task-witness-linux-qualification.SHA256SUMS"
+          /usr/bin/python3 -I -B \
+            "$GITHUB_WORKSPACE/harness/scripts/prepare_task_witness_linux_qualification.py" \
+            write-artifact-manifest \
+            --artifact-root "$artifact_root" \
+            --output "$manifest"
+          (
+            cd "$artifact_root"
+            /usr/bin/sha256sum -c "$manifest"
+          )
+          /usr/bin/mv "$manifest" "$artifact_root/SHA256SUMS"
+          /usr/bin/python3 -I -B \
+            "$GITHUB_WORKSPACE/harness/scripts/prepare_task_witness_linux_qualification.py" \
+            verify-artifact-manifest \
+            --artifact-root "$artifact_root" \
+            --manifest "$artifact_root/SHA256SUMS"
+          (
+            cd "$artifact_root"
+            /usr/bin/sha256sum -c SHA256SUMS
+          )
+
+      - name: Retain qualification receipts and audit records
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: task-witness-linux-x86_64-${{ env.CANDIDATE_SHA }}
+          path: ${{ runner.temp }}/task-witness-linux-qualification
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 6

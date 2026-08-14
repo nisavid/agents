@@ -2562,6 +2562,9 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             worker = bin_dir / "hindsight-worker"
             worker.write_text(f"#!{interpreter}\n", encoding="utf-8")
             worker.chmod(0o700)
+            exact_worker = bin_dir / "hindsight-exact-drain-worker"
+            exact_worker.write_text("synthetic exact worker\n", encoding="utf-8")
+            exact_worker.chmod(0o700)
             (root / "pyvenv.cfg").write_text("home = /private/tmp\n")
             site_packages = root / "lib" / "python3.13" / "site-packages"
             dependency = site_packages / "exact_dependency"
@@ -2610,6 +2613,63 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                     sys.modules.pop("foreign_exact_dependency", None)
                 else:
                     sys.modules["foreign_exact_dependency"] = previous_foreign
+
+    def test_exact_drain_import_origins_accepts_only_real_mp_main_alias(self):
+        worker = (
+            Path.home()
+            / ".local/share/uv/tools/hindsight-api/bin/hindsight-worker"
+        )
+        interpreter = worker.parent / "python3"
+        if not worker.is_file() or not interpreter.is_file():
+            self.skipTest("hindsight worker runtime is unavailable")
+        candidate = ROOT / "lib"
+        entrypoint = ROOT / "bin" / "hindsight-exact-drain-worker"
+
+        def run(mode: str) -> subprocess.CompletedProcess[str]:
+            script = textwrap.dedent(
+                f"""
+                import sys
+                from types import SimpleNamespace
+                sys.path.insert(0, {str(candidate)!r})
+                from hindsight_memory_control_plane.operation_recovery_runtime import validate_exact_drain_import_origins
+                main = sys.modules["__main__"]
+                main.__file__ = {str(entrypoint)!r}
+                if {mode!r} == "real":
+                    import multiprocessing
+                    assert sys.modules["__mp_main__"] is main
+                elif {mode!r} == "forged":
+                    sys.modules["__mp_main__"] = SimpleNamespace(
+                        __file__={str(entrypoint)!r}
+                    )
+                else:
+                    main.__file__ = {str(ROOT / "bin" / "hindsight-memory")!r}
+                    sys.modules["__mp_main__"] = main
+                validate_exact_drain_import_origins(
+                    {str(worker)!r},
+                    {str(candidate)!r},
+                )
+                """
+            )
+            return subprocess.run(
+                [str(interpreter), "-S", "-c", script],
+                check=False,
+                capture_output=True,
+                text=True,
+                env={
+                    "HOME": str(Path.home()),
+                    "PATH": "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                },
+            )
+
+        accepted = run("real")
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        forged = run("forged")
+        self.assertNotEqual(forged.returncode, 0)
+        self.assertIn("loaded module origin differs", forged.stderr)
+        wrong_entrypoint = run("wrong-entrypoint")
+        self.assertNotEqual(wrong_entrypoint.returncode, 0)
+        self.assertIn("loaded module origin differs", wrong_entrypoint.stderr)
 
     def test_exact_drain_policy_version_matches_the_worker_runtime(self):
         validate = self.controller[

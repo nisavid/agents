@@ -3920,6 +3920,14 @@ def validate_exact_drain_import_origins(
     candidate_root = Path(candidate_library).resolve(strict=True)
     release_root = candidate_root.parent.resolve(strict=True)
     python_root = Path(sys.base_prefix).resolve(strict=True)
+    try:
+        worker_entrypoint = (
+            release_root / "bin" / "hindsight-exact-drain-worker"
+        ).resolve(strict=True)
+    except OSError as error:
+        raise OperationRecoveryError(
+            "exact drain worker entrypoint is unavailable"
+        ) from error
     allowed_candidate_names = {
         "hindsight_api",
         "hindsight_memory_control_plane",
@@ -3962,7 +3970,14 @@ def validate_exact_drain_import_origins(
             raise OperationRecoveryError(
                 "exact drain loaded module origin differs"
             ) from error
-        if name != "__main__":
+        # multiprocessing publishes the running main module under this alias.
+        if path != worker_entrypoint or (
+            name != "__main__"
+            and not (
+                name == "__mp_main__"
+                and module is sys.modules.get("__main__")
+            )
+        ):
             raise OperationRecoveryError(
                 "exact drain loaded module origin differs"
             )

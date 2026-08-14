@@ -376,6 +376,14 @@ distinguish a provider rejection from a Phase 1 timeout and see committed work
 without disclosing entity names, document IDs, payloads, results, or error text.
 Legacy progress remains on its original schema and output contract.
 
+Current workers also seal their startup lifecycle before the first claim.
+`monitor` reports the worker status, current startup stage, stage timestamp,
+and, after failure, the failure stage, exit code, closed category,
+retryability, optional HTTP status, and error digest. Archived attempts retain
+the same closed worker evidence. This distinguishes import, provider
+activation, API import, guard installation, worker-main, and memory-engine
+initialization failures without retaining raw exception text or task payloads.
+
 If an exact task cannot persist its terminal state, progress records the closed
 stage `failure.terminal-state` and failure category
 `terminal_state_persistence` before requesting worker shutdown. If a cancelled

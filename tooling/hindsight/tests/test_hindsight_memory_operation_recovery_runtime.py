@@ -480,6 +480,51 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
                 object(),
             )
 
+    def test_v8_runtime_guard_records_memory_initialization_failure(self):
+        events = []
+
+        class WorkerPoller(_RunCapableWorkerPoller):
+            async def _execute_task_inner(self, _task, _holder):
+                return None
+
+            async def _claim_batch_for_schema_inner(self, *_arguments):
+                return []
+
+            async def _claim_batch_for_schema(self, *_arguments):
+                return []
+
+        class MemoryEngine:
+            async def initialize(self):
+                raise RuntimeError("raw startup failure must stay private")
+
+        class Adapter:
+            def __init__(self):
+                self._plan = {"progress_schema_version": 3}
+
+            def record_worker_stage(self, *, status, stage):
+                events.append(("stage", status, stage))
+
+            def record_worker_failure(self, error, *, exit_code):
+                events.append(("failure", type(error).__name__, exit_code))
+
+        install_exact_drain_runtime_guards(
+            type("PostgreSQLOps", (), {}),
+            WorkerPoller,
+            MemoryEngine,
+            Adapter(),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "raw startup failure"):
+            asyncio.run(MemoryEngine().initialize())
+
+        self.assertEqual(
+            events,
+            [
+                ("stage", "starting", "worker.memory.initialize"),
+                ("failure", "RuntimeError", 2),
+            ],
+        )
+
     def test_shutdown_bridge_deduplicates_internal_request_after_signal(self):
         external_handlers = []
         worker_callbacks = []

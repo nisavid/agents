@@ -35,6 +35,7 @@ MAX_PROGRESS_BYTES = 1024 * 1024
 TASK_STATUSES = frozenset(
     {"pending", "processing", "completed", "failed", "cancelled"}
 )
+WORKER_STATUSES = frozenset({"starting", "running", "failed"})
 SUMMARY_STATUSES = TASK_STATUSES | {"retrying"}
 OPERATION_TYPES = frozenset(
     {"retain", "refresh_mental_model", "consolidation"}
@@ -55,6 +56,8 @@ FAILURE_CATEGORIES = frozenset(
         "nonquiescent_shutdown",
         "operation_error",
         "unclassified_empty",
+        "worker_initialization",
+        "worker_initialization_timeout",
     }
 )
 
@@ -378,7 +381,7 @@ class ExactDrainProgressRecorder:
         self.worker_pid = worker_pid
         self.worker_start_time = worker_start_time
         self.worker_attempt = worker_attempt
-        if progress_schema_version not in {1, 2}:
+        if progress_schema_version not in {1, 2, 3}:
             raise OperationRecoveryError(
                 "exact drain progress schema version is invalid"
             )
@@ -390,6 +393,12 @@ class ExactDrainProgressRecorder:
         self._started_at = started_at
         self._observed_at = started_at
         self._last_progress_at = started_at
+        self._worker_status = "starting"
+        self._worker_stage = "progress.created"
+        self._worker_stage_started_at = started_at
+        self._worker_failure_stage: str | None = None
+        self._worker_failure: dict[str, Any] | None = None
+        self._worker_exit_code: int | None = None
         self._prior_attempts = [dict(item) for item in prior_attempts]
         if len(self._prior_attempts) != worker_attempt - 1:
             raise OperationRecoveryError("exact drain prior attempts differ")
@@ -451,7 +460,7 @@ class ExactDrainProgressRecorder:
                     stage_started_at=previous["stage_started_at"],
                     last_progress_at=previous["last_progress_at"],
                 )
-                if progress_schema_version == 2:
+                if progress_schema_version in {2, 3}:
                     task.update(
                         failure_stage=previous["failure_stage"],
                         failure=previous["failure"],
@@ -530,6 +539,18 @@ class ExactDrainProgressRecorder:
                 self._active[key] for key in sorted(self._active)
             ],
             "cooldowns": [self._cooldowns[key] for key in sorted(self._cooldowns)],
+            **(
+                {}
+                if self.progress_schema_version != 3
+                else {
+                    "worker_status": self._worker_status,
+                    "worker_stage": self._worker_stage,
+                    "worker_stage_started_at": self._worker_stage_started_at,
+                    "worker_failure_stage": self._worker_failure_stage,
+                    "worker_failure": self._worker_failure,
+                    "worker_exit_code": self._worker_exit_code,
+                }
+            ),
         }
 
     def _now(self) -> float:
@@ -567,11 +588,105 @@ class ExactDrainProgressRecorder:
             self._last_progress_at = now
             try:
                 self._persist(now)
-            except BaseException:
+            except BaseException:  # noqa: BLE001
                 task.clear()
                 task.update(prior_task)
                 self._observed_at = prior_observed_at
                 self._last_progress_at = prior_last_progress_at
+                raise
+
+    def worker_stage(self, *, status: str, stage: str) -> None:
+        """Persist a payload-free worker lifecycle breadcrumb before claims."""
+        if (
+            self.progress_schema_version != 3
+            or status not in {"starting", "running"}
+            or not isinstance(stage, str)
+            or STAGE.fullmatch(stage) is None
+        ):
+            raise OperationRecoveryError(
+                "exact drain progress worker stage is invalid"
+            )
+        with self._lock:
+            prior = (
+                self._worker_status,
+                self._worker_stage,
+                self._worker_stage_started_at,
+                self._observed_at,
+                self._last_progress_at,
+            )
+            now = self._now()
+            self._worker_status = status
+            self._worker_stage = stage
+            self._worker_stage_started_at = now
+            self._last_progress_at = now
+            try:
+                self._persist(now)
+            except BaseException:  # noqa: BLE001
+                (
+                    self._worker_status,
+                    self._worker_stage,
+                    self._worker_stage_started_at,
+                    self._observed_at,
+                    self._last_progress_at,
+                ) = prior
+                raise
+
+    def worker_failure(
+        self,
+        *,
+        exit_code: int,
+        failure: Mapping[str, Any],
+    ) -> None:
+        """Persist one closed worker failure without raw error content."""
+        if self.progress_schema_version != 3:
+            raise OperationRecoveryError(
+                "exact drain progress worker failure schema is unavailable"
+            )
+        checked_failure = _validated_failure(failure)
+        if (
+            checked_failure is None
+            or type(exit_code) is not int
+            or not 1 <= exit_code <= 255
+        ):
+            raise OperationRecoveryError(
+                "exact drain progress worker failure is invalid"
+            )
+        with self._lock:
+            if self._worker_status == "failed":
+                raise OperationRecoveryError(
+                    "exact drain progress worker failure is invalid"
+                )
+            prior = (
+                self._worker_status,
+                self._worker_stage,
+                self._worker_stage_started_at,
+                self._worker_failure_stage,
+                self._worker_failure,
+                self._worker_exit_code,
+                self._observed_at,
+                self._last_progress_at,
+            )
+            now = self._now()
+            self._worker_failure_stage = self._worker_stage
+            self._worker_failure = checked_failure
+            self._worker_exit_code = exit_code
+            self._worker_status = "failed"
+            self._worker_stage = "failed"
+            self._worker_stage_started_at = now
+            self._last_progress_at = now
+            try:
+                self._persist(now)
+            except BaseException:
+                (
+                    self._worker_status,
+                    self._worker_stage,
+                    self._worker_stage_started_at,
+                    self._worker_failure_stage,
+                    self._worker_failure,
+                    self._worker_exit_code,
+                    self._observed_at,
+                    self._last_progress_at,
+                ) = prior
                 raise
 
     def task_processing_stage(self, operation_id: str, *, stage: str) -> None:
@@ -603,7 +718,7 @@ class ExactDrainProgressRecorder:
         checkpoint: Mapping[str, Any] | None,
     ) -> None:
         """Persist one closed failure/checkpoint projection without raw content."""
-        if self.progress_schema_version != 2:
+        if self.progress_schema_version not in {2, 3}:
             raise OperationRecoveryError(
                 "exact drain failure evidence schema is unavailable"
             )
@@ -655,7 +770,7 @@ class ExactDrainProgressRecorder:
         failure: Mapping[str, Any],
     ) -> None:
         """Record a worker/runtime failure while preserving DB checkpoint evidence."""
-        if self.progress_schema_version != 2:
+        if self.progress_schema_version not in {2, 3}:
             raise OperationRecoveryError(
                 "exact drain failure evidence schema is unavailable"
             )
@@ -983,10 +1098,19 @@ def _validated_progress(
         "cooldowns",
         "progress_digest",
     }
+    if progress_schema_version == 3:
+        expected_keys |= {
+            "worker_status",
+            "worker_stage",
+            "worker_stage_started_at",
+            "worker_failure_stage",
+            "worker_failure",
+            "worker_exit_code",
+        }
     if (
         set(value) != expected_keys
         or value.get("schema_version") != progress_schema_version
-        or progress_schema_version not in {1, 2}
+        or progress_schema_version not in {1, 2, 3}
         or value.get("kind") != "operation-recovery-exact-drain-progress"
         or value.get("plan_digest") != _sha(plan_digest, "exact drain plan digest")
     ):
@@ -1029,6 +1153,46 @@ def _validated_progress(
     )
     if not started_at <= last_progress_at <= observed_at:
         raise OperationRecoveryError("exact drain progress timestamps differ")
+    if progress_schema_version == 3:
+        worker_status = result.get("worker_status")
+        worker_stage = result.get("worker_stage")
+        worker_failure_stage = result.get("worker_failure_stage")
+        worker_failure = _validated_failure(result.get("worker_failure"))
+        worker_exit_code = result.get("worker_exit_code")
+        worker_stage_started_at = _timestamp(
+            result.get("worker_stage_started_at"),
+            "exact drain worker stage start",
+        )
+        if (
+            worker_status not in WORKER_STATUSES
+            or not isinstance(worker_stage, str)
+            or STAGE.fullmatch(worker_stage) is None
+            or not started_at
+            <= worker_stage_started_at
+            <= last_progress_at
+            or (worker_failure is None) != (worker_failure_stage is None)
+            or (worker_failure is None) != (worker_exit_code is None)
+            or (worker_status == "failed") != (worker_failure is not None)
+            or (worker_failure is None and worker_stage == "failed")
+            or (
+                worker_exit_code is not None
+                and (
+                    type(worker_exit_code) is not int
+                    or not 1 <= worker_exit_code <= 255
+                )
+            )
+            or (
+                worker_failure_stage is not None
+                and (
+                    not isinstance(worker_failure_stage, str)
+                    or STAGE.fullmatch(worker_failure_stage) is None
+                    or worker_stage != "failed"
+                )
+            )
+        ):
+            raise OperationRecoveryError(
+                "exact drain progress worker evidence is invalid"
+            )
 
     task_keys = {
         "operation_id",
@@ -1041,7 +1205,7 @@ def _validated_progress(
         "stage_started_at",
         "last_progress_at",
     }
-    if progress_schema_version == 2:
+    if progress_schema_version in {2, 3}:
         task_keys |= {"failure_stage", "failure", "checkpoint"}
     tasks = result.get("tasks")
     if not isinstance(tasks, list):
@@ -1067,7 +1231,7 @@ def _validated_progress(
             raise OperationRecoveryError("exact drain progress task is invalid")
         if not isinstance(stage, str) or STAGE.fullmatch(stage) is None:
             raise OperationRecoveryError("exact drain progress task stage is invalid")
-        if progress_schema_version == 2:
+        if progress_schema_version in {2, 3}:
             failure_stage = item.get("failure_stage")
             failure = _validated_failure(item.get("failure"))
             _validated_checkpoint(item.get("checkpoint"))
@@ -1264,6 +1428,19 @@ def read_exact_drain_progress(
                     archived["active_provider_requests"]
                 ),
                 "cooldowns": archived["cooldowns"],
+                **(
+                    {}
+                    if progress_schema_version != 3
+                    else {
+                        "worker_status": archived["worker_status"],
+                        "worker_stage": archived["worker_stage"],
+                        "worker_failure_stage": archived[
+                            "worker_failure_stage"
+                        ],
+                        "worker_failure": archived["worker_failure"],
+                        "worker_exit_code": archived["worker_exit_code"],
+                    }
+                ),
                 "progress_digest": archived["progress_digest"],
                 "artifact_path": str(archive_path),
             }

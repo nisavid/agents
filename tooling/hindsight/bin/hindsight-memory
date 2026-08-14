@@ -7871,7 +7871,7 @@ def _operation_recovery_validate_exact_worker_provider_runtime(
 def _operation_recovery_exact_runtime_digest(
     args: argparse.Namespace,
     *,
-    schema_version: int = 7,
+    schema_version: int = 8,
 ) -> str:
     return exact_drain_runtime_digest(
         args.worker_runtime,
@@ -7921,7 +7921,7 @@ def operation_recovery_drain_plan_command(args: argparse.Namespace) -> int:
     )
     worker_runtime_digest = _operation_recovery_exact_runtime_digest(
         args,
-        schema_version=7,
+        schema_version=8,
     )
     output_path = Path(args.output)
     artifact_paths = [
@@ -8379,7 +8379,7 @@ def _operation_recovery_exact_execution_lease_projection(
     *,
     now: int | None = None,
 ) -> Mapping[str, Any]:
-    if plan.get("schema_version") not in {2, 3, 4, 5, 6, 7}:
+    if plan.get("schema_version") not in {2, 3, 4, 5, 6, 7, 8}:
         return {}
     observed_at = int(time.time()) if now is None else now
     if authorization is None:
@@ -8409,7 +8409,7 @@ def _operation_recovery_assert_exact_execution_lease(
     *,
     now: int | None = None,
 ) -> int | None:
-    if plan.get("schema_version") not in {2, 3, 4, 5, 6, 7}:
+    if plan.get("schema_version") not in {2, 3, 4, 5, 6, 7, 8}:
         return None
     observed_at = int(time.time()) if now is None else now
     expires_at = (
@@ -8433,7 +8433,7 @@ def operation_recovery_drain_status_command(args: argparse.Namespace) -> int:
         with manager._lock():
             authorization = (
                 _operation_recovery_exact_authorization(plan)
-                if plan.get("schema_version") in {2, 3, 4, 5, 6, 7}
+                if plan.get("schema_version") in {2, 3, 4, 5, 6, 7, 8}
                 and Path(plan["authorization_receipt_path"]).exists()
                 else None
             )
@@ -8443,7 +8443,7 @@ def operation_recovery_drain_status_command(args: argparse.Namespace) -> int:
             result = {
                 "status": (
                     "authorization-only"
-                    if plan.get("schema_version") in {2, 3, 4, 5, 6, 7}
+                    if plan.get("schema_version") in {2, 3, 4, 5, 6, 7, 8}
                     and authorization is not None
                     else "awaiting-approval"
                 ),
@@ -9343,7 +9343,7 @@ def operation_recovery_drain_apply_command(args: argparse.Namespace) -> int:
                             returncode = process.wait(
                                 timeout=(
                                     plan["transaction_timeout_seconds"]
-                                    if plan.get("schema_version") in {2, 3, 4, 5, 6, 7}
+                                    if plan.get("schema_version") in {2, 3, 4, 5, 6, 7, 8}
                                     else EXACT_DRAIN_TRANSACTION_TIMEOUT_SECONDS
                                 )
                             )
@@ -9432,7 +9432,7 @@ def operation_recovery_drain_monitor_command(args: argparse.Namespace) -> int:
         progress_path.exists()
         or application_path.exists()
         or (
-            plan.get("schema_version") in {2, 3, 4, 5, 6, 7}
+            plan.get("schema_version") in {2, 3, 4, 5, 6, 7, 8}
             and Path(plan["authorization_receipt_path"]).exists()
         )
     ):
@@ -9442,7 +9442,7 @@ def operation_recovery_drain_monitor_command(args: argparse.Namespace) -> int:
             {
                 "status": (
                     "authorization-only"
-                    if plan.get("schema_version") in {2, 3, 4, 5, 6, 7}
+                    if plan.get("schema_version") in {2, 3, 4, 5, 6, 7, 8}
                     and authorization is not None
                     else "not-started"
                 ),
@@ -9582,6 +9582,22 @@ def operation_recovery_drain_monitor_command(args: argparse.Namespace) -> int:
             "cooldowns": progress["cooldowns"],
             "prior_attempts": progress["prior_attempts"],
             "progress_digest": progress["progress_digest"],
+            **(
+                {}
+                if plan.get("progress_schema_version") != 3
+                else {
+                    "worker_status": progress["worker_status"],
+                    "worker_stage": progress["worker_stage"],
+                    "worker_stage_started_at": progress[
+                        "worker_stage_started_at"
+                    ],
+                    "worker_failure_stage": progress[
+                        "worker_failure_stage"
+                    ],
+                    "worker_failure": progress["worker_failure"],
+                    "worker_exit_code": progress["worker_exit_code"],
+                }
+            ),
             **_operation_recovery_exact_execution_lease_projection(
                 plan,
                 authorization,

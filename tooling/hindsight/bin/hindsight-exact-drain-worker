@@ -38,6 +38,7 @@ from hindsight_memory_control_plane.operation_recovery_runtime import (  # noqa:
     EXACT_DRAIN_PROFILE_ENVIRONMENT_KEYS,
     exact_drain_candidate_provider_root,
     exact_drain_effective_profile_digest,
+    exact_drain_worker_failure_evidence,
     exact_drain_platform_environment,
     exact_drain_runtime_evidence,
     EXACT_DRAIN_START_MESSAGE_BYTES,
@@ -55,6 +56,19 @@ from hindsight_memory_control_plane.operation_recovery_progress import (  # noqa
     create_exact_drain_progress_recorder,
     verify_exact_drain_application_journal,
 )
+
+
+_WORKER_PROGRESS_RECORDER = None
+_WORKER_STAGE = "worker.bootstrap"
+
+
+def _record_worker_stage(recorder, *, status: str, stage: str) -> None:
+    global _WORKER_STAGE
+    _WORKER_STAGE = stage
+    if getattr(recorder, "progress_schema_version", None) == 3:
+        recorder.worker_stage(status=status, stage=stage)
+
+
 def _private_bytes(value: str | Path, label: str) -> bytes:
     path = Path(value)
     if not path.is_absolute():
@@ -202,6 +216,9 @@ def _read_start_gate(descriptor: int) -> bytes:
 
 
 def main() -> int:
+    global _WORKER_PROGRESS_RECORDER, _WORKER_STAGE
+    _WORKER_PROGRESS_RECORDER = None
+    _WORKER_STAGE = "worker.bootstrap"
     args = parser().parse_args()
     plan_value = strict_json_loads(
         _private_bytes(args.plan, "exact drain plan").decode("utf-8")
@@ -222,7 +239,7 @@ def main() -> int:
     if plan["schema_version"] == 1 and not args.resume:
         plan = verify_exact_drain_plan(plan_value)
     if (
-        plan["schema_version"] in {2, 3, 4, 5, 6, 7}
+        plan["schema_version"] in {2, 3, 4, 5, 6, 7, 8}
         and time.time()
         >= authorization["authorized_at"] + plan["execution_lease_seconds"]
     ):
@@ -312,10 +329,16 @@ def main() -> int:
         journal=journal,
         terminal_reconciliation=False,
     )
+    _WORKER_PROGRESS_RECORDER = progress_recorder
+    _record_worker_stage(
+        progress_recorder,
+        status="starting",
+        stage="worker.imports",
+    )
     set_exact_drain_progress_recorder(progress_recorder)
 
     install_exact_drain_candidate_imports(args.worker_runtime, LIB)
-    if plan["schema_version"] in {2, 3, 4, 5, 6, 7}:
+    if plan["schema_version"] in {2, 3, 4, 5, 6, 7, 8}:
         validate_exact_drain_dependency_spec(
             "asyncpg",
             args.worker_runtime,
@@ -374,7 +397,7 @@ def main() -> int:
         return candidate_release_root
 
     provider_globals["_resolve_active_release"] = resolve_detached_candidate
-    if plan["schema_version"] in {2, 3, 4, 5, 6, 7}:
+    if plan["schema_version"] in {2, 3, 4, 5, 6, 7, 8}:
         validate_exact_drain_import_origins(args.worker_runtime, LIB)
     original_protected_reader = provider_globals.get(
         "_read_protected_file"
@@ -390,6 +413,11 @@ def main() -> int:
         return original_protected_reader(path, label)
 
     provider_globals["_read_protected_file"] = read_bound_provider_file
+    _record_worker_stage(
+        progress_recorder,
+        status="starting",
+        stage="worker.provider.activate",
+    )
     exec(
         compile(
             ast.fix_missing_locations(activation),
@@ -398,7 +426,7 @@ def main() -> int:
         ),
         provider_globals,
     )
-    if plan["schema_version"] in {2, 3, 4, 5, 6, 7}:
+    if plan["schema_version"] in {2, 3, 4, 5, 6, 7, 8}:
         validate_exact_drain_import_origins(args.worker_runtime, LIB)
 
     def complete() -> None:
@@ -411,15 +439,25 @@ def main() -> int:
         resume=args.resume,
         authorization=authorization,
     )
+    _record_worker_stage(
+        progress_recorder,
+        status="starting",
+        stage="worker.api.import",
+    )
     from hindsight_api import MemoryEngine
     from hindsight_api.engine.db.ops_postgresql import PostgreSQLOps
     from hindsight_api.worker import main as worker_main_module
     from hindsight_api.worker.poller import WorkerPoller
 
-    if plan["schema_version"] in {2, 3, 4, 5, 6, 7}:
+    if plan["schema_version"] in {2, 3, 4, 5, 6, 7, 8}:
         validate_exact_drain_import_origins(args.worker_runtime, LIB)
 
     with ExactDrainWorkerMainShutdownBridge(worker_main_module) as shutdown:
+        _record_worker_stage(
+            progress_recorder,
+            status="starting",
+            stage="worker.guard.install",
+        )
         install_exact_drain_runtime_guards(
             PostgreSQLOps,
             WorkerPoller,
@@ -442,13 +480,47 @@ def main() -> int:
             "--log-level",
             "info",
         ]
+        _record_worker_stage(
+            progress_recorder,
+            status="running",
+            stage="worker.main",
+        )
         worker_main_module.main()
     return 0
 
 
-if __name__ == "__main__":
+def run() -> int:
+    """Run the worker and seal any post-progress failure without raw text."""
     try:
-        raise SystemExit(main())
-    except (OperationRecoveryError, UnicodeDecodeError) as error:
-        print(f"hindsight-exact-drain-worker: {error}", file=sys.stderr)
-        raise SystemExit(2) from None
+        return main()
+    except BaseException as error:  # noqa: BLE001
+        if isinstance(error, SystemExit) and error.code in {None, 0}:
+            return 0
+        recorder = _WORKER_PROGRESS_RECORDER
+        if recorder is None and isinstance(
+            error,
+            (OperationRecoveryError, UnicodeDecodeError),
+        ):
+            print(f"hindsight-exact-drain-worker: {error}", file=sys.stderr)
+            return 2
+        failure = exact_drain_worker_failure_evidence(error)
+        failure_stage = getattr(recorder, "_worker_stage", _WORKER_STAGE)
+        if getattr(recorder, "progress_schema_version", None) == 3:
+            try:
+                if getattr(recorder, "_worker_status", None) != "failed":
+                    recorder.worker_failure(exit_code=2, failure=failure)
+            except BaseException:  # noqa: BLE001,S110
+                pass
+        print(
+            "hindsight-exact-drain-worker: "
+            f"stage={failure_stage} "
+            f"category={failure['category']} "
+            f"retryable={str(failure['retryable']).lower()} "
+            f"error_digest={failure['error_digest']}",
+            file=sys.stderr,
+        )
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(run())

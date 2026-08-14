@@ -21,6 +21,175 @@ from tooling.hindsight.lib.hindsight_memory_control_plane.operation_recovery imp
 
 
 class ExactDrainProgressTest(unittest.TestCase):
+    def test_v3_progress_records_preclaim_worker_failure_without_raw_error(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+            path = Path(directory) / "exact-drain-progress.json"
+            recorder = ExactDrainProgressRecorder(
+                path=path,
+                plan_digest="a" * 64,
+                worker_pid=1234,
+                worker_start_time="darwin:1000:1",
+                worker_attempt=1,
+                selected_operations=[
+                    {
+                        "operation_id": (
+                            "00000000-0000-4000-8000-000000000001"
+                        ),
+                        "operation_type": "retain",
+                        "row_digest": "b" * 64,
+                    }
+                ],
+                progress_schema_version=3,
+                clock=lambda: 1000.0,
+            )
+            recorder.worker_stage(
+                status="starting",
+                stage="worker.memory.initialize",
+            )
+            recorder.worker_failure(
+                exit_code=2,
+                failure={
+                    "category": "provider_transport",
+                    "retryable": True,
+                    "http_status": None,
+                    "error_digest": "c" * 64,
+                }
+            )
+            progress = read_exact_drain_progress(
+                path,
+                plan_digest="a" * 64,
+                progress_schema_version=3,
+                now=1001.0,
+            )
+            raw = path.read_text(encoding="utf-8")
+
+        self.assertEqual(progress["worker_status"], "failed")
+        self.assertEqual(progress["worker_stage"], "failed")
+        self.assertEqual(progress["worker_exit_code"], 2)
+        self.assertEqual(
+            progress["worker_failure_stage"],
+            "worker.memory.initialize",
+        )
+        self.assertEqual(
+            progress["worker_failure"],
+            {
+                "category": "provider_transport",
+                "retryable": True,
+                "http_status": None,
+                "error_digest": "c" * 64,
+            },
+        )
+        self.assertEqual(progress["selected_status_counts"], {"pending": 1})
+        self.assertEqual(progress["tasks"][0]["stage"], "queued")
+        self.assertNotIn("provider socket closed", raw)
+
+    def test_v3_progress_rejects_resealed_failed_stage_without_failure(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+            path = Path(directory) / "exact-drain-progress.json"
+            ExactDrainProgressRecorder(
+                path=path,
+                plan_digest="a" * 64,
+                worker_pid=1234,
+                worker_start_time="darwin:1000:1",
+                worker_attempt=1,
+                selected_operations=[],
+                progress_schema_version=3,
+                clock=lambda: 1000.0,
+            )
+            forged = json.loads(path.read_text(encoding="utf-8"))
+            forged["worker_stage"] = "failed"
+            body = {
+                key: value
+                for key, value in forged.items()
+                if key != "progress_digest"
+            }
+            forged["progress_digest"] = digest(body)
+            path.write_text(
+                json.dumps(forged, sort_keys=True, separators=(",", ":")),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                OperationRecoveryError,
+                "worker evidence is invalid",
+            ):
+                read_exact_drain_progress(
+                    path,
+                    plan_digest="a" * 64,
+                    progress_schema_version=3,
+                )
+
+    def test_v3_resume_exposes_closed_prior_worker_failure(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+            path = Path(directory) / "exact-drain-progress.json"
+            plan = {
+                "plan_digest": "a" * 64,
+                "progress_artifact_path": str(path),
+                "progress_schema_version": 3,
+                "worker_max_attempts": 3,
+                "selected_operations": [],
+            }
+            authorization = {
+                "receipt_digest": "c" * 64,
+                "authorized_at": 1000,
+            }
+
+            def journal(attempt: int) -> dict:
+                body = {
+                    "schema_version": 1,
+                    "kind": "operation-recovery-exact-drain-application-journal",
+                    "plan_digest": plan["plan_digest"],
+                    "authorization_receipt_digest": authorization[
+                        "receipt_digest"
+                    ],
+                    "started_at": authorization["authorized_at"],
+                    "worker_pid": os.getpid(),
+                    "worker_start_time": f"darwin:1000:{attempt}",
+                    "worker_attempt": attempt,
+                }
+                return {**body, "receipt_digest": digest(body)}
+
+            first = create_exact_drain_progress_recorder(
+                plan=plan,
+                authorization=authorization,
+                journal=journal(1),
+                clock=lambda: 1001.0,
+            )
+            first.worker_stage(
+                status="starting",
+                stage="worker.memory.initialize",
+            )
+            first.worker_failure(
+                exit_code=2,
+                failure={
+                    "category": "provider_transport",
+                    "retryable": True,
+                    "http_status": None,
+                    "error_digest": "d" * 64,
+                },
+            )
+            create_exact_drain_progress_recorder(
+                plan=plan,
+                authorization=authorization,
+                journal=journal(2),
+                clock=lambda: 1002.0,
+            )
+            resumed = read_exact_drain_progress(
+                path,
+                plan_digest=plan["plan_digest"],
+                progress_schema_version=3,
+                now=1003.0,
+            )
+
+        prior = resumed["prior_attempts"][0]
+        self.assertEqual(prior["worker_status"], "failed")
+        self.assertEqual(
+            prior["worker_failure_stage"],
+            "worker.memory.initialize",
+        )
+        self.assertEqual(prior["worker_failure"]["category"], "provider_transport")
+        self.assertEqual(prior["worker_exit_code"], 2)
+
     def test_v2_progress_exposes_only_closed_failure_and_checkpoint_evidence(self) -> None:
         with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
             path = Path(directory) / "exact-drain-progress.json"

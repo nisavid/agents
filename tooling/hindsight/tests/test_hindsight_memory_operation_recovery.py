@@ -381,7 +381,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
 
         plan = self.drain_plan(snapshot=snapshot, created_at=planned_at)
 
-        self.assertEqual(plan["schema_version"], 7)
+        self.assertEqual(plan["schema_version"], 8)
         self.assertEqual(plan["expires_at"], planned_at + 86_400)
         self.assertEqual(plan["evidence_observed_at"], snapshot["observed_at"])
         self.assertEqual(plan["evidence_max_age_seconds"], 3_600)
@@ -394,10 +394,10 @@ class OperationRecoveryContractTest(unittest.TestCase):
             plan["phase_repair_contract_digest"],
             recovery_contract.EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V5_DIGEST,
         )
-        self.assertEqual(plan["progress_schema_version"], 2)
+        self.assertEqual(plan["progress_schema_version"], 3)
         self.assertEqual(
             plan["failure_evidence_contract_digest"],
-            recovery_contract.EXACT_DRAIN_FAILURE_EVIDENCE_CONTRACT_DIGEST,
+            recovery_contract.EXACT_DRAIN_FAILURE_EVIDENCE_CONTRACT_V2_DIGEST,
         )
         self.assertEqual(
             recovery_contract.verify_exact_drain_plan(plan, now=planned_at),
@@ -512,14 +512,36 @@ class OperationRecoveryContractTest(unittest.TestCase):
             prior,
         )
 
-    def test_exact_drain_v6_failure_evidence_contract_is_closed(self):
+    def test_exact_drain_verifier_preserves_prior_v7_contract(self):
+        current = self.drain_plan()
+        body = {
+            key: value
+            for key, value in current.items()
+            if key != "plan_digest"
+        }
+        body["schema_version"] = 7
+        body["progress_schema_version"] = 2
+        body["failure_evidence_contract_digest"] = (
+            recovery_contract.EXACT_DRAIN_FAILURE_EVIDENCE_CONTRACT_DIGEST
+        )
+        prior = {**body, "plan_digest": digest(body)}
+
+        self.assertEqual(
+            recovery_contract.verify_exact_drain_plan(
+                prior,
+                now=prior["created_at"],
+            ),
+            prior,
+        )
+
+    def test_exact_drain_v8_failure_evidence_contract_is_closed(self):
         plan = self.drain_plan()
         for key, value in (
             ("phase_one_statement_timeout_seconds", 121),
             ("phase_one_client_timeout_seconds", 124),
             ("phase_one_timeout_seconds", 3_601),
             ("phase_repair_contract_digest", "0" * 64),
-            ("progress_schema_version", 1),
+            ("progress_schema_version", 2),
             ("failure_evidence_contract_digest", "0" * 64),
         ):
             with self.subTest(key=key):

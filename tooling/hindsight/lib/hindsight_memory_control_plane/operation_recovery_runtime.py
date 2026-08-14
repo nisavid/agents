@@ -765,6 +765,36 @@ def _exact_drain_failure_evidence(
     }
 
 
+def exact_drain_worker_failure_evidence(
+    error: BaseException,
+) -> dict[str, Any]:
+    """Return a closed retry projection for a worker-level failure."""
+    if not isinstance(error, BaseException):
+        raise OperationRecoveryError(
+            "exact drain worker failure is invalid"
+        )
+    message = str(error)
+    typed_message = (
+        f"{type(error).__name__}: {message}"
+        if message
+        else type(error).__name__
+    )
+    evidence = _exact_drain_failure_evidence(
+        typed_message,
+        retryable=False,
+    )
+    if evidence["category"] == "phase_one_timeout":
+        evidence["category"] = "worker_initialization_timeout"
+    elif evidence["category"] == "operation_error":
+        evidence["category"] = "worker_initialization"
+    evidence["retryable"] = evidence["category"] in {
+        "provider_capacity",
+        "provider_transport",
+        "worker_initialization_timeout",
+    }
+    return evidence
+
+
 def _exact_drain_checkpoint_evidence(
     row: Mapping[str, Any],
 ) -> dict[str, Any] | None:
@@ -1244,7 +1274,15 @@ def install_exact_drain_runtime_guards(
         None,
     )
     upstream_run = getattr(worker_poller_type, "run", None)
-    if not callable(upstream_run):
+    plan = getattr(adapter, "_plan", {})
+    records_worker_lifecycle = (
+        isinstance(plan, Mapping)
+        and plan.get("progress_schema_version") == 3
+    )
+    upstream_memory_initialize = getattr(memory_engine_type, "initialize", None)
+    if not callable(upstream_run) or (
+        records_worker_lifecycle and not callable(upstream_memory_initialize)
+    ):
         raise OperationRecoveryError(
             "operation-recovery required worker lifecycle seam is unavailable"
         )
@@ -1259,6 +1297,26 @@ def install_exact_drain_runtime_guards(
 
     claim_release_disabled = False
     worker_shutdown_requested = False
+
+    async def initialize_exact_memory(
+        engine: Any,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        adapter.record_worker_stage(
+            status="starting",
+            stage="worker.memory.initialize",
+        )
+        try:
+            result = await upstream_memory_initialize(engine, *args, **kwargs)
+        except BaseException as error:  # noqa: BLE001
+            adapter.record_worker_failure(error, exit_code=2)
+            raise
+        adapter.record_worker_stage(
+            status="running",
+            stage="worker.memory.ready",
+        )
+        return result
     phase_one_timeout_seconds = getattr(
         adapter,
         "phase_one_timeout_seconds",
@@ -1862,6 +1920,8 @@ def install_exact_drain_runtime_guards(
     memory_engine_type._mark_operation_completed_and_fire_webhook = (
         engine_mark_exact_consolidation_completed
     )
+    if records_worker_lifecycle:
+        memory_engine_type.initialize = initialize_exact_memory
 
 
 def _exact_drain_file_bytes(
@@ -4048,10 +4108,10 @@ def exact_drain_runtime_evidence(
     provider_runtime_root: str | Path,
     runtime_package_root: str | Path,
     *,
-    schema_version: int = 7,
+    schema_version: int = 8,
 ) -> tuple[str, bytes]:
     """Bind runtime sources and retain prevalidated provider bootstrap bytes."""
-    if type(schema_version) is not int or schema_version not in {1, 2, 3, 4, 5, 6, 7}:
+    if type(schema_version) is not int or schema_version not in {1, 2, 3, 4, 5, 6, 7, 8}:
         raise OperationRecoveryError(
             "exact drain runtime evidence schema version is invalid"
         )
@@ -4141,7 +4201,7 @@ def exact_drain_runtime_evidence(
             sources["phase-repair-contract"] = (
                 EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V4_DIGEST
             )
-        elif schema_version == 7:
+        elif schema_version in {7, 8}:
             if snapshot["schema_version"] != 6:
                 raise OperationRecoveryError(
                     "exact drain cooccurrence-batch repair snapshot is required"
@@ -4199,7 +4259,7 @@ def exact_drain_runtime_digest(
     provider_runtime_root: str | Path,
     runtime_package_root: str | Path,
     *,
-    schema_version: int = 7,
+    schema_version: int = 8,
 ) -> str:
     """Bind the worker entrypoint, claim seam, and provider patch sources."""
     runtime_digest, _provider_bootstrap = exact_drain_runtime_evidence(
@@ -4275,14 +4335,14 @@ class ExactDrainClaimAdapter:
         verified = verify_exact_drain_plan(plan, allow_expired=True)
         if (
             terminal_reconciliation
-            and verified.get("schema_version") in {2, 3, 4, 5, 6, 7}
+            and verified.get("schema_version") in {2, 3, 4, 5, 6, 7, 8}
             and terminal_status_evidence is None
         ):
             raise OperationRecoveryError(
                 "operation-recovery terminal status evidence is required"
             )
         self._clock = clock
-        if verified.get("schema_version") in {2, 3, 4, 5, 6, 7}:
+        if verified.get("schema_version") in {2, 3, 4, 5, 6, 7, 8}:
             if authorization is None:
                 raise OperationRecoveryError(
                     "operation-recovery exact drain authorization is required"
@@ -4309,12 +4369,12 @@ class ExactDrainClaimAdapter:
             )
         self.phase_one_timeout_seconds = (
             verified["phase_one_timeout_seconds"]
-            if verified.get("schema_version") in {3, 4, 5, 6, 7}
+            if verified.get("schema_version") in {3, 4, 5, 6, 7, 8}
             else None
         )
         self.phase_one_statement_timeout_seconds = (
             verified["phase_one_statement_timeout_seconds"]
-            if verified.get("schema_version") in {3, 4, 5, 6, 7}
+            if verified.get("schema_version") in {3, 4, 5, 6, 7, 8}
             else None
         )
         self._cleanup_deadline: float | None = None
@@ -4576,7 +4636,7 @@ class ExactDrainClaimAdapter:
     ) -> None:
         if self._progress_recorder is None:
             return
-        if self._plan.get("progress_schema_version") == 2:
+        if self._plan.get("progress_schema_version") in {2, 3}:
             self._progress_recorder.task_outcome(
                 operation_id,
                 status=status,
@@ -4590,6 +4650,35 @@ class ExactDrainClaimAdapter:
             status=status,
             stage=stage,
         )
+
+    def record_worker_stage(self, *, status: str, stage: str) -> None:
+        """Persist a worker lifecycle stage when the plan binds it."""
+        if (
+            self._progress_recorder is not None
+            and self._plan.get("progress_schema_version") == 3
+        ):
+            self._progress_recorder.worker_stage(
+                status=status,
+                stage=stage,
+            )
+
+    def record_worker_failure(
+        self,
+        error: BaseException,
+        *,
+        exit_code: int,
+    ) -> None:
+        """Persist a closed worker-level failure without changing DB state."""
+        if (
+            self._progress_recorder is not None
+            and self._plan.get("progress_schema_version") == 3
+            and getattr(self._progress_recorder, "_worker_status", None)
+            != "failed"
+        ):
+            self._progress_recorder.worker_failure(
+                exit_code=exit_code,
+                failure=exact_drain_worker_failure_evidence(error),
+            )
 
     def _assert_execution_lease(self) -> None:
         deadline = getattr(self, "_execution_deadline", None)
@@ -4717,7 +4806,7 @@ class ExactDrainClaimAdapter:
             )
         if self._progress_recorder is None:
             return
-        if self._plan.get("progress_schema_version") != 2:
+        if self._plan.get("progress_schema_version") not in {2, 3}:
             self.record_upstream_stage(operation_id, stage)
             return
         message = str(error_message)

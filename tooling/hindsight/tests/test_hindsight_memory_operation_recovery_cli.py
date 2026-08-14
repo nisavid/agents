@@ -1534,6 +1534,11 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
 
         self.assertEqual(result, 0)
         self.assertEqual(captured["status"], "running")
+        self.assertEqual(captured["worker_status"], "starting")
+        self.assertEqual(captured["worker_stage"], "progress.created")
+        self.assertIsNone(captured["worker_failure_stage"])
+        self.assertIsNone(captured["worker_failure"])
+        self.assertIsNone(captured["worker_exit_code"])
         self.assertEqual(
             captured["selected_status_counts"],
             {"pending": 42, "retrying": 1},
@@ -1831,11 +1836,12 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             self.assertEqual(result["status"], "planned")
             self.assertEqual(result["authority"], "unapproved-plan")
             self.assertEqual(result["selected_operation_count"], 43)
-            self.assertEqual(runtime_schemas, [7])
+            self.assertEqual(runtime_schemas, [8])
             plan, create_only = written[args.output]
             self.assertIs(create_only, True)
             self.assertIs(plan["mutation_authorized"], False)
-            self.assertEqual(plan["schema_version"], 7)
+            self.assertEqual(plan["schema_version"], 8)
+            self.assertEqual(plan["progress_schema_version"], 3)
             serialized = json.dumps(plan, sort_keys=True)
             self.assertNotIn('"task_payload":', serialized)
             self.assertNotIn('"worker_id":', serialized)
@@ -4532,6 +4538,60 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("hindsight-exact-drain-worker", result.stdout)
+
+    def test_exact_drain_worker_records_preclaim_failure_without_raw_error(self):
+        worker = runpy.run_path(
+            str(ROOT / "bin" / "hindsight-exact-drain-worker")
+        )
+        with tempfile.TemporaryDirectory(
+            dir="/private/tmp",
+            prefix="exact-drain-worker-failure-",
+        ) as directory:
+            path = Path(directory) / "progress.json"
+            recorder = ExactDrainProgressRecorder(
+                path=path,
+                plan_digest="a" * 64,
+                worker_pid=1234,
+                worker_start_time="darwin:1000:1",
+                worker_attempt=1,
+                selected_operations=[
+                    {
+                        "operation_id": (
+                            "00000000-0000-4000-8000-000000000001"
+                        ),
+                        "operation_type": "retain",
+                        "row_digest": "b" * 64,
+                    }
+                ],
+                progress_schema_version=3,
+                clock=lambda: 1000.0,
+            )
+            globals_ = worker["run"].__globals__
+            globals_["_WORKER_PROGRESS_RECORDER"] = recorder
+            recorder.worker_stage(
+                status="starting",
+                stage="worker.memory.initialize",
+            )
+
+            def fail_before_claim():
+                raise TimeoutError("provider socket closed secret-value")
+
+            globals_["main"] = fail_before_claim
+            self.assertEqual(worker["run"](), 2)
+            progress = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(progress["worker_status"], "failed")
+        self.assertEqual(
+            progress["worker_failure_stage"],
+            "worker.memory.initialize",
+        )
+        self.assertEqual(progress["worker_exit_code"], 2)
+        self.assertEqual(
+            progress["worker_failure"]["category"],
+            "worker_initialization_timeout",
+        )
+        self.assertTrue(progress["worker_failure"]["retryable"])
+        self.assertNotIn("secret-value", json.dumps(progress))
 
     def test_exact_drain_worker_gate_binds_parent_artifacts_before_activation(self):
         fixtures = recovery_fixtures.OperationRecoveryContractTest()

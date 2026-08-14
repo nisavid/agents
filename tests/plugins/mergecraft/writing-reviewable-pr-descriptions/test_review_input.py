@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -14,6 +15,7 @@ from test_validate_change_navigation import (  # noqa: E402
     DIFF,
     MODULE,
     PRODUCTION_VALIDATE,
+    SCRIPT,
 )
 from change_navigation.review_input import (  # noqa: E402
     PR_NUMBER_TOKEN,
@@ -486,6 +488,37 @@ class ReviewInputTests(unittest.TestCase):
             ],
         )
         self.assertNotIn(secret, "\n".join(errors))
+
+    def test_cli_uses_a_constant_diagnostic_for_body_derived_errors(self) -> None:
+        body_sentinel = "unsupported-body-sentinel-12345"
+        body = DIFF.replace(
+            "\n</details>", f"\n  - unsupported {body_sentinel}\n</details>"
+        )
+        review_input = self.write(manifest(DIFF))
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "/dev/stdin",
+                "--repository",
+                "acme/app",
+                "--pr",
+                "2",
+                "--title",
+                "feat: widget",
+                "--review-input",
+                str(review_input),
+            ],
+            input=body,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stderr, "ERROR: Change navigation is invalid\n")
+        self.assertNotIn(body_sentinel, result.stderr)
 
     def test_rejects_head_repository_identity_drift(self) -> None:
         with self.assertRaisesRegex(ReviewInputError, "identity drifted"):

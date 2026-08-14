@@ -325,11 +325,7 @@ def main() -> int:
         git_repository=args.git_repository,
     )
     if errors:
-        for error in errors:
-            # Secret-shaped bodies return before validation; only diagnostics from
-            # non-secret input can reach this sink.
-            # codeql[py/clear-text-logging-sensitive-data]
-            print(f"ERROR: {error}", file=sys.stderr)
+        print("ERROR: Change navigation is invalid", file=sys.stderr)
         return 1
     print("Change navigation is valid")
     return 0

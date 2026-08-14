@@ -1,6 +1,6 @@
 # Versionkeeping plugin
 
-Versionkeeping is a dual-harness Git-safety plugin. It owns task-only
+Versionkeeping is an Agent Plugins package with a native Claude adapter. It owns task-only
 checkpointing, intent-aware conflict resolution, deterministic exact-lease
 publication, separately authorized remote-ref deletion, provenance-aware
 worktree lifecycle, and history-preserving fork synchronization.
@@ -23,8 +23,8 @@ actuation; or model and delegation policy.
 
 ```text
 plugins/versionkeeping/
+├── plugin.json                      # Canonical Agent Plugins v1 manifest
 ├── .claude-plugin/plugin.json       # Claude adapter manifest
-├── .codex-plugin/plugin.json        # Codex adapter manifest
 ├── skills/                          # Shared harness-neutral core
 │   └── checkpointing-and-publishing-git-work/
 │       ├── references/              # Publication, cleanup, and eval integrity
@@ -35,15 +35,15 @@ plugins/versionkeeping/
 └── LICENSE
 ```
 
-The manifests and `skills/*/agents/openai.yaml` are the only thin adapter
-surfaces. Shared skills do not assume a harness-specific installation location:
+The Claude manifest and `skills/*/agents/openai.yaml` are thin client adapter
+surfaces around the standard package. Shared skills do not assume a client-specific installation location:
 they resolve helper scripts from this plugin root.
 The `schema_version` in `topology.json` versions Versionkeeping's local
 topology shape, not a repository-wide interchange schema.
 
-## Installed plugin validation
+## Package validation
 
-From the installed plugin root, these checks use only plugin-relative paths:
+From the package root, these checks use only plugin-relative paths:
 
 ```sh
 python3 skills/checkpointing-and-publishing-git-work/scripts/plan_git_publication.py --help

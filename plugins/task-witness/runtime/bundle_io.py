@@ -17,6 +17,9 @@ if globals().get("_TASK_WITNESS_LAUNCH_CONTEXT") is None:
 C = globals().get("_CANONICAL")
 if C is None:
     raise RuntimeError("Task Witness canonical primitives were not injected")
+MACOS_DESCRIPTOR_HAS_ALLOW_ACL = globals().get("_MACOS_DESCRIPTOR_HAS_ALLOW_ACL")
+if not callable(MACOS_DESCRIPTOR_HAS_ALLOW_ACL):
+    raise RuntimeError("Task Witness ACL policy was not injected")
 
 
 MAX_FILE_BYTES = 1024 * 1024
@@ -34,14 +37,28 @@ def _flags(*names: str) -> int:
     return os.O_RDONLY | sum(int(getattr(os, name)) for name in names)
 
 
-def _private(metadata: os.stat_result, label: str, directory: bool) -> None:
-    if metadata.st_uid != os.getuid() or metadata.st_mode & 0o077:
+def _private(
+    metadata: os.stat_result,
+    label: str,
+    directory: bool,
+    descriptor: int | None = None,
+) -> None:
+    if metadata.st_uid != os.geteuid() or metadata.st_mode & 0o077:
         raise C.EvidenceError(f"{label} must be owned by the current user and private")
     is_right_type = (
         stat.S_ISDIR(metadata.st_mode) if directory else stat.S_ISREG(metadata.st_mode)
     )
     if not is_right_type:
         raise C.EvidenceError(f"{label} has the wrong file type")
+    if not directory and metadata.st_nlink != 1:
+        raise C.EvidenceError(f"{label} has an unsafe hard link")
+    if descriptor is not None:
+        try:
+            has_allow_acl = MACOS_DESCRIPTOR_HAS_ALLOW_ACL(descriptor)
+        except OSError as error:
+            raise C.EvidenceError(f"{label} ACL cannot be verified") from error
+        if has_allow_acl:
+            raise C.EvidenceError(f"{label} has a permissive ACL entry")
 
 
 def absolute(path: Path, label: str) -> Path:
@@ -122,7 +139,7 @@ def open_at(
         )
         opened = os.fstat(descriptor)
         if private:
-            _private(opened, label, False)
+            _private(opened, label, False, descriptor)
         elif not stat.S_ISREG(opened.st_mode):
             raise C.EvidenceError(f"{label} has the wrong file type")
         expected = descriptor_identity(opened)
@@ -221,6 +238,7 @@ def open_directory_at(
         expected = descriptor_identity(os.fstat(descriptor))
         if expected != descriptor_identity(before):
             raise C.EvidenceError(f"{label} changed between preflight and open")
+        _private(os.fstat(descriptor), label, True, descriptor)
         return descriptor, expected
     except BaseException as error:
         if "descriptor" in locals():
@@ -259,6 +277,16 @@ class BundleView:
         return json_object(item[2], label), item[2]
 
 
+def bundle_names(descriptor: int, label: str) -> frozenset[str]:
+    names: set[str] = set()
+    with os.scandir(descriptor) as entries:
+        for entry in entries:
+            names.add(entry.name)
+            if len(names) > MAX_BUNDLE_FILES:
+                raise C.EvidenceError(f"{label} exceeds the file limit")
+    return frozenset(names)
+
+
 def open_bundle(path: Path, label: str) -> BundleView:
     path = absolute(path, label)
     chain = open_chain(path.parent, f"{label} parent")
@@ -267,9 +295,7 @@ def open_bundle(path: Path, label: str) -> BundleView:
         root, root_identity = open_directory_at(parent, path.name, label)
         files: dict[str, tuple[int, tuple[int, ...], bytes]] = {}
         try:
-            names = set(os.listdir(root))
-            if len(names) > MAX_BUNDLE_FILES:
-                raise C.EvidenceError(f"{label} exceeds the file limit")
+            names = bundle_names(root, label)
             total = 0
             for name in names:
                 descriptor, identity = open_at(root, name, f"{label} child")
@@ -296,16 +322,21 @@ def open_bundle(path: Path, label: str) -> BundleView:
 
 def recheck_bundle(view: BundleView, label: str) -> None:
     for descriptor, identity, raw in view.files.values():
+        _private(os.fstat(descriptor), f"{label} child", False, descriptor)
         if read_descriptor(descriptor, identity, f"{label} child") != raw:
             raise C.EvidenceError(f"{label} child changed during validation")
+    _private(os.fstat(view.root), label, True, view.root)
     if descriptor_identity(os.fstat(view.root)) != view.root_identity:
         raise C.EvidenceError(f"{label} changed during validation")
     recheck_chain(view.chain, label)
     visible_root = os.stat(view.root_name, dir_fd=view.parent, follow_symlinks=False)
-    if (
-        descriptor_identity(visible_root) != view.root_identity
-        or set(os.listdir(view.root)) != view.names
-    ):
+    try:
+        current_names = bundle_names(view.root, label)
+    except C.EvidenceError as error:
+        raise C.EvidenceError(f"{label} inventory changed during validation") from error
+    if descriptor_identity(
+        visible_root
+    ) != view.root_identity or current_names != frozenset(view.names):
         raise C.EvidenceError(f"{label} inventory changed during validation")
     for name, (_, identity, _) in view.files.items():
         if (

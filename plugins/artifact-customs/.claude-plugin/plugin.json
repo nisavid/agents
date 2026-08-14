@@ -1,7 +1,7 @@
 {
   "name": "artifact-customs",
   "displayName": "Artifact Customs",
-  "version": "1.0.0+claude.20260722221100",
+  "version": "1.0.0",
   "description": "Clear, adopt, maintain, replace, and retire exact third-party software components under explicit policy.",
   "author": {
     "name": "Ivan D Vasin",

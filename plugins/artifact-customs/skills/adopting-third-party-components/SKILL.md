@@ -12,8 +12,8 @@ boundary. Do not mutate until the task supplies explicit authority for that
 boundary. A request to assess, compare, or recommend is read-only and belongs
 to `assessing-third-party-components`.
 
-Read and apply [the component policy contract](../../references/component-policy-contract.md)
-and [the component clearance contract](../../references/component-clearance-contract.md).
+Read and apply [the component policy contract](references/component-policy-contract.md)
+and [the component clearance contract](references/component-clearance-contract.md).
 
 ## Workflow
 

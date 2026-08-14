@@ -3,15 +3,15 @@
   "algorithm": "sha256",
   "files": {
     ".claude-plugin/plugin.json": {
-      "sha256": "6e7a5850d9d2517b2b5ee42a4398f8221dddb00da10c430d7c647c0331d3ee8a",
-      "mode": 420
-    },
-    ".codex-plugin/plugin.json": {
-      "sha256": "bd7866309442cc00e92cc1a85ce449ba46457518454faf125705bf3f4722b09c",
+      "sha256": "ca7bc6d98d43ad4547a3900c9b1be054e4c1bc21d6d78be2fc21151c748d5853",
       "mode": 420
     },
     "README.md": {
-      "sha256": "6e6e1d20136bfd1bad5318ea113c43ade0980706c0535d18c80ea915fc4d5c18",
+      "sha256": "1d33c00171cdad2047356902036f30fbeabaee7fd2999a00306690d6b50c1d70",
+      "mode": 420
+    },
+    "plugin.json": {
+      "sha256": "6fde278f2e58631c3873eb1c71007f71e3bbfa7ea8e3624c8547fde9ee477890",
       "mode": 420
     },
     "skills/checkpointing-and-publishing-git-work/SKILL.md": {

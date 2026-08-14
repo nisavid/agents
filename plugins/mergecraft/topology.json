@@ -78,7 +78,8 @@
         "skills/publishing-reviewable-prs/scripts/update_reviewable_pr.py"
       ],
       "modules": [
-        "skills/publishing-reviewable-prs/scripts/publication_receipts.py"
+        "skills/publishing-reviewable-prs/scripts/publication_receipts.py",
+        "skills/publishing-reviewable-prs/scripts/required_review.py"
       ],
       "calls": ["operation:pr-content"],
       "conditional_calls": {},
@@ -100,9 +101,15 @@
           "bound-repository-pr-base-head",
           "validated-title-body",
           "expected-preimage",
+          "explicit-publication-review-mode",
+          "frozen-publication-candidate",
+          "authenticated-task-witness-process-profile",
           "publication-authority"
         ],
-        "outputs": ["verified-publication-receipt", "authoritative-audit"],
+        "outputs": [
+          "review-bound-publication-receipt",
+          "authoritative-audit"
+        ],
         "forbidden_reverse_calls": [
           "graphite",
           "resuming-reviewed-prs",
@@ -131,7 +138,6 @@
         "operation:pr-text-write",
         "operation:pr-readiness-write",
         "operation:publication-audit",
-        "operation:publication-reconciliation",
         "operation:git-ref-push"
       ],
       "conditional_calls": {},
@@ -152,6 +158,7 @@
         "inputs": [
           "tracked-stack",
           "exact-branch-heads",
+          "explicit-publication-review-profile",
           "transport-authority"
         ],
         "outputs": ["verified-stack-transport", "publication-handoff"],
@@ -568,7 +575,7 @@
       "import": null,
       "access": "coordinate",
       "authority": "exact requested forge mutation or read-only audit",
-      "callers": ["graphite", "publishing-reviewable-prs"],
+      "callers": ["publishing-reviewable-prs"],
       "disposition": "public-skill"
     },
     {

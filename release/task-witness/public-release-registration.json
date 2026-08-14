@@ -1,0 +1,22 @@
+{
+  "production_eligible": false,
+  "schema_version": 1,
+  "source_stage_validator_flags": [
+    "--source-stage"
+  ],
+  "support_paths": [
+    "docs/superpowers/specs/2026-07-27-task-witness-canonical-client-design.md",
+    "docs/superpowers/specs/2026-08-12-task-witness-tw4-migration-and-qualification-design.md",
+    "release/task-witness/migration",
+    "release/task-witness/source-shape-review.json",
+    "release/task-witness/tw4-bridge-identity.json",
+    "release/task-witness/tw4-bridge-provenance.json",
+    "release/task-witness/tw4-suite-inventory.json",
+    "scripts/run_task_witness_qualification.py",
+    "scripts/run_task_witness_qualification_suite.py",
+    "tests/plugins/task_witness_client",
+    "tests/plugins/task_witness_deployment",
+    "tests/test_task_witness_package.py",
+    "tests/test_task_witness_qualification.py"
+  ]
+}

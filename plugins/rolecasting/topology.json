@@ -1,12 +1,20 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "receipt_contract": {
     "id": "adapter:rolecasting-invocation-topology-receipt",
     "owner": "delegating-cross-agent-work",
     "separate_from": "adapter:model-selection-receipt",
     "binds": [
       "dispatch-identity",
-      "lifecycle",
+      "product-family",
+      "surface",
+      "version",
+      "executor",
+      "relationship",
+      "ownership",
+      "transport",
+      "assurance",
+      "consumer-assurance-minimum",
       "isolation",
       "subdelegation-authority",
       "external-action-authority"
@@ -17,9 +25,15 @@
     "delegating-cross-agent-work": {
       "owns": [
         "worker-topology",
-        "worker-lifecycle",
+        "target-surface",
+        "worker-relationship",
+        "worker-ownership",
+        "dispatch-transport",
+        "dispatch-assurance",
+        "consumer-assurance-minimum",
         "authority",
         "handoffs",
+        "native-codex-dispatch",
         "invocation-topology-receipt",
         "leader-integration"
       ],

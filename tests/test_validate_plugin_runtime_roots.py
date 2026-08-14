@@ -8,7 +8,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-
 REPOSITORY = Path(__file__).resolve().parents[1]
 VALIDATOR = REPOSITORY / "scripts/validate_plugin_runtime_roots.py"
 
@@ -40,6 +39,13 @@ class ValidatePluginRuntimeRootsTests(unittest.TestCase):
     def test_accepts_declared_runtime_roots(self) -> None:
         result = self.validate()
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_rejects_legacy_codex_adapter_in_standard_runtime_root(self) -> None:
+        legacy = self.repository / "plugins/versionkeeping/.codex-plugin"
+        legacy.mkdir()
+        (legacy / "plugin.json").write_text("{}\n")
+
+        self.assert_rejected("runtime root inventory drift")
 
     def test_rejects_development_and_generated_content(self) -> None:
         root = self.repository / "plugins/versionkeeping"

@@ -10,19 +10,22 @@ provider-specific model policy, invent support, or treat the receipt as an
 outgoing invocation edge.
 
 `adapter:rolecasting-invocation-topology-receipt` is a second, orthogonal
-adapter input issued from Rolecasting's frozen delegation plan. It is never
+adapter input defined by Rolecasting's frozen delegation plan. It is never
 folded into `adapter:model-selection-receipt` and is not an outgoing skill call.
 It binds the candidate, review-input, and requirements identities plus a
 closed-world dispatch set containing exactly one unique dispatch entry per
-selected critic or specialist. Every entry fixes lifecycle, executor and
-harness, the same immutable inputs, scope, return and verification contract,
-stop conditions, distinct isolation, read-only authority, default-denied
-subdelegation and external action, and explicit user authority for a user-owned
-task.
+selected critic or specialist. Every entry fixes its target product family,
+surface, version, and executor; child, peer, or external relationship;
+leader-owned or user-owned ownership; transport; the same immutable inputs;
+scope; return and verification contract; stop conditions; distinct isolation;
+read-only authority; consumer assurance minimum; product-attested,
+controller-observed, or self-reported assurance; default-denied subdelegation
+and external action; and explicit user authority for user-owned work.
 
 Reject the entire plan before dispatch when any selected execution is missing,
 duplicated, extra, stale, insufficiently isolated, over-authorized, or bound to
-different input. Do not silently fall back to another executor or lifecycle;
-that change requires a new valid plan and new adapter receipt. A selected
-execution that does not return a usable, verified result keeps the review
-`incomplete / non-clean`.
+different input, or when its assurance is below the bound consumer minimum. Do
+not silently change target, relationship, ownership, transport, executor, or
+assurance minimum; that change requires a new valid plan and new adapter
+receipt. A selected execution that does not return a usable, verified result
+keeps the review `incomplete / non-clean`.

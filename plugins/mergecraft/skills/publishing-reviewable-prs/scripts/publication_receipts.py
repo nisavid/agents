@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -11,10 +12,15 @@ import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-import fcntl
 from pathlib import Path
 from typing import Any, Callable, Iterator, Literal, Mapping
 
+from required_review import (
+    PublicationCandidate,
+    PublicationReview,
+    parse_publication_review,
+    validate_transition_candidate,
+)
 from reviewable_pr_state import (
     ExpectedIdentity,
     PublicationError,
@@ -22,8 +28,8 @@ from reviewable_pr_state import (
     validate_identity_inputs,
 )
 
-
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+LEGACY_SCHEMA_VERSION = 2
 PUBLISHER_NAME = "publishing-reviewable-prs"
 PUBLISHER_VERSION = 1
 POLICY_VERSION = 1
@@ -83,10 +89,13 @@ class _VerifiedTransition:
     final_state: StateSnapshot
     review_input_schema_version: int
     review_input_sha256: str
+    review: PublicationReview | None
+    candidate: PublicationCandidate | None
 
 
 @dataclass(frozen=True)
 class PublicationReceipt:
+    schema_version: int
     sequence: int
     receipt_id: str
     content_sha256: str
@@ -99,10 +108,11 @@ class PublicationReceipt:
     review_input_sha256: str
     preimage: StateSnapshot
     final_state: StateSnapshot
+    review: PublicationReview | None
 
     def unsigned_json(self) -> dict[str, Any]:
-        return {
-            "schema_version": SCHEMA_VERSION,
+        value = {
+            "schema_version": self.schema_version,
             "sequence": self.sequence,
             "receipt_id": self.receipt_id,
             "predecessor_sha256": self.predecessor_sha256,
@@ -129,6 +139,9 @@ class PublicationReceipt:
             "preimage": self.preimage.as_json(),
             "final_state": self.final_state.as_json(),
         }
+        if self.schema_version >= SCHEMA_VERSION:
+            value["review"] = self.review.as_json() if self.review is not None else None
+        return value
 
     def as_json(self) -> dict[str, Any]:
         value = self.unsigned_json()
@@ -136,12 +149,20 @@ class PublicationReceipt:
         return value
 
     def summary(self, status: str) -> dict[str, Any]:
-        return {
+        result: dict[str, Any] = {
             "status": status,
             "receipt_id": self.receipt_id,
             "provenance": self.provenance,
             "sequence": self.sequence,
         }
+        if self.provenance == PROVENANCE_RECONCILED_UNRECEIPTED:
+            result["review"] = {"state": "unwitnessed-reconciliation"}
+        elif self.schema_version == LEGACY_SCHEMA_VERSION:
+            result["review"] = {"state": "legacy-unrecorded"}
+        else:
+            assert self.review is not None
+            result["review"] = self.review.as_json()
+        return result
 
 
 @dataclass(frozen=True)
@@ -479,6 +500,8 @@ def verified_transition(
     final_reread: dict[str, Any],
     review_input_schema_version: int,
     review_input_sha256: str,
+    review: PublicationReview | None,
+    candidate: PublicationCandidate | None,
 ) -> _VerifiedTransition:
     """Bind exact before/after evidence before it can receive provenance."""
 
@@ -494,6 +517,30 @@ def verified_transition(
     before = _snapshot(preimage, expected)
     after = _snapshot(final_reread, expected)
     _validate_transition_shape(operation, before, after)
+    if operation in CANONICAL_OPERATIONS and not isinstance(review, PublicationReview):
+        raise ReceiptError("canonical publication review choice is absent")
+    if operation in CANONICAL_OPERATIONS and not isinstance(
+        candidate, PublicationCandidate
+    ):
+        raise ReceiptError("canonical publication candidate is absent")
+    if operation == "reconcile" and review is not None:
+        raise ReceiptError("reconciliation cannot mint publication review provenance")
+    if operation == "reconcile" and candidate is not None:
+        raise ReceiptError("reconciliation cannot mint a publication candidate")
+    if review is not None and candidate is not None:
+        try:
+            validate_transition_candidate(
+                candidate=candidate,
+                expected=expected,
+                operation=operation,
+                review_input_schema_version=review_input_schema_version,
+                review_input_sha256=review_input_sha256,
+                final_title_sha256=after.title_sha256,
+                final_body_sha256=after.body_sha256,
+                review=review,
+            )
+        except PublicationError as error:
+            raise ReceiptError("publication candidate evidence is invalid") from error
     return _VerifiedTransition(
         expected=expected,
         operation=operation,
@@ -501,6 +548,8 @@ def verified_transition(
         final_state=after,
         review_input_schema_version=review_input_schema_version,
         review_input_sha256=review_input_sha256,
+        review=review,
+        candidate=candidate,
     )
 
 
@@ -559,24 +608,33 @@ def _parse_receipt(
     raw: bytes, path: Path, expected: ExpectedIdentity, *, now: datetime
 ) -> PublicationReceipt:
     value = _strict_json(raw)
+    schema_version = value.get("schema_version")
+    if type(schema_version) is not int or schema_version not in {
+        LEGACY_SCHEMA_VERSION,
+        SCHEMA_VERSION,
+    }:
+        raise ReceiptError("receipt has an unsupported schema version")
+    root_keys = {
+        "schema_version",
+        "sequence",
+        "receipt_id",
+        "content_sha256",
+        "predecessor_sha256",
+        "provenance",
+        "operation",
+        "created_at",
+        "publisher",
+        "policy",
+        "identity",
+        "review_input",
+        "preimage",
+        "final_state",
+    }
+    if schema_version == SCHEMA_VERSION:
+        root_keys.add("review")
     _exact_keys(
         value,
-        {
-            "schema_version",
-            "sequence",
-            "receipt_id",
-            "content_sha256",
-            "predecessor_sha256",
-            "provenance",
-            "operation",
-            "created_at",
-            "publisher",
-            "policy",
-            "identity",
-            "review_input",
-            "preimage",
-            "final_state",
-        },
+        root_keys,
         "root",
     )
     for label, keys in (
@@ -606,9 +664,7 @@ def _parse_receipt(
     identity = value["identity"]
     review_input = value["review_input"]
     if (
-        type(value["schema_version"]) is not int
-        or value["schema_version"] != SCHEMA_VERSION
-        or type(value["sequence"]) is not int
+        type(value["sequence"]) is not int
         or value["sequence"] <= 0
         or not isinstance(value["receipt_id"], str)
         or UUID4_RE.fullmatch(value["receipt_id"]) is None
@@ -691,6 +747,15 @@ def _parse_receipt(
         and value["operation"] != "reconcile"
     ):
         raise ReceiptError("receipt provenance does not match its operation")
+    review: PublicationReview | None = None
+    if schema_version == SCHEMA_VERSION:
+        if value["provenance"] == PROVENANCE_CANONICAL:
+            try:
+                review = parse_publication_review(value["review"])
+            except PublicationError as error:
+                raise ReceiptError("receipt review evidence is invalid") from error
+        elif value["review"] is not None:
+            raise ReceiptError("reconciliation cannot contain review provenance")
     preimage = _parse_snapshot(value["preimage"], "preimage")
     final_state = _parse_snapshot(value["final_state"], "final state")
     _validate_transition_shape(value["operation"], preimage, final_state)
@@ -710,6 +775,7 @@ def _parse_receipt(
     if raw != _canonical(value) + b"\n":
         raise ReceiptError("receipt bytes are not canonical")
     return PublicationReceipt(
+        schema_version=schema_version,
         sequence=value["sequence"],
         receipt_id=value["receipt_id"],
         content_sha256=content_sha256,
@@ -722,6 +788,7 @@ def _parse_receipt(
         review_input_sha256=review_input["content_sha256"],
         preimage=preimage,
         final_state=final_state,
+        review=review,
     )
 
 
@@ -798,6 +865,12 @@ def load_receipts(
             raise ReceiptError("receipt ledger predecessor chain is invalid")
         if index > 1 and receipt.created_at <= receipts[index - 2].created_at:
             raise ReceiptError("receipt ledger timestamps are not strictly ordered")
+        if (
+            index > 1
+            and receipts[index - 2].schema_version == SCHEMA_VERSION
+            and receipt.schema_version == LEGACY_SCHEMA_VERSION
+        ):
+            raise ReceiptError("receipt ledger schema version moved backward")
     return receipts
 
 
@@ -821,6 +894,7 @@ def _append_receipt(
     receipt_id = _new_uuid4()
     predecessor = receipts[-1].content_sha256 if receipts else None
     provisional = PublicationReceipt(
+        schema_version=SCHEMA_VERSION,
         sequence=sequence,
         receipt_id=receipt_id,
         content_sha256="0" * 64,
@@ -833,6 +907,7 @@ def _append_receipt(
         review_input_sha256=transition.review_input_sha256,
         preimage=transition.preimage,
         final_state=transition.final_state,
+        review=transition.review,
     )
     content_sha256 = hashlib.sha256(_canonical(provisional.unsigned_json())).hexdigest()
     receipt = PublicationReceipt(
@@ -886,6 +961,21 @@ def record_verified_publication(
         raise ReceiptError(
             "only canonical publisher transitions can mint canonical provenance"
         )
+    assert transition.review is not None
+    assert transition.candidate is not None
+    try:
+        validate_transition_candidate(
+            candidate=transition.candidate,
+            expected=transition.expected,
+            operation=transition.operation,
+            review_input_schema_version=transition.review_input_schema_version,
+            review_input_sha256=transition.review_input_sha256,
+            final_title_sha256=transition.final_state.title_sha256,
+            final_body_sha256=transition.final_state.body_sha256,
+            review=transition.review,
+        )
+    except PublicationError as error:
+        raise ReceiptError("publication candidate evidence is invalid") from error
     return _append_receipt(
         root=root,
         transition=transition,

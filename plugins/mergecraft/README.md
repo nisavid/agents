@@ -1,12 +1,34 @@
 # Mergecraft
 
-Mergecraft is the portable pull-request lifecycle plugin. It owns reviewer
+Mergecraft is an Agent Plugins pull-request lifecycle package with a native
+Claude adapter. It owns reviewer
 navigation, guarded PR publication, Graphite draft transport, feedback
 coordination and interaction, review readiness, merge closeout, and stacked
 fixups. [topology.json](topology.json) is the only machine-readable graph and
 operation-ownership authority.
 Its `schema_version` versions Mergecraft's local topology shape, not a
 repository-wide interchange schema.
+
+Canonical PR publication requires every caller to select `required` or explicit
+`not-required` review. Required mode fail-closes through the authenticated
+installed Task Witness front door and accepts only a current, trust-anchored,
+bare-clean Tricritical terminal projection bound to the exact publication
+candidate. Receipts retain only redacted digests and distinguish witnessed
+required publication, explicit not-required publication, legacy v2 records,
+and unwitnessed reconciliation.
+This release proves required-review success only with repository fixtures; its
+new-publication Tricritical producer chain is not live-reachable. Required live
+publication remains intentionally unavailable until that chain is installed and
+registered.
+
+Process containment is cooperative. The authenticated Task Witness client's
+exact `task-witness-process-profile-v2` owns its launcher group, pipes,
+deadline, and reap, and registered validators are operator-trusted code within
+that launcher.
+Mergecraft bounds the client invocation and performs identity-safe best-effort
+cleanup within the same-EUID install boundary. Its module-private
+closed call capability is not a security boundary, and ordinary successful
+completion does not prove that arbitrary descendants are quiescent.
 
 ## Public skills
 
@@ -38,7 +60,7 @@ use qualified identities.
 | pr-readiness-write | pr-readiness-write | github | write | exact repository, PR, head, draft preimage, readiness gates, and mark-ready authority | public-skill | publishing-reviewable-prs | skills/publishing-reviewable-prs/SKILL.md | getting-prs-ready-for-review, graphite, publishing-reviewable-prs, stacking-pr-fixups |
 | publication-evidence | - | workflow | coordinate | exact requested forge mutation or read-only audit | public-skill | publishing-reviewable-prs | skills/publishing-reviewable-prs/SKILL.md | publishing-reviewable-prs |
 | publication-audit | - | workflow | read | bound repository, PR, base, head, text, readiness, and authoritative receipt identity | public-skill | publishing-reviewable-prs | skills/publishing-reviewable-prs/SKILL.md | getting-prs-merged, getting-prs-ready-for-review, graphite, publishing-reviewable-prs, resuming-reviewed-prs, stacking-pr-fixups |
-| publication-reconciliation | - | workflow | coordinate | exact requested forge mutation or read-only audit | public-skill | publishing-reviewable-prs | skills/publishing-reviewable-prs/SKILL.md | graphite, publishing-reviewable-prs |
+| publication-reconciliation | - | workflow | coordinate | exact requested forge mutation or read-only audit | public-skill | publishing-reviewable-prs | skills/publishing-reviewable-prs/SKILL.md | publishing-reviewable-prs |
 | graphite-topology | - | workflow | coordinate | bound Graphite stack identity, ancestry, topology, and authorized topology operation | public-skill | graphite | skills/graphite/SKILL.md | graphite, stacking-pr-fixups |
 | graphite-transport | - | workflow | coordinate | bound Graphite stack topology and intended draft transport | public-skill | graphite | skills/graphite/SKILL.md | graphite, stacking-pr-fixups |
 | feedback-acquisition | review-comment-read | github | read | separately bound authority for feedback-acquisition | internal-helper | internal:feedback-state-acquisition | skills/addressing-pr-review-feedback/scripts/review_feedback_state.py | addressing-pr-review-feedback, getting-prs-merged |
@@ -90,16 +112,16 @@ owners; there is no additional public review-orchestration layer.
 ## Layout
 
     plugins/mergecraft/
+    ├── plugin.json
     ├── .claude-plugin/plugin.json
-    ├── .codex-plugin/plugin.json
     ├── skills/
     ├── topology.json
     ├── CHANGELOG.md
     └── LICENSE
 
-## Installed validation
+## Package validation
 
-From the installed plugin root:
+From the package root:
 
     python3 skills/writing-reviewable-pr-descriptions/scripts/validate_change_navigation.py --help
     python3 skills/publishing-reviewable-prs/scripts/create_reviewable_pr.py --help

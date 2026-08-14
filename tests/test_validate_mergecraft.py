@@ -20,6 +20,17 @@ EVAL_ROOT = Path("evals/mergecraft")
 CONTENT_LOCK = Path("release/plugin-content-locks/mergecraft.json")
 ATLAS_RELEASE = Path("release/mergecraft")
 RETIREMENT_LEDGER = Path("release/mergecraft-retirement-contribution-ledger.json")
+AGENT_PLUGIN_SCHEMA = "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json"
+CANONICAL_IDENTITY_FIELDS = (
+    "name",
+    "version",
+    "description",
+    "author",
+    "homepage",
+    "repository",
+    "license",
+    "keywords",
+)
 SPEC = importlib.util.spec_from_file_location("validate_mergecraft", VALIDATOR)
 assert SPEC is not None and SPEC.loader is not None
 VALIDATE_MERGECRAFT = importlib.util.module_from_spec(SPEC)
@@ -112,8 +123,39 @@ class ValidateMergecraftTests(unittest.TestCase):
                 result = self.run_validator("--skill", skill)
                 self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_uses_canonical_agent_plugins_v1_manifest_and_discovery(self) -> None:
+        canonical = json.loads((self.plugin / "plugin.json").read_text())
+        topology = json.loads((self.plugin / "topology.json").read_text())
+
+        self.assertEqual(canonical["$schema"], AGENT_PLUGIN_SCHEMA)
+        self.assertEqual(canonical["name"], "mergecraft")
+        self.assertEqual(canonical["version"], "1.0.0")
+        self.assertEqual(set(canonical["extensions"]), {"com.openai"})
+        self.assertEqual(set(canonical["extensions"]["com.openai"]), {"interface"})
+        self.assertFalse((self.plugin / ".codex-plugin").exists())
+        self.assertEqual(
+            sorted(
+                path.name
+                for path in (self.plugin / "skills").iterdir()
+                if path.is_dir() and (path / "SKILL.md").is_file()
+            ),
+            sorted(component["name"] for component in topology["skills"]),
+        )
+
+    def test_claude_manifest_is_exact_canonical_projection(self) -> None:
+        canonical = json.loads((self.plugin / "plugin.json").read_text())
+        claude = json.loads(
+            (self.plugin / ".claude-plugin" / "plugin.json").read_text()
+        )
+        self.assertEqual(set(claude), set(CANONICAL_IDENTITY_FIELDS) | {"displayName"})
+        self.assertEqual(claude["displayName"], "Mergecraft")
+        self.assertEqual(
+            {field: claude[field] for field in CANONICAL_IDENTITY_FIELDS},
+            {field: canonical[field] for field in CANONICAL_IDENTITY_FIELDS},
+        )
+
     def test_rejects_duplicate_json_at_any_depth(self) -> None:
-        path = self.plugin / ".codex-plugin/plugin.json"
+        path = self.plugin / "plugin.json"
         path.write_text(
             path.read_text().replace(
                 '"name": "mergecraft"',
@@ -147,7 +189,8 @@ class ValidateMergecraftTests(unittest.TestCase):
         before_diff, diff_section = original.split("## Diff Disclosure", 1)
         duplicate = (
             '<picture><img alt="IMPL: 9 additions, 3 deletions" '
-            'src="https://img.shields.io/badge/IMPL-%2B9%20%E2%88%923-0969DA?style=flat" '
+            'src="https://img.shields.io/badge/'
+            'IMPL-%2B9%20%E2%88%923-0969DA?style=flat" '
             'height="16"></picture> '
         )
         for metric in (
@@ -171,20 +214,20 @@ class ValidateMergecraftTests(unittest.TestCase):
                 self.assertIn("summary category badges", result.stderr)
 
     def test_rejects_non_finite_json_at_any_boundary(self) -> None:
-        path = self.plugin / ".codex-plugin/plugin.json"
+        path = self.plugin / "plugin.json"
         for constant in ("NaN", "Infinity", "-Infinity"):
             with self.subTest(constant=constant):
                 path.write_text(
-                    (REPO_ROOT / PLUGIN / ".codex-plugin/plugin.json")
+                    (REPO_ROOT / PLUGIN / "plugin.json")
                     .read_text()
                     .replace('"version":', f'"probe": {constant}, "version":', 1)
                 )
                 self.assert_rejected("non-finite JSON value")
 
     def test_rejects_exponent_overflow_json_at_any_boundary(self) -> None:
-        path = self.plugin / ".codex-plugin/plugin.json"
+        path = self.plugin / "plugin.json"
         path.write_text(
-            (REPO_ROOT / PLUGIN / ".codex-plugin/plugin.json")
+            (REPO_ROOT / PLUGIN / "plugin.json")
             .read_text()
             .replace('"version":', '"probe": 1e999, "version":', 1)
         )
@@ -200,12 +243,12 @@ class ValidateMergecraftTests(unittest.TestCase):
         path.write_text(path.read_text() + "\nprobe: .nan\n")
         self.assert_rejected("non-finite YAML value")
 
-    def test_rejects_unpaired_manifest_versions(self) -> None:
-        path = self.plugin / ".codex-plugin/plugin.json"
+    def test_rejects_manifest_projection_version_drift(self) -> None:
+        path = self.plugin / ".claude-plugin/plugin.json"
         value = json.loads(path.read_text())
-        value["version"] = "1.0.0+codex.20260720145400"
-        self.write_json(".codex-plugin/plugin.json", value)
-        self.assert_rejected("manifest versions are not paired")
+        value["version"] = "1.0.1"
+        self.write_json(".claude-plugin/plugin.json", value)
+        self.assert_rejected("Claude manifest projection drift: version")
 
     def test_rejects_unnamespaced_codex_prompt(self) -> None:
         path = self.plugin / "skills/graphite/agents/openai.yaml"
@@ -825,7 +868,7 @@ class ValidateMergecraftTests(unittest.TestCase):
         path.write_text(
             path.read_text().replace("../publishing-reviewable-prs", "../missing")
         )
-        self.assert_rejected("broken relative link")
+        self.assert_rejected("Agent Skill resource is missing")
 
     def test_rejects_private_or_personal_content(self) -> None:
         path = self.plugin / "skills/graphite/SKILL.md"
@@ -954,7 +997,9 @@ class ValidateMergecraftTests(unittest.TestCase):
     def test_rejects_missing_concrete_atlas_visual_budget(self) -> None:
         path = (
             self.plugin
-            / "skills/writing-reviewable-pr-descriptions/review-atlas-reference-design.md"
+            / "skills"
+            / "writing-reviewable-pr-descriptions"
+            / "review-atlas-reference-design.md"
         )
         path.write_text(
             path.read_text().replace(
@@ -967,7 +1012,10 @@ class ValidateMergecraftTests(unittest.TestCase):
         writer = self.plugin / "skills/writing-reviewable-pr-descriptions/SKILL.md"
         original = writer.read_text()
         weakened = original.replace(
-            "Keep atlas source,\ntests, docs, manifests, and generated assets outside application repositories.",
+            (
+                "Keep atlas source,\ntests, docs, manifests, and generated assets "
+                "outside application repositories."
+            ),
             "Keep atlas assets available.",
         )
         self.assertNotEqual(weakened, original)
@@ -1074,6 +1122,27 @@ class ValidateMergecraftTests(unittest.TestCase):
             helper.read_text().replace('"final_audit_command"', '"audit_command"')
         )
         self.assert_rejected("Graphite helper contract missing")
+
+    def test_rejects_required_review_consumer_contract_drift(self) -> None:
+        consumer = (
+            self.plugin / "skills/publishing-reviewable-prs/scripts/required_review.py"
+        )
+        original = consumer.read_text()
+        mutations = (
+            (
+                'PRODUCER_ID = "tricritical-review-loop-v2"',
+                'PRODUCER_ID = "untrusted-review-loop-v1"',
+            ),
+            (
+                "canonical Task Witness supervisor requires its closed internal "
+                "call shape",
+                "canonical Task Witness supervisor accepts an open call shape",
+            ),
+        )
+        for old, new in mutations:
+            with self.subTest(term=old):
+                consumer.write_text(original.replace(old, new))
+                self.assert_rejected("publisher required-review contract missing")
 
     def test_rejects_feedback_head_repository_contract_drift(self) -> None:
         state = (

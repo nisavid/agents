@@ -24,19 +24,6 @@ from change_navigation.review_input import (  # noqa: E402
     load_review_input,
 )
 from change_navigation.sensitive_content import suspected_secret_error  # noqa: E402
-
-from reviewable_pr_state import (  # noqa: E402
-    ExpectedIdentity,
-    MutationAmbiguousError,
-    PublicationError,
-    github_repository,
-    identity_matches,
-    run_mutation as _run_mutation,
-    run_read as _run_read,
-    state_matches,
-    stored_pr as _stored_pr,
-    validate_identity_inputs,
-)
 from publication_receipts import (  # noqa: E402
     LedgerLease,
     load_receipts,
@@ -47,7 +34,34 @@ from publication_receipts import (  # noqa: E402
     resolve_receipt_root,
     verified_transition,
 )
-
+from required_review import (  # noqa: E402
+    PublicationCandidate,
+    validate_review_input_binding,
+)
+from required_review import (  # noqa: E402
+    build_candidate as _build_candidate,
+)
+from required_review import (  # noqa: E402
+    validate_required_review as _validate_required_review,
+)
+from reviewable_pr_state import (  # noqa: E402
+    ExpectedIdentity,
+    MutationAmbiguousError,
+    PublicationError,
+    github_repository,
+    identity_matches,
+    state_matches,
+    validate_identity_inputs,
+)
+from reviewable_pr_state import (  # noqa: E402
+    run_mutation as _run_mutation,
+)
+from reviewable_pr_state import (  # noqa: E402
+    run_read as _run_read,
+)
+from reviewable_pr_state import (  # noqa: E402
+    stored_pr as _stored_pr,
+)
 
 VALIDATOR = WRITER_SCRIPTS / "validate_change_navigation.py"
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
@@ -57,34 +71,36 @@ def _digest(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-def _read_body(path: Path) -> str:
+def _read_body(path: Path) -> tuple[str, bytes]:
     if not path.is_absolute():
         raise PublicationError("body file path must be absolute")
     try:
-        body = path.read_text(encoding="utf-8")
-    except OSError as error:
+        raw = path.read_bytes()
+        body = raw.decode("utf-8")
+    except (OSError, UnicodeDecodeError) as error:
         raise PublicationError(f"cannot read body file: {error}") from error
     if suspected_secret_error(body) is not None:
         raise PublicationError(
             "PR body contains a suspected credential or secret; publication is blocked"
         )
-    return body
+    return body, raw
 
 
 def _read_body_source(
     *, body_path: Path | None, template_path: Path | None, pr_number: int
-) -> tuple[str, str | None]:
+) -> tuple[str, str | None, bytes, str]:
     if (body_path is None) == (template_path is None):
         raise PublicationError(
             "provide exactly one of body file or new-PR body template"
         )
     if body_path is not None:
-        return _read_body(body_path), None
+        body, raw = _read_body(body_path)
+        return body, None, raw, "body"
     assert template_path is not None
-    template = _read_body(template_path)
+    template, raw = _read_body(template_path)
     if PR_NUMBER_TOKEN not in template:
         raise PublicationError(f"body template must contain {PR_NUMBER_TOKEN}")
-    return template.replace(PR_NUMBER_TOKEN, str(pr_number)), template
+    return template.replace(PR_NUMBER_TOKEN, str(pr_number)), template, raw, "template"
 
 
 def _reject_secret_text(*values: str) -> None:
@@ -206,6 +222,10 @@ def _update_text_locked(
     text_scope: str,
     receipt_root: Path,
     lease: LedgerLease,
+    candidate: PublicationCandidate,
+    review_mode: str,
+    review_bundle_root: Path | None,
+    selected_specialists: list[str],
 ) -> dict[str, Any]:
     before = _preflight(
         expected=expected,
@@ -232,6 +252,28 @@ def _update_text_locked(
         str(before["body"]),
         template_body,
     )
+    validate_review_input_binding(
+        candidate,
+        review_input_schema_version,
+        review_input_sha256,
+        review_input_path,
+    )
+    review = _validate_required_review(
+        review_mode=review_mode,
+        review_bundle_root=review_bundle_root,
+        candidate=candidate,
+    )
+    final_before = before
+    if review.mode == "required":
+        final_before = _preflight(
+            expected=expected,
+            expected_title_sha256=expected_title_sha256,
+            expected_body_sha256=expected_body_sha256,
+            expected_draft=expected_draft,
+        )
+    if final_before != before:
+        raise PublicationError("PR state changed during required-review validation")
+    before = final_before
     command_error: PublicationError | None = None
     with _write_temporary_body(body) as body_file:
         try:
@@ -276,6 +318,8 @@ def _update_text_locked(
             final_reread=after,
             review_input_schema_version=review_input_schema_version,
             review_input_sha256=review_input_sha256,
+            review=review,
+            candidate=candidate,
         )
         record_verified_publication(
             root=receipt_root, transition=transition, lease=lease
@@ -296,6 +340,9 @@ def _mark_ready_locked(
     review_input_path: Path,
     receipt_root: Path,
     lease: LedgerLease,
+    review_mode: str,
+    review_bundle_root: Path | None,
+    selected_specialists: list[str],
 ) -> dict[str, Any]:
     before = _preflight(
         expected=expected,
@@ -313,6 +360,46 @@ def _mark_ready_locked(
         str(before["title"]),
         str(before["body"]),
     )
+    candidate = _build_candidate(
+        operation="mark-ready",
+        repository=expected.repository,
+        pr_number=expected.pr_number,
+        base=expected.base,
+        base_oid=expected.base_oid,
+        head=expected.head,
+        head_oid=expected.head_oid,
+        head_owner=expected.head_owner,
+        head_repository=expected.head_repository,
+        title=title,
+        body_source_kind="stored-body",
+        body_source_raw=body.encode("utf-8"),
+        published_body=body,
+        review_input_path=review_input_path,
+        review_mode=review_mode,
+        selected_specialists=selected_specialists,
+    )
+    validate_review_input_binding(
+        candidate,
+        review_input_schema_version,
+        review_input_sha256,
+        review_input_path,
+    )
+    review = _validate_required_review(
+        review_mode=review_mode,
+        review_bundle_root=review_bundle_root,
+        candidate=candidate,
+    )
+    final_before = before
+    if review.mode == "required":
+        final_before = _preflight(
+            expected=expected,
+            expected_title_sha256=expected_title_sha256,
+            expected_body_sha256=expected_body_sha256,
+            expected_draft=True,
+        )
+    if final_before != before:
+        raise PublicationError("PR state changed during required-review validation")
+    before = final_before
     command_error: PublicationError | None = None
     try:
         _run_mutation(
@@ -346,6 +433,8 @@ def _mark_ready_locked(
             final_reread=after,
             review_input_schema_version=review_input_schema_version,
             review_input_sha256=review_input_sha256,
+            review=review,
+            candidate=candidate,
         )
         record_verified_publication(
             root=receipt_root, transition=transition, lease=lease
@@ -368,17 +457,38 @@ def update_text(
     body_path: Path | None = None,
     body_template_path: Path | None = None,
     review_input_path: Path,
+    review_mode: str,
+    review_bundle_root: Path | None,
+    selected_specialists: list[str],
     text_scope: str = "title-body",
     receipt_directory: Path | None = None,
 ) -> dict[str, Any]:
     if not title.strip():
         raise PublicationError("title must be non-empty")
-    body, template_body = _read_body_source(
+    body, template_body, body_source_raw, body_source_kind = _read_body_source(
         body_path=body_path,
         template_path=body_template_path,
         pr_number=expected.pr_number,
     )
     _reject_secret_text(title, body)
+    candidate = _build_candidate(
+        operation="update-text",
+        repository=expected.repository,
+        pr_number=expected.pr_number,
+        base=expected.base,
+        base_oid=expected.base_oid,
+        head=expected.head,
+        head_oid=expected.head_oid,
+        head_owner=expected.head_owner,
+        head_repository=expected.head_repository,
+        title=title,
+        body_source_kind=body_source_kind,
+        body_source_raw=body_source_raw,
+        published_body=body,
+        review_input_path=review_input_path,
+        review_mode=review_mode,
+        selected_specialists=selected_specialists,
+    )
     validation_arguments = (
         body,
         expected.repository,
@@ -421,6 +531,10 @@ def update_text(
             text_scope=text_scope,
             receipt_root=receipt_root,
             lease=lease,
+            candidate=candidate,
+            review_mode=review_mode,
+            review_bundle_root=review_bundle_root,
+            selected_specialists=selected_specialists,
         )
 
 
@@ -430,6 +544,9 @@ def mark_ready(
     expected_title_sha256: str,
     expected_body_sha256: str,
     review_input_path: Path,
+    review_mode: str,
+    review_bundle_root: Path | None,
+    selected_specialists: list[str],
     receipt_directory: Path | None = None,
 ) -> dict[str, Any]:
     validated = _preflight(
@@ -453,6 +570,9 @@ def mark_ready(
             review_input_path=review_input_path,
             receipt_root=receipt_root,
             lease=lease,
+            review_mode=review_mode,
+            review_bundle_root=review_bundle_root,
+            selected_specialists=selected_specialists,
         )
 
 
@@ -491,6 +611,15 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--expected-title-sha256", required=True)
     parser.add_argument("--expected-body-sha256", required=True)
     parser.add_argument("--review-input", required=True, type=Path)
+    parser.add_argument(
+        "--review-mode", choices=("required", "not-required"), required=True
+    )
+    parser.add_argument("--review-bundle", type=Path)
+    parser.add_argument(
+        "--selected-specialists",
+        required=True,
+        help="sorted unique specialist names as a JSON array; use [] for none",
+    )
 
 
 def main() -> int:
@@ -514,6 +643,12 @@ def main() -> int:
     _add_common(ready_parser)
     args = parser.parse_args()
     try:
+        try:
+            selected_specialists = json.loads(args.selected_specialists)
+        except json.JSONDecodeError as error:
+            raise PublicationError(
+                "selected review specialists must be a JSON array"
+            ) from error
         expected = _expected(args)
         if args.operation == "text":
             stored = update_text(
@@ -525,6 +660,9 @@ def main() -> int:
                 body_path=args.body_file,
                 body_template_path=args.body_template,
                 review_input_path=args.review_input,
+                review_mode=args.review_mode,
+                review_bundle_root=args.review_bundle,
+                selected_specialists=selected_specialists,
                 text_scope=args.text_scope,
                 receipt_directory=None,
             )
@@ -534,6 +672,9 @@ def main() -> int:
                 expected_title_sha256=args.expected_title_sha256,
                 expected_body_sha256=args.expected_body_sha256,
                 review_input_path=args.review_input,
+                review_mode=args.review_mode,
+                review_bundle_root=args.review_bundle,
+                selected_specialists=selected_specialists,
                 receipt_directory=None,
             )
     except PublicationError as error:

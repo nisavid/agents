@@ -1,7 +1,7 @@
 {
   "name": "rolecasting",
   "displayName": "Rolecasting",
-  "version": "1.0.0+claude.20260720121200",
+  "version": "1.0.0",
   "description": "Rolecasting: portable model selection and delegation topology for agent work.",
   "author": {
     "name": "Ivan D Vasin",

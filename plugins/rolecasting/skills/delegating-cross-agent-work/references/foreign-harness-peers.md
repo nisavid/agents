@@ -1,12 +1,39 @@
-# Foreign-Harness Peers
+# Surface And Peer Qualification
 
-Read this reference only after selecting a foreign-harness peer.
+Read this reference after selecting a non-native, separately owned, or
+foreign-harness peer. Surface support is portable policy; it is not evidence
+issuance. Every real dispatch still requires qualification of the exact family,
+surface, version, executor, transport, and assurance source.
+
+## Planned surfaces
+
+| Order | Product surfaces | Qualification state |
+| --- | --- | --- |
+| Initial | ChatGPT Codex; Codex CLI/TUI | Supported separately for ordinary delegation; publication-grade issuance pending |
+| Fast follow | Claude Code; Claude Desktop | Separate paired surfaces; real qualification pending |
+| Next | Cursor; Cursor Agent | Qualify together or in close succession |
+
+ChatGPT Codex and Codex CLI/TUI have separate initial native-child adapter
+profiles. Follow
+[native-codex-subagents.md](native-codex-subagents.md) for their shared
+freeze, native invocation, and post-result recording sequence. This is
+operational skill support, not a registered evidence issuer.
+
+Do not collapse a paired product into one execution surface. ChatGPT Codex and
+Codex CLI/TUI require separate probes. Claude Code and Claude Desktop require
+separate probes. Cursor and Cursor Agent require separate probes. An
+`app-server` transport does not imply an `external` relationship; classify the
+control boundary independently.
 
 Before dispatch, probe the installed surface:
 
-- Cursor Agent: `agent --version`; `agent --help`
-- Claude Code: `claude --version`; `claude --help`; `claude agents --help`
-- Codex: `codex --version`; `codex exec --help`; inspect current tool schemas
+- ChatGPT Codex: inspect the current native tool or task API schema.
+- Codex CLI/TUI: `codex --version`; `codex exec --help`; inspect current tool
+  schemas and `app-server` help only when that transport is selected.
+- Claude Code: `claude --version`; `claude --help`; inspect current tool schemas.
+- Claude Desktop: inspect its current native or app-server schema.
+- Cursor: inspect its current native surface schema.
+- Cursor Agent: `agent --version`; `agent --help`.
 
 Trust local help and schemas over memory. A probe fails when the executable is
 absent, it exits nonzero, its output is malformed or unparseable, or the surface

@@ -2,6 +2,8 @@
 
 ## 1.0.0 - 2026-07-22
 
+- Adopt Agent Plugins v1 as the canonical package, retain the Claude adapter,
+  and project shared contracts into each consuming portable skill.
 - Add independent read-only clearance, explicit adoption, and policy-bound
   maintenance skills.
 - Add a permanent manual invocation envelope with thin Codex/ChatGPT, Claude

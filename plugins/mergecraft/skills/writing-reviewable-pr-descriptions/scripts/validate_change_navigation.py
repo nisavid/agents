@@ -263,10 +263,10 @@ def validate(
     git_repository: Path | None = None,
 ) -> list[str]:
     """Validate publishable review text against its immutable review input."""
-    errors = _validate_markup(body, expected_repository, expected_pr)
     secret_error = suspected_secret_error(body)
     if secret_error is not None:
-        errors.append(secret_error)
+        return [secret_error]
+    errors = _validate_markup(body, expected_repository, expected_pr)
     blocks = extract_leading_details(body.splitlines())
     if not title.strip():
         errors.append("candidate title is empty")
@@ -326,6 +326,9 @@ def main() -> int:
     )
     if errors:
         for error in errors:
+            # Secret-shaped bodies return before validation; only diagnostics from
+            # non-secret input can reach this sink.
+            # codeql[py/clear-text-logging-sensitive-data]
             print(f"ERROR: {error}", file=sys.stderr)
         return 1
     print("Change navigation is valid")

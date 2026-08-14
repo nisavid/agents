@@ -91,6 +91,8 @@ def json_file_bytes(value: Any) -> bytes:
 
 
 def digest_bytes(content: bytes) -> str:
+    # This is a content identity for evidence binding, not password verification.
+    # codeql[py/weak-sensitive-data-hashing]
     return "sha256:" + hashlib.sha256(content).hexdigest()
 
 

@@ -8,10 +8,20 @@ import tempfile
 import unittest
 from pathlib import Path
 
-
 REPOSITORY = Path(__file__).resolve().parents[1]
 VALIDATOR = REPOSITORY / "scripts" / "validate_artifact_customs.py"
 PLUGIN_ROOT = REPOSITORY / "plugins" / "artifact-customs"
+AGENT_PLUGIN_SCHEMA = "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json"
+CANONICAL_IDENTITY_FIELDS = {
+    "name",
+    "version",
+    "description",
+    "author",
+    "homepage",
+    "repository",
+    "license",
+    "keywords",
+}
 SKILLS = (
     "assessing-third-party-components",
     "adopting-third-party-components",
@@ -46,15 +56,31 @@ EXPECTED_EXTERNAL_CALLS = {
 }
 REQUIRED_RUNTIME_FILES = {
     ".claude-plugin/plugin.json",
-    ".codex-plugin/plugin.json",
     "CHANGELOG.md",
     "LICENSE",
     "README.md",
+    "plugin.json",
     "topology.json",
     "references/invocation-envelope.json",
     "references/scheduler-adapters.json",
     *(f"skills/{skill}/SKILL.md" for skill in SKILLS),
     *(f"skills/{skill}/agents/openai.yaml" for skill in SKILLS),
+}
+EXPECTED_SKILL_REFERENCES = {
+    "assessing-third-party-components": {
+        "component-clearance-contract.md",
+        "component-policy-contract.md",
+    },
+    "adopting-third-party-components": {
+        "component-clearance-contract.md",
+        "component-policy-contract.md",
+    },
+    "maintaining-third-party-components": {
+        "component-clearance-contract.md",
+        "component-policy-contract.md",
+        "invocation-envelope.json",
+        "scheduler-adapters.json",
+    },
 }
 
 
@@ -151,12 +177,54 @@ class ArtifactCustomsExactContractTests(unittest.TestCase):
             )
         )
 
-    def test_manifests_expose_exact_three_namespaced_prompts(self) -> None:
-        codex = self.load_json(".codex-plugin/plugin.json")
+    def test_uses_canonical_agent_plugins_v1_manifest_and_skill_local_resources(
+        self,
+    ) -> None:
+        canonical = self.load_json("plugin.json")
         claude = self.load_json(".claude-plugin/plugin.json")
-        self.assertEqual(codex["name"], "artifact-customs")
+
+        self.assertEqual(canonical["$schema"], AGENT_PLUGIN_SCHEMA)
+        self.assertEqual(canonical["name"], "artifact-customs")
+        self.assertEqual(canonical["version"], "1.0.0")
+        self.assertEqual(set(canonical["extensions"]), {"com.openai"})
+        self.assertEqual(set(canonical["extensions"]["com.openai"]), {"interface"})
+        self.assertFalse((self.plugin / ".codex-plugin").exists())
+        self.assertEqual(set(claude), CANONICAL_IDENTITY_FIELDS | {"displayName"})
+        self.assertEqual(claude["displayName"], "Artifact Customs")
+        self.assertEqual(
+            {field: claude[field] for field in CANONICAL_IDENTITY_FIELDS},
+            {field: canonical[field] for field in CANONICAL_IDENTITY_FIELDS},
+        )
+        self.assertEqual(
+            sorted(
+                path.name
+                for path in (self.plugin / "skills").iterdir()
+                if path.is_dir() and (path / "SKILL.md").is_file()
+            ),
+            sorted(SKILLS),
+        )
+        for skill, references in EXPECTED_SKILL_REFERENCES.items():
+            descriptor = (self.plugin / "skills" / skill / "SKILL.md").read_text(
+                encoding="utf-8"
+            )
+            projected = self.plugin / "skills" / skill / "references"
+            self.assertEqual(
+                {path.name for path in projected.iterdir() if path.is_file()},
+                references,
+            )
+            for reference in references:
+                self.assertIn(f"(references/{reference})", descriptor)
+                self.assertEqual(
+                    (projected / reference).read_bytes(),
+                    (self.plugin / "references" / reference).read_bytes(),
+                )
+
+    def test_manifests_expose_exact_three_namespaced_prompts(self) -> None:
+        canonical = self.load_json("plugin.json")
+        claude = self.load_json(".claude-plugin/plugin.json")
+        self.assertEqual(canonical["name"], "artifact-customs")
         self.assertEqual(claude["name"], "artifact-customs")
-        prompts = codex["interface"]["defaultPrompt"]
+        prompts = canonical["extensions"]["com.openai"]["interface"]["defaultPrompt"]
         self.assertEqual(len(prompts), len(SKILLS))
         self.assertEqual(
             {
@@ -172,6 +240,35 @@ class ArtifactCustomsExactContractTests(unittest.TestCase):
                 self.plugin / "skills" / skill / "agents" / "openai.yaml"
             ).read_text(encoding="utf-8")
             self.assertIn(f"$artifact-customs:{skill}", interface)
+
+    def test_validator_rejects_manifest_projection_and_skill_resource_drift(
+        self,
+    ) -> None:
+        claude = self.load_json(".claude-plugin/plugin.json")
+        claude["version"] = "1.0.1"
+        self.write_json(".claude-plugin/plugin.json", claude)
+        self.assert_rejected("Claude manifest projection drift", source_stage=True)
+
+        shutil.copy2(
+            REPOSITORY
+            / "plugins"
+            / "artifact-customs"
+            / ".claude-plugin"
+            / "plugin.json",
+            self.plugin / ".claude-plugin" / "plugin.json",
+        )
+        projection = (
+            self.plugin
+            / "skills"
+            / "maintaining-third-party-components"
+            / "references"
+            / "invocation-envelope.json"
+        )
+        projection.write_text(
+            projection.read_text(encoding="utf-8") + "\n",
+            encoding="utf-8",
+        )
+        self.assert_rejected("skill reference projection drift", source_stage=True)
 
     def test_topology_separates_assessment_adoption_and_maintenance_authority(
         self,

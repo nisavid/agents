@@ -4,6 +4,14 @@ Artifact Customs governs inbound third-party software components from first
 clearance through retirement. It treats every component as an exact external
 identity or byte sequence crossing a declared trust boundary.
 
+The root `plugin.json` is the canonical Agent Plugins v1 package identity.
+Codex reads its `com.openai` interface extension and the standard skills;
+Claude Code uses the `.claude-plugin/plugin.json` identity projection and the
+same skills. Each skill carries ordinary local projections of the shared
+contracts it reads so standard clients do not depend on package-sibling access.
+Release validation requires every projection to match its single authored
+package-level source byte for byte.
+
 The plugin has three public skills:
 
 - `assessing-third-party-components` freezes and evaluates a candidate without

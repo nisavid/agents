@@ -22,6 +22,17 @@ EVAL_ROOT = Path("evals/versionkeeping")
 CHECKPOINT_EVAL_ROOT = EVAL_ROOT / "skills/checkpointing-and-publishing-git-work"
 CONFLICT_ROOT = Path("plugins/versionkeeping/skills/resolving-merge-conflicts")
 CONTENT_LOCK = Path("release/plugin-content-locks/versionkeeping.json")
+AGENT_PLUGIN_SCHEMA = "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json"
+CANONICAL_IDENTITY_FIELDS = (
+    "name",
+    "version",
+    "description",
+    "author",
+    "homepage",
+    "repository",
+    "license",
+    "keywords",
+)
 
 
 class ValidateVersionkeepingTests(unittest.TestCase):
@@ -58,6 +69,37 @@ class ValidateVersionkeepingTests(unittest.TestCase):
     def test_accepts_current_contract(self) -> None:
         result = self.validate()
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_uses_canonical_agent_plugins_v1_manifest_and_discovery(self) -> None:
+        plugin = self.repo / "plugins/versionkeeping"
+        canonical = json.loads((plugin / "plugin.json").read_text())
+        topology = json.loads((plugin / "topology.json").read_text())
+
+        self.assertEqual(canonical["$schema"], AGENT_PLUGIN_SCHEMA)
+        self.assertEqual(canonical["name"], "versionkeeping")
+        self.assertEqual(canonical["version"], "1.0.0")
+        self.assertEqual(set(canonical["extensions"]), {"com.openai"})
+        self.assertEqual(set(canonical["extensions"]["com.openai"]), {"interface"})
+        self.assertFalse((plugin / ".codex-plugin").exists())
+        self.assertEqual(
+            sorted(
+                path.name
+                for path in (plugin / "skills").iterdir()
+                if path.is_dir() and (path / "SKILL.md").is_file()
+            ),
+            sorted(component["name"] for component in topology["skills"]),
+        )
+
+    def test_claude_manifest_is_exact_canonical_projection(self) -> None:
+        plugin = self.repo / "plugins/versionkeeping"
+        canonical = json.loads((plugin / "plugin.json").read_text())
+        claude = json.loads((plugin / ".claude-plugin" / "plugin.json").read_text())
+        self.assertEqual(set(claude), set(CANONICAL_IDENTITY_FIELDS) | {"displayName"})
+        self.assertEqual(claude["displayName"], "Versionkeeping")
+        self.assertEqual(
+            {field: claude[field] for field in CANONICAL_IDENTITY_FIELDS},
+            {field: canonical[field] for field in CANONICAL_IDENTITY_FIELDS},
+        )
 
     def test_requires_dirty_direct_worktree_quarantine_and_retention_contract(
         self,
@@ -902,9 +944,9 @@ class ValidateVersionkeepingTests(unittest.TestCase):
         self.assert_rejected("plugin root file inventory drift")
 
     def test_rejects_adapter_prompt_without_namespace(self) -> None:
-        path = self.repo / "plugins/versionkeeping/.codex-plugin/plugin.json"
+        path = self.repo / "plugins/versionkeeping/plugin.json"
         manifest = json.loads(path.read_text())
-        manifest["interface"]["defaultPrompt"][0] = (
+        manifest["extensions"]["com.openai"]["interface"]["defaultPrompt"][0] = (
             "Use $checkpointing-and-publishing-git-work."
         )
         path.write_text(json.dumps(manifest, indent=2) + "\n")

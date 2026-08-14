@@ -11,8 +11,8 @@ Own read-only candidate clearance. Never edit source, manifests, locks, policy,
 refs, pull requests, reviews, or installations. A caller that may later mutate
 must supply its own authority and rebind the exact candidate before writing.
 
-Read and apply [the component clearance contract](../../references/component-clearance-contract.md).
-Read [the component policy contract](../../references/component-policy-contract.md)
+Read and apply [the component clearance contract](references/component-clearance-contract.md).
+Read [the component policy contract](references/component-policy-contract.md)
 when a policy is supplied or the assessment is intended for adoption or
 maintenance.
 

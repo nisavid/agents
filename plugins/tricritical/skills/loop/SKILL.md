@@ -11,6 +11,9 @@ Read and apply [the shared invocation boundary](../../references/invocation-boun
 
 Read and apply [the portable operator-choice contract](references/operator-choice.md) before offering any extension.
 
+When producing or consuming a retained terminal bundle, read and apply
+[the terminal review-evidence contract](references/review-evidence.md).
+
 `loop` is Tricritical's sole repetition owner. At freeze, record risk: `low` only
 when size, complexity, and consequence are low; `high` when any is high;
 otherwise `ordinary`. Default revised-successor tranches are 2, 3, and 5.

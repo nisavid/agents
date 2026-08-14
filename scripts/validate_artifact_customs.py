@@ -13,6 +13,15 @@ import stat
 import sys
 from pathlib import Path
 
+SCRIPT_DIRECTORY = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIRECTORY))
+
+from agent_plugins_standard import (  # noqa: E402
+    AgentPluginContractError,
+    discover_direct_skills,
+    load_agent_plugin_manifest,
+    validate_skill_resource_links,
+)
 
 PLUGIN_RELATIVE = Path("plugins/artifact-customs")
 CONTENT_LOCK_RELATIVE = Path("release/plugin-content-locks/artifact-customs.json")
@@ -23,10 +32,10 @@ PUBLIC_SKILLS = (
 )
 ROOT_FILES = {
     ".claude-plugin/plugin.json",
-    ".codex-plugin/plugin.json",
     "CHANGELOG.md",
     "LICENSE",
     "README.md",
+    "plugin.json",
     "topology.json",
     "references/component-clearance-contract.md",
     "references/component-policy-contract.md",
@@ -34,6 +43,22 @@ ROOT_FILES = {
     "references/scheduler-adapters.json",
 }
 SKILL_FILES = {"SKILL.md", "agents/openai.yaml"}
+SKILL_REFERENCES = {
+    "assessing-third-party-components": {
+        "component-clearance-contract.md",
+        "component-policy-contract.md",
+    },
+    "adopting-third-party-components": {
+        "component-clearance-contract.md",
+        "component-policy-contract.md",
+    },
+    "maintaining-third-party-components": {
+        "component-clearance-contract.md",
+        "component-policy-contract.md",
+        "invocation-envelope.json",
+        "scheduler-adapters.json",
+    },
+}
 OUTWARD_PLUGINS = ("rolecasting", "tricritical", "versionkeeping", "mergecraft")
 PHASE7_CONTROL_PROJECTION = (
     "rolecasting",
@@ -348,6 +373,11 @@ def validate_inventory(root: Path, files: dict[str, Path]) -> None:
         for skill in PUBLIC_SKILLS
         for relative in SKILL_FILES
     }
+    expected |= {
+        f"skills/{skill}/references/{reference}"
+        for skill, references in SKILL_REFERENCES.items()
+        for reference in references
+    }
     require(set(files) == expected, "skill inventory drift")
     skill_directories = {
         path.name
@@ -367,19 +397,42 @@ def validate_portability(files: dict[str, Path]) -> None:
 
 
 def validate_manifests(root: Path) -> None:
+    canonical = load_agent_plugin_manifest(root)
     claude = strict_json(read(root, ".claude-plugin/plugin.json"), "Claude manifest")
-    codex = strict_json(read(root, ".codex-plugin/plugin.json"), "Codex manifest")
+    identity_fields = {
+        "name",
+        "version",
+        "description",
+        "author",
+        "homepage",
+        "repository",
+        "license",
+        "keywords",
+    }
     require(
-        isinstance(claude, dict) and claude.get("name") == "artifact-customs",
-        "Claude manifest identity drift",
+        set(canonical) == identity_fields | {"$schema", "extensions"}
+        and canonical["name"] == "artifact-customs"
+        and canonical["version"] == "1.0.0",
+        "canonical Agent Plugin manifest drift",
     )
     require(
-        isinstance(codex, dict)
-        and codex.get("name") == "artifact-customs"
-        and codex.get("skills") == "./skills/",
-        "Codex manifest identity drift",
+        isinstance(claude, dict)
+        and set(claude) == identity_fields | {"displayName"}
+        and claude["displayName"] == "Artifact Customs"
+        and all(claude[field] == canonical[field] for field in identity_fields),
+        "Claude manifest projection drift",
     )
-    interface = codex.get("interface")
+    extensions = canonical["extensions"]
+    require(
+        isinstance(extensions, dict) and set(extensions) == {"com.openai"},
+        "canonical Agent Plugin extension inventory drift",
+    )
+    openai = extensions["com.openai"]
+    require(
+        isinstance(openai, dict) and set(openai) == {"interface"},
+        "Codex extension keys drift",
+    )
+    interface = openai["interface"]
     prompts = interface.get("defaultPrompt") if isinstance(interface, dict) else None
     require(
         isinstance(prompts, list) and len(prompts) == len(PUBLIC_SKILLS),
@@ -396,12 +449,29 @@ def validate_manifests(root: Path) -> None:
         observed == {f"$artifact-customs:{skill}" for skill in PUBLIC_SKILLS},
         "manifest prompt inventory drift",
     )
+    discovered = discover_direct_skills(root)
+    require(
+        discovered == tuple(sorted(PUBLIC_SKILLS)),
+        "Agent Plugins direct-child skill inventory drift",
+    )
+    validate_skill_resource_links(root, discovered)
     for skill in PUBLIC_SKILLS:
         require(
             f"$artifact-customs:{skill}"
             in read(root, f"skills/{skill}/agents/openai.yaml"),
             f"skill interface drift: {skill}",
         )
+
+
+def validate_reference_projections(root: Path) -> None:
+    for skill, references in SKILL_REFERENCES.items():
+        for reference in references:
+            authored = root / "references" / reference
+            projection = root / "skills" / skill / "references" / reference
+            require(
+                projection.read_bytes() == authored.read_bytes(),
+                f"skill reference projection drift: {skill}/{reference}",
+            )
 
 
 def validate_topology(root: Path) -> None:
@@ -564,6 +634,7 @@ def validate(repository: Path, *, source_stage: bool) -> str:
     validate_manifests(root)
     validate_topology(root)
     validate_references(root)
+    validate_reference_projections(root)
     validate_content_lock(repository, files)
     return validation_stage
 
@@ -579,7 +650,13 @@ def main(argv: list[str] | None = None) -> int:
         if arguments.write_content_lock:
             write_content_lock(repository)
         validation_stage = validate(repository, source_stage=arguments.source_stage)
-    except (ContractError, OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+    except (
+        AgentPluginContractError,
+        ContractError,
+        OSError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+    ) as error:
         print(f"Artifact Customs contract failed: {error}", file=sys.stderr)
         return 1
     print(f"Artifact Customs {validation_stage} contract passed")

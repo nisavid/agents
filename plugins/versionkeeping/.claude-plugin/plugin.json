@@ -1,7 +1,7 @@
 {
   "name": "versionkeeping",
   "displayName": "Versionkeeping",
-  "version": "1.0.0+claude.20260720120700",
+  "version": "1.0.0",
   "description": "Versionkeeping: safe Git checkpoints, conflict resolution, exact-lease publication, provenance-aware worktree cleanup, and history-preserving fork sync.",
   "author": {
     "name": "Ivan D Vasin",

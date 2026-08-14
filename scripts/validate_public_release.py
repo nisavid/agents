@@ -3,6 +3,19 @@
 
 from __future__ import annotations
 
+import sys
+
+if __name__ == "__main__" and (
+    sys.implementation.name != "cpython"
+    or sys.version_info < (3, 13)
+    or not sys.flags.isolated
+    or not sys.flags.dont_write_bytecode
+):
+    raise SystemExit(
+        "validate_public_release.py must run with CPython 3.13+ and Python -I -B; "
+        "the proof boundary begins at isolated interpreter startup"
+    )
+
 import argparse
 import contextlib
 import hashlib
@@ -16,31 +29,25 @@ import secrets
 import shutil
 import stat
 import subprocess
-import sys
 import tarfile
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
+from types import MappingProxyType, ModuleType
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-if str(SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPT_DIR))
-
-from evidence_transport import (
-    candidate_content_identity,
-)
-from phase7_compatibility_projection import compatibility_bytes
-from phase7_private_evidence_isolation import (
-    IsolationError,
-    validate_public_release_backend_evidence,
-    validate_runtime_backend_release_evidence,
-)
-from private_phase7_evidence import (
-    CHECK_ORDER,
-    ROLE_ORDER,
-    PrivateEvidenceError,
-    validate_composed_replay_binding,
-    verify_public_release_evidence,
+_RUNNING_AS_ENTRYPOINT = __name__ == "__main__"
+SOURCE_SHA256 = "1f37e8a27aed32d932a2a58d287b2ac31fb2d8f8448c361c2bb6cc5e40aae6d5"
+PREPARED_SUPERVISOR_SOURCE_OPTION = "--prepared-supervisor-source-sha256"
+MAX_PROOF_SOURCE_BYTES = 2 * 1024 * 1024
+RELEASE_SUPPORT_SOURCES = (
+    ("evidence_transport", "scripts/evidence_transport.py"),
+    ("phase7_compatibility_projection", "scripts/phase7_compatibility_projection.py"),
+    (
+        "phase7_private_evidence_isolation",
+        "scripts/phase7_private_evidence_isolation.py",
+    ),
+    ("private_phase7_evidence", "scripts/private_phase7_evidence.py"),
 )
 
 CONTROL_PLUGINS = ("rolecasting", "versionkeeping", "mergecraft", "tricritical")
@@ -52,16 +59,6 @@ SKILL_PLUGINS = (
     "tricritical",
     "artifact-customs",
 )
-RUNTIME_PACKAGES = ("task-witness",)
-VALIDATED_PLUGINS = SKILL_PLUGINS + RUNTIME_PACKAGES
-MARKETPLACE_PLUGINS = {
-    "tricritical": "./plugins/tricritical",
-    "rolecasting": "./plugins/rolecasting",
-    "versionkeeping": "./plugins/versionkeeping",
-    "mergecraft": "./plugins/mergecraft",
-    "artifact-customs": "./plugins/artifact-customs",
-    "task-witness": "./plugins/task-witness",
-}
 COMMON_SUPPORT_PATHS = {
     ".claude-plugin/marketplace.json",
     "README.md",
@@ -72,7 +69,6 @@ COMMON_SUPPORT_PATHS = {
     "scripts/evidence_transport.py",
     "scripts/phase7_control_plane.py",
     "scripts/phase7_compatibility_projection.py",
-    "scripts/evidence_transport.py",
     "scripts/phase7_private_evidence_backend_contracts.json",
     "scripts/phase7_private_evidence_isolation.py",
     "scripts/phase7_private_evidence_producer.py",
@@ -82,6 +78,7 @@ COMMON_SUPPORT_PATHS = {
     "scripts/run_phase7_composed_matrix.py",
     "scripts/run_phase7_production_integration.py",
     "scripts/run_skill_routing_eval.py",
+    "scripts/agent_plugins_standard.py",
     "tests/test_evidence_transport.py",
     "tests/test_phase7_control_plane.py",
     "tests/test_phase7_compatibility_projection.py",
@@ -92,16 +89,24 @@ COMMON_SUPPORT_PATHS = {
     "tests/test_private_phase7_evidence_v4.py",
     "tests/phase7_v4_fixture.py",
     "tests/fixtures/phase7-v4-compatibility.json",
+    "tests/fixtures/phase7-v5-compatibility.json",
     "tests/test_control_plane_behavior_eval.py",
     "tests/test_skill_routing_eval.py",
+    "tests/test_agent_plugins_standard.py",
     "scripts/validate_public_release.py",
+    "scripts/run_prepared_release_validation.sh",
+    "scripts/supervise_prepared_release_validation.py",
     "scripts/validate_plugin_runtime_roots.py",
     "tests/test_validate_public_release.py",
     "tests/test_validate_plugin_runtime_roots.py",
     "release/plugin-eval-policy.json",
     "release/plugin-eval-baseline-v1.json",
 }
-PLUGIN_SUPPORT_PATHS = {
+SOURCE_STAGE_COMMON_SUPPORT_PATHS = {
+    "release/public-release-runtime-packages.json",
+}
+RELEASE_CONTRACT_SUPPORT_MODULES = ("scripts/agent_plugins_standard.py",)
+BASE_PLUGIN_SUPPORT_PATHS = {
     "rolecasting": {
         "scripts/validate_rolecasting.py",
         "tests/test_validate_rolecasting.py",
@@ -137,13 +142,6 @@ PLUGIN_SUPPORT_PATHS = {
         "evals/artifact-customs",
         "release/plugin-content-locks/artifact-customs.json",
     },
-    "task-witness": {
-        "release/task-witness/source-shape-review.json",
-        "scripts/validate_task_witness.py",
-        "tests/plugins/test_task_witness_launcher.py",
-        "tests/plugins/test_task_witness_runtime.py",
-        "tests/test_task_witness_package.py",
-    },
 }
 PLUGIN_EVAL_POLICY_PATH = "release/plugin-eval-policy.json"
 PLUGIN_EVAL_BASELINE_PATH = "release/plugin-eval-baseline-v1.json"
@@ -152,19 +150,30 @@ BUDGET_METRICS = (
     "invoke_cost_tokens",
     "deferred_cost_tokens",
 )
-VALIDATOR_PATHS = {
+BASE_VALIDATOR_PATHS = {
     "rolecasting": "scripts/validate_rolecasting.py",
     "versionkeeping": "scripts/validate_versionkeeping.py",
     "mergecraft": "scripts/validate_mergecraft.py",
     "tricritical": "scripts/validate_tricritical.py",
     "artifact-customs": "scripts/validate_artifact_customs.py",
-    "task-witness": "scripts/validate_task_witness.py",
 }
-SOURCE_STAGE_VALIDATOR_FLAGS = {
-    **{plugin: () for plugin in VALIDATED_PLUGINS},
+BASE_SOURCE_STAGE_VALIDATOR_FLAGS = {
+    "rolecasting": (),
+    "versionkeeping": (),
     "mergecraft": ("--source-stage",),
+    "tricritical": (),
     "artifact-customs": ("--source-stage",),
 }
+TASK_WITNESS_FINAL_EVIDENCE_OPTIONS = (
+    ("--task-witness-candidate-root", "--candidate-root"),
+    ("--task-witness-release-manifest", "--release-manifest"),
+    ("--task-witness-macos-receipt", "--macos-receipt"),
+    ("--task-witness-linux-receipt", "--linux-receipt"),
+    ("--task-witness-review-evidence", "--review-evidence"),
+)
+TASK_WITNESS_FINAL_VALIDATOR_OPTIONS = tuple(
+    validator_option for _, validator_option in TASK_WITNESS_FINAL_EVIDENCE_OPTIONS
+)
 SHA256 = re.compile(r"sha256:[0-9a-f]{64}$")
 GIT_OID = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 NODE_SEMVER = re.compile(
@@ -189,6 +198,245 @@ class ReleaseError(ValueError):
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise ReleaseError(message)
+
+
+def parse_task_witness_final_evidence(
+    raw_arguments: list[str], parsed_values: tuple[str | None, ...]
+) -> tuple[str, ...] | None:
+    """Bind the exact ordered generic Task Witness evidence grammar."""
+
+    public_options = tuple(
+        public_option for public_option, _ in TASK_WITNESS_FINAL_EVIDENCE_OPTIONS
+    )
+    require(
+        not any(
+            argument.startswith(f"{public_option}=")
+            for argument in raw_arguments
+            for public_option in public_options
+        ),
+        "Task Witness final evidence options require separate operands",
+    )
+    observed_options = tuple(
+        argument for argument in raw_arguments if argument in public_options
+    )
+    if not observed_options:
+        require(
+            all(value is None for value in parsed_values),
+            "Task Witness final evidence grammar drift",
+        )
+        return None
+    require(
+        observed_options == public_options
+        and all(value is not None for value in parsed_values),
+        "Task Witness final evidence options must occur exactly once in order",
+    )
+    return tuple(str(value) for value in parsed_values)
+
+
+def parse_public_candidate_sha256(value: str) -> str:
+    if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise argparse.ArgumentTypeError(
+            "public candidate identity must be bare lowercase 64-hex"
+        )
+    return value
+
+
+def _normalized_source_generation_sha256(source: bytes) -> str:
+    pattern = re.compile(rb'^SOURCE_SHA256 = "[0-9a-f]{64}"$', re.MULTILINE)
+    if len(pattern.findall(source)) != 1:
+        raise SystemExit("public-release validator source generation is malformed")
+    normalized = pattern.sub(b'SOURCE_SHA256 = "' + (b"0" * 64) + b'"', source)
+    return hashlib.sha256(normalized).hexdigest()
+
+
+def _read_pinned_proof_source(path: Path, label: str) -> bytes:
+    path = Path(os.path.abspath(os.fspath(path)))
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, flags)
+        metadata = os.fstat(descriptor)
+        visible = os.lstat(path)
+        require(
+            stat.S_ISREG(metadata.st_mode)
+            and metadata.st_nlink == 1
+            and (visible.st_dev, visible.st_ino) == (metadata.st_dev, metadata.st_ino)
+            and metadata.st_size <= MAX_PROOF_SOURCE_BYTES,
+            f"{label} is not a pinned single-link regular file",
+        )
+        source = os.pread(descriptor, metadata.st_size + 1, 0)
+        after = os.fstat(descriptor)
+        require(
+            len(source) == metadata.st_size
+            and (after.st_dev, after.st_ino, after.st_size)
+            == (metadata.st_dev, metadata.st_ino, metadata.st_size),
+            f"{label} changed while it was read",
+        )
+        return source
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _bind_loaded_validator_source() -> dict[str, object]:
+    path = Path(os.path.abspath(__file__))
+    try:
+        source = _read_pinned_proof_source(path, "public-release validator")
+        require(
+            _normalized_source_generation_sha256(source) == SOURCE_SHA256,
+            "public-release validator source generation mismatch",
+        )
+        metadata = os.lstat(path)
+    except (OSError, ReleaseError) as error:
+        raise SystemExit(
+            "public-release validator source generation mismatch"
+        ) from error
+    return {
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "path": path,
+        "source": source,
+        "source_sha256": "sha256:" + hashlib.sha256(source).hexdigest(),
+    }
+
+
+_LOADED_VALIDATOR_SOURCE = _bind_loaded_validator_source()
+
+
+def loaded_validator_belongs_to(repository: Path) -> bool:
+    expected = (
+        Path(os.path.abspath(os.fspath(repository)))
+        / "scripts/validate_public_release.py"
+    )
+    if expected != _LOADED_VALIDATOR_SOURCE["path"]:
+        return False
+    try:
+        metadata = os.lstat(expected)
+        source = _read_pinned_proof_source(expected, "public-release validator")
+    except (OSError, ReleaseError):
+        return False
+    return (metadata.st_dev, metadata.st_ino) == (
+        int(_LOADED_VALIDATOR_SOURCE["device"]),
+        int(_LOADED_VALIDATOR_SOURCE["inode"]),
+    ) and source == _LOADED_VALIDATOR_SOURCE["source"]
+
+
+def require_loaded_validator_generation(snapshot: Path) -> None:
+    source = _read_pinned_proof_source(
+        snapshot / "scripts/validate_public_release.py",
+        "frozen public-release validator",
+    )
+    require(
+        source == _LOADED_VALIDATOR_SOURCE["source"],
+        "loaded public-release validator differs from the frozen candidate",
+    )
+
+
+def require_prepared_supervisor_generation(
+    snapshot: Path, expected_source_sha256: str | None
+) -> None:
+    require(
+        isinstance(expected_source_sha256, str)
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", expected_source_sha256) is not None,
+        "prepared release validation requires its supervisor source identity",
+    )
+    source = _read_pinned_proof_source(
+        snapshot / "scripts/supervise_prepared_release_validation.py",
+        "frozen prepared-release supervisor",
+    )
+    require(
+        "sha256:" + hashlib.sha256(source).hexdigest() == expected_source_sha256,
+        "loaded prepared-release supervisor differs from the frozen candidate",
+    )
+
+
+def _compile_frozen_support_module(
+    snapshot: Path, module_name: str, relative_path: str
+) -> ModuleType:
+    require(
+        module_name not in sys.modules,
+        f"release support module loaded before candidate freeze: {module_name}",
+    )
+    path = snapshot / relative_path
+    source = _read_pinned_proof_source(path, f"frozen release support {module_name}")
+    module = ModuleType(module_name)
+    module.__file__ = str(path)
+    module.__package__ = ""
+    sys.modules[module_name] = module
+    try:
+        exec(compile(source, str(path), "exec"), module.__dict__)
+    except BaseException:
+        sys.modules.pop(module_name, None)
+        raise
+    return module
+
+
+def _install_frozen_release_support(snapshot: Path) -> None:
+    snapshot = Path(snapshot)
+    loaded: dict[str, ModuleType] = {}
+    try:
+        for module_name, relative_path in RELEASE_SUPPORT_SOURCES:
+            loaded[module_name] = _compile_frozen_support_module(
+                snapshot, module_name, relative_path
+            )
+    except BaseException as error:
+        for module_name in reversed(loaded):
+            sys.modules.pop(module_name, None)
+        if isinstance(error, ReleaseError):
+            raise
+        raise ReleaseError(
+            f"frozen release support cannot be loaded: {error}"
+        ) from error
+
+    transport = loaded["evidence_transport"]
+    compatibility = loaded["phase7_compatibility_projection"]
+    isolation = loaded["phase7_private_evidence_isolation"]
+    private = loaded["private_phase7_evidence"]
+    globals().update(
+        {
+            "candidate_content_identity": transport.candidate_content_identity,
+            "compatibility_bytes": compatibility.compatibility_bytes,
+            "IsolationError": isolation.IsolationError,
+            "validate_public_release_backend_evidence": isolation.validate_public_release_backend_evidence,
+            "validate_runtime_backend_release_evidence": isolation.validate_runtime_backend_release_evidence,
+            "CHECK_ORDER": private.CHECK_ORDER,
+            "ROLE_ORDER": private.ROLE_ORDER,
+            "PrivateEvidenceError": private.PrivateEvidenceError,
+            "validate_composed_replay_binding": private.validate_composed_replay_binding,
+            "verify_public_release_evidence": private.verify_public_release_evidence,
+        }
+    )
+
+
+if _RUNNING_AS_ENTRYPOINT:
+    _RELEASE_SUPPORT_BOUND = False
+else:
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    from evidence_transport import candidate_content_identity
+    from phase7_compatibility_projection import compatibility_bytes
+    from phase7_private_evidence_isolation import (
+        IsolationError,
+        validate_public_release_backend_evidence,
+        validate_runtime_backend_release_evidence,
+    )
+    from private_phase7_evidence import (
+        CHECK_ORDER,
+        ROLE_ORDER,
+        PrivateEvidenceError,
+        validate_composed_replay_binding,
+        verify_public_release_evidence,
+    )
+
+    _RELEASE_SUPPORT_BOUND = True
+
+
+def ensure_frozen_release_support(snapshot: Path) -> None:
+    global _RELEASE_SUPPORT_BOUND
+    if not _RELEASE_SUPPORT_BOUND:
+        _install_frozen_release_support(snapshot)
+        _RELEASE_SUPPORT_BOUND = True
 
 
 def canonical_digest(value: object) -> str:
@@ -225,6 +473,327 @@ def strict_json(content: str, label: str):
         object_pairs_hook=build_object,
         parse_constant=reject_constant,
         parse_float=finite_float,
+    )
+
+
+PUBLIC_RELEASE_REGISTRATION_FILENAME = "public-release-registration.json"
+PUBLIC_RELEASE_RUNTIME_PACKAGES_PATH = "release/public-release-runtime-packages.json"
+PUBLIC_RELEASE_RUNTIME_PACKAGES_FIELDS = {"schema_version", "runtime_packages"}
+PUBLIC_RELEASE_REGISTRATION_FIELDS = {
+    "production_eligible",
+    "schema_version",
+    "source_stage_validator_flags",
+    "support_paths",
+}
+PUBLIC_RELEASE_NAME = re.compile(r"[a-z][a-z0-9-]*\Z")
+PUBLIC_RELEASE_PATH_PREFIXES = ("docs", "plugins", "release", "scripts", "tests")
+PUBLIC_RELEASE_PACKAGE_KIND = "runtime-package"
+REQUIRED_SOURCE_STAGE_RUNTIME_PACKAGES = ("task-witness",)
+
+
+def canonical_public_release_validator_path(name: str) -> str:
+    """Return the canonical validator path for a registered runtime package."""
+
+    return f"scripts/validate_{name.replace('-', '_')}.py"
+
+
+def load_public_release_runtime_packages(root: Path) -> tuple[str, ...]:
+    """Load the generic catalog that authorizes every runtime-package record."""
+
+    path = root / PUBLIC_RELEASE_RUNTIME_PACKAGES_PATH
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError as error:
+        raise ReleaseError(
+            "public-release runtime-package catalog is missing"
+        ) from error
+    require(
+        stat.S_ISREG(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode),
+        "public-release runtime-package catalog must be a regular file",
+    )
+    catalog = strict_json(
+        path.read_text(encoding="utf-8"), "public-release runtime-package catalog"
+    )
+    require(
+        isinstance(catalog, dict)
+        and set(catalog) == PUBLIC_RELEASE_RUNTIME_PACKAGES_FIELDS,
+        "public-release runtime-package catalog schema drift",
+    )
+    require(
+        type(catalog["schema_version"]) is int and catalog["schema_version"] == 1,
+        "public-release runtime-package catalog schema version drift",
+    )
+    runtime_packages = catalog["runtime_packages"]
+    require(
+        isinstance(runtime_packages, list)
+        and all(
+            isinstance(name, str) and PUBLIC_RELEASE_NAME.fullmatch(name)
+            for name in runtime_packages
+        )
+        and runtime_packages == sorted(set(runtime_packages)),
+        "public-release runtime-package catalog entries must be sorted unique names",
+    )
+    return tuple(runtime_packages)
+
+
+def _registered_relative_path(value: object, label: str) -> str:
+    require(isinstance(value, str) and value, f"{label} must be a non-empty path")
+    path = Path(value)
+    normalized = path.as_posix()
+    require(
+        not path.is_absolute()
+        and ".." not in path.parts
+        and value == normalized
+        and path.parts[:1]
+        in tuple((prefix,) for prefix in PUBLIC_RELEASE_PATH_PREFIXES),
+        f"{label} must be a canonical repository-relative release path",
+    )
+    return normalized
+
+
+def _registration_path(root: Path, registration_path: Path) -> str:
+    try:
+        return registration_path.relative_to(root).as_posix()
+    except ValueError as error:
+        raise ReleaseError(
+            "public-release registration escapes repository root"
+        ) from error
+
+
+def _release_entry(root: Path, relative: str, label: str) -> Path:
+    path = root
+    components = Path(relative).parts
+    for index, component in enumerate(components):
+        path /= component
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError as error:
+            raise ReleaseError(f"{label} is missing: {relative}") from error
+        require(
+            not stat.S_ISLNK(metadata.st_mode),
+            f"{label} contains a symlink: {path.relative_to(root).as_posix()}",
+        )
+        if index < len(components) - 1:
+            require(
+                stat.S_ISDIR(metadata.st_mode),
+                f"{label} has a non-directory parent: {path.relative_to(root).as_posix()}",
+            )
+        else:
+            require(
+                stat.S_ISREG(metadata.st_mode) or stat.S_ISDIR(metadata.st_mode),
+                f"{label} must be a regular file or directory: {relative}",
+            )
+    return path
+
+
+def load_public_release_registrations(root: Path) -> dict[str, dict]:
+    """Discover and validate package-owned public-release registrations."""
+
+    root = root.resolve()
+    release_root = root / "release"
+    require(
+        release_root.exists()
+        and release_root.is_dir()
+        and not release_root.is_symlink(),
+        "public-release registration root is invalid",
+    )
+    runtime_packages = load_public_release_runtime_packages(root)
+    expected_paths = {
+        release_root / name / PUBLIC_RELEASE_REGISTRATION_FILENAME
+        for name in runtime_packages
+    }
+    discovered_paths = set(
+        release_root.glob(f"*/{PUBLIC_RELEASE_REGISTRATION_FILENAME}")
+    )
+    require(
+        discovered_paths == expected_paths,
+        "public-release runtime-package registration catalog drift",
+    )
+    registrations: dict[str, dict] = {}
+    for path in sorted(expected_paths):
+        relative = _registration_path(root, path)
+        package_directory = path.parent
+        package_metadata = package_directory.lstat()
+        require(
+            stat.S_ISDIR(package_metadata.st_mode)
+            and not stat.S_ISLNK(package_metadata.st_mode),
+            f"public-release registration directory is invalid: {relative}",
+        )
+        metadata = path.lstat()
+        require(
+            stat.S_ISREG(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode),
+            f"public-release registration must be a regular file: {relative}",
+        )
+        registration = strict_json(
+            path.read_text(encoding="utf-8"), f"public-release registration: {relative}"
+        )
+        require(
+            isinstance(registration, dict)
+            and set(registration) == PUBLIC_RELEASE_REGISTRATION_FIELDS,
+            f"public-release registration schema drift: {relative}",
+        )
+        name = path.parent.name
+        require(
+            type(registration["schema_version"]) is int
+            and registration["schema_version"] == 1,
+            f"public-release registration schema version drift: {relative}",
+        )
+        require(
+            type(registration["production_eligible"]) is bool,
+            f"public-release production eligibility is invalid: {relative}",
+        )
+        canonical_validator_path = canonical_public_release_validator_path(name)
+        validator = _release_entry(
+            root, canonical_validator_path, "public-release validator"
+        )
+        require(
+            stat.S_ISREG(validator.lstat().st_mode),
+            "public-release validator must be a regular file: "
+            f"{canonical_validator_path}",
+        )
+        plugin_root = _release_entry(
+            root, f"plugins/{name}", "public-release plugin root"
+        )
+        require(
+            stat.S_ISDIR(plugin_root.lstat().st_mode),
+            f"public-release plugin root must be a directory: plugins/{name}",
+        )
+        flags = registration["source_stage_validator_flags"]
+        require(
+            isinstance(flags, list)
+            and all(isinstance(flag, str) and flag.startswith("--") for flag in flags)
+            and flags == sorted(set(flags)),
+            f"public-release source-stage flags are invalid: {relative}",
+        )
+        support_paths = registration["support_paths"]
+        require(
+            isinstance(support_paths, list),
+            f"public-release support paths must be an array: {relative}",
+        )
+        normalized_support_paths = [
+            _registered_relative_path(item, f"public-release support path: {relative}")
+            for item in support_paths
+        ]
+        require(
+            normalized_support_paths == sorted(set(normalized_support_paths)),
+            f"public-release support paths must be sorted and unique: {relative}",
+        )
+        automatic_paths = {relative, canonical_validator_path}
+        require(
+            automatic_paths.isdisjoint(normalized_support_paths),
+            f"public-release support paths redundantly list automatic paths: {relative}",
+        )
+        for support_path in normalized_support_paths:
+            _release_entry(root, support_path, "public-release support path")
+        registrations[name] = {
+            "name": name,
+            "package_kind": PUBLIC_RELEASE_PACKAGE_KIND,
+            "production_eligible": registration["production_eligible"],
+            "schema_version": registration["schema_version"],
+            "source_stage_validator_flags": tuple(flags),
+            "support_paths": tuple(
+                sorted({*normalized_support_paths, *automatic_paths})
+            ),
+            "validator_path": canonical_validator_path,
+            "registration_path": relative,
+        }
+    require(
+        tuple(sorted(registrations)) == runtime_packages,
+        "public-release runtime-package registration catalog drift",
+    )
+    return registrations
+
+
+PUBLIC_RELEASE_RUNTIME_PACKAGES = load_public_release_runtime_packages(
+    SCRIPT_DIR.parent
+)
+PUBLIC_RELEASE_REGISTRATIONS = MappingProxyType(
+    {
+        name: MappingProxyType(dict(registration))
+        for name, registration in load_public_release_registrations(
+            SCRIPT_DIR.parent
+        ).items()
+    }
+)
+
+
+def _runtime_package_inventory(
+    registrations: dict[str, dict],
+    *,
+    production_only: bool,
+) -> tuple[str, ...]:
+    return tuple(
+        sorted(
+            name
+            for name, registration in registrations.items()
+            if registration["package_kind"] == "runtime-package"
+            and (not production_only or registration["production_eligible"])
+        )
+    )
+
+
+REGISTERED_RUNTIME_PACKAGES = _runtime_package_inventory(
+    PUBLIC_RELEASE_REGISTRATIONS,
+    production_only=False,
+)
+PRODUCTION_RUNTIME_PACKAGES = _runtime_package_inventory(
+    PUBLIC_RELEASE_REGISTRATIONS,
+    production_only=True,
+)
+require(
+    not set(SKILL_PLUGINS) & set(REGISTERED_RUNTIME_PACKAGES),
+    "public-release runtime package collides with a skill plugin",
+)
+SOURCE_STAGE_VALIDATED_PLUGINS = SKILL_PLUGINS + REGISTERED_RUNTIME_PACKAGES
+PRODUCTION_VALIDATED_PLUGINS = SKILL_PLUGINS + PRODUCTION_RUNTIME_PACKAGES
+MARKETPLACE_PLUGINS = MappingProxyType(
+    {
+        **{plugin: f"./plugins/{plugin}" for plugin in SKILL_PLUGINS},
+        **{plugin: f"./plugins/{plugin}" for plugin in PRODUCTION_RUNTIME_PACKAGES},
+    }
+)
+PLUGIN_SUPPORT_PATHS = MappingProxyType(
+    {
+        **{name: frozenset(paths) for name, paths in BASE_PLUGIN_SUPPORT_PATHS.items()},
+        **{
+            name: frozenset(registration["support_paths"])
+            for name, registration in PUBLIC_RELEASE_REGISTRATIONS.items()
+        },
+    }
+)
+VALIDATOR_PATHS = MappingProxyType(
+    {
+        **BASE_VALIDATOR_PATHS,
+        **{
+            name: registration["validator_path"]
+            for name, registration in PUBLIC_RELEASE_REGISTRATIONS.items()
+        },
+    }
+)
+SOURCE_STAGE_VALIDATOR_FLAGS = MappingProxyType(
+    {
+        **BASE_SOURCE_STAGE_VALIDATOR_FLAGS,
+        **{
+            name: registration["source_stage_validator_flags"]
+            for name, registration in PUBLIC_RELEASE_REGISTRATIONS.items()
+        },
+    }
+)
+
+
+def validate_public_release_registration_inventory(repository: Path) -> None:
+    runtime_packages = load_public_release_runtime_packages(repository)
+    require(
+        set(REQUIRED_SOURCE_STAGE_RUNTIME_PACKAGES) <= set(runtime_packages),
+        "required source-stage runtime package is missing: task-witness",
+    )
+    require(
+        runtime_packages == PUBLIC_RELEASE_RUNTIME_PACKAGES,
+        "public-release runtime-package catalog inventory drift",
+    )
+    require(
+        load_public_release_registrations(repository) == PUBLIC_RELEASE_REGISTRATIONS,
+        "public-release registration inventory drift",
     )
 
 
@@ -564,7 +1133,7 @@ def private_plugin_eval_environment(root: Path) -> dict[str, str]:
     temporary directory instead of the release process's ambient environment.
     """
 
-    root.mkdir(mode=0o700)
+    root.mkdir(mode=0o700, exist_ok=True)
     home = root / "home"
     temporary = root / "tmp"
     home.mkdir(mode=0o700)
@@ -578,6 +1147,53 @@ def private_plugin_eval_environment(root: Path) -> dict[str, str]:
         "TMP": str(temporary),
         "TMPDIR": str(temporary),
     }
+
+
+def private_python_child_environment(
+    root: Path,
+    *,
+    plugin_eval_executable: Path | None = None,
+) -> dict[str, str]:
+    """Create the isolated environment for proof-producing Python children."""
+
+    root.mkdir(mode=0o700, exist_ok=True)
+    home = root / "home"
+    temporary = root / "tmp"
+    home.mkdir(mode=0o700)
+    temporary.mkdir(mode=0o700)
+    environment = {
+        "HOME": str(home),
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": SAFE_NODE_SEARCH_PATH,
+        "TEMP": str(temporary),
+        "TMP": str(temporary),
+        "TMPDIR": str(temporary),
+        "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+    }
+    if plugin_eval_executable is not None:
+        environment["PLUGIN_EVAL_TEST_EXECUTABLE"] = str(plugin_eval_executable)
+    return environment
+
+
+def run_private_python_child(
+    snapshot: Path,
+    arguments: list[str],
+    *,
+    environment: dict[str, str],
+    timeout: int,
+) -> subprocess.CompletedProcess[str]:
+    """Run Python below the isolated release-validator proof boundary."""
+
+    return subprocess.run(
+        [sys.executable, "-I", "-B", *arguments],
+        cwd=snapshot,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=timeout,
+    )
 
 
 def _required_no_follow_directory_flags() -> int:
@@ -945,7 +1561,7 @@ def validate_plugin_eval_report(
         == {
             "kind": "plugin",
             "path": str(target_root),
-            "entryPath": str(target_root / ".codex-plugin/plugin.json"),
+            "entryPath": str(target_root / "plugin.json"),
             "name": plugin,
             "relativePath": f"plugins/{plugin}",
         },
@@ -1280,12 +1896,21 @@ def support_paths(plugin: str) -> tuple[str, ...]:
     return tuple(sorted(COMMON_SUPPORT_PATHS | PLUGIN_SUPPORT_PATHS[plugin]))
 
 
-def release_test_paths() -> tuple[str, ...]:
+def scope_support_paths(plugins: tuple[str, ...]) -> set[str]:
+    paths = set().union(*(set(support_paths(plugin)) for plugin in plugins))
+    if plugins == SOURCE_STAGE_VALIDATED_PLUGINS:
+        paths |= SOURCE_STAGE_COMMON_SUPPORT_PATHS
+    return paths
+
+
+def release_test_paths(
+    plugins: tuple[str, ...] = PRODUCTION_VALIDATED_PLUGINS,
+) -> tuple[str, ...]:
     return tuple(
         sorted(
             {
                 relative
-                for plugin in VALIDATED_PLUGINS
+                for plugin in plugins
                 for relative in support_paths(plugin)
                 if Path(relative).parts[:1] == ("tests",)
             }
@@ -1293,17 +1918,21 @@ def release_test_paths() -> tuple[str, ...]:
     )
 
 
-def all_scope_paths() -> tuple[str, ...]:
+def all_scope_paths(
+    plugins: tuple[str, ...] = SOURCE_STAGE_VALIDATED_PLUGINS,
+) -> tuple[str, ...]:
     return tuple(
         sorted(
-            {f"plugins/{plugin}" for plugin in VALIDATED_PLUGINS}
-            | set().union(*(set(support_paths(plugin)) for plugin in VALIDATED_PLUGINS))
+            {f"plugins/{plugin}" for plugin in plugins} | scope_support_paths(plugins)
         )
     )
 
 
-def iter_scope_entries(repository: Path):
-    for relative in all_scope_paths():
+def iter_scope_entries(
+    repository: Path,
+    plugins: tuple[str, ...] = SOURCE_STAGE_VALIDATED_PLUGINS,
+):
+    for relative in all_scope_paths(plugins):
         path = repository / relative
         require(
             path.exists() or path.is_symlink(), f"release input is missing: {relative}"
@@ -1315,9 +1944,12 @@ def iter_scope_entries(repository: Path):
             yield entry.relative_to(repository).as_posix(), entry
 
 
-def validate_scope_entries(repository: Path) -> None:
+def validate_scope_entries(
+    repository: Path,
+    plugins: tuple[str, ...] = SOURCE_STAGE_VALIDATED_PLUGINS,
+) -> None:
     seen = set()
-    for relative, path in iter_scope_entries(repository):
+    for relative, path in iter_scope_entries(repository, plugins):
         if relative in seen:
             continue
         seen.add(relative)
@@ -1333,10 +1965,13 @@ def validate_scope_entries(repository: Path) -> None:
         )
 
 
-def scope_observation_digest(repository: Path) -> str:
+def scope_observation_digest(
+    repository: Path,
+    plugins: tuple[str, ...] = SOURCE_STAGE_VALIDATED_PLUGINS,
+) -> str:
     digest = hashlib.sha256()
     seen = set()
-    for relative, path in iter_scope_entries(repository):
+    for relative, path in iter_scope_entries(repository, plugins):
         if relative in seen:
             continue
         seen.add(relative)
@@ -1374,11 +2009,14 @@ def scope_observation_digest(repository: Path) -> str:
     return digest.hexdigest()
 
 
-def scope_content_digest(repository: Path) -> str:
+def scope_content_digest(
+    repository: Path,
+    plugins: tuple[str, ...] = SOURCE_STAGE_VALIDATED_PLUGINS,
+) -> str:
     """Digest release-scope bytes and metadata without volatile filesystem identity."""
     digest = hashlib.sha256()
     seen = set()
-    for relative, path in iter_scope_entries(repository):
+    for relative, path in iter_scope_entries(repository, plugins):
         if relative in seen:
             continue
         seen.add(relative)
@@ -1426,20 +2064,28 @@ def digest_selected_paths(root: Path, relative_paths: tuple[str, ...]) -> str:
     return "sha256:" + digest.hexdigest()
 
 
-def release_contract_identity(snapshot: Path) -> dict:
+def release_contract_identity(
+    snapshot: Path,
+    plugins: tuple[str, ...] = PRODUCTION_VALIDATED_PLUGINS,
+) -> dict:
     validators = tuple(
         sorted(
             {
                 "scripts/validate_public_release.py",
                 "scripts/validate_plugin_runtime_roots.py",
-                *VALIDATOR_PATHS.values(),
+                *(VALIDATOR_PATHS[plugin] for plugin in plugins),
             }
         )
     )
-    tests = release_test_paths()
+    support_modules = RELEASE_CONTRACT_SUPPORT_MODULES
+    tests = release_test_paths(plugins)
     return {
-        "sha256": digest_selected_paths(snapshot, tuple(sorted({*validators, *tests}))),
+        "sha256": digest_selected_paths(
+            snapshot,
+            tuple(sorted({*validators, *support_modules, *tests})),
+        ),
         "validators": list(validators),
+        "support_modules": list(support_modules),
         "tests": list(tests),
     }
 
@@ -1894,8 +2540,12 @@ def deterministic_tree_digest(root: Path) -> str:
     return digest.hexdigest()
 
 
-def copy_release_scope(source: Path, destination: Path) -> None:
-    for relative in all_scope_paths():
+def copy_release_scope(
+    source: Path,
+    destination: Path,
+    plugins: tuple[str, ...] = SOURCE_STAGE_VALIDATED_PLUGINS,
+) -> None:
+    for relative in all_scope_paths(plugins):
         source_path = source / relative
         destination_path = destination / relative
         destination_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1903,11 +2553,14 @@ def copy_release_scope(source: Path, destination: Path) -> None:
             shutil.copytree(source_path, destination_path, symlinks=True)
         else:
             shutil.copy2(source_path, destination_path, follow_symlinks=False)
-    validate_scope_entries(destination)
+    validate_scope_entries(destination, plugins)
 
 
 def snapshot_git_candidate(
-    repository: Path, destination: Path, candidate: dict[str, str]
+    repository: Path,
+    destination: Path,
+    candidate: dict[str, str],
+    plugins: tuple[str, ...] = PRODUCTION_VALIDATED_PLUGINS,
 ) -> None:
     """Materialize the exact clean Git candidate into a self-contained snapshot."""
 
@@ -1969,10 +2622,10 @@ def snapshot_git_candidate(
     # Git does not represent empty directories.  Preserve their required scope
     # presence, but assign the canonical directory mode rather than importing
     # mutable source metadata.
-    for _relative, source_path in iter_scope_entries(repository):
+    for _relative, source_path in iter_scope_entries(repository, plugins):
         if source_path.is_dir():
             (destination / _relative).mkdir(parents=True, exist_ok=True)
-    for relative, target in iter_scope_entries(destination):
+    for relative, target in iter_scope_entries(destination, plugins):
         metadata = target.lstat()
         if stat.S_ISDIR(metadata.st_mode):
             target.chmod(0o755)
@@ -1983,7 +2636,7 @@ def snapshot_git_candidate(
             )
             target.chmod(file_modes[relative])
 
-    validate_scope_entries(destination)
+    validate_scope_entries(destination, plugins)
     for arguments in (("init", "--quiet"), ("add", "--force", "--all")):
         result = subprocess.run(
             ["git", *arguments], cwd=destination, capture_output=True, check=False
@@ -2029,9 +2682,12 @@ def validate_repository_projection(repository: Path) -> None:
         )
 
 
-def candidate_identities(snapshot: Path) -> dict:
+def candidate_identities(
+    snapshot: Path,
+    plugins: tuple[str, ...] = PRODUCTION_VALIDATED_PLUGINS,
+) -> dict:
     identities = {}
-    for plugin in VALIDATED_PLUGINS:
+    for plugin in plugins:
         plugin_digest = deterministic_tree_digest(snapshot / "plugins" / plugin)
         composite = hashlib.sha256()
         composite.update(f"plugin\0{plugin_digest}\0".encode())
@@ -2058,7 +2714,11 @@ def candidate_identities(snapshot: Path) -> dict:
     return {"schema_version": 1, "plugins": identities}
 
 
-def validate_expected_identities(expected: dict, actual: dict) -> None:
+def validate_expected_identities(
+    expected: dict,
+    actual: dict,
+    validated_plugins: tuple[str, ...] = PRODUCTION_VALIDATED_PLUGINS,
+) -> None:
     require(
         isinstance(expected, dict)
         and set(expected) == {"schema_version", "plugins"}
@@ -2066,12 +2726,13 @@ def validate_expected_identities(expected: dict, actual: dict) -> None:
         and expected["schema_version"] == 1,
         "expected identity document schema drift",
     )
-    plugins = expected["plugins"]
+    expected_plugins = expected["plugins"]
     require(
-        isinstance(plugins, dict) and set(plugins) == set(VALIDATED_PLUGINS),
+        isinstance(expected_plugins, dict)
+        and set(expected_plugins) == set(validated_plugins),
         "expected identity plugin inventory drift",
     )
-    for plugin, identity in plugins.items():
+    for plugin, identity in expected_plugins.items():
         require(
             isinstance(identity, dict)
             and set(identity) == {"plugin_sha256", "composite_sha256"}
@@ -2087,65 +2748,83 @@ def validate_expected_identities(expected: dict, actual: dict) -> None:
 
 
 def run_contract_validators(
-    snapshot: Path, plugin_eval_executable: Path | None = None
+    snapshot: Path,
+    plugin_eval_executable: Path | None = None,
+    *,
+    task_witness_final_evidence: tuple[str, ...] | None = None,
 ) -> dict:
-    identity = release_contract_identity(snapshot)
-    environment = os.environ.copy()
-    environment.pop("PYTHONPATH", None)
-    environment["PYTHONDONTWRITEBYTECODE"] = "1"
-    environment["PYTHONNOUSERSITE"] = "1"
-    environment["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
-    if plugin_eval_executable is not None:
-        environment["PLUGIN_EVAL_TEST_EXECUTABLE"] = str(plugin_eval_executable)
-    runtime_root_validator = snapshot / "scripts/validate_plugin_runtime_roots.py"
-    result = subprocess.run(
-        [sys.executable, str(runtime_root_validator), str(snapshot)],
-        env=environment,
-        text=True,
-        capture_output=True,
-        check=False,
-        timeout=120,
-    )
+    task_witness_is_production = "task-witness" in PRODUCTION_VALIDATED_PLUGINS
     require(
-        result.returncode == 0,
-        f"plugin runtime-root validator failed:\n{result.stdout}{result.stderr}",
+        (task_witness_final_evidence is not None) == task_witness_is_production,
+        "Task Witness final evidence must match production eligibility",
     )
-    for plugin in VALIDATED_PLUGINS:
-        result = subprocess.run(
-            [sys.executable, str(snapshot / VALIDATOR_PATHS[plugin]), str(snapshot)],
-            env=environment,
-            text=True,
-            capture_output=True,
-            check=False,
+    if task_witness_final_evidence is not None:
+        require(
+            len(task_witness_final_evidence)
+            == len(TASK_WITNESS_FINAL_VALIDATOR_OPTIONS)
+            and all(isinstance(value, str) for value in task_witness_final_evidence),
+            "Task Witness final evidence shape drift",
+        )
+    identity = release_contract_identity(snapshot, PRODUCTION_VALIDATED_PLUGINS)
+    with tempfile.TemporaryDirectory(prefix="public-release-python-") as temporary:
+        environment = private_python_child_environment(
+            Path(temporary), plugin_eval_executable=plugin_eval_executable
+        )
+        runtime_root_validator = snapshot / "scripts/validate_plugin_runtime_roots.py"
+        result = run_private_python_child(
+            snapshot,
+            [str(runtime_root_validator), str(snapshot)],
+            environment=environment,
             timeout=120,
         )
         require(
             result.returncode == 0,
-            f"{plugin} validator failed:\n{result.stdout}{result.stderr}",
+            f"plugin runtime-root validator failed:\n{result.stdout}{result.stderr}",
         )
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pytest",
-            "-q",
-            "-p",
-            "no:cacheprovider",
-            *release_test_paths(),
-        ],
-        cwd=snapshot,
-        env=environment,
-        text=True,
-        capture_output=True,
-        check=False,
-        timeout=600,
-    )
+        for plugin in PRODUCTION_VALIDATED_PLUGINS:
+            validator_arguments = [
+                str(snapshot / VALIDATOR_PATHS[plugin]),
+                str(snapshot),
+            ]
+            if plugin == "task-witness":
+                assert task_witness_final_evidence is not None
+                validator_arguments.extend(["--final-release"])
+                for option, value in zip(
+                    TASK_WITNESS_FINAL_VALIDATOR_OPTIONS,
+                    task_witness_final_evidence,
+                    strict=True,
+                ):
+                    validator_arguments.extend([option, value])
+            result = run_private_python_child(
+                snapshot,
+                validator_arguments,
+                environment=environment,
+                timeout=120,
+            )
+            require(
+                result.returncode == 0,
+                f"{plugin} validator failed:\n{result.stdout}{result.stderr}",
+            )
+        result = run_private_python_child(
+            snapshot,
+            [
+                "-m",
+                "pytest",
+                "-q",
+                "-p",
+                "no:cacheprovider",
+                "--import-mode=importlib",
+                *release_test_paths(PRODUCTION_VALIDATED_PLUGINS),
+            ],
+            environment=environment,
+            timeout=600,
+        )
+        require(
+            result.returncode == 0,
+            f"release-owned unit suites failed:\n{result.stdout}{result.stderr}",
+        )
     require(
-        result.returncode == 0,
-        f"release-owned unit suites failed:\n{result.stdout}{result.stderr}",
-    )
-    require(
-        release_contract_identity(snapshot) == identity,
+        release_contract_identity(snapshot, PRODUCTION_VALIDATED_PLUGINS) == identity,
         "release-owned validator or test contract changed while validation ran",
     )
     return identity
@@ -2325,7 +3004,7 @@ def run_pinned_plugin_evals(
         }
         evidence[plugin] = {
             "analyzed_plugin": {
-                "entry_path": f"plugins/{plugin}/.codex-plugin/plugin.json",
+                "entry_path": f"plugins/{plugin}/plugin.json",
                 "name": plugin,
                 "path": f"plugins/{plugin}",
                 "target_kind": "plugin",
@@ -2359,10 +3038,18 @@ def validate_release(
     expected_public_candidate_sha256: str | None = None,
     backend_release_evidence: Path | None = None,
     expected_backend_release_evidence_sha256: str | None = None,
+    prepared_supervisor_source_sha256: str | None = None,
+    expected_git_candidate: dict[str, str] | None = None,
+    task_witness_final_evidence: tuple[str, ...] | None = None,
     after_snapshot: Callable[[], None] | None = None,
     source_stage_validator: Callable[[Path], None] | None = None,
 ) -> dict:
     repository = lexical_repository(repository)
+    validated_plugins = (
+        PRODUCTION_VALIDATED_PLUGINS
+        if run_contracts
+        else SOURCE_STAGE_VALIDATED_PLUGINS
+    )
     if plugin_eval_executable is not None:
         plugin_eval_executable = Path(
             os.path.abspath(os.fspath(plugin_eval_executable))
@@ -2371,6 +3058,11 @@ def validate_release(
     evidence_root: Path | None = None
     composed_summary: dict | None = None
     if run_contracts:
+        require(
+            (task_witness_final_evidence is not None)
+            == ("task-witness" in PRODUCTION_VALIDATED_PLUGINS),
+            "Task Witness final evidence must match production eligibility",
+        )
         require(
             routing_evidence is not None,
             "production release validation requires external skill-routing evidence",
@@ -2411,6 +3103,14 @@ def validate_release(
         )
     else:
         require(
+            task_witness_final_evidence is None,
+            "source-stage validation does not accept Task Witness final evidence",
+        )
+        require(
+            expected_git_candidate is None,
+            "source-stage validation does not accept a Git candidate constraint",
+        )
+        require(
             node_executable is None,
             "source-stage validation does not accept a Node executable",
         )
@@ -2436,11 +3136,17 @@ def validate_release(
             ),
             "source-stage validation does not accept private provenance evidence",
         )
-    validate_scope_entries(repository)
-    source_observation = scope_observation_digest(repository)
-    source_content = scope_content_digest(repository)
+    validate_public_release_registration_inventory(repository)
+    validate_scope_entries(repository, validated_plugins)
+    source_observation = scope_observation_digest(repository, validated_plugins)
+    source_content = scope_content_digest(repository, validated_plugins)
     if run_contracts:
         expected_candidate = git_candidate_identity(repository)
+        if expected_git_candidate is not None:
+            require(
+                expected_candidate == expected_git_candidate,
+                "Git candidate differs from the prepared Phase 7 candidate",
+            )
     temporary_parent = Path(tempfile.gettempdir()).resolve()
     receipt_context = (
         held_receipt_output(repository, receipt_output)
@@ -2456,19 +3162,32 @@ def validate_release(
         snapshot = Path(temporary) / "repository"
         if run_contracts:
             assert expected_candidate is not None
-            snapshot_git_candidate(repository, snapshot, expected_candidate)
+            snapshot_git_candidate(
+                repository,
+                snapshot,
+                expected_candidate,
+                PRODUCTION_VALIDATED_PLUGINS,
+            )
         else:
-            copy_release_scope(repository, snapshot)
+            copy_release_scope(repository, snapshot, SOURCE_STAGE_VALIDATED_PLUGINS)
         if after_snapshot is not None:
             after_snapshot()
+        if _RUNNING_AS_ENTRYPOINT:
+            require_loaded_validator_generation(snapshot)
+            require_prepared_supervisor_generation(
+                snapshot, prepared_supervisor_source_sha256
+            )
+        ensure_frozen_release_support(snapshot)
+        validate_public_release_registration_inventory(snapshot)
         require(
-            scope_observation_digest(repository) == source_observation,
+            scope_observation_digest(repository, validated_plugins)
+            == source_observation,
             "release input changed while the private snapshot was created",
         )
         validate_marketplace(snapshot)
         validate_repository_projection(snapshot)
-        snapshot_observation = scope_observation_digest(snapshot)
-        snapshot_content = scope_content_digest(snapshot)
+        snapshot_observation = scope_observation_digest(snapshot, validated_plugins)
+        snapshot_content = scope_content_digest(snapshot, validated_plugins)
         require(
             snapshot_content == source_content,
             "private snapshot content differs from the release input",
@@ -2523,11 +3242,22 @@ def validate_release(
                 raise ReleaseError(
                     f"private provenance validation failed: {error}"
                 ) from error
+            contract_arguments = (
+                {}
+                if task_witness_final_evidence is None
+                else {
+                    "task_witness_final_evidence": task_witness_final_evidence,
+                }
+            )
             contract_identity = run_contract_validators(
-                snapshot, plugin_eval_executable
+                snapshot,
+                plugin_eval_executable,
+                **contract_arguments,
             )
             if contract_identity is None:
-                contract_identity = release_contract_identity(snapshot)
+                contract_identity = release_contract_identity(
+                    snapshot, PRODUCTION_VALIDATED_PLUGINS
+                )
             assert evidence_root is not None and expected_candidate is not None
             routing_summary = validate_routing_evidence(
                 snapshot, evidence_root, expected_candidate
@@ -2542,16 +3272,19 @@ def validate_release(
         if source_stage_validator is not None:
             source_stage_validator(snapshot)
         require(
-            scope_observation_digest(snapshot) == snapshot_observation,
+            scope_observation_digest(snapshot, validated_plugins)
+            == snapshot_observation,
             "private snapshot changed while contract validators ran",
         )
-        identities = candidate_identities(snapshot)
+        identities = candidate_identities(snapshot, validated_plugins)
         require(
-            scope_observation_digest(snapshot) == snapshot_observation,
+            scope_observation_digest(snapshot, validated_plugins)
+            == snapshot_observation,
             "private snapshot changed while release identities were derived",
         )
         require(
-            scope_observation_digest(repository) == source_observation,
+            scope_observation_digest(repository, validated_plugins)
+            == source_observation,
             "release input changed while the private snapshot was validated",
         )
         if run_contracts:
@@ -2560,7 +3293,7 @@ def validate_release(
                 "Git candidate changed while release validation ran",
             )
         if expected is not None:
-            validate_expected_identities(expected, identities)
+            validate_expected_identities(expected, identities, validated_plugins)
         if run_contracts:
             assert (
                 receipt_target is not None
@@ -2611,38 +3344,49 @@ def validate_release(
 def run_source_stage_validators(snapshot: Path) -> None:
     """Run source-stage validators against the retained candidate snapshot only."""
 
-    for plugin in VALIDATED_PLUGINS:
-        result = subprocess.run(
-            [
-                sys.executable,
-                str(snapshot / VALIDATOR_PATHS[plugin]),
-                str(snapshot),
-                *SOURCE_STAGE_VALIDATOR_FLAGS[plugin],
-            ],
-            text=True,
-            capture_output=True,
-            check=False,
-            timeout=120,
-        )
-        require(
-            result.returncode == 0,
-            f"{plugin} source-stage validator failed:\n{result.stdout}{result.stderr}",
-        )
+    with tempfile.TemporaryDirectory(prefix="public-release-python-") as temporary:
+        environment = private_python_child_environment(Path(temporary))
+        for plugin in SOURCE_STAGE_VALIDATED_PLUGINS:
+            result = run_private_python_child(
+                snapshot,
+                [
+                    str(snapshot / VALIDATOR_PATHS[plugin]),
+                    str(snapshot),
+                    *SOURCE_STAGE_VALIDATOR_FLAGS[plugin],
+                ],
+                environment=environment,
+                timeout=120,
+            )
+            require(
+                result.returncode == 0,
+                f"{plugin} source-stage validator failed:\n{result.stdout}{result.stderr}",
+            )
 
 
-def validate_source_stage(repository: Path) -> dict:
+def validate_source_stage(
+    repository: Path,
+    *,
+    prepared_supervisor_source_sha256: str | None = None,
+) -> dict:
     """Validate one retained candidate snapshot without release-only evidence gates."""
 
+    prepared_boundary = (
+        {}
+        if prepared_supervisor_source_sha256 is None
+        else {"prepared_supervisor_source_sha256": prepared_supervisor_source_sha256}
+    )
     identities = validate_release(
         repository,
         run_contracts=False,
         source_stage_validator=run_source_stage_validators,
+        **prepared_boundary,
     )
     return identities
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
+    raw_arguments = sys.argv[1:]
+    parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("repository", nargs="?", type=Path, default=Path.cwd())
     parser.add_argument("--expected-identities", type=Path)
     parser.add_argument("--plugin-eval", type=Path)
@@ -2655,14 +3399,45 @@ def main() -> int:
     parser.add_argument("--expected-frozen-private-identity-sha256")
     parser.add_argument("--expected-private-commit-oid")
     parser.add_argument("--expected-private-producer-package-sha256")
-    parser.add_argument("--expected-public-candidate-sha256")
+    parser.add_argument(
+        "--expected-public-candidate-sha256",
+        type=parse_public_candidate_sha256,
+    )
     parser.add_argument("--backend-release-evidence", type=Path)
     parser.add_argument("--expected-backend-release-evidence-sha256")
+    for public_option, _ in TASK_WITNESS_FINAL_EVIDENCE_OPTIONS:
+        parser.add_argument(public_option)
+    parser.add_argument(
+        PREPARED_SUPERVISOR_SOURCE_OPTION,
+        dest="prepared_supervisor_source_sha256",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--source-stage", action="store_true")
-    arguments = parser.parse_args()
+    arguments = parser.parse_args(raw_arguments)
     try:
+        task_witness_final_evidence_values = tuple(
+            getattr(arguments, public_option.removeprefix("--").replace("-", "_"))
+            for public_option, _ in TASK_WITNESS_FINAL_EVIDENCE_OPTIONS
+        )
+        task_witness_final_evidence = parse_task_witness_final_evidence(
+            raw_arguments,
+            task_witness_final_evidence_values,
+        )
+        if _RUNNING_AS_ENTRYPOINT:
+            require(
+                loaded_validator_belongs_to(arguments.repository),
+                "loaded public-release validator does not belong to the selected repository",
+            )
+            require(
+                arguments.prepared_supervisor_source_sha256 is not None,
+                "public-release validation requires the prepared supervisor",
+            )
         expected = None
         if arguments.source_stage:
+            require(
+                task_witness_final_evidence is None,
+                "source-stage validation does not accept Task Witness final evidence",
+            )
             require(
                 arguments.expected_identities is None
                 and arguments.plugin_eval is None
@@ -2692,9 +3467,19 @@ def main() -> int:
                 ),
                 "source-stage validation does not accept private provenance evidence",
             )
-            identities = validate_source_stage(arguments.repository)
+            identities = validate_source_stage(
+                arguments.repository,
+                prepared_supervisor_source_sha256=(
+                    arguments.prepared_supervisor_source_sha256
+                ),
+            )
             print(json.dumps(identities, indent=2, sort_keys=True))
             return 0
+        require(
+            (task_witness_final_evidence is not None)
+            == ("task-witness" in PRODUCTION_VALIDATED_PLUGINS),
+            "Task Witness final evidence must match production eligibility",
+        )
         require(
             arguments.routing_evidence is not None,
             "production release validation requires --routing-evidence",
@@ -2745,6 +3530,10 @@ def main() -> int:
             backend_release_evidence=arguments.backend_release_evidence,
             expected_backend_release_evidence_sha256=(
                 arguments.expected_backend_release_evidence_sha256
+            ),
+            task_witness_final_evidence=task_witness_final_evidence,
+            prepared_supervisor_source_sha256=(
+                arguments.prepared_supervisor_source_sha256
             ),
         )
     except (

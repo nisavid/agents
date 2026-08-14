@@ -7,9 +7,9 @@ description: Use when selecting a model or reasoning effort for an agent, subage
 
 ## Scope
 
-Own model selection, reasoning-effort selection, and capability proof after delegation is chosen. [delegating-cross-agent-work](../delegating-cross-agent-work/SKILL.md) owns worker topology, lifecycle, authority, handoffs, and integration.
+Own model/effort selection and capability proof post-delegation. [delegating-cross-agent-work](../delegating-cross-agent-work/SKILL.md) owns family, surface, version, executor, relationship, ownership, transport, assurance, authority, handoffs, and integration. Model choice is a separate decision; it cannot repair topology.
 
-Choose the least costly available model that can safely make the required judgments. Escalate for ambiguity, hard-to-reverse decisions, architecture, reviewer-facing work, or final integration.
+Choose the least costly model that safely preserves required judgment. Escalate for ambiguity, hard-to-reverse decisions, architecture, reviewer-facing work, or final integration.
 
 ## Preferred Codex Role Family
 
@@ -42,7 +42,7 @@ consequential review, especially for an authorized foreign-harness perspective.
 Keep the same authority, evidence, and integration boundaries. Use a weaker
 reviewer only with concrete contrary evidence.
 
-Select for the hardest judgment in mixed work. Choose the lowest accepted effort that preserves its judgment margin.
+Select for the hardest judgment; use the lowest safe effort.
 
 ## Fallback And Authority Gates
 

@@ -1,37 +1,45 @@
 ---
 name: delegating-cross-agent-work
-description: Use when deciding whether and how to delegate across native subagents, user-owned Codex tasks, foreign-harness peers, browser/computer-use workers, or separate worktrees.
+description: Use when deciding whether and how to delegate across child, peer, external, leader-owned, or user-owned worker surfaces.
 ---
 
 # Delegating Cross-Agent Work
 
 ## Scope
 
-Lead the work. Keep ambiguity, consequential judgment, architecture, design taste, human-facing copy, and coordination local. Delegate bounded execution that benefits from parallelism, specialist tooling, or waits outside the critical path.
+Keep ambiguity, consequential judgment, architecture, copy, and coordination local. Delegate bounded parallel, specialist, or waiting work.
 
-[choosing-agent-models](../choosing-agent-models/SKILL.md) owns model and effort selection. This skill owns worker topology, lifecycle, authority, bounded handoffs, and leader integration.
+[choosing-agent-models](../choosing-agent-models/SKILL.md) owns model and effort selection. This skill owns target surface, worker topology, authority, bounded handoffs, assurance, and leader integration.
 
-## Choose the Worker Lifecycle
+## Choose the Worker Contract
 
-- **Native subagent:** use for tight, short-lived work in the current harness. The leader creates, scopes, reviews, and ends it.
-- **User-owned Codex task or thread:** create only when the user explicitly asks. It belongs to the user; never create or steer one as an internal subtask.
-- **Foreign-harness peer:** use when an independent lifecycle, browser/computer use, separate worktree, long wait, or cross-harness execution materially helps. It owns only its stated session and scope; it cannot widen scope, subdelegate, or take consequential external actions without explicit authority.
+Choose each axis independently:
 
-When selecting a foreign-harness peer, read [foreign-harness-peers.md](references/foreign-harness-peers.md) before probing or dispatch. A cross-harness CLI or API launch is always a foreign-harness peer.
+- target: exact family, surface, version, and executor;
+- relationship: `child`, `peer`, or `external`;
+- ownership: `leader-owned` or `user-owned`;
+- transport: `native-tool`, `task-api`, `cli`, `app-server`, or `remote-api`; and
+- required assurance: `product-attested`, `controller-observed`, or `self-reported`.
+
+Do not infer one axis from another. Use a leader-owned child for bounded work the leader creates and ends. A leader-owned peer may have an independent session while remaining leader-controlled. A user-owned peer or task requires explicit user consent to create or steer. Use an external worker only when crossing the selected product or control boundary materially helps.
+
+Read [foreign-harness-peers.md](references/foreign-harness-peers.md) before probing a non-native or separately owned surface.
 
 ## Kickoff
 
-Record the leader, repository, branch, immutable base, dirty state, submodules, and owning worktree. Compare plans with live state and policy before dispatch. Choose the lifecycle and boundary before edit authority. If model or effort remains unresolved, use `choosing-agent-models`.
+Record the leader, repository, branch, immutable base, dirty state, submodules, and owning worktree. Compare plans with live state and policy before dispatch. Freeze every topology axis and the consumer's minimum assurance before model choice or edit authority. If model or effort remains unresolved, use `choosing-agent-models`.
 
 ## Bounded Handoff
 
 Every prompt is a bounded task contract: goal and success criteria; worktree and immutable base; relevant facts and target behavior; allowed scope and read/write authority; subdelegation and external-action authority; verification; output; and stop conditions. Unstated authority is absent. Workers preserve user and peer edits.
 
+For native ChatGPT Codex or Codex CLI/TUI children, follow
+[native-codex-subagents.md](references/native-codex-subagents.md): freeze before
+spawning and record only host-protocol observations.
+
 For a caller that needs a frozen multi-worker dispatch plan, issue the portable
 contract defined by [invocation-topology-receipt.md](references/invocation-topology-receipt.md).
-The harness adapter serializes it as
-`adapter:rolecasting-invocation-topology-receipt`; model selection remains a
-separate input and never supplies dispatch authority.
+The harness adapter serializes it as `adapter:rolecasting-invocation-topology-receipt`; model selection remains separate and never supplies dispatch authority. For witnessed execution and assurance minima, use [dispatch-evidence.md](references/dispatch-evidence.md).
 
 Ask workers to return one status:
 

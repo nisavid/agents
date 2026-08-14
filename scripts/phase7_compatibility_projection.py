@@ -12,16 +12,22 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from evidence_transport import candidate_content_identity, json_file_bytes, strict_json_bytes  # noqa: E402
+from evidence_transport import (  # noqa: E402
+    candidate_content_identity,
+    json_file_bytes,
+    strict_json_bytes,
+)
 
 
-COMPATIBILITY_CONTRACT = "phase7-public-private-compatibility-v4"
-COMPATIBILITY_SCHEMA_VERSION = 4
+COMPATIBILITY_CONTRACT = "phase7-public-private-compatibility-v5"
+COMPATIBILITY_SCHEMA_VERSION = 5
 MAX_SOURCE_BYTES = 2 * 1024 * 1024
 
 ROLECASTING_TOPOLOGY = Path("plugins/rolecasting/topology.json")
+ROLECASTING_PROVIDER = Path("plugins/rolecasting/task-witness-provider.json")
 VERSIONKEEPING_TOPOLOGY = Path("plugins/versionkeeping/topology.json")
 TRICRITICAL_TOPOLOGY = Path("plugins/tricritical/topology.json")
+TRICRITICAL_PROVIDER = Path("plugins/tricritical/task-witness-provider.json")
 REVIEW_ATLAS_EXTENSION = Path(
     "plugins/mergecraft/skills/writing-reviewable-pr-descriptions/"
     "references/review-atlas-extension.json"
@@ -49,12 +55,45 @@ REVIEW_ATLAS_EXTENSION_FIELDS = (
     "forbidden_authority",
     "precedence",
 )
+TASK_WITNESS_PROVIDER_FIELDS = (
+    "schema_version",
+    "contract",
+    "plugin_id",
+    "publisher",
+    "repository",
+    "authority_profile",
+    "content_sha256",
+    "producers",
+    "issuers",
+    "validators",
+)
+ROLECASTING_ASSURANCE_DIMENSIONS = (
+    "target",
+    "model",
+    "topology",
+    "authority",
+    "execution_result",
+)
+ROLECASTING_ASSURANCE_LEVELS = (
+    "product-attested",
+    "controller-observed",
+    "self-reported",
+)
+ROLECASTING_ASSURANCE_STRENGTH_ORDER = (
+    "self-reported",
+    "controller-observed",
+    "product-attested",
+)
 
 # This selector document is also the registry-facing coordination contract.
 SOURCE_SELECTORS = (
     {
         "path": ROLECASTING_TOPOLOGY.as_posix(),
         "json_pointers": ("/receipt_contract",),
+    },
+    {
+        "path": ROLECASTING_PROVIDER.as_posix(),
+        "json_pointers": tuple(f"/{field}" for field in TASK_WITNESS_PROVIDER_FIELDS),
     },
     {
         "path": VERSIONKEEPING_TOPOLOGY.as_posix(),
@@ -67,6 +106,10 @@ SOURCE_SELECTORS = (
             for skill in TRICRITICAL_SKILLS
             for field in TRICRITICAL_AUTHORITY_FIELDS
         ),
+    },
+    {
+        "path": TRICRITICAL_PROVIDER.as_posix(),
+        "json_pointers": tuple(f"/{field}" for field in TASK_WITNESS_PROVIDER_FIELDS),
     },
     {
         "path": REVIEW_ATLAS_EXTENSION.as_posix(),
@@ -128,14 +171,33 @@ def _document(root: Path, relative: Path, label: str) -> dict[str, Any]:
     )
 
 
+def _provider_projection(document: dict[str, Any], label: str) -> dict[str, Any]:
+    """Project the complete authority-bearing Task Witness declaration fields."""
+
+    return {
+        field: _field(document, field, label)
+        for field in TASK_WITNESS_PROVIDER_FIELDS
+    }
+
+
 def compatibility_document(root: Path) -> dict[str, Any]:
     """Project only authority consumed across the private deployment boundary."""
 
     rolecasting = _document(root, ROLECASTING_TOPOLOGY, "Rolecasting topology")
+    rolecasting_provider = _document(
+        root,
+        ROLECASTING_PROVIDER,
+        "Rolecasting Task Witness provider",
+    )
     versionkeeping = _document(
         root, VERSIONKEEPING_TOPOLOGY, "Versionkeeping topology"
     )
     tricritical = _document(root, TRICRITICAL_TOPOLOGY, "Tricritical topology")
+    tricritical_provider = _document(
+        root,
+        TRICRITICAL_PROVIDER,
+        "Tricritical Task Witness provider",
+    )
     extension = _document(
         root, REVIEW_ATLAS_EXTENSION, "Review Atlas extension contract"
     )
@@ -167,7 +229,17 @@ def compatibility_document(root: Path) -> dict[str, Any]:
             "receipt_contract": _object(
                 _field(rolecasting, "receipt_contract", "Rolecasting topology"),
                 "Rolecasting receipt contract",
-            )
+            ),
+            "assurance_contract": {
+                "dimensions": list(ROLECASTING_ASSURANCE_DIMENSIONS),
+                "levels": list(ROLECASTING_ASSURANCE_LEVELS),
+                "strength_order": list(ROLECASTING_ASSURANCE_STRENGTH_ORDER),
+                "implicit_promotion": "forbidden",
+            },
+            "task_witness_provider": _provider_projection(
+                rolecasting_provider,
+                "Rolecasting Task Witness provider",
+            ),
         },
         "versionkeeping": {
             "operation_owners": _object(
@@ -187,7 +259,13 @@ def compatibility_document(root: Path) -> dict[str, Any]:
                 "Versionkeeping terminal handoff",
             ),
         },
-        "tricritical": {"skills": projected_skills},
+        "tricritical": {
+            "skills": projected_skills,
+            "task_witness_provider": _provider_projection(
+                tricritical_provider,
+                "Tricritical Task Witness provider",
+            ),
+        },
         "review_atlas": {
             "extension": {
                 field: _field(

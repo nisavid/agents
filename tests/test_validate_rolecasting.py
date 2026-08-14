@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import shutil
 import subprocess
@@ -9,9 +10,38 @@ import tempfile
 import unittest
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 VALIDATOR = REPO_ROOT / "scripts" / "validate_rolecasting.py"
+AGENT_PLUGIN_SCHEMA = "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json"
+DISPATCH_EVIDENCE_CONTRACT = "rolecasting-dispatch-evidence-v2"
+DISPATCH_EVIDENCE_RUNTIME = (
+    "skills/delegating-cross-agent-work/scripts/dispatch_evidence.py"
+)
+DISPATCH_ADAPTER_RUNTIME = (
+    "skills/delegating-cross-agent-work/scripts/dispatch_adapter.py"
+)
+CANONICAL_MANIFEST_KEYS = {
+    "$schema",
+    "name",
+    "version",
+    "description",
+    "author",
+    "homepage",
+    "repository",
+    "license",
+    "keywords",
+    "extensions",
+}
+CANONICAL_IDENTITY_FIELDS = (
+    "name",
+    "version",
+    "description",
+    "author",
+    "homepage",
+    "repository",
+    "license",
+    "keywords",
+)
 
 
 class ValidateRolecastingTests(unittest.TestCase):
@@ -50,6 +80,144 @@ class ValidateRolecastingTests(unittest.TestCase):
     def test_accepts_current_contract(self) -> None:
         result = self.validate()
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_registers_exact_task_witness_dispatch_evidence_owner(self) -> None:
+        provider_path = self.plugin / "task-witness-provider.json"
+        raw = provider_path.read_bytes()
+        provider = json.loads(raw)
+        self.assertEqual(
+            raw,
+            json.dumps(
+                provider,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode()
+            + b"\n",
+        )
+        self.assertEqual(
+            set(provider),
+            {
+                "schema_version",
+                "contract",
+                "content_sha256",
+                "plugin_id",
+                "publisher",
+                "repository",
+                "authority_profile",
+                "producers",
+                "issuers",
+                "validators",
+            },
+        )
+        self.assertEqual(provider["plugin_id"], "rolecasting")
+        self.assertEqual(provider["publisher"], "nisavid")
+        self.assertEqual(provider["repository"], "https://github.com/nisavid/agents")
+        self.assertEqual(
+            provider["authority_profile"], "rolecasting-cooperative-dispatch-v2"
+        )
+        unsigned = {
+            key: value for key, value in provider.items() if key != "content_sha256"
+        }
+        canonical_unsigned = json.dumps(
+            unsigned,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode()
+        self.assertEqual(
+            provider["content_sha256"], hashlib.sha256(canonical_unsigned).hexdigest()
+        )
+        runtime = self.plugin / DISPATCH_EVIDENCE_RUNTIME
+        runtime_raw = runtime.read_bytes()
+        runtime_sha = hashlib.sha256(runtime_raw).hexdigest()
+        adapter = self.plugin / DISPATCH_ADAPTER_RUNTIME
+        adapter_raw = adapter.read_bytes()
+        adapter_sha = hashlib.sha256(adapter_raw).hexdigest()
+        validator = provider["validators"][0]
+        self.assertEqual(validator["entrypoint"], "validator")
+        self.assertEqual(
+            validator["lifecycle"],
+            {"state": "active", "usable_for_new_publication": True},
+        )
+        self.assertEqual(
+            validator["validator_id"],
+            "rolecasting-dispatch-evidence-validator-v2",
+        )
+        self.assertEqual(validator["contract"], DISPATCH_EVIDENCE_CONTRACT)
+        self.assertEqual(
+            validator["modules"],
+            [
+                {
+                    "name": "validator",
+                    "relative_path": DISPATCH_EVIDENCE_RUNTIME,
+                    "length": len(runtime_raw),
+                    "sha256": runtime_sha,
+                },
+                {
+                    "name": "adapter",
+                    "relative_path": DISPATCH_ADAPTER_RUNTIME,
+                    "length": len(adapter_raw),
+                    "sha256": adapter_sha,
+                },
+            ],
+        )
+        implementation_frame = {
+            "contract": "task-witness-validator-artifact-manifest-v1",
+            "validator_contract": DISPATCH_EVIDENCE_CONTRACT,
+            "entrypoint_module": "validator",
+            "modules": [
+                {"name": "validator", "content_sha256": runtime_sha},
+                {"name": "adapter", "content_sha256": adapter_sha},
+            ],
+        }
+        implementation = hashlib.sha256(
+            json.dumps(
+                implementation_frame,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        self.assertEqual(validator["implementation_sha256"], implementation)
+        self.assertEqual(provider["producers"], [])
+        self.assertEqual(provider["issuers"], [])
+
+    def test_rejects_adapter_mutation_without_provider_identity_refresh(self) -> None:
+        path = self.plugin / DISPATCH_ADAPTER_RUNTIME
+        path.write_bytes(path.read_bytes() + b"\n# drift\n")
+
+        self.assert_rejected("Task Witness provider declaration drift")
+
+    def test_rejects_resigned_provider_authority_profile_drift(self) -> None:
+        path = self.plugin / "task-witness-provider.json"
+        provider = json.loads(path.read_text())
+        provider["authority_profile"] = "rolecasting-unbounded-dispatch-v1"
+        unsigned = {
+            key: value for key, value in provider.items() if key != "content_sha256"
+        }
+        provider["content_sha256"] = hashlib.sha256(
+            json.dumps(
+                unsigned,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode()
+        ).hexdigest()
+        path.write_bytes(
+            json.dumps(
+                provider,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode()
+            + b"\n"
+        )
+
+        self.assert_rejected("provider authority profile drift")
 
     def test_accepts_zero_arguments_from_repository_root(self) -> None:
         result = self.validate_without_argument()
@@ -138,7 +306,7 @@ class ValidateRolecastingTests(unittest.TestCase):
         self.assert_rejected("frontmatter schema drift")
 
     def test_rejects_duplicate_key_in_trusted_manifest(self) -> None:
-        path = self.plugin / ".codex-plugin" / "plugin.json"
+        path = self.plugin / "plugin.json"
         path.write_text(
             path.read_text().replace(
                 '  "name": "rolecasting",',
@@ -148,6 +316,117 @@ class ValidateRolecastingTests(unittest.TestCase):
         )
         self.assert_rejected("contains duplicate key: name")
 
+    def test_uses_canonical_agent_plugins_v1_manifest(self) -> None:
+        path = self.plugin / "plugin.json"
+        manifest = json.loads(path.read_text())
+        self.assertEqual(set(manifest), CANONICAL_MANIFEST_KEYS)
+        self.assertEqual(manifest["$schema"], AGENT_PLUGIN_SCHEMA)
+        self.assertEqual(manifest["name"], "rolecasting")
+        self.assertEqual(manifest["version"], "1.0.0")
+        self.assertEqual(set(manifest["extensions"]), {"com.openai"})
+        self.assertEqual(set(manifest["extensions"]["com.openai"]), {"interface"})
+        self.assertFalse((self.plugin / ".codex-plugin").exists())
+
+    def test_rejects_each_agent_plugins_v1_schema_drift(self) -> None:
+        path = self.plugin / "plugin.json"
+        original = json.loads(path.read_text())
+        cases = (
+            ("missing schema", lambda value: value.pop("$schema")),
+            ("unknown field", lambda value: value.update({"skills": "./skills/"})),
+            (
+                "wrong schema",
+                lambda value: value.update(
+                    {
+                        "$schema": "https://agent-plugins.org/schemas/2.0.0/plugin.schema.json"
+                    }
+                ),
+            ),
+            ("invalid name", lambda value: value.update({"name": "role--casting"})),
+            ("wrong version type", lambda value: value.update({"version": 1})),
+            (
+                "unknown author field",
+                lambda value: value["author"].update({"handle": "nisavid"}),
+            ),
+            ("wrong keyword type", lambda value: value.update({"keywords": [1]})),
+            (
+                "wrong extension type",
+                lambda value: value.update({"extensions": {"com.openai": []}}),
+            ),
+        )
+        for label, mutate in cases:
+            with self.subTest(label=label):
+                manifest = copy.deepcopy(original)
+                mutate(manifest)
+                path.write_text(json.dumps(manifest, indent=2) + "\n")
+                self.assert_rejected("Agent Plugins v1 manifest")
+
+    def test_claude_manifest_is_exact_canonical_projection(self) -> None:
+        canonical = json.loads((self.plugin / "plugin.json").read_text())
+        claude = json.loads(
+            (self.plugin / ".claude-plugin" / "plugin.json").read_text()
+        )
+        self.assertEqual(set(claude), set(CANONICAL_IDENTITY_FIELDS) | {"displayName"})
+        self.assertEqual(claude["displayName"], "Rolecasting")
+        self.assertEqual(
+            {field: claude[field] for field in CANONICAL_IDENTITY_FIELDS},
+            {field: canonical[field] for field in CANONICAL_IDENTITY_FIELDS},
+        )
+
+    def test_rejects_claude_projection_drift(self) -> None:
+        path = self.plugin / ".claude-plugin" / "plugin.json"
+        manifest = json.loads(path.read_text())
+        manifest["version"] = "1.0.1"
+        path.write_text(json.dumps(manifest, indent=2) + "\n")
+        self.assert_rejected("Claude manifest projection drift: version")
+
+    def test_agent_plugins_discovery_is_direct_child_only(self) -> None:
+        expected = sorted(
+            json.loads((self.plugin / "topology.json").read_text())["skills"]
+        )
+        discovered = sorted(
+            path.name
+            for path in (self.plugin / "skills").iterdir()
+            if path.is_dir() and (path / "SKILL.md").is_file()
+        )
+        self.assertEqual(discovered, expected)
+
+        shadow = self.plugin / "skills" / "shadow"
+        shadow.mkdir()
+        (shadow / "SKILL.md").write_text(
+            "---\n"
+            "name: shadow\n"
+            "description: Use when testing discovery.\n"
+            "---\n\n"
+            "# Shadow\n"
+        )
+        self.assert_rejected("Agent Plugins direct-child skill inventory drift")
+
+    def test_rejects_agent_skill_resource_escape(self) -> None:
+        outside = self.repo / "outside.md"
+        outside.write_text("outside the plugin\n")
+        path = self.plugin / "skills" / "choosing-agent-models" / "SKILL.md"
+        content = path.read_text()
+        mutated = content.replace(
+            "references/capability-probes-and-fallbacks.md",
+            "../../../../outside.md",
+            1,
+        )
+        self.assertNotEqual(mutated, content)
+        path.write_text(mutated)
+        self.assert_rejected("Agent Skill resource escapes plugin root")
+
+    def test_preserves_codex_skill_interfaces_in_standard_package(self) -> None:
+        self.assertFalse((self.plugin / ".codex-plugin").exists())
+        for skill in sorted(
+            json.loads((self.plugin / "topology.json").read_text())["skills"]
+        ):
+            with self.subTest(skill=skill):
+                self.assertTrue(
+                    (
+                        self.plugin / "skills" / skill / "agents" / "openai.yaml"
+                    ).is_file()
+                )
+
     def test_rejects_non_finite_json_values(self) -> None:
         path = self.plugin / "topology.json"
         original = path.read_text()
@@ -155,7 +434,7 @@ class ValidateRolecastingTests(unittest.TestCase):
             with self.subTest(constant=constant):
                 path.write_text(
                     original.replace(
-                        '"schema_version": 2', f'"schema_version": {constant}'
+                        '"schema_version": 3', f'"schema_version": {constant}'
                     )
                 )
                 self.assert_rejected(f"contains non-finite JSON value: {constant}")
@@ -165,7 +444,7 @@ class ValidateRolecastingTests(unittest.TestCase):
         topology = self.plugin / "topology.json"
         topology.write_text(
             topology.read_text().replace(
-                '"schema_version": 2', '"schema_version": true'
+                '"schema_version": 3', '"schema_version": true'
             )
         )
         self.assert_rejected("topology schema_version must be an integer")
@@ -178,9 +457,9 @@ class ValidateRolecastingTests(unittest.TestCase):
         self.assert_rejected("executor inputs must withhold grader expectations")
 
     def test_rejects_unnamespaced_codex_prompt(self) -> None:
-        path = self.plugin / ".codex-plugin" / "plugin.json"
+        path = self.plugin / "plugin.json"
         manifest = json.loads(path.read_text())
-        manifest["interface"]["defaultPrompt"][0] = (
+        manifest["extensions"]["com.openai"]["interface"]["defaultPrompt"][0] = (
             "Use $delegating-cross-agent-work for this task."
         )
         path.write_text(json.dumps(manifest, indent=2) + "\n")
@@ -320,7 +599,7 @@ class ValidateRolecastingTests(unittest.TestCase):
         for relative_path in (
             "README.md",
             ".claude-plugin/plugin.json",
-            ".codex-plugin/plugin.json",
+            "plugin.json",
         ):
             with self.subTest(relative_path=relative_path):
                 path = self.plugin / relative_path
@@ -361,7 +640,7 @@ class ValidateRolecastingTests(unittest.TestCase):
         self,
     ) -> None:
         topology = json.loads((self.plugin / "topology.json").read_text())
-        self.assertEqual(topology["schema_version"], 2)
+        self.assertEqual(topology["schema_version"], 3)
         self.assertEqual(
             topology["receipt_contract"],
             {
@@ -370,7 +649,15 @@ class ValidateRolecastingTests(unittest.TestCase):
                 "separate_from": "adapter:model-selection-receipt",
                 "binds": [
                     "dispatch-identity",
-                    "lifecycle",
+                    "product-family",
+                    "surface",
+                    "version",
+                    "executor",
+                    "relationship",
+                    "ownership",
+                    "transport",
+                    "assurance",
+                    "consumer-assurance-minimum",
                     "isolation",
                     "subdelegation-authority",
                     "external-action-authority",

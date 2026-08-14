@@ -1,0 +1,27 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "task-witness",
+  "version": "1.0.0",
+  "description": "Task Witness launches exact-byte-pinned registered validators against retained operator trust.",
+  "author": {
+    "name": "Ivan D Vasin",
+    "url": "https://github.com/nisavid"
+  },
+  "homepage": "https://github.com/nisavid/agents/tree/main/plugins/task-witness",
+  "repository": "https://github.com/nisavid/agents",
+  "license": "MIT",
+  "keywords": ["evidence", "provenance", "validation", "trust"],
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "Task Witness",
+        "shortDescription": "Validate registered task-evidence bundles.",
+        "longDescription": "Task Witness runs exact-byte-pinned, operator-approved validators. Validators are trusted full-process Python code with ambient user authority; Task Witness grants no workflow authority and is not a sandbox.",
+        "developerName": "Ivan D Vasin",
+        "category": "Developer Tools",
+        "capabilities": ["Validation"],
+        "websiteURL": "https://github.com/nisavid/agents/tree/main/plugins/task-witness"
+      }
+    }
+  }
+}

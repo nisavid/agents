@@ -15,24 +15,26 @@ Freeze a content-addressed stable snapshot or revision before observation. Recor
 
 Before each distinct critic or specialist dispatch, require a capability-proven
 `adapter:model-selection-receipt` from the harness adapter. The receipt must bind
-the execution role, target harness or executor, exact supported model and effort
-or an inherited fixed-model binding, the live catalog or schema evidence proving
-that selection is available, and the authority for the selection. Reject a
-missing, stale, unsupported, or role-mismatched receipt. This portable skill
-consumes the receipt; it does not select a provider-specific model or copy
-harness policy.
+the execution role, target product family, surface, version, and executor, exact
+supported model and effort or an inherited fixed-model binding, the live catalog
+or schema evidence proving that selection is available, and the authority for
+the selection. Reject a missing, stale, unsupported, or role-mismatched receipt.
+This portable skill consumes the receipt; it
+does not select a provider-specific model or copy harness policy.
 
-Separately require one Rolecasting-issued
+Separately require one valid Rolecasting-defined
 `adapter:rolecasting-invocation-topology-receipt` for the frozen review plan.
 Never fold it into a model-selection receipt. It binds the candidate,
 review-input, and requirements identities and a closed-world dispatch set with
 exactly one unique dispatch entry for every selected critic and specialist.
-Before each dispatch, validate its lifecycle, executor and harness, identical
-input identities, bounded scope, return and verification contract, stop
-conditions, distinct isolation, read-only authority, default-denied
-subdelegation and external action, and explicit user authority for any
-user-owned task. Reject the whole plan on an omitted, duplicate, extra,
-unauthorized, or stale entry.
+Before each dispatch, validate its target product family, surface, version, and
+executor; child, peer, or external relationship; leader-owned or user-owned
+ownership; transport; identical input identities; bounded scope; return and
+verification contract; stop conditions; distinct isolation; read-only
+authority; consumer assurance minimum; product-attested, controller-observed,
+or self-reported assurance; default-denied subdelegation and external action;
+and explicit user authority for any user-owned work. Reject the whole plan on
+an omitted, duplicate, extra, unauthorized, stale, or under-assured entry.
 
 1. When the harness supports distinct read-only critic executions, invoke the public skill identities [intent](../intent/SKILL.md), [runtime](../runtime/SKILL.md), and [structure](../structure/SKILL.md) separately for the selected axes. Give each execution the same frozen contract, byte-identical candidate snapshot, its unique topology entry, and its separate bound model-selection receipt.
 2. Select risk specialists dynamically from the frozen consequence surface, then route each specialist through the closest public critic skill as a separate read-only execution.
@@ -40,8 +42,9 @@ unauthorized, or stale entry.
 4. When distinct executions are unavailable, run the selected axes and specialists in the available context, label every report and the synthesis `non-independent / degraded`, and state the missing isolation capability. Never describe that result as independent or claim clean independence.
 5. Apply the completeness and causal-synthesis rules. A selected execution that is missing, failed, timed out, unusable, or unverified makes the result `incomplete / non-clean`. Report observations and uncertainty. Do not assign dispositions or edit the candidate.
 
-Do not substitute an undeclared lifecycle or executor. Any fallback requires a
-new valid plan and a newly validated Rolecasting receipt before dispatch.
+Do not substitute an undeclared target, relationship, ownership, transport, or
+executor, or weaken the assurance minimum. Any fallback requires a new valid
+plan and a newly validated Rolecasting receipt before dispatch.
 
 ## Completion
 

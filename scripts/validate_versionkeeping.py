@@ -16,6 +16,16 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+SCRIPT_DIRECTORY = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIRECTORY))
+
+from agent_plugins_standard import (  # noqa: E402
+    AgentPluginContractError,
+    discover_direct_skills,
+    load_agent_plugin_manifest,
+    validate_skill_resource_links,
+)
+
 PLUGIN_RELATIVE = Path("plugins/versionkeeping")
 EVAL_RELATIVE = Path("evals/versionkeeping")
 CONTENT_LOCK_RELATIVE = Path("release/plugin-content-locks/versionkeeping.json")
@@ -23,10 +33,10 @@ CONTENT_LOCK_EXCLUSIONS = {"CHANGELOG.md", "LICENSE"}
 SAFE_PLUGIN_REGULAR_FILE_MODES = frozenset({0o644, 0o755})
 ROOT_FILES = {
     ".claude-plugin/plugin.json",
-    ".codex-plugin/plugin.json",
     "CHANGELOG.md",
     "LICENSE",
     "README.md",
+    "plugin.json",
     "topology.json",
 }
 PUBLIC_SKILLS = (
@@ -244,9 +254,7 @@ FORBIDDEN_OWNERS = (
     "writing-reviewable-pr-descriptions",
 )
 MACHINE_LOCAL_MARKERS = ("/Users/ivan", "chezmoi.wt", ".local/share/chezmoi")
-VERSION = re.compile(
-    r"^(?P<release>\d+\.\d+\.\d+)\+(?P<harness>claude|codex)\.(?P<build>\d{14})$"
-)
+RELEASE_VERSION = "1.0.0"
 DIRECT_LOCAL_INTEGRATION = re.compile(
     r"(?m)^[ \t]*git[ \t]+(?:merge(?:[ \t]|$)|rebase(?:[ \t]|$)|"
     r"cherry-pick(?:[ \t]|$)|am(?:[ \t]|$))"
@@ -507,48 +515,76 @@ def load_manifest(root: Path, relative: str) -> dict:
 
 
 def validate_manifests(root: Path) -> None:
-    codex = load_manifest(root, ".codex-plugin/plugin.json")
+    codex = load_agent_plugin_manifest(root)
     claude = load_manifest(root, ".claude-plugin/plugin.json")
-    for manifest, label in ((codex, "Codex"), (claude, "Claude")):
+    identity_fields = {
+        "name",
+        "version",
+        "description",
+        "author",
+        "homepage",
+        "repository",
+        "license",
+        "keywords",
+    }
+    require(
+        set(codex) == identity_fields | {"$schema", "extensions"},
+        "canonical Agent Plugin manifest keys drift",
+    )
+    require(
+        set(claude) == identity_fields | {"displayName"},
+        "Claude manifest keys drift",
+    )
+    for field in identity_fields:
         require(
-            manifest.get("name") == "versionkeeping", f"{label} manifest name drift"
+            claude[field] == codex[field], f"Claude manifest projection drift: {field}"
         )
-        require(manifest.get("license") == "MIT", f"{label} manifest license drift")
-        require(
-            manifest.get("repository") == "https://github.com/nisavid/agents",
-            f"{label} repository drift",
-        )
-    codex_match = VERSION.fullmatch(str(codex.get("version", "")))
-    claude_match = VERSION.fullmatch(str(claude.get("version", "")))
+    require(codex["name"] == "versionkeeping", "canonical manifest name drift")
+    require(codex["version"] == RELEASE_VERSION, "canonical manifest version drift")
+    require(codex["license"] == "MIT", "canonical manifest license drift")
     require(
-        codex_match is not None and claude_match is not None,
-        "manifest version is invalid",
+        codex["repository"] == "https://github.com/nisavid/agents",
+        "canonical manifest repository drift",
     )
+    require(claude["displayName"] == "Versionkeeping", "Claude displayName drift")
+    extensions = codex["extensions"]
     require(
-        codex_match["harness"] == "codex" and claude_match["harness"] == "claude",
-        "manifest harness metadata drift",
+        isinstance(extensions, dict) and set(extensions) == {"com.openai"},
+        "canonical manifest extension inventory drift",
     )
+    openai = extensions["com.openai"]
     require(
-        codex_match["release"] == claude_match["release"]
-        and codex_match["build"] == claude_match["build"],
-        "manifest versions are not paired",
+        isinstance(openai, dict) and set(openai) == {"interface"},
+        "Codex extension keys drift",
     )
-    require(codex.get("skills") == "./skills/", "Codex skills path drift")
-    require(
-        "skills" not in claude and "agents" not in claude,
-        "Claude manifest must use discovery",
-    )
-    interface = codex.get("interface")
+    interface = openai["interface"]
     require(isinstance(interface, dict), "Codex interface must be an object")
     require(
-        "privacyPolicyURL" not in interface and "termsOfServiceURL" not in interface,
-        "Codex interface must not invent optional legal URLs",
+        set(interface)
+        == {
+            "displayName",
+            "shortDescription",
+            "longDescription",
+            "developerName",
+            "category",
+            "capabilities",
+            "websiteURL",
+            "brandColor",
+            "defaultPrompt",
+        },
+        "Codex interface keys drift",
     )
     prompts = interface.get("defaultPrompt")
     require(prompts == list(CODEX_PROMPTS.values()), "Codex default prompts drift")
+    discovered = discover_direct_skills(root)
+    require(
+        discovered == tuple(sorted(PUBLIC_SKILLS)),
+        "Agent Plugins direct-child skill inventory drift",
+    )
+    validate_skill_resource_links(root, discovered)
     changelog = read(root, "CHANGELOG.md")
     require(
-        re.search(rf"^## {re.escape(codex_match['release'])}$", changelog, re.MULTILINE)
+        re.search(rf"^## {re.escape(RELEASE_VERSION)}$", changelog, re.MULTILINE)
         is not None,
         "changelog release drift",
     )
@@ -1604,7 +1640,13 @@ def main() -> int:
             write_content_lock(repo_root, snapshot)
         else:
             validate(repo_root)
-    except (ContractError, OSError, json.JSONDecodeError, TypeError) as error:
+    except (
+        AgentPluginContractError,
+        ContractError,
+        OSError,
+        json.JSONDecodeError,
+        TypeError,
+    ) as error:
         print(f"Versionkeeping contract validation failed: {error}", file=sys.stderr)
         return 1
     print("Versionkeeping contract validation passed")

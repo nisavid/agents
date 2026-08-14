@@ -13,6 +13,16 @@ import sys
 from pathlib import Path
 from typing import Any
 
+SCRIPT_DIRECTORY = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIRECTORY))
+
+from agent_plugins_standard import (  # noqa: E402
+    AgentPluginContractError,
+    discover_direct_skills,
+    load_agent_plugin_manifest,
+    validate_skill_resource_links,
+)
+
 try:
     import yaml
 except ModuleNotFoundError:
@@ -50,10 +60,10 @@ PUBLIC_SKILLS = (
 )
 ROOT_FILES = {
     ".claude-plugin/plugin.json",
-    ".codex-plugin/plugin.json",
     "CHANGELOG.md",
     "LICENSE",
     "README.md",
+    "plugin.json",
     "topology.json",
 }
 WRITER_MODULE_NAMES = (
@@ -180,6 +190,7 @@ EXPECTED_SKILL_FILES = {
         "scripts/audit_reviewable_pr.py",
         "scripts/create_reviewable_pr.py",
         "scripts/publication_receipts.py",
+        "scripts/required_review.py",
         "scripts/reviewable_pr_state.py",
         "scripts/update_reviewable_pr.py",
     },
@@ -454,10 +465,7 @@ EXPECTED_ATLAS_PROSE_SHA256 = {
     "body": "3c59ae1b4ec197b0cd4c41624a39c597744bea4fd5333b1ed81e7f2c8d6753c4",
     "navigation": "7d7cb0ea53a24b962f3298d73c38294f065c6e49543d00d2e8370cb490f68e3b",
 }
-VERSION_RE = re.compile(
-    r"^(?P<release>\d+\.\d+\.\d+)\+(?P<harness>claude|codex)\."
-    r"(?P<build>\d{14})$"
-)
+RELEASE_VERSION = "1.0.0"
 MARKDOWN_LINK_RE = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
 PORTABILITY_MARKERS = (
     "/Users/",
@@ -576,7 +584,10 @@ RETIREMENT_CONTRIBUTIONS = (
         "disposition": "discard-with-reason",
         "destination_owner": "publishing-reviewable-prs",
         "fixture": "direct-connector-and-fill-collision-refusal",
-        "reason": "The bound publisher owns pull request mutation and refuses unbound direct creation.",
+        "reason": (
+            "The bound publisher owns pull request mutation and refuses unbound "
+            "direct creation."
+        ),
     },
     {
         "id": "github-gh-fix-ci-authority",
@@ -609,7 +620,10 @@ RETIREMENT_CONTRIBUTIONS = (
         "disposition": "discard-with-reason",
         "destination_owner": "publishing-reviewable-prs",
         "fixture": "direct-connector-and-fill-collision-refusal",
-        "reason": "The bound publisher owns generated review text and refuses raw filled creation routes.",
+        "reason": (
+            "The bound publisher owns generated review text and refuses raw filled "
+            "creation routes."
+        ),
     },
     {
         "id": "gh-address-comments-unresolved-thread-acquisition",
@@ -1288,10 +1302,9 @@ def validate_no_compatibility_shims(root: Path) -> None:
 
 def validate_manifests(root: Path) -> None:
     claude = load_json(root, ".claude-plugin/plugin.json")
-    codex = load_json(root, ".codex-plugin/plugin.json")
-    claude_keys = {
+    codex = load_agent_plugin_manifest(root)
+    identity_fields = {
         "name",
-        "displayName",
         "version",
         "description",
         "author",
@@ -1300,34 +1313,38 @@ def validate_manifests(root: Path) -> None:
         "license",
         "keywords",
     }
-    codex_keys = (claude_keys - {"displayName"}) | {"skills", "interface"}
-    require(set(claude) == claude_keys, "Claude manifest schema drift")
-    require(set(codex) == codex_keys, "Codex manifest schema drift")
-    for manifest, label in ((claude, "Claude"), (codex, "Codex")):
-        require(manifest.get("name") == "mergecraft", f"{label} plugin name drift")
-        require(manifest.get("license") == "MIT", f"{label} license drift")
+    require(
+        set(claude) == identity_fields | {"displayName"},
+        "Claude manifest schema drift",
+    )
+    require(
+        set(codex) == identity_fields | {"$schema", "extensions"},
+        "canonical Agent Plugin manifest schema drift",
+    )
+    for field in identity_fields:
         require(
-            manifest.get("repository") == "https://github.com/nisavid/agents",
-            f"{label} repository drift",
+            claude[field] == codex[field],
+            f"Claude manifest projection drift: {field}",
         )
-    claude_version = VERSION_RE.fullmatch(str(claude.get("version", "")))
-    codex_version = VERSION_RE.fullmatch(str(codex.get("version", "")))
+    require(codex["name"] == "mergecraft", "canonical plugin name drift")
+    require(codex["version"] == RELEASE_VERSION, "canonical version drift")
+    require(codex["license"] == "MIT", "canonical license drift")
     require(
-        claude_version is not None and codex_version is not None,
-        "manifest version is invalid",
+        codex["repository"] == "https://github.com/nisavid/agents",
+        "canonical repository drift",
     )
+    require(claude["displayName"] == "Mergecraft", "Claude displayName drift")
+    extensions = codex["extensions"]
     require(
-        claude_version["harness"] == "claude" and codex_version["harness"] == "codex",
-        "manifest harness metadata drift",
+        isinstance(extensions, dict) and set(extensions) == {"com.openai"},
+        "canonical manifest extension inventory drift",
     )
+    openai = extensions["com.openai"]
     require(
-        claude_version["release"] == codex_version["release"]
-        and claude_version["build"] == codex_version["build"],
-        "manifest versions are not paired",
+        isinstance(openai, dict) and set(openai) == {"interface"},
+        "Codex extension keys drift",
     )
-    require(codex.get("skills") == "./skills/", "Codex skills path drift")
-    require("skills" not in claude, "Claude manifest must use skill discovery")
-    interface = codex.get("interface")
+    interface = openai["interface"]
     require(
         isinstance(interface, dict)
         and set(interface)
@@ -1347,12 +1364,12 @@ def validate_manifests(root: Path) -> None:
         interface["defaultPrompt"] == MANIFEST_PROMPTS,
         "Codex manifest prompts drift",
     )
-    claude_description = str(claude["description"]).removeprefix("Mergecraft:")
-    codex_description = str(codex["description"]).removeprefix("Mergecraft for Codex:")
+    discovered = discover_direct_skills(root)
     require(
-        claude_description == codex_description,
-        "manifest descriptions are not paired",
+        discovered == tuple(sorted(PUBLIC_SKILLS)),
+        "Agent Plugins direct-child skill inventory drift",
     )
+    validate_skill_resource_links(root, discovered)
 
 
 def validate_adapters_and_frontmatter(root: Path) -> None:
@@ -1393,7 +1410,10 @@ OPERATION_REGISTRY_END = "<!-- END GENERATED OPERATION REGISTRY -->"
 def render_operation_registry(operations: list[dict[str, Any]]) -> str:
     lines = [
         OPERATION_REGISTRY_START,
-        "| Semantic ID | GitHub aliases | Surface | Access | Authority | Disposition | Owner | Implementation/import | Callers |",
+        (
+            "| Semantic ID | GitHub aliases | Surface | Access | Authority | "
+            "Disposition | Owner | Implementation/import | Callers |"
+        ),
         "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for operation in operations:
@@ -1873,8 +1893,14 @@ def validate_atlas_split(repo_root: Path, root: Path) -> None:
         "Resolve only its default path.",
         "Load a regular non-symlink overlay only for exact scope",
         "public core wins.",
-        "Keep atlas source, tests, docs, manifests, and generated assets outside application repositories.",
-        "Protected deep links may rely on destination access control, but never embed bearer or signed credentials.",
+        (
+            "Keep atlas source, tests, docs, manifests, and generated assets outside "
+            "application repositories."
+        ),
+        (
+            "Protected deep links may rely on destination access control, but never "
+            "embed bearer or signed credentials."
+        ),
     ):
         require(
             requirement in normalized_writer,
@@ -1905,7 +1931,10 @@ def validate_atlas_split(repo_root: Path, root: Path) -> None:
         "## Stack Disclosure",
         "## Diff Disclosure",
         "## Validator Binding",
-        "Render exactly one Stack disclosure when stacked and exactly one Diff disclosure",
+        (
+            "Render exactly one Stack disclosure when stacked and exactly one Diff "
+            "disclosure"
+        ),
     ):
         require(
             requirement in normalized_navigation,
@@ -1922,7 +1951,9 @@ def validate_atlas_split(repo_root: Path, root: Path) -> None:
             "stack_heading": "## Stack Disclosure",
             "diff_heading": "## Diff Disclosure",
             "validator_heading": "## Validator Binding",
-            "leading_disclosures": "exactly-one-stack-when-stacked-and-exactly-one-diff",
+            "leading_disclosures": (
+                "exactly-one-stack-when-stacked-and-exactly-one-diff"
+            ),
         }
         and contract["firewall"]
         == {
@@ -1932,10 +1963,23 @@ def validate_atlas_split(repo_root: Path, root: Path) -> None:
         "atlas canonical semantic mapping drift",
     )
     prose_paths = {
-        "design": "skills/writing-reviewable-pr-descriptions/review-atlas-reference-design.md",
+        "design": "/".join(
+            (
+                "skills",
+                "writing-reviewable-pr-descriptions",
+                "review-atlas-reference-design.md",
+            )
+        ),
         "writer": "skills/writing-reviewable-pr-descriptions/SKILL.md",
         "body": "skills/writing-reviewable-pr-descriptions/references/body-contract.md",
-        "navigation": "skills/writing-reviewable-pr-descriptions/references/change-navigation.md",
+        "navigation": "/".join(
+            (
+                "skills",
+                "writing-reviewable-pr-descriptions",
+                "references",
+                "change-navigation.md",
+            )
+        ),
     }
     actual_prose_sha256 = {
         name: hashlib.sha256(read(root, path).encode()).hexdigest()
@@ -2080,7 +2124,11 @@ def validate_retirement_contribution_ledger(repo_root: Path, root: Path) -> None
         and ledger["schema_version"] == 2
         and ledger["purpose"] == "comparative-retirement-evidence"
         and ledger["limitations"]
-        == "This ledger records reviewed contribution decisions and comparative evaluation bindings; it is not a runtime router or exhaustive route-enforcement claim."
+        == (
+            "This ledger records reviewed contribution decisions and comparative "
+            "evaluation bindings; it is not a runtime router or exhaustive "
+            "route-enforcement claim."
+        )
         and ledger["fixture_manifest"] == str(RETIREMENT_FIXTURES_RELATIVE)
         and ledger["scope"]
         == {
@@ -2435,6 +2483,10 @@ def validate_runtime_contracts(root: Path) -> None:
         root,
         "skills/publishing-reviewable-prs/scripts/publication_receipts.py",
     )
+    required_review = read(
+        root,
+        "skills/publishing-reviewable-prs/scripts/required_review.py",
+    )
     comment = read(
         root,
         "skills/getting-prs-merged/scripts/post_coderabbit_comment.py",
@@ -2468,7 +2520,10 @@ def validate_runtime_contracts(root: Path) -> None:
     normalized_ci_adapter = " ".join(ci_adapter.split())
     normalized_merge_actuator = " ".join(merge_actuator.split())
     require(
-        "return the complete validated title/body pair, authorized text surface, and review-input manifest"
+        (
+            "return the complete validated title/body pair, authorized text surface, "
+            "and review-input manifest"
+        )
         in normalized_writer
         and "Do not mutate the forge or verify stored/rendered state"
         in normalized_writer,
@@ -2597,7 +2652,7 @@ def validate_runtime_contracts(root: Path) -> None:
     ):
         require(term in update, f"publisher transition contract missing: {term}")
     for term in (
-        "SCHEMA_VERSION = 2",
+        "SCHEMA_VERSION = 3",
         "PUBLISHER_VERSION = 1",
         "POLICY_VERSION = 1",
         '"sequence"',
@@ -2611,6 +2666,39 @@ def validate_runtime_contracts(root: Path) -> None:
         "actual state transition",
     ):
         require(term in receipts, f"publisher receipt-ledger contract missing: {term}")
+    for term in (
+        'CANDIDATE_CONTRACT = "mergecraft-publication-candidate-v1"',
+        "".join(
+            (
+                "REQUIRED_PROFILE_CONTRACT = ",
+                '"mergecraft-required-publication-review-profile-v2"',
+            )
+        ),
+        'ENVELOPE_CONTRACT = "task-witness-launch-envelope-v1"',
+        'WITNESS_CONTRACT = "task-witness-canonical-projection-v2"',
+        'PROJECTION_CONTRACT = "tricritical-terminal-review-projection-v2"',
+        'PRODUCER_ID = "tricritical-review-loop-v2"',
+        "pwd.getpwuid(os.geteuid())",
+        "class _AuthenticatedFrontDoorObservation",
+        "_FRONT_DOOR_CALL_CAPABILITY = object()",
+        "def _authenticated_front_door(",
+        "def _supervised_process(",
+        "canonical Task Witness supervisor requires its closed internal call shape",
+        "envelope = _strict_envelope(stdout)",
+        "def validate_transition_candidate(",
+        '"gpt-5.6-sol"',
+        '"reasoning_effort": "high"',
+        '"surface": "chatgpt-codex"',
+        '"execution_result": "product-attested"',
+        '"assurance_minimum"',
+        "Rolecasting publication execution assurance minimum drift",
+        '"selected_specialists"',
+        "def _make_publication_review(",
+    ):
+        require(
+            term in required_review,
+            f"publisher required-review contract missing: {term}",
+        )
     for term in (
         "first = stored_pr(",
         "second = stored_pr(",
@@ -2632,6 +2720,10 @@ def validate_runtime_contracts(root: Path) -> None:
         '"--no-interactive",',
         "prepare_receipt_store()",
         '"final_audit_command"',
+        '"target_review_mode"',
+        '"target_publication_candidate_sha256"',
+        '"target_selected_specialists"',
+        "SCHEMA_VERSION = 2",
         "not _audit_matches_target(audit, item)",
     ):
         require(term in graphite, f"Graphite helper contract missing: {term}")
@@ -2669,7 +2761,9 @@ def validate_runtime_contracts(root: Path) -> None:
         review_input.count("json.loads(") == 1,
         "review input must use one strict decoder",
     )
-    combined = f"{state}\n{create}\n{update}\n{comment}\n{review_input}"
+    combined = (
+        f"{state}\n{create}\n{update}\n{required_review}\n{comment}\n{review_input}"
+    )
     for forbidden in ("$HOME/.agents", "run as _run"):
         require(
             forbidden not in combined,
@@ -2787,6 +2881,7 @@ def main() -> int:
             write_content_lock(args.repository, root)
         validate(args.repository, args.skill, source_stage=args.source_stage)
     except (
+        AgentPluginContractError,
         ContractError,
         FileNotFoundError,
         json.JSONDecodeError,

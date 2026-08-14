@@ -2,12 +2,17 @@
 
 ## Prove An Exact Pair
 
-1. Identify the target harness and executor surface.
+1. Identify the exact target family, surface, version, executor, and transport
+   from the invocation topology receipt.
 2. For a Codex target, refresh the live catalog with `codex debug models`. For every non-Codex target, refresh that target harness's live model catalog instead.
 3. Inspect the target executor tool or schema for accepted model slugs and reasoning efforts.
 4. Record the exact live-catalog and target-executor-schema intersection, and pass only a pair present in both.
 
-Catalog presence never proves that a native subagent, task, CLI, or peer accepts the pair. When the target exposes no selection fields, omit them and use an appropriate inherited or environment-fixed model.
+Catalog presence never proves that a native subagent, task, CLI, app-server,
+remote API, or peer accepts the pair. Proof for one product surface does not
+prove its paired surface. Model support also does not prove relationship,
+ownership, transport, or assurance. When the target exposes no selection
+fields, omit them and use an appropriate inherited or environment-fixed model.
 
 Model selection does not grant authority to invoke a model, peer, CLI, API, or external harness. Capability inspection and any proof invocation must remain within the authority already granted by the operator and worker contract.
 

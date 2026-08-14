@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate Rolecasting's portable dual-harness contract."""
+"""Validate Rolecasting's Agent Plugins package and Claude projection."""
 
 from __future__ import annotations
 
@@ -8,6 +8,16 @@ import json
 import re
 import sys
 from pathlib import Path
+
+SCRIPT_DIRECTORY = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIRECTORY))
+
+from agent_plugins_standard import (  # noqa: E402
+    AgentPluginContractError,
+    discover_direct_skills,
+    load_agent_plugin_manifest,
+    validate_skill_resource_links,
+)
 
 try:
     import yaml
@@ -27,22 +37,45 @@ INVOCATION_TOPOLOGY_RECEIPT = "adapter:rolecasting-invocation-topology-receipt"
 INVOCATION_TOPOLOGY_REFERENCE = (
     "skills/delegating-cross-agent-work/references/invocation-topology-receipt.md"
 )
+DISPATCH_EVIDENCE_REFERENCE = (
+    "skills/delegating-cross-agent-work/references/dispatch-evidence.md"
+)
+DISPATCH_EVIDENCE_RUNTIME = (
+    "skills/delegating-cross-agent-work/scripts/dispatch_evidence.py"
+)
+DISPATCH_ADAPTER_RUNTIME = (
+    "skills/delegating-cross-agent-work/scripts/dispatch_adapter.py"
+)
+NATIVE_CODEX_REFERENCE = (
+    "skills/delegating-cross-agent-work/references/native-codex-subagents.md"
+)
+NATIVE_CODEX_RUNTIME = "skills/delegating-cross-agent-work/scripts/native_codex.py"
+TASK_WITNESS_PROVIDER = "task-witness-provider.json"
+DISPATCH_EVIDENCE_CONTRACT = "rolecasting-dispatch-evidence-v2"
+PROVIDER_CONTRACT = "task-witness-provider-declaration-v1"
+VALIDATOR_MANIFEST_CONTRACT = "task-witness-validator-artifact-manifest-v1"
 EXPECTED_RECEIPT_CONTRACT = {
     "id": INVOCATION_TOPOLOGY_RECEIPT,
     "owner": DELEGATING_SKILL,
     "separate_from": "adapter:model-selection-receipt",
     "binds": [
         "dispatch-identity",
-        "lifecycle",
+        "product-family",
+        "surface",
+        "version",
+        "executor",
+        "relationship",
+        "ownership",
+        "transport",
+        "assurance",
+        "consumer-assurance-minimum",
         "isolation",
         "subdelegation-authority",
         "external-action-authority",
     ],
     "default_denies": ["subdelegation", "external-action"],
 }
-VERSION = re.compile(
-    r"^(?P<release>\d+\.\d+\.\d+)\+(?P<harness>claude|codex)\.(?P<build>\d{14})$"
-)
+RELEASE_VERSION = "1.0.0"
 REFERENCE_LINK = re.compile(r"\[[^\]]+\]\((references/[^)]+\.md)\)")
 PORTABILITY_PATTERNS = (
     re.compile(r"/users/", re.IGNORECASE),
@@ -53,12 +86,12 @@ PORTABILITY_PATTERNS = (
 )
 BASE_FILES = {
     ".claude-plugin/plugin.json",
-    ".codex-plugin/plugin.json",
     "CHANGELOG.md",
     "LICENSE",
     "README.md",
     "content-lock.json",
     "evals/delivery.json",
+    "plugin.json",
     "topology.json",
 }
 
@@ -165,6 +198,16 @@ def read(root: Path, relative: str | Path) -> str:
     return read_bytes(root, relative).decode("utf-8")
 
 
+def canonical_bytes(value: object) -> bytes:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
 def decoded_strings(value):
     if isinstance(value, str):
         yield value
@@ -244,7 +287,7 @@ def load_yaml_mapping(content: str, field: str) -> dict:
 
 
 def load_skill_frontmatter(content: str, skill: str) -> dict:
-    match = re.match(r"\A---\r?\n(?P<yaml>.*?)\r?\n---(?:\r?\n|\Z)", content, re.S)
+    match = re.match(r"\A---\r?\n(?P<yaml>.*?)\r?\n---(?:\r?\n|\Z)", content, re.DOTALL)
     require(match is not None, f"{skill} must have opening and closing frontmatter")
     require(content[match.end() :].strip(), f"{skill} must have a skill body")
     return load_yaml_mapping(match.group("yaml"), f"{skill} frontmatter")
@@ -263,7 +306,7 @@ def validate_topology(root: Path) -> dict:
     require_integer(
         topology["schema_version"], "topology schema_version must be an integer"
     )
-    require(topology["schema_version"] == 2, "topology schema_version drift")
+    require(topology["schema_version"] == 3, "topology schema_version drift")
     require(
         topology["receipt_contract"] == EXPECTED_RECEIPT_CONTRACT,
         "invocation topology receipt metadata drift",
@@ -357,6 +400,13 @@ def validate_topology(root: Path) -> dict:
 
 
 def validate_skills(root: Path, topology: dict) -> tuple[dict, dict, set[str]]:
+    discovered = discover_direct_skills(root)
+    require(
+        discovered == tuple(sorted(topology["skills"])),
+        "Agent Plugins direct-child skill inventory drift",
+    )
+    validate_skill_resource_links(root, discovered)
+
     bodies = {}
     prompts = {}
     semantic_files = set()
@@ -431,6 +481,7 @@ def validate_skills(root: Path, topology: dict) -> tuple[dict, dict, set[str]]:
         "skills/delegating-cross-agent-work/references/foreign-harness-peers.md",
     )
     receipt = read(root, INVOCATION_TOPOLOGY_REFERENCE)
+    receipt_words = " ".join(receipt.split())
     receipt_contract = topology["receipt_contract"]
     require(
         "[invocation-topology-receipt.md](references/invocation-topology-receipt.md)"
@@ -446,7 +497,12 @@ def validate_skills(root: Path, topology: dict) -> tuple[dict, dict, set[str]]:
         "candidate identity",
         "review-input identity",
         "requirements identity",
-        "exact executor and harness",
+        "exact product family, named surface, observed version, and concrete executor",
+        "child, peer, or external",
+        "leader-owned or user-owned",
+        "native-tool, task-api, cli, app-server, or remote-api",
+        "product-attested, controller-observed, or self-reported",
+        "consumer assurance minimum",
         "return shape, verification, and stop conditions",
         "distinct session and context isolation",
         "read-only authority",
@@ -455,23 +511,33 @@ def validate_skills(root: Path, topology: dict) -> tuple[dict, dict, set[str]]:
         "new valid plan",
     ):
         require(
-            term in receipt, f"invocation topology receipt contract missing: {term}"
+            term in receipt_words,
+            f"invocation topology receipt contract missing: {term}",
         )
     binding_terms = {
         "dispatch-identity": "exactly one unique dispatch entry",
-        "lifecycle": "execution identity and lifecycle",
+        "product-family": "exact product family",
+        "surface": "named surface",
+        "version": "observed version",
+        "executor": "concrete executor",
+        "relationship": "child, peer, or external",
+        "ownership": "leader-owned or user-owned",
+        "transport": "native-tool, task-api, cli, app-server, or remote-api",
+        "assurance": "product-attested, controller-observed, or self-reported",
+        "consumer-assurance-minimum": "consumer assurance minimum",
         "isolation": "distinct session and context isolation",
         "subdelegation-authority": "default-denied subdelegation",
         "external-action-authority": "external-action authority",
     }
     for binding in receipt_contract["binds"]:
         require(
-            binding_terms[binding] in receipt,
+            binding_terms[binding] in receipt_words,
             f"invocation topology receipt prose binding drift: {binding}",
         )
     require(
         receipt_contract["default_denies"] == ["subdelegation", "external-action"]
-        and "default-denied subdelegation and external-action authority" in receipt,
+        and "default-denied subdelegation and external-action authority"
+        in receipt_words,
         "invocation topology receipt prose default-deny drift",
     )
     require(
@@ -484,9 +550,10 @@ def validate_skills(root: Path, topology: dict) -> tuple[dict, dict, set[str]]:
 
 
 def validate_manifests(root: Path, topology: dict, prompts: dict) -> None:
+    canonical = load_agent_plugin_manifest(root)
+    validate_decoded_portability(canonical, "plugin.json")
     claude = load_json(root, ".claude-plugin/plugin.json", "Claude manifest")
-    codex = load_json(root, ".codex-plugin/plugin.json", "Codex manifest")
-    common_keys = {
+    identity_fields = {
         "name",
         "version",
         "description",
@@ -496,68 +563,69 @@ def validate_manifests(root: Path, topology: dict, prompts: dict) -> None:
         "license",
         "keywords",
     }
-    require(set(claude) == common_keys | {"displayName"}, "Claude manifest keys drift")
     require(
-        set(codex) == common_keys | {"skills", "interface"},
-        "Codex manifest keys drift",
+        set(canonical) == identity_fields | {"$schema", "extensions"},
+        "canonical Agent Plugin manifest keys drift",
     )
-    for label, manifest in (("Claude", claude), ("Codex", codex)):
-        for field in (
-            "name",
-            "version",
-            "description",
-            "homepage",
-            "repository",
-            "license",
-        ):
-            require_nonempty_string(
-                manifest[field], f"{label} manifest {field} must be a string"
-            )
-        require(manifest["name"] == "rolecasting", f"{label} manifest name drift")
-        require(manifest["license"] == "MIT", f"{label} manifest license drift")
-        require(
-            manifest["repository"] == "https://github.com/nisavid/agents",
-            f"{label} manifest repository drift",
+    require(
+        set(claude) == identity_fields | {"displayName"}, "Claude manifest keys drift"
+    )
+    for field in (
+        "name",
+        "version",
+        "description",
+        "homepage",
+        "repository",
+        "license",
+    ):
+        require_nonempty_string(
+            canonical[field], f"canonical manifest {field} must be a string"
         )
-        keywords = manifest["keywords"]
-        require(
-            isinstance(keywords, list)
-            and bool(keywords)
-            and all(isinstance(item, str) and bool(item) for item in keywords),
-            f"{label} manifest keywords must be nonempty strings",
+    require(canonical["name"] == "rolecasting", "canonical manifest name drift")
+    require(canonical["version"] == RELEASE_VERSION, "canonical manifest version drift")
+    require(canonical["license"] == "MIT", "canonical manifest license drift")
+    require(
+        canonical["repository"] == "https://github.com/nisavid/agents",
+        "canonical manifest repository drift",
+    )
+    keywords = canonical["keywords"]
+    require(
+        isinstance(keywords, list)
+        and bool(keywords)
+        and all(isinstance(item, str) and bool(item) for item in keywords),
+        "canonical manifest keywords must be nonempty strings",
+    )
+    author = canonical["author"]
+    require(
+        isinstance(author, dict) and set(author) == {"name", "url"},
+        "canonical manifest author schema drift",
+    )
+    for field in ("name", "url"):
+        require_nonempty_string(
+            author[field], f"canonical manifest author {field} must be a string"
         )
-        author = manifest["author"]
-        require(
-            isinstance(author, dict) and set(author) == {"name", "url"},
-            f"{label} manifest author schema drift",
-        )
-        for field in ("name", "url"):
-            require_nonempty_string(
-                author[field], f"{label} manifest author {field} must be a string"
-            )
 
-    claude_version = VERSION.fullmatch(claude["version"])
-    codex_version = VERSION.fullmatch(codex["version"])
-    require(
-        claude_version is not None and codex_version is not None,
-        "manifest version is invalid",
-    )
-    require(
-        claude_version["harness"] == "claude" and codex_version["harness"] == "codex",
-        "manifest harness metadata drift",
-    )
-    require(
-        claude_version["release"] == codex_version["release"]
-        and claude_version["build"] == codex_version["build"],
-        "manifest versions are not paired",
-    )
+    for field in sorted(identity_fields):
+        require(
+            claude[field] == canonical[field],
+            f"Claude manifest projection drift: {field}",
+        )
     require_nonempty_string(
         claude["displayName"], "Claude displayName must be a string"
     )
     require(claude["displayName"] == "Rolecasting", "Claude displayName drift")
-    require(codex["skills"] == "./skills/", "Codex skills path drift")
 
-    interface = codex["interface"]
+    extensions = canonical["extensions"]
+    require(
+        isinstance(extensions, dict) and set(extensions) == {"com.openai"},
+        "canonical manifest extension inventory drift",
+    )
+    openai = extensions["com.openai"]
+    require(
+        isinstance(openai, dict) and set(openai) == {"interface"},
+        "Codex extension keys drift",
+    )
+    interface = openai["interface"]
     require(isinstance(interface, dict), "Codex interface must be an object")
     require(
         set(interface)
@@ -604,17 +672,183 @@ def validate_manifests(root: Path, topology: dict, prompts: dict) -> None:
         default_prompts == [prompts[skill] for skill in topology["skills"]],
         "Codex default prompts drift",
     )
-    require(
-        claude["description"]
-        == codex["description"].replace("Rolecasting for Codex:", "Rolecasting:", 1),
-        "manifest descriptions are not paired",
-    )
     changelog = read(root, "CHANGELOG.md")
     require(
-        re.search(rf"^## {re.escape(codex_version['release'])}$", changelog, re.M)
+        re.search(rf"^## {re.escape(RELEASE_VERSION)}$", changelog, re.MULTILINE)
         is not None,
         "changelog release drift",
     )
+
+
+def validate_task_witness_provider(root: Path) -> set[str]:
+    runtime_raw = read_bytes(root, DISPATCH_EVIDENCE_RUNTIME)
+    runtime_sha256 = hashlib.sha256(runtime_raw).hexdigest()
+    adapter_raw = read_bytes(root, DISPATCH_ADAPTER_RUNTIME)
+    adapter_sha256 = hashlib.sha256(adapter_raw).hexdigest()
+    modules = [
+        {
+            "name": "validator",
+            "relative_path": DISPATCH_EVIDENCE_RUNTIME,
+            "length": len(runtime_raw),
+            "sha256": runtime_sha256,
+        },
+        {
+            "name": "adapter",
+            "relative_path": DISPATCH_ADAPTER_RUNTIME,
+            "length": len(adapter_raw),
+            "sha256": adapter_sha256,
+        },
+    ]
+    implementation = hashlib.sha256(
+        canonical_bytes(
+            {
+                "contract": VALIDATOR_MANIFEST_CONTRACT,
+                "validator_contract": DISPATCH_EVIDENCE_CONTRACT,
+                "entrypoint_module": "validator",
+                "modules": [
+                    {"name": item["name"], "content_sha256": item["sha256"]}
+                    for item in modules
+                ],
+            }
+        )
+    ).hexdigest()
+    validator_lifecycle = {
+        "state": "active",
+        "usable_for_new_publication": True,
+    }
+    unsigned = {
+        "schema_version": 1,
+        "contract": PROVIDER_CONTRACT,
+        "plugin_id": "rolecasting",
+        "publisher": "nisavid",
+        "repository": "https://github.com/nisavid/agents",
+        "authority_profile": "rolecasting-cooperative-dispatch-v2",
+        "producers": [],
+        "issuers": [],
+        "validators": [
+            {
+                "validator_id": "rolecasting-dispatch-evidence-validator-v2",
+                "contract": DISPATCH_EVIDENCE_CONTRACT,
+                "implementation_sha256": implementation,
+                "entrypoint": "validator",
+                "modules": modules,
+                "lifecycle": validator_lifecycle,
+            }
+        ],
+    }
+    provider = load_json(root, TASK_WITNESS_PROVIDER, "Task Witness provider")
+    raw = read_bytes(root, TASK_WITNESS_PROVIDER)
+    require(
+        raw == canonical_bytes(provider) + b"\n",
+        "Task Witness provider must be canonical JSON with one trailing LF",
+    )
+    require(
+        provider.get("authority_profile") == "rolecasting-cooperative-dispatch-v2",
+        "provider authority profile drift",
+    )
+    expected = {
+        **unsigned,
+        "content_sha256": hashlib.sha256(canonical_bytes(unsigned)).hexdigest(),
+    }
+    require(provider == expected, "Task Witness provider declaration drift")
+    source = read(root, DISPATCH_EVIDENCE_RUNTIME)
+    for forbidden in (
+        "--trust-context",
+        "--task-witness-runtime",
+        "argparse",
+        "importlib",
+        "def validate_bundle(",
+    ):
+        require(
+            forbidden not in source,
+            "dispatch-evidence validator exposes forbidden production seam: "
+            f"{forbidden}",
+        )
+    require(
+        'BUNDLE_CONTRACT = "rolecasting-dispatch-evidence-v2"' in source
+        and '"assurance_minimum"' in source
+        and "def _validate_bundle(" in source,
+        "dispatch-evidence registered API drift",
+    )
+    adapter = read(root, DISPATCH_ADAPTER_RUNTIME)
+    adapter_words = " ".join(adapter.split())
+    for term in (
+        'REQUEST_CONTRACT = "rolecasting-bootstrap-dispatch-request-v2"',
+        'ISSUER_CONTRACT = "rolecasting-bootstrap-adapter-v2"',
+        "def render_dispatch_bundle(",
+        "does not launch a worker, choose a model, or authenticate",
+        "already-observed",
+    ):
+        require(
+            term in adapter_words,
+            f"dispatch adapter truth boundary drift: {term}",
+        )
+    reference = read(root, DISPATCH_EVIDENCE_REFERENCE)
+    reference_words = " ".join(reference.split())
+    for term in (
+        "task-witness validate --bundle <absolute-bundle>",
+        DISPATCH_EVIDENCE_CONTRACT,
+        "rolecasting-dispatch-plan-v2",
+        "rolecasting-model-selection-receipt-v2",
+        "rolecasting-execution-result-receipt-v2",
+        "rolecasting-dispatch-projection-v2",
+        "`assurance_minimum`",
+        "Rolecasting exposes no runtime-path, trust-path, discovery, or fallback CLI",
+        "empty producer and issuer inventories",
+        "No owning harness integration currently authenticates",
+        "Canonical new-publication evidence",
+        "`usable: false` is valid evidence",
+        "exact `usable` status",
+    ):
+        require(
+            term in reference_words,
+            f"dispatch-evidence reference drift: {term}",
+        )
+    native = read(root, NATIVE_CODEX_RUNTIME)
+    native_words = " ".join(native.split())
+    for term in (
+        "def freeze_native_dispatch(",
+        "def record_native_observation(",
+        'surface="chatgpt-codex"',
+        'surface="codex-cli-tui"',
+        'executor="codex"',
+        'relationship="child"',
+        'ownership="leader-owned"',
+        'transport="native-tool"',
+        'model="self-reported"',
+        'authority="self-reported"',
+        "portable_evidence=False",
+        "product_attested=False",
+        '"verification_observation_sha256"',
+        "type(usable) is not bool",
+        "non-completed native result cannot be usable",
+        "must be frozen before recording",
+        "frozen native dispatch is invalid",
+    ):
+        require(term in native_words, f"native Codex binding drift: {term}")
+    native_reference = read(root, NATIVE_CODEX_REFERENCE)
+    native_reference_words = " ".join(native_reference.split())
+    for term in (
+        "ChatGPT Codex and Codex CLI/TUI",
+        "skill-mediated",
+        "before invoking the native subagent tool",
+        "Model-generated text is never host evidence",
+        "Transport completion is not usability",
+        "strict Boolean",
+        "Requested authority is intent",
+        "App-server is an optional later transport",
+        "producer and issuer inventories empty",
+    ):
+        require(
+            term in native_reference_words,
+            f"native Codex reference drift: {term}",
+        )
+    return {
+        TASK_WITNESS_PROVIDER,
+        DISPATCH_EVIDENCE_RUNTIME,
+        DISPATCH_ADAPTER_RUNTIME,
+        NATIVE_CODEX_RUNTIME,
+    }
 
 
 def validate_delivery(root: Path) -> dict:
@@ -991,11 +1225,12 @@ def inspect_contract(root: Path) -> tuple[dict, set[str]]:
     topology = validate_topology(root)
     bodies, prompts, semantic_files = validate_skills(root, topology)
     validate_manifests(root, topology, prompts)
+    semantic_files |= validate_task_witness_provider(root)
     delivery = validate_delivery(root)
     semantic_files |= {
         ".claude-plugin/plugin.json",
-        ".codex-plugin/plugin.json",
         "README.md",
+        "plugin.json",
         "topology.json",
         "evals/delivery.json",
     }
@@ -1038,7 +1273,12 @@ def main() -> None:
             )
             validate_inventory(root, topology, semantic_files)
         validate_content_lock(root, semantic_files)
-    except (ContractError, OSError, UnicodeDecodeError) as error:
+    except (
+        AgentPluginContractError,
+        ContractError,
+        OSError,
+        UnicodeDecodeError,
+    ) as error:
         print(f"Rolecasting contract validation failed: {error}", file=sys.stderr)
         raise SystemExit(1) from error
     if write_lock:

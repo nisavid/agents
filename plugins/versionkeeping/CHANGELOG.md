@@ -4,6 +4,8 @@
 
 Initial dual-harness release, 2026-07-20:
 
+- Uses Agent Plugins v1 as the canonical package format, with a native Claude
+  manifest projection and skill-local Codex metadata.
 - Migrates the canonical checkpoint and publication planner with exact leases,
   literal path commits, target-only SHA authorization, and endpoint verification.
 - Adds durable sibling worktree guidance with explicit harness, agent, user, and

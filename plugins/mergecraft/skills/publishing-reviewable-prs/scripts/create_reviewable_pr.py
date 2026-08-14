@@ -22,21 +22,6 @@ from change_navigation.review_input import (  # noqa: E402
     load_review_input,
 )
 from change_navigation.sensitive_content import suspected_secret_error  # noqa: E402
-
-from reviewable_pr_state import (  # noqa: E402
-    PR_URL_RE,
-    ExpectedIdentity,
-    MutationAmbiguousError,
-    PublicationError,
-    head_base_matches,
-    github_repository,
-    open_prs as _open_prs,
-    run_mutation as _run_mutation,
-    run_read as _run_read,
-    state_matches,
-    stored_pr as _stored_pr,
-    validate_identity_inputs,
-)
 from publication_receipts import (  # noqa: E402
     creation_transaction_lock,
     load_receipts,
@@ -47,7 +32,38 @@ from publication_receipts import (  # noqa: E402
     resolve_receipt_root,
     verified_transition,
 )
-
+from required_review import (  # noqa: E402
+    build_candidate as _build_candidate,
+)
+from required_review import (  # noqa: E402
+    validate_create_rendering,
+    validate_review_input_binding,
+)
+from required_review import (  # noqa: E402
+    validate_required_review as _validate_required_review,
+)
+from reviewable_pr_state import (  # noqa: E402
+    PR_URL_RE,
+    ExpectedIdentity,
+    MutationAmbiguousError,
+    PublicationError,
+    github_repository,
+    head_base_matches,
+    state_matches,
+    validate_identity_inputs,
+)
+from reviewable_pr_state import (  # noqa: E402
+    open_prs as _open_prs,
+)
+from reviewable_pr_state import (  # noqa: E402
+    run_mutation as _run_mutation,
+)
+from reviewable_pr_state import (  # noqa: E402
+    run_read as _run_read,
+)
+from reviewable_pr_state import (  # noqa: E402
+    stored_pr as _stored_pr,
+)
 
 PR_NUMBER_TOKEN = "__PUBLISHING_REVIEWABLE_PRS_PR_NUMBER__"
 VALIDATION_PR_NUMBER = 2_147_483_647
@@ -93,12 +109,13 @@ def _validate(
     _run_read(arguments, input_text=body)
 
 
-def _body_template(path: Path) -> str:
+def _body_template(path: Path) -> tuple[str, bytes]:
     if not path.is_absolute():
         raise PublicationError("body template path must be absolute")
     try:
-        template = path.read_text(encoding="utf-8")
-    except OSError as error:
+        raw = path.read_bytes()
+        template = raw.decode("utf-8")
+    except (OSError, UnicodeDecodeError) as error:
         raise PublicationError(f"cannot read body template: {error}") from error
     if suspected_secret_error(template) is not None:
         raise PublicationError(
@@ -106,7 +123,7 @@ def _body_template(path: Path) -> str:
         )
     if PR_NUMBER_TOKEN not in template:
         raise PublicationError(f"body template must contain {PR_NUMBER_TOKEN}")
-    return template
+    return template, raw
 
 
 def _reject_secret_text(*values: str) -> None:
@@ -308,8 +325,8 @@ def _install_canonical_draft(
     title: str,
     transport_body: str,
     body: str,
+    before: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    before = _stored_pr(expected.repository, expected.pr_number)
     if not state_matches(
         before,
         expected,
@@ -381,6 +398,9 @@ def publish(
     title: str,
     template_path: Path,
     review_input_path: Path,
+    review_mode: str,
+    review_bundle_root: Path | None,
+    selected_specialists: list[str],
     receipt_directory: Path | None = None,
 ) -> dict[str, Any]:
     validate_identity_inputs(
@@ -396,10 +416,10 @@ def publish(
     if not title.strip():
         raise PublicationError("title must be non-empty")
 
-    template = _body_template(template_path)
+    template, template_raw = _body_template(template_path)
     _reject_secret_text(title, template)
     validation_body = template.replace(PR_NUMBER_TOKEN, str(VALIDATION_PR_NUMBER))
-    _review_input(
+    review_input_schema_version, review_input_sha256 = _review_input(
         review_input_path,
         repository=repository,
         base=base,
@@ -421,6 +441,30 @@ def publish(
         review_input_path,
         template_path,
     )
+    candidate = _build_candidate(
+        operation="create",
+        repository=repository,
+        pr_number=PR_NUMBER_TOKEN,
+        base=base,
+        base_oid=base_oid,
+        head=head,
+        head_oid=head_oid,
+        head_owner=head_owner,
+        head_repository=head_repository,
+        title=title,
+        body_source_kind="template",
+        body_source_raw=template_raw,
+        published_body=template,
+        review_input_path=review_input_path,
+        review_mode=review_mode,
+        selected_specialists=selected_specialists,
+    )
+    validate_review_input_binding(
+        candidate,
+        review_input_schema_version,
+        review_input_sha256,
+        review_input_path,
+    )
     receipt_root = prepare_receipt_store(receipt_directory)
     with creation_transaction_lock(
         receipt_root,
@@ -430,6 +474,11 @@ def publish(
         head_owner=head_owner,
         head_repository=head_repository,
     ):
+        initial_review = _validate_required_review(
+            review_mode=review_mode,
+            review_bundle_root=review_bundle_root,
+            candidate=candidate,
+        )
         nonce = _new_nonce()
         transport_body = _transport_body(nonce)
         pr_number, url = _create(
@@ -466,7 +515,8 @@ def publish(
                     is_draft=True,
                 ):
                     raise PublicationError(
-                        "created PR does not have the exact nonce-tagged transport state"
+                        "created PR does not have the exact nonce-tagged "
+                        "transport state"
                     )
                 review_input_schema_version, review_input_sha256 = _review_input(
                     review_input_path,
@@ -490,11 +540,42 @@ def publish(
                     review_input_path,
                     template_path,
                 )
+                validate_review_input_binding(
+                    candidate,
+                    review_input_schema_version,
+                    review_input_sha256,
+                    review_input_path,
+                )
+                validate_create_rendering(
+                    candidate=candidate,
+                    template=template,
+                    rendered_body=body,
+                    pr_number=pr_number,
+                )
+                review = _validate_required_review(
+                    review_mode=review_mode,
+                    review_bundle_root=review_bundle_root,
+                    candidate=candidate,
+                    expected_observation=initial_review.observation,
+                )
+                final_preflight = _stored_pr(repository, pr_number)
+                if not state_matches(
+                    final_preflight,
+                    expected,
+                    title=title,
+                    body=transport_body,
+                    is_draft=True,
+                ):
+                    raise PublicationError(
+                        "canonical body was not written because the created PR no "
+                        "longer has the exact nonce-tagged transport state after review"
+                    )
                 before, stored = _install_canonical_draft(
                     expected=expected,
                     title=title,
                     transport_body=transport_body,
                     body=body,
+                    before=final_preflight,
                 )
                 transition = verified_transition(
                     expected=expected,
@@ -503,6 +584,8 @@ def publish(
                     final_reread=stored,
                     review_input_schema_version=review_input_schema_version,
                     review_input_sha256=review_input_sha256,
+                    review=review,
+                    candidate=candidate,
                 )
                 record_verified_publication(
                     root=receipt_root, transition=transition, lease=lease
@@ -532,8 +615,23 @@ def main() -> int:
     parser.add_argument("--title", required=True)
     parser.add_argument("--body-template", required=True, type=Path)
     parser.add_argument("--review-input", required=True, type=Path)
+    parser.add_argument(
+        "--review-mode", choices=("required", "not-required"), required=True
+    )
+    parser.add_argument("--review-bundle", type=Path)
+    parser.add_argument(
+        "--selected-specialists",
+        required=True,
+        help="sorted unique specialist names as a JSON array; use [] for none",
+    )
     args = parser.parse_args()
     try:
+        try:
+            selected_specialists = json.loads(args.selected_specialists)
+        except json.JSONDecodeError as error:
+            raise PublicationError(
+                "selected review specialists must be a JSON array"
+            ) from error
         stored = publish(
             repository=args.repository,
             base=args.base,
@@ -545,6 +643,9 @@ def main() -> int:
             title=args.title,
             template_path=args.body_template,
             review_input_path=args.review_input,
+            review_mode=args.review_mode,
+            review_bundle_root=args.review_bundle,
+            selected_specialists=selected_specialists,
             receipt_directory=None,
         )
     except PublicationError as error:

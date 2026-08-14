@@ -8,11 +8,13 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
-
 
 REPOSITORY = Path(__file__).resolve().parents[4]
 SCRIPTS = REPOSITORY / "plugins/mergecraft/skills/publishing-reviewable-prs/scripts"
@@ -32,6 +34,833 @@ def load(name: str, filename: str):
 CREATE = load("create_reviewable_pr", "create_reviewable_pr.py")
 UPDATE = load("update_reviewable_pr", "update_reviewable_pr.py")
 AUDIT = load("audit_reviewable_pr", "audit_reviewable_pr.py")
+REQUIRED_REVIEW = importlib.import_module("required_review")
+
+
+def transition_review(mode: str, candidate_sha256: str, observation=None):
+    return REQUIRED_REVIEW._make_publication_review(
+        mode,
+        candidate_sha256,
+        observation,
+        transition_validated=True,
+    )
+
+
+class RequiredReviewTests(unittest.TestCase):
+    @staticmethod
+    def canonical(value: object) -> bytes:
+        return json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+
+    def test_publication_review_constructor_is_private(self) -> None:
+        with self.assertRaisesRegex(
+            REQUIRED_REVIEW.PublicationError, "canonical review factory"
+        ):
+            REQUIRED_REVIEW.PublicationReview("not-required", "a" * 64, None)
+
+    def candidate(self, *, mode: str = "required"):
+        candidate_identity = {
+            "kind": "mergecraft-publication-candidate-v1",
+            "value": "sha256:" + "a" * 64,
+            "content_sha256": "a" * 64,
+        }
+        return REQUIRED_REVIEW.PublicationCandidate(
+            value={
+                "publication_profile": {
+                    "review_mode": mode,
+                    "selected_specialists": ["security"],
+                }
+            },
+            content_sha256="a" * 64,
+            candidate_identity=candidate_identity,
+            review_input_identity={
+                "kind": "mergecraft-review-input-v1",
+                "value": "sha256:" + "b" * 64,
+                "content_sha256": "b" * 64,
+            },
+            requirements_identity={
+                "kind": "mergecraft-required-publication-review-profile-v2",
+                "value": "sha256:" + "c" * 64,
+                "content_sha256": "c" * 64,
+            },
+            body_source_raw=b"body",
+            published_body="body",
+        )
+
+    def envelope(self, candidate=None) -> bytes:
+        candidate = candidate or self.candidate()
+        executions = {}
+        for index, role in enumerate(
+            (
+                "critic-intent",
+                "critic-runtime",
+                "critic-structure",
+                "specialist-security",
+            )
+        ):
+            executions[f"execution-{index}"] = {
+                "execution_id": f"execution-{index}",
+                "role": role,
+                "candidate": candidate.candidate_identity,
+                "target": {
+                    "product_family": "codex",
+                    "surface": "chatgpt-codex",
+                    "executor": "codex",
+                    "version": "2026.08.13",
+                },
+                "topology": {
+                    "relationship": "child",
+                    "ownership": "leader-owned",
+                    "transport": "native-tool",
+                },
+                "model": "gpt-5.6-sol",
+                "reasoning_effort": "high",
+                "user_authority": None,
+                "return_contract": "tricritical-raw-report-v1",
+                "scope": {
+                    "kind": "review-scope-v1",
+                    "value": role,
+                    "content_sha256": "a" * 64,
+                },
+                "request": {
+                    "kind": "review-request-v1",
+                    "value": role,
+                    "content_sha256": "b" * 64,
+                },
+                "authority": {
+                    "access": "read-only",
+                    "subdelegation": False,
+                    "external_action": False,
+                    "evidence": {
+                        "kind": "authority-evidence-v1",
+                        "value": role,
+                        "content_sha256": f"{index + 1:x}" * 64,
+                    },
+                },
+                "isolation": {
+                    "session": f"session-{index}",
+                    "context": f"context-{index}",
+                    "enforceable": True,
+                },
+                "assurance": {
+                    "target": "product-attested",
+                    "model": "product-attested",
+                    "topology": "product-attested",
+                    "authority": "product-attested",
+                    "execution_result": "product-attested",
+                    "evidence": {
+                        "kind": "product-attestation-v1",
+                        "value": role,
+                        "content_sha256": hashlib.sha256(
+                            f"assurance-{role}".encode()
+                        ).hexdigest(),
+                    },
+                },
+                "assurance_minimum": {
+                    "target": "product-attested",
+                    "model": "product-attested",
+                    "topology": "product-attested",
+                    "authority": "product-attested",
+                    "execution_result": "product-attested",
+                },
+                "verification_contract": "review-verification-v1",
+                "stop_contract": "review-stop-v1",
+                "usable": True,
+                "returned": {
+                    "kind": "tricritical-raw-report-v1",
+                    "value": role,
+                    "content_sha256": f"{index + 5:x}" * 64,
+                },
+                "verification": {
+                    "kind": "review-verification-v1",
+                    "value": role,
+                    "content_sha256": f"{index + 9:x}" * 64,
+                },
+                "stop": {
+                    "kind": "review-stop-v1",
+                    "value": role,
+                    "content_sha256": f"{index + 12:x}" * 64,
+                },
+            }
+        projection = {
+            "schema_version": 1,
+            "contract": "tricritical-terminal-review-projection-v2",
+            "evidence_contract": "tricritical-terminal-review-evidence-v2",
+            "manifest_sha256": "d" * 64,
+            "subject": {
+                "candidate": candidate.candidate_identity,
+                "review_input": candidate.review_input_identity,
+                "requirements": candidate.requirements_identity,
+            },
+            "review_profile": {
+                "contract": "tricritical-review-profile-v1",
+                "execution_mode": "independent",
+                "required_axes": ["intent", "runtime", "structure"],
+                "selected_specialists": ["security"],
+            },
+            "final_dispatch": {
+                "contract": "rolecasting-dispatch-projection-v2",
+                "evidence_contract": "rolecasting-dispatch-evidence-v2",
+                "executions": executions,
+            },
+            "terminal": {
+                "state": "clean",
+                "owner": "none",
+                "limitations": [],
+                "missing_executions": [],
+                "unresolved_actionable_findings": 0,
+                "verification": {
+                    "status": "passed",
+                    "candidate": candidate.candidate_identity,
+                    "evidence": {
+                        "kind": "verification-evidence-v1",
+                        "value": "passed",
+                        "content_sha256": "e" * 64,
+                    },
+                    "unchanged": True,
+                },
+            },
+        }
+        projection["content_sha256"] = hashlib.sha256(
+            self.canonical(projection)
+        ).hexdigest()
+        envelope = {
+            "contract": "task-witness-launch-envelope-v1",
+            "anchor": {
+                "contract": "task-witness-complete-anchor-v1",
+                "generation": "sha256-" + "1" * 64,
+                "active_record_sha256": "2" * 64,
+                "runtime_contract": "task-witness-runtime-v1",
+                "interpreter": {
+                    "executable": "/usr/bin/python3",
+                    "implementation": "cpython",
+                    "version": {"major": 3, "minor": 13, "micro": 7},
+                },
+                "public_release": {
+                    "repository": "nisavid/agents",
+                    "revision": "3" * 40,
+                },
+                "runtime_implementation_sha256": "4" * 64,
+                "trust_context_sha256": "5" * 64,
+                "bundle_sha256": "6" * 64,
+                "historical": False,
+            },
+            "witness": {
+                "contract": "task-witness-canonical-projection-v2",
+                "bundle_sha256": "6" * 64,
+                "producer": {
+                    "producer_id": "tricritical-review-loop-v2",
+                    "contract": "tricritical-terminal-review-evidence-v2",
+                    "implementation_sha256": "7" * 64,
+                    "validator_id": (
+                        "tricritical-terminal-review-evidence-validator-v2"
+                    ),
+                    "validator_contract": ("tricritical-terminal-review-evidence-v2"),
+                    "validator_implementation_sha256": "8" * 64,
+                },
+                "validator": {
+                    "validator_id": (
+                        "tricritical-terminal-review-evidence-validator-v2"
+                    ),
+                    "contract": "tricritical-terminal-review-evidence-v2",
+                    "implementation_sha256": "8" * 64,
+                },
+                "projection": projection,
+                "trust_context_sha256": "5" * 64,
+                "historical": False,
+            },
+        }
+        return self.canonical(envelope) + b"\n"
+
+    def mutate_envelope(self, mutation) -> bytes:
+        envelope = json.loads(self.envelope())
+        mutation(envelope)
+        projection = envelope["witness"]["projection"]
+        projection.pop("content_sha256")
+        projection["content_sha256"] = hashlib.sha256(
+            self.canonical(projection)
+        ).hexdigest()
+        return self.canonical(envelope) + b"\n"
+
+    def test_required_review_returns_transitively_bound_redacted_observation(
+        self,
+    ) -> None:
+        candidate = self.candidate()
+        envelope = self.envelope(candidate)
+        with mock.patch.object(
+            REQUIRED_REVIEW, "_invoke_task_witness", return_value=envelope
+        ):
+            review = REQUIRED_REVIEW.validate_required_review(
+                review_mode="required",
+                review_bundle_root=Path("/absolute/review-bundle"),
+                candidate=candidate,
+            )
+
+        self.assertEqual(review.mode, "required")
+        self.assertEqual(review.publication_candidate_sha256, "a" * 64)
+        self.assertIsNotNone(review.observation)
+        assert review.observation is not None
+        self.assertEqual(
+            review.observation.launch_envelope_sha256,
+            hashlib.sha256(envelope).hexdigest(),
+        )
+        self.assertEqual(review.observation.tricritical_manifest_sha256, "d" * 64)
+        self.assertNotIn("subject", review.as_json()["observation"])
+
+    def test_not_required_is_explicit_and_cannot_claim_evidence(self) -> None:
+        candidate = self.candidate(mode="not-required")
+        review = REQUIRED_REVIEW.validate_required_review(
+            review_mode="not-required",
+            review_bundle_root=None,
+            candidate=candidate,
+        )
+        self.assertEqual(review.as_json()["observation"], None)
+        with self.assertRaisesRegex(
+            REQUIRED_REVIEW.PublicationError, "cannot claim evidence"
+        ):
+            REQUIRED_REVIEW.validate_required_review(
+                review_mode="not-required",
+                review_bundle_root=Path("/evidence"),
+                candidate=candidate,
+            )
+
+    def test_required_review_fails_closed_when_canonical_front_door_is_unavailable(
+        self,
+    ) -> None:
+        with (
+            mock.patch.object(
+                REQUIRED_REVIEW,
+                "_invoke_task_witness",
+                side_effect=REQUIRED_REVIEW.PublicationError("front door unavailable"),
+            ),
+            self.assertRaisesRegex(
+                REQUIRED_REVIEW.PublicationError, "front door unavailable"
+            ),
+        ):
+            REQUIRED_REVIEW.validate_required_review(
+                review_mode="required",
+                review_bundle_root=Path("/absolute/review-bundle"),
+                candidate=self.candidate(),
+            )
+
+    def test_required_review_rejects_historical_or_changed_under_lease(self) -> None:
+        candidate = self.candidate()
+        historical = json.loads(self.envelope(candidate))
+        historical["anchor"]["historical"] = True
+        historical["witness"]["historical"] = True
+        with (
+            mock.patch.object(
+                REQUIRED_REVIEW,
+                "_invoke_task_witness",
+                return_value=self.canonical(historical) + b"\n",
+            ),
+            self.assertRaisesRegex(
+                REQUIRED_REVIEW.PublicationError, "current complete anchor"
+            ),
+        ):
+            REQUIRED_REVIEW.validate_required_review(
+                review_mode="required",
+                review_bundle_root=Path("/absolute/review-bundle"),
+                candidate=candidate,
+            )
+
+        valid = self.envelope(candidate)
+        with mock.patch.object(
+            REQUIRED_REVIEW, "_invoke_task_witness", return_value=valid
+        ):
+            first = REQUIRED_REVIEW.validate_required_review(
+                review_mode="required",
+                review_bundle_root=Path("/absolute/review-bundle"),
+                candidate=candidate,
+            )
+        assert first.observation is not None
+        changed = json.loads(valid)
+        changed["anchor"]["active_record_sha256"] = "9" * 64
+        with (
+            mock.patch.object(
+                REQUIRED_REVIEW,
+                "_invoke_task_witness",
+                return_value=self.canonical(changed) + b"\n",
+            ),
+            self.assertRaisesRegex(
+                REQUIRED_REVIEW.PublicationError,
+                "changed under publication lease",
+            ),
+        ):
+            REQUIRED_REVIEW.validate_required_review(
+                review_mode="required",
+                review_bundle_root=Path("/absolute/review-bundle"),
+                candidate=candidate,
+                expected_observation=first.observation,
+            )
+
+    def test_body_binding_distinguishes_raw_source_from_published_utf8(self) -> None:
+        raw = b"line one\r\nline two\r\n"
+        normalized = "line one\nline two\n"
+        binding = REQUIRED_REVIEW.body_source_binding(
+            kind="body",
+            raw=raw,
+            published=normalized,
+            render_contract="literal-utf8-v1",
+        )
+
+        self.assertEqual(binding["raw_byte_length"], len(raw))
+        self.assertEqual(binding["raw_sha256"], hashlib.sha256(raw).hexdigest())
+        self.assertEqual(
+            binding["published_sha256"],
+            hashlib.sha256(normalized.encode("utf-8")).hexdigest(),
+        )
+        self.assertNotEqual(binding["raw_sha256"], binding["published_sha256"])
+
+    def test_required_review_rejects_weaker_or_changed_dispatch(self) -> None:
+        def change_execution(field: str, value: object):
+            def mutate(envelope: dict[str, object]) -> None:
+                executions = envelope["witness"]["projection"]["final_dispatch"][
+                    "executions"
+                ]
+                executions["execution-0"][field] = value
+
+            return mutate
+
+        def missing_specialist(envelope: dict[str, object]) -> None:
+            del envelope["witness"]["projection"]["final_dispatch"]["executions"][
+                "execution-3"
+            ]
+
+        def extra_specialist(envelope: dict[str, object]) -> None:
+            executions = envelope["witness"]["projection"]["final_dispatch"][
+                "executions"
+            ]
+            extra = json.loads(json.dumps(executions["execution-3"]))
+            extra["execution_id"] = "execution-extra"
+            extra["role"] = "specialist-performance"
+            extra["isolation"]["session"] = "session-extra"
+            extra["isolation"]["context"] = "context-extra"
+            executions["execution-extra"] = extra
+
+        def reused_isolation(envelope: dict[str, object]) -> None:
+            executions = envelope["witness"]["projection"]["final_dispatch"][
+                "executions"
+            ]
+            executions["execution-1"]["isolation"]["session"] = "session-0"
+
+        def weaker_authority(envelope: dict[str, object]) -> None:
+            executions = envelope["witness"]["projection"]["final_dispatch"][
+                "executions"
+            ]
+            executions["execution-0"]["authority"]["external_action"] = True
+
+        def change_nested(section: str, field: str, value: object):
+            def mutate(envelope: dict[str, object]) -> None:
+                executions = envelope["witness"]["projection"]["final_dispatch"][
+                    "executions"
+                ]
+                executions["execution-0"][section][field] = value
+
+            return mutate
+
+        cases = {
+            "model": change_execution("model", "gpt-5.6-terra"),
+            "effort": change_execution("reasoning_effort", "medium"),
+            "controller-observed-model": change_nested(
+                "assurance", "model", "controller-observed"
+            ),
+            "self-reported-result": change_nested(
+                "assurance", "execution_result", "self-reported"
+            ),
+            "weaker-assurance-minimum": change_nested(
+                "assurance_minimum", "execution_result", "controller-observed"
+            ),
+            "codex-cli-surface": change_nested("target", "surface", "codex-cli-tui"),
+            "retired-codex-desktop-surface": change_nested(
+                "target", "surface", "codex-desktop"
+            ),
+            "peer-topology": change_nested("topology", "relationship", "peer"),
+            "missing-specialist": missing_specialist,
+            "extra-specialist": extra_specialist,
+            "reused-isolation": reused_isolation,
+            "weaker-authority": weaker_authority,
+            "wrong-return-contract": change_execution(
+                "return_contract", "worker-report-v1"
+            ),
+        }
+        for label, mutation in cases.items():
+            with self.subTest(label=label):
+                with (
+                    mock.patch.object(
+                        REQUIRED_REVIEW,
+                        "_invoke_task_witness",
+                        return_value=self.mutate_envelope(mutation),
+                    ),
+                    self.assertRaisesRegex(
+                        REQUIRED_REVIEW.PublicationError, "Rolecasting"
+                    ),
+                ):
+                    REQUIRED_REVIEW.validate_required_review(
+                        review_mode="required",
+                        review_bundle_root=Path("/absolute/review-bundle"),
+                        candidate=self.candidate(),
+                    )
+
+    def test_supervisor_stops_output_flood_at_hard_cap(self) -> None:
+        started = time.monotonic()
+        source = (
+            f"#!{sys.executable}\nimport os\nwhile True: os.write(1, b'x' * 65536)\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                self.authenticated_test_front_door(
+                    Path(directory), source
+                ) as observation,
+                mock.patch.object(REQUIRED_REVIEW, "MAX_STDOUT_BYTES", 1024),
+                mock.patch.object(REQUIRED_REVIEW, "TIMEOUT_SECONDS", 2),
+                mock.patch.object(REQUIRED_REVIEW, "SETTLEMENT_SECONDS", 3),
+                mock.patch.object(REQUIRED_REVIEW, "TERMINATION_GRACE_SECONDS", 0.1),
+                self.assertRaisesRegex(
+                    REQUIRED_REVIEW.PublicationError, "output exceeded"
+                ),
+            ):
+                REQUIRED_REVIEW._supervised_process(
+                    observation, Path("/absolute/review-bundle")
+                )
+        self.assertLess(time.monotonic() - started, 2)
+
+    def test_supervisor_reaps_detached_descendant_after_timeout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            wrapper_pid = root / "wrapper.pid"
+            child_pid = root / "child.pid"
+            code = (
+                f"#!{sys.executable}\n"
+                "import os,time\n"
+                f"open({str(wrapper_pid)!r},'w').write(str(os.getpid()))\n"
+                "pid=os.fork()\n"
+                "if pid == 0:\n"
+                " os.setsid()\n"
+                f" open({str(child_pid)!r},'w').write(str(os.getpid()))\n"
+                " os.close(0); os.close(1); os.close(2)\n"
+                " while True: time.sleep(1)\n"
+                "while True: time.sleep(1)\n"
+            )
+            with (
+                self.authenticated_test_front_door(root, code) as observation,
+                mock.patch.object(REQUIRED_REVIEW, "TIMEOUT_SECONDS", 1.0),
+                mock.patch.object(REQUIRED_REVIEW, "SETTLEMENT_SECONDS", 2),
+                mock.patch.object(REQUIRED_REVIEW, "TERMINATION_GRACE_SECONDS", 0.1),
+                self.assertRaisesRegex(REQUIRED_REVIEW.PublicationError, "timed out"),
+            ):
+                REQUIRED_REVIEW._supervised_process(
+                    observation, Path("/absolute/review-bundle")
+                )
+
+            for path in (wrapper_pid, child_pid):
+                self.assertTrue(path.is_file())
+                pid = int(path.read_text(encoding="utf-8"))
+                deadline = time.monotonic() + 1
+                while time.monotonic() < deadline:
+                    try:
+                        os.kill(pid, 0)
+                    except ProcessLookupError:
+                        break
+                    time.sleep(0.02)
+                else:
+                    self.fail(f"supervised process {pid} remained live")
+
+    def test_supervisor_rejects_an_open_call_shape_before_launch(self) -> None:
+        with (
+            mock.patch.object(REQUIRED_REVIEW.subprocess, "Popen") as launch,
+            self.assertRaisesRegex(
+                REQUIRED_REVIEW.PublicationError, "closed internal call shape"
+            ),
+        ):
+            REQUIRED_REVIEW._supervised_process(
+                object(), Path("/absolute/review-bundle")
+            )
+        launch.assert_not_called()
+
+    def test_invoke_requires_canonical_envelope_framing_after_status_zero(
+        self,
+    ) -> None:
+        source = f"#!{sys.executable}\nimport os\nos.write(1, b'{{}}\\n')\n"
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            self.installed_front_door(home, source)
+            passwd, effective, group = self.front_door_identity(home)
+            with (
+                passwd,
+                effective,
+                group,
+                self.assertRaisesRegex(
+                    REQUIRED_REVIEW.PublicationError, "envelope framing"
+                ),
+            ):
+                REQUIRED_REVIEW._invoke_task_witness(Path("/absolute/review-bundle"))
+
+    def test_invoke_accepts_exact_canonical_envelope_fixture(self) -> None:
+        envelope = self.envelope()
+        source = f"#!{sys.executable}\nimport os\nos.write(1, {envelope!r})\n"
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            self.installed_front_door(home, source)
+            passwd, effective, group = self.front_door_identity(home)
+            with passwd, effective, group:
+                self.assertEqual(
+                    REQUIRED_REVIEW._invoke_task_witness(
+                        Path("/absolute/review-bundle")
+                    ),
+                    envelope,
+                )
+
+    def test_supervisor_cleanup_attempts_settlement_and_every_close(self) -> None:
+        events: list[str] = []
+
+        class FailingResource:
+            def __init__(self, label: str) -> None:
+                self.label = label
+
+            def close(self) -> None:
+                events.append(self.label)
+                raise RuntimeError(self.label)
+
+            def fileno(self) -> int:
+                return 1
+
+        class FailingSelector(FailingResource):
+            def get_map(self) -> dict[object, object]:
+                return {}
+
+            def register(self, *_: object) -> None:
+                return None
+
+        process = mock.Mock()
+        process.stdout = FailingResource("stdout")
+        process.stderr = FailingResource("stderr")
+        process.poll.return_value = 0
+        process.wait.return_value = 0
+
+        def settle(*_: object, **__: object) -> None:
+            events.append("settle")
+            raise RuntimeError("settle")
+
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                self.authenticated_test_front_door(Path(directory)) as observation,
+                mock.patch.object(
+                    REQUIRED_REVIEW.selectors,
+                    "DefaultSelector",
+                    return_value=FailingSelector("selector"),
+                ),
+                mock.patch.object(
+                    REQUIRED_REVIEW.subprocess, "Popen", return_value=process
+                ),
+                mock.patch.object(REQUIRED_REVIEW.os, "set_blocking"),
+                mock.patch.object(REQUIRED_REVIEW, "_settle", side_effect=settle),
+                self.assertRaisesRegex(
+                    REQUIRED_REVIEW.PublicationError, "process cleanup failed"
+                ) as raised,
+            ):
+                REQUIRED_REVIEW._supervised_process(
+                    observation, Path("/absolute/review-bundle")
+                )
+        self.assertEqual(events, ["settle", "selector", "stdout", "stderr"])
+        self.assertEqual(len(raised.exception.__notes__), 4)
+
+    def test_supervisor_cleanup_faults_do_not_mask_primary_error(self) -> None:
+        process = mock.Mock()
+        process.stdout.fileno.return_value = 1
+        process.stderr.fileno.return_value = 2
+
+        with tempfile.TemporaryDirectory() as directory:
+            with (
+                self.authenticated_test_front_door(Path(directory)) as observation,
+                mock.patch.object(
+                    REQUIRED_REVIEW.subprocess, "Popen", return_value=process
+                ),
+                mock.patch.object(
+                    REQUIRED_REVIEW.selectors.DefaultSelector,
+                    "register",
+                    side_effect=KeyboardInterrupt("primary"),
+                ),
+                mock.patch.object(REQUIRED_REVIEW.os, "set_blocking"),
+                mock.patch.object(
+                    REQUIRED_REVIEW, "_settle", side_effect=RuntimeError("settle")
+                ),
+                self.assertRaisesRegex(KeyboardInterrupt, "primary") as raised,
+            ):
+                REQUIRED_REVIEW._supervised_process(
+                    observation, Path("/absolute/review-bundle")
+                )
+        self.assertTrue(
+            any("RuntimeError('settle')" in note for note in raised.exception.__notes__)
+        )
+        process.stdout.close.assert_called_once_with()
+        process.stderr.close.assert_called_once_with()
+
+    def installed_front_door(
+        self, root: Path, source: str = "#!/bin/sh\nexit 0\n"
+    ) -> Path:
+        root.chmod(0o700)
+        current = root
+        for component in (".local", "libexec", "task-witness"):
+            current /= component
+            current.mkdir()
+            current.chmod(0o700)
+        leaf = current / "task-witness"
+        leaf.write_text(source, encoding="utf-8")
+        leaf.chmod(0o500)
+        return leaf
+
+    @contextmanager
+    def authenticated_test_front_door(self, home: Path, source: str | None = None):
+        self.installed_front_door(
+            home, source if source is not None else "#!/bin/sh\nexit 0\n"
+        )
+        passwd, effective, group = self.front_door_identity(home)
+        with (
+            passwd,
+            effective,
+            group,
+            REQUIRED_REVIEW._authenticated_front_door() as value,
+        ):
+            yield value
+
+    def front_door_identity(self, home: Path):
+        effective_uid = os.geteuid()
+        return (
+            mock.patch.object(
+                REQUIRED_REVIEW.pwd,
+                "getpwuid",
+                return_value=SimpleNamespace(pw_dir=str(home)),
+            ),
+            mock.patch.object(
+                REQUIRED_REVIEW.os, "geteuid", return_value=effective_uid
+            ),
+            mock.patch.object(REQUIRED_REVIEW.os, "getegid", return_value=os.getegid()),
+        )
+
+    def test_front_door_uses_effective_not_real_user_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            leaf = self.installed_front_door(home)
+            passwd, effective, group = self.front_door_identity(home)
+            with (
+                passwd as passwd_lookup,
+                effective,
+                group,
+                mock.patch.object(
+                    REQUIRED_REVIEW.os, "getuid", return_value=os.geteuid() + 1
+                ),
+                REQUIRED_REVIEW._authenticated_front_door() as authenticated,
+            ):
+                self.assertEqual(authenticated.path, leaf)
+            passwd_lookup.assert_called_once_with(os.geteuid())
+
+    def test_front_door_rejects_symlink_mode_owner_and_link_drift(self) -> None:
+        def symlink_leaf(home: Path, leaf: Path) -> None:
+            target = leaf.with_name("target")
+            leaf.rename(target)
+            leaf.symlink_to(target)
+
+        def wrong_mode(_: Path, leaf: Path) -> None:
+            leaf.chmod(0o700)
+
+        def extra_link(_: Path, leaf: Path) -> None:
+            os.link(leaf, leaf.with_name("task-witness-hardlink"))
+
+        cases = {
+            "symlink": symlink_leaf,
+            "mode": wrong_mode,
+            "link": extra_link,
+        }
+        for label, mutate in cases.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                home = Path(directory)
+                leaf = self.installed_front_door(home)
+                mutate(home, leaf)
+                passwd, effective, group = self.front_door_identity(home)
+                with (
+                    passwd,
+                    effective,
+                    group,
+                    self.assertRaises(REQUIRED_REVIEW.PublicationError),
+                ):
+                    with REQUIRED_REVIEW._authenticated_front_door():
+                        self.fail("untrusted front door was authenticated")
+
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            self.installed_front_door(home)
+            with (
+                mock.patch.object(
+                    REQUIRED_REVIEW.pwd,
+                    "getpwuid",
+                    return_value=SimpleNamespace(pw_dir=str(home)),
+                ),
+                mock.patch.object(
+                    REQUIRED_REVIEW.os, "geteuid", return_value=os.geteuid() + 1
+                ),
+                self.assertRaisesRegex(
+                    REQUIRED_REVIEW.PublicationError, "home is not private"
+                ),
+            ):
+                with REQUIRED_REVIEW._authenticated_front_door():
+                    self.fail("wrong-owner front door was authenticated")
+
+    def test_front_door_identity_is_rechecked_after_process_settlement(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            leaf = self.installed_front_door(home)
+
+            def replace_after_launch(*_: object) -> tuple[int, bytes, bytes]:
+                leaf.chmod(0o700)
+                return 0, b"{}\n", b""
+
+            passwd, effective, group = self.front_door_identity(home)
+            with (
+                passwd,
+                effective,
+                group,
+                mock.patch.object(
+                    REQUIRED_REVIEW,
+                    "_supervised_process",
+                    side_effect=replace_after_launch,
+                ),
+                self.assertRaisesRegex(
+                    REQUIRED_REVIEW.PublicationError, "changed during validation"
+                ),
+            ):
+                REQUIRED_REVIEW._invoke_task_witness(Path("/absolute/bundle"))
+
+    def test_front_door_identity_is_rechecked_after_failed_process_settlement(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            leaf = self.installed_front_door(home)
+
+            def fail_after_launch(*_: object) -> tuple[int, bytes, bytes]:
+                leaf.chmod(0o700)
+                raise REQUIRED_REVIEW.PublicationError("validation timed out")
+
+            passwd, effective, group = self.front_door_identity(home)
+            with (
+                passwd,
+                effective,
+                group,
+                mock.patch.object(
+                    REQUIRED_REVIEW,
+                    "_supervised_process",
+                    side_effect=fail_after_launch,
+                ),
+                self.assertRaisesRegex(
+                    REQUIRED_REVIEW.PublicationError, "changed during validation"
+                ),
+            ):
+                REQUIRED_REVIEW._invoke_task_witness(Path("/absolute/bundle"))
 
 
 class ReviewablePrStateTests(unittest.TestCase):
@@ -266,6 +1095,104 @@ class ReviewablePrFixture(unittest.TestCase):
         ).start()
         self.addCleanup(self._create_review_input.stop)
         self.addCleanup(self._update_review_input.stop)
+        self._create_candidate = mock.patch.object(
+            CREATE, "_build_candidate", side_effect=self._fixture_candidate
+        ).start()
+        self._update_candidate = mock.patch.object(
+            UPDATE, "_build_candidate", side_effect=self._fixture_candidate
+        ).start()
+        self._create_required_review = mock.patch.object(
+            CREATE,
+            "_validate_required_review",
+            side_effect=self._fixture_review,
+        ).start()
+        self._update_required_review = mock.patch.object(
+            UPDATE,
+            "_validate_required_review",
+            side_effect=self._fixture_review,
+        ).start()
+        self.addCleanup(self._create_candidate.stop)
+        self.addCleanup(self._update_candidate.stop)
+        self.addCleanup(self._create_required_review.stop)
+        self.addCleanup(self._update_required_review.stop)
+
+    def _fixture_candidate(self, **kwargs: object):
+        operation = str(kwargs["operation"])
+        review_input_raw = Path(kwargs["review_input_path"]).read_bytes()
+        selected_specialists = kwargs.get("selected_specialists", [])
+        review_input = {
+            "schema_version": self.review_input_schema_version,
+            "raw_sha256": hashlib.sha256(review_input_raw).hexdigest(),
+            "content_sha256": self.review_input_sha256,
+        }
+        value = {
+            "schema_version": 1,
+            "contract": "mergecraft-publication-candidate-v1",
+            "operation": operation,
+            "repository": kwargs["repository"],
+            "pr_number": kwargs["pr_number"],
+            "base": {"ref": kwargs["base"], "oid": kwargs["base_oid"]},
+            "head": {
+                "ref": kwargs["head"],
+                "oid": kwargs["head_oid"],
+                "owner": kwargs["head_owner"],
+                "repository": kwargs["head_repository"],
+            },
+            "title": kwargs["title"],
+            "body_source": REQUIRED_REVIEW.body_source_binding(
+                kind=str(kwargs["body_source_kind"]),
+                raw=kwargs["body_source_raw"],
+                published=str(kwargs["published_body"]),
+                render_contract=(
+                    "mergecraft-pr-number-token-render-v1"
+                    if kwargs["body_source_kind"] == "template"
+                    else "literal-utf8-v1"
+                ),
+            ),
+            "review_input": review_input,
+            "publication_profile": {
+                "contract": "mergecraft-publication-profile-v1",
+                "review_mode": kwargs["review_mode"],
+                "selected_specialists": selected_specialists,
+            },
+        }
+        digest = hashlib.sha256(RequiredReviewTests.canonical(value)).hexdigest()
+        return REQUIRED_REVIEW.PublicationCandidate(
+            value=value,
+            content_sha256=digest,
+            candidate_identity={
+                "kind": "mergecraft-publication-candidate-v1",
+                "value": f"sha256:{digest}",
+                "content_sha256": digest,
+            },
+            review_input_identity=REQUIRED_REVIEW._identity_for(
+                "mergecraft-review-input-v1", review_input
+            ),
+            requirements_identity=REQUIRED_REVIEW._identity_for(
+                "mergecraft-required-publication-review-profile-v2",
+                REQUIRED_REVIEW._required_profile(selected_specialists),
+            ),
+            body_source_raw=kwargs["body_source_raw"],
+            published_body=str(kwargs["published_body"]),
+        )
+
+    @staticmethod
+    def _fixture_review(**kwargs: object):
+        candidate = kwargs["candidate"]
+        observation = None
+        if kwargs["review_mode"] == "required":
+            observation = REQUIRED_REVIEW.RequiredReviewObservation(
+                launch_envelope_sha256="1" * 64,
+                generation="sha256-" + "2" * 64,
+                active_record_sha256="3" * 64,
+                trust_context_sha256="4" * 64,
+                bundle_sha256="5" * 64,
+                tricritical_manifest_sha256="6" * 64,
+                tricritical_projection_sha256="7" * 64,
+            )
+        return transition_review(
+            kwargs["review_mode"], candidate.content_sha256, observation
+        )
 
     @property
     def expected(self):
@@ -321,11 +1248,81 @@ class ReviewablePrFixture(unittest.TestCase):
             title=self.title,
             template_path=self.template_path,
             review_input_path=self.template_path,
+            review_mode="not-required",
+            review_bundle_root=None,
+            selected_specialists=[],
             receipt_directory=self.receipt_directory,
         )
 
 
 class CreateReviewablePrTests(ReviewablePrFixture):
+    def required_publish(self):
+        return CREATE.publish(
+            repository=self.repository,
+            base=self.base,
+            base_oid=self.base_oid,
+            head=self.head,
+            head_oid=self.head_oid,
+            head_owner=self.head_owner,
+            head_repository=self.head_repository,
+            title=self.title,
+            template_path=self.template_path,
+            review_input_path=self.template_path,
+            review_mode="required",
+            review_bundle_root=Path("/absolute/review-bundle"),
+            selected_specialists=[],
+            receipt_directory=self.receipt_directory,
+        )
+
+    def test_required_create_remote_drift_after_review_blocks_canonical_edit(
+        self,
+    ) -> None:
+        drifted = self.transport(title="reviewer changed title")
+        with (
+            mock.patch.object(CREATE, "_validate"),
+            mock.patch.object(CREATE, "_new_nonce", return_value=self.nonce),
+            mock.patch.object(CREATE, "_create", return_value=(42, self.url)),
+            mock.patch.object(
+                CREATE, "_stored_pr", side_effect=[self.transport(), drifted]
+            ),
+            mock.patch.object(CREATE, "_run_mutation") as mutate,
+        ):
+            with self.assertRaisesRegex(CREATE.PublicationError, "after review"):
+                self.required_publish()
+
+        mutate.assert_not_called()
+        self.assertEqual(
+            RECEIPTS.load_receipts(self.receipt_directory, self.expected), []
+        )
+
+    def test_required_create_receipt_preimage_is_post_review_snapshot(self) -> None:
+        assigned = self.transport()
+        post_review = dict(assigned)
+        after = self.stored()
+        with (
+            mock.patch.object(CREATE, "_validate"),
+            mock.patch.object(CREATE, "_new_nonce", return_value=self.nonce),
+            mock.patch.object(CREATE, "_create", return_value=(42, self.url)),
+            mock.patch.object(
+                CREATE,
+                "_stored_pr",
+                side_effect=[assigned, post_review, after],
+            ),
+            mock.patch.object(
+                CREATE,
+                "_run_mutation",
+                return_value=subprocess.CompletedProcess([], 0, "", ""),
+            ),
+            mock.patch.object(
+                CREATE,
+                "verified_transition",
+                wraps=RECEIPTS.verified_transition,
+            ) as transition,
+        ):
+            self.required_publish()
+
+        self.assertIs(transition.call_args.kwargs["preimage"], post_review)
+
     def test_candidate_secret_blocks_before_create_without_echoing_value(self) -> None:
         secret = "ghp_123456789012345678901234567890"
         self.template_path.write_text(
@@ -611,6 +1608,9 @@ class CreateReviewablePrTests(ReviewablePrFixture):
                     title=self.title,
                     template_path=self.template_path,
                     review_input_path=self.template_path,
+                    review_mode="not-required",
+                    review_bundle_root=None,
+                    selected_specialists=[],
                     receipt_directory=self.receipt_directory,
                 )
         validate.assert_not_called()
@@ -677,6 +1677,66 @@ class UpdateReviewablePrTests(ReviewablePrFixture):
         path.write_text(self.body + "updated\n", encoding="utf-8")
         return path
 
+    def test_required_text_remote_drift_after_review_blocks_mutation(self) -> None:
+        desired_path = self.desired_body_path()
+        drifted = self.stored(title="reviewer changed title")
+        with (
+            mock.patch.object(UPDATE, "_validate_body"),
+            mock.patch.object(
+                UPDATE,
+                "_stored_pr",
+                side_effect=[self.stored(), self.stored(), drifted],
+            ),
+            mock.patch.object(UPDATE, "_run_mutation") as mutate,
+        ):
+            with self.assertRaisesRegex(UPDATE.PublicationError, "preimage changed"):
+                UPDATE.update_text(
+                    expected=self.expected,
+                    expected_title_sha256=self.digest(self.title),
+                    expected_body_sha256=self.digest(self.body),
+                    expected_draft=True,
+                    title=self.title,
+                    body_path=desired_path,
+                    review_input_path=self.template_path,
+                    review_mode="required",
+                    review_bundle_root=Path("/absolute/review-bundle"),
+                    selected_specialists=[],
+                    receipt_directory=self.receipt_directory,
+                )
+
+        mutate.assert_not_called()
+        self.assertEqual(
+            RECEIPTS.load_receipts(self.receipt_directory, self.expected), []
+        )
+
+    def test_required_ready_remote_drift_after_review_blocks_mutation(self) -> None:
+        drifted = self.stored(body=self.body + "reviewer change\n")
+        with (
+            mock.patch.object(UPDATE, "_validate_body"),
+            mock.patch.object(
+                UPDATE,
+                "_stored_pr",
+                side_effect=[self.stored(), self.stored(), drifted],
+            ),
+            mock.patch.object(UPDATE, "_run_mutation") as mutate,
+        ):
+            with self.assertRaisesRegex(UPDATE.PublicationError, "preimage changed"):
+                UPDATE.mark_ready(
+                    expected=self.expected,
+                    expected_title_sha256=self.digest(self.title),
+                    expected_body_sha256=self.digest(self.body),
+                    review_input_path=self.template_path,
+                    review_mode="required",
+                    review_bundle_root=Path("/absolute/review-bundle"),
+                    selected_specialists=[],
+                    receipt_directory=self.receipt_directory,
+                )
+
+        mutate.assert_not_called()
+        self.assertEqual(
+            RECEIPTS.load_receipts(self.receipt_directory, self.expected), []
+        )
+
     def test_text_update_has_exact_preflight_one_write_and_final_read(self) -> None:
         desired_path = self.desired_body_path()
         desired = desired_path.read_text()
@@ -702,6 +1762,9 @@ class UpdateReviewablePrTests(ReviewablePrFixture):
                 title="feat: updated",
                 body_path=desired_path,
                 review_input_path=self.template_path,
+                review_mode="not-required",
+                review_bundle_root=None,
+                selected_specialists=[],
                 receipt_directory=self.receipt_directory,
             )
         self.assertEqual(result, after)
@@ -731,6 +1794,9 @@ class UpdateReviewablePrTests(ReviewablePrFixture):
                 title=self.title,
                 body_template_path=self.template_path,
                 review_input_path=self.template_path,
+                review_mode="not-required",
+                review_bundle_root=None,
+                selected_specialists=[],
                 receipt_directory=self.receipt_directory,
             )
 
@@ -760,6 +1826,9 @@ class UpdateReviewablePrTests(ReviewablePrFixture):
                     body_path=self.template_path,
                     body_template_path=self.template_path,
                     review_input_path=self.template_path,
+                    review_mode="not-required",
+                    review_bundle_root=None,
+                    selected_specialists=[],
                     receipt_directory=self.receipt_directory,
                 )
         run.assert_not_called()
@@ -794,6 +1863,9 @@ class UpdateReviewablePrTests(ReviewablePrFixture):
                 title="feat: updated",
                 body_path=desired_path,
                 review_input_path=self.template_path,
+                review_mode="not-required",
+                review_bundle_root=None,
+                selected_specialists=[],
                 receipt_directory=self.receipt_directory,
             )
         self.assertEqual(result, after)
@@ -836,6 +1908,9 @@ class UpdateReviewablePrTests(ReviewablePrFixture):
                 title=self.title,
                 body_path=desired_path,
                 review_input_path=self.template_path,
+                review_mode="not-required",
+                review_bundle_root=None,
+                selected_specialists=[],
                 receipt_directory=self.receipt_directory,
             )
         self.assertEqual(result, after)
@@ -855,6 +1930,9 @@ class UpdateReviewablePrTests(ReviewablePrFixture):
                     title=self.title,
                     body_path=self.desired_body_path(),
                     review_input_path=self.template_path,
+                    review_mode="not-required",
+                    review_bundle_root=None,
+                    selected_specialists=[],
                     receipt_directory=self.receipt_directory,
                 )
         run.assert_not_called()
@@ -876,6 +1954,9 @@ class UpdateReviewablePrTests(ReviewablePrFixture):
                     title="feat: unauthorized title",
                     body_path=self.desired_body_path(),
                     review_input_path=self.template_path,
+                    review_mode="not-required",
+                    review_bundle_root=None,
+                    selected_specialists=[],
                     receipt_directory=self.receipt_directory,
                     text_scope="body-only",
                 )
@@ -898,6 +1979,9 @@ class UpdateReviewablePrTests(ReviewablePrFixture):
                     title="feat: authorized title",
                     body_path=self.desired_body_path(),
                     review_input_path=self.template_path,
+                    review_mode="not-required",
+                    review_bundle_root=None,
+                    selected_specialists=[],
                     receipt_directory=self.receipt_directory,
                     text_scope="title-only",
                 )
@@ -932,6 +2016,9 @@ class UpdateReviewablePrTests(ReviewablePrFixture):
                     title=self.title,
                     body_path=desired_path,
                     review_input_path=self.template_path,
+                    review_mode="not-required",
+                    review_bundle_root=None,
+                    selected_specialists=[],
                     receipt_directory=self.receipt_directory,
                 )
         self.assertEqual(run.call_count, 1)
@@ -966,6 +2053,9 @@ class UpdateReviewablePrTests(ReviewablePrFixture):
                     title=self.title,
                     body_path=desired_path,
                     review_input_path=self.template_path,
+                    review_mode="not-required",
+                    review_bundle_root=None,
+                    selected_specialists=[],
                     receipt_directory=self.receipt_directory,
                 )
         self.assertEqual(
@@ -995,6 +2085,9 @@ class UpdateReviewablePrTests(ReviewablePrFixture):
                     title=self.title,
                     body_path=desired_path,
                     review_input_path=self.template_path,
+                    review_mode="not-required",
+                    review_bundle_root=None,
+                    selected_specialists=[],
                     receipt_directory=self.receipt_directory,
                 )
         self.assertEqual(run.call_count, 1)
@@ -1026,6 +2119,9 @@ class UpdateReviewablePrTests(ReviewablePrFixture):
                     title=self.title,
                     body_path=desired_path,
                     review_input_path=self.template_path,
+                    review_mode="not-required",
+                    review_bundle_root=None,
+                    selected_specialists=[],
                     receipt_directory=self.receipt_directory,
                 )
         self.assertEqual(run.call_count, 1)
@@ -1058,6 +2154,9 @@ class UpdateReviewablePrTests(ReviewablePrFixture):
                     expected_title_sha256=self.digest(self.title),
                     expected_body_sha256=self.digest(self.body),
                     review_input_path=self.template_path,
+                    review_mode="not-required",
+                    review_bundle_root=None,
+                    selected_specialists=[],
                     receipt_directory=self.receipt_directory,
                 )
         self.assertEqual(run.call_count, 1)
@@ -1087,6 +2186,9 @@ class UpdateReviewablePrTests(ReviewablePrFixture):
                     expected_title_sha256=self.digest(self.title),
                     expected_body_sha256=self.digest(self.body),
                     review_input_path=self.template_path,
+                    review_mode="not-required",
+                    review_bundle_root=None,
+                    selected_specialists=[],
                     receipt_directory=self.receipt_directory,
                 )
         self.assertEqual(
@@ -1112,6 +2214,9 @@ class UpdateReviewablePrTests(ReviewablePrFixture):
                     expected_title_sha256=self.digest(self.title),
                     expected_body_sha256=self.digest(self.body),
                     review_input_path=self.template_path,
+                    review_mode="not-required",
+                    review_bundle_root=None,
+                    selected_specialists=[],
                     receipt_directory=self.receipt_directory,
                 )
         self.assertEqual(run.call_count, 1)
@@ -1131,6 +2236,9 @@ class UpdateReviewablePrTests(ReviewablePrFixture):
                     expected_title_sha256=self.digest(self.title),
                     expected_body_sha256=self.digest(self.body),
                     review_input_path=self.template_path,
+                    review_mode="not-required",
+                    review_bundle_root=None,
+                    selected_specialists=[],
                     receipt_directory=self.receipt_directory,
                 )
         self.assertEqual(reads.call_count, 2)
@@ -1155,6 +2263,9 @@ class UpdateReviewablePrTests(ReviewablePrFixture):
                     expected_title_sha256=self.digest(self.title),
                     expected_body_sha256=self.digest(legacy_body),
                     review_input_path=self.template_path,
+                    review_mode="not-required",
+                    review_bundle_root=None,
+                    selected_specialists=[],
                     receipt_directory=self.receipt_directory,
                 )
         run.assert_not_called()
@@ -1166,6 +2277,86 @@ class PublicationReceiptTests(ReviewablePrFixture):
         self.receipt_directory = Path(self.temporary_directory.name) / "receipts"
         RECEIPTS.prepare_receipt_store(self.receipt_directory)
 
+    def transition_candidate(
+        self,
+        *,
+        operation: str,
+        final_state: dict[str, object],
+        mode: str,
+        expected=None,
+    ):
+        expected = expected or self.expected
+        if operation == "create":
+            pr_number: int | str = CREATE.PR_NUMBER_TOKEN
+            kind = "template"
+            raw = self.template.encode("utf-8")
+            published = self.template
+        elif operation == "mark-ready":
+            pr_number = expected.pr_number
+            kind = "stored-body"
+            published = str(final_state["body"])
+            raw = published.encode("utf-8")
+        else:
+            pr_number = expected.pr_number
+            kind = "body"
+            published = str(final_state["body"])
+            raw = published.encode("utf-8")
+        value = {
+            "schema_version": 1,
+            "contract": "mergecraft-publication-candidate-v1",
+            "operation": operation,
+            "repository": expected.repository,
+            "pr_number": pr_number,
+            "base": {"ref": expected.base, "oid": expected.base_oid},
+            "head": {
+                "ref": expected.head,
+                "oid": expected.head_oid,
+                "owner": expected.head_owner,
+                "repository": expected.head_repository,
+            },
+            "title": str(final_state["title"]),
+            "body_source": REQUIRED_REVIEW.body_source_binding(
+                kind=kind,
+                raw=raw,
+                published=published,
+                render_contract=(
+                    "mergecraft-pr-number-token-render-v1"
+                    if kind == "template"
+                    else "literal-utf8-v1"
+                ),
+            ),
+            "review_input": {
+                "schema_version": self.review_input_schema_version,
+                "raw_sha256": "e" * 64,
+                "content_sha256": self.review_input_sha256,
+            },
+            "publication_profile": {
+                "contract": "mergecraft-publication-profile-v1",
+                "review_mode": mode,
+                "selected_specialists": [],
+            },
+        }
+        digest = hashlib.sha256(RequiredReviewTests.canonical(value)).hexdigest()
+        candidate = REQUIRED_REVIEW.PublicationCandidate(
+            value=value,
+            content_sha256=digest,
+            candidate_identity={
+                "kind": "mergecraft-publication-candidate-v1",
+                "value": f"sha256:{digest}",
+                "content_sha256": digest,
+            },
+            review_input_identity=REQUIRED_REVIEW._identity_for(
+                "mergecraft-review-input-v1", value["review_input"]
+            ),
+            requirements_identity=REQUIRED_REVIEW._identity_for(
+                "mergecraft-required-publication-review-profile-v2",
+                REQUIRED_REVIEW._required_profile([]),
+            ),
+            body_source_raw=raw,
+            published_body=published,
+        )
+        return candidate
+
     def canonical_receipt(
         self,
         *,
@@ -1173,10 +2364,23 @@ class PublicationReceiptTests(ReviewablePrFixture):
         before: dict[str, object] | None = None,
         after: dict[str, object] | None = None,
         root: Path | None = None,
+        review=None,
     ):
         final_state = after or self.stored()
         if before is None and operation == "create":
             before = self.transport(title=final_state["title"])
+        candidate = self.transition_candidate(
+            operation=operation,
+            final_state=final_state,
+            mode=review.mode if review is not None else "not-required",
+        )
+        chosen_review = review or transition_review(
+            "not-required", candidate.content_sha256, None
+        )
+        if review is not None:
+            chosen_review = transition_review(
+                review.mode, candidate.content_sha256, review.observation
+            )
         transition = RECEIPTS.verified_transition(
             expected=self.expected,
             operation=operation,
@@ -1184,6 +2388,8 @@ class PublicationReceiptTests(ReviewablePrFixture):
             final_reread=final_state,
             review_input_schema_version=self.review_input_schema_version,
             review_input_sha256=self.review_input_sha256,
+            review=chosen_review,
+            candidate=candidate,
         )
         receipt_root = root or self.receipt_directory
         RECEIPTS.prepare_receipt_ledger(receipt_root, self.expected)
@@ -1203,6 +2409,8 @@ class PublicationReceiptTests(ReviewablePrFixture):
             final_reread=stored,
             review_input_schema_version=self.review_input_schema_version,
             review_input_sha256=self.review_input_sha256,
+            review=None,
+            candidate=None,
         )
         receipt_root = root or self.receipt_directory
         RECEIPTS.prepare_receipt_ledger(receipt_root, self.expected)
@@ -1265,6 +2473,139 @@ class PublicationReceiptTests(ReviewablePrFixture):
         self.assertEqual(receipt_path.stat().st_mode & 0o077, 0)
         self.assertFalse(list(self.receipt_directory.rglob("*.tmp")))
 
+    def test_v3_receipt_distinguishes_required_not_required_and_reconciliation(
+        self,
+    ) -> None:
+        observation = REQUIRED_REVIEW.RequiredReviewObservation(
+            launch_envelope_sha256="1" * 64,
+            generation="sha256-" + "2" * 64,
+            active_record_sha256="3" * 64,
+            trust_context_sha256="4" * 64,
+            bundle_sha256="5" * 64,
+            tricritical_manifest_sha256="6" * 64,
+            tricritical_projection_sha256="7" * 64,
+        )
+        required_root = Path(self.temporary_directory.name) / "required"
+        RECEIPTS.prepare_receipt_store(required_root)
+        required = self.canonical_receipt(
+            root=required_root,
+            review=transition_review("required", "8" * 64, observation),
+        )
+        self.assertEqual(required.schema_version, 3)
+        self.assertEqual(required.summary("verified")["review"]["mode"], "required")
+        self.assertEqual(
+            required.summary("verified")["review"]["observation"][
+                "launch_envelope_sha256"
+            ],
+            "1" * 64,
+        )
+
+        not_required = self.canonical_receipt()
+        self.assertEqual(
+            not_required.summary("verified")["review"],
+            {
+                "mode": "not-required",
+                "publication_candidate_sha256": (
+                    not_required.review.publication_candidate_sha256
+                ),
+                "observation": None,
+            },
+        )
+
+        reconciliation_root = Path(self.temporary_directory.name) / "reconcile"
+        RECEIPTS.prepare_receipt_store(reconciliation_root)
+        reconciled = self.reconciled_receipt(root=reconciliation_root)
+        self.assertIsNone(reconciled.review)
+        self.assertEqual(
+            reconciled.summary("verified")["review"],
+            {"state": "unwitnessed-reconciliation"},
+        )
+
+    def test_v2_receipt_remains_chained_but_is_only_legacy_unrecorded(self) -> None:
+        receipt = self.canonical_receipt()
+        path = next(self.receipt_directory.rglob("*.json"))
+        payload = receipt.as_json()
+        payload["schema_version"] = 2
+        del payload["review"]
+        self.rewrite_receipt(path, payload)
+
+        loaded = RECEIPTS.load_receipts(self.receipt_directory, self.expected)
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(loaded[0].schema_version, 2)
+        self.assertIsNone(loaded[0].review)
+        self.assertEqual(
+            loaded[0].summary("verified")["review"],
+            {"state": "legacy-unrecorded"},
+        )
+
+    def test_receipt_ledger_rejects_v2_after_first_v3(self) -> None:
+        state_a = self.stored(title="state A")
+        self.canonical_receipt(after=state_a)
+        state_b = self.stored(title="state B")
+        self.canonical_receipt(
+            operation="update-text",
+            before=state_a,
+            after=state_b,
+        )
+        for path in self.receipt_directory.rglob("*.json"):
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if payload["sequence"] == 2:
+                payload["schema_version"] = 2
+                del payload["review"]
+                self.rewrite_receipt(path, payload)
+                break
+        else:
+            self.fail("second receipt is absent")
+
+        with self.assertRaisesRegex(RECEIPTS.ReceiptError, "moved backward"):
+            RECEIPTS.load_receipts(self.receipt_directory, self.expected)
+
+    def test_review_from_candidate_a_cannot_mint_candidate_b_provenance(
+        self,
+    ) -> None:
+        state_a = self.stored(title="candidate A")
+        state_b = self.stored(title="candidate B")
+        candidate_a = self.transition_candidate(
+            operation="update-text", final_state=state_a, mode="not-required"
+        )
+        candidate_b = self.transition_candidate(
+            operation="update-text", final_state=state_b, mode="not-required"
+        )
+        review_a = transition_review("not-required", candidate_a.content_sha256, None)
+
+        with self.assertRaisesRegex(RECEIPTS.ReceiptError, "candidate evidence"):
+            RECEIPTS.verified_transition(
+                expected=self.expected,
+                operation="update-text",
+                preimage=self.stored(),
+                final_reread=state_b,
+                review_input_schema_version=self.review_input_schema_version,
+                review_input_sha256=self.review_input_sha256,
+                review=review_a,
+                candidate=candidate_b,
+            )
+
+    def test_parsed_receipt_review_cannot_mint_a_new_transition(self) -> None:
+        state = self.stored(title="candidate state")
+        candidate = self.transition_candidate(
+            operation="update-text", final_state=state, mode="not-required"
+        )
+        parsed = REQUIRED_REVIEW.parse_publication_review(
+            transition_review("not-required", candidate.content_sha256, None).as_json()
+        )
+
+        with self.assertRaisesRegex(RECEIPTS.ReceiptError, "candidate evidence"):
+            RECEIPTS.verified_transition(
+                expected=self.expected,
+                operation="update-text",
+                preimage=self.stored(),
+                final_reread=state,
+                review_input_schema_version=self.review_input_schema_version,
+                review_input_sha256=self.review_input_sha256,
+                review=parsed,
+                candidate=candidate,
+            )
+
     def test_receipt_write_failure_never_exposes_a_partial_final_receipt(self) -> None:
         with mock.patch.object(RECEIPTS.os, "link", side_effect=OSError("full")):
             with self.assertRaisesRegex(RECEIPTS.ReceiptError, "atomically commit"):
@@ -1301,6 +2642,9 @@ class PublicationReceiptTests(ReviewablePrFixture):
                 title=self.title,
                 body_path=desired_path,
                 review_input_path=self.template_path,
+                review_mode="not-required",
+                review_bundle_root=None,
+                selected_specialists=[],
                 receipt_directory=self.receipt_directory,
             )
         receipt = RECEIPTS.load_receipts(self.receipt_directory, self.expected)[0]
@@ -1348,6 +2692,9 @@ class PublicationReceiptTests(ReviewablePrFixture):
                     title=self.title,
                     body_path=desired_path,
                     review_input_path=self.template_path,
+                    review_mode="not-required",
+                    review_bundle_root=None,
+                    selected_specialists=[],
                     receipt_directory=self.receipt_directory,
                 )
         self.assertEqual(mutate.call_count, 1)
@@ -1439,6 +2786,8 @@ class PublicationReceiptTests(ReviewablePrFixture):
             final_reread=new_epoch_state,
             review_input_schema_version=self.review_input_schema_version,
             review_input_sha256=self.review_input_sha256,
+            review=None,
+            candidate=None,
         )
         RECEIPTS.prepare_receipt_ledger(self.receipt_directory, new_expected)
         with RECEIPTS.receipt_ledger_lock(
@@ -1483,7 +2832,9 @@ class PublicationReceiptTests(ReviewablePrFixture):
         payload["provenance"] = "canonical"
         payload["operation"] = "create"
         self.rewrite_receipt(path, payload)
-        with self.assertRaisesRegex(RECEIPTS.ReceiptError, "transition"):
+        with self.assertRaisesRegex(
+            RECEIPTS.ReceiptError, "transition|review evidence"
+        ):
             RECEIPTS.load_receipts(self.receipt_directory, self.expected)
 
     def test_reconcile_binds_the_live_state_to_review_input_before_receipting(
@@ -1547,6 +2898,8 @@ class PublicationReceiptTests(ReviewablePrFixture):
                 final_reread=self.stored(),
                 review_input_schema_version=self.review_input_schema_version,
                 review_input_sha256=self.review_input_sha256,
+                review=None,
+                candidate=None,
             )
 
     def test_text_noop_stops_before_store_probe_or_mutation(self) -> None:
@@ -1571,6 +2924,9 @@ class PublicationReceiptTests(ReviewablePrFixture):
                     title=self.title,
                     body_path=same_body,
                     review_input_path=self.template_path,
+                    review_mode="not-required",
+                    review_bundle_root=None,
+                    selected_specialists=[],
                     receipt_directory=self.receipt_directory,
                 )
         prepare.assert_not_called()
@@ -1581,18 +2937,7 @@ class PublicationReceiptTests(ReviewablePrFixture):
         with mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(xdg)}):
             root = RECEIPTS.prepare_receipt_store()
             RECEIPTS.prepare_receipt_ledger(root, self.expected)
-            transition = RECEIPTS.verified_transition(
-                expected=self.expected,
-                operation="create",
-                preimage=self.transport(),
-                final_reread=self.stored(),
-                review_input_schema_version=self.review_input_schema_version,
-                review_input_sha256=self.review_input_sha256,
-            )
-            with RECEIPTS.receipt_ledger_lock(root, self.expected) as lease:
-                receipt = RECEIPTS.record_verified_publication(
-                    root=root, transition=transition, lease=lease
-                )
+            receipt = self.canonical_receipt(root=root)
             result = RECEIPTS.audit_publication(
                 root=None,
                 expected=self.expected,
@@ -1628,6 +2973,9 @@ class PublicationReceiptTests(ReviewablePrFixture):
                     title=self.title,
                     body_path=desired,
                     review_input_path=self.template_path,
+                    review_mode="not-required",
+                    review_bundle_root=None,
+                    selected_specialists=[],
                     receipt_directory=bad_root,
                 )
         mutate.assert_not_called()
@@ -1647,6 +2995,9 @@ class PublicationReceiptTests(ReviewablePrFixture):
                     title=f"Credential {secret}",
                     template_path=self.template_path,
                     review_input_path=self.template_path,
+                    review_mode="not-required",
+                    review_bundle_root=None,
+                    selected_specialists=[],
                     receipt_directory=self.receipt_directory,
                 )
         create.assert_not_called()
@@ -1663,6 +3014,9 @@ class PublicationReceiptTests(ReviewablePrFixture):
                     title=f"Credential {secret}",
                     body_path=changed,
                     review_input_path=self.template_path,
+                    review_mode="not-required",
+                    review_bundle_root=None,
+                    selected_specialists=[],
                     receipt_directory=self.receipt_directory,
                 )
         mutate.assert_not_called()
@@ -1678,6 +3032,9 @@ class PublicationReceiptTests(ReviewablePrFixture):
                         self.body.encode("utf-8")
                     ).hexdigest(),
                     review_input_path=self.template_path,
+                    review_mode="not-required",
+                    review_bundle_root=None,
+                    selected_specialists=[],
                     receipt_directory=self.receipt_directory,
                 )
         with mock.patch.object(AUDIT, "stored_pr", return_value=secret_state):
@@ -1744,6 +3101,22 @@ class PublicationReceiptTests(ReviewablePrFixture):
             final_reread=after,
             review_input_schema_version=self.review_input_schema_version,
             review_input_sha256=self.review_input_sha256,
+            review=transition_review(
+                "not-required",
+                self.transition_candidate(
+                    operation="update-text",
+                    final_state=after,
+                    mode="not-required",
+                    expected=new_expected,
+                ).content_sha256,
+                None,
+            ),
+            candidate=self.transition_candidate(
+                operation="update-text",
+                final_state=after,
+                mode="not-required",
+                expected=new_expected,
+            ),
         )
         RECEIPTS.prepare_receipt_ledger(self.receipt_directory, new_expected)
         with RECEIPTS.receipt_ledger_lock(
@@ -1773,6 +3146,20 @@ class PublicationReceiptTests(ReviewablePrFixture):
             final_reread=self.stored(),
             review_input_schema_version=self.review_input_schema_version,
             review_input_sha256=self.review_input_sha256,
+            review=transition_review(
+                "not-required",
+                self.transition_candidate(
+                    operation="create",
+                    final_state=self.stored(),
+                    mode="not-required",
+                ).content_sha256,
+                None,
+            ),
+            candidate=self.transition_candidate(
+                operation="create",
+                final_state=self.stored(),
+                mode="not-required",
+            ),
         )
         inactive = RECEIPTS.LedgerLease(
             root=self.receipt_directory,
@@ -1789,6 +3176,8 @@ class PublicationReceiptTests(ReviewablePrFixture):
 
     def test_two_process_append_is_serialized_without_sequence_fork(self) -> None:
         child = """
+import hashlib
+import json
 import sys
 import time
 from pathlib import Path
@@ -1798,6 +3187,13 @@ from publication_receipts import (
     receipt_ledger_lock,
     record_verified_publication,
     verified_transition,
+)
+from required_review import (
+    PublicationCandidate,
+    _identity_for,
+    _required_profile,
+    body_source_binding,
+    validate_required_review,
 )
 from reviewable_pr_state import ExpectedIdentity
 root = Path(sys.argv[2])
@@ -1814,9 +3210,53 @@ before = {
     'isDraft': True, 'state': 'OPEN'
 }
 after = {**before, 'body': 'canonical'}
+candidate_value = {
+    'schema_version': 1, 'contract': 'mergecraft-publication-candidate-v1',
+    'operation': 'update-text', 'repository': expected.repository,
+    'pr_number': expected.pr_number,
+    'base': {'ref': expected.base, 'oid': expected.base_oid},
+    'head': {
+        'ref': expected.head, 'oid': expected.head_oid,
+        'owner': expected.head_owner, 'repository': expected.head_repository,
+    },
+    'title': after['title'],
+    'body_source': body_source_binding(
+        kind='body', raw=b'canonical', published='canonical',
+        render_contract='literal-utf8-v1',
+    ),
+    'review_input': {
+        'schema_version': 2, 'raw_sha256': 'e' * 64,
+        'content_sha256': 'd' * 64,
+    },
+    'publication_profile': {
+        'contract': 'mergecraft-publication-profile-v1',
+        'review_mode': 'not-required', 'selected_specialists': [],
+    },
+}
+candidate_sha = hashlib.sha256(json.dumps(
+    candidate_value, sort_keys=True, separators=(',', ':'), ensure_ascii=False,
+).encode('utf-8')).hexdigest()
+candidate = PublicationCandidate(
+    candidate_value, candidate_sha,
+    {'kind': 'mergecraft-publication-candidate-v1',
+     'value': 'sha256:' + candidate_sha, 'content_sha256': candidate_sha},
+    _identity_for('mergecraft-review-input-v1', candidate_value['review_input']),
+    _identity_for(
+        'mergecraft-required-publication-review-profile-v2',
+        _required_profile([]),
+    ),
+    b'canonical', 'canonical',
+)
+review_input = candidate.value['review_input']
+review = validate_required_review(
+    review_mode='not-required', review_bundle_root=None, candidate=candidate,
+)
 transition = verified_transition(
-    expected=expected, operation='create', preimage=before, final_reread=after,
-    review_input_schema_version=2, review_input_sha256='d' * 64
+    expected=expected, operation='update-text', preimage=before, final_reread=after,
+    review_input_schema_version=review_input['schema_version'],
+    review_input_sha256=review_input['content_sha256'],
+    review=review,
+    candidate=candidate,
 )
 prepare_receipt_ledger(root, expected)
 with receipt_ledger_lock(root, expected) as lease:
@@ -1906,6 +3346,8 @@ with receipt_ledger_lock(root, expected) as lease:
             final_reread=state_b,
             review_input_schema_version=self.review_input_schema_version,
             review_input_sha256=self.review_input_sha256,
+            review=None,
+            candidate=None,
         )
         with RECEIPTS.receipt_ledger_lock(
             self.receipt_directory, self.expected

@@ -15,6 +15,15 @@ from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
+SCRIPT_DIRECTORY = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIRECTORY))
+
+from agent_plugins_standard import (  # noqa: E402
+    discover_direct_skills,
+    load_agent_plugin_manifest,
+    validate_skill_resource_links,
+)
+
 try:
     import yaml
 except ModuleNotFoundError:
@@ -150,6 +159,17 @@ REVIEW_COMPLETENESS_LINK = (
 LOOP_OPERATOR_CHOICE_LINK = (
     "[the portable operator-choice contract](references/operator-choice.md)"
 )
+TERMINAL_EVIDENCE_REFERENCE = "skills/loop/references/review-evidence.md"
+TERMINAL_EVIDENCE_RUNTIME = "skills/loop/scripts/review_evidence.py"
+TASK_WITNESS_PROVIDER = "task-witness-provider.json"
+TERMINAL_EVIDENCE_CONTRACT = "tricritical-terminal-review-evidence-v2"
+TERMINAL_PROJECTION_CONTRACT = "tricritical-terminal-review-projection-v2"
+ROLECASTING_EVIDENCE_CONTRACT = "rolecasting-dispatch-evidence-v2"
+ROLECASTING_PROJECTION_CONTRACT = "rolecasting-dispatch-projection-v2"
+TRICRITICAL_AUTHORITY_PROFILE = "tricritical-cooperative-review-v1"
+TERMINAL_EVIDENCE_VALIDATOR_ID = "tricritical-terminal-review-evidence-validator-v2"
+PROVIDER_CONTRACT = "task-witness-provider-declaration-v1"
+VALIDATOR_MANIFEST_CONTRACT = "task-witness-validator-artifact-manifest-v1"
 REVIEW_OUTPUT_SKILLS = ("review", "intent", "runtime", "structure", "adjudicate")
 CONTENT_LOCK_PATH = "content-lock.json"
 CODEX_LOOP_DISCOVERY_PROMPT = (
@@ -168,8 +188,6 @@ HARNESS_API_TOKENS = ("request_user_input", "AskUserQuestion")
 MODEL_SELECTION_REQUIREMENT = "adapter:model-selection-receipt"
 INVOCATION_TOPOLOGY_REQUIREMENT = "adapter:rolecasting-invocation-topology-receipt"
 SEMVER = r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
-CLAUDE_DESCRIPTION_PREFIX = "Tricritical review:"
-CODEX_DESCRIPTION_PREFIX = "Tricritical review for Codex:"
 STABLE_METADATA_FIELDS = (
     "st_dev",
     "st_ino",
@@ -807,10 +825,7 @@ def file_inventory(root: Path, relative_dir: str) -> set[str]:
 
 
 def load_manifests(root: Path) -> tuple[dict, dict]:
-    codex = require_mapping(
-        load_json_document(root, ".codex-plugin/plugin.json", "Codex manifest"),
-        "Codex manifest",
-    )
+    codex = require_mapping(load_agent_plugin_manifest(root), "Agent Plugin manifest")
     claude = require_mapping(
         load_json_document(root, ".claude-plugin/plugin.json", "Claude manifest"),
         "Claude manifest",
@@ -858,8 +873,12 @@ def validate_manifests(root: Path) -> dict:
         "keywords",
     }
     require_exact_keys(claude, common_keys | {"displayName"}, "Claude manifest")
-    require_exact_keys(codex, common_keys | {"skills", "interface"}, "Codex manifest")
-    for label, manifest in (("Claude", claude), ("Codex", codex)):
+    require_exact_keys(
+        codex,
+        common_keys | {"$schema", "extensions"},
+        "Agent Plugin manifest",
+    )
+    for label, manifest in (("Claude", claude), ("Agent Plugin", codex)):
         for field in (
             "name",
             "version",
@@ -875,8 +894,11 @@ def validate_manifests(root: Path) -> dict:
         require_string(author["url"], f"{label} manifest author URL")
         require_string_list(manifest["keywords"], f"{label} manifest keywords")
     require_string(claude["displayName"], "Claude manifest displayName")
-    require_string(codex["skills"], "Codex manifest skills")
-    interface = require_mapping(codex["interface"], "Codex manifest interface")
+    extensions = require_mapping(codex["extensions"], "Agent Plugin extensions")
+    require_exact_keys(extensions, {"com.openai"}, "Agent Plugin extensions")
+    openai = require_mapping(extensions["com.openai"], "Codex extension")
+    require_exact_keys(openai, {"interface"}, "Codex extension")
+    interface = require_mapping(openai["interface"], "Codex manifest interface")
     require_exact_keys(
         interface,
         {
@@ -902,43 +924,23 @@ def validate_manifests(root: Path) -> dict:
         require_string(interface[field], f"Codex manifest interface {field}")
     require_string_list(interface["capabilities"], "Codex manifest capabilities")
     require_string_list(interface["defaultPrompt"], "Codex manifest defaultPrompt")
-    versions = (claude.get("version"), codex.get("version"))
-    version_pattern = re.compile(
-        rf"(?P<release>{SEMVER})\+(?P<harness>claude|codex)\.[0-9A-Za-z.-]+$"
-    )
-    matches = [
-        version_pattern.fullmatch(version) if isinstance(version, str) else None
-        for version in versions
-    ]
-    if (
-        not all(matches)
-        or matches[0].group("harness") != "claude"
-        or matches[1].group("harness") != "codex"
-        or matches[0].group("release") != matches[1].group("release")
-    ):
-        fail("Claude and Codex manifest versions are not a paired release")
+    for field in common_keys:
+        if claude[field] != codex[field]:
+            fail(f"Claude manifest projection drift: {field}")
+    version_pattern = re.compile(rf"{SEMVER}$")
+    if version_pattern.fullmatch(codex["version"]) is None:
+        fail("canonical manifest version is invalid")
     if codex.get("name") != "tricritical" or claude.get("name") != "tricritical":
         fail("manifest names must be tricritical")
-    claude_description = claude.get("description")
-    codex_description = codex.get("description")
-    expected_codex_description = (
-        claude_description.replace(
-            CLAUDE_DESCRIPTION_PREFIX, CODEX_DESCRIPTION_PREFIX, 1
-        )
-        if isinstance(claude_description, str)
-        else None
-    )
-    if (
-        not isinstance(claude_description, str)
-        or not claude_description.startswith(CLAUDE_DESCRIPTION_PREFIX)
-        or codex_description != expected_codex_description
-    ):
-        fail("Claude and Codex manifest descriptions are not paired")
-    if codex.get("skills") != "./skills/" or "skills" in claude or "agents" in claude:
-        fail("harness manifests do not preserve the adapter boundary")
+    if "skills" in claude or "agents" in claude:
+        fail("Claude manifest must use native discovery")
+    discovered = discover_direct_skills(root)
+    if discovered != tuple(sorted(CORE_SKILLS)):
+        fail("Agent Plugins direct-child skill inventory drift")
+    validate_skill_resource_links(root, discovered)
     changelog = read_regular_file(root, "CHANGELOG.md")
     headings = re.findall(r"^##\s+(.+?)\s*$", changelog, re.M)
-    if not headings or headings[0] != matches[0].group("release"):
+    if not headings or headings[0] != codex["version"]:
         fail("manifest versions do not match the latest changelog release")
     return codex
 
@@ -952,18 +954,25 @@ def expected_skill_files(skill: str) -> set[str]:
     if skill == "adjudicate":
         files.add("references/dispositions.md")
     if skill == "loop":
-        files.add("references/operator-choice.md")
+        files.update(
+            {
+                "references/operator-choice.md",
+                "references/review-evidence.md",
+                "scripts/review_evidence.py",
+            }
+        )
     return files
 
 
 def expected_plugin_tree() -> tuple[set[str], set[str]]:
     files = {
         ".claude-plugin/plugin.json",
-        ".codex-plugin/plugin.json",
         "CHANGELOG.md",
         "LICENSE",
         "NOTICE",
         "README.md",
+        "plugin.json",
+        TASK_WITNESS_PROVIDER,
         CONTENT_LOCK_PATH,
         "topology.json",
         SHARED_INPUT_BOUNDARY_PATH,
@@ -976,7 +985,6 @@ def expected_plugin_tree() -> tuple[set[str], set[str]]:
     }
     directories = {
         ".claude-plugin",
-        ".codex-plugin",
         "agents",
         "evals",
         "evals/fixtures",
@@ -989,6 +997,8 @@ def expected_plugin_tree() -> tuple[set[str], set[str]]:
             files.add(f"skills/{skill}/{relative_path}")
         if any(path.startswith("references/") for path in expected_skill_files(skill)):
             directories.add(f"skills/{skill}/references")
+        if any(path.startswith("scripts/") for path in expected_skill_files(skill)):
+            directories.add(f"skills/{skill}/scripts")
     return files, directories
 
 
@@ -1060,7 +1070,12 @@ def load_default_prompts(root: Path) -> dict[str, str]:
 
 def validate_prompt_pairing(root: Path, codex_manifest: dict) -> None:
     prompts = load_default_prompts(root)
-    manifest_prompts = codex_manifest.get("interface", {}).get("defaultPrompt")
+    manifest_prompts = (
+        codex_manifest.get("extensions", {})
+        .get("com.openai", {})
+        .get("interface", {})
+        .get("defaultPrompt")
+    )
     if not isinstance(manifest_prompts, list):
         fail("Codex manifest has no default prompts")
     expected = [
@@ -1129,6 +1144,8 @@ def semantic_release_paths() -> tuple[str, ...]:
     paths.update(
         {
             "topology.json",
+            TASK_WITNESS_PROVIDER,
+            TERMINAL_EVIDENCE_RUNTIME,
             "evals/README.md",
             "evals/corpus.json",
             *(f"evals/fixtures/{fixture}" for fixture in EVAL_FIXTURES),
@@ -1229,6 +1246,120 @@ def validate_adapters(root: Path) -> None:
         for token, allowed_paths in allowed_api_paths.items():
             if token in content and relative_path not in allowed_paths:
                 fail("harness-specific API token escaped its adapter surface")
+
+
+def canonical_bytes(value: object) -> bytes:
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode()
+
+
+def validate_task_witness_provider(root: Path) -> None:
+    runtime_raw = read_regular_bytes(root, TERMINAL_EVIDENCE_RUNTIME)
+    runtime_sha256 = hashlib.sha256(runtime_raw).hexdigest()
+    modules = [
+        {
+            "name": "validator",
+            "relative_path": TERMINAL_EVIDENCE_RUNTIME,
+            "length": len(runtime_raw),
+            "sha256": runtime_sha256,
+        }
+    ]
+    implementation = hashlib.sha256(
+        canonical_bytes(
+            {
+                "contract": VALIDATOR_MANIFEST_CONTRACT,
+                "validator_contract": TERMINAL_EVIDENCE_CONTRACT,
+                "entrypoint_module": "validator",
+                "modules": [{"name": "validator", "content_sha256": runtime_sha256}],
+            }
+        )
+    ).hexdigest()
+    unsigned = {
+        "schema_version": 1,
+        "contract": PROVIDER_CONTRACT,
+        "plugin_id": "tricritical",
+        "publisher": "nisavid",
+        "repository": "https://github.com/nisavid/agents",
+        "authority_profile": TRICRITICAL_AUTHORITY_PROFILE,
+        "producers": [],
+        "issuers": [],
+        "validators": [
+            {
+                "validator_id": TERMINAL_EVIDENCE_VALIDATOR_ID,
+                "contract": TERMINAL_EVIDENCE_CONTRACT,
+                "implementation_sha256": implementation,
+                "entrypoint": "validator",
+                "modules": modules,
+                "lifecycle": {
+                    "state": "active",
+                    "usable_for_new_publication": True,
+                },
+            }
+        ],
+    }
+    provider = load_json_document(root, TASK_WITNESS_PROVIDER, "Task Witness provider")
+    if (
+        read_regular_bytes(root, TASK_WITNESS_PROVIDER)
+        != canonical_bytes(provider) + b"\n"
+    ):
+        fail("Task Witness provider must be canonical JSON with one trailing LF")
+    if provider.get("authority_profile") != TRICRITICAL_AUTHORITY_PROFILE:
+        fail("provider authority profile drift")
+    expected = {
+        **unsigned,
+        "content_sha256": hashlib.sha256(canonical_bytes(unsigned)).hexdigest(),
+    }
+    if provider != expected:
+        fail("Task Witness provider declaration drift")
+    source = runtime_raw.decode("utf-8")
+    for forbidden in (
+        "--trust-context",
+        "--task-witness-runtime",
+        "argparse",
+        "importlib",
+        "def validate_bundle(",
+    ):
+        if forbidden in source:
+            fail(
+                "terminal-evidence validator exposes forbidden production seam: "
+                f"{forbidden}"
+            )
+    if (
+        f'BUNDLE_CONTRACT = "{TERMINAL_EVIDENCE_CONTRACT}"' not in source
+        or f'PROJECTION_CONTRACT = "{TERMINAL_PROJECTION_CONTRACT}"' not in source
+        or f'ROLECASTING_EVIDENCE_CONTRACT = "{ROLECASTING_EVIDENCE_CONTRACT}"'
+        not in source
+        or f'ROLECASTING_PROJECTION_CONTRACT = "{ROLECASTING_PROJECTION_CONTRACT}"'
+        not in source
+        or "def _validate_bundle(" not in source
+        or "invoke_registered_validator" not in source
+    ):
+        fail("terminal-evidence registered API drift")
+    reference = " ".join(read_regular_file(root, TERMINAL_EVIDENCE_REFERENCE).split())
+    for term in (
+        TERMINAL_EVIDENCE_CONTRACT,
+        TERMINAL_EVIDENCE_VALIDATOR_ID,
+        TERMINAL_PROJECTION_CONTRACT,
+        ROLECASTING_PROJECTION_CONTRACT,
+        "preserves the complete registered Rolecasting projection verbatim as "
+        "`final_dispatch`",
+        "does not upgrade or collapse `product-attested`, "
+        "`controller-observed`, or `self-reported` assurance",
+        "consumer must apply its own minimum",
+        "Self-reported evidence is diagnostic and cannot by itself satisfy a hard gate",
+        "producer and issuer inventories are empty",
+        "fixture/bootstrap bundles",
+        "does not expose a new-publication producer chain",
+        "does not claim canonical end-to-end reachability",
+        "Model and reasoning-effort policy belongs to Rolecasting",
+    ):
+        if term not in reference:
+            fail(f"terminal-evidence reference drift: {term}")
 
 
 AUTHORITY_ROLES = {"coordinator", "critic", "adjudicator", "reviser", "loop"}
@@ -1412,11 +1543,16 @@ def validate_authority_topology(root: Path, topology: dict) -> None:
         "candidate, review-input, and requirements identities",
         "closed-world dispatch set",
         "exactly one unique dispatch entry",
-        "lifecycle, executor and harness",
+        "target product family, surface, version, and executor",
+        "child, peer, or external relationship",
+        "leader-owned or user-owned ownership",
+        "transport",
         "return and verification contract",
         "stop conditions",
         "distinct isolation",
         "read-only authority",
+        "consumer assurance minimum",
+        "product-attested, controller-observed, or self-reported assurance",
         "default-denied subdelegation and external action",
         "explicit user authority",
         "new valid plan",
@@ -1734,6 +1870,7 @@ def validate(repo_root: Path) -> None:
             validate_prompt_pairing(root, codex_manifest)
             validate_input_boundaries(root)
             validate_adapters(root)
+            validate_task_witness_provider(root)
             validate_authority_topology(root, topology)
             validate_eval_corpus(root)
             validate_portability(root)

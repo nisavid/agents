@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import ctypes
+import errno
 import hashlib
 import json
 import math
@@ -25,6 +27,7 @@ from types import MappingProxyType
 from typing import Any
 
 ACTIVE_CONTRACT = "task-witness-launch-active-v1"
+COMPLETE_ANCHOR_CONTRACT = "task-witness-complete-anchor-v1"
 ENVELOPE_CONTRACT = "task-witness-launch-envelope-v1"
 RUNTIME_ARTIFACT_MANIFEST_CONTRACT = "task-witness-runtime-artifact-manifest-v2"
 RUNTIME_CONTRACT = "task-witness-runtime-v1"
@@ -36,6 +39,11 @@ PAYLOAD_SPECS = (
 )
 MAX_ACTIVE_BYTES = MAX_PAYLOAD_BYTES = 1024 * 1024
 MAX_JSON_NUMBER_CHARACTERS = 128
+_ACL_TYPE_EXTENDED = 0x100
+_ACL_FIRST_ENTRY = 0
+_ACL_NEXT_ENTRY = -1
+_ACL_EXTENDED_ALLOW = 1
+_ACL_EXTENDED_DENY = 2
 GENERATION = re.compile(r"sha256-[0-9a-f]{64}\Z")
 HEX = re.compile(r"[0-9a-f]{64}\Z")
 GIT_REVISION = re.compile(r"[0-9a-f]{40}\Z")
@@ -88,9 +96,72 @@ def _interpreter_identity() -> dict[str, object]:
     }
 
 
-def _private(metadata: os.stat_result, label: str) -> None:
+def _macos_descriptor_has_allow_acl(descriptor: int) -> bool:
+    if sys.platform != "darwin":
+        return False
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.acl_get_fd_np.argtypes = [ctypes.c_int, ctypes.c_int]
+    libc.acl_get_fd_np.restype = ctypes.c_void_p
+    libc.acl_get_entry.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    libc.acl_get_entry.restype = ctypes.c_int
+    libc.acl_get_tag_type.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_int),
+    ]
+    libc.acl_get_tag_type.restype = ctypes.c_int
+    libc.acl_free.argtypes = [ctypes.c_void_p]
+    libc.acl_free.restype = ctypes.c_int
+    ctypes.set_errno(0)
+    acl = libc.acl_get_fd_np(descriptor, _ACL_TYPE_EXTENDED)
+    if not acl:
+        error = ctypes.get_errno()
+        if error in {errno.ENOENT, getattr(errno, "ENOATTR", 93)}:
+            return False
+        raise OSError(error, os.strerror(error))
+    try:
+        selector = _ACL_FIRST_ENTRY
+        while True:
+            entry = ctypes.c_void_p()
+            ctypes.set_errno(0)
+            if libc.acl_get_entry(acl, selector, ctypes.byref(entry)) != 0:
+                error = ctypes.get_errno()
+                if selector == _ACL_NEXT_ENTRY and error == errno.EINVAL:
+                    return False
+                raise OSError(error, os.strerror(error))
+            tag = ctypes.c_int()
+            ctypes.set_errno(0)
+            if libc.acl_get_tag_type(entry, ctypes.byref(tag)) != 0:
+                error = ctypes.get_errno()
+                raise OSError(error, os.strerror(error))
+            if tag.value == _ACL_EXTENDED_ALLOW:
+                return True
+            if tag.value != _ACL_EXTENDED_DENY:
+                raise OSError(errno.EINVAL, "unsupported ACL entry type")
+            selector = _ACL_NEXT_ENTRY
+    finally:
+        libc.acl_free(acl)
+
+
+def _private(
+    metadata: os.stat_result,
+    label: str,
+    descriptor: int | None = None,
+) -> None:
     if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) & 0o077:
         raise LaunchError(f"{label} is not current-user private")
+    if stat.S_ISREG(metadata.st_mode) and metadata.st_nlink != 1:
+        raise LaunchError(f"{label} has an unsafe hard link")
+    if descriptor is not None:
+        try:
+            has_allow_acl = _macos_descriptor_has_allow_acl(descriptor)
+        except OSError as error:
+            raise LaunchError(f"{label} ACL cannot be verified") from error
+        if has_allow_acl:
+            raise LaunchError(f"{label} has a permissive ACL entry")
 
 
 def _flags(*names: str) -> int:
@@ -140,7 +211,7 @@ def _open_directory(
         if identity != _identity(before):
             raise LaunchError(f"{label} changed during open")
         if private:
-            _private(os.fstat(descriptor), label)
+            _private(os.fstat(descriptor), label, descriptor)
         return descriptor, identity
     except OSError as error:
         raise LaunchError(f"cannot open {label}") from error
@@ -165,7 +236,7 @@ def _open_file(
             os.close(descriptor)
             raise LaunchError(f"{label} changed during open")
         if private:
-            _private(os.fstat(descriptor), label)
+            _private(os.fstat(descriptor), label, descriptor)
         return descriptor, identity, _read(descriptor, identity, label, limit)
     except OSError as error:
         raise LaunchError(f"cannot open {label}") from error
@@ -308,7 +379,7 @@ def _runtime_implementation_identity(
 
 class _Snapshot:
     def __init__(self, root: Path) -> None:
-        self.directories: list[tuple[int, tuple[int, int, int], str]] = []
+        self.directories: list[tuple[int, tuple[int, int, int], str, bool]] = []
         self.files: list[tuple[int, tuple[int, int, int], int, str, bytes]] = []
         self.root = root
 
@@ -319,7 +390,7 @@ class _Snapshot:
             except OSError:
                 pass
         self.files.clear()
-        for descriptor, _, _ in reversed(self.directories):
+        for descriptor, _, _, _ in reversed(self.directories):
             try:
                 os.close(descriptor)
             except OSError:
@@ -333,6 +404,7 @@ class _Snapshot:
         """
         try:
             for descriptor, identity, _, _, raw in self.files:
+                _private(os.fstat(descriptor), "retained runtime payload", descriptor)
                 if (
                     _read(
                         descriptor,
@@ -343,10 +415,12 @@ class _Snapshot:
                     != raw
                 ):
                     raise LaunchError("runtime payload changed during validation")
-            for descriptor, identity, _ in self.directories:
+            for descriptor, identity, _, private in self.directories:
                 if _identity(os.fstat(descriptor)) != identity:
                     raise LaunchError("runtime ancestry changed during validation")
-            for index, (_, identity, name) in enumerate(self.directories):
+                if private:
+                    _private(os.fstat(descriptor), "runtime ancestry", descriptor)
+            for index, (_, identity, name, _) in enumerate(self.directories):
                 if (
                     index
                     and _identity(
@@ -417,14 +491,20 @@ def _snapshot(root: Path) -> tuple[_Snapshot, dict[str, Any], dict[str, bytes], 
     snapshot = _Snapshot(root)
     try:
         descriptor = os.open("/", _flags("O_CLOEXEC", "O_NOFOLLOW", "O_DIRECTORY"))
-        snapshot.directories.append((descriptor, _identity(os.fstat(descriptor)), ""))
-        for name in root.parts[1:]:
+        snapshot.directories.append(
+            (descriptor, _identity(os.fstat(descriptor)), "", False)
+        )
+        root_parts = root.parts[1:]
+        for index, name in enumerate(root_parts):
+            private = index == len(root_parts) - 1
             descriptor, identity = _open_directory(
-                snapshot.directories[-1][0], name, "launcher root"
+                snapshot.directories[-1][0],
+                name,
+                "launcher root",
+                private=private,
             )
-            snapshot.directories.append((descriptor, identity, name))
+            snapshot.directories.append((descriptor, identity, name, private))
         root_descriptor = snapshot.directories[-1][0]
-        _private(os.fstat(root_descriptor), "launcher root")
         active_descriptor, active_identity, active_raw = _open_file(
             root_descriptor,
             "active.json",
@@ -447,13 +527,13 @@ def _snapshot(root: Path) -> tuple[_Snapshot, dict[str, Any], dict[str, bytes], 
             root_descriptor, "generations", "generations", private=True
         )
         snapshot.directories.append(
-            (generations_descriptor, generations_identity, "generations")
+            (generations_descriptor, generations_identity, "generations", True)
         )
         generation_descriptor, generation_identity = _open_directory(
             generations_descriptor, generation, "active generation", private=True
         )
         snapshot.directories.append(
-            (generation_descriptor, generation_identity, generation)
+            (generation_descriptor, generation_identity, generation, True)
         )
         payloads: dict[str, bytes] = {}
         for item in payload_specs:
@@ -507,7 +587,13 @@ def _execute(
         return runtime
 
     canonical = module("canonical", {})
-    bundle_io = module("bundle_io", {"_CANONICAL": canonical})
+    bundle_io = module(
+        "bundle_io",
+        {
+            "_CANONICAL": canonical,
+            "_MACOS_DESCRIPTOR_HAS_ALLOW_ACL": _macos_descriptor_has_allow_acl,
+        },
+    )
     trust = module("trust", {"_CANONICAL": canonical, "_BUNDLE_IO": bundle_io})
     return module(
         "task_witness",
@@ -553,6 +639,7 @@ def _validate(
         return {
             "contract": ENVELOPE_CONTRACT,
             "anchor": {
+                "contract": COMPLETE_ANCHOR_CONTRACT,
                 "generation": active["generation"],
                 "active_record_sha256": active_digest,
                 "runtime_contract": active["runtime_contract"],
@@ -608,7 +695,7 @@ def _canonical_executor() -> bool:
         Path(sys.executable).is_absolute()
         and sys.implementation.name == "cpython"
         and not sys.warnoptions
-        and not sys._xoptions
+        and sys._xoptions == {"disable-remote-debug": True}
         and semantic == _CANONICAL_FLAGS
     )
 

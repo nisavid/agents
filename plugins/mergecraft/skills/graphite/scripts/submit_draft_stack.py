@@ -33,6 +33,7 @@ from publication_receipts import (  # noqa: E402
     creation_transaction_lock,
     prepare_receipt_store,
 )
+from required_review import build_candidate as build_publication_candidate  # noqa: E402
 from reviewable_pr_state import (  # noqa: E402
     ExpectedIdentity,
     PublicationError,
@@ -42,8 +43,7 @@ from reviewable_pr_state import (  # noqa: E402
     validate_identity_inputs,
 )
 
-
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 READ_TIMEOUT_SECONDS = 30
 MUTATION_TIMEOUT_SECONDS = 300
 VALIDATION_PR_NUMBER = 2_147_483_647
@@ -181,14 +181,59 @@ def _read_text(path: Path, label: str) -> str:
     if not path.is_absolute():
         raise GraphiteTransportError(f"{label} path must be absolute")
     try:
-        value = path.read_text(encoding="utf-8")
-    except OSError as error:
+        raw = path.read_bytes()
+        value = raw.decode("utf-8")
+    except (OSError, UnicodeDecodeError) as error:
         raise GraphiteTransportError(f"cannot read {label}: {error}") from error
     if suspected_secret_error(value) is not None:
         raise GraphiteTransportError(
             f"{label} contains a suspected credential or secret"
         )
     return value
+
+
+def _read_source(path: Path) -> tuple[bytes, str]:
+    if not path.is_absolute():
+        raise GraphiteTransportError("body source path must be absolute")
+    try:
+        raw = path.read_bytes()
+        value = raw.decode("utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        raise GraphiteTransportError(f"cannot read body source: {error}") from error
+    if suspected_secret_error(value) is not None:
+        raise GraphiteTransportError(
+            "body source contains a suspected credential or secret"
+        )
+    return raw, value
+
+
+def _review_profile(entry: dict[str, Any]) -> tuple[str, Path | None, list[str]]:
+    mode = entry["review_mode"]
+    bundle_value = entry["review_bundle"]
+    specialists = entry["selected_specialists"]
+    if mode not in {"required", "not-required"}:
+        raise GraphiteTransportError("review_mode must be required or not-required")
+    if (
+        not isinstance(specialists, list)
+        or not all(isinstance(value, str) and value for value in specialists)
+        or specialists != sorted(set(specialists))
+    ):
+        raise GraphiteTransportError(
+            "selected_specialists must be an explicit sorted unique string list"
+        )
+    if mode == "required":
+        if not isinstance(bundle_value, str) or not Path(bundle_value).is_absolute():
+            raise GraphiteTransportError(
+                "required review needs an absolute review_bundle path"
+            )
+        bundle = Path(bundle_value)
+    else:
+        if bundle_value is not None:
+            raise GraphiteTransportError(
+                "not-required review cannot carry a review_bundle path"
+            )
+        bundle = None
+    return mode, bundle, specialists
 
 
 def _matching_prs(entry: dict[str, Any], repository: str) -> list[dict[str, Any]]:
@@ -218,6 +263,9 @@ def _candidate(entry: dict[str, Any], repository: str) -> dict[str, Any]:
             "title",
             "body_source",
             "review_input",
+            "review_mode",
+            "review_bundle",
+            "selected_specialists",
         },
         "stack entry",
     )
@@ -244,9 +292,17 @@ def _candidate(entry: dict[str, Any], repository: str) -> dict[str, Any]:
     local_branch = entry["head"].split(":", 1)[1]
     source_path = Path(body_source["path"])
     review_input_path = Path(entry["review_input"])
-    source = _read_text(source_path, "body source")
+    _review_profile(entry)
+    source_raw, source = _read_source(source_path)
     try:
+        if not review_input_path.is_absolute():
+            raise GraphiteTransportError("review input path must be absolute")
+        review_input_raw = review_input_path.read_bytes()
         review_input = load_review_input(review_input_path)
+        if review_input_path.read_bytes() != review_input_raw:
+            raise GraphiteTransportError("review input changed while it was read")
+    except OSError as error:
+        raise GraphiteTransportError(f"cannot read review input: {error}") from error
     except ReviewInputError as error:
         raise GraphiteTransportError(f"invalid review input: {error}") from error
     if body_source["mode"] == "template":
@@ -318,7 +374,8 @@ def _candidate(entry: dict[str, Any], repository: str) -> dict[str, Any]:
     return {
         **entry,
         "local_branch": local_branch,
-        "body_source_sha256": _sha_text(source),
+        "body_source_sha256": _sha_bytes(source_raw),
+        "review_input_raw_sha256": _sha_bytes(review_input_raw),
         "review_input_sha256": review_input.content_sha256,
         "review_input_pr": review_input.pr_number,
     }
@@ -469,6 +526,8 @@ def _load_plan(path: Path) -> dict[str, Any]:
         "plan",
     )
     supplied = plan["content_sha256"]
+    if plan["schema_version"] != SCHEMA_VERSION:
+        raise GraphiteTransportError(f"plan schema_version must be {SCHEMA_VERSION}")
     unsigned = dict(plan)
     del unsigned["content_sha256"]
     if not isinstance(supplied, str) or supplied != _sha_bytes(_canonical(unsigned)):
@@ -520,6 +579,65 @@ def _common_arguments(expected: ExpectedIdentity, entry: dict[str, Any]) -> list
     ]
 
 
+def _publisher_arguments(
+    expected: ExpectedIdentity, entry: dict[str, Any]
+) -> list[str]:
+    review_mode, review_bundle, specialists = _review_profile(entry)
+    arguments = [
+        *_common_arguments(expected, entry),
+        "--review-mode",
+        review_mode,
+        "--selected-specialists",
+        _canonical(specialists).decode("utf-8"),
+    ]
+    if review_bundle is not None:
+        arguments.extend(["--review-bundle", str(review_bundle)])
+    return arguments
+
+
+def _target_publication_candidate_sha256(
+    *,
+    entry: dict[str, Any],
+    expected: ExpectedIdentity,
+    source_raw: bytes,
+    target_body: str,
+    final_operation: str,
+) -> str:
+    review_mode, _review_bundle, specialists = _review_profile(entry)
+    if final_operation == "mark-ready":
+        body_source_kind = "stored-body"
+        candidate_source = target_body.encode("utf-8")
+    else:
+        body_source_kind = (
+            "template" if entry["body_source"]["mode"] == "template" else "body"
+        )
+        candidate_source = source_raw
+    try:
+        candidate = build_publication_candidate(
+            operation=final_operation,
+            repository=expected.repository,
+            pr_number=expected.pr_number,
+            base=expected.base,
+            base_oid=expected.base_oid,
+            head=expected.head,
+            head_oid=expected.head_oid,
+            head_owner=expected.head_owner,
+            head_repository=expected.head_repository,
+            title=entry["title"],
+            body_source_kind=body_source_kind,
+            body_source_raw=candidate_source,
+            published_body=target_body,
+            review_input_path=Path(entry["review_input"]),
+            review_mode=review_mode,
+            selected_specialists=specialists,
+        )
+    except PublicationError as error:
+        raise GraphiteTransportError(
+            f"cannot freeze publication convergence target: {error}"
+        ) from error
+    return candidate.content_sha256
+
+
 def _handoff_entry(
     entry: dict[str, Any],
     preimage: dict[str, Any] | None,
@@ -546,13 +664,14 @@ def _handoff_entry(
     if preimage is not None and preimage["is_draft"] is True and not is_draft:
         raise GraphiteTransportError("Graphite unexpectedly marked a draft PR ready")
     source_path = Path(entry["body_source"]["path"])
-    source = _read_text(source_path, "body source")
+    source_raw, source = _read_source(source_path)
     target_body = (
         source.replace(PR_NUMBER_TOKEN, str(expected.pr_number))
         if entry["body_source"]["mode"] == "template"
         else source
     )
-    common = _common_arguments(expected, entry)
+    common = _publisher_arguments(expected, entry)
+    audit_common = _common_arguments(expected, entry)
     commands: list[list[str]] = []
     target_is_draft = True if preimage is None else preimage["is_draft"]
     if title != entry["title"] or body != target_body:
@@ -594,8 +713,19 @@ def _handoff_entry(
                 _sha_text(target_body),
             ]
         )
-    audit = [sys.executable, str(AUDIT), "audit", *common]
-    reconcile = [sys.executable, str(AUDIT), "reconcile", *common]
+    if commands:
+        final_operation = "mark-ready" if commands[-1][2] == "ready" else "update-text"
+    else:
+        final_operation = "update-text" if target_is_draft else "mark-ready"
+    target_candidate_sha256 = _target_publication_candidate_sha256(
+        entry=entry,
+        expected=expected,
+        source_raw=source_raw,
+        target_body=target_body,
+        final_operation=final_operation,
+    )
+    review_mode, review_bundle, specialists = _review_profile(entry)
+    audit = [sys.executable, str(AUDIT), "audit", *audit_common]
     return {
         "repository": repository,
         "pr": expected.pr_number,
@@ -611,6 +741,12 @@ def _handoff_entry(
         "target_body_sha256": _sha_text(target_body),
         "target_is_draft": target_is_draft,
         "target_review_input_sha256": entry["review_input_sha256"],
+        "target_review_mode": review_mode,
+        "target_publication_candidate_sha256": target_candidate_sha256,
+        "target_review_bundle": str(review_bundle)
+        if review_bundle is not None
+        else None,
+        "target_selected_specialists": specialists,
         "target_identity_epoch": {
             "repository": repository,
             "pr_number": expected.pr_number,
@@ -624,7 +760,6 @@ def _handoff_entry(
         },
         "publisher_commands": commands,
         "final_audit_command": audit,
-        "no_transition_reconcile_command": reconcile,
     }
 
 
@@ -734,6 +869,8 @@ def _load_handoff(path: Path) -> dict[str, Any]:
         "handoff",
     )
     supplied = handoff["content_sha256"]
+    if handoff["schema_version"] != SCHEMA_VERSION:
+        raise GraphiteTransportError(f"handoff schema_version must be {SCHEMA_VERSION}")
     unsigned = dict(handoff)
     del unsigned["content_sha256"]
     if not isinstance(supplied, str) or supplied != _sha_bytes(_canonical(unsigned)):
@@ -760,12 +897,47 @@ def _checked_helper_command(command: Any, *, operation: str) -> list[str]:
     expected_script = UPDATE if operation == "publish" else AUDIT
     if len(command) < 3 or Path(command[1]).resolve() != expected_script.resolve():
         raise GraphiteTransportError("publisher handoff script drifted")
-    allowed_operations = (
-        {"text", "ready"} if operation == "publish" else {"audit", "reconcile"}
-    )
+    allowed_operations = {"text", "ready"} if operation == "publish" else {"audit"}
     if command[2] not in allowed_operations:
         raise GraphiteTransportError("publisher handoff operation is invalid")
     return command
+
+
+def _exact_flag_value(command: list[str], flag: str) -> str | None:
+    positions = [index for index, value in enumerate(command) if value == flag]
+    if not positions:
+        return None
+    if len(positions) != 1 or positions[0] + 1 >= len(command):
+        raise GraphiteTransportError(f"publisher handoff {flag} is ambiguous")
+    return command[positions[0] + 1]
+
+
+def _checked_publisher_command(command: Any, item: dict[str, Any]) -> list[str]:
+    checked = _checked_helper_command(command, operation="publish")
+    mode = item.get("target_review_mode")
+    bundle = item.get("target_review_bundle")
+    specialists = item.get("target_selected_specialists")
+    if _exact_flag_value(checked, "--review-mode") != mode:
+        raise GraphiteTransportError("publisher handoff review mode drifted")
+    selected = _exact_flag_value(checked, "--selected-specialists")
+    if not isinstance(specialists, list) or selected != _canonical(specialists).decode(
+        "utf-8"
+    ):
+        raise GraphiteTransportError("publisher handoff specialists drifted")
+    command_bundle = _exact_flag_value(checked, "--review-bundle")
+    if mode == "required":
+        if not isinstance(bundle, str) or not Path(bundle).is_absolute():
+            raise GraphiteTransportError("required review bundle target is invalid")
+        if command_bundle != bundle:
+            raise GraphiteTransportError("publisher handoff review bundle drifted")
+    elif mode == "not-required":
+        if bundle is not None or command_bundle is not None:
+            raise GraphiteTransportError(
+                "not-required publisher handoff carries a review bundle"
+            )
+    else:
+        raise GraphiteTransportError("publisher handoff review mode is invalid")
+    return checked
 
 
 def _run_json_command(
@@ -816,9 +988,59 @@ def _audit_summary(audit: dict[str, Any]) -> dict[str, Any]:
             "identity_epoch",
             "final",
             "review_input_sha256",
+            "review",
         )
         if key in audit
     }
+
+
+def _review_matches_target(audit: dict[str, Any], item: dict[str, Any]) -> bool:
+    review = audit.get("review")
+    if not isinstance(review, dict) or set(review) != {
+        "mode",
+        "publication_candidate_sha256",
+        "observation",
+    }:
+        return False
+    mode = item.get("target_review_mode")
+    if (
+        mode not in {"required", "not-required"}
+        or review.get("mode") != mode
+        or review.get("publication_candidate_sha256")
+        != item.get("target_publication_candidate_sha256")
+    ):
+        return False
+    observation = review.get("observation")
+    return isinstance(observation, dict) if mode == "required" else observation is None
+
+
+def _validate_handoff_target(item: dict[str, Any]) -> None:
+    candidate_sha = item.get("target_publication_candidate_sha256")
+    mode = item.get("target_review_mode")
+    specialists = item.get("target_selected_specialists")
+    bundle = item.get("target_review_bundle")
+    if (
+        not isinstance(candidate_sha, str)
+        or len(candidate_sha) != 64
+        or any(character not in "0123456789abcdef" for character in candidate_sha)
+    ):
+        raise GraphiteTransportError("handoff publication candidate digest is invalid")
+    if (
+        not isinstance(specialists, list)
+        or not all(isinstance(value, str) and value for value in specialists)
+        or specialists != sorted(set(specialists))
+    ):
+        raise GraphiteTransportError("handoff review specialists are invalid")
+    if mode == "required":
+        if not isinstance(bundle, str) or not Path(bundle).is_absolute():
+            raise GraphiteTransportError("handoff required review bundle is invalid")
+    elif mode == "not-required":
+        if bundle is not None:
+            raise GraphiteTransportError(
+                "handoff not-required review bundle must be null"
+            )
+    else:
+        raise GraphiteTransportError("handoff review mode is invalid")
 
 
 def _audit_matches_target(audit: dict[str, Any], item: dict[str, Any]) -> bool:
@@ -832,11 +1054,12 @@ def _audit_matches_target(audit: dict[str, Any], item: dict[str, Any]) -> bool:
             "identity_epoch",
             "final",
             "review_input_sha256",
+            "review",
         }
         and audit.get("status") == "verified"
         and isinstance(audit.get("receipt_id"), str)
         and bool(audit["receipt_id"])
-        and audit.get("provenance") in {"canonical", "reconciled-unreceipted"}
+        and audit.get("provenance") == "canonical"
         and type(audit.get("sequence")) is int
         and audit["sequence"] > 0
         and audit.get("identity_epoch") == item.get("target_identity_epoch")
@@ -847,6 +1070,7 @@ def _audit_matches_target(audit: dict[str, Any], item: dict[str, Any]) -> bool:
             "body_sha256": item.get("target_body_sha256"),
         }
         and audit.get("review_input_sha256") == item.get("target_review_input_sha256")
+        and _review_matches_target(audit, item)
     )
 
 
@@ -866,12 +1090,12 @@ def repair(handoff: dict[str, Any], output_path: Path) -> dict[str, Any]:
     for item in handoff["pull_requests"]:
         if not isinstance(item, dict):
             raise GraphiteTransportError("handoff PR entry is invalid")
+        _validate_handoff_target(item)
         commands = item.get("publisher_commands")
         if not isinstance(commands, list):
             raise GraphiteTransportError("handoff publisher commands are invalid")
         checked_commands = [
-            _checked_helper_command(command, operation="publish")
-            for command in commands
+            _checked_publisher_command(command, item) for command in commands
         ]
         audit_command = _checked_helper_command(
             item.get("final_audit_command"), operation="audit"
@@ -889,6 +1113,12 @@ def repair(handoff: dict[str, Any], output_path: Path) -> dict[str, Any]:
                 or _audit_summary(current_audit) != prior.get("audit")
                 or prior.get("target_title_sha256") != item.get("target_title_sha256")
                 or prior.get("target_body_sha256") != item.get("target_body_sha256")
+                or prior.get("target_review_mode") != item.get("target_review_mode")
+                or prior.get("target_publication_candidate_sha256")
+                != item.get("target_publication_candidate_sha256")
+                or prior.get("target_review_bundle") != item.get("target_review_bundle")
+                or prior.get("target_selected_specialists")
+                != item.get("target_selected_specialists")
             ):
                 raise GraphiteTransportError(
                     "checkpointed PR no longer has its exact verified target"
@@ -905,16 +1135,7 @@ def repair(handoff: dict[str, Any], output_path: Path) -> dict[str, Any]:
             ]
             audit = _run_json_command(audit_command, cwd=root, operation="audit")
         else:
-            try:
-                audit = _run_json_command(audit_command, cwd=root, operation="audit")
-            except GraphiteTransportError:
-                reconciliation = _run_json_command(
-                    item.get("no_transition_reconcile_command"),
-                    cwd=root,
-                    operation="audit",
-                )
-                command_results.append(reconciliation)
-                audit = _run_json_command(audit_command, cwd=root, operation="audit")
+            audit = current_audit
         if not _audit_matches_target(audit, item):
             raise GraphiteTransportError(
                 "publisher audit did not verify the exact handoff target"
@@ -927,6 +1148,12 @@ def repair(handoff: dict[str, Any], output_path: Path) -> dict[str, Any]:
             "target_body_sha256": item.get("target_body_sha256"),
             "target_is_draft": item.get("target_is_draft"),
             "target_review_input_sha256": item.get("target_review_input_sha256"),
+            "target_review_mode": item.get("target_review_mode"),
+            "target_publication_candidate_sha256": item.get(
+                "target_publication_candidate_sha256"
+            ),
+            "target_review_bundle": item.get("target_review_bundle"),
+            "target_selected_specialists": item.get("target_selected_specialists"),
             "target_identity_epoch": item.get("target_identity_epoch"),
             "publisher_result_sha256": [
                 _sha_bytes(_canonical(result)) for result in command_results

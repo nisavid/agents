@@ -22,8 +22,8 @@ complete it before invoking
 [Publishing Reviewable PRs](../publishing-reviewable-prs/SKILL.md); the
 publisher never wraps it. Publication requires verified canonical bodies.
 The submit-draft path calls only the publisher's `pr-text-write`,
-`pr-readiness-write`, `publication-audit`, and `publication-reconciliation`
-operations; it does not inherit every publisher mode.
+`pr-readiness-write`, and `publication-audit` operations; it does not inherit
+every publisher mode and cannot mint provenance by reconciliation.
 
 ## Establish Live State
 
@@ -47,10 +47,13 @@ branch can be tracked without moving or deleting the worktree.
 
 1. Verify root/base and checks; ensure each remote head will equal the recorded
    local commit, then prepare every canonical pair and bound review-input file.
-2. Build an absolute-path JSON request for the exact bottom-to-top stack and run
+2. Build a schema-v2 absolute-path JSON request for the exact bottom-to-top stack
+   and run
    `scripts/submit_draft_stack.py plan`. Review its content-addressed private
    plan. It binds the clean worktree, current branch, local base/head OIDs,
-   Graphite log/trunk snapshots, candidate inputs, and existing PR preimages.
+   Graphite log/trunk snapshots, candidate inputs, existing PR preimages, and
+   each entry's mandatory `review_mode`, `review_bundle` (absolute only for
+   `required`, otherwise null), and sorted explicit `selected_specialists`.
 3. Run `scripts/submit_draft_stack.py execute` on that unchanged plan. It invokes
    exactly one `gt submit --stack --draft --no-edit --no-ai --no-interactive`,
    never retries an ambiguous transport, maps every branch to one exact PR, and
@@ -62,8 +65,10 @@ branch can be tracked without moving or deleting the worktree.
    an uncheckpointed PR whose latest audit already matches the exact handoff
    target is durably checkpointed before any publisher command is considered;
    stale preimage commands are never replayed after convergence. When transport
-   already equals the candidate and no canonical transition exists, repair
-   records only permanent `reconciled-unreceipted` provenance.
+   already equals the candidate, repair succeeds only if the latest canonical
+   v3 audit already has the exact review mode and publication-candidate digest;
+   otherwise it blocks. It never upgrades legacy, reconciled, or not-required
+   provenance and never manufactures a no-op transition.
 5. Verify stored/rendered bodies, denominator, bases, dependencies, navigation,
    current marker, and the repair receipt. An older matching receipt does not
    verify current publication. Rebuild every Stack/Diff from its pushed

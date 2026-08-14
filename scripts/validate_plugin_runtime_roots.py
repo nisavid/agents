@@ -12,14 +12,13 @@ import stat
 import sys
 from pathlib import Path
 
-
 PLUGINS = ("versionkeeping", "mergecraft")
 ROOT_FILES = {
     ".claude-plugin/plugin.json",
-    ".codex-plugin/plugin.json",
     "CHANGELOG.md",
     "LICENSE",
     "README.md",
+    "plugin.json",
     "topology.json",
 }
 COMPONENT_FIELDS = {

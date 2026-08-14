@@ -12,10 +12,10 @@ the named existing policy and matching authority for the requested mode. An
 advisory grants investigation authority only; a Dependabot PR is an untrusted
 candidate, not update or merge authority.
 
-Read and apply [the component policy contract](../../references/component-policy-contract.md),
-[the component clearance contract](../../references/component-clearance-contract.md),
-[the invocation envelope](../../references/invocation-envelope.json), and
-[the scheduler adapter contract](../../references/scheduler-adapters.json).
+Read and apply [the component policy contract](references/component-policy-contract.md),
+[the component clearance contract](references/component-clearance-contract.md),
+[the invocation envelope](references/invocation-envelope.json), and
+[the scheduler adapter contract](references/scheduler-adapters.json).
 
 ## Intake And Binding
 

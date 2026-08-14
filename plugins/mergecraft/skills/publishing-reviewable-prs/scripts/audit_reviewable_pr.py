@@ -37,7 +37,6 @@ from change_navigation.review_input import (  # noqa: E402
 )
 from change_navigation.sensitive_content import suspected_secret_error  # noqa: E402
 
-
 VALIDATOR = WRITER_SCRIPTS / "validate_change_navigation.py"
 
 
@@ -162,6 +161,8 @@ def reconcile(
             final_reread=second,
             review_input_schema_version=review_input_schema_version,
             review_input_sha256=review_input_sha256,
+            review=None,
+            candidate=None,
         )
         return record_reconciliation(
             root=receipt_root, transition=transition, lease=lease

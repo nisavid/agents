@@ -1,8 +1,8 @@
 {
   "name": "tricritical",
   "displayName": "Tricritical",
-  "version": "1.0.0+claude.20260720101500",
-  "description": "Tricritical review: independently planned intent, runtime, and structure critics, adjudication, authority-gated revision, and one fixed-point loop.",
+  "version": "1.0.0",
+  "description": "Tricritical: independently planned intent, runtime, and structure critics, adjudication, authority-gated revision, and one fixed-point loop.",
   "author": {
     "name": "Ivan D Vasin",
     "url": "https://github.com/nisavid"

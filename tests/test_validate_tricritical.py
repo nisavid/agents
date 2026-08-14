@@ -1,5 +1,6 @@
-import copy
 import contextlib
+import copy
+import hashlib
 import io
 import json
 import os
@@ -8,12 +9,22 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest import mock
 from pathlib import Path
-
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 VALIDATOR = REPO_ROOT / "scripts" / "validate_tricritical.py"
+AGENT_PLUGIN_SCHEMA = "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json"
+CANONICAL_IDENTITY_FIELDS = (
+    "name",
+    "version",
+    "description",
+    "author",
+    "homepage",
+    "repository",
+    "license",
+    "keywords",
+)
 sys.path.insert(0, str(REPO_ROOT))
 import scripts.validate_tricritical as validator_module  # noqa: E402
 from scripts.validate_tricritical import (  # noqa: E402
@@ -80,6 +91,136 @@ class ValidateTricriticalTests(unittest.TestCase):
         self.assertRegex(result.stdout, r"snapshot_sha256=[0-9a-f]{64}")
         self.assertRegex(result.stdout, r"plugin_sha256=[0-9a-f]{64}")
 
+    def test_registers_only_the_active_task_witness_validator(self):
+        provider_path = self.plugin_root / "task-witness-provider.json"
+        provider = json.loads(provider_path.read_text())
+        self.assertEqual(
+            provider["authority_profile"], "tricritical-cooperative-review-v1"
+        )
+        self.assertEqual(provider["producers"], [])
+        self.assertEqual(provider["issuers"], [])
+        self.assertEqual(len(provider["validators"]), 1)
+        validator = provider["validators"][0]
+        self.assertEqual(
+            validator["validator_id"],
+            "tricritical-terminal-review-evidence-validator-v2",
+        )
+        self.assertEqual(
+            validator["contract"], "tricritical-terminal-review-evidence-v2"
+        )
+        self.assertEqual(
+            validator["lifecycle"],
+            {"state": "active", "usable_for_new_publication": True},
+        )
+        runtime = self.plugin_root / validator["modules"][0]["relative_path"]
+        raw = runtime.read_bytes()
+        digest = hashlib.sha256(raw).hexdigest()
+        self.assertEqual(
+            validator["modules"],
+            [
+                {
+                    "name": "validator",
+                    "relative_path": "skills/loop/scripts/review_evidence.py",
+                    "length": len(raw),
+                    "sha256": digest,
+                }
+            ],
+        )
+        frame = {
+            "contract": "task-witness-validator-artifact-manifest-v1",
+            "validator_contract": "tricritical-terminal-review-evidence-v2",
+            "entrypoint_module": "validator",
+            "modules": [{"name": "validator", "content_sha256": digest}],
+        }
+        self.assertEqual(
+            validator["implementation_sha256"],
+            hashlib.sha256(
+                json.dumps(frame, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest(),
+        )
+
+    def test_terminal_evidence_reference_preserves_dispatch_assurance(self):
+        reference_path = (
+            self.plugin_root / "skills" / "loop" / "references" / "review-evidence.md"
+        )
+        reference = " ".join(reference_path.read_text().split())
+        for term in (
+            "tricritical-terminal-review-evidence-v2",
+            "tricritical-terminal-review-evidence-validator-v2",
+            "tricritical-terminal-review-projection-v2",
+            "rolecasting-dispatch-projection-v2",
+            "preserves the complete registered Rolecasting projection verbatim as "
+            "`final_dispatch`",
+            "does not upgrade or collapse `product-attested`, "
+            "`controller-observed`, or `self-reported` assurance",
+            "consumer must apply its own minimum",
+            "Self-reported evidence is diagnostic and cannot by itself satisfy a "
+            "hard gate",
+            "producer and issuer inventories are empty",
+            "does not expose a new-publication producer chain",
+        ):
+            with self.subTest(term=term):
+                self.assertIn(term, reference)
+
+    def test_rejects_terminal_evidence_assurance_documentation_drift(self):
+        reference_path = (
+            self.plugin_root / "skills" / "loop" / "references" / "review-evidence.md"
+        )
+        reference_path.write_text(
+            reference_path.read_text().replace(
+                "consumer must apply its own minimum",
+                "consumer may infer sufficient assurance",
+            )
+        )
+
+        result = self.run_validator()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("terminal-evidence reference drift", result.stderr)
+
+    def test_rejects_registered_terminal_projection_contract_drift(self):
+        runtime_path = (
+            self.plugin_root / "skills" / "loop" / "scripts" / "review_evidence.py"
+        )
+        source = runtime_path.read_text()
+        changed = source.replace(
+            'PROJECTION_CONTRACT = "tricritical-terminal-review-projection-v2"',
+            'PROJECTION_CONTRACT = "tricritical-terminal-review-projection-v1"',
+        )
+        self.assertNotEqual(changed, source)
+        runtime_path.write_text(changed)
+
+        raw = runtime_path.read_bytes()
+        digest = hashlib.sha256(raw).hexdigest()
+        provider_path = self.plugin_root / "task-witness-provider.json"
+        provider = json.loads(provider_path.read_text())
+        validator = provider["validators"][0]
+        validator["modules"][0]["length"] = len(raw)
+        validator["modules"][0]["sha256"] = digest
+        frame = {
+            "contract": "task-witness-validator-artifact-manifest-v1",
+            "validator_contract": "tricritical-terminal-review-evidence-v2",
+            "entrypoint_module": "validator",
+            "modules": [{"name": "validator", "content_sha256": digest}],
+        }
+        validator["implementation_sha256"] = hashlib.sha256(
+            json.dumps(frame, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        unsigned = {
+            key: value for key, value in provider.items() if key != "content_sha256"
+        }
+        provider["content_sha256"] = hashlib.sha256(
+            json.dumps(unsigned, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        provider_path.write_text(
+            json.dumps(provider, sort_keys=True, separators=(",", ":")) + "\n"
+        )
+
+        result = self.run_validator()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("terminal-evidence registered API drift", result.stderr)
+
     def test_reported_snapshot_identity_matches_validated_bytes(self):
         expected = validator_module.validation_input_digest(self.repo, self.plugin_root)
 
@@ -115,10 +256,43 @@ class ValidateTricriticalTests(unittest.TestCase):
             },
         )
 
+    def test_uses_canonical_agent_plugins_v1_with_native_claude_agents(self):
+        canonical = json.loads((self.plugin_root / "plugin.json").read_text())
+        self.assertEqual(canonical["$schema"], AGENT_PLUGIN_SCHEMA)
+        self.assertEqual(canonical["name"], "tricritical")
+        self.assertEqual(canonical["version"], "1.0.0")
+        self.assertEqual(set(canonical["extensions"]), {"com.openai"})
+        self.assertEqual(set(canonical["extensions"]["com.openai"]), {"interface"})
+        self.assertFalse((self.plugin_root / ".codex-plugin").exists())
+        self.assertEqual(
+            sorted(
+                path.name
+                for path in (self.plugin_root / "skills").iterdir()
+                if path.is_dir() and (path / "SKILL.md").is_file()
+            ),
+            sorted(CORE_SKILLS),
+        )
+        self.assertEqual(
+            sorted(path.stem for path in (self.plugin_root / "agents").glob("*.md")),
+            sorted(PERSONA_SKILLS),
+        )
+
+    def test_claude_manifest_is_exact_canonical_projection(self):
+        canonical = json.loads((self.plugin_root / "plugin.json").read_text())
+        claude = json.loads(
+            (self.plugin_root / ".claude-plugin" / "plugin.json").read_text()
+        )
+        self.assertEqual(set(claude), set(CANONICAL_IDENTITY_FIELDS) | {"displayName"})
+        self.assertEqual(claude["displayName"], "Tricritical")
+        self.assertEqual(
+            {field: claude[field] for field in CANONICAL_IDENTITY_FIELDS},
+            {field: canonical[field] for field in CANONICAL_IDENTITY_FIELDS},
+        )
+
     def test_rejects_manifest_prompt_drift(self):
-        manifest_path = self.plugin_root / ".codex-plugin" / "plugin.json"
+        manifest_path = self.plugin_root / "plugin.json"
         manifest = json.loads(manifest_path.read_text())
-        manifest["interface"]["defaultPrompt"][0] = (
+        manifest["extensions"]["com.openai"]["interface"]["defaultPrompt"][0] = (
             "Use $tricritical:review differently."
         )
         self.write_json(manifest_path, manifest)
@@ -206,9 +380,7 @@ class ValidateTricriticalTests(unittest.TestCase):
         codex_adapter = (
             self.plugin_root / "skills" / "loop" / "agents" / "openai.yaml"
         ).read_text()
-        codex_manifest = (
-            self.plugin_root / ".codex-plugin" / "plugin.json"
-        ).read_text()
+        codex_manifest = (self.plugin_root / "plugin.json").read_text()
         claude_adapter = (self.plugin_root / "agents" / "fathomkeeper.md").read_text()
 
         self.assertEqual(codex_adapter.count(CODEX_OPERATOR_CHOICE_MAPPING), 1)
@@ -436,14 +608,22 @@ class ValidateTricriticalTests(unittest.TestCase):
 
         review = (self.plugin_root / "skills/review/SKILL.md").read_text()
         boundary = (self.plugin_root / "references/invocation-boundary.md").read_text()
+        combined = " ".join((review + boundary).split())
         for required in (
             "adapter:rolecasting-invocation-topology-receipt",
             "closed-world dispatch set",
             "exactly one unique dispatch entry",
+            "target product family, surface, version, and executor",
+            "child, peer, or external relationship",
+            "leader-owned or user-owned ownership",
+            "transport",
+            "consumer assurance minimum",
+            "product-attested, controller-observed, or self-reported assurance",
+            "explicit user authority",
             "new valid plan",
             "incomplete / non-clean",
         ):
-            self.assertIn(required, review + boundary)
+            self.assertIn(required, combined)
 
         for fixture in (
             "topology-unauthorized-user-owned-task.md",
@@ -465,11 +645,10 @@ class ValidateTricriticalTests(unittest.TestCase):
                 " with a Rolecasting invocation-topology receipt",
             )
         )
-        manifest_path = self.plugin_root / ".codex-plugin/plugin.json"
+        manifest_path = self.plugin_root / "plugin.json"
         manifest = json.loads(manifest_path.read_text())
-        manifest["interface"]["defaultPrompt"][0] = manifest["interface"][
-            "defaultPrompt"
-        ][0].replace(
+        interface = manifest["extensions"]["com.openai"]["interface"]
+        interface["defaultPrompt"][0] = interface["defaultPrompt"][0].replace(
             receipt_prompt,
             " with a Rolecasting invocation-topology receipt",
         )
@@ -794,9 +973,9 @@ class ValidateTricriticalTests(unittest.TestCase):
                 self.assertIn("Claude marketplace", result.stderr)
 
     def test_manifest_type_errors_are_reported_without_tracebacks(self):
-        codex_path = self.plugin_root / ".codex-plugin" / "plugin.json"
+        codex_path = self.plugin_root / "plugin.json"
         codex = json.loads(codex_path.read_text())
-        codex["interface"]["defaultPrompt"] = "not-a-list"
+        codex["extensions"]["com.openai"]["interface"]["defaultPrompt"] = "not-a-list"
         self.write_json(codex_path, codex)
         result = self.run_validator()
         self.assertNotEqual(result.returncode, 0)
@@ -806,7 +985,7 @@ class ValidateTricriticalTests(unittest.TestCase):
     def test_rejects_duplicate_keys_in_every_json_contract(self):
         cases = (
             (
-                self.plugin_root / ".codex-plugin" / "plugin.json",
+                self.plugin_root / "plugin.json",
                 '  "name": "tricritical",',
                 '  "name": "tricritical",\n  "name": "duplicate",',
             ),
@@ -848,7 +1027,7 @@ class ValidateTricriticalTests(unittest.TestCase):
 
     def test_rejects_non_finite_values_in_every_json_contract(self):
         paths = (
-            self.plugin_root / ".codex-plugin" / "plugin.json",
+            self.plugin_root / "plugin.json",
             self.plugin_root / ".claude-plugin" / "plugin.json",
             self.repo / ".claude-plugin" / "marketplace.json",
             self.plugin_root / "topology.json",

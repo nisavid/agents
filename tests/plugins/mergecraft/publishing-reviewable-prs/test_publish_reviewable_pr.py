@@ -1325,6 +1325,9 @@ class CreateReviewablePrTests(ReviewablePrFixture):
 
     def test_candidate_secret_blocks_before_create_without_echoing_value(self) -> None:
         secret = "ghp_123456789012345678901234567890"
+        # This test-only credential shape must reach the candidate gate so the test
+        # can prove that production diagnostics never store or echo its value.
+        # codeql[py/clear-text-storage-sensitive-data]
         self.template_path.write_text(
             self.template + f"\nCredential: {secret}\n", encoding="utf-8"
         )

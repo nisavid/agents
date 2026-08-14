@@ -61,7 +61,7 @@
     "skills/writing-reviewable-pr-descriptions/scripts/change_navigation/stack_inventory.py": "d41a89fb4d6c4e44b7e0fc452511080cb9ad52eddf976ff556a92ad6ef15e984",
     "skills/writing-reviewable-pr-descriptions/scripts/change_navigation/types.py": "5a8a32bbaf5c0a29b97afd9280c366e149383712628a55155eda0acd6aa4ee81",
     "skills/writing-reviewable-pr-descriptions/scripts/change_navigation/urls.py": "ca1fd7b3210320967e47ed5696dc3fb12d1005f3cbbbd4214845247b5a895bf6",
-    "skills/writing-reviewable-pr-descriptions/scripts/validate_change_navigation.py": "b531617c9e698e7bc4a62d731fd95b365f1756102a37e7288cd734304b47a720",
+    "skills/writing-reviewable-pr-descriptions/scripts/validate_change_navigation.py": "2d8d3f2f3f5a91b14b9df902e2a6733698a0d017d7fbe51631663833764c51cb",
     "topology.json": "0336b660eeed509dc293e2087ef3ee6ae3e729c7ba0cd52e22e3e4b0e1aeff4b"
   }
 }

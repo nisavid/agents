@@ -464,6 +464,29 @@ class ReviewInputTests(unittest.TestCase):
 
         self.assertTrue(any("Diff" in error for error in errors))
 
+    def test_publishable_validation_never_echoes_secret_from_malformed_markup(
+        self,
+    ) -> None:
+        secret = "ghp_123456789012345678901234567890"
+        body = DIFF.replace("\n</details>", f"\n  - unsupported {secret}\n</details>")
+
+        errors = PRODUCTION_VALIDATE(
+            body,
+            "acme/app",
+            2,
+            title="feat: widget",
+            review_input_path=self.write(manifest(DIFF)),
+        )
+
+        self.assertEqual(
+            errors,
+            [
+                "PR body contains a suspected credential or secret; do not echo or "
+                "republish it, and require authorized removal and rotation"
+            ],
+        )
+        self.assertNotIn(secret, "\n".join(errors))
+
     def test_rejects_head_repository_identity_drift(self) -> None:
         with self.assertRaisesRegex(ReviewInputError, "identity drifted"):
             self.bind(

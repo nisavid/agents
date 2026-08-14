@@ -778,6 +778,172 @@ class TaskWitnessLinuxQualificationHarnessTests(unittest.TestCase):
                 ),
             )
 
+    def test_source_root_dependency_uses_qualified_runtime_relocation(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root).resolve()
+            source_root = root / "source"
+            runtime_root = root / "runtime"
+            loader_root = runtime_root / "lib" / "task-witness-loader"
+            observed = source_root / "lib" / "libpython3.13.so.1.0"
+            relocated = runtime_root / "lib" / "libpython3.13.so.1.0"
+            observed.parent.mkdir(parents=True)
+            relocated.parent.mkdir(parents=True)
+            loader_root.mkdir()
+            observed.write_bytes(b"libpython")
+            observed.chmod(0o777)
+            relocated.write_bytes(b"libpython")
+            relocated.chmod(0o755)
+
+            copy_source, evidence = self.helper.qualify_dependency_source(
+                observed,
+                source_root,
+                runtime_root,
+                "libpython3.13.so.1.0",
+            )
+            bindings = {}
+            destination, created = self.helper.retain_dependency_binding(
+                bindings,
+                loader_root,
+                "libpython3.13.so.1.0",
+                copy_source,
+                source_evidence=evidence,
+            )
+
+            digest = hashlib.sha256(b"libpython").hexdigest()
+            self.assertTrue(created)
+            self.assertEqual(copy_source, relocated)
+            self.assertEqual(destination.read_bytes(), b"libpython")
+            self.assertEqual(
+                bindings["libpython3.13.so.1.0"]["resolved_source"],
+                str(observed),
+            )
+            self.assertEqual(
+                bindings["libpython3.13.so.1.0"]["observed_source_sha256"],
+                digest,
+            )
+            self.assertEqual(
+                bindings["libpython3.13.so.1.0"]["qualified_relocation"],
+                str(relocated),
+            )
+            self.assertEqual(
+                bindings["libpython3.13.so.1.0"]["qualified_relocation_copy_sha256"],
+                digest,
+            )
+
+    def test_source_root_relocation_rejects_unsafe_or_inexact_copies(self) -> None:
+        cases = ("missing", "different", "symlink", "writable")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as raw_root:
+                root = Path(raw_root).resolve()
+                source_root = root / "source"
+                runtime_root = root / "runtime"
+                observed = source_root / "lib" / "libpython3.13.so.1.0"
+                relocated = runtime_root / "lib" / "libpython3.13.so.1.0"
+                observed.parent.mkdir(parents=True)
+                relocated.parent.mkdir(parents=True)
+                observed.write_bytes(b"observed")
+                if case == "different":
+                    relocated.write_bytes(b"different")
+                    relocated.chmod(0o555)
+                elif case == "symlink":
+                    target = root / "relocation-target"
+                    target.write_bytes(b"observed")
+                    target.chmod(0o555)
+                    relocated.symlink_to(target)
+                elif case == "writable":
+                    relocated.write_bytes(b"observed")
+                    relocated.chmod(0o775)
+
+                with self.assertRaises(self.helper.PreparationError):
+                    self.helper.qualify_dependency_source(
+                        observed,
+                        source_root,
+                        runtime_root,
+                        "libpython3.13.so.1.0",
+                    )
+
+    def test_source_root_relocation_rejects_escape_and_source_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root).resolve()
+            source_root = root / "source"
+            runtime_root = root / "runtime"
+            observed = source_root / "lib" / "libpython3.13.so.1.0"
+            relocated = runtime_root / "lib" / "libpython3.13.so.1.0"
+            observed.parent.mkdir(parents=True)
+            relocated.parent.mkdir(parents=True)
+            observed.write_bytes(b"libpython")
+            relocated.write_bytes(b"libpython")
+            relocated.chmod(0o555)
+
+            with self.assertRaises(self.helper.PreparationError):
+                self.helper.qualify_dependency_source(
+                    observed,
+                    source_root / "child" / "..",
+                    runtime_root,
+                    "libpython3.13.so.1.0",
+                )
+
+            sibling_escape = root / "source-other" / "libfixture.so.1.0"
+            sibling_escape.parent.mkdir()
+            sibling_escape.write_bytes(b"escape")
+            sibling_escape.chmod(0o777)
+            with self.assertRaises(self.helper.PreparationError):
+                self.helper.qualify_dependency_source(
+                    sibling_escape,
+                    source_root,
+                    runtime_root,
+                    "libfixture.so.1",
+                )
+
+            stable_binding = self.helper.stable_file_binding
+            calls = 0
+
+            def drift(metadata):
+                nonlocal calls
+                calls += 1
+                binding = stable_binding(metadata)
+                if calls == 2:
+                    return (*binding[:-1], binding[-1] + 1)
+                return binding
+
+            with (
+                mock.patch.object(self.helper, "stable_file_binding", drift),
+                self.assertRaises(self.helper.PreparationError),
+            ):
+                self.helper.qualify_dependency_source(
+                    observed,
+                    source_root,
+                    runtime_root,
+                    "libpython3.13.so.1.0",
+                )
+
+    def test_non_source_root_dependency_keeps_owner_rejection(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root).resolve()
+            source_root = root / "source"
+            runtime_root = root / "runtime"
+            external = root / "external" / "libfixture.so.1.0"
+            source_root.mkdir()
+            runtime_root.mkdir()
+            external.parent.mkdir()
+            external.write_bytes(b"external")
+            external.chmod(0o555)
+
+            with (
+                mock.patch.object(
+                    self.helper.os,
+                    "geteuid",
+                    return_value=os.geteuid() + 1,
+                ),
+                self.assertRaises(self.helper.PreparationError),
+            ):
+                self.helper.qualify_dependency_source(
+                    external,
+                    source_root,
+                    runtime_root,
+                    "libfixture.so.1",
+                )
+
     def test_retained_binding_copies_internal_sources_and_rejects_origin_drift(
         self,
     ) -> None:

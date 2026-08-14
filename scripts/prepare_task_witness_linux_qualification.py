@@ -31,7 +31,7 @@ import zipfile
 from collections.abc import Iterable, Mapping
 from email.parser import BytesParser
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, NamedTuple
 
 CAPABILITY_FIELDS = ("CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb")
 CONTENT_DIGEST_FIELD = "content_sha256"
@@ -104,6 +104,14 @@ SYSTEM_TOOLS = (
 
 class PreparationError(ValueError):
     """A qualification preparation precondition was not satisfied."""
+
+
+class DependencySourceEvidence(NamedTuple):
+    observed_source: Path
+    observed_source_sha256: str
+    copy_source: Path
+    copy_source_sha256: str
+    qualified_relocation: Path | None
 
 
 def canonical_bytes(value: object) -> bytes:
@@ -1164,6 +1172,139 @@ def validate_dependency_graph(
         )
 
 
+def exact_dependency_root(path: Path, label: str) -> Path:
+    path = require_absolute(path, label)
+    try:
+        metadata = path.lstat()
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise PreparationError(f"{label} is unavailable") from error
+    if not stat.S_ISDIR(metadata.st_mode) or path.is_symlink() or resolved != path:
+        raise PreparationError(f"{label} is not an exact regular directory")
+    return path
+
+
+def stable_dependency_source_sha256(
+    path: Path,
+    requested_name: str,
+    *,
+    enforce_safe_disposition: bool,
+) -> str:
+    requested_name = validate_needed_name(requested_name)
+    path = require_absolute(path, "loader dependency source")
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except OSError as error:
+        raise PreparationError(
+            "loader dependency source is unavailable: "
+            f"requested_name={requested_name!r}, source={str(path)!r}"
+        ) from error
+    try:
+        source_metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(source_metadata.st_mode) or (
+            enforce_safe_disposition
+            and (
+                source_metadata.st_uid != os.geteuid()
+                or source_metadata.st_mode & 0o022
+            )
+        ):
+            raise PreparationError(
+                "loader dependency source disposition is unsafe: "
+                f"requested_name={requested_name!r}, "
+                f"source={str(path)!r}, "
+                f"uid={source_metadata.st_uid}, "
+                f"gid={source_metadata.st_gid}, "
+                f"mode={source_metadata.st_mode:#o}, "
+                f"nlink={source_metadata.st_nlink}"
+            )
+        digest = hashlib.sha256()
+        while chunk := os.read(descriptor, 1024 * 1024):
+            digest.update(chunk)
+        if stable_file_binding(os.fstat(descriptor)) != stable_file_binding(
+            source_metadata
+        ):
+            raise PreparationError("loader dependency source changed while reading")
+    finally:
+        os.close(descriptor)
+    return digest.hexdigest()
+
+
+def qualify_dependency_source(
+    source: Path,
+    source_root: Path,
+    runtime_root: Path,
+    requested_name: str,
+) -> tuple[Path, DependencySourceEvidence]:
+    requested_name = validate_needed_name(requested_name)
+    source_root = exact_dependency_root(source_root, "runtime source root")
+    runtime_root = exact_dependency_root(runtime_root, "runtime root")
+    observed_source = resolve_ldd_regular(
+        source,
+        "observed loader dependency source",
+    )
+    if observed_source.is_relative_to(source_root):
+        relative = observed_source.relative_to(source_root)
+        if relative == Path(".") or relative.is_absolute() or ".." in relative.parts:
+            raise PreparationError("loader dependency source relocation path is unsafe")
+        relocation = require_absolute(
+            runtime_root.joinpath(*relative.parts),
+            "loader dependency source relocation",
+        )
+        if relocation == runtime_root or not relocation.is_relative_to(runtime_root):
+            raise PreparationError(
+                "loader dependency source relocation escapes the runtime root"
+            )
+        try:
+            relocation_metadata = relocation.lstat()
+            resolved_relocation = relocation.resolve(strict=True)
+        except (OSError, RuntimeError) as error:
+            raise PreparationError(
+                "loader dependency source relocation is unavailable"
+            ) from error
+        if (
+            not stat.S_ISREG(relocation_metadata.st_mode)
+            or relocation.is_symlink()
+            or resolved_relocation != relocation
+        ):
+            raise PreparationError(
+                "loader dependency source relocation is not an exact regular file"
+            )
+        observed_digest = stable_dependency_source_sha256(
+            observed_source,
+            requested_name,
+            enforce_safe_disposition=False,
+        )
+        relocation_digest = stable_dependency_source_sha256(
+            relocation,
+            requested_name,
+            enforce_safe_disposition=True,
+        )
+        if observed_digest != relocation_digest:
+            raise PreparationError(
+                f"loader dependency source relocation bytes disagree: {requested_name}"
+            )
+        return relocation, DependencySourceEvidence(
+            observed_source=observed_source,
+            observed_source_sha256=observed_digest,
+            copy_source=relocation,
+            copy_source_sha256=relocation_digest,
+            qualified_relocation=relocation,
+        )
+
+    source_digest = stable_dependency_source_sha256(
+        observed_source,
+        requested_name,
+        enforce_safe_disposition=True,
+    )
+    return observed_source, DependencySourceEvidence(
+        observed_source=observed_source,
+        observed_source_sha256=source_digest,
+        copy_source=observed_source,
+        copy_source_sha256=source_digest,
+        qualified_relocation=None,
+    )
+
+
 def retain_dependency_alias(
     loader_root: Path,
     requested_name: str,
@@ -1273,11 +1414,37 @@ def retain_dependency_binding(
     requested_name: str,
     source: Path,
     *,
+    source_evidence: DependencySourceEvidence | None = None,
     requested_path: str | None = None,
 ) -> tuple[Path, bool]:
     requested_name = validate_needed_name(requested_name)
+    source = require_absolute(source, "loader dependency copy source")
     destination = loader_root / requested_name
-    source_digest = sha256_file(source)
+    source_digest = stable_dependency_source_sha256(
+        source,
+        requested_name,
+        enforce_safe_disposition=True,
+    )
+    if source_evidence is None:
+        evidence = DependencySourceEvidence(
+            observed_source=source,
+            observed_source_sha256=source_digest,
+            copy_source=source,
+            copy_source_sha256=source_digest,
+            qualified_relocation=None,
+        )
+    else:
+        evidence = source_evidence
+        if (
+            (evidence.observed_source == destination and source != destination)
+            or evidence.copy_source != source
+            or evidence.observed_source_sha256 != source_digest
+            or evidence.copy_source_sha256 != source_digest
+            or evidence.qualified_relocation not in {None, source}
+        ):
+            raise PreparationError(
+                f"loader dependency source evidence disagrees: {requested_name}"
+            )
     prior = bindings.get(requested_name)
     if source == destination:
         if (
@@ -1293,7 +1460,9 @@ def retain_dependency_binding(
             prior["requested_path"] = requested_path
         return destination, False
     if prior is not None and (
-        prior["resolved_source"] != str(source)
+        prior["resolved_source"] != str(evidence.observed_source)
+        or prior["observed_source_sha256"] != evidence.observed_source_sha256
+        or prior["copy_source"] != str(evidence.copy_source)
         or prior["source_sha256"] != source_digest
     ):
         raise PreparationError(
@@ -1317,12 +1486,22 @@ def retain_dependency_binding(
     details.update(
         {
             "requested_name": requested_name,
-            "resolved_source": str(source),
+            "resolved_source": str(evidence.observed_source),
+            "observed_source_sha256": evidence.observed_source_sha256,
+            "copy_source": str(evidence.copy_source),
+            "copy_source_sha256": evidence.copy_source_sha256,
             "retained_path": str(destination),
             "source_sha256": source_digest,
             "retained_copy_sha256": retained_digest,
         }
     )
+    if evidence.qualified_relocation is not None:
+        details.update(
+            {
+                "qualified_relocation": str(evidence.qualified_relocation),
+                "qualified_relocation_copy_sha256": (evidence.copy_source_sha256),
+            }
+        )
     if requested_path is not None:
         details["requested_path"] = requested_path
     bindings[requested_name] = details
@@ -1652,6 +1831,7 @@ def audit_runtime_elf_dependencies(
 def seal_runtime(args: argparse.Namespace) -> None:
     require_root()
     runtime_root = require_absolute(args.runtime_root, "runtime root")
+    source_root = exact_dependency_root(args.source_root, "runtime source root")
     executable = require_absolute(args.runtime_executable, "runtime executable")
     site_packages = require_absolute(args.site_packages, "site-packages root")
     dependency_wheel = require_absolute(args.dependency_wheel, "dependency wheel")
@@ -1732,21 +1912,34 @@ def seal_runtime(args: argparse.Namespace) -> None:
             **loader_needed_bindings,
             **transitive_bindings,
         }.items():
+            copy_source, source_evidence = qualify_dependency_source(
+                source,
+                source_root,
+                runtime_root,
+                requested_name,
+            )
             destination, created = retain_dependency_binding(
                 copied,
                 loader_root,
                 requested_name,
-                source,
+                copy_source,
+                source_evidence=source_evidence,
             )
             if created:
                 pending.append(destination)
         for requested_path, source in auxiliary_bindings.items():
             requested_name = validate_needed_name(Path(requested_path).name)
             prior = copied.get(requested_name)
+            copy_source, source_evidence = qualify_dependency_source(
+                source,
+                source_root,
+                runtime_root,
+                requested_name,
+            )
             loader_source = (
                 Path(prior["resolved_source"])
                 if source == loader_root / requested_name and prior is not None
-                else source
+                else source_evidence.observed_source
             )
             observed_loader = (requested_name, loader_source)
             if loader_binding is not None and loader_binding != observed_loader:
@@ -1756,7 +1949,8 @@ def seal_runtime(args: argparse.Namespace) -> None:
                 copied,
                 loader_root,
                 requested_name,
-                source,
+                copy_source,
+                source_evidence=source_evidence,
                 requested_path=requested_path,
             )
             if created:
@@ -1915,7 +2109,7 @@ def seal_runtime(args: argparse.Namespace) -> None:
             "source": {
                 "action_sha": args.setup_python_action_sha,
                 "cpython_version_request": args.runtime_version,
-                "root": args.source_root,
+                "root": str(source_root),
                 "qualification_dependencies": [
                     {
                         "distribution": PYYAML_DISTRIBUTION,
@@ -2592,7 +2786,7 @@ def parser() -> argparse.ArgumentParser:
     seal.add_argument("--site-packages", type=Path, required=True)
     seal.add_argument("--dependency-wheel", type=Path, required=True)
     seal.add_argument("--audit-output", type=Path, required=True)
-    seal.add_argument("--source-root", required=True)
+    seal.add_argument("--source-root", type=Path, required=True)
     seal.add_argument("--runtime-version", required=True)
     seal.add_argument("--setup-python-action-sha", required=True)
     seal.add_argument("--pyyaml-version", required=True)

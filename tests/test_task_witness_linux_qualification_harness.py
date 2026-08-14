@@ -7,6 +7,7 @@ import importlib.util
 import io
 import json
 import os
+import struct
 import subprocess
 import sys
 import tempfile
@@ -33,6 +34,58 @@ def load_helper():
 class TaskWitnessLinuxQualificationHarnessTests(unittest.TestCase):
     def setUp(self) -> None:
         self.helper = load_helper()
+
+    def write_elf(
+        self,
+        path: Path,
+        interpreters: list[str],
+        *,
+        dynamic: bool = False,
+    ) -> None:
+        identifier = b"\x7fELF\x02\x01\x01" + (b"\0" * 9)
+        program_count = len(interpreters) + int(dynamic)
+        program_offset = 64 if program_count else 0
+        segment_offset = 64 + (56 * program_count)
+        program_headers: list[bytes] = []
+        segments: list[bytes] = []
+        if dynamic:
+            program_headers.append(struct.pack("<IIQQQQQQ", 2, 4, 0, 0, 0, 0, 0, 8))
+        for interpreter in interpreters:
+            raw = interpreter.encode("utf-8") + b"\0"
+            program_headers.append(
+                struct.pack(
+                    "<IIQQQQQQ",
+                    3,
+                    4,
+                    segment_offset,
+                    0,
+                    0,
+                    len(raw),
+                    len(raw),
+                    1,
+                )
+            )
+            segments.append(raw)
+            segment_offset += len(raw)
+        header = struct.pack(
+            "<16sHHIQQQIHHHHHH",
+            identifier,
+            3,
+            62,
+            1,
+            0,
+            program_offset,
+            0,
+            0,
+            64,
+            56,
+            program_count,
+            64,
+            0,
+            0,
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(header + b"".join(program_headers) + b"".join(segments))
 
     def test_content_document_binds_exact_canonical_unsigned_bytes(self) -> None:
         unsigned = {
@@ -73,6 +126,334 @@ class TaskWitnessLinuxQualificationHarnessTests(unittest.TestCase):
             self.assertEqual(main["role"], "main-executable")
             self.assertEqual(retained["role"], "runtime-resource")
             self.assertEqual(main["sha256"], hashlib.sha256(b"not-an-elf").hexdigest())
+
+    def test_patchelf_interpreter_requires_direct_elf_agreement(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            interpreter = "/opt/task-witness/runtime/lib/ld-linux-x86-64.so.2"
+            executable = root / "executable"
+            shared_object = root / "shared-object"
+            multiple = root / "multiple"
+            malformed = root / "malformed"
+            self.write_elf(executable, [interpreter], dynamic=True)
+            self.write_elf(shared_object, [], dynamic=True)
+            self.write_elf(multiple, [interpreter, interpreter], dynamic=True)
+            malformed.write_bytes(b"\x7fELFtruncated")
+
+            success = subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout=f"{interpreter}\n",
+                stderr="",
+            )
+            no_interpreter = subprocess.CompletedProcess(
+                args=[],
+                returncode=1,
+                stdout="",
+                stderr=f"{self.helper.PATCHELF_NO_INTERPRETER_DIAGNOSTIC}\n",
+            )
+            with mock.patch.object(self.helper, "run", return_value=success):
+                self.assertEqual(
+                    self.helper.patchelf_interpreter(executable),
+                    interpreter,
+                )
+            with mock.patch.object(
+                self.helper,
+                "run",
+                return_value=no_interpreter,
+            ):
+                self.assertIsNone(self.helper.patchelf_interpreter(shared_object))
+                with self.assertRaises(self.helper.PreparationError):
+                    self.helper.patchelf_interpreter(executable)
+            for path in (multiple, malformed):
+                with (
+                    self.subTest(path=path),
+                    self.assertRaises(self.helper.PreparationError),
+                ):
+                    self.helper.patchelf_interpreter(path)
+
+    def test_dynamic_elf_discovery_uses_headers_and_rejects_probe_errors(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            shared_object = root / "shared-object.so"
+            static_object = root / "static-object"
+            self.write_elf(shared_object, [], dynamic=True)
+            self.write_elf(static_object, [])
+            no_interpreter = subprocess.CompletedProcess(
+                args=[],
+                returncode=1,
+                stdout="",
+                stderr=f"{self.helper.PATCHELF_NO_INTERPRETER_DIAGNOSTIC}\n",
+            )
+            unexpected = subprocess.CompletedProcess(
+                args=[],
+                returncode=2,
+                stdout="",
+                stderr="patchelf: unexpected inspection failure\n",
+            )
+
+            with mock.patch.object(
+                self.helper,
+                "run",
+                return_value=no_interpreter,
+            ) as run:
+                self.assertEqual(
+                    self.helper.dynamic_elf_files(root),
+                    [shared_object],
+                )
+            run.assert_called_once_with(
+                [
+                    "/usr/bin/patchelf",
+                    "--print-interpreter",
+                    str(shared_object),
+                ],
+                check=False,
+            )
+            with (
+                mock.patch.object(
+                    self.helper,
+                    "run",
+                    return_value=unexpected,
+                ),
+                self.assertRaises(self.helper.PreparationError),
+            ):
+                self.helper.dynamic_elf_files(root)
+
+    def test_dependency_audit_accepts_only_the_exact_host_loader_artifact(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            runtime_root = root / "runtime"
+            executable = runtime_root / "bin" / "python"
+            retained_loader = (
+                runtime_root / "lib" / "task-witness-loader" / "ld-linux-x86-64.so.2"
+            )
+            internal_library = retained_loader.with_name("libc.so.6")
+            host_loader = root / "host" / "ld-linux-x86-64.so.2"
+            for path in (
+                executable,
+                retained_loader,
+                internal_library,
+                host_loader,
+            ):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"fixture")
+
+            with (
+                mock.patch.object(
+                    self.helper,
+                    "patchelf_interpreter",
+                    return_value=str(retained_loader),
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "ldd_paths",
+                    return_value=([host_loader, internal_library], "ldd trace\n"),
+                ),
+            ):
+                audit = self.helper.audit_runtime_elf_dependencies(
+                    executable,
+                    runtime_root,
+                    retained_loader,
+                    host_loader,
+                    1001,
+                    1001,
+                )
+
+            self.assertEqual(audit["interpreter"], str(retained_loader))
+            self.assertEqual(audit["ldd_loader_artifact"], str(host_loader))
+            self.assertEqual(
+                audit["resolved_paths"],
+                [str(host_loader), str(internal_library)],
+            )
+
+    def test_dependency_audit_rejects_bad_interpreters_and_other_externals(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            runtime_root = root / "runtime"
+            executable = runtime_root / "bin" / "python"
+            retained_loader = (
+                runtime_root / "lib" / "task-witness-loader" / "ld-linux-x86-64.so.2"
+            )
+            other_internal_loader = retained_loader.with_name("other-loader.so")
+            host_loader = root / "host" / "ld-linux-x86-64.so.2"
+            external_library = root / "host" / "libc.so.6"
+            for path in (
+                executable,
+                retained_loader,
+                other_internal_loader,
+                host_loader,
+                external_library,
+            ):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"fixture")
+
+            cases = {
+                "relative-interpreter": (
+                    "lib/task-witness-loader/ld-linux-x86-64.so.2",
+                    [host_loader],
+                ),
+                "external-interpreter": (str(host_loader), [host_loader]),
+                "unapproved-internal-interpreter": (
+                    str(other_internal_loader),
+                    [host_loader],
+                ),
+                "external-library": (
+                    str(retained_loader),
+                    [host_loader, external_library],
+                ),
+            }
+            for name, (interpreter, dependencies) in cases.items():
+                with (
+                    self.subTest(name=name),
+                    mock.patch.object(
+                        self.helper,
+                        "patchelf_interpreter",
+                        return_value=interpreter,
+                    ),
+                    mock.patch.object(
+                        self.helper,
+                        "ldd_paths",
+                        return_value=(dependencies, "ldd trace\n"),
+                    ),
+                    self.assertRaises(self.helper.PreparationError),
+                ):
+                    self.helper.audit_runtime_elf_dependencies(
+                        executable,
+                        runtime_root,
+                        retained_loader,
+                        host_loader,
+                        1001,
+                        1001,
+                    )
+
+            retained_loader.unlink()
+            with (
+                mock.patch.object(
+                    self.helper,
+                    "patchelf_interpreter",
+                    return_value=str(retained_loader),
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "ldd_paths",
+                    return_value=([host_loader], "ldd trace\n"),
+                ),
+                self.assertRaises(self.helper.PreparationError),
+            ):
+                self.helper.audit_runtime_elf_dependencies(
+                    executable,
+                    runtime_root,
+                    retained_loader,
+                    host_loader,
+                    1001,
+                    1001,
+                )
+
+    def test_dependency_audit_rejects_interpreter_inspection_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            runtime_root = root / "runtime"
+            executable = runtime_root / "bin" / "python"
+            retained_loader = (
+                runtime_root / "lib" / "task-witness-loader" / "ld-linux-x86-64.so.2"
+            )
+            host_loader = root / "host" / "ld-linux-x86-64.so.2"
+            for path in (executable, retained_loader, host_loader):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"fixture")
+
+            ldd = mock.Mock(return_value=([host_loader], "ldd trace\n"))
+            with (
+                mock.patch.object(
+                    self.helper,
+                    "patchelf_interpreter",
+                    side_effect=self.helper.PreparationError(
+                        "interpreter inspection failed"
+                    ),
+                ),
+                mock.patch.object(self.helper, "ldd_paths", ldd),
+                self.assertRaises(self.helper.PreparationError),
+            ):
+                self.helper.audit_runtime_elf_dependencies(
+                    executable,
+                    runtime_root,
+                    retained_loader,
+                    host_loader,
+                    1001,
+                    1001,
+                )
+            ldd.assert_not_called()
+
+    def test_shared_object_dependency_audit_keeps_loader_handling_exact(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            runtime_root = root / "runtime"
+            shared_object = runtime_root / "lib" / "libpython.so"
+            retained_loader = (
+                runtime_root / "lib" / "task-witness-loader" / "ld-linux-x86-64.so.2"
+            )
+            host_loader = root / "host" / "ld-linux-x86-64.so.2"
+            lookalike_loader = root / "lookalike" / "ld-linux-x86-64.so.2"
+            for path in (
+                shared_object,
+                retained_loader,
+                host_loader,
+                lookalike_loader,
+            ):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"fixture")
+
+            with (
+                mock.patch.object(
+                    self.helper,
+                    "patchelf_interpreter",
+                    return_value=None,
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "ldd_paths",
+                    return_value=([host_loader], "ldd trace\n"),
+                ),
+            ):
+                audit = self.helper.audit_runtime_elf_dependencies(
+                    shared_object,
+                    runtime_root,
+                    retained_loader,
+                    host_loader,
+                    1001,
+                    1001,
+                )
+            self.assertIsNone(audit["interpreter"])
+
+            with (
+                mock.patch.object(
+                    self.helper,
+                    "patchelf_interpreter",
+                    return_value=None,
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "ldd_paths",
+                    return_value=([lookalike_loader], "ldd trace\n"),
+                ),
+                self.assertRaises(self.helper.PreparationError),
+            ):
+                self.helper.audit_runtime_elf_dependencies(
+                    shared_object,
+                    runtime_root,
+                    retained_loader,
+                    host_loader,
+                    1001,
+                    1001,
+                )
 
     def build_installed_pyyaml(self, root: Path) -> Path:
         site_packages = root / "lib" / "python3.13" / "site-packages"

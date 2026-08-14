@@ -24,6 +24,7 @@ import pwd
 import shutil
 import signal
 import stat
+import struct
 import subprocess
 import sys
 import zipfile
@@ -89,6 +90,10 @@ PYYAML_WHEEL_URL = (
     "https://files.pythonhosted.org/packages/74/27/"
     "e5b8f34d02d9995b80abcef563ea1f8b56d20134d8f4e5e81733b1feceb2/"
     f"{PYYAML_WHEEL_FILENAME}"
+)
+PATCHELF_NO_INTERPRETER_DIAGNOSTIC = (
+    "patchelf: cannot find section '.interp'. "
+    "The input file is most likely statically linked"
 )
 SYSTEM_TOOLS = (
     ("environment-clearer", Path("/usr/bin/env")),
@@ -818,13 +823,13 @@ def elf_files(root: Path) -> list[Path]:
 def dynamic_elf_files(root: Path) -> list[Path]:
     result: list[Path] = []
     for path in elf_files(root):
-        rpath = run(["/usr/bin/patchelf", "--print-rpath", str(path)], check=False)
-        interpreter = run(
-            ["/usr/bin/patchelf", "--print-interpreter", str(path)],
-            check=False,
-        )
-        if rpath.returncode == 0 or interpreter.returncode == 0:
-            result.append(path)
+        is_dynamic, interpreter = elf_program_headers(path)
+        if not is_dynamic:
+            if interpreter is not None:
+                raise PreparationError(f"ELF has PT_INTERP without PT_DYNAMIC: {path}")
+            continue
+        patchelf_interpreter(path)
+        result.append(path)
     return result
 
 
@@ -886,12 +891,180 @@ def ldd_paths(path: Path, uid: int, gid: int) -> tuple[list[Path], str]:
     return sorted(paths), output
 
 
+def elf_program_headers(path: Path) -> tuple[bool, str | None]:
+    descriptor = -1
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        initial = os.fstat(descriptor)
+        if not stat.S_ISREG(initial.st_mode):
+            raise PreparationError(f"ELF inspection target is not regular: {path}")
+        header = os.pread(descriptor, 64, 0)
+        if len(header) != 64:
+            raise PreparationError(f"ELF header is truncated: {path}")
+        (
+            identifier,
+            _file_type,
+            machine,
+            version,
+            _entry,
+            program_offset,
+            _section_offset,
+            _flags,
+            header_size,
+            program_entry_size,
+            program_count,
+            _section_entry_size,
+            _section_count,
+            _section_name_index,
+        ) = struct.unpack("<16sHHIQQQIHHHHHH", header)
+        if (
+            identifier[:7] != b"\x7fELF\x02\x01\x01"
+            or machine != 62
+            or version != 1
+            or header_size != 64
+            or program_count == 0xFFFF
+        ):
+            raise PreparationError(f"ELF header is unsupported or malformed: {path}")
+        if program_count == 0:
+            has_dynamic = False
+            interpreters: list[str] = []
+        else:
+            table_size = program_entry_size * program_count
+            if (
+                program_entry_size != 56
+                or program_count > 4096
+                or program_offset < header_size
+                or program_offset + table_size > initial.st_size
+            ):
+                raise PreparationError(f"ELF program-header table is malformed: {path}")
+            table = os.pread(descriptor, table_size, program_offset)
+            if len(table) != table_size:
+                raise PreparationError(f"ELF program-header table is truncated: {path}")
+            has_dynamic = False
+            interpreters = []
+            for offset in range(0, table_size, program_entry_size):
+                (
+                    segment_type,
+                    _segment_flags,
+                    segment_offset,
+                    _virtual_address,
+                    _physical_address,
+                    file_size,
+                    memory_size,
+                    _alignment,
+                ) = struct.unpack_from("<IIQQQQQQ", table, offset)
+                if segment_type == 2:
+                    has_dynamic = True
+                    continue
+                if segment_type != 3:
+                    continue
+                if (
+                    file_size < 2
+                    or file_size > 4096
+                    or memory_size < file_size
+                    or segment_offset + file_size > initial.st_size
+                ):
+                    raise PreparationError(f"ELF PT_INTERP is malformed: {path}")
+                raw = os.pread(descriptor, file_size, segment_offset)
+                if len(raw) != file_size or raw[-1:] != b"\0" or b"\0" in raw[:-1]:
+                    raise PreparationError(f"ELF PT_INTERP is malformed: {path}")
+                try:
+                    interpreters.append(raw[:-1].decode("utf-8"))
+                except UnicodeDecodeError as error:
+                    raise PreparationError(
+                        f"ELF PT_INTERP is not UTF-8: {path}"
+                    ) from error
+        if stable_file_binding(os.fstat(descriptor)) != stable_file_binding(initial):
+            raise PreparationError(f"ELF changed during interpreter inspection: {path}")
+    except OSError as error:
+        raise PreparationError(f"ELF interpreter inspection failed: {path}") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if len(interpreters) > 1:
+        raise PreparationError(f"ELF has multiple PT_INTERP entries: {path}")
+    return has_dynamic, interpreters[0] if interpreters else None
+
+
+def elf_interpreter(path: Path) -> str | None:
+    _is_dynamic, interpreter = elf_program_headers(path)
+    return interpreter
+
+
 def patchelf_interpreter(path: Path) -> str | None:
+    expected = elf_interpreter(path)
     process = run(["/usr/bin/patchelf", "--print-interpreter", str(path)], check=False)
-    if process.returncode != 0:
-        return None
     value = process.stdout.strip()
-    return value or None
+    if expected is None:
+        if (
+            process.returncode != 1
+            or value
+            or process.stderr.strip() != PATCHELF_NO_INTERPRETER_DIAGNOSTIC
+        ):
+            raise PreparationError(
+                f"patchelf no-interpreter inspection disagrees for {path}"
+            )
+        return None
+    if process.returncode != 0 or value != expected:
+        raise PreparationError(f"patchelf interpreter inspection disagrees for {path}")
+    return expected
+
+
+def audit_runtime_elf_dependencies(
+    path: Path,
+    runtime_root: Path,
+    retained_interpreter: Path,
+    ldd_loader_artifact: Path,
+    uid: int,
+    gid: int,
+) -> dict[str, Any]:
+    try:
+        retained_metadata = retained_interpreter.lstat()
+        loader_metadata = ldd_loader_artifact.lstat()
+    except OSError as error:
+        raise PreparationError("the approved dynamic loader is unavailable") from error
+    if (
+        not retained_interpreter.is_absolute()
+        or not retained_interpreter.is_relative_to(runtime_root)
+        or not stat.S_ISREG(retained_metadata.st_mode)
+        or retained_interpreter.is_symlink()
+        or not ldd_loader_artifact.is_absolute()
+        or ldd_loader_artifact.is_relative_to(runtime_root)
+        or not stat.S_ISREG(loader_metadata.st_mode)
+        or ldd_loader_artifact.is_symlink()
+    ):
+        raise PreparationError("the approved dynamic loader binding is invalid")
+
+    interpreter = patchelf_interpreter(path)
+    if interpreter is not None:
+        interpreter_path = Path(interpreter)
+        if (
+            not interpreter_path.is_absolute()
+            or not interpreter_path.is_relative_to(runtime_root)
+            or interpreter_path != retained_interpreter
+        ):
+            raise PreparationError(f"runtime ELF has an unapproved interpreter: {path}")
+
+    dependencies, output = ldd_paths(path, uid, gid)
+    external = [
+        str(dependency)
+        for dependency in dependencies
+        if not dependency.is_relative_to(runtime_root)
+        and dependency != ldd_loader_artifact
+    ]
+    if external:
+        raise PreparationError(
+            f"runtime ELF still resolves outside the closure: {path}: {external}"
+        )
+    return {
+        "path": str(path),
+        "interpreter": interpreter,
+        "ldd_loader_artifact": (
+            str(ldd_loader_artifact) if ldd_loader_artifact in dependencies else None
+        ),
+        "ldd_sha256": hashlib.sha256(output.encode("utf-8")).hexdigest(),
+        "resolved_paths": [str(dependency) for dependency in dependencies],
+    }
 
 
 def seal_runtime(args: argparse.Namespace) -> None:
@@ -968,13 +1141,14 @@ def seal_runtime(args: argparse.Namespace) -> None:
                 "sha256": source_digest,
             }
 
-    loader_interpreters = {
-        source.name: loader_root / source.name
-        for source in (Path(path) for path in copied)
-        if source.name.startswith("ld-linux")
-    }
-    if not loader_interpreters:
-        raise PreparationError("the Linux dynamic loader was not retained")
+    loader_bindings = [
+        (Path(source), Path(details["retained_path"]))
+        for source, details in copied.items()
+        if Path(source).name.startswith("ld-linux")
+    ]
+    if len(loader_bindings) != 1:
+        raise PreparationError("exactly one Linux dynamic loader must be retained")
+    ldd_loader_artifact, retained_interpreter = loader_bindings[0]
     for item in dynamic_elf_files(runtime_root):
         if item.parent == loader_root and item.name.startswith("ld-linux"):
             continue
@@ -988,43 +1162,28 @@ def seal_runtime(args: argparse.Namespace) -> None:
             ]
         )
         if interpreter is not None:
-            replacement = loader_interpreters.get(Path(interpreter).name)
-            if replacement is None:
+            if Path(interpreter).name != ldd_loader_artifact.name:
                 raise PreparationError(f"no retained interpreter for {item}")
             run(
                 [
                     "/usr/bin/patchelf",
                     "--set-interpreter",
-                    str(replacement),
+                    str(retained_interpreter),
                     str(item),
                 ]
             )
 
-    dependency_audit: list[dict[str, Any]] = []
-    for item in dynamic_elf_files(runtime_root):
-        has_interpreter = patchelf_interpreter(item) is not None
-        dependencies, output = ldd_paths(
+    dependency_audit = [
+        audit_runtime_elf_dependencies(
             item,
+            runtime_root,
+            retained_interpreter,
+            ldd_loader_artifact,
             args.inspection_uid,
             args.inspection_gid,
         )
-        external = [
-            str(path)
-            for path in dependencies
-            if not path.is_relative_to(runtime_root)
-            and (has_interpreter or not path.name.startswith("ld-linux"))
-        ]
-        if external:
-            raise PreparationError(
-                f"runtime ELF still resolves outside the closure: {item}: {external}"
-            )
-        dependency_audit.append(
-            {
-                "path": str(item),
-                "ldd_sha256": hashlib.sha256(output.encode("utf-8")).hexdigest(),
-                "resolved_paths": [str(path) for path in dependencies],
-            }
-        )
+        for item in dynamic_elf_files(runtime_root)
+    ]
 
     pyyaml_after = finalize_installed_wheel(site_packages, pyyaml_before)
     native_paths = {

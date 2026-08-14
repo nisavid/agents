@@ -2524,6 +2524,23 @@ def live_entry(path: Path, root: Path, executable: Path) -> dict[str, Any]:
     }
 
 
+def runtime_inventory_entries(
+    runtime_root: Path,
+    executable: Path,
+) -> list[dict[str, Any]]:
+    if not runtime_root.is_dir() or not executable.is_file():
+        raise PreparationError("sealed runtime is unavailable")
+    if any(path.is_symlink() for path in runtime_root.rglob("*")):
+        raise PreparationError("sealed runtime unexpectedly contains a symlink")
+    paths = [runtime_root, *sorted(runtime_root.rglob("*"), key=str)]
+    entries = [live_entry(path, runtime_root, executable) for path in paths]
+    if [entry["path"] for entry in entries] != sorted(
+        {entry["path"] for entry in entries}
+    ):
+        raise PreparationError("runtime inventory paths are not sorted and unique")
+    return entries
+
+
 def validate_runtime_pyyaml_audit(
     runtime_audit: dict[str, Any],
     runtime_root: Path,
@@ -2686,16 +2703,7 @@ def build_evidence(args: argparse.Namespace) -> None:
     )
     write_create_new(output / "platform-profile.json", profile)
 
-    if not runtime_root.is_dir() or not executable.is_file():
-        raise PreparationError("sealed runtime is unavailable")
-    if any(path.is_symlink() for path in runtime_root.rglob("*")):
-        raise PreparationError("sealed runtime unexpectedly contains a symlink")
-    paths = [runtime_root, *sorted(runtime_root.rglob("*"))]
-    entries = [live_entry(path, runtime_root, executable) for path in paths]
-    if [entry["path"] for entry in entries] != sorted(
-        {entry["path"] for entry in entries}
-    ):
-        raise PreparationError("runtime inventory paths are not sorted and unique")
+    entries = runtime_inventory_entries(runtime_root, executable)
     regular_total = sum(
         entry["length"] for entry in entries if entry["kind"] == "regular-file"
     )

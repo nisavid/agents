@@ -303,6 +303,33 @@ class TaskWitnessLinuxQualificationHarnessTests(unittest.TestCase):
             self.assertEqual(retained["role"], "runtime-resource")
             self.assertEqual(main["sha256"], hashlib.sha256(b"not-an-elf").hexdigest())
 
+    def test_runtime_inventory_uses_serialized_path_order(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            runtime_root = Path(raw_root) / "runtime"
+            executable = runtime_root / "bin" / "python"
+            stdlib = runtime_root / "lib" / "python3.13"
+            gdb_helper = runtime_root / "lib" / "python3.13-gdb.py"
+            stdlib_module = stdlib / "os.py"
+            executable.parent.mkdir(parents=True)
+            stdlib.mkdir(parents=True)
+            executable.write_bytes(b"python")
+            executable.chmod(0o755)
+            gdb_helper.write_bytes(b"gdb")
+            stdlib_module.write_bytes(b"stdlib")
+
+            entries = self.helper.runtime_inventory_entries(
+                runtime_root,
+                executable,
+            )
+
+            paths = [entry["path"] for entry in entries]
+            self.assertEqual(paths, sorted(paths))
+            self.assertEqual(len(paths), len(set(paths)))
+            self.assertLess(
+                paths.index(str(gdb_helper)),
+                paths.index(str(stdlib_module)),
+            )
+
     def test_patchelf_interpreter_requires_direct_elf_agreement(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root)

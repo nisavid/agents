@@ -33,6 +33,13 @@ ownership or destination, or inability to preserve remote work. An active
 conflict operation proceeds only from a complete, exact
 `resolving-merge-conflicts` resolution or authorized-abort handoff.
 
+The publication request always carries `default_branch_policy`: use `null` for
+an ordinary destination or when no repository policy decision has been
+verified. Set it to the exact observed default-branch ref and
+`direct_push_permitted: true` only after repository policy/protection has been
+verified to permit the direct push. A missing, false, or ref-mismatched decision
+cannot authorize publication to the observed default branch.
+
 ## Conflict Integration Handoffs
 
 Never interpret conflict intent or edit conflicted files. For a resolution
@@ -44,6 +51,12 @@ abort authority before running the operation-specific abort and verifying its
 post-state. Stop on any drift, unexpected path, new conflict, or ambiguous
 continuation. Commit and publish only through the ordinary checkpoint and
 exact-lease gates below.
+
+The planner observes the push endpoint's symbolic default branch and binds it
+into the reviewed destination identity. The executor re-observes it before
+actuation. An unavailable, malformed, or changed observation blocks; the
+selected branch name alone never proves that a direct default-branch push is
+permitted.
 
 ## Follow The Checkpoint Workflow
 

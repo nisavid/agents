@@ -106,6 +106,11 @@ REQUIRED_CHECKPOINT_TERMS = (
     "ambient Git hooks",
     "normal configured remote name is discovery metadata",
     "not a read-only command",
+    "`default_branch_policy`",
+    "`direct_push_permitted`",
+    "observed default branch",
+    "Git does not provide a lease for symbolic `HEAD`",
+    "Server-enforced repository policy/protection",
 )
 REQUIRED_TERMINAL_TERMS = (
     "dirty, directly agent-created worktree has a retention-only route",

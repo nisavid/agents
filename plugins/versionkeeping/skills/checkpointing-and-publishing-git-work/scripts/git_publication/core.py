@@ -13,6 +13,7 @@ class PublicationRequest:
     adopted_commits: FrozenSet[str]
     removal_authorized_commits: FrozenSet[str]
     explicit_destination: Optional[dict]
+    default_branch_policy: Optional[dict]
     allow_create: bool
     creation_base_ref: Optional[str]
 
@@ -52,6 +53,7 @@ class RepositorySnapshot:
     ref: str
     endpoint_fingerprint: str
     config_digest: str
+    default_branch_ref: str
     target: TargetState
     start_is_ancestor: bool
 
@@ -70,6 +72,7 @@ def request_document(request: PublicationRequest) -> dict:
         "adopted_commits": sorted(request.adopted_commits),
         "removal_authorized_commits": sorted(request.removal_authorized_commits),
         "explicit_destination": request.explicit_destination,
+        "default_branch_policy": request.default_branch_policy,
         "allow_create": request.allow_create,
         "creation_base_ref": request.creation_base_ref,
     }
@@ -103,6 +106,7 @@ def _base_result(request: PublicationRequest, snapshot: RepositorySnapshot) -> d
             "ref": snapshot.ref,
             "endpoint_fingerprint": snapshot.endpoint_fingerprint,
             "config_digest": snapshot.config_digest,
+            "default_branch_ref": snapshot.default_branch_ref,
         },
         "target": {"present": present, "sha": target_sha},
         "outgoing_shas": list(snapshot.target.outgoing_shas),
@@ -127,6 +131,37 @@ def _append_common_gates(
     if unowned:
         result["reasons"].append(
             _reason("OUTGOING_COMMITS_NOT_OWNED_OR_ADOPTED", shas=unowned)
+        )
+
+
+def _append_default_branch_policy_gate(
+    result: dict, request: PublicationRequest, snapshot: RepositorySnapshot
+) -> None:
+    policy = request.default_branch_policy
+    if policy is not None and policy["ref"] != snapshot.default_branch_ref:
+        result["reasons"].append(
+            _reason(
+                "DEFAULT_BRANCH_POLICY_REF_MISMATCH",
+                policy_ref=policy["ref"],
+                observed_ref=snapshot.default_branch_ref,
+            )
+        )
+        return
+    if snapshot.ref != snapshot.default_branch_ref:
+        return
+    if policy is None:
+        result["reasons"].append(
+            _reason(
+                "DEFAULT_BRANCH_POLICY_NOT_VERIFIED",
+                ref=snapshot.default_branch_ref,
+            )
+        )
+    elif not policy["direct_push_permitted"]:
+        result["reasons"].append(
+            _reason(
+                "DEFAULT_BRANCH_DIRECT_PUSH_NOT_PERMITTED",
+                ref=snapshot.default_branch_ref,
+            )
         )
 
 
@@ -236,6 +271,7 @@ def plan_publication(request: PublicationRequest, snapshot: RepositorySnapshot) 
     """Return a publication decision from a complete, normalized graph snapshot."""
     result = _base_result(request, snapshot)
     _append_common_gates(result, request, snapshot)
+    _append_default_branch_policy_gate(result, request, snapshot)
     if isinstance(snapshot.target, PresentTarget):
         _append_present_target_gates(result, request, snapshot.target)
     else:

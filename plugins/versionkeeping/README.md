@@ -66,6 +66,12 @@ outcome plus explicit repository and operator authorization binding the exact
 remote, full ref, and expected SHA. It deletes under an exact expected-SHA lease
 and completes only by verifying the ref is absent.
 
+Ordinary publication also observes and binds the push endpoint's symbolic
+default branch. A direct push to that observed ref remains blocked unless the
+request carries a matching, separately verified repository policy decision
+with `direct_push_permitted: true`; topic refs remain subject to the ordinary
+ownership, review, verification, and exact-lease gates.
+
 ## Repository release validation
 
 Repository maintainers additionally run `python3 scripts/validate_versionkeeping.py`

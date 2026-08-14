@@ -20,6 +20,46 @@ infer around a gate. Missing authorization for any SHA in `target_only_shas`
 alone yields `needs_reconciliation`; another concurrent gate yields `blocked`.
 The ordinary publication planner and executor never delete a remote ref.
 
+## Default-Branch Policy Gate
+
+Publication request schema version 2 includes one closed
+`default_branch_policy` field:
+
+```json
+null
+```
+
+or:
+
+```json
+{
+  "ref": "refs/heads/main",
+  "direct_push_permitted": true
+}
+```
+
+Use the object only for a separately verified repository policy/protection
+decision. Its `ref` must be the exact full ref reported as the push endpoint's
+symbolic default branch, and `direct_push_permitted` must be boolean. An
+ordinary non-default destination may use `null`. The observed default branch
+is blocked when the field is absent, false, or ref-mismatched; this does not
+blanket-ban a branch named `main` when the endpoint reports another default or
+when verified policy explicitly permits the direct push.
+
+The planner fails closed if the endpoint's symbolic default branch is
+unavailable or malformed. It records that ref in `destination.default_branch_ref`
+and includes it in `destination.config_digest`. The executor re-observes the
+same endpoint after validating the target lease and immediately before push
+actuation, and blocks if the default branch changed.
+
+Git does not provide a lease for symbolic `HEAD`, so the endpoint can still
+change its default branch after that final observation and before it processes
+the push. The executor closes every observable pre-actuation interval but
+cannot turn symbolic `HEAD` into an atomic compare-and-swap condition.
+Server-enforced repository policy/protection is the hard guarantee for direct
+default-branch pushes; this client-side gate detects observed drift and never
+substitutes for that enforcement.
+
 ## Trusted Plan Handoff
 
 Capture the complete `ready` JSON file as exact reviewed plan bytes. Separately
@@ -31,7 +71,8 @@ a fresh planner run and review; never recompute the trusted digest for an edited
 plan.
 
 The executor then requires the current destination remote, full ref, endpoint
-fingerprint, config digest, expected lease, and immutable source SHA to match.
+fingerprint, default-branch ref, config digest, expected lease, and immutable
+source SHA to match.
 It resolves the current push URL without printing it and binds an ephemeral
 config-env remote alias to the captured endpoint string. A normal configured
 remote name is discovery metadata, not a publication actuator.

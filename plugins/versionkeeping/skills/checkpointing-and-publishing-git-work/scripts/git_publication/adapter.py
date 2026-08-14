@@ -38,6 +38,7 @@ EXPECTED_KEYS = {
     "adopted_commits",
     "removal_authorized_commits",
     "explicit_destination",
+    "default_branch_policy",
     "allow_create",
     "creation_base_ref",
 }
@@ -90,7 +91,7 @@ SCRUBBED_GIT_ENV_NAMES = {
 
 
 class MalformedRequest(ValueError):
-    """The request does not conform to schema version 1."""
+    """The request does not conform to schema version 2."""
 
 
 def _strict_object(pairs: list[tuple[str, Any]]) -> dict:
@@ -212,6 +213,27 @@ def _sha_set(value: Any, field: str) -> frozenset:
     return frozenset(checked)
 
 
+def _default_branch_policy(value: Any) -> Optional[dict]:
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != {
+        "ref",
+        "direct_push_permitted",
+    }:
+        raise MalformedRequest(
+            "default_branch_policy must be null or contain exactly ref and "
+            "direct_push_permitted"
+        )
+    if type(value["direct_push_permitted"]) is not bool:
+        raise MalformedRequest(
+            "default_branch_policy direct_push_permitted must be boolean"
+        )
+    return {
+        "ref": _validate_heads_ref(value["ref"], "default_branch_policy ref"),
+        "direct_push_permitted": value["direct_push_permitted"],
+    }
+
+
 def parse_request(raw: Any) -> PublicationRequest:
     if not isinstance(raw, dict):
         raise MalformedRequest("request must be a JSON object")
@@ -221,8 +243,8 @@ def parse_request(raw: Any) -> PublicationRequest:
         raise MalformedRequest(
             f"request fields differ from schema; missing={missing}, extra={extra}"
         )
-    if type(raw["schema_version"]) is not int or raw["schema_version"] != 1:
-        raise MalformedRequest("schema_version must equal 1")
+    if type(raw["schema_version"]) is not int or raw["schema_version"] != 2:
+        raise MalformedRequest("schema_version must equal 2")
     if type(raw["allow_create"]) is not bool:
         raise MalformedRequest("allow_create must be boolean")
 
@@ -241,7 +263,7 @@ def parse_request(raw: Any) -> PublicationRequest:
         creation_base = _validate_heads_ref(creation_base, "creation_base_ref")
 
     return PublicationRequest(
-        schema_version=1,
+        schema_version=2,
         start_head=_validate_sha(raw["start_head"], "start_head"),
         source_sha=_validate_sha(raw["source_sha"], "source_sha"),
         task_owned_commits=_sha_set(raw["task_owned_commits"], "task_owned_commits"),
@@ -250,6 +272,7 @@ def parse_request(raw: Any) -> PublicationRequest:
             raw["removal_authorized_commits"], "removal_authorized_commits"
         ),
         explicit_destination=explicit,
+        default_branch_policy=_default_branch_policy(raw["default_branch_policy"]),
         allow_create=raw["allow_create"],
         creation_base_ref=creation_base,
     )
@@ -656,6 +679,36 @@ def _probe_ref(
     return fields[0]
 
 
+def _probe_default_branch(
+    repo: GitRepository,
+    endpoint: str,
+    object_format: GitObjectFormat,
+) -> str:
+    result = _run_endpoint(repo, endpoint, ["ls-remote", "--symref"], ["HEAD"])
+    if result.returncode != 0:
+        raise PolicyGate("DEFAULT_BRANCH_OBSERVATION_FAILED")
+    lines = result.stdout.splitlines()
+    if len(lines) != 2:
+        raise PolicyGate("DEFAULT_BRANCH_OBSERVATION_MALFORMED")
+    symref_fields = lines[0].split("\t")
+    target_fields = lines[1].split("\t")
+    if (
+        len(symref_fields) != 2
+        or not symref_fields[0].startswith("ref: ")
+        or symref_fields[1] != "HEAD"
+        or len(target_fields) != 2
+        or not object_format.matches(target_fields[0])
+        or target_fields[1] != "HEAD"
+    ):
+        raise PolicyGate("DEFAULT_BRANCH_OBSERVATION_MALFORMED")
+    try:
+        return _validate_heads_ref(
+            symref_fields[0][len("ref: ") :], "observed default branch"
+        )
+    except MalformedRequest as error:
+        raise PolicyGate("DEFAULT_BRANCH_OBSERVATION_MALFORMED") from error
+
+
 def _advertised_heads(
     repo: GitRepository, endpoint: str, object_format: GitObjectFormat
 ) -> Dict[str, str]:
@@ -835,9 +888,16 @@ def _snapshot(
             "config_digest": None,
         }
         endpoint, fingerprint = _endpoint(repo, remote)
+        default_branch_ref = _probe_default_branch(repo, endpoint, object_format)
+        selection = dict(selection)
+        selection["default_branch_ref"] = default_branch_ref
         digest = _config_digest(selection, fingerprint)
         context["destination"].update(
-            {"endpoint_fingerprint": fingerprint, "config_digest": digest}
+            {
+                "endpoint_fingerprint": fingerprint,
+                "config_digest": digest,
+                "default_branch_ref": default_branch_ref,
+            }
         )
         target_sha = _probe_ref(repo, endpoint, ref, object_format)
         context["target"] = {"present": target_sha is not None, "sha": target_sha}
@@ -900,6 +960,7 @@ def _snapshot(
             ref=ref,
             endpoint_fingerprint=fingerprint,
             config_digest=digest,
+            default_branch_ref=default_branch_ref,
             target=target,
             start_is_ancestor=start_is_ancestor,
         )

@@ -27,13 +27,14 @@ C = "c" * 40
 
 def request(**overrides):
     values = {
-        "schema_version": 1,
+        "schema_version": 2,
         "start_head": A,
         "source_sha": B,
         "task_owned_commits": frozenset({B}),
         "adopted_commits": frozenset(),
         "removal_authorized_commits": frozenset(),
         "explicit_destination": None,
+        "default_branch_policy": None,
         "allow_create": False,
         "creation_base_ref": None,
     }
@@ -78,6 +79,7 @@ def snapshot(**overrides):
         "ref": "refs/heads/topic",
         "endpoint_fingerprint": "sha256:endpoint",
         "config_digest": "sha256:config",
+        "default_branch_ref": "refs/heads/main",
         "target": target,
         "start_is_ancestor": True,
     }
@@ -105,6 +107,60 @@ class CorePlanningTests(unittest.TestCase):
         )
         self.assertNotIn("argv", result["push"])
         self.assertTrue(result["planner_effects"]["local_mutation_possible"])
+
+    def test_observed_default_branch_requires_verified_direct_push_permission(self):
+        absent = plan_publication(request(), snapshot(ref="refs/heads/main"))
+        denied = plan_publication(
+            request(
+                default_branch_policy={
+                    "ref": "refs/heads/main",
+                    "direct_push_permitted": False,
+                }
+            ),
+            snapshot(ref="refs/heads/main"),
+        )
+
+        self.assertEqual(absent["status"], "blocked")
+        self.assertEqual(
+            absent["reasons"][0]["code"], "DEFAULT_BRANCH_POLICY_NOT_VERIFIED"
+        )
+        self.assertEqual(denied["status"], "blocked")
+        self.assertEqual(
+            denied["reasons"][0]["code"], "DEFAULT_BRANCH_DIRECT_PUSH_NOT_PERMITTED"
+        )
+
+    def test_observed_default_branch_is_ready_with_verified_permission(self):
+        result = plan_publication(
+            request(
+                default_branch_policy={
+                    "ref": "refs/heads/main",
+                    "direct_push_permitted": True,
+                }
+            ),
+            snapshot(ref="refs/heads/main"),
+        )
+
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(result["destination"]["default_branch_ref"], "refs/heads/main")
+        self.assertEqual(
+            result["push"]["lease"], f"--force-with-lease=refs/heads/main:{A}"
+        )
+
+    def test_default_branch_policy_must_match_observed_default_branch(self):
+        result = plan_publication(
+            request(
+                default_branch_policy={
+                    "ref": "refs/heads/trunk",
+                    "direct_push_permitted": True,
+                }
+            ),
+            snapshot(),
+        )
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(
+            result["reasons"][0]["code"], "DEFAULT_BRANCH_POLICY_REF_MISMATCH"
+        )
 
     def test_verified_has_no_push(self):
         result = plan_publication(request(), snapshot(target_sha=B, outgoing_shas=()))

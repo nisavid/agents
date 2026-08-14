@@ -1182,7 +1182,15 @@ def retain_dependency_alias(
             or source_metadata.st_uid != os.geteuid()
             or source_metadata.st_mode & 0o022
         ):
-            raise PreparationError("loader dependency source disposition is unsafe")
+            raise PreparationError(
+                "loader dependency source disposition is unsafe: "
+                f"requested_name={requested_name!r}, "
+                f"source={str(source)!r}, "
+                f"uid={source_metadata.st_uid}, "
+                f"gid={source_metadata.st_gid}, "
+                f"mode={source_metadata.st_mode:#o}, "
+                f"nlink={source_metadata.st_nlink}"
+            )
         chunks: list[bytes] = []
         while chunk := os.read(source_descriptor, 1024 * 1024):
             chunks.append(chunk)

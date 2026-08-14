@@ -746,6 +746,38 @@ class TaskWitnessLinuxQualificationHarnessTests(unittest.TestCase):
                     second,
                 )
 
+    def test_unsafe_dependency_source_reports_constant_disposition_fields(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            loader_root = root / "loader"
+            loader_root.mkdir()
+            source = root / "libunsafe.so.1.2"
+            source.write_bytes(b"unsafe")
+            source.chmod(0o666)
+            metadata = source.stat()
+
+            with self.assertRaises(self.helper.PreparationError) as raised:
+                self.helper.retain_dependency_alias(
+                    loader_root,
+                    "libunsafe.so.1",
+                    source,
+                )
+
+            self.assertEqual(
+                str(raised.exception),
+                (
+                    "loader dependency source disposition is unsafe: "
+                    "requested_name='libunsafe.so.1', "
+                    f"source={str(source)!r}, "
+                    f"uid={metadata.st_uid}, "
+                    f"gid={metadata.st_gid}, "
+                    f"mode={metadata.st_mode:#o}, "
+                    f"nlink={metadata.st_nlink}"
+                ),
+            )
+
     def test_retained_binding_copies_internal_sources_and_rejects_origin_drift(
         self,
     ) -> None:

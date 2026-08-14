@@ -20,6 +20,7 @@ from .adapter import (
     _bind_request_object_format,
     _guard_repository,
     _object_format,
+    _probe_default_branch,
     _probe_ref,
     _resolve_destination,
     _run_endpoint,
@@ -128,7 +129,13 @@ def validate_ready_plan(raw: Any) -> tuple[dict, Any]:
     _require(
         isinstance(destination, dict)
         and set(destination)
-        == {"remote", "ref", "endpoint_fingerprint", "config_digest"},
+        == {
+            "remote",
+            "ref",
+            "endpoint_fingerprint",
+            "config_digest",
+            "default_branch_ref",
+        },
         "destination fields differ",
     )
     _require(
@@ -138,6 +145,16 @@ def validate_ready_plan(raw: Any) -> tuple[dict, Any]:
         ),
         "destination values must be nonempty strings",
     )
+    policy = request.default_branch_policy
+    _require(
+        policy is None or policy["ref"] == destination["default_branch_ref"],
+        "default branch policy ref drift",
+    )
+    if destination["ref"] == destination["default_branch_ref"]:
+        _require(
+            policy is not None and policy["direct_push_permitted"],
+            "default branch direct push permission is not verified",
+        )
     target = raw["target"]
     _require(
         isinstance(target, dict) and set(target) == {"present", "sha"},
@@ -272,7 +289,6 @@ def execute_repository(
             _ensure_commits(repo, request)
             remote, ref, selection = _resolve_destination(repo, request)
             endpoint, endpoint_fingerprint = _endpoint(repo, remote)
-            config_digest = _config_digest(selection, endpoint_fingerprint)
             destination = plan["destination"]
             if remote != destination["remote"] or ref != destination["ref"]:
                 raise PolicyGate(
@@ -288,6 +304,16 @@ def execute_repository(
                     expected_fingerprint=destination["endpoint_fingerprint"],
                     observed_fingerprint=endpoint_fingerprint,
                 )
+            default_branch_ref = _probe_default_branch(repo, endpoint, object_format)
+            if default_branch_ref != destination["default_branch_ref"]:
+                raise PolicyGate(
+                    "REVIEWED_DEFAULT_BRANCH_CHANGED",
+                    expected_ref=destination["default_branch_ref"],
+                    observed_ref=default_branch_ref,
+                )
+            selection = dict(selection)
+            selection["default_branch_ref"] = default_branch_ref
+            config_digest = _config_digest(selection, endpoint_fingerprint)
             if config_digest != destination["config_digest"]:
                 raise PolicyGate(
                     "REVIEWED_CONFIG_CHANGED",
@@ -303,6 +329,16 @@ def execute_repository(
                     expected_sha=expected_target,
                     observed_sha=observed_target,
                     ref=ref,
+                )
+
+            latest_default_branch_ref = _probe_default_branch(
+                repo, endpoint, object_format
+            )
+            if latest_default_branch_ref != destination["default_branch_ref"]:
+                raise PolicyGate(
+                    "REVIEWED_DEFAULT_BRANCH_CHANGED",
+                    expected_ref=destination["default_branch_ref"],
+                    observed_ref=latest_default_branch_ref,
                 )
 
             push = plan["push"]

@@ -55,13 +55,14 @@ def commit(repo, name):
 
 def raw_request(start, source, **overrides):
     value = {
-        "schema_version": 1,
+        "schema_version": 2,
         "start_head": start,
         "source_sha": source,
         "task_owned_commits": [source] if source != start else [],
         "adopted_commits": [],
         "removal_authorized_commits": [],
         "explicit_destination": {"remote": "publish", "ref": "refs/heads/topic"},
+        "default_branch_policy": None,
         "allow_create": False,
         "creation_base_ref": None,
     }
@@ -76,6 +77,7 @@ class RequestTests(unittest.TestCase):
             {key: value for key, value in complete.items() if key != "source_sha"},
             dict(complete, extra=True),
             dict(complete, source_sha="deadbeef"),
+            dict(complete, schema_version=1),
         ):
             with self.subTest(bad=bad):
                 with self.assertRaises(MalformedRequest):
@@ -188,6 +190,36 @@ class RequestTests(unittest.TestCase):
                 StringIO('{"schema_version":1,"schema_version":1}')
             )
 
+    def test_default_branch_policy_is_closed_and_ref_bound(self):
+        complete = raw_request("a" * 40, "b" * 40)
+        parsed = parse_request(
+            dict(
+                complete,
+                default_branch_policy={
+                    "ref": "refs/heads/main",
+                    "direct_push_permitted": True,
+                },
+            )
+        )
+        self.assertEqual(
+            parsed.default_branch_policy,
+            {"ref": "refs/heads/main", "direct_push_permitted": True},
+        )
+        for policy in (
+            {},
+            {"ref": "refs/heads/main"},
+            {
+                "ref": "refs/heads/main",
+                "direct_push_permitted": True,
+                "extra": True,
+            },
+            {"ref": "main", "direct_push_permitted": True},
+            {"ref": "refs/heads/main", "direct_push_permitted": 1},
+        ):
+            with self.subTest(policy=policy):
+                with self.assertRaises(MalformedRequest):
+                    parse_request(dict(complete, default_branch_policy=policy))
+
     def test_object_format_contract_rejects_unknown_mixed_and_wrong_width_ids(self):
         class FormatRepository:
             def __init__(self, value):
@@ -260,6 +292,8 @@ class RepositoryPlanningTests(unittest.TestCase):
         self.start = commit(self.repo, "base")
         git(self.repo, "remote", "add", "publish", str(self.remote))
         git(self.repo, "push", "publish", f"{self.start}:refs/heads/topic")
+        git(self.repo, "push", "publish", f"{self.start}:refs/heads/main")
+        git(self.remote, "symbolic-ref", "HEAD", "refs/heads/main")
 
     def tearDown(self):
         self.temp.cleanup()
@@ -287,6 +321,64 @@ class RepositoryPlanningTests(unittest.TestCase):
         self.assertEqual(verified["status"], "verified")
         self.assertIsNone(verified["push"])
 
+    def test_observed_default_branch_cannot_become_ready_without_permission(self):
+        source = commit(self.repo, "default-branch-change")
+        destination = {"remote": "publish", "ref": "refs/heads/main"}
+
+        absent = self.plan(
+            raw_request(self.start, source, explicit_destination=destination)
+        )
+        denied = self.plan(
+            raw_request(
+                self.start,
+                source,
+                explicit_destination=destination,
+                default_branch_policy={
+                    "ref": "refs/heads/main",
+                    "direct_push_permitted": False,
+                },
+            )
+        )
+        permitted = self.plan(
+            raw_request(
+                self.start,
+                source,
+                explicit_destination=destination,
+                default_branch_policy={
+                    "ref": "refs/heads/main",
+                    "direct_push_permitted": True,
+                },
+            )
+        )
+
+        self.assertEqual(absent["status"], "blocked")
+        self.assertEqual(
+            absent["reasons"][0]["code"], "DEFAULT_BRANCH_POLICY_NOT_VERIFIED"
+        )
+        self.assertEqual(denied["status"], "blocked")
+        self.assertEqual(
+            denied["reasons"][0]["code"], "DEFAULT_BRANCH_DIRECT_PUSH_NOT_PERMITTED"
+        )
+        self.assertEqual(permitted["status"], "ready")
+        self.assertEqual(
+            permitted["destination"]["default_branch_ref"], "refs/heads/main"
+        )
+        self.assertEqual(
+            permitted["push"]["lease"],
+            f"--force-with-lease=refs/heads/main:{self.start}",
+        )
+
+    def test_missing_default_branch_observation_blocks_ordinary_ref(self):
+        source = commit(self.repo, "change-with-missing-default")
+        git(self.remote, "symbolic-ref", "HEAD", "refs/heads/missing")
+
+        result = self.plan(raw_request(self.start, source))
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(
+            result["reasons"][0]["code"], "DEFAULT_BRANCH_OBSERVATION_MALFORMED"
+        )
+
     def test_sha256_repository_uses_64_character_bound_object_ids(self):
         sha256_remote = self.root / "sha256-remote.git"
         sha256_repo = self.root / "sha256-repo"
@@ -297,6 +389,8 @@ class RepositoryPlanningTests(unittest.TestCase):
         start = commit(sha256_repo, "base")
         git(sha256_repo, "remote", "add", "publish", str(sha256_remote))
         git(sha256_repo, "push", "publish", f"{start}:refs/heads/topic")
+        git(sha256_repo, "push", "publish", f"{start}:refs/heads/main")
+        git(sha256_remote, "symbolic-ref", "HEAD", "refs/heads/main")
         source = commit(sha256_repo, "change")
 
         plan = plan_repository(sha256_repo, raw_request(start, source))
@@ -370,6 +464,8 @@ class RepositoryPlanningTests(unittest.TestCase):
         push_remote = Path(self.temp.name) / "push.git"
         git(Path(self.temp.name), "init", "--bare", str(push_remote))
         git(self.repo, "push", str(push_remote), f"{self.start}:refs/heads/topic")
+        git(self.repo, "push", str(push_remote), f"{self.start}:refs/heads/main")
+        git(push_remote, "symbolic-ref", "HEAD", "refs/heads/main")
         git(self.repo, "remote", "set-url", "--push", "publish", str(push_remote))
         source = commit(self.repo, "change")
 

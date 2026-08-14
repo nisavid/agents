@@ -7,7 +7,7 @@
       "mode": 420
     },
     "README.md": {
-      "sha256": "1d33c00171cdad2047356902036f30fbeabaee7fd2999a00306690d6b50c1d70",
+      "sha256": "54b6abf81db1d9cd16cddf18166f5fe3859a12601a21eb08f818c5468875178e",
       "mode": 420
     },
     "plugin.json": {
@@ -15,7 +15,7 @@
       "mode": 420
     },
     "skills/checkpointing-and-publishing-git-work/SKILL.md": {
-      "sha256": "25c9f721540dbfa554a261c7b4bbee1cc8d3f6ad31ad3063aef2a3a9783188c4",
+      "sha256": "701d2af10064939ed1ed47f7619814ded15769e78ec6f9365c7fec2be5e936b6",
       "mode": 420
     },
     "skills/checkpointing-and-publishing-git-work/agents/openai.yaml": {
@@ -27,7 +27,7 @@
       "mode": 420
     },
     "skills/checkpointing-and-publishing-git-work/references/publication-execution.md": {
-      "sha256": "1146b608572584de24b4b2cc3bffd5f44478367bd3dde086f1d5608fc4f7e154",
+      "sha256": "3cb89bbf88ad7181d60c360556eedb49dda6c80c470dc95c50a19bbe43131211",
       "mode": 420
     },
     "skills/checkpointing-and-publishing-git-work/references/terminal-cleanup.md": {
@@ -51,11 +51,11 @@
       "mode": 420
     },
     "skills/checkpointing-and-publishing-git-work/scripts/git_publication/adapter.py": {
-      "sha256": "772764fd32ee503c794ac9fd6620e3bcc48f5283c70aa15140aa0c1813a01b9a",
+      "sha256": "895047dafa21f9bf8cc3963762726c70e5780d68656c27e8286aac5eef969010",
       "mode": 420
     },
     "skills/checkpointing-and-publishing-git-work/scripts/git_publication/core.py": {
-      "sha256": "c177cd55d8fdd3c184bcf3e10a94a2384213c7b416c8bddda0b90339322381f3",
+      "sha256": "86c80c555d78755f40f5e3af7074965cdf3e00959f1592aa0246d709f85ce7d4",
       "mode": 420
     },
     "skills/checkpointing-and-publishing-git-work/scripts/git_publication/deletion.py": {
@@ -63,7 +63,7 @@
       "mode": 420
     },
     "skills/checkpointing-and-publishing-git-work/scripts/git_publication/execution.py": {
-      "sha256": "90eb0262668ff07a95b8e01104fafab33ba231524c9a0379c22f1a21a64baec9",
+      "sha256": "64c9ef6e2e4c2c863335e4d80e156498efea8b125e0324e230711894d7657d82",
       "mode": 420
     },
     "skills/checkpointing-and-publishing-git-work/scripts/plan_git_publication.py": {

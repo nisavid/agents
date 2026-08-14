@@ -64,7 +64,7 @@ def commit(repo: Path, name: str) -> str:
 
 def request(start: str, source: str) -> dict:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "start_head": start,
         "source_sha": source,
         "task_owned_commits": [source],
@@ -74,6 +74,7 @@ def request(start: str, source: str) -> dict:
             "remote": "publish",
             "ref": "refs/heads/topic",
         },
+        "default_branch_policy": None,
         "allow_create": False,
         "creation_base_ref": None,
     }
@@ -103,6 +104,8 @@ class PublicationExecutionTests(unittest.TestCase):
         self.start = commit(self.repo, "base")
         git(self.repo, "remote", "add", "publish", str(self.remote))
         git(self.repo, "push", "publish", f"{self.start}:refs/heads/topic")
+        git(self.repo, "push", "publish", f"{self.start}:refs/heads/main")
+        git(self.remote, "symbolic-ref", "HEAD", "refs/heads/main")
         self.source = commit(self.repo, "change")
         self.plan = plan_repository(self.repo, request(self.start, self.source))
         self.assertEqual(self.plan["status"], "ready")
@@ -180,6 +183,42 @@ class PublicationExecutionTests(unittest.TestCase):
         self.assertFalse(result["push_attempted"])
         self.assertEqual(result["reasons"][0]["code"], "REVIEWED_ENDPOINT_CHANGED")
         self.assertNotIn(str(changed), json.dumps(result))
+
+    def test_default_branch_change_after_review_blocks_before_push(self) -> None:
+        git(self.remote, "symbolic-ref", "HEAD", "refs/heads/topic")
+
+        result = execute(self.repo, self.plan)
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertFalse(result["push_attempted"])
+        self.assertEqual(
+            result["reasons"][0]["code"], "REVIEWED_DEFAULT_BRANCH_CHANGED"
+        )
+
+    def test_default_branch_change_during_lease_probe_blocks_before_push(self) -> None:
+        original_probe = execution._probe_ref
+        changed = False
+
+        def change_default_after_probe(repo, endpoint, ref, object_format):
+            nonlocal changed
+            observed = original_probe(repo, endpoint, ref, object_format)
+            if not changed and ref == "refs/heads/topic":
+                changed = True
+                git(self.remote, "symbolic-ref", "HEAD", "refs/heads/topic")
+            return observed
+
+        with mock.patch.object(
+            execution, "_probe_ref", side_effect=change_default_after_probe
+        ):
+            result = execute(self.repo, self.plan)
+
+        self.assertTrue(changed)
+        self.assertEqual(result["status"], "blocked")
+        self.assertFalse(result["push_attempted"])
+        self.assertEqual(
+            result["reasons"][0]["code"], "REVIEWED_DEFAULT_BRANCH_CHANGED"
+        )
+        self.assertEqual(git(self.remote, "rev-parse", "refs/heads/topic"), self.start)
 
     def test_config_change_after_review_blocks_before_push(self) -> None:
         git(self.repo, "config", "branch.topic.pushRemote", "publish")

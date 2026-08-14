@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 from builtins import BaseExceptionGroup
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 import ctypes
 from datetime import datetime, timezone
 import hashlib
@@ -38,6 +38,7 @@ from .operation_recovery import (
     EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V3_DIGEST,
     EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V4_DIGEST,
     EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V5_DIGEST,
+    EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V6_DIGEST,
     EXACT_DRAIN_TRANSACTION_TIMEOUT_SECONDS,
     EXPECTED_CLAIM_RELEASE_ROW_COUNT,
     EXPECTED_OPERATION_COUNTS,
@@ -1238,6 +1239,45 @@ class ExactDrainWorkerMainShutdownBridge:
             self._handler()
 
 
+class ExactDrainUvicornSignalGuard:
+    """Keep exact-worker SIGTERM ownership in worker-main's shutdown seam."""
+
+    def __init__(self, server_type: type[Any]) -> None:
+        capture_signals = getattr(server_type, "capture_signals", None)
+        if not callable(capture_signals):
+            raise OperationRecoveryError(
+                "exact drain Uvicorn signal seam is unavailable"
+            )
+        self._server_type = server_type
+        self._upstream_capture_signals = capture_signals
+        self._replacement: Callable[[Any], Any] | None = None
+
+    def __enter__(self) -> Self:
+        if (
+            getattr(self._server_type, "capture_signals", None)
+            is not self._upstream_capture_signals
+        ):
+            raise OperationRecoveryError(
+                "exact drain Uvicorn signal seam drifted"
+            )
+
+        def preserve_worker_main_handler(_server: Any) -> Any:
+            return nullcontext()
+
+        self._replacement = preserve_worker_main_handler
+        self._server_type.capture_signals = preserve_worker_main_handler
+        return self
+
+    def __exit__(self, *_arguments: object) -> None:
+        replacement = self._replacement
+        observed = getattr(self._server_type, "capture_signals", None)
+        self._server_type.capture_signals = self._upstream_capture_signals
+        if replacement is None or observed is not replacement:
+            raise OperationRecoveryError(
+                "exact drain Uvicorn signal seam was rebound"
+            )
+
+
 def install_exact_drain_runtime_guards(
     postgresql_ops_type: type[Any],
     worker_poller_type: type[Any],
@@ -2375,6 +2415,7 @@ def _patch_exact_drain_entity_resolver(
     legacy_entity_schema: bool = False,
     candidate_query_batch_size: int | None = None,
     cooccurrence_query_batch_size: int | None = None,
+    full_strategy_repair: bool = False,
 ) -> bytes:
     """Return the exact bounded Phase-1 resolver overlay for Hindsight 0.9."""
     if (
@@ -2411,6 +2452,87 @@ def _patch_exact_drain_entity_resolver(
             "exact drain candidate entity resolver source differs"
         )
     prefix, remainder = text.split(start, 1)
+    if full_strategy_repair:
+        full_start = "    async def _resolve_entities_batch_full("
+        if prefix.count(full_start) != 1:
+            raise OperationRecoveryError(
+                "exact drain candidate full entity resolver source differs"
+            )
+        before_full, full = prefix.split(full_start, 1)
+        full = full_start + full
+        full = _replace_exact_drain_source_fragment(
+            full,
+            '''        """Original strategy: load all bank entities then match in Python."""
+        # Query ALL candidates for this bank
+''',
+            '''        """Original strategy: load all bank entities then match in Python."""
+
+        async def _bounded_phase1_fetch(stage: str, *arguments):
+            set_stage(stage)
+            async with conn.transaction():
+                await conn.execute("SET TRANSACTION READ ONLY")
+                await conn.execute(
+                    "SET LOCAL statement_timeout = '120s'"
+                )
+                return await conn.fetch(*arguments, timeout=125.0)
+
+        # Query ALL candidates for this bank
+''',
+            "full entity resolver deadline",
+        )
+        full = _replace_exact_drain_source_fragment(
+            full,
+            "        all_entities = await conn.fetch(\n",
+            "        all_entities = await _bounded_phase1_fetch(\n"
+            '            "retain.phase1.candidates.full",\n',
+            "full candidate query",
+        )
+        full = _replace_exact_drain_source_fragment(
+            full,
+            "SELECT canonical_name, id, metadata, last_seen, mention_count",
+            "SELECT id, canonical_name, last_seen, mention_count",
+            "full candidate projection",
+        )
+        full = _replace_exact_drain_source_fragment(
+            full,
+            "        all_cooccurrences = await conn.fetch(\n",
+            "        all_cooccurrences = await _bounded_phase1_fetch(\n"
+            '            "retain.phase1.cooccurrence.full",\n',
+            "full cooccurrence query",
+        )
+        full = _replace_exact_drain_source_fragment(
+            full,
+            "WHERE ec.entity_id_1 IN (SELECT id FROM {fq_table(\"entities\")} WHERE bank_id = $1)\n"
+            "               OR ec.entity_id_2 IN (SELECT id FROM {fq_table(\"entities\")} WHERE bank_id = $1)",
+            "WHERE ec.entity_id_1 IN (SELECT id FROM {fq_table(\"entities\")} WHERE bank_id = $1)\n"
+            "              AND ec.entity_id_2 IN (SELECT id FROM {fq_table(\"entities\")} WHERE bank_id = $1)",
+            "full cooccurrence predicate",
+        )
+        full = _replace_exact_drain_source_fragment(
+            full,
+            '''                metadata = row["metadata"]
+                last_seen = row["last_seen"]
+                mention_count = row["mention_count"]
+''',
+            '''                last_seen = row["last_seen"]
+                mention_count = row["mention_count"]
+''',
+            "full candidate fields",
+        )
+        full = _replace_exact_drain_source_fragment(
+            full,
+            "matching.append((ent_id, canonical_name, metadata, last_seen, mention_count))",
+            "matching.append((ent_id, canonical_name, None, last_seen, mention_count))",
+            "full candidate tuple",
+        )
+        full = _replace_exact_drain_source_fragment(
+            full,
+            "        return await self._resolve_from_candidates(\n",
+            '        set_stage("retain.phase1.scoring")\n'
+            "        return await self._resolve_from_candidates(\n",
+            "full candidate scoring breadcrumb",
+        )
+        prefix = before_full + full
     trigram, suffix = remainder.split(end, 1)
     trigram = start + trigram
     trigram = _replace_exact_drain_source_fragment(
@@ -2601,6 +2723,49 @@ def _patch_exact_drain_entity_resolver(
         "from .retain.types import ResolvedEntity\n",
         "stage import",
     )
+    if full_strategy_repair:
+        text = _replace_exact_drain_source_fragment(
+            text,
+            "_INTRABATCH_MAX_NAMES = 250\n",
+            "_INTRABATCH_MAX_NAMES = 250\n"
+            "_INTRABATCH_MAX_NAME_CODEPOINTS = 4096\n"
+            "_INTRABATCH_MAX_TOTAL_CODEPOINTS = 65536\n",
+            "intrabatch input bounds",
+        )
+        text = _replace_exact_drain_source_fragment(
+            text,
+            "        pairs = _find_intrabatch_similar_pairs(list(rep_by_lower.values()), self._intrabatch_merge_similarity)\n"
+            "        if not pairs:\n",
+            "        eligible_names = [\n"
+            "            name\n"
+            "            for name in rep_by_lower.values()\n"
+            "            if len(name) <= _INTRABATCH_MAX_NAME_CODEPOINTS\n"
+            "        ]\n"
+            "        skipped_name_count = len(rep_by_lower) - len(eligible_names)\n"
+            "        if skipped_name_count:\n"
+            "            logger.warning(\n"
+            "                \"Skipping fuzzy in-batch entity dedup for %d names \"\n"
+            "                \"that exceed the %d-code-point bound.\",\n"
+            "                skipped_name_count,\n"
+            "                _INTRABATCH_MAX_NAME_CODEPOINTS,\n"
+            "            )\n"
+            "        if len(eligible_names) < 2:\n"
+            "            return {}\n"
+            "        total_codepoints = sum(map(len, eligible_names))\n"
+            "        if total_codepoints > _INTRABATCH_MAX_TOTAL_CODEPOINTS:\n"
+            "            logger.warning(\n"
+            "                \"Skipping fuzzy in-batch entity dedup: %d eligible \"\n"
+            "                \"names exceed the %d-code-point batch bound.\",\n"
+            "                len(eligible_names),\n"
+            "                _INTRABATCH_MAX_TOTAL_CODEPOINTS,\n"
+            "            )\n"
+            "            return {}\n"
+            "        pairs = _find_intrabatch_similar_pairs(\n"
+            "            eligible_names, self._intrabatch_merge_similarity\n"
+            "        )\n"
+            "        if not pairs:\n",
+            "intrabatch trigram bounds",
+        )
     text = _replace_exact_drain_source_fragment(
         text,
         """        candidate[1],
@@ -3139,7 +3304,7 @@ def assemble_exact_drain_candidate_runtime_snapshot(
                 require_candidate_patch=False,
             )
         )
-        if snapshot["schema_version"] not in {2, 3, 4, 5, 6}:
+        if snapshot["schema_version"] not in {2, 3, 4, 5, 6, 7}:
             raise OperationRecoveryError(
                 "exact drain candidate runtime snapshot already exists"
             )
@@ -3242,6 +3407,7 @@ def assemble_exact_drain_candidate_runtime_snapshot(
                 cooccurrence_query_batch_size=(
                     EXACT_DRAIN_COOCCURRENCE_QUERY_BATCH_SIZE
                 ),
+                full_strategy_repair=True,
             )
         ),
         EXACT_DRAIN_CANDIDATE_POSTGRESQL_OPS_PATH.as_posix(): (
@@ -3299,7 +3465,7 @@ def assemble_exact_drain_candidate_runtime_snapshot(
             }
         )
     manifest = {
-        "schema_version": 6,
+        "schema_version": 7,
         "kind": "exact-drain-candidate-runtime-snapshot",
         "sources": provider_evidence,
         "candidate_patches": candidate_patch_evidence,
@@ -3509,7 +3675,7 @@ def _verify_exact_drain_candidate_runtime_snapshot(
             raise OperationRecoveryError(
                 "exact drain candidate runtime snapshot differs"
             )
-    elif schema_version in {3, 4, 5, 6}:
+    elif schema_version in {3, 4, 5, 6, 7}:
         hindsight_root = runtime_root / "hindsight"
         _exact_drain_trusted_directory(
             hindsight_root,
@@ -3527,7 +3693,7 @@ def _verify_exact_drain_candidate_runtime_snapshot(
             "ops_postgresql.original.py",
             "ops_postgresql.py",
         }
-        if schema_version in {5, 6}:
+        if schema_version in {5, 6, 7}:
             expected_names |= {
                 "memory_engine.original.py",
                 "memory_engine.py",
@@ -3554,9 +3720,10 @@ def _verify_exact_drain_candidate_runtime_snapshot(
                     ),
                     cooccurrence_query_batch_size=(
                         EXACT_DRAIN_COOCCURRENCE_QUERY_BATCH_SIZE
-                        if schema_version == 6
+                        if schema_version in {6, 7}
                         else None
                     ),
+                    full_strategy_repair=(schema_version == 7),
                 ),
                 "entity resolver",
             ),
@@ -3567,7 +3734,7 @@ def _verify_exact_drain_candidate_runtime_snapshot(
                 "PostgreSQL ops",
             ),
         ]
-        if schema_version in {5, 6}:
+        if schema_version in {5, 6, 7}:
             patch_specs.extend(
                 [
                     (
@@ -4108,10 +4275,10 @@ def exact_drain_runtime_evidence(
     provider_runtime_root: str | Path,
     runtime_package_root: str | Path,
     *,
-    schema_version: int = 8,
+    schema_version: int = 9,
 ) -> tuple[str, bytes]:
     """Bind runtime sources and retain prevalidated provider bootstrap bytes."""
-    if type(schema_version) is not int or schema_version not in {1, 2, 3, 4, 5, 6, 7, 8}:
+    if type(schema_version) is not int or schema_version not in {1, 2, 3, 4, 5, 6, 7, 8, 9}:
         raise OperationRecoveryError(
             "exact drain runtime evidence schema version is invalid"
         )
@@ -4209,6 +4376,14 @@ def exact_drain_runtime_evidence(
             sources["phase-repair-contract"] = (
                 EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V5_DIGEST
             )
+        elif schema_version == 9:
+            if snapshot["schema_version"] != 7:
+                raise OperationRecoveryError(
+                    "exact drain full-query repair snapshot is required"
+                )
+            sources["phase-repair-contract"] = (
+                EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V6_DIGEST
+            )
     for name, source in provider_sources.items():
         sources[f"provider/{name}"] = hashlib.sha256(source).hexdigest()
     package_entries = _exact_drain_package_entries(package_root)
@@ -4259,7 +4434,7 @@ def exact_drain_runtime_digest(
     provider_runtime_root: str | Path,
     runtime_package_root: str | Path,
     *,
-    schema_version: int = 8,
+    schema_version: int = 9,
 ) -> str:
     """Bind the worker entrypoint, claim seam, and provider patch sources."""
     runtime_digest, _provider_bootstrap = exact_drain_runtime_evidence(
@@ -4335,14 +4510,14 @@ class ExactDrainClaimAdapter:
         verified = verify_exact_drain_plan(plan, allow_expired=True)
         if (
             terminal_reconciliation
-            and verified.get("schema_version") in {2, 3, 4, 5, 6, 7, 8}
+            and verified.get("schema_version") in {2, 3, 4, 5, 6, 7, 8, 9}
             and terminal_status_evidence is None
         ):
             raise OperationRecoveryError(
                 "operation-recovery terminal status evidence is required"
             )
         self._clock = clock
-        if verified.get("schema_version") in {2, 3, 4, 5, 6, 7, 8}:
+        if verified.get("schema_version") in {2, 3, 4, 5, 6, 7, 8, 9}:
             if authorization is None:
                 raise OperationRecoveryError(
                     "operation-recovery exact drain authorization is required"
@@ -4369,12 +4544,12 @@ class ExactDrainClaimAdapter:
             )
         self.phase_one_timeout_seconds = (
             verified["phase_one_timeout_seconds"]
-            if verified.get("schema_version") in {3, 4, 5, 6, 7, 8}
+            if verified.get("schema_version") in {3, 4, 5, 6, 7, 8, 9}
             else None
         )
         self.phase_one_statement_timeout_seconds = (
             verified["phase_one_statement_timeout_seconds"]
-            if verified.get("schema_version") in {3, 4, 5, 6, 7, 8}
+            if verified.get("schema_version") in {3, 4, 5, 6, 7, 8, 9}
             else None
         )
         self._cleanup_deadline: float | None = None

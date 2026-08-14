@@ -95,6 +95,22 @@ EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V5 = {
 EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V5_DIGEST = digest(
     EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V5
 )
+EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V6 = {
+    **EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V5,
+    "schema_version": 6,
+    "candidate_runtime_snapshot_schema_version": 7,
+    "full_candidate_projection": (
+        "id-canonical-name-last-seen-mention-count"
+    ),
+    "full_cooccurrence_scope": "bank-induced-graph",
+    "provider_timeout_semantics": "total-wall-clock",
+    "worker_signal_owner": "worker-main",
+    "intrabatch_name_codepoint_limit": 4096,
+    "intrabatch_total_codepoint_limit": 65536,
+}
+EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V6_DIGEST = digest(
+    EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V6
+)
 EXACT_DRAIN_FAILURE_EVIDENCE_CONTRACT = {
     "schema_version": 1,
     "progress_schema_version": 2,
@@ -510,6 +526,7 @@ EXACT_DRAIN_PLAN_V6_KEYS = EXACT_DRAIN_PLAN_V5_KEYS | frozenset(
 )
 EXACT_DRAIN_PLAN_V7_KEYS = EXACT_DRAIN_PLAN_V6_KEYS
 EXACT_DRAIN_PLAN_V8_KEYS = EXACT_DRAIN_PLAN_V7_KEYS
+EXACT_DRAIN_PLAN_V9_KEYS = EXACT_DRAIN_PLAN_V8_KEYS
 POST_ABORT_PLAN_V1_KEYS = frozenset(
     {
         "schema_version",
@@ -2158,7 +2175,7 @@ def create_exact_drain_plan(
             "operation-recovery exact drain evidence is stale"
         )
     body = {
-        "schema_version": 8,
+        "schema_version": 9,
         "kind": "operation-recovery-exact-drain-plan",
         "action": "drain-exact-operation-cohort",
         "authority": "unapproved-plan",
@@ -2206,7 +2223,7 @@ def create_exact_drain_plan(
         ),
         "phase_one_timeout_seconds": EXACT_DRAIN_PHASE_ONE_TIMEOUT_SECONDS,
         "phase_repair_contract_digest": (
-            EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V5_DIGEST
+            EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V6_DIGEST
         ),
         "progress_schema_version": 3,
         "failure_evidence_contract_digest": (
@@ -2230,7 +2247,7 @@ def verify_exact_drain_plan(
             "operation-recovery exact drain plan is invalid"
         )
     schema_version = normalized.get("schema_version")
-    if type(schema_version) is not int or schema_version not in {1, 2, 3, 4, 5, 6, 7, 8}:
+    if type(schema_version) is not int or schema_version not in {1, 2, 3, 4, 5, 6, 7, 8, 9}:
         raise OperationRecoveryError(
             "operation-recovery exact drain plan is invalid"
         )
@@ -2245,6 +2262,7 @@ def verify_exact_drain_plan(
             6: EXACT_DRAIN_PLAN_V6_KEYS,
             7: EXACT_DRAIN_PLAN_V7_KEYS,
             8: EXACT_DRAIN_PLAN_V8_KEYS,
+            9: EXACT_DRAIN_PLAN_V9_KEYS,
         }[schema_version],
         "operation-recovery exact drain plan",
     )
@@ -2309,7 +2327,7 @@ def verify_exact_drain_plan(
     )
     if not allow_expired and observed_at >= expires_at:
         raise OperationRecoveryError("operation-recovery exact drain plan expired")
-    if schema_version in {2, 3, 4, 5, 6, 7, 8}:
+    if schema_version in {2, 3, 4, 5, 6, 7, 8, 9}:
         evidence_observed_at = _integer(
             plan["evidence_observed_at"],
             "exact drain evidence observed-at",
@@ -2331,7 +2349,7 @@ def verify_exact_drain_plan(
         evidence_max_age_seconds = None
         transaction_timeout_seconds = None
         execution_lease_seconds = None
-    if schema_version in {3, 4, 5, 6, 7, 8}:
+    if schema_version in {3, 4, 5, 6, 7, 8, 9}:
         phase_one_statement_timeout_seconds = _integer(
             plan["phase_one_statement_timeout_seconds"],
             "exact drain phase-one statement timeout",
@@ -2348,7 +2366,7 @@ def verify_exact_drain_plan(
         phase_one_statement_timeout_seconds = None
         phase_one_timeout_seconds = None
         phase_repair_contract_digest = None
-    if schema_version in {6, 7, 8}:
+    if schema_version in {6, 7, 8, 9}:
         phase_one_client_timeout_seconds = _integer(
             plan["phase_one_client_timeout_seconds"],
             "exact drain phase-one client timeout",
@@ -2409,7 +2427,7 @@ def verify_exact_drain_plan(
         )
     )
     if (
-        schema_version not in {1, 2, 3, 4, 5, 6, 7, 8}
+        schema_version not in {1, 2, 3, 4, 5, 6, 7, 8, 9}
         or plan.get("kind") != "operation-recovery-exact-drain-plan"
         or plan.get("action") != "drain-exact-operation-cohort"
         or plan.get("authority") != "unapproved-plan"
@@ -2462,7 +2480,7 @@ def verify_exact_drain_plan(
             else EXACT_DRAIN_APPROVAL_LIFETIME_SECONDS
         )
         or (
-            schema_version in {2, 3, 4, 5, 6, 7, 8}
+            schema_version in {2, 3, 4, 5, 6, 7, 8, 9}
             and (
                 evidence_observed_at != snapshot["observed_at"]
                 or evidence_max_age_seconds
@@ -2477,7 +2495,7 @@ def verify_exact_drain_plan(
             )
         )
         or (
-            schema_version in {3, 4, 5, 6, 7, 8}
+            schema_version in {3, 4, 5, 6, 7, 8, 9}
             and (
                 phase_one_statement_timeout_seconds
                 != EXACT_DRAIN_PHASE_ONE_STATEMENT_TIMEOUT_SECONDS
@@ -2492,23 +2510,24 @@ def verify_exact_drain_plan(
                         6: EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V4_DIGEST,
                         7: EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V5_DIGEST,
                         8: EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V5_DIGEST,
+                        9: EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V6_DIGEST,
                     }[schema_version]
                 )
             )
         )
         or (
-            schema_version in {6, 7, 8}
+            schema_version in {6, 7, 8, 9}
             and (
                 phase_one_client_timeout_seconds
                 != EXACT_DRAIN_PHASE_ONE_CLIENT_TIMEOUT_SECONDS
                 or phase_one_client_timeout_seconds
                 <= phase_one_statement_timeout_seconds
                 or progress_schema_version
-                != (3 if schema_version == 8 else 2)
+                != (3 if schema_version in {8, 9} else 2)
                 or failure_evidence_contract_digest
                 != (
                     EXACT_DRAIN_FAILURE_EVIDENCE_CONTRACT_V2_DIGEST
-                    if schema_version == 8
+                    if schema_version in {8, 9}
                     else EXACT_DRAIN_FAILURE_EVIDENCE_CONTRACT_DIGEST
                 )
             )
@@ -2584,7 +2603,7 @@ def verify_exact_drain_plan(
         ),
         **(
             {}
-            if schema_version not in {3, 4, 5, 6, 7, 8}
+            if schema_version not in {3, 4, 5, 6, 7, 8, 9}
             else {
                 "phase_one_statement_timeout_seconds": (
                     phase_one_statement_timeout_seconds
@@ -2597,7 +2616,7 @@ def verify_exact_drain_plan(
         ),
         **(
             {}
-            if schema_version not in {6, 7, 8}
+            if schema_version not in {6, 7, 8, 9}
             else {
                 "phase_one_client_timeout_seconds": (
                     phase_one_client_timeout_seconds

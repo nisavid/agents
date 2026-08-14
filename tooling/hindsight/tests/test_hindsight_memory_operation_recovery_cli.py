@@ -1795,10 +1795,10 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                     lambda _policy, _environment: "7" * 64
                 ),
                 "_operation_recovery_exact_phase_repair_snapshot": (
-                    lambda: "6" * 64
+                    lambda: "7" * 64
                 ),
                 "_operation_recovery_exact_runtime_digest": (
-                    lambda _args, *, schema_version=7: (
+                    lambda _args, *, schema_version=9: (
                         runtime_schemas.append(schema_version) or "8" * 64
                     )
                 ),
@@ -1836,11 +1836,11 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             self.assertEqual(result["status"], "planned")
             self.assertEqual(result["authority"], "unapproved-plan")
             self.assertEqual(result["selected_operation_count"], 43)
-            self.assertEqual(runtime_schemas, [8])
+            self.assertEqual(runtime_schemas, [9])
             plan, create_only = written[args.output]
             self.assertIs(create_only, True)
             self.assertIs(plan["mutation_authorized"], False)
-            self.assertEqual(plan["schema_version"], 8)
+            self.assertEqual(plan["schema_version"], 9)
             self.assertEqual(plan["progress_schema_version"], 3)
             serialized = json.dumps(plan, sort_keys=True)
             self.assertNotIn('"task_payload":', serialized)
@@ -1898,7 +1898,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             globals_["verify_exact_drain_candidate_runtime_snapshot"] = (
                 lambda _library: (
                     {
-                        "schema_version": 6,
+                        "schema_version": 7,
                         "snapshot_digest": "a" * 64,
                     },
                     {},
@@ -1916,7 +1916,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             )
             with self.assertRaisesRegex(
                 Exception,
-                "cooccurrence-batch repair snapshot is required",
+                "full-query repair snapshot is required",
             ):
                 helper()
         finally:
@@ -2002,7 +2002,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             try:
                 with self.assertRaisesRegex(
                     Exception,
-                    "cooccurrence-batch repair snapshot is required",
+                    "full-query repair snapshot is required",
                 ):
                     command(args)
             finally:
@@ -2774,7 +2774,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 )
             )
             self.assertRegex(snapshot["snapshot_digest"], r"^[0-9a-f]{64}$")
-            self.assertEqual(snapshot["schema_version"], 6)
+            self.assertEqual(snapshot["schema_version"], 7)
             patched_resolver = resolver.read_text(encoding="utf-8")
             self.assertNotEqual(resolver.read_bytes(), original_resolver)
             trigram_source = patched_resolver.split(
@@ -2784,6 +2784,19 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 "    async def _resolve_entities_batch_oracle_fuzzy(",
                 1,
             )[0]
+            full_source = patched_resolver.split(
+                "    async def _resolve_entities_batch_full(",
+                1,
+            )[1].split(
+                "    async def _resolve_entities_batch_trigram(",
+                1,
+            )[0]
+            self.assertNotIn("metadata", full_source)
+            self.assertIn(
+                "SELECT id, canonical_name, last_seen, mention_count",
+                full_source,
+            )
+            self.assertNotIn(" OR ", full_source)
             self.assertNotIn(
                 "SELECT e.id, e.canonical_name, e.metadata, e.last_seen, e.mention_count,",
                 trigram_source,
@@ -3083,7 +3096,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 "exact-drain-candidate-runtime-snapshot",
             )
             self.assertRegex(value["snapshot_digest"], r"^[0-9a-f]{64}$")
-            self.assertEqual(value["schema_version"], 6)
+            self.assertEqual(value["schema_version"], 7)
             self.assertNotIn(str(provider_root), result.stdout)
             verified, sources = (
                 operation_recovery_runtime.
@@ -3165,7 +3178,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                     candidate_library,
                 )
             )
-            self.assertEqual(recovered["schema_version"], 6)
+            self.assertEqual(recovered["schema_version"], 7)
             self.assertNotEqual(resolver.read_bytes(), original)
             with self.assertRaisesRegex(Exception, "already exists"):
                 operation_recovery_runtime.assemble_exact_drain_candidate_runtime_snapshot(
@@ -3229,7 +3242,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                     candidate_library,
                 )
             )
-            self.assertEqual(recovered["schema_version"], 6)
+            self.assertEqual(recovered["schema_version"], 7)
 
     def test_exact_drain_snapshot_failure_boundaries_are_retryable(self):
         for boundary in (
@@ -3389,7 +3402,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                     provider_root,
                     candidate_library,
                 )
-                self.assertEqual(recovered["schema_version"], 6)
+                self.assertEqual(recovered["schema_version"], 7)
                 self.assertNotEqual(resolver.read_bytes(), original)
                 self.assertFalse(
                     (
@@ -3476,7 +3489,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 provider_root,
                 candidate_library,
             )
-            self.assertEqual(recovered["schema_version"], 6)
+            self.assertEqual(recovered["schema_version"], 7)
             self.assertFalse(recovery_path.exists())
 
     def test_exact_drain_recovery_marker_partial_write_is_retryable(self):
@@ -3552,7 +3565,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 provider_root,
                 candidate_library,
             )
-            self.assertEqual(recovered["schema_version"], 6)
+            self.assertEqual(recovered["schema_version"], 7)
             self.assertNotEqual(resolver.read_bytes(), original)
 
     def test_exact_drain_recovery_marker_fault_matrix_is_retryable(self):
@@ -3719,7 +3732,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                         provider_root,
                         candidate_library,
                     )
-                    self.assertEqual(recovered["schema_version"], 6)
+                    self.assertEqual(recovered["schema_version"], 7)
                     self.assertNotEqual(resolver.read_bytes(), original)
 
     def test_exact_drain_recovery_marker_restoration_faults_are_retryable(self):
@@ -3912,7 +3925,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                     provider_root,
                     candidate_library,
                 )
-                self.assertEqual(recovered["schema_version"], 6)
+                self.assertEqual(recovered["schema_version"], 7)
                 self.assertFalse(recovery_path.exists())
 
     def test_exact_drain_phase_repair_preserves_trigram_resolution_behavior(self):
@@ -3951,7 +3964,11 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 from datetime import UTC, datetime
 
                 sys.path[:0] = [{str(candidate_library)!r}, {str(dependency_root)!r}]
-                from hindsight_api.engine.entity_resolver import EntityResolver
+                from hindsight_api.engine import entity_resolver as resolver_module
+                from hindsight_api.engine.entity_resolver import (
+                    EntityResolver,
+                    _EntityToCreate,
+                )
 
                 class Transaction:
                     async def __aenter__(self):
@@ -3963,6 +3980,12 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                     def __getitem__(self, key):
                         if key in {{"metadata", "mention_count"}}:
                             raise AssertionError("unused candidate field decoded")
+                        return super().__getitem__(key)
+
+                class FullCandidateRow(dict):
+                    def __getitem__(self, key):
+                        if key == "metadata":
+                            raise AssertionError("candidate metadata decoded")
                         return super().__getitem__(key)
 
                 class ExternalEdge:
@@ -4031,11 +4054,81 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                             for text in arguments[1]
                         ]
 
+                class FullConnection(Connection):
+                    def __init__(self, now, entity_rows):
+                        super().__init__(now)
+                        self.entity_rows = entity_rows
+
+                    async def fetch(self, query, *arguments, timeout):
+                        if timeout != 125.0:
+                            raise AssertionError("client deadline differs")
+                        if "entity_cooccurrences" in query:
+                            if " OR " in query or " AND " not in query:
+                                raise AssertionError(
+                                    "full cooccurrence scope differs"
+                                )
+                            return [
+                                {{
+                                    "entity_id_1": "alice-id",
+                                    "entity_id_2": "bob-id",
+                                    "cooccurrence_count": 1,
+                                }}
+                            ]
+                        if "metadata" in query:
+                            raise AssertionError(
+                                "unused full candidate projection fetched"
+                            )
+                        return [
+                            FullCandidateRow(
+                                id=(
+                                    "alice-id"
+                                    if entity["text"] == "Alicee"
+                                    else "bob-id"
+                                    if entity["text"] == "Bob"
+                                    else f"entity-{{entity['text']}}"
+                                ),
+                                canonical_name=(
+                                    "Alice"
+                                    if entity["text"] == "Alicee"
+                                    else "Bob"
+                                    if entity["text"] == "Bob"
+                                    else entity["text"].removesuffix("x")
+                                ),
+                                last_seen=self.now,
+                                mention_count=99,
+                            )
+                            for entity in self.entity_rows
+                        ] + [
+                            FullCandidateRow(
+                                id=f"bob-overflow-{{position}}",
+                                canonical_name=f"Bob extra {{position}}",
+                                last_seen=self.now,
+                                mention_count=position,
+                            )
+                            for position in range(201)
+                        ]
+
                 def projection(values):
                     return [
                         (item.entity_id, item.canonical_name, item.entity_kind)
                         for item in values
                     ]
+
+                class GuardedTrigramPattern:
+                    def __init__(self, upstream):
+                        self.upstream = upstream
+                        self.max_input_length = 0
+
+                    def findall(self, text):
+                        self.max_input_length = max(
+                            self.max_input_length,
+                            len(text),
+                        )
+                        if len(text) > 4096:
+                            raise AssertionError(
+                                "unbounded entity name reached trigram scan"
+                            )
+                        return self.upstream.findall(text)
 
                 async def exercise():
                     now = datetime(2026, 8, 11, 12, 0, tzinfo=UTC)
@@ -4093,16 +4186,81 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                         (item.entity_id, item.event_date.isoformat())
                         for item in resolver._pending_stats[resolver._task_key()]
                     ]
+                    full_resolver = EntityResolver(pool=None)
+                    full_connection = FullConnection(now, entities)
+                    full = await full_resolver._resolve_entities_batch_full(
+                        full_connection,
+                        "engineering",
+                        entities,
+                        now,
+                    )
+                    full_stats = [
+                        (item.entity_id, item.event_date.isoformat())
+                        for item in full_resolver._pending_stats[
+                            full_resolver._task_key()
+                        ]
+                    ]
+                    guarded_pattern = GuardedTrigramPattern(
+                        resolver_module._TRGM_WORD
+                    )
+                    resolver_module._TRGM_WORD = guarded_pattern
+                    try:
+                        intrabatch = full_resolver._intrabatch_canonical_map(
+                            [
+                                _EntityToCreate(0, "Alpha", now),
+                                _EntityToCreate(1, "Alphaa", now),
+                                _EntityToCreate(2, "x" * 4097, now),
+                            ]
+                        )
+                        name_bound_max_input_length = (
+                            guarded_pattern.max_input_length
+                        )
+                        guarded_pattern.max_input_length = 0
+                        over_budget = (
+                            full_resolver._intrabatch_canonical_map(
+                                [
+                                    _EntityToCreate(
+                                        position,
+                                        f"{{position:02d}}" + "y" * 3998,
+                                        now,
+                                    )
+                                    for position in range(17)
+                                ]
+                            )
+                        )
+                        batch_bound_max_input_length = (
+                            guarded_pattern.max_input_length
+                        )
+                    finally:
+                        resolver_module._TRGM_WORD = (
+                            guarded_pattern.upstream
+                        )
                     return {{
                         "expected": projection(expected),
                         "actual": projection(actual),
+                        "full": projection(full),
                         "expected_stats": expected_stats,
                         "actual_stats": actual_stats,
+                        "full_stats": full_stats,
+                        "full_execute_calls": full_connection.execute_calls,
                         "execute_calls": actual_connection.execute_calls,
                         "query_batch_sizes": actual_connection.query_batch_sizes,
                         "cooccurrence_batch_sizes": (
                             actual_connection.cooccurrence_batch_sizes
                         ),
+                        "max_trigram_input_length": (
+                            name_bound_max_input_length
+                        ),
+                        "intrabatch_normal_keys": sorted(
+                            key for key in intrabatch if len(key) <= 4096
+                        ),
+                        "intrabatch_overlong_preserved": (
+                            intrabatch.get("x" * 4097) == "x" * 4097
+                        ),
+                        "batch_bound_max_trigram_input_length": (
+                            batch_bound_max_input_length
+                        ),
+                        "over_budget_empty": over_budget == {{}},
                     }}
 
                 print(json.dumps(asyncio.run(exercise()), sort_keys=True))
@@ -4120,9 +4278,22 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             self.assertEqual(result.returncode, 0, result.stderr)
             observed = json.loads(result.stdout)
             self.assertEqual(observed["actual"], observed["expected"])
+            self.assertEqual(observed["full"], observed["expected"])
             self.assertEqual(
                 observed["actual_stats"],
                 observed["expected_stats"],
+            )
+            self.assertEqual(
+                observed["full_stats"],
+                observed["expected_stats"],
+            )
+            self.assertEqual(
+                observed["full_execute_calls"],
+                [
+                    "SET TRANSACTION READ ONLY",
+                    "SET LOCAL statement_timeout = '120s'",
+                ]
+                * 2,
             )
             self.assertEqual(
                 observed["execute_calls"],
@@ -4140,6 +4311,17 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 observed["cooccurrence_batch_sizes"],
                 [128, 128, 1],
             )
+            self.assertLessEqual(observed["max_trigram_input_length"], 4096)
+            self.assertEqual(
+                observed["intrabatch_normal_keys"],
+                ["alpha", "alphaa"],
+            )
+            self.assertTrue(observed["intrabatch_overlong_preserved"])
+            self.assertEqual(
+                observed["batch_bound_max_trigram_input_length"],
+                0,
+            )
+            self.assertTrue(observed["over_budget_empty"])
 
     def test_exact_drain_metadata_ceiling_precedes_file_read(self):
         read_version = self.controller[

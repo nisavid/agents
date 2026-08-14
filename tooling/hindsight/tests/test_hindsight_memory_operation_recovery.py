@@ -381,7 +381,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
 
         plan = self.drain_plan(snapshot=snapshot, created_at=planned_at)
 
-        self.assertEqual(plan["schema_version"], 8)
+        self.assertEqual(plan["schema_version"], 9)
         self.assertEqual(plan["expires_at"], planned_at + 86_400)
         self.assertEqual(plan["evidence_observed_at"], snapshot["observed_at"])
         self.assertEqual(plan["evidence_max_age_seconds"], 3_600)
@@ -392,7 +392,13 @@ class OperationRecoveryContractTest(unittest.TestCase):
         self.assertEqual(plan["phase_one_timeout_seconds"], 3_600)
         self.assertEqual(
             plan["phase_repair_contract_digest"],
-            recovery_contract.EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V5_DIGEST,
+            recovery_contract.EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V6_DIGEST,
+        )
+        self.assertEqual(
+            recovery_contract.EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V6[
+                "worker_signal_owner"
+            ],
+            "worker-main",
         )
         self.assertEqual(plan["progress_schema_version"], 3)
         self.assertEqual(
@@ -520,6 +526,9 @@ class OperationRecoveryContractTest(unittest.TestCase):
             if key != "plan_digest"
         }
         body["schema_version"] = 7
+        body["phase_repair_contract_digest"] = (
+            recovery_contract.EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V5_DIGEST
+        )
         body["progress_schema_version"] = 2
         body["failure_evidence_contract_digest"] = (
             recovery_contract.EXACT_DRAIN_FAILURE_EVIDENCE_CONTRACT_DIGEST
@@ -534,7 +543,28 @@ class OperationRecoveryContractTest(unittest.TestCase):
             prior,
         )
 
-    def test_exact_drain_v8_failure_evidence_contract_is_closed(self):
+    def test_exact_drain_verifier_preserves_prior_v8_contract(self):
+        current = self.drain_plan()
+        body = {
+            key: value
+            for key, value in current.items()
+            if key != "plan_digest"
+        }
+        body["schema_version"] = 8
+        body["phase_repair_contract_digest"] = (
+            recovery_contract.EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V5_DIGEST
+        )
+        prior = {**body, "plan_digest": digest(body)}
+
+        self.assertEqual(
+            recovery_contract.verify_exact_drain_plan(
+                prior,
+                now=prior["created_at"],
+            ),
+            prior,
+        )
+
+    def test_exact_drain_v9_failure_evidence_contract_is_closed(self):
         plan = self.drain_plan()
         for key, value in (
             ("phase_one_statement_timeout_seconds", 121),

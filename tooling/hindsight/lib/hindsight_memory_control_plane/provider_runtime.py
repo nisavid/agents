@@ -952,10 +952,19 @@ class _ProviderRuntime:
         if member.max_retries is not None:
             call_kwargs["max_retries"] = member.max_retries
         gate = self._gate(member)
-        if gate is None:
-            return await operation(*args, **call_kwargs)
-        async with gate.slot(member.priority(str(call_kwargs.get("scope", "")))):
-            return await operation(*args, **call_kwargs)
+
+        async def invoke() -> Any:
+            if gate is None:
+                return await operation(*args, **call_kwargs)
+            async with gate.slot(
+                member.priority(str(call_kwargs.get("scope", "")))
+            ):
+                return await operation(*args, **call_kwargs)
+
+        if member.timeout_seconds is None:
+            return await invoke()
+        async with asyncio.timeout(member.timeout_seconds):
+            return await invoke()
 
     def _claim_quota_member(self, member_id: str, now: float) -> tuple[bool, bool]:
         with self._cooldown_lock:

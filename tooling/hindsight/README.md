@@ -246,9 +246,9 @@ members, then tries the remaining members as an ordered fallback tier. A
 provider-reported usage reset is a hint, not a durable exclusion: the runtime
 caps it to `default_usage_limit_cooldown_seconds` and probes the account again.
 Member request timeouts use independent connect, pool, write, and read budgets;
-the policy's `timeout_seconds` is the long read budget. Startup verification is
-bounded independently, so an offline fallback cannot prevent the API from
-starting.
+the policy's `timeout_seconds` also bounds the complete provider member call,
+including its concurrency-gate wait. Startup verification is bounded
+independently, so an offline fallback cannot prevent the API from starting.
 
 The repository policy is a schema example, not a deployable failover chain.
 Its `example.invalid` endpoint is deliberately non-routable. Consumers must
@@ -286,17 +286,21 @@ The helper creates `lib/exact_drain_runtime/` once. It copies only
 `sitecustomize.py` and `hindsight_llm_failover.py`, applies the exact bounded
 Phase 1 entity-resolver and PostgreSQL-write overlays to the detached
 candidate, and writes a canonical payload-free manifest for the provider and
-both original/patched Hindsight sources. The resolver overlay removes unused
-PostgreSQL candidate columns, fetches only the candidate-induced cooccurrence
-graph in deterministic 128-ID first-endpoint batches, emits observational
-candidate and cooccurrence breadcrumbs, and bounds each server query wait to
-120 seconds and each client wait to 125 seconds, so a server cancellation can
-finish before the client deadline. Fuzzy candidate lookup is sealed to at most
-ten candidate names per query, so a large retain cannot concentrate either
-candidate lookup or cooccurrence traversal in one PostgreSQL request. The write
-overlay keeps entity insert and reassertion compatible with the bound
-pre-`entity_kind` database schema. These overlays are not a durable Phase 1
-checkpoint or replay receipt.
+both original/patched Hindsight sources. The resolver overlay removes candidate
+metadata JSONB from the PostgreSQL trigram and full-bank projections, preserves
+the scalar mention count used by full-bank overflow ranking, and fetches only
+the candidate-induced cooccurrence graph. Trigram cooccurrences use
+deterministic 128-ID first-endpoint batches; both lookup strategies emit
+observational candidate, cooccurrence, and scoring breadcrumbs and bound each
+server query wait to 120 seconds and each client wait to 125 seconds. Fuzzy
+candidate lookup is sealed to at most ten candidate names per query. In-batch
+fuzzy clustering excludes individual names over 4,096 code points and skips a
+batch over 65,536 code points; excluded names remain exact-only and are not
+truncated. The exact worker keeps SIGTERM ownership in worker-main instead of
+allowing Uvicorn to replace the graceful-shutdown handler. The write overlay
+keeps entity insert and reassertion compatible with the bound pre-`entity_kind`
+database schema. These overlays are not a durable Phase 1 checkpoint or replay
+receipt.
 
 Release assembly runs this helper before `hindsight-portable-install`; the
 existing release manifest then seals the completed snapshot and patched

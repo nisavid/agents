@@ -1152,6 +1152,88 @@ print("accepted")
         self.assertEqual(finished["active_provider_requests"], [])
         self.assertEqual(finished["provider_counters"][0]["succeeded"], 1)
 
+    def test_managed_provider_timeout_is_a_total_wall_clock_deadline(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+            progress_path = Path(directory) / "progress.json"
+            recorder = ExactDrainProgressRecorder(
+                path=progress_path,
+                plan_digest="a" * 64,
+                worker_pid=os.getpid(),
+                worker_start_time="darwin:1000:1",
+                worker_attempt=1,
+                selected_operations=[
+                    {
+                        "operation_id": "00000000-0000-4000-8000-000000000001",
+                        "operation_type": "retain",
+                        "row_digest": "b" * 64,
+                    }
+                ],
+            )
+            provider_runtime.set_exact_drain_progress_recorder(recorder)
+            self.addCleanup(
+                provider_runtime.set_exact_drain_progress_recorder,
+                None,
+            )
+            value = policy_data()
+            value["members"][2]["timeout_seconds"] = 1
+            LLMProvider, _CodexLLM, MultiLLMProvider = self.install(
+                policy_value=value,
+            )
+
+            members = [
+                StaticMember(
+                    "openai-codex",
+                    "codex-model",
+                    "",
+                    "provider-policy:personal",
+                    ConnectionError("personal unavailable"),
+                ),
+                StaticMember(
+                    "openai-codex",
+                    "codex-model",
+                    "",
+                    "provider-policy:work",
+                    ConnectionError("work unavailable"),
+                ),
+                LLMProvider(
+                    "lmstudio",
+                    "",
+                    "http://inference.example.test:13305/v1",
+                    "private-fallback-model",
+                ),
+            ]
+
+            async def never_finishes(**_kwargs):
+                await asyncio.Event().wait()
+
+            members[2].operation = never_finishes
+            provider = MultiLLMProvider()
+            provider._members = members
+
+            async def scenario():
+                with self.assertRaises(TimeoutError):
+                    await asyncio.wait_for(
+                        provider._dispatch(
+                            "call",
+                            scope="retain_extract_facts",
+                        ),
+                        timeout=2.0,
+                    )
+                return read_exact_drain_progress(
+                    progress_path,
+                    plan_digest="a" * 64,
+                )
+
+            finished = asyncio.run(scenario())
+
+        fallback = next(
+            item
+            for item in finished["provider_counters"]
+            if item["provider_id"] == "fallback"
+        )
+        self.assertEqual(fallback["timed_out"], 1)
+        self.assertEqual(finished["active_provider_requests"], [])
+
     def test_fallback_verification_timeout_does_not_block_startup(self) -> None:
         _LLMProvider, _CodexLLM, MultiLLMProvider = self.install()
 

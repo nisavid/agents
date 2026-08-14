@@ -1,4 +1,4 @@
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from builtins import BaseExceptionGroup
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
@@ -557,6 +557,49 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
                 worker_callbacks,
                 ["shutdown", "shutdown"],
             )
+
+    def test_uvicorn_signal_guard_preserves_worker_main_shutdown_handler(self):
+        signal_bus = {"handler": None}
+        worker_callbacks = []
+        server_callbacks = []
+
+        def install_signal_handlers(_loop, handler):
+            signal_bus["handler"] = handler
+            return True
+
+        class Server:
+            @contextmanager
+            def capture_signals(self):
+                previous_handler = signal_bus["handler"]
+                signal_bus["handler"] = self.handle_exit
+                try:
+                    yield
+                finally:
+                    signal_bus["handler"] = previous_handler
+
+            def handle_exit(self):
+                server_callbacks.append("shutdown")
+
+        worker_main = SimpleNamespace(
+            _install_shutdown_signal_handlers=install_signal_handlers,
+        )
+        bridge = ExactDrainWorkerMainShutdownBridge(worker_main)
+        guard_type = (
+            operation_recovery_runtime.ExactDrainUvicornSignalGuard
+        )
+
+        with bridge, guard_type(Server):
+            self.assertTrue(
+                worker_main._install_shutdown_signal_handlers(
+                    object(),
+                    lambda: worker_callbacks.append("shutdown"),
+                )
+            )
+            with Server().capture_signals():
+                signal_bus["handler"]()
+
+        self.assertEqual(worker_callbacks, ["shutdown"])
+        self.assertEqual(server_callbacks, [])
 
     def test_startup_recovery_failure_requests_worker_main_shutdown(self):
         try:

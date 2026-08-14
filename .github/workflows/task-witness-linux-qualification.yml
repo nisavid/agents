@@ -25,6 +25,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     env:
+      BOOTSTRAP_HELPER: >-
+        /opt/task-witness/bootstrap/prepare_task_witness_linux_qualification.py
       CANDIDATE_SHA: 5b0e5697d3e632add5a9395e03b37363be353c73
       CANDIDATE_ROOT: /opt/task-witness/candidate
       EVIDENCE_ROOT: /opt/task-witness/evidence
@@ -71,6 +73,15 @@ jobs:
             harness/tests/test_task_witness_linux_qualification_harness.py
           harness_sha=$(/usr/bin/git -C harness rev-parse HEAD^{commit})
           test "$harness_sha" = "$GITHUB_SHA"
+          helper_blob=$(
+            /usr/bin/git -C harness rev-parse \
+              "$GITHUB_SHA:scripts/prepare_task_witness_linux_qualification.py"
+          )
+          observed_helper_blob=$(
+            /usr/bin/git -C harness hash-object \
+              scripts/prepare_task_witness_linux_qualification.py
+          )
+          test "$observed_helper_blob" = "$helper_blob"
           candidate_sha=$(
             /usr/bin/git -C candidate-stage rev-parse HEAD^{commit}
           )
@@ -140,6 +151,83 @@ jobs:
 
           sudo /usr/bin/mkdir -p /opt/task-witness
           sudo /usr/bin/mkdir /opt/task-witness/bootstrap
+          sudo /usr/bin/chown root:root \
+            /opt/task-witness \
+            /opt/task-witness/bootstrap
+          sudo /usr/bin/chmod 0755 \
+            /opt/task-witness \
+            /opt/task-witness/bootstrap
+          source_helper="$GITHUB_WORKSPACE/harness/scripts/prepare_task_witness_linux_qualification.py"
+          source_helper_sha=$(
+            /usr/bin/sha256sum "$source_helper" | /usr/bin/cut -d ' ' -f 1
+          )
+          staged_helper_sha=$(
+            sudo /usr/bin/python3 -I -B \
+              "$source_helper" \
+              stage-bootstrap-helper \
+              --source "$source_helper" \
+              --output "$BOOTSTRAP_HELPER"
+          )
+          test "$staged_helper_sha" = "$source_helper_sha"
+          test "$(
+            sudo /usr/bin/stat --format='%u:%g:%a:%h' "$BOOTSTRAP_HELPER"
+          )" = '0:0:555:1'
+          test "$(
+            sudo /usr/bin/stat --format='%u:%g:%a' \
+              /opt/task-witness \
+              /opt/task-witness/bootstrap
+          )" = $'0:0:755\n0:0:755'
+          bootstrap_probe_sha=$(
+            sudo /usr/bin/setpriv \
+              --reuid="$qual_uid" \
+              --regid="$qual_gid" \
+              --clear-groups \
+              --inh-caps=-all \
+              --ambient-caps=-all \
+              --bounding-set=-all \
+              --no-new-privs \
+              --reset-env \
+              /usr/bin/env -i \
+                HOME="$QUALIFICATION_HOME" \
+                LANG=C.UTF-8 \
+                LC_ALL=C.UTF-8 \
+                PATH=/usr/bin:/bin \
+                TZ=UTC \
+                /usr/bin/sh -eu -c '
+                  helper=$1
+                  shift
+                  "$helper" --help >/dev/null
+                  /usr/bin/test -r "$helper"
+                  /usr/bin/test -x "$helper"
+                  for path in "$helper" "$@"; do
+                    /usr/bin/test ! -w "$path"
+                  done
+                  if /usr/bin/dd \
+                    if=/dev/null \
+                    of="$helper" \
+                    oflag=append \
+                    conv=notrunc \
+                    status=none \
+                    2>/dev/null
+                  then
+                    exit 91
+                  fi
+                  for directory in "$@"; do
+                    probe="$directory/.task-witness-no-cap-write-probe"
+                    if /usr/bin/touch "$probe" 2>/dev/null; then
+                      /usr/bin/rm -f "$probe"
+                      exit 92
+                    fi
+                    /usr/bin/test ! -e "$probe"
+                  done
+                  /usr/bin/sha256sum "$helper" | /usr/bin/cut -d " " -f 1
+                ' \
+                task-witness-bootstrap-probe \
+                "$BOOTSTRAP_HELPER" \
+                /opt/task-witness \
+                /opt/task-witness/bootstrap
+          )
+          test "$bootstrap_probe_sha" = "$source_helper_sha"
           sudo /usr/bin/mv \
             "$QUALIFICATION_HOME/$PYYAML_WHEEL_FILENAME" \
             "/opt/task-witness/bootstrap/$PYYAML_WHEEL_FILENAME"
@@ -179,7 +267,7 @@ jobs:
               PATH=/usr/bin:/bin \
               TZ=UTC \
               /usr/bin/python3 -I -B \
-                "$GITHUB_WORKSPACE/harness/scripts/prepare_task_witness_linux_qualification.py" \
+                "$BOOTSTRAP_HELPER" \
                 install-wheel \
                 --runtime-root "$RUNTIME_ROOT" \
                 --site-packages "$RUNTIME_SITE_PACKAGES" \
@@ -244,10 +332,10 @@ jobs:
               PATH=/usr/bin:/bin \
               TZ=UTC \
               /usr/bin/python3 -I -B \
-              "$GITHUB_WORKSPACE/harness/scripts/prepare_task_witness_linux_qualification.py" \
-              probe-host \
-              --context /opt/task-witness/github-actions-context.json \
-              --output-dir "$QUALIFICATION_HOME/host-audit"
+                "$BOOTSTRAP_HELPER" \
+                probe-host \
+                --context /opt/task-witness/github-actions-context.json \
+                --output-dir "$QUALIFICATION_HOME/host-audit"
 
       - name: Build and freeze canonical qualification inputs
         shell: bash

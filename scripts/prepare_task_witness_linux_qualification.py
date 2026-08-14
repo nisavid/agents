@@ -165,6 +165,73 @@ def stable_file_binding(metadata: os.stat_result) -> tuple[int, ...]:
     )
 
 
+def stage_bootstrap_helper(source: Path, output: Path) -> str:
+    source = require_absolute(source, "bootstrap helper source")
+    output = require_absolute(output, "bootstrap helper output")
+    if source == output or output.name == "":
+        raise PreparationError("bootstrap helper paths are invalid")
+
+    source_descriptor = os.open(
+        source,
+        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+    )
+    try:
+        source_metadata = os.fstat(source_descriptor)
+        if (
+            not stat.S_ISREG(source_metadata.st_mode)
+            or source_metadata.st_nlink != 1
+            or source_metadata.st_mode & 0o022
+        ):
+            raise PreparationError("bootstrap helper source disposition is unsafe")
+        chunks: list[bytes] = []
+        while chunk := os.read(source_descriptor, 1024 * 1024):
+            chunks.append(chunk)
+        raw = b"".join(chunks)
+        if not raw or stable_file_binding(os.fstat(source_descriptor)) != (
+            stable_file_binding(source_metadata)
+        ):
+            raise PreparationError("bootstrap helper source changed while reading")
+    finally:
+        os.close(source_descriptor)
+
+    parent_descriptor = os.open(
+        output.parent,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+    )
+    try:
+        output_descriptor = os.open(
+            output.name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o555,
+            dir_fd=parent_descriptor,
+        )
+        try:
+            os.fchmod(output_descriptor, 0o555)
+            offset = 0
+            while offset < len(raw):
+                offset += os.write(output_descriptor, raw[offset:])
+            os.fsync(output_descriptor)
+            output_metadata = os.fstat(output_descriptor)
+            if (
+                not stat.S_ISREG(output_metadata.st_mode)
+                or output_metadata.st_nlink != 1
+                or output_metadata.st_uid != os.geteuid()
+                or output_metadata.st_gid != os.getegid()
+                or stat.S_IMODE(output_metadata.st_mode) != 0o555
+            ):
+                raise PreparationError("bootstrap helper output disposition is unsafe")
+        finally:
+            os.close(output_descriptor)
+        os.fsync(parent_descriptor)
+    finally:
+        os.close(parent_descriptor)
+
+    expected = hashlib.sha256(raw).hexdigest()
+    if sha256_file(output) != expected:
+        raise PreparationError("bootstrap helper copy digest disagrees")
+    return expected
+
+
 def artifact_files(root: Path) -> list[tuple[str, Path]]:
     if not root.is_absolute() or root.is_symlink() or not root.is_dir():
         raise PreparationError("artifact root is not an absolute regular directory")
@@ -1700,6 +1767,13 @@ def parser() -> argparse.ArgumentParser:
     verify.add_argument("--root", type=Path, required=True)
     verify.add_argument("--executable", type=Path, required=True)
     verify.set_defaults(function=verify_runtime_source)
+
+    stage_helper = commands.add_parser("stage-bootstrap-helper")
+    stage_helper.add_argument("--source", type=Path, required=True)
+    stage_helper.add_argument("--output", type=Path, required=True)
+    stage_helper.set_defaults(
+        function=lambda args: print(stage_bootstrap_helper(args.source, args.output))
+    )
 
     install = commands.add_parser("install-wheel")
     install.add_argument("--runtime-root", type=Path, required=True)

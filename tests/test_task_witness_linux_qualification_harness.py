@@ -6,6 +6,9 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -177,6 +180,84 @@ class TaskWitnessLinuxQualificationHarnessTests(unittest.TestCase):
     def test_parser_requires_an_explicit_subcommand(self) -> None:
         with self.assertRaises(SystemExit):
             self.helper.parser().parse_args([])
+
+    def test_bootstrap_helper_survives_a_nontraversable_checkout_ancestor(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            checkout = root / "private-checkout"
+            source = checkout / "scripts" / HELPER.name
+            source.parent.mkdir(parents=True)
+            source.write_bytes(HELPER.read_bytes())
+            source.chmod(0o555)
+            bootstrap = root / "bootstrap"
+            bootstrap.mkdir(mode=0o755)
+            retained = bootstrap / HELPER.name
+
+            stage = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-B",
+                    str(HELPER),
+                    "stage-bootstrap-helper",
+                    "--source",
+                    str(source),
+                    "--output",
+                    str(retained),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(stage.returncode, 0, stage.stderr)
+            self.assertEqual(retained.read_bytes(), source.read_bytes())
+            self.assertEqual(retained.stat().st_uid, os.geteuid())
+            self.assertEqual(retained.stat().st_gid, os.getegid())
+            self.assertEqual(retained.stat().st_mode & 0o777, 0o555)
+
+            retained_raw = retained.read_bytes()
+            replacement = source.with_name("replacement.py")
+            replacement.write_bytes(b"replacement")
+            replacement.chmod(0o555)
+            restage = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-B",
+                    str(HELPER),
+                    "stage-bootstrap-helper",
+                    "--source",
+                    str(replacement),
+                    "--output",
+                    str(retained),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(restage.returncode, 0)
+            self.assertEqual(retained.read_bytes(), retained_raw)
+
+            checkout.chmod(0)
+            try:
+                with self.assertRaises(PermissionError):
+                    subprocess.run(
+                        [str(source), "--help"],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    )
+                runnable = subprocess.run(
+                    [str(retained), "--help"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+            finally:
+                checkout.chmod(0o755)
+            self.assertEqual(runnable.returncode, 0, runnable.stderr)
 
     def test_artifact_manifest_replays_and_detects_tampering(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:

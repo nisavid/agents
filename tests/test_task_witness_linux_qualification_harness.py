@@ -13,10 +13,12 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 REPOSITORY = Path(__file__).resolve().parents[1]
 HELPER = REPOSITORY / "scripts" / "prepare_task_witness_linux_qualification.py"
+CANDIDATE_RUNNER = REPOSITORY / "scripts" / "run_task_witness_qualification.py"
 
 
 def load_helper():
@@ -26,6 +28,18 @@ def load_helper():
     )
     if specification is None or specification.loader is None:
         raise AssertionError("qualification preparation helper cannot be loaded")
+    module = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(module)
+    return module
+
+
+def load_candidate_runner():
+    specification = importlib.util.spec_from_file_location(
+        "task_witness_qualification_runner",
+        CANDIDATE_RUNNER,
+    )
+    if specification is None or specification.loader is None:
+        raise AssertionError("qualification runner cannot be loaded")
     module = importlib.util.module_from_spec(specification)
     specification.loader.exec_module(module)
     return module
@@ -110,6 +124,215 @@ class TaskWitnessLinuxQualificationHarnessTests(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 self.helper.write_create_new(path, {"new": True})
             self.assertEqual(path.read_bytes(), b"existing")
+
+    def test_build_evidence_projects_live_ext_family_label_for_candidate(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root).resolve()
+            runtime_root = root / "runtime"
+            runtime_executable = runtime_root / "bin" / "python"
+            runtime_executable.parent.mkdir(parents=True)
+            runtime_executable.write_bytes(b"python")
+            runtime_executable.chmod(0o755)
+            candidate_root = root / "candidate"
+            candidate_root.mkdir()
+            host_audit_root = root / "host-audit"
+            host_audit_root.mkdir()
+            context = root / "context.json"
+            runtime_audit = root / "runtime-audit.json"
+            output = root / "evidence"
+            candidate_sha = "1" * 40
+            self.helper.write_create_new(
+                context,
+                self.helper.content_document(
+                    {"schema_version": 1, "contract": "test-context-v1"}
+                ),
+            )
+            self.helper.write_create_new(
+                runtime_audit,
+                self.helper.content_document(
+                    {
+                        "schema_version": 1,
+                        "contract": "test-runtime-audit-v1",
+                        "disposition": "qualified",
+                        "smoke": {
+                            "executable": str(runtime_executable),
+                            "implementation": "cpython",
+                            "version": [3, 13, 7],
+                        },
+                    }
+                ),
+            )
+            self.helper.write_create_new(
+                host_audit_root / "provisioning-audit.json",
+                self.helper.content_document(
+                    {
+                        "schema_version": 1,
+                        "contract": "test-provisioning-audit-v1",
+                        "disposition": "qualified",
+                        "passwd_user": {
+                            "name": "task-witness-qualification",
+                            "uid": 1001,
+                            "primary_gid": 1001,
+                            "supplementary_gids": [],
+                            "home": "/home/task-witness-qualification",
+                        },
+                    }
+                ),
+            )
+            self.helper.write_create_new(
+                host_audit_root / "native-host-audit.json",
+                self.helper.content_document(
+                    {
+                        "schema_version": 1,
+                        "contract": "test-native-host-audit-v1",
+                        "disposition": "qualified",
+                    }
+                ),
+            )
+            filesystem_audit = self.helper.content_document(
+                {
+                    "schema_version": 1,
+                    "contract": "task-witness-linux-filesystem-audit-v1",
+                    "authority": {
+                        "kind": "cooperative-operator-owned-workflow",
+                        "cryptographic_attestation": False,
+                        "product_attestation": False,
+                    },
+                    "disposition": "qualified",
+                    "filesystem": {
+                        "type": "ext2/ext3",
+                        "probe_root": (
+                            "/home/task-witness-qualification/"
+                            ".task-witness-filesystem-probe"
+                        ),
+                        "semantics": {
+                            name: (
+                                "C.UTF-8"
+                                if name == "c-utf8-locale"
+                                else (
+                                    "task-witness-qualification"
+                                    if name == "passwd-database"
+                                    else True
+                                )
+                            )
+                            for name in self.helper.FILESYSTEM_SEMANTICS
+                        },
+                    },
+                }
+            )
+            self.helper.write_create_new(
+                host_audit_root / "filesystem-audit.json",
+                filesystem_audit,
+            )
+
+            def tool_record(identifier: str, _path: Path) -> dict[str, object]:
+                invoked = f"/usr/bin/{identifier}"
+                return {
+                    "id": identifier,
+                    "invoked_path": invoked,
+                    "resolved_path": invoked,
+                    "length": 1,
+                    "sha256": "2" * 64,
+                    "uid": 0,
+                    "gid": 0,
+                    "mode": 0o755,
+                }
+
+            args = SimpleNamespace(
+                runtime_root=runtime_root,
+                runtime_executable=runtime_executable,
+                candidate_root=candidate_root,
+                host_audit_root=host_audit_root,
+                output_dir=output,
+                context=context,
+                runtime_audit=runtime_audit,
+                candidate_sha=candidate_sha,
+            )
+            with (
+                mock.patch.object(self.helper, "require_root"),
+                mock.patch.object(self.helper, "validate_runtime_pyyaml_audit"),
+                mock.patch.object(
+                    self.helper,
+                    "runtime_inventory_entries",
+                    return_value=[],
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "tool_record",
+                    side_effect=tool_record,
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "run",
+                    return_value=subprocess.CompletedProcess(
+                        args=[],
+                        returncode=0,
+                        stdout=f"{candidate_sha}\n",
+                        stderr="",
+                    ),
+                ),
+            ):
+                self.helper.build_evidence(args)
+
+            retained_audit_raw = (output / "filesystem-audit.json").read_bytes()
+            retained_audit = json.loads(retained_audit_raw)
+            profile = json.loads(
+                (output / "platform-profile.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                retained_audit_raw,
+                self.helper.canonical_bytes(filesystem_audit),
+            )
+            self.assertEqual(retained_audit, filesystem_audit)
+            self.assertEqual(
+                retained_audit["filesystem"]["type"],
+                "ext2/ext3",
+            )
+            self.assertEqual(profile["filesystem"]["type"], "ext2-ext3")
+            self.assertEqual(
+                profile["filesystem"]["evidence_sha256"],
+                hashlib.sha256(retained_audit_raw).hexdigest(),
+            )
+            load_candidate_runner().parse_platform_profile(profile)
+
+    def test_profile_filesystem_type_rejects_host_label_drift(self) -> None:
+        candidate = load_candidate_runner()
+        mapping = self.helper.PROFILE_FILESYSTEM_TYPE_BY_OBSERVATION
+        self.assertEqual(mapping, {"ext2/ext3": "ext2-ext3"})
+        self.assertEqual(len(set(mapping.values())), len(mapping))
+        self.assertTrue(set(mapping).isdisjoint(mapping.values()))
+        for token in mapping.values():
+            self.assertIsNotNone(candidate.TOKEN_RE.fullmatch(token))
+
+        unsupported = (
+            "ext2-ext3",
+            " ext2/ext3",
+            "ext2/ext3 ",
+            "EXT2/EXT3",
+            "ext2/ext4",
+            "ext2+ext3",
+            "ext2\\ext3",
+            "ext2\u2215ext3",
+            "ext2\uff0fext3",
+            "xfs",
+            "",
+            None,
+            False,
+            7,
+            ["ext2/ext3"],
+            {"label": "ext2/ext3"},
+        )
+        for value in unsupported:
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(
+                    self.helper.PreparationError,
+                    "filesystem type observation is unsupported",
+                ),
+            ):
+                self.helper.profile_filesystem_type(value)
 
     @unittest.skipUnless(
         sys.platform.startswith("linux") and hasattr(os, "pipe2"),

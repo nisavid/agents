@@ -49,6 +49,9 @@ FILESYSTEM_SEMANTICS = [
     "signal-mask-pending",
     "waitid-wnowait",
 ]
+PROFILE_FILESYSTEM_TYPE_BY_OBSERVATION = {
+    "ext2/ext3": "ext2-ext3",
+}
 EXPECTED_HARNESS_REF = "refs/heads/ivan/task-witness-linux-qualification-harness"
 EXPECTED_REPOSITORY = "nisavid/agents"
 GITHUB_CONTEXT_FIELDS = (
@@ -118,6 +121,12 @@ class DependencySourceEvidence(NamedTuple):
     copy_source: Path
     copy_source_sha256: str
     qualified_relocation: Path | None
+
+
+def profile_filesystem_type(value: object) -> str:
+    if type(value) is not str or value not in PROFILE_FILESYSTEM_TYPE_BY_OBSERVATION:
+        raise PreparationError("filesystem type observation is unsupported")
+    return PROFILE_FILESYSTEM_TYPE_BY_OBSERVATION[value]
 
 
 def canonical_bytes(value: object) -> bytes:
@@ -3156,7 +3165,9 @@ def build_evidence(args: argparse.Namespace) -> None:
                 "emulation": False,
             },
             "filesystem": {
-                "type": audit_value["filesystem"]["filesystem"]["type"],
+                "type": profile_filesystem_type(
+                    audit_value["filesystem"]["filesystem"]["type"]
+                ),
                 "evidence_sha256": hashlib.sha256(audit_raw["filesystem"]).hexdigest(),
                 "required_semantics": FILESYSTEM_SEMANTICS,
             },

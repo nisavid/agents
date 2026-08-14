@@ -27,6 +27,7 @@ import stat
 import subprocess
 import sys
 import zipfile
+from collections.abc import Mapping
 from email.parser import BytesParser
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -388,12 +389,19 @@ def require_absolute(path: Path, label: str) -> Path:
     return path
 
 
-def capture_context(output: Path) -> None:
+def capture_context(
+    output: Path,
+    *,
+    environment: Mapping[str, str] | None = None,
+) -> None:
     require_root()
     if output.exists():
         raise PreparationError("context output already exists")
+    source_environment = os.environ if environment is None else environment
     context = {
-        key: os.environ[key] for key in GITHUB_CONTEXT_FIELDS if os.environ.get(key)
+        key: source_environment[key]
+        for key in GITHUB_CONTEXT_FIELDS
+        if source_environment.get(key)
     }
     required = {
         "GITHUB_EVENT_NAME",

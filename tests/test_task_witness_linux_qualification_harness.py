@@ -12,6 +12,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPOSITORY = Path(__file__).resolve().parents[1]
 HELPER = REPOSITORY / "scripts" / "prepare_task_witness_linux_qualification.py"
@@ -180,6 +181,49 @@ class TaskWitnessLinuxQualificationHarnessTests(unittest.TestCase):
     def test_parser_requires_an_explicit_subcommand(self) -> None:
         with self.assertRaises(SystemExit):
             self.helper.parser().parse_args([])
+
+    def test_context_capture_preserves_the_explicit_clean_boundary(self) -> None:
+        forwarded = {
+            key: f"observed-{key.lower()}" for key in self.helper.GITHUB_CONTEXT_FIELDS
+        }
+        forwarded.update(
+            {
+                "GITHUB_EVENT_NAME": "push",
+                "GITHUB_REF": self.helper.EXPECTED_HARNESS_REF,
+                "GITHUB_REPOSITORY": self.helper.EXPECTED_REPOSITORY,
+                "GITHUB_SHA": "1" * 40,
+                "ImageVersion": "",
+                "RUNNER_ARCH": "X64",
+                "RUNNER_ENVIRONMENT": "github-hosted",
+                "RUNNER_OS": "Linux",
+                "UNRELATED_AMBIENT_VALUE": "must-not-cross",
+            }
+        )
+        expected = {
+            key: forwarded[key]
+            for key in self.helper.GITHUB_CONTEXT_FIELDS
+            if forwarded[key]
+        }
+
+        with tempfile.TemporaryDirectory() as raw_root:
+            output = Path(raw_root) / "github-actions-context.json"
+            with mock.patch.object(self.helper, "require_root"):
+                self.helper.capture_context(output, environment=forwarded)
+
+            document = json.loads(output.read_bytes())
+            self.assertEqual(document["context"], expected)
+            self.assertEqual(
+                document["content_sha256"],
+                hashlib.sha256(
+                    self.helper.canonical_bytes(
+                        {
+                            "schema_version": 1,
+                            "contract": "task-witness-github-actions-context-v1",
+                            "context": expected,
+                        }
+                    )
+                ).hexdigest(),
+            )
 
     def test_bootstrap_helper_survives_a_nontraversable_checkout_ancestor(
         self,

@@ -276,10 +276,36 @@ jobs:
           sudo /usr/bin/find "$RUNTIME_ROOT" -type d -exec /usr/bin/chmod go-w {} +
           sudo /usr/bin/find "$RUNTIME_ROOT" -type f -exec /usr/bin/chmod go-w {} +
 
-          sudo /usr/bin/python3 -I -B \
-            harness/scripts/prepare_task_witness_linux_qualification.py \
-            capture-context \
-            --output /opt/task-witness/github-actions-context.json
+          sudo /usr/bin/env -i \
+            HOME=/root \
+            LANG=C.UTF-8 \
+            LC_ALL=C.UTF-8 \
+            PATH=/usr/bin:/bin \
+            TZ=UTC \
+            GITHUB_ACTION="${GITHUB_ACTION-}" \
+            GITHUB_ACTOR="${GITHUB_ACTOR-}" \
+            GITHUB_EVENT_NAME="${GITHUB_EVENT_NAME-}" \
+            GITHUB_JOB="${GITHUB_JOB-}" \
+            GITHUB_REF="${GITHUB_REF-}" \
+            GITHUB_REPOSITORY="${GITHUB_REPOSITORY-}" \
+            GITHUB_RUN_ATTEMPT="${GITHUB_RUN_ATTEMPT-}" \
+            GITHUB_RUN_ID="${GITHUB_RUN_ID-}" \
+            GITHUB_RUN_NUMBER="${GITHUB_RUN_NUMBER-}" \
+            GITHUB_SERVER_URL="${GITHUB_SERVER_URL-}" \
+            GITHUB_SHA="${GITHUB_SHA-}" \
+            GITHUB_WORKFLOW="${GITHUB_WORKFLOW-}" \
+            GITHUB_WORKFLOW_REF="${GITHUB_WORKFLOW_REF-}" \
+            GITHUB_WORKFLOW_SHA="${GITHUB_WORKFLOW_SHA-}" \
+            ImageOS="${ImageOS-}" \
+            ImageVersion="${ImageVersion-}" \
+            RUNNER_ARCH="${RUNNER_ARCH-}" \
+            RUNNER_ENVIRONMENT="${RUNNER_ENVIRONMENT-}" \
+            RUNNER_NAME="${RUNNER_NAME-}" \
+            RUNNER_OS="${RUNNER_OS-}" \
+            /usr/bin/python3 -I -B \
+              "$BOOTSTRAP_HELPER" \
+              capture-context \
+              --output /opt/task-witness/github-actions-context.json
           sudo /usr/bin/python3 -I -B \
             harness/scripts/prepare_task_witness_linux_qualification.py \
             seal-runtime \

@@ -1822,7 +1822,7 @@ else:
         self.assertEqual(sys.path, before_path)
         self.assertEqual(set(sys.modules), before_modules)
 
-    def test_package_contract_cli_normalizes_the_current_source_shape_gate(
+    def test_package_contract_cli_emits_the_current_canonical_result(
         self,
     ) -> None:
         process = subprocess.run(
@@ -1840,13 +1840,23 @@ else:
             check=False,
         )
 
-        self.assertNotEqual(process.returncode, 0)
-        self.assertEqual(process.stdout, b"")
-        self.assertEqual(
-            process.stderr,
-            b"qualification suite failed: qualification suite did not reach "
-            b"the exact terminal\n",
+        self.assertEqual(process.returncode, 0, process.stderr.decode())
+        self.assertEqual(process.stderr, b"")
+        self.assertNotEqual(process.stdout[-1:], b"\n")
+        value = json.loads(process.stdout)
+        self.assertEqual(load_runner_module().parse_suite_result(value), value)
+        expected = suite_result_document()
+        expected.update(
+            {
+                "id": "package-contract",
+                "observed_count": 71,
+                "detail_stdout_length": 90,
+                "detail_stdout_sha256": (
+                    "2589236b349b29d6f0a3daa22dcbec8ce497d1962e8618c79a9a2c9c72cc29e5"
+                ),
+            }
         )
+        self.assertEqual(value, expected)
 
     def test_task_witness_source_stage_owns_one_exact_direct_command(self) -> None:
         driver = load_suite_driver_module()
@@ -2004,7 +2014,7 @@ else:
             ):
                 driver._execute_suite("task-witness-source-stage", REPOSITORY)
 
-    def test_task_witness_source_stage_cli_normalizes_the_missing_inventory(
+    def test_task_witness_source_stage_cli_emits_the_current_canonical_result(
         self,
     ) -> None:
         process = subprocess.run(
@@ -2022,13 +2032,14 @@ else:
             check=False,
         )
 
-        self.assertNotEqual(process.returncode, 0)
-        self.assertEqual(process.stdout, b"")
-        self.assertEqual(
-            process.stderr,
-            b"qualification suite failed: qualification suite did not reach "
-            b"the exact terminal\n",
-        )
+        self.assertEqual(process.returncode, 0, process.stderr.decode())
+        self.assertEqual(process.stderr, b"")
+        self.assertNotEqual(process.stdout[-1:], b"\n")
+        value = json.loads(process.stdout)
+        self.assertEqual(load_runner_module().parse_suite_result(value), value)
+        expected = suite_result_document()
+        expected.update({"id": "task-witness-source-stage", "observed_count": 1})
+        self.assertEqual(value, expected)
 
     def test_public_release_source_stage_owns_one_exact_direct_command(self) -> None:
         driver = load_suite_driver_module()
@@ -2101,7 +2112,7 @@ else:
             ):
                 driver._execute_suite("public-release-source-stage", REPOSITORY)
 
-    def test_public_release_source_stage_cli_normalizes_the_current_closure_gate(
+    def test_public_release_source_stage_cli_emits_the_current_canonical_result(
         self,
     ) -> None:
         process = subprocess.run(
@@ -2119,13 +2130,14 @@ else:
             check=False,
         )
 
-        self.assertNotEqual(process.returncode, 0)
-        self.assertEqual(process.stdout, b"")
-        self.assertEqual(
-            process.stderr,
-            b"qualification suite failed: qualification suite did not reach "
-            b"the exact terminal\n",
-        )
+        self.assertEqual(process.returncode, 0, process.stderr.decode())
+        self.assertEqual(process.stderr, b"")
+        self.assertNotEqual(process.stdout[-1:], b"\n")
+        value = json.loads(process.stdout)
+        self.assertEqual(load_runner_module().parse_suite_result(value), value)
+        expected = suite_result_document()
+        expected.update({"id": "public-release-source-stage", "observed_count": 1})
+        self.assertEqual(value, expected)
 
     def test_literal_rendered_shim_owns_one_direct_fixed_scenario(self) -> None:
         driver = load_suite_driver_module()

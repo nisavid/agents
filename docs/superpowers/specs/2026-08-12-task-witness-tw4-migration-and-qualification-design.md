@@ -1,7 +1,7 @@
 # Task Witness TW4 Migration And Qualification Design
 
-Status: proposed written checkpoint; product choices accepted 2026-08-12,
-pending explicit written-spec approval
+Status: approved written specification; product choices accepted 2026-08-12,
+written-spec approval granted 2026-08-14.
 
 This document amends the Task Witness canonical client design for the TW4
 cross-version migration and release-qualification boundary. The canonical

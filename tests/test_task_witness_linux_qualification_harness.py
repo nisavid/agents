@@ -548,9 +548,68 @@ class TaskWitnessLinuxQualificationHarnessTests(unittest.TestCase):
             paths = [entry["path"] for entry in entries]
             self.assertEqual(paths, sorted(paths))
             self.assertEqual(len(paths), len(set(paths)))
+            self.assertNotIn(str(runtime_root), paths)
+            self.assertEqual(
+                set(paths),
+                {str(path) for path in runtime_root.rglob("*")},
+            )
             self.assertLess(
                 paths.index(str(gdb_helper)),
                 paths.index(str(stdlib_module)),
+            )
+
+    @unittest.skipUnless(
+        sys.version_info >= (3, 11),
+        "the candidate qualification runner requires Python 3.11 or newer",
+    )
+    def test_runtime_inventory_matches_candidate_descendant_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            runtime_root = Path(raw_root).resolve() / "runtime"
+            executable = runtime_root / "bin" / "python"
+            module = runtime_root / "lib" / "python3.13" / "module.py"
+            executable.parent.mkdir(parents=True)
+            module.parent.mkdir(parents=True)
+            executable.write_bytes(b"python")
+            executable.chmod(0o755)
+            module.write_bytes(b"VALUE = 1\n")
+            entries = self.helper.runtime_inventory_entries(
+                runtime_root,
+                executable,
+            )
+            evidence = {
+                "main_executable": {"path": str(executable)},
+                "closure": {
+                    "roots": [{"path": str(runtime_root)}],
+                    "entries": entries,
+                },
+            }
+            candidate = load_candidate_runner()
+
+            with mock.patch.object(
+                candidate,
+                "require_runtime_closure_immutable",
+            ):
+                observed = candidate.validate_runtime_observations(
+                    executable,
+                    evidence,
+                )
+
+            paths = [entry["path"] for entry in entries]
+            expected_descendants = {str(path) for path in runtime_root.rglob("*")}
+            self.assertEqual(paths, sorted(set(paths)))
+            self.assertEqual(set(paths), expected_descendants)
+            self.assertNotIn(str(runtime_root), paths)
+            self.assertEqual(
+                observed["main_executable_observation"]["path"],
+                str(executable),
+            )
+            self.assertEqual(
+                [item["path"] for item in observed["closure_observation"]["roots"]],
+                [str(runtime_root)],
+            )
+            self.assertEqual(
+                [item["path"] for item in observed["closure_observation"]["entries"]],
+                paths,
             )
 
     def test_runtime_sealing_prunes_only_source_backed_bytecode_caches(

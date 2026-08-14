@@ -3003,7 +3003,7 @@ def runtime_inventory_entries(
         raise PreparationError("sealed runtime is unavailable")
     if any(path.is_symlink() for path in runtime_root.rglob("*")):
         raise PreparationError("sealed runtime unexpectedly contains a symlink")
-    paths = [runtime_root, *sorted(runtime_root.rglob("*"), key=str)]
+    paths = sorted(runtime_root.rglob("*"), key=str)
     entries = [live_entry(path, runtime_root, executable) for path in paths]
     if [entry["path"] for entry in entries] != sorted(
         {entry["path"] for entry in entries}

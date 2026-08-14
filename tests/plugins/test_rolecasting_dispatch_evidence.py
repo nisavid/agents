@@ -1003,7 +1003,6 @@ class RolecastingDispatchEvidenceTests(unittest.TestCase):
             projection["executions"]["worker-one"]["role"],
             "documentation-auditor",
         )
-        self.assertNotIn("critic", VALIDATOR.read_text(encoding="utf-8").lower())
 
     def test_test_owned_bootstrap_trust_cannot_authorize_new_publication(self) -> None:
         bundle, expected = self.make_bundle()

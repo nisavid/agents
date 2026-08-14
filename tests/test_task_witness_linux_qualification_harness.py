@@ -330,6 +330,372 @@ class TaskWitnessLinuxQualificationHarnessTests(unittest.TestCase):
                 paths.index(str(stdlib_module)),
             )
 
+    def test_runtime_sealing_prunes_only_source_backed_bytecode_caches(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            runtime_root = Path(raw_root).resolve() / "runtime"
+            package = runtime_root / "lib" / "python3.13" / "package"
+            cache = package / "__pycache__"
+            cache.mkdir(parents=True)
+            source = package / "module.py"
+            source_raw = b"VALUE = 1\n"
+            source.write_bytes(source_raw)
+            retained = package / "data.txt"
+            retained.write_bytes(b"runtime data")
+            bytecode = {
+                cache / "module.cpython-313.pyc": b"bytecode-default",
+                cache / "module.cpython-313.opt-1.pyc": b"bytecode-optimized",
+            }
+            for path, raw in bytecode.items():
+                path.write_bytes(raw)
+            before_inventory = self.helper.runtime_pruning_inventory(runtime_root)
+            before_by_path = {entry["path"]: entry for entry in before_inventory}
+            source_bindings = [
+                {
+                    "bytecode_path": path.relative_to(runtime_root).as_posix(),
+                    "source_path": source.relative_to(runtime_root).as_posix(),
+                    "source_length": len(source_raw),
+                    "source_sha256": hashlib.sha256(source_raw).hexdigest(),
+                }
+                for path, raw in sorted(bytecode.items(), key=lambda item: str(item[0]))
+            ]
+
+            audit = self.helper.prune_source_backed_bytecode_caches(runtime_root)
+
+            after_inventory = self.helper.runtime_pruning_inventory(runtime_root)
+            removed_paths = sorted(
+                [
+                    cache.relative_to(runtime_root).as_posix(),
+                    *(path.relative_to(runtime_root).as_posix() for path in bytecode),
+                ]
+            )
+            removed_inventory = [before_by_path[path] for path in removed_paths]
+            self.assertEqual(
+                audit,
+                self.helper.content_document(
+                    {
+                        "schema_version": 1,
+                        "contract": ("task-witness-cpython-bytecode-cache-pruning-v1"),
+                        "cache_tag": "cpython-313",
+                        "policy": (
+                            "remove-only-source-backed-cpython-bytecode-caches-v1"
+                        ),
+                        "before_inventory": {
+                            "entry_count": len(before_inventory),
+                            "sha256": self.helper.framed_pruning_inventory_sha256(
+                                "before-bytecode-cache-pruning",
+                                before_inventory,
+                            ),
+                        },
+                        "removed_inventory": {
+                            "entry_count": 3,
+                            "cache_directory_count": 1,
+                            "bytecode_file_count": 2,
+                            "bytecode_total_bytes": sum(map(len, bytecode.values())),
+                            "sha256": self.helper.framed_pruning_inventory_sha256(
+                                "removed-bytecode-cache-inventory",
+                                removed_inventory,
+                            ),
+                            "entries": removed_inventory,
+                        },
+                        "source_bindings": {
+                            "source_file_count": 1,
+                            "sha256": self.helper.framed_pruning_inventory_sha256(
+                                "retained-source-bindings",
+                                source_bindings,
+                            ),
+                            "entries": source_bindings,
+                        },
+                        "after_inventory": {
+                            "entry_count": len(after_inventory),
+                            "sha256": self.helper.framed_pruning_inventory_sha256(
+                                "after-bytecode-cache-pruning",
+                                after_inventory,
+                            ),
+                        },
+                        "disposition": "pruned-source-backed-bytecode-caches",
+                    }
+                ),
+            )
+            self.assertFalse(cache.exists())
+            self.assertEqual(source.read_bytes(), source_raw)
+            self.assertEqual(retained.read_bytes(), b"runtime data")
+            imported = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-B",
+                    "-c",
+                    (
+                        "import importlib.util,sys;"
+                        "spec=importlib.util.spec_from_file_location('module',sys.argv[1]);"
+                        "module=importlib.util.module_from_spec(spec);"
+                        "spec.loader.exec_module(module);"
+                        "assert module.VALUE == 1"
+                    ),
+                    str(source),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(imported.returncode, 0, imported.stderr)
+            self.assertFalse(cache.exists())
+
+    def test_runtime_cache_pruning_reduces_complete_inventory_below_input_cap(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            runtime_root = Path(raw_root).resolve() / "runtime"
+            executable = runtime_root / "bin" / "python"
+            stdlib = runtime_root / "lib" / "python3.13"
+            cache = stdlib / "__pycache__"
+            executable.parent.mkdir(parents=True)
+            cache.mkdir(parents=True)
+            executable.write_bytes(b"python")
+            executable.chmod(0o755)
+            for index in range(2100):
+                stem = f"qualification_module_{index:04d}"
+                (stdlib / f"{stem}.py").write_bytes(b"VALUE = 1\n")
+                (cache / f"{stem}.cpython-313.pyc").write_bytes(b"bytecode")
+
+            before = self.helper.canonical_bytes(
+                self.helper.runtime_inventory_entries(runtime_root, executable)
+            )
+            self.assertGreater(len(before), 1024 * 1024)
+
+            audit = self.helper.prune_source_backed_bytecode_caches(runtime_root)
+
+            after = self.helper.canonical_bytes(
+                self.helper.runtime_inventory_entries(runtime_root, executable)
+            )
+            self.assertEqual(
+                audit["removed_inventory"]["bytecode_file_count"],
+                2100,
+            )
+            self.assertLess(len(after), (1024 * 1024) - 200_000)
+
+            oversized = {
+                "entries": [
+                    {
+                        "path": f"residual-runtime-resource-{index:05d}",
+                        "kind": "regular-file",
+                        "sha256": "0" * 64,
+                    }
+                    for index in range(8000)
+                ]
+            }
+            self.assertGreater(
+                len(self.helper.canonical_bytes(oversized)),
+                self.helper.RUNNER_INPUT_CAP_BYTES,
+            )
+            output = Path(raw_root).resolve() / "runtime-closure-evidence.json"
+            with self.assertRaisesRegex(
+                self.helper.PreparationError,
+                "runtime closure evidence exceeds",
+            ):
+                self.helper.write_runtime_closure_evidence(output, oversized)
+            self.assertFalse(output.exists())
+
+    def test_runtime_cache_pruning_rejects_unsafe_or_sourceless_entries(
+        self,
+    ) -> None:
+        cases = (
+            "unexpected-entry",
+            "missing-source",
+            "wrong-cache-tag",
+            "linked-bytecode",
+            "symlink-source",
+            "writable-bytecode",
+            "writable-source",
+            "linked-source",
+            "legacy-bytecode",
+            "special-bytecode",
+        )
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as raw_root:
+                runtime_root = Path(raw_root).resolve() / "runtime"
+                valid_package = runtime_root / "a"
+                valid_cache = valid_package / "__pycache__"
+                valid_cache.mkdir(parents=True)
+                (valid_package / "valid.py").write_bytes(b"valid source")
+                valid_bytecode = valid_cache / "valid.cpython-313.pyc"
+                valid_bytecode.write_bytes(b"valid bytecode")
+
+                package = runtime_root / "z"
+                cache = package / "__pycache__"
+                cache.mkdir(parents=True)
+                source = package / "module.py"
+                source.write_bytes(b"source")
+                bytecode = cache / "module.cpython-313.pyc"
+                bytecode.write_bytes(b"bytecode")
+                if case == "unexpected-entry":
+                    (cache / "README").write_bytes(b"not bytecode")
+                elif case == "missing-source":
+                    source.unlink()
+                elif case == "wrong-cache-tag":
+                    bytecode.rename(cache / "module.cpython-312.pyc")
+                elif case == "linked-bytecode":
+                    os.link(bytecode, runtime_root / "bytecode-alias")
+                elif case == "symlink-source":
+                    source.unlink()
+                    outside = Path(raw_root).resolve() / "source-target"
+                    outside.write_bytes(b"source")
+                    source.symlink_to(outside)
+                elif case == "writable-bytecode":
+                    bytecode.chmod(0o666)
+                elif case == "writable-source":
+                    source.chmod(0o666)
+                elif case == "linked-source":
+                    os.link(source, runtime_root / "source-alias")
+                elif case == "legacy-bytecode":
+                    (runtime_root / "legacy.pyc").write_bytes(b"legacy")
+                elif case == "special-bytecode":
+                    bytecode.unlink()
+                    os.mkfifo(bytecode)
+
+                with self.assertRaisesRegex(
+                    self.helper.PreparationError,
+                    "runtime bytecode cache",
+                ):
+                    self.helper.prune_source_backed_bytecode_caches(runtime_root)
+
+                self.assertTrue(valid_bytecode.is_file())
+                self.assertTrue(valid_cache.is_dir())
+
+    def test_retained_sources_compile_with_exact_unprivileged_runtime(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            runtime_root = Path(raw_root).resolve() / "runtime"
+            executable = runtime_root / "bin" / "python"
+            source = runtime_root / "lib" / "python3.13" / "module.py"
+            executable.parent.mkdir(parents=True)
+            source.parent.mkdir(parents=True)
+            executable.write_bytes(b"python")
+            executable.chmod(0o755)
+            source.write_bytes(b"VALUE = 1\n")
+            source_bindings = [
+                {
+                    "bytecode_path": (
+                        "lib/python3.13/__pycache__/module.cpython-313.pyc"
+                    ),
+                    "source_path": "lib/python3.13/module.py",
+                    "source_length": source.stat().st_size,
+                    "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                }
+            ]
+            observed = {
+                "cache_tag": "cpython-313",
+                "compiled_source_count": 1,
+                "version": [3, 13, 7],
+            }
+            process = subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout=self.helper.canonical_bytes(observed).decode() + "\n",
+                stderr="",
+            )
+
+            with mock.patch.object(
+                self.helper,
+                "run",
+                return_value=process,
+            ) as run:
+                audit = self.helper.compile_retained_runtime_sources(
+                    runtime_root,
+                    executable,
+                    source_bindings,
+                    1001,
+                    1002,
+                )
+
+            invoked = run.call_args.args[0]
+            self.assertEqual(invoked[-5], str(executable))
+            self.assertEqual(invoked[-4:-1], ["-I", "-B", "-c"])
+            self.assertIn("--reuid=1001", invoked)
+            self.assertIn("--regid=1002", invoked)
+            self.assertEqual(
+                json.loads(run.call_args.kwargs["input_text"]),
+                [str(source)],
+            )
+            self.assertEqual(audit["compiled_source_count"], 1)
+            self.assertEqual(audit["version"], [3, 13, 7])
+            self.assertEqual(
+                audit["disposition"],
+                "compiled-in-memory-with-exact-runtime",
+            )
+
+    def test_retained_source_compilation_rejects_mismatch_and_cache_recreation(
+        self,
+    ) -> None:
+        for case in ("mismatch", "cache-recreated", "unsafe-binding"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as raw_root:
+                runtime_root = Path(raw_root).resolve() / "runtime"
+                executable = runtime_root / "bin" / "python"
+                source = runtime_root / "lib" / "python3.13" / "module.py"
+                executable.parent.mkdir(parents=True)
+                source.parent.mkdir(parents=True)
+                executable.write_bytes(b"python")
+                source.write_bytes(b"VALUE = 1\n")
+                source_bindings = [
+                    {
+                        "bytecode_path": (
+                            "lib/python3.13/__pycache__/module.cpython-313.pyc"
+                        ),
+                        "source_path": (
+                            "../escape.py"
+                            if case == "unsafe-binding"
+                            else "lib/python3.13/module.py"
+                        ),
+                        "source_length": source.stat().st_size,
+                        "source_sha256": hashlib.sha256(
+                            source.read_bytes()
+                        ).hexdigest(),
+                    }
+                ]
+                observed = {
+                    "cache_tag": "cpython-313",
+                    "compiled_source_count": 1,
+                    "version": [3, 13, 8] if case == "mismatch" else [3, 13, 7],
+                }
+                process = subprocess.CompletedProcess(
+                    args=[],
+                    returncode=0,
+                    stdout=self.helper.canonical_bytes(observed).decode() + "\n",
+                    stderr="",
+                )
+
+                def run_with_side_effect(
+                    *_args,
+                    observed_case=case,
+                    observed_source=source,
+                    observed_process=process,
+                    **_kwargs,
+                ):
+                    if observed_case == "cache-recreated":
+                        cache = observed_source.parent / "__pycache__"
+                        cache.mkdir()
+                        (cache / "module.cpython-313.pyc").write_bytes(b"cache")
+                    return observed_process
+
+                with (
+                    mock.patch.object(
+                        self.helper,
+                        "run",
+                        side_effect=run_with_side_effect,
+                    ),
+                    self.assertRaises(self.helper.PreparationError),
+                ):
+                    self.helper.compile_retained_runtime_sources(
+                        runtime_root,
+                        executable,
+                        source_bindings,
+                        1001,
+                        1001,
+                    )
+
     def test_patchelf_interpreter_requires_direct_elf_agreement(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root)

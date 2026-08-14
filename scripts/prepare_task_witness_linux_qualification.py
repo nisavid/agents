@@ -21,6 +21,7 @@ import locale
 import os
 import platform
 import pwd
+import re
 import shutil
 import signal
 import stat
@@ -95,6 +96,11 @@ PATCHELF_NO_INTERPRETER_DIAGNOSTIC = (
     "patchelf: cannot find section '.interp'. "
     "The input file is most likely statically linked"
 )
+CPYTHON_CACHE_TAG = "cpython-313"
+CPYTHON_BYTECODE_CACHE_NAME = re.compile(
+    rf"(?P<stem>.+)\.{CPYTHON_CACHE_TAG}(?:\.opt-[12])?\.pyc"
+)
+RUNNER_INPUT_CAP_BYTES = 1024 * 1024
 SYSTEM_TOOLS = (
     ("environment-clearer", Path("/usr/bin/env")),
     ("git", Path("/usr/bin/git")),
@@ -144,6 +150,13 @@ def write_create_new(path: Path, value: object, *, mode: int = 0o444) -> bytes:
     finally:
         os.close(descriptor)
     return raw
+
+
+def write_runtime_closure_evidence(path: Path, evidence: dict[str, Any]) -> bytes:
+    raw = canonical_bytes(evidence)
+    if len(raw) > RUNNER_INPUT_CAP_BYTES:
+        raise PreparationError("runtime closure evidence exceeds the runner input cap")
+    return write_create_new(path, evidence)
 
 
 def load_canonical(path: Path) -> tuple[dict[str, Any], bytes]:
@@ -361,6 +374,7 @@ def run(
     *,
     check: bool = True,
     environment: dict[str, str] | None = None,
+    input_text: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     process = subprocess.run(
         argv,
@@ -368,6 +382,7 @@ def run(
         capture_output=True,
         text=True,
         env=environment,
+        input=input_text,
     )
     if check and process.returncode != 0:
         detail = process.stderr.strip() or process.stdout.strip() or "no diagnostics"
@@ -841,6 +856,322 @@ def dynamic_elf_files(root: Path) -> list[Path]:
     return result
 
 
+def stable_runtime_pruning_file(
+    path: Path,
+    *,
+    require_single_link: bool,
+) -> tuple[os.stat_result, str]:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except OSError as error:
+        raise PreparationError(
+            "runtime bytecode cache binding is unavailable"
+        ) from error
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or (require_single_link and metadata.st_nlink != 1)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_mode & 0o022
+        ):
+            raise PreparationError("runtime bytecode cache disposition is unsafe")
+        digest = hashlib.sha256()
+        while chunk := os.read(descriptor, 1024 * 1024):
+            digest.update(chunk)
+        if stable_file_binding(os.fstat(descriptor)) != stable_file_binding(metadata):
+            raise PreparationError("runtime bytecode cache changed while reading")
+    finally:
+        os.close(descriptor)
+    return metadata, digest.hexdigest()
+
+
+def runtime_pruning_inventory(runtime_root: Path) -> list[dict[str, Any]]:
+    runtime_root = exact_dependency_root(runtime_root, "runtime root")
+    try:
+        paths = [runtime_root, *sorted(runtime_root.rglob("*"), key=str)]
+    except OSError as error:
+        raise PreparationError("runtime bytecode cache cannot be enumerated") from error
+    inventory: list[dict[str, Any]] = []
+    for path in paths:
+        relative = (
+            "." if path == runtime_root else path.relative_to(runtime_root).as_posix()
+        )
+        try:
+            metadata = path.lstat()
+        except OSError as error:
+            raise PreparationError(
+                "runtime bytecode cache inventory cannot be inspected"
+            ) from error
+        common = {
+            "path": relative,
+            "uid": metadata.st_uid,
+            "gid": metadata.st_gid,
+            "mode": stat.S_IMODE(metadata.st_mode),
+        }
+        if metadata.st_uid != os.geteuid() or metadata.st_mode & 0o022:
+            raise PreparationError("runtime bytecode cache disposition is unsafe")
+        if stat.S_ISDIR(metadata.st_mode):
+            inventory.append({**common, "kind": "directory"})
+        elif stat.S_ISREG(metadata.st_mode):
+            stable_metadata, digest = stable_runtime_pruning_file(
+                path,
+                require_single_link=False,
+            )
+            inventory.append(
+                {
+                    **common,
+                    "kind": "regular-file",
+                    "nlink": stable_metadata.st_nlink,
+                    "length": stable_metadata.st_size,
+                    "sha256": digest,
+                }
+            )
+        else:
+            raise PreparationError("runtime bytecode cache inventory is unsafe")
+    if [entry["path"] for entry in inventory] != sorted(
+        {entry["path"] for entry in inventory}
+    ):
+        raise PreparationError("runtime bytecode cache inventory paths disagree")
+    return inventory
+
+
+def framed_pruning_inventory_sha256(
+    disposition: str,
+    entries: list[dict[str, Any]],
+) -> str:
+    return hashlib.sha256(
+        canonical_bytes(
+            {
+                "contract": "task-witness-runtime-pruning-inventory-frame-v1",
+                "disposition": disposition,
+                "entries": entries,
+            }
+        )
+    ).hexdigest()
+
+
+def prune_source_backed_bytecode_caches(runtime_root: Path) -> dict[str, Any]:
+    runtime_root = exact_dependency_root(runtime_root, "runtime root")
+    before_inventory = runtime_pruning_inventory(runtime_root)
+    before_by_path = {entry["path"]: entry for entry in before_inventory}
+    try:
+        cache_directories = sorted(
+            runtime_root.rglob("__pycache__"),
+            key=str,
+        )
+    except OSError as error:
+        raise PreparationError("runtime bytecode cache cannot be enumerated") from error
+
+    bytecode_paths: list[Path] = []
+    source_bindings: list[dict[str, Any]] = []
+    source_paths: set[Path] = set()
+    cache_bindings: dict[Path, tuple[int, ...]] = {}
+    bytecode_bindings: dict[Path, tuple[int, ...]] = {}
+    cache_bytecodes: dict[Path, list[Path]] = {}
+    for cache in cache_directories:
+        try:
+            cache_metadata = cache.lstat()
+            children = sorted(cache.iterdir(), key=str)
+        except OSError as error:
+            raise PreparationError(
+                "runtime bytecode cache cannot be inspected"
+            ) from error
+        if (
+            not stat.S_ISDIR(cache_metadata.st_mode)
+            or cache_metadata.st_uid != os.geteuid()
+            or cache_metadata.st_mode & 0o022
+        ):
+            raise PreparationError("runtime bytecode cache disposition is unsafe")
+        cache_bindings[cache] = stable_file_binding(cache_metadata)
+        cache_bytecodes[cache] = []
+        for bytecode in children:
+            match = CPYTHON_BYTECODE_CACHE_NAME.fullmatch(bytecode.name)
+            if match is None or match.group("stem") in {"", ".", ".."}:
+                raise PreparationError("runtime bytecode cache entry is invalid")
+            source = cache.parent / f"{match.group('stem')}.py"
+            try:
+                resolved_source = source.resolve(strict=True)
+            except (OSError, RuntimeError) as error:
+                raise PreparationError(
+                    "runtime bytecode cache source is unavailable"
+                ) from error
+            if (
+                not source.is_relative_to(runtime_root)
+                or resolved_source != source
+                or "__pycache__" in source.relative_to(runtime_root).parts
+            ):
+                raise PreparationError("runtime bytecode cache source is unsafe")
+            bytecode_metadata, bytecode_sha256 = stable_runtime_pruning_file(
+                bytecode,
+                require_single_link=True,
+            )
+            source_metadata, source_sha256 = stable_runtime_pruning_file(
+                source,
+                require_single_link=True,
+            )
+            bytecode_relative = bytecode.relative_to(runtime_root).as_posix()
+            source_relative = source.relative_to(runtime_root).as_posix()
+            if before_by_path.get(bytecode_relative) != {
+                "path": bytecode_relative,
+                "uid": bytecode_metadata.st_uid,
+                "gid": bytecode_metadata.st_gid,
+                "mode": stat.S_IMODE(bytecode_metadata.st_mode),
+                "kind": "regular-file",
+                "nlink": bytecode_metadata.st_nlink,
+                "length": bytecode_metadata.st_size,
+                "sha256": bytecode_sha256,
+            } or before_by_path.get(source_relative) != {
+                "path": source_relative,
+                "uid": source_metadata.st_uid,
+                "gid": source_metadata.st_gid,
+                "mode": stat.S_IMODE(source_metadata.st_mode),
+                "kind": "regular-file",
+                "nlink": source_metadata.st_nlink,
+                "length": source_metadata.st_size,
+                "sha256": source_sha256,
+            }:
+                raise PreparationError(
+                    "runtime bytecode cache source binding disagrees"
+                )
+            source_bindings.append(
+                {
+                    "bytecode_path": bytecode_relative,
+                    "source_path": source_relative,
+                    "source_length": source_metadata.st_size,
+                    "source_sha256": source_sha256,
+                }
+            )
+            bytecode_paths.append(bytecode)
+            cache_bytecodes[cache].append(bytecode)
+            bytecode_bindings[bytecode] = stable_file_binding(bytecode_metadata)
+            source_paths.add(source)
+        try:
+            final_cache_metadata = cache.lstat()
+        except OSError as error:
+            raise PreparationError(
+                "runtime bytecode cache changed while reading"
+            ) from error
+        if stable_file_binding(final_cache_metadata) != cache_bindings[cache]:
+            raise PreparationError("runtime bytecode cache changed while reading")
+
+    observed_pyc_paths = {
+        runtime_root.joinpath(*PurePosixPath(entry["path"]).parts)
+        for entry in before_inventory
+        if entry["kind"] == "regular-file" and entry["path"].endswith(".pyc")
+    }
+    if observed_pyc_paths != set(bytecode_paths):
+        raise PreparationError("runtime bytecode cache set is not closed")
+
+    try:
+        for cache in cache_directories:
+            cache_descriptor = os.open(
+                cache,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+            try:
+                if (
+                    stable_file_binding(os.fstat(cache_descriptor))
+                    != cache_bindings[cache]
+                ):
+                    raise PreparationError(
+                        "runtime bytecode cache changed before pruning"
+                    )
+                for bytecode in cache_bytecodes[cache]:
+                    current = os.stat(
+                        bytecode.name,
+                        dir_fd=cache_descriptor,
+                        follow_symlinks=False,
+                    )
+                    if stable_file_binding(current) != bytecode_bindings[bytecode]:
+                        raise PreparationError(
+                            "runtime bytecode cache changed before pruning"
+                        )
+                    os.unlink(bytecode.name, dir_fd=cache_descriptor)
+            finally:
+                os.close(cache_descriptor)
+        for cache in sorted(
+            cache_directories, key=lambda path: len(path.parts), reverse=True
+        ):
+            parent_descriptor = os.open(
+                cache.parent,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+            try:
+                os.rmdir(cache.name, dir_fd=parent_descriptor)
+            finally:
+                os.close(parent_descriptor)
+    except PreparationError:
+        raise
+    except OSError as error:
+        raise PreparationError("runtime bytecode cache cannot be pruned") from error
+
+    after_inventory = runtime_pruning_inventory(runtime_root)
+    after_by_path = {entry["path"]: entry for entry in after_inventory}
+    removed_paths = {
+        cache.relative_to(runtime_root).as_posix() for cache in cache_directories
+    } | {bytecode.relative_to(runtime_root).as_posix() for bytecode in bytecode_paths}
+    removed_inventory = [before_by_path[path] for path in sorted(removed_paths)]
+    if (
+        set(before_by_path) != set(after_by_path).union(removed_paths)
+        or set(after_by_path).intersection(removed_paths)
+        or any(before_by_path[path] != entry for path, entry in after_by_path.items())
+        or any(
+            entry["path"].endswith(".pyc")
+            or "__pycache__" in PurePosixPath(entry["path"]).parts
+            for entry in after_inventory
+        )
+    ):
+        raise PreparationError("runtime bytecode cache pruning proof disagrees")
+
+    return content_document(
+        {
+            "schema_version": 1,
+            "contract": "task-witness-cpython-bytecode-cache-pruning-v1",
+            "cache_tag": CPYTHON_CACHE_TAG,
+            "policy": "remove-only-source-backed-cpython-bytecode-caches-v1",
+            "before_inventory": {
+                "entry_count": len(before_inventory),
+                "sha256": framed_pruning_inventory_sha256(
+                    "before-bytecode-cache-pruning",
+                    before_inventory,
+                ),
+            },
+            "removed_inventory": {
+                "entry_count": len(removed_inventory),
+                "cache_directory_count": len(cache_directories),
+                "bytecode_file_count": len(bytecode_paths),
+                "bytecode_total_bytes": sum(
+                    entry["length"]
+                    for entry in removed_inventory
+                    if entry["kind"] == "regular-file"
+                ),
+                "sha256": framed_pruning_inventory_sha256(
+                    "removed-bytecode-cache-inventory",
+                    removed_inventory,
+                ),
+                "entries": removed_inventory,
+            },
+            "source_bindings": {
+                "source_file_count": len(source_paths),
+                "sha256": framed_pruning_inventory_sha256(
+                    "retained-source-bindings",
+                    source_bindings,
+                ),
+                "entries": source_bindings,
+            },
+            "after_inventory": {
+                "entry_count": len(after_inventory),
+                "sha256": framed_pruning_inventory_sha256(
+                    "after-bytecode-cache-pruning",
+                    after_inventory,
+                ),
+            },
+            "disposition": "pruned-source-backed-bytecode-caches",
+        }
+    )
+
+
 def unprivileged_argv(
     uid: int,
     gid: int,
@@ -867,6 +1198,127 @@ def unprivileged_argv(
         "TZ=UTC",
         *argv,
     ]
+
+
+def compile_retained_runtime_sources(
+    runtime_root: Path,
+    executable: Path,
+    source_bindings: list[dict[str, Any]],
+    inspection_uid: int,
+    inspection_gid: int,
+) -> dict[str, Any]:
+    runtime_root = exact_dependency_root(runtime_root, "runtime root")
+    executable = require_absolute(executable, "runtime executable")
+    if (
+        not executable.is_relative_to(runtime_root)
+        or not executable.is_file()
+        or inspection_uid <= 0
+        or inspection_gid < 0
+    ):
+        raise PreparationError("runtime source compilation boundary is invalid")
+    source_paths: list[str] = []
+    for binding in source_bindings:
+        bytecode_relative = normalized_wheel_path(
+            binding.get("bytecode_path", ""),
+            "runtime bytecode binding",
+        )
+        relative = normalized_wheel_path(
+            binding.get("source_path", ""),
+            "runtime source binding",
+        )
+        if (
+            len(bytecode_relative.parts) < 3
+            or bytecode_relative.parts[-2] != "__pycache__"
+        ):
+            raise PreparationError("runtime source compilation input is invalid")
+        match = CPYTHON_BYTECODE_CACHE_NAME.fullmatch(bytecode_relative.name)
+        expected_source = (
+            bytecode_relative.parent.parent / f"{match.group('stem')}.py"
+            if match is not None
+            else None
+        )
+        path = runtime_root.joinpath(*relative.parts)
+        metadata, digest = stable_runtime_pruning_file(
+            path,
+            require_single_link=True,
+        )
+        if (
+            path.suffix != ".py"
+            or expected_source != relative
+            or binding.get("source_length") != metadata.st_size
+            or binding.get("source_sha256") != digest
+        ):
+            raise PreparationError("runtime source compilation input is invalid")
+        source_paths.append(str(path))
+    source_paths = sorted(set(source_paths))
+    if not source_paths:
+        raise PreparationError("runtime source compilation input is empty")
+
+    program = """\
+import json
+import sys
+
+paths = json.load(sys.stdin)
+for path in paths:
+    with open(path, "rb") as stream:
+        compile(stream.read(), path, "exec", dont_inherit=True)
+print(
+    json.dumps(
+        {
+            "cache_tag": sys.implementation.cache_tag,
+            "compiled_source_count": len(paths),
+            "version": list(sys.version_info[:3]),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+)
+"""
+    process = run(
+        unprivileged_argv(
+            inspection_uid,
+            inspection_gid,
+            [str(executable), "-I", "-B", "-c", program],
+            home="/nonexistent-task-witness-runtime-source-compile-home",
+        ),
+        input_text=canonical_bytes(source_paths).decode("utf-8"),
+    )
+    try:
+        observed = json.loads(process.stdout)
+    except json.JSONDecodeError as error:
+        raise PreparationError(
+            "runtime source compilation output is invalid"
+        ) from error
+    expected = {
+        "cache_tag": CPYTHON_CACHE_TAG,
+        "compiled_source_count": len(source_paths),
+        "version": [3, 13, 7],
+    }
+    if (
+        observed != expected
+        or process.stdout != canonical_bytes(expected).decode() + "\n"
+    ):
+        raise PreparationError("runtime source compilation output disagrees")
+    if any(runtime_root.rglob("__pycache__")) or any(runtime_root.rglob("*.pyc")):
+        raise PreparationError("runtime source compilation recreated a bytecode cache")
+    return content_document(
+        {
+            "schema_version": 1,
+            "contract": "task-witness-runtime-source-compilation-v1",
+            "runtime_executable": str(executable),
+            "argv": ["-I", "-B", "-c"],
+            "inspection_uid": inspection_uid,
+            "inspection_gid": inspection_gid,
+            "cache_tag": CPYTHON_CACHE_TAG,
+            "version": [3, 13, 7],
+            "compiled_source_count": len(source_paths),
+            "source_paths_sha256": hashlib.sha256(
+                canonical_bytes(source_paths)
+            ).hexdigest(),
+            "program_sha256": hashlib.sha256(program.encode("utf-8")).hexdigest(),
+            "disposition": "compiled-in-memory-with-exact-runtime",
+        }
+    )
 
 
 def validate_needed_name(value: str) -> str:
@@ -1874,6 +2326,14 @@ def seal_runtime(args: argparse.Namespace) -> None:
             raise PreparationError(
                 "runtime sealing input is not root-owned immutable data"
             )
+    bytecode_cache_pruning = prune_source_backed_bytecode_caches(runtime_root)
+    retained_source_compilation = compile_retained_runtime_sources(
+        runtime_root,
+        executable,
+        bytecode_cache_pruning["source_bindings"]["entries"],
+        args.inspection_uid,
+        args.inspection_gid,
+    )
     pyyaml_before = validate_installed_wheel(site_packages)
     loader_root = runtime_root / "lib" / "task-witness-loader"
     loader_root.mkdir(parents=True, exist_ok=False)
@@ -2129,6 +2589,8 @@ def seal_runtime(args: argparse.Namespace) -> None:
             },
             "transformation": {
                 "runtime_copy_semantics": "archive-dereference-symlinks",
+                "bytecode_cache_pruning": bytecode_cache_pruning,
+                "retained_source_compilation": retained_source_compilation,
                 "loader_dependency_copy_semantics": (
                     "create-new-write-disabled-regular-files-at-dt-needed-aliases"
                 ),
@@ -2763,10 +3225,10 @@ def build_evidence(args: argparse.Namespace) -> None:
             },
         }
     )
-    raw = canonical_bytes(evidence)
-    if len(raw) > 1024 * 1024:
-        raise PreparationError("runtime closure evidence exceeds the runner input cap")
-    write_create_new(output / "runtime-closure-evidence.json", evidence)
+    write_runtime_closure_evidence(
+        output / "runtime-closure-evidence.json",
+        evidence,
+    )
 
     candidate = run(
         [

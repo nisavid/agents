@@ -107,6 +107,12 @@ EXACT_DRAIN_PROVIDER_ORDER = (
 EXACT_DRAIN_EXECUTION_LEASE_EXPIRED_MESSAGE = (
     "operation-recovery exact drain execution lease expired"
 )
+EXACT_DRAIN_EXECUTION_LEASE_ERROR_DIGEST = hashlib.sha256(
+    (
+        f"{OperationRecoveryError.__name__}: "
+        f"{EXACT_DRAIN_EXECUTION_LEASE_EXPIRED_MESSAGE}"
+    ).encode("utf-8")
+).hexdigest()
 EXACT_DRAIN_OAUTH_LOCATORS = {
     "work-codex": "oauth-home:work",
     "personal-codex": "oauth-home:personal",
@@ -791,9 +797,7 @@ def exact_drain_worker_failure_evidence(
             "category": "execution_lease_expired",
             "retryable": False,
             "http_status": None,
-            "error_digest": hashlib.sha256(
-                typed_message.encode("utf-8")
-            ).hexdigest(),
+            "error_digest": EXACT_DRAIN_EXECUTION_LEASE_ERROR_DIGEST,
         }
     else:
         evidence = _exact_drain_failure_evidence(

@@ -21,6 +21,44 @@ from tooling.hindsight.lib.hindsight_memory_control_plane.operation_recovery imp
 
 
 class ExactDrainProgressTest(unittest.TestCase):
+    def test_task_failure_schemas_reject_worker_only_lease_expiry(self) -> None:
+        selected = [
+            {
+                "operation_id": "00000000-0000-4000-8000-000000000001",
+                "operation_type": "retain",
+                "row_digest": "b" * 64,
+            }
+        ]
+        for schema_version in (2, 3):
+            with self.subTest(schema_version=schema_version):
+                with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+                    recorder = ExactDrainProgressRecorder(
+                        path=Path(directory) / "exact-drain-progress.json",
+                        plan_digest="a" * 64,
+                        worker_pid=1234,
+                        worker_start_time="darwin:1000:1",
+                        worker_attempt=1,
+                        selected_operations=selected,
+                        progress_schema_version=schema_version,
+                        clock=lambda: 1000.0,
+                    )
+                    with self.assertRaisesRegex(
+                        OperationRecoveryError,
+                        "failure evidence is invalid",
+                    ):
+                        recorder.task_outcome(
+                            selected[0]["operation_id"],
+                            status="failed",
+                            stage="failed",
+                            failure={
+                                "category": "execution_lease_expired",
+                                "retryable": False,
+                                "http_status": None,
+                                "error_digest": "c" * 64,
+                            },
+                            checkpoint=None,
+                        )
+
     def test_v3_progress_accepts_closed_execution_lease_expiry(self) -> None:
         with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
             path = Path(directory) / "exact-drain-progress.json"

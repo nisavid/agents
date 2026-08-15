@@ -44,14 +44,13 @@ SCOPE_CATEGORIES = frozenset(
     {"retain", "consolidation", "reflect", "default"}
 )
 PROVIDER_OUTCOMES = frozenset({"succeeded", "failed", "timed_out"})
-FAILURE_CATEGORIES = frozenset(
+TASK_FAILURE_CATEGORIES = frozenset(
     {
         "phase_one_timeout",
         "provider_bad_request",
         "provider_authentication",
         "provider_capacity",
         "provider_transport",
-        "execution_lease_expired",
         "retry_ceiling",
         "terminal_state_persistence",
         "nonquiescent_shutdown",
@@ -61,6 +60,9 @@ FAILURE_CATEGORIES = frozenset(
         "worker_initialization_timeout",
     }
 )
+WORKER_FAILURE_CATEGORIES = TASK_FAILURE_CATEGORIES | {
+    "execution_lease_expired"
+}
 
 
 def _sha(value: Any, label: str) -> str:
@@ -102,7 +104,11 @@ def _identifier(value: Any, label: str) -> str:
     return value
 
 
-def _validated_failure(value: Any) -> dict[str, Any] | None:
+def _validated_failure(
+    value: Any,
+    *,
+    categories: frozenset[str] = TASK_FAILURE_CATEGORIES,
+) -> dict[str, Any] | None:
     if value is None:
         return None
     keys = {"category", "retryable", "http_status", "error_digest"}
@@ -112,7 +118,7 @@ def _validated_failure(value: Any) -> dict[str, Any] | None:
     retryable = value.get("retryable")
     http_status = value.get("http_status")
     if (
-        category not in FAILURE_CATEGORIES
+        category not in categories
         or type(retryable) is not bool
         or (
             http_status is not None
@@ -643,7 +649,10 @@ class ExactDrainProgressRecorder:
             raise OperationRecoveryError(
                 "exact drain progress worker failure schema is unavailable"
             )
-        checked_failure = _validated_failure(failure)
+        checked_failure = _validated_failure(
+            failure,
+            categories=WORKER_FAILURE_CATEGORIES,
+        )
         if (
             checked_failure is None
             or type(exit_code) is not int
@@ -1158,7 +1167,10 @@ def _validated_progress(
         worker_status = result.get("worker_status")
         worker_stage = result.get("worker_stage")
         worker_failure_stage = result.get("worker_failure_stage")
-        worker_failure = _validated_failure(result.get("worker_failure"))
+        worker_failure = _validated_failure(
+            result.get("worker_failure"),
+            categories=WORKER_FAILURE_CATEGORIES,
+        )
         worker_exit_code = result.get("worker_exit_code")
         worker_stage_started_at = _timestamp(
             result.get("worker_stage_started_at"),

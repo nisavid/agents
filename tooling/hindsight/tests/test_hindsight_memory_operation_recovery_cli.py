@@ -7216,6 +7216,9 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             worker_runtime.write_text("#!/bin/sh\n", encoding="utf-8")
             worker_runtime.chmod(0o700)
             signals = []
+            lease_error_digest = self.controller[
+                "EXACT_DRAIN_EXECUTION_LEASE_ERROR_DIGEST"
+            ]
 
             class Process:
                 pid = 4242
@@ -7253,7 +7256,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                                 "category": "execution_lease_expired",
                                 "retryable": False,
                                 "http_status": None,
-                                "error_digest": "6" * 64,
+                                "error_digest": lease_error_digest,
                             },
                         )
                     self._returncode = 2
@@ -7354,6 +7357,83 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
         )
         self.assertFalse(progress["worker_failure"]["retryable"])
         self.assertNotIn("execution lease expired", json.dumps(progress))
+
+    def test_closed_lease_failure_requires_exact_child_exit_and_evidence(self):
+        helper = self.controller[
+            "_operation_recovery_exact_progress_closed_lease_expiry"
+        ]
+        now = int(time.time())
+        expected_failure = {
+            "category": "execution_lease_expired",
+            "retryable": False,
+            "http_status": None,
+            "error_digest": self.controller[
+                "EXACT_DRAIN_EXECUTION_LEASE_ERROR_DIGEST"
+            ],
+        }
+        for label, progress_exit, child_exit, failure in (
+            ("valid", 2, 2, expected_failure),
+            ("wrong-progress-exit", 17, 2, expected_failure),
+            ("wrong-child-exit", 2, 17, expected_failure),
+            (
+                "wrong-error-digest",
+                2,
+                2,
+                {**expected_failure, "error_digest": "f" * 64},
+            ),
+        ):
+            with self.subTest(case=label):
+                with tempfile.TemporaryDirectory(
+                    dir="/private/tmp",
+                    prefix="exact-drain-closed-lease-evidence-",
+                ) as directory:
+                    path = Path(directory) / "progress.json"
+                    recorder = ExactDrainProgressRecorder(
+                        path=path,
+                        plan_digest="a" * 64,
+                        worker_pid=4242,
+                        worker_start_time="start-token",
+                        worker_attempt=1,
+                        selected_operations=[],
+                        progress_schema_version=3,
+                        clock=lambda: float(now),
+                    )
+                    recorder.worker_stage(
+                        status="running",
+                        stage="worker.poller.running",
+                    )
+                    recorder.worker_failure(
+                        exit_code=progress_exit,
+                        failure=failure,
+                    )
+                    plan = {
+                        "progress_schema_version": 3,
+                        "progress_artifact_path": str(path),
+                        "plan_digest": "a" * 64,
+                    }
+                    journal = {
+                        "worker_pid": 4242,
+                        "worker_start_time": "start-token",
+                        "worker_attempt": 1,
+                    }
+                    if label == "valid":
+                        self.assertTrue(
+                            helper(
+                                plan,
+                                journal,
+                                child_returncode=child_exit,
+                            )
+                        )
+                    else:
+                        with self.assertRaisesRegex(
+                            self.controller["OperationRecoveryError"],
+                            "lease expiry evidence differs",
+                        ):
+                            helper(
+                                plan,
+                                journal,
+                                child_returncode=child_exit,
+                            )
 
     def test_exact_drain_lease_timeout_with_pid_mismatch_preserves_journal(self):
         fixtures = recovery_fixtures.OperationRecoveryContractTest()

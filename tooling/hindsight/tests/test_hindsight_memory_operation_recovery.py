@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -597,6 +598,35 @@ class OperationRecoveryContractTest(unittest.TestCase):
             self.drain_plan(
                 snapshot=self.drain_snapshot(completed_positions=set())
             )
+
+    def test_exact_drain_execution_window_accepts_only_through_its_maximum(self):
+        calculated_seconds = self.drain_plan()["execution_window"][
+            "calculated_seconds"
+        ]
+
+        with patch.object(
+            recovery_contract,
+            "EXACT_DRAIN_EXECUTION_WINDOW_MAX_SECONDS",
+            calculated_seconds,
+        ):
+            exact = self.drain_plan()
+        self.assertEqual(
+            exact["execution_window"]["calculated_seconds"],
+            exact["execution_window"]["maximum_seconds"],
+        )
+
+        with (
+            patch.object(
+                recovery_contract,
+                "EXACT_DRAIN_EXECUTION_WINDOW_MAX_SECONDS",
+                calculated_seconds - 1,
+            ),
+            self.assertRaisesRegex(
+                OperationRecoveryError,
+                "execution window exceeds maximum",
+            ),
+        ):
+            self.drain_plan()
 
     def test_exact_drain_verifier_preserves_prior_v2_contract(self):
         current = self.drain_plan()

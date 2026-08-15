@@ -7295,9 +7295,12 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 worker_runtime="worker-runtime",
             )
             try:
-                with self.assertRaisesRegex(
-                    Exception,
-                    "execution lease expired",
+                with (
+                    patch.object(globals_["time"], "time", return_value=now),
+                    self.assertRaisesRegex(
+                        Exception,
+                        "execution lease expired",
+                    ),
                 ):
                     command(args)
             finally:

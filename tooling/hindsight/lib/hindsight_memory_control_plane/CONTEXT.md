@@ -31,3 +31,19 @@ _Avoid_: Offline package manifest, curation manifest
 **Shadow plan**:
 A digest-bound migration proposal assembled from validated inventory, approved offline evidence, and live observations read within one unchanged opaque, server-backed adapter discovery generation. That generation is the atomic source-consistency contract; adapter watermarks are secondary drift evidence only. The plan is always unapproved and carries no mutation authority.
 _Avoid_: Apply plan, migration approval
+
+**Execution window**:
+A fixed, nonrenewing duration calculated from the exact selected operation IDs, their persisted retry counts, the effective worker concurrency, bounded task timeouts, retry waits, shutdown attempts, and transaction margins. Authorization time anchors the absolute deadline. Resume and progress do not move it.
+_Avoid_: Approval lifetime, renewable lease
+
+**Recovery epoch**:
+The single bounded transition consumed by a verified post-abort recovery transaction. That transaction may release exact-worker-owned pending or processing rows and may reset exact-worker-owned failed rows for one fresh attempt cycle. The epoch always advances from zero to one and cannot be replayed or renewed.
+_Avoid_: Retry count, worker attempt
+
+**Retry lineage**:
+The digest-bound record of each selected row's persisted retry count, consumed attempts, available attempts after the one permitted recovery, cumulative ceiling, and whether that recovery reset the failed row.
+_Avoid_: Provider retry policy, execution window
+
+**Recovery handoff**:
+The closed link from a verified post-abort plan and its application and verification receipts into a fresh exact-drain plan. It binds the recovery epoch, exact recovered IDs, checkpoint digests, preserved rows, generation, and candidate release without carrying task payloads or raw errors.
+_Avoid_: Resume token, renewed authorization

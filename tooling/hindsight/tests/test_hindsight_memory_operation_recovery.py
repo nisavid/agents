@@ -375,18 +375,46 @@ class OperationRecoveryContractTest(unittest.TestCase):
             )
         )
 
-    def test_exact_drain_plan_separates_approval_evidence_transaction_and_lease(self):
+    def test_exact_drain_plan_separates_approval_evidence_transaction_and_window(self):
         snapshot = self.drain_snapshot()
         planned_at = 1_785_462_000
 
         plan = self.drain_plan(snapshot=snapshot, created_at=planned_at)
 
-        self.assertEqual(plan["schema_version"], 9)
+        self.assertEqual(plan["schema_version"], 10)
         self.assertEqual(plan["expires_at"], planned_at + 86_400)
         self.assertEqual(plan["evidence_observed_at"], snapshot["observed_at"])
         self.assertEqual(plan["evidence_max_age_seconds"], 3_600)
         self.assertEqual(plan["transaction_timeout_seconds"], 120)
-        self.assertEqual(plan["execution_lease_seconds"], 86_400)
+        self.assertNotIn("execution_lease_seconds", plan)
+        self.assertEqual(
+            plan["execution_window"],
+            {
+                "schema_version": 1,
+                "kind": "operation-recovery-exact-drain-execution-window",
+                "anchor": "authorization-receipt-authorized-at",
+                "renewable": False,
+                "selected_operation_count": 43,
+                "remaining_attempt_count": 172,
+                "retry_wait_count": 129,
+                "effective_concurrency": 1,
+                "phase_one_timeout_seconds": 3_600,
+                "transaction_timeout_seconds": 120,
+                "shutdown_attempt_count": 4,
+                "calculated_seconds": 1_119_240,
+                "maximum_seconds": 1_209_600,
+            },
+        )
+        self.assertEqual(plan["recovery_context"]["origin"], "initial-snapshot")
+        self.assertEqual(plan["recovery_context"]["recovery_epoch"], 0)
+        self.assertRegex(
+            plan["recovery_context"]["initial_origin_digest"],
+            r"^[0-9a-f]{64}$",
+        )
+        self.assertEqual(
+            plan["recovery_context_digest"],
+            digest(plan["recovery_context"]),
+        )
         self.assertEqual(plan["phase_one_statement_timeout_seconds"], 120)
         self.assertEqual(plan["phase_one_client_timeout_seconds"], 125)
         self.assertEqual(plan["phase_one_timeout_seconds"], 3_600)
@@ -410,6 +438,108 @@ class OperationRecoveryContractTest(unittest.TestCase):
             plan,
         )
 
+    def test_exact_drain_execution_window_is_closed_and_recomputed(self):
+        plan = self.drain_plan()
+        cases = {}
+        for label, key, value in (
+            (
+                "remaining-attempt-count",
+                "remaining_attempt_count",
+                171,
+            ),
+            ("effective-concurrency", "effective_concurrency", 2),
+            ("calculated-seconds", "calculated_seconds", 1_119_239),
+            ("maximum-seconds", "maximum_seconds", 1_209_601),
+            ("anchor", "anchor", "plan-created-at"),
+            ("renewable", "renewable", True),
+            ("schema-version-bool", "schema_version", True),
+            (
+                "effective-concurrency-bool",
+                "effective_concurrency",
+                True,
+            ),
+            ("renewable-int", "renewable", 0),
+        ):
+            candidate = deepcopy(plan)
+            candidate["execution_window"][key] = value
+            candidate["plan_digest"] = digest(
+                {
+                    item_key: item_value
+                    for item_key, item_value in candidate.items()
+                    if item_key != "plan_digest"
+                }
+            )
+            cases[label] = candidate
+        extra = deepcopy(plan)
+        extra["execution_window"]["extra"] = 1
+        extra["plan_digest"] = digest(
+            {key: value for key, value in extra.items() if key != "plan_digest"}
+        )
+        cases["extra-key"] = extra
+        missing = deepcopy(plan)
+        missing["execution_window"].pop("retry_wait_count")
+        missing["plan_digest"] = digest(
+            {
+                key: value
+                for key, value in missing.items()
+                if key != "plan_digest"
+            }
+        )
+        cases["missing-key"] = missing
+
+        for label, candidate in cases.items():
+            with self.subTest(label=label), self.assertRaises(
+                OperationRecoveryError
+            ):
+                recovery_contract.verify_exact_drain_plan(
+                    candidate,
+                    now=candidate["created_at"],
+                )
+
+    def test_exact_drain_v10_initial_origin_covers_completed_rows(self):
+        rows = operation_rows()
+        for index in {0, 1, 42, 43, 46}:
+            rows[index]["status"] = "completed"
+            rows[index]["completed_at"] = "2026-07-29T13:00:02Z"
+        rows[0]["updated_at"] = "2026-08-15T21:00:00.000000Z"
+        snapshot = dict(
+            create_live_snapshot(
+                self.cohort(),
+                rows,
+                generation_before="systalyze:public:124",
+                generation_after="systalyze:public:124",
+                installation_authority=installation_authority(),
+                observed_at=1_785_461_000,
+            )
+        )
+
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "recovery context is required",
+        ):
+            self.drain_plan(snapshot=snapshot)
+
+    def test_exact_drain_rejects_forged_selected_id_without_raw_key_error(self):
+        plan = self.drain_plan()
+        plan["selected_operations"][0]["operation_id"] = (
+            "ffffffff-ffff-4fff-8fff-ffffffffffff"
+        )
+
+        with self.assertRaises(OperationRecoveryError):
+            recovery_contract.verify_exact_drain_plan(
+                plan,
+                now=plan["created_at"],
+            )
+
+    def test_exact_drain_rejects_an_execution_window_over_fourteen_days(self):
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "execution window exceeds maximum",
+        ):
+            self.drain_plan(
+                snapshot=self.drain_snapshot(completed_positions=set())
+            )
+
     def test_exact_drain_verifier_preserves_prior_v2_contract(self):
         current = self.drain_plan()
         body = {
@@ -424,9 +554,13 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 "phase_one_client_timeout_seconds",
                 "progress_schema_version",
                 "failure_evidence_contract_digest",
+                "execution_window",
+                "recovery_context",
+                "recovery_context_digest",
             }
         }
         body["schema_version"] = 2
+        body["execution_lease_seconds"] = 86_400
         prior = {**body, "plan_digest": digest(body)}
 
         self.assertEqual(
@@ -448,9 +582,13 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 "phase_one_client_timeout_seconds",
                 "progress_schema_version",
                 "failure_evidence_contract_digest",
+                "execution_window",
+                "recovery_context",
+                "recovery_context_digest",
             }
         }
         body["schema_version"] = 3
+        body["execution_lease_seconds"] = 86_400
         body["phase_repair_contract_digest"] = (
             recovery_contract.EXACT_DRAIN_PHASE_REPAIR_CONTRACT_DIGEST
         )
@@ -475,9 +613,13 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 "phase_one_client_timeout_seconds",
                 "progress_schema_version",
                 "failure_evidence_contract_digest",
+                "execution_window",
+                "recovery_context",
+                "recovery_context_digest",
             }
         }
         body["schema_version"] = 4
+        body["execution_lease_seconds"] = 86_400
         body["phase_repair_contract_digest"] = (
             recovery_contract.EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V2_DIGEST
         )
@@ -502,9 +644,13 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 "phase_one_client_timeout_seconds",
                 "progress_schema_version",
                 "failure_evidence_contract_digest",
+                "execution_window",
+                "recovery_context",
+                "recovery_context_digest",
             }
         }
         body["schema_version"] = 5
+        body["execution_lease_seconds"] = 86_400
         body["phase_repair_contract_digest"] = (
             recovery_contract.EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V3_DIGEST
         )
@@ -518,14 +664,68 @@ class OperationRecoveryContractTest(unittest.TestCase):
             prior,
         )
 
+    def test_exact_drain_verifier_preserves_prior_v6_authorization_deadline(self):
+        current = self.drain_plan()
+        body = {
+            key: value
+            for key, value in current.items()
+            if key
+            not in {
+                "plan_digest",
+                "execution_window",
+                "recovery_context",
+                "recovery_context_digest",
+            }
+        }
+        body["schema_version"] = 6
+        body["execution_lease_seconds"] = 86_400
+        body["phase_repair_contract_digest"] = (
+            recovery_contract.EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V4_DIGEST
+        )
+        body["progress_schema_version"] = 2
+        body["failure_evidence_contract_digest"] = (
+            recovery_contract.EXACT_DRAIN_FAILURE_EVIDENCE_CONTRACT_DIGEST
+        )
+        prior = {**body, "plan_digest": digest(body)}
+        authorization = exact_drain_authorization(
+            prior,
+            authorized_at=prior["created_at"] + 123,
+        )
+
+        self.assertEqual(
+            recovery_contract.verify_exact_drain_plan(
+                prior,
+                now=prior["created_at"],
+            ),
+            prior,
+        )
+        self.assertEqual(
+            recovery_contract.exact_drain_execution_window_seconds(prior),
+            86_400,
+        )
+        self.assertEqual(
+            recovery_contract.exact_drain_execution_deadline(
+                prior,
+                authorization,
+            ),
+            authorization["authorized_at"] + 86_400,
+        )
+
     def test_exact_drain_verifier_preserves_prior_v7_contract(self):
         current = self.drain_plan()
         body = {
             key: value
             for key, value in current.items()
-            if key != "plan_digest"
+            if key
+            not in {
+                "plan_digest",
+                "execution_window",
+                "recovery_context",
+                "recovery_context_digest",
+            }
         }
         body["schema_version"] = 7
+        body["execution_lease_seconds"] = 86_400
         body["phase_repair_contract_digest"] = (
             recovery_contract.EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V5_DIGEST
         )
@@ -548,9 +748,16 @@ class OperationRecoveryContractTest(unittest.TestCase):
         body = {
             key: value
             for key, value in current.items()
-            if key != "plan_digest"
+            if key
+            not in {
+                "plan_digest",
+                "execution_window",
+                "recovery_context",
+                "recovery_context_digest",
+            }
         }
         body["schema_version"] = 8
+        body["execution_lease_seconds"] = 86_400
         body["phase_repair_contract_digest"] = (
             recovery_contract.EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V5_DIGEST
         )
@@ -564,7 +771,47 @@ class OperationRecoveryContractTest(unittest.TestCase):
             prior,
         )
 
-    def test_exact_drain_v9_failure_evidence_contract_is_closed(self):
+    def test_exact_drain_verifier_preserves_prior_v9_authorization_deadline(self):
+        current = self.drain_plan()
+        body = {
+            key: value
+            for key, value in current.items()
+            if key
+            not in {
+                "plan_digest",
+                "execution_window",
+                "recovery_context",
+                "recovery_context_digest",
+            }
+        }
+        body["schema_version"] = 9
+        body["execution_lease_seconds"] = 86_400
+        prior = {**body, "plan_digest": digest(body)}
+        authorization = exact_drain_authorization(
+            prior,
+            authorized_at=prior["created_at"] + 123,
+        )
+
+        self.assertEqual(
+            recovery_contract.verify_exact_drain_plan(
+                prior,
+                now=prior["created_at"],
+            ),
+            prior,
+        )
+        self.assertEqual(
+            recovery_contract.exact_drain_execution_window_seconds(prior),
+            86_400,
+        )
+        self.assertEqual(
+            recovery_contract.exact_drain_execution_deadline(
+                prior,
+                authorization,
+            ),
+            authorization["authorized_at"] + 86_400,
+        )
+
+    def test_exact_drain_v10_failure_evidence_contract_is_closed(self):
         plan = self.drain_plan()
         for key, value in (
             ("phase_one_statement_timeout_seconds", 121),
@@ -2444,6 +2691,381 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 tampered,
                 now=tampered["created_at"],
             )
+
+        retry_operation_index = next(
+            index
+            for index, item in enumerate(
+                plan["retry_recovery"]["operations"]
+            )
+            if item["reset_applied"]
+        )
+        for label, key, value in (
+            ("integer-for-boolean", "reset_applied", 1),
+            ("float-for-boolean", "reset_applied", 1.0),
+            ("boolean-for-integer", "retry_count_after", False),
+        ):
+            with self.subTest(retry_recovery_type_confusion=label):
+                confused = deepcopy(plan)
+                confused["retry_recovery"]["operations"][
+                    retry_operation_index
+                ][key] = value
+                confused["plan_digest"] = digest(
+                    {
+                        item_key: item_value
+                        for item_key, item_value in confused.items()
+                        if item_key != "plan_digest"
+                    }
+                )
+                with self.assertRaisesRegex(
+                    OperationRecoveryError,
+                    "retry recovery is invalid",
+                ):
+                    verify_post_abort_recovery_plan(
+                        confused,
+                        now=confused["created_at"],
+                    )
+
+        for nested_digest in (
+            "operation_set_digest",
+            "retry_recovery_digest",
+        ):
+            with self.subTest(retry_recovery_digest=nested_digest):
+                mismatched = deepcopy(plan)
+                if nested_digest == "operation_set_digest":
+                    mismatched["retry_recovery"][nested_digest] = "0" * 64
+                    mismatched["retry_recovery_digest"] = digest(
+                        mismatched["retry_recovery"]
+                    )
+                else:
+                    mismatched[nested_digest] = "0" * 64
+                mismatched["plan_digest"] = digest(
+                    {
+                        item_key: item_value
+                        for item_key, item_value in mismatched.items()
+                        if item_key != "plan_digest"
+                    }
+                )
+                with self.assertRaisesRegex(
+                    OperationRecoveryError,
+                    "retry recovery is invalid",
+                ):
+                    verify_post_abort_recovery_plan(
+                        mismatched,
+                        now=mismatched["created_at"],
+                    )
+
+    def test_exact_drain_v10_binds_verified_post_abort_retry_lineage(self):
+        reference = self.drain_plan(
+            snapshot=self.drain_snapshot(
+                completed_positions=set(range(7)),
+                observed_at=1_786_390_000,
+            ),
+            created_at=1_786_390_001,
+        )
+        interrupted = self.post_abort_v10_snapshot(reference)
+        recovery_backup = rollback_backup_evidence()
+        for key in ("generation_before", "generation_after"):
+            recovery_backup["source_authority"][key] = interrupted[
+                "generation_before"
+            ]
+        recovery_backup["source_authority_digest"] = digest(
+            recovery_backup["source_authority"]
+        )
+        recovery_plan = create_post_abort_recovery_plan(
+            reference,
+            interrupted,
+            candidate_release=release_identity(),
+            rollback_backup=recovery_backup,
+            rollback_encryption=rollback_encryption(),
+            rollback_backup_path="/private/tmp/v10-handoff-backup.age",
+            rollback_bundle_path="/private/tmp/v10-handoff-bundle.age",
+            authorization_receipt_path="/private/tmp/v10-handoff-auth.json",
+            application_receipt_path="/private/tmp/v10-handoff-app.json",
+            verification_receipt_path="/private/tmp/v10-handoff-verify.json",
+            rollback_receipt_path="/private/tmp/v10-handoff-rollback.json",
+            reference_application_authorization=(
+                exact_drain_authorization(reference)
+            ),
+            reference_application_journal=(
+                exact_drain_application_journal(reference)
+            ),
+            reference_application_progress_digest="f" * 64,
+            created_at=1_786_390_500,
+        )
+        selected_ids = {
+            item["operation_id"]
+            for item in recovery_plan["selected_operations"]
+        }
+        retry_after = {
+            item["operation_id"]: item["retry_count_after"]
+            for item in recovery_plan["retry_recovery"]["operations"]
+        }
+        recovered_rows = []
+        for item in interrupted["operations"]:
+            row = {
+                "operation_id": item["operation_id"],
+                "bank_id": "engineering",
+                "operation_type": item["operation_type"],
+                "status": item["current_status"],
+                "created_at": item["created_at"],
+                "updated_at": item["updated_at"],
+                "completed_at": item["completed_at"],
+                "retry_count": item["retry_count"],
+                "next_retry_at": item["next_retry_at"],
+                "worker_id_present": item["worker_id_present"],
+                "worker_id_digest": item["worker_id_digest"],
+                "claimed_at": item["claimed_at"],
+                "task_payload_present": item["task_payload_present"],
+                "task_payload_digest": item["task_payload_digest"],
+                "result_metadata_digest": item[
+                    "result_metadata_digest"
+                ],
+                "error_category": item["error_category"],
+                "error_digest": item["error_digest"],
+            }
+            if item["operation_id"] in selected_ids:
+                was_failed = row["status"] == "failed"
+                row.update(
+                    status="pending",
+                    updated_at="2026-08-15T21:00:00.000000Z",
+                    completed_at=None if was_failed else row["completed_at"],
+                    retry_count=retry_after[item["operation_id"]],
+                    next_retry_at=None if was_failed else row["next_retry_at"],
+                    worker_id_present=False,
+                    worker_id_digest=None,
+                    claimed_at=None,
+                    error_category="none" if was_failed else row["error_category"],
+                    error_digest=None if was_failed else row["error_digest"],
+                )
+            recovered_rows.append(row)
+        recovered_snapshot = dict(
+            create_live_snapshot(
+                self.cohort(),
+                recovered_rows,
+                generation_before="systalyze:public:81700",
+                generation_after="systalyze:public:81700",
+                installation_authority=installation_authority(),
+                observed_at=1_786_390_700,
+            )
+        )
+        recovery_context = {
+            "schema_version": 1,
+            "kind": "operation-recovery-exact-drain-recovery-context",
+            "origin": "post-abort",
+            "generation": recovered_snapshot["generation_before"],
+            "recovery_epoch": 1,
+            "candidate_release_digest": release_identity()["release_digest"],
+            "selected_operation_ids_digest": digest(
+                sorted(selected_ids)
+            ),
+            "initial_origin_digest": None,
+            "post_abort_selected_operation_ids_digest": digest(
+                sorted(selected_ids)
+            ),
+            "post_abort_plan_digest": recovery_plan["plan_digest"],
+            "post_abort_application_receipt_digest": "a" * 64,
+            "post_abort_verification_receipt_digest": "b" * 64,
+            "retry_recovery_digest": recovery_plan[
+                "retry_recovery_digest"
+            ],
+            "selected_checkpoint_set_digest": recovery_plan[
+                "selected_checkpoint_set_digest"
+            ],
+            "preserved_row_set_digest": recovery_plan[
+                "preserved_row_set_digest"
+            ],
+        }
+        drain_backup = drain_backup_evidence()
+        for key in ("generation_before", "generation_after"):
+            drain_backup["source_authority"][key] = recovered_snapshot[
+                "generation_before"
+            ]
+        drain_backup["source_authority_digest"] = digest(
+            drain_backup["source_authority"]
+        )
+        plan = recovery_contract.create_exact_drain_plan(
+            self.cohort(),
+            recovered_snapshot,
+            candidate_release=release_identity(),
+            rollback_backup=drain_backup,
+            rollback_backup_path="/private/tmp/v10-resume-backup.age",
+            provider_policy_digest="9" * 64,
+            effective_profile_digest="7" * 64,
+            worker_runtime_digest="8" * 64,
+            authorization_receipt_path="/private/tmp/v10-resume-auth.json",
+            application_receipt_path="/private/tmp/v10-resume-app.json",
+            status_artifact_path="/private/tmp/v10-resume-status.json",
+            verification_receipt_path="/private/tmp/v10-resume-verify.json",
+            recovery_context=recovery_context,
+            created_at=1_786_390_701,
+        )
+
+        self.assertEqual(plan["selected_operation_count"], 39)
+        self.assertEqual(
+            plan["execution_window"]["remaining_attempt_count"],
+            105,
+        )
+        self.assertEqual(
+            plan["execution_window"]["calculated_seconds"],
+            643_200,
+        )
+        self.assertEqual(plan["recovery_context"], recovery_context)
+        self.assertEqual(
+            recovery_contract.verify_exact_drain_plan(
+                plan,
+                now=plan["created_at"],
+            ),
+            plan,
+        )
+
+        second_rows = deepcopy(recovered_rows)
+        second_selected_id = plan["selected_operations"][0]["operation_id"]
+        second_worker_digest = hashlib.sha256(
+            (
+                "operation-recovery-exact-drain-"
+                f"{plan['plan_digest'][:12]}"
+            ).encode()
+        ).hexdigest()
+        second_failed = next(
+            item
+            for item in second_rows
+            if item["operation_id"] == second_selected_id
+        )
+        second_failed.update(
+            status="failed",
+            updated_at="2026-08-15T21:10:00.000000Z",
+            completed_at="2026-08-15T21:10:00.000000Z",
+            worker_id_present=True,
+            worker_id_digest=second_worker_digest,
+            claimed_at="2026-08-15T21:05:00.000000Z",
+            error_category="provider_transport",
+            error_digest="c" * 64,
+        )
+        second_interrupted = dict(
+            create_live_snapshot(
+                self.cohort(),
+                second_rows,
+                generation_before="systalyze:public:81701",
+                generation_after="systalyze:public:81701",
+                installation_authority=installation_authority(),
+                observed_at=1_786_390_800,
+            )
+        )
+        second_backup = rollback_backup_evidence()
+        for key in ("generation_before", "generation_after"):
+            second_backup["source_authority"][key] = second_interrupted[key]
+        second_backup["source_authority_digest"] = digest(
+            second_backup["source_authority"]
+        )
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "retry recovery is invalid",
+        ):
+            create_post_abort_recovery_plan(
+                plan,
+                second_interrupted,
+                candidate_release=release_identity(),
+                rollback_backup=second_backup,
+                rollback_encryption=rollback_encryption(),
+                rollback_backup_path="/private/tmp/v10-replay-backup.age",
+                rollback_bundle_path="/private/tmp/v10-replay-bundle.age",
+                authorization_receipt_path="/private/tmp/v10-replay-auth.json",
+                application_receipt_path="/private/tmp/v10-replay-app.json",
+                verification_receipt_path="/private/tmp/v10-replay-verify.json",
+                rollback_receipt_path="/private/tmp/v10-replay-rollback.json",
+                reference_application_authorization=(
+                    exact_drain_authorization(plan)
+                ),
+                reference_application_journal=(
+                    exact_drain_application_journal(plan)
+                ),
+                reference_application_progress_digest="d" * 64,
+                created_at=1_786_390_900,
+            )
+
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "recovery context is required",
+        ):
+            recovery_contract.create_exact_drain_plan(
+                self.cohort(),
+                recovered_snapshot,
+                candidate_release=release_identity(),
+                rollback_backup=drain_backup,
+                rollback_backup_path="/private/tmp/v10-omitted-backup.age",
+                provider_policy_digest="9" * 64,
+                effective_profile_digest="7" * 64,
+                worker_runtime_digest="8" * 64,
+                authorization_receipt_path="/private/tmp/v10-omitted-auth.json",
+                application_receipt_path="/private/tmp/v10-omitted-app.json",
+                status_artifact_path="/private/tmp/v10-omitted-status.json",
+                verification_receipt_path="/private/tmp/v10-omitted-verify.json",
+                created_at=1_786_390_701,
+            )
+
+        replayed_epoch = deepcopy(plan)
+        replayed_epoch["recovery_context"]["recovery_epoch"] = 0
+        replayed_epoch["recovery_context_digest"] = digest(
+            replayed_epoch["recovery_context"]
+        )
+        replayed_epoch["plan_digest"] = digest(
+            {
+                key: value
+                for key, value in replayed_epoch.items()
+                if key != "plan_digest"
+            }
+        )
+        with self.assertRaisesRegex(OperationRecoveryError, "context is invalid"):
+            recovery_contract.verify_exact_drain_plan(
+                replayed_epoch,
+                now=replayed_epoch["created_at"],
+            )
+
+    def test_post_abort_v10_consumes_epoch_for_processing_only_cleanup(self):
+        reference = self.drain_plan()
+        snapshot = self.post_abort_snapshot(
+            reference,
+            current_interrupted_subset=True,
+            interrupted_processing_count=1,
+            observed_at=1_786_391_000,
+        )
+        backup = rollback_backup_evidence()
+        for key in ("generation_before", "generation_after"):
+            backup["source_authority"][key] = snapshot[key]
+        backup["source_authority_digest"] = digest(
+            backup["source_authority"]
+        )
+
+        plan = create_post_abort_recovery_plan(
+            reference,
+            snapshot,
+            candidate_release=release_identity(),
+            rollback_backup=backup,
+            rollback_encryption=rollback_encryption(),
+            rollback_backup_path="/private/tmp/v10-cleanup-backup.age",
+            rollback_bundle_path="/private/tmp/v10-cleanup-bundle.age",
+            authorization_receipt_path="/private/tmp/v10-cleanup-auth.json",
+            application_receipt_path="/private/tmp/v10-cleanup-app.json",
+            verification_receipt_path="/private/tmp/v10-cleanup-verify.json",
+            rollback_receipt_path="/private/tmp/v10-cleanup-rollback.json",
+            reference_application_authorization=(
+                exact_drain_authorization(reference)
+            ),
+            reference_application_journal=(
+                exact_drain_application_journal(reference)
+            ),
+            reference_application_progress_digest="e" * 64,
+            created_at=1_786_391_100,
+        )
+
+        self.assertEqual(plan["selected_status_counts"], {"processing": 1})
+        self.assertEqual(plan["retry_recovery"]["failed_reset_count"], 0)
+        self.assertEqual(plan["retry_recovery"]["recovery_epoch_before"], 0)
+        self.assertEqual(plan["retry_recovery"]["recovery_epoch_after"], 1)
+        self.assertEqual(
+            verify_post_abort_recovery_plan(plan, now=plan["created_at"]),
+            plan,
+        )
 
     def test_post_abort_plan_rejects_a_different_processing_owner(self):
         reference = self.drain_plan()

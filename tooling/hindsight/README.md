@@ -325,6 +325,25 @@ records retain the exception type even when the exception text is empty.
 Post-abort recovery preserves every completed exact-drain checkpoint. A current
 recovery plan selects only the reference worker's failed, owned-pending, and
 processing rows; completed rows and all other cohort rows remain digest-exact.
+The whole post-abort recovery consumes the single recovery epoch, advancing it
+from zero to one. Within that transaction, failed rows may reset once while
+pending and processing rows preserve their retry counts. A second post-abort
+recovery or a cumulative attempt count beyond the closed ceiling is rejected.
+
+A current exact-drain plan uses a fixed, nonrenewing execution window instead
+of the legacy 24-hour lease. Planning recomputes the window from the selected
+rows' persisted retry counts, effective concurrency, bounded phase timeouts,
+possible retry waits, worker shutdown attempts, and transaction margins. The
+window begins when the authorization receipt is created, never at resume, and
+planning rejects a result over 14 days instead of truncating it.
+
+After post-abort verification, add `--recovery-plan "$POST_ABORT_PLAN"` to the
+next read-only `operation-recovery drain plan` command. The fresh plan then
+seals the recovery epoch, application and verification receipts, selected
+checkpoint set, preserved row set, generation, and recovered IDs into its
+approval digest. Omit `--recovery-plan` only when the entire cohort satisfies
+the sealed initial-origin proof. Any post-abort mutation makes the verified
+recovery plan mandatory, including after a recovered row later completes.
 
 The managed exact-drain worker runtime is a separate trusted authority. For a
 current plan, planning, apply, and the gated child each stream-hash the complete

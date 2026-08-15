@@ -348,8 +348,15 @@ renewal chain to expand the maximum mutation authority approved in the plan.
 
 ## Decision
 
-Pause the live workflow. Do not run current post-abort schema 9 and do not
-reattempt under the expired plan. Implement and verify the narrow recovery,
-classification, and lease-schema repairs first. Then recover with a newly
-approved invariant-based post-abort plan and reattempt with a freshly approved,
-budget-sized, nonrenewing exact-drain plan.
+Keep the live workflow paused and never reattempt under the expired plan. The
+supported path is an explicitly approved schema-10 post-abort recovery followed
+by a separately approved schema-10 exact drain. Post-abort selection is derived
+from authenticated identity, ownership, state, and checkpoint invariants. The
+single recovery epoch permits one post-abort transaction, within which owned
+failed rows may reset once. The fresh drain binds the verified recovery handoff
+and uses a recomputed, nonrenewing execution window anchored to its new
+authorization receipt. Planning rejects a window over 14 days.
+
+The two approvals remain separate. Post-abort application and verification must
+finish before fresh exact-drain planning. Fresh planning is read-only and must
+stop at the new digest until that digest is explicitly approved.

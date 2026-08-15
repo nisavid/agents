@@ -59,6 +59,122 @@ class ExactDrainProgressTest(unittest.TestCase):
                             checkpoint=None,
                         )
 
+    def test_v2_reader_rejects_resealed_worker_only_task_failure(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+            path = Path(directory) / "exact-drain-progress.json"
+            operation_id = "00000000-0000-4000-8000-000000000001"
+            recorder = ExactDrainProgressRecorder(
+                path=path,
+                plan_digest="a" * 64,
+                worker_pid=1234,
+                worker_start_time="darwin:1000:1",
+                worker_attempt=1,
+                selected_operations=[
+                    {
+                        "operation_id": operation_id,
+                        "operation_type": "retain",
+                        "row_digest": "b" * 64,
+                    }
+                ],
+                progress_schema_version=2,
+                clock=lambda: 1000.0,
+            )
+            recorder.task_outcome(
+                operation_id,
+                status="failed",
+                stage="failed",
+                failure={
+                    "category": "provider_transport",
+                    "retryable": False,
+                    "http_status": None,
+                    "error_digest": "c" * 64,
+                },
+                checkpoint=None,
+            )
+            forged = json.loads(path.read_text(encoding="utf-8"))
+            forged["tasks"][0]["failure"]["category"] = (
+                "execution_lease_expired"
+            )
+            forged["progress_digest"] = digest(
+                {
+                    key: value
+                    for key, value in forged.items()
+                    if key != "progress_digest"
+                }
+            )
+            path.write_text(
+                json.dumps(forged, sort_keys=True, separators=(",", ":")),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                OperationRecoveryError,
+                "failure evidence is invalid",
+            ):
+                read_exact_drain_progress(
+                    path,
+                    plan_digest="a" * 64,
+                    progress_schema_version=2,
+                )
+
+    def test_task_runtime_failure_rejects_worker_only_category_atomically(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+            path = Path(directory) / "exact-drain-progress.json"
+            operation_id = "00000000-0000-4000-8000-000000000001"
+            recorder = ExactDrainProgressRecorder(
+                path=path,
+                plan_digest="a" * 64,
+                worker_pid=1234,
+                worker_start_time="darwin:1000:1",
+                worker_attempt=1,
+                selected_operations=[
+                    {
+                        "operation_id": operation_id,
+                        "operation_type": "retain",
+                        "row_digest": "b" * 64,
+                    }
+                ],
+                progress_schema_version=3,
+                clock=lambda: 1000.0,
+            )
+            recorder.task_stage(
+                operation_id,
+                status="processing",
+                stage="retain.phase1.request",
+            )
+            before = path.read_bytes()
+            before_progress = read_exact_drain_progress(
+                path,
+                plan_digest="a" * 64,
+                progress_schema_version=3,
+            )
+
+            with self.assertRaisesRegex(
+                OperationRecoveryError,
+                "failure evidence is invalid",
+            ):
+                recorder.task_runtime_failure(
+                    operation_id,
+                    stage="failure.runtime",
+                    failure={
+                        "category": "execution_lease_expired",
+                        "retryable": False,
+                        "http_status": None,
+                        "error_digest": "c" * 64,
+                    },
+                )
+
+            after_progress = read_exact_drain_progress(
+                path,
+                plan_digest="a" * 64,
+                progress_schema_version=3,
+            )
+            self.assertEqual(path.read_bytes(), before)
+            self.assertEqual(
+                after_progress["progress_digest"],
+                before_progress["progress_digest"],
+            )
+
     def test_v3_progress_accepts_closed_execution_lease_expiry(self) -> None:
         with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
             path = Path(directory) / "exact-drain-progress.json"

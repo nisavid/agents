@@ -43,6 +43,7 @@ from .operation_recovery import (
     EXPECTED_CLAIM_RELEASE_ROW_COUNT,
     EXPECTED_OPERATION_COUNTS,
     OperationRecoveryError,
+    exact_drain_execution_deadline,
     verify_exact_drain_authorization_receipt,
     verify_exact_drain_plan,
     verify_exact_drain_status,
@@ -4315,10 +4316,12 @@ def exact_drain_runtime_evidence(
     provider_runtime_root: str | Path,
     runtime_package_root: str | Path,
     *,
-    schema_version: int = 9,
+    schema_version: int = 10,
 ) -> tuple[str, bytes]:
     """Bind runtime sources and retain prevalidated provider bootstrap bytes."""
-    if type(schema_version) is not int or schema_version not in {1, 2, 3, 4, 5, 6, 7, 8, 9}:
+    if type(schema_version) is not int or schema_version not in {
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10
+    }:
         raise OperationRecoveryError(
             "exact drain runtime evidence schema version is invalid"
         )
@@ -4416,7 +4419,7 @@ def exact_drain_runtime_evidence(
             sources["phase-repair-contract"] = (
                 EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V5_DIGEST
             )
-        elif schema_version == 9:
+        elif schema_version in {9, 10}:
             if snapshot["schema_version"] != 7:
                 raise OperationRecoveryError(
                     "exact drain full-query repair snapshot is required"
@@ -4474,7 +4477,7 @@ def exact_drain_runtime_digest(
     provider_runtime_root: str | Path,
     runtime_package_root: str | Path,
     *,
-    schema_version: int = 9,
+    schema_version: int = 10,
 ) -> str:
     """Bind the worker entrypoint, claim seam, and provider patch sources."""
     runtime_digest, _provider_bootstrap = exact_drain_runtime_evidence(
@@ -4550,14 +4553,17 @@ class ExactDrainClaimAdapter:
         verified = verify_exact_drain_plan(plan, allow_expired=True)
         if (
             terminal_reconciliation
-            and verified.get("schema_version") in {2, 3, 4, 5, 6, 7, 8, 9}
+            and verified.get("schema_version")
+            in {2, 3, 4, 5, 6, 7, 8, 9, 10}
             and terminal_status_evidence is None
         ):
             raise OperationRecoveryError(
                 "operation-recovery terminal status evidence is required"
             )
         self._clock = clock
-        if verified.get("schema_version") in {2, 3, 4, 5, 6, 7, 8, 9}:
+        if verified.get("schema_version") in {
+            2, 3, 4, 5, 6, 7, 8, 9, 10
+        }:
             if authorization is None:
                 raise OperationRecoveryError(
                     "operation-recovery exact drain authorization is required"
@@ -4566,9 +4572,9 @@ class ExactDrainClaimAdapter:
                 authorization,
                 plan=verified,
             )
-            self._execution_deadline = (
-                checked_authorization["authorized_at"]
-                + verified["execution_lease_seconds"]
+            self._execution_deadline = exact_drain_execution_deadline(
+                verified,
+                checked_authorization,
             )
             self._transaction_timeout_seconds = verified[
                 "transaction_timeout_seconds"
@@ -4584,12 +4590,14 @@ class ExactDrainClaimAdapter:
             )
         self.phase_one_timeout_seconds = (
             verified["phase_one_timeout_seconds"]
-            if verified.get("schema_version") in {3, 4, 5, 6, 7, 8, 9}
+            if verified.get("schema_version")
+            in {3, 4, 5, 6, 7, 8, 9, 10}
             else None
         )
         self.phase_one_statement_timeout_seconds = (
             verified["phase_one_statement_timeout_seconds"]
-            if verified.get("schema_version") in {3, 4, 5, 6, 7, 8, 9}
+            if verified.get("schema_version")
+            in {3, 4, 5, 6, 7, 8, 9, 10}
             else None
         )
         self._cleanup_deadline: float | None = None

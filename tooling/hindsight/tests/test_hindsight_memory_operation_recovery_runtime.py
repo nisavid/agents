@@ -125,6 +125,19 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         self.assertFalse(evidence["retryable"])
         self.assertIsNone(evidence["http_status"])
         self.assertEqual(
+            evidence["error_digest"],
+            hashlib.sha256(
+                (
+                    "OperationRecoveryError: operation-recovery exact drain "
+                    "execution lease expired"
+                ).encode("utf-8")
+            ).hexdigest(),
+        )
+        self.assertEqual(
+            evidence["error_digest"],
+            "2814599b21d040f684426dfa56cf6036e3f9bd90eb629aa355d27a33ed41221f",
+        )
+        self.assertEqual(
             set(evidence),
             {"category", "retryable", "http_status", "error_digest"},
         )
@@ -197,7 +210,8 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
 
         self.assertEqual(
             adapter._execution_deadline,
-            authorization["authorized_at"] + 86_400,
+            authorization["authorized_at"]
+            + plan["execution_window"]["calculated_seconds"],
         )
         self.assertEqual(
             json.dumps(
@@ -284,7 +298,8 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
                 authorization=authorization,
                 resume=True,
                 terminal_reconciliation=True,
-                clock=lambda: planned_at + 86_400,
+                clock=lambda: planned_at
+                + plan["execution_window"]["calculated_seconds"],
             )
 
         adapter = ExactDrainClaimAdapter(
@@ -297,11 +312,15 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
                 "observed_at": planned_at,
                 "status_digest": "6" * 64,
             },
-            clock=lambda: planned_at + 86_400,
+            clock=lambda: planned_at
+            + plan["execution_window"]["calculated_seconds"],
         )
 
         self.assertTrue(adapter._terminal_reconciliation)
-        self.assertEqual(adapter._execution_deadline, planned_at + 86_400)
+        self.assertEqual(
+            adapter._execution_deadline,
+            planned_at + plan["execution_window"]["calculated_seconds"],
+        )
 
     def test_exact_drain_public_claim_rejects_the_execution_lease_boundary(self):
         adapter = object.__new__(ExactDrainClaimAdapter)
@@ -3849,7 +3868,9 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
                 "status_digest": "6" * 64,
             },
             completion_callback=lambda: completed.append(True),
-            clock=lambda: planned_at + 86_401,
+            clock=lambda: planned_at
+            + plan["execution_window"]["calculated_seconds"]
+            + 1,
         )
         adapter._verify_initial_state = AsyncMock()
 
@@ -3910,7 +3931,9 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
                 "observed_at": planned_at,
                 "status_digest": "6" * 64,
             },
-            clock=lambda: planned_at + 86_401,
+            clock=lambda: planned_at
+            + plan["execution_window"]["calculated_seconds"]
+            + 1,
         )
         adapter._verify_initial_state = AsyncMock()
 

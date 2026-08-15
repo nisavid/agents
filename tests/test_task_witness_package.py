@@ -3570,7 +3570,7 @@ class TaskWitnessPackageTests(unittest.TestCase):
                 "tw1_client": 8575,
                 "tw2_control_plane": 24675,
                 "current_control_set": 35050,
-                "direct_release_owned_tests": 59975,
+                "direct_release_owned_tests": 60382,
                 "public_release_registration": 25,
                 "release_documentation": 3250,
                 "release_integration": 10975,

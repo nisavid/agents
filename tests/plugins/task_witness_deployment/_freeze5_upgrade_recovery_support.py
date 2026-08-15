@@ -15,7 +15,11 @@ from ._activation_support import (
     SmokeChildBoundary,
     expected_smoke_envelope,
 )
-from ._routine_support import RoutineDeploymentFixture, _freeze5_git
+from ._routine_support import (
+    RoutineDeploymentFixture,
+    _freeze5_source_raw,
+    materialize_freeze5_plugin,
+)
 from ._support import (
     PLUGIN,
     canonical_document,
@@ -39,7 +43,6 @@ CLIENT_GENERATION_ASSIGNMENT = re.compile(
 CLIENT_PROFILE_ASSIGNMENT = re.compile(
     rb'(?m)^CLIENT_RELEASE_PROFILE = "([a-z0-9-]+)"$',
 )
-_PLUGIN_PREFIX = "plugins/task-witness/"
 
 
 @dataclass(frozen=True)
@@ -65,59 +68,8 @@ class PreparedFreeze5BridgeActivation:
     activation: object
 
 
-def _resolve_freeze5() -> None:
-    resolved = (
-        _freeze5_git(
-            "rev-parse",
-            "--verify",
-            f"{FREEZE5_COMMIT}^{{commit}}",
-        )
-        .decode("ascii")
-        .strip()
-    )
-    if resolved != FREEZE5_COMMIT:
-        raise AssertionError("Freeze 5 commit identity disagrees")
-
-
 def _freeze5_file_raw(relative_path: str) -> bytes:
-    _resolve_freeze5()
-    return _freeze5_git(
-        "show",
-        f"{FREEZE5_COMMIT}:{_PLUGIN_PREFIX}{relative_path}",
-    )
-
-
-def materialize_freeze5_plugin(destination: Path) -> None:
-    """Materialize the exact immutable Freeze 5 plugin tree from Git objects."""
-
-    _resolve_freeze5()
-    tree = _freeze5_git(
-        "ls-tree",
-        "-r",
-        FREEZE5_COMMIT,
-        "plugins/task-witness",
-    ).decode("utf-8")
-    entries: list[tuple[str, str, str]] = []
-    for line in tree.splitlines():
-        binding, path = line.split("\t", 1)
-        mode, kind, object_id = binding.split(" ")
-        if kind != "blob" or mode not in {"100644", "100755"}:
-            raise AssertionError("Freeze 5 plugin tree has an unsupported entry")
-        if not path.startswith(_PLUGIN_PREFIX):
-            raise AssertionError("Freeze 5 plugin entry escaped its tree")
-        entries.append((mode, object_id, path.removeprefix(_PLUGIN_PREFIX)))
-    if not entries:
-        raise AssertionError("Freeze 5 plugin tree is empty")
-    destination.mkdir(mode=0o700)
-    for mode, object_id, relative in entries:
-        target = destination / relative
-        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        raw = _freeze5_git("cat-file", "blob", object_id)
-        target.write_bytes(raw)
-        target.chmod(0o755 if mode == "100755" else 0o644)
-    controller = destination / "controller" / "task_witness_deploy.py"
-    if sha256(controller.read_bytes()) != FREEZE5_CONTROLLER_SHA256:
-        raise AssertionError("Freeze 5 controller digest disagrees")
+    return _freeze5_source_raw(relative_path)
 
 
 def set_resealed_client_profile(path: Path, profile: str) -> None:

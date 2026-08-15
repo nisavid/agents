@@ -16,6 +16,7 @@ from ._activation_support import (
     expected_smoke_envelope,
 )
 from ._support import (
+    PLUGIN,
     REPOSITORY,
     ProviderFixture,
     adapt_agent_plugins_candidate,
@@ -27,44 +28,355 @@ from ._support import (
 )
 
 FREEZE5_COMMIT = "96608a9b91d4dcf3f468a4fab1f0e008c9c32b36"
-FREEZE5_PLUGIN_PREFIX = "plugins/task-witness/"
+FREEZE5_SNAPSHOT_ROOT = (
+    REPOSITORY / "release" / "task-witness" / "migration" / "freeze5"
+)
+FREEZE5_PLUGIN_INVENTORY = {
+    ".claude-plugin/plugin.json": (
+        "snapshot",
+        0o644,
+        506,
+        "14924e412e534b1b0f4ededa55e033b8ed326d0a2eebb9a2653e06b87f7fc12d",
+    ),
+    ".codex-plugin/plugin.json": (
+        "snapshot",
+        0o644,
+        1012,
+        "76520f1e5d4b95772c9cfc7d2e483e11fdf669d1088686427804cd79fc4a5a4e",
+    ),
+    "client/task_witness_client.py": (
+        "snapshot",
+        0o644,
+        294524,
+        "778186f6a460655a8b390c831e05c233171236898663ad4155bd45695597c6cf",
+    ),
+    "client/task_witness_shim.sh.in": (
+        "stable",
+        0o644,
+        148,
+        "86413c755b5e1b53bc05767972798286673a3ab9bb1976c7d8220cba61702919",
+    ),
+    "controller/policy.json": (
+        "snapshot",
+        0o644,
+        2783,
+        "23e84f210ba69ef79e02bfc3039b2c8be3b91153d7649009b3a22850f5086245",
+    ),
+    "controller/task_witness_deploy.py": (
+        "snapshot",
+        0o755,
+        796417,
+        "8dc51b2a644e30d1f7c4f3b71711698b4130b43f1517e9f5361c6d1a0f7d6cfe",
+    ),
+    "launcher/task_witness_launch.py": (
+        "stable",
+        0o644,
+        26956,
+        "4d97e8df695276f8da9cb87ef1c27fa5979c5edf9f338127a0a19ae077d3172b",
+    ),
+    "runtime/bundle_io.py": (
+        "stable",
+        0o644,
+        13507,
+        "dc78fd637ec8530fa22f0a6a3fbe6441941e707c8725800619c0efe156707676",
+    ),
+    "runtime/canonical.py": (
+        "stable",
+        0o644,
+        6986,
+        "55dd41b0977708c91b6841d9aee00dbd03d9d0c8c405a3f174fa4d5cc9afbc3d",
+    ),
+    "runtime/task_witness.py": (
+        "stable",
+        0o644,
+        10387,
+        "9c61d4ad10f54fe14abafeca9016f8d7e472edff7b66b6d871b2f212a0c06afd",
+    ),
+    "runtime/trust.py": (
+        "stable",
+        0o644,
+        14307,
+        "e46866d82bf1427c774467d61c1706a3b69efa399c653b7ed3d6633decd5ba1e",
+    ),
+    "smoke/task_witness_smoke_validator.py": (
+        "stable",
+        0o644,
+        1470,
+        "6d416d50cdc09c9d5d4eb0cc7bf7ef3db9e22b2726326ff886bee2a80723dd47",
+    ),
+}
 
 
-def _freeze5_git(*arguments: str) -> bytes:
-    return subprocess.run(
-        (
-            "git",
-            "--no-replace-objects",
-            "-c",
-            "safe.directory=",
-            "-c",
-            f"safe.directory={REPOSITORY}",
-            *arguments,
-        ),
-        cwd=REPOSITORY,
-        check=True,
-        capture_output=True,
-    ).stdout
+def _freeze5_binding(metadata: os.stat_result) -> tuple[int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+    )
+
+
+def _open_freeze5_root(root: Path, label: str) -> int:
+    descriptor: int | None = None
+    try:
+        visible = root.lstat()
+        descriptor = os.open(
+            root,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+        opened = os.fstat(descriptor)
+    except OSError as error:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise AssertionError(f"Freeze 5 {label} is unavailable") from error
+    if not stat.S_ISDIR(opened.st_mode) or _freeze5_binding(opened) != (
+        _freeze5_binding(visible)
+    ):
+        os.close(descriptor)
+        raise AssertionError(f"Freeze 5 {label} identity disagrees")
+    return descriptor
+
+
+def _open_freeze5_directory_at(
+    parent_descriptor: int,
+    name: str,
+    observed: os.stat_result,
+    label: str,
+) -> int:
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=parent_descriptor,
+        )
+        opened = os.fstat(descriptor)
+    except OSError as error:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise AssertionError(f"Freeze 5 {label} is unavailable") from error
+    if not stat.S_ISDIR(opened.st_mode) or _freeze5_binding(opened) != (
+        _freeze5_binding(observed)
+    ):
+        os.close(descriptor)
+        raise AssertionError(f"Freeze 5 {label} identity disagrees")
+    return descriptor
+
+
+def _read_freeze5_file_at(
+    parent_descriptor: int,
+    name: str,
+    relative_path: str,
+    observed: os.stat_result,
+) -> bytes:
+    _source, expected_mode, expected_length, expected_sha256 = FREEZE5_PLUGIN_INVENTORY[
+        relative_path
+    ]
+    if not stat.S_ISREG(observed.st_mode):
+        raise AssertionError(f"Freeze 5 source {relative_path} identity disagrees")
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK | os.O_NOFOLLOW,
+            dir_fd=parent_descriptor,
+        )
+    except OSError as error:
+        raise AssertionError(
+            f"Freeze 5 source {relative_path} is unavailable"
+        ) from error
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or _freeze5_binding(opened) != _freeze5_binding(observed)
+            or stat.S_IMODE(opened.st_mode) != expected_mode
+            or opened.st_size != expected_length
+        ):
+            raise AssertionError(f"Freeze 5 source {relative_path} identity disagrees")
+        raw = bytearray()
+        while chunk := os.read(descriptor, min(64 * 1024, expected_length + 1)):
+            raw.extend(chunk)
+            if len(raw) > expected_length:
+                break
+        after = os.fstat(descriptor)
+        visible = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if not (
+            _freeze5_binding(opened)
+            == _freeze5_binding(after)
+            == _freeze5_binding(visible)
+        ) or opened.st_size != len(raw):
+            raise AssertionError(f"Freeze 5 source {relative_path} identity disagrees")
+    finally:
+        os.close(descriptor)
+    captured = bytes(raw)
+    if len(captured) != expected_length or sha256(captured) != expected_sha256:
+        raise AssertionError(f"Freeze 5 source {relative_path} identity disagrees")
+    return captured
+
+
+def _freeze5_source_raw(
+    relative_path: str,
+    *,
+    plugin_root: Path = PLUGIN,
+    snapshot_root: Path = FREEZE5_SNAPSHOT_ROOT,
+) -> bytes:
+    try:
+        source, _mode, _length, _digest = FREEZE5_PLUGIN_INVENTORY[relative_path]
+    except KeyError as error:
+        raise AssertionError("Freeze 5 source inventory disagrees") from error
+    relative = Path(relative_path)
+    if (
+        relative.is_absolute()
+        or not relative.parts
+        or any(part in {"", ".", ".."} for part in relative.parts)
+    ):
+        raise AssertionError("Freeze 5 source inventory disagrees")
+    root = snapshot_root if source == "snapshot" else plugin_root
+    descriptors: list[int] = []
+    try:
+        current = _open_freeze5_root(root, "source root")
+        descriptors.append(current)
+        for index, component in enumerate(relative.parts[:-1], start=1):
+            observed = os.stat(
+                component,
+                dir_fd=current,
+                follow_symlinks=False,
+            )
+            current = _open_freeze5_directory_at(
+                current,
+                component,
+                observed,
+                f"source directory {'/'.join(relative.parts[:index])}",
+            )
+            descriptors.append(current)
+        observed = os.stat(
+            relative.name,
+            dir_fd=current,
+            follow_symlinks=False,
+        )
+        return _read_freeze5_file_at(
+            current,
+            relative.name,
+            relative_path,
+            observed,
+        )
+    except OSError as error:
+        raise AssertionError(
+            f"Freeze 5 source {relative_path} is unavailable"
+        ) from error
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
+def _capture_freeze5_snapshot(snapshot_root: Path) -> dict[str, bytes]:
+    expected = {
+        relative
+        for relative, (source, _mode, _length, _digest) in (
+            FREEZE5_PLUGIN_INVENTORY.items()
+        )
+        if source == "snapshot"
+    }
+    expected_directories = {
+        parent.as_posix()
+        for relative in expected
+        for parent in Path(relative).parents
+        if parent != Path(".")
+    }
+    owned_descriptors: set[int] = set()
+    try:
+        root_descriptor = _open_freeze5_root(snapshot_root, "snapshot root")
+        owned_descriptors.add(root_descriptor)
+        observed_files: set[str] = set()
+        observed_directories: set[str] = set()
+        captured: dict[str, bytes] = {}
+        pending = [(root_descriptor, Path("."))]
+        while pending:
+            directory_descriptor, prefix = pending.pop()
+            with os.scandir(directory_descriptor) as entries:
+                for entry in entries:
+                    relative = prefix / entry.name
+                    normalized = relative.as_posix().removeprefix("./")
+                    entry_stat = entry.stat(follow_symlinks=False)
+                    if stat.S_ISDIR(entry_stat.st_mode):
+                        if normalized not in expected_directories:
+                            raise AssertionError(
+                                "Freeze 5 snapshot inventory disagrees"
+                            )
+                        observed_directories.add(normalized)
+                        child_descriptor = _open_freeze5_directory_at(
+                            directory_descriptor,
+                            entry.name,
+                            entry_stat,
+                            f"snapshot directory {normalized}",
+                        )
+                        owned_descriptors.add(child_descriptor)
+                        pending.append((child_descriptor, relative))
+                    elif stat.S_ISREG(entry_stat.st_mode):
+                        if normalized not in expected:
+                            raise AssertionError(
+                                "Freeze 5 snapshot inventory disagrees"
+                            )
+                        observed_files.add(normalized)
+                        captured[normalized] = _read_freeze5_file_at(
+                            directory_descriptor,
+                            entry.name,
+                            normalized,
+                            entry_stat,
+                        )
+                    else:
+                        raise AssertionError("Freeze 5 snapshot inventory disagrees")
+    except OSError as error:
+        raise AssertionError("Freeze 5 snapshot inventory is unavailable") from error
+    finally:
+        for descriptor in sorted(owned_descriptors, reverse=True):
+            os.close(descriptor)
+    if observed_files != expected or observed_directories != expected_directories:
+        raise AssertionError("Freeze 5 snapshot inventory disagrees")
+    return captured
+
+
+def materialize_freeze5_plugin(
+    destination: Path,
+    *,
+    plugin_root: Path = PLUGIN,
+    snapshot_root: Path = FREEZE5_SNAPSHOT_ROOT,
+) -> None:
+    """Build the exact F5 plugin from candidate-owned historical sources."""
+
+    if destination.exists() or destination.is_symlink():
+        raise AssertionError("Freeze 5 materialization destination already exists")
+    captured = _capture_freeze5_snapshot(snapshot_root)
+    captured.update(
+        {
+            relative: _freeze5_source_raw(
+                relative,
+                plugin_root=plugin_root,
+                snapshot_root=snapshot_root,
+            )
+            for relative, (source, _mode, _length, _digest) in (
+                FREEZE5_PLUGIN_INVENTORY.items()
+            )
+            if source == "stable"
+        }
+    )
+    destination.mkdir(mode=0o700)
+    for relative, (_source, mode, _length, _digest) in FREEZE5_PLUGIN_INVENTORY.items():
+        target = destination / relative
+        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        target.write_bytes(captured[relative])
+        target.chmod(mode)
 
 
 def _freeze5_manifest_raw(relative_path: str) -> bytes:
-    """Load one exact legacy-manifest authority from the immutable F5 object."""
+    """Load one exact legacy manifest from candidate-owned F5 history."""
 
-    resolved = (
-        _freeze5_git(
-            "rev-parse",
-            "--verify",
-            f"{FREEZE5_COMMIT}^{{commit}}",
-        )
-        .decode("ascii")
-        .strip()
-    )
-    if resolved != FREEZE5_COMMIT:
-        raise AssertionError("Freeze 5 commit identity disagrees")
-    return _freeze5_git(
-        "show",
-        f"{FREEZE5_COMMIT}:{FREEZE5_PLUGIN_PREFIX}{relative_path}",
-    )
+    if relative_path not in {
+        ".claude-plugin/plugin.json",
+        ".codex-plugin/plugin.json",
+    }:
+        raise AssertionError("Freeze 5 manifest inventory disagrees")
+    return _freeze5_source_raw(relative_path)
 
 
 def smoke_envelope(smoke: object) -> bytes:

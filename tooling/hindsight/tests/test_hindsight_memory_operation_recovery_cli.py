@@ -2009,7 +2009,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 globals_.update(originals)
             self.assertEqual(writes, [])
 
-    def test_post_abort_plan_command_emits_exact_current_v9_subset(self):
+    def test_post_abort_plan_command_emits_invariant_v10_subset(self):
         command = self.controller[
             "operation_recovery_post_abort_plan_command"
         ]
@@ -2028,7 +2028,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
         )
         with tempfile.TemporaryDirectory(
             dir="/private/tmp",
-            prefix="post-abort-v9-plan-",
+            prefix="post-abort-v10-plan-",
         ) as directory:
             root = Path(directory)
             root.chmod(0o700)
@@ -2155,7 +2155,11 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             self.assertEqual(result["selected_operation_count"], 3)
             plan, create_only = written[args.output]
             self.assertIs(create_only, True)
-            self.assertEqual(plan["schema_version"], 9)
+            self.assertEqual(plan["schema_version"], 10)
+            self.assertEqual(
+                plan["selection_contract_digest"],
+                recovery_fixtures.recovery_contract.POST_ABORT_V10_SELECTION_CONTRACT_DIGEST,
+            )
             self.assertEqual(
                 plan["preserved_status_counts"],
                 {"completed": 7, "pending": 38},

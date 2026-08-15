@@ -6894,6 +6894,18 @@ async def apply_post_abort_recovery_transaction(
     selected = {
         item["operation_id"]: item for item in verified["selected_operations"]
     }
+    retry_by_id = (
+        {
+            item["operation_id"]: item
+            for item in verified["retry_recovery"]["operations"]
+        }
+        if verified["schema_version"] == 10
+        else {}
+    )
+    if retry_by_id and set(retry_by_id) != set(selected):
+        raise OperationRecoveryError(
+            "operation-recovery post-abort retry row set differs"
+        )
     snapshot = {
         item["operation_id"]: item
         for item in verified["live_snapshot"]["operations"]
@@ -6990,7 +7002,7 @@ async def apply_post_abort_recovery_transaction(
             "worker_id IS NOT NULL "
             "AND encode(sha256(convert_to(worker_id, 'UTF8')), 'hex') = $3 "
             "AND claimed_at IS NOT NULL"
-            if verified["schema_version"] in {5, 6, 7, 8, 9}
+            if verified["schema_version"] in {5, 6, 7, 8, 9, 10}
             else "worker_id IS NULL AND claimed_at IS NULL"
         )
         result = await connection.execute(
@@ -7030,7 +7042,7 @@ async def apply_post_abort_recovery_transaction(
             selected_identifiers,
             bank_id,
             verified["reference_worker_id_digest"],
-            verified["schema_version"] in {7, 9},
+            verified["schema_version"] in {7, 9, 10},
         )
         if result != f"UPDATE {len(selected)}":
             raise OperationRecoveryError(
@@ -7079,6 +7091,18 @@ async def apply_post_abort_recovery_transaction(
             ):
                 raise OperationRecoveryError(
                     "operation-recovery post-abort post-state differs"
+                )
+            retry_recovery = retry_by_id.get(operation_id)
+            if retry_recovery is not None and (
+                before["retry_count"]
+                != retry_recovery["retry_count_before"]
+                or after["retry_count"]
+                != retry_recovery["retry_count_after"]
+                or retry_recovery["reset_applied"]
+                != (item["expected_status"] == "failed")
+            ):
+                raise OperationRecoveryError(
+                    "operation-recovery post-abort retry state differs"
                 )
             if item["expected_status"] == "processing" and any(
                 after[key] != prior[key]
@@ -7171,7 +7195,7 @@ async def rollback_post_abort_recovery_transaction(
             item = selected[operation_id]
             row = preimage_by_id[operation_id]
             allowed_preimage_statuses = {"processing", "failed"}
-            if verified["schema_version"] == 7:
+            if verified["schema_version"] in {7, 9, 10}:
                 allowed_preimage_statuses.add("pending")
             if (
                 row.get("status") != item["expected_status"]

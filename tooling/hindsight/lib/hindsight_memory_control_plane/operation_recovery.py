@@ -189,6 +189,31 @@ POST_ABORT_V9_FAILED_RETRY_COUNTS = POST_ABORT_V8_FAILED_RETRY_COUNTS
 POST_ABORT_V9_PENDING_RETRY_COUNTS = (3,)
 POST_ABORT_V9_PROCESSING_RETRY_COUNTS = (3,)
 POST_ABORT_V9_PRESERVED_STATUS_COUNTS = {"completed": 7, "pending": 38}
+POST_ABORT_V10_SELECTION_CONTRACT = {
+    "schema_version": 1,
+    "reference_scope": "reference-plan-selected-operation-ids",
+    "selected_states": ["failed", "owned-pending", "processing"],
+    "selected_owner": "reference-worker-digest-and-claim",
+    "preserved_states": [
+        "reference-completed",
+        "reference-worker-completed",
+        "unowned-pending",
+    ],
+    "identity_projection": [
+        "operation_id",
+        "operation_type",
+        "task_payload_digest",
+    ],
+    "checkpoint_projection": [
+        "operation_id",
+        "result_metadata_digest",
+    ],
+    "preserved_projection": ["operation_id", "row_digest"],
+    "retry_mutation": "failed-zero-pending-processing-preserve",
+}
+POST_ABORT_V10_SELECTION_CONTRACT_DIGEST = digest(
+    POST_ABORT_V10_SELECTION_CONTRACT
+)
 POST_ABORT_CONTRACTS = {
     1: (
         POST_ABORT_SELECTED_STATUS_COUNTS,
@@ -597,6 +622,43 @@ POST_ABORT_PLAN_V6_KEYS = POST_ABORT_PLAN_V5_KEYS
 POST_ABORT_PLAN_V7_KEYS = POST_ABORT_PLAN_V6_KEYS
 POST_ABORT_PLAN_V8_KEYS = POST_ABORT_PLAN_V7_KEYS
 POST_ABORT_PLAN_V9_KEYS = POST_ABORT_PLAN_V8_KEYS
+POST_ABORT_PLAN_V10_KEYS = POST_ABORT_PLAN_V9_KEYS | frozenset(
+    {
+        "selection_contract_digest",
+        "selected_checkpoint_set_digest",
+        "preserved_row_set_digest",
+        "retry_recovery",
+        "retry_recovery_digest",
+    }
+)
+POST_ABORT_V10_RETRY_RECOVERY_KEYS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "recovery_epoch_before",
+        "recovery_epoch_after",
+        "recovery_epoch_ceiling",
+        "ordinary_retry_ceiling",
+        "ordinary_attempt_ceiling",
+        "maximum_cumulative_attempts",
+        "operation_count",
+        "failed_reset_count",
+        "operations",
+        "operation_set_digest",
+    }
+)
+POST_ABORT_V10_RETRY_OPERATION_KEYS = frozenset(
+    {
+        "operation_id",
+        "expected_status",
+        "retry_count_before",
+        "retry_count_after",
+        "attempts_consumed_before",
+        "attempts_available_after",
+        "cumulative_attempt_ceiling",
+        "reset_applied",
+    }
+)
 POST_ABORT_REFERENCE_JOURNAL_KEYS = frozenset(
     {
         "schema_version",
@@ -2815,6 +2877,244 @@ def _post_abort_v9_completed_selected_matches(
     )
 
 
+def _post_abort_v10_retry_recovery(
+    reference_plan: Mapping[str, Any],
+    selected: Sequence[Mapping[str, Any]],
+    current: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    ordinary_retry_ceiling = reference_plan["worker_max_retries"]
+    ordinary_attempt_ceiling = reference_plan["worker_max_attempts"]
+    maximum_cumulative_attempts = ordinary_attempt_ceiling * 2
+    operations = []
+    for item in selected:
+        row = current[item["operation_id"]]
+        retry_count_before = row["retry_count"]
+        reset_applied = item["expected_status"] == "failed"
+        retry_count_after = 0 if reset_applied else retry_count_before
+        attempts_consumed_before = retry_count_before + int(
+            item["expected_status"] in {"processing", "failed"}
+        )
+        attempts_available_after = (
+            ordinary_attempt_ceiling - retry_count_after
+        )
+        cumulative_attempt_ceiling = (
+            attempts_consumed_before + attempts_available_after
+        )
+        if (
+            not 0 <= retry_count_before <= ordinary_retry_ceiling
+            or attempts_available_after < 1
+            or cumulative_attempt_ceiling > maximum_cumulative_attempts
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery post-abort retry recovery is invalid"
+            )
+        operations.append(
+            {
+                "operation_id": item["operation_id"],
+                "expected_status": item["expected_status"],
+                "retry_count_before": retry_count_before,
+                "retry_count_after": retry_count_after,
+                "attempts_consumed_before": attempts_consumed_before,
+                "attempts_available_after": attempts_available_after,
+                "cumulative_attempt_ceiling": cumulative_attempt_ceiling,
+                "reset_applied": reset_applied,
+            }
+        )
+    failed_reset_count = sum(
+        item["reset_applied"] for item in operations
+    )
+    body = {
+        "schema_version": 1,
+        "kind": "operation-recovery-post-abort-retry-recovery",
+        "recovery_epoch_before": 0,
+        "recovery_epoch_after": int(failed_reset_count > 0),
+        "recovery_epoch_ceiling": 1,
+        "ordinary_retry_ceiling": ordinary_retry_ceiling,
+        "ordinary_attempt_ceiling": ordinary_attempt_ceiling,
+        "maximum_cumulative_attempts": maximum_cumulative_attempts,
+        "operation_count": len(operations),
+        "failed_reset_count": failed_reset_count,
+        "operations": operations,
+        "operation_set_digest": digest(operations),
+    }
+    return body
+
+
+def _post_abort_v10_contract(
+    reference_plan: Mapping[str, Any],
+    snapshot: Mapping[str, Any],
+) -> tuple[
+    list[dict[str, Any]],
+    str,
+    dict[str, int],
+    dict[str, int],
+    dict[str, int],
+    dict[str, Any],
+]:
+    worker_digest = _post_abort_worker_digest(reference_plan["plan_digest"])
+    reference_selected = {
+        item["operation_id"]: item
+        for item in reference_plan["selected_operations"]
+    }
+    reference_snapshot = {
+        item["operation_id"]: item
+        for item in reference_plan["live_snapshot"]["operations"]
+    }
+    current = {
+        item["operation_id"]: item for item in snapshot["operations"]
+    }
+    reference_preserved_ids = set(reference_snapshot) - set(reference_selected)
+    if (
+        snapshot["cohort_digest"] != reference_plan["cohort_digest"]
+        or snapshot["installation_authority"]
+        != reference_plan["installation_authority"]
+        or snapshot["generation_before"] != snapshot["generation_after"]
+        or set(current) != set(reference_snapshot)
+        or snapshot["status_counts"].get("cancelled", 0)
+        or any(
+            current[operation_id]["operation_type"]
+            != reference_snapshot[operation_id]["operation_type"]
+            or current[operation_id]["task_payload_digest"]
+            != reference_snapshot[operation_id]["task_payload_digest"]
+            for operation_id in current
+        )
+        or any(
+            current[operation_id]["current_status"] != "completed"
+            or current[operation_id]["row_digest"]
+            != reference_snapshot[operation_id]["row_digest"]
+            for operation_id in reference_preserved_ids
+        )
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery post-abort row set is invalid"
+        )
+
+    selected = []
+    for operation_id in sorted(reference_selected):
+        row = current[operation_id]
+        status = row["current_status"]
+        owned = (
+            row["worker_id_present"] is True
+            and row["worker_id_digest"] == worker_digest
+            and row["claimed_at"] is not None
+        )
+        wholly_unowned = (
+            row["worker_id_present"] is False
+            and row["worker_id_digest"] is None
+            and row["claimed_at"] is None
+        )
+        if status in {"failed", "pending", "processing"} and owned:
+            if (
+                (status == "failed") != (row["completed_at"] is not None)
+                or not 0
+                <= row["retry_count"]
+                <= reference_plan["worker_max_retries"]
+            ):
+                raise OperationRecoveryError(
+                    "operation-recovery post-abort row set is invalid"
+                )
+            selected.append(
+                {
+                    "operation_id": operation_id,
+                    "operation_type": row["operation_type"],
+                    "expected_status": status,
+                    "row_digest": row["row_digest"],
+                    "task_payload_digest": row["task_payload_digest"],
+                }
+            )
+        elif status == "pending" and wholly_unowned:
+            if (
+                row["completed_at"] is not None
+                or row["row_digest"]
+                != reference_snapshot[operation_id]["row_digest"]
+            ):
+                raise OperationRecoveryError(
+                    "operation-recovery post-abort row set is invalid"
+                )
+        elif status == "completed" and owned:
+            if (
+                row["completed_at"] is None
+                or not 0
+                <= row["retry_count"]
+                <= reference_plan["worker_max_retries"]
+            ):
+                raise OperationRecoveryError(
+                    "operation-recovery post-abort row set is invalid"
+                )
+        else:
+            raise OperationRecoveryError(
+                "operation-recovery post-abort row set is invalid"
+            )
+    if not selected:
+        raise OperationRecoveryError(
+            "operation-recovery post-abort row set is invalid"
+        )
+    selected_ids = {item["operation_id"] for item in selected}
+    preserved_ids = set(current) - selected_ids
+    selected_status_counts = {
+        status: sum(item["expected_status"] == status for item in selected)
+        for status in ("failed", "pending", "processing")
+    }
+    selected_status_counts = {
+        status: count
+        for status, count in selected_status_counts.items()
+        if count
+    }
+    selected_type_counts = _post_abort_type_counts(selected)
+    preserved_status_counts = {
+        status: sum(
+            current[operation_id]["current_status"] == status
+            for operation_id in preserved_ids
+        )
+        for status in ("completed", "pending")
+    }
+    preserved_status_counts = {
+        status: count
+        for status, count in preserved_status_counts.items()
+        if count
+    }
+    retry_recovery = _post_abort_v10_retry_recovery(
+        reference_plan,
+        selected,
+        current,
+    )
+    derived = {
+        "selection_contract_digest": (
+            POST_ABORT_V10_SELECTION_CONTRACT_DIGEST
+        ),
+        "selected_checkpoint_set_digest": digest(
+            [
+                {
+                    "operation_id": operation_id,
+                    "result_metadata_digest": current[operation_id][
+                        "result_metadata_digest"
+                    ],
+                }
+                for operation_id in sorted(selected_ids)
+            ]
+        ),
+        "preserved_row_set_digest": digest(
+            [
+                {
+                    "operation_id": operation_id,
+                    "row_digest": current[operation_id]["row_digest"],
+                }
+                for operation_id in sorted(preserved_ids)
+            ]
+        ),
+        "retry_recovery": retry_recovery,
+        "retry_recovery_digest": digest(retry_recovery),
+    }
+    return (
+        selected,
+        worker_digest,
+        selected_status_counts,
+        selected_type_counts,
+        preserved_status_counts,
+        derived,
+    )
+
+
 def _post_abort_contract(
     reference_plan: Mapping[str, Any],
     snapshot: Mapping[str, Any],
@@ -2826,7 +3126,10 @@ def _post_abort_contract(
     dict[str, int],
     dict[str, int],
     dict[str, int],
+    dict[str, Any],
 ]:
+    if schema_version == 10:
+        return _post_abort_v10_contract(reference_plan, snapshot)
     worker_digest = _post_abort_worker_digest(reference_plan["plan_digest"])
     selected = _post_abort_selected(snapshot)
     if schema_version in {7, 9}:
@@ -3132,6 +3435,7 @@ def _post_abort_contract(
         selected_status_counts,
         selected_type_counts,
         preserved_status_counts,
+        {},
     )
 
 
@@ -3151,7 +3455,7 @@ def create_post_abort_recovery_plan(
     reference_application_authorization: Mapping[str, Any],
     reference_application_journal: Mapping[str, Any],
     reference_application_progress_digest: str,
-    schema_version: int = 9,
+    schema_version: int = 10,
     created_at: int | None = None,
 ) -> Mapping[str, Any]:
     """Plan the exact stopped-worker cleanup without mutating operations."""
@@ -3173,7 +3477,7 @@ def create_post_abort_recovery_plan(
         reference_application_progress_digest,
         "post-abort reference application progress digest",
     )
-    if schema_version not in {4, 5, 6, 7, 8, 9}:
+    if schema_version not in {4, 5, 6, 7, 8, 9, 10}:
         raise OperationRecoveryError(
             "operation-recovery post-abort creation schema is invalid"
         )
@@ -3183,6 +3487,7 @@ def create_post_abort_recovery_plan(
         selected_status_counts,
         selected_type_counts,
         preserved_status_counts,
+        derived_fields,
     ) = _post_abort_contract(
         reference,
         snapshot,
@@ -3290,6 +3595,7 @@ def create_post_abort_recovery_plan(
         "selected_type_counts": selected_type_counts,
         "selected_row_set_digest": _exact_drain_row_set_digest(selected),
         "preserved_status_counts": preserved_status_counts,
+        **derived_fields,
         "rollback_backup": backup,
         "rollback_encryption": encryption,
         **artifact_paths,
@@ -3321,6 +3627,7 @@ def verify_post_abort_recovery_plan(
         7,
         8,
         9,
+        10,
     }:
         raise OperationRecoveryError(
             "operation-recovery post-abort plan is invalid"
@@ -3337,6 +3644,7 @@ def verify_post_abort_recovery_plan(
             7: POST_ABORT_PLAN_V7_KEYS,
             8: POST_ABORT_PLAN_V8_KEYS,
             9: POST_ABORT_PLAN_V9_KEYS,
+            10: POST_ABORT_PLAN_V10_KEYS,
         }[schema_version],
         "operation-recovery post-abort plan",
     )
@@ -3364,7 +3672,7 @@ def verify_post_abort_recovery_plan(
     )
     reference_progress_digest = (
         None
-        if schema_version not in {3, 4, 5, 6, 7, 8, 9}
+        if schema_version not in {3, 4, 5, 6, 7, 8, 9, 10}
         else _sha(
             plan["reference_application_progress_digest"],
             "post-abort reference application progress digest",
@@ -3376,6 +3684,7 @@ def verify_post_abort_recovery_plan(
         expected_status_counts,
         expected_type_counts,
         expected_preserved_status_counts,
+        expected_derived_fields,
     ) = _post_abort_contract(
         reference,
         snapshot,
@@ -3425,6 +3734,43 @@ def verify_post_abort_recovery_plan(
         plan["preserved_status_counts"],
         "post-abort preserved status counts",
     )
+    derived_fields = {}
+    if schema_version == 10:
+        retry_recovery = _closed(
+            _normalized(plan["retry_recovery"]),
+            POST_ABORT_V10_RETRY_RECOVERY_KEYS,
+            "post-abort retry recovery",
+        )
+        operations = retry_recovery.get("operations")
+        if not isinstance(operations, list):
+            raise OperationRecoveryError(
+                "operation-recovery post-abort retry recovery is invalid"
+            )
+        for item in operations:
+            _closed(
+                _normalized(item),
+                POST_ABORT_V10_RETRY_OPERATION_KEYS,
+                "post-abort retry operation",
+            )
+        derived_fields = {
+            "selection_contract_digest": _sha(
+                plan["selection_contract_digest"],
+                "post-abort selection contract digest",
+            ),
+            "selected_checkpoint_set_digest": _sha(
+                plan["selected_checkpoint_set_digest"],
+                "post-abort selected checkpoint set digest",
+            ),
+            "preserved_row_set_digest": _sha(
+                plan["preserved_row_set_digest"],
+                "post-abort preserved row set digest",
+            ),
+            "retry_recovery": dict(retry_recovery),
+            "retry_recovery_digest": _sha(
+                plan["retry_recovery_digest"],
+                "post-abort retry recovery digest",
+            ),
+        }
     authority = _installation_authority(plan["installation_authority"])
     backup = _backup(
         plan["rollback_backup"],
@@ -3498,6 +3844,7 @@ def verify_post_abort_recovery_plan(
         or status_counts != expected_status_counts
         or type_counts != expected_type_counts
         or preserved != expected_preserved_status_counts
+        or derived_fields != expected_derived_fields
         or plan["selected_row_set_digest"]
         != _exact_drain_row_set_digest(selected)
         or backup["postgres_system_identifier"]
@@ -3547,7 +3894,7 @@ def verify_post_abort_recovery_plan(
                 ),
                 **(
                     {}
-                    if schema_version not in {3, 4, 5, 6, 7, 8, 9}
+                    if schema_version not in {3, 4, 5, 6, 7, 8, 9, 10}
                     else {
                         "reference_application_progress_digest": (
                             reference_progress_digest
@@ -3572,6 +3919,7 @@ def verify_post_abort_recovery_plan(
             "post-abort row-set digest",
         ),
         "preserved_status_counts": preserved,
+        **derived_fields,
         "rollback_backup": backup,
         "rollback_encryption": encryption,
         **artifact_paths,

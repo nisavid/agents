@@ -1267,6 +1267,103 @@ class OperationRecoveryContractTest(unittest.TestCase):
         )
         return snapshot
 
+    def post_abort_v10_snapshot(
+        self,
+        reference_plan,
+        *,
+        observed_at: int = 1_786_390_181,
+    ) -> dict:
+        rows = operation_rows()
+        reference_snapshot = {
+            item["operation_id"]: item
+            for item in reference_plan["live_snapshot"]["operations"]
+        }
+        reference_selected = {
+            item["operation_id"]
+            for item in reference_plan["selected_operations"]
+        }
+        worker_digest = hashlib.sha256(
+            (
+                "operation-recovery-exact-drain-"
+                f"{reference_plan['plan_digest'][:12]}"
+            ).encode()
+        ).hexdigest()
+        selected_rows = [
+            row for row in rows if row["operation_id"] in reference_selected
+        ]
+        self.assertEqual(len(selected_rows), 41)
+        failed_ids = {
+            row["operation_id"] for row in selected_rows[:22]
+        }
+        pending_ids = {
+            row["operation_id"] for row in selected_rows[22:38]
+        }
+        processing_id = selected_rows[38]["operation_id"]
+        completed_ids = {
+            row["operation_id"] for row in selected_rows[39:]
+        }
+        for index, row in enumerate(rows):
+            reference_row = reference_snapshot[row["operation_id"]]
+            if reference_row["current_status"] == "completed":
+                row["status"] = "completed"
+                row["completed_at"] = reference_row["completed_at"]
+            elif row["operation_id"] in failed_ids:
+                row.update(
+                    status="failed",
+                    completed_at="2026-08-15T20:15:00.000000Z",
+                    retry_count=3,
+                    worker_id_present=True,
+                    worker_id_digest=worker_digest,
+                    claimed_at="2026-08-15T19:15:00.000000Z",
+                    error_category=(
+                        "provider_transport" if index % 2 else "unknown"
+                    ),
+                    error_digest=f"{index + 900:064x}",
+                    result_metadata_digest=f"{index + 1000:064x}",
+                )
+            elif row["operation_id"] in pending_ids:
+                row.update(
+                    retry_count=3,
+                    next_retry_at="2026-08-15T20:16:00.000000Z",
+                    worker_id_present=True,
+                    worker_id_digest=worker_digest,
+                    claimed_at="2026-08-15T19:15:00.000000Z",
+                    error_category="provider_transport",
+                    error_digest=f"{index + 1100:064x}",
+                    result_metadata_digest=f"{index + 1200:064x}",
+                )
+            elif row["operation_id"] == processing_id:
+                row.update(
+                    status="processing",
+                    retry_count=3,
+                    worker_id_present=True,
+                    worker_id_digest=worker_digest,
+                    claimed_at="2026-08-15T19:15:00.000000Z",
+                    error_category="provider_transport",
+                    error_digest=f"{index + 1300:064x}",
+                    result_metadata_digest=f"{index + 1400:064x}",
+                )
+            elif row["operation_id"] in completed_ids:
+                row.update(
+                    status="completed",
+                    completed_at="2026-08-15T20:14:00.000000Z",
+                    retry_count=3,
+                    worker_id_present=True,
+                    worker_id_digest=worker_digest,
+                    claimed_at="2026-08-15T19:15:00.000000Z",
+                    result_metadata_digest=f"{index + 1500:064x}",
+                )
+        return dict(
+            create_live_snapshot(
+                self.cohort(),
+                rows,
+                generation_before="systalyze:public:81699",
+                generation_after="systalyze:public:81699",
+                installation_authority=installation_authority(),
+                observed_at=observed_at,
+            )
+        )
+
     def prior_v3_post_abort_plan(self) -> dict:
         reference = self.drain_plan()
         snapshot = self.post_abort_snapshot(
@@ -1461,7 +1558,6 @@ class OperationRecoveryContractTest(unittest.TestCase):
             verify_post_abort_recovery_plan(plan, now=plan["created_at"]),
             plan,
         )
-
     def test_post_abort_v5_plan_derives_four_failed_and_one_processing_retain(self):
         reference = self.drain_plan()
         snapshot = self.post_abort_snapshot(
@@ -2137,6 +2233,217 @@ class OperationRecoveryContractTest(unittest.TestCase):
                     "invalid",
                 ):
                     create(changed)
+
+    def test_post_abort_v10_derives_interrupted_rows_from_invariants(self):
+        reference = self.drain_plan(
+            snapshot=self.drain_snapshot(
+                completed_positions=set(range(7)),
+                observed_at=1_786_390_000,
+            ),
+            created_at=1_786_390_001,
+        )
+        snapshot = self.post_abort_v10_snapshot(reference)
+        backup = rollback_backup_evidence()
+        backup["source_authority"]["generation_before"] = snapshot[
+            "generation_before"
+        ]
+        backup["source_authority"]["generation_after"] = snapshot[
+            "generation_after"
+        ]
+        backup["source_authority_digest"] = digest(
+            backup["source_authority"]
+        )
+
+        def create(value):
+            return create_post_abort_recovery_plan(
+                reference,
+                value,
+                candidate_release=release_identity(),
+                rollback_backup=backup,
+                rollback_encryption=rollback_encryption(),
+                rollback_backup_path="/private/tmp/v10-backup.age",
+                rollback_bundle_path="/private/tmp/v10-bundle.age",
+                authorization_receipt_path="/private/tmp/v10-auth.json",
+                application_receipt_path="/private/tmp/v10-app.json",
+                verification_receipt_path="/private/tmp/v10-verify.json",
+                rollback_receipt_path="/private/tmp/v10-rollback.json",
+                reference_application_authorization=(
+                    exact_drain_authorization(reference)
+                ),
+                reference_application_journal=(
+                    exact_drain_application_journal(reference)
+                ),
+                reference_application_progress_digest="f" * 64,
+                schema_version=10,
+                created_at=1_786_390_500,
+            )
+
+        plan = create(snapshot)
+
+        self.assertEqual(plan["schema_version"], 10)
+        self.assertEqual(plan["selected_operation_count"], 39)
+        self.assertEqual(
+            plan["selected_status_counts"],
+            {"failed": 22, "pending": 16, "processing": 1},
+        )
+        self.assertEqual(
+            plan["preserved_status_counts"],
+            {"completed": 9},
+        )
+        self.assertEqual(plan["retry_recovery"]["recovery_epoch_before"], 0)
+        self.assertEqual(plan["retry_recovery"]["recovery_epoch_after"], 1)
+        self.assertEqual(plan["retry_recovery"]["recovery_epoch_ceiling"], 1)
+        self.assertEqual(plan["retry_recovery"]["failed_reset_count"], 22)
+        self.assertEqual(
+            sum(
+                item["reset_applied"]
+                for item in plan["retry_recovery"]["operations"]
+            ),
+            22,
+        )
+        self.assertEqual(
+            verify_post_abort_recovery_plan(plan, now=plan["created_at"]),
+            plan,
+        )
+        selected_ids = {
+            item["operation_id"] for item in plan["selected_operations"]
+        }
+        self.assertEqual(
+            plan["selected_checkpoint_set_digest"],
+            digest(
+                [
+                    {
+                        "operation_id": item["operation_id"],
+                        "result_metadata_digest": item[
+                            "result_metadata_digest"
+                        ],
+                    }
+                    for item in snapshot["operations"]
+                    if item["operation_id"] in selected_ids
+                ]
+            ),
+        )
+
+        varied = deepcopy(snapshot)
+        varied_failed = next(
+            item
+            for item in varied["operations"]
+            if item["current_status"] == "failed"
+        )
+        varied_failed.update(
+            retry_count=2,
+            error_category="authentication",
+        )
+        varied_failed["row_digest"] = digest(
+            {
+                key: value
+                for key, value in varied_failed.items()
+                if key != "row_digest"
+            }
+        )
+        varied["snapshot_digest"] = digest(
+            {
+                key: value
+                for key, value in varied.items()
+                if key != "snapshot_digest"
+            }
+        )
+        varied_plan = create(varied)
+        varied_retry = next(
+            item
+            for item in varied_plan["retry_recovery"]["operations"]
+            if item["operation_id"] == varied_failed["operation_id"]
+        )
+        self.assertEqual(varied_retry["retry_count_before"], 2)
+        self.assertEqual(varied_retry["cumulative_attempt_ceiling"], 7)
+
+        one_unowned = deepcopy(snapshot)
+        pending_index = next(
+            index
+            for index, item in enumerate(one_unowned["operations"])
+            if item["current_status"] == "pending"
+            and item["worker_id_present"]
+        )
+        operation_id = one_unowned["operations"][pending_index]["operation_id"]
+        one_unowned["operations"][pending_index] = deepcopy(
+            next(
+                item
+                for item in reference["live_snapshot"]["operations"]
+                if item["operation_id"] == operation_id
+            )
+        )
+        one_unowned["status_counts"] = {
+            status: sum(
+                item["current_status"] == status
+                for item in one_unowned["operations"]
+            )
+            for status in recovery_contract.OPERATION_STATUSES
+        }
+        one_unowned["snapshot_digest"] = digest(
+            {
+                key: value
+                for key, value in one_unowned.items()
+                if key != "snapshot_digest"
+            }
+        )
+        one_unowned_plan = create(one_unowned)
+        self.assertEqual(one_unowned_plan["selected_operation_count"], 38)
+        self.assertEqual(
+            one_unowned_plan["preserved_status_counts"],
+            {"completed": 9, "pending": 1},
+        )
+
+        wrong_owner = deepcopy(snapshot)
+        row = next(
+            item
+            for item in wrong_owner["operations"]
+            if item["current_status"] == "failed"
+        )
+        row["worker_id_digest"] = "0" * 64
+        row["row_digest"] = digest(
+            {key: value for key, value in row.items() if key != "row_digest"}
+        )
+        wrong_owner["snapshot_digest"] = digest(
+            {
+                key: value
+                for key, value in wrong_owner.items()
+                if key != "snapshot_digest"
+            }
+        )
+        with self.assertRaisesRegex(OperationRecoveryError, "row set is invalid"):
+            create(wrong_owner)
+
+        excessive_retry = deepcopy(snapshot)
+        row = next(
+            item
+            for item in excessive_retry["operations"]
+            if item["current_status"] == "failed"
+        )
+        row["retry_count"] = 4
+        row["row_digest"] = digest(
+            {key: value for key, value in row.items() if key != "row_digest"}
+        )
+        excessive_retry["snapshot_digest"] = digest(
+            {
+                key: value
+                for key, value in excessive_retry.items()
+                if key != "snapshot_digest"
+            }
+        )
+        with self.assertRaisesRegex(OperationRecoveryError, "row set is invalid"):
+            create(excessive_retry)
+
+        tampered = deepcopy(plan)
+        tampered["retry_recovery"]["recovery_epoch_after"] = 2
+        tampered["retry_recovery_digest"] = digest(tampered["retry_recovery"])
+        tampered["plan_digest"] = digest(
+            {key: value for key, value in tampered.items() if key != "plan_digest"}
+        )
+        with self.assertRaisesRegex(OperationRecoveryError, "invalid"):
+            verify_post_abort_recovery_plan(
+                tampered,
+                now=tampered["created_at"],
+            )
 
     def test_post_abort_plan_rejects_a_different_processing_owner(self):
         reference = self.drain_plan()

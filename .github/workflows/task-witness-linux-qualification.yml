@@ -143,16 +143,6 @@ jobs:
           qual_uid=$(/usr/bin/id -u "$QUALIFICATION_USER")
           qual_gid=$(/usr/bin/id -g "$QUALIFICATION_USER")
 
-          host_hardening_test_root="$RUNNER_TEMP/task-witness-host-hardening-test"
-          test ! -e "$host_hardening_test_root"
-          test ! -L "$host_hardening_test_root"
-          sudo /usr/bin/env -i \
-            PATH=/usr/bin:/bin \
-            /usr/bin/bash \
-              harness/tests/test_harden_task_witness_linux_host.bash \
-              "$host_hardening_test_root" \
-              "$qual_uid" \
-              "$qual_gid"
           sudo /usr/bin/env -i \
             PATH=/usr/bin:/bin \
             RUNNER_ENVIRONMENT="${RUNNER_ENVIRONMENT-}" \
@@ -161,8 +151,11 @@ jobs:
             ImageOS="${ImageOS-}" \
             /usr/bin/bash \
               harness/scripts/harden_task_witness_linux_host.bash \
-              harden \
+              qualify-host \
               / \
+              "$GITHUB_WORKSPACE/harness/tests/test_harden_task_witness_linux_host.bash" \
+              "$GITHUB_RUN_ID" \
+              "$GITHUB_RUN_ATTEMPT" \
               "$qual_uid" \
               "$qual_gid"
 

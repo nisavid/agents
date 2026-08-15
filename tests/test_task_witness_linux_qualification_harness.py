@@ -2609,25 +2609,24 @@ class TaskWitnessLinuxQualificationHarnessTests(unittest.TestCase):
         )
         self.assertIn(
             """\
-              harness/tests/test_harden_task_witness_linux_host.bash \\
-              "$host_hardening_test_root" \\
+              harness/scripts/harden_task_witness_linux_host.bash \\
+              qualify-host \\
+              / \\
+              "$GITHUB_WORKSPACE/harness/tests/test_harden_task_witness_linux_host.bash" \\
+              "$GITHUB_RUN_ID" \\
+              "$GITHUB_RUN_ATTEMPT" \\
               "$qual_uid" \\
               "$qual_gid"
 """,
             workflow,
         )
-        self.assertIn(
+        self.assertEqual(workflow.count("              qualify-host \\\n"), 1)
+        self.assertNotIn("host_hardening_test_root=", workflow)
+        self.assertNotIn(
             """\
-            RUNNER_ENVIRONMENT="${RUNNER_ENVIRONMENT-}" \\
-            RUNNER_OS="${RUNNER_OS-}" \\
-            RUNNER_ARCH="${RUNNER_ARCH-}" \\
-            ImageOS="${ImageOS-}" \\
-            /usr/bin/bash \\
               harness/scripts/harden_task_witness_linux_host.bash \\
               harden \\
               / \\
-              "$qual_uid" \\
-              "$qual_gid"
 """,
             workflow,
         )

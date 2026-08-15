@@ -104,6 +104,9 @@ probe_directories() {
         /usr/bin/printf "%s\n" \
           "task-witness Linux no-capability probe: uid=$expected_uid gid=$expected_gid groups=none CapInh=$cap_inh CapPrm=$cap_prm CapEff=$cap_eff CapBnd=$cap_bnd CapAmb=$cap_amb NoNewPrivs=$no_new_privs"
         for directory in "$@"; do
+          /usr/bin/test -x "$directory"
+        done
+        for directory in "$@"; do
           probe="${directory%/}/.task-witness-no-cap-write-probe"
           /usr/bin/test ! -e "$probe"
           /usr/bin/test ! -L "$probe"
@@ -184,6 +187,50 @@ harden_host() {
     "$bootstrap_root"
 }
 
+qualify_host() {
+  local system_root=$1
+  local behavior_test=$2
+  local run_id=$3
+  local run_attempt=$4
+  local qualification_uid=$5
+  local qualification_gid=$6
+  local behavior_test_resolved
+  local test_root
+
+  require_hosted_boundary
+  require_identity "$run_id" 'run id'
+  require_identity "$run_attempt" 'run attempt'
+  require_identity "$qualification_uid" 'qualification uid'
+  require_identity "$qualification_gid" 'qualification gid'
+  require_real_directory "$system_root"
+  [[ $(/usr/bin/stat --format='%u:%g:%a' "$system_root") == '0:0:755' ]] || \
+    fail 'system root disposition is unsafe'
+  require_real_directory /tmp
+  [[ $(/usr/bin/stat --format='%u:%g:%a' /tmp) == '0:0:1777' ]] || \
+    fail 'temporary root disposition is unsafe'
+
+  [[ $behavior_test == /* ]] || fail 'behavior test path is not absolute'
+  [[ -f $behavior_test && ! -L $behavior_test ]] || \
+    fail 'behavior test disposition is unsafe'
+  behavior_test_resolved=$(/usr/bin/realpath -- "$behavior_test")
+  [[ $behavior_test_resolved == "$behavior_test" ]] || \
+    fail 'behavior test path is not canonical'
+
+  test_root="/tmp/task-witness-host-hardening-test-${run_id}-${run_attempt}"
+  [[ ! -e $test_root && ! -L $test_root ]] || \
+    fail 'behavior test root already exists'
+  /usr/bin/bash \
+    "$behavior_test" \
+    "$test_root" \
+    "$qualification_uid" \
+    "$qualification_gid"
+  require_real_directory "$test_root"
+  [[ $(/usr/bin/stat --format='%u:%g:%a' "$test_root") == '0:0:755' ]] || \
+    fail 'behavior test root disposition is unsafe'
+
+  harden_host "$system_root" "$qualification_uid" "$qualification_gid"
+}
+
 main() {
   require_root
   (( $# > 0 )) || fail 'a command is required'
@@ -197,6 +244,11 @@ main() {
     probe-directories)
       (( $# >= 3 )) || fail 'probe-directories requires UID GID DIRECTORY...'
       probe_directories "$@"
+      ;;
+    qualify-host)
+      (( $# == 6 )) || \
+        fail 'qualify-host requires ROOT TEST RUN_ID ATTEMPT UID GID'
+      qualify_host "$@"
       ;;
     *)
       fail 'command is invalid'

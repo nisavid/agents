@@ -6,7 +6,9 @@ on:
       - ivan/task-witness-linux-qualification-harness
     paths:
       - .github/workflows/task-witness-linux-qualification.yml
+      - scripts/harden_task_witness_linux_host.bash
       - scripts/prepare_task_witness_linux_qualification.py
+      - tests/test_harden_task_witness_linux_host.bash
       - tests/test_task_witness_linux_qualification_harness.py
 
 permissions:
@@ -82,6 +84,24 @@ jobs:
               scripts/prepare_task_witness_linux_qualification.py
           )
           test "$observed_helper_blob" = "$helper_blob"
+          hardening_blob=$(
+            /usr/bin/git -C harness rev-parse \
+              "$GITHUB_SHA:scripts/harden_task_witness_linux_host.bash"
+          )
+          observed_hardening_blob=$(
+            /usr/bin/git -C harness hash-object \
+              scripts/harden_task_witness_linux_host.bash
+          )
+          test "$observed_hardening_blob" = "$hardening_blob"
+          hardening_test_blob=$(
+            /usr/bin/git -C harness rev-parse \
+              "$GITHUB_SHA:tests/test_harden_task_witness_linux_host.bash"
+          )
+          observed_hardening_test_blob=$(
+            /usr/bin/git -C harness hash-object \
+              tests/test_harden_task_witness_linux_host.bash
+          )
+          test "$observed_hardening_test_blob" = "$hardening_test_blob"
           candidate_sha=$(
             /usr/bin/git -C candidate-stage rev-parse HEAD^{commit}
           )
@@ -95,6 +115,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          test "${RUNNER_ENVIRONMENT-}" = github-hosted
+          test "${RUNNER_OS-}" = Linux
+          test "${RUNNER_ARCH-}" = X64
+          test "${ImageOS-}" = ubuntu24
+
           sudo /usr/bin/apt-get update
           sudo /usr/bin/apt-get install --yes --no-install-recommends patchelf
 
@@ -117,6 +142,29 @@ jobs:
           sudo /usr/bin/chmod 0700 "$QUALIFICATION_HOME"
           qual_uid=$(/usr/bin/id -u "$QUALIFICATION_USER")
           qual_gid=$(/usr/bin/id -g "$QUALIFICATION_USER")
+
+          host_hardening_test_root="$RUNNER_TEMP/task-witness-host-hardening-test"
+          test ! -e "$host_hardening_test_root"
+          test ! -L "$host_hardening_test_root"
+          sudo /usr/bin/env -i \
+            PATH=/usr/bin:/bin \
+            /usr/bin/bash \
+              harness/tests/test_harden_task_witness_linux_host.bash \
+              "$host_hardening_test_root" \
+              "$qual_uid" \
+              "$qual_gid"
+          sudo /usr/bin/env -i \
+            PATH=/usr/bin:/bin \
+            RUNNER_ENVIRONMENT="${RUNNER_ENVIRONMENT-}" \
+            RUNNER_OS="${RUNNER_OS-}" \
+            RUNNER_ARCH="${RUNNER_ARCH-}" \
+            ImageOS="${ImageOS-}" \
+            /usr/bin/bash \
+              harness/scripts/harden_task_witness_linux_host.bash \
+              harden \
+              / \
+              "$qual_uid" \
+              "$qual_gid"
 
           sudo /usr/bin/setpriv \
             --reuid="$qual_uid" \
@@ -149,14 +197,6 @@ jobs:
           )
           test "$observed_wheel_sha" = "$PYYAML_WHEEL_SHA256"
 
-          sudo /usr/bin/mkdir -p /opt/task-witness
-          sudo /usr/bin/mkdir /opt/task-witness/bootstrap
-          sudo /usr/bin/chown root:root \
-            /opt/task-witness \
-            /opt/task-witness/bootstrap
-          sudo /usr/bin/chmod 0755 \
-            /opt/task-witness \
-            /opt/task-witness/bootstrap
           source_helper="$GITHUB_WORKSPACE/harness/scripts/prepare_task_witness_linux_qualification.py"
           source_helper_sha=$(
             /usr/bin/sha256sum "$source_helper" | /usr/bin/cut -d ' ' -f 1
@@ -174,9 +214,11 @@ jobs:
           )" = '0:0:555:1'
           test "$(
             sudo /usr/bin/stat --format='%u:%g:%a' \
+              / \
+              /opt \
               /opt/task-witness \
               /opt/task-witness/bootstrap
-          )" = $'0:0:755\n0:0:755'
+          )" = $'0:0:755\n0:0:755\n0:0:755\n0:0:755'
           bootstrap_probe_sha=$(
             sudo /usr/bin/setpriv \
               --reuid="$qual_uid" \
@@ -213,7 +255,7 @@ jobs:
                     exit 91
                   fi
                   for directory in "$@"; do
-                    probe="$directory/.task-witness-no-cap-write-probe"
+                    probe="${directory%/}/.task-witness-no-cap-write-probe"
                     if /usr/bin/touch "$probe" 2>/dev/null; then
                       /usr/bin/rm -f "$probe"
                       exit 92
@@ -224,6 +266,8 @@ jobs:
                 ' \
                 task-witness-bootstrap-probe \
                 "$BOOTSTRAP_HELPER" \
+                / \
+                /opt \
                 /opt/task-witness \
                 /opt/task-witness/bootstrap
           )

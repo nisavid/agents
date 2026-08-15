@@ -19,6 +19,9 @@ from unittest import mock
 REPOSITORY = Path(__file__).resolve().parents[1]
 HELPER = REPOSITORY / "scripts" / "prepare_task_witness_linux_qualification.py"
 CANDIDATE_RUNNER = REPOSITORY / "scripts" / "run_task_witness_qualification.py"
+LINUX_QUALIFICATION_WORKFLOW = (
+    REPOSITORY / ".github" / "workflows" / "task-witness-linux-qualification.yml"
+)
 
 
 def load_helper():
@@ -2593,6 +2596,41 @@ class TaskWitnessLinuxQualificationHarnessTests(unittest.TestCase):
     def test_parser_requires_an_explicit_subcommand(self) -> None:
         with self.assertRaises(SystemExit):
             self.helper.parser().parse_args([])
+
+    def test_workflow_executes_verified_host_hardening_seam(self) -> None:
+        workflow = LINUX_QUALIFICATION_WORKFLOW.read_text()
+        self.assertIn(
+            "      - scripts/harden_task_witness_linux_host.bash\n",
+            workflow,
+        )
+        self.assertIn(
+            "      - tests/test_harden_task_witness_linux_host.bash\n",
+            workflow,
+        )
+        self.assertIn(
+            """\
+              harness/tests/test_harden_task_witness_linux_host.bash \\
+              "$host_hardening_test_root" \\
+              "$qual_uid" \\
+              "$qual_gid"
+""",
+            workflow,
+        )
+        self.assertIn(
+            """\
+            RUNNER_ENVIRONMENT="${RUNNER_ENVIRONMENT-}" \\
+            RUNNER_OS="${RUNNER_OS-}" \\
+            RUNNER_ARCH="${RUNNER_ARCH-}" \\
+            ImageOS="${ImageOS-}" \\
+            /usr/bin/bash \\
+              harness/scripts/harden_task_witness_linux_host.bash \\
+              harden \\
+              / \\
+              "$qual_uid" \\
+              "$qual_gid"
+""",
+            workflow,
+        )
 
     def test_context_capture_preserves_the_explicit_clean_boundary(self) -> None:
         forwarded = {

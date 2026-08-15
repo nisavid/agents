@@ -3,12 +3,16 @@ from __future__ import annotations
 import dataclasses
 import inspect
 import json
-import subprocess
+import os
+import shutil
+import stat
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
+from . import _freeze5_upgrade_recovery_support as freeze5_support
+from . import _routine_support as routine_support
 from ._activation_support import (
     expected_smoke_envelope,
 )
@@ -26,7 +30,6 @@ from ._freeze5_upgrade_recovery_support import (
     FREEZE5_CONTROLLER_SHA256,
     FREEZE5_POLICY_SHA256,
     Freeze5UpgradeRecoveryFixture,
-    _freeze5_git,
     detach_candidate,
     load_controller,
     remove_loaded_controller,
@@ -39,26 +42,254 @@ from ._routine_activation_support import (
     staged_artifact,
 )
 from ._routine_staged_client_support import installed_client_smoke_process
+from ._routine_support import FREEZE5_PLUGIN_INVENTORY, FREEZE5_SNAPSHOT_ROOT
 from ._source_recovery_support import InstalledRecoveryClientProcess
-from ._support import canonical_document, content_document, sha256
+from ._support import PLUGIN, canonical_document, content_document, sha256
 from .test_transaction_result_reconciliation import (
     _run_post_unlink_process_loss,
 )
 
 
+class Freeze5FixtureSourceTests(unittest.TestCase):
+    def test_materializes_from_candidate_owned_history_without_git_object(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory).resolve() / "freeze5-candidate"
+            with mock.patch(
+                "subprocess.run",
+                side_effect=AssertionError("ambient Git objects are unavailable"),
+            ):
+                freeze5_support.materialize_freeze5_plugin(destination)
+
+            observed = {
+                path.relative_to(destination).as_posix(): (
+                    stat.S_IMODE(path.stat().st_mode),
+                    sha256(path.read_bytes()),
+                )
+                for path in destination.rglob("*")
+                if path.is_file()
+            }
+            self.assertEqual(
+                observed,
+                {
+                    relative: (mode, digest)
+                    for relative, (_source, mode, _length, digest) in (
+                        FREEZE5_PLUGIN_INVENTORY.items()
+                    )
+                },
+            )
+
+    def test_rejects_invalid_candidate_history_before_materialization(self) -> None:
+        cases = (
+            ("missing-snapshot", "snapshot", "controller/policy.json", "missing"),
+            (
+                "tampered-snapshot",
+                "snapshot",
+                "client/task_witness_client.py",
+                "tamper",
+            ),
+            ("extra-snapshot", "snapshot", "unexpected", "extra"),
+            ("extra-directory", "snapshot", "unexpected-directory", "directory"),
+            ("symlink-directory", "snapshot", "linked-directory", "symlink-directory"),
+            ("symlink-snapshot", "snapshot", "controller/policy.json", "symlink-file"),
+            (
+                "symlink-snapshot-ancestor",
+                "snapshot",
+                "client",
+                "replace-directory-symlink",
+            ),
+            ("missing-stable", "plugin", "runtime/trust.py", "missing"),
+            ("tampered-stable", "plugin", "runtime/canonical.py", "tamper"),
+            ("special-stable", "plugin", "runtime/trust.py", "fifo"),
+            (
+                "symlink-stable-ancestor",
+                "plugin",
+                "runtime",
+                "replace-directory-symlink",
+            ),
+        )
+        for label, source, relative, operation in cases:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                plugin_root = root / "plugin"
+                snapshot_root = root / "snapshot"
+                shutil.copytree(PLUGIN, plugin_root)
+                shutil.copytree(
+                    FREEZE5_SNAPSHOT_ROOT,
+                    snapshot_root,
+                )
+                selected_root = snapshot_root if source == "snapshot" else plugin_root
+                path = selected_root / relative
+                if operation == "missing":
+                    path.unlink()
+                elif operation == "tamper":
+                    path.write_bytes(path.read_bytes() + b"tamper\n")
+                elif operation == "directory":
+                    path.mkdir()
+                elif operation == "symlink-directory":
+                    path.symlink_to(plugin_root / "runtime", target_is_directory=True)
+                elif operation == "symlink-file":
+                    path.unlink()
+                    path.symlink_to(plugin_root / "controller" / "policy.json")
+                elif operation == "replace-directory-symlink":
+                    target = root / f"{label}-target"
+                    shutil.copytree(path, target)
+                    shutil.rmtree(path)
+                    path.symlink_to(target, target_is_directory=True)
+                elif operation == "fifo":
+                    path.unlink()
+                    os.mkfifo(path, mode=0o600)
+                else:
+                    path.write_bytes(b"unexpected\n")
+                destination = root / "materialized"
+                before = regular_file_snapshot(root)
+                special_before = None
+                try:
+                    metadata = path.lstat()
+                except FileNotFoundError:
+                    pass
+                else:
+                    if not stat.S_ISREG(metadata.st_mode):
+                        special_before = (
+                            stat.S_IFMT(metadata.st_mode),
+                            metadata.st_dev,
+                            metadata.st_ino,
+                            metadata.st_mode,
+                            metadata.st_nlink,
+                            metadata.st_size,
+                            metadata.st_mtime_ns,
+                            metadata.st_ctime_ns,
+                            path.readlink() if stat.S_ISLNK(metadata.st_mode) else None,
+                        )
+
+                with self.assertRaisesRegex(
+                    AssertionError,
+                    r"Freeze 5 (snapshot inventory|source .+ (unavailable|identity disagrees))",
+                ):
+                    freeze5_support.materialize_freeze5_plugin(
+                        destination,
+                        plugin_root=plugin_root,
+                        snapshot_root=snapshot_root,
+                    )
+
+                self.assertFalse(destination.exists())
+                self.assertEqual(regular_file_snapshot(root), before)
+                if special_before is not None:
+                    metadata = path.lstat()
+                    self.assertEqual(
+                        (
+                            stat.S_IFMT(metadata.st_mode),
+                            metadata.st_dev,
+                            metadata.st_ino,
+                            metadata.st_mode,
+                            metadata.st_nlink,
+                            metadata.st_size,
+                            metadata.st_mtime_ns,
+                            metadata.st_ctime_ns,
+                            path.readlink() if stat.S_ISLNK(metadata.st_mode) else None,
+                        ),
+                        special_before,
+                    )
+
+    def test_rejects_regular_to_fifo_race_without_blocking_or_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            plugin_root = root / "plugin"
+            snapshot_root = root / "snapshot"
+            shutil.copytree(PLUGIN, plugin_root)
+            shutil.copytree(FREEZE5_SNAPSHOT_ROOT, snapshot_root)
+            source = plugin_root / "runtime" / "trust.py"
+            backup = root / "trust.py.backup"
+            destination = root / "materialized"
+            before = regular_file_snapshot(root)
+            descriptors_before = len(os.listdir("/dev/fd"))
+            original_open = os.open
+            swapped = False
+
+            def race_open(
+                path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+                flags: int,
+                mode: int = 0o777,
+                *,
+                dir_fd: int | None = None,
+            ) -> int:
+                nonlocal swapped
+                if path == "trust.py" and dir_fd is not None and not swapped:
+                    swapped = True
+                    source.rename(backup)
+                    os.mkfifo(source, mode=0o600)
+                    try:
+                        return original_open(path, flags, mode, dir_fd=dir_fd)
+                    finally:
+                        source.unlink()
+                        backup.rename(source)
+                return original_open(path, flags, mode, dir_fd=dir_fd)
+
+            with (
+                mock.patch.object(routine_support.os, "open", side_effect=race_open),
+                self.assertRaisesRegex(
+                    AssertionError,
+                    r"Freeze 5 source runtime/trust.py identity disagrees",
+                ),
+            ):
+                routine_support.materialize_freeze5_plugin(
+                    destination,
+                    plugin_root=plugin_root,
+                    snapshot_root=snapshot_root,
+                )
+
+            self.assertTrue(swapped)
+            self.assertFalse(destination.exists())
+            self.assertEqual(regular_file_snapshot(root), before)
+            self.assertEqual(len(os.listdir("/dev/fd")), descriptors_before)
+
+    def test_post_open_fstat_failures_close_every_descriptor(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            plugin_root = root / "plugin"
+            shutil.copytree(PLUGIN, plugin_root)
+            destination = root / "materialized"
+            before = regular_file_snapshot(root)
+            original_fstat = os.fstat
+            for fail_at in (1, 2, 3):
+                with self.subTest(opened_component=fail_at):
+                    calls = 0
+                    descriptors_before = len(os.listdir("/dev/fd"))
+
+                    def fail_fstat(
+                        descriptor: int,
+                        expected_failure: int = fail_at,
+                    ) -> os.stat_result:
+                        nonlocal calls
+                        calls += 1
+                        if calls == expected_failure:
+                            raise OSError("injected post-open fstat failure")
+                        return original_fstat(descriptor)
+
+                    with (
+                        mock.patch.object(
+                            routine_support.os,
+                            "fstat",
+                            side_effect=fail_fstat,
+                        ),
+                        self.assertRaisesRegex(
+                            AssertionError,
+                            r"Freeze 5 (source root|source directory runtime|source runtime/trust.py) is unavailable",
+                        ),
+                    ):
+                        routine_support._freeze5_source_raw(
+                            "runtime/trust.py",
+                            plugin_root=plugin_root,
+                        )
+
+                    self.assertFalse(destination.exists())
+                    self.assertEqual(regular_file_snapshot(root), before)
+                    self.assertEqual(len(os.listdir("/dev/fd")), descriptors_before)
+
+
 class Freeze5UpgradeRecoveryTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.different_git_owner = mock.patch.dict(
-            "os.environ",
-            {
-                "GIT_CONFIG_COUNT": "1",
-                "GIT_CONFIG_KEY_0": "safe.directory",
-                "GIT_CONFIG_VALUE_0": "*",
-                "GIT_TEST_ASSUME_DIFFERENT_OWNER": "1",
-            },
-        )
-        self.different_git_owner.start()
-        self.addCleanup(self.different_git_owner.stop)
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name).resolve()
         self.fixture = Freeze5UpgradeRecoveryFixture(self.root)
@@ -69,22 +300,6 @@ class Freeze5UpgradeRecoveryTests(unittest.TestCase):
     def test_direct_freeze5_to_tw4_rejects_before_stage_or_live_mutation(
         self,
     ) -> None:
-        unrelated = self.root / "unrelated-repository"
-        subprocess.run(
-            ("git", "init", "--quiet", str(unrelated)),
-            check=True,
-            capture_output=True,
-        )
-        with self.assertRaises(subprocess.CalledProcessError) as rejected:
-            _freeze5_git(
-                "-C",
-                str(unrelated),
-                "rev-parse",
-                "--show-toplevel",
-            )
-        self.assertEqual(rejected.exception.returncode, 128)
-        self.assertIn(b"dubious ownership", rejected.exception.stderr)
-
         attempt = self.fixture.direct_current_upgrade_request()
         before = regular_file_snapshot(self.root)
         controller = attempt.prior_candidate / "controller" / "task_witness_deploy.py"

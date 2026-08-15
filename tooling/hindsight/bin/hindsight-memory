@@ -8832,6 +8832,31 @@ def _operation_recovery_read_monitor_progress(
     raise AssertionError("unreachable")
 
 
+def _operation_recovery_exact_progress_closed_lease_expiry(
+    plan: Mapping[str, Any],
+    journal: Mapping[str, Any],
+) -> bool:
+    """Authenticate a child-closed execution-window failure."""
+    if (
+        plan.get("progress_schema_version") != 3
+        or not Path(plan["progress_artifact_path"]).is_file()
+    ):
+        return False
+    progress = _operation_recovery_read_monitor_progress(plan)
+    if any(
+        progress[key] != journal[key]
+        for key in ("worker_pid", "worker_start_time", "worker_attempt")
+    ):
+        raise OperationRecoveryError("exact drain progress identity differs")
+    failure = progress.get("worker_failure")
+    return bool(
+        progress.get("worker_status") == "failed"
+        and isinstance(failure, Mapping)
+        and failure.get("category") == "execution_lease_expired"
+        and failure.get("retryable") is False
+    )
+
+
 def _operation_recovery_finalize_exact_application(
     *,
     plan: Mapping[str, Any],
@@ -9387,7 +9412,18 @@ def operation_recovery_drain_apply_command(args: argparse.Namespace) -> int:
                 if start_write >= 0:
                     os.close(start_write)
             if returncode != 0 and not execution_lease_expired:
-                raise OperationRecoveryError("exact drain worker failed")
+                execution_lease_expired = (
+                    _operation_recovery_exact_progress_closed_lease_expiry(
+                        plan,
+                        journal,
+                    )
+                    or (
+                        execution_deadline is not None
+                        and time.time() >= execution_deadline
+                    )
+                )
+                if not execution_lease_expired:
+                    raise OperationRecoveryError("exact drain worker failed")
             terminal = asyncio.run(
                 _operation_recovery_read_exact_drain_status(args, plan)
             )

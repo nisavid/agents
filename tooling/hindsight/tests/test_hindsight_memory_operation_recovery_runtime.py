@@ -41,6 +41,7 @@ from hindsight_memory_control_plane.operation_recovery_runtime import (  # noqa:
     assert_connected_live_database,
     connect_verified_local_postgres,
     exact_drain_worker_interpreter_path,
+    exact_drain_worker_failure_evidence,
     install_exact_drain_runtime_guards,
     live_row_digest,
     read_global_queue_blockers,
@@ -113,6 +114,21 @@ class FakeConnection:
 
 
 class OperationRecoveryRuntimeTest(unittest.TestCase):
+    def test_worker_failure_classifies_exact_drain_execution_lease_expiry(self):
+        evidence = exact_drain_worker_failure_evidence(
+            OperationRecoveryError(
+                "operation-recovery exact drain execution lease expired"
+            )
+        )
+
+        self.assertEqual(evidence["category"], "execution_lease_expired")
+        self.assertFalse(evidence["retryable"])
+        self.assertIsNone(evidence["http_status"])
+        self.assertEqual(
+            set(evidence),
+            {"category", "retryable", "http_status", "error_digest"},
+        )
+
     def test_postgres_safe_error_text_bounds_work_before_encoding(self):
         prefix = "x" * 100 + "\x00\ud800" + "y" * 4898
         value = prefix + "z" * 5_000_000
@@ -522,6 +538,61 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
             [
                 ("stage", "starting", "worker.memory.initialize"),
                 ("failure", "RuntimeError", 2),
+            ],
+        )
+
+    def test_runtime_guard_records_operational_stage_before_poller_run(self):
+        events = []
+
+        class WorkerPoller:
+            def __init__(self):
+                self._shutdown = asyncio.Event()
+
+            async def _execute_task_inner(self, _task, _holder):
+                return None
+
+            async def _claim_batch_for_schema_inner(self, *_arguments):
+                return []
+
+            async def _claim_batch_for_schema(self, *_arguments):
+                return []
+
+            async def run(self):
+                events.append("upstream-run")
+                raise OperationRecoveryError(
+                    "operation-recovery exact drain execution lease expired"
+                )
+
+        class MemoryEngine:
+            async def initialize(self):
+                return None
+
+        class Adapter(_ControlConnectionAdapterMixin):
+            def __init__(self):
+                self._plan = {"progress_schema_version": 3}
+
+            async def reserve_control_connection(self, _backend):
+                events.append("control-reserved")
+
+            def record_worker_stage(self, *, status, stage):
+                events.append(("stage", status, stage))
+
+        install_exact_drain_runtime_guards(
+            type("PostgreSQLOps", (), {}),
+            WorkerPoller,
+            MemoryEngine,
+            Adapter(),
+            request_worker_shutdown=lambda: events.append("shutdown"),
+        )
+
+        self.assertIsNone(asyncio.run(WorkerPoller().run()))
+        self.assertEqual(
+            events,
+            [
+                "control-reserved",
+                ("stage", "running", "worker.poller.running"),
+                "upstream-run",
+                "shutdown",
             ],
         )
 

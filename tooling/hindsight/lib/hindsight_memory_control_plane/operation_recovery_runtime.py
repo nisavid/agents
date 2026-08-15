@@ -104,6 +104,9 @@ EXACT_DRAIN_PROVIDER_ORDER = (
     "alt2-codex",
     "hatchery",
 )
+EXACT_DRAIN_EXECUTION_LEASE_EXPIRED_MESSAGE = (
+    "operation-recovery exact drain execution lease expired"
+)
 EXACT_DRAIN_OAUTH_LOCATORS = {
     "work-codex": "oauth-home:work",
     "personal-codex": "oauth-home:personal",
@@ -780,10 +783,23 @@ def exact_drain_worker_failure_evidence(
         if message
         else type(error).__name__
     )
-    evidence = _exact_drain_failure_evidence(
-        typed_message,
-        retryable=False,
-    )
+    if (
+        isinstance(error, OperationRecoveryError)
+        and message == EXACT_DRAIN_EXECUTION_LEASE_EXPIRED_MESSAGE
+    ):
+        evidence = {
+            "category": "execution_lease_expired",
+            "retryable": False,
+            "http_status": None,
+            "error_digest": hashlib.sha256(
+                typed_message.encode("utf-8")
+            ).hexdigest(),
+        }
+    else:
+        evidence = _exact_drain_failure_evidence(
+            typed_message,
+            retryable=False,
+        )
     if evidence["category"] == "phase_one_timeout":
         evidence["category"] = "worker_initialization_timeout"
     elif evidence["category"] == "operation_error":
@@ -1657,6 +1673,11 @@ def install_exact_drain_runtime_guards(
             await reserve_control_connection(
                 getattr(poller, "_backend", None)
             )
+            if records_worker_lifecycle:
+                adapter.record_worker_stage(
+                    status="running",
+                    stage="worker.poller.running",
+                )
             result = await upstream_run(poller)
         except asyncio.CancelledError:
             raise

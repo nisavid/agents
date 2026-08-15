@@ -51,6 +51,7 @@ FAILURE_CATEGORIES = frozenset(
         "provider_authentication",
         "provider_capacity",
         "provider_transport",
+        "execution_lease_expired",
         "retry_ceiling",
         "terminal_state_persistence",
         "nonquiescent_shutdown",

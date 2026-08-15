@@ -21,6 +21,49 @@ from tooling.hindsight.lib.hindsight_memory_control_plane.operation_recovery imp
 
 
 class ExactDrainProgressTest(unittest.TestCase):
+    def test_v3_progress_accepts_closed_execution_lease_expiry(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+            path = Path(directory) / "exact-drain-progress.json"
+            recorder = ExactDrainProgressRecorder(
+                path=path,
+                plan_digest="a" * 64,
+                worker_pid=1234,
+                worker_start_time="darwin:1000:1",
+                worker_attempt=1,
+                selected_operations=[],
+                progress_schema_version=3,
+                clock=lambda: 1000.0,
+            )
+            recorder.worker_stage(
+                status="running",
+                stage="worker.poller.running",
+            )
+            recorder.worker_failure(
+                exit_code=2,
+                failure={
+                    "category": "execution_lease_expired",
+                    "retryable": False,
+                    "http_status": None,
+                    "error_digest": "c" * 64,
+                },
+            )
+            progress = read_exact_drain_progress(
+                path,
+                plan_digest="a" * 64,
+                progress_schema_version=3,
+                now=1001.0,
+            )
+
+        self.assertEqual(
+            progress["worker_failure_stage"],
+            "worker.poller.running",
+        )
+        self.assertEqual(
+            progress["worker_failure"]["category"],
+            "execution_lease_expired",
+        )
+        self.assertFalse(progress["worker_failure"]["retryable"])
+
     def test_v3_progress_records_preclaim_worker_failure_without_raw_error(self) -> None:
         with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
             path = Path(directory) / "exact-drain-progress.json"

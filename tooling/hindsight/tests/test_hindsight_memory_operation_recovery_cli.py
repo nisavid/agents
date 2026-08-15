@@ -6930,6 +6930,9 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                     lambda _plan: "postgresql://local"
                 ),
                 "_process_start_time": lambda _pid: "start-token",
+                "_operation_recovery_exact_journal_worker_active": (
+                    lambda _journal: False
+                ),
                 "subprocess": SimpleNamespace(
                     Popen=Process,
                     DEVNULL=-3,
@@ -7173,6 +7176,184 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             journal["kind"],
             "operation-recovery-exact-drain-application-journal",
         )
+
+    def test_exact_drain_child_closed_lease_failure_reconciles_as_interrupted(self):
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        now = int(time.time())
+        with tempfile.TemporaryDirectory(
+            dir="/private/tmp",
+            prefix="exact-drain-child-closed-lease-",
+        ) as directory:
+            root = Path(directory)
+            root.chmod(0o700)
+            backup = root / "backup.age"
+            backup.write_bytes(b"synthetic-backup")
+            backup.chmod(0o600)
+            plan = self.controller["create_exact_drain_plan"](
+                fixtures.cohort(),
+                fixtures.drain_snapshot(observed_at=now),
+                candidate_release=recovery_fixtures.release_identity(),
+                rollback_backup=recovery_fixtures.drain_backup_evidence(),
+                rollback_backup_path=str(backup),
+                provider_policy_digest="9" * 64,
+                effective_profile_digest="7" * 64,
+                worker_runtime_digest="8" * 64,
+                authorization_receipt_path=str(root / "auth.json"),
+                application_receipt_path=str(root / "application.json"),
+                status_artifact_path=str(root / "status.json"),
+                verification_receipt_path=str(root / "verify.json"),
+                created_at=now,
+            )
+            plan_path = root / "plan.json"
+            plan_path.write_text(json.dumps(plan), encoding="utf-8")
+            plan_path.chmod(0o600)
+            provider_policy_path = root / "providers.json"
+            provider_policy_path.write_text("{}", encoding="utf-8")
+            provider_policy_path.chmod(0o600)
+            provider_runtime_root = root / "provider-runtime"
+            provider_runtime_root.mkdir()
+            worker_runtime = root / "hindsight-worker"
+            worker_runtime.write_text("#!/bin/sh\n", encoding="utf-8")
+            worker_runtime.chmod(0o700)
+            signals = []
+
+            class Process:
+                pid = 4242
+
+                def __init__(self, _arguments, **keywords):
+                    self._gate = os.dup(keywords["pass_fds"][0])
+                    self._returncode = None
+
+                def poll(self):
+                    return self._returncode
+
+                def wait(self, timeout=None):
+                    del timeout
+                    if self._gate >= 0:
+                        os.read(self._gate, 256)
+                        os.close(self._gate)
+                        self._gate = -1
+                        recorder = ExactDrainProgressRecorder(
+                            path=Path(plan["progress_artifact_path"]),
+                            plan_digest=plan["plan_digest"],
+                            worker_pid=self.pid,
+                            worker_start_time="start-token",
+                            worker_attempt=1,
+                            selected_operations=plan["selected_operations"],
+                            progress_schema_version=3,
+                            clock=lambda: float(now),
+                        )
+                        recorder.worker_stage(
+                            status="running",
+                            stage="worker.poller.running",
+                        )
+                        recorder.worker_failure(
+                            exit_code=2,
+                            failure={
+                                "category": "execution_lease_expired",
+                                "retryable": False,
+                                "http_status": None,
+                                "error_digest": "6" * 64,
+                            },
+                        )
+                    self._returncode = 2
+                    return self._returncode
+
+                def send_signal(self, value):
+                    signals.append(value)
+
+                def kill(self):
+                    raise AssertionError("exact drain used SIGKILL")
+
+            class Manager:
+                def _lock(self):
+                    return nullcontext()
+
+            live = {
+                "generation_before": plan["pre_generation"],
+                "selected_status_counts": {"pending": 43},
+                "preserved_status_counts": {"completed": 5},
+                "outside_nonterminal_counts": [],
+                "status_digest": "7" * 64,
+            }
+            command = self.controller[
+                "operation_recovery_drain_apply_command"
+            ]
+            globals_ = command.__globals__
+            replacements = {
+                "_operation_recovery_candidate": (
+                    lambda _args: plan["candidate_release"]
+                ),
+                "_operation_recovery_exact_provider_policy_evidence": (
+                    lambda _path: (plan["provider_policy_digest"], object())
+                ),
+                "_operation_recovery_profile_environment": dict,
+                "exact_drain_effective_profile_digest": (
+                    lambda _policy, _environment: plan[
+                        "effective_profile_digest"
+                    ]
+                ),
+                "_operation_recovery_exact_runtime_digest": (
+                    lambda _args, *, schema_version=2: plan[
+                        "worker_runtime_digest"
+                    ]
+                ),
+                "_operation_recovery_validate_exact_worker_provider_runtime": (
+                    lambda _policy, _worker_runtime: None
+                ),
+                "_portable_manager": lambda _args: Manager(),
+                "_operation_recovery_lock": lambda _manager: nullcontext(),
+                "_assert_recovery_services_stopped": lambda _manager: None,
+                "_operation_recovery_assert_exact_backup": lambda _plan: None,
+                "_operation_recovery_read_exact_drain_status": (
+                    lambda _args, _plan: _immediate(live)
+                ),
+                "_operation_recovery_exact_worker_interpreter": (
+                    lambda _path: Path("/private/tmp/python")
+                ),
+                "_operation_recovery_exact_database_url": (
+                    lambda _plan: "postgresql://local"
+                ),
+                "_operation_recovery_exact_worker_environment": (
+                    lambda *_arguments, **_keywords: {}
+                ),
+                "_process_start_time": lambda _pid: "start-token",
+                "subprocess": SimpleNamespace(
+                    Popen=Process,
+                    DEVNULL=-3,
+                    TimeoutExpired=subprocess.TimeoutExpired,
+                ),
+            }
+            originals = {key: globals_[key] for key in replacements}
+            globals_.update(replacements)
+            args = SimpleNamespace(
+                plan=str(plan_path),
+                approval_digest=plan["plan_digest"],
+                provider_policy=str(provider_policy_path),
+                provider_runtime_root=str(provider_runtime_root),
+                worker_runtime=str(worker_runtime),
+            )
+            try:
+                with self.assertRaisesRegex(
+                    Exception,
+                    "interrupted at execution lease expiry",
+                ):
+                    command(args)
+                progress = json.loads(
+                    Path(plan["progress_artifact_path"]).read_text(
+                        encoding="utf-8"
+                    )
+                )
+            finally:
+                globals_.update(originals)
+
+        self.assertEqual(signals, [])
+        self.assertEqual(
+            progress["worker_failure"]["category"],
+            "execution_lease_expired",
+        )
+        self.assertFalse(progress["worker_failure"]["retryable"])
+        self.assertNotIn("execution lease expired", json.dumps(progress))
 
     def test_exact_drain_lease_timeout_with_pid_mismatch_preserves_journal(self):
         fixtures = recovery_fixtures.OperationRecoveryContractTest()

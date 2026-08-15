@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import inspect
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -25,6 +26,7 @@ from ._freeze5_upgrade_recovery_support import (
     FREEZE5_CONTROLLER_SHA256,
     FREEZE5_POLICY_SHA256,
     Freeze5UpgradeRecoveryFixture,
+    _freeze5_git,
     detach_candidate,
     load_controller,
     remove_loaded_controller,
@@ -46,6 +48,17 @@ from .test_transaction_result_reconciliation import (
 
 class Freeze5UpgradeRecoveryTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.different_git_owner = mock.patch.dict(
+            "os.environ",
+            {
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "safe.directory",
+                "GIT_CONFIG_VALUE_0": "*",
+                "GIT_TEST_ASSUME_DIFFERENT_OWNER": "1",
+            },
+        )
+        self.different_git_owner.start()
+        self.addCleanup(self.different_git_owner.stop)
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name).resolve()
         self.fixture = Freeze5UpgradeRecoveryFixture(self.root)
@@ -56,6 +69,22 @@ class Freeze5UpgradeRecoveryTests(unittest.TestCase):
     def test_direct_freeze5_to_tw4_rejects_before_stage_or_live_mutation(
         self,
     ) -> None:
+        unrelated = self.root / "unrelated-repository"
+        subprocess.run(
+            ("git", "init", "--quiet", str(unrelated)),
+            check=True,
+            capture_output=True,
+        )
+        with self.assertRaises(subprocess.CalledProcessError) as rejected:
+            _freeze5_git(
+                "-C",
+                str(unrelated),
+                "rev-parse",
+                "--show-toplevel",
+            )
+        self.assertEqual(rejected.exception.returncode, 128)
+        self.assertIn(b"dubious ownership", rejected.exception.stderr)
+
         attempt = self.fixture.direct_current_upgrade_request()
         before = regular_file_snapshot(self.root)
         controller = attempt.prior_candidate / "controller" / "task_witness_deploy.py"

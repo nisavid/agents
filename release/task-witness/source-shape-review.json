@@ -76,12 +76,12 @@
       "tests/plugins/task_witness_deployment/_control_maintenance_followup_support.py": 237,
       "tests/plugins/task_witness_deployment/_control_maintenance_staged_client_support.py": 65,
       "tests/plugins/task_witness_deployment/_control_maintenance_support.py": 315,
-      "tests/plugins/task_witness_deployment/_freeze5_upgrade_recovery_support.py": 383,
+      "tests/plugins/task_witness_deployment/_freeze5_upgrade_recovery_support.py": 373,
       "tests/plugins/task_witness_deployment/_manual_rollback_support.py": 968,
       "tests/plugins/task_witness_deployment/_provider_cache_deletion_and_movement_support.py": 891,
       "tests/plugins/task_witness_deployment/_routine_activation_support.py": 1447,
       "tests/plugins/task_witness_deployment/_routine_staged_client_support.py": 153,
-      "tests/plugins/task_witness_deployment/_routine_support.py": 841,
+      "tests/plugins/task_witness_deployment/_routine_support.py": 849,
       "tests/plugins/task_witness_deployment/_source_evidence_support.py": 247,
       "tests/plugins/task_witness_deployment/_source_recovery_support.py": 202,
       "tests/plugins/task_witness_deployment/_source_transition_support.py": 262,
@@ -97,7 +97,7 @@
       "tests/plugins/task_witness_deployment/test_control_maintenance_followup.py": 113,
       "tests/plugins/task_witness_deployment/test_control_maintenance_staged_client_integration.py": 277,
       "tests/plugins/task_witness_deployment/test_control_maintenance_staging.py": 392,
-      "tests/plugins/task_witness_deployment/test_freeze5_upgrade_recovery.py": 740,
+      "tests/plugins/task_witness_deployment/test_freeze5_upgrade_recovery.py": 768,
       "tests/plugins/task_witness_deployment/test_manual_rollback_activation.py": 466,
       "tests/plugins/task_witness_deployment/test_manual_rollback_preparation.py": 103,
       "tests/plugins/task_witness_deployment/test_manual_rollback_recovery.py": 1045,
@@ -132,7 +132,7 @@
         ]
       },
       "direct_release_owned_tests": {
-        "aggregate_nonblank_noncomment_lines": 59898,
+        "aggregate_nonblank_noncomment_lines": 59924,
         "paths": [
           "tests/plugins/task_witness_client/__init__.py",
           "tests/plugins/task_witness_client/_activation_smoke_driver.py",
@@ -298,7 +298,7 @@
   "source_byte_identity": {
     "aggregate_sha256_by_set": {
       "current_control_set": "f7008ffa2f5dfae3a5d6172c8ee1d8f469715c4261012618581600bbe45e1a85",
-      "direct_release_owned_tests": "957cbb44b5c481b3f223f4f13a9e1989bbb22c51de4e7852015dff96c3245e80",
+      "direct_release_owned_tests": "2b2203c828a908b4d54a2c6cb81b8264aaff70b49f3684e97220e114ab259668",
       "public_release_registration": "358a821a27fe493c637cc5034e662c89193b5eaf46246f29c244f6df2e8c0f7f",
       "release_documentation": "e0cc1f1b6bdbd2b86d43ada6f092c377044717bbbf257b541133116d8696e8da",
       "release_integration": "34e37c32c87bbe1047f9b54992606b4dc46720b0de71b6a7b446178bb7ff6ff2",
@@ -562,7 +562,7 @@
       },
       {
         "path": "tests/plugins/task_witness_deployment/_freeze5_upgrade_recovery_support.py",
-        "sha256": "907c9625579ce224bd470d1ca88fd318a7a8ca0b8839a45a13e9dc146660d6cd"
+        "sha256": "6c2f319bd5d7cd70e531e1525c2a73fd263a2b4a4a101e67dec4ca75eb587a67"
       },
       {
         "path": "tests/plugins/task_witness_deployment/_manual_rollback_support.py",
@@ -582,7 +582,7 @@
       },
       {
         "path": "tests/plugins/task_witness_deployment/_routine_support.py",
-        "sha256": "5c1086858181695ec26dcdf013bf069209b84d54ec7d003f3d0e27ce9825da5c"
+        "sha256": "b1ae52592566df030c3ce4682ef11452a9e9f5adef198abc61fa9969c793c316"
       },
       {
         "path": "tests/plugins/task_witness_deployment/_source_evidence_support.py",
@@ -646,7 +646,7 @@
       },
       {
         "path": "tests/plugins/task_witness_deployment/test_freeze5_upgrade_recovery.py",
-        "sha256": "6dcf14c55ce11936c4bffcfbfd42eb4f37465aae0def28aa4c8c1a9d3ad20170"
+        "sha256": "af3d00ea5fdb837a5ee9706858a22e1539b9d9444a4c09dbe86df829b5994b82"
       },
       {
         "path": "tests/plugins/task_witness_deployment/test_manual_rollback_activation.py",

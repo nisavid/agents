@@ -4,7 +4,6 @@ import dataclasses
 import importlib.util
 import re
 import shutil
-import subprocess
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -16,10 +15,9 @@ from ._activation_support import (
     SmokeChildBoundary,
     expected_smoke_envelope,
 )
-from ._routine_support import RoutineDeploymentFixture
+from ._routine_support import RoutineDeploymentFixture, _freeze5_git
 from ._support import (
     PLUGIN,
-    REPOSITORY,
     canonical_document,
     content_document,
     sha256,
@@ -69,13 +67,12 @@ class PreparedFreeze5BridgeActivation:
 
 def _resolve_freeze5() -> None:
     resolved = (
-        subprocess.run(
-            ("git", "rev-parse", "--verify", f"{FREEZE5_COMMIT}^{{commit}}"),
-            cwd=REPOSITORY,
-            check=True,
-            capture_output=True,
+        _freeze5_git(
+            "rev-parse",
+            "--verify",
+            f"{FREEZE5_COMMIT}^{{commit}}",
         )
-        .stdout.decode("ascii")
+        .decode("ascii")
         .strip()
     )
     if resolved != FREEZE5_COMMIT:
@@ -84,24 +81,22 @@ def _resolve_freeze5() -> None:
 
 def _freeze5_file_raw(relative_path: str) -> bytes:
     _resolve_freeze5()
-    return subprocess.run(
-        ("git", "show", f"{FREEZE5_COMMIT}:{_PLUGIN_PREFIX}{relative_path}"),
-        cwd=REPOSITORY,
-        check=True,
-        capture_output=True,
-    ).stdout
+    return _freeze5_git(
+        "show",
+        f"{FREEZE5_COMMIT}:{_PLUGIN_PREFIX}{relative_path}",
+    )
 
 
 def materialize_freeze5_plugin(destination: Path) -> None:
     """Materialize the exact immutable Freeze 5 plugin tree from Git objects."""
 
     _resolve_freeze5()
-    tree = subprocess.run(
-        ("git", "ls-tree", "-r", FREEZE5_COMMIT, "plugins/task-witness"),
-        cwd=REPOSITORY,
-        check=True,
-        capture_output=True,
-    ).stdout.decode("utf-8")
+    tree = _freeze5_git(
+        "ls-tree",
+        "-r",
+        FREEZE5_COMMIT,
+        "plugins/task-witness",
+    ).decode("utf-8")
     entries: list[tuple[str, str, str]] = []
     for line in tree.splitlines():
         binding, path = line.split("\t", 1)
@@ -117,12 +112,7 @@ def materialize_freeze5_plugin(destination: Path) -> None:
     for mode, object_id, relative in entries:
         target = destination / relative
         target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        raw = subprocess.run(
-            ("git", "cat-file", "blob", object_id),
-            cwd=REPOSITORY,
-            check=True,
-            capture_output=True,
-        ).stdout
+        raw = _freeze5_git("cat-file", "blob", object_id)
         target.write_bytes(raw)
         target.chmod(0o755 if mode == "100755" else 0o644)
     controller = destination / "controller" / "task_witness_deploy.py"

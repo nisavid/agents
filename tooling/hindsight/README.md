@@ -336,6 +336,9 @@ rows' persisted retry counts, effective concurrency, bounded phase timeouts,
 possible retry waits, worker shutdown attempts, and transaction margins. The
 window begins when the authorization receipt is created, never at resume, and
 planning rejects a result over 14 days instead of truncating it.
+The transaction margin reserves separate bounded claim and outcome
+transactions for every remaining task attempt; shutdown transactions are
+accounted for separately.
 Current-plan retry and defer timestamps must be timezone-aware, no more than
 one hour ahead, and strictly before the absolute execution deadline. The
 worker rejects an out-of-window timestamp instead of clamping or persisting it.

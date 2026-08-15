@@ -2198,8 +2198,10 @@ def _exact_drain_execution_window(
         - 1
     ) // EXACT_DRAIN_EXECUTION_EFFECTIVE_CONCURRENCY
     transaction_margin_seconds = (
-        remaining_attempt_count + 1
-    ) * EXACT_DRAIN_TRANSACTION_TIMEOUT_SECONDS
+        2
+        * remaining_attempt_count
+        * EXACT_DRAIN_TRANSACTION_TIMEOUT_SECONDS
+    )
     shutdown_margin_seconds = (
         EXACT_DRAIN_WORKER_MAX_ATTEMPTS
         * EXACT_DRAIN_TRANSACTION_TIMEOUT_SECONDS

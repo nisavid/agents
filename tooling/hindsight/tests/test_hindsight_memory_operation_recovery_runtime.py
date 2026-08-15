@@ -1331,12 +1331,12 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
 
                 self.assertEqual(connection.update_count, 1)
 
-        class NonFiniteDatetime(datetime):
+        class DatetimeSubclass(datetime):
             def timestamp(self):
-                return float("nan")
+                raise AssertionError("datetime subclass reached timestamp")
 
         adapter, operation_id, connection, backend = case()
-        hostile = NonFiniteDatetime.fromtimestamp(observed_at, timezone.utc)
+        hostile = DatetimeSubclass.fromtimestamp(observed_at, timezone.utc)
         with self.assertRaisesRegex(
             OperationRecoveryError,
             "reschedule time is invalid",

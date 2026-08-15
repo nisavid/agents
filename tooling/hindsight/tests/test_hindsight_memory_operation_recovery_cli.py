@@ -5900,7 +5900,10 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
 
     def test_expired_execution_lease_rejects_before_provider_activation(self):
         fixtures = recovery_fixtures.OperationRecoveryContractTest()
-        planned_at = int(time.time()) - 1_119_241
+        execution_window_seconds = fixtures.drain_plan()["execution_window"][
+            "calculated_seconds"
+        ]
+        planned_at = int(time.time()) - execution_window_seconds - 1
         with tempfile.TemporaryDirectory(
             dir="/private/tmp",
             prefix="exact-drain-expired-no-provider-",
@@ -7176,7 +7179,10 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
     def test_exact_drain_apply_does_not_launch_at_the_execution_lease_boundary(self):
         fixtures = recovery_fixtures.OperationRecoveryContractTest()
         now = int(time.time())
-        authorized_at = now - 1_119_240
+        execution_window_seconds = fixtures.drain_plan()["execution_window"][
+            "calculated_seconds"
+        ]
+        authorized_at = now - execution_window_seconds
         with tempfile.TemporaryDirectory(
             dir="/private/tmp",
             prefix="exact-drain-expired-lease-",

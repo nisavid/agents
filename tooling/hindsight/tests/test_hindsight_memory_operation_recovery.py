@@ -429,10 +429,10 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 "transaction_timeout_seconds": 120,
                 "maximum_retry_delay_seconds": 3_600,
                 "startup_margin_seconds": 14_400,
-                "transaction_margin_seconds": 20_760,
+                "transaction_margin_seconds": 41_280,
                 "shutdown_attempt_count": 4,
                 "shutdown_margin_seconds": 480,
-                "calculated_seconds": 1_119_240,
+                "calculated_seconds": 1_139_760,
                 "maximum_seconds": 1_209_600,
             },
         )
@@ -469,6 +469,21 @@ class OperationRecoveryContractTest(unittest.TestCase):
             plan,
         )
 
+    def test_exact_drain_execution_window_budgets_claim_and_outcome_transactions(self):
+        window = self.drain_plan()["execution_window"]
+
+        transaction_slots_per_attempt = 2
+        expected_transaction_margin = (
+            window["remaining_attempt_count"]
+            * transaction_slots_per_attempt
+            * window["transaction_timeout_seconds"]
+        )
+
+        self.assertEqual(
+            window["transaction_margin_seconds"],
+            expected_transaction_margin,
+        )
+
     def test_exact_drain_execution_window_is_closed_and_recomputed(self):
         plan = self.drain_plan()
         cases = {}
@@ -488,10 +503,10 @@ class OperationRecoveryContractTest(unittest.TestCase):
             (
                 "transaction-margin",
                 "transaction_margin_seconds",
-                20_759,
+                41_279,
             ),
             ("shutdown-margin", "shutdown_margin_seconds", 479),
-            ("calculated-seconds", "calculated_seconds", 1_119_239),
+            ("calculated-seconds", "calculated_seconds", 1_139_759),
             ("maximum-seconds", "maximum_seconds", 1_209_601),
             ("anchor", "anchor", "plan-created-at"),
             ("renewable", "renewable", True),
@@ -2948,9 +2963,16 @@ class OperationRecoveryContractTest(unittest.TestCase):
             plan["execution_window"]["remaining_attempt_count"],
             105,
         )
+        window = plan["execution_window"]
         self.assertEqual(
-            plan["execution_window"]["calculated_seconds"],
-            643_200,
+            window["calculated_seconds"],
+            window["remaining_attempt_count"]
+            * window["phase_one_timeout_seconds"]
+            + window["retry_wait_count"]
+            * window["maximum_retry_delay_seconds"]
+            + window["startup_margin_seconds"]
+            + window["transaction_margin_seconds"]
+            + window["shutdown_margin_seconds"],
         )
         self.assertEqual(plan["recovery_context"], recovery_context)
         self.assertEqual(

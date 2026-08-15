@@ -22,6 +22,7 @@ CANDIDATE_RUNNER = REPOSITORY / "scripts" / "run_task_witness_qualification.py"
 LINUX_QUALIFICATION_WORKFLOW = (
     REPOSITORY / ".github" / "workflows" / "task-witness-linux-qualification.yml"
 )
+FROZEN_CANDIDATE_SHA = "a342f1468374933d3240b345ead000f529945990"
 
 
 def load_helper():
@@ -646,6 +647,23 @@ class TaskWitnessLinuxQualificationHarnessTests(unittest.TestCase):
         )
         self.assertEqual(workflow.count(preflight_and_detachment), 1)
         self.assertLess(workflow.index(preflight_and_detachment), workflow.index(copy))
+
+    def test_workflow_binds_the_exact_frozen_candidate(self) -> None:
+        workflow = LINUX_QUALIFICATION_WORKFLOW.read_text()
+        self.assertEqual(workflow.count(FROZEN_CANDIDATE_SHA), 3)
+        self.assertIn(
+            "vars.TASK_WITNESS_LINUX_QUALIFICATION_CANDIDATE ==\n"
+            f"          '{FROZEN_CANDIDATE_SHA}' &&\n",
+            workflow,
+        )
+        self.assertIn(
+            f"      CANDIDATE_SHA: {FROZEN_CANDIDATE_SHA}\n",
+            workflow,
+        )
+        self.assertIn(
+            f"          ref: {FROZEN_CANDIDATE_SHA}\n",
+            workflow,
+        )
 
     def write_elf(
         self,

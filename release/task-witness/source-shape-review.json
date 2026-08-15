@@ -60,7 +60,7 @@
       "tests/plugins/task_witness_client/test_control_maintenance_smoke.py": 245,
       "tests/plugins/task_witness_client/test_invocation_profile.py": 1644,
       "tests/plugins/task_witness_client/test_launcher.py": 1229,
-      "tests/plugins/task_witness_client/test_process_supervision.py": 2597,
+      "tests/plugins/task_witness_client/test_process_supervision.py": 2602,
       "tests/plugins/task_witness_client/test_retained_state.py": 2033,
       "tests/plugins/task_witness_client/test_runtime.py": 22,
       "tests/plugins/task_witness_client/test_runtime_acceptance.py": 625,
@@ -132,7 +132,7 @@
         ]
       },
       "direct_release_owned_tests": {
-        "aggregate_nonblank_noncomment_lines": 59893,
+        "aggregate_nonblank_noncomment_lines": 59898,
         "paths": [
           "tests/plugins/task_witness_client/__init__.py",
           "tests/plugins/task_witness_client/_activation_smoke_driver.py",
@@ -298,7 +298,7 @@
   "source_byte_identity": {
     "aggregate_sha256_by_set": {
       "current_control_set": "f7008ffa2f5dfae3a5d6172c8ee1d8f469715c4261012618581600bbe45e1a85",
-      "direct_release_owned_tests": "3d95c74f89de6911ae815cc8a034959b97f4518d933098b4777d03f92d5d8a9f",
+      "direct_release_owned_tests": "c52248123dc8112ece81b5d8aac0e06a434e88cd778bb0d35c4cab7c0874fbe4",
       "public_release_registration": "358a821a27fe493c637cc5034e662c89193b5eaf46246f29c244f6df2e8c0f7f",
       "release_documentation": "e0cc1f1b6bdbd2b86d43ada6f092c377044717bbbf257b541133116d8696e8da",
       "release_integration": "34e37c32c87bbe1047f9b54992606b4dc46720b0de71b6a7b446178bb7ff6ff2",
@@ -498,7 +498,7 @@
       },
       {
         "path": "tests/plugins/task_witness_client/test_process_supervision.py",
-        "sha256": "53de7bc698afbbae7e543bacab6cc7a92fc2605cbefc4513663a5f8519bc0b51"
+        "sha256": "f81fa915377e373919ba29b6c0e58e56b56c0b9dc4258133b5b01c1a008b1c0b"
       },
       {
         "path": "tests/plugins/task_witness_client/test_retained_state.py",

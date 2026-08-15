@@ -1366,6 +1366,11 @@ class ProcessSupervisionTests(_TaskWitnessClientTestCase):
         try:
             with (
                 mock.patch.object(module.sys, "platform", "darwin"),
+                mock.patch.object(
+                    module,
+                    "_darwin_wait_for_process_group_state",
+                    return_value="quiescent",
+                ),
                 mock.patch.object(module.time, "monotonic", side_effect=fail_once),
                 self.assertRaisesRegex(
                     module.ClientError,

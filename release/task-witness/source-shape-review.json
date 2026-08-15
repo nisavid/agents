@@ -298,7 +298,7 @@
   "source_byte_identity": {
     "aggregate_sha256_by_set": {
       "current_control_set": "f7008ffa2f5dfae3a5d6172c8ee1d8f469715c4261012618581600bbe45e1a85",
-      "direct_release_owned_tests": "2b2203c828a908b4d54a2c6cb81b8264aaff70b49f3684e97220e114ab259668",
+      "direct_release_owned_tests": "736d27c9d146b6292bfc157c5ab84469ae6bdc1e82f5bf9b0e80ef4e059f1552",
       "public_release_registration": "358a821a27fe493c637cc5034e662c89193b5eaf46246f29c244f6df2e8c0f7f",
       "release_documentation": "e0cc1f1b6bdbd2b86d43ada6f092c377044717bbbf257b541133116d8696e8da",
       "release_integration": "34e37c32c87bbe1047f9b54992606b4dc46720b0de71b6a7b446178bb7ff6ff2",
@@ -610,7 +610,7 @@
       },
       {
         "path": "tests/plugins/task_witness_deployment/test_activation_transactions.py",
-        "sha256": "e7fc129d64673dc7c988d95462e793990a0389bfecae247f7bc38d446288b065"
+        "sha256": "4ced1c749412177ddde2d3aa0b711971752a91b8f3f5d73c8a288613c241925a"
       },
       {
         "path": "tests/plugins/task_witness_deployment/test_agent_plugins_source_receipts.py",

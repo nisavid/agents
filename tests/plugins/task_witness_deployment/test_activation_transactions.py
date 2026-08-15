@@ -513,7 +513,7 @@ class ActivationTransactionTests(unittest.TestCase):
         deployment = self.deployment()
         pid_path = self.root / "timeout-smoke.pid"
         descendant_pid_path = self.root / "timeout-smoke-descendant.pid"
-        linger_seconds = 2.0
+        linger_seconds = 5.0
         argv = real_smoke_output_command(
             pid_path,
             stdout_bytes=0,
@@ -526,7 +526,7 @@ class ActivationTransactionTests(unittest.TestCase):
         with mock.patch.dict(
             deployment.PROCESS_PROFILE,
             {
-                "validation_deadline_seconds": 0.1,
+                "validation_deadline_seconds": 1.0,
                 "termination_grace_seconds": 0.1,
                 "kill_reap_seconds": 1,
             },

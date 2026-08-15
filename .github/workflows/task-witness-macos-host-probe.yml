@@ -1,0 +1,143 @@
+name: Task Witness macOS ARM64 host probe
+
+on:
+  push:
+    branches:
+      - ivan/task-witness-macos-qualification-harness
+    paths:
+      - .github/workflows/task-witness-macos-host-probe.yml
+      - scripts/probe_task_witness_macos_host.py
+      - tests/test_task_witness_macos_host_probe.py
+
+permissions:
+  contents: read
+
+concurrency:
+  group: task-witness-macos-host-probe-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    if: >-
+      ${{ github.repository == 'nisavid/agents' &&
+          github.event_name == 'push' &&
+          github.ref ==
+          'refs/heads/ivan/task-witness-macos-qualification-harness' &&
+          vars.TASK_WITNESS_MACOS_HOST_PROBE_CANDIDATE ==
+          'b47f03519068b858cf0c070b5d331ee053ef6b7b' &&
+          vars.TASK_WITNESS_MACOS_HOST_PROBE_HARNESS == github.sha }}
+    runs-on: macos-15
+    timeout-minutes: 15
+    env:
+      CANDIDATE_SHA: b47f03519068b858cf0c070b5d331ee053ef6b7b
+    steps:
+      - name: Check out the operator-owned harness
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          path: harness
+          persist-credentials: false
+
+      - name: Verify the exact harness inputs and local contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          harness_sha=$(/usr/bin/git -C harness rev-parse HEAD^{commit})
+          /usr/bin/test "$harness_sha" = "$GITHUB_SHA"
+          /usr/bin/git -C harness diff --quiet
+          /usr/bin/git -C harness diff --cached --quiet
+          /usr/bin/test -z "$(/usr/bin/git -C harness status --porcelain)"
+          workflow_blob=$(
+            /usr/bin/git -C harness rev-parse \
+              "$GITHUB_SHA:.github/workflows/task-witness-macos-host-probe.yml"
+          )
+          observed_workflow_blob=$(
+            /usr/bin/git -C harness hash-object \
+              .github/workflows/task-witness-macos-host-probe.yml
+          )
+          /usr/bin/test "$observed_workflow_blob" = "$workflow_blob"
+          helper_blob=$(
+            /usr/bin/git -C harness rev-parse \
+              "$GITHUB_SHA:scripts/probe_task_witness_macos_host.py"
+          )
+          observed_helper_blob=$(
+            /usr/bin/git -C harness hash-object \
+              scripts/probe_task_witness_macos_host.py
+          )
+          /usr/bin/test "$observed_helper_blob" = "$helper_blob"
+          test_blob=$(
+            /usr/bin/git -C harness rev-parse \
+              "$GITHUB_SHA:tests/test_task_witness_macos_host_probe.py"
+          )
+          observed_test_blob=$(
+            /usr/bin/git -C harness hash-object \
+              tests/test_task_witness_macos_host_probe.py
+          )
+          /usr/bin/test "$observed_test_blob" = "$test_blob"
+          /usr/bin/python3 -I -B \
+            harness/tests/test_task_witness_macos_host_probe.py
+
+      - name: Capture the bounded direct-session probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          probe_root="$RUNNER_TEMP/task-witness-macos-host-probe"
+          /bin/mkdir -m 0700 "$probe_root"
+          set +e
+          /usr/bin/python3 -I -B \
+            harness/scripts/probe_task_witness_macos_host.py \
+              probe \
+              --candidate-sha "$CANDIDATE_SHA" \
+              --output "$probe_root/probe.json" \
+              >"$probe_root/probe.stdout" \
+              2>"$probe_root/probe.stderr"
+          probe_status=$?
+          set -e
+          /usr/bin/printf '%s\n' "$probe_status" >"$probe_root/probe.status"
+
+      - name: Seal the bounded diagnostic artifact
+        id: seal
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          probe_root="$RUNNER_TEMP/task-witness-macos-host-probe"
+          external_manifest="${probe_root}.SHA256SUMS"
+          /usr/bin/python3 -I -B \
+            harness/scripts/probe_task_witness_macos_host.py \
+              write-artifact-manifest \
+              --artifact-root "$probe_root" \
+              --output "$external_manifest"
+          /bin/mv "$external_manifest" "$probe_root/SHA256SUMS"
+          /usr/bin/python3 -I -B \
+            harness/scripts/probe_task_witness_macos_host.py \
+              verify-artifact-manifest \
+              --artifact-root "$probe_root" \
+              --manifest "$probe_root/SHA256SUMS"
+          (
+            cd "$probe_root"
+            /usr/bin/shasum -a 256 -c SHA256SUMS
+          )
+
+      - name: Retain bounded macOS host probe diagnostics
+        if: ${{ always() && steps.seal.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: >-
+            task-witness-macos-arm64-host-probe-${{ env.CANDIDATE_SHA }}-${{ github.sha }}
+          path: ${{ runner.temp }}/task-witness-macos-host-probe
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 6
+
+      - name: Require an eligible direct session
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          probe_root="$RUNNER_TEMP/task-witness-macos-host-probe"
+          /usr/bin/python3 -I -B \
+            harness/scripts/probe_task_witness_macos_host.py \
+              verify-artifact-manifest \
+              --artifact-root "$probe_root" \
+              --manifest "$probe_root/SHA256SUMS"
+          /usr/bin/test "$(/bin/cat "$probe_root/probe.status")" = 0

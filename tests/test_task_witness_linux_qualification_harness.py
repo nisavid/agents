@@ -22,7 +22,7 @@ CANDIDATE_RUNNER = REPOSITORY / "scripts" / "run_task_witness_qualification.py"
 LINUX_QUALIFICATION_WORKFLOW = (
     REPOSITORY / ".github" / "workflows" / "task-witness-linux-qualification.yml"
 )
-FROZEN_CANDIDATE_SHA = "a342f1468374933d3240b345ead000f529945990"
+FROZEN_CANDIDATE_SHA = "394ad2a1a9ed0bd84c6097b655574bedf3c83a5a"
 
 
 def load_helper():

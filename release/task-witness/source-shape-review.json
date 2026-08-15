@@ -298,7 +298,7 @@
   "source_byte_identity": {
     "aggregate_sha256_by_set": {
       "current_control_set": "f7008ffa2f5dfae3a5d6172c8ee1d8f469715c4261012618581600bbe45e1a85",
-      "direct_release_owned_tests": "c52248123dc8112ece81b5d8aac0e06a434e88cd778bb0d35c4cab7c0874fbe4",
+      "direct_release_owned_tests": "957cbb44b5c481b3f223f4f13a9e1989bbb22c51de4e7852015dff96c3245e80",
       "public_release_registration": "358a821a27fe493c637cc5034e662c89193b5eaf46246f29c244f6df2e8c0f7f",
       "release_documentation": "e0cc1f1b6bdbd2b86d43ada6f092c377044717bbbf257b541133116d8696e8da",
       "release_integration": "34e37c32c87bbe1047f9b54992606b4dc46720b0de71b6a7b446178bb7ff6ff2",
@@ -670,7 +670,7 @@
       },
       {
         "path": "tests/plugins/task_witness_deployment/test_receipt_staging.py",
-        "sha256": "8c3f54a4ea0b1784744532fcc388dac6e4d9fe9b176e75d65241b9f7fdccd2d7"
+        "sha256": "7192c36181016bf2249832e8e2b35dafdef6bb5a1acbd984b672185b76435407"
       },
       {
         "path": "tests/plugins/task_witness_deployment/test_routine_activation_recovery.py",

@@ -2258,7 +2258,7 @@ class ReceiptStagingTests(unittest.TestCase):
         self.assertFalse(staging_root.exists())
         stage_receipt = moved_stage / "stage.json"
         self.assertTrue(stage_receipt.is_file())
-        self.assertEqual(len(stage_receipt.read_bytes()), 11_706)
+        self.assertEqual(len(stage_receipt.read_bytes()), len(control.stage_raw))
         residue = self.tree_state(moved_stage)
         self.assertEqual(
             tuple(item for item in residue if item[0] != "stage.json"),
@@ -2268,7 +2268,7 @@ class ReceiptStagingTests(unittest.TestCase):
         self.assertEqual(len(stage_entries), 1)
         self.assertEqual(stage_entries[0][1], "file")
         self.assertEqual(stage_entries[0][2] & 0o777, 0o600)
-        self.assertEqual(stage_entries[0][3][0], 11_706)
+        self.assertEqual(stage_entries[0][3][0], len(control.stage_raw))
         verified_stages = []
         with self.assertRaisesRegex(
             deployment.DeploymentError,

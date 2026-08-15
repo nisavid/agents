@@ -109,6 +109,11 @@ jobs:
           /usr/bin/git -C candidate-stage diff --quiet
           /usr/bin/git -C candidate-stage diff --cached --quiet
           test -z "$(/usr/bin/git -C candidate-stage status --porcelain)"
+          /usr/bin/python3 \
+            harness/scripts/prepare_task_witness_linux_qualification.py \
+            detach-candidate-transport \
+            --candidate-root "$GITHUB_WORKSPACE/candidate-stage" \
+            --candidate-sha "$CANDIDATE_SHA"
 
       - name: Provision immutable roots and qualification identity
         id: provision

@@ -54,6 +54,19 @@ PROFILE_FILESYSTEM_TYPE_BY_OBSERVATION = {
 }
 EXPECTED_HARNESS_REF = "refs/heads/ivan/task-witness-linux-qualification-harness"
 EXPECTED_REPOSITORY = "nisavid/agents"
+EXPECTED_CANDIDATE_REMOTE_URL = "https://github.com/nisavid/agents"
+EXPECTED_CANDIDATE_FETCH_REFSPEC = "+refs/heads/*:refs/remotes/origin/*"
+MAX_CANDIDATE_OBJECT_STORAGE_ENTRIES = 100_000
+MAX_CANDIDATE_VISIBLE_BYTES = 4 * 1024 * 1024 * 1024
+MAX_CANDIDATE_VISIBLE_DEPTH = 32
+CANDIDATE_EXECUTION_CONFIG_PATTERN = (
+    r"^(alias|credential|diff|fetch|filter|gpg|http|include|includeif|interactive|merge|"
+    r"pager|protocol|remote|ssh|submodule|url)\."
+    r"|^branch\..+\.(pushremote|remote)$"
+    r"|^core\.(alternaterefscommand|attributesfile|checkstat|editor|fsmonitor|"
+    r"gitproxy|hookspath|pager|sshcommand|trustctime)$"
+    r"|^extensions\.(partialclone|worktreeconfig)$"
+)
 GITHUB_CONTEXT_FIELDS = (
     "GITHUB_ACTION",
     "GITHUB_ACTOR",
@@ -121,6 +134,16 @@ class DependencySourceEvidence(NamedTuple):
     copy_source: Path
     copy_source_sha256: str
     qualified_relocation: Path | None
+
+
+class CandidateTransportState(NamedTuple):
+    commit: str
+    tree: str
+    symbolic_head: bytes
+    index_sha256: str
+    index_binding: tuple[int, ...]
+    objects: tuple[bytes, ...]
+    refs: tuple[bytes, ...]
 
 
 def profile_filesystem_type(value: object) -> str:
@@ -424,6 +447,641 @@ def require_absolute(path: Path, label: str) -> Path:
     if not path.is_absolute() or ".." in path.parts or str(path).startswith("//"):
         raise PreparationError(f"{label} must be a normalized absolute path")
     return path
+
+
+def candidate_transport_git_environment() -> dict[str, str]:
+    return {
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_SYSTEM": "/dev/null",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_ATTR_NOSYSTEM": "1",
+        "GIT_EDITOR": "/usr/bin/false",
+        "GIT_PAGER": "/usr/bin/false",
+        "GIT_SEQUENCE_EDITOR": "/usr/bin/false",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GCM_INTERACTIVE": "never",
+        "GIT_ASKPASS": "/usr/bin/false",
+        "GIT_SSH_COMMAND": "/usr/bin/false",
+        "SSH_ASKPASS": "/usr/bin/false",
+        "GIT_LFS_SKIP_SMUDGE": "1",
+        "GIT_NO_LAZY_FETCH": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "HOME": "/nonexistent-task-witness-home",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": "/usr/bin:/bin",
+        "PAGER": "/usr/bin/false",
+    }
+
+
+def candidate_transport_git(
+    candidate_root: Path,
+    *arguments: str,
+    allowed_statuses: tuple[int, ...] = (0,),
+) -> subprocess.CompletedProcess[bytes]:
+    process = subprocess.run(
+        [
+            "/usr/bin/git",
+            "--no-replace-objects",
+            "-c",
+            f"safe.directory={candidate_root}",
+            "-C",
+            str(candidate_root),
+            *arguments,
+        ],
+        check=False,
+        capture_output=True,
+        env=candidate_transport_git_environment(),
+    )
+    if process.returncode not in allowed_statuses or process.stderr:
+        raise PreparationError("candidate transport Git operation failed")
+    return process
+
+
+def candidate_transport_git_line(
+    candidate_root: Path,
+    *arguments: str,
+) -> str:
+    raw = candidate_transport_git(candidate_root, *arguments).stdout
+    if not raw.endswith(b"\n") or raw.count(b"\n") != 1:
+        raise PreparationError("candidate transport Git result is invalid")
+    try:
+        return raw[:-1].decode("ascii")
+    except UnicodeDecodeError as error:
+        raise PreparationError("candidate transport Git result is invalid") from error
+
+
+def candidate_transport_config_projection(
+    candidate_root: Path,
+) -> list[tuple[bytes, bytes, bytes, bytes]]:
+    process = candidate_transport_git(
+        candidate_root,
+        "config",
+        "--includes",
+        "--show-scope",
+        "--show-origin",
+        "--null",
+        "--get-regexp",
+        CANDIDATE_EXECUTION_CONFIG_PATTERN,
+        allowed_statuses=(0, 1),
+    )
+    tokens = process.stdout.split(b"\0")
+    values = tokens[:-1]
+    if tokens[-1] != b"" or len(values) % 3 != 0:
+        raise PreparationError("candidate transport Git configuration is invalid")
+    rows: list[tuple[bytes, bytes, bytes, bytes]] = []
+    for scope, origin, key_value in zip(
+        values[::3],
+        values[1::3],
+        values[2::3],
+    ):
+        key, separator, value = key_value.partition(b"\n")
+        if separator != b"\n" or not scope or not origin or not key:
+            raise PreparationError("candidate transport Git configuration is invalid")
+        rows.append((scope, origin, key, value))
+    return rows
+
+
+def candidate_transport_local_config(candidate_root: Path) -> tuple[bytes, ...]:
+    raw = candidate_transport_git(
+        candidate_root,
+        "config",
+        "--local",
+        "--null",
+        "--list",
+    ).stdout
+    rows = raw.split(b"\0")
+    if rows[-1] != b"" or any(row.count(b"\n") < 1 for row in rows[:-1]):
+        raise PreparationError("candidate transport local configuration is invalid")
+    return tuple(rows[:-1])
+
+
+def stable_regular_file_digest(path: Path, label: str) -> tuple[str, tuple[int, ...]]:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except OSError as error:
+        raise PreparationError(f"{label} is unavailable") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise PreparationError(f"{label} disposition is unsafe")
+        digest = hashlib.sha256()
+        while chunk := os.read(descriptor, 1024 * 1024):
+            digest.update(chunk)
+        binding = stable_file_binding(metadata)
+        if stable_file_binding(os.fstat(descriptor)) != binding:
+            raise PreparationError(f"{label} changed while reading")
+        return digest.hexdigest(), binding
+    finally:
+        os.close(descriptor)
+
+
+def candidate_transport_tree_path(raw_path: bytes) -> str:
+    try:
+        path = raw_path.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise PreparationError("candidate transport tree path is invalid") from error
+    if (
+        not path
+        or path.startswith("/")
+        or any(part in {"", ".", ".."} for part in path.split("/"))
+    ):
+        raise PreparationError("candidate transport tree path is invalid")
+    return path
+
+
+def candidate_transport_index_entries(
+    candidate_root: Path,
+) -> dict[str, tuple[str, str]]:
+    raw = candidate_transport_git(
+        candidate_root,
+        "ls-files",
+        "--stage",
+        "-z",
+    ).stdout
+    rows = raw.split(b"\0")
+    if rows[-1] != b"":
+        raise PreparationError("candidate transport index projection is invalid")
+    entries: dict[str, tuple[str, str]] = {}
+    try:
+        for row in rows[:-1]:
+            left, raw_path = row.split(b"\t", 1)
+            mode, oid, stage = left.decode("ascii").split(" ")
+            path = candidate_transport_tree_path(raw_path)
+            if (
+                path in entries
+                or stage != "0"
+                or mode not in {"100644", "100755", "120000"}
+                or re.fullmatch(r"[0-9a-f]{40}", oid) is None
+            ):
+                raise ValueError
+            entries[path] = (mode, oid)
+    except (UnicodeDecodeError, ValueError) as error:
+        raise PreparationError(
+            "candidate transport index projection is invalid"
+        ) from error
+    return entries
+
+
+def candidate_transport_head_entries(
+    candidate_root: Path,
+) -> dict[str, tuple[str, str]]:
+    raw = candidate_transport_git(
+        candidate_root,
+        "ls-tree",
+        "-r",
+        "-z",
+        "--full-tree",
+        "HEAD",
+    ).stdout
+    rows = raw.split(b"\0")
+    if rows[-1] != b"":
+        raise PreparationError("candidate transport HEAD projection is invalid")
+    entries: dict[str, tuple[str, str]] = {}
+    try:
+        for row in rows[:-1]:
+            left, raw_path = row.split(b"\t", 1)
+            mode, kind, oid = left.decode("ascii").split(" ")
+            path = candidate_transport_tree_path(raw_path)
+            if (
+                path in entries
+                or kind != "blob"
+                or mode not in {"100644", "100755", "120000"}
+                or re.fullmatch(r"[0-9a-f]{40}", oid) is None
+            ):
+                raise ValueError
+            entries[path] = (mode, oid)
+    except (UnicodeDecodeError, ValueError) as error:
+        raise PreparationError(
+            "candidate transport HEAD projection is invalid"
+        ) from error
+    return entries
+
+
+def candidate_transport_visible_blob(
+    path: Path,
+    metadata: os.stat_result,
+    *,
+    remaining_bytes: int,
+) -> tuple[str, str, int]:
+    if stat.S_ISLNK(metadata.st_mode):
+        try:
+            raw = os.readlink(path).encode("utf-8")
+            after = path.lstat()
+        except (OSError, UnicodeEncodeError) as error:
+            raise PreparationError(
+                "candidate transport visible symlink is unavailable"
+            ) from error
+        if stable_file_binding(after) != stable_file_binding(metadata):
+            raise PreparationError("candidate transport visible symlink changed")
+        mode = "120000"
+    else:
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) not in {0o644, 0o755}
+        ):
+            raise PreparationError(
+                "candidate transport visible file disposition is unsupported"
+            )
+        if metadata.st_size > remaining_bytes:
+            raise PreparationError("candidate transport visible tree is too large")
+        try:
+            descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        except OSError as error:
+            raise PreparationError(
+                "candidate transport visible file is unavailable"
+            ) from error
+        try:
+            opened = os.fstat(descriptor)
+            if stable_file_binding(opened) != stable_file_binding(metadata):
+                raise PreparationError("candidate transport visible file changed")
+            digest = hashlib.sha1(
+                b"blob " + str(metadata.st_size).encode("ascii") + b"\0"
+            )
+            length = 0
+            while chunk := os.read(descriptor, 1024 * 1024):
+                length += len(chunk)
+                if length > remaining_bytes:
+                    raise PreparationError(
+                        "candidate transport visible tree is too large"
+                    )
+                digest.update(chunk)
+            if length != metadata.st_size or stable_file_binding(
+                os.fstat(descriptor)
+            ) != stable_file_binding(opened):
+                raise PreparationError("candidate transport visible file changed")
+        except OSError as error:
+            raise PreparationError(
+                "candidate transport visible file is unavailable"
+            ) from error
+        finally:
+            os.close(descriptor)
+        return (
+            "100755" if stat.S_IMODE(metadata.st_mode) == 0o755 else "100644",
+            digest.hexdigest(),
+            length,
+        )
+
+    if len(raw) > remaining_bytes:
+        raise PreparationError("candidate transport visible tree is too large")
+    framed = b"blob " + str(len(raw)).encode("ascii") + b"\0" + raw
+    return mode, hashlib.sha1(framed).hexdigest(), len(raw)
+
+
+def require_candidate_visible_tree_matches_head(candidate_root: Path) -> None:
+    index = candidate_transport_index_entries(candidate_root)
+    expected_files = candidate_transport_head_entries(candidate_root)
+    if index != expected_files:
+        raise PreparationError("candidate transport index disagrees with HEAD")
+
+    expected_directories: set[str] = set()
+    for path in expected_files:
+        parts = path.split("/")
+        expected_directories.update(
+            "/".join(parts[:length]) for length in range(1, len(parts))
+        )
+
+    observed_directories: set[str] = set()
+    observed_files: dict[str, tuple[str, str]] = {}
+    pending = [(candidate_root, "", 0)]
+    observed_count = 0
+    retained_bytes = 0
+    while pending:
+        directory, prefix, depth = pending.pop()
+        if depth > MAX_CANDIDATE_VISIBLE_DEPTH:
+            raise PreparationError("candidate transport visible tree is too deep")
+        try:
+            children = list(directory.iterdir())
+        except OSError as error:
+            raise PreparationError(
+                "candidate transport visible tree is unavailable"
+            ) from error
+        for child in children:
+            relative = f"{prefix}/{child.name}" if prefix else child.name
+            if not prefix and relative == ".git":
+                continue
+            try:
+                relative.encode("utf-8")
+            except UnicodeEncodeError as error:
+                raise PreparationError(
+                    "candidate transport visible path is invalid"
+                ) from error
+            observed_count += 1
+            if observed_count > MAX_CANDIDATE_OBJECT_STORAGE_ENTRIES:
+                raise PreparationError("candidate transport visible tree is too large")
+            try:
+                metadata = child.lstat()
+            except OSError as error:
+                raise PreparationError(
+                    "candidate transport visible tree is unavailable"
+                ) from error
+            if stat.S_ISDIR(metadata.st_mode):
+                observed_directories.add(relative)
+                pending.append((child, relative, depth + 1))
+                continue
+            mode, oid, length = candidate_transport_visible_blob(
+                child,
+                metadata,
+                remaining_bytes=MAX_CANDIDATE_VISIBLE_BYTES - retained_bytes,
+            )
+            retained_bytes += length
+            if relative in observed_files:
+                raise PreparationError("candidate transport visible tree is invalid")
+            observed_files[relative] = (mode, oid)
+
+    if observed_directories != expected_directories or observed_files != expected_files:
+        raise PreparationError("candidate transport visible tree disagrees with HEAD")
+
+
+def candidate_transport_repository_state(
+    candidate_root: Path,
+) -> CandidateTransportState:
+    commit = candidate_transport_git_line(
+        candidate_root,
+        "rev-parse",
+        "--verify",
+        "HEAD^{commit}",
+    )
+    tree = candidate_transport_git_line(
+        candidate_root,
+        "rev-parse",
+        "--verify",
+        "HEAD^{tree}",
+    )
+    symbolic_head = candidate_transport_git(
+        candidate_root,
+        "symbolic-ref",
+        "-q",
+        "HEAD",
+        allowed_statuses=(0, 1),
+    ).stdout
+    index_flags = candidate_transport_git(
+        candidate_root,
+        "ls-files",
+        "-v",
+        "-z",
+    ).stdout
+    index_rows = index_flags.split(b"\0")
+    if index_rows[-1] != b"" or any(
+        not row.startswith(b"H ") for row in index_rows[:-1]
+    ):
+        raise PreparationError("candidate transport index contains hidden state")
+    require_candidate_visible_tree_matches_head(candidate_root)
+    status = candidate_transport_git(
+        candidate_root,
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+    ).stdout
+    if status:
+        raise PreparationError("candidate transport checkout is not clean")
+    candidate_transport_git(candidate_root, "diff", "--quiet", "--no-ext-diff")
+    candidate_transport_git(
+        candidate_root,
+        "diff",
+        "--cached",
+        "--quiet",
+        "--no-ext-diff",
+    )
+
+    index_path = Path(
+        candidate_transport_git_line(
+            candidate_root,
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "index",
+        )
+    )
+    index_sha256, index_binding = stable_regular_file_digest(
+        index_path,
+        "candidate transport index",
+    )
+
+    raw_objects = candidate_transport_git(
+        candidate_root,
+        "cat-file",
+        "--batch-all-objects",
+        "--batch-check=%(objectname) %(objecttype) %(objectsize)",
+    ).stdout
+    object_rows = raw_objects.splitlines()
+    if (
+        not object_rows
+        or not raw_objects.endswith(b"\n")
+        or len(set(object_rows)) != len(object_rows)
+        or any(
+            re.fullmatch(
+                rb"[0-9a-f]{40} (blob|commit|tag|tree) [0-9]+",
+                row,
+            )
+            is None
+            for row in object_rows
+        )
+    ):
+        raise PreparationError("candidate transport object inventory is invalid")
+
+    raw_refs = candidate_transport_git(
+        candidate_root,
+        "for-each-ref",
+        "--format=%(refname) %(objectname)",
+    ).stdout
+    ref_rows = raw_refs.splitlines()
+    ref_names = [row.partition(b" ")[0] for row in ref_rows]
+    if (
+        (raw_refs and not raw_refs.endswith(b"\n"))
+        or len(set(ref_names)) != len(ref_names)
+        or any(
+            re.fullmatch(rb"refs/[^\x00-\x20~^:?*\\]+ [0-9a-f]{40}", row) is None
+            for row in ref_rows
+        )
+    ):
+        raise PreparationError("candidate transport reference inventory is invalid")
+
+    return CandidateTransportState(
+        commit=commit,
+        tree=tree,
+        symbolic_head=symbolic_head,
+        index_sha256=index_sha256,
+        index_binding=index_binding,
+        objects=tuple(sorted(object_rows)),
+        refs=tuple(sorted(ref_rows)),
+    )
+
+
+def require_candidate_legacy_transports_absent(git_directory: Path) -> None:
+    for name in ("branches", "remotes"):
+        path = git_directory / name
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise PreparationError(
+                "candidate legacy transport state is unavailable"
+            ) from error
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise PreparationError("candidate legacy transport state is unsupported")
+        try:
+            children = list(path.iterdir())
+        except OSError as error:
+            raise PreparationError(
+                "candidate legacy transport state is unavailable"
+            ) from error
+        if children:
+            raise PreparationError("candidate legacy transport state is unsupported")
+
+
+def require_candidate_alternate_object_storage_absent(git_directory: Path) -> None:
+    alternates = git_directory / "objects" / "info" / "alternates"
+    try:
+        alternates.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise PreparationError(
+            "candidate alternate object storage is unavailable"
+        ) from error
+    raise PreparationError("candidate alternate object storage is unsupported")
+
+
+def require_candidate_object_storage_local(git_directory: Path) -> None:
+    objects = git_directory / "objects"
+    try:
+        metadata = objects.lstat()
+    except OSError as error:
+        raise PreparationError("candidate object storage is unavailable") from error
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise PreparationError("candidate object storage disposition is unsupported")
+
+    pending = [objects]
+    observed = 0
+    while pending:
+        directory = pending.pop()
+        try:
+            children = list(directory.iterdir())
+        except OSError as error:
+            raise PreparationError("candidate object storage is unavailable") from error
+        for child in children:
+            observed += 1
+            if observed > MAX_CANDIDATE_OBJECT_STORAGE_ENTRIES:
+                raise PreparationError("candidate object storage is too large")
+            try:
+                metadata = child.lstat()
+            except OSError as error:
+                raise PreparationError(
+                    "candidate object storage is unavailable"
+                ) from error
+            if stat.S_ISDIR(metadata.st_mode):
+                pending.append(child)
+            elif not stat.S_ISREG(metadata.st_mode):
+                raise PreparationError(
+                    "candidate object storage disposition is unsupported"
+                )
+
+
+def detach_candidate_transport(candidate_root: Path, candidate_sha: str) -> None:
+    candidate_root = require_absolute(candidate_root, "candidate transport root")
+    if re.fullmatch(r"[0-9a-f]{40}", candidate_sha) is None:
+        raise PreparationError("candidate transport SHA is invalid")
+    try:
+        if candidate_root.resolve(strict=True) != candidate_root:
+            raise PreparationError("candidate transport root is not canonical")
+        root_metadata = candidate_root.lstat()
+        git_metadata = (candidate_root / ".git").lstat()
+    except OSError as error:
+        raise PreparationError("candidate transport checkout is unavailable") from error
+    if not stat.S_ISDIR(root_metadata.st_mode) or not stat.S_ISDIR(
+        git_metadata.st_mode
+    ):
+        raise PreparationError("candidate transport checkout disposition is unsafe")
+
+    top_level = Path(
+        candidate_transport_git_line(candidate_root, "rev-parse", "--show-toplevel")
+    )
+    git_directory = Path(
+        candidate_transport_git_line(candidate_root, "rev-parse", "--absolute-git-dir")
+    )
+    config_path = Path(
+        candidate_transport_git_line(
+            candidate_root,
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "config",
+        )
+    )
+    if (
+        top_level != candidate_root
+        or git_directory != candidate_root / ".git"
+        or config_path != candidate_root / ".git" / "config"
+    ):
+        raise PreparationError("candidate transport Git administration is unsupported")
+    require_candidate_legacy_transports_absent(git_directory)
+    require_candidate_object_storage_local(git_directory)
+    require_candidate_alternate_object_storage_absent(git_directory)
+
+    config_sha256, config_binding = stable_regular_file_digest(
+        config_path,
+        "candidate transport configuration",
+    )
+    config_origin = b"file:.git/config"
+    expected_projection = sorted(
+        [
+            (
+                b"local",
+                config_origin,
+                b"remote.origin.url",
+                EXPECTED_CANDIDATE_REMOTE_URL.encode("ascii"),
+            ),
+            (
+                b"local",
+                config_origin,
+                b"remote.origin.fetch",
+                EXPECTED_CANDIDATE_FETCH_REFSPEC.encode("ascii"),
+            ),
+        ]
+    )
+    if sorted(candidate_transport_config_projection(candidate_root)) != (
+        expected_projection
+    ):
+        raise PreparationError("candidate transport Git configuration is unsupported")
+
+    local_config_before = candidate_transport_local_config(candidate_root)
+    before = candidate_transport_repository_state(candidate_root)
+    if before.commit != candidate_sha:
+        raise PreparationError("candidate transport SHA disagrees")
+    if stable_regular_file_digest(
+        config_path,
+        "candidate transport configuration",
+    ) != (config_sha256, config_binding):
+        raise PreparationError("candidate transport configuration changed")
+
+    candidate_transport_git(
+        candidate_root,
+        "config",
+        "--local",
+        "--remove-section",
+        "remote.origin",
+    )
+    require_candidate_legacy_transports_absent(git_directory)
+    require_candidate_object_storage_local(git_directory)
+    require_candidate_alternate_object_storage_absent(git_directory)
+    stable_regular_file_digest(config_path, "candidate transport configuration")
+    if candidate_transport_config_projection(candidate_root):
+        raise PreparationError("candidate transport Git configuration remains unsafe")
+    local_config_after = candidate_transport_local_config(candidate_root)
+    expected_local_config_after = tuple(
+        row
+        for row in local_config_before
+        if not row.partition(b"\n")[0].startswith(b"remote.origin.")
+    )
+    if local_config_after != expected_local_config_after:
+        raise PreparationError("candidate transport local configuration changed")
+    after = candidate_transport_repository_state(candidate_root)
+    if after != before:
+        raise PreparationError("candidate transport repository state changed")
 
 
 def capture_context(
@@ -3292,6 +3950,16 @@ def parser() -> argparse.ArgumentParser:
     capture = commands.add_parser("capture-context")
     capture.add_argument("--output", type=Path, required=True)
     capture.set_defaults(function=lambda args: capture_context(args.output))
+
+    detach_transport = commands.add_parser("detach-candidate-transport")
+    detach_transport.add_argument("--candidate-root", type=Path, required=True)
+    detach_transport.add_argument("--candidate-sha", required=True)
+    detach_transport.set_defaults(
+        function=lambda args: detach_candidate_transport(
+            args.candidate_root,
+            args.candidate_sha,
+        )
+    )
 
     verify = commands.add_parser("verify-runtime-source")
     verify.add_argument("--root", type=Path, required=True)

@@ -52,6 +52,601 @@ class TaskWitnessLinuxQualificationHarnessTests(unittest.TestCase):
     def setUp(self) -> None:
         self.helper = load_helper()
 
+    def git_environment(self, home: Path) -> dict[str, str]:
+        return {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_SYSTEM": "/dev/null",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_TERMINAL_PROMPT": "0",
+            "HOME": str(home),
+            "LANG": "C",
+            "LC_ALL": "C",
+            "PATH": "/usr/bin:/bin",
+        }
+
+    def git(
+        self,
+        root: Path,
+        *arguments: str,
+        check: bool = True,
+    ) -> subprocess.CompletedProcess[bytes]:
+        process = subprocess.run(
+            ["/usr/bin/git", "-C", str(root), *arguments],
+            check=False,
+            capture_output=True,
+            env=self.git_environment(root.parent),
+        )
+        if check and process.returncode != 0:
+            raise AssertionError(process.stderr.decode("utf-8", errors="replace"))
+        return process
+
+    def build_candidate_transport_repository(self, root: Path) -> str:
+        root.mkdir()
+        self.git(root, "init")
+        self.git(root, "symbolic-ref", "HEAD", "refs/heads/main")
+        candidate_runner = root / "scripts" / "run_task_witness_qualification.py"
+        candidate_runner.parent.mkdir()
+        candidate_runner.write_text("candidate runner\n")
+        self.git(root, "add", str(candidate_runner.relative_to(root)))
+        self.git(
+            root,
+            "-c",
+            "user.name=Qualification Test",
+            "-c",
+            "user.email=qualification@example.invalid",
+            "commit",
+            "-m",
+            "test candidate",
+        )
+        self.git(
+            root,
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/nisavid/agents",
+        )
+        self.git(root, "config", "--local", "gc.auto", "0")
+        head = self.git(root, "rev-parse", "HEAD^{commit}").stdout.decode().strip()
+        self.git(root, "update-ref", "refs/remotes/origin/main", head)
+        return head
+
+    def add_candidate_worktree_config_drift(self, root: Path) -> None:
+        self.git(root, "config", "--local", "extensions.worktreeConfig", "true")
+        self.git(
+            root,
+            "config",
+            "--worktree",
+            "core.hooksPath",
+            str(root.parent / "hooks"),
+        )
+
+    def candidate_transport_state(self, root: Path) -> tuple[bytes, ...]:
+        index_path = Path(
+            self.git(
+                root,
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "index",
+            )
+            .stdout.decode()
+            .strip()
+        )
+        return (
+            self.git(root, "rev-parse", "HEAD^{commit}").stdout,
+            self.git(root, "rev-parse", "HEAD^{tree}").stdout,
+            index_path.read_bytes(),
+            self.git(
+                root,
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=all",
+            ).stdout,
+            b"\n".join(
+                sorted(
+                    self.git(
+                        root,
+                        "cat-file",
+                        "--batch-all-objects",
+                        "--batch-check=%(objectname) %(objecttype) %(objectsize)",
+                    ).stdout.splitlines()
+                )
+            ),
+            self.git(
+                root,
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+            ).stdout,
+        )
+
+    def candidate_transport_config_files(
+        self,
+        root: Path,
+    ) -> tuple[bytes | None, bytes | None]:
+        paths = (root / ".git" / "config", root / ".git" / "config.worktree")
+        return tuple(path.read_bytes() if path.exists() else None for path in paths)
+
+    def detach_candidate_transport(
+        self,
+        root: Path,
+        candidate_sha: str,
+    ) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.run(
+            [
+                sys.executable,
+                str(HELPER),
+                "detach-candidate-transport",
+                "--candidate-root",
+                str(root),
+                "--candidate-sha",
+                candidate_sha,
+            ],
+            check=False,
+            capture_output=True,
+            env=self.git_environment(root.parent),
+        )
+
+    def test_candidate_transport_detachment_preserves_repository(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root).resolve() / "candidate-stage"
+            candidate_sha = self.build_candidate_transport_repository(root)
+            before = self.candidate_transport_state(root)
+
+            result = self.detach_candidate_transport(root, candidate_sha)
+
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+            self.assertEqual(result.stderr, b"")
+            self.assertEqual(self.candidate_transport_state(root), before)
+            self.assertEqual(
+                self.git(
+                    root,
+                    "config",
+                    "--local",
+                    "--get-regexp",
+                    "^remote\\.",
+                    check=False,
+                ).returncode,
+                1,
+            )
+            self.assertEqual(
+                self.git(
+                    root,
+                    "config",
+                    "--local",
+                    "--get",
+                    "gc.auto",
+                ).stdout,
+                b"0\n",
+            )
+            self.assertEqual(
+                self.git(
+                    root,
+                    "show-ref",
+                    "--verify",
+                    "refs/remotes/origin/main",
+                ).stdout,
+                f"{candidate_sha} refs/remotes/origin/main\n".encode(),
+            )
+
+    @unittest.skipUnless(
+        sys.version_info >= (3, 10),
+        "the frozen candidate requires Python 3.10 or newer",
+    )
+    def test_detached_candidate_passes_frozen_candidate_config_check(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root).resolve() / "candidate-stage"
+            candidate_sha = self.build_candidate_transport_repository(root)
+            result = self.detach_candidate_transport(root, candidate_sha)
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+
+            candidate_runner = load_candidate_runner()
+            candidate_runner._require_safe_candidate_config(
+                root,
+                Path("/usr/bin/git"),
+            )
+
+    def test_candidate_transport_detachment_rejects_drift_before_mutation(
+        self,
+    ) -> None:
+        mutations = {
+            "missing-origin": lambda root: self.git(
+                root, "config", "--local", "--remove-section", "remote.origin"
+            ),
+            "changed-url": lambda root: self.git(
+                root,
+                "config",
+                "--local",
+                "remote.origin.url",
+                "https://example.invalid/agents",
+            ),
+            "duplicate-url": lambda root: self.git(
+                root,
+                "config",
+                "--local",
+                "--add",
+                "remote.origin.url",
+                "https://github.com/nisavid/agents",
+            ),
+            "changed-fetch": lambda root: self.git(
+                root,
+                "config",
+                "--local",
+                "remote.origin.fetch",
+                "+refs/heads/main:refs/remotes/origin/main",
+            ),
+            "duplicate-fetch": lambda root: self.git(
+                root,
+                "config",
+                "--local",
+                "--add",
+                "remote.origin.fetch",
+                "+refs/heads/*:refs/remotes/origin/*",
+            ),
+            "extra-remote-key": lambda root: self.git(
+                root,
+                "config",
+                "--local",
+                "remote.origin.pushurl",
+                "https://example.invalid/agents",
+            ),
+            "credential-header": lambda root: self.git(
+                root,
+                "config",
+                "--local",
+                "http.https://github.com/.extraheader",
+                "AUTHORIZATION: basic redacted",
+            ),
+            "fetch-bundle-uri": lambda root: self.git(
+                root,
+                "config",
+                "--local",
+                "fetch.bundleURI",
+                "https://example.invalid/candidate.bundle",
+            ),
+            "alternate-refs-command": lambda root: self.git(
+                root,
+                "config",
+                "--local",
+                "core.alternateRefsCommand",
+                "/usr/bin/false",
+            ),
+            "branch-remote": lambda root: self.git(
+                root,
+                "config",
+                "--local",
+                "branch.main.remote",
+                "https://example.invalid/agents",
+            ),
+            "branch-push-remote": lambda root: self.git(
+                root,
+                "config",
+                "--local",
+                "branch.main.pushRemote",
+                "https://example.invalid/agents",
+            ),
+            "include": lambda root: self.git(
+                root,
+                "config",
+                "--local",
+                "include.path",
+                str(root.parent / "missing-configuration"),
+            ),
+            "conditional-include": lambda root: self.git(
+                root,
+                "config",
+                "--local",
+                "includeIf.onbranch:main.path",
+                str(root.parent / "missing-conditional-configuration"),
+            ),
+            "worktree-config": self.add_candidate_worktree_config_drift,
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as raw_root:
+                root = Path(raw_root).resolve() / "candidate-stage"
+                candidate_sha = self.build_candidate_transport_repository(root)
+                mutate(root)
+                before_config = self.candidate_transport_config_files(root)
+                before_state = self.candidate_transport_state(root)
+
+                result = self.detach_candidate_transport(root, candidate_sha)
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(
+                    self.candidate_transport_config_files(root),
+                    before_config,
+                )
+                self.assertEqual(self.candidate_transport_state(root), before_state)
+
+    def test_candidate_transport_detachment_rejects_git_diagnostics_before_mutation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root).resolve() / "candidate-stage"
+            candidate_sha = self.build_candidate_transport_repository(root)
+            broken_ref = root / ".git" / "refs" / "remotes" / "origin" / "broken"
+            broken_ref.write_bytes(b"not-an-object-id\n")
+            before_config = self.candidate_transport_config_files(root)
+            before_ref = broken_ref.read_bytes()
+            diagnostic = self.git(
+                root,
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+            )
+            self.assertEqual(diagnostic.returncode, 0)
+            self.assertNotEqual(diagnostic.stderr, b"")
+            self.assertNotIn(b"refs/remotes/origin/broken", diagnostic.stdout)
+
+            result = self.detach_candidate_transport(root, candidate_sha)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(
+                self.candidate_transport_config_files(root),
+                before_config,
+            )
+            self.assertEqual(broken_ref.read_bytes(), before_ref)
+
+    def test_candidate_transport_detachment_rejects_sha_mismatch_before_mutation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root).resolve() / "candidate-stage"
+            candidate_sha = self.build_candidate_transport_repository(root)
+            wrong_sha = "0" * 40 if candidate_sha != "0" * 40 else "1" * 40
+            before_config = self.candidate_transport_config_files(root)
+            before_state = self.candidate_transport_state(root)
+
+            result = self.detach_candidate_transport(root, wrong_sha)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(
+                self.candidate_transport_config_files(root),
+                before_config,
+            )
+            self.assertEqual(self.candidate_transport_state(root), before_state)
+
+    def test_candidate_transport_detachment_rejects_hidden_runner_changes_before_mutation(
+        self,
+    ) -> None:
+        hidden_flags = {
+            "assume-unchanged": "--assume-unchanged",
+            "skip-worktree": "--skip-worktree",
+        }
+        for name, flag in hidden_flags.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as raw_root:
+                root = Path(raw_root).resolve() / "candidate-stage"
+                candidate_sha = self.build_candidate_transport_repository(root)
+                relative_runner = Path("scripts/run_task_witness_qualification.py")
+                candidate_runner = root / relative_runner
+                self.git(root, "update-index", flag, str(relative_runner))
+                altered_runner = b"altered candidate runner\n"
+                candidate_runner.write_bytes(altered_runner)
+                self.assertEqual(
+                    self.git(
+                        root,
+                        "status",
+                        "--porcelain=v1",
+                        "-z",
+                        "--untracked-files=all",
+                    ).stdout,
+                    b"",
+                )
+                self.assertEqual(
+                    self.git(root, "diff", "--quiet", check=False).returncode,
+                    0,
+                )
+                hidden_entry = self.git(root, "ls-files", "-v", "-z").stdout
+                self.assertFalse(hidden_entry.startswith(b"H "))
+                before_config = self.candidate_transport_config_files(root)
+                before_state = self.candidate_transport_state(root)
+
+                result = self.detach_candidate_transport(root, candidate_sha)
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(
+                    self.candidate_transport_config_files(root),
+                    before_config,
+                )
+                self.assertEqual(self.candidate_transport_state(root), before_state)
+                self.assertEqual(candidate_runner.read_bytes(), altered_runner)
+                self.assertEqual(
+                    self.git(root, "ls-files", "-v", "-z").stdout,
+                    hidden_entry,
+                )
+
+    def test_candidate_transport_detachment_rejects_stat_cache_hidden_runner_change_before_mutation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root).resolve() / "candidate-stage"
+            candidate_sha = self.build_candidate_transport_repository(root)
+            candidate_runner = root / "scripts" / "run_task_witness_qualification.py"
+            old_timestamp_ns = 946_684_800_000_000_000
+            os.utime(
+                candidate_runner,
+                ns=(old_timestamp_ns, old_timestamp_ns),
+            )
+            self.git(root, "update-index", "--refresh")
+            original_metadata = candidate_runner.stat()
+            original = candidate_runner.read_bytes()
+            altered_runner = b"!" * (len(original) - 1) + b"\n"
+            self.git(root, "config", "--local", "core.trustctime", "false")
+            self.git(root, "config", "--local", "core.checkStat", "minimal")
+            candidate_runner.write_bytes(altered_runner)
+            os.utime(
+                candidate_runner,
+                ns=(original_metadata.st_atime_ns, original_metadata.st_mtime_ns),
+            )
+            self.assertEqual(
+                self.git(
+                    root,
+                    "status",
+                    "--porcelain=v1",
+                    "-z",
+                    "--untracked-files=all",
+                ).stdout,
+                b"",
+            )
+            self.assertEqual(
+                self.git(root, "diff", "--quiet", check=False).returncode,
+                0,
+            )
+            self.assertTrue(
+                self.git(root, "ls-files", "-v", "-z").stdout.startswith(b"H ")
+            )
+            with self.assertRaises(self.helper.PreparationError):
+                self.helper.require_candidate_visible_tree_matches_head(root)
+            before_config = self.candidate_transport_config_files(root)
+            before_state = self.candidate_transport_state(root)
+
+            result = self.detach_candidate_transport(root, candidate_sha)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(
+                self.candidate_transport_config_files(root),
+                before_config,
+            )
+            self.assertEqual(self.candidate_transport_state(root), before_state)
+            self.assertEqual(candidate_runner.read_bytes(), altered_runner)
+
+    def test_candidate_transport_detachment_rejects_legacy_remotes_before_mutation(
+        self,
+    ) -> None:
+        legacy_sources = {
+            "remotes/origin": (
+                b"URL: https://example.invalid/agents\n"
+                b"Pull: refs/heads/*:refs/remotes/origin/*\n"
+            ),
+            "branches/origin": b"https://example.invalid/agents#main\n",
+        }
+        for relative, content in legacy_sources.items():
+            with self.subTest(relative=relative), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw).resolve() / "candidate-stage"
+                candidate_sha = self.build_candidate_transport_repository(root)
+                legacy = root / ".git" / relative
+                legacy.parent.mkdir(exist_ok=True)
+                legacy.write_bytes(content)
+                before_config = self.candidate_transport_config_files(root)
+                before_state = self.candidate_transport_state(root)
+
+                result = self.detach_candidate_transport(root, candidate_sha)
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(
+                    self.candidate_transport_config_files(root),
+                    before_config,
+                )
+                self.assertEqual(self.candidate_transport_state(root), before_state)
+                self.assertEqual(legacy.read_bytes(), content)
+
+    def test_candidate_transport_detachment_rejects_alternate_objects_before_mutation(
+        self,
+    ) -> None:
+        for disposition in ("regular", "symlink"):
+            with (
+                self.subTest(disposition=disposition),
+                tempfile.TemporaryDirectory() as raw,
+            ):
+                root = Path(raw).resolve() / "candidate-stage"
+                candidate_sha = self.build_candidate_transport_repository(root)
+                alternate_repository = root.parent / "alternate.git"
+                clone = subprocess.run(
+                    [
+                        "/usr/bin/git",
+                        "clone",
+                        "--bare",
+                        "--no-hardlinks",
+                        str(root),
+                        str(alternate_repository),
+                    ],
+                    check=False,
+                    capture_output=True,
+                    env=self.git_environment(root.parent),
+                )
+                self.assertEqual(clone.returncode, 0, clone.stderr.decode())
+
+                alternates = root / ".git" / "objects" / "info" / "alternates"
+                content = f"{alternate_repository / 'objects'}\n".encode()
+                if disposition == "regular":
+                    alternates.write_bytes(content)
+                else:
+                    alternate_list = root.parent / "alternate-object-path"
+                    alternate_list.write_bytes(content)
+                    alternates.symlink_to(alternate_list)
+                before_config = self.candidate_transport_config_files(root)
+                before_state = self.candidate_transport_state(root)
+
+                result = self.detach_candidate_transport(root, candidate_sha)
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(
+                    self.candidate_transport_config_files(root),
+                    before_config,
+                )
+                self.assertEqual(self.candidate_transport_state(root), before_state)
+                if disposition == "regular":
+                    self.assertEqual(alternates.read_bytes(), content)
+                else:
+                    self.assertTrue(alternates.is_symlink())
+                    self.assertEqual(os.readlink(alternates), str(alternate_list))
+
+    def test_candidate_transport_detachment_rejects_external_object_directories_before_mutation(
+        self,
+    ) -> None:
+        for disposition in ("objects", "loose-object-directory"):
+            with (
+                self.subTest(disposition=disposition),
+                tempfile.TemporaryDirectory() as raw,
+            ):
+                root = Path(raw).resolve() / "candidate-stage"
+                candidate_sha = self.build_candidate_transport_repository(root)
+                objects = root / ".git" / "objects"
+                if disposition == "objects":
+                    object_directory = objects
+                else:
+                    object_directory = objects / candidate_sha[:2]
+                external_objects = root.parent / f"external-{disposition}"
+                object_directory.rename(external_objects)
+                object_directory.symlink_to(external_objects, target_is_directory=True)
+                before_config = self.candidate_transport_config_files(root)
+                before_state = self.candidate_transport_state(root)
+
+                result = self.detach_candidate_transport(root, candidate_sha)
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(
+                    self.candidate_transport_config_files(root),
+                    before_config,
+                )
+                self.assertEqual(self.candidate_transport_state(root), before_state)
+                self.assertTrue(object_directory.is_symlink())
+                self.assertEqual(os.readlink(object_directory), str(external_objects))
+
+    def test_workflow_detaches_candidate_transport_after_exact_input_checks(
+        self,
+    ) -> None:
+        workflow = LINUX_QUALIFICATION_WORKFLOW.read_text()
+        preflight_and_detachment = """\
+          candidate_sha=$(
+            /usr/bin/git -C candidate-stage rev-parse HEAD^{commit}
+          )
+          test "$candidate_sha" = "$CANDIDATE_SHA"
+          /usr/bin/git -C candidate-stage diff --quiet
+          /usr/bin/git -C candidate-stage diff --cached --quiet
+          test -z "$(/usr/bin/git -C candidate-stage status --porcelain)"
+          /usr/bin/python3 \\
+            harness/scripts/prepare_task_witness_linux_qualification.py \\
+            detach-candidate-transport \\
+            --candidate-root "$GITHUB_WORKSPACE/candidate-stage" \\
+            --candidate-sha "$CANDIDATE_SHA"
+"""
+        copy = (
+            '          sudo /usr/bin/cp -a -- "$GITHUB_WORKSPACE/candidate-stage" '
+            '"$CANDIDATE_ROOT"\n'
+        )
+        self.assertEqual(workflow.count(preflight_and_detachment), 1)
+        self.assertLess(workflow.index(preflight_and_detachment), workflow.index(copy))
+
     def write_elf(
         self,
         path: Path,

@@ -640,9 +640,15 @@ class TaskWitnessMacOSHostProbeTests(unittest.TestCase):
         self.assertNotIn("probe.status", upload)
         self.assertIn("        if: always()\n", terminal)
         self.assertIn(
-            '          /usr/bin/test "$(/bin/cat "$probe_root/probe.status")" = 0\n',
+            '          /bin/test "$(/bin/cat "$probe_root/probe.status")" = 0\n',
             terminal,
         )
+
+    def test_workflow_uses_the_portable_macos_test_binary(self) -> None:
+        workflow = WORKFLOW.read_text()
+
+        self.assertNotIn("/usr/bin/test", workflow)
+        self.assertEqual(workflow.count("          /bin/test "), 6)
 
     def test_linux_workflow_cannot_run_on_the_macos_probe_branch(self) -> None:
         workflow = LINUX_WORKFLOW.read_text()

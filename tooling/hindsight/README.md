@@ -336,6 +336,9 @@ rows' persisted retry counts, effective concurrency, bounded phase timeouts,
 possible retry waits, worker shutdown attempts, and transaction margins. The
 window begins when the authorization receipt is created, never at resume, and
 planning rejects a result over 14 days instead of truncating it.
+Current-plan retry and defer timestamps must be timezone-aware, no more than
+one hour ahead, and strictly before the absolute execution deadline. The
+worker rejects an out-of-window timestamp instead of clamping or persisting it.
 
 After post-abort verification, add `--recovery-plan "$POST_ABORT_PLAN"` to the
 next read-only `operation-recovery drain plan` command. The fresh plan then

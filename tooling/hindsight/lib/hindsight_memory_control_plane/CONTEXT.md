@@ -34,6 +34,7 @@ _Avoid_: Apply plan, migration approval
 
 **Execution window**:
 A fixed, nonrenewing duration calculated from the exact selected operation IDs, their persisted retry counts, the effective worker concurrency, bounded task timeouts, retry waits, shutdown attempts, and transaction margins. Authorization time anchors the absolute deadline. Resume and progress do not move it.
+Retry and defer timestamps are accepted only when they are timezone-aware, no farther ahead than the plan-bound retry delay, and strictly before that deadline.
 _Avoid_: Approval lifetime, renewable lease
 
 **Recovery epoch**:

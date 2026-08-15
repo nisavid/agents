@@ -3,6 +3,7 @@ from builtins import BaseExceptionGroup
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 import asyncio
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
@@ -1096,6 +1097,321 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         self.assertEqual(evidence["stage"], "retry-ceiling")
         self.assertEqual(evidence["failure"]["category"], "retry_ceiling")
         self.assertIs(evidence["failure"]["retryable"], False)
+
+    def test_schema10_retry_and_defer_enforce_the_plan_bound_delay(self):
+        observed_at = int(time.time())
+        maximum_delay = 3_600
+
+        class Transaction:
+            async def __aenter__(self):
+                return None
+
+            async def __aexit__(self, *_arguments):
+                return None
+
+        class Connection:
+            def __init__(self, row):
+                self.row = row
+                self.update_count = 0
+                self.update_arguments = []
+
+            def transaction(self):
+                return Transaction()
+
+            async def fetchrow(self, *_arguments):
+                return dict(self.row)
+
+            async def execute(self, statement, *arguments):
+                if "UPDATE public.async_operations" in statement:
+                    self.update_count += 1
+                    self.update_arguments.append(arguments)
+                    return "UPDATE 1"
+                return "SET"
+
+        class Context:
+            def __init__(self, connection):
+                self.connection = connection
+
+            async def __aenter__(self):
+                return self.connection
+
+            async def __aexit__(self, *_arguments):
+                return None
+
+        class Backend:
+            def __init__(self, connection):
+                self.connection = connection
+
+            def acquire(self):
+                return Context(self.connection)
+
+        def case(*, retry_count=0, clock=lambda: observed_at):
+            adapter = self._current_exact_drain_adapter()
+            adapter._clock = clock
+            adapter._verify_unstarted_state = AsyncMock()
+            adapter._configure_mutation_transaction = AsyncMock()
+            operation_id, selected = next(iter(adapter._selected.items()))
+            connection = Connection(
+                {
+                    "operation_type": selected["operation_type"],
+                    "status": "processing",
+                    "worker_id": adapter._worker_id,
+                    "retry_count": retry_count,
+                    "task_payload_digest": selected["task_payload_digest"],
+                    "checkpoint_facts_committed": False,
+                    "checkpoint_committed_document_count": 0,
+                    "checkpoint_unit_ids_count": 0,
+                    "checkpoint_stage": "unavailable",
+                    "checkpoint_processed": 0,
+                    "checkpoint_total": 0,
+                }
+            )
+            return adapter, operation_id, connection, Backend(connection)
+
+        def invoke(name, adapter, operation_id, backend, timestamp):
+            if name == "retry":
+                return adapter.schedule_retry(
+                    backend,
+                    operation_id,
+                    timestamp,
+                    "provider unavailable",
+                    "public",
+                )
+            return adapter.defer_operation(
+                backend,
+                operation_id,
+                timestamp,
+                "capacity",
+                "public",
+            )
+
+        for name in ("retry", "defer"):
+            with self.subTest(name=name, timestamp="non-UTC-boundary"):
+                adapter, operation_id, connection, backend = case()
+                self.assertEqual(
+                    adapter._maximum_retry_delay_seconds,
+                    maximum_delay,
+                )
+                boundary = datetime.fromtimestamp(
+                    observed_at + maximum_delay,
+                    timezone(timedelta(hours=5, minutes=45)),
+                )
+
+                asyncio.run(
+                    invoke(name, adapter, operation_id, backend, boundary)
+                )
+
+                self.assertEqual(connection.update_count, 1)
+                self.assertEqual(
+                    connection.update_arguments[0][1],
+                    boundary.astimezone(timezone.utc),
+                )
+                self.assertIs(
+                    connection.update_arguments[0][1].tzinfo,
+                    timezone.utc,
+                )
+
+            for label, timestamp in {
+                "past": datetime.fromtimestamp(
+                    observed_at - 1,
+                    timezone.utc,
+                ),
+                "immediate": datetime.fromtimestamp(
+                    observed_at,
+                    timezone.utc,
+                ),
+            }.items():
+                with self.subTest(name=name, timestamp=label):
+                    adapter, operation_id, connection, backend = case()
+
+                    asyncio.run(
+                        invoke(name, adapter, operation_id, backend, timestamp)
+                    )
+
+                    self.assertEqual(connection.update_count, 1)
+
+            invalid = {
+                "over-limit": datetime.fromtimestamp(
+                    observed_at + maximum_delay,
+                    timezone.utc,
+                )
+                + timedelta(microseconds=1),
+                "naive": datetime.fromtimestamp(observed_at),
+                "non-datetime": object(),
+            }
+            for label, timestamp in invalid.items():
+                with self.subTest(name=name, timestamp=label):
+                    adapter, operation_id, connection, backend = case()
+                    with self.assertRaisesRegex(
+                        OperationRecoveryError,
+                        "reschedule time is invalid",
+                    ):
+                        asyncio.run(
+                            invoke(
+                                name,
+                                adapter,
+                                operation_id,
+                                backend,
+                                timestamp,
+                            )
+                        )
+
+                    self.assertEqual(connection.update_count, 0)
+
+            with self.subTest(name=name, timestamp="deadline"):
+                adapter, operation_id, connection, backend = case()
+                adapter._execution_deadline = observed_at + maximum_delay // 2
+                deadline = datetime.fromtimestamp(
+                    adapter._execution_deadline,
+                    timezone.utc,
+                )
+                with self.assertRaisesRegex(
+                    OperationRecoveryError,
+                    "reschedule time is invalid",
+                ):
+                    asyncio.run(
+                        invoke(name, adapter, operation_id, backend, deadline)
+                    )
+                self.assertEqual(connection.update_count, 0)
+
+            with self.subTest(name=name, timestamp="before-deadline"):
+                adapter, operation_id, connection, backend = case()
+                adapter._execution_deadline = observed_at + maximum_delay // 2
+                before_deadline = datetime.fromtimestamp(
+                    adapter._execution_deadline,
+                    timezone.utc,
+                ) - timedelta(microseconds=1)
+
+                asyncio.run(
+                    invoke(
+                        name,
+                        adapter,
+                        operation_id,
+                        backend,
+                        before_deadline,
+                    )
+                )
+
+                self.assertEqual(connection.update_count, 1)
+
+            for label, clock_value in {
+                "boolean": True,
+                "not-numeric": "now",
+                "nan": float("nan"),
+                "infinity": float("inf"),
+                "overflowing-integer": 10**1_000,
+            }.items():
+                with self.subTest(name=name, clock=label):
+                    adapter, operation_id, connection, backend = case(
+                        clock=lambda value=clock_value: value
+                    )
+                    timestamp = datetime.fromtimestamp(
+                        observed_at,
+                        timezone.utc,
+                    )
+                    with self.assertRaisesRegex(
+                        OperationRecoveryError,
+                        "clock is invalid",
+                    ):
+                        asyncio.run(
+                            invoke(
+                                name,
+                                adapter,
+                                operation_id,
+                                backend,
+                                timestamp,
+                            )
+                        )
+                    self.assertEqual(connection.update_count, 0)
+
+            with self.subTest(name=name, timestamp="retry-ceiling-none"):
+                adapter, operation_id, connection, backend = case(retry_count=3)
+
+                asyncio.run(invoke(name, adapter, operation_id, backend, None))
+
+                self.assertEqual(connection.update_count, 1)
+
+        class NonFiniteDatetime(datetime):
+            def timestamp(self):
+                return float("nan")
+
+        adapter, operation_id, connection, backend = case()
+        hostile = NonFiniteDatetime.fromtimestamp(observed_at, timezone.utc)
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "reschedule time is invalid",
+        ):
+            asyncio.run(
+                invoke("retry", adapter, operation_id, backend, hostile)
+            )
+        self.assertEqual(connection.update_count, 0)
+
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        schema10 = fixtures.drain_plan(
+            snapshot=fixtures.drain_snapshot(observed_at=observed_at),
+            created_at=observed_at,
+        )
+        body = {
+            key: value
+            for key, value in schema10.items()
+            if key
+            not in {
+                "plan_digest",
+                "execution_window",
+                "recovery_context",
+                "recovery_context_digest",
+            }
+        }
+        body["schema_version"] = 9
+        body["execution_lease_seconds"] = 86_400
+        schema9 = {
+            **body,
+            "plan_digest": recovery_fixtures.digest(body),
+        }
+        legacy = ExactDrainClaimAdapter(
+            schema9,
+            authorization=recovery_fixtures.exact_drain_authorization(
+                schema9,
+                authorized_at=observed_at,
+            ),
+            clock=lambda: observed_at,
+        )
+        legacy._verify_unstarted_state = AsyncMock()
+        legacy._configure_mutation_transaction = AsyncMock()
+        operation_id, selected = next(iter(legacy._selected.items()))
+        connection = Connection(
+            {
+                "operation_type": selected["operation_type"],
+                "status": "processing",
+                "worker_id": legacy._worker_id,
+                "retry_count": 0,
+                "task_payload_digest": selected["task_payload_digest"],
+                "checkpoint_facts_committed": False,
+                "checkpoint_committed_document_count": 0,
+                "checkpoint_unit_ids_count": 0,
+                "checkpoint_stage": "unavailable",
+                "checkpoint_processed": 0,
+                "checkpoint_total": 0,
+            }
+        )
+        far_future = datetime.fromtimestamp(
+            observed_at + 10 * 86_400,
+            timezone(timedelta(hours=-4)),
+        )
+
+        asyncio.run(
+            legacy.schedule_retry(
+                Backend(connection),
+                operation_id,
+                far_future,
+                "provider unavailable",
+                "public",
+            )
+        )
+
+        self.assertIsNone(legacy._maximum_retry_delay_seconds)
+        self.assertEqual(connection.update_count, 1)
+        self.assertIs(connection.update_arguments[0][1], far_future)
 
     def test_closed_control_connection_never_falls_back_to_worker_pool(self):
         adapter = self._current_exact_drain_adapter()

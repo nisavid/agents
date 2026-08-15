@@ -44,6 +44,10 @@ EXACT_DRAIN_EXECUTION_EFFECTIVE_CONCURRENCY = 1
 EXACT_DRAIN_PHASE_ONE_STATEMENT_TIMEOUT_SECONDS = 120
 EXACT_DRAIN_PHASE_ONE_CLIENT_TIMEOUT_SECONDS = 125
 EXACT_DRAIN_PHASE_ONE_TIMEOUT_SECONDS = 3_600
+EXACT_DRAIN_MAXIMUM_RETRY_DELAY_SECONDS = 3_600
+EXACT_DRAIN_STARTUP_MARGIN_SECONDS = (
+    EXACT_DRAIN_WORKER_MAX_ATTEMPTS * EXACT_DRAIN_PHASE_ONE_TIMEOUT_SECONDS
+)
 EXACT_DRAIN_PHASE_REPAIR_CONTRACT = {
     "schema_version": 1,
     "candidate_runtime_snapshot_schema_version": 2,
@@ -581,7 +585,11 @@ EXACT_DRAIN_EXECUTION_WINDOW_KEYS = frozenset(
         "effective_concurrency",
         "phase_one_timeout_seconds",
         "transaction_timeout_seconds",
+        "maximum_retry_delay_seconds",
+        "startup_margin_seconds",
+        "transaction_margin_seconds",
         "shutdown_attempt_count",
+        "shutdown_margin_seconds",
         "calculated_seconds",
         "maximum_seconds",
     }
@@ -2189,19 +2197,19 @@ def _exact_drain_execution_window(
         + EXACT_DRAIN_EXECUTION_EFFECTIVE_CONCURRENCY
         - 1
     ) // EXACT_DRAIN_EXECUTION_EFFECTIVE_CONCURRENCY
-    calculated_seconds = (
-        (
-            execution_waves
-            + retry_wait_count
-            + EXACT_DRAIN_WORKER_MAX_ATTEMPTS
-        )
-        * EXACT_DRAIN_PHASE_ONE_TIMEOUT_SECONDS
-        + (
-            remaining_attempt_count
-            + EXACT_DRAIN_WORKER_MAX_ATTEMPTS
-            + 1
-        )
+    transaction_margin_seconds = (
+        remaining_attempt_count + 1
+    ) * EXACT_DRAIN_TRANSACTION_TIMEOUT_SECONDS
+    shutdown_margin_seconds = (
+        EXACT_DRAIN_WORKER_MAX_ATTEMPTS
         * EXACT_DRAIN_TRANSACTION_TIMEOUT_SECONDS
+    )
+    calculated_seconds = (
+        execution_waves * EXACT_DRAIN_PHASE_ONE_TIMEOUT_SECONDS
+        + retry_wait_count * EXACT_DRAIN_MAXIMUM_RETRY_DELAY_SECONDS
+        + EXACT_DRAIN_STARTUP_MARGIN_SECONDS
+        + transaction_margin_seconds
+        + shutdown_margin_seconds
     )
     if calculated_seconds > EXACT_DRAIN_EXECUTION_WINDOW_MAX_SECONDS:
         raise OperationRecoveryError(
@@ -2224,7 +2232,13 @@ def _exact_drain_execution_window(
         "transaction_timeout_seconds": (
             EXACT_DRAIN_TRANSACTION_TIMEOUT_SECONDS
         ),
+        "maximum_retry_delay_seconds": (
+            EXACT_DRAIN_MAXIMUM_RETRY_DELAY_SECONDS
+        ),
+        "startup_margin_seconds": EXACT_DRAIN_STARTUP_MARGIN_SECONDS,
+        "transaction_margin_seconds": transaction_margin_seconds,
         "shutdown_attempt_count": EXACT_DRAIN_WORKER_MAX_ATTEMPTS,
+        "shutdown_margin_seconds": shutdown_margin_seconds,
         "calculated_seconds": calculated_seconds,
         "maximum_seconds": EXACT_DRAIN_EXECUTION_WINDOW_MAX_SECONDS,
     }
@@ -2281,9 +2295,25 @@ def _verified_exact_drain_execution_window(value: Any) -> dict[str, Any]:
             window["transaction_timeout_seconds"],
             "exact drain execution window transaction timeout",
         ),
+        "maximum_retry_delay_seconds": _integer(
+            window["maximum_retry_delay_seconds"],
+            "exact drain execution window maximum retry delay",
+        ),
+        "startup_margin_seconds": _integer(
+            window["startup_margin_seconds"],
+            "exact drain execution window startup margin",
+        ),
+        "transaction_margin_seconds": _integer(
+            window["transaction_margin_seconds"],
+            "exact drain execution window transaction margin",
+        ),
         "shutdown_attempt_count": _integer(
             window["shutdown_attempt_count"],
             "exact drain execution window shutdown attempt count",
+        ),
+        "shutdown_margin_seconds": _integer(
+            window["shutdown_margin_seconds"],
+            "exact drain execution window shutdown margin",
         ),
         "calculated_seconds": _integer(
             window["calculated_seconds"],
@@ -3614,6 +3644,11 @@ def _post_abort_contract(
     dict[str, int],
     dict[str, Any],
 ]:
+    if schema_version != 10 and reference_plan["schema_version"] == 10:
+        raise OperationRecoveryError(
+            "operation-recovery legacy post-abort schema cannot reference "
+            "schema 10"
+        )
     if schema_version == 10:
         return _post_abort_v10_contract(reference_plan, snapshot)
     worker_digest = _post_abort_worker_digest(reference_plan["plan_digest"])
@@ -4138,6 +4173,11 @@ def verify_post_abort_recovery_plan(
         plan["reference_plan"],
         allow_expired=True,
     )
+    if schema_version != 10 and reference["schema_version"] == 10:
+        raise OperationRecoveryError(
+            "operation-recovery legacy post-abort schema cannot reference "
+            "schema 10"
+        )
     snapshot = verify_live_snapshot(plan["live_snapshot"])
     reference_authorization = (
         None

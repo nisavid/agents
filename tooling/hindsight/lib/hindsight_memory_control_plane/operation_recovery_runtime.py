@@ -17,6 +17,7 @@ import hashlib
 import importlib.util
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import re
@@ -4561,6 +4562,11 @@ class ExactDrainClaimAdapter:
                 "operation-recovery terminal status evidence is required"
             )
         self._clock = clock
+        self._maximum_retry_delay_seconds = (
+            verified["execution_window"]["maximum_retry_delay_seconds"]
+            if verified.get("schema_version") == 10
+            else None
+        )
         if verified.get("schema_version") in {
             2, 3, 4, 5, 6, 7, 8, 9, 10
         }:
@@ -4903,19 +4909,72 @@ class ExactDrainClaimAdapter:
                 failure=exact_drain_worker_failure_evidence(error),
             )
 
-    def _assert_execution_lease(self) -> None:
+    def _assert_execution_lease(self) -> float | None:
         deadline = getattr(self, "_execution_deadline", None)
-        if deadline is not None and getattr(self, "_clock", time.time)() >= deadline:
+        if deadline is None:
+            return None
+        observed_at = getattr(self, "_clock", time.time)()
+        try:
+            normalized_observed_at = (
+                float(observed_at)
+                if type(observed_at) in {int, float}
+                else float("nan")
+            )
+        except (OverflowError, TypeError, ValueError):
+            normalized_observed_at = float("nan")
+        if not math.isfinite(normalized_observed_at):
+            raise OperationRecoveryError(
+                "operation-recovery exact drain clock is invalid"
+            )
+        if normalized_observed_at >= deadline:
             raise OperationRecoveryError(
                 "operation-recovery exact drain execution lease expired"
             )
+        return normalized_observed_at
 
-    def _assert_claim_capable_mutation(self) -> None:
+    def _assert_claim_capable_mutation(self) -> float | None:
         if getattr(self, "_terminal_reconciliation", False):
             raise OperationRecoveryError(
                 "operation-recovery terminal reconciliation cannot mutate"
             )
-        self._assert_execution_lease()
+        return self._assert_execution_lease()
+
+    def _validated_reschedule_time(
+        self,
+        value: Any,
+        *,
+        observed_at: float | None,
+    ) -> Any:
+        maximum_delay = getattr(
+            self,
+            "_maximum_retry_delay_seconds",
+            None,
+        )
+        if maximum_delay is None:
+            return value
+        try:
+            aware = (
+                type(value) is datetime
+                and value.tzinfo is not None
+                and value.utcoffset() is not None
+            )
+            normalized = value.astimezone(timezone.utc) if aware else None
+            delayed_until = normalized.timestamp() if normalized else None
+        except (OverflowError, OSError, TypeError, ValueError):
+            normalized = None
+            delayed_until = None
+        deadline = getattr(self, "_execution_deadline", None)
+        if (
+            observed_at is None
+            or delayed_until is None
+            or not math.isfinite(delayed_until)
+            or delayed_until - observed_at > maximum_delay
+            or (deadline is not None and delayed_until >= deadline)
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery exact drain reschedule time is invalid"
+            )
+        return normalized
 
     async def _configure_mutation_transaction(
         self,
@@ -5556,7 +5615,7 @@ class ExactDrainClaimAdapter:
         error_message: str | None,
         schema: str | None,
     ) -> None:
-        self._assert_claim_capable_mutation()
+        observed_at = self._assert_claim_capable_mutation()
         if schema not in {None, "public"}:
             raise OperationRecoveryError(
                 "operation-recovery exact drain public schema is unavailable"
@@ -5610,7 +5669,13 @@ class ExactDrainClaimAdapter:
                     raise OperationRecoveryError(
                         "operation-recovery exact drain retry row drifted"
                     )
-                if row["retry_count"] >= self._max_retries:
+                retry_ceiling = row["retry_count"] >= self._max_retries
+                if not retry_ceiling:
+                    next_retry_at = self._validated_reschedule_time(
+                        next_retry_at,
+                        observed_at=observed_at,
+                    )
+                if retry_ceiling:
                     result = await connection.execute(
                         """
                         UPDATE public.async_operations
@@ -5670,7 +5735,6 @@ class ExactDrainClaimAdapter:
                     )
                 self._started_ids.add(str(identifier))
                 self._initial_guard_complete = True
-        retry_ceiling = row["retry_count"] >= self._max_retries
         failure_message = (
             "operation-recovery exact drain retry ceiling reached"
             if retry_ceiling and error_message is None

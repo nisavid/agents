@@ -375,6 +375,33 @@ class OperationRecoveryContractTest(unittest.TestCase):
             )
         )
 
+    def legacy_drain_plan(
+        self,
+        *,
+        snapshot: dict | None = None,
+        created_at: int = 1_785_462_000,
+    ) -> dict:
+        current = self.drain_plan(
+            snapshot=snapshot,
+            created_at=created_at,
+        )
+        body = {
+            key: deepcopy(value)
+            for key, value in current.items()
+            if key
+            not in {
+                "plan_digest",
+                "execution_window",
+                "recovery_context",
+                "recovery_context_digest",
+            }
+        }
+        body["schema_version"] = 9
+        body["execution_lease_seconds"] = (
+            recovery_contract.EXACT_DRAIN_EXECUTION_LEASE_SECONDS
+        )
+        return {**body, "plan_digest": digest(body)}
+
     def test_exact_drain_plan_separates_approval_evidence_transaction_and_window(self):
         snapshot = self.drain_snapshot()
         planned_at = 1_785_462_000
@@ -400,7 +427,11 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 "effective_concurrency": 1,
                 "phase_one_timeout_seconds": 3_600,
                 "transaction_timeout_seconds": 120,
+                "maximum_retry_delay_seconds": 3_600,
+                "startup_margin_seconds": 14_400,
+                "transaction_margin_seconds": 20_760,
                 "shutdown_attempt_count": 4,
+                "shutdown_margin_seconds": 480,
                 "calculated_seconds": 1_119_240,
                 "maximum_seconds": 1_209_600,
             },
@@ -448,6 +479,18 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 171,
             ),
             ("effective-concurrency", "effective_concurrency", 2),
+            (
+                "maximum-retry-delay",
+                "maximum_retry_delay_seconds",
+                3_599,
+            ),
+            ("startup-margin", "startup_margin_seconds", 14_399),
+            (
+                "transaction-margin",
+                "transaction_margin_seconds",
+                20_759,
+            ),
+            ("shutdown-margin", "shutdown_margin_seconds", 479),
             ("calculated-seconds", "calculated_seconds", 1_119_239),
             ("maximum-seconds", "maximum_seconds", 1_209_601),
             ("anchor", "anchor", "plan-created-at"),
@@ -1055,7 +1098,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
         )
 
     def prior_v2_post_abort_plan(self) -> dict:
-        reference = self.drain_plan()
+        reference = self.legacy_drain_plan()
         snapshot = self.post_abort_snapshot(
             reference,
             interrupted_processing_count=4,
@@ -1612,7 +1655,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
         )
 
     def prior_v3_post_abort_plan(self) -> dict:
-        reference = self.drain_plan()
+        reference = self.legacy_drain_plan()
         snapshot = self.post_abort_snapshot(
             reference,
             interrupted_processing_count=3,
@@ -1722,7 +1765,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
         )
 
     def test_post_abort_v4_plan_derives_exact_retain_and_consolidation(self):
-        reference = self.drain_plan()
+        reference = self.legacy_drain_plan()
         snapshot = self.post_abort_snapshot(
             reference,
             interrupted_operation_types=("retain", "consolidation"),
@@ -1806,7 +1849,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
             plan,
         )
     def test_post_abort_v5_plan_derives_four_failed_and_one_processing_retain(self):
-        reference = self.drain_plan()
+        reference = self.legacy_drain_plan()
         snapshot = self.post_abort_snapshot(
             reference,
             interrupted_processing_count=1,
@@ -1938,7 +1981,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
         )
 
     def test_post_abort_v5_rejects_failure_and_completion_shape_drift(self):
-        reference = self.drain_plan()
+        reference = self.legacy_drain_plan()
 
         def create(snapshot):
             backup = rollback_backup_evidence()
@@ -2061,7 +2104,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 create(snapshot)
 
     def test_post_abort_v6_plan_binds_three_blank_failures_and_one_processing(self):
-        reference = self.drain_plan(
+        reference = self.legacy_drain_plan(
             snapshot=self.drain_snapshot(
                 completed_positions={0, 1, 42, 43, 46, 47},
                 observed_at=1_786_390_000,
@@ -2159,7 +2202,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
                     create(changed)
 
     def test_post_abort_v7_plan_binds_owned_pending_retry(self):
-        reference = self.drain_plan(
+        reference = self.legacy_drain_plan(
             snapshot=self.drain_snapshot(
                 completed_positions={0, 1, 42, 43, 46, 47},
                 observed_at=1_786_390_000,
@@ -2242,7 +2285,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
                     create(changed)
 
     def test_post_abort_v8_plan_binds_failed_and_processing_retries(self):
-        reference = self.drain_plan(
+        reference = self.legacy_drain_plan(
             snapshot=self.drain_snapshot(
                 completed_positions={0, 1, 42, 43, 46, 47},
                 observed_at=1_786_390_000,
@@ -2342,7 +2385,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
                     create(changed)
 
     def test_post_abort_v9_plan_preserves_completed_checkpoint(self):
-        reference = self.drain_plan(
+        reference = self.legacy_drain_plan(
             snapshot=self.drain_snapshot(
                 completed_positions={0, 1, 42, 43, 46, 47},
                 observed_at=1_786_390_000,
@@ -2983,6 +3026,78 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 created_at=1_786_390_900,
             )
 
+        for legacy_schema_version in range(4, 10):
+            with (
+                self.subTest(
+                    creation_schema_version=legacy_schema_version,
+                ),
+                self.assertRaisesRegex(
+                    OperationRecoveryError,
+                    "legacy post-abort schema cannot reference schema 10",
+                ),
+            ):
+                create_post_abort_recovery_plan(
+                    plan,
+                    second_interrupted,
+                    candidate_release=release_identity(),
+                    rollback_backup=second_backup,
+                    rollback_encryption=rollback_encryption(),
+                    rollback_backup_path="/private/tmp/v9-replay-backup.age",
+                    rollback_bundle_path="/private/tmp/v9-replay-bundle.age",
+                    authorization_receipt_path="/private/tmp/v9-replay-auth.json",
+                    application_receipt_path="/private/tmp/v9-replay-app.json",
+                    verification_receipt_path="/private/tmp/v9-replay-verify.json",
+                    rollback_receipt_path="/private/tmp/v9-replay-rollback.json",
+                    reference_application_authorization=(
+                        exact_drain_authorization(plan)
+                    ),
+                    reference_application_journal=(
+                        exact_drain_application_journal(plan)
+                    ),
+                    reference_application_progress_digest="d" * 64,
+                    schema_version=legacy_schema_version,
+                    created_at=1_786_390_900,
+                )
+
+        legacy_key_sets = {
+            version: getattr(
+                recovery_contract,
+                f"POST_ABORT_PLAN_V{version}_KEYS",
+            )
+            for version in range(1, 10)
+        }
+        for legacy_schema_version, key_set in legacy_key_sets.items():
+            downgraded_recovery = {
+                key: deepcopy(value)
+                for key, value in recovery_plan.items()
+                if key in key_set
+            }
+            downgraded_recovery.update(
+                schema_version=legacy_schema_version,
+                reference_plan=plan,
+                reference_plan_digest=plan["plan_digest"],
+            )
+            downgraded_recovery["plan_digest"] = digest(
+                {
+                    key: value
+                    for key, value in downgraded_recovery.items()
+                    if key != "plan_digest"
+                }
+            )
+            with (
+                self.subTest(
+                    verification_schema_version=legacy_schema_version,
+                ),
+                self.assertRaisesRegex(
+                    OperationRecoveryError,
+                    "legacy post-abort schema cannot reference schema 10",
+                ),
+            ):
+                verify_post_abort_recovery_plan(
+                    downgraded_recovery,
+                    now=downgraded_recovery["created_at"],
+                )
+
         with self.assertRaisesRegex(
             OperationRecoveryError,
             "recovery context is required",
@@ -3068,7 +3183,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
         )
 
     def test_post_abort_plan_rejects_a_different_processing_owner(self):
-        reference = self.drain_plan()
+        reference = self.legacy_drain_plan()
         snapshot = self.post_abort_snapshot(
             reference,
             interrupted_operation_types=("retain", "consolidation"),
@@ -3131,7 +3246,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
             )
 
     def test_post_abort_v4_planner_rejects_non_exact_current_shapes(self):
-        reference = self.drain_plan()
+        reference = self.legacy_drain_plan()
         base = self.post_abort_snapshot(
             reference,
             interrupted_operation_types=("retain", "consolidation"),
@@ -3384,7 +3499,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 )
 
     def test_post_abort_v4_verifier_rejects_schema_and_bound_set_tampering(self):
-        reference = self.drain_plan()
+        reference = self.legacy_drain_plan()
         snapshot = self.post_abort_snapshot(
             reference,
             interrupted_operation_types=("retain", "consolidation"),
@@ -3467,7 +3582,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 )
 
     def test_post_abort_v4_requires_exact_type_specific_retry_vector(self):
-        reference = self.drain_plan()
+        reference = self.legacy_drain_plan()
         snapshot = self.post_abort_snapshot(
             reference,
             interrupted_operation_types=("retain", "consolidation"),
@@ -3589,7 +3704,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 )
 
     def test_post_abort_v2_verifier_rejects_forged_reference_authority(self):
-        reference = self.drain_plan()
+        reference = self.legacy_drain_plan()
         snapshot = self.post_abort_snapshot(
             reference,
             interrupted_operation_types=("retain", "consolidation"),

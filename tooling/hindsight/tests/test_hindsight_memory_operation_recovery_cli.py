@@ -130,7 +130,7 @@ class OperationRecoveryCliTest(unittest.TestCase):
 
     def _post_abort_plan(self, root: Path) -> dict:
         fixtures = recovery_fixtures.OperationRecoveryContractTest()
-        reference = fixtures.drain_plan()
+        reference = fixtures.legacy_drain_plan()
         snapshot = fixtures.post_abort_snapshot(
             reference,
             interrupted_operation_types=("retain", "consolidation"),
@@ -2676,6 +2676,89 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             self.assertNotIn('"task_payload":', serialized)
             self.assertNotIn('"worker_id":', serialized)
             self.assertNotIn('"error_message":', serialized)
+
+            reference_sources = [
+                args.reference_plan,
+                *(
+                    value
+                    for key, value in reference.items()
+                    if key.endswith("_path") and isinstance(value, str)
+                ),
+                *(
+                    str(
+                        self.controller["exact_drain_progress_archive_path"](
+                            Path(reference["progress_artifact_path"]),
+                            attempt,
+                        )
+                    )
+                    for attempt in range(
+                        1,
+                        reference["worker_max_attempts"] + 1,
+                    )
+                ),
+            ]
+            for target, source in (
+                ("output", reference_sources[0]),
+                ("rollback_bundle", reference["verification_receipt_path"]),
+                ("authorization_receipt", reference["status_artifact_path"]),
+                ("application_receipt", reference_sources[-1]),
+                ("verification_receipt", reference["rollback_backup_path"]),
+                ("rollback_receipt", reference["progress_artifact_path"]),
+            ):
+                with self.subTest(reference_path_alias=target):
+                    alias_args = SimpleNamespace(**vars(args))
+                    setattr(alias_args, target, source)
+                    written.clear()
+                    globals_.update(replacements)
+                    try:
+                        with self.assertRaisesRegex(
+                            Exception,
+                            "post-abort plan path aliases an artifact",
+                        ):
+                            command(alias_args)
+                    finally:
+                        globals_.update(originals)
+                    self.assertEqual(written, {})
+
+            drifted_reference = deepcopy(reference)
+            drifted_reference["verification_receipt_path"] = str(
+                root / "drifted-reference-verification.json"
+            )
+            drifted_reference["plan_digest"] = self.controller["digest"](
+                {
+                    key: value
+                    for key, value in drifted_reference.items()
+                    if key != "plan_digest"
+                }
+            )
+            reference_reads = 0
+
+            def read_with_reference_drift(path, _label):
+                nonlocal reference_reads
+                if str(path) == args.reference_plan:
+                    reference_reads += 1
+                    return (
+                        reference
+                        if reference_reads == 1
+                        else drifted_reference
+                    )
+                return documents[str(path)]
+
+            written.clear()
+            globals_.update(replacements)
+            globals_["_operation_recovery_read_private_json"] = (
+                read_with_reference_drift
+            )
+            try:
+                with self.assertRaisesRegex(
+                    Exception,
+                    "reference exact drain plan drifted",
+                ):
+                    command(args)
+            finally:
+                globals_.update(originals)
+            self.assertEqual(reference_reads, 2)
+            self.assertEqual(written, {})
 
             for label, changed_tasks in (
                 (

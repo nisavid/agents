@@ -22,14 +22,14 @@ jobs:
   qualify:
     if: >-
       ${{ vars.TASK_WITNESS_LINUX_QUALIFICATION_CANDIDATE ==
-          '07c4782fcd887876e27fd462c0e1b6d2955538f2' &&
+          '56ff34f0217491d69b4e5b9cccf7c7d9bf53e8da' &&
           vars.TASK_WITNESS_LINUX_QUALIFICATION_HARNESS == github.sha }}
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     env:
       BOOTSTRAP_HELPER: >-
         /opt/task-witness/bootstrap/prepare_task_witness_linux_qualification.py
-      CANDIDATE_SHA: 07c4782fcd887876e27fd462c0e1b6d2955538f2
+      CANDIDATE_SHA: 56ff34f0217491d69b4e5b9cccf7c7d9bf53e8da
       CANDIDATE_ROOT: /opt/task-witness/candidate
       EVIDENCE_ROOT: /opt/task-witness/evidence
       QUALIFICATION_HOME: /home/task-witness-qualification
@@ -55,7 +55,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           repository: nisavid/agents
-          ref: 07c4782fcd887876e27fd462c0e1b6d2955538f2
+          ref: 56ff34f0217491d69b4e5b9cccf7c7d9bf53e8da
           fetch-depth: 0
           path: candidate-stage
           persist-credentials: false

@@ -16,6 +16,7 @@ from ._activation_support import (
     expected_smoke_envelope,
 )
 from ._support import (
+    REPOSITORY,
     ProviderFixture,
     adapt_agent_plugins_candidate,
     canonical_document,
@@ -29,32 +30,41 @@ FREEZE5_COMMIT = "96608a9b91d4dcf3f468a4fab1f0e008c9c32b36"
 FREEZE5_PLUGIN_PREFIX = "plugins/task-witness/"
 
 
+def _freeze5_git(*arguments: str) -> bytes:
+    return subprocess.run(
+        (
+            "git",
+            "--no-replace-objects",
+            "-c",
+            "safe.directory=",
+            "-c",
+            f"safe.directory={REPOSITORY}",
+            *arguments,
+        ),
+        cwd=REPOSITORY,
+        check=True,
+        capture_output=True,
+    ).stdout
+
+
 def _freeze5_manifest_raw(relative_path: str) -> bytes:
     """Load one exact legacy-manifest authority from the immutable F5 object."""
 
-    repository = Path(__file__).resolve().parents[3]
     resolved = (
-        subprocess.run(
-            ("git", "rev-parse", "--verify", f"{FREEZE5_COMMIT}^{{commit}}"),
-            cwd=repository,
-            check=True,
-            capture_output=True,
+        _freeze5_git(
+            "rev-parse",
+            "--verify",
+            f"{FREEZE5_COMMIT}^{{commit}}",
         )
-        .stdout.decode("ascii")
+        .decode("ascii")
         .strip()
     )
     if resolved != FREEZE5_COMMIT:
         raise AssertionError("Freeze 5 commit identity disagrees")
-    return subprocess.run(
-        (
-            "git",
-            "show",
-            f"{FREEZE5_COMMIT}:{FREEZE5_PLUGIN_PREFIX}{relative_path}",
-        ),
-        cwd=repository,
-        check=True,
-        capture_output=True,
-    ).stdout
+    return _freeze5_git(
+        "show",
+        f"{FREEZE5_COMMIT}:{FREEZE5_PLUGIN_PREFIX}{relative_path}",
+    )
 
 
 def smoke_envelope(smoke: object) -> bytes:

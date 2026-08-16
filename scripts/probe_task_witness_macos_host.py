@@ -41,6 +41,7 @@ MAX_ARTIFACT_BYTES = 256 * 1024
 MAX_COMMAND_OUTPUT_BYTES = 4 * 1024
 MAX_HELPER_BYTES = 256 * 1024
 MAX_OWNERSHIP_BYTES = 4 * 1024
+MAX_ACCOUNT_BINDING_BYTES = 4 * 1024
 MAX_PROCESS_LIST_BYTES = 64 * 1024
 COMMAND_TIMEOUT_SECONDS = 10
 LAUNCHD_POLL_INTERVAL_SECONDS = 0.25
@@ -103,10 +104,10 @@ LIFECYCLE_COMMAND_IDS = frozenset(
     {
         "account-create-record",
         "account-delete",
+        "account-generated-uid-read",
         "account-name-list",
         "account-record-read",
         "account-set-authentication-authority",
-        "account-set-generated-uid",
         "account-set-gid",
         "account-set-hidden",
         "account-set-home",
@@ -148,7 +149,6 @@ class DisposableAccount(NamedTuple):
     uid: int
     gid: int
     home: Path
-    generated_uid: str
 
 
 class LaunchdPlan(NamedTuple):
@@ -168,6 +168,11 @@ class LaunchctlJobStructure(NamedTuple):
 class ValidatedLaunchdJobSnapshot(NamedTuple):
     binding: dict[str, str]
     sanitized: str
+
+
+class ValidatedStageBindings(NamedTuple):
+    account: dict | None
+    launchd: dict | None
 
 
 def canonical_bytes(value: object) -> bytes:
@@ -963,9 +968,9 @@ def require_exact_account_record(
     record: Mapping[str, Sequence[str]],
     expected: DisposableAccount,
 ) -> None:
+    _validated_system_generated_uid(record)
     required = {
         "AuthenticationAuthority": [";DisabledUser;"],
-        "GeneratedUID": [expected.generated_uid],
         "IsHidden": ["1"],
         "NFSHomeDirectory": [str(expected.home)],
         "Password": ["*"],
@@ -975,6 +980,20 @@ def require_exact_account_record(
     }
     if any(list(record.get(name, ())) != values for name, values in required.items()):
         raise ProbeError("account-record-drift")
+
+
+def _validated_system_generated_uid(record: Mapping[str, Sequence[str]]) -> str:
+    values = list(record.get("GeneratedUID", ()))
+    if len(values) != 1 or not isinstance(values[0], str):
+        raise ProbeError("account-record-drift")
+    value = values[0]
+    try:
+        parsed = uuid.UUID(value)
+    except (AttributeError, ValueError) as error:
+        raise ProbeError("account-record-drift") from error
+    if parsed.int == 0 or str(parsed).upper() != value:
+        raise ProbeError("account-record-drift")
+    return value
 
 
 def parse_dscl_record(raw: str) -> dict[str, list[str]]:
@@ -1741,7 +1760,6 @@ def verify_launchd_success(artifact_root: Path) -> None:
         uid=credentials["effective_uid"],
         gid=credentials["effective_gid"],
         home=expected_home,
-        generated_uid=str(uuid.uuid5(uuid.NAMESPACE_URL, label)).upper(),
     )
     expected_plan = LaunchdPlan(
         account=account,
@@ -2115,6 +2133,17 @@ def _account_record(account: DisposableAccount) -> dict[str, list[str]]:
     return record
 
 
+def _read_system_generated_uid(name: str) -> str:
+    raw = _require_command_success(
+        ["/usr/bin/dscl", ".", "-read", f"/Users/{name}", "GeneratedUID"],
+        command_id="account-generated-uid-read",
+    )
+    record = parse_dscl_record(raw)
+    if set(record) != {"GeneratedUID"}:
+        raise ProbeError("account-record-drift")
+    return _validated_system_generated_uid(record)
+
+
 def _list_accounts() -> dict[str, int]:
     return parse_dscl_uid_list(
         _require_command_success(
@@ -2143,9 +2172,14 @@ def _account_exists(name: str) -> bool:
     return name in names
 
 
-def _rollback_disposable_account_creation(account: DisposableAccount) -> None:
+def _rollback_disposable_account_creation(
+    account: DisposableAccount,
+    generated_uid: str,
+) -> None:
     if not _account_exists(account.name):
         return
+    if _read_system_generated_uid(account.name) != generated_uid:
+        raise ProbeError("account-record-drift")
     _require_command_success(
         ["/usr/bin/dscl", ".", "-delete", f"/Users/{account.name}"],
         command_id="account-delete",
@@ -2154,7 +2188,11 @@ def _rollback_disposable_account_creation(account: DisposableAccount) -> None:
         raise ProbeError("account-create-rollback-disagrees")
 
 
-def _create_disposable_account(account: DisposableAccount) -> None:
+def _create_disposable_account(
+    plan: LaunchdPlan,
+    state: Mapping[str, object],
+) -> None:
+    account = plan.account
     accounts = _list_accounts()
     if (
         _account_exists(account.name)
@@ -2163,8 +2201,7 @@ def _create_disposable_account(account: DisposableAccount) -> None:
     ):
         raise ProbeError("account-or-uid-already-exists")
     record_path = f"/Users/{account.name}"
-    command_ids = (
-        "account-create-record",
+    property_command_ids = (
         "account-set-shell",
         "account-set-authentication-authority",
         "account-set-password",
@@ -2172,10 +2209,8 @@ def _create_disposable_account(account: DisposableAccount) -> None:
         "account-set-uid",
         "account-set-gid",
         "account-set-home",
-        "account-set-generated-uid",
     )
-    commands = [
-        ["/usr/bin/dscl", ".", "-create", record_path],
+    property_commands = [
         [
             "/usr/bin/dscl",
             ".",
@@ -2211,23 +2246,23 @@ def _create_disposable_account(account: DisposableAccount) -> None:
             "NFSHomeDirectory",
             str(account.home),
         ],
-        [
-            "/usr/bin/dscl",
-            ".",
-            "-create",
-            record_path,
-            "GeneratedUID",
-            account.generated_uid,
-        ],
     ]
-    if len(command_ids) != len(commands):
+    if len(property_command_ids) != len(property_commands):
         raise ProbeError("invalid-lifecycle-command-table")
-    creation_attempted = False
+    record_created = False
+    generated_uid: str | None = None
     try:
-        creation_attempted = True
-        for command_id, command in zip(command_ids, commands):
+        _require_command_success(
+            ["/usr/bin/dscl", ".", "-create", record_path],
+            command_id="account-create-record",
+        )
+        record_created = True
+        generated_uid = _read_system_generated_uid(account.name)
+        _write_account_binding(plan, state, generated_uid)
+        for command_id, command in zip(property_command_ids, property_commands):
             _require_command_success(command, command_id=command_id)
-        _account_record(account)
+        if _validated_system_generated_uid(_account_record(account)) != generated_uid:
+            raise ProbeError("account-record-drift")
         accounts = _list_accounts()
         if (
             accounts.get(account.name) != account.uid
@@ -2235,9 +2270,9 @@ def _create_disposable_account(account: DisposableAccount) -> None:
         ):
             raise ProbeError("account-list-readback-disagrees")
     except ProbeError as primary_error:
-        if creation_attempted:
+        if record_created and generated_uid is not None:
             try:
-                _rollback_disposable_account_creation(account)
+                _rollback_disposable_account_creation(account, generated_uid)
             except ProbeError as rollback_error:
                 primary_code, secondary_code = _merge_probe_error(
                     primary_error.code,
@@ -2402,7 +2437,6 @@ def _lifecycle_state(
                 "uid": plan.account.uid,
                 "gid": plan.account.gid,
                 "home": str(plan.account.home),
-                "generated_uid": plan.account.generated_uid,
             },
             "label": plan.label,
             "stage_root": str(plan.stage_root),
@@ -2413,6 +2447,122 @@ def _lifecycle_state(
             "runner_gid": runner_gid,
         }
     )
+
+
+def _account_binding_document(
+    plan: LaunchdPlan,
+    state: Mapping[str, object],
+    generated_uid: str,
+) -> dict:
+    state_sha256 = state.get("content_sha256")
+    try:
+        validated_generated_uid = _validated_system_generated_uid(
+            {"GeneratedUID": [generated_uid]}
+        )
+    except ProbeError as error:
+        raise ProbeError("account-binding-invalid") from error
+    if (
+        not isinstance(state_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", state_sha256) is None
+    ):
+        raise ProbeError("account-binding-state-invalid")
+    return _document_with_digest(
+        {
+            "schema_version": 1,
+            "contract": "task-witness-macos-launchd-account-binding-v1",
+            "candidate_sha1": EXPECTED_CANDIDATE_SHA,
+            "account": {
+                "name": plan.account.name,
+                "uid": plan.account.uid,
+                "gid": plan.account.gid,
+                "home": str(plan.account.home),
+                "generated_uid": validated_generated_uid,
+            },
+            "label": plan.label,
+            "stage_root": str(plan.stage_root),
+            "state_sha256": state_sha256,
+        }
+    )
+
+
+def _load_account_binding(
+    plan: LaunchdPlan,
+    state: Mapping[str, object],
+) -> dict | None:
+    path = plan.stage_root / "account.json"
+    if not _path_exists_no_follow(path):
+        return None
+    if not _metadata_matches(
+        path,
+        kind="file",
+        mode=0o600,
+        uid=0,
+        gid=0,
+        nlink=1,
+    ):
+        raise ProbeError("account-binding-drift")
+    document = _load_canonical_document(
+        path,
+        MAX_ACCOUNT_BINDING_BYTES,
+        "account-binding",
+    )
+    _require_content_digest(document, "account-binding")
+    account = document.get("account")
+    if not isinstance(account, dict):
+        raise ProbeError("account-binding-drift")
+    generated_uid = account.get("generated_uid")
+    if not isinstance(generated_uid, str):
+        raise ProbeError("account-binding-drift")
+    try:
+        expected = _account_binding_document(plan, state, generated_uid)
+    except ProbeError as error:
+        raise ProbeError("account-binding-drift") from error
+    if document != expected:
+        raise ProbeError("account-binding-drift")
+    return document
+
+
+def _write_account_binding(
+    plan: LaunchdPlan,
+    state: Mapping[str, object],
+    generated_uid: str,
+) -> dict:
+    document = _account_binding_document(plan, state, generated_uid)
+    raw = canonical_bytes(document)
+    if len(raw) > MAX_ACCOUNT_BINDING_BYTES:
+        raise ProbeError("account-binding-too-large")
+    path = plan.stage_root / "account.json"
+    try:
+        _write_root_file(path, raw, 0o600)
+        observed = _load_account_binding(plan, state)
+        if observed != document:
+            raise ProbeError("account-binding-disagrees")
+    except ProbeError:
+        if _path_exists_no_follow(path):
+            try:
+                removable = (
+                    _metadata_matches(
+                        path,
+                        kind="file",
+                        mode=0o600,
+                        uid=0,
+                        gid=0,
+                        nlink=1,
+                    )
+                    and _read_stable_regular_file(
+                        path,
+                        len(raw),
+                        "partial-account-binding",
+                    )
+                    == raw
+                )
+                if not removable:
+                    raise ProbeError("account-binding-preserved")
+                path.unlink()
+            except (OSError, ProbeError) as cleanup_error:
+                raise ProbeError("account-binding-preserved") from cleanup_error
+        raise
+    return document
 
 
 def _launchd_ownership_document(
@@ -2440,7 +2590,6 @@ def _launchd_ownership_document(
             "account": {
                 "name": plan.account.name,
                 "uid": plan.account.uid,
-                "generated_uid": plan.account.generated_uid,
             },
             "label": plan.label,
             "stage_root": str(plan.stage_root),
@@ -2456,6 +2605,8 @@ def _write_launchd_ownership_marker(
     plan: LaunchdPlan,
     state: Mapping[str, object],
 ) -> dict:
+    if _load_account_binding(plan, state) is None:
+        raise ProbeError("account-binding-missing")
     document = _launchd_ownership_document(plan, state)
     raw = canonical_bytes(document)
     if len(raw) > MAX_OWNERSHIP_BYTES:
@@ -2588,7 +2739,6 @@ def _initialize_lifecycle(
         uid=uid,
         gid=runner_gid,
         home=Path("/Users") / account_name,
-        generated_uid=str(uuid.uuid5(uuid.NAMESPACE_URL, label)).upper(),
     )
     plan = LaunchdPlan(
         account=account,
@@ -3256,10 +3406,11 @@ def run_launchd_user_lifecycle(
             runner_gid=runner_gid,
             environment=os.environ,
         )
-        if _validate_exact_stage(plan, state) is not None:
+        stage_bindings = _validate_exact_stage(plan, state)
+        if stage_bindings.account is not None or stage_bindings.launchd is not None:
             raise ProbeError("launchd-job-ownership-already-recorded")
         _require_launchd_absent(plan.label)
-        _create_disposable_account(plan.account)
+        _create_disposable_account(plan, state)
         _create_disposable_home(plan.account)
         _require_launchd_absent(plan.label)
         bootstrap_attempted = True
@@ -3402,7 +3553,6 @@ def _load_lifecycle_state(
             uid=int(account_value["uid"]),
             gid=int(account_value["gid"]),
             home=Path(str(account_value["home"])),
-            generated_uid=str(account_value["generated_uid"]),
         )
     except (KeyError, TypeError, ValueError) as error:
         raise ProbeError("lifecycle-state-drift") from error
@@ -3429,7 +3579,7 @@ def _load_lifecycle_state(
             "runner_gid",
             "content_sha256",
         }
-        or set(account_value) != {"name", "uid", "gid", "home", "generated_uid"}
+        or set(account_value) != {"name", "uid", "gid", "home"}
         or state.get("schema_version") != 1
         or state.get("contract") != "task-witness-macos-launchd-lifecycle-state-v1"
         or state.get("candidate_sha1") != EXPECTED_CANDIDATE_SHA
@@ -3443,8 +3593,6 @@ def _load_lifecycle_state(
         or account.uid not in range(DISPOSABLE_UID_MIN, DISPOSABLE_UID_MAX + 1)
         or account.gid != runner_gid
         or account.home != Path("/Users") / expected_name
-        or account.generated_uid
-        != str(uuid.uuid5(uuid.NAMESPACE_URL, expected_label)).upper()
     ):
         raise ProbeError("lifecycle-state-drift")
     return plan, state
@@ -3453,14 +3601,20 @@ def _load_lifecycle_state(
 def _validate_exact_stage(
     plan: LaunchdPlan,
     state: Mapping[str, object],
-) -> dict | None:
+) -> ValidatedStageBindings:
     try:
         names = {entry.name for entry in plan.stage_root.iterdir()}
     except OSError as error:
         raise ProbeError("stage-cleanup-drift") from error
     base_names = {"helper.py", "job.plist", "state.json"}
+    account_names = base_names | {"account.json"}
     if (
-        names not in (base_names, base_names | {"ownership.json"})
+        names
+        not in (
+            base_names,
+            account_names,
+            account_names | {"ownership.json"},
+        )
         or not _metadata_matches(
             plan.stage_root,
             kind="directory",
@@ -3492,10 +3646,15 @@ def _validate_exact_stage(
         "helper_sha256"
     ) or hashlib.sha256(plist).hexdigest() != state.get("plist_sha256"):
         raise ProbeError("stage-cleanup-drift")
+    account = _load_account_binding(plan, state)
     ownership = _load_launchd_ownership_marker(plan, state)
-    if ("ownership.json" in names) != (ownership is not None):
+    if (
+        ("account.json" in names) != (account is not None)
+        or ("ownership.json" in names) != (ownership is not None)
+        or (ownership is not None and account is None)
+    ):
         raise ProbeError("stage-cleanup-drift")
-    return ownership
+    return ValidatedStageBindings(account=account, launchd=ownership)
 
 
 def _require_no_uid_processes(uid: int) -> None:
@@ -3584,20 +3743,24 @@ def cleanup_launchd_user_lifecycle(
             runner_gid=runner_gid,
             environment=os.environ,
         )
-        ownership = _validate_exact_stage(plan, state)
-        _reconcile_owned_launchd_job(plan, state, ownership)
-        accounts = _list_accounts()
+        stage_bindings = _validate_exact_stage(plan, state)
+        _reconcile_owned_launchd_job(plan, state, stage_bindings.launchd)
         account_present = _account_exists(plan.account.name)
-        uid_owners = [name for name, uid in accounts.items() if uid == plan.account.uid]
-        if uid_owners not in ([], [plan.account.name]):
-            raise ProbeError("account-record-drift")
-        if account_present:
-            if accounts.get(plan.account.name) != plan.account.uid:
-                raise ProbeError("account-record-drift")
-            _account_record(plan.account)
-        elif plan.account.name in accounts:
-            raise ProbeError("account-record-drift")
         home_present = _path_exists_no_follow(plan.account.home)
+        expected_generated_uid: str | None = None
+        if account_present or home_present:
+            if stage_bindings.account is None:
+                raise ProbeError("account-binding-missing")
+            account_value = stage_bindings.account.get("account")
+            if not isinstance(account_value, dict) or not isinstance(
+                account_value.get("generated_uid"), str
+            ):
+                raise ProbeError("account-binding-drift")
+            expected_generated_uid = account_value["generated_uid"]
+        if account_present and (
+            _read_system_generated_uid(plan.account.name) != expected_generated_uid
+        ):
+            raise ProbeError("account-record-drift")
         if home_present:
             _validate_exact_disposable_home(
                 plan.account.home,
@@ -3610,11 +3773,18 @@ def cleanup_launchd_user_lifecycle(
                 ["/usr/bin/dscl", ".", "-delete", f"/Users/{plan.account.name}"],
                 command_id="account-delete",
             )
-            if (
-                _account_exists(plan.account.name)
-                or plan.account.name in _list_accounts()
-            ):
+            if _account_exists(plan.account.name):
                 raise ProbeError("account-delete-disagrees")
+        remaining_accounts = _list_accounts()
+        if (
+            plan.account.name in remaining_accounts
+            or plan.account.uid in remaining_accounts.values()
+        ):
+            raise ProbeError(
+                "account-delete-disagrees"
+                if account_present
+                else "account-record-drift"
+            )
         if home_present:
             remove_exact_disposable_home(
                 plan.account.home,
@@ -3623,7 +3793,9 @@ def cleanup_launchd_user_lifecycle(
             )
         try:
             stage_names = ["helper.py", "job.plist", "state.json"]
-            if ownership is not None:
+            if stage_bindings.account is not None:
+                stage_names.append("account.json")
+            if stage_bindings.launchd is not None:
                 stage_names.append("ownership.json")
             for name in stage_names:
                 (stage_root / name).unlink()

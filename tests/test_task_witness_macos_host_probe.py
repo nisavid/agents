@@ -868,9 +868,6 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             uid=502,
             gid=20,
             home=Path("/Users") / account_name,
-            generated_uid=str(
-                self.helper.uuid.uuid5(self.helper.uuid.NAMESPACE_URL, label)
-            ).upper(),
         )
         return self.helper.LaunchdPlan(
             account=account,
@@ -891,7 +888,6 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                     "uid": plan.account.uid,
                     "gid": plan.account.gid,
                     "home": str(plan.account.home),
-                    "generated_uid": plan.account.generated_uid,
                 },
                 "label": plan.label,
                 "stage_root": str(plan.stage_root),
@@ -1623,11 +1619,11 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             uid=502,
             gid=20,
             home=Path("/Users/twq-0123456789ab"),
-            generated_uid="01234567-89AB-CDEF-0123-456789ABCDEF",
         )
+        system_generated_uid = "01234567-89AB-4DEF-8123-456789ABCDEF"
         record = {
             "AuthenticationAuthority": [";DisabledUser;"],
-            "GeneratedUID": [expected.generated_uid],
+            "GeneratedUID": [system_generated_uid],
             "IsHidden": ["1"],
             "NFSHomeDirectory": [str(expected.home)],
             "Password": ["*"],
@@ -1638,8 +1634,23 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
         self.helper.require_exact_account_record(record, expected)
         changed = dict(record)
         changed["GeneratedUID"] = ["AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"]
-        with self.assertRaisesRegex(self.helper.ProbeError, "account-record-drift"):
-            self.helper.require_exact_account_record(changed, expected)
+        self.helper.require_exact_account_record(changed, expected)
+        for invalid_generated_uid in (
+            [system_generated_uid.lower()],
+            ["00000000-0000-0000-0000-000000000000"],
+            ["not-a-guid"],
+            [system_generated_uid, "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"],
+        ):
+            changed = dict(record)
+            changed["GeneratedUID"] = invalid_generated_uid
+            with (
+                self.subTest(generated_uid=invalid_generated_uid),
+                self.assertRaisesRegex(
+                    self.helper.ProbeError,
+                    "account-record-drift",
+                ),
+            ):
+                self.helper.require_exact_account_record(changed, expected)
         changed = dict(record)
         changed["UniqueID"] = ["-2"]
         with self.assertRaisesRegex(self.helper.ProbeError, "account-record-drift"):
@@ -2541,7 +2552,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             mock.patch.object(
                 self.helper,
                 "_validate_exact_stage",
-                return_value=None,
+                return_value=self.helper.ValidatedStageBindings(None, None),
             ),
             mock.patch.object(self.helper, "_create_disposable_account"),
             mock.patch.object(self.helper, "_create_disposable_home"),
@@ -2623,7 +2634,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             mock.patch.object(
                 self.helper,
                 "_validate_exact_stage",
-                return_value=None,
+                return_value=self.helper.ValidatedStageBindings(None, None),
             ),
             mock.patch.object(self.helper, "_create_disposable_account"),
             mock.patch.object(self.helper, "_create_disposable_home"),
@@ -2707,7 +2718,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             mock.patch.object(
                 self.helper,
                 "_validate_exact_stage",
-                return_value=None,
+                return_value=self.helper.ValidatedStageBindings(None, None),
             ),
             mock.patch.object(self.helper, "_create_disposable_account"),
             mock.patch.object(self.helper, "_create_disposable_home"),
@@ -2770,12 +2781,24 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             uid=502,
             gid=20,
             home=Path("/Users/twq-0123456789ab"),
-            generated_uid="01234567-89AB-CDEF-0123-456789ABCDEF",
         )
+        plan = self.helper.LaunchdPlan(
+            account=account,
+            label="io.nisavid.task-witness.macos-probe.0123456789ab",
+            stage_root=Path("/private/var/tmp/task-witness-macos-launchd-123456789-2"),
+            helper=Path(
+                "/private/var/tmp/task-witness-macos-launchd-123456789-2/helper.py"
+            ),
+            plist=Path(
+                "/private/var/tmp/task-witness-macos-launchd-123456789-2/job.plist"
+            ),
+        )
+        state = self.lifecycle_state(plan)
+        system_generated_uid = "01234567-89AB-4DEF-8123-456789ABCDEF"
         record = "\n".join(
             (
                 "AuthenticationAuthority: ;DisabledUser;",
-                f"GeneratedUID: {account.generated_uid}",
+                f"GeneratedUID: {system_generated_uid}",
                 "IsHidden: 1",
                 f"NFSHomeDirectory: {account.home}",
                 "Password: *",
@@ -2785,6 +2808,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             )
         )
         calls: list[tuple[str, ...]] = []
+        events: list[tuple[str, ...] | str] = []
         list_count = 0
 
         def command(
@@ -2797,25 +2821,51 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             nonlocal list_count
             call = tuple(argv)
             calls.append(call)
+            events.append(call)
             if call == ("/usr/bin/dscl", ".", "-list", "/Users", "UniqueID"):
                 list_count += 1
                 suffix = f"\n{account.name} {account.uid}" if list_count == 2 else ""
                 return 0, f"root 0\nrunner 501{suffix}", ""
             if call == ("/usr/bin/dscl", ".", "-list", "/Users"):
                 return 0, "root\nrunner", ""
+            if call == (
+                "/usr/bin/dscl",
+                ".",
+                "-read",
+                f"/Users/{account.name}",
+                "GeneratedUID",
+            ):
+                return 0, f"GeneratedUID: {system_generated_uid}", ""
             if call[:4] == ("/usr/bin/dscl", ".", "-read", f"/Users/{account.name}"):
                 return 0, record, ""
             return 0, "", ""
 
-        with mock.patch.object(
-            self.helper,
-            "_run_lifecycle_command",
-            side_effect=command,
+        def write_account_binding(
+            _plan: object,
+            _state: object,
+            _generated_uid: str,
+        ) -> dict[str, str]:
+            events.append("account-binding")
+            return {"generated_uid": system_generated_uid}
+
+        with (
+            mock.patch.object(
+                self.helper,
+                "_run_lifecycle_command",
+                side_effect=command,
+            ),
+            mock.patch.object(
+                self.helper,
+                "_write_account_binding",
+                side_effect=write_account_binding,
+            ) as write_binding,
         ):
-            self.helper._create_disposable_account(account)
+            self.helper._create_disposable_account(plan, state)
+
+        write_binding.assert_called_once_with(plan, state, system_generated_uid)
 
         creates = [call for call in calls if call[2] == "-create"]
-        self.assertEqual(len(creates), 9)
+        self.assertEqual(len(creates), 8)
         self.assertEqual(
             creates[0],
             (
@@ -2824,6 +2874,27 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 "-create",
                 f"/Users/{account.name}",
             ),
+        )
+        self.assertEqual(
+            calls[calls.index(creates[0]) + 1],
+            (
+                "/usr/bin/dscl",
+                ".",
+                "-read",
+                f"/Users/{account.name}",
+                "GeneratedUID",
+            ),
+        )
+        generated_uid_read = calls[calls.index(creates[0]) + 1]
+        self.assertEqual(
+            events[
+                events.index(generated_uid_read) + 1 : events.index(generated_uid_read)
+                + 3
+            ],
+            ["account-binding", creates[1]],
+        )
+        self.assertFalse(
+            any(call[2] == "-create" and "GeneratedUID" in call for call in calls)
         )
         self.assertEqual(
             creates[1],
@@ -2859,10 +2930,22 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             uid=502,
             gid=20,
             home=Path("/Users/twq-0123456789ab"),
-            generated_uid="01234567-89AB-CDEF-0123-456789ABCDEF",
         )
+        plan = self.helper.LaunchdPlan(
+            account=account,
+            label="io.nisavid.task-witness.macos-probe.0123456789ab",
+            stage_root=Path("/private/var/tmp/task-witness-macos-launchd-123456789-2"),
+            helper=Path(
+                "/private/var/tmp/task-witness-macos-launchd-123456789-2/helper.py"
+            ),
+            plist=Path(
+                "/private/var/tmp/task-witness-macos-launchd-123456789-2/job.plist"
+            ),
+        )
+        state = self.lifecycle_state(plan)
         command_ids = (
             "account-create-record",
+            "account-generated-uid-read",
             "account-set-shell",
             "account-set-authentication-authority",
             "account-set-password",
@@ -2870,12 +2953,11 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             "account-set-uid",
             "account-set-gid",
             "account-set-home",
-            "account-set-generated-uid",
         )
         for failure_index, command_id in enumerate(command_ids):
             calls: list[tuple[str, ...]] = []
             record_present = False
-            create_index = 0
+            phase_index = 0
 
             def command(
                 argv: list[str],
@@ -2883,7 +2965,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 failed_at: int = failure_index,
                 **_kwargs: object,
             ) -> tuple[int, str, str]:
-                nonlocal record_present, create_index
+                nonlocal record_present, phase_index
                 call = tuple(argv)
                 observed_calls.append(call)
                 if call == ("/usr/bin/dscl", ".", "-list", "/Users", "UniqueID"):
@@ -2906,11 +2988,23 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                     f"/Users/{account.name}",
                 ):
                     record_present = True
-                    current_index = create_index
-                    create_index += 1
+                    current_index = phase_index
+                    phase_index += 1
                     if current_index == failed_at:
                         return 1, "", "synthetic failure"
                     return 0, "", ""
+                if call == (
+                    "/usr/bin/dscl",
+                    ".",
+                    "-read",
+                    f"/Users/{account.name}",
+                    "GeneratedUID",
+                ):
+                    current_index = phase_index
+                    phase_index += 1
+                    if current_index == failed_at:
+                        return 1, "", "synthetic failure"
+                    return 0, "GeneratedUID: 01234567-89AB-4DEF-8123-456789ABCDEF", ""
                 raise AssertionError(call)
 
             with (
@@ -2920,27 +3014,151 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                     "_run_lifecycle_command",
                     side_effect=command,
                 ),
+                mock.patch.object(
+                    self.helper,
+                    "_write_account_binding",
+                    return_value={
+                        "generated_uid": "01234567-89AB-4DEF-8123-456789ABCDEF"
+                    },
+                ) as write_binding,
                 self.assertRaisesRegex(
                     self.helper.ProbeError,
                     f"lifecycle-command-nonzero-{command_id}",
                 ),
             ):
-                self.helper._create_disposable_account(account)
+                self.helper._create_disposable_account(plan, state)
 
             deletes = [call for call in calls if call[2] == "-delete"]
-            self.assertEqual(
-                deletes,
-                [
+            expected_deletes = []
+            if failure_index >= 2:
+                expected_deletes = [
                     (
                         "/usr/bin/dscl",
                         ".",
                         "-delete",
                         f"/Users/{account.name}",
                     )
-                ],
+                ]
+            self.assertEqual(
+                deletes,
+                expected_deletes,
             )
-            self.assertFalse(record_present)
-            self.assertEqual(create_index, failure_index + 1)
+            self.assertEqual(record_present, failure_index < 2)
+            self.assertEqual(write_binding.call_count, int(failure_index >= 2))
+            self.assertEqual(
+                phase_index,
+                failure_index + (2 if failure_index >= 2 else 1),
+            )
+
+    def test_account_rollback_requires_the_observed_immutable_guid(self) -> None:
+        account = self.helper.DisposableAccount(
+            name="twq-0123456789ab",
+            uid=502,
+            gid=20,
+            home=Path("/Users/twq-0123456789ab"),
+        )
+        expected = "01234567-89AB-4DEF-8123-456789ABCDEF"
+        different = "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE"
+        with (
+            mock.patch.object(self.helper, "_account_exists", return_value=True),
+            mock.patch.object(
+                self.helper,
+                "_read_system_generated_uid",
+                return_value=different,
+            ),
+            mock.patch.object(self.helper, "_require_command_success") as delete,
+            self.assertRaisesRegex(
+                self.helper.ProbeError,
+                "account-record-drift",
+            ),
+        ):
+            self.helper._rollback_disposable_account_creation(account, expected)
+        delete.assert_not_called()
+
+    def test_account_binding_is_bounded_root_owned_and_state_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            stage = Path(directory) / "stage"
+            stage.mkdir()
+            plan = self.lifecycle_plan(stage)
+            state = self.lifecycle_state(plan)
+            generated_uid = "01234567-89AB-4DEF-8123-456789ABCDEF"
+            document = self.helper._account_binding_document(
+                plan,
+                state,
+                generated_uid,
+            )
+            raw = self.helper.canonical_bytes(document)
+            self.assertLessEqual(len(raw), self.helper.MAX_ACCOUNT_BINDING_BYTES)
+            self.assertEqual(
+                document["account"]["generated_uid"],
+                generated_uid,
+            )
+
+            with (
+                mock.patch.object(self.helper, "_write_root_file") as write,
+                mock.patch.object(
+                    self.helper,
+                    "_load_account_binding",
+                    return_value=document,
+                ),
+            ):
+                self.assertEqual(
+                    self.helper._write_account_binding(
+                        plan,
+                        state,
+                        generated_uid,
+                    ),
+                    document,
+                )
+            write.assert_called_once_with(stage / "account.json", raw, 0o600)
+
+            (stage / "account.json").write_bytes(raw)
+            with mock.patch.object(
+                self.helper,
+                "_metadata_matches",
+                return_value=True,
+            ) as metadata:
+                self.assertEqual(
+                    self.helper._load_account_binding(plan, state),
+                    document,
+                )
+            metadata.assert_called_once_with(
+                stage / "account.json",
+                kind="file",
+                mode=0o600,
+                uid=0,
+                gid=0,
+                nlink=1,
+            )
+
+            changed_state = dict(state)
+            changed_state["content_sha256"] = "f" * 64
+            with (
+                mock.patch.object(
+                    self.helper,
+                    "_metadata_matches",
+                    return_value=True,
+                ),
+                self.assertRaisesRegex(
+                    self.helper.ProbeError,
+                    "account-binding-drift",
+                ),
+            ):
+                self.helper._load_account_binding(plan, changed_state)
+
+            for invalid in (
+                "01234567-89ab-4def-8123-456789abcdef",
+                "00000000-0000-0000-0000-000000000000",
+                "not-a-guid",
+            ):
+                with (
+                    self.subTest(invalid=invalid),
+                    self.assertRaisesRegex(
+                        self.helper.ProbeError,
+                        "account-binding-invalid",
+                    ),
+                ):
+                    self.helper._account_binding_document(plan, state, invalid)
 
     def test_lifecycle_command_diagnostics_are_fixed_and_do_not_persist_argv(
         self,
@@ -3057,7 +3275,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 mock.patch.object(
                     self.helper,
                     "_validate_exact_stage",
-                    return_value=None,
+                    return_value=self.helper.ValidatedStageBindings(None, None),
                 ),
                 mock.patch.object(self.helper, "_require_launchd_absent"),
                 mock.patch.object(self.helper, "_create_disposable_account"),
@@ -3144,18 +3362,36 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             uid=502,
             gid=20,
             home=Path("/Users/twq-0123456789ab"),
-            generated_uid="01234567-89AB-CDEF-0123-456789ABCDEF",
         )
         primary = "lifecycle-command-nonzero-account-set-authentication-authority"
         secondary = "lifecycle-command-nonzero-account-delete"
+        plan = self.helper.LaunchdPlan(
+            account=account,
+            label="io.nisavid.task-witness.macos-probe.0123456789ab",
+            stage_root=Path("/private/var/tmp/task-witness-macos-launchd-123456789-2"),
+            helper=Path(
+                "/private/var/tmp/task-witness-macos-launchd-123456789-2/helper.py"
+            ),
+            plist=Path(
+                "/private/var/tmp/task-witness-macos-launchd-123456789-2/job.plist"
+            ),
+        )
+        state = self.lifecycle_state(plan)
+        generated_uid = "01234567-89AB-4DEF-8123-456789ABCDEF"
         with (
             mock.patch.object(self.helper, "_list_accounts", return_value={"root": 0}),
             mock.patch.object(self.helper, "_account_exists", return_value=False),
             mock.patch.object(
                 self.helper,
                 "_require_command_success",
-                side_effect=self.helper.ProbeError(primary),
+                side_effect=["", self.helper.ProbeError(primary)],
             ),
+            mock.patch.object(
+                self.helper,
+                "_read_system_generated_uid",
+                return_value=generated_uid,
+            ),
+            mock.patch.object(self.helper, "_write_account_binding"),
             mock.patch.object(
                 self.helper,
                 "_rollback_disposable_account_creation",
@@ -3163,7 +3399,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             ),
             self.assertRaises(self.helper.ProbeError) as raised,
         ):
-            self.helper._create_disposable_account(account)
+            self.helper._create_disposable_account(plan, state)
         self.assertEqual(raised.exception.code, primary)
         self.assertEqual(raised.exception.secondary_code, secondary)
 
@@ -3207,7 +3443,6 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                     uid=502,
                     gid=20,
                     home=home,
-                    generated_uid="01234567-89AB-CDEF-0123-456789ABCDEF",
                 )
                 chown_count = 0
 
@@ -3389,7 +3624,27 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             self.assertLessEqual(len(raw), self.helper.MAX_OWNERSHIP_BYTES)
 
             with (
+                mock.patch.object(
+                    self.helper,
+                    "_load_account_binding",
+                    return_value=None,
+                ),
+                mock.patch.object(self.helper, "_write_root_file") as rejected_write,
+                self.assertRaisesRegex(
+                    self.helper.ProbeError,
+                    "account-binding-missing",
+                ),
+            ):
+                self.helper._write_launchd_ownership_marker(plan, state)
+            rejected_write.assert_not_called()
+
+            with (
                 mock.patch.object(self.helper, "_write_root_file") as write,
+                mock.patch.object(
+                    self.helper,
+                    "_load_account_binding",
+                    return_value={"account": "exact"},
+                ),
                 mock.patch.object(
                     self.helper,
                     "_load_launchd_ownership_marker",
@@ -3441,6 +3696,70 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 ),
             ):
                 self.helper._load_launchd_ownership_marker(plan, state)
+
+    def test_stage_inventory_requires_account_binding_before_launchd_ownership(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            stage = Path(directory) / "stage"
+            stage.mkdir()
+            plan = self.lifecycle_plan(stage)
+            helper_raw = b"exact helper\n"
+            plist_raw = b"exact plist\n"
+            (stage / "helper.py").write_bytes(helper_raw)
+            (stage / "job.plist").write_bytes(plist_raw)
+            unsigned_state = {
+                name: value
+                for name, value in self.lifecycle_state(plan).items()
+                if name != "content_sha256"
+            }
+            unsigned_state["helper_sha256"] = hashlib.sha256(helper_raw).hexdigest()
+            unsigned_state["plist_sha256"] = hashlib.sha256(plist_raw).hexdigest()
+            state = self.helper._document_with_digest(unsigned_state)
+            (stage / "state.json").write_bytes(self.helper.canonical_bytes(state))
+            generated_uid = "01234567-89AB-4DEF-8123-456789ABCDEF"
+            account_binding = self.helper._account_binding_document(
+                plan,
+                state,
+                generated_uid,
+            )
+            ownership = self.helper._launchd_ownership_document(plan, state)
+
+            with mock.patch.object(
+                self.helper,
+                "_metadata_matches",
+                return_value=True,
+            ):
+                self.assertEqual(
+                    self.helper._validate_exact_stage(plan, state),
+                    self.helper.ValidatedStageBindings(None, None),
+                )
+
+                (stage / "ownership.json").write_bytes(
+                    self.helper.canonical_bytes(ownership)
+                )
+                with self.assertRaisesRegex(
+                    self.helper.ProbeError,
+                    "stage-cleanup-drift",
+                ):
+                    self.helper._validate_exact_stage(plan, state)
+                (stage / "ownership.json").unlink()
+
+                (stage / "account.json").write_bytes(
+                    self.helper.canonical_bytes(account_binding)
+                )
+                self.assertEqual(
+                    self.helper._validate_exact_stage(plan, state),
+                    self.helper.ValidatedStageBindings(account_binding, None),
+                )
+
+                (stage / "ownership.json").write_bytes(
+                    self.helper.canonical_bytes(ownership)
+                )
+                self.assertEqual(
+                    self.helper._validate_exact_stage(plan, state),
+                    self.helper.ValidatedStageBindings(account_binding, ownership),
+                )
 
     def test_foreign_or_unknown_launchd_job_is_never_booted_out(self) -> None:
         plan = self.lifecycle_plan(Path("/private/var/tmp/stage"))
@@ -3656,7 +3975,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 mock.patch.object(
                     self.helper,
                     "_validate_exact_stage",
-                    return_value=None,
+                    return_value=self.helper.ValidatedStageBindings(None, None),
                 ),
                 mock.patch.object(self.helper, "_create_disposable_account"),
                 mock.patch.object(self.helper, "_create_disposable_home"),
@@ -3713,7 +4032,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             mock.patch.object(
                 self.helper,
                 "_validate_exact_stage",
-                return_value=None,
+                return_value=self.helper.ValidatedStageBindings(None, None),
             ),
             mock.patch.object(self.helper, "_create_disposable_account"),
             mock.patch.object(self.helper, "_create_disposable_home"),
@@ -4257,7 +4576,6 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 uid=502,
                 gid=os.getegid(),
                 home=root / "absent-home",
-                generated_uid="01234567-89AB-CDEF-0123-456789ABCDEF",
             )
             plan = self.helper.LaunchdPlan(
                 account=account,
@@ -4272,8 +4590,11 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 events.append("load-state")
                 return plan, {}
 
-            def validate_stage(*_args: object, **_kwargs: object) -> None:
+            def validate_stage(
+                *_args: object, **_kwargs: object
+            ) -> self.helper.ValidatedStageBindings:
                 events.append("validate-stage")
+                return self.helper.ValidatedStageBindings(None, None)
 
             def snapshot(_label: str) -> None:
                 events.append("observe-absent")
@@ -4332,18 +4653,317 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             )
             launchctl_mutation.assert_not_called()
 
+    def test_cleanup_preserves_account_or_home_without_account_binding(self) -> None:
+        plan = self.lifecycle_plan(Path("/private/var/tmp/task-witness-stage"))
+        state = self.lifecycle_state(plan)
+        for account_present, home_present in ((True, False), (False, True)):
+            with (
+                self.subTest(
+                    account_present=account_present,
+                    home_present=home_present,
+                ),
+                mock.patch.dict(os.environ, eligible_context(), clear=True),
+                mock.patch.object(self.helper, "_normalized_context"),
+                mock.patch.object(self.helper, "_validate_lifecycle_arguments"),
+                mock.patch.object(
+                    self.helper,
+                    "_cleanup_helper_only_stage_before_state",
+                    return_value=False,
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_load_lifecycle_state",
+                    return_value=(plan, state),
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_validate_exact_stage",
+                    return_value=self.helper.ValidatedStageBindings(None, None),
+                ),
+                mock.patch.object(self.helper, "_reconcile_owned_launchd_job"),
+                mock.patch.object(
+                    self.helper,
+                    "_account_exists",
+                    return_value=account_present,
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_path_exists_no_follow",
+                    return_value=home_present,
+                ),
+                mock.patch.object(self.helper, "_list_accounts") as list_accounts,
+                mock.patch.object(
+                    self.helper,
+                    "_require_command_success",
+                ) as mutate_account,
+                mock.patch.object(
+                    self.helper,
+                    "remove_exact_disposable_home",
+                ) as remove_home,
+            ):
+                self.assertEqual(
+                    self.helper.cleanup_launchd_user_lifecycle(
+                        stage_root=plan.stage_root,
+                        artifact_root=Path("/private/tmp/task-witness-artifact"),
+                        expected_helper_sha256="1" * 64,
+                        runner_uid=501,
+                        runner_gid=20,
+                    ),
+                    2,
+                )
+            list_accounts.assert_not_called()
+            mutate_account.assert_not_called()
+            remove_home.assert_not_called()
+
+    def test_cleanup_preserves_replaced_account_with_different_guid(self) -> None:
+        plan = self.lifecycle_plan(Path("/private/var/tmp/task-witness-stage"))
+        state = self.lifecycle_state(plan)
+        expected = "01234567-89AB-4DEF-8123-456789ABCDEF"
+        different = "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE"
+        binding = self.helper._account_binding_document(plan, state, expected)
+        with (
+            mock.patch.dict(os.environ, eligible_context(), clear=True),
+            mock.patch.object(self.helper, "_normalized_context"),
+            mock.patch.object(self.helper, "_validate_lifecycle_arguments"),
+            mock.patch.object(
+                self.helper,
+                "_cleanup_helper_only_stage_before_state",
+                return_value=False,
+            ),
+            mock.patch.object(
+                self.helper,
+                "_load_lifecycle_state",
+                return_value=(plan, state),
+            ),
+            mock.patch.object(
+                self.helper,
+                "_validate_exact_stage",
+                return_value=self.helper.ValidatedStageBindings(binding, None),
+            ),
+            mock.patch.object(self.helper, "_reconcile_owned_launchd_job"),
+            mock.patch.object(self.helper, "_account_exists", return_value=True),
+            mock.patch.object(
+                self.helper,
+                "_path_exists_no_follow",
+                return_value=False,
+            ),
+            mock.patch.object(
+                self.helper,
+                "_read_system_generated_uid",
+                return_value=different,
+            ),
+            mock.patch.object(
+                self.helper,
+                "_require_command_success",
+            ) as mutate_account,
+            mock.patch.object(
+                self.helper,
+                "remove_exact_disposable_home",
+            ) as remove_home,
+        ):
+            self.assertEqual(
+                self.helper.cleanup_launchd_user_lifecycle(
+                    stage_root=plan.stage_root,
+                    artifact_root=Path("/private/tmp/task-witness-artifact"),
+                    expected_helper_sha256="1" * 64,
+                    runner_uid=501,
+                    runner_gid=20,
+                ),
+                2,
+            )
+        mutate_account.assert_not_called()
+        remove_home.assert_not_called()
+
+    def test_cleanup_deletes_guid_bound_partial_account(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            stage = Path(directory) / "stage"
+            stage.mkdir()
+            for name in ("helper.py", "job.plist", "state.json", "account.json"):
+                (stage / name).write_bytes(f"exact-{name}".encode())
+            plan = self.lifecycle_plan(stage)
+            state = self.lifecycle_state(plan)
+            generated_uid = "01234567-89AB-4DEF-8123-456789ABCDEF"
+            binding = self.helper._account_binding_document(
+                plan,
+                state,
+                generated_uid,
+            )
+            delete_call = [
+                "/usr/bin/dscl",
+                ".",
+                "-delete",
+                f"/Users/{plan.account.name}",
+            ]
+            with (
+                mock.patch.dict(os.environ, eligible_context(), clear=True),
+                mock.patch.object(self.helper, "_normalized_context"),
+                mock.patch.object(self.helper, "_validate_lifecycle_arguments"),
+                mock.patch.object(
+                    self.helper,
+                    "_cleanup_helper_only_stage_before_state",
+                    return_value=False,
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_load_lifecycle_state",
+                    return_value=(plan, state),
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_validate_exact_stage",
+                    return_value=self.helper.ValidatedStageBindings(binding, None),
+                ),
+                mock.patch.object(self.helper, "_reconcile_owned_launchd_job"),
+                mock.patch.object(
+                    self.helper,
+                    "_account_exists",
+                    side_effect=[True, False],
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_path_exists_no_follow",
+                    return_value=False,
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_read_system_generated_uid",
+                    return_value=generated_uid,
+                ),
+                mock.patch.object(self.helper, "_require_no_uid_processes"),
+                mock.patch.object(
+                    self.helper,
+                    "_require_command_success",
+                    return_value="",
+                ) as command,
+                mock.patch.object(self.helper, "_list_accounts", return_value={}),
+                mock.patch.object(self.helper, "_account_record") as full_record,
+                mock.patch.object(self.helper, "_validate_precleanup_artifact"),
+                mock.patch.object(self.helper, "_write_root_file"),
+                mock.patch.object(self.helper, "launchd_artifact_payloads"),
+                mock.patch.object(self.helper.os, "chown"),
+            ):
+                self.assertEqual(
+                    self.helper.cleanup_launchd_user_lifecycle(
+                        stage_root=stage,
+                        artifact_root=Path(directory) / "artifact",
+                        expected_helper_sha256="1" * 64,
+                        runner_uid=501,
+                        runner_gid=20,
+                    ),
+                    0,
+                )
+            command.assert_called_once_with(
+                delete_call,
+                command_id="account-delete",
+            )
+            full_record.assert_not_called()
+            self.assertFalse(stage.exists())
+
+    def test_cleanup_preserves_stage_when_planned_uid_remains_occupied(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            stage = Path(directory) / "stage"
+            stage.mkdir()
+            for name in ("helper.py", "job.plist", "state.json", "account.json"):
+                (stage / name).write_bytes(f"exact-{name}".encode())
+            plan = self.lifecycle_plan(stage)
+            state = self.lifecycle_state(plan)
+            generated_uid = "01234567-89AB-4DEF-8123-456789ABCDEF"
+            binding = self.helper._account_binding_document(
+                plan,
+                state,
+                generated_uid,
+            )
+            with (
+                mock.patch.dict(os.environ, eligible_context(), clear=True),
+                mock.patch.object(self.helper, "_normalized_context"),
+                mock.patch.object(self.helper, "_validate_lifecycle_arguments"),
+                mock.patch.object(
+                    self.helper,
+                    "_cleanup_helper_only_stage_before_state",
+                    return_value=False,
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_load_lifecycle_state",
+                    return_value=(plan, state),
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_validate_exact_stage",
+                    return_value=self.helper.ValidatedStageBindings(binding, None),
+                ),
+                mock.patch.object(self.helper, "_reconcile_owned_launchd_job"),
+                mock.patch.object(
+                    self.helper,
+                    "_account_exists",
+                    side_effect=[True, False],
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_path_exists_no_follow",
+                    return_value=False,
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_read_system_generated_uid",
+                    return_value=generated_uid,
+                ),
+                mock.patch.object(self.helper, "_require_no_uid_processes"),
+                mock.patch.object(
+                    self.helper,
+                    "_require_command_success",
+                    return_value="",
+                ) as delete,
+                mock.patch.object(
+                    self.helper,
+                    "_list_accounts",
+                    return_value={"foreign": plan.account.uid},
+                ),
+            ):
+                self.assertEqual(
+                    self.helper.cleanup_launchd_user_lifecycle(
+                        stage_root=stage,
+                        artifact_root=Path(directory) / "artifact",
+                        expected_helper_sha256="1" * 64,
+                        runner_uid=501,
+                        runner_gid=20,
+                    ),
+                    2,
+                )
+            delete.assert_called_once_with(
+                [
+                    "/usr/bin/dscl",
+                    ".",
+                    "-delete",
+                    f"/Users/{plan.account.name}",
+                ],
+                command_id="account-delete",
+            )
+            self.assertTrue(stage.is_dir())
+
     def test_cleanup_preserves_foreign_live_job_and_all_local_sources(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             stage = root / "stage"
             stage.mkdir()
-            for name in ("helper.py", "job.plist", "state.json", "ownership.json"):
+            for name in (
+                "helper.py",
+                "job.plist",
+                "state.json",
+                "account.json",
+                "ownership.json",
+            ):
                 (stage / name).write_bytes(f"exact-{name}".encode())
             artifact = root / "artifact"
             artifact.mkdir()
             (artifact / "sentinel").write_bytes(b"preserve-artifact")
             plan = self.lifecycle_plan(stage)
             state = self.lifecycle_state(plan)
+            account_binding = self.helper._account_binding_document(
+                plan,
+                state,
+                "01234567-89AB-4DEF-8123-456789ABCDEF",
+            )
             marker = self.helper._launchd_ownership_document(plan, state)
             foreign = self.launchctl_job(plan, state).replace(
                 str(plan.plist),
@@ -4356,9 +4976,11 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 events.append("load-state")
                 return plan, state
 
-            def validate_stage(*_args: object, **_kwargs: object) -> dict:
+            def validate_stage(
+                *_args: object, **_kwargs: object
+            ) -> self.helper.ValidatedStageBindings:
                 events.append("validate-stage")
-                return marker
+                return self.helper.ValidatedStageBindings(account_binding, marker)
 
             def snapshot(_label: str) -> str:
                 events.append("observe-live")
@@ -4420,10 +5042,21 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             root = Path(directory)
             stage = root / "stage"
             stage.mkdir()
-            for name in ("helper.py", "job.plist", "state.json", "ownership.json"):
+            for name in (
+                "helper.py",
+                "job.plist",
+                "state.json",
+                "account.json",
+                "ownership.json",
+            ):
                 (stage / name).write_bytes(f"exact-{name}".encode())
             plan = self.lifecycle_plan(stage)
             state = self.lifecycle_state(plan)
+            account_binding = self.helper._account_binding_document(
+                plan,
+                state,
+                "01234567-89AB-4DEF-8123-456789ABCDEF",
+            )
             marker = self.helper._launchd_ownership_document(plan, state)
             owned = self.launchctl_job(plan, state)
             artifact = root / "artifact"
@@ -4433,9 +5066,11 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 events.append("load-state")
                 return plan, state
 
-            def validate_stage(*_args: object, **_kwargs: object) -> dict:
+            def validate_stage(
+                *_args: object, **_kwargs: object
+            ) -> self.helper.ValidatedStageBindings:
                 events.append("validate-stage")
-                return marker
+                return self.helper.ValidatedStageBindings(account_binding, marker)
 
             def snapshot(_label: str) -> str | None:
                 events.append("observe-job")
@@ -4522,7 +5157,14 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             mock.patch.object(
                 self.helper,
                 "_validate_exact_stage",
-                return_value={"ownership": "exact"},
+                return_value=self.helper.ValidatedStageBindings(
+                    {
+                        "account": {
+                            "generated_uid": "01234567-89AB-4DEF-8123-456789ABCDEF"
+                        }
+                    },
+                    {"ownership": "exact"},
+                ),
             ),
             mock.patch.object(
                 self.helper,

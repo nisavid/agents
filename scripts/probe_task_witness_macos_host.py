@@ -49,7 +49,6 @@ LAUNCHD_POLL_TIMEOUT_SECONDS = 30
 PROCESS_EXIT_POLL_INTERVAL_SECONDS = 0.25
 PROCESS_EXIT_POLL_TIMEOUT_SECONDS = 30
 PROCESS_LIST_MIN_TIMEOUT_SECONDS = 1
-PROCESS_DOMAIN_OBSERVATION_TIMEOUT_SECONDS = 1
 LAUNCHD_PRINT_MAX_BYTES = 16 * 1024
 LAUNCHCTL_NOT_FOUND_STATUS = 113
 DISPOSABLE_UID_MIN = 502
@@ -152,10 +151,10 @@ DISPOSABLE_PROCESS_REMAINS_CODES = frozenset(
         "disposable-user-zombie-only-remains",
     }
 )
-LAUNCHD_USER_DOMAIN_PRESENT_CODES = frozenset(
+DISPOSABLE_UID_ACTIVE_CODES = frozenset(
     {
-        "launchd-user-domain-present-before-account",
-        "launchd-user-domain-present-before-bootstrap",
+        "disposable-uid-active-before-bootstrap",
+        "disposable-uid-active-before-create",
     }
 )
 
@@ -2405,10 +2404,6 @@ def _create_disposable_account(
     ):
         raise ProbeError("account-or-uid-already-exists")
     _require_disposable_uid_available(account.uid)
-    _require_launchd_user_domain_absent(
-        account.uid,
-        present_code="launchd-user-domain-present-before-account",
-    )
     record_path = f"/Users/{account.name}"
     property_command_ids = (
         "account-set-shell",
@@ -2952,10 +2947,6 @@ def _initialize_lifecycle(
         if DISPOSABLE_UID_MIN <= uid <= DISPOSABLE_UID_MAX
     }
     uid = choose_disposable_uid(set(accounts.values()) | process_uids)
-    _require_launchd_user_domain_absent(
-        uid,
-        present_code="launchd-user-domain-present-before-account",
-    )
     account_name, label = _launchd_identity(environment)
     if account_name in accounts:
         raise ProbeError("account-name-already-exists")
@@ -3142,79 +3133,6 @@ def _launchd_job_snapshot(label: str) -> str | None:
     if status == LAUNCHCTL_NOT_FOUND_STATUS:
         return None
     raise ProbeError("launchd-presence-unavailable")
-
-
-def _launchd_user_domain_present(
-    uid: int,
-    *,
-    timeout: float = COMMAND_TIMEOUT_SECONDS,
-) -> bool:
-    if type(uid) is not int or not DISPOSABLE_UID_MIN <= uid <= DISPOSABLE_UID_MAX:
-        raise ProbeError("invalid-disposable-uid")
-    if (
-        isinstance(timeout, bool)
-        or not isinstance(timeout, (int, float))
-        or not 0 < timeout <= COMMAND_TIMEOUT_SECONDS
-    ):
-        raise ProbeError("invalid-launchd-user-domain-timeout")
-    try:
-        process = subprocess.run(
-            ["/bin/launchctl", "print", f"user/{uid}"],
-            check=False,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=timeout,
-            env={
-                "HOME": "/var/empty",
-                "LANG": "C",
-                "LC_ALL": "C",
-                "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
-                "TZ": "UTC",
-            },
-        )
-    except (OSError, subprocess.TimeoutExpired) as error:
-        raise ProbeError("launchd-user-domain-presence-unavailable") from error
-    try:
-        returncode = process.returncode
-    except AttributeError as error:
-        raise ProbeError("launchd-user-domain-presence-unavailable") from error
-    if type(returncode) is not int or not 0 <= returncode <= 255:
-        raise ProbeError("launchd-user-domain-presence-unavailable")
-    if returncode == 0:
-        return True
-    if returncode == LAUNCHCTL_NOT_FOUND_STATUS:
-        return False
-    raise ProbeError("launchd-user-domain-presence-unavailable")
-
-
-def _require_launchd_user_domain_absent(
-    uid: int,
-    *,
-    present_code: str,
-) -> None:
-    if present_code not in LAUNCHD_USER_DOMAIN_PRESENT_CODES:
-        raise ProbeError("invalid-launchd-user-domain-present-code")
-    if _launchd_user_domain_present(uid):
-        raise ProbeError(present_code)
-
-
-def _launchd_user_domain_observation_code(
-    uid: int,
-    *,
-    timeout: float,
-) -> str:
-    try:
-        present = _launchd_user_domain_present(uid, timeout=timeout)
-    except ProbeError as error:
-        if error.code != "launchd-user-domain-presence-unavailable":
-            raise
-        return "launchd-user-domain-observation-unavailable"
-    return (
-        "launchd-user-domain-present-during-process-wait"
-        if present
-        else "launchd-user-domain-absent-during-process-wait"
-    )
 
 
 def _require_launchd_absent(label: str) -> None:
@@ -3713,9 +3631,9 @@ def run_launchd_user_lifecycle(
         _require_launchd_absent(plan.label)
         _create_disposable_account(plan, state)
         _create_disposable_home(plan.account)
-        _require_launchd_user_domain_absent(
+        _require_disposable_uid_available(
             plan.account.uid,
-            present_code="launchd-user-domain-present-before-bootstrap",
+            active_code="disposable-uid-active-before-bootstrap",
         )
         _require_launchd_absent(plan.label)
         bootstrap_attempted = True
@@ -4136,9 +4054,15 @@ def _process_survivor_code(
     raise ProbeError("process-list-invalid")
 
 
-def _require_disposable_uid_available(uid: int) -> None:
+def _require_disposable_uid_available(
+    uid: int,
+    *,
+    active_code: str = "disposable-uid-active-before-create",
+) -> None:
+    if active_code not in DISPOSABLE_UID_ACTIVE_CODES:
+        raise ProbeError("invalid-disposable-uid-active-code")
     if _process_survivor_code(_process_records(), uid) is not None:
-        raise ProbeError("disposable-uid-active-before-create")
+        raise ProbeError(active_code)
 
 
 def _require_no_uid_processes(
@@ -4159,75 +4083,28 @@ def _process_wait_timeout_code(observed_codes: set[str]) -> str:
     return "disposable-user-process-observation-unavailable"
 
 
-def _process_wait_domain_code(observed_codes: set[str]) -> str:
-    if len(observed_codes) == 1:
-        return next(iter(observed_codes))
-    if not observed_codes:
-        return "launchd-user-domain-observation-unavailable"
-    return "launchd-user-domain-observation-unstable"
-
-
-def _process_wait_error(
-    observed_process_codes: set[str],
-    observed_domain_codes: set[str],
-) -> ProbeError:
-    return ProbeError(
-        _process_wait_timeout_code(observed_process_codes),
-        secondary_code=_process_wait_domain_code(observed_domain_codes),
-    )
-
-
 def _wait_for_no_uid_processes(
     uid: int,
 ) -> None:
     deadline = time.monotonic() + PROCESS_EXIT_POLL_TIMEOUT_SECONDS
     observed_codes: set[str] = set()
-    observed_domain_codes: set[str] = set()
     while True:
         remaining = deadline - time.monotonic()
-        if remaining < (
-            PROCESS_LIST_MIN_TIMEOUT_SECONDS
-            + PROCESS_DOMAIN_OBSERVATION_TIMEOUT_SECONDS
-        ):
-            if remaining > 0:
-                observed_domain_codes.add(
-                    _launchd_user_domain_observation_code(
-                        uid,
-                        timeout=min(
-                            PROCESS_DOMAIN_OBSERVATION_TIMEOUT_SECONDS,
-                            remaining,
-                        ),
-                    )
-                )
-            raise _process_wait_error(observed_codes, observed_domain_codes)
+        if remaining < PROCESS_LIST_MIN_TIMEOUT_SECONDS:
+            raise ProbeError(_process_wait_timeout_code(observed_codes))
         try:
             _require_no_uid_processes(
                 uid,
-                timeout=min(
-                    COMMAND_TIMEOUT_SECONDS,
-                    remaining - PROCESS_DOMAIN_OBSERVATION_TIMEOUT_SECONDS,
-                ),
+                timeout=min(COMMAND_TIMEOUT_SECONDS, remaining),
             )
             return
         except ProbeError as error:
             if error.code not in DISPOSABLE_PROCESS_REMAINS_CODES:
                 raise
             observed_codes.add(error.code)
-            if not observed_domain_codes:
-                remaining = deadline - time.monotonic()
-                if remaining > 0:
-                    observed_domain_codes.add(
-                        _launchd_user_domain_observation_code(
-                            uid,
-                            timeout=min(
-                                PROCESS_DOMAIN_OBSERVATION_TIMEOUT_SECONDS,
-                                remaining,
-                            ),
-                        )
-                    )
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise _process_wait_error(observed_codes, observed_domain_codes)
+            raise ProbeError(_process_wait_timeout_code(observed_codes))
         time.sleep(min(PROCESS_EXIT_POLL_INTERVAL_SECONDS, remaining))
 
 

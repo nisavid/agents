@@ -25,12 +25,14 @@ jobs:
           'refs/heads/ivan/task-witness-macos-qualification-harness' &&
           vars.TASK_WITNESS_MACOS_HOST_PROBE_CANDIDATE ==
           'b47f03519068b858cf0c070b5d331ee053ef6b7b' &&
-          vars.TASK_WITNESS_MACOS_HOST_PROBE_HARNESS == github.sha }}
+          vars.TASK_WITNESS_MACOS_HOST_PROBE_HARNESS == github.sha &&
+          vars.TASK_WITNESS_MACOS_HOST_PROBE_RESET == github.sha }}
     runs-on: macos-15
     timeout-minutes: 15
     env:
       CANDIDATE_SHA: b47f03519068b858cf0c070b5d331ee053ef6b7b
-      HELPER_SHA256: 20bacad8eb0eb29b6ee499d36d08f10f245124a370edef981307541ee8dc53f7
+      HELPER_SHA256: 75a9d6eccd8c9465fd714aa74180229f28f71852ff534edafe9cc034055db8b2
+      USER_DOMAIN_RESET_AUTHORIZATION_SHA: ${{ vars.TASK_WITNESS_MACOS_HOST_PROBE_RESET }}
     steps:
       - name: Check out the operator-owned harness
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
@@ -908,7 +910,9 @@ jobs:
               --stage-root "$stage_root" \
               --artifact-root "$artifact_root" \
               --runner-uid "$runner_uid" \
-              --runner-gid "$runner_gid"
+              --runner-gid "$runner_gid" \
+              --user-domain-reset-authorization \
+              "$USER_DOMAIN_RESET_AUTHORIZATION_SHA"
 
       - name: Clean the disposable launchd-user probe
         id: launchd_cleanup
@@ -941,7 +945,9 @@ jobs:
               --stage-root "$stage_root" \
               --artifact-root "$artifact_root" \
               --runner-uid "$runner_uid" \
-              --runner-gid "$runner_gid"
+              --runner-gid "$runner_gid" \
+              --user-domain-reset-authorization \
+              "$USER_DOMAIN_RESET_AUTHORIZATION_SHA"
 
       - name: Seal the bounded launchd-user artifact
         id: launchd_seal

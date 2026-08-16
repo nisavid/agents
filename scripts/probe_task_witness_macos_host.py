@@ -42,6 +42,7 @@ MAX_COMMAND_OUTPUT_BYTES = 4 * 1024
 MAX_HELPER_BYTES = 256 * 1024
 MAX_OWNERSHIP_BYTES = 4 * 1024
 MAX_ACCOUNT_BINDING_BYTES = 4 * 1024
+MAX_USER_DOMAIN_RESET_BYTES = 4 * 1024
 MAX_PROCESS_LIST_BYTES = 64 * 1024
 COMMAND_TIMEOUT_SECONDS = 10
 LAUNCHD_POLL_INTERVAL_SECONDS = 0.25
@@ -162,6 +163,8 @@ DISPOSABLE_UID_ACTIVE_CODES = frozenset(
         "disposable-uid-active-before-create",
     }
 )
+USER_DOMAIN_RESET_CAPABILITY = "github-hosted-ephemeral-user-domain-reset-v1"
+USER_DOMAIN_RESET_SURVIVOR_CODE = "disposable-user-pid1-parented-processes-remain"
 
 
 class ProbeError(Exception):
@@ -214,6 +217,7 @@ class ValidatedLaunchdJobSnapshot(NamedTuple):
 class ValidatedStageBindings(NamedTuple):
     account: dict | None
     launchd: dict | None
+    domain_reset: dict | None = None
 
 
 class ProcessRecord(NamedTuple):
@@ -352,6 +356,27 @@ def _normalized_context(environment: Mapping[str, str]) -> tuple[dict, dict]:
             128,
         ),
     }
+    return harness, runner
+
+
+def _require_user_domain_reset_capability(
+    authorization_sha: object,
+    environment: Mapping[str, str],
+) -> tuple[dict, dict]:
+    try:
+        harness, runner = _normalized_context(environment)
+    except ProbeError as error:
+        raise ProbeError("user-domain-reset-capability-unavailable") from error
+    if (
+        not isinstance(authorization_sha, str)
+        or authorization_sha != harness["commit_sha1"]
+        or runner["environment"] != "github-hosted"
+        or runner["os"] != "macOS"
+        or runner["arch"] != "ARM64"
+        or runner["image_os"] != "macos15"
+        or not runner["image_version"]
+    ):
+        raise ProbeError("user-domain-reset-capability-unavailable")
     return harness, runner
 
 
@@ -1917,26 +1942,34 @@ def verify_launchd_success(artifact_root: Path) -> None:
     ):
         raise ProbeError("launchd-user-probe-ineligible")
     binding = _validated_launchd_binding_evidence(lifecycle.get("binding"))
+    domain_reset = _validated_domain_reset_evidence(lifecycle.get("domain_reset"))
+    if (
+        domain_reset["disposition"] == "recovered-to-stable-zero"
+        or _validated_domain_reset_evidence(cleanup.get("domain_reset")) != domain_reset
+    ):
+        raise ProbeError("launchd-user-probe-ineligible")
     expected_lifecycle = _document_with_digest(
         {
-            "schema_version": 1,
-            "contract": "task-witness-macos-launchd-lifecycle-v1",
+            "schema_version": 2,
+            "contract": "task-witness-macos-launchd-lifecycle-v2",
             "candidate_sha1": EXPECTED_CANDIDATE_SHA,
             "label": label,
             "kickstart_pid": validated["process"]["pid"],
             "probe_disposition": "launchd-user-eligible",
             "disposition": "launchd-user-eligible",
             "binding": binding,
+            "domain_reset": domain_reset,
         }
     )
     expected_cleanup = _document_with_digest(
         {
-            "schema_version": 1,
-            "contract": "task-witness-macos-launchd-cleanup-v1",
+            "schema_version": 2,
+            "contract": "task-witness-macos-launchd-cleanup-v2",
             "candidate_sha1": EXPECTED_CANDIDATE_SHA,
             "account": account_name,
             "label": label,
             "disposition": "cleaned",
+            "domain_reset": domain_reset,
         }
     )
     if (
@@ -2030,6 +2063,37 @@ def _run_lifecycle_command(
         )
     except UnicodeDecodeError as error:
         raise ProbeError("lifecycle-command-output-invalid") from error
+
+
+def _run_user_domain_reset(uid: int) -> None:
+    if type(uid) is not int or not DISPOSABLE_UID_MIN <= uid <= DISPOSABLE_UID_MAX:
+        raise ProbeError("invalid-user-domain-reset-uid")
+    argv = ["/bin/launchctl", "bootout", f"user/{uid}"]
+    try:
+        process = subprocess.run(
+            argv,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=COMMAND_TIMEOUT_SECONDS,
+            env={
+                "HOME": "/var/empty",
+                "LANG": "C",
+                "LC_ALL": "C",
+                "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+                "TZ": "UTC",
+            },
+        )
+    except subprocess.TimeoutExpired as error:
+        raise ProbeError("launchd-user-domain-bootout-timeout") from error
+    except OSError as error:
+        raise ProbeError("launchd-user-domain-bootout-failed") from error
+    status = process.returncode
+    if type(status) is not int or status < 0 or status > 255:
+        raise ProbeError("launchd-user-domain-bootout-status-invalid")
+    if status != 0:
+        raise ProbeError("launchd-user-domain-bootout-nonzero")
 
 
 def _require_command_success(
@@ -2861,6 +2925,210 @@ def _load_launchd_ownership_marker(
     return document
 
 
+def _exact_disposable_home_identity(account: DisposableAccount) -> dict[str, int]:
+    _validate_exact_disposable_home(
+        account.home,
+        expected_uid=account.uid,
+        expected_gid=account.gid,
+    )
+    try:
+        home = account.home.lstat()
+        probe = (account.home / "launchd-probe").lstat()
+    except OSError as error:
+        raise ProbeError("home-cleanup-drift") from error
+    return {
+        "home_device": home.st_dev,
+        "home_inode": home.st_ino,
+        "probe_device": probe.st_dev,
+        "probe_inode": probe.st_ino,
+    }
+
+
+def _validated_disposable_home_identity(value: object) -> dict[str, int]:
+    identity = _require_exact_keys(
+        value,
+        {"home_device", "home_inode", "probe_device", "probe_inode"},
+        "user-domain-reset-home-identity",
+    )
+    if any(
+        type(identity[name]) is not int
+        or identity[name] < 0
+        or identity[name] > (1 << 64) - 1
+        for name in identity
+    ) or any(identity[name] == 0 for name in ("home_inode", "probe_inode")):
+        raise ProbeError("user-domain-reset-home-identity-invalid")
+    return {name: int(identity[name]) for name in sorted(identity)}
+
+
+def _user_domain_reset_document(
+    plan: LaunchdPlan,
+    state: Mapping[str, object],
+    account_binding: Mapping[str, object],
+    ownership: Mapping[str, object],
+    authorization_sha: object,
+    environment: Mapping[str, str],
+    *,
+    home_identity: object = None,
+) -> dict:
+    harness, runner = _require_user_domain_reset_capability(
+        authorization_sha,
+        environment,
+    )
+    if account_binding != _load_account_binding(
+        plan, state
+    ) or ownership != _launchd_ownership_document(plan, state):
+        raise ProbeError("user-domain-reset-binding-drift")
+    account_value = account_binding.get("account")
+    state_sha256 = state.get("content_sha256")
+    account_sha256 = account_binding.get("content_sha256")
+    ownership_sha256 = ownership.get("content_sha256")
+    if not isinstance(account_value, dict) or any(
+        not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None
+        for value in (state_sha256, account_sha256, ownership_sha256)
+    ):
+        raise ProbeError("user-domain-reset-binding-drift")
+    return _document_with_digest(
+        {
+            "schema_version": 1,
+            "contract": (
+                "task-witness-macos-launchd-user-domain-reset-authorization-v1"
+            ),
+            "candidate_sha1": EXPECTED_CANDIDATE_SHA,
+            "capability": USER_DOMAIN_RESET_CAPABILITY,
+            "disposition": "armed",
+            "authorized_survivor_code": USER_DOMAIN_RESET_SURVIVOR_CODE,
+            "authorization_sha1": authorization_sha,
+            "target": f"user/{plan.account.uid}",
+            "harness": harness,
+            "runner": runner,
+            "account": account_value,
+            "home_identity": (
+                _exact_disposable_home_identity(plan.account)
+                if home_identity is None
+                else _validated_disposable_home_identity(home_identity)
+            ),
+            "label": plan.label,
+            "stage_root": str(plan.stage_root),
+            "state_sha256": state_sha256,
+            "account_binding_sha256": account_sha256,
+            "ownership_sha256": ownership_sha256,
+        }
+    )
+
+
+def _load_user_domain_reset_authorization(
+    plan: LaunchdPlan,
+    state: Mapping[str, object],
+    account_binding: Mapping[str, object],
+    ownership: Mapping[str, object],
+    authorization_sha: object,
+    environment: Mapping[str, str],
+) -> dict | None:
+    path = plan.stage_root / "domain-reset.json"
+    if not _path_exists_no_follow(path):
+        return None
+    if not _metadata_matches(
+        path,
+        kind="file",
+        mode=0o600,
+        uid=0,
+        gid=0,
+        nlink=1,
+    ):
+        raise ProbeError("user-domain-reset-authorization-drift")
+    document = _load_canonical_document(
+        path,
+        MAX_USER_DOMAIN_RESET_BYTES,
+        "user-domain-reset-authorization",
+    )
+    _require_content_digest(document, "user-domain-reset-authorization")
+    try:
+        expected = _user_domain_reset_document(
+            plan,
+            state,
+            account_binding,
+            ownership,
+            authorization_sha,
+            environment,
+            home_identity=document.get("home_identity"),
+        )
+    except ProbeError as error:
+        raise ProbeError("user-domain-reset-authorization-drift") from error
+    if document != expected:
+        raise ProbeError("user-domain-reset-authorization-drift")
+    return document
+
+
+def _fsync_stage_directory(stage_root: Path) -> None:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            stage_root,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+        opened = os.fstat(descriptor)
+        visible = stage_root.lstat()
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or stat.S_IMODE(opened.st_mode) != 0o755
+            or opened.st_uid != 0
+            or opened.st_gid != 0
+            or (opened.st_dev, opened.st_ino) != (visible.st_dev, visible.st_ino)
+        ):
+            raise ProbeError("user-domain-reset-stage-drift")
+        os.fsync(descriptor)
+    except OSError as error:
+        raise ProbeError("user-domain-reset-stage-fsync-failed") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _write_user_domain_reset_authorization(
+    plan: LaunchdPlan,
+    state: Mapping[str, object],
+    bindings: ValidatedStageBindings,
+    authorization_sha: object,
+    environment: Mapping[str, str],
+) -> dict:
+    if (
+        bindings.account is None
+        or bindings.launchd is None
+        or bindings.domain_reset is not None
+    ):
+        raise ProbeError("user-domain-reset-binding-missing")
+    account_value = bindings.account.get("account")
+    if not isinstance(account_value, dict) or account_value.get(
+        "generated_uid"
+    ) != _read_system_generated_uid(plan.account.name):
+        raise ProbeError("account-record-generated-uid-drift")
+    _require_launchd_absent(plan.label)
+    document = _user_domain_reset_document(
+        plan,
+        state,
+        bindings.account,
+        bindings.launchd,
+        authorization_sha,
+        environment,
+    )
+    raw = canonical_bytes(document)
+    if len(raw) > MAX_USER_DOMAIN_RESET_BYTES:
+        raise ProbeError("user-domain-reset-authorization-too-large")
+    _write_root_file(plan.stage_root / "domain-reset.json", raw, 0o600)
+    _fsync_stage_directory(plan.stage_root)
+    observed = _load_user_domain_reset_authorization(
+        plan,
+        state,
+        bindings.account,
+        bindings.launchd,
+        authorization_sha,
+        environment,
+    )
+    if observed != document:
+        raise ProbeError("user-domain-reset-authorization-disagrees")
+    return document
+
+
 def validate_prestaged_helper(stage_root: Path, expected_sha256: str) -> bytes:
     if re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None:
         raise ProbeError("invalid-staged-helper-digest")
@@ -3493,6 +3761,7 @@ def _write_lifecycle_artifact(
     status: int,
     error_code: str | None,
     secondary_error_code: str | None = None,
+    domain_reset: Mapping[str, object] | None = None,
 ) -> None:
     label = plan.label if plan is not None else _launchd_identity(environment)[1]
     child: dict[str, bytes]
@@ -3561,8 +3830,8 @@ def _write_lifecycle_artifact(
                 environment=environment,
             ).sanitized
     unsigned: dict[str, object] = {
-        "schema_version": 1,
-        "contract": "task-witness-macos-launchd-lifecycle-v1",
+        "schema_version": 2,
+        "contract": "task-witness-macos-launchd-lifecycle-v2",
         "candidate_sha1": EXPECTED_CANDIDATE_SHA,
         "label": label,
         "kickstart_pid": kickstart_pid,
@@ -3578,6 +3847,9 @@ def _write_lifecycle_artifact(
         if plan is None or validated_binding is None:
             raise ProbeError("launchd-job-binding-invalid")
         unsigned["binding"] = validated_binding
+        unsigned["domain_reset"] = _validated_domain_reset_evidence(
+            _domain_reset_evidence(None) if domain_reset is None else domain_reset
+        )
     payloads = {
         "launchd.loaded": artifact_loaded.encode("utf-8"),
         "launchd.terminal": artifact_terminal.encode("utf-8"),
@@ -3600,6 +3872,7 @@ def run_launchd_user_lifecycle(
     candidate_sha: str,
     runner_uid: int,
     runner_gid: int,
+    user_domain_reset_authorization: str | None = None,
 ) -> int:
     if candidate_sha != EXPECTED_CANDIDATE_SHA:
         raise ProbeError("candidate-sha-disagrees")
@@ -3620,6 +3893,7 @@ def run_launchd_user_lifecycle(
     status = 2
     error_code: str | None = None
     secondary_error_code: str | None = None
+    reset_evidence = _domain_reset_evidence(None)
     bootstrap_attempted = False
     bootout_confirmed = False
     _create_root_directory(artifact_root, 0o700)
@@ -3630,7 +3904,12 @@ def run_launchd_user_lifecycle(
             runner_gid=runner_gid,
             environment=os.environ,
         )
-        stage_bindings = _validate_exact_stage(plan, state)
+        stage_bindings = _validate_exact_stage(
+            plan,
+            state,
+            user_domain_reset_authorization=user_domain_reset_authorization,
+            environment=os.environ,
+        )
         if stage_bindings.account is not None or stage_bindings.launchd is not None:
             raise ProbeError("launchd-job-ownership-already-recorded")
         _require_launchd_absent(plan.label)
@@ -3718,7 +3997,22 @@ def run_launchd_user_lifecycle(
     processes_absent = False
     if plan is not None and bootout_confirmed:
         try:
-            _wait_for_no_uid_processes(plan.account.uid)
+            current_bindings = _validate_exact_stage(
+                plan,
+                state,
+                user_domain_reset_authorization=user_domain_reset_authorization,
+                environment=os.environ,
+            )
+            reset_evidence = _quiesce_disposable_user(
+                plan,
+                state,
+                current_bindings,
+                user_domain_reset_authorization,
+                os.environ,
+                allow_create=(
+                    status == 0 and error_code is None and secondary_error_code is None
+                ),
+            )
             processes_absent = True
         except ProbeError as error:
             error_code, secondary_error_code = _merge_probe_error(
@@ -3748,6 +4042,7 @@ def run_launchd_user_lifecycle(
         status=status,
         error_code=error_code,
         secondary_error_code=secondary_error_code,
+        domain_reset=reset_evidence,
     )
     if status == 2:
         print(
@@ -3841,6 +4136,9 @@ def _load_lifecycle_state(
 def _validate_exact_stage(
     plan: LaunchdPlan,
     state: Mapping[str, object],
+    *,
+    user_domain_reset_authorization: object = None,
+    environment: Mapping[str, str] | None = None,
 ) -> ValidatedStageBindings:
     try:
         names = {entry.name for entry in plan.stage_root.iterdir()}
@@ -3848,12 +4146,15 @@ def _validate_exact_stage(
         raise ProbeError("stage-cleanup-drift") from error
     base_names = {"helper.py", "job.plist", "state.json"}
     account_names = base_names | {"account.json"}
+    ownership_names = account_names | {"ownership.json"}
+    reset_names = ownership_names | {"domain-reset.json"}
     if (
         names
         not in (
             base_names,
             account_names,
-            account_names | {"ownership.json"},
+            ownership_names,
+            reset_names,
         )
         or not _metadata_matches(
             plan.stage_root,
@@ -3888,13 +4189,31 @@ def _validate_exact_stage(
         raise ProbeError("stage-cleanup-drift")
     account = _load_account_binding(plan, state)
     ownership = _load_launchd_ownership_marker(plan, state)
+    domain_reset: dict | None = None
+    if "domain-reset.json" in names:
+        if account is None or ownership is None or environment is None:
+            raise ProbeError("stage-cleanup-drift")
+        domain_reset = _load_user_domain_reset_authorization(
+            plan,
+            state,
+            account,
+            ownership,
+            user_domain_reset_authorization,
+            environment,
+        )
     if (
         ("account.json" in names) != (account is not None)
         or ("ownership.json" in names) != (ownership is not None)
+        or ("domain-reset.json" in names) != (domain_reset is not None)
         or (ownership is not None and account is None)
+        or (domain_reset is not None and ownership is None)
     ):
         raise ProbeError("stage-cleanup-drift")
-    return ValidatedStageBindings(account=account, launchd=ownership)
+    return ValidatedStageBindings(
+        account=account,
+        launchd=ownership,
+        domain_reset=domain_reset,
+    )
 
 
 def parse_process_list(raw: str) -> tuple[ProcessRecord, ...]:
@@ -4139,6 +4458,230 @@ def _wait_for_no_uid_processes(
         time.sleep(min(PROCESS_EXIT_POLL_INTERVAL_SECONDS, remaining))
 
 
+def _require_stable_no_uid_processes(uid: int) -> None:
+    _require_no_uid_processes(uid)
+    time.sleep(PROCESS_EXIT_POLL_INTERVAL_SECONDS)
+    _require_no_uid_processes(uid)
+
+
+def _domain_reset_evidence(marker: Mapping[str, object] | None) -> dict[str, str]:
+    if marker is None:
+        return {
+            "authorization_sha256": "none",
+            "capability": USER_DOMAIN_RESET_CAPABILITY,
+            "disposition": "not-needed",
+            "precondition": "none",
+        }
+    digest = marker.get("content_sha256")
+    if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise ProbeError("user-domain-reset-authorization-drift")
+    return {
+        "authorization_sha256": digest,
+        "capability": USER_DOMAIN_RESET_CAPABILITY,
+        "disposition": "performed",
+        "precondition": USER_DOMAIN_RESET_SURVIVOR_CODE,
+    }
+
+
+def _recovered_domain_reset_evidence(
+    marker: Mapping[str, object],
+) -> dict[str, str]:
+    evidence = _domain_reset_evidence(marker)
+    evidence["disposition"] = "recovered-to-stable-zero"
+    return evidence
+
+
+def _validated_domain_reset_evidence(value: object) -> dict[str, str]:
+    evidence = _require_exact_keys(
+        value,
+        {
+            "authorization_sha256",
+            "capability",
+            "disposition",
+            "precondition",
+        },
+        "user-domain-reset-evidence",
+    )
+    disposition = evidence.get("disposition")
+    authorization_sha256 = evidence.get("authorization_sha256")
+    precondition = evidence.get("precondition")
+    if (
+        evidence.get("capability") != USER_DOMAIN_RESET_CAPABILITY
+        or disposition not in {"not-needed", "performed", "recovered-to-stable-zero"}
+        or (
+            disposition == "not-needed"
+            and (authorization_sha256 != "none" or precondition != "none")
+        )
+        or (
+            disposition in {"performed", "recovered-to-stable-zero"}
+            and (
+                not isinstance(authorization_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", authorization_sha256) is None
+                or precondition != USER_DOMAIN_RESET_SURVIVOR_CODE
+            )
+        )
+    ):
+        raise ProbeError("invalid-user-domain-reset-evidence")
+    return {
+        "authorization_sha256": str(authorization_sha256),
+        "capability": USER_DOMAIN_RESET_CAPABILITY,
+        "disposition": str(disposition),
+        "precondition": str(precondition),
+    }
+
+
+def _cleanup_domain_reset_evidence(
+    artifact_root: Path,
+    plan: LaunchdPlan,
+    state: Mapping[str, object],
+    marker: Mapping[str, object] | None,
+) -> dict[str, str]:
+    if marker is None:
+        return _domain_reset_evidence(None)
+    performed = _domain_reset_evidence(marker)
+    recovered = _recovered_domain_reset_evidence(marker)
+    try:
+        lifecycle = _load_canonical_document(
+            artifact_root / "lifecycle.json",
+            LAUNCHD_ARTIFACT_FILES["lifecycle.json"],
+            "launchd-lifecycle",
+        )
+        _require_content_digest(lifecycle, "launchd-lifecycle")
+        _require_exact_keys(
+            lifecycle,
+            {
+                "binding",
+                "candidate_sha1",
+                "content_sha256",
+                "contract",
+                "disposition",
+                "domain_reset",
+                "kickstart_pid",
+                "label",
+                "probe_disposition",
+                "schema_version",
+            },
+            "launchd-lifecycle",
+        )
+        binding = _validated_launchd_binding_evidence(lifecycle.get("binding"))
+        if (
+            lifecycle.get("schema_version") != 2
+            or lifecycle.get("contract") != "task-witness-macos-launchd-lifecycle-v2"
+            or lifecycle.get("candidate_sha1") != EXPECTED_CANDIDATE_SHA
+            or lifecycle.get("label") != plan.label
+            or type(lifecycle.get("kickstart_pid")) is not int
+            or lifecycle["kickstart_pid"] <= 0
+            or lifecycle.get("probe_disposition") != "launchd-user-eligible"
+            or lifecycle.get("disposition") != "launchd-user-eligible"
+            or binding.get("ownership_marker") != state.get("ownership_marker")
+            or _validated_domain_reset_evidence(lifecycle.get("domain_reset"))
+            != performed
+        ):
+            return recovered
+    except ProbeError:
+        return recovered
+    return performed
+
+
+def _validate_reset_bindings_and_resources(
+    plan: LaunchdPlan,
+    state: Mapping[str, object],
+    marker: Mapping[str, object],
+    authorization_sha: object,
+    environment: Mapping[str, str],
+) -> tuple[bool, bool]:
+    _require_launchd_absent(plan.label)
+    bindings = _validate_exact_stage(
+        plan,
+        state,
+        user_domain_reset_authorization=authorization_sha,
+        environment=environment,
+    )
+    if bindings.domain_reset != marker or bindings.account is None:
+        raise ProbeError("user-domain-reset-authorization-drift")
+    account_value = bindings.account.get("account")
+    if not isinstance(account_value, dict):
+        raise ProbeError("account-binding-drift")
+    account_present = _account_exists(plan.account.name)
+    accounts = _list_accounts()
+    if account_present:
+        if accounts.get(plan.account.name) != plan.account.uid or account_value.get(
+            "generated_uid"
+        ) != _read_system_generated_uid(plan.account.name):
+            raise ProbeError("account-record-generated-uid-drift")
+    elif plan.account.name in accounts or plan.account.uid in accounts.values():
+        raise ProbeError("account-record-drift")
+    home_present = _path_exists_no_follow(plan.account.home)
+    if home_present and _exact_disposable_home_identity(
+        plan.account
+    ) != _validated_disposable_home_identity(marker.get("home_identity")):
+        raise ProbeError("home-cleanup-drift")
+    return account_present, home_present
+
+
+def _quiesce_disposable_user(
+    plan: LaunchdPlan,
+    state: Mapping[str, object],
+    bindings: ValidatedStageBindings,
+    authorization_sha: object,
+    environment: Mapping[str, str],
+    *,
+    allow_create: bool,
+) -> dict[str, str]:
+    marker = bindings.domain_reset
+    if marker is not None:
+        _validate_reset_bindings_and_resources(
+            plan,
+            state,
+            marker,
+            authorization_sha,
+            environment,
+        )
+    try:
+        _wait_for_no_uid_processes(plan.account.uid)
+    except ProbeError as error:
+        if error.code != USER_DOMAIN_RESET_SURVIVOR_CODE:
+            raise
+        if marker is None:
+            if not allow_create:
+                raise
+            marker = _write_user_domain_reset_authorization(
+                plan,
+                state,
+                bindings,
+                authorization_sha,
+                environment,
+            )
+        _validate_reset_bindings_and_resources(
+            plan,
+            state,
+            marker,
+            authorization_sha,
+            environment,
+        )
+        _run_user_domain_reset(plan.account.uid)
+        _wait_for_no_uid_processes(plan.account.uid)
+        _require_stable_no_uid_processes(plan.account.uid)
+        _validate_reset_bindings_and_resources(
+            plan,
+            state,
+            marker,
+            authorization_sha,
+            environment,
+        )
+        return _domain_reset_evidence(marker)
+    if marker is not None:
+        _require_stable_no_uid_processes(plan.account.uid)
+        _validate_reset_bindings_and_resources(
+            plan,
+            state,
+            marker,
+            authorization_sha,
+            environment,
+        )
+    return _domain_reset_evidence(marker)
+
+
 def _validate_precleanup_artifact(artifact_root: Path) -> None:
     try:
         names = {entry.name for entry in artifact_root.iterdir()}
@@ -4172,6 +4715,7 @@ def cleanup_launchd_user_lifecycle(
     expected_helper_sha256: str,
     runner_uid: int,
     runner_gid: int,
+    user_domain_reset_authorization: str | None = None,
 ) -> int:
     _normalized_context(os.environ)
     _validate_lifecycle_arguments(
@@ -4204,7 +4748,12 @@ def cleanup_launchd_user_lifecycle(
             runner_gid=runner_gid,
             environment=os.environ,
         )
-        stage_bindings = _validate_exact_stage(plan, state)
+        stage_bindings = _validate_exact_stage(
+            plan,
+            state,
+            user_domain_reset_authorization=user_domain_reset_authorization,
+            environment=os.environ,
+        )
         _reconcile_owned_launchd_job(plan, state, stage_bindings.launchd)
         account_present = _account_exists(plan.account.name)
         home_present = _path_exists_no_follow(plan.account.home)
@@ -4228,15 +4777,56 @@ def cleanup_launchd_user_lifecycle(
                 expected_uid=plan.account.uid,
                 expected_gid=plan.account.gid,
             )
-        if stage_bindings.account is not None or account_present or home_present:
-            _wait_for_no_uid_processes(plan.account.uid)
+        reset_evidence = _domain_reset_evidence(stage_bindings.domain_reset)
+        owned_user_state = (
+            stage_bindings.account is not None or account_present or home_present
+        )
+        if owned_user_state:
+            reset_evidence = _quiesce_disposable_user(
+                plan,
+                state,
+                stage_bindings,
+                user_domain_reset_authorization,
+                os.environ,
+                allow_create=False,
+            )
+        if stage_bindings.domain_reset is not None:
+            account_present, home_present = _validate_reset_bindings_and_resources(
+                plan,
+                state,
+                stage_bindings.domain_reset,
+                user_domain_reset_authorization,
+                os.environ,
+            )
+        reset_evidence = _cleanup_domain_reset_evidence(
+            artifact_root,
+            plan,
+            state,
+            stage_bindings.domain_reset,
+        )
+        if owned_user_state:
+            _require_no_uid_processes(plan.account.uid)
         if account_present:
+            current_accounts = _list_accounts()
+            current_uid = current_accounts.get(plan.account.name)
+            if (
+                (stage_bindings.launchd is not None and current_uid != plan.account.uid)
+                or (current_uid is not None and current_uid != plan.account.uid)
+                or any(
+                    name != plan.account.name and uid == plan.account.uid
+                    for name, uid in current_accounts.items()
+                )
+            ):
+                raise ProbeError("account-record-drift")
+            if _read_system_generated_uid(plan.account.name) != expected_generated_uid:
+                raise ProbeError("account-record-generated-uid-drift")
             _require_command_success(
                 ["/usr/bin/dscl", ".", "-delete", f"/Users/{plan.account.name}"],
                 command_id="account-delete",
             )
             if _account_exists(plan.account.name):
                 raise ProbeError("account-delete-disagrees")
+            _require_no_uid_processes(plan.account.uid)
         remaining_accounts = _list_accounts()
         if (
             plan.account.name in remaining_accounts
@@ -4248,6 +4838,13 @@ def cleanup_launchd_user_lifecycle(
                 else "account-record-drift"
             )
         if home_present:
+            if stage_bindings.domain_reset is not None and (
+                _exact_disposable_home_identity(plan.account)
+                != _validated_disposable_home_identity(
+                    stage_bindings.domain_reset.get("home_identity")
+                )
+            ):
+                raise ProbeError("home-cleanup-drift")
             remove_exact_disposable_home(
                 plan.account.home,
                 expected_uid=plan.account.uid,
@@ -4259,6 +4856,8 @@ def cleanup_launchd_user_lifecycle(
                 stage_names.append("account.json")
             if stage_bindings.launchd is not None:
                 stage_names.append("ownership.json")
+            if stage_bindings.domain_reset is not None:
+                stage_names.append("domain-reset.json")
             for name in stage_names:
                 (stage_root / name).unlink()
             stage_root.rmdir()
@@ -4267,12 +4866,13 @@ def cleanup_launchd_user_lifecycle(
         _validate_precleanup_artifact(artifact_root)
         cleanup = _document_with_digest(
             {
-                "schema_version": 1,
-                "contract": "task-witness-macos-launchd-cleanup-v1",
+                "schema_version": 2,
+                "contract": "task-witness-macos-launchd-cleanup-v2",
                 "candidate_sha1": EXPECTED_CANDIDATE_SHA,
                 "account": plan.account.name,
                 "label": plan.label,
                 "disposition": "cleaned",
+                "domain_reset": _validated_domain_reset_evidence(reset_evidence),
             }
         )
         _write_root_file(
@@ -4304,8 +4904,8 @@ def cleanup_launchd_user_lifecycle(
         ) and not _path_exists_no_follow(artifact_root / "cleanup.json"):
             cleanup = _document_with_digest(
                 {
-                    "schema_version": 1,
-                    "contract": "task-witness-macos-launchd-cleanup-v1",
+                    "schema_version": 2,
+                    "contract": "task-witness-macos-launchd-cleanup-v2",
                     "candidate_sha1": EXPECTED_CANDIDATE_SHA,
                     "disposition": "preserved-on-drift",
                     "error": _validated_probe_error(
@@ -4437,6 +5037,7 @@ def parser() -> argparse.ArgumentParser:
     lifecycle.add_argument("--artifact-root", required=True, type=Path)
     lifecycle.add_argument("--runner-uid", required=True, type=int)
     lifecycle.add_argument("--runner-gid", required=True, type=int)
+    lifecycle.add_argument("--user-domain-reset-authorization", required=True)
 
     cleanup = subparsers.add_parser("cleanup-launchd-user-lifecycle")
     cleanup.add_argument("--expected-helper-sha256", required=True)
@@ -4444,6 +5045,7 @@ def parser() -> argparse.ArgumentParser:
     cleanup.add_argument("--artifact-root", required=True, type=Path)
     cleanup.add_argument("--runner-uid", required=True, type=int)
     cleanup.add_argument("--runner-gid", required=True, type=int)
+    cleanup.add_argument("--user-domain-reset-authorization", required=True)
 
     launchd_manifest = subparsers.add_parser("write-launchd-artifact-manifest")
     launchd_manifest.add_argument("--artifact-root", required=True, type=Path)
@@ -4502,6 +5104,7 @@ def main() -> int:
                 candidate_sha=args.candidate_sha,
                 runner_uid=args.runner_uid,
                 runner_gid=args.runner_gid,
+                user_domain_reset_authorization=(args.user_domain_reset_authorization),
             )
         if args.command == "cleanup-launchd-user-lifecycle":
             return cleanup_launchd_user_lifecycle(
@@ -4510,6 +5113,7 @@ def main() -> int:
                 expected_helper_sha256=args.expected_helper_sha256,
                 runner_uid=args.runner_uid,
                 runner_gid=args.runner_gid,
+                user_domain_reset_authorization=(args.user_domain_reset_authorization),
             )
         if args.command == "write-launchd-artifact-manifest":
             write_launchd_artifact_manifest(args.artifact_root, args.output)

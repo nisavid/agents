@@ -140,6 +140,107 @@ class TaskWitnessMacOSHostProbeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.helper = load_helper()
 
+    def test_root_directory_normalizes_macos_parent_group_inheritance(self) -> None:
+        path = Path("/private/tmp/task-witness-macos-launchd-user-probe")
+        state = {"gid": 20, "mode": 0o600}
+
+        def lstat() -> SimpleNamespace:
+            return SimpleNamespace(
+                st_dev=7,
+                st_gid=state["gid"],
+                st_ino=11,
+                st_mode=stat.S_IFDIR | state["mode"],
+                st_nlink=2,
+                st_uid=0,
+            )
+
+        def fchown(descriptor: int, uid: int, gid: int) -> None:
+            self.assertEqual((descriptor, uid, gid), (42, 0, 0))
+            state["gid"] = 0
+
+        def fchmod(descriptor: int, mode: int) -> None:
+            self.assertEqual((descriptor, mode), (42, 0o700))
+            state["mode"] = mode
+
+        with (
+            mock.patch.object(
+                Path,
+                "mkdir",
+                side_effect=AssertionError("path-based mkdir is not identity-bound"),
+            ),
+            mock.patch.object(
+                self.helper.os,
+                "chown",
+                side_effect=AssertionError("path-based chown is not identity-bound"),
+            ),
+            mock.patch.object(self.helper.os, "open", side_effect=[41, 42]) as opened,
+            mock.patch.object(self.helper.os, "mkdir") as mkdir,
+            mock.patch.object(self.helper.os, "fstat", side_effect=lambda _fd: lstat()),
+            mock.patch.object(self.helper.os, "fchown", side_effect=fchown),
+            mock.patch.object(self.helper.os, "fchmod", side_effect=fchmod),
+            mock.patch.object(
+                self.helper.os, "stat", side_effect=lambda *_a, **_k: lstat()
+            ),
+            mock.patch.object(self.helper.os, "close") as close,
+        ):
+            self.helper._create_root_directory(path, 0o700)
+
+        self.assertEqual(opened.call_args_list[0].args[0], path.parent)
+        self.assertEqual(opened.call_args_list[1].args[0], path.name)
+        mkdir.assert_called_once_with(path.name, 0o700, dir_fd=41)
+        self.assertEqual(state, {"gid": 0, "mode": 0o700})
+        self.assertCountEqual(close.call_args_list, [mock.call(42), mock.call(41)])
+
+    def test_root_directory_failure_rolls_back_only_the_created_identity(self) -> None:
+        path = Path("/private/tmp/task-witness-macos-launchd-user-probe")
+
+        def metadata(inode: int) -> SimpleNamespace:
+            return SimpleNamespace(
+                st_dev=7,
+                st_gid=20,
+                st_ino=inode,
+                st_mode=stat.S_IFDIR | 0o700,
+                st_nlink=2,
+                st_uid=0,
+            )
+
+        for label, visible_inode, expected_error, removes in (
+            ("same-created-directory", 11, "directory-create-new-failed", True),
+            ("substituted-directory", 12, "directory-create-new-preserved", False),
+        ):
+            with (
+                self.subTest(label=label),
+                mock.patch.object(self.helper.os, "open", side_effect=[41, 42]),
+                mock.patch.object(self.helper.os, "mkdir"),
+                mock.patch.object(
+                    self.helper.os,
+                    "fstat",
+                    side_effect=lambda _fd: metadata(11),
+                ),
+                mock.patch.object(
+                    self.helper.os,
+                    "fchown",
+                    side_effect=OSError("synthetic normalization failure"),
+                ),
+                mock.patch.object(
+                    self.helper.os,
+                    "stat",
+                    side_effect=lambda *_a, _inode=visible_inode, **_k: metadata(
+                        _inode
+                    ),
+                ),
+                mock.patch.object(self.helper.os, "listdir", return_value=[]),
+                mock.patch.object(self.helper.os, "rmdir") as rmdir,
+                mock.patch.object(self.helper.os, "close"),
+                self.assertRaisesRegex(self.helper.ProbeError, expected_error),
+            ):
+                self.helper._create_root_directory(path, 0o700)
+
+            if removes:
+                rmdir.assert_called_once_with(path.name, dir_fd=41)
+            else:
+                rmdir.assert_not_called()
+
     def test_eligible_direct_session_emits_only_a_probe_claim(self) -> None:
         document = self.helper.build_probe_document(
             FROZEN_CANDIDATE_SHA,

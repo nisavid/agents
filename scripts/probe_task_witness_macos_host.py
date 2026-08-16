@@ -1910,19 +1910,125 @@ def _path_exists_no_follow(path: Path) -> bool:
     return True
 
 
-def _create_root_directory(path: Path, mode: int) -> None:
+def _same_directory_identity(
+    metadata: os.stat_result,
+    identity: tuple[int, int],
+) -> bool:
+    return (
+        stat.S_ISDIR(metadata.st_mode)
+        and (
+            metadata.st_dev,
+            metadata.st_ino,
+        )
+        == identity
+    )
+
+
+def _rollback_created_root_directory(
+    *,
+    parent_descriptor: int,
+    directory_descriptor: int,
+    name: str,
+    created_metadata: os.stat_result | None,
+    requested_mode: int,
+) -> bool:
+    if directory_descriptor < 0 or created_metadata is None:
+        return False
+    identity = (created_metadata.st_dev, created_metadata.st_ino)
+
+    def removable(metadata: os.stat_result) -> bool:
+        return (
+            _same_directory_identity(metadata, identity)
+            and metadata.st_uid == 0
+            and metadata.st_gid in {created_metadata.st_gid, 0}
+            and stat.S_IMODE(metadata.st_mode)
+            in {stat.S_IMODE(created_metadata.st_mode), requested_mode}
+        )
+
     try:
-        path.mkdir(mode=mode)
-    except OSError as error:
+        if not removable(os.fstat(directory_descriptor)) or not removable(
+            os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        ):
+            return False
+        if os.listdir(directory_descriptor):
+            return False
+        if not removable(os.fstat(directory_descriptor)) or not removable(
+            os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        ):
+            return False
+        os.rmdir(name, dir_fd=parent_descriptor)
+    except OSError:
+        return False
+    return True
+
+
+def _create_root_directory(path: Path, mode: int) -> None:
+    parent_descriptor = -1
+    directory_descriptor = -1
+    created = False
+    created_metadata: os.stat_result | None = None
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        parent_descriptor = os.open(path.parent, flags)
+        os.mkdir(path.name, mode, dir_fd=parent_descriptor)
+        created = True
+        directory_descriptor = os.open(
+            path.name,
+            flags,
+            dir_fd=parent_descriptor,
+        )
+        created_metadata = os.fstat(directory_descriptor)
+        if not stat.S_ISDIR(created_metadata.st_mode) or created_metadata.st_uid != 0:
+            raise ProbeError("directory-create-new-disagrees")
+        identity = (created_metadata.st_dev, created_metadata.st_ino)
+        os.fchown(directory_descriptor, 0, 0)
+        os.fchmod(directory_descriptor, mode)
+        normalized = os.fstat(directory_descriptor)
+        visible = os.stat(
+            path.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not _same_directory_identity(normalized, identity)
+            or not _same_directory_identity(visible, identity)
+            or stat.S_IMODE(normalized.st_mode) != mode
+            or normalized.st_uid != 0
+            or normalized.st_gid != 0
+            or (
+                visible.st_mode,
+                visible.st_uid,
+                visible.st_gid,
+            )
+            != (
+                normalized.st_mode,
+                normalized.st_uid,
+                normalized.st_gid,
+            )
+        ):
+            raise ProbeError("directory-create-new-disagrees")
+    except (OSError, ProbeError) as error:
+        if created and not _rollback_created_root_directory(
+            parent_descriptor=parent_descriptor,
+            directory_descriptor=directory_descriptor,
+            name=path.name,
+            created_metadata=created_metadata,
+            requested_mode=mode,
+        ):
+            raise ProbeError("directory-create-new-preserved") from error
+        if isinstance(error, ProbeError):
+            raise
         raise ProbeError("directory-create-new-failed") from error
-    if not _metadata_matches(
-        path,
-        kind="directory",
-        mode=mode,
-        uid=0,
-        gid=0,
-    ):
-        raise ProbeError("directory-create-new-disagrees")
+    finally:
+        if directory_descriptor >= 0:
+            os.close(directory_descriptor)
+        if parent_descriptor >= 0:
+            os.close(parent_descriptor)
 
 
 def _account_record(account: DisposableAccount) -> dict[str, list[str]]:

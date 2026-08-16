@@ -53,6 +53,7 @@ DISPOSABLE_UID_MAX = 599
 DSCL_UID_MIN = -(1 << 31)
 DSCL_UID_MAX = (1 << 31) - 1
 DSCL_UID_RE = re.compile(r"(?:0|[1-9][0-9]*|-[1-9][0-9]*)")
+DSCL_ATTRIBUTE_PREFIXES = ("dsAttrTypeNative:", "dsAttrTypeStandard:")
 DISABLED_PASSWORD_WRITE_MARKER = "*"
 DISABLED_PASSWORD_READBACK_MARKER = "********"
 LAUNCHD_ACCOUNT_RE = re.compile(r"twq-[0-9a-f]{12}")
@@ -1060,7 +1061,12 @@ def parse_dscl_record(raw: str) -> dict[str, list[str]]:
                 raise ProbeError("account-record-invalid")
             record[current].append(line.strip())
             continue
-        name, separator, value = line.partition(":")
+        for prefix in DSCL_ATTRIBUTE_PREFIXES:
+            if line.startswith(prefix):
+                name, separator, value = line[len(prefix) :].partition(":")
+                break
+        else:
+            name, separator, value = line.partition(":")
         if not separator or not name or name in record:
             raise ProbeError("account-record-invalid")
         current = name

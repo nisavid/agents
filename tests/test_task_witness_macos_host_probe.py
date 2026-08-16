@@ -1732,6 +1732,31 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             )
             self.assertIsNone(raised.exception.secondary_code)
 
+    def test_dscl_record_parser_normalizes_qualified_attribute_names(self) -> None:
+        self.assertEqual(
+            self.helper.parse_dscl_record(
+                "AuthenticationAuthority: ;DisabledUser;\n"
+                "dsAttrTypeNative:IsHidden: 1\n"
+            ),
+            {
+                "AuthenticationAuthority": [";DisabledUser;"],
+                "IsHidden": ["1"],
+            },
+        )
+        for label, raw in (
+            (
+                "duplicate-normalized-name",
+                "IsHidden: 1\ndsAttrTypeNative:IsHidden: 1\n",
+            ),
+            ("empty-qualified-name", "dsAttrTypeNative:: 1\n"),
+        ):
+            with (
+                self.subTest(label=label),
+                self.assertRaises(self.helper.ProbeError) as raised,
+            ):
+                self.helper.parse_dscl_record(raw)
+            self.assertEqual(raised.exception.code, "account-record-invalid")
+
     def test_launchctl_terminal_parser_rejects_timeout_respawn_and_pid_drift(
         self,
     ) -> None:
@@ -2875,7 +2900,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             (
                 "AuthenticationAuthority: ;DisabledUser;",
                 f"GeneratedUID: {system_generated_uid}",
-                "IsHidden: 1",
+                "dsAttrTypeNative:IsHidden: 1",
                 f"NFSHomeDirectory: {account.home}",
                 "Password: ********",
                 "PrimaryGroupID: 20",

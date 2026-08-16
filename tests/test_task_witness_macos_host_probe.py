@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 import os
+import plistlib
 import re
 import stat
 import subprocess
@@ -900,20 +901,6 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
         )
 
     def launchctl_job(self, plan: object, state: dict[str, object]) -> str:
-        arguments = [
-            "/usr/bin/python3",
-            "-I",
-            "-B",
-            str(plan.helper),
-            "probe-launchd-user",
-            "--candidate-sha",
-            FROZEN_CANDIDATE_SHA,
-            "--output",
-            str(plan.account.home / "launchd-probe/probe.json"),
-            "--status-output",
-            str(plan.account.home / "launchd-probe/probe.status"),
-        ]
-        argument_lines = "\n".join(f"\t\t{item}" for item in arguments)
         plist = self.helper.build_launchd_user_plist(
             label=plan.label,
             user=plan.account.name,
@@ -923,6 +910,8 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             environment=self.launchd_context(),
             ownership_marker=state["ownership_marker"],
         )
+        arguments = plist["ProgramArguments"]
+        argument_lines = "\n".join(f"\t\t{item}" for item in arguments)
         environment = plist["EnvironmentVariables"]
         environment_lines = "\n".join(
             f"\t\t{name} => {value}" for name, value in sorted(environment.items())
@@ -932,7 +921,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             "\tactive count = 0\n"
             f"\tpath = {plan.plist}\n"
             "\tstate = not running\n\n"
-            "\tprogram = /usr/bin/python3\n"
+            f"\tprogram = {plist['Program']}\n"
             "\targuments = {\n"
             f"{argument_lines}\n"
             "\t}\n\n"
@@ -1039,7 +1028,6 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             environment=context,
             ownership_marker=marker,
         )["EnvironmentVariables"]
-        child_environment["XPC_SERVICE_NAME"] = context["TASK_WITNESS_LAUNCHD_LABEL"]
 
         for sudo_status, expected in ((0, True), (1, False)):
             completed = SimpleNamespace(returncode=sudo_status)
@@ -1176,7 +1164,6 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             environment=context,
             ownership_marker=marker,
         )["EnvironmentVariables"]
-        child_environment["XPC_SERVICE_NAME"] = context["TASK_WITNESS_LAUNCHD_LABEL"]
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory) / "launchd-probe"
@@ -1246,13 +1233,6 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             home=home,
             ownership_marker=marker,
         )
-        with_xpc = {**expected, "XPC_SERVICE_NAME": label}
-        self.helper._require_exact_launchd_child_environment(
-            with_xpc,
-            label=label,
-            home=home,
-            ownership_marker=marker,
-        )
 
         mutations = {
             "missing": {
@@ -1260,7 +1240,16 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             },
             "altered": {**expected, "HOME": "/Users/foreign"},
             "extra": {**expected, "UNEXPECTED_SECRET": "must-not-cross"},
-            "wrong-xpc": {**expected, "XPC_SERVICE_NAME": "foreign"},
+            "launchd-xpc-name": {**expected, "XPC_SERVICE_NAME": label},
+            "launchd-xpc-flags": {**expected, "XPC_FLAGS": "0x0"},
+            "launchd-user": {**expected, "USER": account_name},
+            "launchd-logname": {**expected, "LOGNAME": account_name},
+            "launchd-shell": {**expected, "SHELL": "/usr/bin/false"},
+            "launchd-tmpdir": {**expected, "TMPDIR": "/private/var/folders/x"},
+            "launchd-cf-encoding": {
+                **expected,
+                "__CF_USER_TEXT_ENCODING": "0x1F6:0x0:0x0",
+            },
         }
         for label_name, mutation in mutations.items():
             with (
@@ -1276,6 +1265,287 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                     home=home,
                     ownership_marker=marker,
                 )
+
+    def test_launchd_program_scrubs_inherited_environment_before_python(
+        self,
+    ) -> None:
+        context = self.launchd_context()
+        marker = "3" * 32
+        account_name, label = self.helper._launchd_identity(context)
+        home = Path("/Users") / account_name
+        helper = Path("/private/var/tmp/task-witness-probe/helper.py")
+        plist = self.helper.build_launchd_user_plist(
+            label=label,
+            user=account_name,
+            home=home,
+            helper=helper,
+            candidate_sha=FROZEN_CANDIDATE_SHA,
+            environment=context,
+            ownership_marker=marker,
+        )
+
+        self.assertEqual(plist["Program"], "/usr/bin/env")
+        self.assertEqual(
+            plist["ProgramArguments"],
+            [
+                "/usr/bin/env",
+                "-i",
+                "/usr/bin/python3",
+                "-I",
+                "-B",
+                str(helper),
+                "probe-launchd-user",
+                "--candidate-sha",
+                FROZEN_CANDIDATE_SHA,
+                "--output",
+                str(home / "launchd-probe/probe.json"),
+                "--status-output",
+                str(home / "launchd-probe/probe.status"),
+            ],
+        )
+        self.assertNotIn("/bin/sh", plist["ProgramArguments"])
+        self.assertNotIn("-S", plist["ProgramArguments"])
+        self.assertNotIn("-P", plist["ProgramArguments"])
+
+        expected_environment = dict(plist["EnvironmentVariables"])
+        raw = plistlib.dumps(plist, fmt=plistlib.FMT_XML, sort_keys=True)
+        self.assertEqual(
+            self.helper._validated_launchd_child_environment_from_plist(
+                raw,
+                helper,
+            ),
+            expected_environment,
+        )
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"UNEXPECTED_SECRET": "must-not-cross"},
+                clear=True,
+            ),
+            mock.patch.object(
+                self.helper,
+                "_load_staged_launchd_child_environment",
+                return_value=expected_environment,
+            ) as load_environment,
+        ):
+            self.helper._prepare_launchd_child_environment(helper)
+            self.assertEqual(dict(os.environ), expected_environment)
+        load_environment.assert_called_once_with(helper)
+
+        mutations = {}
+        extra_environment = json.loads(json.dumps(plist))
+        extra_environment["EnvironmentVariables"]["UNEXPECTED_SECRET"] = (
+            "must-not-cross"
+        )
+        mutations["extra-environment"] = extra_environment
+        wrong_program = json.loads(json.dumps(plist))
+        wrong_program["Program"] = "/usr/bin/python3"
+        mutations["wrong-program"] = wrong_program
+        wrong_helper = json.loads(json.dumps(plist))
+        wrong_helper["ProgramArguments"][5] = "/private/var/tmp/foreign/helper.py"
+        mutations["wrong-helper"] = wrong_helper
+        wrong_candidate = json.loads(json.dumps(plist))
+        wrong_candidate["ProgramArguments"][8] = "0" * 40
+        mutations["wrong-candidate"] = wrong_candidate
+        for label_name, mutation in mutations.items():
+            with (
+                self.subTest(label=label_name),
+                self.assertRaises(self.helper.ProbeError) as raised,
+            ):
+                self.helper._validated_launchd_child_environment_from_plist(
+                    plistlib.dumps(
+                        mutation,
+                        fmt=plistlib.FMT_XML,
+                        sort_keys=True,
+                    ),
+                    helper,
+                )
+            self.assertEqual(
+                raised.exception.code,
+                "launchd-child-environment-invalid",
+            )
+            self.assertNotIn("must-not-cross", str(raised.exception))
+
+    def test_launchd_probe_cli_prepares_the_scrubbed_environment_first(
+        self,
+    ) -> None:
+        output = Path("/Users/twq-test/launchd-probe/probe.json")
+        status_output = Path("/Users/twq-test/launchd-probe/probe.status")
+        arguments = SimpleNamespace(
+            command="probe-launchd-user",
+            candidate_sha=FROZEN_CANDIDATE_SHA,
+            output=output,
+            status_output=status_output,
+        )
+        events = []
+        parser = mock.Mock()
+        parser.parse_args.return_value = arguments
+        with (
+            mock.patch.object(self.helper, "parser", return_value=parser),
+            mock.patch.object(
+                self.helper,
+                "_prepare_launchd_child_environment",
+                side_effect=lambda helper: events.append(("prepare", helper)),
+            ) as prepare,
+            mock.patch.object(
+                self.helper,
+                "run_launchd_user_probe",
+                side_effect=lambda *args: events.append(("run", args)) or 0,
+            ) as run,
+        ):
+            self.assertEqual(self.helper.main(), 0)
+
+        prepare.assert_called_once_with(Path(self.helper.__file__))
+        run.assert_called_once_with(output, status_output, FROZEN_CANDIDATE_SHA)
+        self.assertEqual([event[0] for event in events], ["prepare", "run"])
+
+    def test_staged_launchd_environment_requires_each_root_owned_component(
+        self,
+    ) -> None:
+        helper = Path("/private/var/tmp/task-witness-macos-launchd-123-1/helper.py")
+        stage_root = helper.parent
+        plist = stage_root / "job.plist"
+        expected_calls = [
+            mock.call(
+                stage_root,
+                kind="directory",
+                mode=0o755,
+                uid=0,
+                gid=0,
+            ),
+            mock.call(
+                helper,
+                kind="file",
+                mode=0o555,
+                uid=0,
+                gid=0,
+                nlink=1,
+            ),
+            mock.call(
+                plist,
+                kind="file",
+                mode=0o644,
+                uid=0,
+                gid=0,
+                nlink=1,
+            ),
+        ]
+        cases = {
+            "stage-root": [False],
+            "helper": [True, False],
+            "plist": [True, True, False],
+        }
+        for label, metadata_results in cases.items():
+            with (
+                self.subTest(label=label),
+                mock.patch.object(
+                    self.helper,
+                    "_metadata_matches",
+                    side_effect=metadata_results,
+                ) as metadata_matches,
+                mock.patch.object(
+                    self.helper,
+                    "_read_stable_regular_file",
+                ) as read_plist,
+                self.assertRaises(self.helper.ProbeError) as raised,
+            ):
+                self.helper._load_staged_launchd_child_environment(helper)
+            self.assertEqual(
+                raised.exception.code,
+                "launchd-child-environment-invalid",
+            )
+            self.assertEqual(
+                metadata_matches.call_args_list,
+                expected_calls[: len(metadata_results)],
+            )
+            read_plist.assert_not_called()
+
+    def test_staged_launchd_environment_rejects_unsafe_plist_before_scrub(
+        self,
+    ) -> None:
+        context = self.launchd_context()
+        marker = "3" * 32
+        account_name, label = self.helper._launchd_identity(context)
+        home = Path("/Users") / account_name
+        cases = ("symlink", "hardlink", "drift")
+
+        for case in cases:
+            with tempfile.TemporaryDirectory() as directory, self.subTest(case=case):
+                stage_root = Path(directory)
+                helper = stage_root / "helper.py"
+                helper.write_bytes(b"trusted helper")
+                raw = plistlib.dumps(
+                    self.helper.build_launchd_user_plist(
+                        label=label,
+                        user=account_name,
+                        home=home,
+                        helper=helper,
+                        candidate_sha=FROZEN_CANDIDATE_SHA,
+                        environment=context,
+                        ownership_marker=marker,
+                    ),
+                    fmt=plistlib.FMT_XML,
+                    sort_keys=True,
+                )
+                target = stage_root / "target.plist"
+                target.write_bytes(raw)
+                plist = stage_root / "job.plist"
+                if case == "symlink":
+                    plist.symlink_to(target.name)
+                elif case == "hardlink":
+                    os.link(target, plist)
+                else:
+                    plist.write_bytes(raw)
+
+                original_fstat = os.fstat
+                fstat_calls = 0
+
+                def changed_fstat(
+                    descriptor: int,
+                    original=original_fstat,
+                    active_case=case,
+                ) -> object:
+                    nonlocal fstat_calls
+                    result = original(descriptor)
+                    fstat_calls += 1
+                    if active_case != "drift" or fstat_calls != 2:
+                        return result
+                    return SimpleNamespace(
+                        st_dev=result.st_dev,
+                        st_gid=result.st_gid,
+                        st_ino=result.st_ino,
+                        st_mode=result.st_mode,
+                        st_mtime_ns=result.st_mtime_ns + 1,
+                        st_nlink=result.st_nlink,
+                        st_size=result.st_size,
+                        st_uid=result.st_uid,
+                    )
+
+                expected_code = {
+                    "symlink": "unreadable-staged-plist",
+                    "hardlink": "unsafe-staged-plist",
+                    "drift": "changed-staged-plist",
+                }[case]
+                with (
+                    mock.patch.dict(
+                        os.environ,
+                        {"UNEXPECTED_SECRET": "must-remain-on-failure"},
+                        clear=True,
+                    ),
+                    mock.patch.object(
+                        self.helper,
+                        "_metadata_matches",
+                        return_value=True,
+                    ),
+                    mock.patch.object(os, "fstat", side_effect=changed_fstat),
+                ):
+                    with self.assertRaises(self.helper.ProbeError) as raised:
+                        self.helper._prepare_launchd_child_environment(helper)
+                    self.assertEqual(raised.exception.code, expected_code)
+                    self.assertEqual(
+                        dict(os.environ),
+                        {"UNEXPECTED_SECRET": "must-remain-on-failure"},
+                    )
 
     def test_each_launchd_child_boundary_fails_closed(self) -> None:
         cases: dict[str, tuple[str, object]] = {
@@ -1381,7 +1651,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             ownership_marker="3" * 32,
         )
 
-        self.assertEqual(plist["Program"], "/usr/bin/python3")
+        self.assertEqual(plist["Program"], "/usr/bin/env")
         self.assertEqual(plist["UserName"], "twq-0123456789ab")
         self.assertTrue(plist["InitGroups"])
         self.assertNotIn("GroupName", plist)
@@ -1394,8 +1664,10 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             "3" * 32,
         )
         self.assertEqual(
-            plist["ProgramArguments"][:4],
+            plist["ProgramArguments"][:6],
             [
+                "/usr/bin/env",
+                "-i",
                 "/usr/bin/python3",
                 "-I",
                 "-B",
@@ -1639,19 +1911,40 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
     ) -> None:
         raw = (
             "0 1 0 1 Ss launchd\n"
+            "0 200 1 200 Ss mds\n"
+            "0 201 1 201 Ss rootbroker\n"
             "-2 0 0 0 I kernel_task\n"
             "4294967294 2 1 2 S nobody\n"
+            "700 210 1 210 S broker-private-name\n"
             "502 120 1 120 S cfprefsd\n"
             "503 130 1 130 S distnoted\n"
             "504 140 1 140 Z launchd\n"
             "505 150 1 150 S unrelated-private-name\n"
             "506 160 1 160 S first\n"
-            "506 161 1 161 S second"
+            "506 161 1 161 S second\n"
+            "507 170 200 170 S mdworker_shared\n"
+            "508 180 201 180 S root-child-private-name\n"
+            "509 190 210 190 S other-child-private-name\n"
+            "510 195 999 195 S orphan-private-name"
         )
         records = self.helper.parse_process_list(raw)
         self.assertEqual(
             self.helper.process_occupied_uids(records),
-            {-2, 0, 502, 503, 504, 505, 506, 4294967294},
+            {
+                -2,
+                0,
+                502,
+                503,
+                504,
+                505,
+                506,
+                507,
+                508,
+                509,
+                510,
+                700,
+                4294967294,
+            },
         )
         expected_codes = {
             502: "disposable-user-cfprefsd-name-remains",
@@ -1659,6 +1952,10 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             504: "disposable-user-zombie-only-remains",
             505: "disposable-user-pid1-parented-process-remains",
             506: "disposable-user-multiple-processes-remain",
+            507: "disposable-user-spotlight-worker-remains",
+            508: "disposable-user-root-parented-process-remains",
+            509: "disposable-user-other-uid-parented-process-remains",
+            510: "disposable-user-parent-unobserved-process-remains",
         }
         for uid, expected_code in expected_codes.items():
             with self.subTest(uid=uid):
@@ -1666,8 +1963,11 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                     self.helper._process_survivor_code(records, uid),
                     expected_code,
                 )
-        self.assertIsNone(self.helper._process_survivor_code(records, 507))
+        self.assertIsNone(self.helper._process_survivor_code(records, 511))
         self.assertNotIn("unrelated-private-name", str(expected_codes))
+        self.assertNotIn("root-child-private-name", str(expected_codes))
+        self.assertNotIn("other-child-private-name", str(expected_codes))
+        self.assertNotIn("orphan-private-name", str(expected_codes))
 
         with mock.patch.object(
             self.helper,
@@ -2195,7 +2495,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 self.helper.verify_launchd_success(root)
 
             path_line = f"\tpath = {plan.plist}\n"
-            program_line = "\tprogram = /usr/bin/python3\n"
+            program_line = "\tprogram = /usr/bin/env\n"
             user_line = f"\tusername = {plan.account.name}\n"
             domain_line = "\tdomain = system\n"
             arguments = self.helper._expected_launchd_program_arguments(plan)
@@ -4321,7 +4621,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 marker,
             ),
             "foreign-program": (
-                owned.replace("program = /usr/bin/python3", "program = /bin/false"),
+                owned.replace("program = /usr/bin/env", "program = /bin/false"),
                 marker,
             ),
             "foreign-argument": (

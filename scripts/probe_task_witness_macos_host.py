@@ -134,9 +134,13 @@ DISPOSABLE_PROCESS_REMAINS_CODES = frozenset(
         "disposable-user-distnoted-name-remains",
         "disposable-user-launchd-name-remains",
         "disposable-user-multiple-processes-remain",
+        "disposable-user-other-uid-parented-process-remains",
+        "disposable-user-parent-unobserved-process-remains",
         "disposable-user-pid1-parented-process-remains",
         "disposable-user-probe-name-remains",
         "disposable-user-process-observation-unstable",
+        "disposable-user-root-parented-process-remains",
+        "disposable-user-spotlight-worker-remains",
         "disposable-user-unclassified-process-remains",
         "disposable-user-zombie-only-remains",
     }
@@ -907,8 +911,10 @@ def build_launchd_user_plist(
         "ExitTimeOut": 5,
         "InitGroups": True,
         "Label": label,
-        "Program": "/usr/bin/python3",
+        "Program": "/usr/bin/env",
         "ProgramArguments": [
+            "/usr/bin/env",
+            "-i",
             "/usr/bin/python3",
             "-I",
             "-B",
@@ -976,9 +982,94 @@ def _require_exact_launchd_child_environment(
         home=home,
         ownership_marker=ownership_marker,
     )
-    with_xpc = {**expected, "XPC_SERVICE_NAME": label}
-    if dict(environment) not in (expected, with_xpc):
+    if dict(environment) != expected:
         raise ProbeError("launchd-child-environment-invalid")
+
+
+def _validated_launchd_child_environment_from_plist(
+    raw: bytes,
+    helper: Path,
+) -> dict[str, str]:
+    if (
+        not isinstance(raw, bytes)
+        or len(raw) > 64 * 1024
+        or not helper.is_absolute()
+        or helper.name != "helper.py"
+    ):
+        raise ProbeError("launchd-child-environment-invalid")
+    try:
+        value = plistlib.loads(raw)
+    except (plistlib.InvalidFileException, ValueError, TypeError) as error:
+        raise ProbeError("launchd-child-environment-invalid") from error
+    if not isinstance(value, dict):
+        raise ProbeError("launchd-child-environment-invalid")
+    environment = value.get("EnvironmentVariables")
+    if not isinstance(environment, dict) or any(
+        not isinstance(name, str) or not isinstance(item, str)
+        for name, item in environment.items()
+    ):
+        raise ProbeError("launchd-child-environment-invalid")
+    try:
+        account_name, label = _launchd_identity(environment)
+        marker = _require_string(
+            environment.get("TASK_WITNESS_LAUNCHD_OWNERSHIP_MARKER"),
+            "launchd-ownership-marker",
+            64,
+        )
+        home = Path("/Users") / account_name
+        expected = build_launchd_user_plist(
+            label=label,
+            user=account_name,
+            home=home,
+            helper=helper,
+            candidate_sha=EXPECTED_CANDIDATE_SHA,
+            environment=environment,
+            ownership_marker=marker,
+        )
+    except ProbeError as error:
+        raise ProbeError("launchd-child-environment-invalid") from error
+    if value != expected:
+        raise ProbeError("launchd-child-environment-invalid")
+    return dict(expected["EnvironmentVariables"])
+
+
+def _load_staged_launchd_child_environment(helper: Path) -> dict[str, str]:
+    stage_root = helper.parent
+    plist = stage_root / "job.plist"
+    if (
+        not _metadata_matches(
+            stage_root,
+            kind="directory",
+            mode=0o755,
+            uid=0,
+            gid=0,
+        )
+        or not _metadata_matches(
+            helper,
+            kind="file",
+            mode=0o555,
+            uid=0,
+            gid=0,
+            nlink=1,
+        )
+        or not _metadata_matches(
+            plist,
+            kind="file",
+            mode=0o644,
+            uid=0,
+            gid=0,
+            nlink=1,
+        )
+    ):
+        raise ProbeError("launchd-child-environment-invalid")
+    raw = _read_stable_regular_file(plist, 64 * 1024, "staged-plist")
+    return _validated_launchd_child_environment_from_plist(raw, helper)
+
+
+def _prepare_launchd_child_environment(helper: Path) -> None:
+    environment = _load_staged_launchd_child_environment(helper)
+    os.environ.clear()
+    os.environ.update(environment)
 
 
 def choose_disposable_uid(occupied: set[int]) -> int:
@@ -3130,6 +3221,8 @@ def _launchctl_block_values(
 def _expected_launchd_program_arguments(plan: LaunchdPlan) -> list[str]:
     probe_root = plan.account.home / "launchd-probe"
     return [
+        "/usr/bin/env",
+        "-i",
         "/usr/bin/python3",
         "-I",
         "-B",
@@ -3166,7 +3259,7 @@ def _validated_launchd_job_snapshot(
     structure = _parse_launchctl_job_structure(raw, plan.label)
     if (
         _launchctl_top_value(structure, "path") != str(plan.plist)
-        or _launchctl_top_value(structure, "program") != "/usr/bin/python3"
+        or _launchctl_top_value(structure, "program") != "/usr/bin/env"
         or _launchctl_top_value(structure, "username") != plan.account.name
         or _launchctl_top_value(structure, "domain") != "system"
         or list(_launchctl_block_values(structure, "arguments"))
@@ -3239,7 +3332,7 @@ def _validated_launchd_job_snapshot(
         f"\tactive count = {active_count}\n"
         f"\tpath = {plan.plist}\n"
         f"\tstate = {state_value}\n\n"
-        "\tprogram = /usr/bin/python3\n"
+        "\tprogram = /usr/bin/env\n"
         "\targuments = {\n"
         f"{argument_lines}\n"
         "\t}\n\n"
@@ -3889,6 +3982,21 @@ def _process_survivor_code(
         return "disposable-user-probe-name-remains"
     if record.ppid == 1:
         return "disposable-user-pid1-parented-process-remains"
+    by_pid = {item.pid: item for item in records}
+    parent = by_pid.get(record.ppid)
+    parent_command = "" if parent is None else Path(parent.command).name.lower()
+    if command in {"mdworker", "mdworker_shared", "mdworker_sizing"} or (
+        parent is not None
+        and parent.uid == 0
+        and parent_command in {"mds", "mds_stores"}
+    ):
+        return "disposable-user-spotlight-worker-remains"
+    if parent is None:
+        return "disposable-user-parent-unobserved-process-remains"
+    if parent.uid == 0:
+        return "disposable-user-root-parented-process-remains"
+    if parent.uid != uid:
+        return "disposable-user-other-uid-parented-process-remains"
     return "disposable-user-unclassified-process-remains"
 
 
@@ -4262,6 +4370,7 @@ def main() -> int:
             verify_artifact_manifest(args.artifact_root, args.manifest)
             return 0
         if args.command == "probe-launchd-user":
+            _prepare_launchd_child_environment(Path(__file__))
             return run_launchd_user_probe(
                 args.output,
                 args.status_output,

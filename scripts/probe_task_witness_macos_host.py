@@ -4613,8 +4613,8 @@ def _validate_reset_bindings_and_resources(
             != 1
         ):
             raise ProbeError("account-record-drift")
-        if account_value.get("generated_uid") != _read_system_generated_uid(
-            plan.account.name
+        if account_value.get("generated_uid") != _validated_system_generated_uid(
+            _account_record(plan.account)
         ):
             raise ProbeError("account-record-generated-uid-drift")
     elif plan.account.name in accounts or plan.account.uid in accounts.values():
@@ -4815,19 +4815,38 @@ def cleanup_launchd_user_lifecycle(
         if owned_user_state:
             _require_no_uid_processes(plan.account.uid)
         if account_present:
-            current_accounts = _list_accounts()
-            current_uid = current_accounts.get(plan.account.name)
-            if (
-                (stage_bindings.launchd is not None and current_uid != plan.account.uid)
-                or (current_uid is not None and current_uid != plan.account.uid)
-                or any(
-                    name != plan.account.name and uid == plan.account.uid
-                    for name, uid in current_accounts.items()
+            if stage_bindings.domain_reset is not None:
+                current_account_present, home_present = (
+                    _validate_reset_bindings_and_resources(
+                        plan,
+                        state,
+                        stage_bindings.domain_reset,
+                        user_domain_reset_authorization,
+                        os.environ,
+                    )
                 )
-            ):
-                raise ProbeError("account-record-drift")
-            if _read_system_generated_uid(plan.account.name) != expected_generated_uid:
-                raise ProbeError("account-record-generated-uid-drift")
+                if not current_account_present:
+                    raise ProbeError("account-record-drift")
+            else:
+                current_accounts = _list_accounts()
+                current_uid = current_accounts.get(plan.account.name)
+                if (
+                    (
+                        stage_bindings.launchd is not None
+                        and current_uid != plan.account.uid
+                    )
+                    or (current_uid is not None and current_uid != plan.account.uid)
+                    or any(
+                        name != plan.account.name and uid == plan.account.uid
+                        for name, uid in current_accounts.items()
+                    )
+                ):
+                    raise ProbeError("account-record-drift")
+                if (
+                    _read_system_generated_uid(plan.account.name)
+                    != expected_generated_uid
+                ):
+                    raise ProbeError("account-record-generated-uid-drift")
             _require_command_success(
                 ["/usr/bin/dscl", ".", "-delete", f"/Users/{plan.account.name}"],
                 command_id="account-delete",

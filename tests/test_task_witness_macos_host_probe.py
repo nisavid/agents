@@ -6431,6 +6431,168 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             delete.assert_not_called()
             self.assertTrue(stage.is_dir())
 
+    def test_cleanup_revalidates_full_record_before_marker_bound_delete(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stage = root / "stage"
+            stage.mkdir()
+            for name in (
+                "helper.py",
+                "job.plist",
+                "state.json",
+                "account.json",
+                "ownership.json",
+                "domain-reset.json",
+            ):
+                (stage / name).write_bytes(f"exact-{name}".encode())
+            artifact = root / "artifact"
+            artifact.mkdir()
+            plan = self.lifecycle_plan(stage)
+            state = self.lifecycle_state(plan)
+            generated_uid = "01234567-89AB-4DEF-8123-456789ABCDEF"
+            account = self.helper._account_binding_document(
+                plan,
+                state,
+                generated_uid,
+            )
+            ownership = self.helper._launchd_ownership_document(plan, state)
+            marker = {
+                "content_sha256": "4" * 64,
+                "home_identity": {
+                    "home_device": 1,
+                    "home_inode": 2,
+                    "probe_device": 1,
+                    "probe_inode": 3,
+                },
+            }
+            bindings = self.helper.ValidatedStageBindings(
+                account,
+                ownership,
+                marker,
+            )
+            with ExitStack() as stack:
+                stack.enter_context(
+                    mock.patch.dict(os.environ, eligible_context(), clear=True)
+                )
+                for name in (
+                    "_normalized_context",
+                    "_validate_lifecycle_arguments",
+                    "_reconcile_owned_launchd_job",
+                    "_wait_for_no_uid_processes",
+                    "_require_stable_no_uid_processes",
+                    "_require_no_uid_processes",
+                    "_validate_precleanup_artifact",
+                    "_write_root_file",
+                    "launchd_artifact_payloads",
+                ):
+                    stack.enter_context(mock.patch.object(self.helper, name))
+                stack.enter_context(
+                    mock.patch.object(
+                        self.helper,
+                        "_cleanup_helper_only_stage_before_state",
+                        return_value=False,
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        self.helper,
+                        "_load_lifecycle_state",
+                        return_value=(plan, state),
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        self.helper,
+                        "_validate_exact_stage",
+                        return_value=bindings,
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        self.helper,
+                        "_account_exists",
+                        side_effect=[True, False],
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        self.helper,
+                        "_path_exists_no_follow",
+                        return_value=False,
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        self.helper,
+                        "_read_system_generated_uid",
+                        return_value=generated_uid,
+                    )
+                )
+                validate = stack.enter_context(
+                    mock.patch.object(
+                        self.helper,
+                        "_validate_reset_bindings_and_resources",
+                        side_effect=[
+                            (True, False),
+                            (True, False),
+                            (True, False),
+                            self.helper.ProbeError("account-record-home-drift"),
+                        ],
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        self.helper,
+                        "_cleanup_domain_reset_evidence",
+                        return_value=self.helper._recovered_domain_reset_evidence(
+                            marker
+                        ),
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        self.helper,
+                        "_list_accounts",
+                        side_effect=[
+                            {plan.account.name: plan.account.uid},
+                            {},
+                        ],
+                    )
+                )
+                delete = stack.enter_context(
+                    mock.patch.object(
+                        self.helper,
+                        "_require_command_success",
+                        return_value="",
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        self.helper,
+                        "_metadata_matches",
+                        return_value=False,
+                    )
+                )
+                stack.enter_context(mock.patch.object(self.helper.os, "chown"))
+                self.assertEqual(
+                    self.helper.cleanup_launchd_user_lifecycle(
+                        stage_root=stage,
+                        artifact_root=artifact,
+                        expected_helper_sha256="1" * 64,
+                        runner_uid=501,
+                        runner_gid=20,
+                        user_domain_reset_authorization=(
+                            eligible_context()["GITHUB_SHA"]
+                        ),
+                    ),
+                    2,
+                )
+            self.assertEqual(validate.call_count, 4)
+            delete.assert_not_called()
+            self.assertTrue(stage.is_dir())
+
     def test_cleanup_revalidates_home_identity_immediately_before_removal(
         self,
     ) -> None:
@@ -8727,14 +8889,7 @@ raise SystemExit(93)
                             mock.patch.object(
                                 self.helper,
                                 "_list_accounts",
-                                side_effect=(
-                                    [
-                                        {plan.account.name: plan.account.uid},
-                                        {},
-                                    ]
-                                    if account_present
-                                    else [{}]
-                                ),
+                                return_value={},
                             )
                         )
                         stack.enter_context(
@@ -8792,19 +8947,19 @@ raise SystemExit(93)
                     )
                     self.assertFalse(stage.exists())
                     arm.assert_not_called()
-                    self.assertEqual(
-                        events,
-                        [
-                            "binding",
-                            "wait",
-                            "binding",
-                            "reset",
-                            "wait",
-                            "stable-zero",
-                            "binding",
-                            "binding",
-                        ],
-                    )
+                    expected_events = [
+                        "binding",
+                        "wait",
+                        "binding",
+                        "reset",
+                        "wait",
+                        "stable-zero",
+                        "binding",
+                        "binding",
+                    ]
+                    if account_present:
+                        expected_events.append("binding")
+                    self.assertEqual(events, expected_events)
                     self.assertEqual(
                         command.call_count,
                         int(account_present),
@@ -8853,6 +9008,16 @@ raise SystemExit(93)
         }
         marker = {"content_sha256": "4" * 64, "home_identity": identity}
         bindings = self.helper.ValidatedStageBindings(account, ownership, marker)
+        exact_record = {
+            "AuthenticationAuthority": [";DisabledUser;"],
+            "GeneratedUID": [generated_uid],
+            "IsHidden": ["1"],
+            "NFSHomeDirectory": [str(plan.account.home)],
+            "Password": ["*"],
+            "PrimaryGroupID": [str(plan.account.gid)],
+            "UniqueID": [str(plan.account.uid)],
+            "UserShell": ["/usr/bin/false"],
+        }
         for account_present, home_present in (
             (True, True),
             (True, False),
@@ -8884,9 +9049,9 @@ raise SystemExit(93)
                 ),
                 mock.patch.object(
                     self.helper,
-                    "_read_system_generated_uid",
-                    return_value=generated_uid,
-                ) as read_guid,
+                    "_account_record",
+                    return_value=exact_record,
+                ) as read_record,
                 mock.patch.object(
                     self.helper,
                     "_path_exists_no_follow",
@@ -8908,7 +9073,7 @@ raise SystemExit(93)
                     ),
                     (account_present, home_present),
                 )
-            self.assertEqual(read_guid.call_count, int(account_present))
+            self.assertEqual(read_record.call_count, int(account_present))
             self.assertEqual(read_home.call_count, int(home_present))
 
         with (
@@ -8958,8 +9123,8 @@ raise SystemExit(93)
             ),
             mock.patch.object(
                 self.helper,
-                "_read_system_generated_uid",
-                return_value=generated_uid,
+                "_account_record",
+                return_value=exact_record,
             ),
             mock.patch.object(
                 self.helper,
@@ -9051,6 +9216,81 @@ raise SystemExit(93)
             )
         self.assertEqual(raised.exception.code, "account-record-drift")
         reset.assert_not_called()
+
+    def test_reset_rejects_mutable_account_drift_before_bootout(self) -> None:
+        plan = self.lifecycle_plan(Path("/private/var/tmp/stage"))
+        state = self.lifecycle_state(plan)
+        generated_uid = "01234567-89AB-4DEF-8123-456789ABCDEF"
+        account = self.helper._account_binding_document(plan, state, generated_uid)
+        ownership = self.helper._launchd_ownership_document(plan, state)
+        identity = {
+            "home_device": 1,
+            "home_inode": 2,
+            "probe_device": 1,
+            "probe_inode": 3,
+        }
+        marker = {"content_sha256": "4" * 64, "home_identity": identity}
+        bindings = self.helper.ValidatedStageBindings(account, ownership, marker)
+        for code in ("account-record-home-drift", "account-record-gid-drift"):
+            with (
+                self.subTest(code=code),
+                mock.patch.object(self.helper, "_require_launchd_absent"),
+                mock.patch.object(
+                    self.helper,
+                    "_validate_exact_stage",
+                    return_value=bindings,
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_account_exists",
+                    return_value=True,
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_list_accounts",
+                    return_value={plan.account.name: plan.account.uid},
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_account_record",
+                    side_effect=self.helper.ProbeError(code),
+                ) as account_record,
+                mock.patch.object(
+                    self.helper,
+                    "_read_system_generated_uid",
+                    return_value=generated_uid,
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_path_exists_no_follow",
+                    return_value=True,
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_exact_disposable_home_identity",
+                    return_value=identity,
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_wait_for_no_uid_processes",
+                    side_effect=self.helper.ProbeError(
+                        "disposable-user-pid1-parented-processes-remain"
+                    ),
+                ),
+                mock.patch.object(self.helper, "_run_user_domain_reset") as reset,
+                self.assertRaises(self.helper.ProbeError) as raised,
+            ):
+                self.helper._quiesce_disposable_user(
+                    plan,
+                    state,
+                    bindings,
+                    eligible_context()["GITHUB_SHA"],
+                    eligible_context(),
+                    allow_create=False,
+                )
+            self.assertEqual(raised.exception.code, code)
+            account_record.assert_called_once_with(plan.account)
+            reset.assert_not_called()
 
     def test_cleanup_reset_evidence_requires_exact_eligible_lifecycle(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

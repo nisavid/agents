@@ -39,6 +39,7 @@ from hindsight_memory_control_plane.operation_recovery_runtime import (  # noqa:
     ExactDrainWorkerMainShutdownBridge,
     SAFE_OPERATION_QUERY,
     apply_requeue_transaction,
+    apply_post_abort_recovery_transaction,
     assert_connected_live_database,
     connect_verified_local_postgres,
     exact_drain_worker_interpreter_path,
@@ -5677,6 +5678,111 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
                             },
                         )
                     )
+
+    def test_post_abort_v10_retry_postcondition_reads_the_selected_row(self):
+        before = {
+            "operation_id": "00000000-0000-4000-8000-000000000001",
+            "bank_id": "engineering",
+            "operation_type": "retain",
+            "status": "failed",
+            "created_at": "2026-07-29T12:00:00.000000Z",
+            "updated_at": "2026-07-29T13:00:00.000000Z",
+            "completed_at": "2026-07-29T13:00:00.000000Z",
+            "retry_count": 3,
+            "next_retry_at": None,
+            "worker_id_present": True,
+            "worker_id_digest": "d" * 64,
+            "claimed_at": "2026-07-29T12:30:00.000000Z",
+            "task_payload_present": True,
+            "task_payload_digest": "a" * 64,
+            "result_metadata_digest": "b" * 64,
+            "error_category": "provider_capacity",
+            "error_digest": "c" * 64,
+        }
+        after = {
+            **before,
+            "status": "pending",
+            "updated_at": "2026-07-30T16:00:00.000000Z",
+            "completed_at": None,
+            "retry_count": 0,
+            "next_retry_at": None,
+            "worker_id_present": False,
+            "worker_id_digest": None,
+            "claimed_at": None,
+            "error_category": "none",
+            "error_digest": None,
+        }
+
+        class PostAbortConnection(FakeConnection):
+            def __init__(self):
+                super().__init__()
+                self.fetchval_results = [123, 0, False, 124]
+                self.fetch_results = [[before], [after]]
+
+            async def fetchval(self, query, *arguments):
+                if "set_config" in query:
+                    return arguments[-1]
+                return self.fetchval_results.pop(0)
+
+            async def fetch(self, query, *arguments):
+                self.fetch_calls.append((query, arguments))
+                return self.fetch_results.pop(0)
+
+            async def execute(self, query, *arguments):
+                return "UPDATE 1"
+
+        selected = {
+            "operation_id": before["operation_id"],
+            "operation_type": "retain",
+            "expected_status": "failed",
+            "row_digest": live_row_digest(before),
+            "task_payload_digest": before["task_payload_digest"],
+        }
+        plan = {
+            "schema_version": 10,
+            "pre_generation": "systalyze:public:123",
+            "selected_operations": [selected],
+            "live_snapshot": {
+                "operations": [
+                    {
+                        "operation_id": before["operation_id"],
+                        "row_digest": live_row_digest(before),
+                    }
+                ]
+            },
+            "retry_recovery": {
+                "operations": [
+                    {
+                        "operation_id": before["operation_id"],
+                        "retry_count_before": 3,
+                        "retry_count_after": 0,
+                        "reset_applied": True,
+                    }
+                ]
+            },
+            "reference_worker_id_digest": before["worker_id_digest"],
+            "transaction_timeout_seconds": 120,
+            "expires_at": int(time.time()) + 60,
+        }
+        with patch.object(
+            operation_recovery_runtime,
+            "verify_post_abort_recovery_plan",
+            side_effect=lambda value: value,
+        ):
+            generations = asyncio.run(
+                apply_post_abort_recovery_transaction(
+                    PostAbortConnection(),
+                    profile_id="systalyze",
+                    schema="public",
+                    bank_id="engineering",
+                    plan=plan,
+                )
+            )
+
+        self.assertEqual(
+            generations,
+            ("systalyze:public:123", "systalyze:public:124"),
+        )
 
     def test_rollback_reconciles_claimed_selected_preimage(self):
         restored = {

@@ -7166,7 +7166,7 @@ async def apply_post_abort_recovery_transaction(
                 )
             retry_recovery = retry_by_id.get(operation_id)
             if retry_recovery is not None and (
-                before["retry_count"]
+                prior["retry_count"]
                 != retry_recovery["retry_count_before"]
                 or after["retry_count"]
                 != retry_recovery["retry_count_after"]

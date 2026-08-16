@@ -10,14 +10,18 @@ import hashlib
 import json
 import os
 import platform
+import plistlib
 import pwd
 import re
 import stat
 import subprocess
 import sys
 import tempfile
+import time
+import uuid
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import NamedTuple
 
 EXPECTED_CANDIDATE_SHA = "b47f03519068b858cf0c070b5d331ee053ef6b7b"
 EXPECTED_REPOSITORY = "nisavid/agents"
@@ -35,7 +39,25 @@ MAX_STDERR_BYTES = 64 * 1024
 MAX_MANIFEST_BYTES = 4 * 1024
 MAX_ARTIFACT_BYTES = 256 * 1024
 MAX_COMMAND_OUTPUT_BYTES = 4 * 1024
+MAX_HELPER_BYTES = 256 * 1024
+MAX_OWNERSHIP_BYTES = 4 * 1024
+MAX_PROCESS_LIST_BYTES = 64 * 1024
 COMMAND_TIMEOUT_SECONDS = 10
+LAUNCHD_POLL_INTERVAL_SECONDS = 0.25
+LAUNCHD_POLL_TIMEOUT_SECONDS = 30
+LAUNCHD_PRINT_MAX_BYTES = 16 * 1024
+LAUNCHCTL_NOT_FOUND_STATUS = 113
+DISPOSABLE_UID_MIN = 502
+DISPOSABLE_UID_MAX = 599
+DSCL_UID_MIN = -(1 << 31)
+DSCL_UID_MAX = (1 << 31) - 1
+DSCL_UID_RE = re.compile(r"(?:0|[1-9][0-9]*|-[1-9][0-9]*)")
+LAUNCHD_ACCOUNT_RE = re.compile(r"twq-[0-9a-f]{12}")
+LAUNCHD_LABEL_RE = re.compile(r"io\.nisavid\.task-witness\.macos-probe\.[0-9a-f]{12}")
+LAUNCHD_OWNERSHIP_MARKER_RE = re.compile(r"[0-9a-f]{32}")
+LAUNCHD_STAGE_RE = re.compile(
+    r"/private/var/tmp/task-witness-macos-launchd-[1-9][0-9]*-[1-9][0-9]*"
+)
 
 ARTIFACT_FILES = {
     "probe.json": MAX_PROBE_JSON_BYTES,
@@ -43,10 +65,39 @@ ARTIFACT_FILES = {
     "probe.stderr": MAX_STDERR_BYTES,
     "probe.stdout": MAX_STDOUT_BYTES,
 }
+LAUNCHD_CHILD_FILES = {
+    "probe.json": MAX_PROBE_JSON_BYTES,
+    "probe.status": 16,
+    "probe.stderr": MAX_STDERR_BYTES,
+    "probe.stdout": MAX_STDOUT_BYTES,
+}
+LAUNCHD_ARTIFACT_FILES = {
+    "cleanup.json": 16 * 1024,
+    "launchd.loaded": LAUNCHD_PRINT_MAX_BYTES,
+    "launchd.terminal": LAUNCHD_PRINT_MAX_BYTES,
+    "lifecycle.json": 16 * 1024,
+    "lifecycle.status": 16,
+    **LAUNCHD_CHILD_FILES,
+}
 PROVISIONING_TOOLS = (
     ("dscl", "/usr/bin/dscl"),
     ("launchctl", "/bin/launchctl"),
     ("sysadminctl", "/usr/sbin/sysadminctl"),
+)
+LAUNCHD_CONTEXT_NAMES = (
+    "GITHUB_EVENT_NAME",
+    "GITHUB_REF",
+    "GITHUB_REPOSITORY",
+    "GITHUB_RUN_ATTEMPT",
+    "GITHUB_RUN_ID",
+    "GITHUB_SHA",
+    "GITHUB_WORKFLOW_REF",
+    "GITHUB_WORKFLOW_SHA",
+    "ImageOS",
+    "ImageVersion",
+    "RUNNER_ARCH",
+    "RUNNER_ENVIRONMENT",
+    "RUNNER_OS",
 )
 
 
@@ -56,6 +107,33 @@ class ProbeError(Exception):
     def __init__(self, code: str) -> None:
         super().__init__(code)
         self.code = code
+
+
+class DisposableAccount(NamedTuple):
+    name: str
+    uid: int
+    gid: int
+    home: Path
+    generated_uid: str
+
+
+class LaunchdPlan(NamedTuple):
+    account: DisposableAccount
+    label: str
+    stage_root: Path
+    helper: Path
+    plist: Path
+
+
+class LaunchctlJobStructure(NamedTuple):
+    top_values: dict[str, tuple[str, ...]]
+    top_blocks: dict[str, tuple[tuple[str, ...], ...]]
+    block_values: tuple[tuple[tuple[str, ...], str], ...]
+
+
+class ValidatedLaunchdJobSnapshot(NamedTuple):
+    binding: dict[str, str]
+    sanitized: str
 
 
 def canonical_bytes(value: object) -> bytes:
@@ -511,6 +589,497 @@ def build_probe_error_document(
     return document
 
 
+def _validated_launchd_observations(value: object) -> dict:
+    observations = _require_exact_keys(
+        value,
+        {
+            "credentials",
+            "environment_exact",
+            "home",
+            "passwordless_sudo",
+            "platform",
+            "process",
+        },
+        "launchd-observations",
+    )
+    base = _validated_observations(
+        {
+            "credentials": observations["credentials"],
+            "home": observations["home"],
+            "platform": observations["platform"],
+            "provisioning_capability": {
+                "passwordless_sudo": False,
+                "tools": [
+                    {"available": False, "id": tool_id, "path": tool_path}
+                    for tool_id, tool_path in PROVISIONING_TOOLS
+                ],
+            },
+        }
+    )
+    process_value = _require_exact_keys(
+        observations["process"],
+        {"label", "parent_path", "pid", "ppid"},
+        "launchd-process-observation",
+    )
+    parent_path = _require_string(
+        process_value["parent_path"],
+        "launchd-parent-path",
+        4096,
+    )
+    if not parent_path.startswith("/"):
+        raise ProbeError("invalid-launchd-parent-path")
+    process = {
+        "pid": _require_nonnegative_integer(process_value["pid"], "launchd-pid"),
+        "ppid": _require_nonnegative_integer(process_value["ppid"], "launchd-ppid"),
+        "parent_path": parent_path,
+        "label": _require_string(process_value["label"], "launchd-label", 256),
+    }
+    return {
+        "platform": base["platform"],
+        "credentials": base["credentials"],
+        "home": base["home"],
+        "environment_exact": _require_boolean(
+            observations["environment_exact"],
+            "launchd-environment-exact",
+        ),
+        "passwordless_sudo": _require_boolean(
+            observations["passwordless_sudo"],
+            "launchd-passwordless-sudo",
+        ),
+        "process": process,
+    }
+
+
+def build_launchd_user_probe_document(
+    candidate_sha: str,
+    environment: Mapping[str, str],
+    observations: object,
+) -> dict:
+    if candidate_sha != EXPECTED_CANDIDATE_SHA:
+        raise ProbeError("candidate-sha-disagrees")
+    harness, runner = _normalized_context(environment)
+    expected_label = _require_string(
+        environment.get("TASK_WITNESS_LAUNCHD_LABEL"),
+        "launchd-label",
+        256,
+    )
+    if LAUNCHD_LABEL_RE.fullmatch(expected_label) is None:
+        raise ProbeError("invalid-launchd-label")
+    observed = _validated_launchd_observations(observations)
+    credentials = observed["credentials"]
+    passwd_value = credentials["passwd"]
+    home = observed["home"]
+    process = observed["process"]
+    platform_value = observed["platform"]
+    requirements = {
+        "admin_absent": credentials["admin_member"] is False,
+        "child_environment_exact": observed["environment_exact"] is True,
+        "credentials_equal": (
+            credentials["real_uid"] == credentials["effective_uid"]
+            and credentials["real_gid"] == credentials["effective_gid"]
+        ),
+        "direct_launchd_parent": (
+            process["pid"] > 1
+            and process["ppid"] == 1
+            and Path(process["parent_path"]).name == "launchd"
+            and process["label"] == expected_label
+        ),
+        "github_hosted": runner["environment"] == "github-hosted",
+        "group_views_agree": (
+            credentials["supplementary_gids"] == credentials["passwd_group_gids"]
+        ),
+        "home_apfs": home["filesystem_type"].lower() == "apfs",
+        "home_directory": home["kind"] == "directory",
+        "home_group_is_primary": home["gid"] == credentials["effective_gid"],
+        "home_mode_0700": home["mode"] == 0o700,
+        "home_owned_by_effective_uid": home["uid"] == credentials["effective_uid"],
+        "home_symlink_free": home["symlink_components"] == [],
+        "issetugid_false": credentials["issetugid"] is False,
+        "native_darwin_arm64": (
+            platform_value["system"] == "darwin"
+            and platform_value["machine"] == "arm64"
+        ),
+        "no_container_indicators": not any(
+            platform_value["container_indicators"].values()
+        ),
+        "nonroot_primary_gids": (
+            credentials["real_gid"] != 0
+            and credentials["effective_gid"] != 0
+            and passwd_value["primary_gid"] != 0
+            and home["gid"] != 0
+        ),
+        "nonroot_uid": credentials["effective_uid"] != 0,
+        "not_translated": platform_value["translated"] is False,
+        "passwd_backed_identity": (
+            bool(passwd_value["name"])
+            and passwd_value["uid"] == credentials["effective_uid"]
+            and passwd_value["primary_gid"] == credentials["effective_gid"]
+            and passwd_value["home"] == home["path"]
+            and passwd_value["shell"] == "/usr/bin/false"
+        ),
+        "passwordless_sudo_absent": observed["passwordless_sudo"] is False,
+        "root_group_absent": (
+            0 not in credentials["supplementary_gids"]
+            and 0 not in credentials["passwd_group_gids"]
+        ),
+        "runner_arch_arm64": runner["arch"] == "ARM64",
+        "runner_os_macos": runner["os"] == "macOS",
+    }
+    disposition = (
+        "launchd-user-eligible"
+        if all(requirements.values())
+        else "launchd-user-ineligible"
+    )
+    unsigned = {
+        "schema_version": 1,
+        "contract": "task-witness-macos-github-launchd-user-probe-v1",
+        "claim": "host-prerequisite-probe-only",
+        "candidate_sha1": candidate_sha,
+        "harness": harness,
+        "runner": runner,
+        "observations": observed,
+        "requirements": requirements,
+        "disposition": disposition,
+    }
+    document = {
+        **unsigned,
+        "content_sha256": hashlib.sha256(canonical_bytes(unsigned)).hexdigest(),
+    }
+    if len(canonical_bytes(document)) > MAX_PROBE_JSON_BYTES:
+        raise ProbeError("probe-json-too-large")
+    return document
+
+
+def build_launchd_user_probe_error_document(
+    candidate_sha: str,
+    environment: Mapping[str, str],
+    error_code: str,
+) -> dict:
+    if candidate_sha != EXPECTED_CANDIDATE_SHA:
+        raise ProbeError("candidate-sha-disagrees")
+    harness, runner = _normalized_context(environment)
+    code = _require_string(error_code, "probe-error-code", 128)
+    if re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", code) is None:
+        raise ProbeError("invalid-probe-error-code")
+    unsigned = {
+        "schema_version": 1,
+        "contract": "task-witness-macos-github-launchd-user-probe-v1",
+        "claim": "host-prerequisite-probe-only",
+        "candidate_sha1": candidate_sha,
+        "harness": harness,
+        "runner": runner,
+        "observations": None,
+        "requirements": None,
+        "disposition": "probe-error",
+        "error": {"code": code},
+    }
+    return {
+        **unsigned,
+        "content_sha256": hashlib.sha256(canonical_bytes(unsigned)).hexdigest(),
+    }
+
+
+def build_launchd_user_plist(
+    *,
+    label: str,
+    user: str,
+    home: Path,
+    helper: Path,
+    candidate_sha: str,
+    environment: Mapping[str, str],
+    ownership_marker: str,
+) -> dict:
+    _normalized_context(environment)
+    if (
+        LAUNCHD_LABEL_RE.fullmatch(label) is None
+        or environment.get("TASK_WITNESS_LAUNCHD_LABEL") != label
+    ):
+        raise ProbeError("invalid-launchd-label")
+    if LAUNCHD_ACCOUNT_RE.fullmatch(user) is None:
+        raise ProbeError("invalid-launchd-user")
+    if (
+        not home.is_absolute()
+        or home != Path("/Users") / user
+        or not helper.is_absolute()
+        or helper.name == ""
+    ):
+        raise ProbeError("invalid-launchd-path")
+    if candidate_sha != EXPECTED_CANDIDATE_SHA:
+        raise ProbeError("candidate-sha-disagrees")
+    if LAUNCHD_OWNERSHIP_MARKER_RE.fullmatch(ownership_marker) is None:
+        raise ProbeError("invalid-launchd-ownership-marker")
+    probe_root = home / "launchd-probe"
+    child_environment = _expected_launchd_child_environment(
+        environment,
+        label=label,
+        home=home,
+        ownership_marker=ownership_marker,
+    )
+    return {
+        "AbandonProcessGroup": False,
+        "EnvironmentVariables": child_environment,
+        "ExitTimeOut": 5,
+        "InitGroups": True,
+        "Label": label,
+        "Program": "/usr/bin/python3",
+        "ProgramArguments": [
+            "/usr/bin/python3",
+            "-I",
+            "-B",
+            str(helper),
+            "probe-launchd-user",
+            "--candidate-sha",
+            candidate_sha,
+            "--output",
+            str(probe_root / "probe.json"),
+            "--status-output",
+            str(probe_root / "probe.status"),
+        ],
+        "StandardErrorPath": str(probe_root / "probe.stderr"),
+        "StandardOutPath": str(probe_root / "probe.stdout"),
+        "Umask": 0o077,
+        "UserName": user,
+        "WorkingDirectory": str(home),
+    }
+
+
+def _expected_launchd_child_environment(
+    environment: Mapping[str, str],
+    *,
+    label: str,
+    home: Path,
+    ownership_marker: str,
+) -> dict[str, str]:
+    _normalized_context(environment)
+    if (
+        LAUNCHD_LABEL_RE.fullmatch(label) is None
+        or not home.is_absolute()
+        or LAUNCHD_OWNERSHIP_MARKER_RE.fullmatch(ownership_marker) is None
+    ):
+        raise ProbeError("launchd-child-environment-invalid")
+    expected = {name: environment[name] for name in LAUNCHD_CONTEXT_NAMES}
+    expected.update(
+        {
+            "HOME": str(home),
+            "LANG": "C",
+            "LC_ALL": "C",
+            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+            "TASK_WITNESS_LAUNCHD_LABEL": label,
+            "TASK_WITNESS_LAUNCHD_OWNERSHIP_MARKER": ownership_marker,
+            "TZ": "UTC",
+        }
+    )
+    if any(
+        not isinstance(value, str) or any(character in value for character in "\0\r\n")
+        for value in expected.values()
+    ):
+        raise ProbeError("launchd-child-environment-invalid")
+    return expected
+
+
+def _require_exact_launchd_child_environment(
+    environment: Mapping[str, str],
+    *,
+    label: str,
+    home: Path,
+    ownership_marker: str,
+) -> None:
+    expected = _expected_launchd_child_environment(
+        environment,
+        label=label,
+        home=home,
+        ownership_marker=ownership_marker,
+    )
+    with_xpc = {**expected, "XPC_SERVICE_NAME": label}
+    if dict(environment) not in (expected, with_xpc):
+        raise ProbeError("launchd-child-environment-invalid")
+
+
+def choose_disposable_uid(occupied: set[int]) -> int:
+    if any(
+        type(value) is not int or not DSCL_UID_MIN <= value <= DSCL_UID_MAX
+        for value in occupied
+    ):
+        raise ProbeError("invalid-occupied-uids")
+    for candidate in range(DISPOSABLE_UID_MIN, DISPOSABLE_UID_MAX + 1):
+        if candidate not in occupied:
+            return candidate
+    raise ProbeError("uid-range-exhausted")
+
+
+def require_exact_account_record(
+    record: Mapping[str, Sequence[str]],
+    expected: DisposableAccount,
+) -> None:
+    required = {
+        "AuthenticationAuthority": [";DisabledUser;"],
+        "GeneratedUID": [expected.generated_uid],
+        "IsHidden": ["1"],
+        "NFSHomeDirectory": [str(expected.home)],
+        "Password": ["*"],
+        "PrimaryGroupID": [str(expected.gid)],
+        "UniqueID": [str(expected.uid)],
+        "UserShell": ["/usr/bin/false"],
+    }
+    if any(list(record.get(name, ())) != values for name, values in required.items()):
+        raise ProbeError("account-record-drift")
+
+
+def parse_dscl_record(raw: str) -> dict[str, list[str]]:
+    if len(raw.encode("utf-8")) > MAX_COMMAND_OUTPUT_BYTES:
+        raise ProbeError("account-record-too-large")
+    record: dict[str, list[str]] = {}
+    current: str | None = None
+    for line in raw.splitlines():
+        if line.startswith(" "):
+            if current is None or not line.strip():
+                raise ProbeError("account-record-invalid")
+            record[current].append(line.strip())
+            continue
+        name, separator, value = line.partition(":")
+        if not separator or not name or name in record:
+            raise ProbeError("account-record-invalid")
+        current = name
+        record[name] = value.strip().split() if value.strip() else []
+    if not record:
+        raise ProbeError("account-record-invalid")
+    return record
+
+
+def parse_launchctl_terminal(raw: str, *, expected_status: int) -> dict[str, object]:
+    if len(raw.encode("utf-8")) > LAUNCHD_PRINT_MAX_BYTES:
+        raise ProbeError("launchctl-print-too-large")
+    if re.search(r"(?m)^\s*pid\s*=", raw):
+        raise ProbeError("launchd-job-still-running")
+
+    def exact_field(name: str) -> str:
+        escaped = re.escape(name)
+        top_level = re.findall(rf"(?m)^\t{escaped} = ([^\r\n]*)$", raw)
+        if len(top_level) != 1:
+            raise ProbeError("launchctl-terminal-invalid")
+        return top_level[0]
+
+    active_count = exact_field("active count")
+    state = exact_field("state")
+    runs_raw = exact_field("runs")
+    exit_raw = exact_field("last exit code")
+    if (
+        active_count != "0"
+        or state != "not running"
+        or re.fullmatch(r"[0-9]+", runs_raw) is None
+        or re.fullmatch(r"-?[0-9]+", exit_raw) is None
+    ):
+        raise ProbeError("launchctl-terminal-invalid")
+    runs = int(runs_raw)
+    last_exit_code = int(exit_raw)
+    if runs != 1:
+        raise ProbeError("launchd-job-respawned")
+    if last_exit_code != expected_status:
+        raise ProbeError("launchd-exit-status-disagrees")
+    return {
+        "last_exit_code": last_exit_code,
+        "runs": runs,
+        "state": state,
+    }
+
+
+def launchd_artifact_payloads(
+    artifact_root: Path,
+    *,
+    include_manifest: bool,
+) -> dict[str, bytes]:
+    expected_names = set(LAUNCHD_ARTIFACT_FILES)
+    if include_manifest:
+        expected_names.add("SHA256SUMS")
+    try:
+        root_metadata = artifact_root.lstat()
+        observed_names = {entry.name for entry in artifact_root.iterdir()}
+    except OSError as error:
+        raise ProbeError("launchd-artifact-root-unreadable") from error
+    if not stat.S_ISDIR(root_metadata.st_mode) or artifact_root.is_symlink():
+        raise ProbeError("launchd-artifact-root-unsafe")
+    if observed_names != expected_names:
+        raise ProbeError("launchd-artifact-file-set-disagrees")
+    payloads = {
+        name: _bounded_regular_file(
+            artifact_root / name,
+            maximum,
+            name.replace(".", "-"),
+        )
+        for name, maximum in LAUNCHD_ARTIFACT_FILES.items()
+    }
+    if payloads["probe.status"] not in {b"0\n", b"1\n", b"2\n"}:
+        raise ProbeError("probe-status-invalid")
+    if payloads["lifecycle.status"] not in {b"0\n", b"1\n", b"2\n"}:
+        raise ProbeError("lifecycle-status-invalid")
+    if sum(len(raw) for raw in payloads.values()) > MAX_ARTIFACT_BYTES:
+        raise ProbeError("launchd-artifact-too-large")
+    return payloads
+
+
+def remove_exact_disposable_home(
+    home: Path,
+    *,
+    expected_uid: int,
+    expected_gid: int,
+) -> None:
+    _validate_exact_disposable_home(
+        home,
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
+    )
+    probe_root = home / "launchd-probe"
+    try:
+        for name in sorted(LAUNCHD_CHILD_FILES):
+            (probe_root / name).unlink()
+        probe_root.rmdir()
+        home.rmdir()
+    except OSError as error:
+        raise ProbeError("home-cleanup-failed") from error
+
+
+def _validate_exact_disposable_home(
+    home: Path,
+    *,
+    expected_uid: int,
+    expected_gid: int,
+) -> None:
+    expected_files = set(LAUNCHD_CHILD_FILES)
+    probe_root = home / "launchd-probe"
+    try:
+        home_metadata = home.lstat()
+        probe_metadata = probe_root.lstat()
+        names = {entry.name for entry in probe_root.iterdir()}
+    except OSError as error:
+        raise ProbeError("home-cleanup-drift") from error
+    if (
+        not stat.S_ISDIR(home_metadata.st_mode)
+        or stat.S_IMODE(home_metadata.st_mode) != 0o700
+        or home_metadata.st_uid != expected_uid
+        or home_metadata.st_gid != expected_gid
+        or not stat.S_ISDIR(probe_metadata.st_mode)
+        or stat.S_IMODE(probe_metadata.st_mode) != 0o700
+        or probe_metadata.st_uid != expected_uid
+        or probe_metadata.st_gid != expected_gid
+        or names != expected_files
+    ):
+        raise ProbeError("home-cleanup-drift")
+    for name in sorted(expected_files):
+        path = probe_root / name
+        try:
+            metadata = path.lstat()
+        except OSError as error:
+            raise ProbeError("home-cleanup-drift") from error
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_uid != expected_uid
+            or metadata.st_gid != expected_gid
+            or metadata.st_size > LAUNCHD_CHILD_FILES[name]
+        ):
+            raise ProbeError("home-cleanup-drift")
+
+
 def _run_bounded_command(argv: Sequence[str]) -> tuple[int, str, str]:
     try:
         process = subprocess.run(
@@ -543,6 +1112,34 @@ def _run_bounded_command(argv: Sequence[str]) -> tuple[int, str, str]:
 def _command_value(argv: Sequence[str]) -> str:
     status, stdout, _stderr = _run_bounded_command(argv)
     return stdout if status == 0 else ""
+
+
+def _passwordless_sudo_available() -> bool:
+    try:
+        process = subprocess.run(
+            ["/usr/bin/sudo", "-n", "/usr/bin/true"],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=COMMAND_TIMEOUT_SECONDS,
+            env={
+                "HOME": "/var/empty",
+                "LANG": "C",
+                "LC_ALL": "C",
+                "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+                "TZ": "UTC",
+            },
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise ProbeError("passwordless-sudo-probe-failed") from error
+    try:
+        returncode = process.returncode
+    except AttributeError as error:
+        raise ProbeError("passwordless-sudo-probe-failed") from error
+    if type(returncode) is not int or not 0 <= returncode <= 255:
+        raise ProbeError("passwordless-sudo-probe-failed")
+    return returncode == 0
 
 
 def _darwin_issetugid(system: str) -> bool | None:
@@ -625,7 +1222,7 @@ def _path_symlink_components(path: Path) -> list[str]:
     return symlink_components
 
 
-def collect_observations() -> dict:
+def collect_observations(*, include_provisioning: bool = True) -> dict:
     system = platform.system().lower()
     machine = _normalize_machine(platform.machine())
     translated = _darwin_translation_state(system, machine)
@@ -667,17 +1264,10 @@ def collect_observations() -> dict:
     filesystem_type = ""
     if home_kind == "directory":
         filesystem_type = _darwin_filesystem_type(home, system)
-    sudo_available = Path("/usr/bin/sudo").is_file()
-    passwordless_sudo = False
-    if sudo_available:
-        try:
-            sudo_status, _sudo_stdout, _sudo_stderr = _run_bounded_command(
-                ["/usr/bin/sudo", "-n", "/usr/bin/true"]
-            )
-        except ProbeError:
-            sudo_status = 1
-        passwordless_sudo = sudo_status == 0
-    return {
+    passwordless_sudo = (
+        _passwordless_sudo_available() if include_provisioning else False
+    )
+    observations = {
         "platform": {
             "system": system,
             "machine": machine,
@@ -722,7 +1312,9 @@ def collect_observations() -> dict:
             "filesystem_type": filesystem_type,
             "symlink_components": home_symlink_components,
         },
-        "provisioning_capability": {
+    }
+    if include_provisioning:
+        observations["provisioning_capability"] = {
             "passwordless_sudo": passwordless_sudo,
             "tools": [
                 {
@@ -735,8 +1327,59 @@ def collect_observations() -> dict:
                 }
                 for tool_id, tool_path in PROVISIONING_TOOLS
             ],
-        },
+        }
+    return observations
+
+
+def _darwin_process_path(pid: int, system: str) -> str:
+    if system != "darwin" or pid < 0:
+        raise ProbeError("launchd-parent-unavailable")
+    try:
+        library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        proc_pidpath = library.proc_pidpath
+        proc_pidpath.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+        proc_pidpath.restype = ctypes.c_int
+        buffer = ctypes.create_string_buffer(4096)
+        length = proc_pidpath(pid, buffer, len(buffer))
+        if length <= 0 or length >= len(buffer):
+            raise ProbeError("launchd-parent-unavailable")
+        raw = buffer.value
+        if len(raw) not in {length, length - 1}:
+            raise ProbeError("launchd-parent-unavailable")
+        return raw.decode("utf-8", "strict")
+    except (AttributeError, OSError, UnicodeDecodeError) as error:
+        raise ProbeError("launchd-parent-unavailable") from error
+
+
+def collect_launchd_observations() -> dict:
+    observations = collect_observations(include_provisioning=False)
+    system = observations["platform"]["system"]
+    parent_pid = os.getppid()
+    label = _require_string(
+        os.environ.get("TASK_WITNESS_LAUNCHD_LABEL"),
+        "launchd-label",
+        256,
+    )
+    ownership_marker = _require_string(
+        os.environ.get("TASK_WITNESS_LAUNCHD_OWNERSHIP_MARKER"),
+        "launchd-ownership-marker",
+        64,
+    )
+    _require_exact_launchd_child_environment(
+        os.environ,
+        label=label,
+        home=Path(observations["home"]["path"]),
+        ownership_marker=ownership_marker,
+    )
+    observations["environment_exact"] = True
+    observations["passwordless_sudo"] = _passwordless_sudo_available()
+    observations["process"] = {
+        "pid": os.getpid(),
+        "ppid": parent_pid,
+        "parent_path": _darwin_process_path(parent_pid, system),
+        "label": label,
     }
+    return observations
 
 
 def write_create_new(path: Path, raw: bytes, mode: int = 0o600) -> None:
@@ -840,6 +1483,1957 @@ def verify_artifact_manifest(artifact_root: Path, manifest: Path) -> None:
         raise ProbeError("artifact-manifest-disagrees")
 
 
+def write_launchd_artifact_manifest(artifact_root: Path, output: Path) -> None:
+    payloads = launchd_artifact_payloads(artifact_root, include_manifest=False)
+    write_create_new(output, _manifest_bytes(payloads))
+
+
+def verify_launchd_artifact_manifest(artifact_root: Path, manifest: Path) -> None:
+    payloads = launchd_artifact_payloads(artifact_root, include_manifest=True)
+    observed = _bounded_regular_file(manifest, MAX_MANIFEST_BYTES, "manifest")
+    if observed != _manifest_bytes(payloads):
+        raise ProbeError("launchd-artifact-manifest-disagrees")
+
+
+def _load_canonical_document(path: Path, maximum: int, label: str) -> dict:
+    raw = _bounded_regular_file(path, maximum, label)
+    try:
+        value = json.loads(raw.decode("utf-8", "strict"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ProbeError(f"invalid-{label}") from error
+    if not isinstance(value, dict) or canonical_bytes(value) != raw:
+        raise ProbeError(f"noncanonical-{label}")
+    return value
+
+
+def _require_content_digest(document: Mapping[str, object], label: str) -> None:
+    recorded = document.get("content_sha256")
+    if not isinstance(recorded, str) or re.fullmatch(r"[0-9a-f]{64}", recorded) is None:
+        raise ProbeError(f"invalid-{label}-digest")
+    unsigned = {
+        key: value for key, value in document.items() if key != "content_sha256"
+    }
+    if hashlib.sha256(canonical_bytes(unsigned)).hexdigest() != recorded:
+        raise ProbeError(f"{label}-digest-disagrees")
+
+
+def verify_provisioning_capability(artifact_root: Path) -> None:
+    verify_artifact_manifest(artifact_root, artifact_root / "SHA256SUMS")
+    payloads = _artifact_payloads(artifact_root, include_manifest=True)
+    if payloads["probe.status"] not in {b"0\n", b"1\n"}:
+        raise ProbeError("provisioner-probe-failed")
+    document = _load_canonical_document(
+        artifact_root / "probe.json",
+        MAX_PROBE_JSON_BYTES,
+        "provisioner-probe",
+    )
+    _require_content_digest(document, "provisioner-probe")
+    if (
+        document.get("contract") != "task-witness-macos-github-host-probe-v1"
+        or document.get("candidate_sha1") != EXPECTED_CANDIDATE_SHA
+        or document.get("claim") != "host-prerequisite-probe-only"
+    ):
+        raise ProbeError("provisioner-probe-contract-disagrees")
+    requirements = document.get("requirements")
+    observations = document.get("observations")
+    if not isinstance(requirements, dict) or not isinstance(observations, dict):
+        raise ProbeError("provisioner-probe-unavailable")
+    expected_document = build_probe_document(
+        EXPECTED_CANDIDATE_SHA,
+        os.environ,
+        observations,
+    )
+    expected_status = (
+        b"0\n"
+        if expected_document["disposition"] == "direct-session-eligible"
+        else b"1\n"
+    )
+    if document != expected_document or payloads["probe.status"] != expected_status:
+        raise ProbeError("provisioner-probe-contract-disagrees")
+    required = {
+        "credentials_equal",
+        "github_hosted",
+        "group_views_agree",
+        "home_apfs",
+        "home_directory",
+        "home_owned_by_effective_uid",
+        "home_symlink_free",
+        "issetugid_false",
+        "native_darwin_arm64",
+        "no_container_indicators",
+        "nonroot_uid",
+        "not_translated",
+        "passwd_backed_identity",
+        "runner_arch_arm64",
+        "runner_os_macos",
+    }
+    if any(requirements.get(name) is not True for name in required):
+        raise ProbeError("provisioner-host-ineligible")
+    capability = observations.get("provisioning_capability")
+    if (
+        not isinstance(capability, dict)
+        or capability.get("passwordless_sudo") is not True
+    ):
+        raise ProbeError("provisioner-sudo-unavailable")
+    tools = capability.get("tools")
+    if (
+        not isinstance(tools, list)
+        or len(tools) != len(PROVISIONING_TOOLS)
+        or any(
+            not isinstance(item, dict)
+            or item.get("id") != expected_id
+            or item.get("path") != expected_path
+            or item.get("available") is not True
+            for item, (expected_id, expected_path) in zip(
+                tools,
+                PROVISIONING_TOOLS,
+            )
+        )
+    ):
+        raise ProbeError("provisioner-tools-unavailable")
+
+
+def verify_launchd_success(artifact_root: Path) -> None:
+    verify_launchd_artifact_manifest(artifact_root, artifact_root / "SHA256SUMS")
+    payloads = launchd_artifact_payloads(artifact_root, include_manifest=True)
+    if payloads["probe.status"] != b"0\n" or payloads["lifecycle.status"] != b"0\n":
+        raise ProbeError("launchd-user-probe-failed")
+    probe = _load_canonical_document(
+        artifact_root / "probe.json",
+        MAX_PROBE_JSON_BYTES,
+        "launchd-user-probe",
+    )
+    lifecycle = _load_canonical_document(
+        artifact_root / "lifecycle.json",
+        LAUNCHD_ARTIFACT_FILES["lifecycle.json"],
+        "launchd-lifecycle",
+    )
+    cleanup = _load_canonical_document(
+        artifact_root / "cleanup.json",
+        LAUNCHD_ARTIFACT_FILES["cleanup.json"],
+        "launchd-cleanup",
+    )
+    _require_content_digest(probe, "launchd-user-probe")
+    _require_content_digest(lifecycle, "launchd-lifecycle")
+    _require_content_digest(cleanup, "launchd-cleanup")
+    observations = probe.get("observations")
+    if not isinstance(observations, dict):
+        raise ProbeError("launchd-user-probe-ineligible")
+    validated = _validated_launchd_observations(observations)
+    harness, _runner = _normalized_context(os.environ)
+    account_name, label = _launchd_identity(os.environ)
+    expected_home = Path("/Users") / account_name
+    credentials = validated["credentials"]
+    passwd = credentials["passwd"]
+    if (
+        validated["process"]["label"] != label
+        or passwd["name"] != account_name
+        or passwd["home"] != str(expected_home)
+        or validated["home"]["path"] != str(expected_home)
+        or not DISPOSABLE_UID_MIN <= credentials["effective_uid"] <= DISPOSABLE_UID_MAX
+    ):
+        raise ProbeError("launchd-user-probe-ineligible")
+    expected_probe = build_launchd_user_probe_document(
+        EXPECTED_CANDIDATE_SHA,
+        {**os.environ, "TASK_WITNESS_LAUNCHD_LABEL": label},
+        validated,
+    )
+    requirements = expected_probe.get("requirements")
+    if (
+        expected_probe.get("disposition") != "launchd-user-eligible"
+        or not isinstance(requirements, dict)
+        or any(value is not True for value in requirements.values())
+    ):
+        raise ProbeError("launchd-user-probe-ineligible")
+    binding = _validated_launchd_binding_evidence(lifecycle.get("binding"))
+    expected_lifecycle = _document_with_digest(
+        {
+            "schema_version": 1,
+            "contract": "task-witness-macos-launchd-lifecycle-v1",
+            "candidate_sha1": EXPECTED_CANDIDATE_SHA,
+            "label": label,
+            "kickstart_pid": validated["process"]["pid"],
+            "probe_disposition": "launchd-user-eligible",
+            "disposition": "launchd-user-eligible",
+            "binding": binding,
+        }
+    )
+    expected_cleanup = _document_with_digest(
+        {
+            "schema_version": 1,
+            "contract": "task-witness-macos-launchd-cleanup-v1",
+            "candidate_sha1": EXPECTED_CANDIDATE_SHA,
+            "account": account_name,
+            "label": label,
+            "disposition": "cleaned",
+        }
+    )
+    if (
+        probe != expected_probe
+        or lifecycle != expected_lifecycle
+        or cleanup != expected_cleanup
+    ):
+        raise ProbeError("launchd-user-probe-ineligible")
+    if not payloads["launchd.loaded"]:
+        raise ProbeError("launchd-loaded-evidence-missing")
+    try:
+        loaded = payloads["launchd.loaded"].decode("utf-8", "strict")
+    except UnicodeDecodeError as error:
+        raise ProbeError("launchd-job-binding-invalid") from error
+    expected_stage_root = Path(
+        "/private/var/tmp/"
+        f"task-witness-macos-launchd-{harness['run_id']}-{harness['run_attempt']}"
+    )
+    account = DisposableAccount(
+        name=account_name,
+        uid=credentials["effective_uid"],
+        gid=credentials["effective_gid"],
+        home=expected_home,
+        generated_uid=str(uuid.uuid5(uuid.NAMESPACE_URL, label)).upper(),
+    )
+    expected_plan = LaunchdPlan(
+        account=account,
+        label=label,
+        stage_root=expected_stage_root,
+        helper=expected_stage_root / "helper.py",
+        plist=expected_stage_root / "job.plist",
+    )
+    expected_state = {"ownership_marker": binding["ownership_marker"]}
+    loaded_snapshot = _validated_launchd_job_snapshot(
+        loaded,
+        expected_plan,
+        expected_state,
+    )
+    if loaded_snapshot.binding != binding or loaded_snapshot.sanitized != loaded:
+        raise ProbeError("launchd-job-binding-invalid")
+    try:
+        terminal = payloads["launchd.terminal"].decode("utf-8", "strict")
+    except UnicodeDecodeError as error:
+        raise ProbeError("launchd-terminal-invalid") from error
+    terminal_snapshot = _validated_launchd_job_snapshot(
+        terminal,
+        expected_plan,
+        expected_state,
+    )
+    if terminal_snapshot.binding != binding or terminal_snapshot.sanitized != terminal:
+        raise ProbeError("launchd-job-binding-invalid")
+    parse_launchctl_terminal(terminal_snapshot.sanitized, expected_status=0)
+
+
+def _document_with_digest(unsigned: Mapping[str, object]) -> dict:
+    document = dict(unsigned)
+    document["content_sha256"] = hashlib.sha256(canonical_bytes(unsigned)).hexdigest()
+    return document
+
+
+def _run_lifecycle_command(
+    argv: Sequence[str],
+    *,
+    maximum: int = MAX_COMMAND_OUTPUT_BYTES,
+    timeout: float = COMMAND_TIMEOUT_SECONDS,
+) -> tuple[int, str, str]:
+    if not argv or any(not isinstance(item, str) or not item for item in argv):
+        raise ProbeError("invalid-lifecycle-command")
+    try:
+        process = subprocess.run(
+            list(argv),
+            check=False,
+            capture_output=True,
+            timeout=timeout,
+            env={
+                "HOME": "/var/empty",
+                "LANG": "C",
+                "LC_ALL": "C",
+                "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+                "TZ": "UTC",
+            },
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise ProbeError("lifecycle-command-failed") from error
+    if len(process.stdout) > maximum or len(process.stderr) > maximum:
+        raise ProbeError("lifecycle-command-output-too-large")
+    try:
+        return (
+            process.returncode,
+            process.stdout.decode("utf-8", "strict").strip(),
+            process.stderr.decode("utf-8", "strict").strip(),
+        )
+    except UnicodeDecodeError as error:
+        raise ProbeError("lifecycle-command-output-invalid") from error
+
+
+def _require_command_success(
+    argv: Sequence[str],
+    *,
+    maximum: int = MAX_COMMAND_OUTPUT_BYTES,
+) -> str:
+    status, stdout, _stderr = _run_lifecycle_command(argv, maximum=maximum)
+    if status != 0:
+        raise ProbeError("lifecycle-command-nonzero")
+    return stdout
+
+
+def parse_dscl_uid_list(raw: str) -> dict[str, int]:
+    if len(raw.encode("utf-8")) > MAX_COMMAND_OUTPUT_BYTES:
+        raise ProbeError("account-list-too-large")
+    result: dict[str, int] = {}
+    occupied: set[int] = set()
+    for line in raw.splitlines():
+        fields = line.split()
+        if (
+            len(fields) != 2
+            or not fields[0]
+            or fields[0] in result
+            or DSCL_UID_RE.fullmatch(fields[1]) is None
+        ):
+            raise ProbeError("account-list-invalid")
+        uid = int(fields[1])
+        if not DSCL_UID_MIN <= uid <= DSCL_UID_MAX or uid in occupied:
+            raise ProbeError("account-list-invalid")
+        result[fields[0]] = uid
+        occupied.add(uid)
+    if not result:
+        raise ProbeError("account-list-invalid")
+    return result
+
+
+def _read_stable_regular_file(path: Path, maximum: int, label: str) -> bytes:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+        )
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_size < 0
+            or before.st_size > maximum
+        ):
+            raise ProbeError(f"unsafe-{label}")
+        chunks = []
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 64 * 1024))
+            if not chunk:
+                raise ProbeError(f"changed-{label}")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise ProbeError(f"changed-{label}")
+        after = os.fstat(descriptor)
+        current = path.lstat()
+    except OSError as error:
+        raise ProbeError(f"unreadable-{label}") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    ) or (after.st_dev, after.st_ino) != (current.st_dev, current.st_ino):
+        raise ProbeError(f"changed-{label}")
+    return b"".join(chunks)
+
+
+def _launchd_identity(environment: Mapping[str, str]) -> tuple[str, str]:
+    harness, _runner = _normalized_context(environment)
+    seed = (
+        f"{harness['commit_sha1']}:{harness['run_id']}:{harness['run_attempt']}"
+    ).encode("ascii")
+    token = hashlib.sha256(seed).hexdigest()[:12]
+    return f"twq-{token}", f"io.nisavid.task-witness.macos-probe.{token}"
+
+
+def _validate_lifecycle_arguments(
+    *,
+    source_helper: Path,
+    stage_root: Path,
+    artifact_root: Path,
+    runner_uid: int,
+    runner_gid: int,
+) -> None:
+    if (
+        os.geteuid() != 0
+        or type(runner_uid) is not int
+        or runner_uid <= 0
+        or type(runner_gid) is not int
+        or runner_gid < 0
+        or not source_helper.is_absolute()
+        or source_helper.name != Path(__file__).name
+        or LAUNCHD_STAGE_RE.fullmatch(str(stage_root)) is None
+        or not artifact_root.is_absolute()
+        or artifact_root.name != "task-witness-macos-launchd-user-probe"
+        or stage_root == artifact_root
+    ):
+        raise ProbeError("invalid-lifecycle-arguments")
+
+
+def _require_nonroot_runner_gid(runner_gid: int) -> None:
+    if type(runner_gid) is not int or runner_gid <= 0:
+        raise ProbeError("invalid-lifecycle-arguments")
+
+
+def _metadata_matches(
+    path: Path,
+    *,
+    kind: str,
+    mode: int,
+    uid: int,
+    gid: int,
+    nlink: int | None = None,
+) -> bool:
+    try:
+        metadata = path.lstat()
+    except OSError:
+        return False
+    expected_kind = stat.S_ISDIR if kind == "directory" else stat.S_ISREG
+    return (
+        expected_kind(metadata.st_mode)
+        and stat.S_IMODE(metadata.st_mode) == mode
+        and metadata.st_uid == uid
+        and metadata.st_gid == gid
+        and (nlink is None or metadata.st_nlink == nlink)
+    )
+
+
+def _path_exists_no_follow(path: Path) -> bool:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise ProbeError("path-observation-failed") from error
+    return True
+
+
+def _create_root_directory(path: Path, mode: int) -> None:
+    try:
+        path.mkdir(mode=mode)
+    except OSError as error:
+        raise ProbeError("directory-create-new-failed") from error
+    if not _metadata_matches(
+        path,
+        kind="directory",
+        mode=mode,
+        uid=0,
+        gid=0,
+    ):
+        raise ProbeError("directory-create-new-disagrees")
+
+
+def _account_record(account: DisposableAccount) -> dict[str, list[str]]:
+    attributes = (
+        "AuthenticationAuthority",
+        "GeneratedUID",
+        "IsHidden",
+        "NFSHomeDirectory",
+        "Password",
+        "PrimaryGroupID",
+        "UniqueID",
+        "UserShell",
+    )
+    raw = _require_command_success(
+        ["/usr/bin/dscl", ".", "-read", f"/Users/{account.name}", *attributes]
+    )
+    record = parse_dscl_record(raw)
+    require_exact_account_record(record, account)
+    return record
+
+
+def _list_accounts() -> dict[str, int]:
+    return parse_dscl_uid_list(
+        _require_command_success(["/usr/bin/dscl", ".", "-list", "/Users", "UniqueID"])
+    )
+
+
+def _account_exists(name: str) -> bool:
+    if LAUNCHD_ACCOUNT_RE.fullmatch(name) is None:
+        raise ProbeError("invalid-launchd-user")
+    raw = _require_command_success(["/usr/bin/dscl", ".", "-list", "/Users"])
+    names = raw.splitlines()
+    if (
+        not names
+        or names != sorted(set(names))
+        or any(
+            not item or item.strip() != item or item.split() != [item] for item in names
+        )
+    ):
+        raise ProbeError("account-name-list-invalid")
+    return name in names
+
+
+def _rollback_disposable_account_creation(account: DisposableAccount) -> None:
+    if not _account_exists(account.name):
+        return
+    _require_command_success(
+        ["/usr/bin/dscl", ".", "-delete", f"/Users/{account.name}"]
+    )
+    if _account_exists(account.name):
+        raise ProbeError("account-create-rollback-disagrees")
+
+
+def _create_disposable_account(account: DisposableAccount) -> None:
+    accounts = _list_accounts()
+    if (
+        _account_exists(account.name)
+        or account.name in accounts
+        or account.uid in accounts.values()
+    ):
+        raise ProbeError("account-or-uid-already-exists")
+    record_path = f"/Users/{account.name}"
+    commands = [
+        ["/usr/bin/dscl", ".", "-create", record_path],
+        [
+            "/usr/bin/dscl",
+            ".",
+            "-create",
+            record_path,
+            "UserShell",
+            "/usr/bin/false",
+        ],
+        [
+            "/usr/bin/dscl",
+            ".",
+            "-create",
+            record_path,
+            "AuthenticationAuthority",
+            ";DisabledUser;",
+        ],
+        ["/usr/bin/dscl", ".", "-create", record_path, "Password", "*"],
+        ["/usr/bin/dscl", ".", "-create", record_path, "IsHidden", "1"],
+        ["/usr/bin/dscl", ".", "-create", record_path, "UniqueID", str(account.uid)],
+        [
+            "/usr/bin/dscl",
+            ".",
+            "-create",
+            record_path,
+            "PrimaryGroupID",
+            str(account.gid),
+        ],
+        [
+            "/usr/bin/dscl",
+            ".",
+            "-create",
+            record_path,
+            "NFSHomeDirectory",
+            str(account.home),
+        ],
+        [
+            "/usr/bin/dscl",
+            ".",
+            "-create",
+            record_path,
+            "GeneratedUID",
+            account.generated_uid,
+        ],
+    ]
+    creation_attempted = False
+    try:
+        creation_attempted = True
+        for command in commands:
+            _require_command_success(command)
+        _account_record(account)
+        accounts = _list_accounts()
+        if (
+            accounts.get(account.name) != account.uid
+            or sum(uid == account.uid for uid in accounts.values()) != 1
+        ):
+            raise ProbeError("account-list-readback-disagrees")
+    except ProbeError:
+        if creation_attempted:
+            try:
+                _rollback_disposable_account_creation(account)
+            except ProbeError as rollback_error:
+                raise ProbeError(
+                    "account-create-rollback-preserved"
+                ) from rollback_error
+        raise
+
+
+def _new_directory_identity(path: Path) -> tuple[int, int, int, int]:
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise ProbeError("home-create-new-disagrees") from error
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+        or metadata.st_uid != os.geteuid()
+    ):
+        raise ProbeError("home-create-new-disagrees")
+    return metadata.st_dev, metadata.st_ino, metadata.st_uid, metadata.st_gid
+
+
+def _created_directory_is_exact(
+    path: Path,
+    identity: tuple[int, int, int, int] | None,
+    account: DisposableAccount,
+) -> bool:
+    if identity is None:
+        return False
+    try:
+        metadata = path.lstat()
+    except OSError:
+        return False
+    return (
+        stat.S_ISDIR(metadata.st_mode)
+        and stat.S_IMODE(metadata.st_mode) == 0o700
+        and (metadata.st_dev, metadata.st_ino) == identity[:2]
+        and (metadata.st_uid, metadata.st_gid)
+        in {identity[2:], (account.uid, account.gid)}
+    )
+
+
+def _rollback_created_home(
+    account: DisposableAccount,
+    *,
+    home_created: bool,
+    home_identity: tuple[int, int, int, int] | None,
+    probe_created: bool,
+    probe_identity: tuple[int, int, int, int] | None,
+) -> None:
+    probe_root = account.home / "launchd-probe"
+    if account.home.name != account.name or probe_root.parent != account.home:
+        raise ProbeError("home-create-new-preserved")
+    try:
+        if probe_created and (
+            not _created_directory_is_exact(probe_root, probe_identity, account)
+            or any(probe_root.iterdir())
+        ):
+            raise ProbeError("home-create-new-preserved")
+        expected_home_names = {"launchd-probe"} if probe_created else set()
+        if home_created and (
+            not _created_directory_is_exact(account.home, home_identity, account)
+            or {entry.name for entry in account.home.iterdir()} != expected_home_names
+        ):
+            raise ProbeError("home-create-new-preserved")
+        if probe_created:
+            probe_root.rmdir()
+        if home_created:
+            account.home.rmdir()
+    except OSError as error:
+        raise ProbeError("home-create-new-preserved") from error
+
+
+def _create_disposable_home(account: DisposableAccount) -> None:
+    probe_root = account.home / "launchd-probe"
+    home_created = False
+    probe_created = False
+    home_identity: tuple[int, int, int, int] | None = None
+    probe_identity: tuple[int, int, int, int] | None = None
+    try:
+        account.home.mkdir(mode=0o700)
+        home_created = True
+        home_identity = _new_directory_identity(account.home)
+        os.chown(account.home, account.uid, account.gid, follow_symlinks=False)
+        probe_root.mkdir(mode=0o700)
+        probe_created = True
+        probe_identity = _new_directory_identity(probe_root)
+        os.chown(probe_root, account.uid, account.gid, follow_symlinks=False)
+        for path in (account.home, probe_root):
+            if not _metadata_matches(
+                path,
+                kind="directory",
+                mode=0o700,
+                uid=account.uid,
+                gid=account.gid,
+            ):
+                raise ProbeError("home-create-new-disagrees")
+    except (OSError, ProbeError) as error:
+        _rollback_created_home(
+            account,
+            home_created=home_created,
+            home_identity=home_identity,
+            probe_created=probe_created,
+            probe_identity=probe_identity,
+        )
+        if isinstance(error, ProbeError):
+            raise
+        raise ProbeError("home-create-new-failed") from error
+
+
+def _write_root_file(path: Path, raw: bytes, mode: int) -> None:
+    write_create_new(path, raw, mode)
+    if not _metadata_matches(
+        path,
+        kind="file",
+        mode=mode,
+        uid=0,
+        gid=0,
+        nlink=1,
+    ):
+        raise ProbeError("root-file-disagrees")
+
+
+def _write_account_file(path: Path, raw: bytes, account: DisposableAccount) -> None:
+    write_create_new(path, raw)
+    try:
+        os.chown(path, account.uid, account.gid, follow_symlinks=False)
+    except OSError as error:
+        raise ProbeError("account-file-chown-failed") from error
+    if not _metadata_matches(
+        path,
+        kind="file",
+        mode=0o600,
+        uid=account.uid,
+        gid=account.gid,
+        nlink=1,
+    ):
+        raise ProbeError("account-file-disagrees")
+
+
+def _lifecycle_state(
+    *,
+    plan: LaunchdPlan,
+    source_sha256: str,
+    plist_sha256: str,
+    ownership_marker: str,
+    runner_uid: int,
+    runner_gid: int,
+) -> dict:
+    return _document_with_digest(
+        {
+            "schema_version": 1,
+            "contract": "task-witness-macos-launchd-lifecycle-state-v1",
+            "candidate_sha1": EXPECTED_CANDIDATE_SHA,
+            "account": {
+                "name": plan.account.name,
+                "uid": plan.account.uid,
+                "gid": plan.account.gid,
+                "home": str(plan.account.home),
+                "generated_uid": plan.account.generated_uid,
+            },
+            "label": plan.label,
+            "stage_root": str(plan.stage_root),
+            "helper_sha256": source_sha256,
+            "plist_sha256": plist_sha256,
+            "ownership_marker": ownership_marker,
+            "runner_uid": runner_uid,
+            "runner_gid": runner_gid,
+        }
+    )
+
+
+def _launchd_ownership_document(
+    plan: LaunchdPlan,
+    state: Mapping[str, object],
+) -> dict:
+    ownership_marker = state.get("ownership_marker")
+    helper_sha256 = state.get("helper_sha256")
+    plist_sha256 = state.get("plist_sha256")
+    state_sha256 = state.get("content_sha256")
+    if (
+        not isinstance(ownership_marker, str)
+        or LAUNCHD_OWNERSHIP_MARKER_RE.fullmatch(ownership_marker) is None
+        or any(
+            not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None
+            for value in (helper_sha256, plist_sha256, state_sha256)
+        )
+    ):
+        raise ProbeError("launchd-ownership-state-invalid")
+    return _document_with_digest(
+        {
+            "schema_version": 1,
+            "contract": "task-witness-macos-launchd-ownership-v1",
+            "candidate_sha1": EXPECTED_CANDIDATE_SHA,
+            "account": {
+                "name": plan.account.name,
+                "uid": plan.account.uid,
+                "generated_uid": plan.account.generated_uid,
+            },
+            "label": plan.label,
+            "stage_root": str(plan.stage_root),
+            "ownership_marker": ownership_marker,
+            "helper_sha256": helper_sha256,
+            "plist_sha256": plist_sha256,
+            "state_sha256": state_sha256,
+        }
+    )
+
+
+def _write_launchd_ownership_marker(
+    plan: LaunchdPlan,
+    state: Mapping[str, object],
+) -> dict:
+    document = _launchd_ownership_document(plan, state)
+    raw = canonical_bytes(document)
+    if len(raw) > MAX_OWNERSHIP_BYTES:
+        raise ProbeError("launchd-ownership-marker-too-large")
+    _write_root_file(plan.stage_root / "ownership.json", raw, 0o600)
+    observed = _load_launchd_ownership_marker(plan, state)
+    if observed != document:
+        raise ProbeError("launchd-ownership-marker-disagrees")
+    return document
+
+
+def _load_launchd_ownership_marker(
+    plan: LaunchdPlan,
+    state: Mapping[str, object],
+) -> dict | None:
+    marker_path = plan.stage_root / "ownership.json"
+    if not _path_exists_no_follow(marker_path):
+        return None
+    if not _metadata_matches(
+        marker_path,
+        kind="file",
+        mode=0o600,
+        uid=0,
+        gid=0,
+        nlink=1,
+    ):
+        raise ProbeError("launchd-ownership-marker-drift")
+    document = _load_canonical_document(
+        marker_path,
+        MAX_OWNERSHIP_BYTES,
+        "launchd-ownership-marker",
+    )
+    _require_content_digest(document, "launchd-ownership-marker")
+    if document != _launchd_ownership_document(plan, state):
+        raise ProbeError("launchd-ownership-marker-drift")
+    return document
+
+
+def validate_prestaged_helper(stage_root: Path, expected_sha256: str) -> bytes:
+    if re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None:
+        raise ProbeError("invalid-staged-helper-digest")
+    helper = stage_root / "helper.py"
+    try:
+        names = {entry.name for entry in stage_root.iterdir()}
+    except OSError as error:
+        raise ProbeError("staged-helper-metadata-drift") from error
+    if (
+        names != {"helper.py"}
+        or not _metadata_matches(
+            stage_root,
+            kind="directory",
+            mode=0o755,
+            uid=0,
+            gid=0,
+        )
+        or not _metadata_matches(
+            helper,
+            kind="file",
+            mode=0o555,
+            uid=0,
+            gid=0,
+            nlink=1,
+        )
+    ):
+        raise ProbeError("staged-helper-metadata-drift")
+    raw = _read_stable_regular_file(helper, MAX_HELPER_BYTES, "staged-helper")
+    if hashlib.sha256(raw).hexdigest() != expected_sha256:
+        raise ProbeError("staged-helper-digest-disagrees")
+    return raw
+
+
+def _cleanup_helper_only_stage_before_state(
+    *,
+    stage_root: Path,
+    artifact_root: Path,
+    expected_helper_sha256: str,
+    environment: Mapping[str, str],
+) -> bool:
+    try:
+        names = {entry.name for entry in stage_root.iterdir()}
+    except OSError as error:
+        raise ProbeError("helper-only-stage-observation-failed") from error
+    if names != {"helper.py"}:
+        return False
+    helper = stage_root / "helper.py"
+    if Path(__file__) != helper:
+        raise ProbeError("helper-only-executable-path-disagrees")
+    validate_prestaged_helper(stage_root, expected_helper_sha256)
+    account_name, label = _launchd_identity(environment)
+    if _launchd_job_snapshot(label) is not None:
+        raise ProbeError("helper-only-launchd-label-present")
+    accounts = _list_accounts()
+    if account_name in accounts or _account_exists(account_name):
+        raise ProbeError("helper-only-account-present")
+    if _path_exists_no_follow(Path("/Users") / account_name):
+        raise ProbeError("helper-only-home-present")
+    if _path_exists_no_follow(artifact_root):
+        raise ProbeError("helper-only-artifact-present")
+    validate_prestaged_helper(stage_root, expected_helper_sha256)
+    try:
+        helper.unlink()
+        stage_root.rmdir()
+    except OSError as error:
+        raise ProbeError("helper-only-stage-cleanup-failed") from error
+    if _path_exists_no_follow(stage_root):
+        raise ProbeError("helper-only-stage-cleanup-disagrees")
+    return True
+
+
+def _initialize_lifecycle(
+    *,
+    stage_root: Path,
+    expected_helper_sha256: str,
+    runner_uid: int,
+    runner_gid: int,
+    environment: Mapping[str, str],
+) -> LaunchdPlan:
+    _require_nonroot_runner_gid(runner_gid)
+    helper_raw = validate_prestaged_helper(
+        stage_root,
+        expected_helper_sha256,
+    )
+    accounts = _list_accounts()
+    uid = choose_disposable_uid(set(accounts.values()))
+    account_name, label = _launchd_identity(environment)
+    if account_name in accounts:
+        raise ProbeError("account-name-already-exists")
+    account = DisposableAccount(
+        name=account_name,
+        uid=uid,
+        gid=runner_gid,
+        home=Path("/Users") / account_name,
+        generated_uid=str(uuid.uuid5(uuid.NAMESPACE_URL, label)).upper(),
+    )
+    plan = LaunchdPlan(
+        account=account,
+        label=label,
+        stage_root=stage_root,
+        helper=stage_root / "helper.py",
+        plist=stage_root / "job.plist",
+    )
+    ownership_marker = uuid.uuid4().hex
+    plist_raw = plistlib.dumps(
+        build_launchd_user_plist(
+            label=label,
+            user=account.name,
+            home=account.home,
+            helper=plan.helper,
+            candidate_sha=EXPECTED_CANDIDATE_SHA,
+            environment={**environment, "TASK_WITNESS_LAUNCHD_LABEL": label},
+            ownership_marker=ownership_marker,
+        ),
+        fmt=plistlib.FMT_XML,
+        sort_keys=True,
+    )
+    state = _lifecycle_state(
+        plan=plan,
+        source_sha256=hashlib.sha256(helper_raw).hexdigest(),
+        plist_sha256=hashlib.sha256(plist_raw).hexdigest(),
+        ownership_marker=ownership_marker,
+        runner_uid=runner_uid,
+        runner_gid=runner_gid,
+    )
+    state_raw = canonical_bytes(state)
+    expected_files = {
+        "job.plist": (plist_raw, 0o644),
+        "state.json": (state_raw, 0o600),
+    }
+    attempted: list[str] = []
+    completed: list[str] = []
+    try:
+        for name, (raw, mode) in expected_files.items():
+            attempted.append(name)
+            _write_root_file(stage_root / name, raw, mode)
+            completed.append(name)
+    except ProbeError:
+        try:
+            removable: list[Path] = []
+            for name in reversed(attempted):
+                raw, mode = expected_files[name]
+                path = stage_root / name
+                if not _path_exists_no_follow(path):
+                    if name in completed:
+                        raise ProbeError("stage-initialization-preserved")
+                    continue
+                if (
+                    not _metadata_matches(
+                        path,
+                        kind="file",
+                        mode=mode,
+                        uid=0,
+                        gid=0,
+                        nlink=1,
+                    )
+                    or _read_stable_regular_file(
+                        path,
+                        len(raw),
+                        "partial-stage-file",
+                    )
+                    != raw
+                ):
+                    raise ProbeError("stage-initialization-preserved")
+                removable.append(path)
+            for path in removable:
+                path.unlink()
+        except (OSError, ProbeError) as cleanup_error:
+            raise ProbeError("stage-initialization-preserved") from cleanup_error
+        raise
+    return plan
+
+
+def initialize_launchd_user_lifecycle(
+    *,
+    stage_root: Path,
+    artifact_root: Path,
+    candidate_sha: str,
+    expected_helper_sha256: str,
+    runner_uid: int,
+    runner_gid: int,
+) -> int:
+    if candidate_sha != EXPECTED_CANDIDATE_SHA:
+        raise ProbeError("candidate-sha-disagrees")
+    _normalized_context(os.environ)
+    _validate_lifecycle_arguments(
+        source_helper=Path(__file__),
+        stage_root=stage_root,
+        artifact_root=artifact_root,
+        runner_uid=runner_uid,
+        runner_gid=runner_gid,
+    )
+    if Path(__file__) != stage_root / "helper.py" or _path_exists_no_follow(
+        artifact_root
+    ):
+        raise ProbeError("invalid-prestaged-helper-path")
+    _initialize_lifecycle(
+        stage_root=stage_root,
+        expected_helper_sha256=expected_helper_sha256,
+        runner_uid=runner_uid,
+        runner_gid=runner_gid,
+        environment=os.environ,
+    )
+    return 0
+
+
+def _child_status(home: Path) -> int:
+    raw = _read_stable_regular_file(
+        home / "launchd-probe/probe.status",
+        16,
+        "probe-status",
+    )
+    if raw not in {b"0\n", b"1\n", b"2\n"}:
+        raise ProbeError("probe-status-invalid")
+    return int(raw.strip())
+
+
+def _poll_launchd_terminal(
+    plan: LaunchdPlan,
+    state: Mapping[str, object],
+) -> tuple[str, int]:
+    deadline = time.monotonic() + LAUNCHD_POLL_TIMEOUT_SECONDS
+    target = f"system/{plan.label}"
+    last = ""
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        status, stdout, _stderr = _run_lifecycle_command(
+            ["/bin/launchctl", "print", target],
+            maximum=LAUNCHD_PRINT_MAX_BYTES,
+            timeout=min(COMMAND_TIMEOUT_SECONDS, remaining),
+        )
+        if status != 0:
+            raise ProbeError("launchd-job-disappeared")
+        last = stdout
+        if not re.search(r"(?m)^\s*pid\s*=", stdout) and re.search(
+            r"(?m)^\s*state\s*=\s*not running\s*$",
+            stdout,
+        ):
+            validated = _validated_launchd_job_snapshot(stdout, plan, state)
+            child_status = _child_status(plan.account.home)
+            parse_launchctl_terminal(
+                validated.sanitized,
+                expected_status=child_status,
+            )
+            return validated.sanitized, child_status
+        time.sleep(
+            min(
+                LAUNCHD_POLL_INTERVAL_SECONDS,
+                max(0.0, deadline - time.monotonic()),
+            )
+        )
+    if len(last.encode("utf-8")) > LAUNCHD_PRINT_MAX_BYTES:
+        raise ProbeError("launchctl-print-too-large")
+    raise ProbeError("launchd-job-timeout")
+
+
+def _launchd_job_snapshot(label: str) -> str | None:
+    if LAUNCHD_LABEL_RE.fullmatch(label) is None:
+        raise ProbeError("invalid-launchd-label")
+    target = f"system/{label}"
+    status, stdout, _stderr = _run_lifecycle_command(
+        ["/bin/launchctl", "print", target],
+        maximum=LAUNCHD_PRINT_MAX_BYTES,
+    )
+    if status == 0:
+        if not stdout:
+            raise ProbeError("launchd-job-binding-invalid")
+        return stdout
+    if status == LAUNCHCTL_NOT_FOUND_STATUS:
+        return None
+    raise ProbeError("launchd-presence-unavailable")
+
+
+def _require_launchd_absent(label: str) -> None:
+    if _launchd_job_snapshot(label) is not None:
+        raise ProbeError("launchd-label-already-loaded")
+
+
+def _parse_launchctl_job_structure(raw: str, label: str) -> LaunchctlJobStructure:
+    if (
+        not raw
+        or len(raw.encode("utf-8")) > LAUNCHD_PRINT_MAX_BYTES
+        or "\x00" in raw
+        or "\r" in raw
+    ):
+        raise ProbeError("launchd-job-binding-invalid")
+    lines = raw.splitlines()
+    if not lines or lines[0] != f"system/{label} = {{" or lines[-1] != "}":
+        raise ProbeError("launchd-job-binding-invalid")
+
+    top_values: dict[str, list[str]] = {}
+    top_blocks: dict[str, list[tuple[str, ...]]] = {}
+    block_values: list[tuple[tuple[str, ...], str]] = []
+    stack: list[tuple[str, int, list[str], tuple[str, ...]]] = []
+    for line in lines[1:-1]:
+        if not line:
+            continue
+        if not line.startswith("\t"):
+            raise ProbeError("launchd-job-binding-invalid")
+        indent = len(line) - len(line.lstrip("\t"))
+        content = line[indent:]
+        if not content:
+            raise ProbeError("launchd-job-binding-invalid")
+        if content == "}":
+            if not stack or indent != stack[-1][1]:
+                raise ProbeError("launchd-job-binding-invalid")
+            name, block_indent, values, _path = stack.pop()
+            if block_indent == 1:
+                top_blocks.setdefault(name, []).append(tuple(values))
+            continue
+        expected_indent = 1 if not stack else stack[-1][1] + 1
+        if indent != expected_indent:
+            raise ProbeError("launchd-job-binding-invalid")
+        if content.endswith(" = {"):
+            name = content.removesuffix(" = {")
+            if not name or name.strip() != name:
+                raise ProbeError("launchd-job-binding-invalid")
+            if stack:
+                stack[-1][2].append(content)
+                path = (*stack[-1][3], name)
+            else:
+                path = (name,)
+            stack.append((name, indent, [], path))
+            continue
+        if stack:
+            stack[-1][2].append(content)
+            block_values.append((stack[-1][3], content))
+            continue
+        name, separator, value = content.partition(" = ")
+        if not separator or not name or not value or name.strip() != name:
+            raise ProbeError("launchd-job-binding-invalid")
+        top_values.setdefault(name, []).append(value)
+    if stack:
+        raise ProbeError("launchd-job-binding-invalid")
+    return LaunchctlJobStructure(
+        top_values={name: tuple(values) for name, values in top_values.items()},
+        top_blocks={name: tuple(values) for name, values in top_blocks.items()},
+        block_values=tuple(block_values),
+    )
+
+
+def _launchctl_top_value(structure: LaunchctlJobStructure, name: str) -> str:
+    values = structure.top_values.get(name, ())
+    if len(values) != 1 or not values[0]:
+        raise ProbeError("launchd-job-binding-invalid")
+    return values[0]
+
+
+def _launchctl_optional_top_value(
+    structure: LaunchctlJobStructure,
+    name: str,
+) -> str | None:
+    values = structure.top_values.get(name, ())
+    if len(values) > 1 or (values and not values[0]):
+        raise ProbeError("launchd-job-binding-invalid")
+    return values[0] if values else None
+
+
+def _launchctl_block_values(
+    structure: LaunchctlJobStructure,
+    name: str,
+) -> tuple[str, ...]:
+    blocks = structure.top_blocks.get(name, ())
+    if len(blocks) != 1:
+        raise ProbeError("launchd-job-binding-invalid")
+    return blocks[0]
+
+
+def _expected_launchd_program_arguments(plan: LaunchdPlan) -> list[str]:
+    probe_root = plan.account.home / "launchd-probe"
+    return [
+        "/usr/bin/python3",
+        "-I",
+        "-B",
+        str(plan.helper),
+        "probe-launchd-user",
+        "--candidate-sha",
+        EXPECTED_CANDIDATE_SHA,
+        "--output",
+        str(probe_root / "probe.json"),
+        "--status-output",
+        str(probe_root / "probe.status"),
+    ]
+
+
+def _validated_launchd_binding_evidence(value: object) -> dict[str, str]:
+    if not isinstance(value, dict) or set(value) != {"ownership_marker"}:
+        raise ProbeError("launchd-job-binding-invalid")
+    ownership_marker = value.get("ownership_marker")
+    if (
+        not isinstance(ownership_marker, str)
+        or LAUNCHD_OWNERSHIP_MARKER_RE.fullmatch(ownership_marker) is None
+    ):
+        raise ProbeError("launchd-job-binding-invalid")
+    return {"ownership_marker": ownership_marker}
+
+
+def _validated_launchd_job_snapshot(
+    raw: str,
+    plan: LaunchdPlan,
+    state: Mapping[str, object],
+    *,
+    environment: Mapping[str, str] | None = None,
+) -> ValidatedLaunchdJobSnapshot:
+    structure = _parse_launchctl_job_structure(raw, plan.label)
+    if (
+        _launchctl_top_value(structure, "path") != str(plan.plist)
+        or _launchctl_top_value(structure, "program") != "/usr/bin/python3"
+        or _launchctl_top_value(structure, "username") != plan.account.name
+        or _launchctl_top_value(structure, "domain") != "system"
+        or list(_launchctl_block_values(structure, "arguments"))
+        != _expected_launchd_program_arguments(plan)
+    ):
+        raise ProbeError("launchd-job-binding-invalid")
+    marker = state.get("ownership_marker")
+    if (
+        not isinstance(marker, str)
+        or LAUNCHD_OWNERSHIP_MARKER_RE.fullmatch(marker) is None
+    ):
+        raise ProbeError("launchd-job-binding-invalid")
+    job_environment = _launchctl_block_values(structure, "environment")
+    expected_environment = _expected_launchd_child_environment(
+        os.environ if environment is None else environment,
+        label=plan.label,
+        home=plan.account.home,
+        ownership_marker=marker,
+    )
+    required = {f"{name} => {value}" for name, value in expected_environment.items()}
+    xpc = f"XPC_SERVICE_NAME => {plan.label}"
+    if not (
+        (len(job_environment) == len(required) and set(job_environment) == required)
+        or (
+            len(job_environment) == len(required) + 1
+            and set(job_environment) == required | {xpc}
+        )
+    ):
+        raise ProbeError("launchd-job-binding-invalid")
+    marker_prefix = "TASK_WITNESS_LAUNCHD_OWNERSHIP_MARKER => "
+    marker_occurrences = [
+        (path, value)
+        for path, value in structure.block_values
+        if value.startswith(marker_prefix)
+    ]
+    if marker_occurrences != [(("environment",), f"{marker_prefix}{marker}")]:
+        raise ProbeError("launchd-job-binding-invalid")
+
+    active_count = _launchctl_top_value(structure, "active count")
+    state_value = _launchctl_top_value(structure, "state")
+    runs = _launchctl_optional_top_value(structure, "runs")
+    last_exit_code = _launchctl_optional_top_value(structure, "last exit code")
+    if (
+        re.fullmatch(r"[0-9]+", active_count) is None
+        or re.fullmatch(r"[a-z][a-z -]*", state_value) is None
+        or (runs is not None and re.fullmatch(r"[0-9]+", runs) is None)
+        or (
+            last_exit_code is not None
+            and re.fullmatch(r"-?[0-9]+", last_exit_code) is None
+        )
+    ):
+        raise ProbeError("launchd-job-binding-invalid")
+
+    argument_lines = "\n".join(
+        f"\t\t{argument}" for argument in _expected_launchd_program_arguments(plan)
+    )
+    environment_lines = "\n".join(
+        f"\t\t{name} => {value}" for name, value in sorted(expected_environment.items())
+    )
+    if xpc in job_environment:
+        environment_lines += f"\n\t\t{xpc}"
+    terminal_lines = ""
+    if runs is not None:
+        terminal_lines += f"\truns = {runs}\n"
+    if last_exit_code is not None:
+        terminal_lines += f"\tlast exit code = {last_exit_code}\n"
+    sanitized = (
+        f"system/{plan.label} = {{\n"
+        f"\tactive count = {active_count}\n"
+        f"\tpath = {plan.plist}\n"
+        f"\tstate = {state_value}\n\n"
+        "\tprogram = /usr/bin/python3\n"
+        "\targuments = {\n"
+        f"{argument_lines}\n"
+        "\t}\n\n"
+        "\tenvironment = {\n"
+        f"{environment_lines}\n"
+        "\t}\n\n"
+        "\tdomain = system\n"
+        f"\tusername = {plan.account.name}\n"
+        f"{terminal_lines}"
+        "}\n"
+    )
+    return ValidatedLaunchdJobSnapshot(
+        binding={"ownership_marker": marker},
+        sanitized=sanitized,
+    )
+
+
+def _validate_launchd_job_binding(
+    raw: str,
+    plan: LaunchdPlan,
+    state: Mapping[str, object],
+) -> dict[str, str]:
+    return _validated_launchd_job_snapshot(raw, plan, state).binding
+
+
+def _reconcile_owned_launchd_job(
+    plan: LaunchdPlan,
+    state: Mapping[str, object],
+    ownership: Mapping[str, object] | None,
+) -> None:
+    snapshot = _launchd_job_snapshot(plan.label)
+    if snapshot is None:
+        return
+    if ownership != _launchd_ownership_document(plan, state):
+        raise ProbeError("launchd-job-ownership-unproven")
+    _bootout_validated_launchd_job(plan, state, snapshot)
+
+
+def _reconcile_in_process_bootstrap(
+    plan: LaunchdPlan,
+    state: Mapping[str, object],
+) -> None:
+    snapshot = _launchd_job_snapshot(plan.label)
+    if snapshot is None:
+        return
+    _bootout_validated_launchd_job(plan, state, snapshot)
+
+
+def _bootout_validated_launchd_job(
+    plan: LaunchdPlan,
+    state: Mapping[str, object],
+    snapshot: str,
+) -> None:
+    _validate_launchd_job_binding(snapshot, plan, state)
+    target = f"system/{plan.label}"
+    _require_command_success(["/bin/launchctl", "bootout", target])
+    if _launchd_job_snapshot(plan.label) is not None:
+        raise ProbeError("launchd-bootout-disagrees")
+
+
+def _read_launchd_child_payloads(account: DisposableAccount) -> dict[str, bytes]:
+    _validate_exact_disposable_home(
+        account.home,
+        expected_uid=account.uid,
+        expected_gid=account.gid,
+    )
+    payloads = {
+        name: _read_stable_regular_file(
+            account.home / "launchd-probe" / name,
+            maximum,
+            name.replace(".", "-"),
+        )
+        for name, maximum in LAUNCHD_CHILD_FILES.items()
+    }
+    if payloads["probe.status"] not in {b"0\n", b"1\n", b"2\n"}:
+        raise ProbeError("probe-status-invalid")
+    return payloads
+
+
+def _ensure_failed_child_files(
+    account: DisposableAccount,
+    environment: Mapping[str, str],
+    code: str,
+) -> None:
+    probe_root = account.home / "launchd-probe"
+    if not _metadata_matches(
+        account.home,
+        kind="directory",
+        mode=0o700,
+        uid=account.uid,
+        gid=account.gid,
+    ) or not _metadata_matches(
+        probe_root,
+        kind="directory",
+        mode=0o700,
+        uid=account.uid,
+        gid=account.gid,
+    ):
+        raise ProbeError("home-cleanup-drift")
+    try:
+        names = {entry.name for entry in probe_root.iterdir()}
+    except OSError as error:
+        raise ProbeError("home-cleanup-drift") from error
+    if not names <= set(LAUNCHD_CHILD_FILES):
+        raise ProbeError("home-cleanup-drift")
+    payloads = {
+        "probe.json": canonical_bytes(
+            build_launchd_user_probe_error_document(
+                EXPECTED_CANDIDATE_SHA,
+                {
+                    **environment,
+                    "TASK_WITNESS_LAUNCHD_LABEL": _launchd_identity(environment)[1],
+                },
+                code,
+            )
+        ),
+        "probe.status": b"2\n",
+        "probe.stderr": f"task-witness macOS launchd-user probe: {code}\n".encode(),
+        "probe.stdout": b"probe-error\n",
+    }
+    for name, raw in payloads.items():
+        path = probe_root / name
+        if not _path_exists_no_follow(path):
+            _write_account_file(path, raw, account)
+
+
+def _write_lifecycle_artifact(
+    *,
+    artifact_root: Path,
+    plan: LaunchdPlan | None,
+    binding: Mapping[str, object] | None,
+    environment: Mapping[str, str],
+    loaded: str,
+    terminal: str,
+    kickstart_pid: int | None,
+    status: int,
+    error_code: str | None,
+) -> None:
+    label = plan.label if plan is not None else _launchd_identity(environment)[1]
+    child: dict[str, bytes]
+    probe_disposition = "probe-error"
+    if plan is not None:
+        try:
+            child = _read_launchd_child_payloads(plan.account)
+            probe_document = json.loads(child["probe.json"].decode("utf-8", "strict"))
+            if (
+                not isinstance(probe_document, dict)
+                or canonical_bytes(probe_document) != child["probe.json"]
+            ):
+                raise ProbeError("noncanonical-launchd-user-probe")
+            _require_content_digest(probe_document, "launchd-user-probe")
+            probe_disposition = str(probe_document.get("disposition", "probe-error"))
+        except (ProbeError, UnicodeDecodeError, json.JSONDecodeError):
+            child = {}
+    else:
+        child = {}
+    if not child:
+        code = error_code or "lifecycle-incomplete"
+        child = {
+            "probe.json": canonical_bytes(
+                build_launchd_user_probe_error_document(
+                    EXPECTED_CANDIDATE_SHA,
+                    {**environment, "TASK_WITNESS_LAUNCHD_LABEL": label},
+                    code,
+                )
+            ),
+            "probe.status": b"2\n",
+            "probe.stderr": f"task-witness macOS launchd-user probe: {code}\n".encode(),
+            "probe.stdout": b"probe-error\n",
+        }
+    disposition = (
+        "launchd-user-eligible"
+        if status == 0 and probe_disposition == "launchd-user-eligible"
+        else "launchd-user-ineligible"
+        if status == 1
+        else "probe-error"
+    )
+    validated_binding = (
+        _validated_launchd_binding_evidence(binding) if binding is not None else None
+    )
+    artifact_loaded = ""
+    artifact_terminal = ""
+    if loaded or terminal:
+        if plan is None or validated_binding is None:
+            raise ProbeError("launchd-job-binding-invalid")
+        snapshot_state = {"ownership_marker": validated_binding["ownership_marker"]}
+        if loaded:
+            artifact_loaded = _validated_launchd_job_snapshot(
+                loaded,
+                plan,
+                snapshot_state,
+                environment=environment,
+            ).sanitized
+        if terminal:
+            artifact_terminal = _validated_launchd_job_snapshot(
+                terminal,
+                plan,
+                snapshot_state,
+                environment=environment,
+            ).sanitized
+    unsigned: dict[str, object] = {
+        "schema_version": 1,
+        "contract": "task-witness-macos-launchd-lifecycle-v1",
+        "candidate_sha1": EXPECTED_CANDIDATE_SHA,
+        "label": label,
+        "kickstart_pid": kickstart_pid,
+        "probe_disposition": probe_disposition,
+        "disposition": disposition,
+    }
+    if error_code is not None:
+        unsigned["error"] = {"code": error_code}
+    if disposition == "launchd-user-eligible":
+        if plan is None or validated_binding is None:
+            raise ProbeError("launchd-job-binding-invalid")
+        unsigned["binding"] = validated_binding
+    payloads = {
+        "launchd.loaded": artifact_loaded.encode("utf-8"),
+        "launchd.terminal": artifact_terminal.encode("utf-8"),
+        "lifecycle.json": canonical_bytes(_document_with_digest(unsigned)),
+        "lifecycle.status": f"{status}\n".encode("ascii"),
+        **child,
+    }
+    if set(payloads) != set(LAUNCHD_ARTIFACT_FILES) - {"cleanup.json"}:
+        raise ProbeError("launchd-artifact-build-disagrees")
+    for name, raw in payloads.items():
+        if len(raw) > LAUNCHD_ARTIFACT_FILES[name]:
+            raise ProbeError("launchd-artifact-payload-too-large")
+        _write_root_file(artifact_root / name, raw, 0o600)
+
+
+def run_launchd_user_lifecycle(
+    *,
+    stage_root: Path,
+    artifact_root: Path,
+    candidate_sha: str,
+    runner_uid: int,
+    runner_gid: int,
+) -> int:
+    if candidate_sha != EXPECTED_CANDIDATE_SHA:
+        raise ProbeError("candidate-sha-disagrees")
+    _normalized_context(os.environ)
+    _validate_lifecycle_arguments(
+        source_helper=Path(__file__),
+        stage_root=stage_root,
+        artifact_root=artifact_root,
+        runner_uid=runner_uid,
+        runner_gid=runner_gid,
+    )
+    _require_nonroot_runner_gid(runner_gid)
+    plan: LaunchdPlan | None = None
+    binding: dict[str, str] | None = None
+    loaded = ""
+    terminal = ""
+    kickstart_pid: int | None = None
+    status = 2
+    error_code: str | None = None
+    bootstrap_attempted = False
+    bootout_confirmed = False
+    _create_root_directory(artifact_root, 0o700)
+    try:
+        plan, state = _load_lifecycle_state(
+            stage_root=stage_root,
+            runner_uid=runner_uid,
+            runner_gid=runner_gid,
+            environment=os.environ,
+        )
+        if _validate_exact_stage(plan, state) is not None:
+            raise ProbeError("launchd-job-ownership-already-recorded")
+        _require_launchd_absent(plan.label)
+        _create_disposable_account(plan.account)
+        _create_disposable_home(plan.account)
+        _require_launchd_absent(plan.label)
+        bootstrap_attempted = True
+        _require_command_success(
+            ["/bin/launchctl", "bootstrap", "system", str(plan.plist)]
+        )
+        _write_launchd_ownership_marker(plan, state)
+        loaded_snapshot = _launchd_job_snapshot(plan.label)
+        if loaded_snapshot is None:
+            raise ProbeError("launchd-job-disappeared")
+        validated_loaded = _validated_launchd_job_snapshot(
+            loaded_snapshot,
+            plan,
+            state,
+        )
+        binding = validated_loaded.binding
+        loaded = validated_loaded.sanitized
+        pid_raw = _require_command_success(
+            ["/bin/launchctl", "kickstart", "-p", f"system/{plan.label}"]
+        )
+        if re.fullmatch(r"[1-9][0-9]*", pid_raw) is None:
+            raise ProbeError("launchd-kickstart-pid-invalid")
+        kickstart_pid = int(pid_raw)
+        terminal, status = _poll_launchd_terminal(plan, state)
+        probe = _load_canonical_document(
+            plan.account.home / "launchd-probe/probe.json",
+            MAX_PROBE_JSON_BYTES,
+            "launchd-user-probe",
+        )
+        observed_pid = (
+            probe.get("observations", {}).get("process", {}).get("pid")
+            if isinstance(probe.get("observations"), dict)
+            else None
+        )
+        if observed_pid != kickstart_pid:
+            raise ProbeError("launchd-child-pid-disagrees")
+    except ProbeError as error:
+        error_code = error.code
+        status = 2
+    finally:
+        if plan is not None and bootstrap_attempted:
+            try:
+                _reconcile_in_process_bootstrap(plan, state)
+                bootout_confirmed = True
+            except ProbeError as error:
+                error_code = error.code
+                status = 2
+    processes_absent = False
+    if plan is not None and bootout_confirmed:
+        try:
+            _require_no_uid_processes(plan.account.uid)
+            processes_absent = True
+        except ProbeError as error:
+            error_code = error.code
+            status = 2
+    if status == 2 and plan is not None and processes_absent:
+        try:
+            _ensure_failed_child_files(
+                plan.account,
+                os.environ,
+                error_code or "lifecycle-incomplete",
+            )
+        except ProbeError:
+            pass
+    _write_lifecycle_artifact(
+        artifact_root=artifact_root,
+        plan=plan if processes_absent else None,
+        binding=binding if processes_absent else None,
+        environment=os.environ,
+        loaded=loaded,
+        terminal=terminal,
+        kickstart_pid=kickstart_pid,
+        status=status,
+        error_code=error_code,
+    )
+    return status
+
+
+def _load_lifecycle_state(
+    stage_root: Path,
+    *,
+    runner_uid: int,
+    runner_gid: int,
+    environment: Mapping[str, str],
+) -> tuple[LaunchdPlan, dict]:
+    state_path = stage_root / "state.json"
+    if not _metadata_matches(
+        state_path,
+        kind="file",
+        mode=0o600,
+        uid=0,
+        gid=0,
+        nlink=1,
+    ):
+        raise ProbeError("lifecycle-state-drift")
+    state = _load_canonical_document(state_path, 16 * 1024, "lifecycle-state")
+    _require_content_digest(state, "lifecycle-state")
+    expected_name, expected_label = _launchd_identity(environment)
+    account_value = state.get("account")
+    if not isinstance(account_value, dict):
+        raise ProbeError("lifecycle-state-drift")
+    try:
+        account = DisposableAccount(
+            name=str(account_value["name"]),
+            uid=int(account_value["uid"]),
+            gid=int(account_value["gid"]),
+            home=Path(str(account_value["home"])),
+            generated_uid=str(account_value["generated_uid"]),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ProbeError("lifecycle-state-drift") from error
+    plan = LaunchdPlan(
+        account=account,
+        label=expected_label,
+        stage_root=stage_root,
+        helper=stage_root / "helper.py",
+        plist=stage_root / "job.plist",
+    )
+    if (
+        set(state)
+        != {
+            "schema_version",
+            "contract",
+            "candidate_sha1",
+            "account",
+            "label",
+            "stage_root",
+            "helper_sha256",
+            "plist_sha256",
+            "ownership_marker",
+            "runner_uid",
+            "runner_gid",
+            "content_sha256",
+        }
+        or set(account_value) != {"name", "uid", "gid", "home", "generated_uid"}
+        or state.get("schema_version") != 1
+        or state.get("contract") != "task-witness-macos-launchd-lifecycle-state-v1"
+        or state.get("candidate_sha1") != EXPECTED_CANDIDATE_SHA
+        or state.get("label") != expected_label
+        or state.get("stage_root") != str(stage_root)
+        or state.get("runner_uid") != runner_uid
+        or state.get("runner_gid") != runner_gid
+        or not isinstance(state.get("ownership_marker"), str)
+        or LAUNCHD_OWNERSHIP_MARKER_RE.fullmatch(state["ownership_marker"]) is None
+        or account.name != expected_name
+        or account.uid not in range(DISPOSABLE_UID_MIN, DISPOSABLE_UID_MAX + 1)
+        or account.gid != runner_gid
+        or account.home != Path("/Users") / expected_name
+        or account.generated_uid
+        != str(uuid.uuid5(uuid.NAMESPACE_URL, expected_label)).upper()
+    ):
+        raise ProbeError("lifecycle-state-drift")
+    return plan, state
+
+
+def _validate_exact_stage(
+    plan: LaunchdPlan,
+    state: Mapping[str, object],
+) -> dict | None:
+    try:
+        names = {entry.name for entry in plan.stage_root.iterdir()}
+    except OSError as error:
+        raise ProbeError("stage-cleanup-drift") from error
+    base_names = {"helper.py", "job.plist", "state.json"}
+    if (
+        names not in (base_names, base_names | {"ownership.json"})
+        or not _metadata_matches(
+            plan.stage_root,
+            kind="directory",
+            mode=0o755,
+            uid=0,
+            gid=0,
+        )
+        or not _metadata_matches(
+            plan.helper,
+            kind="file",
+            mode=0o555,
+            uid=0,
+            gid=0,
+            nlink=1,
+        )
+        or not _metadata_matches(
+            plan.plist,
+            kind="file",
+            mode=0o644,
+            uid=0,
+            gid=0,
+            nlink=1,
+        )
+    ):
+        raise ProbeError("stage-cleanup-drift")
+    helper = _read_stable_regular_file(plan.helper, MAX_HELPER_BYTES, "staged-helper")
+    plist = _read_stable_regular_file(plan.plist, 64 * 1024, "staged-plist")
+    if hashlib.sha256(helper).hexdigest() != state.get(
+        "helper_sha256"
+    ) or hashlib.sha256(plist).hexdigest() != state.get("plist_sha256"):
+        raise ProbeError("stage-cleanup-drift")
+    ownership = _load_launchd_ownership_marker(plan, state)
+    if ("ownership.json" in names) != (ownership is not None):
+        raise ProbeError("stage-cleanup-drift")
+    return ownership
+
+
+def _require_no_uid_processes(uid: int) -> None:
+    raw = _require_command_success(
+        ["/bin/ps", "-axo", "uid=,pid="],
+        maximum=MAX_PROCESS_LIST_BYTES,
+    )
+    observed_pid_one = False
+    for line in raw.splitlines():
+        fields = line.split()
+        if len(fields) != 2 or any(
+            re.fullmatch(r"[0-9]+", item) is None for item in fields
+        ):
+            raise ProbeError("process-list-invalid")
+        process_uid, process_id = (int(item) for item in fields)
+        if process_uid == 0 and process_id == 1:
+            observed_pid_one = True
+        if process_uid == uid:
+            raise ProbeError("disposable-user-process-remains")
+    if not observed_pid_one:
+        raise ProbeError("process-list-invalid")
+
+
+def _validate_precleanup_artifact(artifact_root: Path) -> None:
+    try:
+        names = {entry.name for entry in artifact_root.iterdir()}
+    except OSError as error:
+        raise ProbeError("launchd-artifact-root-unreadable") from error
+    expected = set(LAUNCHD_ARTIFACT_FILES) - {"cleanup.json"}
+    if names != expected or not _metadata_matches(
+        artifact_root,
+        kind="directory",
+        mode=0o700,
+        uid=0,
+        gid=0,
+    ):
+        raise ProbeError("launchd-artifact-precleanup-drift")
+    for name in expected:
+        if not _metadata_matches(
+            artifact_root / name,
+            kind="file",
+            mode=0o600,
+            uid=0,
+            gid=0,
+            nlink=1,
+        ):
+            raise ProbeError("launchd-artifact-precleanup-drift")
+
+
+def cleanup_launchd_user_lifecycle(
+    *,
+    stage_root: Path,
+    artifact_root: Path,
+    expected_helper_sha256: str,
+    runner_uid: int,
+    runner_gid: int,
+) -> int:
+    _normalized_context(os.environ)
+    _validate_lifecycle_arguments(
+        source_helper=Path(__file__),
+        stage_root=stage_root,
+        artifact_root=artifact_root,
+        runner_uid=runner_uid,
+        runner_gid=runner_gid,
+    )
+    try:
+        if _cleanup_helper_only_stage_before_state(
+            stage_root=stage_root,
+            artifact_root=artifact_root,
+            expected_helper_sha256=expected_helper_sha256,
+            environment=os.environ,
+        ):
+            return 2
+    except ProbeError:
+        return 2
+    error_code: str | None = None
+    try:
+        plan, state = _load_lifecycle_state(
+            stage_root,
+            runner_uid=runner_uid,
+            runner_gid=runner_gid,
+            environment=os.environ,
+        )
+        ownership = _validate_exact_stage(plan, state)
+        _reconcile_owned_launchd_job(plan, state, ownership)
+        accounts = _list_accounts()
+        account_present = _account_exists(plan.account.name)
+        uid_owners = [name for name, uid in accounts.items() if uid == plan.account.uid]
+        if uid_owners not in ([], [plan.account.name]):
+            raise ProbeError("account-record-drift")
+        if account_present:
+            if accounts.get(plan.account.name) != plan.account.uid:
+                raise ProbeError("account-record-drift")
+            _account_record(plan.account)
+        elif plan.account.name in accounts:
+            raise ProbeError("account-record-drift")
+        home_present = _path_exists_no_follow(plan.account.home)
+        if home_present:
+            _validate_exact_disposable_home(
+                plan.account.home,
+                expected_uid=plan.account.uid,
+                expected_gid=plan.account.gid,
+            )
+        _require_no_uid_processes(plan.account.uid)
+        if account_present:
+            _require_command_success(
+                ["/usr/bin/dscl", ".", "-delete", f"/Users/{plan.account.name}"]
+            )
+            if (
+                _account_exists(plan.account.name)
+                or plan.account.name in _list_accounts()
+            ):
+                raise ProbeError("account-delete-disagrees")
+        if home_present:
+            remove_exact_disposable_home(
+                plan.account.home,
+                expected_uid=plan.account.uid,
+                expected_gid=plan.account.gid,
+            )
+        try:
+            stage_names = ["helper.py", "job.plist", "state.json"]
+            if ownership is not None:
+                stage_names.append("ownership.json")
+            for name in stage_names:
+                (stage_root / name).unlink()
+            stage_root.rmdir()
+        except OSError as error:
+            raise ProbeError("stage-cleanup-failed") from error
+        _validate_precleanup_artifact(artifact_root)
+        cleanup = _document_with_digest(
+            {
+                "schema_version": 1,
+                "contract": "task-witness-macos-launchd-cleanup-v1",
+                "candidate_sha1": EXPECTED_CANDIDATE_SHA,
+                "account": plan.account.name,
+                "label": plan.label,
+                "disposition": "cleaned",
+            }
+        )
+        _write_root_file(
+            artifact_root / "cleanup.json", canonical_bytes(cleanup), 0o600
+        )
+        launchd_artifact_payloads(artifact_root, include_manifest=False)
+        try:
+            for name in LAUNCHD_ARTIFACT_FILES:
+                os.chown(
+                    artifact_root / name,
+                    runner_uid,
+                    runner_gid,
+                    follow_symlinks=False,
+                )
+            os.chown(artifact_root, runner_uid, runner_gid, follow_symlinks=False)
+        except OSError as error:
+            raise ProbeError("artifact-transfer-failed") from error
+        return 0
+    except ProbeError as error:
+        error_code = error.code
+    try:
+        if _metadata_matches(
+            artifact_root,
+            kind="directory",
+            mode=0o700,
+            uid=0,
+            gid=0,
+        ) and not _path_exists_no_follow(artifact_root / "cleanup.json"):
+            cleanup = _document_with_digest(
+                {
+                    "schema_version": 1,
+                    "contract": "task-witness-macos-launchd-cleanup-v1",
+                    "candidate_sha1": EXPECTED_CANDIDATE_SHA,
+                    "disposition": "preserved-on-drift",
+                    "error": {"code": error_code},
+                }
+            )
+            _write_root_file(
+                artifact_root / "cleanup.json",
+                canonical_bytes(cleanup),
+                0o600,
+            )
+    except ProbeError:
+        pass
+    return 2
+
+
 def run_probe(output: Path, candidate_sha: str) -> int:
     if candidate_sha != EXPECTED_CANDIDATE_SHA:
         raise ProbeError("candidate-sha-disagrees")
@@ -864,6 +3458,46 @@ def run_probe(output: Path, candidate_sha: str) -> int:
     return status
 
 
+def run_launchd_user_probe(
+    output: Path,
+    status_output: Path,
+    candidate_sha: str,
+) -> int:
+    if (
+        output.parent != status_output.parent
+        or output.name != "probe.json"
+        or status_output.name != "probe.status"
+    ):
+        raise ProbeError("invalid-launchd-output-paths")
+    _normalized_context(os.environ)
+    status = 0
+    try:
+        observations = collect_launchd_observations()
+        document = build_launchd_user_probe_document(
+            candidate_sha,
+            os.environ,
+            observations,
+        )
+        if document["disposition"] != "launchd-user-eligible":
+            status = 1
+    except ProbeError as error:
+        document = build_launchd_user_probe_error_document(
+            candidate_sha,
+            os.environ,
+            error.code,
+        )
+        status = 2
+    write_create_new(output, canonical_bytes(document))
+    write_create_new(status_output, f"{status}\n".encode("ascii"))
+    print(document["disposition"])
+    if status == 2:
+        print(
+            f"task-witness macOS launchd-user probe: {document['error']['code']}",
+            file=sys.stderr,
+        )
+    return status
+
+
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser()
     subparsers = value.add_subparsers(dest="command", required=True)
@@ -879,6 +3513,53 @@ def parser() -> argparse.ArgumentParser:
     verify = subparsers.add_parser("verify-artifact-manifest")
     verify.add_argument("--artifact-root", required=True, type=Path)
     verify.add_argument("--manifest", required=True, type=Path)
+
+    launchd_probe = subparsers.add_parser("probe-launchd-user")
+    launchd_probe.add_argument("--candidate-sha", required=True)
+    launchd_probe.add_argument("--output", required=True, type=Path)
+    launchd_probe.add_argument("--status-output", required=True, type=Path)
+
+    provisioner = subparsers.add_parser("verify-provisioner")
+    provisioner.add_argument("--candidate-sha", required=True)
+    provisioner.add_argument("--artifact-root", required=True, type=Path)
+
+    initialize = subparsers.add_parser("initialize-launchd-user-lifecycle")
+    initialize.add_argument("--candidate-sha", required=True)
+    initialize.add_argument("--expected-helper-sha256", required=True)
+    initialize.add_argument("--stage-root", required=True, type=Path)
+    initialize.add_argument("--artifact-root", required=True, type=Path)
+    initialize.add_argument("--runner-uid", required=True, type=int)
+    initialize.add_argument("--runner-gid", required=True, type=int)
+
+    lifecycle = subparsers.add_parser("run-launchd-user-lifecycle")
+    lifecycle.add_argument("--candidate-sha", required=True)
+    lifecycle.add_argument("--stage-root", required=True, type=Path)
+    lifecycle.add_argument("--artifact-root", required=True, type=Path)
+    lifecycle.add_argument("--runner-uid", required=True, type=int)
+    lifecycle.add_argument("--runner-gid", required=True, type=int)
+
+    cleanup = subparsers.add_parser("cleanup-launchd-user-lifecycle")
+    cleanup.add_argument("--expected-helper-sha256", required=True)
+    cleanup.add_argument("--stage-root", required=True, type=Path)
+    cleanup.add_argument("--artifact-root", required=True, type=Path)
+    cleanup.add_argument("--runner-uid", required=True, type=int)
+    cleanup.add_argument("--runner-gid", required=True, type=int)
+
+    launchd_manifest = subparsers.add_parser("write-launchd-artifact-manifest")
+    launchd_manifest.add_argument("--artifact-root", required=True, type=Path)
+    launchd_manifest.add_argument("--output", required=True, type=Path)
+
+    verify_launchd_manifest = subparsers.add_parser("verify-launchd-artifact-manifest")
+    verify_launchd_manifest.add_argument(
+        "--artifact-root",
+        required=True,
+        type=Path,
+    )
+    verify_launchd_manifest.add_argument("--manifest", required=True, type=Path)
+
+    launchd_success = subparsers.add_parser("verify-launchd-success")
+    launchd_success.add_argument("--artifact-root", required=True, type=Path)
+    launchd_success.add_argument("--manifest", required=True, type=Path)
     return value
 
 
@@ -892,6 +3573,53 @@ def main() -> int:
             return 0
         if args.command == "verify-artifact-manifest":
             verify_artifact_manifest(args.artifact_root, args.manifest)
+            return 0
+        if args.command == "probe-launchd-user":
+            return run_launchd_user_probe(
+                args.output,
+                args.status_output,
+                args.candidate_sha,
+            )
+        if args.command == "verify-provisioner":
+            if args.candidate_sha != EXPECTED_CANDIDATE_SHA:
+                raise ProbeError("candidate-sha-disagrees")
+            verify_provisioning_capability(args.artifact_root)
+            return 0
+        if args.command == "initialize-launchd-user-lifecycle":
+            return initialize_launchd_user_lifecycle(
+                stage_root=args.stage_root,
+                artifact_root=args.artifact_root,
+                candidate_sha=args.candidate_sha,
+                expected_helper_sha256=args.expected_helper_sha256,
+                runner_uid=args.runner_uid,
+                runner_gid=args.runner_gid,
+            )
+        if args.command == "run-launchd-user-lifecycle":
+            return run_launchd_user_lifecycle(
+                stage_root=args.stage_root,
+                artifact_root=args.artifact_root,
+                candidate_sha=args.candidate_sha,
+                runner_uid=args.runner_uid,
+                runner_gid=args.runner_gid,
+            )
+        if args.command == "cleanup-launchd-user-lifecycle":
+            return cleanup_launchd_user_lifecycle(
+                stage_root=args.stage_root,
+                artifact_root=args.artifact_root,
+                expected_helper_sha256=args.expected_helper_sha256,
+                runner_uid=args.runner_uid,
+                runner_gid=args.runner_gid,
+            )
+        if args.command == "write-launchd-artifact-manifest":
+            write_launchd_artifact_manifest(args.artifact_root, args.output)
+            return 0
+        if args.command == "verify-launchd-artifact-manifest":
+            verify_launchd_artifact_manifest(args.artifact_root, args.manifest)
+            return 0
+        if args.command == "verify-launchd-success":
+            if args.manifest != args.artifact_root / "SHA256SUMS":
+                raise ProbeError("launchd-manifest-path-disagrees")
+            verify_launchd_success(args.artifact_root)
             return 0
         raise ProbeError("unsupported-command")
     except ProbeError as error:

@@ -30,6 +30,7 @@ jobs:
     timeout-minutes: 15
     env:
       CANDIDATE_SHA: b47f03519068b858cf0c070b5d331ee053ef6b7b
+      HELPER_SHA256: 9f07ab1ccf59301ad58038749b617a92de05f7d4b3b378cadbc2b8e3f7c1ebf7
     steps:
       - name: Check out the operator-owned harness
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
@@ -129,15 +130,865 @@ jobs:
           retention-days: 14
           compression-level: 6
 
-      - name: Require an eligible direct session
-        if: always()
+      - name: Require a launchd-capable macOS provisioner
         shell: bash
         run: |
           set -euo pipefail
           probe_root="$RUNNER_TEMP/task-witness-macos-host-probe"
           /usr/bin/python3 -I -B \
             harness/scripts/probe_task_witness_macos_host.py \
-              verify-artifact-manifest \
-              --artifact-root "$probe_root" \
-              --manifest "$probe_root/SHA256SUMS"
-          /bin/test "$(/bin/cat "$probe_root/probe.status")" = 0
+              verify-provisioner \
+              --candidate-sha "$CANDIDATE_SHA" \
+              --artifact-root "$probe_root"
+          runner_gid=$(/usr/bin/id -g)
+          /bin/test "$runner_gid" -gt 0
+
+      - name: Generate the launchd staging ownership nonce
+        id: launchd_stage_nonce
+        shell: bash
+        run: |
+          set -euo pipefail
+          ownership_nonce=$(
+            /usr/bin/python3 -I -B -c \
+              'import os; print(os.urandom(32).hex())'
+          )
+          case "$ownership_nonce" in
+            ""|*[!0-9a-f]*)
+              exit 1
+              ;;
+          esac
+          /bin/test "${#ownership_nonce}" -eq 64
+          /usr/bin/printf 'nonce=%s\n' "$ownership_nonce" >>"$GITHUB_OUTPUT"
+
+      - name: Stage the exact root-owned launchd helper
+        id: launchd_stage
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage_root="/private/var/tmp/task-witness-macos-launchd-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          partial_helper="$stage_root/helper.py.partial"
+          ownership_nonce="${{ steps.launchd_stage_nonce.outputs.nonce }}"
+          ownership_marker_name=".task-witness-stage-owner-$ownership_nonce"
+          ownership_marker="$stage_root/$ownership_marker_name"
+          source_helper="$GITHUB_WORKSPACE/harness/scripts/probe_task_witness_macos_host.py"
+          case "$ownership_nonce" in
+            ""|*[!0-9a-f]*)
+              exit 1
+              ;;
+          esac
+          /bin/test "${#ownership_nonce}" -eq 64
+          runner_uid=$(/usr/bin/id -u)
+          runner_gid=$(/usr/bin/id -g)
+          helper_blob=$(
+            /usr/bin/git -C harness rev-parse \
+              "$GITHUB_SHA:scripts/probe_task_witness_macos_host.py"
+          )
+          observed_helper_blob=$(
+            /usr/bin/git -C harness hash-object \
+              scripts/probe_task_witness_macos_host.py
+          )
+          /bin/test "$observed_helper_blob" = "$helper_blob"
+          /usr/bin/sudo -n /bin/test ! -e "$stage_root"
+          /usr/bin/sudo -n /bin/test ! -L "$stage_root"
+          /usr/bin/sudo -n /bin/test -f "$source_helper"
+          /usr/bin/sudo -n /bin/test ! -L "$source_helper"
+          source_metadata_before=$(
+            /usr/bin/sudo -n /usr/bin/stat -f '%HT:%u:%g:%Lp:%l' \
+              "$source_helper"
+          )
+          /bin/test "$source_metadata_before" = \
+            "Regular File:${runner_uid}:${runner_gid}:755:1"
+          source_identity_before=$(
+            /usr/bin/sudo -n /usr/bin/stat -f '%d:%i:%z:%m' \
+              "$source_helper"
+          )
+          source_digest_before=$(
+            /usr/bin/sudo -n /usr/bin/shasum -a 256 "$source_helper"
+          )
+          /bin/test "$source_digest_before" = \
+            "$HELPER_SHA256  $source_helper"
+          stage_transaction_complete=false
+          stage_output_published=false
+          cleanup_unpublished_stage() {
+            status=$?
+            if /bin/test "$stage_transaction_complete" = true && \
+                /bin/test "$stage_output_published" != true; then
+              /usr/bin/sudo -n /bin/test ! -L "$stage_root"
+              stage_metadata=$(
+                /usr/bin/sudo -n /usr/bin/stat -f '%HT:%u:%g:%Lp' \
+                  "$stage_root"
+              )
+              /bin/test "$stage_metadata" = "Directory:0:0:755"
+              stage_contents=$(/usr/bin/sudo -n /bin/ls -A "$stage_root")
+              case "$stage_contents" in
+                "$ownership_marker_name
+          helper.py.partial"|"helper.py.partial
+          $ownership_marker_name")
+                  ;;
+                *)
+                  exit 1
+                  ;;
+              esac
+              ownership_metadata=$(
+                /usr/bin/sudo -n /usr/bin/stat -f '%HT:%u:%g:%Lp:%l:%z' \
+                  "$ownership_marker"
+              )
+              /bin/test "$ownership_metadata" = \
+                "Regular File:0:0:600:1:64"
+              ownership_value=$(
+                /usr/bin/sudo -n /bin/cat "$ownership_marker"
+              )
+              /bin/test "$ownership_value" = "$ownership_nonce"
+              helper_metadata=$(
+                /usr/bin/sudo -n /usr/bin/stat -f '%HT:%u:%g:%Lp:%l' \
+                  "$partial_helper"
+              )
+              /bin/test "$helper_metadata" = "Regular File:0:0:444:1"
+              helper_digest=$(
+                /usr/bin/sudo -n /usr/bin/shasum -a 256 "$partial_helper"
+              )
+              /bin/test "$helper_digest" = "$HELPER_SHA256  $partial_helper"
+              /usr/bin/sudo -n /bin/unlink "$partial_helper"
+              /usr/bin/sudo -n /bin/unlink "$ownership_marker"
+              /usr/bin/sudo -n /bin/rmdir "$stage_root"
+              /usr/bin/sudo -n /bin/test ! -e "$stage_root"
+              /usr/bin/sudo -n /bin/test ! -L "$stage_root"
+            fi
+            exit "$status"
+          }
+          trap cleanup_unpublished_stage EXIT
+          /usr/bin/sudo -n /usr/bin/python3 -I -B -c 'exec("""
+          import hashlib
+          import os
+          import stat
+          import sys
+
+          maximum = 256 * 1024
+          (
+              source_path,
+              stage_path,
+              expected_digest,
+              runner_uid,
+              runner_gid,
+              ownership_nonce,
+          ) = sys.argv[1:]
+          if os.geteuid() != 0 or os.getegid() != 0:
+              raise SystemExit("staged-helper-not-root")
+          if (
+              not runner_uid.isdecimal()
+              or not runner_gid.isdecimal()
+              or len(expected_digest) != 64
+              or any(character not in "0123456789abcdef" for character in expected_digest)
+              or len(ownership_nonce) != 64
+              or any(character not in "0123456789abcdef" for character in ownership_nonce)
+          ):
+              raise SystemExit("staged-helper-arguments-invalid")
+          expected_runner_uid = int(runner_uid)
+          expected_runner_gid = int(runner_gid)
+          privileged_uid = os.geteuid()
+          privileged_gid = os.getegid()
+          ownership_name = f".task-witness-stage-owner-{ownership_nonce}"
+          ownership_raw = ownership_nonce.encode("ascii")
+          stage_created = False
+          stage_identity = None
+          stage_descriptor = -1
+          ownership_descriptor = -1
+          source_descriptor = -1
+          target_descriptor = -1
+          try:
+              os.mkdir(stage_path, 0o755)
+              stage_created = True
+              stage_identity = os.lstat(stage_path)
+              stage_descriptor = os.open(
+                  stage_path,
+                  os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+              )
+              opened_stage = os.fstat(stage_descriptor)
+              if (
+                  not stat.S_ISDIR(stage_identity.st_mode)
+                  or stage_identity.st_dev != opened_stage.st_dev
+                  or stage_identity.st_ino != opened_stage.st_ino
+              ):
+                  raise SystemExit("staged-helper-directory-identity-invalid")
+              os.fchown(stage_descriptor, privileged_uid, privileged_gid)
+              os.fchmod(stage_descriptor, 0o755)
+              stage_metadata = os.fstat(stage_descriptor)
+              if (
+                  not stat.S_ISDIR(stage_metadata.st_mode)
+                  or stat.S_IMODE(stage_metadata.st_mode) != 0o755
+                  or stage_metadata.st_uid != privileged_uid
+                  or stage_metadata.st_gid != privileged_gid
+                  or os.listdir(stage_descriptor)
+              ):
+                  raise SystemExit("staged-helper-directory-invalid")
+              ownership_descriptor = os.open(
+                  ownership_name,
+                  os.O_RDWR
+                  | os.O_CREAT
+                  | os.O_EXCL
+                  | os.O_CLOEXEC
+                  | os.O_NOFOLLOW,
+                  0o600,
+                  dir_fd=stage_descriptor,
+              )
+              os.fchown(ownership_descriptor, privileged_uid, privileged_gid)
+              os.fchmod(ownership_descriptor, 0o600)
+              ownership_view = memoryview(ownership_raw)
+              while ownership_view:
+                  written = os.write(ownership_descriptor, ownership_view)
+                  if written <= 0:
+                      raise SystemExit("staged-helper-owner-write-failed")
+                  ownership_view = ownership_view[written:]
+              os.fsync(ownership_descriptor)
+              ownership_metadata = os.fstat(ownership_descriptor)
+              ownership_path_metadata = os.stat(
+                  ownership_name,
+                  dir_fd=stage_descriptor,
+                  follow_symlinks=False,
+              )
+              if (
+                  not stat.S_ISREG(ownership_metadata.st_mode)
+                  or stat.S_IMODE(ownership_metadata.st_mode) != 0o600
+                  or ownership_metadata.st_uid != privileged_uid
+                  or ownership_metadata.st_gid != privileged_gid
+                  or ownership_metadata.st_nlink != 1
+                  or ownership_metadata.st_size != len(ownership_raw)
+                  or ownership_path_metadata.st_dev != ownership_metadata.st_dev
+                  or ownership_path_metadata.st_ino != ownership_metadata.st_ino
+                  or os.pread(
+                      ownership_descriptor,
+                      len(ownership_raw) + 1,
+                      0,
+                  ) != ownership_raw
+              ):
+                  raise SystemExit("staged-helper-owner-invalid")
+              os.fsync(stage_descriptor)
+              source_descriptor = os.open(
+                  source_path,
+                  os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+              )
+              source_before = os.fstat(source_descriptor)
+              if (
+                  not stat.S_ISREG(source_before.st_mode)
+                  or stat.S_IMODE(source_before.st_mode) != 0o755
+                  or source_before.st_uid != expected_runner_uid
+                  or source_before.st_gid != expected_runner_gid
+                  or source_before.st_nlink != 1
+                  or source_before.st_size <= 0
+                  or source_before.st_size > maximum
+              ):
+                  raise SystemExit("staged-helper-source-invalid")
+              target_descriptor = os.open(
+                  "helper.py.partial",
+                  os.O_RDWR
+                  | os.O_CREAT
+                  | os.O_EXCL
+                  | os.O_CLOEXEC
+                  | os.O_NOFOLLOW,
+                  0o444,
+                  dir_fd=stage_descriptor,
+              )
+              os.fchown(target_descriptor, privileged_uid, privileged_gid)
+              os.fchmod(target_descriptor, 0o444)
+              source_digest = hashlib.sha256()
+              copied = 0
+              while True:
+                  chunk = os.read(source_descriptor, 64 * 1024)
+                  if not chunk:
+                      break
+                  copied += len(chunk)
+                  if copied > maximum:
+                      raise SystemExit("staged-helper-source-grew")
+                  source_digest.update(chunk)
+                  view = memoryview(chunk)
+                  while view:
+                      written = os.write(target_descriptor, view)
+                      if written <= 0:
+                          raise SystemExit("staged-helper-write-failed")
+                      view = view[written:]
+              os.fsync(target_descriptor)
+              source_after = os.fstat(source_descriptor)
+              target_after = os.fstat(target_descriptor)
+              source_identity_before = (
+                  source_before.st_dev,
+                  source_before.st_ino,
+                  source_before.st_mode,
+                  source_before.st_uid,
+                  source_before.st_gid,
+                  source_before.st_nlink,
+                  source_before.st_size,
+                  source_before.st_mtime_ns,
+              )
+              source_identity_after = (
+                  source_after.st_dev,
+                  source_after.st_ino,
+                  source_after.st_mode,
+                  source_after.st_uid,
+                  source_after.st_gid,
+                  source_after.st_nlink,
+                  source_after.st_size,
+                  source_after.st_mtime_ns,
+              )
+              if (
+                  source_identity_after != source_identity_before
+                  or source_digest.hexdigest() != expected_digest
+                  or not stat.S_ISREG(target_after.st_mode)
+                  or stat.S_IMODE(target_after.st_mode) != 0o444
+                  or target_after.st_uid != privileged_uid
+                  or target_after.st_gid != privileged_gid
+                  or target_after.st_nlink != 1
+                  or target_after.st_size != copied
+                  or set(os.listdir(stage_descriptor))
+                  != {ownership_name, "helper.py.partial"}
+              ):
+                  raise SystemExit("staged-helper-copy-invalid")
+          except BaseException:
+              if stage_created:
+                  try:
+                      if stage_identity is None:
+                          stage_identity = os.lstat(stage_path)
+                      if stage_descriptor < 0:
+                          stage_descriptor = os.open(
+                              stage_path,
+                              os.O_RDONLY
+                              | os.O_CLOEXEC
+                              | os.O_DIRECTORY
+                              | os.O_NOFOLLOW,
+                          )
+                      stage_now = os.fstat(stage_descriptor)
+                      stage_path_now = os.lstat(stage_path)
+                      if (
+                          not stat.S_ISDIR(stage_now.st_mode)
+                          or stage_now.st_dev != stage_identity.st_dev
+                          or stage_now.st_ino != stage_identity.st_ino
+                          or stage_path_now.st_dev != stage_identity.st_dev
+                          or stage_path_now.st_ino != stage_identity.st_ino
+                      ):
+                          raise SystemExit("staged-helper-marker-rollback-drift")
+                      expected_names = set()
+                      if ownership_descriptor >= 0:
+                          expected_names.add(ownership_name)
+                      if target_descriptor >= 0:
+                          expected_names.add("helper.py.partial")
+                      if set(os.listdir(stage_descriptor)) != expected_names:
+                          raise SystemExit("staged-helper-marker-rollback-drift")
+                      if target_descriptor >= 0:
+                          target_now = os.fstat(target_descriptor)
+                          target_path_now = os.stat(
+                              "helper.py.partial",
+                              dir_fd=stage_descriptor,
+                              follow_symlinks=False,
+                          )
+                          if (
+                              not stat.S_ISREG(target_now.st_mode)
+                              or stat.S_IMODE(target_now.st_mode) & ~0o444
+                              or target_now.st_uid != privileged_uid
+                              or target_now.st_gid != privileged_gid
+                              or target_now.st_nlink != 1
+                              or target_now.st_size > maximum
+                              or target_path_now.st_dev != target_now.st_dev
+                              or target_path_now.st_ino != target_now.st_ino
+                          ):
+                              raise SystemExit("staged-helper-marker-rollback-drift")
+                      if ownership_descriptor >= 0:
+                          ownership_now = os.fstat(ownership_descriptor)
+                          ownership_path_now = os.stat(
+                              ownership_name,
+                              dir_fd=stage_descriptor,
+                              follow_symlinks=False,
+                          )
+                          ownership_prefix = os.pread(
+                              ownership_descriptor,
+                              len(ownership_raw) + 1,
+                              0,
+                          )
+                          if (
+                              not stat.S_ISREG(ownership_now.st_mode)
+                              or stat.S_IMODE(ownership_now.st_mode) & ~0o600
+                              or ownership_now.st_uid != privileged_uid
+                              or ownership_now.st_gid != privileged_gid
+                              or ownership_now.st_nlink != 1
+                              or ownership_now.st_size > len(ownership_raw)
+                              or ownership_path_now.st_dev != ownership_now.st_dev
+                              or ownership_path_now.st_ino != ownership_now.st_ino
+                              or ownership_prefix
+                              != ownership_raw[: len(ownership_prefix)]
+                          ):
+                              raise SystemExit("staged-helper-marker-rollback-drift")
+                      if target_descriptor >= 0:
+                          os.unlink("helper.py.partial", dir_fd=stage_descriptor)
+                      if ownership_descriptor >= 0:
+                          os.unlink(ownership_name, dir_fd=stage_descriptor)
+                      if os.listdir(stage_descriptor):
+                          raise SystemExit("staged-helper-marker-rollback-drift")
+                      os.rmdir(stage_path)
+                  except BaseException as cleanup_error:
+                      raise SystemExit(
+                          "staged-helper-marker-rollback-failed"
+                      ) from cleanup_error
+              raise
+          finally:
+              for descriptor in (
+                  target_descriptor,
+                  source_descriptor,
+                  ownership_descriptor,
+                  stage_descriptor,
+              ):
+                  if descriptor >= 0:
+                      os.close(descriptor)
+          """)' \
+            "$source_helper" "$stage_root" "$HELPER_SHA256" \
+            "$runner_uid" "$runner_gid" "$ownership_nonce"
+          stage_transaction_complete=true
+          /usr/bin/printf 'created=true\n' >>"$GITHUB_OUTPUT"
+          stage_output_published=true
+          trap - EXIT
+          destination_metadata=$(
+            /usr/bin/sudo -n /usr/bin/stat -f '%HT:%u:%g:%Lp:%l' \
+              "$partial_helper"
+          )
+          /bin/test "$destination_metadata" = "Regular File:0:0:444:1"
+          destination_digest=$(
+            /usr/bin/sudo -n /usr/bin/shasum -a 256 "$partial_helper"
+          )
+          /bin/test "$destination_digest" = \
+            "$HELPER_SHA256  $partial_helper"
+          source_metadata_after=$(
+            /usr/bin/sudo -n /usr/bin/stat -f '%HT:%u:%g:%Lp:%l' \
+              "$source_helper"
+          )
+          source_identity_after=$(
+            /usr/bin/sudo -n /usr/bin/stat -f '%d:%i:%z:%m' \
+              "$source_helper"
+          )
+          source_digest_after=$(
+            /usr/bin/sudo -n /usr/bin/shasum -a 256 "$source_helper"
+          )
+          /bin/test "$source_metadata_after" = "$source_metadata_before"
+          /bin/test "$source_identity_after" = "$source_identity_before"
+          /bin/test "$source_digest_after" = "$source_digest_before"
+          /usr/bin/sudo -n /bin/chmod 0555 "$partial_helper"
+          destination_metadata=$(
+            /usr/bin/sudo -n /usr/bin/stat -f '%HT:%u:%g:%Lp:%l' \
+              "$partial_helper"
+          )
+          /bin/test "$destination_metadata" = "Regular File:0:0:555:1"
+          destination_digest=$(
+            /usr/bin/sudo -n /usr/bin/shasum -a 256 "$partial_helper"
+          )
+          /bin/test "$destination_digest" = \
+            "$HELPER_SHA256  $partial_helper"
+          /usr/bin/sudo -n /bin/mv "$partial_helper" "$stage_root/helper.py"
+          destination_metadata=$(
+            /usr/bin/sudo -n /usr/bin/stat -f '%HT:%u:%g:%Lp:%l' \
+              "$stage_root/helper.py"
+          )
+          /bin/test "$destination_metadata" = "Regular File:0:0:555:1"
+          destination_digest=$(
+            /usr/bin/sudo -n /usr/bin/shasum -a 256 "$stage_root/helper.py"
+          )
+          /bin/test "$destination_digest" = \
+            "$HELPER_SHA256  $stage_root/helper.py"
+          /usr/bin/sudo -n /usr/bin/python3 -I -B -c 'exec("""
+          import hashlib
+          import os
+          import stat
+          import sys
+
+          stage_path, ownership_nonce, expected_digest = sys.argv[1:]
+          maximum = 256 * 1024
+          if os.geteuid() != 0 or os.getegid() != 0:
+              raise SystemExit("staged-helper-finalizer-not-root")
+          if (
+              len(ownership_nonce) != 64
+              or any(character not in "0123456789abcdef" for character in ownership_nonce)
+              or len(expected_digest) != 64
+              or any(character not in "0123456789abcdef" for character in expected_digest)
+          ):
+              raise SystemExit("staged-helper-finalizer-arguments-invalid")
+          privileged_uid = os.geteuid()
+          privileged_gid = os.getegid()
+          ownership_name = f".task-witness-stage-owner-{ownership_nonce}"
+          ownership_raw = ownership_nonce.encode("ascii")
+          stage_descriptor = -1
+          ownership_descriptor = -1
+          helper_descriptor = -1
+          committed = False
+          try:
+              stage_descriptor = os.open(
+                  stage_path,
+                  os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+              )
+              stage_metadata = os.fstat(stage_descriptor)
+              stage_path_metadata = os.lstat(stage_path)
+              if (
+                  not stat.S_ISDIR(stage_metadata.st_mode)
+                  or stat.S_IMODE(stage_metadata.st_mode) != 0o755
+                  or stage_metadata.st_uid != privileged_uid
+                  or stage_metadata.st_gid != privileged_gid
+                  or stage_path_metadata.st_dev != stage_metadata.st_dev
+                  or stage_path_metadata.st_ino != stage_metadata.st_ino
+                  or set(os.listdir(stage_descriptor))
+                  != {ownership_name, "helper.py"}
+              ):
+                  raise SystemExit("staged-helper-finalizer-directory-invalid")
+              ownership_descriptor = os.open(
+                  ownership_name,
+                  os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                  dir_fd=stage_descriptor,
+              )
+              ownership_metadata = os.fstat(ownership_descriptor)
+              ownership_path_metadata = os.stat(
+                  ownership_name,
+                  dir_fd=stage_descriptor,
+                  follow_symlinks=False,
+              )
+              if (
+                  not stat.S_ISREG(ownership_metadata.st_mode)
+                  or stat.S_IMODE(ownership_metadata.st_mode) != 0o600
+                  or ownership_metadata.st_uid != privileged_uid
+                  or ownership_metadata.st_gid != privileged_gid
+                  or ownership_metadata.st_nlink != 1
+                  or ownership_metadata.st_size != len(ownership_raw)
+                  or ownership_path_metadata.st_dev != ownership_metadata.st_dev
+                  or ownership_path_metadata.st_ino != ownership_metadata.st_ino
+                  or os.pread(
+                      ownership_descriptor,
+                      len(ownership_raw) + 1,
+                      0,
+                  ) != ownership_raw
+              ):
+                  raise SystemExit("staged-helper-finalizer-owner-invalid")
+              helper_descriptor = os.open(
+                  "helper.py",
+                  os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                  dir_fd=stage_descriptor,
+              )
+              helper_metadata = os.fstat(helper_descriptor)
+              helper_path_metadata = os.stat(
+                  "helper.py",
+                  dir_fd=stage_descriptor,
+                  follow_symlinks=False,
+              )
+              helper_raw = os.pread(helper_descriptor, maximum + 1, 0)
+              if (
+                  not stat.S_ISREG(helper_metadata.st_mode)
+                  or stat.S_IMODE(helper_metadata.st_mode) != 0o555
+                  or helper_metadata.st_uid != privileged_uid
+                  or helper_metadata.st_gid != privileged_gid
+                  or helper_metadata.st_nlink != 1
+                  or helper_metadata.st_size <= 0
+                  or helper_metadata.st_size > maximum
+                  or helper_path_metadata.st_dev != helper_metadata.st_dev
+                  or helper_path_metadata.st_ino != helper_metadata.st_ino
+                  or len(helper_raw) != helper_metadata.st_size
+                  or hashlib.sha256(helper_raw).hexdigest() != expected_digest
+                  or set(os.listdir(stage_descriptor))
+                  != {ownership_name, "helper.py"}
+              ):
+                  raise SystemExit("staged-helper-finalizer-helper-invalid")
+              os.close(helper_descriptor)
+              helper_descriptor = -1
+              os.close(ownership_descriptor)
+              ownership_descriptor = -1
+              os.fsync(stage_descriptor)
+              os.unlink(ownership_name, dir_fd=stage_descriptor)
+              committed = True
+          finally:
+              for descriptor in (
+                  helper_descriptor,
+                  ownership_descriptor,
+                  stage_descriptor,
+              ):
+                  if descriptor >= 0:
+                      try:
+                          os.close(descriptor)
+                      except OSError:
+                          if not committed:
+                              raise
+          """)' "$stage_root" "$ownership_nonce" "$HELPER_SHA256"
+
+      - name: Rollback partial root-owned launchd helper
+        if: >-
+          ${{ always() &&
+              steps.launchd_stage.outcome == 'failure' &&
+              steps.launchd_stage.outputs.created == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage_root="/private/var/tmp/task-witness-macos-launchd-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          created_proof="${{ steps.launchd_stage.outputs.created }}"
+          ownership_nonce="${{ steps.launchd_stage_nonce.outputs.nonce }}"
+          /bin/test "$created_proof" = true
+          case "$ownership_nonce" in
+            ""|*[!0-9a-f]*)
+              exit 1
+              ;;
+          esac
+          /bin/test "${#ownership_nonce}" -eq 64
+          if /usr/bin/sudo -n /bin/test ! -e "$stage_root"; then
+            /usr/bin/sudo -n /bin/test ! -L "$stage_root"
+            exit 0
+          fi
+          /usr/bin/sudo -n /usr/bin/python3 -I -B -c 'exec("""
+          import hashlib
+          import os
+          import stat
+          import sys
+
+          stage_path, ownership_nonce, expected_digest = sys.argv[1:]
+          maximum = 256 * 1024
+          if os.geteuid() != 0 or os.getegid() != 0:
+              raise SystemExit("staged-helper-rollback-not-root")
+          if (
+              len(ownership_nonce) != 64
+              or any(character not in "0123456789abcdef" for character in ownership_nonce)
+              or len(expected_digest) != 64
+              or any(character not in "0123456789abcdef" for character in expected_digest)
+          ):
+              raise SystemExit("staged-helper-rollback-arguments-invalid")
+          privileged_uid = os.geteuid()
+          privileged_gid = os.getegid()
+          ownership_name = f".task-witness-stage-owner-{ownership_nonce}"
+          ownership_raw = ownership_nonce.encode("ascii")
+          stage_descriptor = os.open(
+              stage_path,
+              os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+          )
+          ownership_descriptor = -1
+          helper_descriptor = -1
+          helper_name = None
+          try:
+              stage_metadata = os.fstat(stage_descriptor)
+              stage_path_metadata = os.lstat(stage_path)
+              if (
+                  not stat.S_ISDIR(stage_metadata.st_mode)
+                  or stat.S_IMODE(stage_metadata.st_mode) != 0o755
+                  or stage_metadata.st_uid != privileged_uid
+                  or stage_metadata.st_gid != privileged_gid
+                  or stage_path_metadata.st_dev != stage_metadata.st_dev
+                  or stage_path_metadata.st_ino != stage_metadata.st_ino
+              ):
+                  raise SystemExit("staged-helper-rollback-directory-invalid")
+              names = set(os.listdir(stage_descriptor))
+              if names == {ownership_name}:
+                  pass
+              elif names == {ownership_name, "helper.py.partial"}:
+                  helper_name = "helper.py.partial"
+              elif names == {ownership_name, "helper.py"}:
+                  helper_name = "helper.py"
+              else:
+                  raise SystemExit("staged-helper-rollback-contents-invalid")
+              ownership_descriptor = os.open(
+                  ownership_name,
+                  os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                  dir_fd=stage_descriptor,
+              )
+              ownership_metadata = os.fstat(ownership_descriptor)
+              ownership_path_metadata = os.stat(
+                  ownership_name,
+                  dir_fd=stage_descriptor,
+                  follow_symlinks=False,
+              )
+              if (
+                  not stat.S_ISREG(ownership_metadata.st_mode)
+                  or stat.S_IMODE(ownership_metadata.st_mode) != 0o600
+                  or ownership_metadata.st_uid != privileged_uid
+                  or ownership_metadata.st_gid != privileged_gid
+                  or ownership_metadata.st_nlink != 1
+                  or ownership_metadata.st_size != len(ownership_raw)
+                  or ownership_path_metadata.st_dev != ownership_metadata.st_dev
+                  or ownership_path_metadata.st_ino != ownership_metadata.st_ino
+                  or os.pread(
+                      ownership_descriptor,
+                      len(ownership_raw) + 1,
+                      0,
+                  ) != ownership_raw
+              ):
+                  raise SystemExit("staged-helper-rollback-owner-invalid")
+              if helper_name is not None:
+                  helper_descriptor = os.open(
+                      helper_name,
+                      os.O_RDONLY
+                      | os.O_CLOEXEC
+                      | os.O_NOFOLLOW
+                      | os.O_NONBLOCK,
+                      dir_fd=stage_descriptor,
+                  )
+                  helper_metadata = os.fstat(helper_descriptor)
+                  helper_path_metadata = os.stat(
+                      helper_name,
+                      dir_fd=stage_descriptor,
+                      follow_symlinks=False,
+                  )
+                  helper_mode = stat.S_IMODE(helper_metadata.st_mode)
+                  if (
+                      not stat.S_ISREG(helper_metadata.st_mode)
+                      or helper_metadata.st_uid != privileged_uid
+                      or helper_metadata.st_gid != privileged_gid
+                      or helper_metadata.st_nlink != 1
+                      or helper_metadata.st_size > maximum
+                      or helper_path_metadata.st_dev != helper_metadata.st_dev
+                      or helper_path_metadata.st_ino != helper_metadata.st_ino
+                  ):
+                      raise SystemExit("staged-helper-rollback-helper-invalid")
+                  if helper_name == "helper.py.partial":
+                      if helper_mode not in {0, 4, 0o40, 0o44, 0o400, 0o404, 0o440, 0o444, 0o555}:
+                          raise SystemExit("staged-helper-rollback-helper-invalid")
+                  else:
+                      helper_raw = os.pread(helper_descriptor, maximum + 1, 0)
+                      if (
+                          helper_mode != 0o555
+                          or len(helper_raw) != helper_metadata.st_size
+                          or hashlib.sha256(helper_raw).hexdigest()
+                          != expected_digest
+                      ):
+                          raise SystemExit("staged-helper-rollback-helper-invalid")
+              if set(os.listdir(stage_descriptor)) != names:
+                  raise SystemExit("staged-helper-rollback-contents-drift")
+              if helper_name is not None:
+                  os.unlink(helper_name, dir_fd=stage_descriptor)
+              os.unlink(ownership_name, dir_fd=stage_descriptor)
+              os.rmdir(stage_path)
+          finally:
+              for descriptor in (
+                  helper_descriptor,
+                  ownership_descriptor,
+                  stage_descriptor,
+              ):
+                  if descriptor >= 0:
+                      os.close(descriptor)
+          """)' "$stage_root" "$ownership_nonce" "$HELPER_SHA256"
+          /usr/bin/sudo -n /bin/test ! -e "$stage_root"
+          /usr/bin/sudo -n /bin/test ! -L "$stage_root"
+
+      - name: Capture the disposable launchd-user probe
+        id: launchd_capture
+        if: ${{ steps.launchd_stage.outcome == 'success' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage_root="/private/var/tmp/task-witness-macos-launchd-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          artifact_root="$RUNNER_TEMP/task-witness-macos-launchd-user-probe"
+          runner_uid=$(/usr/bin/id -u)
+          runner_gid=$(/usr/bin/id -g)
+          launchd_environment=(
+            "GITHUB_EVENT_NAME=$GITHUB_EVENT_NAME"
+            "GITHUB_REF=$GITHUB_REF"
+            "GITHUB_REPOSITORY=$GITHUB_REPOSITORY"
+            "GITHUB_RUN_ATTEMPT=$GITHUB_RUN_ATTEMPT"
+            "GITHUB_RUN_ID=$GITHUB_RUN_ID"
+            "GITHUB_SHA=$GITHUB_SHA"
+            "GITHUB_WORKFLOW_REF=$GITHUB_WORKFLOW_REF"
+            "GITHUB_WORKFLOW_SHA=$GITHUB_WORKFLOW_SHA"
+            "ImageOS=$ImageOS"
+            "ImageVersion=$ImageVersion"
+            "RUNNER_ARCH=$RUNNER_ARCH"
+            "RUNNER_ENVIRONMENT=$RUNNER_ENVIRONMENT"
+            "RUNNER_OS=$RUNNER_OS"
+          )
+          /usr/bin/sudo -n /usr/bin/env -i \
+            "${launchd_environment[@]}" \
+            /usr/bin/python3 -I -B \
+              "$stage_root/helper.py" \
+              initialize-launchd-user-lifecycle \
+              --candidate-sha "$CANDIDATE_SHA" \
+              --expected-helper-sha256 "$HELPER_SHA256" \
+              --stage-root "$stage_root" \
+              --artifact-root "$artifact_root" \
+              --runner-uid "$runner_uid" \
+              --runner-gid "$runner_gid"
+          /usr/bin/sudo -n /usr/bin/env -i \
+            "${launchd_environment[@]}" \
+            /usr/bin/python3 -I -B \
+              "$stage_root/helper.py" \
+              run-launchd-user-lifecycle \
+              --candidate-sha "$CANDIDATE_SHA" \
+              --stage-root "$stage_root" \
+              --artifact-root "$artifact_root" \
+              --runner-uid "$runner_uid" \
+              --runner-gid "$runner_gid"
+
+      - name: Clean the disposable launchd-user probe
+        id: launchd_cleanup
+        if: ${{ always() && steps.launchd_stage.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage_root="/private/var/tmp/task-witness-macos-launchd-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          artifact_root="$RUNNER_TEMP/task-witness-macos-launchd-user-probe"
+          runner_uid=$(/usr/bin/id -u)
+          runner_gid=$(/usr/bin/id -g)
+          /usr/bin/sudo -n /usr/bin/env -i \
+            GITHUB_EVENT_NAME="$GITHUB_EVENT_NAME" \
+            GITHUB_REF="$GITHUB_REF" \
+            GITHUB_REPOSITORY="$GITHUB_REPOSITORY" \
+            GITHUB_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" \
+            GITHUB_RUN_ID="$GITHUB_RUN_ID" \
+            GITHUB_SHA="$GITHUB_SHA" \
+            GITHUB_WORKFLOW_REF="$GITHUB_WORKFLOW_REF" \
+            GITHUB_WORKFLOW_SHA="$GITHUB_WORKFLOW_SHA" \
+            ImageOS="$ImageOS" \
+            ImageVersion="$ImageVersion" \
+            RUNNER_ARCH="$RUNNER_ARCH" \
+            RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" \
+            RUNNER_OS="$RUNNER_OS" \
+            /usr/bin/python3 -I -B \
+              "$stage_root/helper.py" \
+              cleanup-launchd-user-lifecycle \
+              --expected-helper-sha256 "$HELPER_SHA256" \
+              --stage-root "$stage_root" \
+              --artifact-root "$artifact_root" \
+              --runner-uid "$runner_uid" \
+              --runner-gid "$runner_gid"
+
+      - name: Seal the bounded launchd-user artifact
+        id: launchd_seal
+        if: ${{ always() && steps.launchd_cleanup.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact_root="$RUNNER_TEMP/task-witness-macos-launchd-user-probe"
+          external_manifest="${artifact_root}.SHA256SUMS"
+          /usr/bin/python3 -I -B \
+            harness/scripts/probe_task_witness_macos_host.py \
+              write-launchd-artifact-manifest \
+              --artifact-root "$artifact_root" \
+              --output "$external_manifest"
+          /bin/mv "$external_manifest" "$artifact_root/SHA256SUMS"
+          /usr/bin/python3 -I -B \
+            harness/scripts/probe_task_witness_macos_host.py \
+              verify-launchd-artifact-manifest \
+              --artifact-root "$artifact_root" \
+              --manifest "$artifact_root/SHA256SUMS"
+          (
+            cd "$artifact_root"
+            /usr/bin/shasum -a 256 -c SHA256SUMS
+          )
+
+      - name: Retain bounded launchd-user probe diagnostics
+        if: >-
+          ${{ always() &&
+              steps.launchd_cleanup.outcome == 'success' &&
+              steps.launchd_seal.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: >-
+            task-witness-macos-launchd-user-probe-${{ env.CANDIDATE_SHA }}-${{ github.sha }}
+          path: ${{ runner.temp }}/task-witness-macos-launchd-user-probe
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 6
+
+      - name: Require an eligible disposable launchd user
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact_root="$RUNNER_TEMP/task-witness-macos-launchd-user-probe"
+          /usr/bin/python3 -I -B \
+            harness/scripts/probe_task_witness_macos_host.py \
+              verify-launchd-success \
+              --artifact-root "$artifact_root" \
+              --manifest "$artifact_root/SHA256SUMS"

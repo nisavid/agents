@@ -4605,9 +4605,17 @@ def _validate_reset_bindings_and_resources(
     account_present = _account_exists(plan.account.name)
     accounts = _list_accounts()
     if account_present:
-        if accounts.get(plan.account.name) != plan.account.uid or account_value.get(
-            "generated_uid"
-        ) != _read_system_generated_uid(plan.account.name):
+        if (
+            accounts.get(plan.account.name) != plan.account.uid
+            or sum(
+                observed_uid == plan.account.uid for observed_uid in accounts.values()
+            )
+            != 1
+        ):
+            raise ProbeError("account-record-drift")
+        if account_value.get("generated_uid") != _read_system_generated_uid(
+            plan.account.name
+        ):
             raise ProbeError("account-record-generated-uid-drift")
     elif plan.account.name in accounts or plan.account.uid in accounts.values():
         raise ProbeError("account-record-drift")

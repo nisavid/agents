@@ -8906,6 +8906,76 @@ raise SystemExit(93)
             )
         self.assertEqual(replaced.exception.code, "home-cleanup-drift")
 
+    def test_reset_rejects_foreign_uid_collision_before_bootout(self) -> None:
+        plan = self.lifecycle_plan(Path("/private/var/tmp/stage"))
+        state = self.lifecycle_state(plan)
+        generated_uid = "01234567-89AB-4DEF-8123-456789ABCDEF"
+        account = self.helper._account_binding_document(plan, state, generated_uid)
+        ownership = self.helper._launchd_ownership_document(plan, state)
+        identity = {
+            "home_device": 1,
+            "home_inode": 2,
+            "probe_device": 1,
+            "probe_inode": 3,
+        }
+        marker = {"content_sha256": "4" * 64, "home_identity": identity}
+        bindings = self.helper.ValidatedStageBindings(account, ownership, marker)
+        with (
+            mock.patch.object(self.helper, "_require_launchd_absent"),
+            mock.patch.object(
+                self.helper,
+                "_validate_exact_stage",
+                return_value=bindings,
+            ),
+            mock.patch.object(
+                self.helper,
+                "_account_exists",
+                return_value=True,
+            ),
+            mock.patch.object(
+                self.helper,
+                "_list_accounts",
+                return_value={
+                    plan.account.name: plan.account.uid,
+                    "foreign": plan.account.uid,
+                },
+            ),
+            mock.patch.object(
+                self.helper,
+                "_read_system_generated_uid",
+                return_value=generated_uid,
+            ),
+            mock.patch.object(
+                self.helper,
+                "_path_exists_no_follow",
+                return_value=True,
+            ),
+            mock.patch.object(
+                self.helper,
+                "_exact_disposable_home_identity",
+                return_value=identity,
+            ),
+            mock.patch.object(
+                self.helper,
+                "_wait_for_no_uid_processes",
+                side_effect=self.helper.ProbeError(
+                    "disposable-user-pid1-parented-processes-remain"
+                ),
+            ),
+            mock.patch.object(self.helper, "_run_user_domain_reset") as reset,
+            self.assertRaises(self.helper.ProbeError) as raised,
+        ):
+            self.helper._quiesce_disposable_user(
+                plan,
+                state,
+                bindings,
+                eligible_context()["GITHUB_SHA"],
+                eligible_context(),
+                allow_create=False,
+            )
+        self.assertEqual(raised.exception.code, "account-record-drift")
+        reset.assert_not_called()
+
     def test_cleanup_reset_evidence_requires_exact_eligible_lifecycle(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             artifact = Path(directory)

@@ -46,6 +46,8 @@ MAX_PROCESS_LIST_BYTES = 64 * 1024
 COMMAND_TIMEOUT_SECONDS = 10
 LAUNCHD_POLL_INTERVAL_SECONDS = 0.25
 LAUNCHD_POLL_TIMEOUT_SECONDS = 30
+PROCESS_EXIT_POLL_INTERVAL_SECONDS = 0.25
+PROCESS_EXIT_POLL_TIMEOUT_SECONDS = 30
 LAUNCHD_PRINT_MAX_BYTES = 16 * 1024
 LAUNCHCTL_NOT_FOUND_STATUS = 113
 DISPOSABLE_UID_MIN = 502
@@ -1905,11 +1907,16 @@ def _require_command_success(
     *,
     command_id: str,
     maximum: int = MAX_COMMAND_OUTPUT_BYTES,
+    timeout: float = COMMAND_TIMEOUT_SECONDS,
 ) -> str:
     if command_id not in LIFECYCLE_COMMAND_IDS:
         raise ProbeError("invalid-lifecycle-command-id")
     try:
-        status, stdout, _stderr = _run_lifecycle_command(argv, maximum=maximum)
+        status, stdout, _stderr = _run_lifecycle_command(
+            argv,
+            maximum=maximum,
+            timeout=timeout,
+        )
     except ProbeError as error:
         if error.code not in {
             "lifecycle-command-failed",
@@ -3569,7 +3576,7 @@ def run_launchd_user_lifecycle(
     processes_absent = False
     if plan is not None and bootout_confirmed:
         try:
-            _require_no_uid_processes(plan.account.uid)
+            _wait_for_no_uid_processes(plan.account.uid)
             processes_absent = True
         except ProbeError as error:
             error_code, secondary_error_code = _merge_probe_error(
@@ -3736,11 +3743,16 @@ def _validate_exact_stage(
     return ValidatedStageBindings(account=account, launchd=ownership)
 
 
-def _require_no_uid_processes(uid: int) -> None:
+def _require_no_uid_processes(
+    uid: int,
+    *,
+    timeout: float = COMMAND_TIMEOUT_SECONDS,
+) -> None:
     raw = _require_command_success(
         ["/bin/ps", "-axo", "uid=,pid="],
         command_id="process-list",
         maximum=MAX_PROCESS_LIST_BYTES,
+        timeout=timeout,
     )
     observed_pid_one = False
     for line in raw.splitlines():
@@ -3756,6 +3768,27 @@ def _require_no_uid_processes(uid: int) -> None:
             raise ProbeError("disposable-user-process-remains")
     if not observed_pid_one:
         raise ProbeError("process-list-invalid")
+
+
+def _wait_for_no_uid_processes(uid: int) -> None:
+    deadline = time.monotonic() + PROCESS_EXIT_POLL_TIMEOUT_SECONDS
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ProbeError("disposable-user-process-remains")
+        try:
+            _require_no_uid_processes(
+                uid,
+                timeout=min(COMMAND_TIMEOUT_SECONDS, remaining),
+            )
+            return
+        except ProbeError as error:
+            if error.code != "disposable-user-process-remains":
+                raise
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ProbeError("disposable-user-process-remains")
+        time.sleep(min(PROCESS_EXIT_POLL_INTERVAL_SECONDS, remaining))
 
 
 def _validate_precleanup_artifact(artifact_root: Path) -> None:
@@ -3846,7 +3879,7 @@ def cleanup_launchd_user_lifecycle(
                 expected_uid=plan.account.uid,
                 expected_gid=plan.account.gid,
             )
-        _require_no_uid_processes(plan.account.uid)
+        _wait_for_no_uid_processes(plan.account.uid)
         if account_present:
             _require_command_success(
                 ["/usr/bin/dscl", ".", "-delete", f"/Users/{plan.account.name}"],

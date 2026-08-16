@@ -3383,6 +3383,25 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             "-create",
             "/Users/twq-secret-value",
         ]
+        with mock.patch.object(
+            self.helper,
+            "_run_lifecycle_command",
+            return_value=(0, "ok", ""),
+        ) as command:
+            self.assertEqual(
+                self.helper._require_command_success(
+                    secret_argv,
+                    command_id="account-create-record",
+                    timeout=1.25,
+                ),
+                "ok",
+            )
+        command.assert_called_once_with(
+            secret_argv,
+            maximum=self.helper.MAX_COMMAND_OUTPUT_BYTES,
+            timeout=1.25,
+        )
+
         with (
             mock.patch.object(
                 self.helper,
@@ -3781,6 +3800,69 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             self.helper._poll_launchd_terminal(plan, state)
         child_status.assert_not_called()
 
+    def test_disposable_user_process_exit_wait_is_bounded_and_fail_closed(
+        self,
+    ) -> None:
+        process_remains = self.helper.ProbeError("disposable-user-process-remains")
+        with (
+            mock.patch.object(
+                self.helper,
+                "_require_no_uid_processes",
+                side_effect=[process_remains, None],
+            ) as scan,
+            mock.patch.object(
+                self.helper.time,
+                "monotonic",
+                side_effect=[0.0, 0.1, 0.2, 0.3],
+            ),
+            mock.patch.object(self.helper.time, "sleep") as sleep,
+        ):
+            self.helper._wait_for_no_uid_processes(502)
+        self.assertEqual(
+            scan.call_args_list,
+            [mock.call(502, timeout=10), mock.call(502, timeout=10)],
+        )
+        sleep.assert_called_once_with(self.helper.PROCESS_EXIT_POLL_INTERVAL_SECONDS)
+
+        with (
+            mock.patch.object(
+                self.helper,
+                "_require_no_uid_processes",
+            ) as scan,
+            mock.patch.object(
+                self.helper.time,
+                "monotonic",
+                side_effect=[0.0, 25.0],
+            ),
+        ):
+            self.helper._wait_for_no_uid_processes(502)
+        scan.assert_called_once_with(502, timeout=5.0)
+
+        for label, error in (
+            ("timeout", self.helper.ProbeError("disposable-user-process-remains")),
+            ("invalid-list", self.helper.ProbeError("process-list-invalid")),
+        ):
+            monotonic = [0.0, 0.1, 31.0] if label == "timeout" else [0.0, 0.1]
+            with (
+                self.subTest(label=label),
+                mock.patch.object(
+                    self.helper,
+                    "_require_no_uid_processes",
+                    side_effect=error,
+                ) as scan,
+                mock.patch.object(
+                    self.helper.time,
+                    "monotonic",
+                    side_effect=monotonic,
+                ),
+                mock.patch.object(self.helper.time, "sleep") as sleep,
+                self.assertRaises(self.helper.ProbeError) as raised,
+            ):
+                self.helper._wait_for_no_uid_processes(502)
+            self.assertEqual(raised.exception.code, error.code)
+            scan.assert_called_once_with(502, timeout=10)
+            sleep.assert_not_called()
+
     def test_owned_job_reconciliation_is_exact_and_absence_is_idempotent(
         self,
     ) -> None:
@@ -4171,8 +4253,11 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
 
             def require_no_processes(
                 _uid: int,
+                *,
+                timeout: float = self.helper.COMMAND_TIMEOUT_SECONDS,
                 observed_events: list[str] = events,
             ) -> None:
+                self.assertGreater(timeout, 0)
                 observed_events.append("require-no-processes")
 
             with (
@@ -5078,6 +5163,122 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             )
             full_record.assert_not_called()
             self.assertFalse(stage.exists())
+
+    def test_cleanup_process_wait_failure_preserves_all_owned_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stage = root / "stage"
+            stage.mkdir()
+            for name in ("helper.py", "job.plist", "state.json", "account.json"):
+                (stage / name).write_bytes(f"exact-{name}".encode())
+            artifact = root / "artifact"
+            artifact.mkdir()
+            plan = self.lifecycle_plan(stage)
+            state = self.lifecycle_state(plan)
+            generated_uid = "01234567-89AB-4DEF-8123-456789ABCDEF"
+            binding = self.helper._account_binding_document(
+                plan,
+                state,
+                generated_uid,
+            )
+            stage_before = {entry.name: entry.read_bytes() for entry in stage.iterdir()}
+            stderr = io.StringIO()
+
+            def path_exists(path: Path) -> bool:
+                if path == plan.account.home:
+                    return True
+                if path == artifact / "cleanup.json":
+                    return False
+                raise AssertionError(path)
+
+            with (
+                mock.patch.dict(os.environ, eligible_context(), clear=True),
+                mock.patch.object(self.helper, "_normalized_context"),
+                mock.patch.object(self.helper, "_validate_lifecycle_arguments"),
+                mock.patch.object(
+                    self.helper,
+                    "_cleanup_helper_only_stage_before_state",
+                    return_value=False,
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_load_lifecycle_state",
+                    return_value=(plan, state),
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_validate_exact_stage",
+                    return_value=self.helper.ValidatedStageBindings(binding, None),
+                ),
+                mock.patch.object(self.helper, "_reconcile_owned_launchd_job"),
+                mock.patch.object(self.helper, "_account_exists", return_value=True),
+                mock.patch.object(
+                    self.helper,
+                    "_path_exists_no_follow",
+                    side_effect=path_exists,
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_read_system_generated_uid",
+                    return_value=generated_uid,
+                ),
+                mock.patch.object(self.helper, "_validate_exact_disposable_home"),
+                mock.patch.object(
+                    self.helper,
+                    "_wait_for_no_uid_processes",
+                    side_effect=self.helper.ProbeError(
+                        "disposable-user-process-remains"
+                    ),
+                ) as wait,
+                mock.patch.multiple(
+                    self.helper,
+                    _require_command_success=mock.DEFAULT,
+                    _list_accounts=mock.DEFAULT,
+                    remove_exact_disposable_home=mock.DEFAULT,
+                    launchd_artifact_payloads=mock.DEFAULT,
+                ) as mutations,
+                mock.patch.object(self.helper, "_metadata_matches", return_value=True),
+                mock.patch.object(self.helper, "_write_root_file") as write_cleanup,
+                mock.patch.object(self.helper.os, "chown") as transfer_artifact,
+                redirect_stderr(stderr),
+            ):
+                self.assertEqual(
+                    self.helper.cleanup_launchd_user_lifecycle(
+                        stage_root=stage,
+                        artifact_root=artifact,
+                        expected_helper_sha256="1" * 64,
+                        runner_uid=501,
+                        runner_gid=20,
+                    ),
+                    2,
+                )
+
+            wait.assert_called_once_with(plan.account.uid)
+            mutations["_require_command_success"].assert_not_called()
+            mutations["_list_accounts"].assert_not_called()
+            mutations["remove_exact_disposable_home"].assert_not_called()
+            mutations["launchd_artifact_payloads"].assert_not_called()
+            transfer_artifact.assert_not_called()
+            self.assertEqual(
+                {entry.name: entry.read_bytes() for entry in stage.iterdir()},
+                stage_before,
+            )
+            self.assertEqual(list(artifact.iterdir()), [])
+            write_cleanup.assert_called_once()
+            cleanup_path, cleanup_raw, cleanup_mode = write_cleanup.call_args.args
+            self.assertEqual(cleanup_path, artifact / "cleanup.json")
+            self.assertEqual(cleanup_mode, 0o600)
+            cleanup = json.loads(cleanup_raw)
+            self.assertEqual(cleanup["disposition"], "preserved-on-drift")
+            self.assertEqual(
+                cleanup["error"],
+                {"code": "disposable-user-process-remains"},
+            )
+            self.assertEqual(
+                stderr.getvalue(),
+                "task-witness macOS launchd-user cleanup: "
+                "disposable-user-process-remains\n",
+            )
 
     def test_cleanup_preserves_stage_when_planned_uid_remains_occupied(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -4347,6 +4347,8 @@ def _process_survivor_code(
             return "disposable-user-background-and-spotlight-names-remain"
         if "probe" in families:
             return "disposable-user-probe-and-other-processes-remain"
+        if "same-uid" in families:
+            return "disposable-user-same-uid-process-tree-remains"
         external_relations = families & {
             "other-uid-parent",
             "parent-unobserved",
@@ -4367,8 +4369,6 @@ def _process_survivor_code(
                 "pid1": "disposable-user-pid1-parented-processes-remain",
                 "root-parent": "disposable-user-root-parented-processes-remain",
             }[relation]
-        if "same-uid" in families:
-            return "disposable-user-same-uid-process-tree-remains"
         if "spotlight" in families:
             return "disposable-user-spotlight-and-other-processes-remain"
         return "disposable-user-mixed-processes-remain"

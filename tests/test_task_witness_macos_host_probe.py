@@ -2027,6 +2027,14 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 ),
                 "disposable-user-pid1-parented-processes-remain",
             ),
+            "pid-one-and-same-uid-tree": (
+                (
+                    pid_one,
+                    self.helper.ProcessRecord(502, 300, 1, 300, "S", "private-a"),
+                    self.helper.ProcessRecord(502, 301, 300, 301, "S", "private-child"),
+                ),
+                "disposable-user-same-uid-process-tree-remains",
+            ),
             "root-parent": (
                 (
                     pid_one,
@@ -7929,6 +7937,74 @@ raise SystemExit(93)
                 "precondition": ("disposable-user-pid1-parented-processes-remain"),
             },
         )
+
+    def test_same_uid_process_tree_never_authorizes_domain_reset(self) -> None:
+        plan = self.lifecycle_plan(Path("/private/var/tmp/stage"))
+        state = self.lifecycle_state(plan)
+        account = self.helper._account_binding_document(
+            plan,
+            state,
+            "01234567-89AB-4DEF-8123-456789ABCDEF",
+        )
+        ownership = self.helper._launchd_ownership_document(plan, state)
+        bindings = self.helper.ValidatedStageBindings(account, ownership)
+        records = (
+            self.helper.ProcessRecord(0, 1, 0, 1, "Ss", "launchd"),
+            self.helper.ProcessRecord(
+                plan.account.uid,
+                300,
+                1,
+                300,
+                "S",
+                "private-parent",
+            ),
+            self.helper.ProcessRecord(
+                plan.account.uid,
+                301,
+                300,
+                301,
+                "S",
+                "private-child",
+            ),
+        )
+
+        def wait(uid: int) -> None:
+            code = self.helper._process_survivor_code(records, uid)
+            if code is not None:
+                raise self.helper.ProbeError(code)
+
+        with (
+            mock.patch.object(
+                self.helper,
+                "_wait_for_no_uid_processes",
+                side_effect=wait,
+            ),
+            mock.patch.object(
+                self.helper,
+                "_write_user_domain_reset_authorization",
+                return_value={"content_sha256": "4" * 64},
+            ) as arm,
+            mock.patch.object(
+                self.helper,
+                "_validate_reset_bindings_and_resources",
+            ),
+            mock.patch.object(self.helper, "_run_user_domain_reset") as reset,
+            self.assertRaises(self.helper.ProbeError) as raised,
+        ):
+            self.helper._quiesce_disposable_user(
+                plan,
+                state,
+                bindings,
+                eligible_context()["GITHUB_SHA"],
+                eligible_context(),
+                allow_create=True,
+            )
+        self.assertEqual(
+            raised.exception.code,
+            "disposable-user-same-uid-process-tree-remains",
+        )
+        arm.assert_not_called()
+        reset.assert_not_called()
 
     def test_user_domain_reset_writer_is_durable_before_bootout(self) -> None:
         plan = self.lifecycle_plan(Path("/private/var/tmp/stage"))

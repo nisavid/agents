@@ -141,7 +141,6 @@ DISPOSABLE_PROCESS_REMAINS_CODES = frozenset(
         "disposable-user-process-observation-unstable",
         "disposable-user-root-parented-process-remains",
         "disposable-user-spotlight-worker-remains",
-        "disposable-user-unclassified-process-remains",
         "disposable-user-zombie-only-remains",
     }
 )
@@ -3910,6 +3909,7 @@ def parse_process_list(raw: str) -> tuple[ProcessRecord, ...]:
             or pid > DSCL_UID_MAX
             or ppid > DSCL_UID_MAX
             or pgid > DSCL_UID_MAX
+            or (pid != 0 and pid == ppid)
             or pid in observed_pids
         ):
             raise ProbeError("process-list-invalid")
@@ -3997,7 +3997,7 @@ def _process_survivor_code(
         return "disposable-user-root-parented-process-remains"
     if parent.uid != uid:
         return "disposable-user-other-uid-parented-process-remains"
-    return "disposable-user-unclassified-process-remains"
+    raise ProbeError("process-list-invalid")
 
 
 def _require_disposable_uid_available(uid: int) -> None:
@@ -4015,6 +4015,14 @@ def _require_no_uid_processes(
         raise ProbeError(code)
 
 
+def _process_wait_timeout_code(observed_codes: set[str]) -> str:
+    if len(observed_codes) == 1:
+        return next(iter(observed_codes))
+    if observed_codes:
+        return "disposable-user-process-observation-unstable"
+    return "disposable-user-process-observation-unavailable"
+
+
 def _wait_for_no_uid_processes(
     uid: int,
 ) -> None:
@@ -4023,7 +4031,7 @@ def _wait_for_no_uid_processes(
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise ProbeError("disposable-user-unclassified-process-remains")
+            raise ProbeError(_process_wait_timeout_code(observed_codes))
         try:
             _require_no_uid_processes(
                 uid,
@@ -4036,12 +4044,7 @@ def _wait_for_no_uid_processes(
             observed_codes.add(error.code)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            code = (
-                next(iter(observed_codes))
-                if len(observed_codes) == 1
-                else "disposable-user-process-observation-unstable"
-            )
-            raise ProbeError(code)
+            raise ProbeError(_process_wait_timeout_code(observed_codes))
         time.sleep(min(PROCESS_EXIT_POLL_INTERVAL_SECONDS, remaining))
 
 

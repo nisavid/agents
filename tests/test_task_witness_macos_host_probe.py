@@ -1999,6 +1999,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             "duplicate-pid": "0 1 0 1 Ss launchd\n502 1 1 1 S cfprefsd\n",
             "nonnumeric": "0 1 0 1 Ss launchd\n502 pid 1 1 S cfprefsd\n",
             "empty-command": "0 1 0 1 Ss \n",
+            "self-parent": "0 1 0 1 Ss launchd\n502 120 120 120 S private\n",
         }
         for label, value in invalid.items():
             with (
@@ -4396,6 +4397,51 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             mock.patch.object(
                 self.helper,
                 "_require_no_uid_processes",
+                side_effect=self.helper.ProbeError(
+                    "disposable-user-cfprefsd-name-remains"
+                ),
+            ) as scan,
+            mock.patch.object(
+                self.helper.time,
+                "monotonic",
+                side_effect=[0.0, 0.1, 29.9, 30.1],
+            ),
+            mock.patch.object(self.helper.time, "sleep") as sleep,
+            self.assertRaises(self.helper.ProbeError) as raised,
+        ):
+            self.helper._wait_for_no_uid_processes(502)
+        self.assertEqual(
+            raised.exception.code,
+            "disposable-user-cfprefsd-name-remains",
+        )
+        scan.assert_called_once_with(502, timeout=10)
+        sleep.assert_called_once()
+
+        with (
+            mock.patch.object(
+                self.helper,
+                "_require_no_uid_processes",
+            ) as scan,
+            mock.patch.object(
+                self.helper.time,
+                "monotonic",
+                side_effect=[0.0, 31.0],
+            ),
+            mock.patch.object(self.helper.time, "sleep") as sleep,
+            self.assertRaises(self.helper.ProbeError) as raised,
+        ):
+            self.helper._wait_for_no_uid_processes(502)
+        self.assertEqual(
+            raised.exception.code,
+            "disposable-user-process-observation-unavailable",
+        )
+        scan.assert_not_called()
+        sleep.assert_not_called()
+
+        with (
+            mock.patch.object(
+                self.helper,
+                "_require_no_uid_processes",
                 side_effect=[
                     self.helper.ProbeError("disposable-user-cfprefsd-name-remains"),
                     self.helper.ProbeError("disposable-user-distnoted-name-remains"),
@@ -5797,7 +5843,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                     self.helper,
                     "_wait_for_no_uid_processes",
                     side_effect=self.helper.ProbeError(
-                        "disposable-user-unclassified-process-remains"
+                        "disposable-user-spotlight-worker-remains"
                     ),
                 ) as wait,
                 mock.patch.multiple(
@@ -5842,12 +5888,12 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             self.assertEqual(cleanup["disposition"], "preserved-on-drift")
             self.assertEqual(
                 cleanup["error"],
-                {"code": "disposable-user-unclassified-process-remains"},
+                {"code": "disposable-user-spotlight-worker-remains"},
             )
             self.assertEqual(
                 stderr.getvalue(),
                 "task-witness macOS launchd-user cleanup: "
-                "disposable-user-unclassified-process-remains\n",
+                "disposable-user-spotlight-worker-remains\n",
             )
 
     def test_cleanup_preserves_stage_when_planned_uid_remains_occupied(self) -> None:

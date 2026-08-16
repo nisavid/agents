@@ -1551,7 +1551,8 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
         ) as dscl:
             listed = self.helper._list_accounts()
         dscl.assert_called_once_with(
-            ["/usr/bin/dscl", ".", "-list", "/Users", "UniqueID"]
+            ["/usr/bin/dscl", ".", "-list", "/Users", "UniqueID"],
+            command_id="account-uid-list",
         )
         self.assertEqual(
             listed,
@@ -2429,7 +2430,12 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             "probe.stdout": b"launchd-user-eligible\n",
         }
 
-        def capture(*, status: int, error_code: str | None) -> dict[str, bytes]:
+        def capture(
+            *,
+            status: int,
+            error_code: str | None,
+            secondary_error_code: str | None = None,
+        ) -> dict[str, bytes]:
             written: dict[str, bytes] = {}
 
             def record(path: Path, raw: bytes, _mode: int) -> None:
@@ -2457,6 +2463,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                     kickstart_pid=4321,
                     status=status,
                     error_code=error_code,
+                    secondary_error_code=secondary_error_code,
                 )
             return written
 
@@ -2471,8 +2478,21 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             b"".join(success_payloads.values()),
         )
 
-        failure_payloads = capture(status=2, error_code="lifecycle-incomplete")
+        failure_payloads = capture(
+            status=2,
+            error_code="lifecycle-command-nonzero-launchd-bootstrap",
+            secondary_error_code="lifecycle-command-nonzero-launchd-bootout",
+        )
         failure = json.loads(failure_payloads["lifecycle.json"].decode("utf-8"))
+        failure_probe = json.loads(failure_payloads["probe.json"].decode("utf-8"))
+        expected_error = {
+            "code": "lifecycle-command-nonzero-launchd-bootstrap",
+            "secondary_code": "lifecycle-command-nonzero-launchd-bootout",
+        }
+        self.assertEqual(failure["error"], expected_error)
+        self.assertEqual(failure_probe["error"], expected_error)
+        self.assertEqual(failure_probe["disposition"], "probe-error")
+        self.assertEqual(failure_payloads["probe.status"], b"2\n")
         self.assertNotIn("binding", failure)
         self.assertNotIn(
             secret.encode("utf-8"),
@@ -2564,6 +2584,99 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
         self.assertEqual(write.call_args.kwargs["loaded"], loaded)
         self.assertEqual(write.call_args.kwargs["terminal"], loaded)
         self.assertNotIn(secret, repr(write.call_args.kwargs))
+
+    def test_child_probe_error_remains_primary_through_reconciliation(self) -> None:
+        context = self.launchd_context()
+        plan = self.lifecycle_plan(
+            Path("/private/var/tmp/task-witness-macos-launchd-123456789-2")
+        )
+        state = self.lifecycle_state(plan)
+        loaded = self.launchctl_job(plan, state)
+        primary = "passwordless-sudo-probe-failed"
+        secondary = "lifecycle-command-nonzero-launchd-bootout"
+        child_probe = self.helper.build_launchd_user_probe_error_document(
+            FROZEN_CANDIDATE_SHA,
+            context,
+            primary,
+        )
+        payloads: dict[str, bytes] = {}
+
+        def record(path: Path, raw: bytes, _mode: int) -> None:
+            payloads[path.name] = raw
+
+        def command(argv: list[str], **_kwargs: object) -> str:
+            if argv[:3] == ["/bin/launchctl", "bootstrap", "system"]:
+                return ""
+            if argv[:3] == ["/bin/launchctl", "kickstart", "-p"]:
+                return "4321"
+            raise AssertionError(argv)
+
+        with (
+            mock.patch.dict(os.environ, context, clear=True),
+            mock.patch.object(self.helper, "_validate_lifecycle_arguments"),
+            mock.patch.object(self.helper, "_create_root_directory"),
+            mock.patch.object(
+                self.helper,
+                "_load_lifecycle_state",
+                return_value=(plan, state),
+            ),
+            mock.patch.object(
+                self.helper,
+                "_validate_exact_stage",
+                return_value=None,
+            ),
+            mock.patch.object(self.helper, "_create_disposable_account"),
+            mock.patch.object(self.helper, "_create_disposable_home"),
+            mock.patch.object(self.helper, "_require_launchd_absent"),
+            mock.patch.object(
+                self.helper,
+                "_require_command_success",
+                side_effect=command,
+            ),
+            mock.patch.object(self.helper, "_write_launchd_ownership_marker"),
+            mock.patch.object(
+                self.helper,
+                "_launchd_job_snapshot",
+                return_value=loaded,
+            ),
+            mock.patch.object(
+                self.helper,
+                "_poll_launchd_terminal",
+                return_value=(loaded, 2),
+            ),
+            mock.patch.object(
+                self.helper,
+                "_load_canonical_document",
+                return_value=child_probe,
+            ),
+            mock.patch.object(
+                self.helper,
+                "_reconcile_in_process_bootstrap",
+                side_effect=self.helper.ProbeError(secondary),
+            ),
+            mock.patch.object(
+                self.helper,
+                "_write_root_file",
+                side_effect=record,
+            ),
+        ):
+            status = self.helper.run_launchd_user_lifecycle(
+                stage_root=plan.stage_root,
+                artifact_root=Path("/private/tmp/artifact"),
+                candidate_sha=FROZEN_CANDIDATE_SHA,
+                runner_uid=501,
+                runner_gid=20,
+            )
+
+        self.assertEqual(status, 2)
+        expected_error = {"code": primary, "secondary_code": secondary}
+        lifecycle = json.loads(payloads["lifecycle.json"].decode("utf-8"))
+        probe = json.loads(payloads["probe.json"].decode("utf-8"))
+        self.assertEqual(lifecycle["error"], expected_error)
+        self.assertEqual(probe["error"], expected_error)
+        self.assertEqual(payloads["launchd.loaded"], b"")
+        self.assertEqual(payloads["launchd.terminal"], b"")
+        self.assertNotEqual(lifecycle["error"]["code"], "launchd-child-pid-disagrees")
 
     def test_unexpected_launchd_environment_is_not_passed_to_artifact_writer(
         self,
@@ -2738,7 +2851,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             any("sysadminctl" in field for call in calls for field in call)
         )
 
-    def test_account_creation_rolls_back_its_exact_name_on_early_or_late_failure(
+    def test_account_creation_reports_and_rolls_back_every_failed_step(
         self,
     ) -> None:
         account = self.helper.DisposableAccount(
@@ -2748,7 +2861,18 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             home=Path("/Users/twq-0123456789ab"),
             generated_uid="01234567-89AB-CDEF-0123-456789ABCDEF",
         )
-        for failure_index in (0, 8):
+        command_ids = (
+            "account-create-record",
+            "account-set-shell",
+            "account-set-authentication-authority",
+            "account-set-password",
+            "account-set-hidden",
+            "account-set-uid",
+            "account-set-gid",
+            "account-set-home",
+            "account-set-generated-uid",
+        )
+        for failure_index, command_id in enumerate(command_ids):
             calls: list[tuple[str, ...]] = []
             record_present = False
             create_index = 0
@@ -2798,7 +2922,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 ),
                 self.assertRaisesRegex(
                     self.helper.ProbeError,
-                    "lifecycle-command-nonzero",
+                    f"lifecycle-command-nonzero-{command_id}",
                 ),
             ):
                 self.helper._create_disposable_account(account)
@@ -2817,6 +2941,259 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             )
             self.assertFalse(record_present)
             self.assertEqual(create_index, failure_index + 1)
+
+    def test_lifecycle_command_diagnostics_are_fixed_and_do_not_persist_argv(
+        self,
+    ) -> None:
+        secret_argv = [
+            "/usr/bin/dscl",
+            ".",
+            "-create",
+            "/Users/twq-secret-value",
+        ]
+        with (
+            mock.patch.object(
+                self.helper,
+                "_run_lifecycle_command",
+                return_value=(1, "secret stdout", "secret stderr"),
+            ),
+            self.assertRaises(self.helper.ProbeError) as raised,
+        ):
+            self.helper._require_command_success(
+                secret_argv,
+                command_id="account-create-record",
+            )
+        self.assertEqual(
+            raised.exception.code,
+            "lifecycle-command-nonzero-account-create-record",
+        )
+        self.assertNotIn("twq-secret-value", raised.exception.code)
+        self.assertNotIn("secret stdout", raised.exception.code)
+        self.assertNotIn("secret stderr", raised.exception.code)
+
+        payloads: dict[str, bytes] = {}
+
+        def record(path: Path, raw: bytes, _mode: int) -> None:
+            payloads[path.name] = raw
+
+        context = self.launchd_context()
+        with mock.patch.object(
+            self.helper,
+            "_write_root_file",
+            side_effect=record,
+        ):
+            self.helper._write_lifecycle_artifact(
+                artifact_root=Path("/private/tmp/artifact"),
+                plan=None,
+                binding=None,
+                environment=context,
+                loaded="",
+                terminal="",
+                kickstart_pid=None,
+                status=2,
+                error_code=raised.exception.code,
+            )
+        lifecycle = json.loads(payloads["lifecycle.json"].decode("utf-8"))
+        probe = json.loads(payloads["probe.json"].decode("utf-8"))
+        expected_error = {"code": "lifecycle-command-nonzero-account-create-record"}
+        self.assertEqual(lifecycle["error"], expected_error)
+        self.assertEqual(probe["error"], expected_error)
+        self.assertEqual(
+            payloads["lifecycle.json"],
+            self.helper.canonical_bytes(lifecycle),
+        )
+        self.assertEqual(payloads["probe.json"], self.helper.canonical_bytes(probe))
+        persisted = b"".join(payloads.values())
+        self.assertNotIn(b"twq-secret-value", persisted)
+        self.assertNotIn(b"secret stdout", persisted)
+        self.assertNotIn(b"secret stderr", persisted)
+
+        with (
+            mock.patch.object(
+                self.helper,
+                "_run_lifecycle_command",
+                side_effect=self.helper.ProbeError("lifecycle-command-failed"),
+            ),
+            self.assertRaises(self.helper.ProbeError) as failed,
+        ):
+            self.helper._require_command_success(
+                secret_argv,
+                command_id="account-create-record",
+            )
+        self.assertEqual(
+            failed.exception.code,
+            "lifecycle-command-failed-account-create-record",
+        )
+
+        with (
+            mock.patch.object(self.helper, "_run_lifecycle_command") as command,
+            self.assertRaisesRegex(
+                self.helper.ProbeError,
+                "invalid-lifecycle-command-id",
+            ),
+        ):
+            self.helper._require_command_success(
+                secret_argv,
+                command_id="twq-secret-value",
+            )
+        command.assert_not_called()
+
+    def test_primary_command_error_survives_reconciliation_failure(self) -> None:
+        plan = self.lifecycle_plan(Path("/private/var/tmp/stage"))
+        state = self.lifecycle_state(plan)
+        primary = "lifecycle-command-nonzero-launchd-bootstrap"
+
+        def capture(reconciliation_code: str) -> dict[str, object]:
+            with (
+                mock.patch.dict(os.environ, eligible_context(), clear=True),
+                mock.patch.object(self.helper, "_normalized_context"),
+                mock.patch.object(self.helper, "_validate_lifecycle_arguments"),
+                mock.patch.object(self.helper, "_create_root_directory"),
+                mock.patch.object(
+                    self.helper,
+                    "_load_lifecycle_state",
+                    return_value=(plan, state),
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_validate_exact_stage",
+                    return_value=None,
+                ),
+                mock.patch.object(self.helper, "_require_launchd_absent"),
+                mock.patch.object(self.helper, "_create_disposable_account"),
+                mock.patch.object(self.helper, "_create_disposable_home"),
+                mock.patch.object(
+                    self.helper,
+                    "_run_lifecycle_command",
+                    return_value=(1, "", "sensitive bootstrap stderr"),
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_reconcile_in_process_bootstrap",
+                    side_effect=self.helper.ProbeError(reconciliation_code),
+                ),
+                mock.patch.object(self.helper, "_write_lifecycle_artifact") as write,
+            ):
+                self.assertEqual(
+                    self.helper.run_launchd_user_lifecycle(
+                        stage_root=plan.stage_root,
+                        artifact_root=Path("/private/tmp/artifact"),
+                        candidate_sha=FROZEN_CANDIDATE_SHA,
+                        runner_uid=501,
+                        runner_gid=20,
+                    ),
+                    2,
+                )
+            return write.call_args.kwargs
+
+        distinct = capture("lifecycle-command-nonzero-launchd-bootout")
+        self.assertEqual(distinct["error_code"], primary)
+        self.assertEqual(
+            distinct["secondary_error_code"],
+            "lifecycle-command-nonzero-launchd-bootout",
+        )
+        duplicate = capture(primary)
+        self.assertEqual(duplicate["error_code"], primary)
+        self.assertIsNone(duplicate["secondary_error_code"])
+        self.assertNotIn("sensitive bootstrap stderr", str(distinct))
+        self.assertNotIn("sensitive bootstrap stderr", str(duplicate))
+
+    def test_probe_error_merge_has_one_exact_precedence_rule(self) -> None:
+        primary = "lifecycle-command-nonzero-launchd-bootstrap"
+        secondary = "lifecycle-command-nonzero-launchd-bootout"
+        tertiary = "lifecycle-command-nonzero-process-list"
+
+        self.assertEqual(
+            self.helper._merge_probe_error(
+                None,
+                None,
+                self.helper.ProbeError(primary, secondary_code=secondary),
+            ),
+            (primary, secondary),
+        )
+        self.assertEqual(
+            self.helper._merge_probe_error(
+                primary,
+                None,
+                self.helper.ProbeError(secondary),
+            ),
+            (primary, secondary),
+        )
+        self.assertEqual(
+            self.helper._merge_probe_error(
+                primary,
+                None,
+                self.helper.ProbeError(primary),
+            ),
+            (primary, None),
+        )
+        self.assertEqual(
+            self.helper._merge_probe_error(
+                primary,
+                secondary,
+                self.helper.ProbeError(tertiary),
+            ),
+            (primary, secondary),
+        )
+
+    def test_account_rollback_failure_is_secondary_to_primary_command_error(
+        self,
+    ) -> None:
+        account = self.helper.DisposableAccount(
+            name="twq-0123456789ab",
+            uid=502,
+            gid=20,
+            home=Path("/Users/twq-0123456789ab"),
+            generated_uid="01234567-89AB-CDEF-0123-456789ABCDEF",
+        )
+        primary = "lifecycle-command-nonzero-account-set-authentication-authority"
+        secondary = "lifecycle-command-nonzero-account-delete"
+        with (
+            mock.patch.object(self.helper, "_list_accounts", return_value={"root": 0}),
+            mock.patch.object(self.helper, "_account_exists", return_value=False),
+            mock.patch.object(
+                self.helper,
+                "_require_command_success",
+                side_effect=self.helper.ProbeError(primary),
+            ),
+            mock.patch.object(
+                self.helper,
+                "_rollback_disposable_account_creation",
+                side_effect=self.helper.ProbeError(secondary),
+            ),
+            self.assertRaises(self.helper.ProbeError) as raised,
+        ):
+            self.helper._create_disposable_account(account)
+        self.assertEqual(raised.exception.code, primary)
+        self.assertEqual(raised.exception.secondary_code, secondary)
+
+        payloads: dict[str, bytes] = {}
+
+        def record(path: Path, raw: bytes, _mode: int) -> None:
+            payloads[path.name] = raw
+
+        with mock.patch.object(
+            self.helper,
+            "_write_root_file",
+            side_effect=record,
+        ):
+            self.helper._write_lifecycle_artifact(
+                artifact_root=Path("/private/tmp/artifact"),
+                plan=None,
+                binding=None,
+                environment=self.launchd_context(),
+                loaded="",
+                terminal="",
+                kickstart_pid=None,
+                status=2,
+                error_code=raised.exception.code,
+                secondary_error_code=raised.exception.secondary_code,
+            )
+        expected_error = {"code": primary, "secondary_code": secondary}
+        lifecycle = json.loads(payloads["lifecycle.json"].decode("utf-8"))
+        probe = json.loads(payloads["probe.json"].decode("utf-8"))
+        self.assertEqual(lifecycle["error"], expected_error)
+        self.assertEqual(probe["error"], expected_error)
 
     def test_home_creation_rolls_back_only_exact_empty_created_directories(
         self,
@@ -2981,7 +3358,10 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             [call.args[0] for call in snapshot.call_args_list],
             [plan.label, plan.label],
         )
-        command.assert_called_once_with(["/bin/launchctl", "bootout", target])
+        command.assert_called_once_with(
+            ["/bin/launchctl", "bootout", target],
+            command_id="launchd-bootout",
+        )
 
         with (
             mock.patch.dict(os.environ, self.launchd_context(), clear=True),
@@ -4113,8 +4493,58 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 ["load-state", "validate-stage", "observe-job", "observe-job"],
             )
             command.assert_called_once_with(
-                ["/bin/launchctl", "bootout", f"system/{plan.label}"]
+                ["/bin/launchctl", "bootout", f"system/{plan.label}"],
+                command_id="launchd-bootout",
             )
+
+    def test_cleanup_failure_logs_only_the_bounded_command_id(self) -> None:
+        stage = Path("/private/var/tmp/task-witness-macos-launchd-123456789-2")
+        artifact = Path("/private/tmp/task-witness-macos-launchd-user-probe")
+        plan = self.lifecycle_plan(stage)
+        state = self.lifecycle_state(plan)
+        code = "lifecycle-command-nonzero-launchd-bootout"
+        stderr = io.StringIO()
+
+        with (
+            mock.patch.dict(os.environ, eligible_context(), clear=True),
+            mock.patch.object(self.helper, "_normalized_context"),
+            mock.patch.object(self.helper, "_validate_lifecycle_arguments"),
+            mock.patch.object(
+                self.helper,
+                "_cleanup_helper_only_stage_before_state",
+                return_value=False,
+            ),
+            mock.patch.object(
+                self.helper,
+                "_load_lifecycle_state",
+                return_value=(plan, state),
+            ),
+            mock.patch.object(
+                self.helper,
+                "_validate_exact_stage",
+                return_value={"ownership": "exact"},
+            ),
+            mock.patch.object(
+                self.helper,
+                "_reconcile_owned_launchd_job",
+                side_effect=self.helper.ProbeError(code),
+            ),
+            mock.patch.object(self.helper, "_metadata_matches", return_value=False),
+            redirect_stderr(stderr),
+        ):
+            status = self.helper.cleanup_launchd_user_lifecycle(
+                stage_root=stage,
+                artifact_root=artifact,
+                expected_helper_sha256="1" * 64,
+                runner_uid=501,
+                runner_gid=20,
+            )
+
+        self.assertEqual(status, 2)
+        self.assertEqual(
+            stderr.getvalue(),
+            f"task-witness macOS launchd-user cleanup: {code}\n",
+        )
 
     def test_cli_exposes_only_explicit_launchd_lifecycle_operations(self) -> None:
         choices = self.helper.parser()._subparsers._group_actions[0].choices

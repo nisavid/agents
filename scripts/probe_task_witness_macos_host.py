@@ -99,14 +99,48 @@ LAUNCHD_CONTEXT_NAMES = (
     "RUNNER_ENVIRONMENT",
     "RUNNER_OS",
 )
+LIFECYCLE_COMMAND_IDS = frozenset(
+    {
+        "account-create-record",
+        "account-delete",
+        "account-name-list",
+        "account-record-read",
+        "account-set-authentication-authority",
+        "account-set-generated-uid",
+        "account-set-gid",
+        "account-set-hidden",
+        "account-set-home",
+        "account-set-password",
+        "account-set-shell",
+        "account-set-uid",
+        "account-uid-list",
+        "launchd-bootstrap",
+        "launchd-bootout",
+        "launchd-kickstart",
+        "process-list",
+    }
+)
 
 
 class ProbeError(Exception):
     """A bounded probe-contract failure."""
 
-    def __init__(self, code: str) -> None:
+    def __init__(self, code: str, *, secondary_code: str | None = None) -> None:
         super().__init__(code)
         self.code = code
+        self.secondary_code = secondary_code
+
+
+def _merge_probe_error(
+    primary_code: str | None,
+    secondary_code: str | None,
+    incoming: ProbeError,
+) -> tuple[str, str | None]:
+    if primary_code is None:
+        return incoming.code, incoming.secondary_code
+    if secondary_code is None and incoming.code != primary_code:
+        return primary_code, incoming.code
+    return primary_code, secondary_code
 
 
 class DisposableAccount(NamedTuple):
@@ -557,6 +591,29 @@ def build_probe_document(
     return document
 
 
+def _validated_probe_error(
+    error_code: str,
+    secondary_error_code: str | None = None,
+) -> dict[str, str]:
+    code = _require_string(error_code, "probe-error-code", 128)
+    if re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", code) is None:
+        raise ProbeError("invalid-probe-error-code")
+    error = {"code": code}
+    if secondary_error_code is not None:
+        secondary = _require_string(
+            secondary_error_code,
+            "probe-secondary-error-code",
+            128,
+        )
+        if (
+            re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", secondary) is None
+            or secondary == code
+        ):
+            raise ProbeError("invalid-probe-secondary-error-code")
+        error["secondary_code"] = secondary
+    return error
+
+
 def build_probe_error_document(
     candidate_sha: str,
     environment: Mapping[str, str],
@@ -565,9 +622,6 @@ def build_probe_error_document(
     if candidate_sha != EXPECTED_CANDIDATE_SHA:
         raise ProbeError("candidate-sha-disagrees")
     harness, runner = _normalized_context(environment)
-    code = _require_string(error_code, "probe-error-code", 128)
-    if re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", code) is None:
-        raise ProbeError("invalid-probe-error-code")
     unsigned = {
         "schema_version": 1,
         "contract": "task-witness-macos-github-host-probe-v1",
@@ -578,7 +632,7 @@ def build_probe_error_document(
         "observations": None,
         "requirements": None,
         "disposition": "probe-error",
-        "error": {"code": code},
+        "error": _validated_probe_error(error_code),
     }
     document = {
         **unsigned,
@@ -754,13 +808,11 @@ def build_launchd_user_probe_error_document(
     candidate_sha: str,
     environment: Mapping[str, str],
     error_code: str,
+    secondary_error_code: str | None = None,
 ) -> dict:
     if candidate_sha != EXPECTED_CANDIDATE_SHA:
         raise ProbeError("candidate-sha-disagrees")
     harness, runner = _normalized_context(environment)
-    code = _require_string(error_code, "probe-error-code", 128)
-    if re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", code) is None:
-        raise ProbeError("invalid-probe-error-code")
     unsigned = {
         "schema_version": 1,
         "contract": "task-witness-macos-github-launchd-user-probe-v1",
@@ -771,7 +823,7 @@ def build_launchd_user_probe_error_document(
         "observations": None,
         "requirements": None,
         "disposition": "probe-error",
-        "error": {"code": code},
+        "error": _validated_probe_error(error_code, secondary_error_code),
     }
     return {
         **unsigned,
@@ -1765,11 +1817,23 @@ def _run_lifecycle_command(
 def _require_command_success(
     argv: Sequence[str],
     *,
+    command_id: str,
     maximum: int = MAX_COMMAND_OUTPUT_BYTES,
 ) -> str:
-    status, stdout, _stderr = _run_lifecycle_command(argv, maximum=maximum)
+    if command_id not in LIFECYCLE_COMMAND_IDS:
+        raise ProbeError("invalid-lifecycle-command-id")
+    try:
+        status, stdout, _stderr = _run_lifecycle_command(argv, maximum=maximum)
+    except ProbeError as error:
+        if error.code not in {
+            "lifecycle-command-failed",
+            "lifecycle-command-output-invalid",
+            "lifecycle-command-output-too-large",
+        }:
+            raise
+        raise ProbeError(f"{error.code}-{command_id}") from error
     if status != 0:
-        raise ProbeError("lifecycle-command-nonzero")
+        raise ProbeError(f"lifecycle-command-nonzero-{command_id}")
     return stdout
 
 
@@ -2043,7 +2107,8 @@ def _account_record(account: DisposableAccount) -> dict[str, list[str]]:
         "UserShell",
     )
     raw = _require_command_success(
-        ["/usr/bin/dscl", ".", "-read", f"/Users/{account.name}", *attributes]
+        ["/usr/bin/dscl", ".", "-read", f"/Users/{account.name}", *attributes],
+        command_id="account-record-read",
     )
     record = parse_dscl_record(raw)
     require_exact_account_record(record, account)
@@ -2052,14 +2117,20 @@ def _account_record(account: DisposableAccount) -> dict[str, list[str]]:
 
 def _list_accounts() -> dict[str, int]:
     return parse_dscl_uid_list(
-        _require_command_success(["/usr/bin/dscl", ".", "-list", "/Users", "UniqueID"])
+        _require_command_success(
+            ["/usr/bin/dscl", ".", "-list", "/Users", "UniqueID"],
+            command_id="account-uid-list",
+        )
     )
 
 
 def _account_exists(name: str) -> bool:
     if LAUNCHD_ACCOUNT_RE.fullmatch(name) is None:
         raise ProbeError("invalid-launchd-user")
-    raw = _require_command_success(["/usr/bin/dscl", ".", "-list", "/Users"])
+    raw = _require_command_success(
+        ["/usr/bin/dscl", ".", "-list", "/Users"],
+        command_id="account-name-list",
+    )
     names = raw.splitlines()
     if (
         not names
@@ -2076,7 +2147,8 @@ def _rollback_disposable_account_creation(account: DisposableAccount) -> None:
     if not _account_exists(account.name):
         return
     _require_command_success(
-        ["/usr/bin/dscl", ".", "-delete", f"/Users/{account.name}"]
+        ["/usr/bin/dscl", ".", "-delete", f"/Users/{account.name}"],
+        command_id="account-delete",
     )
     if _account_exists(account.name):
         raise ProbeError("account-create-rollback-disagrees")
@@ -2091,6 +2163,17 @@ def _create_disposable_account(account: DisposableAccount) -> None:
     ):
         raise ProbeError("account-or-uid-already-exists")
     record_path = f"/Users/{account.name}"
+    command_ids = (
+        "account-create-record",
+        "account-set-shell",
+        "account-set-authentication-authority",
+        "account-set-password",
+        "account-set-hidden",
+        "account-set-uid",
+        "account-set-gid",
+        "account-set-home",
+        "account-set-generated-uid",
+    )
     commands = [
         ["/usr/bin/dscl", ".", "-create", record_path],
         [
@@ -2137,11 +2220,13 @@ def _create_disposable_account(account: DisposableAccount) -> None:
             account.generated_uid,
         ],
     ]
+    if len(command_ids) != len(commands):
+        raise ProbeError("invalid-lifecycle-command-table")
     creation_attempted = False
     try:
         creation_attempted = True
-        for command in commands:
-            _require_command_success(command)
+        for command_id, command in zip(command_ids, commands):
+            _require_command_success(command, command_id=command_id)
         _account_record(account)
         accounts = _list_accounts()
         if (
@@ -2149,13 +2234,19 @@ def _create_disposable_account(account: DisposableAccount) -> None:
             or sum(uid == account.uid for uid in accounts.values()) != 1
         ):
             raise ProbeError("account-list-readback-disagrees")
-    except ProbeError:
+    except ProbeError as primary_error:
         if creation_attempted:
             try:
                 _rollback_disposable_account_creation(account)
             except ProbeError as rollback_error:
+                primary_code, secondary_code = _merge_probe_error(
+                    primary_error.code,
+                    primary_error.secondary_code,
+                    rollback_error,
+                )
                 raise ProbeError(
-                    "account-create-rollback-preserved"
+                    primary_code,
+                    secondary_code=secondary_code,
                 ) from rollback_error
         raise
 
@@ -2940,7 +3031,10 @@ def _bootout_validated_launchd_job(
 ) -> None:
     _validate_launchd_job_binding(snapshot, plan, state)
     target = f"system/{plan.label}"
-    _require_command_success(["/bin/launchctl", "bootout", target])
+    _require_command_success(
+        ["/bin/launchctl", "bootout", target],
+        command_id="launchd-bootout",
+    )
     if _launchd_job_snapshot(plan.label) is not None:
         raise ProbeError("launchd-bootout-disagrees")
 
@@ -2968,6 +3062,7 @@ def _ensure_failed_child_files(
     account: DisposableAccount,
     environment: Mapping[str, str],
     code: str,
+    secondary_code: str | None = None,
 ) -> None:
     probe_root = account.home / "launchd-probe"
     if not _metadata_matches(
@@ -2999,6 +3094,7 @@ def _ensure_failed_child_files(
                     "TASK_WITNESS_LAUNCHD_LABEL": _launchd_identity(environment)[1],
                 },
                 code,
+                secondary_code,
             )
         ),
         "probe.status": b"2\n",
@@ -3022,6 +3118,7 @@ def _write_lifecycle_artifact(
     kickstart_pid: int | None,
     status: int,
     error_code: str | None,
+    secondary_error_code: str | None = None,
 ) -> None:
     label = plan.label if plan is not None else _launchd_identity(environment)[1]
     child: dict[str, bytes]
@@ -3041,6 +3138,9 @@ def _write_lifecycle_artifact(
             child = {}
     else:
         child = {}
+    if status == 2 and error_code is not None:
+        child = {}
+        probe_disposition = "probe-error"
     if not child:
         code = error_code or "lifecycle-incomplete"
         child = {
@@ -3049,6 +3149,7 @@ def _write_lifecycle_artifact(
                     EXPECTED_CANDIDATE_SHA,
                     {**environment, "TASK_WITNESS_LAUNCHD_LABEL": label},
                     code,
+                    secondary_error_code,
                 )
             ),
             "probe.status": b"2\n",
@@ -3095,7 +3196,10 @@ def _write_lifecycle_artifact(
         "disposition": disposition,
     }
     if error_code is not None:
-        unsigned["error"] = {"code": error_code}
+        unsigned["error"] = _validated_probe_error(
+            error_code,
+            secondary_error_code,
+        )
     if disposition == "launchd-user-eligible":
         if plan is None or validated_binding is None:
             raise ProbeError("launchd-job-binding-invalid")
@@ -3141,6 +3245,7 @@ def run_launchd_user_lifecycle(
     kickstart_pid: int | None = None
     status = 2
     error_code: str | None = None
+    secondary_error_code: str | None = None
     bootstrap_attempted = False
     bootout_confirmed = False
     _create_root_directory(artifact_root, 0o700)
@@ -3159,7 +3264,8 @@ def run_launchd_user_lifecycle(
         _require_launchd_absent(plan.label)
         bootstrap_attempted = True
         _require_command_success(
-            ["/bin/launchctl", "bootstrap", "system", str(plan.plist)]
+            ["/bin/launchctl", "bootstrap", "system", str(plan.plist)],
+            command_id="launchd-bootstrap",
         )
         _write_launchd_ownership_marker(plan, state)
         loaded_snapshot = _launchd_job_snapshot(plan.label)
@@ -3173,7 +3279,8 @@ def run_launchd_user_lifecycle(
         binding = validated_loaded.binding
         loaded = validated_loaded.sanitized
         pid_raw = _require_command_success(
-            ["/bin/launchctl", "kickstart", "-p", f"system/{plan.label}"]
+            ["/bin/launchctl", "kickstart", "-p", f"system/{plan.label}"],
+            command_id="launchd-kickstart",
         )
         if re.fullmatch(r"[1-9][0-9]*", pid_raw) is None:
             raise ProbeError("launchd-kickstart-pid-invalid")
@@ -3184,15 +3291,38 @@ def run_launchd_user_lifecycle(
             MAX_PROBE_JSON_BYTES,
             "launchd-user-probe",
         )
-        observed_pid = (
-            probe.get("observations", {}).get("process", {}).get("pid")
-            if isinstance(probe.get("observations"), dict)
-            else None
-        )
-        if observed_pid != kickstart_pid:
-            raise ProbeError("launchd-child-pid-disagrees")
+        if status == 2:
+            raw_error = probe.get("error")
+            if not isinstance(raw_error, dict):
+                raise ProbeError("launchd-user-probe-error-disagrees")
+            try:
+                child_error = _validated_probe_error(
+                    raw_error.get("code"),
+                    raw_error.get("secondary_code"),
+                )
+                expected_probe = build_launchd_user_probe_error_document(
+                    EXPECTED_CANDIDATE_SHA,
+                    {**os.environ, "TASK_WITNESS_LAUNCHD_LABEL": plan.label},
+                    child_error["code"],
+                    child_error.get("secondary_code"),
+                )
+            except ProbeError as error:
+                raise ProbeError("launchd-user-probe-error-disagrees") from error
+            if probe != expected_probe:
+                raise ProbeError("launchd-user-probe-error-disagrees")
+            error_code = child_error["code"]
+            secondary_error_code = child_error.get("secondary_code")
+        else:
+            observed_pid = (
+                probe.get("observations", {}).get("process", {}).get("pid")
+                if isinstance(probe.get("observations"), dict)
+                else None
+            )
+            if observed_pid != kickstart_pid:
+                raise ProbeError("launchd-child-pid-disagrees")
     except ProbeError as error:
         error_code = error.code
+        secondary_error_code = error.secondary_code
         status = 2
     finally:
         if plan is not None and bootstrap_attempted:
@@ -3200,7 +3330,11 @@ def run_launchd_user_lifecycle(
                 _reconcile_in_process_bootstrap(plan, state)
                 bootout_confirmed = True
             except ProbeError as error:
-                error_code = error.code
+                error_code, secondary_error_code = _merge_probe_error(
+                    error_code,
+                    secondary_error_code,
+                    error,
+                )
                 status = 2
     processes_absent = False
     if plan is not None and bootout_confirmed:
@@ -3208,7 +3342,11 @@ def run_launchd_user_lifecycle(
             _require_no_uid_processes(plan.account.uid)
             processes_absent = True
         except ProbeError as error:
-            error_code = error.code
+            error_code, secondary_error_code = _merge_probe_error(
+                error_code,
+                secondary_error_code,
+                error,
+            )
             status = 2
     if status == 2 and plan is not None and processes_absent:
         try:
@@ -3216,6 +3354,7 @@ def run_launchd_user_lifecycle(
                 plan.account,
                 os.environ,
                 error_code or "lifecycle-incomplete",
+                secondary_error_code,
             )
         except ProbeError:
             pass
@@ -3224,11 +3363,12 @@ def run_launchd_user_lifecycle(
         plan=plan if processes_absent else None,
         binding=binding if processes_absent else None,
         environment=os.environ,
-        loaded=loaded,
-        terminal=terminal,
+        loaded=loaded if processes_absent else "",
+        terminal=terminal if processes_absent else "",
         kickstart_pid=kickstart_pid,
         status=status,
         error_code=error_code,
+        secondary_error_code=secondary_error_code,
     )
     return status
 
@@ -3361,6 +3501,7 @@ def _validate_exact_stage(
 def _require_no_uid_processes(uid: int) -> None:
     raw = _require_command_success(
         ["/bin/ps", "-axo", "uid=,pid="],
+        command_id="process-list",
         maximum=MAX_PROCESS_LIST_BYTES,
     )
     observed_pid_one = False
@@ -3429,7 +3570,11 @@ def cleanup_launchd_user_lifecycle(
             environment=os.environ,
         ):
             return 2
-    except ProbeError:
+    except ProbeError as error:
+        print(
+            f"task-witness macOS launchd-user cleanup: {error.code}",
+            file=sys.stderr,
+        )
         return 2
     error_code: str | None = None
     try:
@@ -3462,7 +3607,8 @@ def cleanup_launchd_user_lifecycle(
         _require_no_uid_processes(plan.account.uid)
         if account_present:
             _require_command_success(
-                ["/usr/bin/dscl", ".", "-delete", f"/Users/{plan.account.name}"]
+                ["/usr/bin/dscl", ".", "-delete", f"/Users/{plan.account.name}"],
+                command_id="account-delete",
             )
             if (
                 _account_exists(plan.account.name)
@@ -3537,6 +3683,10 @@ def cleanup_launchd_user_lifecycle(
             )
     except ProbeError:
         pass
+    print(
+        f"task-witness macOS launchd-user cleanup: {error_code}",
+        file=sys.stderr,
+    )
     return 2
 
 

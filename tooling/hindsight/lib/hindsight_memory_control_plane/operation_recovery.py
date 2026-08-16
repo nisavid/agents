@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence, Set
+from datetime import datetime
 import re
 import time
 import unicodedata
@@ -3458,6 +3459,19 @@ def _post_abort_v10_retry_recovery(
     return body
 
 
+def _post_abort_timestamp(value: Any) -> float | None:
+    if not isinstance(value, str) or not value:
+        return None
+    normalized = f"{value[:-1]}+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(normalized)
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            return None
+        return parsed.timestamp()
+    except (OSError, OverflowError, TypeError, ValueError):
+        return None
+
+
 def _post_abort_v10_contract(
     reference_plan: Mapping[str, Any],
     snapshot: Mapping[str, Any],
@@ -3541,10 +3555,48 @@ def _post_abort_v10_contract(
                 }
             )
         elif status == "pending" and wholly_unowned:
+            reference_row = reference_snapshot[operation_id]
+            reference_wholly_unowned = (
+                reference_row["worker_id_present"] is False
+                and reference_row["worker_id_digest"] is None
+                and reference_row["claimed_at"] is None
+            )
+            reference_updated_at = _post_abort_timestamp(
+                reference_row["updated_at"]
+            )
+            current_updated_at = _post_abort_timestamp(row["updated_at"])
+            next_retry_at = (
+                None
+                if row["next_retry_at"] is None
+                else _post_abort_timestamp(row["next_retry_at"])
+            )
             if (
-                row["completed_at"] is not None
-                or row["row_digest"]
-                != reference_snapshot[operation_id]["row_digest"]
+                reference_row["current_status"] != "pending"
+                or not reference_wholly_unowned
+                or reference_row["completed_at"] is not None
+                or row["completed_at"] is not None
+                or row["created_at"] != reference_row["created_at"]
+                or row["result_metadata_digest"]
+                != reference_row["result_metadata_digest"]
+                or row["task_payload_present"]
+                is not reference_row["task_payload_present"]
+                or not 0
+                <= reference_row["retry_count"]
+                <= row["retry_count"]
+                <= reference_plan["worker_max_retries"]
+                or reference_updated_at is None
+                or current_updated_at is None
+                or (
+                    row["row_digest"] != reference_row["row_digest"]
+                    and current_updated_at <= reference_updated_at
+                )
+                or (
+                    row["next_retry_at"] is not None
+                    and (
+                        next_retry_at is None
+                        or next_retry_at > snapshot["observed_at"]
+                    )
+                )
             ):
                 raise OperationRecoveryError(
                     "operation-recovery post-abort row set is invalid"

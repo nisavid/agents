@@ -2842,6 +2842,314 @@ class OperationRecoveryContractTest(unittest.TestCase):
                         now=mismatched["created_at"],
                     )
 
+    def test_post_abort_v10_preserves_changed_unowned_pending_row(self):
+        reference_snapshot = self.drain_snapshot(
+            completed_positions=set(range(7)),
+            observed_at=1_786_390_000,
+        )
+        reference = self.legacy_drain_plan(
+            snapshot=reference_snapshot,
+            created_at=1_786_390_001,
+        )
+        preliminary_interrupted = self.post_abort_v10_snapshot(
+            reference
+        )
+        operation_id = next(
+            item["operation_id"]
+            for item in preliminary_interrupted["operations"]
+            if item["current_status"] == "pending"
+            and item["worker_id_present"]
+        )
+        reference_row = next(
+            item
+            for item in reference["live_snapshot"]["operations"]
+            if item["operation_id"] == operation_id
+        )
+        reference_row["retry_count"] = 1
+        reference_row["row_digest"] = digest(
+            {
+                key: value
+                for key, value in reference_row.items()
+                if key != "row_digest"
+            }
+        )
+        reference["live_snapshot"]["snapshot_digest"] = digest(
+            {
+                key: value
+                for key, value in reference["live_snapshot"].items()
+                if key != "snapshot_digest"
+            }
+        )
+        reference["snapshot_digest"] = reference["live_snapshot"][
+            "snapshot_digest"
+        ]
+        selected_reference_row = next(
+            item
+            for item in reference["selected_operations"]
+            if item["operation_id"] == operation_id
+        )
+        selected_reference_row["row_digest"] = reference_row["row_digest"]
+        reference["selected_row_set_digest"] = (
+            recovery_contract._exact_drain_row_set_digest(
+                reference["selected_operations"]
+            )
+        )
+        reference["plan_digest"] = digest(
+            {
+                key: value
+                for key, value in reference.items()
+                if key != "plan_digest"
+            }
+        )
+        self.assertEqual(
+            recovery_contract.verify_exact_drain_plan(
+                reference,
+                now=reference["created_at"],
+            ),
+            reference,
+        )
+        self.assertIn(
+            operation_id,
+            {
+                item["operation_id"]
+                for item in reference["selected_operations"]
+            },
+        )
+
+        snapshot = self.post_abort_v10_snapshot(
+            reference,
+            observed_at=1_786_825_000,
+        )
+        reference_row = next(
+            item
+            for item in reference["live_snapshot"]["operations"]
+            if item["operation_id"] == operation_id
+        )
+        released_row = next(
+            item
+            for item in snapshot["operations"]
+            if item["operation_id"] == operation_id
+        )
+        released_row.update(
+            worker_id_present=False,
+            worker_id_digest=None,
+            claimed_at=None,
+            updated_at="2026-08-15T20:16:00.000000Z",
+            result_metadata_digest=reference_row["result_metadata_digest"],
+        )
+        released_row["row_digest"] = digest(
+            {
+                key: value
+                for key, value in released_row.items()
+                if key != "row_digest"
+            }
+        )
+        snapshot["snapshot_digest"] = digest(
+            {
+                key: value
+                for key, value in snapshot.items()
+                if key != "snapshot_digest"
+            }
+        )
+        self.assertEqual(reference_row["retry_count"], 1)
+        self.assertEqual(released_row["retry_count"], 3)
+        self.assertIsNone(released_row["completed_at"])
+        self.assertNotEqual(
+            released_row["error_digest"],
+            reference_row["error_digest"],
+        )
+        self.assertNotEqual(
+            released_row["next_retry_at"],
+            reference_row["next_retry_at"],
+        )
+        self.assertEqual(
+            released_row["result_metadata_digest"],
+            reference_row["result_metadata_digest"],
+        )
+        self.assertEqual(
+            released_row["created_at"],
+            reference_row["created_at"],
+        )
+        self.assertGreater(
+            released_row["updated_at"],
+            reference_row["updated_at"],
+        )
+
+        backup = rollback_backup_evidence()
+        for key in ("generation_before", "generation_after"):
+            backup["source_authority"][key] = snapshot[
+                "generation_before"
+            ]
+        backup["source_authority_digest"] = digest(
+            backup["source_authority"]
+        )
+
+        def create(value):
+            return create_post_abort_recovery_plan(
+                reference,
+                value,
+                candidate_release=release_identity(),
+                rollback_backup=backup,
+                rollback_encryption=rollback_encryption(),
+                rollback_backup_path="/private/tmp/v10-release-backup.age",
+                rollback_bundle_path="/private/tmp/v10-release-bundle.age",
+                authorization_receipt_path=(
+                    "/private/tmp/v10-release-auth.json"
+                ),
+                application_receipt_path=(
+                    "/private/tmp/v10-release-app.json"
+                ),
+                verification_receipt_path=(
+                    "/private/tmp/v10-release-verify.json"
+                ),
+                rollback_receipt_path=(
+                    "/private/tmp/v10-release-rollback.json"
+                ),
+                reference_application_authorization=(
+                    exact_drain_authorization(reference)
+                ),
+                reference_application_journal=(
+                    exact_drain_application_journal(reference)
+                ),
+                reference_application_progress_digest="f" * 64,
+                schema_version=10,
+                created_at=1_786_825_100,
+            )
+
+        plan = create(snapshot)
+        selected_ids = {
+            item["operation_id"] for item in plan["selected_operations"]
+        }
+        self.assertNotIn(operation_id, selected_ids)
+        self.assertNotIn(
+            operation_id,
+            {
+                item["operation_id"]
+                for item in plan["retry_recovery"]["operations"]
+            },
+        )
+        self.assertEqual(plan["selected_operation_count"], 38)
+        self.assertEqual(
+            plan["preserved_status_counts"],
+            {"completed": 9, "pending": 1},
+        )
+        self.assertEqual(
+            plan["preserved_row_set_digest"],
+            digest(
+                [
+                    {
+                        "operation_id": item["operation_id"],
+                        "row_digest": item["row_digest"],
+                    }
+                    for item in snapshot["operations"]
+                    if item["operation_id"] not in selected_ids
+                ]
+            ),
+        )
+        self.assertEqual(
+            verify_post_abort_recovery_plan(plan, now=plan["created_at"]),
+            plan,
+        )
+
+        offset_equivalent = deepcopy(snapshot)
+        offset_row = next(
+            item
+            for item in offset_equivalent["operations"]
+            if item["operation_id"] == operation_id
+        )
+        offset_row.update(
+            updated_at="2026-08-15T16:16:00.000000-04:00",
+            next_retry_at="2026-08-15T16:16:00.000000-04:00",
+        )
+        offset_row["row_digest"] = digest(
+            {
+                key: value
+                for key, value in offset_row.items()
+                if key != "row_digest"
+            }
+        )
+        offset_equivalent["snapshot_digest"] = digest(
+            {
+                key: value
+                for key, value in offset_equivalent.items()
+                if key != "snapshot_digest"
+            }
+        )
+        offset_plan = create(offset_equivalent)
+        self.assertNotIn(
+            operation_id,
+            {
+                item["operation_id"]
+                for item in offset_plan["selected_operations"]
+            },
+        )
+
+        for label, updates in (
+            (
+                "completed-at",
+                {"completed_at": "2026-08-15T20:17:00.000000Z"},
+            ),
+            (
+                "retry-count-decrease",
+                {"retry_count": reference_row["retry_count"] - 1},
+            ),
+            (
+                "retry-count-over-ceiling",
+                {"retry_count": reference["worker_max_retries"] + 1},
+            ),
+            (
+                "result-metadata",
+                {"result_metadata_digest": "0" * 64},
+            ),
+            (
+                "created-at",
+                {"created_at": "2026-07-29T00:00:00Z"},
+            ),
+            (
+                "non-advancing-updated-at",
+                {"updated_at": reference_row["updated_at"]},
+            ),
+            (
+                "lexically-later-chronologically-earlier-updated-at",
+                {"updated_at": "2026-07-29T13:59:01.000000+14:00"},
+            ),
+            (
+                "future-next-retry-at",
+                {"next_retry_at": "2026-08-15T21:00:00.000000Z"},
+            ),
+            (
+                "naive-next-retry-at",
+                {"next_retry_at": "2026-08-15T20:16:00.000000"},
+            ),
+        ):
+            with self.subTest(invalid_unowned_pending=label):
+                invalid = deepcopy(snapshot)
+                invalid_row = next(
+                    item
+                    for item in invalid["operations"]
+                    if item["operation_id"] == operation_id
+                )
+                invalid_row.update(updates)
+                invalid_row["row_digest"] = digest(
+                    {
+                        key: value
+                        for key, value in invalid_row.items()
+                        if key != "row_digest"
+                    }
+                )
+                invalid["snapshot_digest"] = digest(
+                    {
+                        key: value
+                        for key, value in invalid.items()
+                        if key != "snapshot_digest"
+                    }
+                )
+                with self.assertRaisesRegex(
+                    OperationRecoveryError,
+                    "row set is invalid",
+                ):
+                    create(invalid)
+
     def test_exact_drain_v10_binds_verified_post_abort_retry_lineage(self):
         reference = self.drain_plan(
             snapshot=self.drain_snapshot(
@@ -3043,7 +3351,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 generation_before="systalyze:public:81701",
                 generation_after="systalyze:public:81701",
                 installation_authority=installation_authority(),
-                observed_at=1_786_390_800,
+                observed_at=1_786_829_500,
             )
         )
         second_backup = rollback_backup_evidence()
@@ -3075,7 +3383,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
                     exact_drain_application_journal(plan)
                 ),
                 reference_application_progress_digest="d" * 64,
-                created_at=1_786_390_900,
+                created_at=1_786_829_600,
             )
 
         for legacy_schema_version in range(4, 10):
@@ -3108,7 +3416,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
                     ),
                     reference_application_progress_digest="d" * 64,
                     schema_version=legacy_schema_version,
-                    created_at=1_786_390_900,
+                    created_at=1_786_829_600,
                 )
 
         legacy_key_sets = {

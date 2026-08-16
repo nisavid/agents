@@ -1634,6 +1634,214 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             ):
                 self.helper.choose_disposable_uid(occupied)
 
+    def test_process_table_drives_uid_selection_and_value_free_diagnostics(
+        self,
+    ) -> None:
+        raw = (
+            "0 1 0 1 Ss launchd\n"
+            "-2 0 0 0 I kernel_task\n"
+            "4294967294 2 1 2 S nobody\n"
+            "502 120 1 120 S cfprefsd\n"
+            "503 130 1 130 S distnoted\n"
+            "504 140 1 140 Z launchd\n"
+            "505 150 1 150 S unrelated-private-name\n"
+            "506 160 1 160 S first\n"
+            "506 161 1 161 S second"
+        )
+        records = self.helper.parse_process_list(raw)
+        self.assertEqual(
+            self.helper.process_occupied_uids(records),
+            {-2, 0, 502, 503, 504, 505, 506, 4294967294},
+        )
+        expected_codes = {
+            502: "disposable-user-cfprefsd-name-remains",
+            503: "disposable-user-distnoted-name-remains",
+            504: "disposable-user-zombie-only-remains",
+            505: "disposable-user-pid1-parented-process-remains",
+            506: "disposable-user-multiple-processes-remain",
+        }
+        for uid, expected_code in expected_codes.items():
+            with self.subTest(uid=uid):
+                self.assertEqual(
+                    self.helper._process_survivor_code(records, uid),
+                    expected_code,
+                )
+        self.assertIsNone(self.helper._process_survivor_code(records, 507))
+        self.assertNotIn("unrelated-private-name", str(expected_codes))
+
+        with mock.patch.object(
+            self.helper,
+            "_require_command_success",
+            return_value=raw,
+        ) as process_command:
+            self.assertEqual(self.helper._process_records(timeout=1.25), records)
+        process_command.assert_called_once_with(
+            [
+                "/bin/ps",
+                "-axo",
+                "uid=,pid=,ppid=,pgid=,state=,ucomm=",
+            ],
+            command_id="process-list",
+            maximum=self.helper.MAX_PROCESS_LIST_BYTES,
+            timeout=1.25,
+        )
+
+        launchd_named = self.helper.parse_process_list(
+            "0 1 0 1 Ss launchd\n502 1234 1 1234 S Python\n"
+        )
+        self.assertEqual(
+            self.helper._process_survivor_code(launchd_named, 502),
+            "disposable-user-probe-name-remains",
+        )
+
+        invalid = {
+            "missing-pid-one": "502 120 1 120 S cfprefsd\n",
+            "duplicate-pid": "0 1 0 1 Ss launchd\n502 1 1 1 S cfprefsd\n",
+            "nonnumeric": "0 1 0 1 Ss launchd\n502 pid 1 1 S cfprefsd\n",
+            "empty-command": "0 1 0 1 Ss \n",
+        }
+        for label, value in invalid.items():
+            with (
+                self.subTest(label=label),
+                self.assertRaisesRegex(self.helper.ProbeError, "process-list-invalid"),
+            ):
+                self.helper.parse_process_list(value)
+        with self.assertRaisesRegex(
+            self.helper.ProbeError,
+            "process-list-too-large",
+        ):
+            self.helper.parse_process_list(
+                "0 1 0 1 Ss launchd\n" + " " * self.helper.MAX_PROCESS_LIST_BYTES
+            )
+
+    def test_lifecycle_initialization_excludes_process_occupied_uids(self) -> None:
+        stage = Path("/private/var/tmp/task-witness-macos-launchd-123456789-2")
+        process_record = self.helper.ProcessRecord(
+            uid=502,
+            pid=120,
+            ppid=1,
+            pgid=120,
+            state="S",
+            command="cfprefsd",
+        )
+        with (
+            mock.patch.object(
+                self.helper,
+                "validate_prestaged_helper",
+                return_value=b"trusted helper",
+            ),
+            mock.patch.object(
+                self.helper,
+                "_list_accounts",
+                return_value={"root": 0, "runner": 501, "occupied": 503},
+            ),
+            mock.patch.object(
+                self.helper,
+                "_process_records",
+                return_value=(process_record,),
+            ) as process_scan,
+            mock.patch.object(self.helper, "_write_root_file"),
+        ):
+            plan = self.helper._initialize_lifecycle(
+                stage_root=stage,
+                expected_helper_sha256="1" * 64,
+                runner_uid=501,
+                runner_gid=20,
+                environment=eligible_context(),
+            )
+        self.assertEqual(plan.account.uid, 504)
+        process_scan.assert_called_once_with()
+
+    def test_account_creation_rechecks_process_occupancy_before_ds_mutation(
+        self,
+    ) -> None:
+        plan = self.lifecycle_plan(
+            Path("/private/var/tmp/task-witness-macos-launchd-123456789-2")
+        )
+        state = self.lifecycle_state(plan)
+        with (
+            mock.patch.object(
+                self.helper,
+                "_list_accounts",
+                return_value={"root": 0, "runner": 501},
+            ) as list_accounts,
+            mock.patch.object(
+                self.helper,
+                "_account_exists",
+                return_value=False,
+            ) as account_exists,
+            mock.patch.object(
+                self.helper,
+                "_require_disposable_uid_available",
+                side_effect=self.helper.ProbeError(
+                    "disposable-uid-active-before-create"
+                ),
+            ) as process_check,
+            mock.patch.object(self.helper, "_require_command_success") as mutate,
+            self.assertRaises(self.helper.ProbeError) as raised,
+        ):
+            self.helper._create_disposable_account(plan, state)
+        self.assertEqual(
+            raised.exception.code,
+            "disposable-uid-active-before-create",
+        )
+        process_check.assert_called_once_with(plan.account.uid)
+        list_accounts.assert_called_once_with()
+        account_exists.assert_called_once_with(plan.account.name)
+        mutate.assert_not_called()
+
+    def test_precreate_uid_collision_is_visible_without_process_metadata(
+        self,
+    ) -> None:
+        plan = self.lifecycle_plan(Path("/private/var/tmp/stage"))
+        state = self.lifecycle_state(plan)
+        code = "disposable-uid-active-before-create"
+        stderr = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, eligible_context(), clear=True),
+            mock.patch.object(self.helper, "_normalized_context"),
+            mock.patch.object(self.helper, "_validate_lifecycle_arguments"),
+            mock.patch.object(self.helper, "_create_root_directory"),
+            mock.patch.object(
+                self.helper,
+                "_load_lifecycle_state",
+                return_value=(plan, state),
+            ),
+            mock.patch.object(
+                self.helper,
+                "_validate_exact_stage",
+                return_value=self.helper.ValidatedStageBindings(None, None),
+            ),
+            mock.patch.object(self.helper, "_require_launchd_absent"),
+            mock.patch.object(
+                self.helper,
+                "_create_disposable_account",
+                side_effect=self.helper.ProbeError(code),
+            ),
+            mock.patch.object(self.helper, "_create_disposable_home") as create_home,
+            mock.patch.object(self.helper, "_write_lifecycle_artifact") as write,
+            redirect_stderr(stderr),
+        ):
+            self.assertEqual(
+                self.helper.run_launchd_user_lifecycle(
+                    stage_root=plan.stage_root,
+                    artifact_root=Path("/private/tmp/artifact"),
+                    candidate_sha=FROZEN_CANDIDATE_SHA,
+                    runner_uid=501,
+                    runner_gid=20,
+                ),
+                2,
+            )
+        create_home.assert_not_called()
+        self.assertEqual(write.call_args.kwargs["error_code"], code)
+        self.assertEqual(
+            stderr.getvalue(),
+            f"task-witness macOS launchd-user lifecycle: {code}\n",
+        )
+        self.assertNotIn("pid", stderr.getvalue())
+        self.assertNotIn("cfprefsd", stderr.getvalue())
+
+    def test_dscl_uid_parser_and_account_record_validation_are_closed(self) -> None:
         self.assertEqual(
             self.helper.parse_dscl_uid_list(
                 f"minimum {-(1 << 31)}\nmaximum {(1 << 31) - 1}\n"
@@ -3018,6 +3226,10 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             ),
             mock.patch.object(
                 self.helper,
+                "_require_disposable_uid_available",
+            ),
+            mock.patch.object(
+                self.helper,
                 "_write_account_binding",
                 side_effect=write_account_binding,
             ) as write_binding,
@@ -3184,6 +3396,10 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 self.subTest(failure_index=failure_index),
                 mock.patch.object(
                     self.helper,
+                    "_require_disposable_uid_available",
+                ),
+                mock.patch.object(
+                    self.helper,
                     "_run_lifecycle_command",
                     side_effect=command,
                 ),
@@ -3263,6 +3479,10 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 return_value={"root": 0},
             ),
             mock.patch.object(self.helper, "_account_exists", return_value=False),
+            mock.patch.object(
+                self.helper,
+                "_require_disposable_uid_available",
+            ),
             mock.patch.object(self.helper, "_require_command_success"),
             mock.patch.object(
                 self.helper,
@@ -3616,6 +3836,10 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             mock.patch.object(self.helper, "_account_exists", return_value=False),
             mock.patch.object(
                 self.helper,
+                "_require_disposable_uid_available",
+            ),
+            mock.patch.object(
+                self.helper,
                 "_require_command_success",
                 side_effect=["", self.helper.ProbeError(primary)],
             ),
@@ -3803,7 +4027,9 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
     def test_disposable_user_process_exit_wait_is_bounded_and_fail_closed(
         self,
     ) -> None:
-        process_remains = self.helper.ProbeError("disposable-user-process-remains")
+        process_remains = self.helper.ProbeError(
+            "disposable-user-cfprefsd-name-remains"
+        )
         with (
             mock.patch.object(
                 self.helper,
@@ -3839,7 +4065,10 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
         scan.assert_called_once_with(502, timeout=5.0)
 
         for label, error in (
-            ("timeout", self.helper.ProbeError("disposable-user-process-remains")),
+            (
+                "timeout",
+                self.helper.ProbeError("disposable-user-cfprefsd-name-remains"),
+            ),
             ("invalid-list", self.helper.ProbeError("process-list-invalid")),
         ):
             monotonic = [0.0, 0.1, 31.0] if label == "timeout" else [0.0, 0.1]
@@ -3862,6 +4091,29 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             self.assertEqual(raised.exception.code, error.code)
             scan.assert_called_once_with(502, timeout=10)
             sleep.assert_not_called()
+
+        with (
+            mock.patch.object(
+                self.helper,
+                "_require_no_uid_processes",
+                side_effect=[
+                    self.helper.ProbeError("disposable-user-cfprefsd-name-remains"),
+                    self.helper.ProbeError("disposable-user-distnoted-name-remains"),
+                ],
+            ),
+            mock.patch.object(
+                self.helper.time,
+                "monotonic",
+                side_effect=[0.0, 0.1, 0.2, 0.3, 31.0],
+            ),
+            mock.patch.object(self.helper.time, "sleep"),
+            self.assertRaises(self.helper.ProbeError) as raised,
+        ):
+            self.helper._wait_for_no_uid_processes(502)
+        self.assertEqual(
+            raised.exception.code,
+            "disposable-user-process-observation-unstable",
+        )
 
     def test_owned_job_reconciliation_is_exact_and_absence_is_idempotent(
         self,
@@ -4609,6 +4861,20 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                     ),
                     mock.patch.object(
                         self.helper,
+                        "_process_records",
+                        return_value=(
+                            self.helper.ProcessRecord(
+                                uid=0,
+                                pid=1,
+                                ppid=0,
+                                pgid=1,
+                                state="Ss",
+                                command="launchd",
+                            ),
+                        ),
+                    ),
+                    mock.patch.object(
+                        self.helper,
                         "_write_root_file",
                         side_effect=fail_initialization,
                     ),
@@ -4928,7 +5194,10 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 ) as launchctl_mutation,
                 mock.patch.object(self.helper, "_list_accounts", return_value={}),
                 mock.patch.object(self.helper, "_account_exists", return_value=False),
-                mock.patch.object(self.helper, "_require_no_uid_processes"),
+                mock.patch.object(
+                    self.helper,
+                    "_wait_for_no_uid_processes",
+                ) as wait_for_processes,
                 mock.patch.object(
                     self.helper,
                     "_validate_precleanup_artifact",
@@ -4950,6 +5219,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 events[:3],
                 ["load-state", "validate-stage", "observe-absent"],
             )
+            wait_for_processes.assert_not_called()
             launchctl_mutation.assert_not_called()
 
     def test_cleanup_preserves_account_or_home_without_account_binding(self) -> None:
@@ -5227,7 +5497,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                     self.helper,
                     "_wait_for_no_uid_processes",
                     side_effect=self.helper.ProbeError(
-                        "disposable-user-process-remains"
+                        "disposable-user-unclassified-process-remains"
                     ),
                 ) as wait,
                 mock.patch.multiple(
@@ -5272,12 +5542,12 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             self.assertEqual(cleanup["disposition"], "preserved-on-drift")
             self.assertEqual(
                 cleanup["error"],
-                {"code": "disposable-user-process-remains"},
+                {"code": "disposable-user-unclassified-process-remains"},
             )
             self.assertEqual(
                 stderr.getvalue(),
                 "task-witness macOS launchd-user cleanup: "
-                "disposable-user-process-remains\n",
+                "disposable-user-unclassified-process-remains\n",
             )
 
     def test_cleanup_preserves_stage_when_planned_uid_remains_occupied(self) -> None:

@@ -128,6 +128,19 @@ LIFECYCLE_COMMAND_IDS = frozenset(
         "process-list",
     }
 )
+DISPOSABLE_PROCESS_REMAINS_CODES = frozenset(
+    {
+        "disposable-user-cfprefsd-name-remains",
+        "disposable-user-distnoted-name-remains",
+        "disposable-user-launchd-name-remains",
+        "disposable-user-multiple-processes-remain",
+        "disposable-user-pid1-parented-process-remains",
+        "disposable-user-probe-name-remains",
+        "disposable-user-process-observation-unstable",
+        "disposable-user-unclassified-process-remains",
+        "disposable-user-zombie-only-remains",
+    }
+)
 
 
 class ProbeError(Exception):
@@ -180,6 +193,15 @@ class ValidatedLaunchdJobSnapshot(NamedTuple):
 class ValidatedStageBindings(NamedTuple):
     account: dict | None
     launchd: dict | None
+
+
+class ProcessRecord(NamedTuple):
+    uid: int
+    pid: int
+    ppid: int
+    pgid: int
+    state: str
+    command: str
 
 
 def canonical_bytes(value: object) -> bytes:
@@ -2278,6 +2300,7 @@ def _create_disposable_account(
         or account.uid in accounts.values()
     ):
         raise ProbeError("account-or-uid-already-exists")
+    _require_disposable_uid_available(account.uid)
     record_path = f"/Users/{account.name}"
     property_command_ids = (
         "account-set-shell",
@@ -2815,7 +2838,12 @@ def _initialize_lifecycle(
         expected_helper_sha256,
     )
     accounts = _list_accounts()
-    uid = choose_disposable_uid(set(accounts.values()))
+    process_uids = {
+        uid
+        for uid in process_occupied_uids(_process_records())
+        if DISPOSABLE_UID_MIN <= uid <= DISPOSABLE_UID_MAX
+    }
+    uid = choose_disposable_uid(set(accounts.values()) | process_uids)
     account_name, label = _launchd_identity(environment)
     if account_name in accounts:
         raise ProbeError("account-name-already-exists")
@@ -3607,6 +3635,18 @@ def run_launchd_user_lifecycle(
         error_code=error_code,
         secondary_error_code=secondary_error_code,
     )
+    if status == 2:
+        print(
+            "task-witness macOS launchd-user lifecycle: "
+            f"{error_code or 'lifecycle-incomplete'}",
+            file=sys.stderr,
+        )
+        if secondary_error_code is not None:
+            print(
+                "task-witness macOS launchd-user lifecycle secondary: "
+                f"{secondary_error_code}",
+                file=sys.stderr,
+            )
     return status
 
 
@@ -3743,39 +3783,139 @@ def _validate_exact_stage(
     return ValidatedStageBindings(account=account, launchd=ownership)
 
 
+def parse_process_list(raw: str) -> tuple[ProcessRecord, ...]:
+    if len(raw.encode("utf-8")) > MAX_PROCESS_LIST_BYTES:
+        raise ProbeError("process-list-too-large")
+    result: list[ProcessRecord] = []
+    observed_pids: set[int] = set()
+    observed_pid_one = False
+    for line in raw.splitlines():
+        fields = line.split(maxsplit=5)
+        if (
+            len(fields) != 6
+            or DSCL_UID_RE.fullmatch(fields[0]) is None
+            or any(
+                re.fullmatch(r"(?:0|[1-9][0-9]*)", item) is None for item in fields[1:4]
+            )
+            or not fields[4]
+            or len(fields[4]) > 32
+            or any(
+                character.isspace() or not character.isascii()
+                for character in fields[4]
+            )
+            or not fields[5]
+            or len(fields[5].encode("utf-8")) > 128
+            or any(
+                ord(character) < 0x20 or ord(character) == 0x7F
+                for character in fields[5]
+            )
+        ):
+            raise ProbeError("process-list-invalid")
+        uid, pid, ppid, pgid = (int(item) for item in fields[:4])
+        if (
+            not DSCL_UID_MIN <= uid <= (1 << 32) - 1
+            or pid > DSCL_UID_MAX
+            or ppid > DSCL_UID_MAX
+            or pgid > DSCL_UID_MAX
+            or pid in observed_pids
+        ):
+            raise ProbeError("process-list-invalid")
+        observed_pids.add(pid)
+        if uid == 0 and pid == 1:
+            observed_pid_one = True
+        result.append(
+            ProcessRecord(
+                uid=uid,
+                pid=pid,
+                ppid=ppid,
+                pgid=pgid,
+                state=fields[4],
+                command=fields[5],
+            )
+        )
+    if not result or not observed_pid_one:
+        raise ProbeError("process-list-invalid")
+    return tuple(result)
+
+
+def process_occupied_uids(records: Sequence[ProcessRecord]) -> set[int]:
+    if any(not isinstance(record, ProcessRecord) for record in records):
+        raise ProbeError("process-list-invalid")
+    return {record.uid for record in records}
+
+
+def _process_records(
+    *,
+    timeout: float = COMMAND_TIMEOUT_SECONDS,
+) -> tuple[ProcessRecord, ...]:
+    return parse_process_list(
+        _require_command_success(
+            ["/bin/ps", "-axo", "uid=,pid=,ppid=,pgid=,state=,ucomm="],
+            command_id="process-list",
+            maximum=MAX_PROCESS_LIST_BYTES,
+            timeout=timeout,
+        )
+    )
+
+
+def _process_survivor_code(
+    records: Sequence[ProcessRecord],
+    uid: int,
+) -> str | None:
+    if (
+        type(uid) is not int
+        or not DISPOSABLE_UID_MIN <= uid <= DISPOSABLE_UID_MAX
+        or any(not isinstance(record, ProcessRecord) for record in records)
+    ):
+        raise ProbeError("process-list-invalid")
+    observed = [record for record in records if record.uid == uid]
+    if not observed:
+        return None
+    if len(observed) > 1:
+        return "disposable-user-multiple-processes-remain"
+    record = observed[0]
+    if record.pid <= 0:
+        raise ProbeError("process-list-invalid")
+    command = Path(record.command).name.lower()
+    if record.state.upper().startswith("Z"):
+        return "disposable-user-zombie-only-remains"
+    if command == "launchd":
+        return "disposable-user-launchd-name-remains"
+    if command == "cfprefsd":
+        return "disposable-user-cfprefsd-name-remains"
+    if command == "distnoted":
+        return "disposable-user-distnoted-name-remains"
+    if command in {"python", "python3"} or command.startswith("python3."):
+        return "disposable-user-probe-name-remains"
+    if record.ppid == 1:
+        return "disposable-user-pid1-parented-process-remains"
+    return "disposable-user-unclassified-process-remains"
+
+
+def _require_disposable_uid_available(uid: int) -> None:
+    if _process_survivor_code(_process_records(), uid) is not None:
+        raise ProbeError("disposable-uid-active-before-create")
+
+
 def _require_no_uid_processes(
     uid: int,
     *,
     timeout: float = COMMAND_TIMEOUT_SECONDS,
 ) -> None:
-    raw = _require_command_success(
-        ["/bin/ps", "-axo", "uid=,pid="],
-        command_id="process-list",
-        maximum=MAX_PROCESS_LIST_BYTES,
-        timeout=timeout,
-    )
-    observed_pid_one = False
-    for line in raw.splitlines():
-        fields = line.split()
-        if len(fields) != 2 or any(
-            re.fullmatch(r"[0-9]+", item) is None for item in fields
-        ):
-            raise ProbeError("process-list-invalid")
-        process_uid, process_id = (int(item) for item in fields)
-        if process_uid == 0 and process_id == 1:
-            observed_pid_one = True
-        if process_uid == uid:
-            raise ProbeError("disposable-user-process-remains")
-    if not observed_pid_one:
-        raise ProbeError("process-list-invalid")
+    code = _process_survivor_code(_process_records(timeout=timeout), uid)
+    if code is not None:
+        raise ProbeError(code)
 
 
-def _wait_for_no_uid_processes(uid: int) -> None:
+def _wait_for_no_uid_processes(
+    uid: int,
+) -> None:
     deadline = time.monotonic() + PROCESS_EXIT_POLL_TIMEOUT_SECONDS
+    observed_codes: set[str] = set()
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise ProbeError("disposable-user-process-remains")
+            raise ProbeError("disposable-user-unclassified-process-remains")
         try:
             _require_no_uid_processes(
                 uid,
@@ -3783,11 +3923,17 @@ def _wait_for_no_uid_processes(uid: int) -> None:
             )
             return
         except ProbeError as error:
-            if error.code != "disposable-user-process-remains":
+            if error.code not in DISPOSABLE_PROCESS_REMAINS_CODES:
                 raise
+            observed_codes.add(error.code)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise ProbeError("disposable-user-process-remains")
+            code = (
+                next(iter(observed_codes))
+                if len(observed_codes) == 1
+                else "disposable-user-process-observation-unstable"
+            )
+            raise ProbeError(code)
         time.sleep(min(PROCESS_EXIT_POLL_INTERVAL_SECONDS, remaining))
 
 
@@ -3879,7 +4025,8 @@ def cleanup_launchd_user_lifecycle(
                 expected_uid=plan.account.uid,
                 expected_gid=plan.account.gid,
             )
-        _wait_for_no_uid_processes(plan.account.uid)
+        if stage_bindings.account is not None or account_present or home_present:
+            _wait_for_no_uid_processes(plan.account.uid)
         if account_present:
             _require_command_success(
                 ["/usr/bin/dscl", ".", "-delete", f"/Users/{plan.account.name}"],

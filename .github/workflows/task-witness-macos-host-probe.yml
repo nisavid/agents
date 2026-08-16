@@ -30,7 +30,7 @@ jobs:
     timeout-minutes: 15
     env:
       CANDIDATE_SHA: b47f03519068b858cf0c070b5d331ee053ef6b7b
-      HELPER_SHA256: a9c8034dd0300afa32811ee55b8e0cf7827a25ff29a83401738ec7e02d9957e7
+      HELPER_SHA256: 20bacad8eb0eb29b6ee499d36d08f10f245124a370edef981307541ee8dc53f7
     steps:
       - name: Check out the operator-owned harness
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4

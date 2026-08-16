@@ -135,16 +135,21 @@ DISPOSABLE_PROCESS_REMAINS_CODES = frozenset(
         "disposable-user-background-and-spotlight-names-remain",
         "disposable-user-cfprefsd-name-remains",
         "disposable-user-distnoted-name-remains",
-        "disposable-user-external-parented-processes-remain",
         "disposable-user-launchd-name-remains",
+        "disposable-user-mixed-parent-topologies-remain",
         "disposable-user-mixed-processes-remain",
         "disposable-user-other-uid-parented-process-remains",
+        "disposable-user-other-uid-parented-processes-remain",
         "disposable-user-parent-unobserved-process-remains",
+        "disposable-user-parent-unobserved-processes-remain",
         "disposable-user-pid1-parented-process-remains",
+        "disposable-user-pid1-parented-processes-remain",
         "disposable-user-probe-and-other-processes-remain",
         "disposable-user-probe-name-remains",
         "disposable-user-process-observation-unstable",
         "disposable-user-root-parented-process-remains",
+        "disposable-user-root-parented-processes-remain",
+        "disposable-user-same-uid-process-tree-remains",
         "disposable-user-spotlight-and-other-processes-remain",
         "disposable-user-spotlight-worker-remains",
         "disposable-user-spotlight-workers-remain",
@@ -4001,8 +4006,14 @@ def _process_survivor_code(
             and parent_command in {"mds", "mds_stores"}
         ):
             return "spotlight"
-        if record.ppid == 1 or parent is None or parent.uid != uid:
-            return "external"
+        if record.ppid == 1:
+            return "pid1"
+        if parent is None:
+            return "parent-unobserved"
+        if parent.uid == 0:
+            return "root-parent"
+        if parent.uid != uid:
+            return "other-uid-parent"
         return "same-uid"
 
     if len(observed) > 1:
@@ -4017,10 +4028,30 @@ def _process_survivor_code(
             return "disposable-user-background-and-spotlight-names-remain"
         if "probe" in families:
             return "disposable-user-probe-and-other-processes-remain"
+        external_relations = families & {
+            "other-uid-parent",
+            "parent-unobserved",
+            "pid1",
+            "root-parent",
+        }
+        if len(external_relations) > 1:
+            return "disposable-user-mixed-parent-topologies-remain"
+        if external_relations:
+            relation = next(iter(external_relations))
+            return {
+                "other-uid-parent": (
+                    "disposable-user-other-uid-parented-processes-remain"
+                ),
+                "parent-unobserved": (
+                    "disposable-user-parent-unobserved-processes-remain"
+                ),
+                "pid1": "disposable-user-pid1-parented-processes-remain",
+                "root-parent": "disposable-user-root-parented-processes-remain",
+            }[relation]
+        if "same-uid" in families:
+            return "disposable-user-same-uid-process-tree-remains"
         if "spotlight" in families:
             return "disposable-user-spotlight-and-other-processes-remain"
-        if "external" in families:
-            return "disposable-user-external-parented-processes-remain"
         return "disposable-user-mixed-processes-remain"
 
     record = observed[0]

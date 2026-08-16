@@ -1964,7 +1964,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             503: "disposable-user-distnoted-name-remains",
             504: "disposable-user-zombie-only-remains",
             505: "disposable-user-pid1-parented-process-remains",
-            506: "disposable-user-external-parented-processes-remain",
+            506: "disposable-user-pid1-parented-processes-remain",
             507: "disposable-user-spotlight-worker-remains",
             508: "disposable-user-root-parented-process-remains",
             509: "disposable-user-other-uid-parented-process-remains",
@@ -2011,6 +2011,123 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             self.helper._process_survivor_code(launchd_named, 502),
             "disposable-user-probe-name-remains",
         )
+
+        pid_one = self.helper.ProcessRecord(0, 1, 0, 1, "Ss", "launchd")
+        root_parent = self.helper.ProcessRecord(0, 200, 1, 200, "Ss", "private-root")
+        other_uid_parent = self.helper.ProcessRecord(
+            700, 210, 1, 210, "S", "private-broker"
+        )
+        spotlight = self.helper.ProcessRecord(502, 290, 1, 290, "S", "mdworker_shared")
+        topology_cases = {
+            "pid-one": (
+                (
+                    pid_one,
+                    self.helper.ProcessRecord(502, 300, 1, 300, "S", "private-a"),
+                    self.helper.ProcessRecord(502, 301, 1, 301, "S", "private-b"),
+                ),
+                "disposable-user-pid1-parented-processes-remain",
+            ),
+            "root-parent": (
+                (
+                    pid_one,
+                    root_parent,
+                    self.helper.ProcessRecord(502, 300, 200, 300, "S", "private-a"),
+                    self.helper.ProcessRecord(502, 301, 200, 301, "S", "private-b"),
+                ),
+                "disposable-user-root-parented-processes-remain",
+            ),
+            "other-uid-parent": (
+                (
+                    pid_one,
+                    other_uid_parent,
+                    self.helper.ProcessRecord(502, 300, 210, 300, "S", "private-a"),
+                    self.helper.ProcessRecord(502, 301, 210, 301, "S", "private-b"),
+                ),
+                "disposable-user-other-uid-parented-processes-remain",
+            ),
+            "parent-unobserved": (
+                (
+                    pid_one,
+                    self.helper.ProcessRecord(502, 300, 900, 300, "S", "private-a"),
+                    self.helper.ProcessRecord(502, 301, 901, 301, "S", "private-b"),
+                ),
+                "disposable-user-parent-unobserved-processes-remain",
+            ),
+            "same-uid-tree": (
+                (
+                    pid_one,
+                    self.helper.ProcessRecord(502, 300, 1, 300, "S", "launchd"),
+                    self.helper.ProcessRecord(502, 301, 300, 301, "S", "private-a"),
+                ),
+                "disposable-user-same-uid-process-tree-remains",
+            ),
+            "mixed-parent-topologies": (
+                (
+                    pid_one,
+                    root_parent,
+                    self.helper.ProcessRecord(502, 300, 1, 300, "S", "private-a"),
+                    self.helper.ProcessRecord(502, 301, 200, 301, "S", "private-b"),
+                ),
+                "disposable-user-mixed-parent-topologies-remain",
+            ),
+            "background-and-pid-one": (
+                (
+                    pid_one,
+                    self.helper.ProcessRecord(502, 300, 1, 300, "S", "launchd"),
+                    self.helper.ProcessRecord(502, 301, 1, 301, "S", "private-a"),
+                ),
+                "disposable-user-pid1-parented-processes-remain",
+            ),
+            "spotlight-and-pid-one": (
+                (
+                    pid_one,
+                    spotlight,
+                    self.helper.ProcessRecord(502, 300, 1, 300, "S", "private-a"),
+                ),
+                "disposable-user-pid1-parented-processes-remain",
+            ),
+            "spotlight-and-root-parent": (
+                (
+                    pid_one,
+                    root_parent,
+                    spotlight,
+                    self.helper.ProcessRecord(502, 300, 200, 300, "S", "private-a"),
+                ),
+                "disposable-user-root-parented-processes-remain",
+            ),
+            "spotlight-and-other-uid-parent": (
+                (
+                    pid_one,
+                    other_uid_parent,
+                    spotlight,
+                    self.helper.ProcessRecord(502, 300, 210, 300, "S", "private-a"),
+                ),
+                "disposable-user-other-uid-parented-processes-remain",
+            ),
+            "spotlight-and-parent-unobserved": (
+                (
+                    pid_one,
+                    spotlight,
+                    self.helper.ProcessRecord(502, 300, 900, 300, "S", "private-a"),
+                ),
+                "disposable-user-parent-unobserved-processes-remain",
+            ),
+            "spotlight-and-same-uid-tree": (
+                (
+                    pid_one,
+                    spotlight,
+                    self.helper.ProcessRecord(502, 300, 290, 300, "S", "private-a"),
+                ),
+                "disposable-user-same-uid-process-tree-remains",
+            ),
+        }
+        for label, (topology, expected_code) in topology_cases.items():
+            for order in (topology, tuple(reversed(topology))):
+                with self.subTest(label=label, reversed=order is not topology):
+                    code = self.helper._process_survivor_code(order, 502)
+                    self.assertEqual(code, expected_code)
+                    self.assertNotIn("private", code)
+                    self.assertNotRegex(code, r"\b(?:200|210|300|301|900|901)\b")
 
     def test_process_table_parser_and_active_code_contract_fail_closed(
         self,
@@ -4453,7 +4570,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
         self,
     ) -> None:
         process_remains = self.helper.ProbeError(
-            "disposable-user-cfprefsd-name-remains"
+            "disposable-user-pid1-parented-processes-remain"
         )
         with (
             mock.patch.object(
@@ -4521,7 +4638,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             self.helper._wait_for_no_uid_processes(502)
         self.assertEqual(
             raised.exception.code,
-            "disposable-user-cfprefsd-name-remains",
+            "disposable-user-pid1-parented-processes-remain",
         )
         self.assertIsNone(raised.exception.secondary_code)
         scan.assert_called_once_with(502, timeout=10)
@@ -4534,8 +4651,12 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 self.helper,
                 "_require_no_uid_processes",
                 side_effect=[
-                    self.helper.ProbeError("disposable-user-cfprefsd-name-remains"),
-                    self.helper.ProbeError("disposable-user-distnoted-name-remains"),
+                    self.helper.ProbeError(
+                        "disposable-user-pid1-parented-processes-remain"
+                    ),
+                    self.helper.ProbeError(
+                        "disposable-user-root-parented-processes-remain"
+                    ),
                 ],
             ),
             mock.patch.object(
@@ -5959,7 +6080,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                     self.helper,
                     "_wait_for_no_uid_processes",
                     side_effect=self.helper.ProbeError(
-                        "disposable-user-spotlight-worker-remains",
+                        "disposable-user-pid1-parented-processes-remain",
                     ),
                 ) as wait,
                 mock.patch.multiple(
@@ -6004,12 +6125,12 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             self.assertEqual(cleanup["disposition"], "preserved-on-drift")
             self.assertEqual(
                 cleanup["error"],
-                {"code": "disposable-user-spotlight-worker-remains"},
+                {"code": "disposable-user-pid1-parented-processes-remain"},
             )
             self.assertEqual(
                 stderr.getvalue(),
                 "task-witness macOS launchd-user cleanup: "
-                "disposable-user-spotlight-worker-remains\n",
+                "disposable-user-pid1-parented-processes-remain\n",
             )
 
     def test_cleanup_preserves_stage_when_planned_uid_remains_occupied(self) -> None:

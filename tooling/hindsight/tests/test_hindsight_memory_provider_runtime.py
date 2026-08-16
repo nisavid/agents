@@ -222,6 +222,7 @@ class ProviderRuntimePolicyTest(unittest.TestCase):
 
         self.assertEqual(policy.hindsight_version, "0.8.4")
         self.assertEqual(policy.member("private-fallback").identity.provider, "lmstudio")
+        self.assertEqual(policy.member("private-fallback").max_concurrent, 2)
         self.assertNotIn("api_key", json.dumps(example).lower())
 
     @unittest.skipUnless(
@@ -1387,6 +1388,62 @@ print("accepted")
             ),
             ["executing", "queued", "queued"],
         )
+
+    def test_split_concurrency_two_executes_two_and_queues_third(self) -> None:
+        value = split_timeout_policy_data()
+        value["members"][2]["max_concurrent"] = 2
+        LLMProvider, _CodexLLM, _MultiLLMProvider = self.install(
+            policy_value=value,
+        )
+        member = LLMProvider.__new__(LLMProvider)
+        with mock.patch.object(
+            provider_runtime,
+            "_split_timeout",
+            return_value=1_200,
+        ):
+            LLMProvider.__init__(
+                member,
+                "lmstudio",
+                "",
+                "http://inference.example.test:13305/v1",
+                "private-fallback-model",
+            )
+        entered = 0
+        two_entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blocked_call(**_kwargs):
+            nonlocal entered
+            entered += 1
+            if entered == 2:
+                two_entered.set()
+            await release.wait()
+            return "done"
+
+        member.operation = blocked_call
+
+        async def scenario():
+            pending = [
+                asyncio.create_task(member.call())
+                for _index in range(3)
+            ]
+            await two_entered.wait()
+            await asyncio.sleep(0)
+            entered_before_release = entered
+            release.set()
+            return entered_before_release, await asyncio.gather(*pending)
+
+        with mock.patch.object(
+            provider_runtime,
+            "_split_timeout",
+            return_value=1_200,
+        ):
+            entered_before_release, results = asyncio.run(
+                asyncio.wait_for(scenario(), timeout=2.5)
+            )
+
+        self.assertEqual(entered_before_release, 2)
+        self.assertEqual(results, ["done", "done", "done"])
 
     def test_split_queue_timeout_never_enters_provider_operation(self) -> None:
         value = split_timeout_policy_data()

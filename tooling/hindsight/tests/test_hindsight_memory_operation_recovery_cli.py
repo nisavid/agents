@@ -61,6 +61,7 @@ def _exact_split_timeout_policy_data() -> dict[str, object]:
             member["identity"]["base_url"] = (
                 "http://hatchery.komodo-vector.ts.net:13305/v1"
             )
+            member["max_concurrent"] = 2
         else:
             member["identity"]["credential_marker"] = (
                 f"provider-policy:{member_id}"
@@ -5169,6 +5170,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
         policy = self.controller["ProviderRuntimePolicy"].load(
             policy_value
         )
+        self.assertEqual(policy.member("hatchery").max_concurrent, 2)
         validate(policy)
         with self.assertRaisesRegex(Exception, "provider policy differs"):
             validate(
@@ -5213,6 +5215,21 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                     )
                 )
         hatchery = policy.member("hatchery")
+        with self.assertRaisesRegex(
+            Exception,
+            "provider policy differs",
+        ):
+            validate(
+                replace(
+                    policy,
+                    members=tuple(
+                        replace(hatchery, max_concurrent=1)
+                        if member.id == hatchery.id
+                        else member
+                        for member in policy.members
+                    ),
+                )
+            )
         bounded_hatchery = replace(hatchery, max_retries=0)
         bounded_policy = replace(
             policy,
@@ -5222,6 +5239,24 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             ),
         )
         validate(bounded_policy)
+
+        legacy_value = deepcopy(policy_value)
+        legacy_value["schema_version"] = 1
+        for member in legacy_value["members"]:
+            execution_timeout = member.pop("execution_timeout_seconds")
+            member.pop("queue_timeout_seconds")
+            member["timeout_seconds"] = (
+                execution_timeout if member["id"] == "hatchery" else None
+            )
+            if member["id"] == "hatchery":
+                member["max_concurrent"] = 1
+        legacy_policy = self.controller["ProviderRuntimePolicy"].load(
+            legacy_value
+        )
+        operation_recovery_runtime.validate_exact_drain_provider_policy(
+            legacy_policy,
+            plan_schema_version=10,
+        )
         with self.assertRaisesRegex(
             Exception,
             "provider policy differs",

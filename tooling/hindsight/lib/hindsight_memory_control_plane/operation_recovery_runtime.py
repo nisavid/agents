@@ -32,6 +32,8 @@ import uuid
 from typing import TYPE_CHECKING, Any, Self
 
 from .operation_recovery import (
+    EXACT_DRAIN_HATCHERY_MAX_CONCURRENT,
+    EXACT_DRAIN_LEGACY_HATCHERY_MAX_CONCURRENT,
     EXACT_DRAIN_PHASE_ONE_CLIENT_TIMEOUT_SECONDS,
     EXACT_DRAIN_PHASE_ONE_STATEMENT_TIMEOUT_SECONDS,
     EXACT_DRAIN_PHASE_REPAIR_CONTRACT_DIGEST,
@@ -352,6 +354,11 @@ def validate_exact_drain_provider_policy(
 ) -> None:
     """Require the exact four-Codex then Hatchery provider authority."""
     members = {member.id: member for member in policy.members}
+    hatchery_max_concurrent = (
+        EXACT_DRAIN_HATCHERY_MAX_CONCURRENT
+        if policy.schema_version == 2
+        else EXACT_DRAIN_LEGACY_HATCHERY_MAX_CONCURRENT
+    )
     legacy_timeout_invalid = (
         policy.schema_version == 1
         and members.get("hatchery") is not None
@@ -400,7 +407,7 @@ def validate_exact_drain_provider_policy(
         or legacy_timeout_invalid
         or split_timeout_invalid
         or members["hatchery"].max_retries != 0
-        or members["hatchery"].max_concurrent != 1
+        or members["hatchery"].max_concurrent != hatchery_max_concurrent
     ):
         raise OperationRecoveryError(
             "operation-recovery exact drain provider policy differs"

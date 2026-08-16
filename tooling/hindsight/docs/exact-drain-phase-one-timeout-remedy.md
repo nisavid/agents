@@ -254,14 +254,12 @@ A future progress contract should expose payload-free `queued` versus
 `executing` state and separate ages. That would distinguish a slow model call
 from a request whose budget was consumed waiting behind another call.
 
-Do not simply increase Hatchery concurrency or its 1,200-second timeout. The
-current values are exact-drain authority, not incidental configuration, and a
-change would require source-contract changes and a new candidate and plan
-(`tooling/hindsight/lib/hindsight_memory_control_plane/operation_recovery_runtime.py:344-375`).
-Only revisit those values if terminal evidence shows repeated provider queue
-budget exhaustion after Codex probes remain unavailable. If revisited, retain a
-separate bounded queue deadline and execution deadline whose combined worst
-case remains within the plan's 3,600-second Phase 1 and execution-window math.
+Schema 11 raises only the Hindsight-side Hatchery execution gate from one to
+two. The operation-level drain concurrency remains one, and Hatchery retains a
+separate 3,600-second queue deadline, 1,200-second execution deadline, and the
+outer 3,600-second attempt deadline. The new gate is exact-drain authority,
+bound into the plan and provider-policy digests; it requires a new candidate,
+plan, and authorization and cannot affect the active schema-10 worker.
 
 ## Recommended path
 
@@ -361,7 +359,7 @@ extended by retries, breadcrumbs, or provider transitions:
    `provider_execution_timeout`; outer expiry is
    `operation_attempt_timeout`. All three are closed, payload-free categories.
 
-The critical rule is that waiting for `_PriorityGate(max_concurrent=1)` must
+The critical rule is that waiting for `_PriorityGate(max_concurrent=2)` must
 not consume the member's execution budget. Today the member timeout wraps the
 gate wait and operation together
 (`tooling/hindsight/lib/hindsight_memory_control_plane/provider_runtime.py:940-967`).
@@ -455,8 +453,8 @@ authorization. It cannot be applied to the active schema-10 worker.
 
 The implementation gate is a deterministic test matrix, not another live
 trial: deadline continuity across `retain.phase1.* -> llm.* ->
-retain.phase1.*`; one executing and at least two queued provider calls under
-`max_concurrent=1`; queue timeout without provider entry; a full execution
+retain.phase1.*`; two executing and at least one queued provider call under
+`max_concurrent=2`; queue timeout without provider entry; a full execution
 budget after gate acquisition; outer attempt cancellation and quiescence;
 phase-specific closed classification; schema-11 arithmetic recomputation and
 tamper rejection; payload-redacted progress; and unchanged golden verification

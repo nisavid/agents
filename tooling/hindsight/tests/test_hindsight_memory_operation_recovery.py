@@ -467,6 +467,15 @@ class OperationRecoveryContractTest(unittest.TestCase):
             recovery_contract.EXACT_DRAIN_PROVIDER_TIMEOUT_CONTRACT,
         )
         self.assertEqual(
+            plan["provider_timeout_contract"]["members"][-1],
+            {
+                "provider_id": "hatchery",
+                "queue_timeout_seconds": 3_600,
+                "execution_timeout_seconds": 1_200,
+                "max_concurrent": 2,
+            },
+        )
+        self.assertEqual(
             plan["phase_repair_contract_digest"],
             recovery_contract.EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V7_DIGEST,
         )

@@ -42,6 +42,8 @@ EXACT_DRAIN_TRANSACTION_TIMEOUT_SECONDS = 120
 EXACT_DRAIN_EXECUTION_LEASE_SECONDS = 86_400
 EXACT_DRAIN_EXECUTION_WINDOW_MAX_SECONDS = 14 * 24 * 60 * 60
 EXACT_DRAIN_EXECUTION_EFFECTIVE_CONCURRENCY = 1
+EXACT_DRAIN_LEGACY_HATCHERY_MAX_CONCURRENT = 1
+EXACT_DRAIN_HATCHERY_MAX_CONCURRENT = 2
 EXACT_DRAIN_PHASE_ONE_STATEMENT_TIMEOUT_SECONDS = 120
 EXACT_DRAIN_PHASE_ONE_CLIENT_TIMEOUT_SECONDS = 125
 EXACT_DRAIN_PHASE_ONE_TIMEOUT_SECONDS = 3_600
@@ -184,7 +186,11 @@ EXACT_DRAIN_PROVIDER_TIMEOUT_CONTRACT = {
             "execution_timeout_seconds": (
                 1_200 if provider_id == "hatchery" else 3_600
             ),
-            "max_concurrent": 1 if provider_id == "hatchery" else None,
+            "max_concurrent": (
+                EXACT_DRAIN_HATCHERY_MAX_CONCURRENT
+                if provider_id == "hatchery"
+                else None
+            ),
         }
         for provider_id in (
             "work-codex",

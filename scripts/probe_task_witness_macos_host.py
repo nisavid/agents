@@ -974,34 +974,64 @@ def require_exact_account_record(
         (
             "AuthenticationAuthority",
             [";DisabledUser;"],
+            "account-record-authentication-authority-missing",
             "account-record-authentication-authority-drift",
         ),
-        ("IsHidden", ["1"], "account-record-hidden-drift"),
+        (
+            "GeneratedUID",
+            None,
+            "account-record-generated-uid-missing",
+            "account-record-generated-uid-drift",
+        ),
+        (
+            "IsHidden",
+            ["1"],
+            "account-record-hidden-missing",
+            "account-record-hidden-drift",
+        ),
         (
             "NFSHomeDirectory",
             [str(expected.home)],
+            "account-record-home-missing",
             "account-record-home-drift",
         ),
         (
             "Password",
             [DISABLED_PASSWORD_READBACK_MARKER],
+            "account-record-password-missing",
             "account-record-password-drift",
         ),
-        ("PrimaryGroupID", [str(expected.gid)], "account-record-gid-drift"),
-        ("UniqueID", [str(expected.uid)], "account-record-uid-drift"),
-        ("UserShell", ["/usr/bin/false"], "account-record-shell-drift"),
+        (
+            "PrimaryGroupID",
+            [str(expected.gid)],
+            "account-record-gid-missing",
+            "account-record-gid-drift",
+        ),
+        (
+            "UniqueID",
+            [str(expected.uid)],
+            "account-record-uid-missing",
+            "account-record-uid-drift",
+        ),
+        (
+            "UserShell",
+            ["/usr/bin/false"],
+            "account-record-shell-missing",
+            "account-record-shell-drift",
+        ),
     )
-    if set(record) != {
-        "GeneratedUID",
-        *(name for name, _values, _code in field_requirements),
-    }:
-        raise ProbeError("account-record-fields-drift")
+    expected_names = {name for name, *_rest in field_requirements}
+    if set(record) - expected_names:
+        raise ProbeError("account-record-fields-unexpected")
+    for name, _values, missing_code, _drift_code in field_requirements:
+        if name not in record:
+            raise ProbeError(missing_code)
     try:
         _validated_system_generated_uid(record)
     except ProbeError as error:
         raise ProbeError("account-record-generated-uid-drift") from error
-    for name, values, code in field_requirements:
-        if list(record.get(name, ())) != values:
+    for name, values, _missing_code, code in field_requirements:
+        if values is not None and list(record.get(name, ())) != values:
             raise ProbeError(code)
 
 

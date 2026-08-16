@@ -1671,18 +1671,35 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                     self.helper.require_exact_account_record(changed, expected)
                 self.assertEqual(raised.exception.code, code)
                 self.assertIsNone(raised.exception.secondary_code)
-        for label, changed in (
-            (
-                "missing",
-                {name: value for name, value in record.items() if name != "Password"},
-            ),
-            ("extra", {**record, "RecordName": [expected.name]}),
-        ):
-            with self.subTest(label=label):
+        missing_codes = {
+            "AuthenticationAuthority": "account-record-authentication-authority-missing",
+            "GeneratedUID": "account-record-generated-uid-missing",
+            "IsHidden": "account-record-hidden-missing",
+            "NFSHomeDirectory": "account-record-home-missing",
+            "Password": "account-record-password-missing",
+            "PrimaryGroupID": "account-record-gid-missing",
+            "UniqueID": "account-record-uid-missing",
+            "UserShell": "account-record-shell-missing",
+        }
+        for field, code in missing_codes.items():
+            changed = {name: value for name, value in record.items() if name != field}
+            with self.subTest(missing=field):
                 with self.assertRaises(self.helper.ProbeError) as raised:
                     self.helper.require_exact_account_record(changed, expected)
-                self.assertEqual(raised.exception.code, "account-record-fields-drift")
+                self.assertEqual(raised.exception.code, code)
                 self.assertIsNone(raised.exception.secondary_code)
+
+        changed = {**record, "RecordName": [expected.name]}
+        with self.assertRaises(self.helper.ProbeError) as raised:
+            self.helper.require_exact_account_record(changed, expected)
+        self.assertEqual(raised.exception.code, "account-record-fields-unexpected")
+        self.assertIsNone(raised.exception.secondary_code)
+
+        changed.pop("Password")
+        with self.assertRaises(self.helper.ProbeError) as raised:
+            self.helper.require_exact_account_record(changed, expected)
+        self.assertEqual(raised.exception.code, "account-record-fields-unexpected")
+        self.assertIsNone(raised.exception.secondary_code)
 
         changed = dict(record)
         changed["GeneratedUID"] = [system_generated_uid.lower()]

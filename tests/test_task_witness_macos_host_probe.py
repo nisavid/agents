@@ -1626,7 +1626,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             "GeneratedUID": [system_generated_uid],
             "IsHidden": ["1"],
             "NFSHomeDirectory": [str(expected.home)],
-            "Password": ["*"],
+            "Password": ["********"],
             "PrimaryGroupID": [str(expected.gid)],
             "UniqueID": [str(expected.uid)],
             "UserShell": ["/usr/bin/false"],
@@ -1643,18 +1643,77 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
         ):
             changed = dict(record)
             changed["GeneratedUID"] = invalid_generated_uid
-            with (
-                self.subTest(generated_uid=invalid_generated_uid),
-                self.assertRaisesRegex(
-                    self.helper.ProbeError,
-                    "account-record-drift",
-                ),
-            ):
-                self.helper.require_exact_account_record(changed, expected)
+            with self.subTest(generated_uid=invalid_generated_uid):
+                with self.assertRaises(self.helper.ProbeError) as raised:
+                    self.helper.require_exact_account_record(changed, expected)
+                self.assertEqual(
+                    raised.exception.code,
+                    "account-record-generated-uid-drift",
+                )
+                self.assertIsNone(raised.exception.secondary_code)
+        field_drifts = {
+            "AuthenticationAuthority": (
+                [";ShadowHash;"],
+                "account-record-authentication-authority-drift",
+            ),
+            "IsHidden": (["0"], "account-record-hidden-drift"),
+            "NFSHomeDirectory": (["/Users/other"], "account-record-home-drift"),
+            "Password": (["*"], "account-record-password-drift"),
+            "PrimaryGroupID": (["0"], "account-record-gid-drift"),
+            "UniqueID": (["-2"], "account-record-uid-drift"),
+            "UserShell": (["/bin/zsh"], "account-record-shell-drift"),
+        }
+        for field, (value, code) in field_drifts.items():
+            changed = dict(record)
+            changed[field] = value
+            with self.subTest(field=field):
+                with self.assertRaises(self.helper.ProbeError) as raised:
+                    self.helper.require_exact_account_record(changed, expected)
+                self.assertEqual(raised.exception.code, code)
+                self.assertIsNone(raised.exception.secondary_code)
+        for label, changed in (
+            (
+                "missing",
+                {name: value for name, value in record.items() if name != "Password"},
+            ),
+            ("extra", {**record, "RecordName": [expected.name]}),
+        ):
+            with self.subTest(label=label):
+                with self.assertRaises(self.helper.ProbeError) as raised:
+                    self.helper.require_exact_account_record(changed, expected)
+                self.assertEqual(raised.exception.code, "account-record-fields-drift")
+                self.assertIsNone(raised.exception.secondary_code)
+
         changed = dict(record)
-        changed["UniqueID"] = ["-2"]
-        with self.assertRaisesRegex(self.helper.ProbeError, "account-record-drift"):
+        changed["GeneratedUID"] = [system_generated_uid.lower()]
+        changed["Password"] = ["*"]
+        with self.assertRaises(self.helper.ProbeError) as raised:
             self.helper.require_exact_account_record(changed, expected)
+        self.assertEqual(
+            raised.exception.code,
+            "account-record-generated-uid-drift",
+        )
+
+    def test_generated_uid_read_uses_the_fixed_field_diagnostic(self) -> None:
+        for label, raw in (
+            ("wrong-field", "Password: ********"),
+            ("malformed-guid", "GeneratedUID: not-a-guid"),
+        ):
+            with (
+                self.subTest(label=label),
+                mock.patch.object(
+                    self.helper,
+                    "_require_command_success",
+                    return_value=raw,
+                ),
+                self.assertRaises(self.helper.ProbeError) as raised,
+            ):
+                self.helper._read_system_generated_uid("twq-0123456789ab")
+            self.assertEqual(
+                raised.exception.code,
+                "account-record-generated-uid-drift",
+            )
+            self.assertIsNone(raised.exception.secondary_code)
 
     def test_launchctl_terminal_parser_rejects_timeout_respawn_and_pid_drift(
         self,
@@ -2801,7 +2860,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 f"GeneratedUID: {system_generated_uid}",
                 "IsHidden: 1",
                 f"NFSHomeDirectory: {account.home}",
-                "Password: *",
+                "Password: ********",
                 "PrimaryGroupID: 20",
                 "UniqueID: 502",
                 "UserShell: /usr/bin/false",
@@ -2916,6 +2975,17 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 f"/Users/{account.name}",
                 "AuthenticationAuthority",
                 ";DisabledUser;",
+            ),
+        )
+        self.assertEqual(
+            creates[3],
+            (
+                "/usr/bin/dscl",
+                ".",
+                "-create",
+                f"/Users/{account.name}",
+                "Password",
+                "*",
             ),
         )
         self.assertFalse(
@@ -3069,11 +3139,52 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             mock.patch.object(self.helper, "_require_command_success") as delete,
             self.assertRaisesRegex(
                 self.helper.ProbeError,
-                "account-record-drift",
+                "account-record-generated-uid-drift",
             ),
         ):
             self.helper._rollback_disposable_account_creation(account, expected)
         delete.assert_not_called()
+
+    def test_account_creation_rejects_a_changed_observed_guid(self) -> None:
+        plan = self.lifecycle_plan(
+            Path("/private/var/tmp/task-witness-macos-launchd-123456789-2")
+        )
+        account = plan.account
+        state = self.lifecycle_state(plan)
+        observed = "01234567-89AB-4DEF-8123-456789ABCDEF"
+        changed = "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE"
+        with (
+            mock.patch.object(
+                self.helper,
+                "_list_accounts",
+                return_value={"root": 0},
+            ),
+            mock.patch.object(self.helper, "_account_exists", return_value=False),
+            mock.patch.object(self.helper, "_require_command_success"),
+            mock.patch.object(
+                self.helper,
+                "_read_system_generated_uid",
+                return_value=observed,
+            ),
+            mock.patch.object(self.helper, "_write_account_binding"),
+            mock.patch.object(
+                self.helper,
+                "_account_record",
+                return_value={"GeneratedUID": [changed]},
+            ),
+            mock.patch.object(
+                self.helper,
+                "_rollback_disposable_account_creation",
+            ) as rollback,
+            self.assertRaises(self.helper.ProbeError) as raised,
+        ):
+            self.helper._create_disposable_account(plan, state)
+        self.assertEqual(
+            raised.exception.code,
+            "account-record-generated-uid-drift",
+        )
+        self.assertIsNone(raised.exception.secondary_code)
+        rollback.assert_called_once_with(account, observed)
 
     def test_account_binding_is_bounded_root_owned_and_state_bound(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -4760,6 +4871,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 self.helper,
                 "remove_exact_disposable_home",
             ) as remove_home,
+            redirect_stderr(io.StringIO()) as stderr,
         ):
             self.assertEqual(
                 self.helper.cleanup_launchd_user_lifecycle(
@@ -4773,6 +4885,11 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             )
         mutate_account.assert_not_called()
         remove_home.assert_not_called()
+        self.assertEqual(
+            stderr.getvalue(),
+            "task-witness macOS launchd-user cleanup: "
+            "account-record-generated-uid-drift\n",
+        )
 
     def test_cleanup_deletes_guid_bound_partial_account(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

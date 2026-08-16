@@ -53,6 +53,8 @@ DISPOSABLE_UID_MAX = 599
 DSCL_UID_MIN = -(1 << 31)
 DSCL_UID_MAX = (1 << 31) - 1
 DSCL_UID_RE = re.compile(r"(?:0|[1-9][0-9]*|-[1-9][0-9]*)")
+DISABLED_PASSWORD_WRITE_MARKER = "*"
+DISABLED_PASSWORD_READBACK_MARKER = "********"
 LAUNCHD_ACCOUNT_RE = re.compile(r"twq-[0-9a-f]{12}")
 LAUNCHD_LABEL_RE = re.compile(r"io\.nisavid\.task-witness\.macos-probe\.[0-9a-f]{12}")
 LAUNCHD_OWNERSHIP_MARKER_RE = re.compile(r"[0-9a-f]{32}")
@@ -968,18 +970,39 @@ def require_exact_account_record(
     record: Mapping[str, Sequence[str]],
     expected: DisposableAccount,
 ) -> None:
-    _validated_system_generated_uid(record)
-    required = {
-        "AuthenticationAuthority": [";DisabledUser;"],
-        "IsHidden": ["1"],
-        "NFSHomeDirectory": [str(expected.home)],
-        "Password": ["*"],
-        "PrimaryGroupID": [str(expected.gid)],
-        "UniqueID": [str(expected.uid)],
-        "UserShell": ["/usr/bin/false"],
-    }
-    if any(list(record.get(name, ())) != values for name, values in required.items()):
-        raise ProbeError("account-record-drift")
+    field_requirements = (
+        (
+            "AuthenticationAuthority",
+            [";DisabledUser;"],
+            "account-record-authentication-authority-drift",
+        ),
+        ("IsHidden", ["1"], "account-record-hidden-drift"),
+        (
+            "NFSHomeDirectory",
+            [str(expected.home)],
+            "account-record-home-drift",
+        ),
+        (
+            "Password",
+            [DISABLED_PASSWORD_READBACK_MARKER],
+            "account-record-password-drift",
+        ),
+        ("PrimaryGroupID", [str(expected.gid)], "account-record-gid-drift"),
+        ("UniqueID", [str(expected.uid)], "account-record-uid-drift"),
+        ("UserShell", ["/usr/bin/false"], "account-record-shell-drift"),
+    )
+    if set(record) != {
+        "GeneratedUID",
+        *(name for name, _values, _code in field_requirements),
+    }:
+        raise ProbeError("account-record-fields-drift")
+    try:
+        _validated_system_generated_uid(record)
+    except ProbeError as error:
+        raise ProbeError("account-record-generated-uid-drift") from error
+    for name, values, code in field_requirements:
+        if list(record.get(name, ())) != values:
+            raise ProbeError(code)
 
 
 def _validated_system_generated_uid(record: Mapping[str, Sequence[str]]) -> str:
@@ -2138,10 +2161,13 @@ def _read_system_generated_uid(name: str) -> str:
         ["/usr/bin/dscl", ".", "-read", f"/Users/{name}", "GeneratedUID"],
         command_id="account-generated-uid-read",
     )
-    record = parse_dscl_record(raw)
-    if set(record) != {"GeneratedUID"}:
-        raise ProbeError("account-record-drift")
-    return _validated_system_generated_uid(record)
+    try:
+        record = parse_dscl_record(raw)
+        if set(record) != {"GeneratedUID"}:
+            raise ProbeError("account-record-drift")
+        return _validated_system_generated_uid(record)
+    except ProbeError as error:
+        raise ProbeError("account-record-generated-uid-drift") from error
 
 
 def _list_accounts() -> dict[str, int]:
@@ -2179,7 +2205,7 @@ def _rollback_disposable_account_creation(
     if not _account_exists(account.name):
         return
     if _read_system_generated_uid(account.name) != generated_uid:
-        raise ProbeError("account-record-drift")
+        raise ProbeError("account-record-generated-uid-drift")
     _require_command_success(
         ["/usr/bin/dscl", ".", "-delete", f"/Users/{account.name}"],
         command_id="account-delete",
@@ -2227,7 +2253,14 @@ def _create_disposable_account(
             "AuthenticationAuthority",
             ";DisabledUser;",
         ],
-        ["/usr/bin/dscl", ".", "-create", record_path, "Password", "*"],
+        [
+            "/usr/bin/dscl",
+            ".",
+            "-create",
+            record_path,
+            "Password",
+            DISABLED_PASSWORD_WRITE_MARKER,
+        ],
         ["/usr/bin/dscl", ".", "-create", record_path, "IsHidden", "1"],
         ["/usr/bin/dscl", ".", "-create", record_path, "UniqueID", str(account.uid)],
         [
@@ -2262,7 +2295,7 @@ def _create_disposable_account(
         for command_id, command in zip(property_command_ids, property_commands):
             _require_command_success(command, command_id=command_id)
         if _validated_system_generated_uid(_account_record(account)) != generated_uid:
-            raise ProbeError("account-record-drift")
+            raise ProbeError("account-record-generated-uid-drift")
         accounts = _list_accounts()
         if (
             accounts.get(account.name) != account.uid
@@ -3760,7 +3793,7 @@ def cleanup_launchd_user_lifecycle(
         if account_present and (
             _read_system_generated_uid(plan.account.name) != expected_generated_uid
         ):
-            raise ProbeError("account-record-drift")
+            raise ProbeError("account-record-generated-uid-drift")
         if home_present:
             _validate_exact_disposable_home(
                 plan.account.home,

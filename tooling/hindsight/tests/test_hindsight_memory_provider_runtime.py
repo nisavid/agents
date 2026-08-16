@@ -110,6 +110,18 @@ def policy_data() -> dict[str, object]:
     }
 
 
+def split_timeout_policy_data() -> dict[str, object]:
+    value = copy.deepcopy(policy_data())
+    value["schema_version"] = 2
+    for member in value["members"]:
+        execution_timeout = member.pop("timeout_seconds")
+        member["queue_timeout_seconds"] = 3_600
+        member["execution_timeout_seconds"] = (
+            3_600 if execution_timeout is None else execution_timeout
+        )
+    return value
+
+
 def four_codex_policy_data() -> dict[str, object]:
     value = copy.deepcopy(policy_data())
     personal, work, fallback = value["members"]
@@ -123,6 +135,18 @@ def four_codex_policy_data() -> dict[str, object]:
     alt2["credential"]["locator"] = "oauth-home:alt2"
     value["failover_order"] = ["work", "personal", "alt1", "alt2", "fallback"]
     value["members"] = [work, personal, alt1, alt2, fallback]
+    return value
+
+
+def four_codex_split_timeout_policy_data() -> dict[str, object]:
+    value = four_codex_policy_data()
+    value["schema_version"] = 2
+    for member in value["members"]:
+        execution_timeout = member.pop("timeout_seconds")
+        member["queue_timeout_seconds"] = 3_600
+        member["execution_timeout_seconds"] = (
+            3_600 if execution_timeout is None else execution_timeout
+        )
     return value
 
 
@@ -172,6 +196,23 @@ def four_codex_members() -> dict[str, StaticMember]:
 
 
 class ProviderRuntimePolicyTest(unittest.TestCase):
+    def test_schema_two_closes_split_queue_and_execution_timeouts(self) -> None:
+        policy = ProviderRuntimePolicy.load(split_timeout_policy_data())
+
+        fallback = policy.member("fallback")
+        self.assertEqual(policy.schema_version, 2)
+        self.assertIsNone(fallback.timeout_seconds)
+        self.assertEqual(fallback.queue_timeout_seconds, 3_600)
+        self.assertEqual(fallback.execution_timeout_seconds, 1_200)
+
+    def test_schema_one_keeps_total_wall_clock_timeout_semantics(self) -> None:
+        policy = ProviderRuntimePolicy.load(policy_data())
+
+        fallback = policy.member("fallback")
+        self.assertEqual(policy.schema_version, 1)
+        self.assertEqual(fallback.timeout_seconds, 1_200)
+        self.assertIsNone(fallback.queue_timeout_seconds)
+        self.assertIsNone(fallback.execution_timeout_seconds)
     def test_repository_example_is_a_valid_secret_free_policy(self) -> None:
         example = json.loads(
             (HINDSIGHT_ROOT / "examples/provider-runtime-policy.json").read_text()
@@ -1233,6 +1274,177 @@ print("accepted")
         )
         self.assertEqual(fallback["timed_out"], 1)
         self.assertEqual(finished["active_provider_requests"], [])
+
+    def test_split_timeout_wait_does_not_consume_execution_budget(self) -> None:
+        value = split_timeout_policy_data()
+        value["members"][2]["queue_timeout_seconds"] = 2
+        value["members"][2]["execution_timeout_seconds"] = 1
+        LLMProvider, _CodexLLM, _MultiLLMProvider = self.install(
+            policy_value=value,
+        )
+        member = LLMProvider(
+            "lmstudio",
+            "",
+            "http://inference.example.test:13305/v1",
+            "private-fallback-model",
+        )
+        entered = 0
+
+        async def bounded_call(**_kwargs):
+            nonlocal entered
+            entered += 1
+            await asyncio.sleep(0.6)
+            return entered
+
+        member.operation = bounded_call
+
+        async def scenario():
+            return await asyncio.wait_for(
+                asyncio.gather(member.call(), member.call()),
+                timeout=2.0,
+            )
+
+        self.assertEqual(asyncio.run(scenario()), [1, 2])
+
+    def test_split_progress_distinguishes_one_executing_and_two_queued(self) -> None:
+        value = split_timeout_policy_data()
+        value["failover_order"] = ["fallback"]
+        value["members"] = [value["members"][2]]
+        value["members"][0]["queue_timeout_seconds"] = 2
+        value["members"][0]["execution_timeout_seconds"] = 2
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+            progress_path = Path(directory) / "progress.json"
+            recorder = ExactDrainProgressRecorder(
+                path=progress_path,
+                plan_digest="a" * 64,
+                worker_pid=os.getpid(),
+                worker_start_time="darwin:1000:1",
+                worker_attempt=1,
+                selected_operations=[],
+                progress_schema_version=4,
+            )
+            provider_runtime.set_exact_drain_progress_recorder(recorder)
+            self.addCleanup(
+                provider_runtime.set_exact_drain_progress_recorder,
+                None,
+            )
+            LLMProvider, _CodexLLM, MultiLLMProvider = self.install(
+                policy_value=value,
+            )
+            member = LLMProvider(
+                "lmstudio",
+                "",
+                "http://inference.example.test:13305/v1",
+                "private-fallback-model",
+            )
+            first_entered = asyncio.Event()
+            release = asyncio.Event()
+
+            async def blocked_call(**_kwargs):
+                first_entered.set()
+                await release.wait()
+                return "done"
+
+            member.operation = blocked_call
+            provider = MultiLLMProvider()
+            provider._members = [member]
+
+            async def scenario():
+                pending = [
+                    asyncio.create_task(
+                        provider._dispatch(
+                            "call",
+                            scope="retain_extract_facts",
+                        )
+                    )
+                    for _index in range(3)
+                ]
+                await first_entered.wait()
+                for _index in range(100):
+                    active = read_exact_drain_progress(
+                        progress_path,
+                        plan_digest="a" * 64,
+                        progress_schema_version=4,
+                    )
+                    if len(active["active_provider_requests"]) == 3:
+                        break
+                    await asyncio.sleep(0)
+                else:
+                    self.fail("provider requests did not reach the queue")
+                release.set()
+                results = await asyncio.gather(*pending)
+                return active, results
+
+            active, results = asyncio.run(
+                asyncio.wait_for(scenario(), timeout=2.5)
+            )
+
+        self.assertEqual(results, ["done", "done", "done"])
+        self.assertEqual(
+            sorted(
+                request["state"]
+                for request in active["active_provider_requests"]
+            ),
+            ["executing", "queued", "queued"],
+        )
+
+    def test_split_queue_timeout_never_enters_provider_operation(self) -> None:
+        value = split_timeout_policy_data()
+        value["members"][2]["queue_timeout_seconds"] = 1
+        value["members"][2]["execution_timeout_seconds"] = 3
+        LLMProvider, _CodexLLM, _MultiLLMProvider = self.install(
+            policy_value=value,
+        )
+        member = LLMProvider(
+            "lmstudio",
+            "",
+            "http://inference.example.test:13305/v1",
+            "private-fallback-model",
+        )
+        first_entered = asyncio.Event()
+        release = asyncio.Event()
+        entered = 0
+
+        async def blocked_call(**_kwargs):
+            nonlocal entered
+            entered += 1
+            first_entered.set()
+            await release.wait()
+            return "done"
+
+        member.operation = blocked_call
+
+        async def scenario():
+            first = asyncio.create_task(member.call())
+            await first_entered.wait()
+            with self.assertRaises(provider_runtime.ProviderQueueTimeout):
+                await member.call()
+            self.assertEqual(entered, 1)
+            release.set()
+            await first
+
+        asyncio.run(asyncio.wait_for(scenario(), timeout=2.5))
+
+    def test_split_transport_timeout_is_classified_as_execution_timeout(self) -> None:
+        import httpx
+
+        LLMProvider, _CodexLLM, _MultiLLMProvider = self.install(
+            policy_value=split_timeout_policy_data(),
+        )
+        member = LLMProvider(
+            "lmstudio",
+            "",
+            "http://inference.example.test:13305/v1",
+            "private-fallback-model",
+        )
+
+        async def transport_timeout(**_kwargs):
+            raise httpx.ReadTimeout("synthetic transport timeout")
+
+        member.operation = transport_timeout
+
+        with self.assertRaises(provider_runtime.ProviderExecutionTimeout):
+            asyncio.run(member.call())
 
     def test_fallback_verification_timeout_does_not_block_startup(self) -> None:
         _LLMProvider, _CodexLLM, MultiLLMProvider = self.install()

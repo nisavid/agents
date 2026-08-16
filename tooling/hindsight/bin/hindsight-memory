@@ -7814,7 +7814,10 @@ def operation_recovery_plan_command(args: argparse.Namespace) -> int:
 def _operation_recovery_validate_exact_provider_policy(
     policy: ProviderRuntimePolicy,
 ) -> None:
-    validate_exact_drain_provider_policy(policy)
+    validate_exact_drain_provider_policy(
+        policy,
+        plan_schema_version=11,
+    )
 
 
 def _operation_recovery_exact_provider_policy_evidence(
@@ -7874,7 +7877,7 @@ def _operation_recovery_validate_exact_worker_provider_runtime(
 def _operation_recovery_exact_runtime_digest(
     args: argparse.Namespace,
     *,
-    schema_version: int = 10,
+    schema_version: int = 11,
 ) -> str:
     return exact_drain_runtime_digest(
         args.worker_runtime,
@@ -8099,7 +8102,7 @@ def operation_recovery_drain_plan_command(args: argparse.Namespace) -> int:
     )
     worker_runtime_digest = _operation_recovery_exact_runtime_digest(
         args,
-        schema_version=10,
+        schema_version=11,
     )
     recovery_context = _operation_recovery_exact_recovery_context(
         args,
@@ -8635,7 +8638,7 @@ def _operation_recovery_exact_execution_lease_projection(
     now: int | None = None,
 ) -> Mapping[str, Any]:
     if plan.get("schema_version") not in {
-        2, 3, 4, 5, 6, 7, 8, 9, 10
+        2, 3, 4, 5, 6, 7, 8, 9, 10, 11
     }:
         return {}
     window_seconds = exact_drain_execution_window_seconds(plan)
@@ -8670,7 +8673,7 @@ def _operation_recovery_assert_exact_execution_lease(
     now: int | None = None,
 ) -> int | None:
     if plan.get("schema_version") not in {
-        2, 3, 4, 5, 6, 7, 8, 9, 10
+        2, 3, 4, 5, 6, 7, 8, 9, 10, 11
     }:
         return None
     execution_deadline = exact_drain_execution_deadline(plan, authorization)
@@ -8696,7 +8699,7 @@ def operation_recovery_drain_status_command(args: argparse.Namespace) -> int:
             authorization = (
                 _operation_recovery_exact_authorization(plan)
                 if plan.get("schema_version")
-                in {2, 3, 4, 5, 6, 7, 8, 9, 10}
+                in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11}
                 and Path(plan["authorization_receipt_path"]).exists()
                 else None
             )
@@ -8707,7 +8710,7 @@ def operation_recovery_drain_status_command(args: argparse.Namespace) -> int:
                 "status": (
                     "authorization-only"
                     if plan.get("schema_version")
-                    in {2, 3, 4, 5, 6, 7, 8, 9, 10}
+                    in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11}
                     and authorization is not None
                     else "awaiting-approval"
                 ),
@@ -9104,7 +9107,7 @@ def _operation_recovery_exact_progress_closed_lease_expiry(
 ) -> bool:
     """Authenticate a child-closed execution-window failure."""
     if (
-        plan.get("progress_schema_version") != 3
+        plan.get("progress_schema_version") not in {3, 4}
         or not Path(plan["progress_artifact_path"]).is_file()
     ):
         return False
@@ -9647,7 +9650,7 @@ def operation_recovery_drain_apply_command(args: argparse.Namespace) -> int:
                                 timeout=(
                                     plan["transaction_timeout_seconds"]
                                     if plan.get("schema_version")
-                                    in {2, 3, 4, 5, 6, 7, 8, 9, 10}
+                                    in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11}
                                     else EXACT_DRAIN_TRANSACTION_TIMEOUT_SECONDS
                                 )
                             )
@@ -9749,7 +9752,7 @@ def operation_recovery_drain_monitor_command(args: argparse.Namespace) -> int:
         or application_path.exists()
         or (
             plan.get("schema_version")
-            in {2, 3, 4, 5, 6, 7, 8, 9, 10}
+            in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11}
             and Path(plan["authorization_receipt_path"]).exists()
         )
     ):
@@ -9760,7 +9763,7 @@ def operation_recovery_drain_monitor_command(args: argparse.Namespace) -> int:
                 "status": (
                     "authorization-only"
                     if plan.get("schema_version")
-                    in {2, 3, 4, 5, 6, 7, 8, 9, 10}
+                    in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11}
                     and authorization is not None
                     else "not-started"
                 ),
@@ -9902,7 +9905,7 @@ def operation_recovery_drain_monitor_command(args: argparse.Namespace) -> int:
             "progress_digest": progress["progress_digest"],
             **(
                 {}
-                if plan.get("progress_schema_version") != 3
+                if plan.get("progress_schema_version") not in {3, 4}
                 else {
                     "worker_status": progress["worker_status"],
                     "worker_stage": progress["worker_stage"],

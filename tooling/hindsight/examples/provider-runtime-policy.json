@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "hindsight_version": "0.8.4",
   "default_usage_limit_cooldown_seconds": 300,
   "failover_order": [
@@ -20,7 +20,8 @@
         "mode": "oauth-home",
         "locator": "oauth-home:personal"
       },
-      "timeout_seconds": null,
+      "queue_timeout_seconds": 3600,
+      "execution_timeout_seconds": 3600,
       "max_retries": 0,
       "max_concurrent": null,
       "operation_priorities": {
@@ -43,7 +44,8 @@
         "mode": "oauth-home",
         "locator": "oauth-home:work"
       },
-      "timeout_seconds": null,
+      "queue_timeout_seconds": 3600,
+      "execution_timeout_seconds": 3600,
       "max_retries": 0,
       "max_concurrent": null,
       "operation_priorities": {
@@ -66,7 +68,8 @@
         "mode": "none",
         "locator": null
       },
-      "timeout_seconds": 1200,
+      "queue_timeout_seconds": 3600,
+      "execution_timeout_seconds": 1200,
       "max_retries": 0,
       "max_concurrent": 1,
       "operation_priorities": {

@@ -144,6 +144,25 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
             {"category", "retryable", "http_status", "error_digest"},
         )
 
+    def test_worker_failure_classifies_operation_attempt_timeout(self):
+        evidence = exact_drain_worker_failure_evidence(
+            OperationRecoveryError(
+                operation_recovery_runtime.EXACT_DRAIN_OPERATION_ATTEMPT_TIMEOUT_MESSAGE
+            )
+        )
+
+        self.assertEqual(evidence["category"], "operation_attempt_timeout")
+        self.assertFalse(evidence["retryable"])
+        self.assertIsNone(evidence["http_status"])
+        self.assertEqual(
+            evidence["error_digest"],
+            hashlib.sha256(
+                operation_recovery_runtime.EXACT_DRAIN_OPERATION_ATTEMPT_TIMEOUT_MESSAGE.encode(
+                    "utf-8"
+                )
+            ).hexdigest(),
+        )
+
     def test_postgres_safe_error_text_bounds_work_before_encoding(self):
         prefix = "x" * 100 + "\x00\ud800" + "y" * 4898
         value = prefix + "z" * 5_000_000
@@ -1021,6 +1040,29 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
             "provider_bad_request",
         )
         self.assertEqual(openai_bad_request["http_status"], 400)
+
+    def test_schema_eleven_timeout_failures_have_distinct_closed_categories(self):
+        classify = operation_recovery_runtime._exact_drain_failure_evidence
+
+        queue = classify("provider_queue_timeout", retryable=True)
+        execution = classify("provider_execution_timeout", retryable=True)
+        attempt = classify(
+            operation_recovery_runtime.EXACT_DRAIN_OPERATION_ATTEMPT_TIMEOUT_MESSAGE,
+            retryable=False,
+        )
+
+        self.assertEqual(queue["category"], "provider_queue_timeout")
+        self.assertEqual(execution["category"], "provider_execution_timeout")
+        self.assertEqual(attempt["category"], "operation_attempt_timeout")
+        self.assertTrue(queue["retryable"])
+        self.assertTrue(execution["retryable"])
+        self.assertFalse(attempt["retryable"])
+        for evidence in (queue, execution, attempt):
+            self.assertIsNone(evidence["http_status"])
+            self.assertEqual(
+                set(evidence),
+                {"category", "retryable", "http_status", "error_digest"},
+            )
 
     def test_retry_ceiling_records_the_terminal_disposition(self):
         adapter = self._current_exact_drain_adapter()
@@ -2410,6 +2452,14 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
             def __init__(self):
                 self._shutdown = asyncio.Event()
 
+            async def _claim_batch_for_schema_inner(self, *_arguments):
+                return []
+
+            async def _claim_batch_for_schema(self, schema, reserved, shared):
+                return await self._claim_batch_for_schema_inner(
+                    schema, reserved, shared
+                )
+
             async def _execute_task_inner(self, _task, holder):
                 holder.stage = "retain.phase1.candidates.fuzzy.1/2"
                 try:
@@ -2914,6 +2964,14 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
             def __init__(self):
                 self._shutdown = asyncio.Event()
 
+            async def _claim_batch_for_schema_inner(self, *_arguments):
+                return []
+
+            async def _claim_batch_for_schema(self, schema, reserved, shared):
+                return await self._claim_batch_for_schema_inner(
+                    schema, reserved, shared
+                )
+
             async def _execute_task_inner(self, _task, _holder):
                 return None
 
@@ -3069,6 +3127,108 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         with self.assertRaisesRegex(
             OperationRecoveryError,
             "retain phase one exceeded its deadline",
+        ):
+            asyncio.run(exercise())
+        self.assertEqual(events, ["shutdown", "cancelled"])
+
+    def test_schema_eleven_phase_one_deadline_survives_llm_breadcrumb(self):
+        events = []
+
+        class Adapter(_ControlConnectionAdapterMixin):
+            phase_one_timeout_seconds = 0.3
+            phase_one_nested_stage_prefixes = ("llm.",)
+
+            def record_upstream_stage(self, _operation_id, _stage):
+                return None
+
+        class WorkerPoller(_RunCapableWorkerPoller):
+            def __init__(self):
+                self._shutdown = asyncio.Event()
+
+            async def _claim_batch_for_schema_inner(self, *_arguments):
+                return []
+
+            async def _claim_batch_for_schema(self, schema, reserved, shared):
+                return await self._claim_batch_for_schema_inner(
+                    schema, reserved, shared
+                )
+
+            async def _execute_task_inner(self, _task, holder):
+                holder.stage = "retain.phase1.resolve"
+                await asyncio.sleep(0.26)
+                holder.stage = "llm.codex.retain.attempt=1/1"
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    events.append("cancelled")
+
+        install_exact_drain_runtime_guards(
+            type("PostgreSQLOps", (), {}),
+            WorkerPoller,
+            type("MemoryEngine", (), {}),
+            Adapter(),
+            request_worker_shutdown=lambda: events.append("shutdown"),
+        )
+
+        async def exercise():
+            return await WorkerPoller()._execute_task_inner(
+                SimpleNamespace(operation_id="operation-1"),
+                SimpleNamespace(stage="queued.retain"),
+            )
+
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "retain phase one exceeded its deadline",
+        ):
+            asyncio.run(exercise())
+        self.assertEqual(events, ["shutdown", "cancelled"])
+
+    def test_schema_eleven_operation_attempt_deadline_bounds_all_stages(self):
+        events = []
+
+        class Adapter(_ControlConnectionAdapterMixin):
+            operation_attempt_timeout_seconds = 0.01
+            phase_one_nested_stage_prefixes = ("llm.",)
+
+            def record_upstream_stage(self, _operation_id, _stage):
+                return None
+
+        class WorkerPoller(_RunCapableWorkerPoller):
+            def __init__(self):
+                self._shutdown = asyncio.Event()
+
+            async def _claim_batch_for_schema_inner(self, *_arguments):
+                return []
+
+            async def _claim_batch_for_schema(self, schema, reserved, shared):
+                return await self._claim_batch_for_schema_inner(
+                    schema, reserved, shared
+                )
+
+            async def _execute_task_inner(self, _task, holder):
+                holder.stage = "retain.phase2.insert_facts"
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    events.append("cancelled")
+
+        install_exact_drain_runtime_guards(
+            type("PostgreSQLOps", (), {}),
+            WorkerPoller,
+            type("MemoryEngine", (), {}),
+            Adapter(),
+            request_worker_shutdown=lambda: events.append("shutdown"),
+        )
+
+        async def exercise():
+            return await WorkerPoller()._execute_task_inner(
+                SimpleNamespace(operation_id="operation-1"),
+                SimpleNamespace(stage="queued.retain"),
+            )
+
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "operation attempt exceeded its deadline",
         ):
             asyncio.run(exercise())
         self.assertEqual(events, ["shutdown", "cancelled"])

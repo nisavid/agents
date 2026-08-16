@@ -29,6 +29,7 @@ from tooling.hindsight.tests import (
 )
 from tooling.hindsight.tests.test_hindsight_memory_provider_runtime import (
     four_codex_policy_data,
+    four_codex_split_timeout_policy_data,
     policy_data,
 )
 from tooling.hindsight.lib.hindsight_memory_control_plane import (
@@ -42,6 +43,36 @@ from tooling.hindsight.lib.hindsight_memory_control_plane.operation_recovery_pro
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _exact_split_timeout_policy_data() -> dict[str, object]:
+    value = four_codex_split_timeout_policy_data()
+    renamed = {
+        "work": "work-codex",
+        "personal": "personal-codex",
+        "alt1": "alt1-codex",
+        "alt2": "alt2-codex",
+        "fallback": "hatchery",
+    }
+    for member in value["members"]:
+        member_id = renamed[member["id"]]
+        member["id"] = member_id
+        if member_id == "hatchery":
+            member["identity"]["base_url"] = (
+                "http://hatchery.komodo-vector.ts.net:13305/v1"
+            )
+        else:
+            member["identity"]["credential_marker"] = (
+                f"provider-policy:{member_id}"
+            )
+    value["failover_order"] = [
+        "work-codex",
+        "personal-codex",
+        "alt1-codex",
+        "alt2-codex",
+        "hatchery",
+    ]
+    return value
 
 
 def _copy_patchable_entity_resolver(candidate_library: Path) -> Path:
@@ -1569,6 +1600,8 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 retry_attempt=1,
                 scope="retain_extract_facts",
             )
+            if plan.get("progress_schema_version") == 4:
+                recorder.provider_executing(active_request)
             diagnostic_operation = plan["selected_operations"][0]["operation_id"]
             recorder.task_stage(
                 diagnostic_operation,
@@ -2043,12 +2076,12 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             self.assertEqual(result["status"], "planned")
             self.assertEqual(result["authority"], "unapproved-plan")
             self.assertEqual(result["selected_operation_count"], 43)
-            self.assertEqual(runtime_schemas, [10])
+            self.assertEqual(runtime_schemas, [11])
             plan, create_only = written[args.output]
             self.assertIs(create_only, True)
             self.assertIs(plan["mutation_authorized"], False)
-            self.assertEqual(plan["schema_version"], 10)
-            self.assertEqual(plan["progress_schema_version"], 3)
+            self.assertEqual(plan["schema_version"], 11)
+            self.assertEqual(plan["progress_schema_version"], 4)
             serialized = json.dumps(plan, sort_keys=True)
             self.assertNotIn('"task_payload":', serialized)
             self.assertNotIn('"worker_id":', serialized)
@@ -5112,7 +5145,10 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             Path.home()
             / ".config/hindsight-control-plane/provider-runtime-policy.json"
         )
-        body = policy_path.read_bytes()
+        body = json.dumps(
+            _exact_split_timeout_policy_data(),
+            separators=(",", ":"),
+        ).encode("utf-8")
         reads = []
         original = globals_["_operation_recovery_read_private_bytes"]
         globals_["_operation_recovery_read_private_bytes"] = (
@@ -5129,32 +5165,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
         validate = self.controller[
             "_operation_recovery_validate_exact_provider_policy"
         ]
-        policy_value = four_codex_policy_data()
-        renamed = {
-            "work": "work-codex",
-            "personal": "personal-codex",
-            "alt1": "alt1-codex",
-            "alt2": "alt2-codex",
-            "fallback": "hatchery",
-        }
-        for member in policy_value["members"]:
-            member_id = renamed[member["id"]]
-            member["id"] = member_id
-            if member_id == "hatchery":
-                member["identity"]["base_url"] = (
-                    "http://hatchery.komodo-vector.ts.net:13305/v1"
-                )
-            else:
-                member["identity"]["credential_marker"] = (
-                    f"provider-policy:{member_id}"
-                )
-        policy_value["failover_order"] = [
-            "work-codex",
-            "personal-codex",
-            "alt1-codex",
-            "alt2-codex",
-            "hatchery",
-        ]
+        policy_value = _exact_split_timeout_policy_data()
         policy = self.controller["ProviderRuntimePolicy"].load(
             policy_value
         )
@@ -5202,11 +5213,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                     )
                 )
         hatchery = policy.member("hatchery")
-        bounded_hatchery = replace(
-            hatchery,
-            timeout_seconds=1200,
-            max_retries=0,
-        )
+        bounded_hatchery = replace(hatchery, max_retries=0)
         bounded_policy = replace(
             policy,
             members=tuple(
@@ -5225,7 +5232,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                     members=tuple(
                         replace(
                             hatchery,
-                            timeout_seconds=300,
+                            execution_timeout_seconds=300,
                             max_retries=1,
                         )
                         if member.id == hatchery.id
@@ -5240,9 +5247,22 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             Path.home()
             / ".config/hindsight-control-plane/provider-runtime-policy.json"
         )
-        _policy_digest, policy = self.controller[
+        evidence = self.controller[
             "_operation_recovery_exact_provider_policy_evidence"
-        ](policy_path)
+        ]
+        globals_ = evidence.__globals__
+        body = json.dumps(
+            _exact_split_timeout_policy_data(),
+            separators=(",", ":"),
+        ).encode("utf-8")
+        original = globals_["_operation_recovery_read_private_bytes"]
+        globals_["_operation_recovery_read_private_bytes"] = (
+            lambda _path, _label: body
+        )
+        try:
+            _policy_digest, policy = evidence(policy_path)
+        finally:
+            globals_["_operation_recovery_read_private_bytes"] = original
         profile = {
             "HINDSIGHT_API_LLM_STRATEGY": '{"mode":"round-robin"}',
             "HINDSIGHT_API_EMBEDDINGS_PROVIDER": "openai-codex",
@@ -5808,7 +5828,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                     lambda *_arguments, **_keywords: ("8" * 64, bootstrap)
                 ),
                 "validate_exact_drain_provider_policy": (
-                    lambda _policy: None
+                    lambda _policy, **_keywords: None
                 ),
                 "exact_drain_effective_profile_digest": (
                     lambda _policy, _environment: "7" * 64
@@ -7826,7 +7846,9 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                             worker_start_time="start-token",
                             worker_attempt=1,
                             selected_operations=plan["selected_operations"],
-                            progress_schema_version=3,
+                            progress_schema_version=plan[
+                                "progress_schema_version"
+                            ],
                             clock=lambda: float(now),
                         )
                         recorder.worker_stage(

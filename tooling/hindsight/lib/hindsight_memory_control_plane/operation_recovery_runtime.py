@@ -40,6 +40,7 @@ from .operation_recovery import (
     EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V4_DIGEST,
     EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V5_DIGEST,
     EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V6_DIGEST,
+    EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V7_DIGEST,
     EXACT_DRAIN_TRANSACTION_TIMEOUT_SECONDS,
     EXPECTED_CLAIM_RELEASE_ROW_COUNT,
     EXPECTED_OPERATION_COUNTS,
@@ -115,6 +116,9 @@ EXACT_DRAIN_EXECUTION_LEASE_ERROR_DIGEST = hashlib.sha256(
         f"{EXACT_DRAIN_EXECUTION_LEASE_EXPIRED_MESSAGE}"
     ).encode("utf-8")
 ).hexdigest()
+EXACT_DRAIN_OPERATION_ATTEMPT_TIMEOUT_MESSAGE = (
+    "operation-recovery exact drain operation attempt exceeded its deadline"
+)
 EXACT_DRAIN_OAUTH_LOCATORS = {
     "work-codex": "oauth-home:work",
     "personal-codex": "oauth-home:personal",
@@ -343,11 +347,36 @@ def verify_exact_drain_start_message(
 
 def validate_exact_drain_provider_policy(
     policy: ProviderRuntimePolicy,
+    *,
+    plan_schema_version: int | None = None,
 ) -> None:
     """Require the exact four-Codex then Hatchery provider authority."""
     members = {member.id: member for member in policy.members}
+    legacy_timeout_invalid = (
+        policy.schema_version == 1
+        and members.get("hatchery") is not None
+        and members["hatchery"].timeout_seconds != 1200
+    )
+    split_timeout_invalid = (
+        policy.schema_version == 2
+        and any(
+            member.queue_timeout_seconds != 3600
+            or member.execution_timeout_seconds
+            != (1200 if member.id == "hatchery" else 3600)
+            for member in policy.members
+        )
+    )
     if (
-        policy.default_usage_limit_cooldown_seconds != 300
+        policy.schema_version not in {1, 2}
+        or (
+            plan_schema_version == 11
+            and policy.schema_version != 2
+        )
+        or (
+            plan_schema_version in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
+            and policy.schema_version != 1
+        )
+        or policy.default_usage_limit_cooldown_seconds != 300
         or policy.failover_order != EXACT_DRAIN_PROVIDER_ORDER
         or set(members) != set(EXACT_DRAIN_PROVIDER_ORDER)
         or any(
@@ -359,6 +388,7 @@ def validate_exact_drain_provider_policy(
             or members[member_id].credential_locator != locator
             or members[member_id].quota_cooldown is not True
             or members[member_id].max_retries != 0
+            or members[member_id].max_concurrent is not None
             for member_id, locator in EXACT_DRAIN_OAUTH_LOCATORS.items()
         )
         or members["hatchery"].identity.provider != "lmstudio"
@@ -367,7 +397,8 @@ def validate_exact_drain_provider_policy(
         or members["hatchery"].identity.credential_marker is not None
         or members["hatchery"].credential_mode != "none"
         or members["hatchery"].credential_locator is not None
-        or members["hatchery"].timeout_seconds != 1200
+        or legacy_timeout_invalid
+        or split_timeout_invalid
         or members["hatchery"].max_retries != 0
         or members["hatchery"].max_concurrent != 1
     ):
@@ -736,6 +767,7 @@ def _exact_drain_failure_evidence(
         "retry_ceiling",
         "terminal_state_persistence",
         "nonquiescent_shutdown",
+        "operation_attempt_timeout",
     }:
         raise OperationRecoveryError(
             "exact drain failure category is invalid"
@@ -755,6 +787,12 @@ def _exact_drain_failure_evidence(
     lowered = safe_error.casefold()
     if category_override is not None:
         category = category_override
+    elif safe_error == "provider_queue_timeout":
+        category = "provider_queue_timeout"
+    elif safe_error == "provider_execution_timeout":
+        category = "provider_execution_timeout"
+    elif safe_error == EXACT_DRAIN_OPERATION_ATTEMPT_TIMEOUT_MESSAGE:
+        category = "operation_attempt_timeout"
     elif http_status == 400:
         category = "provider_bad_request"
     elif EXACT_DRAIN_AUTHENTICATION_ERROR.search(safe_error) is not None:
@@ -801,6 +839,14 @@ def exact_drain_worker_failure_evidence(
             "http_status": None,
             "error_digest": EXACT_DRAIN_EXECUTION_LEASE_ERROR_DIGEST,
         }
+    elif (
+        isinstance(error, OperationRecoveryError)
+        and message == EXACT_DRAIN_OPERATION_ATTEMPT_TIMEOUT_MESSAGE
+    ):
+        evidence = _exact_drain_failure_evidence(
+            message,
+            retryable=False,
+        )
     else:
         evidence = _exact_drain_failure_evidence(
             typed_message,
@@ -1339,7 +1385,7 @@ def install_exact_drain_runtime_guards(
     plan = getattr(adapter, "_plan", {})
     records_worker_lifecycle = (
         isinstance(plan, Mapping)
-        and plan.get("progress_schema_version") == 3
+        and plan.get("progress_schema_version") in {3, 4}
     )
     upstream_memory_initialize = getattr(memory_engine_type, "initialize", None)
     if not callable(upstream_run) or (
@@ -1384,6 +1430,33 @@ def install_exact_drain_runtime_guards(
         "phase_one_timeout_seconds",
         None,
     )
+    operation_attempt_timeout_seconds = getattr(
+        adapter,
+        "operation_attempt_timeout_seconds",
+        None,
+    )
+    if operation_attempt_timeout_seconds is not None and (
+        type(operation_attempt_timeout_seconds) not in {int, float}
+        or operation_attempt_timeout_seconds <= 0
+    ):
+        raise OperationRecoveryError(
+            "exact drain operation-attempt timeout authority is invalid"
+        )
+    phase_one_nested_stage_prefixes = getattr(
+        adapter,
+        "phase_one_nested_stage_prefixes",
+        (),
+    )
+    if (
+        not isinstance(phase_one_nested_stage_prefixes, tuple)
+        or any(
+            not isinstance(prefix, str) or not prefix
+            for prefix in phase_one_nested_stage_prefixes
+        )
+    ):
+        raise OperationRecoveryError(
+            "exact drain phase-one nested-stage authority is invalid"
+        )
     if phase_one_timeout_seconds is not None and (
         type(phase_one_timeout_seconds) not in {int, float}
         or phase_one_timeout_seconds <= 0
@@ -1508,26 +1581,46 @@ def install_exact_drain_runtime_guards(
         )
         last_stage: str | None = None
         phase_one_deadline: float | None = None
+        operation_attempt_deadline = (
+            None
+            if operation_attempt_timeout_seconds is None
+            else time.monotonic() + operation_attempt_timeout_seconds
+        )
         try:
             while True:
                 stage = getattr(holder, "stage", None)
+                now = time.monotonic()
+                if (
+                    operation_attempt_deadline is not None
+                    and now >= operation_attempt_deadline
+                ):
+                    request_exact_worker_shutdown(poller)
+                    raise OperationRecoveryError(
+                        EXACT_DRAIN_OPERATION_ATTEMPT_TIMEOUT_MESSAGE
+                    )
                 if (
                     phase_one_timeout_seconds is not None
                     and isinstance(stage, str)
                     and stage.startswith("retain.phase1.")
                 ):
-                    now = time.monotonic()
                     if phase_one_deadline is None:
                         phase_one_deadline = (
                             now + phase_one_timeout_seconds
                         )
-                    if now >= phase_one_deadline:
-                        request_exact_worker_shutdown(poller)
-                        raise OperationRecoveryError(
-                            "exact drain retain phase one exceeded its deadline"
-                        )
-                else:
+                elif not (
+                    phase_one_deadline is not None
+                    and isinstance(stage, str)
+                    and stage.startswith(phase_one_nested_stage_prefixes)
+                ):
                     phase_one_deadline = None
+                if (
+                    phase_one_deadline is not None
+                    and now >= phase_one_deadline
+                ):
+                    request_exact_worker_shutdown(poller)
+                    raise OperationRecoveryError(
+                        "exact drain retain phase one exceeded its deadline"
+                    )
                 if isinstance(stage, str) and stage != last_stage:
                     try:
                         adapter.record_upstream_stage(
@@ -1538,9 +1631,23 @@ def install_exact_drain_runtime_guards(
                         request_exact_worker_shutdown(poller)
                         raise
                     last_stage = stage
+                active_deadlines = tuple(
+                    deadline
+                    for deadline in (
+                        operation_attempt_deadline,
+                        phase_one_deadline,
+                    )
+                    if deadline is not None
+                )
+                wait_timeout = 0.25
+                if active_deadlines:
+                    wait_timeout = min(
+                        wait_timeout,
+                        max(0.0, min(active_deadlines) - now),
+                    )
                 done, _pending = await asyncio.wait(
                     {execution},
-                    timeout=0.25,
+                    timeout=wait_timeout,
                 )
                 if done:
                     stage = getattr(holder, "stage", None)
@@ -4317,11 +4424,11 @@ def exact_drain_runtime_evidence(
     provider_runtime_root: str | Path,
     runtime_package_root: str | Path,
     *,
-    schema_version: int = 10,
+    schema_version: int = 11,
 ) -> tuple[str, bytes]:
     """Bind runtime sources and retain prevalidated provider bootstrap bytes."""
     if type(schema_version) is not int or schema_version not in {
-        1, 2, 3, 4, 5, 6, 7, 8, 9, 10
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11
     }:
         raise OperationRecoveryError(
             "exact drain runtime evidence schema version is invalid"
@@ -4428,6 +4535,14 @@ def exact_drain_runtime_evidence(
             sources["phase-repair-contract"] = (
                 EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V6_DIGEST
             )
+        elif schema_version == 11:
+            if snapshot["schema_version"] != 7:
+                raise OperationRecoveryError(
+                    "exact drain full-query repair snapshot is required"
+                )
+            sources["phase-repair-contract"] = (
+                EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V7_DIGEST
+            )
     for name, source in provider_sources.items():
         sources[f"provider/{name}"] = hashlib.sha256(source).hexdigest()
     package_entries = _exact_drain_package_entries(package_root)
@@ -4478,7 +4593,7 @@ def exact_drain_runtime_digest(
     provider_runtime_root: str | Path,
     runtime_package_root: str | Path,
     *,
-    schema_version: int = 10,
+    schema_version: int = 11,
 ) -> str:
     """Bind the worker entrypoint, claim seam, and provider patch sources."""
     runtime_digest, _provider_bootstrap = exact_drain_runtime_evidence(
@@ -4555,7 +4670,7 @@ class ExactDrainClaimAdapter:
         if (
             terminal_reconciliation
             and verified.get("schema_version")
-            in {2, 3, 4, 5, 6, 7, 8, 9, 10}
+            in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11}
             and terminal_status_evidence is None
         ):
             raise OperationRecoveryError(
@@ -4564,11 +4679,11 @@ class ExactDrainClaimAdapter:
         self._clock = clock
         self._maximum_retry_delay_seconds = (
             verified["execution_window"]["maximum_retry_delay_seconds"]
-            if verified.get("schema_version") == 10
+            if verified.get("schema_version") in {10, 11}
             else None
         )
         if verified.get("schema_version") in {
-            2, 3, 4, 5, 6, 7, 8, 9, 10
+            2, 3, 4, 5, 6, 7, 8, 9, 10, 11
         }:
             if authorization is None:
                 raise OperationRecoveryError(
@@ -4597,14 +4712,24 @@ class ExactDrainClaimAdapter:
         self.phase_one_timeout_seconds = (
             verified["phase_one_timeout_seconds"]
             if verified.get("schema_version")
-            in {3, 4, 5, 6, 7, 8, 9, 10}
+            in {3, 4, 5, 6, 7, 8, 9, 10, 11}
             else None
         )
         self.phase_one_statement_timeout_seconds = (
             verified["phase_one_statement_timeout_seconds"]
             if verified.get("schema_version")
-            in {3, 4, 5, 6, 7, 8, 9, 10}
+            in {3, 4, 5, 6, 7, 8, 9, 10, 11}
             else None
+        )
+        self.operation_attempt_timeout_seconds = (
+            verified["operation_attempt_timeout_seconds"]
+            if verified.get("schema_version") == 11
+            else None
+        )
+        self.phase_one_nested_stage_prefixes = (
+            tuple(verified["phase_one_nested_stage_prefixes"])
+            if verified.get("schema_version") == 11
+            else ()
         )
         self._cleanup_deadline: float | None = None
         self._terminal_reconciliation_deadline: float | None = None
@@ -4865,7 +4990,7 @@ class ExactDrainClaimAdapter:
     ) -> None:
         if self._progress_recorder is None:
             return
-        if self._plan.get("progress_schema_version") in {2, 3}:
+        if self._plan.get("progress_schema_version") in {2, 3, 4}:
             self._progress_recorder.task_outcome(
                 operation_id,
                 status=status,
@@ -4884,7 +5009,7 @@ class ExactDrainClaimAdapter:
         """Persist a worker lifecycle stage when the plan binds it."""
         if (
             self._progress_recorder is not None
-            and self._plan.get("progress_schema_version") == 3
+            and self._plan.get("progress_schema_version") in {3, 4}
         ):
             self._progress_recorder.worker_stage(
                 status=status,
@@ -4900,7 +5025,7 @@ class ExactDrainClaimAdapter:
         """Persist a closed worker-level failure without changing DB state."""
         if (
             self._progress_recorder is not None
-            and self._plan.get("progress_schema_version") == 3
+            and self._plan.get("progress_schema_version") in {3, 4}
             and getattr(self._progress_recorder, "_worker_status", None)
             != "failed"
         ):
@@ -5088,7 +5213,7 @@ class ExactDrainClaimAdapter:
             )
         if self._progress_recorder is None:
             return
-        if self._plan.get("progress_schema_version") not in {2, 3}:
+        if self._plan.get("progress_schema_version") not in {2, 3, 4}:
             self.record_upstream_stage(operation_id, stage)
             return
         message = str(error_message)

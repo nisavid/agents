@@ -351,6 +351,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
         *,
         snapshot: dict | None = None,
         created_at: int = 1_785_462_000,
+        schema_version: int = 10,
     ) -> dict:
         return dict(
             recovery_contract.create_exact_drain_plan(
@@ -373,6 +374,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
                     "/private/tmp/drain-verification.json"
                 ),
                 created_at=created_at,
+                schema_version=schema_version,
             )
         )
 
@@ -407,9 +409,13 @@ class OperationRecoveryContractTest(unittest.TestCase):
         snapshot = self.drain_snapshot()
         planned_at = 1_785_462_000
 
-        plan = self.drain_plan(snapshot=snapshot, created_at=planned_at)
+        plan = self.drain_plan(
+            snapshot=snapshot,
+            created_at=planned_at,
+            schema_version=11,
+        )
 
-        self.assertEqual(plan["schema_version"], 10)
+        self.assertEqual(plan["schema_version"], 11)
         self.assertEqual(plan["expires_at"], planned_at + 86_400)
         self.assertEqual(plan["evidence_observed_at"], snapshot["observed_at"])
         self.assertEqual(plan["evidence_max_age_seconds"], 3_600)
@@ -418,7 +424,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
         self.assertEqual(
             plan["execution_window"],
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "kind": "operation-recovery-exact-drain-execution-window",
                 "anchor": "authorization-receipt-authorized-at",
                 "renewable": False,
@@ -426,7 +432,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 "remaining_attempt_count": 172,
                 "retry_wait_count": 129,
                 "effective_concurrency": 1,
-                "phase_one_timeout_seconds": 3_600,
+                "operation_attempt_timeout_seconds": 3_600,
                 "transaction_timeout_seconds": 120,
                 "maximum_retry_delay_seconds": 3_600,
                 "startup_margin_seconds": 14_400,
@@ -450,20 +456,30 @@ class OperationRecoveryContractTest(unittest.TestCase):
         self.assertEqual(plan["phase_one_statement_timeout_seconds"], 120)
         self.assertEqual(plan["phase_one_client_timeout_seconds"], 125)
         self.assertEqual(plan["phase_one_timeout_seconds"], 3_600)
+        self.assertEqual(plan["operation_attempt_timeout_seconds"], 3_600)
         self.assertEqual(
-            plan["phase_repair_contract_digest"],
-            recovery_contract.EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V6_DIGEST,
+            plan["phase_one_deadline_anchor"],
+            "first-phase-one-entry",
+        )
+        self.assertEqual(plan["phase_one_nested_stage_prefixes"], ["llm."])
+        self.assertEqual(
+            plan["provider_timeout_contract"],
+            recovery_contract.EXACT_DRAIN_PROVIDER_TIMEOUT_CONTRACT,
         )
         self.assertEqual(
-            recovery_contract.EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V6[
+            plan["phase_repair_contract_digest"],
+            recovery_contract.EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V7_DIGEST,
+        )
+        self.assertEqual(
+            recovery_contract.EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V7[
                 "worker_signal_owner"
             ],
             "worker-main",
         )
-        self.assertEqual(plan["progress_schema_version"], 3)
+        self.assertEqual(plan["progress_schema_version"], 4)
         self.assertEqual(
             plan["failure_evidence_contract_digest"],
-            recovery_contract.EXACT_DRAIN_FAILURE_EVIDENCE_CONTRACT_V2_DIGEST,
+            recovery_contract.EXACT_DRAIN_FAILURE_EVIDENCE_CONTRACT_V3_DIGEST,
         )
         self.assertEqual(
             recovery_contract.verify_exact_drain_plan(plan, now=planned_at),
@@ -486,7 +502,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
         )
 
     def test_exact_drain_execution_window_is_closed_and_recomputed(self):
-        plan = self.drain_plan()
+        plan = self.drain_plan(schema_version=11)
         cases = {}
         for label, key, value in (
             (
@@ -495,6 +511,11 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 171,
             ),
             ("effective-concurrency", "effective_concurrency", 2),
+            (
+                "operation-attempt-timeout",
+                "operation_attempt_timeout_seconds",
+                3_599,
+            ),
             (
                 "maximum-retry-delay",
                 "maximum_retry_delay_seconds",
@@ -899,14 +920,18 @@ class OperationRecoveryContractTest(unittest.TestCase):
             authorization["authorized_at"] + 86_400,
         )
 
-    def test_exact_drain_v10_failure_evidence_contract_is_closed(self):
-        plan = self.drain_plan()
+    def test_exact_drain_v11_timeout_and_failure_contracts_are_closed(self):
+        plan = self.drain_plan(schema_version=11)
         for key, value in (
             ("phase_one_statement_timeout_seconds", 121),
             ("phase_one_client_timeout_seconds", 124),
             ("phase_one_timeout_seconds", 3_601),
+            ("operation_attempt_timeout_seconds", 3_601),
+            ("phase_one_deadline_anchor", "most-recent-phase-one-entry"),
+            ("phase_one_nested_stage_prefixes", ["provider."]),
+            ("provider_timeout_contract", {}),
             ("phase_repair_contract_digest", "0" * 64),
-            ("progress_schema_version", 2),
+            ("progress_schema_version", 3),
             ("failure_evidence_contract_digest", "0" * 64),
         ):
             with self.subTest(key=key):
@@ -918,6 +943,36 @@ class OperationRecoveryContractTest(unittest.TestCase):
                     if item_key != "plan_digest"
                 }
                 changed["plan_digest"] = digest(body)
+                with self.assertRaises(OperationRecoveryError):
+                    recovery_contract.verify_exact_drain_plan(
+                        changed,
+                        now=changed["created_at"],
+                    )
+
+        for label, mutate in (
+            (
+                "schema-version-bool",
+                lambda value: value["provider_timeout_contract"].update(
+                    schema_version=True
+                ),
+            ),
+            (
+                "max-concurrent-bool",
+                lambda value: value["provider_timeout_contract"]["members"][-1].update(
+                    max_concurrent=True
+                ),
+            ),
+        ):
+            with self.subTest(label=label):
+                changed = deepcopy(plan)
+                mutate(changed)
+                changed["plan_digest"] = digest(
+                    {
+                        key: value
+                        for key, value in changed.items()
+                        if key != "plan_digest"
+                    }
+                )
                 with self.assertRaises(OperationRecoveryError):
                     recovery_contract.verify_exact_drain_plan(
                         changed,
@@ -3294,6 +3349,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
             verification_receipt_path="/private/tmp/v10-resume-verify.json",
             recovery_context=recovery_context,
             created_at=1_786_390_701,
+            schema_version=10,
         )
 
         self.assertEqual(plan["selected_operation_count"], 39)
@@ -3418,6 +3474,50 @@ class OperationRecoveryContractTest(unittest.TestCase):
                     schema_version=legacy_schema_version,
                     created_at=1_786_829_600,
                 )
+
+        schema_eleven_plan = recovery_contract.create_exact_drain_plan(
+            self.cohort(),
+            recovered_snapshot,
+            candidate_release=release_identity(),
+            rollback_backup=drain_backup,
+            rollback_backup_path="/private/tmp/v11-resume-backup.age",
+            provider_policy_digest="9" * 64,
+            effective_profile_digest="7" * 64,
+            worker_runtime_digest="8" * 64,
+            authorization_receipt_path="/private/tmp/v11-resume-auth.json",
+            application_receipt_path="/private/tmp/v11-resume-app.json",
+            status_artifact_path="/private/tmp/v11-resume-status.json",
+            verification_receipt_path="/private/tmp/v11-resume-verify.json",
+            recovery_context=recovery_context,
+            created_at=1_786_390_701,
+            schema_version=11,
+        )
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "legacy post-abort schema cannot reference schema 10",
+        ):
+            create_post_abort_recovery_plan(
+                schema_eleven_plan,
+                second_interrupted,
+                candidate_release=release_identity(),
+                rollback_backup=second_backup,
+                rollback_encryption=rollback_encryption(),
+                rollback_backup_path="/private/tmp/v11-replay-backup.age",
+                rollback_bundle_path="/private/tmp/v11-replay-bundle.age",
+                authorization_receipt_path="/private/tmp/v11-replay-auth.json",
+                application_receipt_path="/private/tmp/v11-replay-app.json",
+                verification_receipt_path="/private/tmp/v11-replay-verify.json",
+                rollback_receipt_path="/private/tmp/v11-replay-rollback.json",
+                reference_application_authorization=(
+                    exact_drain_authorization(schema_eleven_plan)
+                ),
+                reference_application_journal=(
+                    exact_drain_application_journal(schema_eleven_plan)
+                ),
+                reference_application_progress_digest="d" * 64,
+                schema_version=9,
+                created_at=1_786_829_600,
+            )
 
         legacy_key_sets = {
             version: getattr(

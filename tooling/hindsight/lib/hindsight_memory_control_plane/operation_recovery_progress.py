@@ -44,9 +44,20 @@ SCOPE_CATEGORIES = frozenset(
     {"retain", "consolidation", "reflect", "default"}
 )
 PROVIDER_OUTCOMES = frozenset({"succeeded", "failed", "timed_out"})
+PROVIDER_OUTCOMES_V4 = frozenset(
+    {
+        "succeeded",
+        "failed",
+        "queue_timed_out",
+        "execution_timed_out",
+    }
+)
 TASK_FAILURE_CATEGORIES = frozenset(
     {
         "phase_one_timeout",
+        "provider_queue_timeout",
+        "provider_execution_timeout",
+        "operation_attempt_timeout",
         "provider_bad_request",
         "provider_authentication",
         "provider_capacity",
@@ -388,7 +399,7 @@ class ExactDrainProgressRecorder:
         self.worker_pid = worker_pid
         self.worker_start_time = worker_start_time
         self.worker_attempt = worker_attempt
-        if progress_schema_version not in {1, 2, 3}:
+        if progress_schema_version not in {1, 2, 3, 4}:
             raise OperationRecoveryError(
                 "exact drain progress schema version is invalid"
             )
@@ -467,7 +478,7 @@ class ExactDrainProgressRecorder:
                     stage_started_at=previous["stage_started_at"],
                     last_progress_at=previous["last_progress_at"],
                 )
-                if progress_schema_version in {2, 3}:
+                if progress_schema_version in {2, 3, 4}:
                     task.update(
                         failure_stage=previous["failure_stage"],
                         failure=previous["failure"],
@@ -500,6 +511,26 @@ class ExactDrainProgressRecorder:
 
     def _counter(self, provider_id: str) -> dict[str, Any]:
         _identifier(provider_id, "exact drain progress provider")
+        if self.progress_schema_version == 4:
+            return self._provider_counters.setdefault(
+                provider_id,
+                {
+                    "provider_id": provider_id,
+                    "started": 0,
+                    "succeeded": 0,
+                    "failed": 0,
+                    "queue_timed_out": 0,
+                    "execution_timed_out": 0,
+                    "failed_over": 0,
+                    "queue_duration_count": 0,
+                    "queue_duration_total_seconds": 0.0,
+                    "queue_duration_max_seconds": 0.0,
+                    "execution_duration_count": 0,
+                    "execution_duration_total_seconds": 0.0,
+                    "execution_duration_max_seconds": 0.0,
+                    "last_provider_response_at": None,
+                },
+            )
         return self._provider_counters.setdefault(
             provider_id,
             {
@@ -548,7 +579,7 @@ class ExactDrainProgressRecorder:
             "cooldowns": [self._cooldowns[key] for key in sorted(self._cooldowns)],
             **(
                 {}
-                if self.progress_schema_version != 3
+                if self.progress_schema_version not in {3, 4}
                 else {
                     "worker_status": self._worker_status,
                     "worker_stage": self._worker_stage,
@@ -605,7 +636,7 @@ class ExactDrainProgressRecorder:
     def worker_stage(self, *, status: str, stage: str) -> None:
         """Persist a payload-free worker lifecycle breadcrumb before claims."""
         if (
-            self.progress_schema_version != 3
+            self.progress_schema_version not in {3, 4}
             or status not in {"starting", "running"}
             or not isinstance(stage, str)
             or STAGE.fullmatch(stage) is None
@@ -645,7 +676,7 @@ class ExactDrainProgressRecorder:
         failure: Mapping[str, Any],
     ) -> None:
         """Persist one closed worker failure without raw error content."""
-        if self.progress_schema_version != 3:
+        if self.progress_schema_version not in {3, 4}:
             raise OperationRecoveryError(
                 "exact drain progress worker failure schema is unavailable"
             )
@@ -728,7 +759,7 @@ class ExactDrainProgressRecorder:
         checkpoint: Mapping[str, Any] | None,
     ) -> None:
         """Persist one closed failure/checkpoint projection without raw content."""
-        if self.progress_schema_version not in {2, 3}:
+        if self.progress_schema_version not in {2, 3, 4}:
             raise OperationRecoveryError(
                 "exact drain failure evidence schema is unavailable"
             )
@@ -780,7 +811,7 @@ class ExactDrainProgressRecorder:
         failure: Mapping[str, Any],
     ) -> None:
         """Record a worker/runtime failure while preserving DB checkpoint evidence."""
-        if self.progress_schema_version not in {2, 3}:
+        if self.progress_schema_version not in {2, 3, 4}:
             raise OperationRecoveryError(
                 "exact drain failure evidence schema is unavailable"
             )
@@ -837,16 +868,43 @@ class ExactDrainProgressRecorder:
             ).hexdigest()
             counter = self._counter(provider_id)
             counter["started"] += 1
-            self._active[token] = {
-                "request_digest": token,
-                "provider_id": provider_id,
-                "started_at": now,
-                "retry_attempt": retry_attempt,
-                "scope_category": _scope_category(scope),
-            }
+            self._active[token] = (
+                {
+                    "request_digest": token,
+                    "provider_id": provider_id,
+                    "state": "queued",
+                    "queued_at": now,
+                    "executing_at": None,
+                    "retry_attempt": retry_attempt,
+                    "scope_category": _scope_category(scope),
+                }
+                if self.progress_schema_version == 4
+                else {
+                    "request_digest": token,
+                    "provider_id": provider_id,
+                    "started_at": now,
+                    "retry_attempt": retry_attempt,
+                    "scope_category": _scope_category(scope),
+                }
+            )
             self._last_progress_at = now
             self._persist(now)
             return token
+
+    def provider_executing(self, request_digest: str) -> None:
+        if self.progress_schema_version != 4:
+            return
+        with self._lock:
+            active = self._active.get(request_digest)
+            if active is None or active.get("state") != "queued":
+                raise OperationRecoveryError(
+                    "exact drain progress request is not queued"
+                )
+            now = self._now()
+            active["state"] = "executing"
+            active["executing_at"] = now
+            self._last_progress_at = now
+            self._persist(now)
 
     def provider_finished(
         self,
@@ -855,23 +913,61 @@ class ExactDrainProgressRecorder:
         outcome: str,
         failed_over: bool = False,
     ) -> None:
-        if outcome not in PROVIDER_OUTCOMES or type(failed_over) is not bool:
+        allowed_outcomes = (
+            PROVIDER_OUTCOMES_V4
+            if self.progress_schema_version == 4
+            else PROVIDER_OUTCOMES
+        )
+        if outcome not in allowed_outcomes or type(failed_over) is not bool:
             raise OperationRecoveryError("exact drain progress provider outcome is invalid")
         with self._lock:
-            active = self._active.pop(request_digest, None)
+            active = self._active.get(request_digest)
             if active is None:
                 raise OperationRecoveryError("exact drain progress request is unknown")
+            if self.progress_schema_version == 4 and (
+                (outcome == "queue_timed_out" and active["state"] != "queued")
+                or (outcome != "queue_timed_out" and active["state"] != "executing")
+            ):
+                raise OperationRecoveryError(
+                    "exact drain progress provider outcome is invalid"
+                )
+            del self._active[request_digest]
             now = self._now()
-            duration = max(0.0, now - float(active["started_at"]))
             counter = self._counter(active["provider_id"])
             counter[outcome] += 1
             if failed_over:
                 counter["failed_over"] += 1
-            counter["duration_count"] += 1
-            counter["duration_total_seconds"] += duration
-            counter["duration_max_seconds"] = max(
-                counter["duration_max_seconds"], duration
-            )
+            if self.progress_schema_version == 4:
+                queued_at = float(active["queued_at"])
+                executing_at = active["executing_at"]
+                queue_duration = max(
+                    0.0,
+                    float(executing_at if executing_at is not None else now)
+                    - queued_at,
+                )
+                counter["queue_duration_count"] += 1
+                counter["queue_duration_total_seconds"] += queue_duration
+                counter["queue_duration_max_seconds"] = max(
+                    counter["queue_duration_max_seconds"],
+                    queue_duration,
+                )
+                if executing_at is not None:
+                    execution_duration = max(0.0, now - float(executing_at))
+                    counter["execution_duration_count"] += 1
+                    counter["execution_duration_total_seconds"] += (
+                        execution_duration
+                    )
+                    counter["execution_duration_max_seconds"] = max(
+                        counter["execution_duration_max_seconds"],
+                        execution_duration,
+                    )
+            else:
+                duration = max(0.0, now - float(active["started_at"]))
+                counter["duration_count"] += 1
+                counter["duration_total_seconds"] += duration
+                counter["duration_max_seconds"] = max(
+                    counter["duration_max_seconds"], duration
+                )
             counter["last_provider_response_at"] = now
             self._last_progress_at = now
             self._persist(now)
@@ -884,7 +980,13 @@ class ExactDrainProgressRecorder:
                 raise OperationRecoveryError(
                     "exact drain progress failover count differs"
                 )
-            if counter["failed_over"] >= counter["failed"] + counter["timed_out"]:
+            timeout_count = (
+                counter["queue_timed_out"]
+                + counter["execution_timed_out"]
+                if self.progress_schema_version == 4
+                else counter["timed_out"]
+            )
+            if counter["failed_over"] >= counter["failed"] + timeout_count:
                 raise OperationRecoveryError(
                     "exact drain progress failover count differs"
                 )
@@ -1108,7 +1210,7 @@ def _validated_progress(
         "cooldowns",
         "progress_digest",
     }
-    if progress_schema_version == 3:
+    if progress_schema_version in {3, 4}:
         expected_keys |= {
             "worker_status",
             "worker_stage",
@@ -1120,7 +1222,7 @@ def _validated_progress(
     if (
         set(value) != expected_keys
         or value.get("schema_version") != progress_schema_version
-        or progress_schema_version not in {1, 2, 3}
+        or progress_schema_version not in {1, 2, 3, 4}
         or value.get("kind") != "operation-recovery-exact-drain-progress"
         or value.get("plan_digest") != _sha(plan_digest, "exact drain plan digest")
     ):
@@ -1163,7 +1265,7 @@ def _validated_progress(
     )
     if not started_at <= last_progress_at <= observed_at:
         raise OperationRecoveryError("exact drain progress timestamps differ")
-    if progress_schema_version == 3:
+    if progress_schema_version in {3, 4}:
         worker_status = result.get("worker_status")
         worker_stage = result.get("worker_stage")
         worker_failure_stage = result.get("worker_failure_stage")
@@ -1218,7 +1320,7 @@ def _validated_progress(
         "stage_started_at",
         "last_progress_at",
     }
-    if progress_schema_version in {2, 3}:
+    if progress_schema_version in {2, 3, 4}:
         task_keys |= {"failure_stage", "failure", "checkpoint"}
     tasks = result.get("tasks")
     if not isinstance(tasks, list):
@@ -1244,7 +1346,7 @@ def _validated_progress(
             raise OperationRecoveryError("exact drain progress task is invalid")
         if not isinstance(stage, str) or STAGE.fullmatch(stage) is None:
             raise OperationRecoveryError("exact drain progress task stage is invalid")
-        if progress_schema_version in {2, 3}:
+        if progress_schema_version in {2, 3, 4}:
             failure_stage = item.get("failure_stage")
             failure = _validated_failure(item.get("failure"))
             _validated_checkpoint(item.get("checkpoint"))
@@ -1299,6 +1401,22 @@ def _validated_progress(
         "duration_max_seconds",
         "last_provider_response_at",
     }
+    counter_keys_v4 = {
+        "provider_id",
+        "started",
+        "succeeded",
+        "failed",
+        "queue_timed_out",
+        "execution_timed_out",
+        "failed_over",
+        "queue_duration_count",
+        "queue_duration_total_seconds",
+        "queue_duration_max_seconds",
+        "execution_duration_count",
+        "execution_duration_total_seconds",
+        "execution_duration_max_seconds",
+        "last_provider_response_at",
+    }
     counters = result.get("provider_counters")
     active = result.get("active_provider_requests")
     cooldowns = result.get("cooldowns")
@@ -1306,36 +1424,105 @@ def _validated_progress(
         raise OperationRecoveryError("exact drain provider progress is invalid")
     counters_by_id: dict[str, Mapping[str, Any]] = {}
     for item in counters:
-        if not isinstance(item, Mapping) or set(item) != counter_keys:
+        expected_counter_keys = (
+            counter_keys_v4 if progress_schema_version == 4 else counter_keys
+        )
+        if not isinstance(item, Mapping) or set(item) != expected_counter_keys:
             raise OperationRecoveryError("exact drain provider counter is invalid")
         provider_id = _identifier(item.get("provider_id"), "exact drain provider")
         if provider_id in counters_by_id:
             raise OperationRecoveryError("exact drain provider counter is invalid")
-        counts = [
-            _count(item.get(key), f"exact drain provider {key}")
-            for key in (
-                "started",
-                "succeeded",
-                "failed",
-                "timed_out",
-                "failed_over",
-                "duration_count",
+        if progress_schema_version == 4:
+            counts = {
+                key: _count(item.get(key), f"exact drain provider {key}")
+                for key in (
+                    "started",
+                    "succeeded",
+                    "failed",
+                    "queue_timed_out",
+                    "execution_timed_out",
+                    "failed_over",
+                    "queue_duration_count",
+                    "execution_duration_count",
+                )
+            }
+            terminal_count = sum(
+                counts[key]
+                for key in (
+                    "succeeded",
+                    "failed",
+                    "queue_timed_out",
+                    "execution_timed_out",
+                )
             )
-        ]
-        duration_total = _timestamp(
-            item.get("duration_total_seconds"), "exact drain provider duration"
-        )
-        duration_max = _timestamp(
-            item.get("duration_max_seconds"), "exact drain provider duration"
-        )
-        terminal_count = counts[1] + counts[2] + counts[3]
-        if (
-            counts[4] > counts[2] + counts[3]
-            or counts[5] != terminal_count
-            or duration_max > duration_total
-            or (terminal_count == 0 and (duration_total or duration_max))
-        ):
-            raise OperationRecoveryError("exact drain provider counter differs")
+            queue_total = _timestamp(
+                item.get("queue_duration_total_seconds"),
+                "exact drain provider queue duration",
+            )
+            queue_max = _timestamp(
+                item.get("queue_duration_max_seconds"),
+                "exact drain provider queue duration",
+            )
+            execution_total = _timestamp(
+                item.get("execution_duration_total_seconds"),
+                "exact drain provider execution duration",
+            )
+            execution_max = _timestamp(
+                item.get("execution_duration_max_seconds"),
+                "exact drain provider execution duration",
+            )
+            if (
+                counts["failed_over"]
+                > counts["failed"]
+                + counts["queue_timed_out"]
+                + counts["execution_timed_out"]
+                or counts["queue_duration_count"] != terminal_count
+                or counts["execution_duration_count"]
+                != terminal_count - counts["queue_timed_out"]
+                or queue_max > queue_total
+                or execution_max > execution_total
+                or (
+                    counts["queue_duration_count"] == 0
+                    and (queue_total or queue_max)
+                )
+                or (
+                    counts["execution_duration_count"] == 0
+                    and (execution_total or execution_max)
+                )
+            ):
+                raise OperationRecoveryError(
+                    "exact drain provider counter differs"
+                )
+        else:
+            counts = [
+                _count(item.get(key), f"exact drain provider {key}")
+                for key in (
+                    "started",
+                    "succeeded",
+                    "failed",
+                    "timed_out",
+                    "failed_over",
+                    "duration_count",
+                )
+            ]
+            duration_total = _timestamp(
+                item.get("duration_total_seconds"),
+                "exact drain provider duration",
+            )
+            duration_max = _timestamp(
+                item.get("duration_max_seconds"),
+                "exact drain provider duration",
+            )
+            terminal_count = counts[1] + counts[2] + counts[3]
+            if (
+                counts[4] > counts[2] + counts[3]
+                or counts[5] != terminal_count
+                or duration_max > duration_total
+                or (terminal_count == 0 and (duration_total or duration_max))
+            ):
+                raise OperationRecoveryError(
+                    "exact drain provider counter differs"
+                )
         last_response = item.get("last_provider_response_at")
         if last_response is not None:
             _timestamp(last_response, "exact drain provider response")
@@ -1348,10 +1535,22 @@ def _validated_progress(
         "retry_attempt",
         "scope_category",
     }
+    active_keys_v4 = {
+        "request_digest",
+        "provider_id",
+        "state",
+        "queued_at",
+        "executing_at",
+        "retry_attempt",
+        "scope_category",
+    }
     active_by_provider: dict[str, int] = {}
     request_ids: set[str] = set()
     for item in active:
-        if not isinstance(item, Mapping) or set(item) != active_keys:
+        expected_active_keys = (
+            active_keys_v4 if progress_schema_version == 4 else active_keys
+        )
+        if not isinstance(item, Mapping) or set(item) != expected_active_keys:
             raise OperationRecoveryError("exact drain active request is invalid")
         request_digest = _sha(
             item.get("request_digest"), "exact drain request digest"
@@ -1363,16 +1562,52 @@ def _validated_progress(
             or type(item.get("retry_attempt")) is not int
             or item["retry_attempt"] < 1
             or item.get("scope_category") not in SCOPE_CATEGORIES
-            or not started_at
-            <= _timestamp(item.get("started_at"), "exact drain request start")
-            <= observed_at
         ):
+            raise OperationRecoveryError("exact drain active request is invalid")
+        if progress_schema_version == 4:
+            queued_at = _timestamp(
+                item.get("queued_at"), "exact drain request queue start"
+            )
+            executing_at = item.get("executing_at")
+            if (
+                item.get("state") not in {"queued", "executing"}
+                or not started_at <= queued_at <= observed_at
+                or (
+                    item.get("state") == "queued"
+                    and executing_at is not None
+                )
+                or (
+                    item.get("state") == "executing"
+                    and (
+                        executing_at is None
+                        or not queued_at
+                        <= _timestamp(
+                            executing_at,
+                            "exact drain request execution start",
+                        )
+                        <= observed_at
+                    )
+                )
+            ):
+                raise OperationRecoveryError(
+                    "exact drain active request is invalid"
+                )
+        elif not started_at <= _timestamp(
+            item.get("started_at"), "exact drain request start"
+        ) <= observed_at:
             raise OperationRecoveryError("exact drain active request is invalid")
         request_ids.add(request_digest)
         active_by_provider[provider_id] = active_by_provider.get(provider_id, 0) + 1
     for provider_id, counter in counters_by_id.items():
         terminal_count = (
-            counter["succeeded"] + counter["failed"] + counter["timed_out"]
+            counter["succeeded"]
+            + counter["failed"]
+            + (
+                counter["queue_timed_out"]
+                + counter["execution_timed_out"]
+                if progress_schema_version == 4
+                else counter["timed_out"]
+            )
         )
         if counter["started"] != terminal_count + active_by_provider.get(provider_id, 0):
             raise OperationRecoveryError("exact drain provider counter differs")
@@ -1443,7 +1678,7 @@ def read_exact_drain_progress(
                 "cooldowns": archived["cooldowns"],
                 **(
                     {}
-                    if progress_schema_version != 3
+                    if progress_schema_version not in {3, 4}
                     else {
                         "worker_status": archived["worker_status"],
                         "worker_stage": archived["worker_stage"],
@@ -1471,9 +1706,25 @@ def read_exact_drain_progress(
     active = []
     for item in value["active_provider_requests"]:
         request = dict(item)
-        request["age_seconds"] = max(
-            0.0, observed_now - float(request["started_at"])
-        )
+        if progress_schema_version == 4:
+            queued_at = float(request["queued_at"])
+            executing_at = request["executing_at"]
+            request["queue_age_seconds"] = max(
+                0.0,
+                float(
+                    observed_now if executing_at is None else executing_at
+                )
+                - queued_at,
+            )
+            request["execution_age_seconds"] = (
+                None
+                if executing_at is None
+                else max(0.0, observed_now - float(executing_at))
+            )
+        else:
+            request["age_seconds"] = max(
+                0.0, observed_now - float(request["started_at"])
+            )
         active.append(request)
     return {
         **value,

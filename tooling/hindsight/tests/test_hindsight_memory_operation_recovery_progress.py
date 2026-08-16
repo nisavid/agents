@@ -1003,6 +1003,111 @@ class ExactDrainProgressTest(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, rendered)
 
+    def test_progress_schema_four_separates_queue_and_execution_age(self) -> None:
+        ticks = iter((1000.0, 1001.0, 1003.0, 1006.0))
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+            path = Path(directory) / "exact-drain-progress.json"
+            recorder = ExactDrainProgressRecorder(
+                path=path,
+                plan_digest="a" * 64,
+                worker_pid=1234,
+                worker_start_time="darwin:1000:1",
+                worker_attempt=1,
+                selected_operations=[],
+                progress_schema_version=4,
+                clock=lambda: next(ticks),
+            )
+            request = recorder.provider_started(
+                "hatchery",
+                retry_attempt=1,
+                scope="retain_extract_facts",
+            )
+            queued = read_exact_drain_progress(
+                path,
+                plan_digest="a" * 64,
+                progress_schema_version=4,
+                now=1002.0,
+            )
+            recorder.provider_executing(request)
+            executing = read_exact_drain_progress(
+                path,
+                plan_digest="a" * 64,
+                progress_schema_version=4,
+                now=1004.0,
+            )
+            recorder.provider_finished(request, outcome="succeeded")
+            finished = read_exact_drain_progress(
+                path,
+                plan_digest="a" * 64,
+                progress_schema_version=4,
+                now=1006.0,
+            )
+
+        self.assertEqual(queued["active_provider_requests"][0]["state"], "queued")
+        self.assertEqual(queued["active_provider_requests"][0]["queue_age_seconds"], 1.0)
+        self.assertIsNone(queued["active_provider_requests"][0]["execution_age_seconds"])
+        self.assertEqual(executing["active_provider_requests"][0]["state"], "executing")
+        self.assertEqual(executing["active_provider_requests"][0]["queue_age_seconds"], 2.0)
+        self.assertEqual(executing["active_provider_requests"][0]["execution_age_seconds"], 1.0)
+        self.assertEqual(finished["active_provider_requests"], [])
+        self.assertEqual(
+            finished["provider_counters"],
+            [
+                {
+                    "provider_id": "hatchery",
+                    "started": 1,
+                    "succeeded": 1,
+                    "failed": 0,
+                    "queue_timed_out": 0,
+                    "execution_timed_out": 0,
+                    "failed_over": 0,
+                    "queue_duration_count": 1,
+                    "queue_duration_total_seconds": 2.0,
+                    "queue_duration_max_seconds": 2.0,
+                    "execution_duration_count": 1,
+                    "execution_duration_total_seconds": 3.0,
+                    "execution_duration_max_seconds": 3.0,
+                    "last_provider_response_at": 1006.0,
+                }
+            ],
+        )
+
+    def test_progress_schema_four_rejects_success_before_gate_admission(self) -> None:
+        ticks = iter((1000.0, 1001.0))
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+            path = Path(directory) / "exact-drain-progress.json"
+            recorder = ExactDrainProgressRecorder(
+                path=path,
+                plan_digest="a" * 64,
+                worker_pid=1234,
+                worker_start_time="darwin:1000:1",
+                worker_attempt=1,
+                selected_operations=[],
+                progress_schema_version=4,
+                clock=lambda: next(ticks),
+            )
+            request = recorder.provider_started(
+                "hatchery",
+                retry_attempt=1,
+                scope="retain_extract_facts",
+            )
+            with self.assertRaisesRegex(
+                OperationRecoveryError,
+                "provider outcome is invalid",
+            ):
+                recorder.provider_finished(request, outcome="succeeded")
+            queued = read_exact_drain_progress(
+                path,
+                plan_digest="a" * 64,
+                progress_schema_version=4,
+                now=1002.0,
+            )
+
+        self.assertEqual(
+            queued["active_provider_requests"][0]["state"],
+            "queued",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

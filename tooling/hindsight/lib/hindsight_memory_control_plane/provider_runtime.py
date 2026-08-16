@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager, contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 import heapq
 from importlib import metadata
@@ -22,6 +23,20 @@ from urllib.parse import urlsplit, urlunsplit
 
 class ProviderRuntimeCompatibilityError(RuntimeError):
     """The provider policy cannot be applied safely to this runtime."""
+
+
+class ProviderQueueTimeout(TimeoutError):
+    """A managed provider request expired before gate admission."""
+
+    def __init__(self) -> None:
+        super().__init__("provider_queue_timeout")
+
+
+class ProviderExecutionTimeout(TimeoutError):
+    """A managed provider request expired after gate admission."""
+
+    def __init__(self) -> None:
+        super().__init__("provider_execution_timeout")
 
 
 def _is_timeout_exception(error: BaseException) -> bool:
@@ -61,6 +76,10 @@ MEMBER_KEYS = {
     "max_concurrent",
     "operation_priorities",
     "quota_cooldown",
+}
+MEMBER_V2_KEYS = (MEMBER_KEYS - {"timeout_seconds"}) | {
+    "queue_timeout_seconds",
+    "execution_timeout_seconds",
 }
 IDENTITY_KEYS = {"provider", "model", "base_url", "credential_marker"}
 CREDENTIAL_KEYS = {"mode", "locator"}
@@ -103,6 +122,10 @@ PROVIDER_POOL_TIMEOUT_SECONDS = 20.0
 PROVIDER_WRITE_TIMEOUT_SECONDS = 60.0
 _CODEX_ENVIRONMENT_LOCK = threading.Lock()
 _EXACT_DRAIN_PROGRESS_RECORDER: Any | None = None
+_PROVIDER_REQUEST_DIGEST: ContextVar[str | None] = ContextVar(
+    "hindsight_provider_request_digest",
+    default=None,
+)
 _CODEX_MODELS_WITHOUT_REASONING_SUMMARY = frozenset(
     {"gpt-5.3-codex-spark"}
 )
@@ -279,6 +302,8 @@ class ProviderMemberPolicy:
     credential_mode: str
     credential_locator: str | None
     timeout_seconds: int | None
+    queue_timeout_seconds: int | None
+    execution_timeout_seconds: int | None
     max_retries: int | None
     max_concurrent: int | None
     operation_priorities: Mapping[str, int] = field(hash=False, compare=True)
@@ -296,6 +321,7 @@ class ProviderMemberPolicy:
 
 @dataclass(frozen=True)
 class ProviderRuntimePolicy:
+    schema_version: int
     hindsight_version: str
     default_usage_limit_cooldown_seconds: float
     failover_order: tuple[str, ...]
@@ -308,9 +334,10 @@ class ProviderRuntimePolicy:
                 "provider runtime policy must be an object"
             )
         _closed(value, POLICY_KEYS, "provider runtime policy")
-        if value["schema_version"] != 1:
+        schema_version = value["schema_version"]
+        if type(schema_version) is not int or schema_version not in {1, 2}:
             raise ProviderRuntimeCompatibilityError(
-                "provider runtime schema_version must be 1"
+                "provider runtime schema_version must be 1 or 2"
             )
         hindsight_version = _string(value["hindsight_version"], "hindsight_version")
         cooldown = value["default_usage_limit_cooldown_seconds"]
@@ -326,7 +353,10 @@ class ProviderRuntimePolicy:
         raw_members = value["members"]
         if not isinstance(raw_members, list) or not raw_members:
             raise ProviderRuntimeCompatibilityError("members must be a non-empty list")
-        members = tuple(_load_member(item) for item in raw_members)
+        members = tuple(
+            _load_member(item, schema_version=schema_version)
+            for item in raw_members
+        )
         ids = [member.id for member in members]
         if len(ids) != len(set(ids)):
             raise ProviderRuntimeCompatibilityError("member ids must be unique")
@@ -377,6 +407,7 @@ class ProviderRuntimePolicy:
                 "failover_order must name every member exactly once"
             )
         return cls(
+            schema_version=schema_version,
             hindsight_version=hindsight_version,
             default_usage_limit_cooldown_seconds=float(cooldown),
             failover_order=tuple(raw_order),
@@ -412,10 +443,18 @@ class ProviderRuntimePolicy:
         return matches[0] if matches else None
 
 
-def _load_member(value: Any) -> ProviderMemberPolicy:
+def _load_member(
+    value: Any,
+    *,
+    schema_version: int,
+) -> ProviderMemberPolicy:
     if not isinstance(value, Mapping):
         raise ProviderRuntimeCompatibilityError("provider member must be an object")
-    _closed(value, MEMBER_KEYS, "provider member")
+    _closed(
+        value,
+        MEMBER_KEYS if schema_version == 1 else MEMBER_V2_KEYS,
+        "provider member",
+    )
     member_id = _identifier(value["id"], "provider member id")
     identity = value["identity"]
     if not isinstance(identity, Mapping):
@@ -491,8 +530,32 @@ def _load_member(value: Any) -> ProviderMemberPolicy:
         identity=provider_identity,
         credential_mode=mode,
         credential_locator=locator,
-        timeout_seconds=_optional_bounded_int(
-            value["timeout_seconds"], "timeout_seconds", 1, 3600
+        timeout_seconds=(
+            _optional_bounded_int(
+                value["timeout_seconds"], "timeout_seconds", 1, 3600
+            )
+            if schema_version == 1
+            else None
+        ),
+        queue_timeout_seconds=(
+            None
+            if schema_version == 1
+            else _bounded_int(
+                value["queue_timeout_seconds"],
+                "queue_timeout_seconds",
+                1,
+                3600,
+            )
+        ),
+        execution_timeout_seconds=(
+            None
+            if schema_version == 1
+            else _bounded_int(
+                value["execution_timeout_seconds"],
+                "execution_timeout_seconds",
+                1,
+                3600,
+            )
         ),
         max_retries=_optional_bounded_int(
             value["max_retries"], "max_retries", 0, 10
@@ -854,17 +917,22 @@ class _ProviderRuntime:
         member = self.policy.match(runtime_member)
         if member is None:
             return
-        if member.timeout_seconds is not None:
-            runtime_member.timeout = member.timeout_seconds
+        effective_timeout = (
+            member.timeout_seconds
+            if self.policy.schema_version == 1
+            else member.execution_timeout_seconds
+        )
+        if effective_timeout is not None:
+            runtime_member.timeout = effective_timeout
         if member.max_retries is not None:
             runtime_member.max_retries = member.max_retries
         provider_impl = getattr(runtime_member, "_provider_impl", None)
-        if provider_impl is not None and member.timeout_seconds is not None:
-            provider_impl.timeout = member.timeout_seconds
+        if provider_impl is not None and effective_timeout is not None:
+            provider_impl.timeout = effective_timeout
             client = getattr(provider_impl, "_client", None)
             if client is not None and hasattr(client, "with_options"):
                 provider_impl._client = client.with_options(
-                    timeout=_split_timeout(member.timeout_seconds)
+                    timeout=_split_timeout(effective_timeout)
                 )
 
     @contextmanager
@@ -953,18 +1021,48 @@ class _ProviderRuntime:
             call_kwargs["max_retries"] = member.max_retries
         gate = self._gate(member)
 
-        async def invoke() -> Any:
-            if gate is None:
-                return await operation(*args, **call_kwargs)
-            async with gate.slot(
-                member.priority(str(call_kwargs.get("scope", "")))
-            ):
-                return await operation(*args, **call_kwargs)
+        async def execute() -> Any:
+            return await operation(*args, **call_kwargs)
 
-        if member.timeout_seconds is None:
-            return await invoke()
-        async with asyncio.timeout(member.timeout_seconds):
-            return await invoke()
+        if self.policy.schema_version == 1:
+            async def invoke_legacy() -> Any:
+                if gate is None:
+                    return await execute()
+                async with gate.slot(
+                    member.priority(str(call_kwargs.get("scope", "")))
+                ):
+                    return await execute()
+
+            if member.timeout_seconds is None:
+                return await invoke_legacy()
+            async with asyncio.timeout(member.timeout_seconds):
+                return await invoke_legacy()
+
+        if gate is not None:
+            try:
+                async with asyncio.timeout(member.queue_timeout_seconds):
+                    await gate.acquire(
+                        member.priority(str(call_kwargs.get("scope", "")))
+                    )
+            except TimeoutError as error:
+                raise ProviderQueueTimeout() from error
+        progress_recorder = self._progress_recorder
+        request_digest = _PROVIDER_REQUEST_DIGEST.get()
+        if progress_recorder is not None and request_digest is not None:
+            progress_recorder.provider_executing(request_digest)
+        try:
+            try:
+                async with asyncio.timeout(member.execution_timeout_seconds):
+                    return await execute()
+            except BaseException as error:
+                if isinstance(error, asyncio.CancelledError):
+                    raise
+                if _is_timeout_exception(error):
+                    raise ProviderExecutionTimeout() from error
+                raise
+        finally:
+            if gate is not None:
+                gate.release()
 
     def _claim_quota_member(self, member_id: str, now: float) -> tuple[bool, bool]:
         with self._cooldown_lock:
@@ -1073,16 +1171,35 @@ class _ProviderRuntime:
                     scope=str(kwargs.get("scope", "")),
                 )
             try:
-                result = await getattr(by_id[member_id], method_name)(**kwargs)
+                request_context = _PROVIDER_REQUEST_DIGEST.set(
+                    request_digest
+                )
+                try:
+                    result = await getattr(
+                        by_id[member_id], method_name
+                    )(**kwargs)
+                finally:
+                    _PROVIDER_REQUEST_DIGEST.reset(request_context)
             except BaseException as exc:
                 failover = should_failover(exc)
                 if progress_recorder is not None and request_digest is not None:
                     progress_recorder.provider_finished(
                         request_digest,
                         outcome=(
-                            "timed_out"
-                            if _is_timeout_exception(exc)
-                            else "failed"
+                            "queue_timed_out"
+                            if isinstance(exc, ProviderQueueTimeout)
+                            else (
+                                "execution_timed_out"
+                                if isinstance(
+                                    exc,
+                                    ProviderExecutionTimeout,
+                                )
+                                else (
+                                    "timed_out"
+                                    if _is_timeout_exception(exc)
+                                    else "failed"
+                                )
+                            )
                         ),
                     )
                 if not failover:

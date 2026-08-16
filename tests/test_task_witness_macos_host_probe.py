@@ -1926,6 +1926,15 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             "508 180 201 180 S root-child-private-name\n"
             "509 190 210 190 S other-child-private-name\n"
             "510 195 999 195 S orphan-private-name"
+            "\n512 220 1 220 S launchd"
+            "\n512 221 220 220 S cfprefsd"
+            "\n513 230 200 230 S mdworker_shared"
+            "\n513 231 200 231 S mdworker_sizing"
+            "\n514 240 1 240 S launchd"
+            "\n514 241 240 240 S distnoted"
+            "\n514 242 200 242 S mdworker"
+            "\n515 250 1 250 S Python"
+            "\n515 251 1 251 S private-companion-name"
         )
         records = self.helper.parse_process_list(raw)
         self.assertEqual(
@@ -1942,6 +1951,10 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 508,
                 509,
                 510,
+                512,
+                513,
+                514,
+                515,
                 700,
                 4294967294,
             },
@@ -1951,11 +1964,15 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             503: "disposable-user-distnoted-name-remains",
             504: "disposable-user-zombie-only-remains",
             505: "disposable-user-pid1-parented-process-remains",
-            506: "disposable-user-multiple-processes-remain",
+            506: "disposable-user-external-parented-processes-remain",
             507: "disposable-user-spotlight-worker-remains",
             508: "disposable-user-root-parented-process-remains",
             509: "disposable-user-other-uid-parented-process-remains",
             510: "disposable-user-parent-unobserved-process-remains",
+            512: "disposable-user-background-agent-names-remain",
+            513: "disposable-user-spotlight-workers-remain",
+            514: "disposable-user-background-and-spotlight-names-remain",
+            515: "disposable-user-probe-and-other-processes-remain",
         }
         for uid, expected_code in expected_codes.items():
             with self.subTest(uid=uid):
@@ -1968,6 +1985,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
         self.assertNotIn("root-child-private-name", str(expected_codes))
         self.assertNotIn("other-child-private-name", str(expected_codes))
         self.assertNotIn("orphan-private-name", str(expected_codes))
+        self.assertNotIn("private-companion-name", str(expected_codes))
 
         with mock.patch.object(
             self.helper,
@@ -1993,6 +2011,168 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             self.helper._process_survivor_code(launchd_named, 502),
             "disposable-user-probe-name-remains",
         )
+
+    def test_launchd_user_domain_observation_is_status_only_and_fail_closed(
+        self,
+    ) -> None:
+        expected_env = {
+            "HOME": "/var/empty",
+            "LANG": "C",
+            "LC_ALL": "C",
+            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+            "TZ": "UTC",
+        }
+        for returncode, expected in ((0, True), (113, False)):
+            with (
+                self.subTest(returncode=returncode),
+                mock.patch.object(
+                    self.helper.subprocess,
+                    "run",
+                    return_value=self.helper.subprocess.CompletedProcess(
+                        args=[],
+                        returncode=returncode,
+                    ),
+                ) as run,
+            ):
+                self.assertEqual(
+                    self.helper._launchd_user_domain_present(502),
+                    expected,
+                )
+            run.assert_called_once_with(
+                ["/bin/launchctl", "print", "user/502"],
+                check=False,
+                stdin=self.helper.subprocess.DEVNULL,
+                stdout=self.helper.subprocess.DEVNULL,
+                stderr=self.helper.subprocess.DEVNULL,
+                timeout=self.helper.COMMAND_TIMEOUT_SECONDS,
+                env=expected_env,
+            )
+
+        with mock.patch.object(
+            self.helper.subprocess,
+            "run",
+            return_value=self.helper.subprocess.CompletedProcess(
+                args=[],
+                returncode=113,
+            ),
+        ) as run:
+            self.assertEqual(
+                self.helper._launchd_user_domain_observation_code(
+                    502,
+                    timeout=0.75,
+                ),
+                "launchd-user-domain-absent-during-process-wait",
+            )
+        self.assertEqual(run.call_args.kwargs["timeout"], 0.75)
+
+        for invalid_timeout in (True, 0, -1, 10.1, "1", None):
+            with (
+                self.subTest(invalid_timeout=invalid_timeout),
+                mock.patch.object(self.helper.subprocess, "run") as run,
+                self.assertRaises(self.helper.ProbeError) as raised,
+            ):
+                self.helper._launchd_user_domain_present(
+                    502,
+                    timeout=invalid_timeout,
+                )
+            self.assertEqual(
+                raised.exception.code,
+                "invalid-launchd-user-domain-timeout",
+            )
+            run.assert_not_called()
+
+        for label, outcome in (
+            (
+                "other-status",
+                self.helper.subprocess.CompletedProcess(args=[], returncode=1),
+            ),
+            (
+                "signal",
+                self.helper.subprocess.CompletedProcess(args=[], returncode=-9),
+            ),
+            (
+                "boolean-status",
+                self.helper.subprocess.CompletedProcess(args=[], returncode=True),
+            ),
+            (
+                "missing-status",
+                self.helper.subprocess.CompletedProcess(args=[], returncode=None),
+            ),
+            (
+                "out-of-range-status",
+                self.helper.subprocess.CompletedProcess(args=[], returncode=256),
+            ),
+            ("os-error", OSError("secret command failure")),
+            (
+                "timeout",
+                self.helper.subprocess.TimeoutExpired(
+                    cmd=["/bin/launchctl"],
+                    timeout=10,
+                    output=b"secret output",
+                    stderr=b"secret stderr",
+                ),
+            ),
+        ):
+            side_effect = outcome if isinstance(outcome, BaseException) else None
+            return_value = None if side_effect is not None else outcome
+            with (
+                self.subTest(label=label),
+                mock.patch.object(
+                    self.helper.subprocess,
+                    "run",
+                    side_effect=side_effect,
+                    return_value=return_value,
+                ),
+                self.assertRaises(self.helper.ProbeError) as raised,
+            ):
+                self.helper._launchd_user_domain_present(502)
+            self.assertEqual(
+                raised.exception.code,
+                "launchd-user-domain-presence-unavailable",
+            )
+            self.assertNotIn("secret", raised.exception.code)
+
+        with (
+            mock.patch.object(self.helper.subprocess, "run") as run,
+            self.assertRaises(self.helper.ProbeError) as raised,
+        ):
+            self.helper._launchd_user_domain_present(501)
+        self.assertEqual(raised.exception.code, "invalid-disposable-uid")
+        run.assert_not_called()
+
+        with (
+            mock.patch.object(
+                self.helper,
+                "_launchd_user_domain_present",
+                return_value=True,
+            ),
+            self.assertRaises(self.helper.ProbeError) as raised,
+        ):
+            self.helper._require_launchd_user_domain_absent(
+                502,
+                present_code="launchd-user-domain-present-before-account",
+            )
+        self.assertEqual(
+            raised.exception.code,
+            "launchd-user-domain-present-before-account",
+        )
+
+        with (
+            mock.patch.object(
+                self.helper,
+                "_launchd_user_domain_present",
+            ) as observe,
+            self.assertRaises(self.helper.ProbeError) as raised,
+        ):
+            self.helper._require_launchd_user_domain_absent(
+                502,
+                present_code="secret-dynamic-code",
+            )
+        self.assertEqual(
+            raised.exception.code,
+            "invalid-launchd-user-domain-present-code",
+        )
+        observe.assert_not_called()
 
         invalid = {
             "missing-pid-one": "502 120 1 120 S cfprefsd\n",
@@ -2041,6 +2221,10 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 "_process_records",
                 return_value=(process_record,),
             ) as process_scan,
+            mock.patch.object(
+                self.helper,
+                "_require_launchd_user_domain_absent",
+            ) as domain_check,
             mock.patch.object(self.helper, "_write_root_file"),
         ):
             plan = self.helper._initialize_lifecycle(
@@ -2052,6 +2236,49 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             )
         self.assertEqual(plan.account.uid, 504)
         process_scan.assert_called_once_with()
+        domain_check.assert_called_once_with(
+            504,
+            present_code="launchd-user-domain-present-before-account",
+        )
+
+    def test_lifecycle_initialization_rejects_preexisting_user_domain_before_writes(
+        self,
+    ) -> None:
+        stage = Path("/private/var/tmp/task-witness-macos-launchd-123456789-2")
+        code = "launchd-user-domain-present-before-account"
+        with (
+            mock.patch.object(
+                self.helper,
+                "validate_prestaged_helper",
+                return_value=b"trusted helper",
+            ),
+            mock.patch.object(
+                self.helper,
+                "_list_accounts",
+                return_value={"root": 0, "runner": 501},
+            ),
+            mock.patch.object(self.helper, "_process_records", return_value=()),
+            mock.patch.object(
+                self.helper,
+                "_require_launchd_user_domain_absent",
+                side_effect=self.helper.ProbeError(code),
+            ) as domain_check,
+            mock.patch.object(self.helper, "_write_root_file") as write,
+            self.assertRaises(self.helper.ProbeError) as raised,
+        ):
+            self.helper._initialize_lifecycle(
+                stage_root=stage,
+                expected_helper_sha256="1" * 64,
+                runner_uid=501,
+                runner_gid=20,
+                environment=eligible_context(),
+            )
+        self.assertEqual(raised.exception.code, code)
+        domain_check.assert_called_once_with(
+            502,
+            present_code=code,
+        )
+        write.assert_not_called()
 
     def test_account_creation_rechecks_process_occupancy_before_ds_mutation(
         self,
@@ -2090,6 +2317,38 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
         list_accounts.assert_called_once_with()
         account_exists.assert_called_once_with(plan.account.name)
         mutate.assert_not_called()
+
+    def test_account_creation_rechecks_user_domain_before_ds_mutation(self) -> None:
+        plan = self.lifecycle_plan(
+            Path("/private/var/tmp/task-witness-macos-launchd-123456789-2")
+        )
+        state = self.lifecycle_state(plan)
+        code = "launchd-user-domain-present-before-account"
+        with (
+            mock.patch.object(
+                self.helper,
+                "_list_accounts",
+                return_value={"root": 0, "runner": 501},
+            ),
+            mock.patch.object(self.helper, "_account_exists", return_value=False),
+            mock.patch.object(self.helper, "_require_disposable_uid_available"),
+            mock.patch.object(
+                self.helper,
+                "_require_launchd_user_domain_absent",
+                side_effect=self.helper.ProbeError(code),
+            ) as domain_check,
+            mock.patch.object(self.helper, "_require_command_success") as mutate,
+            mock.patch.object(self.helper, "_write_account_binding") as bind,
+            self.assertRaises(self.helper.ProbeError) as raised,
+        ):
+            self.helper._create_disposable_account(plan, state)
+        self.assertEqual(raised.exception.code, code)
+        domain_check.assert_called_once_with(
+            plan.account.uid,
+            present_code=code,
+        )
+        mutate.assert_not_called()
+        bind.assert_not_called()
 
     def test_precreate_uid_collision_is_visible_without_process_metadata(
         self,
@@ -2141,6 +2400,62 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
         )
         self.assertNotIn("pid", stderr.getvalue())
         self.assertNotIn("cfprefsd", stderr.getvalue())
+
+    def test_user_domain_appearance_before_bootstrap_stops_launchd_mutation(
+        self,
+    ) -> None:
+        plan = self.lifecycle_plan(Path("/private/var/tmp/stage"))
+        state = self.lifecycle_state(plan)
+        code = "launchd-user-domain-present-before-bootstrap"
+        stderr = io.StringIO()
+        with (
+            mock.patch.dict(os.environ, eligible_context(), clear=True),
+            mock.patch.object(self.helper, "_normalized_context"),
+            mock.patch.object(self.helper, "_validate_lifecycle_arguments"),
+            mock.patch.object(self.helper, "_create_root_directory"),
+            mock.patch.object(
+                self.helper,
+                "_load_lifecycle_state",
+                return_value=(plan, state),
+            ),
+            mock.patch.object(
+                self.helper,
+                "_validate_exact_stage",
+                return_value=self.helper.ValidatedStageBindings(None, None),
+            ),
+            mock.patch.object(self.helper, "_require_launchd_absent") as job_absent,
+            mock.patch.object(self.helper, "_create_disposable_account"),
+            mock.patch.object(self.helper, "_create_disposable_home"),
+            mock.patch.object(
+                self.helper,
+                "_require_launchd_user_domain_absent",
+                side_effect=self.helper.ProbeError(code),
+            ) as domain_check,
+            mock.patch.object(self.helper, "_require_command_success") as mutate,
+            mock.patch.object(self.helper, "_write_lifecycle_artifact") as write,
+            redirect_stderr(stderr),
+        ):
+            self.assertEqual(
+                self.helper.run_launchd_user_lifecycle(
+                    stage_root=plan.stage_root,
+                    artifact_root=Path("/private/tmp/artifact"),
+                    candidate_sha=FROZEN_CANDIDATE_SHA,
+                    runner_uid=501,
+                    runner_gid=20,
+                ),
+                2,
+            )
+        job_absent.assert_called_once_with(plan.label)
+        domain_check.assert_called_once_with(
+            plan.account.uid,
+            present_code=code,
+        )
+        mutate.assert_not_called()
+        self.assertEqual(write.call_args.kwargs["error_code"], code)
+        self.assertEqual(
+            stderr.getvalue(),
+            f"task-witness macOS launchd-user lifecycle: {code}\n",
+        )
 
     def test_dscl_uid_parser_and_account_record_validation_are_closed(self) -> None:
         self.assertEqual(
@@ -3227,6 +3542,10 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             ),
             mock.patch.object(self.helper, "_create_disposable_account"),
             mock.patch.object(self.helper, "_create_disposable_home"),
+            mock.patch.object(
+                self.helper,
+                "_require_launchd_user_domain_absent",
+            ),
             mock.patch.object(self.helper, "_require_launchd_absent"),
             mock.patch.object(
                 self.helper,
@@ -3309,6 +3628,10 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             ),
             mock.patch.object(self.helper, "_create_disposable_account"),
             mock.patch.object(self.helper, "_create_disposable_home"),
+            mock.patch.object(
+                self.helper,
+                "_require_launchd_user_domain_absent",
+            ),
             mock.patch.object(self.helper, "_require_launchd_absent"),
             mock.patch.object(
                 self.helper,
@@ -3393,6 +3716,10 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             ),
             mock.patch.object(self.helper, "_create_disposable_account"),
             mock.patch.object(self.helper, "_create_disposable_home"),
+            mock.patch.object(
+                self.helper,
+                "_require_launchd_user_domain_absent",
+            ),
             mock.patch.object(self.helper, "_require_launchd_absent"),
             mock.patch.object(
                 self.helper,
@@ -3528,6 +3855,10 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             mock.patch.object(
                 self.helper,
                 "_require_disposable_uid_available",
+            ),
+            mock.patch.object(
+                self.helper,
+                "_require_launchd_user_domain_absent",
             ),
             mock.patch.object(
                 self.helper,
@@ -3701,6 +4032,10 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 ),
                 mock.patch.object(
                     self.helper,
+                    "_require_launchd_user_domain_absent",
+                ),
+                mock.patch.object(
+                    self.helper,
                     "_run_lifecycle_command",
                     side_effect=command,
                 ),
@@ -3783,6 +4118,10 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             mock.patch.object(
                 self.helper,
                 "_require_disposable_uid_available",
+            ),
+            mock.patch.object(
+                self.helper,
+                "_require_launchd_user_domain_absent",
             ),
             mock.patch.object(self.helper, "_require_command_success"),
             mock.patch.object(
@@ -4036,6 +4375,10 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 mock.patch.object(self.helper, "_create_disposable_home"),
                 mock.patch.object(
                     self.helper,
+                    "_require_launchd_user_domain_absent",
+                ),
+                mock.patch.object(
+                    self.helper,
                     "_run_lifecycle_command",
                     return_value=(1, "", "sensitive bootstrap stderr"),
                 ),
@@ -4138,6 +4481,10 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             mock.patch.object(
                 self.helper,
                 "_require_disposable_uid_available",
+            ),
+            mock.patch.object(
+                self.helper,
+                "_require_launchd_user_domain_absent",
             ),
             mock.patch.object(
                 self.helper,
@@ -4328,6 +4675,14 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
     def test_disposable_user_process_exit_wait_is_bounded_and_fail_closed(
         self,
     ) -> None:
+        real_domain_observation = self.helper._launchd_user_domain_observation_code
+        domain_observation_patcher = mock.patch.object(
+            self.helper,
+            "_launchd_user_domain_observation_code",
+            return_value="launchd-user-domain-absent-during-process-wait",
+        )
+        domain_observation = domain_observation_patcher.start()
+        self.addCleanup(domain_observation_patcher.stop)
         process_remains = self.helper.ProbeError(
             "disposable-user-cfprefsd-name-remains"
         )
@@ -4340,7 +4695,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             mock.patch.object(
                 self.helper.time,
                 "monotonic",
-                side_effect=[0.0, 0.1, 0.2, 0.3],
+                side_effect=[0.0, 0.1, 0.2, 0.3, 0.4],
             ),
             mock.patch.object(self.helper.time, "sleep") as sleep,
         ):
@@ -4363,7 +4718,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             ),
         ):
             self.helper._wait_for_no_uid_processes(502)
-        scan.assert_called_once_with(502, timeout=5.0)
+        scan.assert_called_once_with(502, timeout=4.0)
 
         for label, error in (
             (
@@ -4372,7 +4727,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             ),
             ("invalid-list", self.helper.ProbeError("process-list-invalid")),
         ):
-            monotonic = [0.0, 0.1, 31.0] if label == "timeout" else [0.0, 0.1]
+            monotonic = [0.0, 0.1, 31.0, 31.0] if label == "timeout" else [0.0, 0.1]
             with (
                 self.subTest(label=label),
                 mock.patch.object(
@@ -4405,6 +4760,31 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 self.helper.time,
                 "monotonic",
                 side_effect=[0.0, 0.1, 29.9, 30.1],
+            ),
+            mock.patch.object(self.helper.time, "sleep") as sleep,
+            self.assertRaises(self.helper.ProbeError) as raised,
+        ):
+            self.helper._wait_for_no_uid_processes(502)
+        self.assertEqual(
+            raised.exception.code,
+            "disposable-user-cfprefsd-name-remains",
+        )
+        scan.assert_called_once_with(502, timeout=10)
+        sleep.assert_not_called()
+
+        with (
+            mock.patch.object(
+                self.helper,
+                "_require_no_uid_processes",
+                side_effect=[
+                    self.helper.ProbeError("disposable-user-cfprefsd-name-remains"),
+                    self.helper.ProbeError("lifecycle-command-failed-process-list"),
+                ],
+            ) as scan,
+            mock.patch.object(
+                self.helper.time,
+                "monotonic",
+                side_effect=[0.0, 0.1, 0.2, 29.9, 30.1],
             ),
             mock.patch.object(self.helper.time, "sleep") as sleep,
             self.assertRaises(self.helper.ProbeError) as raised,
@@ -4450,7 +4830,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             mock.patch.object(
                 self.helper.time,
                 "monotonic",
-                side_effect=[0.0, 0.1, 0.2, 0.3, 31.0],
+                side_effect=[0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 31.0],
             ),
             mock.patch.object(self.helper.time, "sleep"),
             self.assertRaises(self.helper.ProbeError) as raised,
@@ -4460,6 +4840,79 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             raised.exception.code,
             "disposable-user-process-observation-unstable",
         )
+
+        domain_observation.side_effect = [
+            "launchd-user-domain-absent-during-process-wait",
+            "launchd-user-domain-present-during-process-wait",
+        ]
+        with (
+            mock.patch.object(
+                self.helper,
+                "_require_no_uid_processes",
+                side_effect=self.helper.ProbeError(
+                    "disposable-user-background-agent-names-remain"
+                ),
+            ),
+            mock.patch.object(
+                self.helper.time,
+                "monotonic",
+                side_effect=[0.0, 0.1, 0.2, 29.9, 29.95],
+            ),
+            mock.patch.object(self.helper.time, "sleep"),
+            self.assertRaises(self.helper.ProbeError) as raised,
+        ):
+            self.helper._wait_for_no_uid_processes(502)
+        self.assertEqual(
+            raised.exception.code,
+            "disposable-user-background-agent-names-remain",
+        )
+        self.assertEqual(
+            raised.exception.secondary_code,
+            "launchd-user-domain-observation-unstable",
+        )
+
+        with (
+            mock.patch.object(
+                self.helper,
+                "_launchd_user_domain_observation_code",
+                side_effect=real_domain_observation,
+            ),
+            mock.patch.object(
+                self.helper,
+                "_require_no_uid_processes",
+                side_effect=self.helper.ProbeError(
+                    "disposable-user-background-agent-names-remain"
+                ),
+            ),
+            mock.patch.object(
+                self.helper.subprocess,
+                "run",
+                return_value=self.helper.subprocess.CompletedProcess(
+                    args=[],
+                    returncode=113,
+                ),
+            ) as run,
+            mock.patch.object(
+                self.helper.time,
+                "monotonic",
+                side_effect=[0.0, 0.1, 0.2, 29.9, 29.95],
+            ),
+            mock.patch.object(self.helper.time, "sleep"),
+            self.assertRaises(self.helper.ProbeError) as raised,
+        ):
+            self.helper._wait_for_no_uid_processes(502)
+        self.assertEqual(
+            raised.exception.code,
+            "disposable-user-background-agent-names-remain",
+        )
+        self.assertEqual(
+            raised.exception.secondary_code,
+            "launchd-user-domain-absent-during-process-wait",
+        )
+        domain_timeouts = [call.kwargs["timeout"] for call in run.call_args_list]
+        self.assertEqual(len(domain_timeouts), 2)
+        self.assertAlmostEqual(domain_timeouts[0], 1.0)
+        self.assertAlmostEqual(domain_timeouts[1], 0.05)
 
     def test_owned_job_reconciliation_is_exact_and_absence_is_idempotent(
         self,
@@ -4878,6 +5331,10 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 mock.patch.object(self.helper, "_create_disposable_home"),
                 mock.patch.object(
                     self.helper,
+                    "_require_launchd_user_domain_absent",
+                ),
+                mock.patch.object(
+                    self.helper,
                     "_require_launchd_absent",
                     side_effect=require_absent,
                 ),
@@ -4933,6 +5390,10 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             ),
             mock.patch.object(self.helper, "_create_disposable_account"),
             mock.patch.object(self.helper, "_create_disposable_home"),
+            mock.patch.object(
+                self.helper,
+                "_require_launchd_user_domain_absent",
+            ),
             mock.patch.object(
                 self.helper,
                 "_require_launchd_absent",
@@ -5218,6 +5679,10 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                                 command="launchd",
                             ),
                         ),
+                    ),
+                    mock.patch.object(
+                        self.helper,
+                        "_require_launchd_user_domain_absent",
                     ),
                     mock.patch.object(
                         self.helper,
@@ -5843,7 +6308,10 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                     self.helper,
                     "_wait_for_no_uid_processes",
                     side_effect=self.helper.ProbeError(
-                        "disposable-user-spotlight-worker-remains"
+                        "disposable-user-spotlight-worker-remains",
+                        secondary_code=(
+                            "launchd-user-domain-present-during-process-wait"
+                        ),
                     ),
                 ) as wait,
                 mock.patch.multiple(
@@ -5888,12 +6356,19 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             self.assertEqual(cleanup["disposition"], "preserved-on-drift")
             self.assertEqual(
                 cleanup["error"],
-                {"code": "disposable-user-spotlight-worker-remains"},
+                {
+                    "code": "disposable-user-spotlight-worker-remains",
+                    "secondary_code": (
+                        "launchd-user-domain-present-during-process-wait"
+                    ),
+                },
             )
             self.assertEqual(
                 stderr.getvalue(),
                 "task-witness macOS launchd-user cleanup: "
-                "disposable-user-spotlight-worker-remains\n",
+                "disposable-user-spotlight-worker-remains\n"
+                "task-witness macOS launchd-user cleanup secondary: "
+                "launchd-user-domain-present-during-process-wait\n",
             )
 
     def test_cleanup_preserves_stage_when_planned_uid_remains_occupied(self) -> None:

@@ -6512,6 +6512,13 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 stack.enter_context(
                     mock.patch.object(
                         self.helper,
+                        "_require_durable_user_domain_reset_authorization",
+                        return_value=marker,
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        self.helper,
                         "_account_exists",
                         side_effect=[True, False],
                     )
@@ -6676,6 +6683,13 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                         self.helper,
                         "_validate_exact_stage",
                         return_value=bindings,
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        self.helper,
+                        "_require_durable_user_domain_reset_authorization",
+                        return_value=marker,
                     )
                 )
                 stack.enter_context(
@@ -8433,6 +8447,194 @@ raise SystemExit(93)
                     + (["readback"] if failure in {"readback", "disagree"} else []),
                 )
 
+    def test_cleanup_reestablishes_reset_authorization_after_failed_fsync(
+        self,
+    ) -> None:
+        plan = self.lifecycle_plan(Path("/private/var/tmp/stage"))
+        state = self.lifecycle_state(plan)
+        generated_uid = "01234567-89AB-4DEF-8123-456789ABCDEF"
+        account = self.helper._account_binding_document(plan, state, generated_uid)
+        ownership = self.helper._launchd_ownership_document(plan, state)
+        bindings = self.helper.ValidatedStageBindings(account, ownership)
+        authorization = eligible_context()["GITHUB_SHA"]
+        home_identity = {
+            "home_device": 1,
+            "home_inode": 2,
+            "probe_device": 1,
+            "probe_inode": 3,
+        }
+        events: list[str] = []
+        written: dict[str, object] = {}
+
+        def write(path: Path, raw: bytes, mode: int) -> None:
+            events.append("write")
+            written.update(path=path, raw=raw, mode=mode)
+
+        def fsync(_stage: Path) -> None:
+            events.append("fsync")
+            if events.count("fsync") == 1:
+                raise self.helper.ProbeError("user-domain-reset-stage-fsync-failed")
+
+        def readback(*_args: object, **_kwargs: object) -> dict:
+            events.append("readback")
+            return json.loads(bytes(written["raw"]))
+
+        def wait(_uid: int) -> None:
+            events.append("wait")
+            if events.count("wait") == 1:
+                raise self.helper.ProbeError(
+                    "disposable-user-pid1-parented-processes-remain"
+                )
+
+        with (
+            mock.patch.object(
+                self.helper,
+                "_read_system_generated_uid",
+                return_value=generated_uid,
+            ),
+            mock.patch.object(self.helper, "_require_launchd_absent"),
+            mock.patch.object(
+                self.helper,
+                "_load_account_binding",
+                return_value=account,
+            ),
+            mock.patch.object(
+                self.helper,
+                "_exact_disposable_home_identity",
+                return_value=home_identity,
+            ),
+            mock.patch.object(self.helper, "_write_root_file", side_effect=write),
+            mock.patch.object(
+                self.helper,
+                "_fsync_stage_directory",
+                side_effect=fsync,
+            ) as sync,
+            mock.patch.object(
+                self.helper,
+                "_load_user_domain_reset_authorization",
+                side_effect=readback,
+            ) as load,
+            mock.patch.object(
+                self.helper,
+                "_validate_reset_bindings_and_resources",
+                side_effect=lambda *_args, **_kwargs: events.append("binding"),
+            ),
+            mock.patch.object(
+                self.helper,
+                "_wait_for_no_uid_processes",
+                side_effect=wait,
+            ),
+            mock.patch.object(
+                self.helper,
+                "_run_user_domain_reset",
+                side_effect=lambda _uid: events.append("reset"),
+            ) as reset,
+            mock.patch.object(
+                self.helper,
+                "_require_stable_no_uid_processes",
+                side_effect=lambda _uid: events.append("stable-zero"),
+            ),
+        ):
+            with self.assertRaises(self.helper.ProbeError) as raised:
+                self.helper._write_user_domain_reset_authorization(
+                    plan,
+                    state,
+                    bindings,
+                    authorization,
+                    eligible_context(),
+                )
+            self.assertEqual(
+                raised.exception.code,
+                "user-domain-reset-stage-fsync-failed",
+            )
+            marker = json.loads(bytes(written["raw"]))
+            recovered = self.helper._quiesce_disposable_user(
+                plan,
+                state,
+                self.helper.ValidatedStageBindings(account, ownership, marker),
+                authorization,
+                eligible_context(),
+                allow_create=False,
+            )
+
+        self.assertEqual(
+            events,
+            [
+                "write",
+                "fsync",
+                "fsync",
+                "readback",
+                "binding",
+                "wait",
+                "binding",
+                "reset",
+                "wait",
+                "stable-zero",
+                "binding",
+            ],
+        )
+        self.assertEqual(sync.call_count, 2)
+        load.assert_called_once_with(
+            plan,
+            state,
+            account,
+            ownership,
+            authorization,
+            eligible_context(),
+        )
+        reset.assert_called_once_with(plan.account.uid)
+        self.assertEqual(
+            recovered["authorization_sha256"],
+            marker["content_sha256"],
+        )
+
+    def test_cleanup_refuses_reset_when_marker_durability_cannot_be_restored(
+        self,
+    ) -> None:
+        plan = self.lifecycle_plan(Path("/private/var/tmp/stage"))
+        state = self.lifecycle_state(plan)
+        marker = {"content_sha256": "4" * 64}
+        bindings = self.helper.ValidatedStageBindings(
+            {"account": "exact"},
+            {"ownership": "exact"},
+            marker,
+        )
+        with (
+            mock.patch.object(
+                self.helper,
+                "_fsync_stage_directory",
+                side_effect=self.helper.ProbeError(
+                    "user-domain-reset-stage-fsync-failed"
+                ),
+            ) as sync,
+            mock.patch.object(
+                self.helper,
+                "_load_user_domain_reset_authorization",
+            ) as load,
+            mock.patch.object(
+                self.helper,
+                "_wait_for_no_uid_processes",
+            ) as wait,
+            mock.patch.object(self.helper, "_run_user_domain_reset") as reset,
+            self.assertRaises(self.helper.ProbeError) as raised,
+        ):
+            self.helper._quiesce_disposable_user(
+                plan,
+                state,
+                bindings,
+                eligible_context()["GITHUB_SHA"],
+                eligible_context(),
+                allow_create=False,
+            )
+        self.assertEqual(
+            raised.exception.code,
+            "user-domain-reset-stage-fsync-failed",
+        )
+        sync.assert_called_once_with(plan.stage_root)
+        load.assert_not_called()
+        wait.assert_not_called()
+        reset.assert_not_called()
+
     def test_user_domain_reset_marker_is_canonical_and_fully_bound(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             stage = Path(directory) / "stage"
@@ -8589,6 +8791,11 @@ raise SystemExit(93)
         with (
             mock.patch.object(
                 self.helper,
+                "_require_durable_user_domain_reset_authorization",
+                return_value=marker,
+            ),
+            mock.patch.object(
+                self.helper,
                 "_wait_for_no_uid_processes",
                 side_effect=wait,
             ),
@@ -8637,6 +8844,11 @@ raise SystemExit(93)
             marker,
         )
         with (
+            mock.patch.object(
+                self.helper,
+                "_require_durable_user_domain_reset_authorization",
+                return_value=marker,
+            ),
             mock.patch.object(
                 self.helper,
                 "_validate_reset_bindings_and_resources",
@@ -8811,6 +9023,13 @@ raise SystemExit(93)
                                 self.helper,
                                 "_validate_exact_stage",
                                 return_value=bindings,
+                            )
+                        )
+                        stack.enter_context(
+                            mock.patch.object(
+                                self.helper,
+                                "_require_durable_user_domain_reset_authorization",
+                                return_value=marker,
                             )
                         )
                         stack.enter_context(
@@ -9162,6 +9381,11 @@ raise SystemExit(93)
         marker = {"content_sha256": "4" * 64, "home_identity": identity}
         bindings = self.helper.ValidatedStageBindings(account, ownership, marker)
         with (
+            mock.patch.object(
+                self.helper,
+                "_require_durable_user_domain_reset_authorization",
+                return_value=marker,
+            ),
             mock.patch.object(self.helper, "_require_launchd_absent"),
             mock.patch.object(
                 self.helper,
@@ -9234,6 +9458,11 @@ raise SystemExit(93)
         for code in ("account-record-home-drift", "account-record-gid-drift"):
             with (
                 self.subTest(code=code),
+                mock.patch.object(
+                    self.helper,
+                    "_require_durable_user_domain_reset_authorization",
+                    return_value=marker,
+                ),
                 mock.patch.object(self.helper, "_require_launchd_absent"),
                 mock.patch.object(
                     self.helper,

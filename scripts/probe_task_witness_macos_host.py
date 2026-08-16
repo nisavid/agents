@@ -3084,6 +3084,30 @@ def _fsync_stage_directory(stage_root: Path) -> None:
             os.close(descriptor)
 
 
+def _require_durable_user_domain_reset_authorization(
+    plan: LaunchdPlan,
+    state: Mapping[str, object],
+    bindings: ValidatedStageBindings,
+    authorization_sha: object,
+    environment: Mapping[str, str],
+    expected: Mapping[str, object],
+) -> dict:
+    if bindings.account is None or bindings.launchd is None:
+        raise ProbeError("user-domain-reset-binding-missing")
+    _fsync_stage_directory(plan.stage_root)
+    observed = _load_user_domain_reset_authorization(
+        plan,
+        state,
+        bindings.account,
+        bindings.launchd,
+        authorization_sha,
+        environment,
+    )
+    if observed != expected:
+        raise ProbeError("user-domain-reset-authorization-disagrees")
+    return observed
+
+
 def _write_user_domain_reset_authorization(
     plan: LaunchdPlan,
     state: Mapping[str, object],
@@ -3115,18 +3139,14 @@ def _write_user_domain_reset_authorization(
     if len(raw) > MAX_USER_DOMAIN_RESET_BYTES:
         raise ProbeError("user-domain-reset-authorization-too-large")
     _write_root_file(plan.stage_root / "domain-reset.json", raw, 0o600)
-    _fsync_stage_directory(plan.stage_root)
-    observed = _load_user_domain_reset_authorization(
+    return _require_durable_user_domain_reset_authorization(
         plan,
         state,
-        bindings.account,
-        bindings.launchd,
+        bindings,
         authorization_sha,
         environment,
+        document,
     )
-    if observed != document:
-        raise ProbeError("user-domain-reset-authorization-disagrees")
-    return document
 
 
 def validate_prestaged_helper(stage_root: Path, expected_sha256: str) -> bytes:
@@ -4638,6 +4658,14 @@ def _quiesce_disposable_user(
 ) -> dict[str, str]:
     marker = bindings.domain_reset
     if marker is not None:
+        marker = _require_durable_user_domain_reset_authorization(
+            plan,
+            state,
+            bindings,
+            authorization_sha,
+            environment,
+            marker,
+        )
         _validate_reset_bindings_and_resources(
             plan,
             state,

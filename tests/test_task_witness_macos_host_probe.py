@@ -1632,6 +1632,21 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             "UserShell": ["/usr/bin/false"],
         }
         self.helper.require_exact_account_record(record, expected)
+        for password_marker in ("*", "********"):
+            changed = dict(record)
+            changed["Password"] = [password_marker]
+            self.helper.require_exact_account_record(changed, expected)
+        for invalid_password in ([], ["**"], ["*", "********"], ["hash"]):
+            changed = dict(record)
+            changed["Password"] = invalid_password
+            with self.subTest(password=invalid_password):
+                with self.assertRaises(self.helper.ProbeError) as raised:
+                    self.helper.require_exact_account_record(changed, expected)
+                self.assertEqual(
+                    raised.exception.code,
+                    "account-record-password-drift",
+                )
+                self.assertIsNone(raised.exception.secondary_code)
         changed = dict(record)
         changed["GeneratedUID"] = ["AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"]
         self.helper.require_exact_account_record(changed, expected)
@@ -1658,7 +1673,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             ),
             "IsHidden": (["0"], "account-record-hidden-drift"),
             "NFSHomeDirectory": (["/Users/other"], "account-record-home-drift"),
-            "Password": (["*"], "account-record-password-drift"),
+            "Password": (["**"], "account-record-password-drift"),
             "PrimaryGroupID": (["0"], "account-record-gid-drift"),
             "UniqueID": (["-2"], "account-record-uid-drift"),
             "UserShell": (["/bin/zsh"], "account-record-shell-drift"),
@@ -2902,7 +2917,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 f"GeneratedUID: {system_generated_uid}",
                 "dsAttrTypeNative:IsHidden: 1",
                 f"NFSHomeDirectory: {account.home}",
-                "Password: ********",
+                "Password: *",
                 "PrimaryGroupID: 20",
                 "UniqueID: 502",
                 "UserShell: /usr/bin/false",

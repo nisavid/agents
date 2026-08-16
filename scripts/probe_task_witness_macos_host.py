@@ -55,7 +55,9 @@ DSCL_UID_MAX = (1 << 31) - 1
 DSCL_UID_RE = re.compile(r"(?:0|[1-9][0-9]*|-[1-9][0-9]*)")
 DSCL_ATTRIBUTE_PREFIXES = ("dsAttrTypeNative:", "dsAttrTypeStandard:")
 DISABLED_PASSWORD_WRITE_MARKER = "*"
-DISABLED_PASSWORD_READBACK_MARKER = "********"
+DISABLED_PASSWORD_READBACK_MARKERS = frozenset(
+    (DISABLED_PASSWORD_WRITE_MARKER, "********")
+)
 LAUNCHD_ACCOUNT_RE = re.compile(r"twq-[0-9a-f]{12}")
 LAUNCHD_LABEL_RE = re.compile(r"io\.nisavid\.task-witness\.macos-probe\.[0-9a-f]{12}")
 LAUNCHD_OWNERSHIP_MARKER_RE = re.compile(r"[0-9a-f]{32}")
@@ -998,7 +1000,7 @@ def require_exact_account_record(
         ),
         (
             "Password",
-            [DISABLED_PASSWORD_READBACK_MARKER],
+            None,
             "account-record-password-missing",
             "account-record-password-drift",
         ),
@@ -1032,7 +1034,14 @@ def require_exact_account_record(
     except ProbeError as error:
         raise ProbeError("account-record-generated-uid-drift") from error
     for name, values, _missing_code, code in field_requirements:
-        if values is not None and list(record.get(name, ())) != values:
+        observed = list(record.get(name, ()))
+        if name == "Password":
+            if (
+                len(observed) != 1
+                or observed[0] not in DISABLED_PASSWORD_READBACK_MARKERS
+            ):
+                raise ProbeError(code)
+        elif values is not None and observed != values:
             raise ProbeError(code)
 
 

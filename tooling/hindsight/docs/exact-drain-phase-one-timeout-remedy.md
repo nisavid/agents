@@ -297,3 +297,169 @@ total-wall-clock timeout test was rerun in an ephemeral `uv --with httpx`
 environment and passed. The first result was dependency-only, not a behavioral
 failure. `git diff --check` also passed, and the repository remained unchanged
 except for this uncommitted research note.
+
+## Schema 11 design addendum
+
+### What schema 10 actually bounds
+
+The exact Phase 1 guard does **not** preserve one deadline across Phase 1 LLM
+breadcrumbs. It creates the deadline while the holder starts with
+`retain.phase1.`, but clears it on every other stage. A transition such as
+`retain.phase1.resolve` to `llm.codex.retain.attempt=1/1` therefore discards the
+old deadline; returning to `retain.phase1.*` starts a new 3,600-second clock
+(`tooling/hindsight/lib/hindsight_memory_control_plane/operation_recovery_runtime.py:1500-1530`).
+The existing stage-projection test proves that this transition is normal,
+while the timeout test covers only a holder that remains continuously in one
+Phase 1 stage. There is no test for deadline continuity across the transition
+(`tooling/hindsight/tests/test_hindsight_memory_operation_recovery_runtime.py:2960-3074`).
+
+There is nevertheless a separate whole-retain backstop in the bound upstream
+poller. `_run_executor` wraps the complete task executor in the configured
+retain wall timeout and distinguishes that outer timeout from a nested
+`TimeoutError`. The bound candidate defaults that wall timeout to 3,600 seconds.
+The exact worker's closed environment does not permit the corresponding
+override, so the default is effective for this candidate
+(`bound candidate lib/hindsight_api/worker/poller.py:54-70`,
+`bound candidate lib/hindsight_api/config.py:1273-1280`,
+`tooling/hindsight/bin/hindsight-exact-drain-worker:144-198`). The exact
+candidate patch also requires the upstream `_wall_timeout_for` seam to exist
+(`tooling/hindsight/lib/hindsight_memory_control_plane/operation_recovery_runtime.py:2960-2976`).
+
+Consequently, schema 10's arithmetic happens to reserve 3,600 seconds per
+whole operation attempt, not merely per Phase 1: the execution-window term is
+one 3,600-second value per remaining-attempt wave
+(`tooling/hindsight/lib/hindsight_memory_control_plane/operation_recovery.py:2176-2247`).
+That equality is implicit, however. The plan calls the field
+`phase_one_timeout_seconds`; neither its closed verifier nor the runtime guard
+states that it is also the upstream whole-task ceiling. Schema 11 should make
+that authority explicit instead of relying on two independent constants that
+currently share a value.
+
+### Exact deadline semantics
+
+Schema 11 should use three monotonic deadlines, all anchored once and never
+extended by retries, breadcrumbs, or provider transitions:
+
+1. **Operation-attempt deadline:** `operation_attempt_timeout_seconds = 3600`.
+   It starts immediately before the complete claimed task executor and bounds
+   every phase, provider wait, provider execution, and cancellation path for
+   that one attempt. It replaces the implicit reliance on the upstream default.
+2. **Phase 1 deadline:** `phase_one_timeout_seconds = 3600`. It starts on the
+   first `retain.phase1.*` observation and remains fixed until an explicit
+   Phase 1 completion transition. `llm.*` is a nested breadcrumb, not a Phase 1
+   exit, so it must not clear this deadline. The operation-attempt deadline may
+   fire first when both values are 3,600; the Phase 1 deadline still preserves
+   correct phase authority if a later schema gives the whole attempt a larger
+   allowance.
+3. **Provider deadlines:** each member call gets
+   `provider_queue_timeout_seconds = 3600` from admission until its concurrency
+   gate is acquired, then a fresh
+   `provider_execution_timeout_seconds = member.timeout_seconds` only while the
+   provider operation runs. Every effective deadline is additionally capped by
+   the remaining operation-attempt deadline. Queue expiry is
+   `provider_queue_timeout`; execution expiry is
+   `provider_execution_timeout`; outer expiry is
+   `operation_attempt_timeout`. All three are closed, payload-free categories.
+
+The critical rule is that waiting for `_PriorityGate(max_concurrent=1)` must
+not consume the member's execution budget. Today the member timeout wraps the
+gate wait and operation together
+(`tooling/hindsight/lib/hindsight_memory_control_plane/provider_runtime.py:940-967`).
+Requests are recorded before that gate, so the monitor's active age likewise
+mixes queue and execution time
+(`tooling/hindsight/lib/hindsight_memory_control_plane/provider_runtime.py:1052-1076`).
+The deterministic two-call harness demonstrated the defect: with a one-second
+member timeout and one slot, only the first call entered the provider operation,
+yet both calls timed out in under 1.3 seconds. Separate clocks make the queued
+call retain its full execution allowance after admission while the outer
+3,600-second attempt ceiling still prevents an unbounded queue.
+
+This is safe under intra-operation fanout because every queued call is capped
+by the same immutable attempt deadline and the provider gate still admits only
+one execution. The upstream extraction path can create all chunk calls
+concurrently, so schema 11 must not pretend that the three calls observed in
+this run are a universal fanout bound. No fanout multiplier is needed in the
+lease formula: the whole-attempt deadline is the authoritative cap regardless
+of how many children are queued. At attempt expiry, the worker must cancel the
+executor, wait for the existing bounded quiescence path, and retain claim
+ownership if quiescence cannot be proved
+(`tooling/hindsight/lib/hindsight_memory_control_plane/operation_recovery_runtime.py:1557-1583`).
+
+### Closed plan and verifier contract
+
+Use plan schema 11 with progress schema 4 and a new failure-evidence contract
+digest. The plan must close and verify these fields:
+
+| Surface | Required closed fields |
+| --- | --- |
+| Attempt authority | `operation_attempt_timeout_seconds=3600`, `phase_one_timeout_seconds=3600`, `phase_one_deadline_anchor=first-phase-one-entry`, `phase_one_nested_stage_prefixes=["llm."]` |
+| Provider authority | per-member `queue_timeout_seconds=3600`, `execution_timeout_seconds` (the existing member timeout, including Hatchery's 1,200 seconds), `max_concurrent` |
+| Failure evidence | closed categories `provider_queue_timeout`, `provider_execution_timeout`, `operation_attempt_timeout`, and the existing categories; retryability and failure stage remain explicit |
+| Progress | payload-free request state `queued` or `executing`, queue-start/acquire/finish timestamps, queue age, execution age, and separate queue/execution timeout counters |
+| Execution window | `remaining_attempt_count`, `retry_wait_count`, `effective_concurrency`, `operation_attempt_timeout_seconds`, transaction/retry/startup/shutdown margins, `calculated_seconds`, and `maximum_seconds` |
+
+The schema-11 window formula is:
+
+```text
+execution_waves = ceil(remaining_attempt_count / effective_concurrency)
+transaction_margin = 2 * remaining_attempt_count * transaction_timeout
+shutdown_margin = shutdown_attempt_count * transaction_timeout
+calculated_seconds =
+    execution_waves * operation_attempt_timeout
+    + retry_wait_count * maximum_retry_delay
+    + startup_margin
+    + transaction_margin
+    + shutdown_margin
+```
+
+The verifier must recompute every count and term from the sealed selected rows,
+require `0 < execution_timeout_seconds <= operation_attempt_timeout_seconds`,
+`0 < queue_timeout_seconds <= operation_attempt_timeout_seconds`, and
+`0 < phase_one_timeout_seconds <= operation_attempt_timeout_seconds`, and reject
+`calculated_seconds > maximum_seconds`. Queue and execution budgets are nested
+within the whole-attempt ceiling, so they must **not** be added again to the
+execution-window formula. With the recommended 3,600-second whole-attempt value,
+schema 11 preserves schema 10's current 975,600-second calculation for this row
+set while fixing what that term explicitly means.
+
+The runtime must distinguish which timeout scope fired rather than classifying
+any `TimeoutError` as Phase 1. The current classifier collapses both typed and
+plain timeout evidence into `phase_one_timeout`
+(`tooling/hindsight/lib/hindsight_memory_control_plane/operation_recovery_runtime.py:743-777`).
+Schema 11 should use dedicated bounded exception types, check each timeout
+context's `expired()` state, and project only category, retryability, optional
+HTTP status, error digest, failure stage, and payload-free checkpoints.
+
+### Compatibility boundary
+
+Schemas 1 through 10 and progress schemas 1 through 3 are immutable historical
+contracts. Do not migrate, reinterpret, or resume their plans under schema-11
+semantics. Their plan digests, monolithic provider timeouts, failure categories,
+execution-window field names, candidate snapshots, and progress journal shapes
+must continue through their existing version-specific verifier paths. The
+progress writer and verifier currently accept only versions 1, 2, and 3, so
+version 4 must be an additive branch rather than a silent expansion of version
+3 (`tooling/hindsight/lib/hindsight_memory_control_plane/operation_recovery_progress.py:377-395`,
+`tooling/hindsight/lib/hindsight_memory_control_plane/operation_recovery_progress.py:1091-1123`).
+
+Provider-policy compatibility should follow the same rule: legacy policy
+schema keeps `timeout_seconds` as the total gate-plus-execution wall clock;
+schema 11 binds a new policy schema with mutually required
+`queue_timeout_seconds` and `execution_timeout_seconds`. Monitoring may read
+both shapes, but archived progress must validate against the plan's original
+progress schema. A schema-11 repair therefore requires a rebuilt candidate,
+new runtime and failure-contract digests, a fresh verified plan, and new
+authorization. It cannot be applied to the active schema-10 worker.
+
+### Required proof before a schema-11 plan
+
+The implementation gate is a deterministic test matrix, not another live
+trial: deadline continuity across `retain.phase1.* -> llm.* ->
+retain.phase1.*`; one executing and at least two queued provider calls under
+`max_concurrent=1`; queue timeout without provider entry; a full execution
+budget after gate acquisition; outer attempt cancellation and quiescence;
+phase-specific closed classification; schema-11 arithmetic recomputation and
+tamper rejection; payload-redacted progress; and unchanged golden verification
+for plan schemas 1-10 and progress schemas 1-3. Only after those tests and
+candidate verification pass should a fresh schema-11 exact-drain plan be
+offered for approval.

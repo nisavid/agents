@@ -1407,7 +1407,9 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
         self.assertNotIn("/bin/su", argv)
         self.assertNotIn("/bin/sh", argv)
 
-    def test_launchd_job_binding_requires_the_exact_child_environment(self) -> None:
+    def test_launchd_job_binding_requires_exact_environment_and_runtime_shape(
+        self,
+    ) -> None:
         context = self.launchd_context()
         plan = self.lifecycle_plan(
             Path("/private/var/tmp/task-witness-macos-launchd-123456789-2")
@@ -1428,6 +1430,50 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 self.helper._validate_launchd_job_binding(loaded, plan, state),
                 {"ownership_marker": state["ownership_marker"]},
             )
+            pre_kickstart = loaded.replace(
+                "\truns = 1\n\tlast exit code = 0\n",
+                "\truns = 0\n\tlast exit code = (never exited)\n",
+            )
+            validated_pre_kickstart = self.helper._validated_launchd_job_snapshot(
+                pre_kickstart,
+                plan,
+                state,
+            )
+            self.assertEqual(validated_pre_kickstart.sanitized, pre_kickstart)
+            running_after_kickstart = (
+                pre_kickstart.replace("active count = 0", "active count = 1", 1)
+                .replace("state = not running", "state = running", 1)
+                .replace("\truns = 0\n", "\tpid = 1234\n\truns = 1\n", 1)
+            )
+            validated_running = self.helper._validated_launchd_job_snapshot(
+                running_after_kickstart,
+                plan,
+                state,
+            )
+            self.assertIn("\tstate = running\n", validated_running.sanitized)
+            self.assertNotIn("\tpid = 1234\n", validated_running.sanitized)
+            with self.assertRaises(self.helper.ProbeError) as raised:
+                self.helper.parse_launchctl_terminal(
+                    pre_kickstart,
+                    expected_status=0,
+                )
+            self.assertEqual(raised.exception.code, "launchctl-terminal-invalid")
+            for invalid_exit in ("(abandoned)", "(failed reap)", "never exited"):
+                invalid_pre_kickstart = pre_kickstart.replace(
+                    "(never exited)",
+                    invalid_exit,
+                )
+                with self.subTest(last_exit_code=invalid_exit):
+                    with self.assertRaises(self.helper.ProbeError) as raised:
+                        self.helper._validated_launchd_job_snapshot(
+                            invalid_pre_kickstart,
+                            plan,
+                            state,
+                        )
+                    self.assertEqual(
+                        raised.exception.code,
+                        "launchd-job-binding-invalid",
+                    )
             secret = "default-environment-secret-canary"
             normal = self.launchctl_job_with_unrelated_blocks(
                 plan,

@@ -3180,6 +3180,7 @@ def _validated_launchd_job_snapshot(
         or (runs is not None and re.fullmatch(r"[0-9]+", runs) is None)
         or (
             last_exit_code is not None
+            and last_exit_code != "(never exited)"
             and re.fullmatch(r"-?[0-9]+", last_exit_code) is None
         )
     ):

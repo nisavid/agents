@@ -1193,6 +1193,10 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 mock.patch.dict(os.environ, child_environment, clear=True),
                 mock.patch.object(
                     self.helper,
+                    "_validate_launchd_child_entry_home",
+                ),
+                mock.patch.object(
+                    self.helper,
                     "collect_observations",
                     return_value=json.loads(json.dumps(base)),
                 ),
@@ -1231,6 +1235,157 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             self.assertIsNone(document["observations"])
             self.assertIsNone(document["requirements"])
             self.assertNotIn("launchd-user-eligible", output.read_text())
+
+    def test_launchd_child_entry_checkpoint_binds_exact_identity(self) -> None:
+        context = self.launchd_context()
+        marker = "3" * 32
+        account_name, label = self.helper._launchd_identity(context)
+        home = Path("/Users") / account_name
+        child_environment = self.helper.build_launchd_user_plist(
+            label=label,
+            user=account_name,
+            home=home,
+            helper=Path("/private/var/tmp/task-witness-probe/helper.py"),
+            candidate_sha=FROZEN_CANDIDATE_SHA,
+            environment=context,
+            ownership_marker=marker,
+        )["EnvironmentVariables"]
+        output = home / "launchd-probe/probe.json"
+        status_output = home / "launchd-probe/probe.status"
+
+        with (
+            mock.patch.dict(os.environ, child_environment, clear=True),
+            mock.patch.object(self.helper.os, "geteuid", return_value=550),
+            mock.patch.object(self.helper.os, "getegid", return_value=20),
+            mock.patch.object(
+                self.helper,
+                "_validate_disposable_home_root",
+            ) as validate,
+        ):
+            self.helper._validate_launchd_child_entry_home(
+                output,
+                status_output,
+            )
+
+        validate.assert_called_once_with(
+            self.helper.DisposableAccount(
+                name=account_name,
+                uid=550,
+                gid=20,
+                home=home,
+            ),
+            diagnostic_phase="child-entry",
+        )
+
+        for label_name, environment in (
+            ("home", {**child_environment, "HOME": "/Users/foreign"}),
+            (
+                "marker",
+                {
+                    **child_environment,
+                    "TASK_WITNESS_LAUNCHD_OWNERSHIP_MARKER": "invalid",
+                },
+            ),
+        ):
+            with (
+                self.subTest(label=label_name),
+                mock.patch.dict(os.environ, environment, clear=True),
+                mock.patch.object(
+                    self.helper,
+                    "_validate_disposable_home_root",
+                ) as rejected_validate,
+                self.assertRaises(self.helper.ProbeError),
+            ):
+                self.helper._validate_launchd_child_entry_home(
+                    output,
+                    status_output,
+                )
+            rejected_validate.assert_not_called()
+
+        foreign_root = Path("/private/tmp/private-launchd-output-canary")
+        for label_name, rejected_output, rejected_status in (
+            (
+                "output",
+                foreign_root / "probe.json",
+                status_output,
+            ),
+            (
+                "status",
+                output,
+                foreign_root / "probe.status",
+            ),
+            (
+                "both",
+                foreign_root / "probe.json",
+                foreign_root / "probe.status",
+            ),
+        ):
+            with (
+                self.subTest(label=label_name),
+                mock.patch.dict(os.environ, child_environment, clear=True),
+                mock.patch.object(
+                    self.helper,
+                    "_validate_disposable_home_root",
+                ) as rejected_validate,
+                self.assertRaises(self.helper.ProbeError) as raised,
+            ):
+                self.helper._validate_launchd_child_entry_home(
+                    rejected_output,
+                    rejected_status,
+                )
+            self.assertEqual(raised.exception.code, "invalid-launchd-output-paths")
+            self.assertNotIn("private-launchd-output-canary", raised.exception.code)
+            rejected_validate.assert_not_called()
+
+    def test_launchd_child_entry_failure_precedes_observation_collection(
+        self,
+    ) -> None:
+        context = self.launchd_context()
+        code = "home-cleanup-child-entry-home-entry-known-library-owned-directory"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "launchd-probe"
+            root.mkdir()
+            output = root / "probe.json"
+            status_output = root / "probe.status"
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                mock.patch.dict(os.environ, context, clear=True),
+                mock.patch.object(
+                    self.helper,
+                    "_validate_launchd_child_entry_home",
+                    side_effect=self.helper.ProbeError(code),
+                ) as validate,
+                mock.patch.object(
+                    self.helper,
+                    "collect_launchd_observations",
+                ) as collect,
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                status = self.helper.run_launchd_user_probe(
+                    output,
+                    status_output,
+                    FROZEN_CANDIDATE_SHA,
+                )
+
+            document = json.loads(output.read_text())
+            self.assertEqual(status, 2)
+            self.assertEqual(status_output.read_bytes(), b"2\n")
+            self.assertEqual(document["disposition"], "probe-error")
+            self.assertEqual(document["error"], {"code": code})
+            self.assertIsNone(document["observations"])
+            self.assertIsNone(document["requirements"])
+            validate.assert_called_once_with(output, status_output)
+            collect.assert_not_called()
+            self.assertEqual(stdout.getvalue(), "probe-error\n")
+            self.assertEqual(
+                stderr.getvalue(),
+                f"task-witness macOS launchd-user probe: {code}\n",
+            )
+            self.assertNotIn(str(root), self.helper.canonical_bytes(document).decode())
+            self.assertNotIn(str(root), stdout.getvalue())
+            self.assertNotIn(str(root), stderr.getvalue())
 
     def test_child_accepts_only_the_exact_plist_environment(self) -> None:
         context = self.launchd_context()

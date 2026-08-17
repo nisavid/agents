@@ -171,6 +171,7 @@ USER_DOMAIN_RESET_CAPABILITY = "github-hosted-ephemeral-user-domain-reset-v1"
 USER_DOMAIN_RESET_SURVIVOR_CODE = "disposable-user-pid1-parented-processes-remain"
 HOME_CLEANUP_DIAGNOSTIC_PHASES = frozenset(
     {
+        "child-entry",
         "child-read",
         "cleanup-entry",
         "home-removal",
@@ -5945,6 +5946,40 @@ def run_probe(output: Path, candidate_sha: str) -> int:
     return status
 
 
+def _validate_launchd_child_entry_home(
+    output: Path,
+    status_output: Path,
+) -> None:
+    account_name, label = _launchd_identity(os.environ)
+    home = Path("/Users") / account_name
+    ownership_marker = _require_string(
+        os.environ.get("TASK_WITNESS_LAUNCHD_OWNERSHIP_MARKER"),
+        "launchd-ownership-marker",
+        64,
+    )
+    _require_exact_launchd_child_environment(
+        os.environ,
+        label=label,
+        home=home,
+        ownership_marker=ownership_marker,
+    )
+    probe_root = home / "launchd-probe"
+    if (
+        output != probe_root / "probe.json"
+        or status_output != probe_root / "probe.status"
+    ):
+        raise ProbeError("invalid-launchd-output-paths")
+    _validate_disposable_home_root(
+        DisposableAccount(
+            name=account_name,
+            uid=os.geteuid(),
+            gid=os.getegid(),
+            home=home,
+        ),
+        diagnostic_phase="child-entry",
+    )
+
+
 def run_launchd_user_probe(
     output: Path,
     status_output: Path,
@@ -5959,6 +5994,7 @@ def run_launchd_user_probe(
     _normalized_context(os.environ)
     status = 0
     try:
+        _validate_launchd_child_entry_home(output, status_output)
         observations = collect_launchd_observations()
         document = build_launchd_user_probe_document(
             candidate_sha,

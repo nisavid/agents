@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import errno
 import grp
 import hashlib
 import json
@@ -43,6 +44,7 @@ MAX_HELPER_BYTES = 256 * 1024
 MAX_OWNERSHIP_BYTES = 4 * 1024
 MAX_ACCOUNT_BINDING_BYTES = 4 * 1024
 MAX_USER_DOMAIN_RESET_BYTES = 4 * 1024
+MAX_HOME_CLEANUP_BYTES = 4 * 1024
 MAX_PROCESS_LIST_BYTES = 64 * 1024
 COMMAND_TIMEOUT_SECONDS = 10
 LAUNCHD_POLL_INTERVAL_SECONDS = 0.25
@@ -52,6 +54,7 @@ PROCESS_EXIT_POLL_TIMEOUT_SECONDS = 30
 PROCESS_LIST_MIN_TIMEOUT_SECONDS = 1
 LAUNCHD_PRINT_MAX_BYTES = 16 * 1024
 LAUNCHCTL_NOT_FOUND_STATUS = 113
+RENAME_EXCL = 0x00000004
 DISPOSABLE_UID_MIN = 502
 DISPOSABLE_UID_MAX = 599
 DSCL_UID_MIN = -(1 << 31)
@@ -218,6 +221,7 @@ class ValidatedStageBindings(NamedTuple):
     account: dict | None
     launchd: dict | None
     domain_reset: dict | None = None
+    home_cleanup: dict | None = None
 
 
 class ProcessRecord(NamedTuple):
@@ -1376,6 +1380,108 @@ def _validate_exact_disposable_home(
             raise ProbeError("home-cleanup-drift")
 
 
+def _validated_marker_bound_disposable_home(
+    account: DisposableAccount,
+    expected_identity: object,
+) -> tuple[bool, bool, tuple[str, ...]]:
+    identity = _validated_disposable_home_identity(expected_identity)
+    home = account.home
+    probe_root = home / "launchd-probe"
+    try:
+        home_metadata = home.lstat()
+    except FileNotFoundError:
+        return False, False, ()
+    except OSError as error:
+        raise ProbeError("home-cleanup-drift") from error
+    if (
+        not stat.S_ISDIR(home_metadata.st_mode)
+        or stat.S_IMODE(home_metadata.st_mode) != 0o700
+        or home_metadata.st_uid != account.uid
+        or home_metadata.st_gid != account.gid
+        or (home_metadata.st_dev, home_metadata.st_ino)
+        != (identity["home_device"], identity["home_inode"])
+    ):
+        raise ProbeError("home-cleanup-drift")
+    try:
+        home_names = {entry.name for entry in home.iterdir()}
+    except OSError as error:
+        raise ProbeError("home-cleanup-drift") from error
+    try:
+        probe_metadata = probe_root.lstat()
+    except FileNotFoundError:
+        if home_names:
+            raise ProbeError("home-cleanup-drift")
+        return True, False, ()
+    except OSError as error:
+        raise ProbeError("home-cleanup-drift") from error
+    if (
+        home_names != {"launchd-probe"}
+        or not stat.S_ISDIR(probe_metadata.st_mode)
+        or stat.S_IMODE(probe_metadata.st_mode) != 0o700
+        or probe_metadata.st_uid != account.uid
+        or probe_metadata.st_gid != account.gid
+        or (probe_metadata.st_dev, probe_metadata.st_ino)
+        != (identity["probe_device"], identity["probe_inode"])
+    ):
+        raise ProbeError("home-cleanup-drift")
+    try:
+        names = {entry.name for entry in probe_root.iterdir()}
+    except OSError as error:
+        raise ProbeError("home-cleanup-drift") from error
+    if not names <= set(LAUNCHD_CHILD_FILES):
+        raise ProbeError("home-cleanup-drift")
+    for name in sorted(names):
+        try:
+            metadata = (probe_root / name).lstat()
+        except OSError as error:
+            raise ProbeError("home-cleanup-drift") from error
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_uid != account.uid
+            or metadata.st_gid != account.gid
+            or metadata.st_size > LAUNCHD_CHILD_FILES[name]
+        ):
+            raise ProbeError("home-cleanup-drift")
+    return True, True, tuple(sorted(names))
+
+
+def _remove_marker_bound_disposable_home(
+    account: DisposableAccount,
+    expected_identity: object,
+    authorization: Mapping[str, object] | None,
+) -> None:
+    identity = _validated_disposable_home_identity(expected_identity)
+    if (
+        authorization is None
+        or authorization.get("disposition") != "armed"
+        or authorization.get("account")
+        != {
+            "name": account.name,
+            "uid": account.uid,
+            "gid": account.gid,
+            "home": str(account.home),
+        }
+        or authorization.get("home_identity") != identity
+    ):
+        raise ProbeError("home-cleanup-authorization-drift")
+    home_present, probe_present, names = _validated_marker_bound_disposable_home(
+        account,
+        identity,
+    )
+    if not home_present:
+        return
+    probe_root = account.home / "launchd-probe"
+    try:
+        for name in names:
+            (probe_root / name).unlink()
+        if probe_present:
+            probe_root.rmdir()
+        account.home.rmdir()
+    except OSError as error:
+        raise ProbeError("home-cleanup-failed") from error
+
+
 def _run_bounded_command(argv: Sequence[str]) -> tuple[int, str, str]:
     try:
         process = subprocess.run(
@@ -1708,6 +1814,56 @@ def write_create_new(path: Path, raw: bytes, mode: int = 0o600) -> None:
                 raise ProbeError("temporary-output-cleanup-failed") from error
 
 
+def _rename_exclusive(source: Path, destination: Path) -> None:
+    try:
+        library = ctypes.CDLL(None, use_errno=True)
+        renamex_np = library.renamex_np
+        renamex_np.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        renamex_np.restype = ctypes.c_int
+    except (AttributeError, OSError) as error:
+        raise OSError(errno.ENOTSUP, "exclusive rename unavailable") from error
+    if renamex_np(os.fsencode(source), os.fsencode(destination), RENAME_EXCL) != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(
+            error_number,
+            os.strerror(error_number),
+            str(destination),
+        )
+
+
+def _write_stage_create_new(path: Path, raw: bytes, mode: int) -> None:
+    temporary_descriptor = -1
+    temporary_path = ""
+    try:
+        # Keep an interrupted pre-publication file outside the stage's exact-name
+        # lattice, then publish one single-link name without replacing a peer.
+        temporary_descriptor, temporary_path = tempfile.mkstemp(
+            prefix=f".{path.parent.name}-{path.name}-",
+            dir=path.parent.parent,
+        )
+        os.fchmod(temporary_descriptor, mode)
+        offset = 0
+        while offset < len(raw):
+            offset += os.write(temporary_descriptor, raw[offset:])
+        os.fsync(temporary_descriptor)
+        os.close(temporary_descriptor)
+        temporary_descriptor = -1
+        _rename_exclusive(Path(temporary_path), path)
+        temporary_path = ""
+    except OSError as error:
+        raise ProbeError("output-create-new-failed") from error
+    finally:
+        if temporary_descriptor >= 0:
+            os.close(temporary_descriptor)
+        if temporary_path:
+            try:
+                os.unlink(temporary_path)
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                raise ProbeError("temporary-output-cleanup-failed") from error
+
+
 def _bounded_regular_file(path: Path, maximum: int, label: str) -> bytes:
     try:
         metadata = path.lstat()
@@ -1943,9 +2099,11 @@ def verify_launchd_success(artifact_root: Path) -> None:
         raise ProbeError("launchd-user-probe-ineligible")
     binding = _validated_launchd_binding_evidence(lifecycle.get("binding"))
     domain_reset = _validated_domain_reset_evidence(lifecycle.get("domain_reset"))
+    home_cleanup = _validated_home_cleanup_evidence(cleanup.get("home_cleanup"))
     if (
         domain_reset["disposition"] == "recovered-to-stable-zero"
         or _validated_domain_reset_evidence(cleanup.get("domain_reset")) != domain_reset
+        or home_cleanup["disposition"] != "performed"
     ):
         raise ProbeError("launchd-user-probe-ineligible")
     expected_lifecycle = _document_with_digest(
@@ -1963,13 +2121,14 @@ def verify_launchd_success(artifact_root: Path) -> None:
     )
     expected_cleanup = _document_with_digest(
         {
-            "schema_version": 2,
-            "contract": "task-witness-macos-launchd-cleanup-v2",
+            "schema_version": 3,
+            "contract": "task-witness-macos-launchd-cleanup-v3",
             "candidate_sha1": EXPECTED_CANDIDATE_SHA,
             "account": account_name,
             "label": label,
             "disposition": "cleaned",
             "domain_reset": domain_reset,
+            "home_cleanup": home_cleanup,
         }
     )
     if (
@@ -3149,6 +3308,152 @@ def _write_user_domain_reset_authorization(
     )
 
 
+def _home_cleanup_document(
+    plan: LaunchdPlan,
+    state: Mapping[str, object],
+    bindings: ValidatedStageBindings,
+    home_identity: object,
+) -> dict:
+    if bindings.account is None:
+        raise ProbeError("home-cleanup-authorization-binding-missing")
+    state_sha256 = state.get("content_sha256")
+    account_sha256 = bindings.account.get("content_sha256")
+    ownership_sha256 = (
+        "none" if bindings.launchd is None else bindings.launchd.get("content_sha256")
+    )
+    reset_sha256 = (
+        "none"
+        if bindings.domain_reset is None
+        else bindings.domain_reset.get("content_sha256")
+    )
+    account_value = bindings.account.get("account")
+    identity = _validated_disposable_home_identity(home_identity)
+    if (
+        not isinstance(account_value, dict)
+        or account_value
+        != {
+            "name": plan.account.name,
+            "uid": plan.account.uid,
+            "gid": plan.account.gid,
+            "home": str(plan.account.home),
+            "generated_uid": account_value.get("generated_uid"),
+        }
+        or not isinstance(account_value.get("generated_uid"), str)
+        or any(
+            not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None
+            for value in (
+                state_sha256,
+                account_sha256,
+            )
+        )
+        or any(
+            value != "none"
+            and (
+                not isinstance(value, str)
+                or re.fullmatch(r"[0-9a-f]{64}", value) is None
+            )
+            for value in (ownership_sha256, reset_sha256)
+        )
+        or (
+            bindings.domain_reset is not None
+            and bindings.domain_reset.get("home_identity") != identity
+        )
+    ):
+        raise ProbeError("home-cleanup-authorization-binding-drift")
+    return _document_with_digest(
+        {
+            "schema_version": 1,
+            "contract": "task-witness-macos-home-cleanup-authorization-v1",
+            "candidate_sha1": EXPECTED_CANDIDATE_SHA,
+            "disposition": "armed",
+            "account": {
+                "name": plan.account.name,
+                "uid": plan.account.uid,
+                "gid": plan.account.gid,
+                "home": str(plan.account.home),
+            },
+            "home_identity": identity,
+            "label": plan.label,
+            "stage_root": str(plan.stage_root),
+            "state_sha256": state_sha256,
+            "account_binding_sha256": account_sha256,
+            "ownership_sha256": ownership_sha256,
+            "domain_reset_sha256": reset_sha256,
+        }
+    )
+
+
+def _load_home_cleanup_authorization(
+    plan: LaunchdPlan,
+    state: Mapping[str, object],
+    bindings: ValidatedStageBindings,
+) -> dict | None:
+    path = plan.stage_root / "home-cleanup.json"
+    if not _path_exists_no_follow(path):
+        return None
+    if not _metadata_matches(
+        path,
+        kind="file",
+        mode=0o600,
+        uid=0,
+        gid=0,
+        nlink=1,
+    ):
+        raise ProbeError("home-cleanup-authorization-drift")
+    document = _load_canonical_document(
+        path,
+        MAX_HOME_CLEANUP_BYTES,
+        "home-cleanup-authorization",
+    )
+    _require_content_digest(document, "home-cleanup-authorization")
+    try:
+        expected = _home_cleanup_document(
+            plan,
+            state,
+            bindings,
+            document.get("home_identity"),
+        )
+    except ProbeError as error:
+        raise ProbeError("home-cleanup-authorization-drift") from error
+    if document != expected:
+        raise ProbeError("home-cleanup-authorization-drift")
+    return document
+
+
+def _require_durable_home_cleanup_authorization(
+    plan: LaunchdPlan,
+    state: Mapping[str, object],
+    bindings: ValidatedStageBindings,
+    expected: Mapping[str, object],
+) -> dict:
+    _fsync_stage_directory(plan.stage_root)
+    observed = _load_home_cleanup_authorization(plan, state, bindings)
+    if observed != expected:
+        raise ProbeError("home-cleanup-authorization-disagrees")
+    return observed
+
+
+def _write_home_cleanup_authorization(
+    plan: LaunchdPlan,
+    state: Mapping[str, object],
+    bindings: ValidatedStageBindings,
+    home_identity: object,
+) -> dict:
+    if bindings.home_cleanup is not None:
+        raise ProbeError("home-cleanup-authorization-already-exists")
+    document = _home_cleanup_document(plan, state, bindings, home_identity)
+    raw = canonical_bytes(document)
+    if len(raw) > MAX_HOME_CLEANUP_BYTES:
+        raise ProbeError("home-cleanup-authorization-too-large")
+    _write_stage_create_new(plan.stage_root / "home-cleanup.json", raw, 0o600)
+    return _require_durable_home_cleanup_authorization(
+        plan,
+        state,
+        bindings,
+        document,
+    )
+
+
 def validate_prestaged_helper(stage_root: Path, expected_sha256: str) -> bytes:
     if re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None:
         raise ProbeError("invalid-staged-helper-digest")
@@ -4168,6 +4473,9 @@ def _validate_exact_stage(
     account_names = base_names | {"account.json"}
     ownership_names = account_names | {"ownership.json"}
     reset_names = ownership_names | {"domain-reset.json"}
+    account_home_cleanup_names = account_names | {"home-cleanup.json"}
+    ownership_home_cleanup_names = ownership_names | {"home-cleanup.json"}
+    reset_home_cleanup_names = reset_names | {"home-cleanup.json"}
     if (
         names
         not in (
@@ -4175,6 +4483,9 @@ def _validate_exact_stage(
             account_names,
             ownership_names,
             reset_names,
+            account_home_cleanup_names,
+            ownership_home_cleanup_names,
+            reset_home_cleanup_names,
         )
         or not _metadata_matches(
             plan.stage_root,
@@ -4210,6 +4521,7 @@ def _validate_exact_stage(
     account = _load_account_binding(plan, state)
     ownership = _load_launchd_ownership_marker(plan, state)
     domain_reset: dict | None = None
+    home_cleanup: dict | None = None
     if "domain-reset.json" in names:
         if account is None or ownership is None or environment is None:
             raise ProbeError("stage-cleanup-drift")
@@ -4221,18 +4533,29 @@ def _validate_exact_stage(
             user_domain_reset_authorization,
             environment,
         )
+    if "home-cleanup.json" in names:
+        if account is None:
+            raise ProbeError("stage-cleanup-drift")
+        home_cleanup = _load_home_cleanup_authorization(
+            plan,
+            state,
+            ValidatedStageBindings(account, ownership, domain_reset),
+        )
     if (
         ("account.json" in names) != (account is not None)
         or ("ownership.json" in names) != (ownership is not None)
         or ("domain-reset.json" in names) != (domain_reset is not None)
+        or ("home-cleanup.json" in names) != (home_cleanup is not None)
         or (ownership is not None and account is None)
         or (domain_reset is not None and ownership is None)
+        or (home_cleanup is not None and account is None)
     ):
         raise ProbeError("stage-cleanup-drift")
     return ValidatedStageBindings(
         account=account,
         launchd=ownership,
         domain_reset=domain_reset,
+        home_cleanup=home_cleanup,
     )
 
 
@@ -4550,16 +4873,65 @@ def _validated_domain_reset_evidence(value: object) -> dict[str, str]:
     }
 
 
+def _home_cleanup_evidence(
+    authorization: Mapping[str, object] | None,
+    *,
+    recovered: bool,
+) -> dict[str, str]:
+    if authorization is None:
+        return {
+            "authorization_sha256": "none",
+            "disposition": "not-needed",
+        }
+    digest = authorization.get("content_sha256")
+    if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise ProbeError("home-cleanup-authorization-drift")
+    return {
+        "authorization_sha256": digest,
+        "disposition": "recovered" if recovered else "performed",
+    }
+
+
+def _validated_home_cleanup_evidence(value: object) -> dict[str, str]:
+    evidence = _require_exact_keys(
+        value,
+        {"authorization_sha256", "disposition"},
+        "home-cleanup-evidence",
+    )
+    authorization_sha256 = evidence.get("authorization_sha256")
+    disposition = evidence.get("disposition")
+    if (
+        disposition not in {"not-needed", "performed", "recovered"}
+        or (disposition == "not-needed" and authorization_sha256 != "none")
+        or (
+            disposition in {"performed", "recovered"}
+            and (
+                not isinstance(authorization_sha256, str)
+                or re.fullmatch(r"[0-9a-f]{64}", authorization_sha256) is None
+            )
+        )
+    ):
+        raise ProbeError("invalid-home-cleanup-evidence")
+    return {
+        "authorization_sha256": str(authorization_sha256),
+        "disposition": str(disposition),
+    }
+
+
 def _cleanup_domain_reset_evidence(
     artifact_root: Path,
     plan: LaunchdPlan,
     state: Mapping[str, object],
     marker: Mapping[str, object] | None,
+    *,
+    force_recovered: bool = False,
 ) -> dict[str, str]:
     if marker is None:
         return _domain_reset_evidence(None)
     performed = _domain_reset_evidence(marker)
     recovered = _recovered_domain_reset_evidence(marker)
+    if force_recovered:
+        return recovered
     try:
         lifecycle = _load_canonical_document(
             artifact_root / "lifecycle.json",
@@ -4609,6 +4981,7 @@ def _validate_reset_bindings_and_resources(
     marker: Mapping[str, object],
     authorization_sha: object,
     environment: Mapping[str, str],
+    home_cleanup: Mapping[str, object] | None = None,
 ) -> tuple[bool, bool]:
     _require_launchd_absent(plan.label)
     bindings = _validate_exact_stage(
@@ -4617,7 +4990,11 @@ def _validate_reset_bindings_and_resources(
         user_domain_reset_authorization=authorization_sha,
         environment=environment,
     )
-    if bindings.domain_reset != marker or bindings.account is None:
+    if (
+        bindings.domain_reset != marker
+        or bindings.home_cleanup != home_cleanup
+        or bindings.account is None
+    ):
         raise ProbeError("user-domain-reset-authorization-drift")
     account_value = bindings.account.get("account")
     if not isinstance(account_value, dict):
@@ -4639,11 +5016,29 @@ def _validate_reset_bindings_and_resources(
             raise ProbeError("account-record-generated-uid-drift")
     elif plan.account.name in accounts or plan.account.uid in accounts.values():
         raise ProbeError("account-record-drift")
-    home_present = _path_exists_no_follow(plan.account.home)
-    if home_present and _exact_disposable_home_identity(
-        plan.account
-    ) != _validated_disposable_home_identity(marker.get("home_identity")):
+    home_present, probe_present, remaining_home_files = (
+        _validated_marker_bound_disposable_home(
+            plan.account,
+            marker.get("home_identity"),
+        )
+    )
+    if (
+        account_present
+        and home_present
+        and (not probe_present or set(remaining_home_files) != set(LAUNCHD_CHILD_FILES))
+    ):
         raise ProbeError("home-cleanup-drift")
+    home_complete = (
+        home_present
+        and probe_present
+        and set(remaining_home_files) == set(LAUNCHD_CHILD_FILES)
+    )
+    if (not home_complete and home_cleanup is None) or (
+        home_cleanup is not None and account_present
+    ):
+        raise ProbeError(
+            "home-cleanup-drift" if home_cleanup is None else "account-record-drift"
+        )
     return account_present, home_present
 
 
@@ -4656,6 +5051,15 @@ def _quiesce_disposable_user(
     *,
     allow_create: bool,
 ) -> dict[str, str]:
+    if bindings.home_cleanup is not None:
+        bindings = bindings._replace(
+            home_cleanup=_require_durable_home_cleanup_authorization(
+                plan,
+                state,
+                bindings,
+                bindings.home_cleanup,
+            )
+        )
     marker = bindings.domain_reset
     if marker is not None:
         marker = _require_durable_user_domain_reset_authorization(
@@ -4672,6 +5076,7 @@ def _quiesce_disposable_user(
             marker,
             authorization_sha,
             environment,
+            bindings.home_cleanup,
         )
     try:
         _wait_for_no_uid_processes(plan.account.uid)
@@ -4694,6 +5099,7 @@ def _quiesce_disposable_user(
             marker,
             authorization_sha,
             environment,
+            bindings.home_cleanup,
         )
         _run_user_domain_reset(plan.account.uid)
         _wait_for_no_uid_processes(plan.account.uid)
@@ -4704,6 +5110,7 @@ def _quiesce_disposable_user(
             marker,
             authorization_sha,
             environment,
+            bindings.home_cleanup,
         )
         return _domain_reset_evidence(marker)
     if marker is not None:
@@ -4714,6 +5121,7 @@ def _quiesce_disposable_user(
             marker,
             authorization_sha,
             environment,
+            bindings.home_cleanup,
         )
     return _domain_reset_evidence(marker)
 
@@ -4807,12 +5215,23 @@ def cleanup_launchd_user_lifecycle(
             _read_system_generated_uid(plan.account.name) != expected_generated_uid
         ):
             raise ProbeError("account-record-generated-uid-drift")
+        if stage_bindings.home_cleanup is not None and account_present:
+            raise ProbeError("account-record-drift")
         if home_present:
-            _validate_exact_disposable_home(
-                plan.account.home,
-                expected_uid=plan.account.uid,
-                expected_gid=plan.account.gid,
-            )
+            if stage_bindings.home_cleanup is not None:
+                _validated_marker_bound_disposable_home(
+                    plan.account,
+                    stage_bindings.home_cleanup.get("home_identity"),
+                )
+            elif stage_bindings.domain_reset is None:
+                _validate_exact_disposable_home(
+                    plan.account.home,
+                    expected_uid=plan.account.uid,
+                    expected_gid=plan.account.gid,
+                )
+        home_cleanup_recovered = stage_bindings.home_cleanup is not None or (
+            stage_bindings.account is not None and not account_present
+        )
         reset_evidence = _domain_reset_evidence(stage_bindings.domain_reset)
         owned_user_state = (
             stage_bindings.account is not None or account_present or home_present
@@ -4833,13 +5252,8 @@ def cleanup_launchd_user_lifecycle(
                 stage_bindings.domain_reset,
                 user_domain_reset_authorization,
                 os.environ,
+                stage_bindings.home_cleanup,
             )
-        reset_evidence = _cleanup_domain_reset_evidence(
-            artifact_root,
-            plan,
-            state,
-            stage_bindings.domain_reset,
-        )
         if owned_user_state:
             _require_no_uid_processes(plan.account.uid)
         if account_present:
@@ -4851,6 +5265,7 @@ def cleanup_launchd_user_lifecycle(
                         stage_bindings.domain_reset,
                         user_domain_reset_authorization,
                         os.environ,
+                        stage_bindings.home_cleanup,
                     )
                 )
                 if not current_account_present:
@@ -4892,19 +5307,78 @@ def cleanup_launchd_user_lifecycle(
                 if account_present
                 else "account-record-drift"
             )
-        if home_present:
-            if stage_bindings.domain_reset is not None and (
-                _exact_disposable_home_identity(plan.account)
+        if owned_user_state:
+            _require_stable_no_uid_processes(plan.account.uid)
+            current_accounts = _list_accounts()
+            if (
+                plan.account.name in current_accounts
+                or plan.account.uid in current_accounts.values()
+            ):
+                raise ProbeError("account-record-drift")
+        if home_present and stage_bindings.home_cleanup is None:
+            home_identity = _exact_disposable_home_identity(plan.account)
+            if (
+                stage_bindings.domain_reset is not None
+                and home_identity
                 != _validated_disposable_home_identity(
                     stage_bindings.domain_reset.get("home_identity")
                 )
             ):
                 raise ProbeError("home-cleanup-drift")
-            remove_exact_disposable_home(
-                plan.account.home,
-                expected_uid=plan.account.uid,
-                expected_gid=plan.account.gid,
+            stage_bindings = stage_bindings._replace(
+                home_cleanup=_write_home_cleanup_authorization(
+                    plan,
+                    state,
+                    stage_bindings,
+                    home_identity,
+                )
             )
+        elif stage_bindings.home_cleanup is not None:
+            stage_bindings = stage_bindings._replace(
+                home_cleanup=_require_durable_home_cleanup_authorization(
+                    plan,
+                    state,
+                    stage_bindings,
+                    stage_bindings.home_cleanup,
+                )
+            )
+        if stage_bindings.home_cleanup is not None:
+            _require_stable_no_uid_processes(plan.account.uid)
+            current_accounts = _list_accounts()
+            if (
+                plan.account.name in current_accounts
+                or plan.account.uid in current_accounts.values()
+            ):
+                raise ProbeError("account-record-drift")
+            marker_home_present, probe_present, remaining_home_files = (
+                _validated_marker_bound_disposable_home(
+                    plan.account,
+                    stage_bindings.home_cleanup.get("home_identity"),
+                )
+            )
+            home_cleanup_recovered = home_cleanup_recovered or (
+                marker_home_present
+                and (
+                    not probe_present
+                    or set(remaining_home_files) != set(LAUNCHD_CHILD_FILES)
+                )
+            )
+            if marker_home_present:
+                _remove_marker_bound_disposable_home(
+                    plan.account,
+                    stage_bindings.home_cleanup.get("home_identity"),
+                    stage_bindings.home_cleanup,
+                )
+        reset_evidence = _cleanup_domain_reset_evidence(
+            artifact_root,
+            plan,
+            state,
+            stage_bindings.domain_reset,
+        )
+        home_cleanup_evidence = _home_cleanup_evidence(
+            stage_bindings.home_cleanup,
+            recovered=home_cleanup_recovered,
+        )
         try:
             stage_names = ["helper.py", "job.plist", "state.json"]
             if stage_bindings.account is not None:
@@ -4913,6 +5387,8 @@ def cleanup_launchd_user_lifecycle(
                 stage_names.append("ownership.json")
             if stage_bindings.domain_reset is not None:
                 stage_names.append("domain-reset.json")
+            if stage_bindings.home_cleanup is not None:
+                stage_names.append("home-cleanup.json")
             for name in stage_names:
                 (stage_root / name).unlink()
             stage_root.rmdir()
@@ -4921,13 +5397,14 @@ def cleanup_launchd_user_lifecycle(
         _validate_precleanup_artifact(artifact_root)
         cleanup = _document_with_digest(
             {
-                "schema_version": 2,
-                "contract": "task-witness-macos-launchd-cleanup-v2",
+                "schema_version": 3,
+                "contract": "task-witness-macos-launchd-cleanup-v3",
                 "candidate_sha1": EXPECTED_CANDIDATE_SHA,
                 "account": plan.account.name,
                 "label": plan.label,
                 "disposition": "cleaned",
                 "domain_reset": _validated_domain_reset_evidence(reset_evidence),
+                "home_cleanup": _validated_home_cleanup_evidence(home_cleanup_evidence),
             }
         )
         _write_root_file(

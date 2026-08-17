@@ -569,6 +569,25 @@ class TaskWitnessMacOSHostProbeTests(unittest.TestCase):
                 ["link.json", "probe.json"],
             )
 
+    def test_stage_create_new_uses_exclusive_atomic_rename(self) -> None:
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            stage = root / "stage"
+            stage.mkdir()
+            output = stage / "home-cleanup.json"
+            self.helper._write_stage_create_new(output, b"first", 0o600)
+            self.assertEqual(output.read_bytes(), b"first")
+            self.assertEqual(output.lstat().st_nlink, 1)
+            self.assertEqual([entry.name for entry in stage.iterdir()], [output.name])
+            self.assertEqual([entry.name for entry in root.iterdir()], [stage.name])
+
+            with self.assertRaises(self.helper.ProbeError) as raised:
+                self.helper._write_stage_create_new(output, b"replacement", 0o600)
+            self.assertEqual(raised.exception.code, "output-create-new-failed")
+            self.assertEqual(output.read_bytes(), b"first")
+            self.assertEqual(output.lstat().st_nlink, 1)
+            self.assertEqual([entry.name for entry in root.iterdir()], [stage.name])
+
     def test_manifest_is_fixed_bounded_and_detects_tampering(self) -> None:
         with tempfile.TemporaryDirectory() as raw_root:
             root = Path(raw_root)
@@ -2694,6 +2713,10 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
         loaded = self.launchctl_job(plan, state)
         binding = {"ownership_marker": state["ownership_marker"]}
         domain_reset = self.helper._domain_reset_evidence(None)
+        home_cleanup = {
+            "authorization_sha256": "5" * 64,
+            "disposition": "performed",
+        }
         lifecycle = self.helper._document_with_digest(
             {
                 "schema_version": 2,
@@ -2709,13 +2732,14 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
         )
         cleanup = self.helper._document_with_digest(
             {
-                "schema_version": 2,
-                "contract": "task-witness-macos-launchd-cleanup-v2",
+                "schema_version": 3,
+                "contract": "task-witness-macos-launchd-cleanup-v3",
                 "candidate_sha1": FROZEN_CANDIDATE_SHA,
                 "account": account,
                 "label": label,
                 "disposition": "cleaned",
                 "domain_reset": domain_reset,
+                "home_cleanup": home_cleanup,
             }
         )
         terminal = loaded.encode("utf-8")
@@ -2771,6 +2795,28 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             external.replace(root / "SHA256SUMS")
             with mock.patch.dict(os.environ, context, clear=True):
                 self.helper.verify_launchd_success(root)
+            recovered_home_cleanup = dict(performed_cleanup)
+            recovered_home_cleanup["home_cleanup"] = {
+                **home_cleanup,
+                "disposition": "recovered",
+            }
+            (root / "cleanup.json").write_bytes(
+                self.helper.canonical_bytes(
+                    self.helper._document_with_digest(recovered_home_cleanup)
+                )
+            )
+            (root / "SHA256SUMS").unlink()
+            self.helper.write_launchd_artifact_manifest(root, external)
+            external.replace(root / "SHA256SUMS")
+            with (
+                mock.patch.dict(os.environ, context, clear=True),
+                self.assertRaises(self.helper.ProbeError) as recovered_home,
+            ):
+                self.helper.verify_launchd_success(root)
+            self.assertEqual(
+                recovered_home.exception.code,
+                "launchd-user-probe-ineligible",
+            )
             recovered_evidence = {
                 **performed,
                 "disposition": "recovered-to-stable-zero",
@@ -3774,6 +3820,328 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 )
             self.assertTrue(home.is_dir())
             self.assertTrue((probe / "foreign").is_file())
+
+    def test_marker_bound_home_cleanup_resumes_after_every_unlink(self) -> None:
+        names = sorted(self.helper.LAUNCHD_CHILD_FILES)
+        mutation_count = len(names) + 2
+        for interrupt_after in range(1, mutation_count + 1):
+            with (
+                self.subTest(interrupt_after=interrupt_after),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                home = Path(directory) / "home"
+                probe = home / "launchd-probe"
+                probe.mkdir(parents=True, mode=0o700)
+                home.chmod(0o700)
+                probe.chmod(0o700)
+                for name in names:
+                    (probe / name).write_bytes(b"value")
+                home_metadata = home.lstat()
+                probe_metadata = probe.lstat()
+                identity = {
+                    "home_device": home_metadata.st_dev,
+                    "home_inode": home_metadata.st_ino,
+                    "probe_device": probe_metadata.st_dev,
+                    "probe_inode": probe_metadata.st_ino,
+                }
+                account = self.helper.DisposableAccount(
+                    name="twq-0123456789ab",
+                    uid=os.geteuid(),
+                    gid=os.getegid(),
+                    home=home,
+                )
+                authorization = {
+                    "disposition": "armed",
+                    "account": {
+                        "name": account.name,
+                        "uid": account.uid,
+                        "gid": account.gid,
+                        "home": str(account.home),
+                    },
+                    "home_identity": identity,
+                }
+                observed_mutations = 0
+                original_unlink = Path.unlink
+                original_rmdir = Path.rmdir
+
+                def interrupt(expected_mutations: int = interrupt_after) -> None:
+                    nonlocal observed_mutations
+                    observed_mutations += 1
+                    if observed_mutations == expected_mutations:
+                        raise KeyboardInterrupt
+
+                def unlink(
+                    path: Path,
+                    *args: object,
+                    operation: object = original_unlink,
+                    **kwargs: object,
+                ) -> None:
+                    operation(path, *args, **kwargs)  # type: ignore[operator]
+                    interrupt()
+
+                def rmdir(path: Path, operation: object = original_rmdir) -> None:
+                    operation(path)  # type: ignore[operator]
+                    interrupt()
+
+                with (
+                    mock.patch.object(Path, "unlink", unlink),
+                    mock.patch.object(Path, "rmdir", rmdir),
+                    self.assertRaises(KeyboardInterrupt),
+                ):
+                    self.helper._remove_marker_bound_disposable_home(
+                        account,
+                        identity,
+                        authorization,
+                    )
+
+                self.assertEqual(observed_mutations, interrupt_after)
+                self.helper._remove_marker_bound_disposable_home(
+                    account,
+                    identity,
+                    authorization,
+                )
+                self.assertFalse(home.exists())
+
+    def test_marker_bound_partial_home_preserves_unexpected_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "home"
+            probe = home / "launchd-probe"
+            probe.mkdir(parents=True, mode=0o700)
+            home.chmod(0o700)
+            probe.chmod(0o700)
+            home_metadata = home.lstat()
+            probe_metadata = probe.lstat()
+            identity = {
+                "home_device": home_metadata.st_dev,
+                "home_inode": home_metadata.st_ino,
+                "probe_device": probe_metadata.st_dev,
+                "probe_inode": probe_metadata.st_ino,
+            }
+            account = self.helper.DisposableAccount(
+                name="twq-0123456789ab",
+                uid=os.geteuid(),
+                gid=os.getegid(),
+                home=home,
+            )
+            foreign = probe / "private-canary"
+            foreign.write_bytes(b"preserve")
+
+            with self.assertRaises(self.helper.ProbeError) as raised:
+                self.helper._remove_marker_bound_disposable_home(
+                    account,
+                    identity,
+                    {
+                        "disposition": "armed",
+                        "account": {
+                            "name": account.name,
+                            "uid": account.uid,
+                            "gid": account.gid,
+                            "home": str(account.home),
+                        },
+                        "home_identity": identity,
+                    },
+                )
+            self.assertEqual(raised.exception.code, "home-cleanup-drift")
+            self.assertEqual(foreign.read_bytes(), b"preserve")
+
+    def test_no_reset_cleanup_recovers_after_interrupted_home_unlink(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stage = root / "stage"
+            stage.mkdir()
+            home = root / "home"
+            probe = home / "launchd-probe"
+            probe.mkdir(parents=True, mode=0o700)
+            home.chmod(0o700)
+            probe.chmod(0o700)
+            for name in self.helper.LAUNCHD_CHILD_FILES:
+                (probe / name).write_bytes(b"value")
+            account = self.helper.DisposableAccount(
+                name="twq-0123456789ab",
+                uid=os.geteuid(),
+                gid=os.getegid(),
+                home=home,
+            )
+            plan = self.helper.LaunchdPlan(
+                account=account,
+                label="io.nisavid.task-witness.macos-probe.0123456789ab",
+                stage_root=stage,
+                helper=stage / "helper.py",
+                plist=stage / "job.plist",
+            )
+            state = self.lifecycle_state(plan)
+            generated_uid = "01234567-89AB-4DEF-8123-456789ABCDEF"
+            account_binding = self.helper._account_binding_document(
+                plan,
+                state,
+                generated_uid,
+            )
+            bindings = self.helper.ValidatedStageBindings(account_binding, None)
+            for name in ("helper.py", "job.plist", "state.json", "account.json"):
+                (stage / name).write_bytes(f"exact-{name}".encode())
+            artifact = root / "artifact"
+            artifact.mkdir()
+            account_live = True
+            cleanup_writes: list[tuple[Path, bytes, int]] = []
+
+            def validate_stage(*_args: object, **_kwargs: object) -> object:
+                journal_path = stage / "home-cleanup.json"
+                if not journal_path.exists():
+                    return bindings
+                return bindings._replace(
+                    home_cleanup=json.loads(journal_path.read_bytes())
+                )
+
+            def account_exists(_name: str) -> bool:
+                return account_live
+
+            def list_accounts() -> dict[str, int]:
+                return {account.name: account.uid} if account_live else {}
+
+            def command(*_args: object, **_kwargs: object) -> str:
+                nonlocal account_live
+                account_live = False
+                return ""
+
+            def write_root(path: Path, raw: bytes, mode: int) -> None:
+                cleanup_writes.append((path, raw, mode))
+
+            with ExitStack() as stack:
+                stack.enter_context(
+                    mock.patch.dict(os.environ, eligible_context(), clear=True)
+                )
+                for name in (
+                    "_normalized_context",
+                    "_validate_lifecycle_arguments",
+                    "_reconcile_owned_launchd_job",
+                    "_require_no_uid_processes",
+                    "_require_stable_no_uid_processes",
+                    "_fsync_stage_directory",
+                    "_validate_precleanup_artifact",
+                    "launchd_artifact_payloads",
+                ):
+                    stack.enter_context(mock.patch.object(self.helper, name))
+                stack.enter_context(
+                    mock.patch.object(
+                        self.helper,
+                        "_cleanup_helper_only_stage_before_state",
+                        return_value=False,
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        self.helper,
+                        "_load_lifecycle_state",
+                        return_value=(plan, state),
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        self.helper,
+                        "_validate_exact_stage",
+                        side_effect=validate_stage,
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        self.helper,
+                        "_account_exists",
+                        side_effect=account_exists,
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        self.helper,
+                        "_read_system_generated_uid",
+                        return_value=generated_uid,
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        self.helper,
+                        "_list_accounts",
+                        side_effect=list_accounts,
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        self.helper,
+                        "_require_command_success",
+                        side_effect=command,
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        self.helper,
+                        "_metadata_matches",
+                        return_value=True,
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        self.helper,
+                        "_write_root_file",
+                        side_effect=write_root,
+                    )
+                )
+                stack.enter_context(mock.patch.object(self.helper.os, "chown"))
+
+                original_unlink = Path.unlink
+                child_unlinked = False
+
+                def interrupt_first_child(
+                    path: Path,
+                    *args: object,
+                    operation: object = original_unlink,
+                    **kwargs: object,
+                ) -> None:
+                    nonlocal child_unlinked
+                    operation(path, *args, **kwargs)  # type: ignore[operator]
+                    if path.parent == probe and not child_unlinked:
+                        child_unlinked = True
+                        raise KeyboardInterrupt
+
+                with (
+                    mock.patch.object(Path, "unlink", interrupt_first_child),
+                    self.assertRaises(KeyboardInterrupt),
+                ):
+                    self.helper.cleanup_launchd_user_lifecycle(
+                        stage_root=stage,
+                        artifact_root=artifact,
+                        expected_helper_sha256="1" * 64,
+                        runner_uid=501,
+                        runner_gid=20,
+                    )
+
+                self.assertFalse(account_live)
+                self.assertTrue((stage / "home-cleanup.json").is_file())
+                self.assertEqual(len(list(probe.iterdir())), 3)
+                self.assertEqual(cleanup_writes, [])
+
+                self.assertEqual(
+                    self.helper.cleanup_launchd_user_lifecycle(
+                        stage_root=stage,
+                        artifact_root=artifact,
+                        expected_helper_sha256="1" * 64,
+                        runner_uid=501,
+                        runner_gid=20,
+                    ),
+                    0,
+                )
+
+            self.assertFalse(stage.exists())
+            self.assertFalse(home.exists())
+            self.assertEqual(len(cleanup_writes), 1)
+            cleanup_path, cleanup_raw, cleanup_mode = cleanup_writes[0]
+            self.assertEqual(cleanup_path, artifact / "cleanup.json")
+            self.assertEqual(cleanup_mode, 0o600)
+            cleanup = json.loads(cleanup_raw)
+            self.assertEqual(cleanup["schema_version"], 3)
+            self.assertEqual(
+                cleanup["domain_reset"],
+                self.helper._domain_reset_evidence(None),
+            )
+            self.assertEqual(cleanup["home_cleanup"]["disposition"], "recovered")
 
     def test_disabled_account_creation_uses_exact_dscl_commands_and_readback(
         self,
@@ -5003,17 +5371,74 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                     )
                 load_reset.assert_called_once()
 
+                journal = {"content_sha256": "5" * 64}
+                (stage / "home-cleanup.json").write_bytes(b"exact home cleanup marker")
+                with (
+                    mock.patch.object(
+                        self.helper,
+                        "_load_user_domain_reset_authorization",
+                        return_value=reset,
+                    ),
+                    mock.patch.object(
+                        self.helper,
+                        "_load_home_cleanup_authorization",
+                        return_value=journal,
+                    ) as load_home_cleanup,
+                ):
+                    self.assertEqual(
+                        self.helper._validate_exact_stage(
+                            plan,
+                            state,
+                            user_domain_reset_authorization="1" * 40,
+                            environment=eligible_context(),
+                        ),
+                        self.helper.ValidatedStageBindings(
+                            account_binding,
+                            ownership,
+                            reset,
+                            journal,
+                        ),
+                    )
+                load_home_cleanup.assert_called_once()
+
+                (stage / "domain-reset.json").unlink()
+                with mock.patch.object(
+                    self.helper,
+                    "_load_home_cleanup_authorization",
+                    return_value=journal,
+                ):
+                    self.assertEqual(
+                        self.helper._validate_exact_stage(plan, state),
+                        self.helper.ValidatedStageBindings(
+                            account_binding,
+                            ownership,
+                            None,
+                            journal,
+                        ),
+                    )
+
                 (stage / "ownership.json").unlink()
+                with mock.patch.object(
+                    self.helper,
+                    "_load_home_cleanup_authorization",
+                    return_value=journal,
+                ):
+                    self.assertEqual(
+                        self.helper._validate_exact_stage(plan, state),
+                        self.helper.ValidatedStageBindings(
+                            account_binding,
+                            None,
+                            None,
+                            journal,
+                        ),
+                    )
+
+                (stage / "account.json").unlink()
                 with self.assertRaisesRegex(
                     self.helper.ProbeError,
                     "stage-cleanup-drift",
                 ):
-                    self.helper._validate_exact_stage(
-                        plan,
-                        state,
-                        user_domain_reset_authorization="1" * 40,
-                        environment=eligible_context(),
-                    )
+                    self.helper._validate_exact_stage(plan, state)
 
     def test_foreign_or_unknown_launchd_job_is_never_booted_out(self) -> None:
         plan = self.lifecycle_plan(Path("/private/var/tmp/stage"))
@@ -6145,7 +6570,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 delete_call,
                 command_id="account-delete",
             )
-            self.assertEqual(process_scan.call_count, 3)
+            self.assertEqual(process_scan.call_count, 5)
             self.assertEqual(
                 process_scan.call_args_list[-2:],
                 [mock.call(plan.account.uid), mock.call(plan.account.uid)],
@@ -6637,6 +7062,15 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 "content_sha256": "4" * 64,
                 "home_identity": home_identity,
             }
+            journal = {
+                "content_sha256": "5" * 64,
+                "disposition": "armed",
+                "account": {
+                    "name": plan.account.name,
+                    "uid": plan.account.uid,
+                },
+                "home_identity": home_identity,
+            }
             bindings = self.helper.ValidatedStageBindings(
                 account,
                 ownership,
@@ -6731,14 +7165,28 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 stack.enter_context(
                     mock.patch.object(
                         self.helper,
-                        "_exact_disposable_home_identity",
-                        return_value={**home_identity, "home_inode": 99},
+                        "_validated_marker_bound_disposable_home",
+                        side_effect=[
+                            (
+                                True,
+                                True,
+                                tuple(sorted(self.helper.LAUNCHD_CHILD_FILES)),
+                            ),
+                            self.helper.ProbeError("home-cleanup-drift"),
+                        ],
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        self.helper,
+                        "_write_home_cleanup_authorization",
+                        return_value=journal,
                     )
                 )
                 remove_home = stack.enter_context(
                     mock.patch.object(
                         self.helper,
-                        "remove_exact_disposable_home",
+                        "_remove_marker_bound_disposable_home",
                     )
                 )
                 stack.enter_context(
@@ -8731,6 +9179,263 @@ raise SystemExit(93)
                 nlink=1,
             )
 
+    def test_home_cleanup_authorization_is_durable_before_first_unlink(
+        self,
+    ) -> None:
+        plan = self.lifecycle_plan(Path("/private/var/tmp/stage"))
+        state = self.lifecycle_state(plan)
+        generated_uid = "01234567-89AB-4DEF-8123-456789ABCDEF"
+        account = self.helper._account_binding_document(plan, state, generated_uid)
+        ownership = self.helper._launchd_ownership_document(plan, state)
+        marker = {
+            "content_sha256": "4" * 64,
+            "home_identity": {
+                "home_device": 1,
+                "home_inode": 2,
+                "probe_device": 1,
+                "probe_inode": 3,
+            },
+        }
+        bindings = self.helper.ValidatedStageBindings(account, ownership, marker)
+        events: list[str] = []
+        written: dict[str, object] = {}
+
+        def write(path: Path, raw: bytes, mode: int) -> None:
+            events.append("write")
+            written.update(path=path, raw=raw, mode=mode)
+
+        def readback(*_args: object, **_kwargs: object) -> dict:
+            events.append("readback")
+            return json.loads(bytes(written["raw"]))
+
+        with (
+            mock.patch.object(
+                self.helper,
+                "_write_stage_create_new",
+                side_effect=write,
+            ),
+            mock.patch.object(
+                self.helper,
+                "_fsync_stage_directory",
+                side_effect=lambda _stage: events.append("fsync"),
+            ) as sync,
+            mock.patch.object(
+                self.helper,
+                "_load_home_cleanup_authorization",
+                side_effect=readback,
+            ) as load,
+        ):
+            document = self.helper._write_home_cleanup_authorization(
+                plan,
+                state,
+                bindings,
+                marker["home_identity"],
+            )
+
+        self.assertEqual(events, ["write", "fsync", "readback"])
+        self.assertEqual(
+            written,
+            {
+                "path": plan.stage_root / "home-cleanup.json",
+                "raw": self.helper.canonical_bytes(document),
+                "mode": 0o600,
+            },
+        )
+        sync.assert_called_once_with(plan.stage_root)
+        load.assert_called_once_with(plan, state, bindings)
+        self.assertEqual(document["domain_reset_sha256"], "4" * 64)
+        self.assertEqual(document["home_identity"], marker["home_identity"])
+
+    def test_home_cleanup_authorization_round_trips_without_reset_or_ownership(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            stage = Path(directory) / "stage"
+            stage.mkdir()
+            plan = self.lifecycle_plan(stage)
+            state = self.lifecycle_state(plan)
+            account = self.helper._account_binding_document(
+                plan,
+                state,
+                "01234567-89AB-4DEF-8123-456789ABCDEF",
+            )
+            bindings = self.helper.ValidatedStageBindings(account, None)
+            identity = {
+                "home_device": 1,
+                "home_inode": 2,
+                "probe_device": 1,
+                "probe_inode": 3,
+            }
+            with (
+                mock.patch.object(
+                    self.helper,
+                    "_metadata_matches",
+                    return_value=True,
+                ),
+                mock.patch.object(self.helper, "_fsync_stage_directory"),
+            ):
+                document = self.helper._write_home_cleanup_authorization(
+                    plan,
+                    state,
+                    bindings,
+                    identity,
+                )
+                self.assertEqual(
+                    self.helper._load_home_cleanup_authorization(
+                        plan,
+                        state,
+                        bindings,
+                    ),
+                    document,
+                )
+            self.assertEqual(document["ownership_sha256"], "none")
+            self.assertEqual(document["domain_reset_sha256"], "none")
+            self.assertEqual(
+                document["account"],
+                {
+                    "name": plan.account.name,
+                    "uid": plan.account.uid,
+                    "gid": plan.account.gid,
+                    "home": str(plan.account.home),
+                },
+            )
+
+    def test_home_cleanup_authorization_fsync_failure_prevents_readback(
+        self,
+    ) -> None:
+        plan = self.lifecycle_plan(Path("/private/var/tmp/stage"))
+        state = self.lifecycle_state(plan)
+        account = self.helper._account_binding_document(
+            plan,
+            state,
+            "01234567-89AB-4DEF-8123-456789ABCDEF",
+        )
+        ownership = self.helper._launchd_ownership_document(plan, state)
+        bindings = self.helper.ValidatedStageBindings(
+            account,
+            ownership,
+            {
+                "content_sha256": "4" * 64,
+                "home_identity": {
+                    "home_device": 1,
+                    "home_inode": 2,
+                    "probe_device": 1,
+                    "probe_inode": 3,
+                },
+            },
+        )
+        with (
+            mock.patch.object(self.helper, "_write_stage_create_new"),
+            mock.patch.object(
+                self.helper,
+                "_fsync_stage_directory",
+                side_effect=self.helper.ProbeError(
+                    "user-domain-reset-stage-fsync-failed"
+                ),
+            ),
+            mock.patch.object(
+                self.helper,
+                "_load_home_cleanup_authorization",
+            ) as load,
+            self.assertRaises(self.helper.ProbeError) as raised,
+        ):
+            self.helper._write_home_cleanup_authorization(
+                plan,
+                state,
+                bindings,
+                bindings.domain_reset["home_identity"],
+            )
+        self.assertEqual(
+            raised.exception.code,
+            "user-domain-reset-stage-fsync-failed",
+        )
+        load.assert_not_called()
+
+    def test_home_cleanup_publication_interruptions_leave_retryable_stage(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            stage = Path(directory) / "stage"
+            stage.mkdir()
+            plan = self.lifecycle_plan(stage)
+            state = self.lifecycle_state(plan)
+            account = self.helper._account_binding_document(
+                plan,
+                state,
+                "01234567-89AB-4DEF-8123-456789ABCDEF",
+            )
+            ownership = self.helper._launchd_ownership_document(plan, state)
+            bindings = self.helper.ValidatedStageBindings(
+                account,
+                ownership,
+                {
+                    "content_sha256": "4" * 64,
+                    "home_identity": {
+                        "home_device": 1,
+                        "home_inode": 2,
+                        "probe_device": 1,
+                        "probe_inode": 3,
+                    },
+                },
+            )
+            document = self.helper._home_cleanup_document(
+                plan,
+                state,
+                bindings,
+                bindings.domain_reset["home_identity"],
+            )
+            raw = self.helper.canonical_bytes(document)
+            destination = stage / "home-cleanup.json"
+
+            with (
+                mock.patch.object(
+                    self.helper,
+                    "_rename_exclusive",
+                    side_effect=KeyboardInterrupt,
+                ),
+                mock.patch.object(
+                    self.helper.tempfile,
+                    "mkstemp",
+                    wraps=tempfile.mkstemp,
+                ) as create,
+                self.assertRaises(KeyboardInterrupt),
+            ):
+                self.helper._write_stage_create_new(destination, raw, 0o600)
+            self.assertEqual(list(stage.iterdir()), [])
+            self.assertEqual(create.call_args.kwargs["dir"], stage.parent)
+
+            def rename_then_interrupt(source: Path, target: Path) -> None:
+                os.rename(source, target)
+                raise KeyboardInterrupt
+
+            with (
+                mock.patch.object(
+                    self.helper,
+                    "_rename_exclusive",
+                    side_effect=rename_then_interrupt,
+                ),
+                self.assertRaises(KeyboardInterrupt),
+            ):
+                self.helper._write_stage_create_new(destination, raw, 0o600)
+            self.assertEqual(
+                {entry.name for entry in stage.iterdir()}, {destination.name}
+            )
+            self.assertEqual(destination.lstat().st_nlink, 1)
+            self.assertEqual(destination.read_bytes(), raw)
+            with mock.patch.object(
+                self.helper,
+                "_metadata_matches",
+                return_value=True,
+            ):
+                self.assertEqual(
+                    self.helper._load_home_cleanup_authorization(
+                        plan,
+                        state,
+                        bindings,
+                    ),
+                    document,
+                )
+
     def test_cleanup_cannot_arm_reset_without_lifecycle_authorization(self) -> None:
         plan = self.lifecycle_plan(Path("/private/var/tmp/stage"))
         state = self.lifecycle_state(plan)
@@ -8886,31 +9591,34 @@ raise SystemExit(93)
         generated_uid = "01234567-89AB-4DEF-8123-456789ABCDEF"
         authorization = eligible_context()["GITHUB_SHA"]
         for lifecycle_state in ("failed", "missing"):
-            for account_present, home_present in (
-                (True, True),
-                (True, False),
-                (False, True),
-                (False, False),
+            for account_present, home_present, journal_preexisting in (
+                (True, True, False),
+                (False, True, True),
+                (False, False, True),
             ):
                 with (
                     self.subTest(
                         lifecycle_state=lifecycle_state,
                         account_present=account_present,
                         home_present=home_present,
+                        journal_preexisting=journal_preexisting,
                     ),
                     tempfile.TemporaryDirectory() as directory,
                 ):
                     root = Path(directory)
                     stage = root / "stage"
                     stage.mkdir()
-                    for name in (
+                    stage_names = [
                         "helper.py",
                         "job.plist",
                         "state.json",
                         "account.json",
                         "ownership.json",
                         "domain-reset.json",
-                    ):
+                    ]
+                    if journal_preexisting:
+                        stage_names.append("home-cleanup.json")
+                    for name in stage_names:
                         (stage / name).write_bytes(f"exact-{name}".encode())
                     artifact = root / "artifact"
                     artifact.mkdir()
@@ -8932,10 +9640,22 @@ raise SystemExit(93)
                         "content_sha256": "4" * 64,
                         "home_identity": home_identity,
                     }
+                    journal = {
+                        "content_sha256": "5" * 64,
+                        "disposition": "armed",
+                        "account": {
+                            "name": plan.account.name,
+                            "uid": plan.account.uid,
+                            "gid": plan.account.gid,
+                            "home": str(plan.account.home),
+                        },
+                        "home_identity": home_identity,
+                    }
                     bindings = self.helper.ValidatedStageBindings(
                         account,
                         ownership,
                         marker,
+                        journal if journal_preexisting else None,
                     )
                     if lifecycle_state == "failed":
                         lifecycle = self.helper._document_with_digest(
@@ -8987,6 +9707,17 @@ raise SystemExit(93)
                         observed.append("binding")
                         return expected_account, expected_home
 
+                    def write_home_authorization(
+                        *_args: object,
+                        observed: list[str] = events,
+                        expected_stage: Path = stage,
+                        expected_journal: dict = journal,
+                        **_kwargs: object,
+                    ) -> dict:
+                        observed.append("arm-home")
+                        (expected_stage / "home-cleanup.json").write_bytes(b"exact")
+                        return expected_journal
+
                     account_presence = [True, False] if account_present else [False]
                     with ExitStack() as stack:
                         stack.enter_context(
@@ -9030,6 +9761,20 @@ raise SystemExit(93)
                                 self.helper,
                                 "_require_durable_user_domain_reset_authorization",
                                 return_value=marker,
+                            )
+                        )
+                        stack.enter_context(
+                            mock.patch.object(
+                                self.helper,
+                                "_require_durable_home_cleanup_authorization",
+                                return_value=journal,
+                            )
+                        )
+                        arm_home = stack.enter_context(
+                            mock.patch.object(
+                                self.helper,
+                                "_write_home_cleanup_authorization",
+                                side_effect=write_home_authorization,
                             )
                         )
                         stack.enter_context(
@@ -9114,6 +9859,19 @@ raise SystemExit(93)
                         stack.enter_context(
                             mock.patch.object(
                                 self.helper,
+                                "_validated_marker_bound_disposable_home",
+                                return_value=(
+                                    home_present,
+                                    home_present,
+                                    tuple(sorted(self.helper.LAUNCHD_CHILD_FILES))
+                                    if home_present
+                                    else (),
+                                ),
+                            )
+                        )
+                        stack.enter_context(
+                            mock.patch.object(
+                                self.helper,
                                 "_exact_disposable_home_identity",
                                 return_value=home_identity,
                             )
@@ -9121,7 +9879,10 @@ raise SystemExit(93)
                         remove_home = stack.enter_context(
                             mock.patch.object(
                                 self.helper,
-                                "remove_exact_disposable_home",
+                                "_remove_marker_bound_disposable_home",
+                                side_effect=lambda *_args, observed=events: (
+                                    observed.append("remove-home")
+                                ),
                             )
                         )
                         stack.enter_context(
@@ -9166,6 +9927,10 @@ raise SystemExit(93)
                     )
                     self.assertFalse(stage.exists())
                     arm.assert_not_called()
+                    self.assertEqual(
+                        arm_home.call_count,
+                        int(not journal_preexisting),
+                    )
                     expected_events = [
                         "binding",
                         "wait",
@@ -9178,6 +9943,12 @@ raise SystemExit(93)
                     ]
                     if account_present:
                         expected_events.append("binding")
+                    expected_events.append("stable-zero")
+                    if not journal_preexisting:
+                        expected_events.append("arm-home")
+                    expected_events.append("stable-zero")
+                    if home_present:
+                        expected_events.append("remove-home")
                     self.assertEqual(events, expected_events)
                     self.assertEqual(
                         command.call_count,
@@ -9237,22 +10008,31 @@ raise SystemExit(93)
             "UniqueID": [str(plan.account.uid)],
             "UserShell": ["/usr/bin/false"],
         }
-        for account_present, home_present in (
-            (True, True),
-            (True, False),
-            (False, True),
-            (False, False),
+        for account_present, home_state, home_cleanup in (
+            (True, "complete", None),
+            (False, "complete", None),
+            (False, "partial", {"journal": "exact"}),
+            (False, "absent", {"journal": "exact"}),
         ):
+            home_present = home_state != "absent"
+            observed_files = (
+                tuple(sorted(self.helper.LAUNCHD_CHILD_FILES))
+                if home_state == "complete"
+                else ("probe.stdout",)
+                if home_state == "partial"
+                else ()
+            )
+            observed_bindings = bindings._replace(home_cleanup=home_cleanup)
             with (
                 self.subTest(
                     account_present=account_present,
-                    home_present=home_present,
+                    home_state=home_state,
                 ),
                 mock.patch.object(self.helper, "_require_launchd_absent"),
                 mock.patch.object(
                     self.helper,
                     "_validate_exact_stage",
-                    return_value=bindings,
+                    return_value=observed_bindings,
                 ),
                 mock.patch.object(
                     self.helper,
@@ -9273,13 +10053,12 @@ raise SystemExit(93)
                 ) as read_record,
                 mock.patch.object(
                     self.helper,
-                    "_path_exists_no_follow",
-                    return_value=home_present,
-                ),
-                mock.patch.object(
-                    self.helper,
-                    "_exact_disposable_home_identity",
-                    return_value=identity,
+                    "_validated_marker_bound_disposable_home",
+                    return_value=(
+                        home_present,
+                        home_present,
+                        observed_files,
+                    ),
                 ) as read_home,
             ):
                 self.assertEqual(
@@ -9289,11 +10068,45 @@ raise SystemExit(93)
                         marker,
                         eligible_context()["GITHUB_SHA"],
                         eligible_context(),
+                        home_cleanup,
                     ),
                     (account_present, home_present),
                 )
             self.assertEqual(read_record.call_count, int(account_present))
-            self.assertEqual(read_home.call_count, int(home_present))
+            read_home.assert_called_once_with(plan.account, identity)
+
+        with (
+            mock.patch.object(self.helper, "_require_launchd_absent"),
+            mock.patch.object(
+                self.helper,
+                "_validate_exact_stage",
+                return_value=bindings,
+            ),
+            mock.patch.object(
+                self.helper,
+                "_account_exists",
+                return_value=False,
+            ),
+            mock.patch.object(
+                self.helper,
+                "_list_accounts",
+                return_value={},
+            ),
+            mock.patch.object(
+                self.helper,
+                "_validated_marker_bound_disposable_home",
+                return_value=(True, True, ("probe.stdout",)),
+            ),
+            self.assertRaises(self.helper.ProbeError) as unjournaled,
+        ):
+            self.helper._validate_reset_bindings_and_resources(
+                plan,
+                state,
+                marker,
+                eligible_context()["GITHUB_SHA"],
+                eligible_context(),
+            )
+        self.assertEqual(unjournaled.exception.code, "home-cleanup-drift")
 
         with (
             mock.patch.object(self.helper, "_require_launchd_absent"),
@@ -9347,13 +10160,8 @@ raise SystemExit(93)
             ),
             mock.patch.object(
                 self.helper,
-                "_path_exists_no_follow",
-                return_value=True,
-            ),
-            mock.patch.object(
-                self.helper,
-                "_exact_disposable_home_identity",
-                return_value={**identity, "home_inode": 99},
+                "_validated_marker_bound_disposable_home",
+                side_effect=self.helper.ProbeError("home-cleanup-drift"),
             ),
             self.assertRaises(self.helper.ProbeError) as replaced,
         ):
@@ -9554,6 +10362,16 @@ raise SystemExit(93)
                     marker,
                 ),
                 performed,
+            )
+            self.assertEqual(
+                self.helper._cleanup_domain_reset_evidence(
+                    artifact,
+                    plan,
+                    state,
+                    marker,
+                    force_recovered=True,
+                )["disposition"],
+                "recovered-to-stable-zero",
             )
             lifecycle["disposition"] = "probe-error"
             (artifact / "lifecycle.json").write_bytes(

@@ -933,6 +933,18 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             capture_output=True,
         )
 
+    def guard_home_validation_mutations(self, stack: ExitStack) -> tuple:
+        return (
+            stack.enter_context(
+                mock.patch.object(self.helper, "_write_stage_create_new")
+            ),
+            stack.enter_context(mock.patch.object(self.helper, "_renameat_exclusive")),
+            stack.enter_context(mock.patch.object(self.helper.os, "unlink")),
+            stack.enter_context(mock.patch.object(self.helper.os, "rmdir")),
+            stack.enter_context(mock.patch.object(Path, "unlink")),
+            stack.enter_context(mock.patch.object(Path, "rmdir")),
+        )
+
     def bounded_library_cleanup_fixture(
         self,
         root: Path,
@@ -6954,6 +6966,40 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             self.assertTrue(home.is_dir())
             self.assertTrue((probe / "foreign").is_file())
 
+    def test_exact_home_cleanup_rejects_partial_children_before_mutation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "home"
+            probe = home / "launchd-probe"
+            probe.mkdir(parents=True, mode=0o700)
+            home.chmod(0o700)
+            probe.chmod(0o700)
+            missing = min(self.helper.LAUNCHD_CHILD_FILES)
+            for name in set(self.helper.LAUNCHD_CHILD_FILES) - {missing}:
+                (probe / name).write_bytes(b"preserve")
+
+            with ExitStack() as stack:
+                mutations = self.guard_home_validation_mutations(stack)
+                with self.assertRaises(self.helper.ProbeError) as raised:
+                    self.helper.remove_exact_disposable_home(
+                        home,
+                        expected_uid=os.geteuid(),
+                        expected_gid=os.getegid(),
+                    )
+
+            self.assertEqual(
+                raised.exception.code,
+                "home-cleanup-home-removal-probe-entry-set-drift",
+            )
+            for mutation in mutations:
+                mutation.assert_not_called()
+            self.assertTrue(home.is_dir())
+            self.assertEqual(
+                {entry.name for entry in probe.iterdir()},
+                set(self.helper.LAUNCHD_CHILD_FILES) - {missing},
+            )
+
     def test_home_drift_diagnostics_are_phase_bound_and_value_free(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory) / "home"
@@ -7077,6 +7123,319 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                     f"home-cleanup-pre-reset-marker-{detail}",
                 )
                 self.assertNotIn("private", raised.exception.code)
+
+    def test_disposable_directory_metadata_compaction_seam_preserves_precedence(
+        self,
+    ) -> None:
+        phase = "pre-reset-marker"
+        uid, gid = os.geteuid(), os.getegid()
+        for node in ("home", "probe"):
+            states = (
+                (
+                    SimpleNamespace(
+                        st_mode=stat.S_IFREG | 0o755,
+                        st_uid=uid + 1,
+                        st_gid=gid + 1,
+                    ),
+                    "kind-drift",
+                ),
+                (
+                    SimpleNamespace(
+                        st_mode=stat.S_IFDIR | 0o755,
+                        st_uid=uid + 1,
+                        st_gid=gid + 1,
+                    ),
+                    "mode-drift",
+                ),
+                (
+                    SimpleNamespace(
+                        st_mode=stat.S_IFDIR | 0o700,
+                        st_uid=uid + 1,
+                        st_gid=gid + 1,
+                    ),
+                    "owner-drift",
+                ),
+            )
+            with self.subTest(node=node), ExitStack() as stack:
+                mutations = self.guard_home_validation_mutations(stack)
+                for metadata, detail in states:
+                    with self.assertRaises(self.helper.ProbeError) as raised:
+                        self.helper._require_disposable_directory_metadata(
+                            node, metadata, uid, gid, phase
+                        )
+                    self.assertEqual(
+                        raised.exception.code,
+                        f"home-cleanup-{phase}-{node}-{detail}",
+                    )
+                self.assertIsNone(
+                    self.helper._require_disposable_directory_metadata(
+                        node,
+                        SimpleNamespace(
+                            st_mode=stat.S_IFDIR | 0o700,
+                            st_uid=uid,
+                            st_gid=gid,
+                        ),
+                        uid,
+                        gid,
+                        phase,
+                    )
+                )
+                for mutation in mutations:
+                    mutation.assert_not_called()
+
+    def test_disposable_home_names_compaction_seam_preserves_validation_order(
+        self,
+    ) -> None:
+        phase = "pre-reset-marker"
+        uid, gid = os.geteuid(), os.getegid()
+        home = Path("/private/tmp/private-home-name-canary")
+        metadata = SimpleNamespace(st_dev=7, st_ino=8)
+        cases = (
+            (["Library", "launchd-probe"], None, ["enumerate", "allow"]),
+            (
+                ["Library", "private-extra-canary"],
+                "probe-missing",
+                ["enumerate"],
+            ),
+        )
+        for listing, detail, expected_events in cases:
+            events: list[str] = []
+
+            def enumerate_names(
+                *_args: object,
+                _events: list[str] = events,
+                _listing: list[str] = listing,
+                **_kwargs: object,
+            ) -> list[str]:
+                _events.append("enumerate")
+                return _listing
+
+            def allow_names(
+                *_args: object,
+                _events: list[str] = events,
+                **_kwargs: object,
+            ) -> None:
+                _events.append("allow")
+
+            with self.subTest(detail=detail), ExitStack() as stack:
+                mutations = self.guard_home_validation_mutations(stack)
+                bounded = stack.enter_context(
+                    mock.patch.object(
+                        self.helper,
+                        "_bounded_path_directory_names",
+                        side_effect=enumerate_names,
+                    )
+                )
+                allowed = stack.enter_context(
+                    mock.patch.object(
+                        self.helper,
+                        "_require_allowed_disposable_home_names",
+                        side_effect=allow_names,
+                    )
+                )
+                if detail is None:
+                    self.assertEqual(
+                        self.helper._validated_disposable_home_names(
+                            home, metadata, uid, gid, phase
+                        ),
+                        set(listing),
+                    )
+                    allowed.assert_called_once_with(
+                        home,
+                        set(listing),
+                        expected_uid=uid,
+                        expected_gid=gid,
+                        diagnostic_phase=phase,
+                    )
+                else:
+                    with self.assertRaises(self.helper.ProbeError) as raised:
+                        self.helper._validated_disposable_home_names(
+                            home, metadata, uid, gid, phase
+                        )
+                    self.assertEqual(
+                        raised.exception.code,
+                        f"home-cleanup-{phase}-{detail}",
+                    )
+                    self.assertNotIn("private", raised.exception.code)
+                    allowed.assert_not_called()
+                self.assertEqual(events, expected_events)
+                bounded.assert_called_once_with(
+                    home,
+                    metadata,
+                    self.helper.MAX_DISPOSABLE_HOME_ENTRIES,
+                    limit_code=(
+                        f"home-cleanup-{phase}-home-entry-observation-unreadable"
+                    ),
+                    failure_code=f"home-cleanup-{phase}-home-read-failed",
+                )
+                for mutation in mutations:
+                    mutation.assert_not_called()
+
+    def test_launchd_probe_children_compaction_seam_preserves_contract(
+        self,
+    ) -> None:
+        phase = "pre-reset-marker"
+        uid, gid = os.geteuid(), os.getegid()
+        probe_root = Path("/private/tmp/private-probe-root-canary")
+        probe_metadata = SimpleNamespace(st_dev=7, st_ino=8)
+        expected = tuple(sorted(self.helper.LAUNCHD_CHILD_FILES))
+        expected_set = set(expected)
+        set_drift = f"home-cleanup-{phase}-probe-entry-set-drift"
+
+        def valid_metadata(path: Path) -> SimpleNamespace:
+            return SimpleNamespace(
+                st_mode=stat.S_IFREG | 0o600,
+                st_nlink=1,
+                st_uid=uid,
+                st_gid=gid,
+                st_size=self.helper.LAUNCHD_CHILD_FILES[path.name],
+            )
+
+        def exercise(
+            names: set[str],
+            allow_subset: bool,
+            bad: SimpleNamespace | None = None,
+        ) -> tuple[object, list[str]]:
+            target = expected[0]
+
+            def metadata(path: Path) -> SimpleNamespace:
+                return (
+                    bad
+                    if bad is not None and path.name == target
+                    else valid_metadata(path)
+                )
+
+            with ExitStack() as stack:
+                mutations = self.guard_home_validation_mutations(stack)
+                bounded = stack.enter_context(
+                    mock.patch.object(
+                        self.helper,
+                        "_bounded_path_directory_names",
+                        return_value=sorted(names, reverse=True),
+                    )
+                )
+                lstat = stack.enter_context(
+                    mock.patch.object(
+                        Path,
+                        "lstat",
+                        autospec=True,
+                        side_effect=metadata,
+                    )
+                )
+                try:
+                    outcome: object = self.helper._validated_launchd_probe_children(
+                        probe_root,
+                        probe_metadata,
+                        uid,
+                        gid,
+                        phase,
+                        allow_subset=allow_subset,
+                    )
+                except self.helper.ProbeError as error:
+                    outcome = error
+                bounded.assert_called_once_with(
+                    probe_root,
+                    probe_metadata,
+                    self.helper.MAX_LAUNCHD_PROBE_ENTRIES,
+                    limit_code=set_drift,
+                    failure_code=f"home-cleanup-{phase}-probe-read-failed",
+                )
+                for mutation in mutations:
+                    mutation.assert_not_called()
+                return outcome, [call.args[0].name for call in lstat.call_args_list]
+
+        for mask in range(1 << len(expected)):
+            names = {name for index, name in enumerate(expected) if mask & (1 << index)}
+            for allow_subset in (False, True):
+                with self.subTest(
+                    names=tuple(sorted(names)), allow_subset=allow_subset
+                ):
+                    outcome, observed = exercise(names, allow_subset)
+                    if allow_subset or names == expected_set:
+                        self.assertEqual(outcome, tuple(sorted(names)))
+                        self.assertEqual(observed, sorted(names))
+                    else:
+                        self.assertIsInstance(outcome, self.helper.ProbeError)
+                        self.assertEqual(outcome.code, set_drift)
+                        self.assertEqual(observed, [])
+
+        extra = "private-extra-canary"
+        for names in ({extra}, expected_set | {extra}):
+            for allow_subset in (False, True):
+                outcome, observed = exercise(names, allow_subset)
+                self.assertIsInstance(outcome, self.helper.ProbeError)
+                self.assertEqual(outcome.code, set_drift)
+                self.assertNotIn("private", outcome.code)
+                self.assertEqual(observed, [])
+
+        target = expected[0]
+        limit = self.helper.LAUNCHD_CHILD_FILES[target]
+        states = (
+            (
+                SimpleNamespace(
+                    st_mode=stat.S_IFDIR | 0o700,
+                    st_nlink=2,
+                    st_uid=uid + 1,
+                    st_gid=gid + 1,
+                    st_size=limit + 1,
+                ),
+                "probe-child-kind-drift",
+                "kind",
+            ),
+            (
+                SimpleNamespace(
+                    st_mode=stat.S_IFREG | 0o600,
+                    st_nlink=2,
+                    st_uid=uid + 1,
+                    st_gid=gid + 1,
+                    st_size=limit + 1,
+                ),
+                "probe-child-link-count-drift",
+                "link-count",
+            ),
+            (
+                SimpleNamespace(
+                    st_mode=stat.S_IFREG | 0o600,
+                    st_nlink=1,
+                    st_uid=uid + 1,
+                    st_gid=gid,
+                    st_size=limit + 1,
+                ),
+                "probe-child-owner-drift",
+                "uid",
+            ),
+            (
+                SimpleNamespace(
+                    st_mode=stat.S_IFREG | 0o600,
+                    st_nlink=1,
+                    st_uid=uid,
+                    st_gid=gid + 1,
+                    st_size=limit + 1,
+                ),
+                "probe-child-owner-drift",
+                "gid",
+            ),
+            (
+                SimpleNamespace(
+                    st_mode=stat.S_IFREG | 0o600,
+                    st_nlink=1,
+                    st_uid=uid,
+                    st_gid=gid,
+                    st_size=limit + 1,
+                ),
+                "probe-child-size-drift",
+                "size",
+            ),
+        )
+        for metadata, detail, predicate in states:
+            with self.subTest(predicate=predicate):
+                outcome, observed = exercise(expected_set, False, metadata)
+                self.assertIsInstance(outcome, self.helper.ProbeError)
+                self.assertEqual(
+                    outcome.code,
+                    f"home-cleanup-{phase}-{detail}",
+                )
+                self.assertEqual(observed, [target])
 
     def test_disposable_home_root_validator_checks_real_anchor_state(self) -> None:
         def validate(
@@ -8476,6 +8835,115 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 rmdir.assert_not_called()
                 self.assertTrue((home / residual_name).exists())
                 self.assertNotIn("private", raised.exception.code)
+
+    def test_marker_bound_inventory_preserves_diagnostic_precedence(self) -> None:
+        def fixture(root: Path) -> tuple[object, dict[str, int], Path, Path]:
+            home = root / "home"
+            probe = home / "launchd-probe"
+            probe.mkdir(parents=True, mode=0o700)
+            home.chmod(0o700)
+            probe.chmod(0o700)
+            home_metadata = home.lstat()
+            probe_metadata = probe.lstat()
+            account = self.helper.DisposableAccount(
+                name="twq-0123456789ab",
+                uid=os.geteuid(),
+                gid=os.getegid(),
+                home=home,
+            )
+            return (
+                account,
+                {
+                    "home_device": home_metadata.st_dev,
+                    "home_inode": home_metadata.st_ino,
+                    "probe_device": probe_metadata.st_dev,
+                    "probe_inode": probe_metadata.st_ino,
+                },
+                home,
+                probe,
+            )
+
+        arrangements = (
+            (
+                "unexpected",
+                lambda home: (home / "private-entry-canary").mkdir(),
+            ),
+            (
+                "both-library-names",
+                lambda home: (
+                    (home / self.helper.HOME_LIBRARY_NAME).mkdir(),
+                    (home / self.helper.HOME_LIBRARY_QUARANTINE_NAME).mkdir(),
+                ),
+            ),
+        )
+        for label, arrange in arrangements:
+            with (
+                self.subTest(label=label),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                account, identity, home, _probe = fixture(Path(directory))
+                arrange(home)
+                with ExitStack() as stack:
+                    mutations = self.guard_home_validation_mutations(stack)
+                    with self.assertRaises(self.helper.ProbeError) as raised:
+                        self.helper._validated_marker_bound_disposable_home(
+                            account,
+                            identity,
+                            diagnostic_phase="home-removal",
+                            library_inventory="none",
+                        )
+                self.assertEqual(
+                    raised.exception.code,
+                    "home-library-inventory-drift",
+                )
+                self.assertNotIn("private", raised.exception.code)
+                for mutation in mutations:
+                    mutation.assert_not_called()
+
+        with tempfile.TemporaryDirectory() as directory:
+            account, identity, _home, _probe = fixture(Path(directory))
+            with ExitStack() as stack:
+                mutations = self.guard_home_validation_mutations(stack)
+                stack.enter_context(
+                    mock.patch.object(
+                        self.helper,
+                        "_bounded_path_directory_names",
+                        return_value=[],
+                    )
+                )
+                with self.assertRaises(self.helper.ProbeError) as raised:
+                    self.helper._validated_marker_bound_disposable_home(
+                        account,
+                        identity,
+                        diagnostic_phase="home-removal",
+                        library_inventory="none",
+                    )
+            self.assertEqual(raised.exception.code, "home-library-inventory-drift")
+            for mutation in mutations:
+                mutation.assert_not_called()
+
+        with tempfile.TemporaryDirectory() as directory:
+            account, identity, home, probe = fixture(Path(directory))
+            (home / self.helper.HOME_LIBRARY_NAME).mkdir()
+            inventory = self.helper._bounded_library_inventory(account)
+            self.assertIsInstance(inventory, dict)
+            probe.rmdir()
+            with ExitStack() as stack:
+                mutations = self.guard_home_validation_mutations(stack)
+                with self.assertRaises(self.helper.ProbeError) as raised:
+                    self.helper._validated_marker_bound_disposable_home(
+                        account,
+                        identity,
+                        diagnostic_phase="home-removal",
+                        library_inventory=inventory,
+                    )
+            self.assertEqual(
+                raised.exception.code,
+                ("home-cleanup-home-removal-home-entry-known-library-owned-directory"),
+            )
+            for mutation in mutations:
+                mutation.assert_not_called()
+            self.assertTrue((home / self.helper.HOME_LIBRARY_NAME).is_dir())
 
     def test_marker_bound_home_listing_race_stops_before_removal(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

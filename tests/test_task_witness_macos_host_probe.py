@@ -8684,7 +8684,11 @@ raise SystemExit(93)
                 "_exact_disposable_home_identity",
                 return_value=home_identity,
             ),
-            mock.patch.object(self.helper, "_write_root_file", side_effect=write),
+            mock.patch.object(
+                self.helper,
+                "_write_stage_create_new",
+                side_effect=write,
+            ),
             mock.patch.object(
                 self.helper,
                 "_fsync_stage_directory",
@@ -8749,6 +8753,194 @@ raise SystemExit(93)
             evidence["authorization_sha256"],
             json.loads(bytes(written["raw"]))["content_sha256"],
         )
+
+    def test_user_domain_reset_publication_interruptions_leave_retryable_stage(
+        self,
+    ) -> None:
+        authorization = eligible_context()["GITHUB_SHA"]
+        home_identity = {
+            "home_device": 1,
+            "home_inode": 2,
+            "probe_device": 1,
+            "probe_inode": 3,
+        }
+        for cut in ("before-rename", "after-rename"):
+            with self.subTest(cut=cut), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                stage = root / "stage"
+                stage.mkdir()
+                plan = self.lifecycle_plan(stage)
+                helper_raw = b"exact helper\n"
+                plist_raw = b"exact plist\n"
+                plan.helper.write_bytes(helper_raw)
+                plan.plist.write_bytes(plist_raw)
+                unsigned_state = {
+                    name: value
+                    for name, value in self.lifecycle_state(plan).items()
+                    if name != "content_sha256"
+                }
+                unsigned_state["helper_sha256"] = hashlib.sha256(helper_raw).hexdigest()
+                unsigned_state["plist_sha256"] = hashlib.sha256(plist_raw).hexdigest()
+                state = self.helper._document_with_digest(unsigned_state)
+                (stage / "state.json").write_bytes(self.helper.canonical_bytes(state))
+                generated_uid = "01234567-89AB-4DEF-8123-456789ABCDEF"
+                account = self.helper._account_binding_document(
+                    plan,
+                    state,
+                    generated_uid,
+                )
+                ownership = self.helper._launchd_ownership_document(plan, state)
+                (stage / "account.json").write_bytes(
+                    self.helper.canonical_bytes(account)
+                )
+                (stage / "ownership.json").write_bytes(
+                    self.helper.canonical_bytes(ownership)
+                )
+                bindings = self.helper.ValidatedStageBindings(account, ownership)
+
+                def interrupt(
+                    source: Path,
+                    destination: Path,
+                    selected: str = cut,
+                ) -> None:
+                    if selected == "after-rename":
+                        os.rename(source, destination)
+                    raise KeyboardInterrupt
+
+                with (
+                    mock.patch.object(
+                        self.helper,
+                        "_read_system_generated_uid",
+                        return_value=generated_uid,
+                    ),
+                    mock.patch.object(self.helper, "_require_launchd_absent"),
+                    mock.patch.object(
+                        self.helper,
+                        "_exact_disposable_home_identity",
+                        return_value=home_identity,
+                    ),
+                    mock.patch.object(
+                        self.helper,
+                        "_metadata_matches",
+                        return_value=True,
+                    ),
+                    mock.patch.object(self.helper, "_fsync_stage_directory"),
+                    mock.patch.object(
+                        self.helper,
+                        "_rename_exclusive",
+                        side_effect=interrupt,
+                    ),
+                    self.assertRaises(KeyboardInterrupt),
+                ):
+                    self.helper._write_user_domain_reset_authorization(
+                        plan,
+                        state,
+                        bindings,
+                        authorization,
+                        eligible_context(),
+                    )
+
+                expected_names = {
+                    "helper.py",
+                    "job.plist",
+                    "state.json",
+                    "account.json",
+                    "ownership.json",
+                }
+                if cut == "after-rename":
+                    expected_names.add("domain-reset.json")
+                self.assertEqual(
+                    {entry.name for entry in stage.iterdir()},
+                    expected_names,
+                )
+                self.assertEqual({entry.name for entry in root.iterdir()}, {"stage"})
+
+                with (
+                    mock.patch.object(
+                        self.helper,
+                        "_read_system_generated_uid",
+                        return_value=generated_uid,
+                    ),
+                    mock.patch.object(self.helper, "_require_launchd_absent"),
+                    mock.patch.object(
+                        self.helper,
+                        "_exact_disposable_home_identity",
+                        return_value=home_identity,
+                    ),
+                    mock.patch.object(
+                        self.helper,
+                        "_metadata_matches",
+                        return_value=True,
+                    ),
+                    mock.patch.object(self.helper, "_fsync_stage_directory"),
+                ):
+                    if cut == "before-rename":
+                        marker = self.helper._write_user_domain_reset_authorization(
+                            plan,
+                            state,
+                            bindings,
+                            authorization,
+                            eligible_context(),
+                        )
+                    else:
+                        marker = self.helper._load_user_domain_reset_authorization(
+                            plan,
+                            state,
+                            account,
+                            ownership,
+                            authorization,
+                            eligible_context(),
+                        )
+                    self.assertIsNotNone(marker)
+                    self.assertEqual(
+                        (stage / "domain-reset.json").lstat().st_nlink,
+                        1,
+                    )
+                    observed = self.helper._validate_exact_stage(
+                        plan,
+                        state,
+                        user_domain_reset_authorization=authorization,
+                        environment=eligible_context(),
+                    )
+                    self.assertEqual(observed.domain_reset, marker)
+
+                    with (
+                        mock.patch.object(
+                            self.helper,
+                            "_validate_reset_bindings_and_resources",
+                        ),
+                        mock.patch.object(
+                            self.helper,
+                            "_wait_for_no_uid_processes",
+                            side_effect=[
+                                self.helper.ProbeError(
+                                    "disposable-user-pid1-parented-processes-remain"
+                                ),
+                                None,
+                            ],
+                        ),
+                        mock.patch.object(
+                            self.helper,
+                            "_run_user_domain_reset",
+                        ) as reset,
+                        mock.patch.object(
+                            self.helper,
+                            "_require_stable_no_uid_processes",
+                        ),
+                    ):
+                        evidence = self.helper._quiesce_disposable_user(
+                            plan,
+                            state,
+                            observed,
+                            authorization,
+                            eligible_context(),
+                            allow_create=False,
+                        )
+                    reset.assert_called_once_with(plan.account.uid)
+                    self.assertEqual(
+                        evidence,
+                        self.helper._domain_reset_evidence(marker),
+                    )
 
     def test_user_domain_reset_writer_failure_prevents_bootout(self) -> None:
         plan = self.lifecycle_plan(Path("/private/var/tmp/stage"))
@@ -8845,7 +9037,7 @@ raise SystemExit(93)
                     stack.enter_context(
                         mock.patch.object(
                             self.helper,
-                            "_write_root_file",
+                            "_write_stage_create_new",
                             side_effect=write,
                         )
                     )
@@ -8951,7 +9143,11 @@ raise SystemExit(93)
                 "_exact_disposable_home_identity",
                 return_value=home_identity,
             ),
-            mock.patch.object(self.helper, "_write_root_file", side_effect=write),
+            mock.patch.object(
+                self.helper,
+                "_write_stage_create_new",
+                side_effect=write,
+            ),
             mock.patch.object(
                 self.helper,
                 "_fsync_stage_directory",

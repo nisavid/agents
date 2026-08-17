@@ -3297,7 +3297,7 @@ def _write_user_domain_reset_authorization(
     raw = canonical_bytes(document)
     if len(raw) > MAX_USER_DOMAIN_RESET_BYTES:
         raise ProbeError("user-domain-reset-authorization-too-large")
-    _write_root_file(plan.stage_root / "domain-reset.json", raw, 0o600)
+    _write_stage_create_new(plan.stage_root / "domain-reset.json", raw, 0o600)
     return _require_durable_user_domain_reset_authorization(
         plan,
         state,

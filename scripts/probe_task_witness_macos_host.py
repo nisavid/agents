@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Capture a bounded, non-qualifying GitHub-hosted macOS session probe."""
+# ruff: noqa: SIM905
 
 from __future__ import annotations
 
@@ -183,6 +184,22 @@ USER_DOMAIN_RESET_CAPABILITY = "github-hosted-ephemeral-user-domain-reset-v1"
 USER_DOMAIN_RESET_SURVIVOR_CODE = "disposable-user-pid1-parented-processes-remain"
 HOME_LIBRARY_NAME = "Library"
 HOME_LIBRARY_QUARANTINE_NAME = ".task-witness-library-cleanup"
+_HOME_LIBRARY_SCOPES = ("root", "directory", "file")
+HOME_LIBRARY_UNSAFE_CAUSES = frozenset(
+    "bound-home-acl duplicate-identity entry-stat-unsupported-kind "
+    "file-stat-link-count path-component root-kind".split()
+    + [
+        f"{scope}-{attribute}"
+        for scope in _HOME_LIBRARY_SCOPES
+        for attribute in ("acl", "xattr")
+    ]
+    + [
+        f"{scope}-stat-{invariant}"
+        for scope in _HOME_LIBRARY_SCOPES
+        for invariant in "device-mismatch uid-mismatch gid-mismatch "
+        "group-other-write flags-present owner-access".split()
+    ]
+)
 HOME_LIBRARY_ALLOWED_PHASES = frozenset(
     {
         "child-entry",
@@ -3386,7 +3403,7 @@ def _require_new_directory_no_acl(
             metadata.st_gid,
         ) != identity or stat.S_IMODE(metadata.st_mode) != 0o700:
             raise ProbeError("home-create-new-disagrees")
-        _require_no_extended_acl(descriptor)
+        _require_no_extended_acl(descriptor, "bound-home-acl")
     except (OSError, ProbeError) as error:
         raise ProbeError("home-create-new-disagrees") from error
     finally:
@@ -3758,6 +3775,15 @@ def _load_launchd_ownership_marker(
     return document
 
 
+def _home_library_unsafe_error(cause: object) -> ProbeError:
+    secondary = (
+        f"home-library-unsafe-entry-{cause}"
+        if isinstance(cause, str) and cause in HOME_LIBRARY_UNSAFE_CAUSES
+        else "home-library-diagnostic-invalid"
+    )
+    return ProbeError("home-library-unsafe-entry", secondary_code=secondary)
+
+
 def _home_library_path_sha256(components: Sequence[str]) -> str:
     digest = hashlib.sha256(b"task-witness-macos-home-library-path-v1\0")
     total = 0
@@ -3770,7 +3796,7 @@ def _home_library_path_sha256(components: Sequence[str]) -> str:
             or b"\0" in raw
             or len(raw) > MAX_HOME_LIBRARY_COMPONENT_BYTES
         ):
-            raise ProbeError("home-library-unsafe-entry")
+            raise _home_library_unsafe_error("path-component")
         total += len(raw)
         if total > MAX_HOME_LIBRARY_PATH_BYTES:
             raise ProbeError("home-library-bounds-exceeded")
@@ -3794,7 +3820,7 @@ def _darwin_fstatfs_identity(descriptor: int) -> tuple[int, int, str]:
         raise ProbeError("home-library-observation-failed") from error
 
 
-def _require_no_extended_acl(descriptor: int) -> None:
+def _require_no_extended_acl(descriptor: int, unsafe_cause: object) -> None:
     acl = None
     try:
         libc = ctypes.CDLL(None, use_errno=True)
@@ -3820,7 +3846,7 @@ def _require_no_extended_acl(descriptor: int) -> None:
         entry = ctypes.c_void_p()
         result = acl_get_entry(acl, ACL_FIRST_ENTRY, ctypes.byref(entry))
         if result == 0:
-            raise ProbeError("home-library-unsafe-entry")
+            raise _home_library_unsafe_error(unsafe_cause)
         raise OSError(ctypes.get_errno(), "acl_get_entry failed")
     except ProbeError:
         raise
@@ -3834,7 +3860,7 @@ def _require_no_extended_acl(descriptor: int) -> None:
                 pass
 
 
-def _require_no_extended_attributes(descriptor: int) -> None:
+def _require_no_extended_attributes(descriptor: int, unsafe_cause: object) -> None:
     try:
         libc = ctypes.CDLL(None, use_errno=True)
         flistxattr = libc.flistxattr
@@ -3850,7 +3876,7 @@ def _require_no_extended_attributes(descriptor: int) -> None:
         if observed < 0:
             raise OSError(ctypes.get_errno(), "flistxattr failed")
         if observed != 0:
-            raise ProbeError("home-library-unsafe-entry")
+            raise _home_library_unsafe_error(unsafe_cause)
     except ProbeError:
         raise
     except (AttributeError, OSError) as error:
@@ -3898,7 +3924,7 @@ def _require_bound_home_descriptor(
         )
     ):
         raise ProbeError("home-library-home-drift")
-    _require_no_extended_acl(descriptor)
+    _require_no_extended_acl(descriptor, "bound-home-acl")
     return opened
 
 
@@ -3927,6 +3953,7 @@ def _require_home_library_node(
     *,
     account: DisposableAccount,
     home_device: int,
+    diagnostic_scope: str | None = None,
 ) -> str:
     kind = (
         "directory"
@@ -3935,18 +3962,29 @@ def _require_home_library_node(
         if stat.S_ISREG(metadata.st_mode)
         else ""
     )
-    if (
-        not kind
-        or metadata.st_dev != home_device
-        or metadata.st_uid != account.uid
-        or metadata.st_gid != account.gid
-        or stat.S_IMODE(metadata.st_mode) & 0o022
-        or int(getattr(metadata, "st_flags", 0)) != 0
-        or (kind == "directory" and stat.S_IMODE(metadata.st_mode) & 0o700 != 0o700)
-        or (kind == "file" and stat.S_IMODE(metadata.st_mode) & 0o400 != 0o400)
-        or (kind == "file" and metadata.st_nlink != 1)
-    ):
-        raise ProbeError("home-library-unsafe-entry")
+    if not kind:
+        raise _home_library_unsafe_error(
+            "root-kind" if diagnostic_scope == "root" else "entry-stat-unsupported-kind"
+        )
+    mode = stat.S_IMODE(metadata.st_mode)
+    checks = (
+        ("device-mismatch", metadata.st_dev != home_device),
+        ("uid-mismatch", metadata.st_uid != account.uid),
+        ("gid-mismatch", metadata.st_gid != account.gid),
+        ("group-other-write", bool(mode & 0o022)),
+        ("flags-present", int(getattr(metadata, "st_flags", 0)) != 0),
+        (
+            "owner-access",
+            mode & (0o700 if kind == "directory" else 0o400)
+            != (0o700 if kind == "directory" else 0o400),
+        ),
+        ("link-count", kind == "file" and metadata.st_nlink != 1),
+    )
+    for invariant, failed in checks:
+        if failed:
+            raise _home_library_unsafe_error(
+                f"{diagnostic_scope or kind}-stat-{invariant}"
+            )
     return kind
 
 
@@ -3965,8 +4003,8 @@ def _read_home_library_file(
         opened = os.fstat(descriptor)
         if _home_library_metadata(opened) != _home_library_metadata(expected):
             raise ProbeError("home-library-observation-unstable")
-        _require_no_extended_acl(descriptor)
-        _require_no_extended_attributes(descriptor)
+        _require_no_extended_acl(descriptor, "file-acl")
+        _require_no_extended_attributes(descriptor, "file-xattr")
         if opened.st_size < 0 or opened.st_size > MAX_HOME_LIBRARY_FILE_BYTES:
             raise ProbeError("home-library-bounds-exceeded")
         chunks: list[bytes] = []
@@ -3986,7 +4024,7 @@ def _read_home_library_file(
             or _home_library_metadata(current) != _home_library_metadata(opened)
         ):
             raise ProbeError("home-library-observation-unstable")
-        _require_no_extended_attributes(descriptor)
+        _require_no_extended_attributes(descriptor, "file-xattr")
         return raw, opened
     except ProbeError:
         raise
@@ -4085,15 +4123,14 @@ def _observe_bounded_library(
             dir_fd=home_descriptor,
             follow_symlinks=False,
         )
-        if (
-            _require_home_library_node(
-                library_metadata,
-                account=account,
-                home_device=home_opened.st_dev,
-            )
-            != "directory"
-        ):
-            raise ProbeError("home-library-unsafe-entry")
+        if not stat.S_ISDIR(library_metadata.st_mode):
+            raise _home_library_unsafe_error("root-kind")
+        _require_home_library_node(
+            library_metadata,
+            account=account,
+            home_device=home_opened.st_dev,
+            diagnostic_scope="root",
+        )
         library_descriptor = os.open(
             leaf_name,
             os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
@@ -4120,13 +4157,15 @@ def _observe_bounded_library(
             path_sha256 = _home_library_path_sha256(components)
             identity = (metadata.st_dev, metadata.st_ino)
             if identity in seen_identities:
-                raise ProbeError("home-library-unsafe-entry")
+                raise _home_library_unsafe_error("duplicate-identity")
             seen_identities.add(identity)
             kind = _require_home_library_node(
                 metadata,
                 account=account,
                 home_device=home_opened.st_dev,
+                diagnostic_scope="root" if depth == 1 else None,
             )
+            scope = "root" if depth == 1 else kind
             record = {
                 "depth": depth,
                 "device": metadata.st_dev,
@@ -4169,8 +4208,8 @@ def _observe_bounded_library(
                     {**observed, "content_sha256": record["content_sha256"]}
                 )
                 return
-            _require_no_extended_acl(descriptor)
-            _require_no_extended_attributes(descriptor)
+            _require_no_extended_acl(descriptor, f"{scope}-acl")
+            _require_no_extended_attributes(descriptor, f"{scope}-xattr")
             records.append(record)
             stability.append(observed)
             names = _bounded_directory_names(
@@ -4538,14 +4577,14 @@ def _delete_authorized_library_directory(
             )
             opened = os.fstat(child_descriptor)
             _require_library_record_metadata(record, opened, "directory")
-            _require_no_extended_acl(child_descriptor)
-            _require_no_extended_attributes(child_descriptor)
+            _require_no_extended_acl(child_descriptor, "directory-acl")
+            _require_no_extended_attributes(child_descriptor, "directory-xattr")
             _delete_authorized_library_directory(
                 child_descriptor,
                 child_components,
                 authorized_by_path,
             )
-            _require_no_extended_attributes(child_descriptor)
+            _require_no_extended_attributes(child_descriptor, "directory-xattr")
         except ProbeError:
             raise
         except OSError as error:
@@ -4656,13 +4695,13 @@ def _quarantine_and_remove_bounded_library(
                 os.fstat(library_descriptor),
                 "directory",
             )
-            _require_no_extended_attributes(library_descriptor)
+            _require_no_extended_attributes(library_descriptor, "root-xattr")
             _delete_authorized_library_directory(
                 library_descriptor,
                 (HOME_LIBRARY_NAME,),
                 authorized_by_path,
             )
-            _require_no_extended_attributes(library_descriptor)
+            _require_no_extended_attributes(library_descriptor, "root-xattr")
         finally:
             if library_descriptor >= 0:
                 os.close(library_descriptor)

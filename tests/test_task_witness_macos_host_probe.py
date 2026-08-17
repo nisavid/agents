@@ -4701,35 +4701,68 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             acl_free=acl_free,
         )
 
-        with (
-            mock.patch.object(
-                self.helper.ctypes,
-                "CDLL",
-                return_value=fake_libc,
-            ),
-            self.assertRaises(self.helper.ProbeError) as raised,
+        for cause in (
+            "bound-home-acl",
+            "root-acl",
+            "directory-acl",
+            "file-acl",
         ):
-            self.helper._require_no_extended_acl(17)
+            calls.clear()
+            with (
+                self.subTest(cause=cause),
+                mock.patch.object(
+                    self.helper.ctypes,
+                    "CDLL",
+                    return_value=fake_libc,
+                ),
+                self.assertRaises(self.helper.ProbeError) as raised,
+            ):
+                self.helper._require_no_extended_acl(17, unsafe_cause=cause)
 
-        self.assertEqual(raised.exception.code, "home-library-unsafe-entry")
-        self.assertEqual(
-            [name for name, _args in calls], ["get-fd", "get-entry", "free"]
-        )
-        self.assertEqual(calls[0][1], (17, self.helper.ACL_TYPE_EXTENDED))
-        self.assertEqual(calls[1][1][1], self.helper.ACL_FIRST_ENTRY)
+            self.assertEqual(raised.exception.code, "home-library-unsafe-entry")
+            self.assertEqual(
+                raised.exception.secondary_code,
+                f"home-library-unsafe-entry-{cause}",
+            )
+            self.assertEqual(
+                [name for name, _args in calls], ["get-fd", "get-entry", "free"]
+            )
+            self.assertEqual(calls[0][1], (17, self.helper.ACL_TYPE_EXTENDED))
+            self.assertEqual(calls[1][1][1], self.helper.ACL_FIRST_ENTRY)
 
     def test_bounded_library_rejects_native_extended_attributes(self) -> None:
         native_helper = load_helper()
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             cases = (
-                ("file", root / "file", "com.example.task-witness"),
-                ("directory", root / "directory", "com.example.task-witness"),
-                ("resource-fork", root / "resource", "com.apple.ResourceFork"),
+                (
+                    "file",
+                    root / "file",
+                    "com.example.task-witness",
+                    "file-xattr",
+                ),
+                (
+                    "directory",
+                    root / "directory",
+                    "com.example.task-witness",
+                    "directory-xattr",
+                ),
+                (
+                    "root",
+                    root / "root",
+                    "com.example.task-witness",
+                    "root-xattr",
+                ),
+                (
+                    "resource-fork",
+                    root / "resource",
+                    "com.apple.ResourceFork",
+                    "file-xattr",
+                ),
             )
-            for label, path, attribute in cases:
+            for label, path, attribute, cause in cases:
                 with self.subTest(label=label):
-                    if label == "directory":
+                    if label in {"directory", "root"}:
                         path.mkdir()
                         flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY
                     else:
@@ -4748,12 +4781,19 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                     descriptor = os.open(path, flags)
                     try:
                         with self.assertRaises(native_helper.ProbeError) as raised:
-                            native_helper._require_no_extended_attributes(descriptor)
+                            native_helper._require_no_extended_attributes(
+                                descriptor,
+                                unsafe_cause=cause,
+                            )
                     finally:
                         os.close(descriptor)
                     self.assertEqual(
                         raised.exception.code,
                         "home-library-unsafe-entry",
+                    )
+                    self.assertEqual(
+                        raised.exception.secondary_code,
+                        f"home-library-unsafe-entry-{cause}",
                     )
 
         calls: list[tuple[object, ...]] = []
@@ -4771,11 +4811,505 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             "CDLL",
             return_value=SimpleNamespace(flistxattr=NoAttributes()),
         ):
-            native_helper._require_no_extended_attributes(17)
+            native_helper._require_no_extended_attributes(
+                17,
+                unsafe_cause="root-xattr",
+            )
         self.assertEqual(
             calls,
             [(17, None, 0, native_helper.XATTR_SHOWCOMPRESSION)],
         )
+
+    def test_home_library_unsafe_diagnostic_constructor_is_finite_and_value_free(
+        self,
+    ) -> None:
+        primary = "home-library-unsafe-entry"
+        common_metadata = {
+            "device-mismatch",
+            "uid-mismatch",
+            "gid-mismatch",
+            "group-other-write",
+            "flags-present",
+            "owner-access",
+        }
+        expected_causes = frozenset(
+            {
+                "bound-home-acl",
+                "duplicate-identity",
+                "entry-stat-unsupported-kind",
+                "file-stat-link-count",
+                "path-component",
+                "root-kind",
+                *(
+                    f"{scope}-{attribute}"
+                    for scope in ("root", "directory", "file")
+                    for attribute in ("acl", "xattr")
+                ),
+                *(
+                    f"{scope}-stat-{invariant}"
+                    for scope in ("root", "directory", "file")
+                    for invariant in common_metadata
+                ),
+            }
+        )
+        self.assertEqual(
+            self.helper.HOME_LIBRARY_UNSAFE_CAUSES,
+            expected_causes,
+        )
+
+        for cause in expected_causes:
+            with self.subTest(cause=cause):
+                error = self.helper._home_library_unsafe_error(cause)
+                expected_secondary = f"{primary}-{cause}"
+                self.assertEqual(error.code, primary)
+                self.assertEqual(error.secondary_code, expected_secondary)
+                self.assertLessEqual(len(expected_secondary), 128)
+                self.assertEqual(
+                    self.helper._validated_probe_error(
+                        error.code,
+                        error.secondary_code,
+                    ),
+                    {
+                        "code": primary,
+                        "secondary_code": expected_secondary,
+                    },
+                )
+
+        for invalid_cause in (
+            "",
+            "private-name-canary",
+            "file-xattr-private-attribute-canary",
+            None,
+            ["root-acl"],
+        ):
+            with self.subTest(invalid_cause=invalid_cause):
+                error = self.helper._home_library_unsafe_error(invalid_cause)
+                self.assertEqual(error.code, primary)
+                self.assertEqual(
+                    error.secondary_code,
+                    "home-library-diagnostic-invalid",
+                )
+                self.assertNotIn("canary", str(error.code))
+                self.assertNotIn("canary", str(error.secondary_code))
+
+    def test_home_library_path_component_diagnostic_is_value_free(self) -> None:
+        canary = "private/path-component-canary"
+
+        with self.assertRaises(self.helper.ProbeError) as raised:
+            self.helper._home_library_path_sha256((canary,))
+
+        self.assertEqual(raised.exception.code, "home-library-unsafe-entry")
+        self.assertEqual(
+            raised.exception.secondary_code,
+            "home-library-unsafe-entry-path-component",
+        )
+        self.assertNotIn("private", raised.exception.code)
+        self.assertNotIn("private", raised.exception.secondary_code)
+        self.assertEqual(
+            self.helper._home_library_path_sha256(("Library",)),
+            self.helper._home_library_path_sha256(("Library",)),
+        )
+
+    def test_home_library_node_metadata_diagnostics_are_ordered_and_exact(
+        self,
+    ) -> None:
+        account = self.helper.DisposableAccount(
+            name="twq-0123456789ab",
+            uid=502,
+            gid=20,
+            home=Path("/Users/twq-0123456789ab"),
+        )
+        primary = "home-library-unsafe-entry"
+        unsupported = SimpleNamespace(
+            st_dev=7,
+            st_gid=account.gid,
+            st_mode=stat.S_IFLNK | 0o700,
+            st_nlink=1,
+            st_uid=account.uid,
+            st_flags=0,
+        )
+        with self.assertRaises(self.helper.ProbeError) as raised:
+            self.helper._require_home_library_node(
+                unsupported,
+                account=account,
+                home_device=7,
+            )
+        self.assertEqual(raised.exception.code, primary)
+        self.assertEqual(
+            raised.exception.secondary_code,
+            f"{primary}-entry-stat-unsupported-kind",
+        )
+
+        for scope in ("root", "directory", "file"):
+            mode = (
+                stat.S_IFDIR | 0o700
+                if scope in {"root", "directory"}
+                else stat.S_IFREG | 0o600
+            )
+            changes_by_invariant = {
+                "device-mismatch": {"st_dev": 8},
+                "uid-mismatch": {"st_uid": 503},
+                "gid-mismatch": {"st_gid": 21},
+                "group-other-write": {"st_mode": mode | 0o020},
+                "flags-present": {"st_flags": 1},
+                "owner-access": {
+                    "st_mode": (
+                        stat.S_IFREG | 0o200
+                        if scope == "file"
+                        else stat.S_IFDIR | 0o600
+                    )
+                },
+            }
+            if scope == "file":
+                changes_by_invariant["link-count"] = {"st_nlink": 2}
+            diagnostic_scope = {"diagnostic_scope": "root"} if scope == "root" else {}
+            for invariant, changes in changes_by_invariant.items():
+                values = {
+                    "st_dev": 7,
+                    "st_gid": account.gid,
+                    "st_mode": mode,
+                    "st_nlink": 1,
+                    "st_uid": account.uid,
+                    "st_flags": 0,
+                    **changes,
+                }
+                with (
+                    self.subTest(scope=scope, invariant=invariant),
+                    self.assertRaises(self.helper.ProbeError) as raised,
+                ):
+                    self.helper._require_home_library_node(
+                        SimpleNamespace(**values),
+                        account=account,
+                        home_device=7,
+                        **diagnostic_scope,
+                    )
+                self.assertEqual(raised.exception.code, primary)
+                self.assertEqual(
+                    raised.exception.secondary_code,
+                    f"{primary}-{scope}-stat-{invariant}",
+                )
+
+        precedence = {
+            "st_dev": 8,
+            "st_gid": 21,
+            "st_mode": stat.S_IFREG | 0o220,
+            "st_nlink": 2,
+            "st_uid": 503,
+            "st_flags": 1,
+        }
+        repairs = (
+            ("device-mismatch", {"st_dev": 7}),
+            ("uid-mismatch", {"st_uid": account.uid}),
+            ("gid-mismatch", {"st_gid": account.gid}),
+            ("group-other-write", {"st_mode": stat.S_IFREG | 0o200}),
+            ("flags-present", {"st_flags": 0}),
+            ("owner-access", {"st_mode": stat.S_IFREG | 0o600}),
+            ("link-count", {"st_nlink": 1}),
+        )
+        for invariant, repair in repairs:
+            with (
+                self.subTest(precedence=invariant),
+                self.assertRaises(self.helper.ProbeError) as raised,
+            ):
+                self.helper._require_home_library_node(
+                    SimpleNamespace(**precedence),
+                    account=account,
+                    home_device=7,
+                )
+            self.assertEqual(
+                raised.exception.secondary_code,
+                f"home-library-unsafe-entry-file-stat-{invariant}",
+            )
+            precedence.update(repair)
+        self.assertEqual(
+            self.helper._require_home_library_node(
+                SimpleNamespace(**precedence),
+                account=account,
+                home_device=7,
+            ),
+            "file",
+        )
+
+    def test_bounded_library_inventory_threads_scoped_acl_and_xattr_causes(
+        self,
+    ) -> None:
+        cases = (
+            ("home-acl", "home", "bound-home-acl"),
+            ("root-acl", "root", "root-acl"),
+            ("root-xattr", "root", "root-xattr"),
+            ("directory-acl", "directory", "directory-acl"),
+            ("directory-xattr", "directory", "directory-xattr"),
+            ("file-acl", "file", "file-acl"),
+            ("file-xattr", "file", "file-xattr"),
+        )
+        primary = "home-library-unsafe-entry"
+        for label, target_kind, cause in cases:
+            with (
+                self.subTest(label=label),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                home = Path(directory) / "home"
+                library = home / "Library"
+                child_directory = library / "private-directory-canary"
+                child_file = child_directory / "private-file-canary"
+                child_directory.mkdir(parents=True)
+                child_file.write_bytes(b"private-value-canary")
+                home.chmod(0o700)
+                targets = {
+                    "home": home,
+                    "root": library,
+                    "directory": child_directory,
+                    "file": child_file,
+                }
+                target = targets[target_kind]
+                target_inode = target.lstat().st_ino
+                observed_causes: list[object] = []
+
+                def reject(
+                    descriptor: int,
+                    unsafe_cause: object = None,
+                    target_inode: int = target_inode,
+                    observed_causes: list[object] = observed_causes,
+                    cause: str = cause,
+                ) -> None:
+                    if os.fstat(descriptor).st_ino == target_inode:
+                        observed_causes.append(unsafe_cause)
+                        raise self.helper.ProbeError(
+                            primary,
+                            secondary_code=f"{primary}-{cause}",
+                        )
+
+                account = self.helper.DisposableAccount(
+                    name="twq-0123456789ab",
+                    uid=os.geteuid(),
+                    gid=os.getegid(),
+                    home=home,
+                )
+                rejecting_acl = label.endswith("acl")
+                with (
+                    mock.patch.object(
+                        self.helper,
+                        "_require_no_extended_acl",
+                        side_effect=reject if rejecting_acl else None,
+                    ),
+                    mock.patch.object(
+                        self.helper,
+                        "_require_no_extended_attributes",
+                        side_effect=None if rejecting_acl else reject,
+                    ),
+                    mock.patch.object(
+                        self.helper,
+                        "_write_stage_create_new",
+                    ) as publish,
+                    mock.patch.object(
+                        self.helper,
+                        "_renameat_exclusive",
+                    ) as rename,
+                    mock.patch.object(self.helper.os, "unlink") as unlink,
+                    mock.patch.object(self.helper.os, "rmdir") as rmdir,
+                    self.assertRaises(self.helper.ProbeError) as raised,
+                ):
+                    self.helper._bounded_library_inventory(account)
+
+                self.assertEqual(raised.exception.code, primary)
+                self.assertEqual(
+                    raised.exception.secondary_code,
+                    f"{primary}-{cause}",
+                )
+                self.assertEqual(observed_causes, [cause])
+                self.assertNotIn("private", raised.exception.code)
+                self.assertNotIn("private", raised.exception.secondary_code)
+                publish.assert_not_called()
+                rename.assert_not_called()
+                unlink.assert_not_called()
+                rmdir.assert_not_called()
+                self.assertTrue(target.exists())
+
+        for target_kind in ("root", "directory", "file"):
+            with (
+                self.subTest(precedence=target_kind),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                home = Path(directory) / "home"
+                library = home / "Library"
+                child_directory = library / "private-directory-canary"
+                child_file = child_directory / "private-file-canary"
+                child_directory.mkdir(parents=True)
+                child_file.write_bytes(b"private-value-canary")
+                home.chmod(0o700)
+                target = {
+                    "root": library,
+                    "directory": child_directory,
+                    "file": child_file,
+                }[target_kind]
+                target_inode = target.lstat().st_ino
+                acl_causes: list[object] = []
+                xattr_causes: list[object] = []
+
+                def reject_acl(
+                    descriptor: int,
+                    unsafe_cause: object = None,
+                    target_inode: int = target_inode,
+                    acl_causes: list[object] = acl_causes,
+                ) -> None:
+                    if os.fstat(descriptor).st_ino == target_inode:
+                        acl_causes.append(unsafe_cause)
+                        raise self.helper._home_library_unsafe_error(unsafe_cause)
+
+                def reject_xattr(
+                    descriptor: int,
+                    unsafe_cause: object = None,
+                    target_inode: int = target_inode,
+                    xattr_causes: list[object] = xattr_causes,
+                ) -> None:
+                    if os.fstat(descriptor).st_ino == target_inode:
+                        xattr_causes.append(unsafe_cause)
+                        raise self.helper._home_library_unsafe_error(unsafe_cause)
+
+                account = self.helper.DisposableAccount(
+                    name="twq-0123456789ab",
+                    uid=os.geteuid(),
+                    gid=os.getegid(),
+                    home=home,
+                )
+                with (
+                    mock.patch.object(
+                        self.helper,
+                        "_require_no_extended_acl",
+                        side_effect=reject_acl,
+                    ),
+                    mock.patch.object(
+                        self.helper,
+                        "_require_no_extended_attributes",
+                        side_effect=reject_xattr,
+                    ),
+                    self.assertRaises(self.helper.ProbeError) as raised,
+                ):
+                    self.helper._bounded_library_inventory(account)
+
+                expected = f"{target_kind}-acl"
+                self.assertEqual(
+                    raised.exception.secondary_code,
+                    f"home-library-unsafe-entry-{expected}",
+                )
+                self.assertEqual(acl_causes, [expected])
+                self.assertEqual(xattr_causes, [])
+                self.assertTrue(target.exists())
+
+    def test_bounded_library_inventory_reports_root_kind_and_duplicate_identity(
+        self,
+    ) -> None:
+        primary = "home-library-unsafe-entry"
+        for scenario in (
+            "root-file",
+            "root-hardlink",
+            "root-symlink",
+            "root-fifo",
+            "duplicate-identity",
+        ):
+            with (
+                self.subTest(scenario=scenario),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                home = Path(directory) / "home"
+                home.mkdir()
+                home.chmod(0o700)
+                library = home / "Library"
+                preserved: tuple[Path, ...]
+                open_patch = nullcontext()
+                stat_patch = nullcontext()
+                if scenario != "duplicate-identity":
+                    if scenario == "root-file":
+                        library.write_bytes(b"private-root-file-canary")
+                    elif scenario == "root-hardlink":
+                        source = home / "private-root-source-canary"
+                        source.write_bytes(b"private-root-file-canary")
+                        os.link(source, library)
+                        preserved = (source, library)
+                    elif scenario == "root-symlink":
+                        library.symlink_to("private-missing-root-canary")
+                    else:
+                        os.mkfifo(library)
+                    if scenario != "root-hardlink":
+                        preserved = (library,)
+                else:
+                    first = library / "private-duplicate-a-canary"
+                    second = library / "private-duplicate-b-canary"
+                    first.mkdir(parents=True)
+                    second.mkdir()
+                    preserved = (first, second)
+                    original_open = self.helper.os.open
+                    original_stat = self.helper.os.stat
+
+                    def duplicate_open(
+                        path: object,
+                        *args: object,
+                        first: Path = first,
+                        second: Path = second,
+                        original_open: object = original_open,
+                        **kwargs: object,
+                    ) -> int:
+                        selected = first.name if path == second.name else path
+                        return original_open(selected, *args, **kwargs)
+
+                    def duplicate_stat(
+                        path: object,
+                        *args: object,
+                        first: Path = first,
+                        second: Path = second,
+                        original_stat: object = original_stat,
+                        **kwargs: object,
+                    ) -> os.stat_result:
+                        selected = first.name if path == second.name else path
+                        return original_stat(selected, *args, **kwargs)
+
+                    open_patch = mock.patch.object(
+                        self.helper.os,
+                        "open",
+                        side_effect=duplicate_open,
+                    )
+                    stat_patch = mock.patch.object(
+                        self.helper.os,
+                        "stat",
+                        side_effect=duplicate_stat,
+                    )
+                account = self.helper.DisposableAccount(
+                    name="twq-0123456789ab",
+                    uid=os.geteuid(),
+                    gid=os.getegid(),
+                    home=home,
+                )
+                with (
+                    open_patch,
+                    stat_patch,
+                    mock.patch.object(
+                        self.helper,
+                        "_write_stage_create_new",
+                    ) as publish,
+                    mock.patch.object(
+                        self.helper,
+                        "_renameat_exclusive",
+                    ) as rename,
+                    mock.patch.object(self.helper.os, "unlink") as unlink,
+                    mock.patch.object(self.helper.os, "rmdir") as rmdir,
+                    self.assertRaises(self.helper.ProbeError) as raised,
+                ):
+                    self.helper._bounded_library_inventory(account)
+
+                self.assertEqual(raised.exception.code, primary)
+                self.assertEqual(
+                    raised.exception.secondary_code,
+                    f"{primary}-"
+                    f"{'duplicate-identity' if scenario == 'duplicate-identity' else 'root-kind'}",
+                )
+                self.assertNotIn("private", raised.exception.code)
+                self.assertNotIn("private", raised.exception.secondary_code)
+                publish.assert_not_called()
+                rename.assert_not_called()
+                unlink.assert_not_called()
+                rmdir.assert_not_called()
+                for path in preserved:
+                    self.assertTrue(path.exists() or path.is_symlink())
 
     def test_bounded_library_inventory_is_canonical_and_value_free(self) -> None:
         inventory_builder = getattr(
@@ -5257,13 +5791,13 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             self.write_extended_attribute(path, "com.apple.ResourceFork")
             return (path,)
 
-        for label, arrange in (
-            ("symlink", symlink),
-            ("fifo", fifo),
-            ("hardlink", hardlink),
-            ("file-xattr", file_xattr),
-            ("directory-xattr", directory_xattr),
-            ("resource-fork", resource_fork),
+        for label, arrange, expected_cause in (
+            ("symlink", symlink, "entry-stat-unsupported-kind"),
+            ("fifo", fifo, "entry-stat-unsupported-kind"),
+            ("hardlink", hardlink, "file-stat-link-count"),
+            ("file-xattr", file_xattr, "file-xattr"),
+            ("directory-xattr", directory_xattr, "directory-xattr"),
+            ("resource-fork", resource_fork, "file-xattr"),
         ):
             with (
                 self.subTest(label=label),
@@ -5285,10 +5819,11 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
 
                 def reject_extended_attributes(
                     descriptor: int,
+                    unsafe_cause: object = None,
                     rejected: set[int] = rejected_inodes,
                 ) -> None:
                     if os.fstat(descriptor).st_ino in rejected:
-                        raise self.helper.ProbeError("home-library-unsafe-entry")
+                        raise self.helper._home_library_unsafe_error(unsafe_cause)
 
                 account = self.helper.DisposableAccount(
                     name="twq-0123456789ab",
@@ -5308,6 +5843,10 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                     inventory_builder(account)
 
                 self.assertNotIn("private", raised.exception.code)
+                self.assertEqual(
+                    raised.exception.secondary_code,
+                    f"home-library-unsafe-entry-{expected_cause}",
+                )
                 for path in preserved:
                     self.assertTrue(path.exists() or path.is_symlink())
                 if label == "hardlink":
@@ -5415,17 +5954,30 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
     def test_bounded_library_cleanup_rejects_extended_attributes_before_mutation(
         self,
     ) -> None:
-        for label, relative_path, attribute in (
+        for label, relative_path, attribute, expected_cause in (
+            (
+                "root",
+                (),
+                "com.example.task-witness",
+                "root-xattr",
+            ),
             (
                 "file",
                 ("Preferences", "settings.plist"),
                 "com.example.task-witness",
+                "file-xattr",
             ),
-            ("directory", ("Container",), "com.example.task-witness"),
+            (
+                "directory",
+                ("Container",),
+                "com.example.task-witness",
+                "directory-xattr",
+            ),
             (
                 "resource-fork",
                 ("Container", "Deep", "payload.bin"),
                 "com.apple.ResourceFork",
+                "file-xattr",
             ),
         ):
             with (
@@ -5454,10 +6006,11 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
 
                 def reject_extended_attributes(
                     descriptor: int,
+                    unsafe_cause: object = None,
                     target: int = target_inode,
                 ) -> None:
                     if os.fstat(descriptor).st_ino == target:
-                        raise self.helper.ProbeError("home-library-unsafe-entry")
+                        raise self.helper._home_library_unsafe_error(unsafe_cause)
 
                 with (
                     mock.patch.object(
@@ -5479,6 +6032,10 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                     )
 
                 self.assertEqual(raised.exception.code, "home-library-unsafe-entry")
+                self.assertEqual(
+                    raised.exception.secondary_code,
+                    f"home-library-unsafe-entry-{expected_cause}",
+                )
                 self.assertNotIn("private", raised.exception.code)
                 rename.assert_not_called()
                 unlink.assert_not_called()
@@ -5488,114 +6045,185 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
     def test_bounded_library_cleanup_rechecks_xattrs_at_each_delete_boundary(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            account, _identity, authorization, _relative_files = (
-                self.bounded_library_cleanup_fixture(root)
-            )
-            source_target = account.home / "Library/Preferences/settings.plist"
-            target_inode = source_target.lstat().st_ino
-            after_quarantine_scan = False
-            stable_observed = self.helper._stable_observed_library
+        def exercise(
+            relative_path: tuple[str, ...],
+            expected_cause: str,
+            reject_call: int,
+        ) -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                account, _identity, authorization, _relative_files = (
+                    self.bounded_library_cleanup_fixture(root)
+                )
+                source_target = account.home.joinpath(
+                    self.helper.HOME_LIBRARY_NAME,
+                    *relative_path,
+                )
+                target_inode = source_target.lstat().st_ino
+                after_quarantine_scan = False
+                target_calls: list[object] = []
+                stable_observed = self.helper._stable_observed_library
 
-            def stable(*args: object, **kwargs: object) -> dict:
-                nonlocal after_quarantine_scan
-                observed = stable_observed(*args, **kwargs)
-                if args[1] == self.helper.HOME_LIBRARY_QUARANTINE_NAME:
-                    after_quarantine_scan = True
-                return observed
+                def stable(*args: object, **kwargs: object) -> dict:
+                    nonlocal after_quarantine_scan
+                    observed = stable_observed(*args, **kwargs)
+                    if args[1] == self.helper.HOME_LIBRARY_QUARANTINE_NAME:
+                        after_quarantine_scan = True
+                    return observed
 
-            def reject_file_xattrs(descriptor: int) -> None:
-                if (
-                    after_quarantine_scan
-                    and os.fstat(descriptor).st_ino == target_inode
+                def reject_target_xattrs(
+                    descriptor: int,
+                    unsafe_cause: object = None,
+                ) -> None:
+                    if (
+                        after_quarantine_scan
+                        and os.fstat(descriptor).st_ino == target_inode
+                    ):
+                        target_calls.append(unsafe_cause)
+                        if len(target_calls) == reject_call:
+                            raise self.helper._home_library_unsafe_error(unsafe_cause)
+
+                with (
+                    mock.patch.object(
+                        self.helper,
+                        "_renameat_exclusive",
+                        side_effect=self.rename_library_portably,
+                    ),
+                    mock.patch.object(
+                        self.helper,
+                        "_stable_observed_library",
+                        side_effect=stable,
+                    ),
+                    mock.patch.object(
+                        self.helper,
+                        "_require_no_extended_attributes",
+                        side_effect=reject_target_xattrs,
+                    ),
+                    self.assertRaises(self.helper.ProbeError) as raised,
                 ):
-                    raise self.helper.ProbeError("home-library-unsafe-entry")
+                    self.helper._quarantine_and_remove_bounded_library(
+                        account,
+                        authorization,
+                    )
 
-            with (
-                mock.patch.object(
-                    self.helper,
-                    "_renameat_exclusive",
-                    side_effect=self.rename_library_portably,
-                ),
-                mock.patch.object(
-                    self.helper,
-                    "_stable_observed_library",
-                    side_effect=stable,
-                ),
-                mock.patch.object(
-                    self.helper,
-                    "_require_no_extended_attributes",
-                    side_effect=reject_file_xattrs,
-                ),
-                mock.patch.object(self.helper.os, "unlink") as unlink,
-                mock.patch.object(self.helper.os, "rmdir") as rmdir,
-                self.assertRaises(self.helper.ProbeError) as raised,
-            ):
-                self.helper._quarantine_and_remove_bounded_library(
-                    account,
-                    authorization,
+                self.assertEqual(
+                    raised.exception.code,
+                    "home-library-unsafe-entry",
                 )
-
-            self.assertEqual(raised.exception.code, "home-library-unsafe-entry")
-            self.assertNotIn(
-                "settings.plist",
-                [call.args[0] for call in unlink.call_args_list],
-            )
-            quarantine = account.home / self.helper.HOME_LIBRARY_QUARANTINE_NAME
-            self.assertTrue(
-                quarantine.joinpath("Preferences", "settings.plist").is_file()
-            )
-
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            account, _identity, authorization, _relative_files = (
-                self.bounded_library_cleanup_fixture(root)
-            )
-            rejected_directory_inode: int | None = None
-            original_unlink = os.unlink
-            original_rmdir = os.rmdir
-            removed_directories: list[str] = []
-
-            def unlink(name: str, *, dir_fd: int | None = None) -> None:
-                nonlocal rejected_directory_inode
-                original_unlink(name, dir_fd=dir_fd)
-                if name == "settings.plist":
-                    assert dir_fd is not None
-                    rejected_directory_inode = os.fstat(dir_fd).st_ino
-
-            def reject_directory_xattrs(descriptor: int) -> None:
-                if os.fstat(descriptor).st_ino == rejected_directory_inode:
-                    raise self.helper.ProbeError("home-library-unsafe-entry")
-
-            def rmdir(name: str, *, dir_fd: int | None = None) -> None:
-                removed_directories.append(name)
-                original_rmdir(name, dir_fd=dir_fd)
-
-            with (
-                mock.patch.object(
-                    self.helper,
-                    "_renameat_exclusive",
-                    side_effect=self.rename_library_portably,
-                ),
-                mock.patch.object(
-                    self.helper,
-                    "_require_no_extended_attributes",
-                    side_effect=reject_directory_xattrs,
-                ),
-                mock.patch.object(self.helper.os, "unlink", side_effect=unlink),
-                mock.patch.object(self.helper.os, "rmdir", side_effect=rmdir),
-                self.assertRaises(self.helper.ProbeError) as raised,
-            ):
-                self.helper._quarantine_and_remove_bounded_library(
-                    account,
-                    authorization,
+                self.assertEqual(
+                    raised.exception.secondary_code,
+                    f"home-library-unsafe-entry-{expected_cause}",
                 )
+                self.assertEqual(
+                    target_calls,
+                    [expected_cause] * reject_call,
+                )
+                quarantine_target = account.home.joinpath(
+                    self.helper.HOME_LIBRARY_QUARANTINE_NAME,
+                    *relative_path,
+                )
+                self.assertTrue(quarantine_target.exists())
 
-            self.assertEqual(raised.exception.code, "home-library-unsafe-entry")
-            self.assertNotIn("Preferences", removed_directories)
-            quarantine = account.home / self.helper.HOME_LIBRARY_QUARANTINE_NAME
-            self.assertTrue((quarantine / "Preferences").is_dir())
+        cases = (
+            ("file", ("Preferences", "settings.plist"), "file-xattr"),
+            ("directory", ("Preferences",), "directory-xattr"),
+            ("root", (), "root-xattr"),
+        )
+        for scope, relative_path, expected_cause in cases:
+            for reject_call in (1, 2):
+                with self.subTest(scope=scope, reject_call=reject_call):
+                    exercise(relative_path, expected_cause, reject_call)
+
+    def test_bounded_library_delete_threads_file_and_directory_acl_causes(
+        self,
+    ) -> None:
+        for kind in ("file", "directory"):
+            with (
+                self.subTest(kind=kind),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                home = Path(directory) / "home"
+                library = home / "Library"
+                library.mkdir(parents=True)
+                home.chmod(0o700)
+                target = library / "private-acl-target-canary"
+                if kind == "file":
+                    target.write_bytes(b"private-acl-value-canary")
+                else:
+                    target.mkdir()
+                account = self.helper.DisposableAccount(
+                    name="twq-0123456789ab",
+                    uid=os.geteuid(),
+                    gid=os.getegid(),
+                    home=home,
+                )
+                inventory = self.helper._bounded_library_inventory(account)
+                self.assertIsNotNone(inventory)
+                entries = inventory["entries"]
+                authorized = {entry["path_sha256"]: entry for entry in entries}
+                target_inode = target.lstat().st_ino
+                causes: list[object] = []
+                xattr_causes: list[object] = []
+
+                def reject(
+                    descriptor: int,
+                    unsafe_cause: object = None,
+                    target_inode: int = target_inode,
+                    causes: list[object] = causes,
+                ) -> None:
+                    if os.fstat(descriptor).st_ino == target_inode:
+                        causes.append(unsafe_cause)
+                        raise self.helper._home_library_unsafe_error(unsafe_cause)
+
+                def reject_xattr(
+                    descriptor: int,
+                    unsafe_cause: object = None,
+                    target_inode: int = target_inode,
+                    xattr_causes: list[object] = xattr_causes,
+                ) -> None:
+                    if os.fstat(descriptor).st_ino == target_inode:
+                        xattr_causes.append(unsafe_cause)
+                        raise self.helper._home_library_unsafe_error(unsafe_cause)
+
+                descriptor = os.open(
+                    library,
+                    os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+                )
+                try:
+                    with (
+                        mock.patch.object(
+                            self.helper,
+                            "_require_no_extended_acl",
+                            side_effect=reject,
+                        ),
+                        mock.patch.object(
+                            self.helper,
+                            "_require_no_extended_attributes",
+                            side_effect=reject_xattr,
+                        ),
+                        mock.patch.object(self.helper.os, "unlink") as unlink,
+                        mock.patch.object(self.helper.os, "rmdir") as rmdir,
+                        self.assertRaises(self.helper.ProbeError) as raised,
+                    ):
+                        self.helper._delete_authorized_library_directory(
+                            descriptor,
+                            (self.helper.HOME_LIBRARY_NAME,),
+                            authorized,
+                        )
+                finally:
+                    os.close(descriptor)
+
+                expected = f"{kind}-acl"
+                self.assertEqual(raised.exception.code, "home-library-unsafe-entry")
+                self.assertEqual(
+                    raised.exception.secondary_code,
+                    f"home-library-unsafe-entry-{expected}",
+                )
+                self.assertEqual(causes, [expected])
+                self.assertEqual(xattr_causes, [])
+                unlink.assert_not_called()
+                rmdir.assert_not_called()
+                self.assertTrue(target.exists())
 
     def test_home_cleanup_authorization_rejects_home_acl_before_publication(
         self,
@@ -5963,7 +6591,10 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             )
             home_inode = account.home.lstat().st_ino
 
-            def reject_home_acl(descriptor: int) -> None:
+            def reject_home_acl(
+                descriptor: int,
+                unsafe_cause: object = None,
+            ) -> None:
                 if os.fstat(descriptor).st_ino == home_inode:
                     raise self.helper.ProbeError("home-library-unsafe-entry")
 
@@ -8755,6 +9386,24 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 None,
                 self.helper.ProbeError(primary, secondary_code=secondary),
             ),
+            (primary, secondary),
+        )
+        unsafe_primary = "home-library-unsafe-entry"
+        unsafe_secondary = "home-library-unsafe-entry-file-xattr"
+        unsafe = self.helper.ProbeError(
+            unsafe_primary,
+            secondary_code=unsafe_secondary,
+        )
+        self.assertEqual(
+            self.helper._merge_probe_error(None, None, unsafe),
+            (unsafe_primary, unsafe_secondary),
+        )
+        self.assertEqual(
+            self.helper._merge_probe_error(primary, None, unsafe),
+            (primary, unsafe_primary),
+        )
+        self.assertEqual(
+            self.helper._merge_probe_error(primary, secondary, unsafe),
             (primary, secondary),
         )
         self.assertEqual(
@@ -11659,6 +12308,10 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             helper_sha.group(1),
             hashlib.sha256(HELPER.read_bytes()).hexdigest(),
         )
+        self.assertLessEqual(
+            len(HELPER.read_bytes()),
+            self.helper.MAX_HELPER_BYTES,
+        )
         helper_source = HELPER.read_text(encoding="utf-8")
         self.assertEqual(helper_source.count('f"user/{uid}"'), 1)
         self.assertNotIn('"print", f"user/', helper_source)
@@ -14378,6 +15031,202 @@ raise SystemExit(93)
                             ),
                         },
                     )
+
+    def test_cleanup_propagates_home_library_secondary_from_journal_inventory(
+        self,
+    ) -> None:
+        primary = "home-library-unsafe-entry"
+        secondary = "home-library-unsafe-entry-file-xattr"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stage = root / "stage"
+            artifact = root / "artifact"
+            home = root / "home"
+            library = home / "Library"
+            stage.mkdir()
+            artifact.mkdir()
+            library.mkdir(parents=True)
+            home.chmod(0o700)
+            canary = library / "private-hosted-inventory-canary"
+            canary.write_bytes(b"private-hosted-value-canary")
+            account = self.helper.DisposableAccount(
+                name="twq-0123456789ab",
+                uid=os.geteuid(),
+                gid=os.getegid(),
+                home=home,
+            )
+            plan = self.helper.LaunchdPlan(
+                account=account,
+                label="io.nisavid.task-witness.macos-probe.0123456789ab",
+                stage_root=stage,
+                helper=stage / "helper.py",
+                plist=stage / "job.plist",
+            )
+            state = self.lifecycle_state(plan)
+            binding = self.helper._account_binding_document(
+                plan,
+                state,
+                "01234567-89AB-4DEF-8123-456789ABCDEF",
+            )
+            bindings = self.helper.ValidatedStageBindings(
+                binding,
+                {"ownership": "exact"},
+            )
+            identity = {
+                "home_device": home.lstat().st_dev,
+                "home_inode": home.lstat().st_ino,
+                "probe_device": home.lstat().st_dev,
+                "probe_inode": home.lstat().st_ino + 1,
+            }
+            payloads: list[tuple[Path, bytes, int]] = []
+
+            def exists(path: Path) -> bool:
+                return path == home
+
+            def record(path: Path, raw: bytes, mode: int) -> None:
+                payloads.append((path, raw, mode))
+
+            stderr = io.StringIO()
+            with ExitStack() as stack:
+                stack.enter_context(
+                    mock.patch.dict(os.environ, eligible_context(), clear=True)
+                )
+                for name in (
+                    "_normalized_context",
+                    "_validate_lifecycle_arguments",
+                    "_reconcile_owned_launchd_job",
+                    "_validate_exact_disposable_home",
+                    "_quiesce_disposable_user",
+                    "_require_no_uid_processes",
+                    "_require_stable_no_uid_processes",
+                ):
+                    stack.enter_context(mock.patch.object(self.helper, name))
+                stack.enter_context(
+                    mock.patch.object(
+                        self.helper,
+                        "_cleanup_helper_only_stage_before_state",
+                        return_value=False,
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        self.helper,
+                        "_load_lifecycle_state",
+                        return_value=(plan, state),
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        self.helper,
+                        "_validate_exact_stage",
+                        return_value=bindings,
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        self.helper,
+                        "_account_exists",
+                        return_value=False,
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        self.helper,
+                        "_path_exists_no_follow",
+                        side_effect=exists,
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(self.helper, "_list_accounts", return_value={})
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        self.helper,
+                        "_exact_disposable_home_identity",
+                        return_value=identity,
+                    )
+                )
+                bound_home = stack.enter_context(
+                    mock.patch.object(self.helper, "_require_bound_home_path")
+                )
+                inventory = stack.enter_context(
+                    mock.patch.object(
+                        self.helper,
+                        "_bounded_library_inventory",
+                        side_effect=self.helper.ProbeError(
+                            primary,
+                            secondary_code=secondary,
+                        ),
+                    )
+                )
+                publish = stack.enter_context(
+                    mock.patch.object(self.helper, "_write_stage_create_new")
+                )
+                rename = stack.enter_context(
+                    mock.patch.object(self.helper, "_renameat_exclusive")
+                )
+                unlink = stack.enter_context(
+                    mock.patch.object(self.helper.os, "unlink")
+                )
+                rmdir = stack.enter_context(mock.patch.object(self.helper.os, "rmdir"))
+                path_unlink = stack.enter_context(mock.patch.object(Path, "unlink"))
+                path_rmdir = stack.enter_context(mock.patch.object(Path, "rmdir"))
+                stack.enter_context(
+                    mock.patch.object(
+                        self.helper,
+                        "_metadata_matches",
+                        side_effect=lambda path, **_kwargs: path == artifact,
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        self.helper,
+                        "_write_root_file",
+                        side_effect=record,
+                    )
+                )
+                stack.enter_context(redirect_stderr(stderr))
+                status = self.helper.cleanup_launchd_user_lifecycle(
+                    stage_root=stage,
+                    artifact_root=artifact,
+                    expected_helper_sha256="1" * 64,
+                    runner_uid=501,
+                    runner_gid=20,
+                )
+
+            self.assertEqual(status, 2)
+            self.assertEqual(
+                stderr.getvalue(),
+                (
+                    "task-witness macOS launchd-user cleanup: "
+                    f"{primary}\n"
+                    "task-witness macOS launchd-user cleanup secondary: "
+                    f"{secondary}\n"
+                ),
+            )
+            bound_home.assert_called_once_with(account, identity)
+            inventory.assert_called_once_with(account)
+            publish.assert_not_called()
+            rename.assert_not_called()
+            unlink.assert_not_called()
+            rmdir.assert_not_called()
+            path_unlink.assert_not_called()
+            path_rmdir.assert_not_called()
+            self.assertTrue(stage.is_dir())
+            self.assertFalse((stage / "home-cleanup.json").exists())
+            self.assertTrue(canary.is_file())
+            self.assertEqual(len(payloads), 1)
+            cleanup_path, cleanup_raw, cleanup_mode = payloads[0]
+            self.assertEqual(cleanup_path, artifact / "cleanup.json")
+            self.assertEqual(cleanup_mode, 0o600)
+            cleanup = json.loads(cleanup_raw)
+            self.assertEqual(cleanup["disposition"], "preserved-on-drift")
+            self.assertEqual(
+                cleanup["error"],
+                {"code": primary, "secondary_code": secondary},
+            )
+            self.assertNotIn("private", stderr.getvalue())
+            self.assertNotIn("private", cleanup_raw.decode("utf-8"))
 
     def test_reset_binding_validation_recovers_partial_cleanup_states(self) -> None:
         plan = self.lifecycle_plan(Path("/private/var/tmp/stage"))

@@ -4969,7 +4969,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                     root / "resource",
                     "com.apple.ResourceFork",
                     "file-xattr",
-                    ("resource-fork", "mixed-other"),
+                    ("resource-fork", "apple-mixed"),
                 ),
             )
             for label, path, attribute, cause, family in cases:
@@ -4999,7 +4999,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                                 **(
                                     {
                                         "diagnostic_phase": "journal-inventory",
-                                        "diagnostic_locus": "direct",
+                                        "diagnostic_path_family": "direct",
                                     }
                                     if family is not None
                                     else {}
@@ -5050,7 +5050,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             [(17, None, 0, native_helper.XATTR_SHOWCOMPRESSION)],
         )
 
-    def test_file_xattr_diagnostic_constructor_is_finite_and_value_free(
+    def test_file_xattr_refined_diagnostic_contract_is_finite_and_value_free(
         self,
     ) -> None:
         primary = "home-library-unsafe-entry"
@@ -5060,18 +5060,34 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             "quarantine-revalidation",
             "delete-boundary",
         )
-        loci = ("direct", "nested")
+        path_families = (
+            "direct",
+            "preferences",
+            "caches",
+            "application-support",
+            "containers",
+            "group-containers",
+            "metadata",
+            "nested-other",
+        )
         families = (
+            "apple-provenance",
+            "apple-quarantine",
+            "apple-metadata",
+            "apple-mixed",
+            "apple-other",
             "compression",
             "resource-fork",
             "finder-info",
-            "apple-other",
             "nonapple-other",
             "mixed-other",
             "overflow",
             "unstable",
             "unclassified",
         )
+        self.assertEqual(tuple(self.helper._XATTR_PHASES), phases)
+        self.assertEqual(tuple(self.helper._XATTR_PATH_FAMILIES), path_families)
+        self.assertEqual(tuple(self.helper._XATTR_FAMILIES), families)
         constructor = getattr(
             self.helper,
             "_home_library_file_xattr_error",
@@ -5091,16 +5107,31 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             def __format__(self, _spec: str) -> str:
                 return "private-format-canary"
 
+        first = constructor(
+            "journal-inventory",
+            "preferences",
+            "apple-provenance",
+        )
+        expected_secondary = (
+            "home-library-unsafe-entry-file-xattr-"
+            "journal-inventory-preferences-apple-provenance"
+        )
+        self.assertEqual(
+            (first.code, first.secondary_code),
+            (primary, expected_secondary),
+        )
         for phase in phases:
-            for locus in loci:
+            for path_family in path_families:
                 for family in families:
                     with self.subTest(
                         phase=phase,
-                        locus=locus,
+                        path_family=path_family,
                         family=family,
                     ):
-                        error = constructor(phase, locus, family)
-                        secondary = f"{primary}-file-xattr-{phase}-{locus}-{family}"
+                        error = constructor(phase, path_family, family)
+                        secondary = (
+                            f"{primary}-file-xattr-{phase}-{path_family}-{family}"
+                        )
                         self.assertEqual(error.code, primary)
                         self.assertEqual(error.secondary_code, secondary)
                         self.assertLessEqual(len(secondary), 128)
@@ -5117,7 +5148,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
 
         invalid = (
             ("private-phase-canary", "direct", "compression"),
-            ("journal-inventory", "private-locus-canary", "compression"),
+            ("journal-inventory", "private-path-canary", "compression"),
             ("journal-inventory", "direct", "private-family-canary"),
             (None, "direct", "compression"),
             ("journal-inventory", ["direct"], "compression"),
@@ -5128,15 +5159,277 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             ("journal-inventory", ValueBearingStr("direct"), "compression"),
             ("journal-inventory", "direct", ValueBearingStr("compression")),
         )
-        for phase, locus, family in invalid:
-            with self.subTest(invalid=(phase, locus, family)):
-                error = constructor(phase, locus, family)
+        for phase, path_family, family in invalid:
+            with self.subTest(invalid=(phase, path_family, family)):
+                error = constructor(phase, path_family, family)
                 self.assertEqual(error.code, primary)
                 self.assertEqual(
                     error.secondary_code,
                     "home-library-diagnostic-invalid",
                 )
                 self.assertNotIn("canary", error.secondary_code)
+
+    def test_file_xattr_path_family_uses_exact_first_library_component(
+        self,
+    ) -> None:
+        classify = getattr(
+            self.helper,
+            "_home_library_file_xattr_path_family",
+            None,
+        )
+        self.assertIsNotNone(classify)
+        assert classify is not None
+        self.assertEqual(
+            self.helper._XATTR_PATH_FAMILY_BY_COMPONENT,
+            {
+                "Preferences": "preferences",
+                "Caches": "caches",
+                "Application Support": "application-support",
+                "Containers": "containers",
+                "Group Containers": "group-containers",
+                "Metadata": "metadata",
+            },
+        )
+        subclass_calls = []
+
+        class ValueBearingStr(str):
+            def __hash__(self) -> int:
+                subclass_calls.append("private-hash-canary")
+                return super().__hash__()
+
+            def __eq__(self, other: object) -> bool:
+                subclass_calls.append("private-equality-canary")
+                return super().__eq__(other)
+
+        class ValueBearingTuple(tuple):
+            pass
+
+        cases = (
+            (("Library", "direct.bin"), "direct"),
+            (("Library", "Preferences", "item"), "preferences"),
+            (("Library", "Caches", "item"), "caches"),
+            (("Library", "Application Support", "item"), "application-support"),
+            (("Library", "Containers", "item"), "containers"),
+            (("Library", "Group Containers", "item"), "group-containers"),
+            (("Library", "Metadata", "item"), "metadata"),
+            (("Library", "Preferences", "ByHost", "item"), "preferences"),
+            (("Library", "Caches", "Deep", "item"), "caches"),
+            (
+                ("Library", "Application Support", "Vendor", "item"),
+                "application-support",
+            ),
+            (("Library", "Containers", "id", "Data", "item"), "containers"),
+            (
+                ("Library", "Group Containers", "id", "Data", "item"),
+                "group-containers",
+            ),
+            (("Library", "Metadata", "CoreSpotlight", "item"), "metadata"),
+            (("Library", "Other", "Deep", "item"), "nested-other"),
+            (("Library", "preferences", "private-canary"), "nested-other"),
+            (("Library", "Caches ", "private-canary"), "nested-other"),
+            (("Library", "ApplicationSupport", "private-canary"), "nested-other"),
+            (("Library", "Container", "private-canary"), "nested-other"),
+            (("Library", "Group containers", "private-canary"), "nested-other"),
+            (("Library", "MetaData", "private-canary"), "nested-other"),
+            (("Library", "Preferences"), "direct"),
+            (("private-root-canary", "Preferences", "item"), "nested-other"),
+            (["Library", "Preferences", "item"], "nested-other"),
+            (
+                ValueBearingTuple(("Library", "Preferences", "item")),
+                "nested-other",
+            ),
+            ((), "nested-other"),
+            (("Library",), "nested-other"),
+            ((7, "Preferences", "item"), "nested-other"),
+            (("Library", 7, "item"), "nested-other"),
+            (("Library", "Preferences", 7), "nested-other"),
+            (
+                (ValueBearingStr("Library"), "Preferences", "item"),
+                "nested-other",
+            ),
+            (
+                ("Library", ValueBearingStr("Preferences"), "item"),
+                "nested-other",
+            ),
+            (
+                ("Library", "Preferences", ValueBearingStr("item")),
+                "nested-other",
+            ),
+        )
+        self.assertEqual(
+            [classify(components) for components, _expected in cases],
+            [expected for _components, expected in cases],
+        )
+        self.assertEqual(subclass_calls, [])
+
+    def test_file_xattr_classifier_refines_apple_names_without_values(self) -> None:
+        show = self.helper.XATTR_SHOWCOMPRESSION
+        maximum = self.helper.MAX_HOME_LIBRARY_XATTR_LIST_BYTES
+
+        def encoded(values: tuple[bytes, ...]) -> bytes:
+            return b"" if not values else b"\0".join(values) + b"\0"
+
+        class StableList:
+            def __init__(
+                self,
+                normal: tuple[bytes, ...],
+                shown: tuple[bytes, ...] | None = None,
+            ) -> None:
+                self.raw = {
+                    0: encoded(normal),
+                    show: encoded(normal if shown is None else shown),
+                }
+                self.calls: list[tuple[int, int, int]] = []
+
+            def __call__(
+                self,
+                descriptor: int,
+                buffer: object,
+                size: int,
+                options: int,
+            ) -> int:
+                self.calls.append((descriptor, size, options))
+                raw = self.raw[options]
+                ctypes.memmove(buffer, raw, len(raw))
+                return len(raw)
+
+        full_buffer_names = tuple(
+            prefix + b"x" * (127 - len(prefix))
+            for index in range(32)
+            for prefix in (f"org.example.{index:02d}.".encode("ascii"),)
+        )
+        self.assertEqual(len(encoded(full_buffer_names)), maximum)
+        cases = (
+            ("provenance", (b"com.apple.provenance",), None, "apple-provenance"),
+            ("quarantine", (b"com.apple.quarantine",), None, "apple-quarantine"),
+            (
+                "provenance-prefix-near-miss",
+                (b"com.apple.provenance.private-canary",),
+                None,
+                "apple-other",
+            ),
+            (
+                "quarantine-prefix-near-miss",
+                (b"com.apple.quarantine.extra",),
+                None,
+                "apple-other",
+            ),
+            (
+                "compression-name-near-miss",
+                (b"com.apple.decmpfs.extra",),
+                None,
+                "apple-other",
+            ),
+            (
+                "resource-fork-name-near-miss",
+                (b"com.apple.ResourceFork.extra",),
+                None,
+                "apple-other",
+            ),
+            (
+                "finder-info-name-near-miss",
+                (b"com.apple.FinderInfo.extra",),
+                None,
+                "apple-other",
+            ),
+            (
+                "metadata-single",
+                (b"com.apple.metadata:where",),
+                None,
+                "apple-metadata",
+            ),
+            (
+                "metadata-one-byte-suffix",
+                (b"com.apple.metadata:x",),
+                None,
+                "apple-metadata",
+            ),
+            (
+                "metadata-multiple",
+                (b"com.apple.metadata:first", b"com.apple.metadata:second"),
+                (b"com.apple.metadata:second", b"com.apple.metadata:first"),
+                "apple-metadata",
+            ),
+            (
+                "metadata-empty-suffix",
+                (b"com.apple.metadata:",),
+                None,
+                "apple-other",
+            ),
+            (
+                "metadata-prefix-near-miss",
+                (b"com.apple.metadatax:private-canary",),
+                None,
+                "apple-other",
+            ),
+            (
+                "apple-other-multiple",
+                (b"com.apple.first", b"com.apple.second"),
+                None,
+                "apple-other",
+            ),
+            (
+                "provenance-and-quarantine",
+                (b"com.apple.provenance", b"com.apple.quarantine"),
+                None,
+                "apple-mixed",
+            ),
+            (
+                "metadata-and-quarantine",
+                (b"com.apple.metadata:where", b"com.apple.quarantine"),
+                None,
+                "apple-mixed",
+            ),
+            (
+                "known-and-apple-other",
+                (b"com.apple.ResourceFork", b"com.apple.private-canary"),
+                None,
+                "apple-mixed",
+            ),
+            (
+                "hidden-compression-and-quarantine",
+                (b"com.apple.quarantine",),
+                (b"com.apple.quarantine", b"com.apple.decmpfs"),
+                "apple-mixed",
+            ),
+            (
+                "nonapple-only",
+                (b"org.example.first", b"com.applex.second"),
+                None,
+                "nonapple-other",
+            ),
+            ("one-byte-name", (b"x",), None, "nonapple-other"),
+            (
+                "full-buffer-nonapple",
+                full_buffer_names,
+                None,
+                "nonapple-other",
+            ),
+            (
+                "apple-and-nonapple",
+                (b"com.apple.quarantine", b"org.example.private-canary"),
+                None,
+                "mixed-other",
+            ),
+        )
+        observed = []
+        for label, normal, shown, expected in cases:
+            fake = StableList(normal, shown)
+            observed.append((label, self.helper._file_xattr_family(fake, 17)))
+            self.assertEqual(
+                fake.calls,
+                [
+                    (17, maximum, 0),
+                    (17, maximum, show),
+                    (17, maximum, 0),
+                    (17, maximum, show),
+                ],
+            )
+        self.assertEqual(
+            observed,
+            [(label, expected) for label, _normal, _shown, expected in cases],
+        )
+        self.assertNotIn("private", repr(observed))
 
     def test_file_xattr_observer_is_bounded_stable_and_name_only(self) -> None:
         native_helper = load_helper()
@@ -5210,6 +5503,12 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 ctypes.memmove(buffer, raw, len(raw))
                 return len(raw)
 
+        expected_file_calls = [
+            (17, False, maximum, 0),
+            (17, False, maximum, show),
+            (17, False, maximum, 0),
+            (17, False, maximum, show),
+        ]
         stable_cases = (
             (
                 "compression",
@@ -5248,10 +5547,38 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 "finder-info",
             ),
             (
-                "apple-other",
+                "provenance",
+                stable(names(b"com.apple.provenance")),
+                stable(names(b"com.apple.provenance")),
+                "apple-provenance",
+            ),
+            (
+                "metadata-single",
+                stable(names(b"com.apple.metadata:where")),
+                stable(names(b"com.apple.metadata:where")),
+                "apple-metadata",
+            ),
+            (
+                "metadata-multiple",
+                stable(
+                    names(
+                        b"com.apple.metadata:first",
+                        b"com.apple.metadata:second",
+                    )
+                ),
+                stable(
+                    names(
+                        b"com.apple.metadata:second",
+                        b"com.apple.metadata:first",
+                    )
+                ),
+                "apple-metadata",
+            ),
+            (
+                "apple-category-mix",
                 stable(names(b"com.apple.quarantine", b"com.apple.metadata:where")),
                 stable(names(b"com.apple.quarantine", b"com.apple.metadata:where")),
-                "apple-other",
+                "apple-mixed",
             ),
             (
                 "order-normalized",
@@ -5266,10 +5593,10 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 "apple-other",
             ),
             (
-                "singleton-apple-other",
+                "singleton-quarantine",
                 stable(names(b"com.apple.quarantine")),
                 stable(names(b"com.apple.quarantine")),
-                "apple-other",
+                "apple-quarantine",
             ),
             (
                 "apple-prefix-boundary",
@@ -5305,13 +5632,13 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 "known-plus-apple-other",
                 stable(names(b"com.apple.ResourceFork", b"com.apple.quarantine")),
                 stable(names(b"com.apple.ResourceFork", b"com.apple.quarantine")),
-                "mixed-other",
+                "apple-mixed",
             ),
             (
                 "compression-plus-apple-other",
                 stable(names(b"com.apple.quarantine")),
                 stable(names(b"com.apple.quarantine", b"com.apple.decmpfs")),
-                "mixed-other",
+                "apple-mixed",
             ),
             (
                 "shown-added-noncompression",
@@ -5323,7 +5650,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 "two-known",
                 stable(names(b"com.apple.ResourceFork", b"com.apple.FinderInfo")),
                 stable(names(b"com.apple.ResourceFork", b"com.apple.FinderInfo")),
-                "mixed-other",
+                "apple-mixed",
             ),
             (
                 "apple-and-nonapple",
@@ -5344,6 +5671,18 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 "unclassified",
             ),
             (
+                "leading-empty-component",
+                stable(names(b"", b"private-leading-empty-canary")),
+                stable(names(b"", b"private-leading-empty-canary")),
+                "unclassified",
+            ),
+            (
+                "singleton-empty-component",
+                stable(names(b"")),
+                stable(names(b"")),
+                "unclassified",
+            ),
+            (
                 "duplicate",
                 stable(names(b"private-duplicate-canary", b"private-duplicate-canary")),
                 stable(names(b"private-duplicate-canary", b"private-duplicate-canary")),
@@ -5359,6 +5698,17 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 "inconsistent",
                 stable(names(b"private-normal-canary")),
                 stable(names(b"private-shown-canary")),
+                "unclassified",
+            ),
+            (
+                "normal-not-visible-with-show",
+                stable(
+                    names(
+                        b"com.apple.quarantine",
+                        b"private-normal-only-canary",
+                    )
+                ),
+                stable(names(b"com.apple.quarantine")),
                 "unclassified",
             ),
             (
@@ -5396,7 +5746,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                     17,
                     unsafe_cause="file-xattr",
                     diagnostic_phase="journal-inventory",
-                    diagnostic_locus="direct",
+                    diagnostic_path_family="direct",
                 )
             self.assertEqual(raised.exception.code, "home-library-unsafe-entry")
             self.assertEqual(
@@ -5405,11 +5755,43 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 f"journal-inventory-direct-{family}",
             )
             self.assertNotIn("private", raised.exception.secondary_code)
-            self.assertEqual([call[3] for call in fake.calls], [0, show, 0, show])
-            self.assertTrue(all(call[0] == 17 for call in fake.calls))
-            self.assertTrue(all(not call[1] for call in fake.calls))
-            self.assertTrue(all(call[2] == maximum for call in fake.calls))
-            self.assertEqual({call[3] for call in fake.calls}, {0, show})
+            self.assertEqual(fake.calls, expected_file_calls)
+
+        for phase, path_family in (
+            ("journal-inventory", "preferences"),
+            ("source-revalidation", "caches"),
+            ("quarantine-revalidation", "application-support"),
+            ("delete-boundary", "containers"),
+            ("journal-inventory", "group-containers"),
+            ("source-revalidation", "metadata"),
+            ("quarantine-revalidation", "nested-other"),
+        ):
+            fake = FListXattr(
+                stable(names(b"com.apple.quarantine")),
+                stable(names(b"com.apple.quarantine")),
+            )
+            with (
+                self.subTest(phase=phase, path_family=path_family),
+                mock.patch.object(
+                    native_helper.ctypes,
+                    "CDLL",
+                    return_value=SimpleNamespace(flistxattr=fake),
+                ),
+                self.assertRaises(native_helper.ProbeError) as raised,
+            ):
+                native_helper._require_no_extended_attributes(
+                    17,
+                    unsafe_cause="file-xattr",
+                    diagnostic_phase=phase,
+                    diagnostic_path_family=path_family,
+                )
+            self.assertEqual(
+                raised.exception.secondary_code,
+                "home-library-unsafe-entry-file-xattr-"
+                f"{phase}-{path_family}-apple-quarantine",
+            )
+            self.assertEqual(fake.calls, expected_file_calls)
+            self.assertNotIn("private", raised.exception.secondary_code)
 
         precedence_cases = (
             (
@@ -5458,7 +5840,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                     17,
                     unsafe_cause="file-xattr",
                     diagnostic_phase="journal-inventory",
-                    diagnostic_locus="direct",
+                    diagnostic_path_family="direct",
                 )
             self.assertEqual(
                 raised.exception.secondary_code,
@@ -5466,6 +5848,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 f"journal-inventory-direct-{family}",
             )
             self.assertNotIn("private", raised.exception.secondary_code)
+            self.assertEqual(fake.calls, expected_file_calls)
 
         empty = FListXattr((b"", b""), (b"", b""))
         with mock.patch.object(
@@ -5478,13 +5861,10 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                     17,
                     unsafe_cause="file-xattr",
                     diagnostic_phase="journal-inventory",
-                    diagnostic_locus="direct",
+                    diagnostic_path_family="direct",
                 )
             )
-        self.assertEqual([call[3] for call in empty.calls].count(0), 2)
-        self.assertEqual([call[3] for call in empty.calls].count(show), 2)
-        self.assertTrue(all(not call[1] for call in empty.calls))
-        self.assertTrue(all(call[2] == maximum for call in empty.calls))
+        self.assertEqual(empty.calls, expected_file_calls)
 
         transition = FListXattr(
             stable(b""),
@@ -5503,12 +5883,13 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 17,
                 unsafe_cause="file-xattr",
                 diagnostic_phase="journal-inventory",
-                diagnostic_locus="direct",
+                diagnostic_path_family="direct",
             )
         self.assertEqual(
             raised.exception.secondary_code,
             "home-library-unsafe-entry-file-xattr-journal-inventory-direct-unstable",
         )
+        self.assertEqual(transition.calls, expected_file_calls)
 
         visible = names(b"private-overflow-canary")
         over_capacity = b"x" * maximum + b"\0"
@@ -5542,14 +5923,16 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                     17,
                     unsafe_cause="file-xattr",
                     diagnostic_phase="delete-boundary",
-                    diagnostic_locus="nested",
+                    diagnostic_path_family="nested-other",
                 )
             self.assertEqual(raised.exception.code, "home-library-unsafe-entry")
             self.assertEqual(
                 raised.exception.secondary_code,
-                "home-library-unsafe-entry-file-xattr-delete-boundary-nested-overflow",
+                "home-library-unsafe-entry-file-xattr-"
+                "delete-boundary-nested-other-overflow",
             )
             self.assertNotIn("private", raised.exception.secondary_code)
+            self.assertEqual(fake.calls, expected_file_calls)
 
         native_error = FListXattr(
             stable(visible),
@@ -5568,7 +5951,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 17,
                 unsafe_cause="file-xattr",
                 diagnostic_phase="delete-boundary",
-                diagnostic_locus="nested",
+                diagnostic_path_family="nested-other",
             )
         self.assertEqual(raised.exception.code, "home-library-observation-failed")
         self.assertIsNone(raised.exception.secondary_code)
@@ -5604,11 +5987,11 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             ),
             (
                 "missing-phase",
-                {"diagnostic_locus": "direct"},
+                {"diagnostic_path_family": "direct"},
                 FListXattr(stable(b""), stable(b"")),
             ),
             (
-                "missing-locus",
+                "missing-path-family",
                 {"diagnostic_phase": "journal-inventory"},
                 FListXattr(stable(b""), stable(b"")),
             ),
@@ -5616,15 +5999,15 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 "invalid-phase",
                 {
                     "diagnostic_phase": "private-phase-canary",
-                    "diagnostic_locus": "direct",
+                    "diagnostic_path_family": "direct",
                 },
                 FListXattr(stable(b""), stable(b"")),
             ),
             (
-                "invalid-locus",
+                "invalid-path-family",
                 {
                     "diagnostic_phase": "journal-inventory",
-                    "diagnostic_locus": "private-locus-canary",
+                    "diagnostic_path_family": "private-path-canary",
                 },
                 FListXattr(stable(b""), stable(b"")),
             ),
@@ -5669,16 +6052,57 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
         )
         self.assertNotIn("private", raised.exception.secondary_code)
 
-    def test_file_xattr_context_threads_all_file_check_surfaces(self) -> None:
+    def test_file_xattr_path_family_threads_all_file_check_surfaces(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory) / "home"
             library = home / self.helper.HOME_LIBRARY_NAME
-            nested = library / "Nested"
             probe = home / "launchd-probe"
-            nested.mkdir(parents=True)
-            probe.mkdir()
-            (library / "direct.bin").write_bytes(b"direct")
-            (nested / "nested.bin").write_bytes(b"nested")
+            probe.mkdir(parents=True)
+            paths = (
+                ("direct", library / "direct.bin"),
+                ("preferences", library / "Preferences" / "shallow.bin"),
+                ("caches", library / "Caches" / "shallow.bin"),
+                (
+                    "application-support",
+                    library / "Application Support" / "shallow.bin",
+                ),
+                ("containers", library / "Containers" / "shallow.bin"),
+                (
+                    "group-containers",
+                    library / "Group Containers" / "shallow.bin",
+                ),
+                ("metadata", library / "Metadata" / "shallow.bin"),
+                (
+                    "preferences",
+                    library / "Preferences" / "ByHost" / "item.bin",
+                ),
+                ("caches", library / "Caches" / "Deep" / "item.bin"),
+                (
+                    "application-support",
+                    library / "Application Support" / "Vendor" / "item.bin",
+                ),
+                (
+                    "containers",
+                    library / "Containers" / "id" / "Data" / "item.bin",
+                ),
+                (
+                    "group-containers",
+                    library / "Group Containers" / "id" / "Data" / "item.bin",
+                ),
+                (
+                    "metadata",
+                    library / "Metadata" / "CoreSpotlight" / "item.bin",
+                ),
+                (
+                    "nested-other",
+                    library / "PrivateNestedCanary" / "Deep" / "item.bin",
+                ),
+            )
+            inode_families = {}
+            for path_family, path in paths:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(path_family.encode("ascii"))
+                inode_families[path.lstat().st_ino] = path_family
             home.chmod(0o700)
             account = self.helper.DisposableAccount(
                 name="twq-0123456789ab",
@@ -5694,9 +6118,6 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 "probe_inode": probe.lstat().st_ino,
             }
 
-            direct_inode = (library / "direct.bin").lstat().st_ino
-            nested_inode = (nested / "nested.bin").lstat().st_ino
-
             def capture(operation) -> tuple[object, list[tuple[int, str, str]]]:
                 contexts: list[tuple[int, str, str]] = []
 
@@ -5708,13 +6129,13 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                     if unsafe_cause == "file-xattr":
                         self.assertEqual(
                             set(context),
-                            {"diagnostic_phase", "diagnostic_locus"},
+                            {"diagnostic_phase", "diagnostic_path_family"},
                         )
                         contexts.append(
                             (
                                 os.fstat(_descriptor).st_ino,
                                 str(context["diagnostic_phase"]),
-                                str(context["diagnostic_locus"]),
+                                str(context["diagnostic_path_family"]),
                             )
                         )
 
@@ -5734,8 +6155,11 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             self.assertEqual(
                 sorted(contexts),
                 sorted(
-                    [(direct_inode, "journal-inventory", "direct")] * 4
-                    + [(nested_inode, "journal-inventory", "nested")] * 4
+                    [
+                        (inode, "journal-inventory", path_family)
+                        for inode, path_family in inode_families.items()
+                        for _ in range(4)
+                    ]
                 ),
             )
 
@@ -5757,16 +6181,20 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             self.assertEqual(
                 sorted(contexts),
                 sorted(
-                    [(direct_inode, "source-revalidation", "direct")] * 4
-                    + [(nested_inode, "source-revalidation", "nested")] * 4
-                    + [(direct_inode, "quarantine-revalidation", "direct")] * 4
-                    + [(nested_inode, "quarantine-revalidation", "nested")] * 4
-                    + [(direct_inode, "delete-boundary", "direct")] * 2
-                    + [(nested_inode, "delete-boundary", "nested")] * 2
+                    [
+                        (inode, phase, path_family)
+                        for inode, path_family in inode_families.items()
+                        for phase, count in (
+                            ("source-revalidation", 4),
+                            ("quarantine-revalidation", 4),
+                            ("delete-boundary", 2),
+                        )
+                        for _ in range(count)
+                    ]
                 ),
             )
 
-    def test_file_xattr_checks_bracket_each_file_read(self) -> None:
+    def test_file_xattr_path_family_checks_bracket_each_file_read(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             path = root / "payload.bin"
@@ -5778,9 +6206,15 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             )
             original_read = os.read
             try:
-                for phase, locus in (
+                for phase, path_family in (
                     ("journal-inventory", "direct"),
-                    ("delete-boundary", "nested"),
+                    ("source-revalidation", "preferences"),
+                    ("quarantine-revalidation", "caches"),
+                    ("delete-boundary", "application-support"),
+                    ("journal-inventory", "containers"),
+                    ("source-revalidation", "group-containers"),
+                    ("quarantine-revalidation", "metadata"),
+                    ("delete-boundary", "nested-other"),
                 ):
                     events: list[tuple[object, ...]] = []
 
@@ -5796,7 +6230,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                                     "xattr",
                                     descriptor,
                                     context["diagnostic_phase"],
-                                    context["diagnostic_locus"],
+                                    context.get("diagnostic_path_family"),
                                 )
                             )
 
@@ -5809,7 +6243,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                         return original_read(descriptor, maximum)
 
                     with (
-                        self.subTest(phase=phase, locus=locus),
+                        self.subTest(phase=phase, path_family=path_family),
                         mock.patch.object(
                             self.helper,
                             "_require_no_extended_attributes",
@@ -5821,12 +6255,15 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                             parent_descriptor,
                             path.name,
                             path.lstat(),
-                            (phase, locus),
+                            (phase, path_family),
                         )
                     self.assertEqual(raw, payload)
                     self.assertEqual(events[0][0], "xattr")
                     descriptor = events[0][1]
-                    self.assertEqual(events[0], ("xattr", descriptor, phase, locus))
+                    self.assertEqual(
+                        events[0],
+                        ("xattr", descriptor, phase, path_family),
+                    )
                     self.assertEqual(events[-1], events[0])
                     self.assertTrue(events[1:-1])
                     self.assertTrue(
@@ -18178,22 +18615,26 @@ raise SystemExit(93)
                         },
                     )
 
-    def test_cleanup_propagates_home_library_secondary_from_journal_inventory(
+    def test_cleanup_propagates_refined_file_xattr_from_journal_inventory(
         self,
     ) -> None:
         primary = "home-library-unsafe-entry"
-        secondary = "home-library-unsafe-entry-file-xattr"
+        secondary = (
+            "home-library-unsafe-entry-file-xattr-"
+            "journal-inventory-preferences-apple-provenance"
+        )
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             stage = root / "stage"
             artifact = root / "artifact"
             home = root / "home"
             library = home / "Library"
+            preferences = library / "Preferences"
             stage.mkdir()
             artifact.mkdir()
-            library.mkdir(parents=True)
+            preferences.mkdir(parents=True)
             home.chmod(0o700)
-            canary = library / "private-hosted-inventory-canary"
+            canary = preferences / "private-hosted-inventory-canary"
             canary.write_bytes(b"private-hosted-value-canary")
             account = self.helper.DisposableAccount(
                 name="twq-0123456789ab",
@@ -18225,12 +18666,33 @@ raise SystemExit(93)
                 "probe_inode": home.lstat().st_ino + 1,
             }
             payloads: list[tuple[Path, bytes, int]] = []
+            xattr_contexts: list[tuple[int, object, object]] = []
 
             def exists(path: Path) -> bool:
-                return path == home
+                return path in {home, library}
 
             def record(path: Path, raw: bytes, mode: int) -> None:
                 payloads.append((path, raw, mode))
+
+            def observe_xattrs(
+                descriptor: int,
+                unsafe_cause: object,
+                **context: object,
+            ) -> None:
+                if unsafe_cause != "file-xattr":
+                    return
+                xattr_contexts.append(
+                    (
+                        os.fstat(descriptor).st_ino,
+                        context.get("diagnostic_phase"),
+                        context.get("diagnostic_path_family"),
+                    )
+                )
+                raise self.helper._home_library_file_xattr_error(
+                    context.get("diagnostic_phase"),
+                    context.get("diagnostic_path_family"),
+                    "apple-provenance",
+                )
 
             stderr = io.StringIO()
             with ExitStack() as stack:
@@ -18299,10 +18761,31 @@ raise SystemExit(93)
                     mock.patch.object(
                         self.helper,
                         "_bounded_library_inventory",
-                        side_effect=self.helper.ProbeError(
-                            primary,
-                            secondary_code=secondary,
-                        ),
+                        wraps=self.helper._bounded_library_inventory,
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        self.helper,
+                        "_require_bound_home_descriptor",
+                        return_value=home.lstat(),
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        self.helper,
+                        "_darwin_fstatfs_identity",
+                        return_value=(1, 2, "apfs"),
+                    )
+                )
+                stack.enter_context(
+                    mock.patch.object(self.helper, "_require_no_extended_acl")
+                )
+                stack.enter_context(
+                    mock.patch.object(
+                        self.helper,
+                        "_require_no_extended_attributes",
+                        side_effect=observe_xattrs,
                     )
                 )
                 publish = stack.enter_context(
@@ -18352,6 +18835,16 @@ raise SystemExit(93)
             )
             bound_home.assert_called_once_with(account, identity)
             inventory.assert_called_once_with(account)
+            self.assertEqual(
+                xattr_contexts,
+                [
+                    (
+                        canary.lstat().st_ino,
+                        "journal-inventory",
+                        "preferences",
+                    )
+                ],
+            )
             publish.assert_not_called()
             rename.assert_not_called()
             unlink.assert_not_called()

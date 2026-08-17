@@ -190,11 +190,23 @@ _XATTR_PHASES = (
     "journal-inventory source-revalidation quarantine-revalidation "
     "delete-boundary".split()
 )
-_XATTR_LOCI = ("direct", "nested")
-_XATTR_FAMILIES = (
-    "compression resource-fork finder-info apple-other nonapple-other "
-    "mixed-other overflow unstable unclassified".split()
+_XATTR_PATH_FAMILIES = (
+    "direct preferences caches application-support containers "
+    "group-containers metadata nested-other".split()
 )
+_XATTR_FAMILIES = (
+    "apple-provenance apple-quarantine apple-metadata apple-mixed apple-other "
+    "compression resource-fork finder-info nonapple-other mixed-other overflow "
+    "unstable unclassified".split()
+)
+_XATTR_PATH_FAMILY_BY_COMPONENT = {
+    "Preferences": "preferences",
+    "Caches": "caches",
+    "Application Support": "application-support",
+    "Containers": "containers",
+    "Group Containers": "group-containers",
+    "Metadata": "metadata",
+}
 HOME_LIBRARY_UNSAFE_CAUSES = frozenset(
     "bound-home-acl duplicate-identity entry-stat-unsupported-kind "
     "file-stat-link-count path-component root-kind".split()
@@ -3690,23 +3702,36 @@ def _home_library_unsafe_error(cause: object) -> ProbeError:
 
 def _home_library_file_xattr_error(
     phase: object,
-    locus: object,
+    path_family: object,
     family: object,
 ) -> ProbeError:
     valid = (
         type(phase) is str
-        and type(locus) is str
+        and type(path_family) is str
         and type(family) is str
         and phase in _XATTR_PHASES
-        and locus in _XATTR_LOCI
+        and path_family in _XATTR_PATH_FAMILIES
         and family in _XATTR_FAMILIES
     )
     secondary = (
-        f"home-library-unsafe-entry-file-xattr-{phase}-{locus}-{family}"
+        f"home-library-unsafe-entry-file-xattr-{phase}-{path_family}-{family}"
         if valid
         else "home-library-diagnostic-invalid"
     )
     return ProbeError("home-library-unsafe-entry", secondary_code=secondary)
+
+
+def _home_library_file_xattr_path_family(components: object) -> str:
+    if (
+        type(components) is not tuple
+        or len(components) < 2
+        or any(type(component) is not str for component in components)
+        or components[0] != HOME_LIBRARY_NAME
+    ):
+        return "nested-other"
+    if len(components) == 2:
+        return "direct"
+    return _XATTR_PATH_FAMILY_BY_COMPONENT.get(components[1], "nested-other")
 
 
 def _home_library_path_sha256(components: Sequence[str]) -> str:
@@ -3819,22 +3844,30 @@ def _file_xattr_family(call, fd):
     normal, shown = map(set, items[:2])
     if not normal <= shown or shown - normal - {"com.apple.decmpfs"}:
         return "unclassified"
-    if not shown or not normal:
-        return None if not shown else "compression"
+    if not shown:
+        return None
     known = {
         "com.apple.decmpfs": "compression",
         "com.apple.ResourceFork": "resource-fork",
         "com.apple.FinderInfo": "finder-info",
+        "com.apple.provenance": "apple-provenance",
+        "com.apple.quarantine": "apple-quarantine",
     }
-    family = known.get(next(iter(shown))) if len(shown) == 1 else None
-    if family:
-        return family
-    if shown & known.keys():
+    apple = {name for name in shown if name.startswith("com.apple.")}
+    if not apple:
+        return "nonapple-other"
+    if apple != shown:
         return "mixed-other"
-    apple = sum(name.startswith("com.apple.") for name in shown)
-    if not apple or apple == len(shown):
-        return "apple-other" if apple else "nonapple-other"
-    return "mixed-other"
+    categories = {
+        known.get(name)
+        or (
+            "apple-metadata"
+            if name.startswith("com.apple.metadata:") and name != "com.apple.metadata:"
+            else "apple-other"
+        )
+        for name in shown
+    }
+    return next(iter(categories)) if len(categories) == 1 else "apple-mixed"
 
 
 def _require_no_extended_attributes(
@@ -3842,7 +3875,7 @@ def _require_no_extended_attributes(
     unsafe_cause: object,
     *,
     diagnostic_phase: object = None,
-    diagnostic_locus: object = None,
+    diagnostic_path_family: object = None,
 ) -> None:
     try:
         libc = ctypes.CDLL(None, use_errno=True)
@@ -3856,7 +3889,7 @@ def _require_no_extended_attributes(
         flistxattr.restype = ctypes.c_ssize_t
         if unsafe_cause == "file-xattr":
             invalid = _home_library_file_xattr_error(
-                diagnostic_phase, diagnostic_locus, "unclassified"
+                diagnostic_phase, diagnostic_path_family, "unclassified"
             )
             if invalid.secondary_code == "home-library-diagnostic-invalid":
                 raise invalid
@@ -3864,7 +3897,7 @@ def _require_no_extended_attributes(
             if family is None:
                 return
             raise _home_library_file_xattr_error(
-                diagnostic_phase, diagnostic_locus, family
+                diagnostic_phase, diagnostic_path_family, family
             )
         ctypes.set_errno(0)
         observed = flistxattr(descriptor, None, 0, XATTR_SHOWCOMPRESSION)
@@ -4002,7 +4035,7 @@ def _read_home_library_file(
         _require_no_extended_acl(descriptor, "file-acl")
         context = {
             "diagnostic_phase": diagnostic_context[0],
-            "diagnostic_locus": diagnostic_context[1],
+            "diagnostic_path_family": diagnostic_context[1],
         }
         _require_no_extended_attributes(descriptor, "file-xattr", **context)
         if opened.st_size < 0 or opened.st_size > MAX_HOME_LIBRARY_FILE_BYTES:
@@ -4206,7 +4239,10 @@ def _observe_bounded_library(
                     descriptor,
                     components[-1],
                     metadata,
-                    (diagnostic_phase, "direct" if depth == 2 else "nested"),
+                    (
+                        diagnostic_phase,
+                        _home_library_file_xattr_path_family(components),
+                    ),
                 )
                 total_bytes += len(raw)
                 if total_bytes > MAX_HOME_LIBRARY_TOTAL_BYTES:
@@ -4563,7 +4599,7 @@ def _delete_authorized_library_directory(
                 metadata,
                 (
                     "delete-boundary",
-                    "direct" if len(child_components) == 2 else "nested",
+                    _home_library_file_xattr_path_family(child_components),
                 ),
             )
             if any(

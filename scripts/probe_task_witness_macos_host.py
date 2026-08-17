@@ -44,9 +44,17 @@ MAX_HELPER_BYTES = 256 * 1024
 MAX_OWNERSHIP_BYTES = 4 * 1024
 MAX_ACCOUNT_BINDING_BYTES = 4 * 1024
 MAX_USER_DOMAIN_RESET_BYTES = 4 * 1024
-MAX_HOME_CLEANUP_BYTES = 4 * 1024
+MAX_HOME_CLEANUP_BYTES = 256 * 1024
 MAX_PROCESS_LIST_BYTES = 64 * 1024
 MAX_HOME_ENTRY_OBSERVATION_FILE_BYTES = 4 * 1024
+MAX_HOME_LIBRARY_DEPTH = 16
+MAX_HOME_LIBRARY_NODES = 512
+MAX_HOME_LIBRARY_COMPONENT_BYTES = 255
+MAX_HOME_LIBRARY_PATH_BYTES = 2 * 1024
+MAX_HOME_LIBRARY_FILE_BYTES = 1024 * 1024
+MAX_HOME_LIBRARY_TOTAL_BYTES = 8 * 1024 * 1024
+MAX_DISPOSABLE_HOME_ENTRIES = 3
+MAX_LAUNCHD_PROBE_ENTRIES = 4
 COMMAND_TIMEOUT_SECONDS = 10
 LAUNCHD_POLL_INTERVAL_SECONDS = 0.25
 LAUNCHD_POLL_TIMEOUT_SECONDS = 30
@@ -56,6 +64,10 @@ PROCESS_LIST_MIN_TIMEOUT_SECONDS = 1
 LAUNCHD_PRINT_MAX_BYTES = 16 * 1024
 LAUNCHCTL_NOT_FOUND_STATUS = 113
 RENAME_EXCL = 0x00000004
+RENAME_NOFOLLOW_ANY = 0x00000010
+ACL_FIRST_ENTRY = 0
+ACL_TYPE_EXTENDED = 0x00000100
+XATTR_SHOWCOMPRESSION = 0x00000020
 DISPOSABLE_UID_MIN = 502
 DISPOSABLE_UID_MAX = 599
 DSCL_UID_MIN = -(1 << 31)
@@ -169,6 +181,25 @@ DISPOSABLE_UID_ACTIVE_CODES = frozenset(
 )
 USER_DOMAIN_RESET_CAPABILITY = "github-hosted-ephemeral-user-domain-reset-v1"
 USER_DOMAIN_RESET_SURVIVOR_CODE = "disposable-user-pid1-parented-processes-remain"
+HOME_LIBRARY_NAME = "Library"
+HOME_LIBRARY_QUARANTINE_NAME = ".task-witness-library-cleanup"
+HOME_LIBRARY_ALLOWED_PHASES = frozenset(
+    {
+        "child-entry",
+        "child-read",
+        "cleanup-entry",
+        "home-removal",
+        "marker-replay",
+        "post-child-terminal",
+        "post-reset",
+        "post-system-bootout",
+        "pre-account-delete",
+        "pre-home-removal",
+        "pre-journal",
+        "pre-reset",
+        "pre-reset-marker",
+    }
+)
 HOME_CLEANUP_DIAGNOSTIC_PHASES = frozenset(
     {
         "child-entry",
@@ -248,9 +279,17 @@ def _home_entry_observation_snapshot(
 ) -> tuple:
     home_metadata = home.lstat()
     entries = []
-    for entry in sorted(home.iterdir(), key=lambda path: path.name):
-        if entry.name == "launchd-probe":
+    names = _bounded_path_directory_names(
+        home,
+        home_metadata,
+        MAX_DISPOSABLE_HOME_ENTRIES,
+        limit_code="unreadable-home-entry-observation",
+        failure_code="unreadable-home-entry-observation",
+    )
+    for name in names:
+        if name == "launchd-probe":
             continue
+        entry = home / name
         metadata = entry.lstat()
         digest = None
         uid_matches = metadata.st_uid == expected_uid
@@ -274,7 +313,7 @@ def _home_entry_observation_snapshot(
             ).hexdigest()
         entries.append(
             (
-                entry.name,
+                name,
                 metadata.st_dev,
                 metadata.st_ino,
                 metadata.st_mode,
@@ -356,6 +395,31 @@ def _classified_unexpected_home_entry_detail(
     return "home-entry-multiple-or-mixed"
 
 
+def _require_allowed_disposable_home_names(
+    home: Path,
+    observed_names: set[str],
+    *,
+    expected_uid: int,
+    expected_gid: int,
+    diagnostic_phase: str,
+) -> None:
+    if observed_names == {"launchd-probe"}:
+        return
+    detail = _classified_unexpected_home_entry_detail(
+        home,
+        observed_names,
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
+    )
+    if (
+        diagnostic_phase in HOME_LIBRARY_ALLOWED_PHASES
+        and observed_names == {"launchd-probe", HOME_LIBRARY_NAME}
+        and detail == "home-entry-known-library-owned-directory"
+    ):
+        return
+    raise _home_cleanup_drift_error(diagnostic_phase, detail)
+
+
 def _merge_probe_error(
     primary_code: str | None,
     secondary_code: str | None,
@@ -408,6 +472,11 @@ class ProcessRecord(NamedTuple):
     pgid: int
     state: str
     command: str
+
+
+class ObservedHomeLibrary(NamedTuple):
+    inventory: dict
+    stability_sha256: str
 
 
 def canonical_bytes(value: object) -> bytes:
@@ -1536,25 +1605,30 @@ def _validate_disposable_home_root(
         raise _home_cleanup_drift_error(diagnostic_phase, "home-mode-drift")
     if home_metadata.st_uid != account.uid or home_metadata.st_gid != account.gid:
         raise _home_cleanup_drift_error(diagnostic_phase, "home-owner-drift")
-    try:
-        home_names = {entry.name for entry in home.iterdir()}
-    except OSError as error:
-        raise _home_cleanup_drift_error(
-            diagnostic_phase,
-            "home-read-failed",
-        ) from error
+    home_names = set(
+        _bounded_path_directory_names(
+            home,
+            home_metadata,
+            MAX_DISPOSABLE_HOME_ENTRIES,
+            limit_code=_home_cleanup_drift_error(
+                diagnostic_phase,
+                "home-entry-observation-unreadable",
+            ).code,
+            failure_code=_home_cleanup_drift_error(
+                diagnostic_phase,
+                "home-read-failed",
+            ).code,
+        )
+    )
     if "launchd-probe" not in home_names:
         raise _home_cleanup_drift_error(diagnostic_phase, "probe-missing")
-    if home_names != {"launchd-probe"}:
-        raise _home_cleanup_drift_error(
-            diagnostic_phase,
-            _classified_unexpected_home_entry_detail(
-                home,
-                home_names,
-                expected_uid=account.uid,
-                expected_gid=account.gid,
-            ),
-        )
+    _require_allowed_disposable_home_names(
+        home,
+        home_names,
+        expected_uid=account.uid,
+        expected_gid=account.gid,
+        diagnostic_phase=diagnostic_phase,
+    )
     try:
         probe_metadata = probe_root.lstat()
     except FileNotFoundError as error:
@@ -1597,25 +1671,30 @@ def _validate_exact_disposable_home(
         raise _home_cleanup_drift_error(diagnostic_phase, "home-mode-drift")
     if home_metadata.st_uid != expected_uid or home_metadata.st_gid != expected_gid:
         raise _home_cleanup_drift_error(diagnostic_phase, "home-owner-drift")
-    try:
-        home_names = {entry.name for entry in home.iterdir()}
-    except OSError as error:
-        raise _home_cleanup_drift_error(
-            diagnostic_phase,
-            "home-read-failed",
-        ) from error
+    home_names = set(
+        _bounded_path_directory_names(
+            home,
+            home_metadata,
+            MAX_DISPOSABLE_HOME_ENTRIES,
+            limit_code=_home_cleanup_drift_error(
+                diagnostic_phase,
+                "home-entry-observation-unreadable",
+            ).code,
+            failure_code=_home_cleanup_drift_error(
+                diagnostic_phase,
+                "home-read-failed",
+            ).code,
+        )
+    )
     if "launchd-probe" not in home_names:
         raise _home_cleanup_drift_error(diagnostic_phase, "probe-missing")
-    if home_names != {"launchd-probe"}:
-        raise _home_cleanup_drift_error(
-            diagnostic_phase,
-            _classified_unexpected_home_entry_detail(
-                home,
-                home_names,
-                expected_uid=expected_uid,
-                expected_gid=expected_gid,
-            ),
-        )
+    _require_allowed_disposable_home_names(
+        home,
+        home_names,
+        expected_uid=expected_uid,
+        expected_gid=expected_gid,
+        diagnostic_phase=diagnostic_phase,
+    )
     try:
         probe_metadata = probe_root.lstat()
     except FileNotFoundError as error:
@@ -1634,13 +1713,21 @@ def _validate_exact_disposable_home(
         raise _home_cleanup_drift_error(diagnostic_phase, "probe-mode-drift")
     if probe_metadata.st_uid != expected_uid or probe_metadata.st_gid != expected_gid:
         raise _home_cleanup_drift_error(diagnostic_phase, "probe-owner-drift")
-    try:
-        names = {entry.name for entry in probe_root.iterdir()}
-    except OSError as error:
-        raise _home_cleanup_drift_error(
-            diagnostic_phase,
-            "probe-read-failed",
-        ) from error
+    names = set(
+        _bounded_path_directory_names(
+            probe_root,
+            probe_metadata,
+            MAX_LAUNCHD_PROBE_ENTRIES,
+            limit_code=_home_cleanup_drift_error(
+                diagnostic_phase,
+                "probe-entry-set-drift",
+            ).code,
+            failure_code=_home_cleanup_drift_error(
+                diagnostic_phase,
+                "probe-read-failed",
+            ).code,
+        )
+    )
     if names != expected_files:
         raise _home_cleanup_drift_error(
             diagnostic_phase,
@@ -1682,6 +1769,7 @@ def _validated_marker_bound_disposable_home(
     expected_identity: object,
     *,
     diagnostic_phase: str,
+    library_inventory: object = None,
 ) -> tuple[bool, bool, tuple[str, ...]]:
     identity = _validated_disposable_home_identity(expected_identity)
     home = account.home
@@ -1706,23 +1794,90 @@ def _validated_marker_bound_disposable_home(
         identity["home_inode"],
     ):
         raise _home_cleanup_drift_error(diagnostic_phase, "home-identity-drift")
-    try:
-        home_names = {entry.name for entry in home.iterdir()}
-    except OSError as error:
-        raise _home_cleanup_drift_error(
-            diagnostic_phase,
-            "home-read-failed",
-        ) from error
-    if "launchd-probe" in home_names and home_names != {"launchd-probe"}:
-        raise _home_cleanup_drift_error(
-            diagnostic_phase,
-            _classified_unexpected_home_entry_detail(
+    home_names = set(
+        _bounded_path_directory_names(
+            home,
+            home_metadata,
+            MAX_DISPOSABLE_HOME_ENTRIES,
+            limit_code=(
+                "home-library-inventory-drift"
+                if library_inventory is not None
+                else _home_cleanup_drift_error(
+                    diagnostic_phase,
+                    "home-entry-observation-unreadable",
+                ).code
+            ),
+            failure_code=_home_cleanup_drift_error(
+                diagnostic_phase,
+                "home-read-failed",
+            ).code,
+        )
+    )
+    library_names = home_names & {
+        HOME_LIBRARY_NAME,
+        HOME_LIBRARY_QUARANTINE_NAME,
+    }
+    unexpected_names = home_names - {"launchd-probe"} - library_names
+    if unexpected_names or len(library_names) > 1:
+        if library_inventory is None:
+            raise _home_cleanup_drift_error(
+                diagnostic_phase,
+                _classified_unexpected_home_entry_detail(
+                    home,
+                    home_names,
+                    expected_uid=account.uid,
+                    expected_gid=account.gid,
+                ),
+            )
+        raise ProbeError("home-library-inventory-drift")
+    if library_inventory is None:
+        if library_names != ({HOME_LIBRARY_NAME} if library_names else set()):
+            raise ProbeError("home-library-inventory-drift")
+        if library_names:
+            _require_allowed_disposable_home_names(
                 home,
-                home_names,
+                {"launchd-probe", HOME_LIBRARY_NAME},
                 expected_uid=account.uid,
                 expected_gid=account.gid,
-            ),
+                diagnostic_phase=diagnostic_phase,
+            )
+    elif library_inventory == "none":
+        if library_names:
+            raise ProbeError("home-library-inventory-drift")
+    else:
+        inventory = _validated_library_inventory(
+            library_inventory,
+            account,
+            identity["home_device"],
         )
+        if library_names:
+            leaf_name = next(iter(library_names))
+            try:
+                metadata = (home / leaf_name).lstat()
+            except OSError as error:
+                raise ProbeError("home-library-inventory-drift") from error
+            root_sha256 = _home_library_path_sha256((HOME_LIBRARY_NAME,))
+            root = next(
+                (
+                    item
+                    for item in inventory["entries"]
+                    if item.get("path_sha256") == root_sha256
+                ),
+                None,
+            )
+            if not isinstance(root, dict) or any(
+                root.get(name) != value
+                for name, value in {
+                    "device": metadata.st_dev,
+                    "flags": int(getattr(metadata, "st_flags", 0)),
+                    "gid": metadata.st_gid,
+                    "inode": metadata.st_ino,
+                    "kind": "directory",
+                    "mode": metadata.st_mode,
+                    "uid": metadata.st_uid,
+                }.items()
+            ):
+                raise ProbeError("home-library-inventory-drift")
     try:
         probe_metadata = probe_root.lstat()
     except FileNotFoundError:
@@ -1742,16 +1897,18 @@ def _validated_marker_bound_disposable_home(
             diagnostic_phase,
             "probe-read-failed",
         ) from error
-    if home_names != {"launchd-probe"}:
-        raise _home_cleanup_drift_error(
-            diagnostic_phase,
-            _classified_unexpected_home_entry_detail(
-                home,
-                home_names,
-                expected_uid=account.uid,
-                expected_gid=account.gid,
-            ),
-        )
+    if home_names != {"launchd-probe"} | library_names:
+        if library_inventory is None:
+            raise _home_cleanup_drift_error(
+                diagnostic_phase,
+                _classified_unexpected_home_entry_detail(
+                    home,
+                    home_names,
+                    expected_uid=account.uid,
+                    expected_gid=account.gid,
+                ),
+            )
+        raise ProbeError("home-library-inventory-drift")
     if not stat.S_ISDIR(probe_metadata.st_mode):
         raise _home_cleanup_drift_error(diagnostic_phase, "probe-kind-drift")
     if stat.S_IMODE(probe_metadata.st_mode) != 0o700:
@@ -1763,13 +1920,21 @@ def _validated_marker_bound_disposable_home(
         identity["probe_inode"],
     ):
         raise _home_cleanup_drift_error(diagnostic_phase, "probe-identity-drift")
-    try:
-        names = {entry.name for entry in probe_root.iterdir()}
-    except OSError as error:
-        raise _home_cleanup_drift_error(
-            diagnostic_phase,
-            "probe-read-failed",
-        ) from error
+    names = set(
+        _bounded_path_directory_names(
+            probe_root,
+            probe_metadata,
+            MAX_LAUNCHD_PROBE_ENTRIES,
+            limit_code=_home_cleanup_drift_error(
+                diagnostic_phase,
+                "probe-entry-set-drift",
+            ).code,
+            failure_code=_home_cleanup_drift_error(
+                diagnostic_phase,
+                "probe-read-failed",
+            ).code,
+        )
+    )
     if not names <= set(LAUNCHD_CHILD_FILES):
         raise _home_cleanup_drift_error(
             diagnostic_phase,
@@ -1829,9 +1994,20 @@ def _remove_marker_bound_disposable_home(
         account,
         identity,
         diagnostic_phase="home-removal",
+        library_inventory=authorization.get("library_inventory"),
     )
     if not home_present:
         return
+    _quarantine_and_remove_bounded_library(account, authorization)
+    home_present, probe_present, names = _validated_marker_bound_disposable_home(
+        account,
+        identity,
+        diagnostic_phase="home-removal",
+        library_inventory=authorization.get("library_inventory"),
+    )
+    if not home_present:
+        return
+    _require_bound_home_path(account, identity)
     probe_root = account.home / "launchd-probe"
     try:
         for name in names:
@@ -2189,6 +2365,45 @@ def _rename_exclusive(source: Path, destination: Path) -> None:
             error_number,
             os.strerror(error_number),
             str(destination),
+        )
+
+
+def _renameat_exclusive(
+    source_parent_descriptor: int,
+    source_name: str,
+    destination_parent_descriptor: int,
+    destination_name: str,
+) -> None:
+    if (
+        source_name != HOME_LIBRARY_NAME
+        or destination_name != HOME_LIBRARY_QUARANTINE_NAME
+    ):
+        raise ProbeError("home-library-quarantine-drift")
+    try:
+        library = ctypes.CDLL(None, use_errno=True)
+        renameatx_np = library.renameatx_np
+        renameatx_np.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameatx_np.restype = ctypes.c_int
+        result = renameatx_np(
+            source_parent_descriptor,
+            os.fsencode(source_name),
+            destination_parent_descriptor,
+            os.fsencode(destination_name),
+            RENAME_EXCL | RENAME_NOFOLLOW_ANY,
+        )
+    except (AttributeError, OSError) as error:
+        raise ProbeError("home-library-quarantine-failed") from error
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise ProbeError("home-library-quarantine-failed") from OSError(
+            error_number,
+            os.strerror(error_number),
         )
 
 
@@ -3117,17 +3332,66 @@ def _create_disposable_account(
 
 
 def _new_directory_identity(path: Path) -> tuple[int, int, int, int]:
+    descriptor = -1
     try:
         metadata = path.lstat()
-    except OSError as error:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+            or metadata.st_uid != os.geteuid()
+            or (
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_mode,
+                metadata.st_uid,
+                metadata.st_gid,
+            )
+            != (
+                opened.st_dev,
+                opened.st_ino,
+                opened.st_mode,
+                opened.st_uid,
+                opened.st_gid,
+            )
+        ):
+            raise ProbeError("home-create-new-disagrees")
+    except (OSError, ProbeError) as error:
         raise ProbeError("home-create-new-disagrees") from error
-    if (
-        not stat.S_ISDIR(metadata.st_mode)
-        or stat.S_IMODE(metadata.st_mode) != 0o700
-        or metadata.st_uid != os.geteuid()
-    ):
-        raise ProbeError("home-create-new-disagrees")
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
     return metadata.st_dev, metadata.st_ino, metadata.st_uid, metadata.st_gid
+
+
+def _require_new_directory_no_acl(
+    path: Path,
+    identity: tuple[int, int, int, int],
+) -> None:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+        metadata = os.fstat(descriptor)
+        if (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_uid,
+            metadata.st_gid,
+        ) != identity or stat.S_IMODE(metadata.st_mode) != 0o700:
+            raise ProbeError("home-create-new-disagrees")
+        _require_no_extended_acl(descriptor)
+    except (OSError, ProbeError) as error:
+        raise ProbeError("home-create-new-disagrees") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def _created_directory_is_exact(
@@ -3162,15 +3426,32 @@ def _rollback_created_home(
     if account.home.name != account.name or probe_root.parent != account.home:
         raise ProbeError("home-create-new-preserved")
     try:
+        probe_metadata = probe_root.lstat() if probe_created else None
         if probe_created and (
             not _created_directory_is_exact(probe_root, probe_identity, account)
-            or any(probe_root.iterdir())
+            or _bounded_path_directory_names(
+                probe_root,
+                probe_metadata,
+                0,
+                limit_code="home-create-new-preserved",
+                failure_code="home-create-new-preserved",
+            )
         ):
             raise ProbeError("home-create-new-preserved")
         expected_home_names = {"launchd-probe"} if probe_created else set()
+        home_metadata = account.home.lstat() if home_created else None
         if home_created and (
             not _created_directory_is_exact(account.home, home_identity, account)
-            or {entry.name for entry in account.home.iterdir()} != expected_home_names
+            or set(
+                _bounded_path_directory_names(
+                    account.home,
+                    home_metadata,
+                    len(expected_home_names),
+                    limit_code="home-create-new-preserved",
+                    failure_code="home-create-new-preserved",
+                )
+            )
+            != expected_home_names
         ):
             raise ProbeError("home-create-new-preserved")
         if probe_created:
@@ -3191,10 +3472,12 @@ def _create_disposable_home(account: DisposableAccount) -> None:
         account.home.mkdir(mode=0o700)
         home_created = True
         home_identity = _new_directory_identity(account.home)
+        _require_new_directory_no_acl(account.home, home_identity)
         os.chown(account.home, account.uid, account.gid, follow_symlinks=False)
         probe_root.mkdir(mode=0o700)
         probe_created = True
         probe_identity = _new_directory_identity(probe_root)
+        _require_new_directory_no_acl(probe_root, probe_identity)
         os.chown(probe_root, account.uid, account.gid, follow_symlinks=False)
         for path in (account.home, probe_root):
             if not _metadata_matches(
@@ -3475,6 +3758,932 @@ def _load_launchd_ownership_marker(
     return document
 
 
+def _home_library_path_sha256(components: Sequence[str]) -> str:
+    digest = hashlib.sha256(b"task-witness-macos-home-library-path-v1\0")
+    total = 0
+    for component in components:
+        raw = os.fsencode(component)
+        if (
+            not raw
+            or raw in {b".", b".."}
+            or b"/" in raw
+            or b"\0" in raw
+            or len(raw) > MAX_HOME_LIBRARY_COMPONENT_BYTES
+        ):
+            raise ProbeError("home-library-unsafe-entry")
+        total += len(raw)
+        if total > MAX_HOME_LIBRARY_PATH_BYTES:
+            raise ProbeError("home-library-bounds-exceeded")
+        digest.update(len(raw).to_bytes(2, "big"))
+        digest.update(raw)
+    return digest.hexdigest()
+
+
+def _darwin_fstatfs_identity(descriptor: int) -> tuple[int, int, str]:
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        fstatfs = libc.fstatfs
+        fstatfs.argtypes = [ctypes.c_int, ctypes.POINTER(_DarwinStatFs)]
+        fstatfs.restype = ctypes.c_int
+        observed = _DarwinStatFs()
+        if fstatfs(descriptor, ctypes.byref(observed)) != 0:
+            raise OSError(ctypes.get_errno(), "fstatfs failed")
+        filesystem = bytes(observed.f_fstypename).split(b"\0", 1)[0].decode("ascii")
+        return int(observed.f_fsid[0]), int(observed.f_fsid[1]), filesystem.lower()
+    except (AttributeError, OSError, UnicodeDecodeError) as error:
+        raise ProbeError("home-library-observation-failed") from error
+
+
+def _require_no_extended_acl(descriptor: int) -> None:
+    acl = None
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        acl_get_fd_np = libc.acl_get_fd_np
+        acl_get_fd_np.argtypes = [ctypes.c_int, ctypes.c_int]
+        acl_get_fd_np.restype = ctypes.c_void_p
+        acl_get_entry = libc.acl_get_entry
+        acl_get_entry.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        acl_get_entry.restype = ctypes.c_int
+        acl_free = libc.acl_free
+        acl_free.argtypes = [ctypes.c_void_p]
+        acl_free.restype = ctypes.c_int
+        ctypes.set_errno(0)
+        acl = acl_get_fd_np(descriptor, ACL_TYPE_EXTENDED)
+        if not acl:
+            if ctypes.get_errno() == errno.ENOENT:
+                return
+            raise OSError(ctypes.get_errno(), "acl_get_fd_np failed")
+        entry = ctypes.c_void_p()
+        result = acl_get_entry(acl, ACL_FIRST_ENTRY, ctypes.byref(entry))
+        if result == 0:
+            raise ProbeError("home-library-unsafe-entry")
+        raise OSError(ctypes.get_errno(), "acl_get_entry failed")
+    except ProbeError:
+        raise
+    except (AttributeError, OSError) as error:
+        raise ProbeError("home-library-observation-failed") from error
+    finally:
+        if acl:
+            try:
+                acl_free(acl)
+            except (AttributeError, OSError):
+                pass
+
+
+def _require_no_extended_attributes(descriptor: int) -> None:
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        flistxattr = libc.flistxattr
+        flistxattr.argtypes = [
+            ctypes.c_int,
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_int,
+        ]
+        flistxattr.restype = ctypes.c_ssize_t
+        ctypes.set_errno(0)
+        observed = flistxattr(descriptor, None, 0, XATTR_SHOWCOMPRESSION)
+        if observed < 0:
+            raise OSError(ctypes.get_errno(), "flistxattr failed")
+        if observed != 0:
+            raise ProbeError("home-library-unsafe-entry")
+    except ProbeError:
+        raise
+    except (AttributeError, OSError) as error:
+        raise ProbeError("home-library-observation-failed") from error
+
+
+def _home_library_metadata(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+        int(getattr(metadata, "st_flags", 0)),
+    )
+
+
+def _require_bound_home_descriptor(
+    account: DisposableAccount,
+    descriptor: int,
+    expected_identity: Mapping[str, int] | None = None,
+) -> os.stat_result:
+    try:
+        opened = os.fstat(descriptor)
+        visible = account.home.lstat()
+    except OSError as error:
+        raise ProbeError("home-library-home-drift") from error
+    if (
+        _home_library_metadata(opened) != _home_library_metadata(visible)
+        or not stat.S_ISDIR(opened.st_mode)
+        or stat.S_IMODE(opened.st_mode) != 0o700
+        or opened.st_uid != account.uid
+        or opened.st_gid != account.gid
+        or (
+            expected_identity is not None
+            and (opened.st_dev, opened.st_ino)
+            != (
+                expected_identity["home_device"],
+                expected_identity["home_inode"],
+            )
+        )
+    ):
+        raise ProbeError("home-library-home-drift")
+    _require_no_extended_acl(descriptor)
+    return opened
+
+
+def _require_bound_home_path(
+    account: DisposableAccount,
+    expected_identity: Mapping[str, int],
+) -> None:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            account.home,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+        _require_bound_home_descriptor(account, descriptor, expected_identity)
+    except ProbeError:
+        raise
+    except OSError as error:
+        raise ProbeError("home-library-home-drift") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _require_home_library_node(
+    metadata: os.stat_result,
+    *,
+    account: DisposableAccount,
+    home_device: int,
+) -> str:
+    kind = (
+        "directory"
+        if stat.S_ISDIR(metadata.st_mode)
+        else "file"
+        if stat.S_ISREG(metadata.st_mode)
+        else ""
+    )
+    if (
+        not kind
+        or metadata.st_dev != home_device
+        or metadata.st_uid != account.uid
+        or metadata.st_gid != account.gid
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+        or int(getattr(metadata, "st_flags", 0)) != 0
+        or (kind == "directory" and stat.S_IMODE(metadata.st_mode) & 0o700 != 0o700)
+        or (kind == "file" and stat.S_IMODE(metadata.st_mode) & 0o400 != 0o400)
+        or (kind == "file" and metadata.st_nlink != 1)
+    ):
+        raise ProbeError("home-library-unsafe-entry")
+    return kind
+
+
+def _read_home_library_file(
+    parent_descriptor: int,
+    name: str,
+    expected: os.stat_result,
+) -> tuple[bytes, os.stat_result]:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=parent_descriptor,
+        )
+        opened = os.fstat(descriptor)
+        if _home_library_metadata(opened) != _home_library_metadata(expected):
+            raise ProbeError("home-library-observation-unstable")
+        _require_no_extended_acl(descriptor)
+        _require_no_extended_attributes(descriptor)
+        if opened.st_size < 0 or opened.st_size > MAX_HOME_LIBRARY_FILE_BYTES:
+            raise ProbeError("home-library-bounds-exceeded")
+        chunks: list[bytes] = []
+        remaining = opened.st_size + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+        after = os.fstat(descriptor)
+        current = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if (
+            len(raw) != opened.st_size
+            or _home_library_metadata(after) != _home_library_metadata(opened)
+            or _home_library_metadata(current) != _home_library_metadata(opened)
+        ):
+            raise ProbeError("home-library-observation-unstable")
+        _require_no_extended_attributes(descriptor)
+        return raw, opened
+    except ProbeError:
+        raise
+    except OSError as error:
+        raise ProbeError("home-library-observation-failed") from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _bounded_directory_names(
+    descriptor: int,
+    maximum: int,
+    *,
+    limit_code: str,
+    failure_code: str,
+) -> list[str]:
+    if type(maximum) is not int or not 0 <= maximum <= MAX_HOME_LIBRARY_NODES:
+        raise ProbeError(limit_code)
+    names: list[str] = []
+    try:
+        with os.scandir(descriptor) as entries:
+            for entry in entries:
+                names.append(entry.name)
+                if len(names) > maximum:
+                    raise ProbeError(limit_code)
+        return sorted(names, key=os.fsencode)
+    except ProbeError:
+        raise
+    except (OSError, UnicodeError) as error:
+        raise ProbeError(failure_code) from error
+
+
+def _bounded_path_directory_names(
+    path: Path,
+    expected: os.stat_result,
+    maximum: int,
+    *,
+    limit_code: str,
+    failure_code: str,
+) -> list[str]:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+        opened = os.fstat(descriptor)
+        if _home_library_metadata(opened) != _home_library_metadata(expected):
+            raise ProbeError(failure_code)
+        names = _bounded_directory_names(
+            descriptor,
+            maximum,
+            limit_code=limit_code,
+            failure_code=failure_code,
+        )
+        if _home_library_metadata(os.fstat(descriptor)) != _home_library_metadata(
+            opened
+        ) or _home_library_metadata(path.lstat()) != _home_library_metadata(opened):
+            raise ProbeError(failure_code)
+        return names
+    except ProbeError:
+        raise
+    except (OSError, UnicodeError) as error:
+        raise ProbeError(failure_code) from error
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _observe_bounded_library(
+    account: DisposableAccount,
+    leaf_name: str,
+    expected_home_identity: Mapping[str, int] | None = None,
+) -> ObservedHomeLibrary:
+    home_descriptor = -1
+    library_descriptor = -1
+    records: list[dict] = []
+    stability: list[dict] = []
+    node_count = 0
+    total_bytes = 0
+    seen_identities: set[tuple[int, int]] = set()
+    try:
+        home_descriptor = os.open(
+            account.home,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+        home_opened = _require_bound_home_descriptor(
+            account,
+            home_descriptor,
+            expected_home_identity,
+        )
+        home_filesystem = _darwin_fstatfs_identity(home_descriptor)
+        library_metadata = os.stat(
+            leaf_name,
+            dir_fd=home_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            _require_home_library_node(
+                library_metadata,
+                account=account,
+                home_device=home_opened.st_dev,
+            )
+            != "directory"
+        ):
+            raise ProbeError("home-library-unsafe-entry")
+        library_descriptor = os.open(
+            leaf_name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=home_descriptor,
+        )
+        if (
+            _home_library_metadata(os.fstat(library_descriptor))
+            != _home_library_metadata(library_metadata)
+            or _darwin_fstatfs_identity(library_descriptor) != home_filesystem
+        ):
+            raise ProbeError("home-library-observation-unstable")
+
+        def walk(
+            descriptor: int,
+            metadata: os.stat_result,
+            components: tuple[str, ...],
+            parent_sha256: str,
+        ) -> None:
+            nonlocal node_count, total_bytes
+            depth = len(components)
+            node_count += 1
+            if depth > MAX_HOME_LIBRARY_DEPTH or node_count > MAX_HOME_LIBRARY_NODES:
+                raise ProbeError("home-library-bounds-exceeded")
+            path_sha256 = _home_library_path_sha256(components)
+            identity = (metadata.st_dev, metadata.st_ino)
+            if identity in seen_identities:
+                raise ProbeError("home-library-unsafe-entry")
+            seen_identities.add(identity)
+            kind = _require_home_library_node(
+                metadata,
+                account=account,
+                home_device=home_opened.st_dev,
+            )
+            record = {
+                "depth": depth,
+                "device": metadata.st_dev,
+                "flags": int(getattr(metadata, "st_flags", 0)),
+                "gid": metadata.st_gid,
+                "inode": metadata.st_ino,
+                "kind": kind,
+                "mode": metadata.st_mode,
+                "parent_sha256": parent_sha256,
+                "path_sha256": path_sha256,
+                "uid": metadata.st_uid,
+            }
+            observed = {
+                **record,
+                "link_count": metadata.st_nlink,
+                "size": metadata.st_size,
+                "mtime_ns": metadata.st_mtime_ns,
+                "ctime_ns": metadata.st_ctime_ns,
+            }
+            if kind == "file":
+                raw, opened = _read_home_library_file(
+                    descriptor,
+                    components[-1],
+                    metadata,
+                )
+                total_bytes += len(raw)
+                if total_bytes > MAX_HOME_LIBRARY_TOTAL_BYTES:
+                    raise ProbeError("home-library-bounds-exceeded")
+                record.update(
+                    {
+                        "content_sha256": hashlib.sha256(raw).hexdigest(),
+                        "ctime_ns": opened.st_ctime_ns,
+                        "link_count": opened.st_nlink,
+                        "mtime_ns": opened.st_mtime_ns,
+                        "size": opened.st_size,
+                    }
+                )
+                records.append(record)
+                stability.append(
+                    {**observed, "content_sha256": record["content_sha256"]}
+                )
+                return
+            _require_no_extended_acl(descriptor)
+            _require_no_extended_attributes(descriptor)
+            records.append(record)
+            stability.append(observed)
+            names = _bounded_directory_names(
+                descriptor,
+                MAX_HOME_LIBRARY_NODES - node_count,
+                limit_code="home-library-bounds-exceeded",
+                failure_code="home-library-observation-failed",
+            )
+            for name in names:
+                child_components = (*components, name)
+                child_metadata = os.stat(
+                    name,
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
+                )
+                child_kind = _require_home_library_node(
+                    child_metadata,
+                    account=account,
+                    home_device=home_opened.st_dev,
+                )
+                if child_kind == "file":
+                    walk(descriptor, child_metadata, child_components, path_sha256)
+                    continue
+                child_descriptor = -1
+                try:
+                    child_descriptor = os.open(
+                        name,
+                        os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+                        dir_fd=descriptor,
+                    )
+                    child_opened = os.fstat(child_descriptor)
+                    if (
+                        _home_library_metadata(child_opened)
+                        != _home_library_metadata(child_metadata)
+                        or _darwin_fstatfs_identity(child_descriptor) != home_filesystem
+                    ):
+                        raise ProbeError("home-library-observation-unstable")
+                    walk(
+                        child_descriptor,
+                        child_opened,
+                        child_components,
+                        path_sha256,
+                    )
+                finally:
+                    if child_descriptor >= 0:
+                        os.close(child_descriptor)
+
+        walk(
+            library_descriptor,
+            os.fstat(library_descriptor),
+            (HOME_LIBRARY_NAME,),
+            _home_library_path_sha256(()),
+        )
+        records.sort(key=lambda item: item["path_sha256"])
+        inventory = _document_with_digest(
+            {
+                "schema_version": 1,
+                "contract": "task-witness-macos-bounded-library-inventory-v1",
+                "entry_count": node_count,
+                "regular_file_bytes": total_bytes,
+                "entries": records,
+            }
+        )
+        stability.sort(key=lambda item: item["path_sha256"])
+        return ObservedHomeLibrary(
+            inventory=inventory,
+            stability_sha256=hashlib.sha256(canonical_bytes(stability)).hexdigest(),
+        )
+    except ProbeError:
+        raise
+    except (OSError, UnicodeError) as error:
+        raise ProbeError("home-library-observation-failed") from error
+    finally:
+        if library_descriptor >= 0:
+            os.close(library_descriptor)
+        if home_descriptor >= 0:
+            os.close(home_descriptor)
+
+
+def _validated_library_inventory(
+    value: object,
+    account: DisposableAccount,
+    home_device: int,
+) -> dict:
+    inventory = _require_exact_keys(
+        value,
+        {
+            "content_sha256",
+            "contract",
+            "entries",
+            "entry_count",
+            "regular_file_bytes",
+            "schema_version",
+        },
+        "home-library-inventory",
+    )
+    _require_content_digest(inventory, "home-library-inventory")
+    records = inventory.get("entries")
+    root_path = _home_library_path_sha256((HOME_LIBRARY_NAME,))
+    if (
+        type(inventory.get("schema_version")) is not int
+        or inventory.get("schema_version") != 1
+        or inventory.get("contract")
+        != "task-witness-macos-bounded-library-inventory-v1"
+        or not isinstance(records, list)
+        or not 1 <= len(records) <= MAX_HOME_LIBRARY_NODES
+        or type(inventory.get("entry_count")) is not int
+        or inventory.get("entry_count") != len(records)
+        or type(inventory.get("regular_file_bytes")) is not int
+        or any(
+            not isinstance(item, dict)
+            or not isinstance(item.get("path_sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", item["path_sha256"]) is None
+            for item in records
+        )
+        or canonical_bytes(records)
+        != canonical_bytes(sorted(records, key=lambda item: item["path_sha256"]))
+    ):
+        raise ProbeError("home-library-inventory-invalid")
+    by_hash: dict[str, dict] = {}
+    identities: set[tuple[int, int]] = set()
+    total_bytes = 0
+    for record_value in records:
+        if not isinstance(record_value, dict):
+            raise ProbeError("home-library-inventory-invalid")
+        kind = record_value.get("kind")
+        common_keys = {
+            "depth",
+            "device",
+            "flags",
+            "gid",
+            "inode",
+            "kind",
+            "mode",
+            "parent_sha256",
+            "path_sha256",
+            "uid",
+        }
+        file_keys = common_keys | {
+            "content_sha256",
+            "ctime_ns",
+            "link_count",
+            "mtime_ns",
+            "size",
+        }
+        if set(record_value) != (file_keys if kind == "file" else common_keys):
+            raise ProbeError("home-library-inventory-invalid")
+        path_sha256 = record_value.get("path_sha256")
+        parent_sha256 = record_value.get("parent_sha256")
+        integer_names = common_keys - {
+            "kind",
+            "parent_sha256",
+            "path_sha256",
+        }
+        if kind == "file":
+            integer_names |= {"ctime_ns", "link_count", "mtime_ns", "size"}
+        if (
+            not isinstance(kind, str)
+            or kind not in {"directory", "file"}
+            or not isinstance(path_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", path_sha256) is None
+            or not isinstance(parent_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", parent_sha256) is None
+            or path_sha256 in by_hash
+            or any(type(record_value.get(name)) is not int for name in integer_names)
+            or record_value.get("depth", 0) not in range(1, MAX_HOME_LIBRARY_DEPTH + 1)
+            or record_value.get("device") != home_device
+            or record_value.get("uid") != account.uid
+            or record_value.get("gid") != account.gid
+            or record_value.get("flags") != 0
+        ):
+            raise ProbeError("home-library-inventory-invalid")
+        identity = (record_value["device"], record_value["inode"])
+        if record_value["inode"] <= 0 or identity in identities:
+            raise ProbeError("home-library-inventory-invalid")
+        identities.add(identity)
+        if kind == "directory":
+            if (
+                not stat.S_ISDIR(record_value["mode"])
+                or stat.S_IMODE(record_value["mode"]) & 0o022
+                or stat.S_IMODE(record_value["mode"]) & 0o700 != 0o700
+            ):
+                raise ProbeError("home-library-inventory-invalid")
+        else:
+            digest = record_value.get("content_sha256")
+            size = record_value.get("size")
+            if (
+                not stat.S_ISREG(record_value["mode"])
+                or stat.S_IMODE(record_value["mode"]) & 0o022
+                or stat.S_IMODE(record_value["mode"]) & 0o400 != 0o400
+                or record_value.get("link_count") != 1
+                or not isinstance(digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+                or not isinstance(size, int)
+                or not 0 <= size <= MAX_HOME_LIBRARY_FILE_BYTES
+            ):
+                raise ProbeError("home-library-inventory-invalid")
+            total_bytes += size
+        by_hash[path_sha256] = record_value
+    empty_path = _home_library_path_sha256(())
+    for path_sha256, record in by_hash.items():
+        parent = record["parent_sha256"]
+        if record["depth"] == 1:
+            if (
+                path_sha256 != root_path
+                or parent != empty_path
+                or record["kind"] != "directory"
+            ):
+                raise ProbeError("home-library-inventory-invalid")
+        elif (
+            parent not in by_hash
+            or by_hash[parent]["kind"] != "directory"
+            or by_hash[parent]["depth"] != record["depth"] - 1
+        ):
+            raise ProbeError("home-library-inventory-invalid")
+    if (
+        total_bytes != inventory.get("regular_file_bytes")
+        or total_bytes > MAX_HOME_LIBRARY_TOTAL_BYTES
+    ):
+        raise ProbeError("home-library-inventory-invalid")
+    return dict(inventory)
+
+
+def _bounded_library_inventory(account: DisposableAccount) -> dict | None:
+    source = account.home / HOME_LIBRARY_NAME
+    quarantine = account.home / HOME_LIBRARY_QUARANTINE_NAME
+    if _path_exists_no_follow(quarantine):
+        raise ProbeError("home-library-quarantine-drift")
+    if not _path_exists_no_follow(source):
+        return None
+    first = _observe_bounded_library(account, HOME_LIBRARY_NAME)
+    second = _observe_bounded_library(account, HOME_LIBRARY_NAME)
+    if first != second:
+        raise ProbeError("home-library-observation-unstable")
+    home_device = account.home.lstat().st_dev
+    return _validated_library_inventory(first.inventory, account, home_device)
+
+
+def _require_library_inventory_relation(
+    observed: Mapping[str, object],
+    authorized: Mapping[str, object],
+    *,
+    exact: bool,
+) -> None:
+    observed_entries = observed.get("entries")
+    authorized_entries = authorized.get("entries")
+    if not isinstance(observed_entries, list) or not isinstance(
+        authorized_entries, list
+    ):
+        raise ProbeError("home-library-inventory-drift")
+    authorized_by_path = {
+        item.get("path_sha256"): item
+        for item in authorized_entries
+        if isinstance(item, dict)
+    }
+    if len(authorized_by_path) != len(authorized_entries) or any(
+        not isinstance(item, dict)
+        or authorized_by_path.get(item.get("path_sha256")) != item
+        for item in observed_entries
+    ):
+        raise ProbeError("home-library-inventory-drift")
+    if exact and len(observed_entries) != len(authorized_entries):
+        raise ProbeError("home-library-inventory-drift")
+
+
+def _stable_observed_library(
+    account: DisposableAccount,
+    leaf_name: str,
+    authorized: Mapping[str, object],
+    home_identity: Mapping[str, int],
+    *,
+    exact: bool,
+) -> dict:
+    first = _observe_bounded_library(account, leaf_name, home_identity)
+    second = _observe_bounded_library(account, leaf_name, home_identity)
+    if first != second:
+        raise ProbeError("home-library-observation-unstable")
+    current = _validated_library_inventory(
+        first.inventory,
+        account,
+        home_identity["home_device"],
+    )
+    _require_library_inventory_relation(current, authorized, exact=exact)
+    return current
+
+
+def _authorized_library_record(
+    authorized_by_path: Mapping[str, Mapping[str, object]],
+    components: Sequence[str],
+) -> Mapping[str, object]:
+    record = authorized_by_path.get(_home_library_path_sha256(components))
+    if record is None:
+        raise ProbeError("home-library-inventory-drift")
+    return record
+
+
+def _require_library_record_metadata(
+    record: Mapping[str, object],
+    metadata: os.stat_result,
+    kind: str,
+) -> None:
+    if any(
+        record.get(name) != value
+        for name, value in {
+            "device": metadata.st_dev,
+            "flags": int(getattr(metadata, "st_flags", 0)),
+            "gid": metadata.st_gid,
+            "inode": metadata.st_ino,
+            "kind": kind,
+            "mode": metadata.st_mode,
+            "uid": metadata.st_uid,
+        }.items()
+    ):
+        raise ProbeError("home-library-inventory-drift")
+
+
+def _delete_authorized_library_directory(
+    descriptor: int,
+    components: tuple[str, ...],
+    authorized_by_path: Mapping[str, Mapping[str, object]],
+) -> None:
+    names = _bounded_directory_names(
+        descriptor,
+        len(authorized_by_path),
+        limit_code="home-library-inventory-drift",
+        failure_code="home-library-cleanup-failed",
+    )
+    for name in names:
+        child_components = (*components, name)
+        record = _authorized_library_record(authorized_by_path, child_components)
+        try:
+            metadata = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+        except OSError as error:
+            raise ProbeError("home-library-inventory-drift") from error
+        kind = record.get("kind")
+        if kind == "file":
+            _require_library_record_metadata(record, metadata, "file")
+            raw, opened = _read_home_library_file(descriptor, name, metadata)
+            if any(
+                record.get(field) != value
+                for field, value in {
+                    "content_sha256": hashlib.sha256(raw).hexdigest(),
+                    "ctime_ns": opened.st_ctime_ns,
+                    "link_count": opened.st_nlink,
+                    "mtime_ns": opened.st_mtime_ns,
+                    "size": opened.st_size,
+                }.items()
+            ):
+                raise ProbeError("home-library-inventory-drift")
+            try:
+                os.unlink(name, dir_fd=descriptor)
+                os.fsync(descriptor)
+            except OSError as error:
+                raise ProbeError("home-library-cleanup-failed") from error
+            continue
+        if kind != "directory":
+            raise ProbeError("home-library-inventory-drift")
+        _require_library_record_metadata(record, metadata, "directory")
+        child_descriptor = -1
+        try:
+            child_descriptor = os.open(
+                name,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=descriptor,
+            )
+            opened = os.fstat(child_descriptor)
+            _require_library_record_metadata(record, opened, "directory")
+            _require_no_extended_acl(child_descriptor)
+            _require_no_extended_attributes(child_descriptor)
+            _delete_authorized_library_directory(
+                child_descriptor,
+                child_components,
+                authorized_by_path,
+            )
+            _require_no_extended_attributes(child_descriptor)
+        except ProbeError:
+            raise
+        except OSError as error:
+            raise ProbeError("home-library-cleanup-failed") from error
+        finally:
+            if child_descriptor >= 0:
+                os.close(child_descriptor)
+        try:
+            current = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            _require_library_record_metadata(record, current, "directory")
+            os.rmdir(name, dir_fd=descriptor)
+            os.fsync(descriptor)
+        except ProbeError:
+            raise
+        except OSError as error:
+            raise ProbeError("home-library-cleanup-failed") from error
+
+
+def _quarantine_and_remove_bounded_library(
+    account: DisposableAccount,
+    authorization: Mapping[str, object],
+) -> None:
+    identity = _validated_disposable_home_identity(authorization.get("home_identity"))
+    inventory_value = authorization.get("library_inventory", "none")
+    if inventory_value is None:
+        inventory_value = "none"
+    source = account.home / HOME_LIBRARY_NAME
+    quarantine = account.home / HOME_LIBRARY_QUARANTINE_NAME
+    source_present = _path_exists_no_follow(source)
+    quarantine_present = _path_exists_no_follow(quarantine)
+    if inventory_value == "none":
+        if source_present or quarantine_present:
+            raise ProbeError("home-library-inventory-drift")
+        return
+    inventory = _validated_library_inventory(
+        inventory_value,
+        account,
+        identity["home_device"],
+    )
+    if source_present and quarantine_present:
+        raise ProbeError("home-library-quarantine-drift")
+    if not source_present and not quarantine_present:
+        return
+    home_descriptor = -1
+    try:
+        home_descriptor = os.open(
+            account.home,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+        _require_bound_home_descriptor(account, home_descriptor, identity)
+        if source_present:
+            _stable_observed_library(
+                account,
+                HOME_LIBRARY_NAME,
+                inventory,
+                identity,
+                exact=True,
+            )
+            _require_bound_home_descriptor(account, home_descriptor, identity)
+            _renameat_exclusive(
+                home_descriptor,
+                HOME_LIBRARY_NAME,
+                home_descriptor,
+                HOME_LIBRARY_QUARANTINE_NAME,
+            )
+        try:
+            os.fsync(home_descriptor)
+        except OSError as error:
+            raise ProbeError("home-library-quarantine-failed") from error
+        current = _stable_observed_library(
+            account,
+            HOME_LIBRARY_QUARANTINE_NAME,
+            inventory,
+            identity,
+            exact=False,
+        )
+        _require_bound_home_descriptor(account, home_descriptor, identity)
+        authorized_entries = inventory.get("entries")
+        if not isinstance(authorized_entries, list):
+            raise ProbeError("home-library-inventory-drift")
+        authorized_by_path = {
+            item["path_sha256"]: item
+            for item in authorized_entries
+            if isinstance(item, dict) and isinstance(item.get("path_sha256"), str)
+        }
+        current_entries = current.get("entries")
+        if not isinstance(current_entries, list) or not current_entries:
+            raise ProbeError("home-library-inventory-drift")
+        root = _authorized_library_record(
+            authorized_by_path,
+            (HOME_LIBRARY_NAME,),
+        )
+        root_metadata = os.stat(
+            HOME_LIBRARY_QUARANTINE_NAME,
+            dir_fd=home_descriptor,
+            follow_symlinks=False,
+        )
+        _require_library_record_metadata(root, root_metadata, "directory")
+        library_descriptor = -1
+        try:
+            library_descriptor = os.open(
+                HOME_LIBRARY_QUARANTINE_NAME,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=home_descriptor,
+            )
+            _require_library_record_metadata(
+                root,
+                os.fstat(library_descriptor),
+                "directory",
+            )
+            _require_no_extended_attributes(library_descriptor)
+            _delete_authorized_library_directory(
+                library_descriptor,
+                (HOME_LIBRARY_NAME,),
+                authorized_by_path,
+            )
+            _require_no_extended_attributes(library_descriptor)
+        finally:
+            if library_descriptor >= 0:
+                os.close(library_descriptor)
+        try:
+            final_root = os.stat(
+                HOME_LIBRARY_QUARANTINE_NAME,
+                dir_fd=home_descriptor,
+                follow_symlinks=False,
+            )
+            _require_library_record_metadata(root, final_root, "directory")
+            os.rmdir(HOME_LIBRARY_QUARANTINE_NAME, dir_fd=home_descriptor)
+            os.fsync(home_descriptor)
+        except ProbeError:
+            raise
+        except OSError as error:
+            raise ProbeError("home-library-cleanup-failed") from error
+    finally:
+        if home_descriptor >= 0:
+            os.close(home_descriptor)
+
+
 def _exact_disposable_home_identity(
     account: DisposableAccount,
     *,
@@ -3721,6 +4930,7 @@ def _home_cleanup_document(
     state: Mapping[str, object],
     bindings: ValidatedStageBindings,
     home_identity: object,
+    library_inventory: object = None,
 ) -> dict:
     if bindings.account is None:
         raise ProbeError("home-cleanup-authorization-binding-missing")
@@ -3736,6 +4946,15 @@ def _home_cleanup_document(
     )
     account_value = bindings.account.get("account")
     identity = _validated_disposable_home_identity(home_identity)
+    validated_library = (
+        "none"
+        if library_inventory is None or library_inventory == "none"
+        else _validated_library_inventory(
+            library_inventory,
+            plan.account,
+            identity["home_device"],
+        )
+    )
     if (
         not isinstance(account_value, dict)
         or account_value
@@ -3770,8 +4989,8 @@ def _home_cleanup_document(
         raise ProbeError("home-cleanup-authorization-binding-drift")
     return _document_with_digest(
         {
-            "schema_version": 1,
-            "contract": "task-witness-macos-home-cleanup-authorization-v1",
+            "schema_version": 2,
+            "contract": "task-witness-macos-home-cleanup-authorization-v2",
             "candidate_sha1": EXPECTED_CANDIDATE_SHA,
             "disposition": "armed",
             "account": {
@@ -3781,6 +5000,7 @@ def _home_cleanup_document(
                 "home": str(plan.account.home),
             },
             "home_identity": identity,
+            "library_inventory": validated_library,
             "label": plan.label,
             "stage_root": str(plan.stage_root),
             "state_sha256": state_sha256,
@@ -3820,10 +5040,11 @@ def _load_home_cleanup_authorization(
             state,
             bindings,
             document.get("home_identity"),
+            document.get("library_inventory"),
         )
     except ProbeError as error:
         raise ProbeError("home-cleanup-authorization-drift") from error
-    if document != expected:
+    if canonical_bytes(document) != canonical_bytes(expected):
         raise ProbeError("home-cleanup-authorization-drift")
     return document
 
@@ -3836,7 +5057,7 @@ def _require_durable_home_cleanup_authorization(
 ) -> dict:
     _fsync_stage_directory(plan.stage_root)
     observed = _load_home_cleanup_authorization(plan, state, bindings)
-    if observed != expected:
+    if observed is None or canonical_bytes(observed) != canonical_bytes(expected):
         raise ProbeError("home-cleanup-authorization-disagrees")
     return observed
 
@@ -3849,7 +5070,17 @@ def _write_home_cleanup_authorization(
 ) -> dict:
     if bindings.home_cleanup is not None:
         raise ProbeError("home-cleanup-authorization-already-exists")
-    document = _home_cleanup_document(plan, state, bindings, home_identity)
+    identity = _validated_disposable_home_identity(home_identity)
+    _require_bound_home_path(plan.account, identity)
+    library_inventory = _bounded_library_inventory(plan.account)
+    _require_bound_home_path(plan.account, identity)
+    document = _home_cleanup_document(
+        plan,
+        state,
+        bindings,
+        identity,
+        library_inventory,
+    )
     raw = canonical_bytes(document)
     if len(raw) > MAX_HOME_CLEANUP_BYTES:
         raise ProbeError("home-cleanup-authorization-too-large")
@@ -4456,7 +5687,18 @@ def _ensure_failed_child_files(
     ):
         raise ProbeError("home-cleanup-drift")
     try:
-        names = {entry.name for entry in probe_root.iterdir()}
+        probe_metadata = probe_root.lstat()
+        names = set(
+            _bounded_path_directory_names(
+                probe_root,
+                probe_metadata,
+                MAX_LAUNCHD_PROBE_ENTRIES,
+                limit_code="home-cleanup-drift",
+                failure_code="home-cleanup-drift",
+            )
+        )
+    except ProbeError:
+        raise
     except OSError as error:
         raise ProbeError("home-cleanup-drift") from error
     if not names <= set(LAUNCHD_CHILD_FILES):
@@ -5284,6 +6526,7 @@ def _validated_domain_reset_evidence(value: object) -> dict[str, str]:
     precondition = evidence.get("precondition")
     if (
         evidence.get("capability") != USER_DOMAIN_RESET_CAPABILITY
+        or not isinstance(disposition, str)
         or disposition not in {"not-needed", "performed", "recovered-to-stable-zero"}
         or (
             disposition == "not-needed"
@@ -5335,7 +6578,8 @@ def _validated_home_cleanup_evidence(value: object) -> dict[str, str]:
     authorization_sha256 = evidence.get("authorization_sha256")
     disposition = evidence.get("disposition")
     if (
-        disposition not in {"not-needed", "performed", "recovered"}
+        not isinstance(disposition, str)
+        or disposition not in {"not-needed", "performed", "recovered"}
         or (disposition == "not-needed" and authorization_sha256 != "none")
         or (
             disposition in {"performed", "recovered"}
@@ -5452,11 +6696,18 @@ def _validate_reset_bindings_and_resources(
             raise ProbeError("account-record-generated-uid-drift")
     elif plan.account.name in accounts or plan.account.uid in accounts.values():
         raise ProbeError("account-record-drift")
+    marker_home_arguments = {
+        "diagnostic_phase": home_drift_phase,
+    }
+    if home_cleanup is not None and "library_inventory" in home_cleanup:
+        marker_home_arguments["library_inventory"] = home_cleanup.get(
+            "library_inventory"
+        )
     home_present, probe_present, remaining_home_files = (
         _validated_marker_bound_disposable_home(
             plan.account,
             marker.get("home_identity"),
-            diagnostic_phase=home_drift_phase,
+            **marker_home_arguments,
         )
     )
     if (
@@ -5668,6 +6919,9 @@ def cleanup_launchd_user_lifecycle(
                     plan.account,
                     stage_bindings.home_cleanup.get("home_identity"),
                     diagnostic_phase="cleanup-entry",
+                    library_inventory=stage_bindings.home_cleanup.get(
+                        "library_inventory"
+                    ),
                 )
             elif stage_bindings.domain_reset is None:
                 _validate_exact_disposable_home(
@@ -5810,6 +7064,9 @@ def cleanup_launchd_user_lifecycle(
                     plan.account,
                     stage_bindings.home_cleanup.get("home_identity"),
                     diagnostic_phase="pre-home-removal",
+                    library_inventory=stage_bindings.home_cleanup.get(
+                        "library_inventory"
+                    ),
                 )
             )
             home_cleanup_recovered = home_cleanup_recovered or (

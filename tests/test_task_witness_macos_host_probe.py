@@ -11,6 +11,7 @@ import stat
 import subprocess
 import tempfile
 import unittest
+from collections.abc import Iterator
 from contextlib import ExitStack, nullcontext, redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
@@ -837,6 +838,12 @@ class TaskWitnessMacOSHostProbeTests(unittest.TestCase):
 class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.helper = load_helper()
+        self.xattr_patcher = mock.patch.object(
+            self.helper,
+            "_require_no_extended_attributes",
+        )
+        self.xattr_check = self.xattr_patcher.start()
+        self.addCleanup(self.xattr_patcher.stop)
 
     def launchd_context(self) -> dict[str, str]:
         context = eligible_context()
@@ -917,6 +924,101 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 "runner_uid": 501,
                 "runner_gid": 20,
             }
+        )
+
+    def write_extended_attribute(self, path: Path, name: str) -> None:
+        subprocess.run(
+            ["/usr/bin/xattr", "-w", name, "private-xattr-canary", str(path)],
+            check=True,
+            capture_output=True,
+        )
+
+    def bounded_library_cleanup_fixture(
+        self,
+        root: Path,
+    ) -> tuple[object, dict[str, int], dict, tuple[tuple[str, ...], ...]]:
+        stage = root / "stage"
+        stage.mkdir()
+        home = root / "home"
+        probe = home / "launchd-probe"
+        deep = home / "Library" / "Container" / "Deep"
+        preferences = home / "Library" / "Preferences"
+        probe.mkdir(parents=True, mode=0o700)
+        deep.mkdir(parents=True)
+        preferences.mkdir()
+        home.chmod(0o700)
+        probe.chmod(0o700)
+        for name in self.helper.LAUNCHD_CHILD_FILES:
+            (probe / name).write_bytes(b"value")
+        relative_files = (
+            ("Container", "Deep", "payload.bin"),
+            ("Preferences", "settings.plist"),
+        )
+        (home / "Library").joinpath(*relative_files[0]).write_bytes(b"payload")
+        (home / "Library").joinpath(*relative_files[1]).write_bytes(b"settings")
+        account = self.helper.DisposableAccount(
+            name="twq-0123456789ab",
+            uid=os.geteuid(),
+            gid=os.getegid(),
+            home=home,
+        )
+        plan = self.helper.LaunchdPlan(
+            account=account,
+            label="io.nisavid.task-witness.macos-probe.0123456789ab",
+            stage_root=stage,
+            helper=stage / "helper.py",
+            plist=stage / "job.plist",
+        )
+        state = self.lifecycle_state(plan)
+        account_binding = self.helper._account_binding_document(
+            plan,
+            state,
+            "01234567-89AB-4DEF-8123-456789ABCDEF",
+        )
+        bindings = self.helper.ValidatedStageBindings(account_binding, None)
+        home_metadata = home.lstat()
+        probe_metadata = probe.lstat()
+        identity = {
+            "home_device": home_metadata.st_dev,
+            "home_inode": home_metadata.st_ino,
+            "probe_device": probe_metadata.st_dev,
+            "probe_inode": probe_metadata.st_ino,
+        }
+        inventory = self.helper._bounded_library_inventory(account)
+        self.assertIsInstance(inventory, dict)
+        authorization = self.helper._home_cleanup_document(
+            plan,
+            state,
+            bindings,
+            identity,
+            inventory,
+        )
+        self.assertEqual(authorization["schema_version"], 2)
+        self.assertEqual(authorization["library_inventory"], inventory)
+        self.helper._require_content_digest(
+            authorization,
+            "home-cleanup-authorization",
+        )
+        return account, identity, authorization, relative_files
+
+    def rename_library_portably(
+        self,
+        source_parent_descriptor: int,
+        source_name: str,
+        destination_parent_descriptor: int,
+        destination_name: str,
+    ) -> None:
+        self.assertEqual(source_parent_descriptor, destination_parent_descriptor)
+        self.assertEqual(source_name, self.helper.HOME_LIBRARY_NAME)
+        self.assertEqual(
+            destination_name,
+            self.helper.HOME_LIBRARY_QUARANTINE_NAME,
+        )
+        os.rename(
+            source_name,
+            destination_name,
+            src_dir_fd=source_parent_descriptor,
+            dst_dir_fd=destination_parent_descriptor,
         )
 
     def launchctl_job(self, plan: object, state: dict[str, object]) -> str:
@@ -2920,6 +3022,82 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             with mock.patch.dict(os.environ, context, clear=True):
                 self.helper.verify_launchd_success(root)
 
+            def reseal() -> None:
+                manifest = root / "SHA256SUMS"
+                if manifest.exists():
+                    manifest.unlink()
+                self.helper.write_launchd_artifact_manifest(root, external)
+                external.replace(manifest)
+
+            malformed_evidence = (
+                (
+                    "domain-reset-list",
+                    "lifecycle.json",
+                    lifecycle,
+                    "domain_reset",
+                    [],
+                    "invalid-user-domain-reset-evidence",
+                ),
+                (
+                    "domain-reset-mapping",
+                    "lifecycle.json",
+                    lifecycle,
+                    "domain_reset",
+                    {},
+                    "invalid-user-domain-reset-evidence",
+                ),
+                (
+                    "home-cleanup-list",
+                    "cleanup.json",
+                    cleanup,
+                    "home_cleanup",
+                    [],
+                    "invalid-home-cleanup-evidence",
+                ),
+                (
+                    "home-cleanup-mapping",
+                    "cleanup.json",
+                    cleanup,
+                    "home_cleanup",
+                    {},
+                    "invalid-home-cleanup-evidence",
+                ),
+            )
+            for (
+                label,
+                file_name,
+                original,
+                evidence_name,
+                disposition,
+                expected_code,
+            ) in malformed_evidence:
+                with self.subTest(label=label):
+                    unsigned = {
+                        key: value
+                        for key, value in original.items()
+                        if key != "content_sha256"
+                    }
+                    unsigned[evidence_name] = {
+                        **unsigned[evidence_name],
+                        "disposition": disposition,
+                    }
+                    (root / file_name).write_bytes(
+                        self.helper.canonical_bytes(
+                            self.helper._document_with_digest(unsigned)
+                        )
+                    )
+                    reseal()
+                    with (
+                        mock.patch.dict(os.environ, context, clear=True),
+                        self.assertRaises(self.helper.ProbeError) as malformed,
+                    ):
+                        self.helper.verify_launchd_success(root)
+                    self.assertEqual(malformed.exception.code, expected_code)
+                    (root / file_name).write_bytes(
+                        self.helper.canonical_bytes(original)
+                    )
+                    reseal()
+
             performed = {
                 "authorization_sha256": "4" * 64,
                 "capability": "github-hosted-ephemeral-user-domain-reset-v1",
@@ -4374,6 +4552,1753 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             repr(write.call_args.kwargs),
         )
 
+    def test_library_activation_phase_policy_is_narrow(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "home"
+            probe = home / "launchd-probe"
+            library = home / "Library"
+            probe.mkdir(parents=True, mode=0o700)
+            library.mkdir()
+            home.chmod(0o700)
+            probe.chmod(0o700)
+            for name in self.helper.LAUNCHD_CHILD_FILES:
+                (probe / name).write_bytes(b"value")
+            account = self.helper.DisposableAccount(
+                name="twq-0123456789ab",
+                uid=os.geteuid(),
+                gid=os.getegid(),
+                home=home,
+            )
+
+            for phase in ("post-home-create", "post-system-bootstrap"):
+                with (
+                    self.subTest(phase=phase),
+                    self.assertRaises(self.helper.ProbeError) as raised,
+                ):
+                    self.helper._validate_disposable_home_root(
+                        account,
+                        diagnostic_phase=phase,
+                    )
+                self.assertEqual(
+                    raised.exception.code,
+                    f"home-cleanup-{phase}-home-entry-known-library-owned-directory",
+                )
+
+            self.helper._validate_disposable_home_root(
+                account,
+                diagnostic_phase="child-entry",
+            )
+            self.helper._validate_exact_disposable_home(
+                home,
+                expected_uid=account.uid,
+                expected_gid=account.gid,
+                diagnostic_phase="child-read",
+            )
+            self.helper._validate_exact_disposable_home(
+                home,
+                expected_uid=account.uid,
+                expected_gid=account.gid,
+                diagnostic_phase="pre-journal",
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "home"
+            probe = home / "launchd-probe"
+            probe.mkdir(parents=True, mode=0o700)
+            home.chmod(0o700)
+            probe.chmod(0o700)
+            canary = home / "private-owned-directory-canary"
+            canary.mkdir()
+            account = self.helper.DisposableAccount(
+                name="twq-0123456789ab",
+                uid=os.geteuid(),
+                gid=os.getegid(),
+                home=home,
+            )
+
+            with self.assertRaises(self.helper.ProbeError) as raised:
+                self.helper._validate_disposable_home_root(
+                    account,
+                    diagnostic_phase="child-entry",
+                )
+            self.assertEqual(
+                raised.exception.code,
+                ("home-cleanup-child-entry-home-entry-single-owned-directory-other"),
+            )
+            self.assertTrue(canary.is_dir())
+            self.assertNotIn(canary.name, raised.exception.code)
+
+    def test_library_activation_rejects_foreign_anchor_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "home"
+            probe = home / "launchd-probe"
+            library = home / "Library"
+            probe.mkdir(parents=True, mode=0o700)
+            library.mkdir()
+            home.chmod(0o700)
+            probe.chmod(0o700)
+            account = self.helper.DisposableAccount(
+                name="twq-0123456789ab",
+                uid=os.geteuid(),
+                gid=os.getegid(),
+                home=home,
+            )
+            stable = self.helper._home_entry_observation_snapshot(
+                home,
+                expected_uid=account.uid,
+                expected_gid=account.gid,
+            )
+            self.assertEqual(len(stable[2]), 1)
+
+            for label, field in (
+                ("uid", 7),
+                ("gid", 8),
+                ("device", 9),
+            ):
+                changed_entry = list(stable[2][0])
+                changed_entry[field] = False
+                changed = (stable[0], stable[1], (tuple(changed_entry),))
+                with (
+                    self.subTest(label=label),
+                    mock.patch.object(
+                        self.helper,
+                        "_home_entry_observation_snapshot",
+                        side_effect=(changed, changed),
+                    ),
+                    self.assertRaises(self.helper.ProbeError) as raised,
+                ):
+                    self.helper._validate_disposable_home_root(
+                        account,
+                        diagnostic_phase="child-entry",
+                    )
+                self.assertEqual(
+                    raised.exception.code,
+                    ("home-cleanup-child-entry-home-entry-unsafe-or-foreign"),
+                )
+                self.assertTrue(library.is_dir())
+
+    def test_bounded_library_rejects_darwin_extended_acl_entry(self) -> None:
+        calls: list[tuple[str, object]] = []
+
+        class FakeFunction:
+            argtypes = None
+            restype = None
+
+            def __init__(self, name: str, result: object) -> None:
+                self.name = name
+                self.result = result
+
+            def __call__(self, *args: object) -> object:
+                calls.append((self.name, args))
+                return self.result
+
+        acl_get_fd_np = FakeFunction("get-fd", 1)
+        acl_get_entry = FakeFunction("get-entry", 0)
+        acl_free = FakeFunction("free", 0)
+        fake_libc = SimpleNamespace(
+            acl_get_fd_np=acl_get_fd_np,
+            acl_get_entry=acl_get_entry,
+            acl_free=acl_free,
+        )
+
+        with (
+            mock.patch.object(
+                self.helper.ctypes,
+                "CDLL",
+                return_value=fake_libc,
+            ),
+            self.assertRaises(self.helper.ProbeError) as raised,
+        ):
+            self.helper._require_no_extended_acl(17)
+
+        self.assertEqual(raised.exception.code, "home-library-unsafe-entry")
+        self.assertEqual(
+            [name for name, _args in calls], ["get-fd", "get-entry", "free"]
+        )
+        self.assertEqual(calls[0][1], (17, self.helper.ACL_TYPE_EXTENDED))
+        self.assertEqual(calls[1][1][1], self.helper.ACL_FIRST_ENTRY)
+
+    def test_bounded_library_rejects_native_extended_attributes(self) -> None:
+        native_helper = load_helper()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cases = (
+                ("file", root / "file", "com.example.task-witness"),
+                ("directory", root / "directory", "com.example.task-witness"),
+                ("resource-fork", root / "resource", "com.apple.ResourceFork"),
+            )
+            for label, path, attribute in cases:
+                with self.subTest(label=label):
+                    if label == "directory":
+                        path.mkdir()
+                        flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY
+                    else:
+                        path.write_bytes(b"value")
+                        flags = os.O_RDONLY | os.O_CLOEXEC
+                    self.write_extended_attribute(path, attribute)
+                    self.assertIn(
+                        attribute,
+                        subprocess.run(
+                            ["/usr/bin/xattr", str(path)],
+                            check=True,
+                            capture_output=True,
+                            text=True,
+                        ).stdout.splitlines(),
+                    )
+                    descriptor = os.open(path, flags)
+                    try:
+                        with self.assertRaises(native_helper.ProbeError) as raised:
+                            native_helper._require_no_extended_attributes(descriptor)
+                    finally:
+                        os.close(descriptor)
+                    self.assertEqual(
+                        raised.exception.code,
+                        "home-library-unsafe-entry",
+                    )
+
+        calls: list[tuple[object, ...]] = []
+
+        class NoAttributes:
+            argtypes = None
+            restype = None
+
+            def __call__(self, *args: object) -> int:
+                calls.append(args)
+                return 0
+
+        with mock.patch.object(
+            native_helper.ctypes,
+            "CDLL",
+            return_value=SimpleNamespace(flistxattr=NoAttributes()),
+        ):
+            native_helper._require_no_extended_attributes(17)
+        self.assertEqual(
+            calls,
+            [(17, None, 0, native_helper.XATTR_SHOWCOMPRESSION)],
+        )
+
+    def test_bounded_library_inventory_is_canonical_and_value_free(self) -> None:
+        inventory_builder = getattr(
+            self.helper,
+            "_bounded_library_inventory",
+            None,
+        )
+        self.assertIsNotNone(inventory_builder)
+        assert inventory_builder is not None
+
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "home"
+            probe = home / "launchd-probe"
+            preferences = home / "Library" / "Preferences"
+            caches = home / "Library" / "Caches"
+            probe.mkdir(parents=True, mode=0o700)
+            preferences.mkdir(parents=True)
+            caches.mkdir()
+            home.chmod(0o700)
+            probe.chmod(0o700)
+            name_canary = "private-library-name-canary.plist"
+            value_canary = b"private-library-value-canary"
+            payload = preferences / name_canary
+            payload.write_bytes(value_canary)
+            account = self.helper.DisposableAccount(
+                name="twq-0123456789ab",
+                uid=os.geteuid(),
+                gid=os.getegid(),
+                home=home,
+            )
+
+            first = inventory_builder(account)
+            second = inventory_builder(account)
+            self.assertEqual(first, second)
+            self.assertEqual(
+                set(first),
+                {
+                    "schema_version",
+                    "contract",
+                    "entry_count",
+                    "regular_file_bytes",
+                    "entries",
+                    "content_sha256",
+                },
+            )
+            self.assertEqual(first["schema_version"], 1)
+            self.assertEqual(
+                first["contract"],
+                "task-witness-macos-bounded-library-inventory-v1",
+            )
+            self.assertEqual(first["entry_count"], len(first["entries"]))
+            self.assertEqual(first["regular_file_bytes"], len(value_canary))
+            self.assertEqual(
+                [entry["path_sha256"] for entry in first["entries"]],
+                sorted(entry["path_sha256"] for entry in first["entries"]),
+            )
+            for entry in first["entries"]:
+                self.assertRegex(entry["path_sha256"], r"[0-9a-f]{64}")
+            self.assertTrue(
+                any(entry.get("kind") == "file" for entry in first["entries"])
+            )
+            self.helper._require_content_digest(
+                first,
+                "bounded-library-inventory",
+            )
+            raw = self.helper.canonical_bytes(first)
+            self.assertEqual(json.loads(raw.decode("utf-8")), first)
+            for raw_name in ("Library", "Preferences", "Caches", name_canary):
+                self.assertNotIn(raw_name.encode(), raw)
+            self.assertNotIn(value_canary, raw)
+
+            payload.write_bytes(b"changed-library-value-canary")
+            changed = inventory_builder(account)
+            self.assertNotEqual(changed, first)
+            self.assertNotEqual(
+                changed["content_sha256"],
+                first["content_sha256"],
+            )
+
+    def test_bounded_library_inventory_rejects_malformed_records_before_mutation(
+        self,
+    ) -> None:
+        private_canary = "private-malformed-library-inventory-canary"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            account, _identity, authorization, _relative_files = (
+                self.bounded_library_cleanup_fixture(root)
+            )
+            inventory = authorization["library_inventory"]
+            self.assertIsInstance(inventory, dict)
+            plan = self.helper.LaunchdPlan(
+                account=account,
+                label=authorization["label"],
+                stage_root=root / "stage",
+                helper=root / "stage/helper.py",
+                plist=root / "stage/job.plist",
+            )
+            state = self.lifecycle_state(plan)
+            bindings = self.helper.ValidatedStageBindings(
+                self.helper._account_binding_document(
+                    plan,
+                    state,
+                    "01234567-89AB-4DEF-8123-456789ABCDEF",
+                ),
+                None,
+            )
+            root_record = next(
+                entry for entry in inventory["entries"] if entry.get("depth") == 1
+            )
+            file_root_record = {
+                **root_record,
+                "content_sha256": "0" * 64,
+                "ctime_ns": 1,
+                "kind": "file",
+                "link_count": 1,
+                "mode": stat.S_IFREG | 0o600,
+                "mtime_ns": 1,
+                "size": 0,
+            }
+
+            cases = {
+                "scalar-record": {
+                    "entries": [private_canary],
+                    "entry_count": 1,
+                    "regular_file_bytes": 0,
+                },
+                "non-string-path": {
+                    "entries": [{"path_sha256": 7}],
+                    "entry_count": 1,
+                    "regular_file_bytes": 0,
+                },
+                "list-kind": {
+                    "entries": [{**root_record, "kind": []}],
+                    "entry_count": 1,
+                    "regular_file_bytes": 0,
+                },
+                "mapping-kind": {
+                    "entries": [{**root_record, "kind": {}}],
+                    "entry_count": 1,
+                    "regular_file_bytes": 0,
+                },
+                "file-root": {
+                    "entries": [file_root_record],
+                    "entry_count": 1,
+                    "regular_file_bytes": 0,
+                },
+                "boolean-schema": {"schema_version": True},
+                "floating-schema": {"schema_version": 1.0},
+            }
+            for label, changes in cases.items():
+                malformed = {
+                    **inventory,
+                    **changes,
+                }
+                malformed = self.helper._document_with_digest(
+                    {
+                        key: value
+                        for key, value in malformed.items()
+                        if key != "content_sha256"
+                    }
+                )
+                changed_authorization = {
+                    **authorization,
+                    "library_inventory": malformed,
+                }
+                changed_authorization = self.helper._document_with_digest(
+                    {
+                        key: value
+                        for key, value in changed_authorization.items()
+                        if key != "content_sha256"
+                    }
+                )
+                with (
+                    self.subTest(label=label),
+                    mock.patch.object(self.helper, "_renameat_exclusive") as rename,
+                    mock.patch.object(self.helper.os, "unlink") as unlink,
+                    mock.patch.object(self.helper.os, "rmdir") as rmdir,
+                    self.assertRaises(self.helper.ProbeError) as raised,
+                ):
+                    self.helper._quarantine_and_remove_bounded_library(
+                        account,
+                        changed_authorization,
+                    )
+
+                self.assertEqual(
+                    raised.exception.code,
+                    "home-library-inventory-invalid",
+                )
+                self.assertNotIn(private_canary, raised.exception.code)
+                rename.assert_not_called()
+                unlink.assert_not_called()
+                rmdir.assert_not_called()
+                self.assertTrue((account.home / "Library").is_dir())
+
+                with (
+                    self.subTest(label=f"{label}-journal"),
+                    mock.patch.object(
+                        self.helper,
+                        "_path_exists_no_follow",
+                        return_value=True,
+                    ),
+                    mock.patch.object(
+                        self.helper,
+                        "_metadata_matches",
+                        return_value=True,
+                    ),
+                    mock.patch.object(
+                        self.helper,
+                        "_load_canonical_document",
+                        return_value=changed_authorization,
+                    ),
+                    self.assertRaises(self.helper.ProbeError) as journal_error,
+                ):
+                    self.helper._load_home_cleanup_authorization(
+                        plan,
+                        state,
+                        bindings,
+                    )
+                self.assertEqual(
+                    journal_error.exception.code,
+                    "home-cleanup-authorization-drift",
+                )
+                self.assertNotIn(private_canary, journal_error.exception.code)
+
+            outer_schema_drift = self.helper._document_with_digest(
+                {
+                    **{
+                        key: value
+                        for key, value in authorization.items()
+                        if key != "content_sha256"
+                    },
+                    "schema_version": 2.0,
+                }
+            )
+            with (
+                mock.patch.object(
+                    self.helper,
+                    "_path_exists_no_follow",
+                    return_value=True,
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_metadata_matches",
+                    return_value=True,
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_load_canonical_document",
+                    return_value=outer_schema_drift,
+                ),
+                self.assertRaises(self.helper.ProbeError) as outer_error,
+            ):
+                self.helper._load_home_cleanup_authorization(
+                    plan,
+                    state,
+                    bindings,
+                )
+            self.assertEqual(
+                outer_error.exception.code,
+                "home-cleanup-authorization-drift",
+            )
+
+    def test_bounded_library_enumeration_stops_at_the_node_budget(self) -> None:
+        class BoundedEntries:
+            def __init__(self, count: int) -> None:
+                self.count = count
+                self.consumed = 0
+
+            def __enter__(self) -> Iterator[SimpleNamespace]:
+                return iter(self)
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def __iter__(self):
+                for index in range(self.count):
+                    self.consumed += 1
+                    yield SimpleNamespace(name=f"private-entry-{index}")
+
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "home"
+            probe = home / "launchd-probe"
+            library = home / "Library"
+            probe.mkdir(parents=True, mode=0o700)
+            library.mkdir()
+            home.chmod(0o700)
+            probe.chmod(0o700)
+            account = self.helper.DisposableAccount(
+                name="twq-0123456789ab",
+                uid=os.geteuid(),
+                gid=os.getegid(),
+                home=home,
+            )
+            observed = BoundedEntries(self.helper.MAX_HOME_LIBRARY_NODES + 5)
+            with (
+                mock.patch.object(self.helper.os, "scandir", return_value=observed),
+                mock.patch.object(
+                    self.helper.os,
+                    "listdir",
+                    side_effect=AssertionError("unbounded directory materialization"),
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_require_no_extended_acl",
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_darwin_fstatfs_identity",
+                    return_value=(1, 2, "apfs"),
+                ),
+                self.assertRaises(self.helper.ProbeError) as raised,
+            ):
+                self.helper._bounded_library_inventory(account)
+
+            self.assertEqual(raised.exception.code, "home-library-bounds-exceeded")
+            self.assertEqual(
+                observed.consumed,
+                self.helper.MAX_HOME_LIBRARY_NODES,
+            )
+
+        deleting = BoundedEntries(5)
+        with (
+            mock.patch.object(self.helper.os, "scandir", return_value=deleting),
+            mock.patch.object(
+                self.helper.os,
+                "listdir",
+                side_effect=AssertionError("unbounded directory materialization"),
+            ),
+            self.assertRaises(self.helper.ProbeError) as raised,
+        ):
+            self.helper._delete_authorized_library_directory(
+                17,
+                (self.helper.HOME_LIBRARY_NAME,),
+                {"0" * 64: {"kind": "directory"}},
+            )
+        self.assertEqual(raised.exception.code, "home-library-inventory-drift")
+        self.assertEqual(deleting.consumed, 2)
+
+    def test_home_and_probe_enumeration_stop_at_their_exact_budgets(self) -> None:
+        class BoundedEntries:
+            def __init__(self, count: int) -> None:
+                self.count = count
+                self.consumed = 0
+
+            def __enter__(self) -> Iterator[SimpleNamespace]:
+                return iter(self)
+
+            def __exit__(self, *_args: object) -> None:
+                return None
+
+            def __iter__(self):
+                for index in range(self.count):
+                    self.consumed += 1
+                    yield SimpleNamespace(name=f"private-entry-{index}")
+
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "home"
+            probe = home / "launchd-probe"
+            probe.mkdir(parents=True, mode=0o700)
+            home.chmod(0o700)
+            probe.chmod(0o700)
+            account = self.helper.DisposableAccount(
+                name="twq-0123456789ab",
+                uid=os.geteuid(),
+                gid=os.getegid(),
+                home=home,
+            )
+            excess_home = BoundedEntries(20)
+            with (
+                mock.patch.object(
+                    self.helper.os,
+                    "scandir",
+                    return_value=excess_home,
+                ),
+                mock.patch.object(Path, "unlink") as unlink,
+                mock.patch.object(Path, "rmdir") as rmdir,
+                self.assertRaises(self.helper.ProbeError) as raised,
+            ):
+                self.helper._validate_disposable_home_root(
+                    account,
+                    diagnostic_phase="child-entry",
+                )
+            self.assertEqual(
+                raised.exception.code,
+                "home-cleanup-child-entry-home-entry-observation-unreadable",
+            )
+            self.assertEqual(
+                excess_home.consumed,
+                self.helper.MAX_DISPOSABLE_HOME_ENTRIES + 1,
+            )
+            unlink.assert_not_called()
+            rmdir.assert_not_called()
+
+            for name in self.helper.LAUNCHD_CHILD_FILES:
+                (probe / name).write_bytes(b"value")
+            excess_probe = BoundedEntries(20)
+            original_scandir = os.scandir
+            probe_inode = probe.lstat().st_ino
+
+            def selective_scandir(descriptor: int):
+                return (
+                    excess_probe
+                    if os.fstat(descriptor).st_ino == probe_inode
+                    else original_scandir(descriptor)
+                )
+
+            with (
+                mock.patch.object(
+                    self.helper.os,
+                    "scandir",
+                    side_effect=selective_scandir,
+                ),
+                mock.patch.object(Path, "unlink") as unlink,
+                mock.patch.object(Path, "rmdir") as rmdir,
+                self.assertRaises(self.helper.ProbeError) as raised,
+            ):
+                self.helper._validate_exact_disposable_home(
+                    home,
+                    expected_uid=account.uid,
+                    expected_gid=account.gid,
+                    diagnostic_phase="pre-journal",
+                )
+            self.assertEqual(
+                raised.exception.code,
+                "home-cleanup-pre-journal-probe-entry-set-drift",
+            )
+            self.assertEqual(
+                excess_probe.consumed,
+                self.helper.MAX_LAUNCHD_PROBE_ENTRIES + 1,
+            )
+            unlink.assert_not_called()
+            rmdir.assert_not_called()
+
+    def test_bounded_library_inventory_rejects_unsafe_nested_nodes_without_deletion(
+        self,
+    ) -> None:
+        inventory_builder = getattr(
+            self.helper,
+            "_bounded_library_inventory",
+            None,
+        )
+        self.assertIsNotNone(inventory_builder)
+        assert inventory_builder is not None
+
+        def symlink(library: Path) -> tuple[Path, ...]:
+            target = library / "target"
+            target.write_bytes(b"preserve")
+            link = library / "private-symlink-canary"
+            link.symlink_to(target)
+            return target, link
+
+        def fifo(library: Path) -> tuple[Path, ...]:
+            path = library / "private-fifo-canary"
+            os.mkfifo(path)
+            return (path,)
+
+        def hardlink(library: Path) -> tuple[Path, ...]:
+            source = library / "private-hardlink-source-canary"
+            peer = library / "private-hardlink-peer-canary"
+            source.write_bytes(b"preserve")
+            os.link(source, peer)
+            return source, peer
+
+        def file_xattr(library: Path) -> tuple[Path, ...]:
+            path = library / "private-file-xattr-canary"
+            path.write_bytes(b"preserve")
+            self.write_extended_attribute(path, "com.example.task-witness")
+            return (path,)
+
+        def directory_xattr(library: Path) -> tuple[Path, ...]:
+            path = library / "private-directory-xattr-canary"
+            path.mkdir()
+            self.write_extended_attribute(path, "com.example.task-witness")
+            return (path,)
+
+        def resource_fork(library: Path) -> tuple[Path, ...]:
+            path = library / "private-resource-fork-canary"
+            path.write_bytes(b"preserve")
+            self.write_extended_attribute(path, "com.apple.ResourceFork")
+            return (path,)
+
+        for label, arrange in (
+            ("symlink", symlink),
+            ("fifo", fifo),
+            ("hardlink", hardlink),
+            ("file-xattr", file_xattr),
+            ("directory-xattr", directory_xattr),
+            ("resource-fork", resource_fork),
+        ):
+            with (
+                self.subTest(label=label),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                home = Path(directory) / "home"
+                probe = home / "launchd-probe"
+                library = home / "Library"
+                probe.mkdir(parents=True, mode=0o700)
+                library.mkdir()
+                home.chmod(0o700)
+                probe.chmod(0o700)
+                preserved = arrange(library)
+                rejected_inodes = (
+                    {path.lstat().st_ino for path in preserved}
+                    if label in {"file-xattr", "directory-xattr", "resource-fork"}
+                    else set()
+                )
+
+                def reject_extended_attributes(
+                    descriptor: int,
+                    rejected: set[int] = rejected_inodes,
+                ) -> None:
+                    if os.fstat(descriptor).st_ino in rejected:
+                        raise self.helper.ProbeError("home-library-unsafe-entry")
+
+                account = self.helper.DisposableAccount(
+                    name="twq-0123456789ab",
+                    uid=os.geteuid(),
+                    gid=os.getegid(),
+                    home=home,
+                )
+
+                with (
+                    mock.patch.object(
+                        self.helper,
+                        "_require_no_extended_attributes",
+                        side_effect=reject_extended_attributes,
+                    ),
+                    self.assertRaises(self.helper.ProbeError) as raised,
+                ):
+                    inventory_builder(account)
+
+                self.assertNotIn("private", raised.exception.code)
+                for path in preserved:
+                    self.assertTrue(path.exists() or path.is_symlink())
+                if label == "hardlink":
+                    self.assertEqual(preserved[0].lstat().st_nlink, 2)
+                    self.assertEqual(preserved[1].lstat().st_nlink, 2)
+
+    def test_home_cleanup_v2_authorization_includes_bounded_library_inventory(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stage = root / "stage"
+            stage.mkdir()
+            home = root / "home"
+            probe = home / "launchd-probe"
+            library = home / "Library"
+            probe.mkdir(parents=True, mode=0o700)
+            library.mkdir()
+            home.chmod(0o700)
+            probe.chmod(0o700)
+            account = self.helper.DisposableAccount(
+                name="twq-0123456789ab",
+                uid=os.geteuid(),
+                gid=os.getegid(),
+                home=home,
+            )
+            plan = self.helper.LaunchdPlan(
+                account=account,
+                label="io.nisavid.task-witness.macos-probe.0123456789ab",
+                stage_root=stage,
+                helper=stage / "helper.py",
+                plist=stage / "job.plist",
+            )
+            state = self.lifecycle_state(plan)
+            account_binding = self.helper._account_binding_document(
+                plan,
+                state,
+                "01234567-89AB-4DEF-8123-456789ABCDEF",
+            )
+            bindings = self.helper.ValidatedStageBindings(account_binding, None)
+            home_metadata = home.lstat()
+            probe_metadata = probe.lstat()
+            home_identity = {
+                "home_device": home_metadata.st_dev,
+                "home_inode": home_metadata.st_ino,
+                "probe_device": probe_metadata.st_dev,
+                "probe_inode": probe_metadata.st_ino,
+            }
+            inventory = self.helper._bounded_library_inventory(account)
+            self.assertIsInstance(inventory, dict)
+            written: dict[str, object] = {}
+
+            def write(path: Path, raw: bytes, mode: int) -> None:
+                written.update(path=path, raw=raw, mode=mode)
+
+            def readback(*_args: object, **_kwargs: object) -> dict:
+                return json.loads(bytes(written["raw"]))
+
+            with (
+                mock.patch.object(
+                    self.helper,
+                    "_bounded_library_inventory",
+                    create=True,
+                    return_value=inventory,
+                ) as bounded,
+                mock.patch.object(
+                    self.helper,
+                    "_write_stage_create_new",
+                    side_effect=write,
+                ),
+                mock.patch.object(self.helper, "_fsync_stage_directory"),
+                mock.patch.object(
+                    self.helper,
+                    "_load_home_cleanup_authorization",
+                    side_effect=readback,
+                ),
+            ):
+                document = self.helper._write_home_cleanup_authorization(
+                    plan,
+                    state,
+                    bindings,
+                    home_identity,
+                )
+
+            self.assertEqual(document["schema_version"], 2)
+            self.assertEqual(
+                document["contract"],
+                "task-witness-macos-home-cleanup-authorization-v2",
+            )
+            self.assertEqual(document["library_inventory"], inventory)
+            bounded.assert_called_once_with(account)
+            self.assertEqual(
+                written,
+                {
+                    "path": stage / "home-cleanup.json",
+                    "raw": self.helper.canonical_bytes(document),
+                    "mode": 0o600,
+                },
+            )
+            self.helper._require_content_digest(
+                document,
+                "home-cleanup-authorization",
+            )
+
+    def test_bounded_library_cleanup_rejects_extended_attributes_before_mutation(
+        self,
+    ) -> None:
+        for label, relative_path, attribute in (
+            (
+                "file",
+                ("Preferences", "settings.plist"),
+                "com.example.task-witness",
+            ),
+            ("directory", ("Container",), "com.example.task-witness"),
+            (
+                "resource-fork",
+                ("Container", "Deep", "payload.bin"),
+                "com.apple.ResourceFork",
+            ),
+        ):
+            with (
+                self.subTest(label=label),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                account, _identity, authorization, _relative_files = (
+                    self.bounded_library_cleanup_fixture(root)
+                )
+                target = account.home.joinpath(
+                    self.helper.HOME_LIBRARY_NAME,
+                    *relative_path,
+                )
+                self.write_extended_attribute(target, attribute)
+                self.assertIn(
+                    attribute,
+                    subprocess.run(
+                        ["/usr/bin/xattr", str(target)],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    ).stdout.splitlines(),
+                )
+                target_inode = target.lstat().st_ino
+
+                def reject_extended_attributes(
+                    descriptor: int,
+                    target: int = target_inode,
+                ) -> None:
+                    if os.fstat(descriptor).st_ino == target:
+                        raise self.helper.ProbeError("home-library-unsafe-entry")
+
+                with (
+                    mock.patch.object(
+                        self.helper,
+                        "_require_no_extended_attributes",
+                        side_effect=reject_extended_attributes,
+                    ),
+                    mock.patch.object(
+                        self.helper,
+                        "_renameat_exclusive",
+                    ) as rename,
+                    mock.patch.object(self.helper.os, "unlink") as unlink,
+                    mock.patch.object(self.helper.os, "rmdir") as rmdir,
+                    self.assertRaises(self.helper.ProbeError) as raised,
+                ):
+                    self.helper._quarantine_and_remove_bounded_library(
+                        account,
+                        authorization,
+                    )
+
+                self.assertEqual(raised.exception.code, "home-library-unsafe-entry")
+                self.assertNotIn("private", raised.exception.code)
+                rename.assert_not_called()
+                unlink.assert_not_called()
+                rmdir.assert_not_called()
+                self.assertTrue(target.exists())
+
+    def test_bounded_library_cleanup_rechecks_xattrs_at_each_delete_boundary(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            account, _identity, authorization, _relative_files = (
+                self.bounded_library_cleanup_fixture(root)
+            )
+            source_target = account.home / "Library/Preferences/settings.plist"
+            target_inode = source_target.lstat().st_ino
+            after_quarantine_scan = False
+            stable_observed = self.helper._stable_observed_library
+
+            def stable(*args: object, **kwargs: object) -> dict:
+                nonlocal after_quarantine_scan
+                observed = stable_observed(*args, **kwargs)
+                if args[1] == self.helper.HOME_LIBRARY_QUARANTINE_NAME:
+                    after_quarantine_scan = True
+                return observed
+
+            def reject_file_xattrs(descriptor: int) -> None:
+                if (
+                    after_quarantine_scan
+                    and os.fstat(descriptor).st_ino == target_inode
+                ):
+                    raise self.helper.ProbeError("home-library-unsafe-entry")
+
+            with (
+                mock.patch.object(
+                    self.helper,
+                    "_renameat_exclusive",
+                    side_effect=self.rename_library_portably,
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_stable_observed_library",
+                    side_effect=stable,
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_require_no_extended_attributes",
+                    side_effect=reject_file_xattrs,
+                ),
+                mock.patch.object(self.helper.os, "unlink") as unlink,
+                mock.patch.object(self.helper.os, "rmdir") as rmdir,
+                self.assertRaises(self.helper.ProbeError) as raised,
+            ):
+                self.helper._quarantine_and_remove_bounded_library(
+                    account,
+                    authorization,
+                )
+
+            self.assertEqual(raised.exception.code, "home-library-unsafe-entry")
+            self.assertNotIn(
+                "settings.plist",
+                [call.args[0] for call in unlink.call_args_list],
+            )
+            quarantine = account.home / self.helper.HOME_LIBRARY_QUARANTINE_NAME
+            self.assertTrue(
+                quarantine.joinpath("Preferences", "settings.plist").is_file()
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            account, _identity, authorization, _relative_files = (
+                self.bounded_library_cleanup_fixture(root)
+            )
+            rejected_directory_inode: int | None = None
+            original_unlink = os.unlink
+            original_rmdir = os.rmdir
+            removed_directories: list[str] = []
+
+            def unlink(name: str, *, dir_fd: int | None = None) -> None:
+                nonlocal rejected_directory_inode
+                original_unlink(name, dir_fd=dir_fd)
+                if name == "settings.plist":
+                    assert dir_fd is not None
+                    rejected_directory_inode = os.fstat(dir_fd).st_ino
+
+            def reject_directory_xattrs(descriptor: int) -> None:
+                if os.fstat(descriptor).st_ino == rejected_directory_inode:
+                    raise self.helper.ProbeError("home-library-unsafe-entry")
+
+            def rmdir(name: str, *, dir_fd: int | None = None) -> None:
+                removed_directories.append(name)
+                original_rmdir(name, dir_fd=dir_fd)
+
+            with (
+                mock.patch.object(
+                    self.helper,
+                    "_renameat_exclusive",
+                    side_effect=self.rename_library_portably,
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_require_no_extended_attributes",
+                    side_effect=reject_directory_xattrs,
+                ),
+                mock.patch.object(self.helper.os, "unlink", side_effect=unlink),
+                mock.patch.object(self.helper.os, "rmdir", side_effect=rmdir),
+                self.assertRaises(self.helper.ProbeError) as raised,
+            ):
+                self.helper._quarantine_and_remove_bounded_library(
+                    account,
+                    authorization,
+                )
+
+            self.assertEqual(raised.exception.code, "home-library-unsafe-entry")
+            self.assertNotIn("Preferences", removed_directories)
+            quarantine = account.home / self.helper.HOME_LIBRARY_QUARANTINE_NAME
+            self.assertTrue((quarantine / "Preferences").is_dir())
+
+    def test_home_cleanup_authorization_rejects_home_acl_before_publication(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stage = root / "stage"
+            stage.mkdir()
+            home = root / "home"
+            probe = home / "launchd-probe"
+            probe.mkdir(parents=True, mode=0o700)
+            home.chmod(0o700)
+            probe.chmod(0o700)
+            account = self.helper.DisposableAccount(
+                name="twq-0123456789ab",
+                uid=os.geteuid(),
+                gid=os.getegid(),
+                home=home,
+            )
+            plan = self.helper.LaunchdPlan(
+                account=account,
+                label="io.nisavid.task-witness.macos-probe.0123456789ab",
+                stage_root=stage,
+                helper=stage / "helper.py",
+                plist=stage / "job.plist",
+            )
+            state = self.lifecycle_state(plan)
+            account_binding = self.helper._account_binding_document(
+                plan,
+                state,
+                "01234567-89AB-4DEF-8123-456789ABCDEF",
+            )
+            bindings = self.helper.ValidatedStageBindings(account_binding, None)
+            home_metadata = home.lstat()
+            probe_metadata = probe.lstat()
+            home_identity = {
+                "home_device": home_metadata.st_dev,
+                "home_inode": home_metadata.st_ino,
+                "probe_device": probe_metadata.st_dev,
+                "probe_inode": probe_metadata.st_ino,
+            }
+
+            with (
+                mock.patch.object(
+                    self.helper,
+                    "_require_no_extended_acl",
+                    side_effect=self.helper.ProbeError("home-library-unsafe-entry"),
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_write_stage_create_new",
+                ) as write,
+                self.assertRaises(self.helper.ProbeError) as raised,
+            ):
+                self.helper._write_home_cleanup_authorization(
+                    plan,
+                    state,
+                    bindings,
+                    home_identity,
+                )
+
+            self.assertEqual(raised.exception.code, "home-library-unsafe-entry")
+            write.assert_not_called()
+            self.assertFalse((stage / "home-cleanup.json").exists())
+            self.assertTrue(home.is_dir())
+
+    def test_bounded_library_quarantine_is_exclusive_durable_and_descriptor_relative(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            account, _identity, authorization, _relative_files = (
+                self.bounded_library_cleanup_fixture(root)
+            )
+            home_inode = account.home.lstat().st_ino
+            events: list[tuple[str, object, object]] = []
+            original_fsync = os.fsync
+            original_unlink = os.unlink
+            original_rmdir = os.rmdir
+
+            def rename(
+                source_parent_descriptor: int,
+                source_name: str,
+                destination_parent_descriptor: int,
+                destination_name: str,
+            ) -> None:
+                events.append(("rename", source_name, source_parent_descriptor))
+                self.rename_library_portably(
+                    source_parent_descriptor,
+                    source_name,
+                    destination_parent_descriptor,
+                    destination_name,
+                )
+
+            def fsync(descriptor: int) -> None:
+                events.append(("fsync", os.fstat(descriptor).st_ino, descriptor))
+                original_fsync(descriptor)
+
+            def unlink(name: str, *, dir_fd: int | None = None) -> None:
+                self.assertIsNotNone(dir_fd)
+                self.assertNotIn("/", name)
+                events.append(("unlink", name, dir_fd))
+                original_unlink(name, dir_fd=dir_fd)
+
+            def rmdir(name: str, *, dir_fd: int | None = None) -> None:
+                self.assertIsNotNone(dir_fd)
+                self.assertNotIn("/", name)
+                events.append(("rmdir", name, dir_fd))
+                original_rmdir(name, dir_fd=dir_fd)
+
+            with (
+                mock.patch.object(
+                    self.helper,
+                    "_renameat_exclusive",
+                    side_effect=rename,
+                ) as exclusive,
+                mock.patch.object(
+                    Path,
+                    "unlink",
+                    side_effect=AssertionError(
+                        "Library cleanup must not use Path.unlink"
+                    ),
+                ),
+                mock.patch.object(
+                    Path,
+                    "rmdir",
+                    side_effect=AssertionError(
+                        "Library cleanup must not use Path.rmdir"
+                    ),
+                ),
+                mock.patch.object(self.helper.os, "fsync", side_effect=fsync),
+                mock.patch.object(self.helper.os, "unlink", side_effect=unlink),
+                mock.patch.object(self.helper.os, "rmdir", side_effect=rmdir),
+            ):
+                self.helper._quarantine_and_remove_bounded_library(
+                    account,
+                    authorization,
+                )
+
+            exclusive.assert_called_once()
+            self.assertEqual(events[0][0], "rename")
+            first_delete = next(
+                index
+                for index, event in enumerate(events)
+                if event[0] in {"unlink", "rmdir"}
+            )
+            first_home_fsync = next(
+                index
+                for index, event in enumerate(events)
+                if event[:2] == ("fsync", home_inode)
+            )
+            self.assertLess(0, first_home_fsync)
+            self.assertLess(first_home_fsync, first_delete)
+            mutations = [(event[0], event[1]) for event in events]
+            self.assertLess(
+                mutations.index(("unlink", "payload.bin")),
+                mutations.index(("rmdir", "Deep")),
+            )
+            self.assertLess(
+                mutations.index(("rmdir", "Deep")),
+                mutations.index(("rmdir", "Container")),
+            )
+            self.assertLess(
+                mutations.index(("rmdir", "Container")),
+                mutations.index(("rmdir", self.helper.HOME_LIBRARY_QUARANTINE_NAME)),
+            )
+            self.assertFalse((account.home / "Library").exists())
+            self.assertFalse(
+                (account.home / self.helper.HOME_LIBRARY_QUARANTINE_NAME).exists()
+            )
+            self.assertTrue((account.home / "launchd-probe").is_dir())
+
+    def test_bounded_library_quarantine_replays_exact_remaining_subset(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            account, _identity, authorization, relative_files = (
+                self.bounded_library_cleanup_fixture(root)
+            )
+            home_inode = account.home.lstat().st_ino
+            source = account.home / self.helper.HOME_LIBRARY_NAME
+            quarantine = account.home / self.helper.HOME_LIBRARY_QUARANTINE_NAME
+            source.rename(quarantine)
+            removed = quarantine.joinpath(*relative_files[0])
+            removed.unlink()
+            events: list[tuple[str, object]] = []
+            original_fsync = os.fsync
+            original_unlink = os.unlink
+            original_rmdir = os.rmdir
+
+            def fsync(descriptor: int) -> None:
+                events.append(("fsync", os.fstat(descriptor).st_ino))
+                original_fsync(descriptor)
+
+            def unlink(name: str, *, dir_fd: int | None = None) -> None:
+                events.append(("unlink", name))
+                original_unlink(name, dir_fd=dir_fd)
+
+            def rmdir(name: str, *, dir_fd: int | None = None) -> None:
+                events.append(("rmdir", name))
+                original_rmdir(name, dir_fd=dir_fd)
+
+            with (
+                mock.patch.object(
+                    self.helper,
+                    "_renameat_exclusive",
+                ) as rename,
+                mock.patch.object(
+                    Path,
+                    "unlink",
+                    side_effect=AssertionError(
+                        "Library replay must not use Path.unlink"
+                    ),
+                ),
+                mock.patch.object(
+                    Path,
+                    "rmdir",
+                    side_effect=AssertionError(
+                        "Library replay must not use Path.rmdir"
+                    ),
+                ),
+                mock.patch.object(self.helper.os, "fsync", side_effect=fsync),
+                mock.patch.object(self.helper.os, "unlink", side_effect=unlink),
+                mock.patch.object(self.helper.os, "rmdir", side_effect=rmdir),
+            ):
+                self.helper._quarantine_and_remove_bounded_library(
+                    account,
+                    authorization,
+                )
+
+            rename.assert_not_called()
+            first_delete = next(
+                index
+                for index, event in enumerate(events)
+                if event[0] in {"unlink", "rmdir"}
+            )
+            first_home_fsync = events.index(("fsync", home_inode))
+            self.assertLess(first_home_fsync, first_delete)
+            self.assertFalse(source.exists())
+            self.assertFalse(quarantine.exists())
+            self.assertFalse(removed.exists())
+            self.assertTrue((account.home / "launchd-probe").is_dir())
+
+    def test_bounded_library_quarantine_replay_fsync_failure_preserves_tree(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            account, _identity, authorization, relative_files = (
+                self.bounded_library_cleanup_fixture(root)
+            )
+            source = account.home / self.helper.HOME_LIBRARY_NAME
+            quarantine = account.home / self.helper.HOME_LIBRARY_QUARANTINE_NAME
+            source.rename(quarantine)
+            canary = quarantine.joinpath(*relative_files[0])
+
+            with (
+                mock.patch.object(self.helper.os, "fsync", side_effect=OSError),
+                mock.patch.object(self.helper.os, "unlink") as unlink,
+                mock.patch.object(self.helper.os, "rmdir") as rmdir,
+                self.assertRaises(self.helper.ProbeError) as raised,
+            ):
+                self.helper._quarantine_and_remove_bounded_library(
+                    account,
+                    authorization,
+                )
+
+            self.assertEqual(
+                raised.exception.code,
+                "home-library-quarantine-failed",
+            )
+            unlink.assert_not_called()
+            rmdir.assert_not_called()
+            self.assertFalse(source.exists())
+            self.assertTrue(quarantine.is_dir())
+            self.assertTrue(canary.is_file())
+
+    def test_bounded_library_quarantine_preserves_conflicting_and_drifted_states(
+        self,
+    ) -> None:
+        scenarios = (
+            ("both", "home-library-quarantine-drift"),
+            ("inserted-source", "home-library-inventory-drift"),
+            ("inserted-quarantine", "home-library-inventory-drift"),
+            ("replaced-symlink", "home-library-unsafe-entry"),
+        )
+        for scenario, expected_code in scenarios:
+            with (
+                self.subTest(scenario=scenario),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                account, _identity, authorization, relative_files = (
+                    self.bounded_library_cleanup_fixture(root)
+                )
+                source = account.home / self.helper.HOME_LIBRARY_NAME
+                quarantine = account.home / self.helper.HOME_LIBRARY_QUARANTINE_NAME
+                canary: Path
+                external = root / "external-preserve-canary"
+                external.write_bytes(b"preserve")
+                if scenario == "both":
+                    quarantine.mkdir()
+                    canary = quarantine
+                elif scenario == "inserted-source":
+                    canary = source / "private-inserted-canary"
+                    canary.write_bytes(b"preserve")
+                elif scenario == "inserted-quarantine":
+                    source.rename(quarantine)
+                    canary = quarantine / "private-inserted-canary"
+                    canary.write_bytes(b"preserve")
+                else:
+                    canary = source.joinpath(*relative_files[0])
+                    canary.unlink()
+                    canary.symlink_to(external)
+
+                with (
+                    mock.patch.object(
+                        self.helper,
+                        "_renameat_exclusive",
+                    ) as rename,
+                    mock.patch.object(self.helper.os, "unlink") as unlink,
+                    mock.patch.object(self.helper.os, "rmdir") as rmdir,
+                    self.assertRaises(self.helper.ProbeError) as raised,
+                ):
+                    self.helper._quarantine_and_remove_bounded_library(
+                        account,
+                        authorization,
+                    )
+
+                self.assertEqual(raised.exception.code, expected_code)
+                self.assertNotIn("private", raised.exception.code)
+                rename.assert_not_called()
+                unlink.assert_not_called()
+                rmdir.assert_not_called()
+                self.assertTrue(canary.exists() or canary.is_symlink())
+                self.assertEqual(external.read_bytes(), b"preserve")
+
+    def test_bounded_library_observer_requires_authorized_home_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            account, identity, _authorization, _relative_files = (
+                self.bounded_library_cleanup_fixture(root)
+            )
+            foreign = root / "foreign-home-identity"
+            foreign.mkdir(mode=0o700)
+            changed_identity = {
+                **identity,
+                "home_inode": foreign.lstat().st_ino,
+            }
+
+            with self.assertRaises(self.helper.ProbeError) as raised:
+                self.helper._observe_bounded_library(
+                    account,
+                    self.helper.HOME_LIBRARY_NAME,
+                    changed_identity,
+                )
+
+            self.assertEqual(raised.exception.code, "home-library-home-drift")
+            self.assertTrue((account.home / self.helper.HOME_LIBRARY_NAME).is_dir())
+
+    def test_bounded_library_cleanup_rejects_home_acl_before_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            account, _identity, authorization, relative_files = (
+                self.bounded_library_cleanup_fixture(root)
+            )
+            home_inode = account.home.lstat().st_ino
+
+            def reject_home_acl(descriptor: int) -> None:
+                if os.fstat(descriptor).st_ino == home_inode:
+                    raise self.helper.ProbeError("home-library-unsafe-entry")
+
+            with (
+                mock.patch.object(
+                    self.helper,
+                    "_require_no_extended_acl",
+                    side_effect=reject_home_acl,
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_renameat_exclusive",
+                ) as rename,
+                mock.patch.object(self.helper.os, "unlink") as unlink,
+                mock.patch.object(self.helper.os, "rmdir") as rmdir,
+                self.assertRaises(self.helper.ProbeError) as raised,
+            ):
+                self.helper._quarantine_and_remove_bounded_library(
+                    account,
+                    authorization,
+                )
+
+            self.assertEqual(raised.exception.code, "home-library-unsafe-entry")
+            rename.assert_not_called()
+            unlink.assert_not_called()
+            rmdir.assert_not_called()
+            library = account.home / self.helper.HOME_LIBRARY_NAME
+            self.assertTrue(library.joinpath(*relative_files[0]).is_file())
+            self.assertTrue(library.joinpath(*relative_files[1]).is_file())
+
+    def test_bounded_library_cleanup_revalidates_home_before_each_mutation(
+        self,
+    ) -> None:
+        for boundary in ("rename", "delete"):
+            with (
+                self.subTest(boundary=boundary),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                account, _identity, authorization, relative_files = (
+                    self.bounded_library_cleanup_fixture(root)
+                )
+                source = account.home / self.helper.HOME_LIBRARY_NAME
+                quarantine = account.home / self.helper.HOME_LIBRARY_QUARANTINE_NAME
+                leaf_name = self.helper.HOME_LIBRARY_NAME
+                if boundary == "delete":
+                    source.rename(quarantine)
+                    leaf_name = self.helper.HOME_LIBRARY_QUARANTINE_NAME
+                authorized_home = root / "authorized-home"
+                replacement_canary = account.home / "private-replacement-canary"
+                original_stable = self.helper._stable_observed_library
+
+                def observe_then_replace(
+                    *args: object,
+                    _original=original_stable,
+                    _account=account,
+                    _authorized_home=authorized_home,
+                    _replacement_canary=replacement_canary,
+                    **kwargs: object,
+                ) -> dict:
+                    observed = _original(*args, **kwargs)
+                    _account.home.rename(_authorized_home)
+                    _account.home.mkdir(mode=0o700)
+                    _replacement_canary.write_bytes(b"preserve")
+                    return observed
+
+                with (
+                    mock.patch.object(
+                        self.helper,
+                        "_stable_observed_library",
+                        side_effect=observe_then_replace,
+                    ) as stable,
+                    mock.patch.object(
+                        self.helper,
+                        "_renameat_exclusive",
+                    ) as rename,
+                    mock.patch.object(self.helper.os, "unlink") as unlink,
+                    mock.patch.object(self.helper.os, "rmdir") as rmdir,
+                    self.assertRaises(self.helper.ProbeError) as raised,
+                ):
+                    self.helper._quarantine_and_remove_bounded_library(
+                        account,
+                        authorization,
+                    )
+
+                self.assertEqual(raised.exception.code, "home-library-home-drift")
+                stable.assert_called_once_with(
+                    account,
+                    leaf_name,
+                    authorization["library_inventory"],
+                    authorization["home_identity"],
+                    exact=boundary == "rename",
+                )
+                rename.assert_not_called()
+                unlink.assert_not_called()
+                rmdir.assert_not_called()
+                self.assertTrue(replacement_canary.is_file())
+                self.assertEqual(replacement_canary.read_bytes(), b"preserve")
+                preserved_root = authorized_home / leaf_name
+                self.assertTrue(preserved_root.is_dir())
+                self.assertTrue(preserved_root.joinpath(*relative_files[0]).is_file())
+
+    def test_bounded_library_quarantine_resumes_after_interruptions(self) -> None:
+        for interrupt_at in ("rename", "nested-unlink"):
+            with (
+                self.subTest(interrupt_at=interrupt_at),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                account, _identity, authorization, _relative_files = (
+                    self.bounded_library_cleanup_fixture(root)
+                )
+                source = account.home / self.helper.HOME_LIBRARY_NAME
+                quarantine = account.home / self.helper.HOME_LIBRARY_QUARANTINE_NAME
+                original_unlink = os.unlink
+                unlinked = 0
+
+                def rename_then_interrupt(
+                    source_parent_descriptor: int,
+                    source_name: str,
+                    destination_parent_descriptor: int,
+                    destination_name: str,
+                ) -> None:
+                    self.rename_library_portably(
+                        source_parent_descriptor,
+                        source_name,
+                        destination_parent_descriptor,
+                        destination_name,
+                    )
+                    raise KeyboardInterrupt
+
+                def unlink_then_interrupt(
+                    name: str,
+                    *,
+                    dir_fd: int | None = None,
+                    operation=original_unlink,
+                ) -> None:
+                    nonlocal unlinked
+                    operation(name, dir_fd=dir_fd)
+                    unlinked += 1
+                    if unlinked == 1:
+                        raise KeyboardInterrupt
+
+                rename_effect = (
+                    rename_then_interrupt
+                    if interrupt_at == "rename"
+                    else self.rename_library_portably
+                )
+                with (
+                    mock.patch.object(
+                        self.helper,
+                        "_renameat_exclusive",
+                        side_effect=rename_effect,
+                    ),
+                    mock.patch.object(
+                        Path,
+                        "unlink",
+                        side_effect=AssertionError(
+                            "Library cleanup must not use Path.unlink"
+                        ),
+                    ),
+                    mock.patch.object(
+                        Path,
+                        "rmdir",
+                        side_effect=AssertionError(
+                            "Library cleanup must not use Path.rmdir"
+                        ),
+                    ),
+                    mock.patch.object(
+                        self.helper.os,
+                        "unlink",
+                        side_effect=(
+                            unlink_then_interrupt
+                            if interrupt_at == "nested-unlink"
+                            else original_unlink
+                        ),
+                    ),
+                    self.assertRaises(KeyboardInterrupt),
+                ):
+                    self.helper._quarantine_and_remove_bounded_library(
+                        account,
+                        authorization,
+                    )
+
+                self.assertFalse(source.exists())
+                self.assertTrue(quarantine.is_dir())
+                if interrupt_at == "nested-unlink":
+                    self.assertEqual(unlinked, 1)
+
+                with (
+                    mock.patch.object(
+                        self.helper,
+                        "_renameat_exclusive",
+                    ) as replay_rename,
+                    mock.patch.object(
+                        Path,
+                        "unlink",
+                        side_effect=AssertionError(
+                            "Library replay must not use Path.unlink"
+                        ),
+                    ),
+                    mock.patch.object(
+                        Path,
+                        "rmdir",
+                        side_effect=AssertionError(
+                            "Library replay must not use Path.rmdir"
+                        ),
+                    ),
+                ):
+                    self.helper._quarantine_and_remove_bounded_library(
+                        account,
+                        authorization,
+                    )
+
+                replay_rename.assert_not_called()
+                self.assertFalse(quarantine.exists())
+                self.assertEqual(
+                    self.helper._home_cleanup_evidence(
+                        authorization,
+                        recovered=True,
+                    )["disposition"],
+                    "recovered",
+                )
+
+    def test_marker_bound_home_cleanup_keeps_library_deletion_descriptor_relative(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            account, identity, authorization, _relative_files = (
+                self.bounded_library_cleanup_fixture(root)
+            )
+            original_unlink = Path.unlink
+            original_rmdir = Path.rmdir
+            path_mutations: list[Path] = []
+
+            def unlink(path: Path, *args: object, **kwargs: object) -> None:
+                self.assertNotIn(self.helper.HOME_LIBRARY_NAME, path.parts)
+                self.assertNotIn(
+                    self.helper.HOME_LIBRARY_QUARANTINE_NAME,
+                    path.parts,
+                )
+                path_mutations.append(path)
+                original_unlink(path, *args, **kwargs)
+
+            def rmdir(path: Path) -> None:
+                self.assertNotIn(self.helper.HOME_LIBRARY_NAME, path.parts)
+                self.assertNotIn(
+                    self.helper.HOME_LIBRARY_QUARANTINE_NAME,
+                    path.parts,
+                )
+                path_mutations.append(path)
+                original_rmdir(path)
+
+            with (
+                mock.patch.object(
+                    self.helper,
+                    "_renameat_exclusive",
+                    side_effect=self.rename_library_portably,
+                ),
+                mock.patch.object(Path, "unlink", unlink),
+                mock.patch.object(Path, "rmdir", rmdir),
+            ):
+                self.helper._remove_marker_bound_disposable_home(
+                    account,
+                    identity,
+                    authorization,
+                )
+
+            self.assertFalse(account.home.exists())
+            self.assertEqual(
+                {path.name for path in path_mutations},
+                set(self.helper.LAUNCHD_CHILD_FILES) | {"launchd-probe", "home"},
+            )
+
+    def test_marker_bound_home_cleanup_rejects_home_acl_without_library(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "home"
+            probe = home / "launchd-probe"
+            probe.mkdir(parents=True, mode=0o700)
+            home.chmod(0o700)
+            probe.chmod(0o700)
+            for name in self.helper.LAUNCHD_CHILD_FILES:
+                (probe / name).write_bytes(b"preserve")
+            account = self.helper.DisposableAccount(
+                name="twq-0123456789ab",
+                uid=os.geteuid(),
+                gid=os.getegid(),
+                home=home,
+            )
+            home_metadata = home.lstat()
+            probe_metadata = probe.lstat()
+            identity = {
+                "home_device": home_metadata.st_dev,
+                "home_inode": home_metadata.st_ino,
+                "probe_device": probe_metadata.st_dev,
+                "probe_inode": probe_metadata.st_ino,
+            }
+            authorization = {
+                "disposition": "armed",
+                "account": {
+                    "name": account.name,
+                    "uid": account.uid,
+                    "gid": account.gid,
+                    "home": str(account.home),
+                },
+                "home_identity": identity,
+                "library_inventory": "none",
+            }
+
+            with (
+                mock.patch.object(
+                    self.helper,
+                    "_require_no_extended_acl",
+                    side_effect=self.helper.ProbeError("home-library-unsafe-entry"),
+                ),
+                mock.patch.object(Path, "unlink") as unlink,
+                mock.patch.object(Path, "rmdir") as rmdir,
+                self.assertRaises(self.helper.ProbeError) as raised,
+            ):
+                self.helper._remove_marker_bound_disposable_home(
+                    account,
+                    identity,
+                    authorization,
+                )
+
+            self.assertEqual(raised.exception.code, "home-library-unsafe-entry")
+            unlink.assert_not_called()
+            rmdir.assert_not_called()
+            self.assertTrue(home.is_dir())
+            self.assertEqual(
+                {entry.name for entry in probe.iterdir()},
+                set(self.helper.LAUNCHD_CHILD_FILES),
+            )
+
     def test_home_cleanup_preserves_everything_on_drift(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory) / "home"
@@ -4498,6 +6423,15 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 for name in self.helper.LAUNCHD_CHILD_FILES:
                     (probe / name).write_bytes(b"value")
                 arrange(home)
+
+                if detail == "home-entry-known-library-owned-directory":
+                    self.helper._validate_exact_disposable_home(
+                        home,
+                        expected_uid=os.geteuid(),
+                        expected_gid=os.getegid(),
+                        diagnostic_phase="pre-reset-marker",
+                    )
+                    continue
 
                 with self.assertRaises(self.helper.ProbeError) as raised:
                     self.helper._validate_exact_disposable_home(
@@ -5062,12 +6996,42 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
 
     def test_home_entry_snapshot_detects_metadata_replacement(self) -> None:
         scenarios = (
-            ("private-home-identity-canary", "home", 3, "st_ino"),
-            ("private-home-device-canary", "home", 3, "st_dev"),
-            ("private-entry-identity-canary", "entry", 2, "st_ino"),
-            ("private-entry-mtime-canary", "entry", 2, "st_mtime_ns"),
+            (
+                "private-home-identity-canary",
+                "home",
+                4,
+                "st_ino",
+                "home-entry-observation-unreadable",
+            ),
+            (
+                "private-home-device-canary",
+                "home",
+                4,
+                "st_dev",
+                "home-entry-observation-unreadable",
+            ),
+            (
+                "private-entry-identity-canary",
+                "entry",
+                2,
+                "st_ino",
+                "home-entry-observation-unstable",
+            ),
+            (
+                "private-entry-mtime-canary",
+                "entry",
+                2,
+                "st_mtime_ns",
+                "home-entry-observation-unstable",
+            ),
         )
-        for label, target_name, replace_on_call, changed_field in scenarios:
+        for (
+            label,
+            target_name,
+            replace_on_call,
+            changed_field,
+            detail,
+        ) in scenarios:
             with (
                 self.subTest(label=label),
                 tempfile.TemporaryDirectory() as directory,
@@ -5108,6 +7072,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                         "st_nlink": metadata.st_nlink,
                         "st_size": metadata.st_size,
                         "st_mtime_ns": metadata.st_mtime_ns,
+                        "st_ctime_ns": metadata.st_ctime_ns,
                         "st_uid": metadata.st_uid,
                         "st_gid": metadata.st_gid,
                     }
@@ -5133,7 +7098,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 self.assertEqual(target_calls, replace_on_call)
                 self.assertEqual(
                     raised.exception.code,
-                    ("home-cleanup-pre-reset-marker-home-entry-observation-unstable"),
+                    f"home-cleanup-pre-reset-marker-{detail}",
                 )
                 self.assertNotIn(label, raised.exception.code)
 
@@ -5150,8 +7115,6 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             probe.chmod(0o700)
             for name in self.helper.LAUNCHD_CHILD_FILES:
                 (probe / name).write_bytes(b"value")
-            path_type = type(home)
-            original_iterdir = path_type.iterdir
             home_listings = iter(
                 (
                     (probe, library, text_encoding),
@@ -5161,23 +7124,20 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             )
             observed_home_listings = 0
 
-            def permuted_iterdir(
-                path: Path,
-                *,
-                operation=original_iterdir,
-            ):
+            def permuted_scandir(_descriptor: int):
                 nonlocal observed_home_listings
-                if path != home:
-                    return operation(path)
                 observed_home_listings += 1
-                return iter(next(home_listings))
+                context = mock.MagicMock()
+                context.__enter__.return_value = iter(
+                    SimpleNamespace(name=path.name) for path in next(home_listings)
+                )
+                return context
 
             with (
                 mock.patch.object(
-                    path_type,
-                    "iterdir",
-                    autospec=True,
-                    side_effect=permuted_iterdir,
+                    self.helper.os,
+                    "scandir",
+                    side_effect=permuted_scandir,
                 ),
                 self.assertRaises(self.helper.ProbeError) as raised,
             ):
@@ -5299,7 +7259,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 )
             self.assertEqual(
                 raised.exception.code,
-                "home-cleanup-pre-reset-marker-home-entry-observation-unstable",
+                "home-cleanup-pre-reset-marker-home-entry-observation-unreadable",
             )
             self.assertNotIn("private", raised.exception.code)
 
@@ -5917,24 +7877,23 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 },
                 "home_identity": identity,
             }
-            path_type = type(home)
-            original_iterdir = path_type.iterdir
+            original_scandir = os.scandir
             home_observations = 0
 
-            def raced_iterdir(path: Path):
+            def raced_scandir(descriptor: int):
                 nonlocal home_observations
-                if path == home:
-                    home_observations += 1
-                    if home_observations == 1:
-                        return iter(())
-                return original_iterdir(path)
+                home_observations += 1
+                if home_observations == 1:
+                    context = mock.MagicMock()
+                    context.__enter__.return_value = iter(())
+                    return context
+                return original_scandir(descriptor)
 
             with (
                 mock.patch.object(
-                    path_type,
-                    "iterdir",
-                    autospec=True,
-                    side_effect=raced_iterdir,
+                    self.helper.os,
+                    "scandir",
+                    side_effect=raced_scandir,
                 ),
                 mock.patch.object(Path, "unlink") as unlink,
                 mock.patch.object(Path, "rmdir") as rmdir,
@@ -6959,6 +8918,30 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                     self.assertEqual((probe / "foreign").read_bytes(), b"preserve")
                 else:
                     self.assertFalse(home.exists())
+
+    def test_home_creation_rejects_an_inherited_extended_acl(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "twq-0123456789ab"
+            account = self.helper.DisposableAccount(
+                name=home.name,
+                uid=os.geteuid(),
+                gid=os.getegid(),
+                home=home,
+            )
+
+            with (
+                mock.patch.object(
+                    self.helper,
+                    "_require_no_extended_acl",
+                    side_effect=self.helper.ProbeError("home-library-unsafe-entry"),
+                ) as reject_acl,
+                self.assertRaises(self.helper.ProbeError) as raised,
+            ):
+                self.helper._create_disposable_home(account)
+
+            self.assertEqual(raised.exception.code, "home-create-new-disagrees")
+            reject_acl.assert_called_once()
+            self.assertFalse(home.exists())
 
     def test_launchd_poll_is_bounded_and_accepts_one_terminal_run(self) -> None:
         context = self.launchd_context()
@@ -11556,7 +13539,23 @@ raise SystemExit(93)
             events.append("readback")
             return json.loads(bytes(written["raw"]))
 
+        def validate_home(*_args: object, **_kwargs: object) -> None:
+            events.append("validate-home")
+
+        def inventory(*_args: object, **_kwargs: object) -> None:
+            events.append("inventory")
+
         with (
+            mock.patch.object(
+                self.helper,
+                "_require_bound_home_path",
+                side_effect=validate_home,
+            ) as validate,
+            mock.patch.object(
+                self.helper,
+                "_bounded_library_inventory",
+                side_effect=inventory,
+            ) as read_inventory,
             mock.patch.object(
                 self.helper,
                 "_write_stage_create_new",
@@ -11580,7 +13579,25 @@ raise SystemExit(93)
                 marker["home_identity"],
             )
 
-        self.assertEqual(events, ["write", "fsync", "readback"])
+        self.assertEqual(
+            events,
+            [
+                "validate-home",
+                "inventory",
+                "validate-home",
+                "write",
+                "fsync",
+                "readback",
+            ],
+        )
+        self.assertEqual(
+            validate.call_args_list,
+            [
+                mock.call(plan.account, marker["home_identity"]),
+                mock.call(plan.account, marker["home_identity"]),
+            ],
+        )
+        read_inventory.assert_called_once_with(plan.account)
         self.assertEqual(
             written,
             {
@@ -11619,6 +13636,12 @@ raise SystemExit(93)
                     self.helper,
                     "_metadata_matches",
                     return_value=True,
+                ),
+                mock.patch.object(self.helper, "_require_bound_home_path"),
+                mock.patch.object(
+                    self.helper,
+                    "_bounded_library_inventory",
+                    return_value=None,
                 ),
                 mock.patch.object(self.helper, "_fsync_stage_directory"),
             ):
@@ -11673,6 +13696,12 @@ raise SystemExit(93)
             },
         )
         with (
+            mock.patch.object(self.helper, "_require_bound_home_path"),
+            mock.patch.object(
+                self.helper,
+                "_bounded_library_inventory",
+                return_value=None,
+            ),
             mock.patch.object(self.helper, "_write_stage_create_new"),
             mock.patch.object(
                 self.helper,

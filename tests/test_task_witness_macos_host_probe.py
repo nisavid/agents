@@ -3808,18 +3808,460 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             home = Path(directory) / "home"
             probe = home / "launchd-probe"
             probe.mkdir(parents=True, mode=0o700)
+            home.chmod(0o700)
+            probe.chmod(0o700)
             for name in ("probe.json", "probe.status", "probe.stderr", "probe.stdout"):
                 (probe / name).write_bytes(b"value")
             (probe / "foreign").write_bytes(b"preserve")
 
-            with self.assertRaisesRegex(self.helper.ProbeError, "home-cleanup-drift"):
+            with self.assertRaises(self.helper.ProbeError) as raised:
                 self.helper.remove_exact_disposable_home(
                     home,
                     expected_uid=os.geteuid(),
                     expected_gid=os.getegid(),
                 )
+            self.assertEqual(
+                raised.exception.code,
+                "home-cleanup-home-removal-probe-entry-set-drift",
+            )
             self.assertTrue(home.is_dir())
             self.assertTrue((probe / "foreign").is_file())
+
+    def test_home_drift_diagnostics_are_phase_bound_and_value_free(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "home"
+            probe = home / "launchd-probe"
+            probe.mkdir(parents=True, mode=0o700)
+            home.chmod(0o700)
+            probe.chmod(0o700)
+            for name in self.helper.LAUNCHD_CHILD_FILES:
+                (probe / name).write_bytes(b"value")
+            home_metadata = home.lstat()
+            probe_metadata = probe.lstat()
+            identity = {
+                "home_device": home_metadata.st_dev,
+                "home_inode": home_metadata.st_ino,
+                "probe_device": probe_metadata.st_dev,
+                "probe_inode": probe_metadata.st_ino,
+            }
+            account = self.helper.DisposableAccount(
+                name="twq-0123456789ab",
+                uid=os.geteuid(),
+                gid=os.getegid(),
+                home=home,
+            )
+            canary = "private-home-entry-canary"
+            (home / canary).mkdir()
+
+            with self.assertRaises(self.helper.ProbeError) as exact:
+                self.helper._validate_exact_disposable_home(
+                    home,
+                    expected_uid=account.uid,
+                    expected_gid=account.gid,
+                    diagnostic_phase="pre-reset-marker",
+                )
+            self.assertEqual(
+                exact.exception.code,
+                "home-cleanup-pre-reset-marker-home-entry-set-drift",
+            )
+            self.assertNotIn(canary, exact.exception.code)
+
+            with self.assertRaises(self.helper.ProbeError) as bound:
+                self.helper._validated_marker_bound_disposable_home(
+                    account,
+                    identity,
+                    diagnostic_phase="post-reset",
+                )
+            self.assertEqual(
+                bound.exception.code,
+                "home-cleanup-post-reset-home-entry-set-drift",
+            )
+            self.assertNotIn(canary, bound.exception.code)
+
+    def test_home_drift_diagnostics_distinguish_exact_invariants(self) -> None:
+        scenarios = (
+            (
+                "home-mode",
+                lambda root, home, probe: home.chmod(0o755),
+                "home-cleanup-pre-reset-marker-home-mode-drift",
+            ),
+            (
+                "probe-mode",
+                lambda root, home, probe: probe.chmod(0o755),
+                "home-cleanup-pre-reset-marker-probe-mode-drift",
+            ),
+            (
+                "probe-entry-set",
+                lambda root, home, probe: (probe / "private-probe-canary").write_bytes(
+                    b"preserve"
+                ),
+                "home-cleanup-pre-reset-marker-probe-entry-set-drift",
+            ),
+            (
+                "probe-child-link-count",
+                lambda root, home, probe: os.link(
+                    probe / "probe.stdout",
+                    root / "private-link-canary",
+                ),
+                "home-cleanup-pre-reset-marker-probe-child-link-count-drift",
+            ),
+        )
+        for label, mutate, expected_code in scenarios:
+            with (
+                self.subTest(label=label),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                home = root / "home"
+                probe = home / "launchd-probe"
+                probe.mkdir(parents=True, mode=0o700)
+                home.chmod(0o700)
+                probe.chmod(0o700)
+                for name in self.helper.LAUNCHD_CHILD_FILES:
+                    (probe / name).write_bytes(b"value")
+                mutate(root, home, probe)
+
+                with self.assertRaises(self.helper.ProbeError) as raised:
+                    self.helper._validate_exact_disposable_home(
+                        home,
+                        expected_uid=os.geteuid(),
+                        expected_gid=os.getegid(),
+                        diagnostic_phase="pre-reset-marker",
+                    )
+                self.assertEqual(raised.exception.code, expected_code)
+                self.assertNotIn("private", raised.exception.code)
+
+    def test_home_drift_diagnostics_distinguish_bound_invariants(self) -> None:
+        scenarios = (
+            (
+                "home-mode",
+                lambda root, home, probe, identity: home.chmod(0o755),
+                "home-cleanup-post-reset-home-mode-drift",
+            ),
+            (
+                "home-identity",
+                lambda root, home, probe, identity: identity.update(
+                    home_inode=identity["home_inode"] + 1
+                ),
+                "home-cleanup-post-reset-home-identity-drift",
+            ),
+            (
+                "probe-mode",
+                lambda root, home, probe, identity: probe.chmod(0o755),
+                "home-cleanup-post-reset-probe-mode-drift",
+            ),
+            (
+                "probe-identity",
+                lambda root, home, probe, identity: identity.update(
+                    probe_inode=identity["probe_inode"] + 1
+                ),
+                "home-cleanup-post-reset-probe-identity-drift",
+            ),
+            (
+                "probe-entry-set",
+                lambda root, home, probe, identity: (
+                    probe / "private-probe-canary"
+                ).write_bytes(b"preserve"),
+                "home-cleanup-post-reset-probe-entry-set-drift",
+            ),
+            (
+                "probe-child-link-count",
+                lambda root, home, probe, identity: os.link(
+                    probe / "probe.stdout",
+                    root / "private-link-canary",
+                ),
+                "home-cleanup-post-reset-probe-child-link-count-drift",
+            ),
+        )
+        for label, mutate, expected_code in scenarios:
+            with (
+                self.subTest(label=label),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                home = root / "home"
+                probe = home / "launchd-probe"
+                probe.mkdir(parents=True, mode=0o700)
+                home.chmod(0o700)
+                probe.chmod(0o700)
+                for name in self.helper.LAUNCHD_CHILD_FILES:
+                    (probe / name).write_bytes(b"value")
+                home_metadata = home.lstat()
+                probe_metadata = probe.lstat()
+                identity = {
+                    "home_device": home_metadata.st_dev,
+                    "home_inode": home_metadata.st_ino,
+                    "probe_device": probe_metadata.st_dev,
+                    "probe_inode": probe_metadata.st_ino,
+                }
+                account = self.helper.DisposableAccount(
+                    name="twq-0123456789ab",
+                    uid=os.geteuid(),
+                    gid=os.getegid(),
+                    home=home,
+                )
+                mutate(root, home, probe, identity)
+
+                with self.assertRaises(self.helper.ProbeError) as raised:
+                    self.helper._validated_marker_bound_disposable_home(
+                        account,
+                        identity,
+                        diagnostic_phase="post-reset",
+                    )
+                self.assertEqual(raised.exception.code, expected_code)
+                self.assertNotIn("private", raised.exception.code)
+
+    def test_home_drift_diagnostics_cover_split_invariants(self) -> None:
+        def remove_probe_children(probe: Path) -> None:
+            for child in probe.iterdir():
+                child.unlink()
+
+        def home_kind(root: Path, home: Path, probe: Path):
+            del root
+            remove_probe_children(probe)
+            probe.rmdir()
+            home.rmdir()
+            home.write_bytes(b"private-home-kind-canary")
+            return nullcontext()
+
+        def probe_missing(root: Path, home: Path, probe: Path):
+            del root, home
+            remove_probe_children(probe)
+            probe.rmdir()
+            return nullcontext()
+
+        def probe_kind(root: Path, home: Path, probe: Path):
+            del root, home
+            remove_probe_children(probe)
+            probe.rmdir()
+            probe.write_bytes(b"private-probe-kind-canary")
+            return nullcontext()
+
+        def child_kind(root: Path, home: Path, probe: Path):
+            del root, home
+            child = probe / "probe.status"
+            child.unlink()
+            child.mkdir()
+            return nullcontext()
+
+        def child_size(root: Path, home: Path, probe: Path):
+            del root, home
+            (probe / "probe.status").write_bytes(b"x" * 17)
+            return nullcontext()
+
+        def lstat_failure(target: str):
+            def prepare(root: Path, home: Path, probe: Path):
+                del root
+                targets = {
+                    "home": home,
+                    "probe": probe,
+                    "child": probe / "probe.status",
+                }
+                selected = targets[target]
+                original = Path.lstat
+
+                def fail(path: Path):
+                    if path == selected:
+                        raise OSError("private-read-canary")
+                    return original(path)
+
+                return mock.patch.object(Path, "lstat", fail)
+
+            return prepare
+
+        def owner_drift(target: str):
+            def prepare(root: Path, home: Path, probe: Path):
+                del root
+                targets = {
+                    "home": home,
+                    "probe": probe,
+                    "child": probe / "probe.status",
+                }
+                selected = targets[target]
+                original = Path.lstat
+
+                def changed(path: Path):
+                    metadata = original(path)
+                    if path != selected:
+                        return metadata
+                    values = {
+                        name: getattr(metadata, name)
+                        for name in (
+                            "st_dev",
+                            "st_gid",
+                            "st_ino",
+                            "st_mode",
+                            "st_nlink",
+                            "st_size",
+                            "st_uid",
+                        )
+                    }
+                    values["st_uid"] += 1
+                    return SimpleNamespace(**values)
+
+                return mock.patch.object(Path, "lstat", changed)
+
+            return prepare
+
+        scenarios = (
+            ("home-kind", home_kind, "home-kind-drift", ("exact", "bound")),
+            (
+                "home-owner",
+                owner_drift("home"),
+                "home-owner-drift",
+                ("exact", "bound"),
+            ),
+            (
+                "home-read",
+                lstat_failure("home"),
+                "home-read-failed",
+                ("exact", "bound"),
+            ),
+            ("probe-missing", probe_missing, "probe-missing", ("exact",)),
+            ("probe-kind", probe_kind, "probe-kind-drift", ("exact", "bound")),
+            (
+                "probe-owner",
+                owner_drift("probe"),
+                "probe-owner-drift",
+                ("exact", "bound"),
+            ),
+            (
+                "probe-read",
+                lstat_failure("probe"),
+                "probe-read-failed",
+                ("exact", "bound"),
+            ),
+            (
+                "child-read",
+                lstat_failure("child"),
+                "probe-child-read-failed",
+                ("exact", "bound"),
+            ),
+            (
+                "child-kind",
+                child_kind,
+                "probe-child-kind-drift",
+                ("exact", "bound"),
+            ),
+            (
+                "child-owner",
+                owner_drift("child"),
+                "probe-child-owner-drift",
+                ("exact", "bound"),
+            ),
+            (
+                "child-size",
+                child_size,
+                "probe-child-size-drift",
+                ("exact", "bound"),
+            ),
+        )
+        for label, prepare, detail, validators in scenarios:
+            for validator in validators:
+                with (
+                    self.subTest(label=label, validator=validator),
+                    tempfile.TemporaryDirectory() as directory,
+                ):
+                    root = Path(directory)
+                    home = root / "home"
+                    probe = home / "launchd-probe"
+                    probe.mkdir(parents=True, mode=0o700)
+                    home.chmod(0o700)
+                    probe.chmod(0o700)
+                    for name in self.helper.LAUNCHD_CHILD_FILES:
+                        (probe / name).write_bytes(b"value")
+                    home_metadata = home.lstat()
+                    probe_metadata = probe.lstat()
+                    identity = {
+                        "home_device": home_metadata.st_dev,
+                        "home_inode": home_metadata.st_ino,
+                        "probe_device": probe_metadata.st_dev,
+                        "probe_inode": probe_metadata.st_ino,
+                    }
+                    account = self.helper.DisposableAccount(
+                        name="twq-0123456789ab",
+                        uid=os.geteuid(),
+                        gid=os.getegid(),
+                        home=home,
+                    )
+                    phase = "pre-reset-marker" if validator == "exact" else "post-reset"
+                    with (
+                        prepare(root, home, probe),
+                        self.assertRaises(self.helper.ProbeError) as raised,
+                    ):
+                        if validator == "exact":
+                            self.helper._validate_exact_disposable_home(
+                                home,
+                                expected_uid=account.uid,
+                                expected_gid=account.gid,
+                                diagnostic_phase=phase,
+                            )
+                        else:
+                            self.helper._validated_marker_bound_disposable_home(
+                                account,
+                                identity,
+                                diagnostic_phase=phase,
+                            )
+                    self.assertEqual(
+                        raised.exception.code,
+                        f"home-cleanup-{phase}-{detail}",
+                    )
+                    self.assertNotIn("canary", raised.exception.code)
+
+    def test_home_drift_diagnostic_vocabulary_is_bounded(self) -> None:
+        for phase in self.helper.HOME_CLEANUP_DIAGNOSTIC_PHASES:
+            for detail in self.helper.HOME_CLEANUP_DIAGNOSTIC_DETAILS:
+                with self.subTest(phase=phase, detail=detail):
+                    error = self.helper._home_cleanup_drift_error(phase, detail)
+                    self.assertLessEqual(len(error.code), 128)
+                    self.assertEqual(
+                        self.helper._validated_probe_error(error.code),
+                        {"code": error.code},
+                    )
+        for phase, detail in (
+            ("private-phase-canary", "home-mode-drift"),
+            ("post-reset", "private-detail-canary"),
+        ):
+            with self.subTest(phase=phase, detail=detail):
+                error = self.helper._home_cleanup_drift_error(phase, detail)
+                self.assertEqual(error.code, "home-cleanup-diagnostic-invalid")
+                self.assertEqual(
+                    self.helper._validated_probe_error(error.code),
+                    {"code": "home-cleanup-diagnostic-invalid"},
+                )
+                self.assertNotIn("canary", error.code)
+
+    def test_launchd_child_read_binds_home_drift_phase(self) -> None:
+        account = self.helper.DisposableAccount(
+            name="twq-0123456789ab",
+            uid=502,
+            gid=20,
+            home=Path("/Users/twq-0123456789ab"),
+        )
+
+        def read(path: Path, _maximum: int, _label: str) -> bytes:
+            return b"0\n" if path.name == "probe.status" else b""
+
+        with (
+            mock.patch.object(
+                self.helper,
+                "_validate_exact_disposable_home",
+            ) as validate_home,
+            mock.patch.object(
+                self.helper,
+                "_read_stable_regular_file",
+                side_effect=read,
+            ),
+        ):
+            payloads = self.helper._read_launchd_child_payloads(account)
+
+        self.assertEqual(payloads["probe.status"], b"0\n")
+        validate_home.assert_called_once_with(
+            account.home,
+            expected_uid=account.uid,
+            expected_gid=account.gid,
+            diagnostic_phase="child-read",
+        )
 
     def test_marker_bound_home_cleanup_resumes_after_every_unlink(self) -> None:
         names = sorted(self.helper.LAUNCHD_CHILD_FILES)
@@ -3941,7 +4383,10 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                         "home_identity": identity,
                     },
                 )
-            self.assertEqual(raised.exception.code, "home-cleanup-drift")
+            self.assertEqual(
+                raised.exception.code,
+                "home-cleanup-home-removal-probe-entry-set-drift",
+            )
             self.assertEqual(foreign.read_bytes(), b"preserve")
 
     def test_no_reset_cleanup_recovers_after_interrupted_home_unlink(self) -> None:
@@ -6636,7 +7081,10 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                     "_read_system_generated_uid",
                     return_value=generated_uid,
                 ),
-                mock.patch.object(self.helper, "_validate_exact_disposable_home"),
+                mock.patch.object(
+                    self.helper,
+                    "_validate_exact_disposable_home",
+                ) as validate_home,
                 mock.patch.object(
                     self.helper,
                     "_wait_for_no_uid_processes",
@@ -6668,6 +7116,12 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 )
 
             wait.assert_called_once_with(plan.account.uid)
+            validate_home.assert_called_once_with(
+                plan.account.home,
+                expected_uid=plan.account.uid,
+                expected_gid=plan.account.gid,
+                diagnostic_phase="cleanup-entry",
+            )
             mutations["_require_command_success"].assert_not_called()
             mutations["_list_accounts"].assert_not_called()
             mutations["remove_exact_disposable_home"].assert_not_called()
@@ -8503,6 +8957,9 @@ raise SystemExit(93)
         def stable(_uid: int) -> None:
             events.append("stable-zero")
 
+        def validate(*_args: object, **kwargs: object) -> None:
+            events.append(f"binding:{kwargs['home_drift_phase']}")
+
         with (
             mock.patch.object(
                 self.helper,
@@ -8528,7 +8985,7 @@ raise SystemExit(93)
             mock.patch.object(
                 self.helper,
                 "_validate_reset_bindings_and_resources",
-                side_effect=lambda *_args, **_kwargs: events.append("binding"),
+                side_effect=validate,
             ),
         ):
             evidence = self.helper._quiesce_disposable_user(
@@ -8545,11 +9002,11 @@ raise SystemExit(93)
             [
                 "wait",
                 "arm",
-                "binding",
+                "binding:pre-reset",
                 "reset",
                 "wait",
                 "stable-zero",
-                "binding",
+                "binding:post-reset",
             ],
         )
         self.assertEqual(
@@ -8560,6 +9017,127 @@ raise SystemExit(93)
                 "disposition": "performed",
                 "precondition": ("disposable-user-pid1-parented-processes-remain"),
             },
+        )
+
+    def test_post_reset_home_drift_reaches_lifecycle_boundary_exactly(self) -> None:
+        context = self.launchd_context()
+        plan = self.lifecycle_plan(
+            Path("/private/var/tmp/task-witness-macos-launchd-123456789-2")
+        )
+        state = self.lifecycle_state(plan)
+        loaded = self.launchctl_job(plan, state)
+        marker = {"content_sha256": "4" * 64}
+        code = "home-cleanup-post-reset-home-entry-set-drift"
+        phases: list[str] = []
+        stderr = io.StringIO()
+
+        def command(argv: list[str], **_kwargs: object) -> str:
+            if argv[:3] == ["/bin/launchctl", "bootstrap", "system"]:
+                return ""
+            if argv[:3] == ["/bin/launchctl", "kickstart", "-p"]:
+                return "4321"
+            raise AssertionError(argv)
+
+        wait_count = 0
+
+        def wait(_uid: int) -> None:
+            nonlocal wait_count
+            wait_count += 1
+            if wait_count == 1:
+                raise self.helper.ProbeError(
+                    "disposable-user-pid1-parented-processes-remain"
+                )
+
+        def validate(*_args: object, **kwargs: object) -> None:
+            phase = str(kwargs["home_drift_phase"])
+            phases.append(phase)
+            if phase == "post-reset":
+                raise self.helper.ProbeError(code)
+
+        with (
+            mock.patch.dict(os.environ, context, clear=True),
+            mock.patch.multiple(
+                self.helper,
+                _normalized_context=mock.DEFAULT,
+                _validate_lifecycle_arguments=mock.DEFAULT,
+                _create_root_directory=mock.DEFAULT,
+                _create_disposable_account=mock.DEFAULT,
+                _create_disposable_home=mock.DEFAULT,
+                _require_disposable_uid_available=mock.DEFAULT,
+                _require_launchd_absent=mock.DEFAULT,
+                _write_launchd_ownership_marker=mock.DEFAULT,
+                _reconcile_in_process_bootstrap=mock.DEFAULT,
+                _run_user_domain_reset=mock.DEFAULT,
+                _require_stable_no_uid_processes=mock.DEFAULT,
+            ),
+            mock.patch.object(
+                self.helper,
+                "_load_lifecycle_state",
+                return_value=(plan, state),
+            ),
+            mock.patch.object(
+                self.helper,
+                "_validate_exact_stage",
+                return_value=self.helper.ValidatedStageBindings(None, None),
+            ),
+            mock.patch.object(
+                self.helper,
+                "_require_command_success",
+                side_effect=command,
+            ),
+            mock.patch.object(
+                self.helper,
+                "_launchd_job_snapshot",
+                return_value=loaded,
+            ),
+            mock.patch.object(
+                self.helper,
+                "_poll_launchd_terminal",
+                return_value=(loaded, 0),
+            ),
+            mock.patch.object(
+                self.helper,
+                "_load_canonical_document",
+                return_value={"observations": {"process": {"pid": 4321}}},
+            ),
+            mock.patch.object(
+                self.helper,
+                "_wait_for_no_uid_processes",
+                side_effect=wait,
+            ),
+            mock.patch.object(
+                self.helper,
+                "_write_user_domain_reset_authorization",
+                return_value=marker,
+            ),
+            mock.patch.object(
+                self.helper,
+                "_validate_reset_bindings_and_resources",
+                side_effect=validate,
+            ),
+            mock.patch.object(self.helper, "_write_lifecycle_artifact") as write,
+            redirect_stderr(stderr),
+        ):
+            status = self.helper.run_launchd_user_lifecycle(
+                stage_root=plan.stage_root,
+                artifact_root=Path("/private/tmp/artifact"),
+                candidate_sha=FROZEN_CANDIDATE_SHA,
+                runner_uid=501,
+                runner_gid=20,
+                user_domain_reset_authorization=context["GITHUB_SHA"],
+            )
+
+        self.assertEqual(status, 2)
+        self.assertEqual(
+            phases,
+            ["pre-reset", "post-reset"],
+            repr(write.call_args),
+        )
+        self.assertEqual(write.call_args.kwargs["error_code"], code)
+        self.assertIsNone(write.call_args.kwargs["secondary_error_code"])
+        self.assertEqual(
+            stderr.getvalue(),
+            f"task-witness macOS launchd-user lifecycle: {code}\n",
         )
 
     def test_same_uid_process_tree_never_authorizes_domain_reset(self) -> None:
@@ -8683,7 +9261,7 @@ raise SystemExit(93)
                 self.helper,
                 "_exact_disposable_home_identity",
                 return_value=home_identity,
-            ),
+            ) as read_home_identity,
             mock.patch.object(
                 self.helper,
                 "_write_stage_create_new",
@@ -8740,6 +9318,10 @@ raise SystemExit(93)
         )
         self.assertEqual(written["path"], plan.stage_root / "domain-reset.json")
         self.assertEqual(written["mode"], 0o600)
+        read_home_identity.assert_called_once_with(
+            plan.account,
+            diagnostic_phase="pre-reset-marker",
+        )
         sync.assert_called_once_with(plan.stage_root)
         load.assert_called_once_with(
             plan,
@@ -9898,9 +10480,9 @@ raise SystemExit(93)
                         observed: list[str] = events,
                         expected_account: bool = account_present,
                         expected_home: bool = home_present,
-                        **_kwargs: object,
+                        **kwargs: object,
                     ) -> tuple[bool, bool]:
-                        observed.append("binding")
+                        observed.append(f"binding:{kwargs['home_drift_phase']}")
                         return expected_account, expected_home
 
                     def write_home_authorization(
@@ -10052,7 +10634,7 @@ raise SystemExit(93)
                                 return_value={},
                             )
                         )
-                        stack.enter_context(
+                        read_home = stack.enter_context(
                             mock.patch.object(
                                 self.helper,
                                 "_validated_marker_bound_disposable_home",
@@ -10065,7 +10647,7 @@ raise SystemExit(93)
                                 ),
                             )
                         )
-                        stack.enter_context(
+                        read_home_identity = stack.enter_context(
                             mock.patch.object(
                                 self.helper,
                                 "_exact_disposable_home_identity",
@@ -10128,17 +10710,17 @@ raise SystemExit(93)
                         int(not journal_preexisting),
                     )
                     expected_events = [
-                        "binding",
+                        "binding:marker-replay",
                         "wait",
-                        "binding",
+                        "binding:pre-reset",
                         "reset",
                         "wait",
                         "stable-zero",
-                        "binding",
-                        "binding",
+                        "binding:post-reset",
+                        "binding:pre-account-delete",
                     ]
                     if account_present:
-                        expected_events.append("binding")
+                        expected_events.append("binding:pre-account-delete")
                     expected_events.append("stable-zero")
                     if not journal_preexisting:
                         expected_events.append("arm-home")
@@ -10154,6 +10736,24 @@ raise SystemExit(93)
                         process_scan.call_count,
                         1 + int(account_present),
                     )
+                    self.assertEqual(
+                        [
+                            call.kwargs["diagnostic_phase"]
+                            for call in read_home.call_args_list
+                        ],
+                        (
+                            ["cleanup-entry", "pre-home-removal"]
+                            if home_present and journal_preexisting
+                            else ["pre-home-removal"]
+                        ),
+                    )
+                    if home_present and not journal_preexisting:
+                        read_home_identity.assert_called_once_with(
+                            plan.account,
+                            diagnostic_phase="pre-journal",
+                        )
+                    else:
+                        read_home_identity.assert_not_called()
                     self.assertEqual(remove_home.call_count, int(home_present))
                     self.assertEqual(
                         len(cleanup_writes),
@@ -10265,11 +10865,16 @@ raise SystemExit(93)
                         eligible_context()["GITHUB_SHA"],
                         eligible_context(),
                         home_cleanup,
+                        home_drift_phase="marker-replay",
                     ),
                     (account_present, home_present),
                 )
             self.assertEqual(read_record.call_count, int(account_present))
-            read_home.assert_called_once_with(plan.account, identity)
+            read_home.assert_called_once_with(
+                plan.account,
+                identity,
+                diagnostic_phase="marker-replay",
+            )
 
         with (
             mock.patch.object(self.helper, "_require_launchd_absent"),
@@ -10301,8 +10906,12 @@ raise SystemExit(93)
                 marker,
                 eligible_context()["GITHUB_SHA"],
                 eligible_context(),
+                home_drift_phase="marker-replay",
             )
-        self.assertEqual(unjournaled.exception.code, "home-cleanup-drift")
+        self.assertEqual(
+            unjournaled.exception.code,
+            "home-cleanup-marker-replay-home-state-drift",
+        )
 
         with (
             mock.patch.object(self.helper, "_require_launchd_absent"),
@@ -10329,6 +10938,7 @@ raise SystemExit(93)
                 marker,
                 eligible_context()["GITHUB_SHA"],
                 eligible_context(),
+                home_drift_phase="marker-replay",
             )
         self.assertEqual(reused.exception.code, "account-record-drift")
 
@@ -10357,7 +10967,9 @@ raise SystemExit(93)
             mock.patch.object(
                 self.helper,
                 "_validated_marker_bound_disposable_home",
-                side_effect=self.helper.ProbeError("home-cleanup-drift"),
+                side_effect=self.helper.ProbeError(
+                    "home-cleanup-marker-replay-home-identity-drift"
+                ),
             ),
             self.assertRaises(self.helper.ProbeError) as replaced,
         ):
@@ -10367,8 +10979,12 @@ raise SystemExit(93)
                 marker,
                 eligible_context()["GITHUB_SHA"],
                 eligible_context(),
+                home_drift_phase="marker-replay",
             )
-        self.assertEqual(replaced.exception.code, "home-cleanup-drift")
+        self.assertEqual(
+            replaced.exception.code,
+            "home-cleanup-marker-replay-home-identity-drift",
+        )
 
     def test_reset_rejects_foreign_uid_collision_before_bootout(self) -> None:
         plan = self.lifecycle_plan(Path("/private/var/tmp/stage"))

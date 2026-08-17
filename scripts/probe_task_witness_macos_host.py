@@ -168,6 +168,43 @@ DISPOSABLE_UID_ACTIVE_CODES = frozenset(
 )
 USER_DOMAIN_RESET_CAPABILITY = "github-hosted-ephemeral-user-domain-reset-v1"
 USER_DOMAIN_RESET_SURVIVOR_CODE = "disposable-user-pid1-parented-processes-remain"
+HOME_CLEANUP_DIAGNOSTIC_PHASES = frozenset(
+    {
+        "child-read",
+        "cleanup-entry",
+        "home-removal",
+        "marker-replay",
+        "post-reset",
+        "pre-account-delete",
+        "pre-home-removal",
+        "pre-journal",
+        "pre-reset",
+        "pre-reset-marker",
+    }
+)
+HOME_CLEANUP_DIAGNOSTIC_DETAILS = frozenset(
+    {
+        "home-entry-set-drift",
+        "home-identity-drift",
+        "home-kind-drift",
+        "home-mode-drift",
+        "home-owner-drift",
+        "home-read-failed",
+        "home-state-drift",
+        "probe-child-kind-drift",
+        "probe-child-link-count-drift",
+        "probe-child-owner-drift",
+        "probe-child-read-failed",
+        "probe-child-size-drift",
+        "probe-entry-set-drift",
+        "probe-identity-drift",
+        "probe-kind-drift",
+        "probe-missing",
+        "probe-mode-drift",
+        "probe-owner-drift",
+        "probe-read-failed",
+    }
+)
 
 
 class ProbeError(Exception):
@@ -177,6 +214,15 @@ class ProbeError(Exception):
         super().__init__(code)
         self.code = code
         self.secondary_code = secondary_code
+
+
+def _home_cleanup_drift_error(phase: str, detail: str) -> ProbeError:
+    if (
+        phase not in HOME_CLEANUP_DIAGNOSTIC_PHASES
+        or detail not in HOME_CLEANUP_DIAGNOSTIC_DETAILS
+    ):
+        return ProbeError("home-cleanup-diagnostic-invalid")
+    return ProbeError(f"home-cleanup-{phase}-{detail}")
 
 
 def _merge_probe_error(
@@ -1327,6 +1373,7 @@ def remove_exact_disposable_home(
         home,
         expected_uid=expected_uid,
         expected_gid=expected_gid,
+        diagnostic_phase="home-removal",
     )
     probe_root = home / "launchd-probe"
     try:
@@ -1343,46 +1390,103 @@ def _validate_exact_disposable_home(
     *,
     expected_uid: int,
     expected_gid: int,
+    diagnostic_phase: str,
 ) -> None:
     expected_files = set(LAUNCHD_CHILD_FILES)
     probe_root = home / "launchd-probe"
     try:
         home_metadata = home.lstat()
+    except OSError as error:
+        raise _home_cleanup_drift_error(
+            diagnostic_phase,
+            "home-read-failed",
+        ) from error
+    if not stat.S_ISDIR(home_metadata.st_mode):
+        raise _home_cleanup_drift_error(diagnostic_phase, "home-kind-drift")
+    if stat.S_IMODE(home_metadata.st_mode) != 0o700:
+        raise _home_cleanup_drift_error(diagnostic_phase, "home-mode-drift")
+    if home_metadata.st_uid != expected_uid or home_metadata.st_gid != expected_gid:
+        raise _home_cleanup_drift_error(diagnostic_phase, "home-owner-drift")
+    try:
+        home_names = {entry.name for entry in home.iterdir()}
+    except OSError as error:
+        raise _home_cleanup_drift_error(
+            diagnostic_phase,
+            "home-read-failed",
+        ) from error
+    if "launchd-probe" not in home_names:
+        raise _home_cleanup_drift_error(diagnostic_phase, "probe-missing")
+    if home_names != {"launchd-probe"}:
+        raise _home_cleanup_drift_error(
+            diagnostic_phase,
+            "home-entry-set-drift",
+        )
+    try:
         probe_metadata = probe_root.lstat()
+    except FileNotFoundError as error:
+        raise _home_cleanup_drift_error(
+            diagnostic_phase,
+            "probe-missing",
+        ) from error
+    except OSError as error:
+        raise _home_cleanup_drift_error(
+            diagnostic_phase,
+            "probe-read-failed",
+        ) from error
+    if not stat.S_ISDIR(probe_metadata.st_mode):
+        raise _home_cleanup_drift_error(diagnostic_phase, "probe-kind-drift")
+    if stat.S_IMODE(probe_metadata.st_mode) != 0o700:
+        raise _home_cleanup_drift_error(diagnostic_phase, "probe-mode-drift")
+    if probe_metadata.st_uid != expected_uid or probe_metadata.st_gid != expected_gid:
+        raise _home_cleanup_drift_error(diagnostic_phase, "probe-owner-drift")
+    try:
         names = {entry.name for entry in probe_root.iterdir()}
     except OSError as error:
-        raise ProbeError("home-cleanup-drift") from error
-    if (
-        not stat.S_ISDIR(home_metadata.st_mode)
-        or stat.S_IMODE(home_metadata.st_mode) != 0o700
-        or home_metadata.st_uid != expected_uid
-        or home_metadata.st_gid != expected_gid
-        or not stat.S_ISDIR(probe_metadata.st_mode)
-        or stat.S_IMODE(probe_metadata.st_mode) != 0o700
-        or probe_metadata.st_uid != expected_uid
-        or probe_metadata.st_gid != expected_gid
-        or names != expected_files
-    ):
-        raise ProbeError("home-cleanup-drift")
+        raise _home_cleanup_drift_error(
+            diagnostic_phase,
+            "probe-read-failed",
+        ) from error
+    if names != expected_files:
+        raise _home_cleanup_drift_error(
+            diagnostic_phase,
+            "probe-entry-set-drift",
+        )
     for name in sorted(expected_files):
         path = probe_root / name
         try:
             metadata = path.lstat()
         except OSError as error:
-            raise ProbeError("home-cleanup-drift") from error
-        if (
-            not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_nlink != 1
-            or metadata.st_uid != expected_uid
-            or metadata.st_gid != expected_gid
-            or metadata.st_size > LAUNCHD_CHILD_FILES[name]
-        ):
-            raise ProbeError("home-cleanup-drift")
+            raise _home_cleanup_drift_error(
+                diagnostic_phase,
+                "probe-child-read-failed",
+            ) from error
+        if not stat.S_ISREG(metadata.st_mode):
+            raise _home_cleanup_drift_error(
+                diagnostic_phase,
+                "probe-child-kind-drift",
+            )
+        if metadata.st_nlink != 1:
+            raise _home_cleanup_drift_error(
+                diagnostic_phase,
+                "probe-child-link-count-drift",
+            )
+        if metadata.st_uid != expected_uid or metadata.st_gid != expected_gid:
+            raise _home_cleanup_drift_error(
+                diagnostic_phase,
+                "probe-child-owner-drift",
+            )
+        if metadata.st_size > LAUNCHD_CHILD_FILES[name]:
+            raise _home_cleanup_drift_error(
+                diagnostic_phase,
+                "probe-child-size-drift",
+            )
 
 
 def _validated_marker_bound_disposable_home(
     account: DisposableAccount,
     expected_identity: object,
+    *,
+    diagnostic_phase: str,
 ) -> tuple[bool, bool, tuple[str, ...]]:
     identity = _validated_disposable_home_identity(expected_identity)
     home = account.home
@@ -1392,57 +1496,103 @@ def _validated_marker_bound_disposable_home(
     except FileNotFoundError:
         return False, False, ()
     except OSError as error:
-        raise ProbeError("home-cleanup-drift") from error
-    if (
-        not stat.S_ISDIR(home_metadata.st_mode)
-        or stat.S_IMODE(home_metadata.st_mode) != 0o700
-        or home_metadata.st_uid != account.uid
-        or home_metadata.st_gid != account.gid
-        or (home_metadata.st_dev, home_metadata.st_ino)
-        != (identity["home_device"], identity["home_inode"])
+        raise _home_cleanup_drift_error(
+            diagnostic_phase,
+            "home-read-failed",
+        ) from error
+    if not stat.S_ISDIR(home_metadata.st_mode):
+        raise _home_cleanup_drift_error(diagnostic_phase, "home-kind-drift")
+    if stat.S_IMODE(home_metadata.st_mode) != 0o700:
+        raise _home_cleanup_drift_error(diagnostic_phase, "home-mode-drift")
+    if home_metadata.st_uid != account.uid or home_metadata.st_gid != account.gid:
+        raise _home_cleanup_drift_error(diagnostic_phase, "home-owner-drift")
+    if (home_metadata.st_dev, home_metadata.st_ino) != (
+        identity["home_device"],
+        identity["home_inode"],
     ):
-        raise ProbeError("home-cleanup-drift")
+        raise _home_cleanup_drift_error(diagnostic_phase, "home-identity-drift")
     try:
         home_names = {entry.name for entry in home.iterdir()}
     except OSError as error:
-        raise ProbeError("home-cleanup-drift") from error
+        raise _home_cleanup_drift_error(
+            diagnostic_phase,
+            "home-read-failed",
+        ) from error
+    if "launchd-probe" in home_names and home_names != {"launchd-probe"}:
+        raise _home_cleanup_drift_error(
+            diagnostic_phase,
+            "home-entry-set-drift",
+        )
     try:
         probe_metadata = probe_root.lstat()
     except FileNotFoundError:
         if home_names:
-            raise ProbeError("home-cleanup-drift")
+            raise _home_cleanup_drift_error(
+                diagnostic_phase,
+                "home-entry-set-drift",
+            )
         return True, False, ()
     except OSError as error:
-        raise ProbeError("home-cleanup-drift") from error
-    if (
-        home_names != {"launchd-probe"}
-        or not stat.S_ISDIR(probe_metadata.st_mode)
-        or stat.S_IMODE(probe_metadata.st_mode) != 0o700
-        or probe_metadata.st_uid != account.uid
-        or probe_metadata.st_gid != account.gid
-        or (probe_metadata.st_dev, probe_metadata.st_ino)
-        != (identity["probe_device"], identity["probe_inode"])
+        raise _home_cleanup_drift_error(
+            diagnostic_phase,
+            "probe-read-failed",
+        ) from error
+    if home_names != {"launchd-probe"}:
+        raise _home_cleanup_drift_error(
+            diagnostic_phase,
+            "home-entry-set-drift",
+        )
+    if not stat.S_ISDIR(probe_metadata.st_mode):
+        raise _home_cleanup_drift_error(diagnostic_phase, "probe-kind-drift")
+    if stat.S_IMODE(probe_metadata.st_mode) != 0o700:
+        raise _home_cleanup_drift_error(diagnostic_phase, "probe-mode-drift")
+    if probe_metadata.st_uid != account.uid or probe_metadata.st_gid != account.gid:
+        raise _home_cleanup_drift_error(diagnostic_phase, "probe-owner-drift")
+    if (probe_metadata.st_dev, probe_metadata.st_ino) != (
+        identity["probe_device"],
+        identity["probe_inode"],
     ):
-        raise ProbeError("home-cleanup-drift")
+        raise _home_cleanup_drift_error(diagnostic_phase, "probe-identity-drift")
     try:
         names = {entry.name for entry in probe_root.iterdir()}
     except OSError as error:
-        raise ProbeError("home-cleanup-drift") from error
+        raise _home_cleanup_drift_error(
+            diagnostic_phase,
+            "probe-read-failed",
+        ) from error
     if not names <= set(LAUNCHD_CHILD_FILES):
-        raise ProbeError("home-cleanup-drift")
+        raise _home_cleanup_drift_error(
+            diagnostic_phase,
+            "probe-entry-set-drift",
+        )
     for name in sorted(names):
         try:
             metadata = (probe_root / name).lstat()
         except OSError as error:
-            raise ProbeError("home-cleanup-drift") from error
-        if (
-            not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_nlink != 1
-            or metadata.st_uid != account.uid
-            or metadata.st_gid != account.gid
-            or metadata.st_size > LAUNCHD_CHILD_FILES[name]
-        ):
-            raise ProbeError("home-cleanup-drift")
+            raise _home_cleanup_drift_error(
+                diagnostic_phase,
+                "probe-child-read-failed",
+            ) from error
+        if not stat.S_ISREG(metadata.st_mode):
+            raise _home_cleanup_drift_error(
+                diagnostic_phase,
+                "probe-child-kind-drift",
+            )
+        if metadata.st_nlink != 1:
+            raise _home_cleanup_drift_error(
+                diagnostic_phase,
+                "probe-child-link-count-drift",
+            )
+        if metadata.st_uid != account.uid or metadata.st_gid != account.gid:
+            raise _home_cleanup_drift_error(
+                diagnostic_phase,
+                "probe-child-owner-drift",
+            )
+        if metadata.st_size > LAUNCHD_CHILD_FILES[name]:
+            raise _home_cleanup_drift_error(
+                diagnostic_phase,
+                "probe-child-size-drift",
+            )
     return True, True, tuple(sorted(names))
 
 
@@ -1468,6 +1618,7 @@ def _remove_marker_bound_disposable_home(
     home_present, probe_present, names = _validated_marker_bound_disposable_home(
         account,
         identity,
+        diagnostic_phase="home-removal",
     )
     if not home_present:
         return
@@ -3084,17 +3235,31 @@ def _load_launchd_ownership_marker(
     return document
 
 
-def _exact_disposable_home_identity(account: DisposableAccount) -> dict[str, int]:
+def _exact_disposable_home_identity(
+    account: DisposableAccount,
+    *,
+    diagnostic_phase: str,
+) -> dict[str, int]:
     _validate_exact_disposable_home(
         account.home,
         expected_uid=account.uid,
         expected_gid=account.gid,
+        diagnostic_phase=diagnostic_phase,
     )
     try:
         home = account.home.lstat()
+    except OSError as error:
+        raise _home_cleanup_drift_error(
+            diagnostic_phase,
+            "home-read-failed",
+        ) from error
+    try:
         probe = (account.home / "launchd-probe").lstat()
     except OSError as error:
-        raise ProbeError("home-cleanup-drift") from error
+        raise _home_cleanup_drift_error(
+            diagnostic_phase,
+            "probe-read-failed",
+        ) from error
     return {
         "home_device": home.st_dev,
         "home_inode": home.st_ino,
@@ -3162,7 +3327,10 @@ def _user_domain_reset_document(
             "runner": runner,
             "account": account_value,
             "home_identity": (
-                _exact_disposable_home_identity(plan.account)
+                _exact_disposable_home_identity(
+                    plan.account,
+                    diagnostic_phase="pre-reset-marker",
+                )
                 if home_identity is None
                 else _validated_disposable_home_identity(home_identity)
             ),
@@ -4011,6 +4179,7 @@ def _read_launchd_child_payloads(account: DisposableAccount) -> dict[str, bytes]
         account.home,
         expected_uid=account.uid,
         expected_gid=account.gid,
+        diagnostic_phase="child-read",
     )
     payloads = {
         name: _read_stable_regular_file(
@@ -4982,6 +5151,8 @@ def _validate_reset_bindings_and_resources(
     authorization_sha: object,
     environment: Mapping[str, str],
     home_cleanup: Mapping[str, object] | None = None,
+    *,
+    home_drift_phase: str,
 ) -> tuple[bool, bool]:
     _require_launchd_absent(plan.label)
     bindings = _validate_exact_stage(
@@ -5020,6 +5191,7 @@ def _validate_reset_bindings_and_resources(
         _validated_marker_bound_disposable_home(
             plan.account,
             marker.get("home_identity"),
+            diagnostic_phase=home_drift_phase,
         )
     )
     if (
@@ -5027,18 +5199,22 @@ def _validate_reset_bindings_and_resources(
         and home_present
         and (not probe_present or set(remaining_home_files) != set(LAUNCHD_CHILD_FILES))
     ):
-        raise ProbeError("home-cleanup-drift")
+        raise _home_cleanup_drift_error(
+            home_drift_phase,
+            "probe-entry-set-drift",
+        )
     home_complete = (
         home_present
         and probe_present
         and set(remaining_home_files) == set(LAUNCHD_CHILD_FILES)
     )
-    if (not home_complete and home_cleanup is None) or (
-        home_cleanup is not None and account_present
-    ):
-        raise ProbeError(
-            "home-cleanup-drift" if home_cleanup is None else "account-record-drift"
+    if not home_complete and home_cleanup is None:
+        raise _home_cleanup_drift_error(
+            home_drift_phase,
+            "home-state-drift",
         )
+    if home_cleanup is not None and account_present:
+        raise ProbeError("account-record-drift")
     return account_present, home_present
 
 
@@ -5077,6 +5253,7 @@ def _quiesce_disposable_user(
             authorization_sha,
             environment,
             bindings.home_cleanup,
+            home_drift_phase="marker-replay",
         )
     try:
         _wait_for_no_uid_processes(plan.account.uid)
@@ -5100,6 +5277,7 @@ def _quiesce_disposable_user(
             authorization_sha,
             environment,
             bindings.home_cleanup,
+            home_drift_phase="pre-reset",
         )
         _run_user_domain_reset(plan.account.uid)
         _wait_for_no_uid_processes(plan.account.uid)
@@ -5111,6 +5289,7 @@ def _quiesce_disposable_user(
             authorization_sha,
             environment,
             bindings.home_cleanup,
+            home_drift_phase="post-reset",
         )
         return _domain_reset_evidence(marker)
     if marker is not None:
@@ -5122,6 +5301,7 @@ def _quiesce_disposable_user(
             authorization_sha,
             environment,
             bindings.home_cleanup,
+            home_drift_phase="marker-replay",
         )
     return _domain_reset_evidence(marker)
 
@@ -5222,12 +5402,14 @@ def cleanup_launchd_user_lifecycle(
                 _validated_marker_bound_disposable_home(
                     plan.account,
                     stage_bindings.home_cleanup.get("home_identity"),
+                    diagnostic_phase="cleanup-entry",
                 )
             elif stage_bindings.domain_reset is None:
                 _validate_exact_disposable_home(
                     plan.account.home,
                     expected_uid=plan.account.uid,
                     expected_gid=plan.account.gid,
+                    diagnostic_phase="cleanup-entry",
                 )
         home_cleanup_recovered = stage_bindings.home_cleanup is not None or (
             stage_bindings.account is not None and not account_present
@@ -5253,6 +5435,7 @@ def cleanup_launchd_user_lifecycle(
                 user_domain_reset_authorization,
                 os.environ,
                 stage_bindings.home_cleanup,
+                home_drift_phase="pre-account-delete",
             )
         if owned_user_state:
             _require_no_uid_processes(plan.account.uid)
@@ -5266,6 +5449,7 @@ def cleanup_launchd_user_lifecycle(
                         user_domain_reset_authorization,
                         os.environ,
                         stage_bindings.home_cleanup,
+                        home_drift_phase="pre-account-delete",
                     )
                 )
                 if not current_account_present:
@@ -5316,7 +5500,10 @@ def cleanup_launchd_user_lifecycle(
             ):
                 raise ProbeError("account-record-drift")
         if home_present and stage_bindings.home_cleanup is None:
-            home_identity = _exact_disposable_home_identity(plan.account)
+            home_identity = _exact_disposable_home_identity(
+                plan.account,
+                diagnostic_phase="pre-journal",
+            )
             if (
                 stage_bindings.domain_reset is not None
                 and home_identity
@@ -5324,7 +5511,10 @@ def cleanup_launchd_user_lifecycle(
                     stage_bindings.domain_reset.get("home_identity")
                 )
             ):
-                raise ProbeError("home-cleanup-drift")
+                raise _home_cleanup_drift_error(
+                    "pre-journal",
+                    "home-identity-drift",
+                )
             stage_bindings = stage_bindings._replace(
                 home_cleanup=_write_home_cleanup_authorization(
                     plan,
@@ -5354,6 +5544,7 @@ def cleanup_launchd_user_lifecycle(
                 _validated_marker_bound_disposable_home(
                     plan.account,
                     stage_bindings.home_cleanup.get("home_identity"),
+                    diagnostic_phase="pre-home-removal",
                 )
             )
             home_cleanup_recovered = home_cleanup_recovered or (

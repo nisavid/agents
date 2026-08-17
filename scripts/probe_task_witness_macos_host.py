@@ -1356,29 +1356,9 @@ def _load_staged_launchd_child_environment(helper: Path) -> dict[str, str]:
     stage_root = helper.parent
     plist = stage_root / "job.plist"
     if (
-        not _metadata_matches(
-            stage_root,
-            kind="directory",
-            mode=0o755,
-            uid=0,
-            gid=0,
-        )
-        or not _metadata_matches(
-            helper,
-            kind="file",
-            mode=0o555,
-            uid=0,
-            gid=0,
-            nlink=1,
-        )
-        or not _metadata_matches(
-            plist,
-            kind="file",
-            mode=0o644,
-            uid=0,
-            gid=0,
-            nlink=1,
-        )
+        not _directory_matches(stage_root, 0o755, 0, 0)
+        or not _root_file_matches(helper, 0o555)
+        or not _root_file_matches(plist, 0o644)
     ):
         raise ProbeError("launchd-child-environment-invalid")
     raw = _read_stable_regular_file(plist, 64 * 1024, "staged-plist")
@@ -1875,15 +1855,9 @@ def _validated_marker_bound_disposable_home(
             )
             if not isinstance(root, dict) or any(
                 root.get(name) != value
-                for name, value in {
-                    "device": metadata.st_dev,
-                    "flags": int(getattr(metadata, "st_flags", 0)),
-                    "gid": metadata.st_gid,
-                    "inode": metadata.st_ino,
-                    "kind": "directory",
-                    "mode": metadata.st_mode,
-                    "uid": metadata.st_uid,
-                }.items()
+                for name, value in _library_record_metadata(
+                    metadata, "directory"
+                ).items()
             ):
                 raise ProbeError("home-library-inventory-drift")
     try:
@@ -2485,13 +2459,17 @@ def _load_canonical_document(path: Path, maximum: int, label: str) -> dict:
 
 def _require_content_digest(document: Mapping[str, object], label: str) -> None:
     recorded = document.get("content_sha256")
-    if not isinstance(recorded, str) or re.fullmatch(r"[0-9a-f]{64}", recorded) is None:
+    if not _is_sha256(recorded):
         raise ProbeError(f"invalid-{label}-digest")
     unsigned = {
         key: value for key, value in document.items() if key != "content_sha256"
     }
     if hashlib.sha256(canonical_bytes(unsigned)).hexdigest() != recorded:
         raise ProbeError(f"{label}-digest-disagrees")
+
+
+def _is_sha256(value: object) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
 
 
 def verify_provisioning_capability(artifact_root: Path) -> None:
@@ -2965,6 +2943,41 @@ def _metadata_matches(
     )
 
 
+def _root_file_matches(path: Path, mode: int) -> bool:
+    return _metadata_matches(
+        path,
+        kind="file",
+        mode=mode,
+        uid=0,
+        gid=0,
+        nlink=1,
+    )
+
+
+def _directory_matches(path: Path, mode: int, uid: int, gid: int) -> bool:
+    return _metadata_matches(
+        path,
+        kind="directory",
+        mode=mode,
+        uid=uid,
+        gid=gid,
+    )
+
+
+def _load_root_stage_document(
+    path: Path,
+    maximum: int,
+    label: str,
+) -> dict | None:
+    if not _path_exists_no_follow(path):
+        return None
+    if not _root_file_matches(path, 0o600):
+        raise ProbeError(f"{label}-drift")
+    document = _load_canonical_document(path, maximum, label)
+    _require_content_digest(document, label)
+    return document
+
+
 def _path_exists_no_follow(path: Path) -> bool:
     try:
         path.lstat()
@@ -3429,13 +3442,7 @@ def _create_disposable_home(account: DisposableAccount) -> None:
         _require_new_directory_no_acl(probe_root, probe_identity)
         os.chown(probe_root, account.uid, account.gid, follow_symlinks=False)
         for path in (account.home, probe_root):
-            if not _metadata_matches(
-                path,
-                kind="directory",
-                mode=0o700,
-                uid=account.uid,
-                gid=account.gid,
-            ):
+            if not _directory_matches(path, 0o700, account.uid, account.gid):
                 raise ProbeError("home-create-new-disagrees")
     except (OSError, ProbeError) as error:
         _rollback_created_home(
@@ -3452,14 +3459,7 @@ def _create_disposable_home(account: DisposableAccount) -> None:
 
 def _write_root_file(path: Path, raw: bytes, mode: int) -> None:
     write_create_new(path, raw, mode)
-    if not _metadata_matches(
-        path,
-        kind="file",
-        mode=mode,
-        uid=0,
-        gid=0,
-        nlink=1,
-    ):
+    if not _root_file_matches(path, mode):
         raise ProbeError("root-file-disagrees")
 
 
@@ -3523,10 +3523,7 @@ def _account_binding_document(
         )
     except ProbeError as error:
         raise ProbeError("account-binding-invalid") from error
-    if (
-        not isinstance(state_sha256, str)
-        or re.fullmatch(r"[0-9a-f]{64}", state_sha256) is None
-    ):
+    if not _is_sha256(state_sha256):
         raise ProbeError("account-binding-state-invalid")
     return _document_with_digest(
         {
@@ -3551,24 +3548,13 @@ def _load_account_binding(
     plan: LaunchdPlan,
     state: Mapping[str, object],
 ) -> dict | None:
-    path = plan.stage_root / "account.json"
-    if not _path_exists_no_follow(path):
-        return None
-    if not _metadata_matches(
-        path,
-        kind="file",
-        mode=0o600,
-        uid=0,
-        gid=0,
-        nlink=1,
-    ):
-        raise ProbeError("account-binding-drift")
-    document = _load_canonical_document(
-        path,
+    document = _load_root_stage_document(
+        plan.stage_root / "account.json",
         MAX_ACCOUNT_BINDING_BYTES,
         "account-binding",
     )
-    _require_content_digest(document, "account-binding")
+    if document is None:
+        return None
     account = document.get("account")
     if not isinstance(account, dict):
         raise ProbeError("account-binding-drift")
@@ -3603,14 +3589,7 @@ def _write_account_binding(
         if _path_exists_no_follow(path):
             try:
                 removable = (
-                    _metadata_matches(
-                        path,
-                        kind="file",
-                        mode=0o600,
-                        uid=0,
-                        gid=0,
-                        nlink=1,
-                    )
+                    _root_file_matches(path, 0o600)
                     and _read_stable_regular_file(
                         path,
                         len(raw),
@@ -3639,8 +3618,12 @@ def _launchd_ownership_document(
         not isinstance(ownership_marker, str)
         or LAUNCHD_OWNERSHIP_MARKER_RE.fullmatch(ownership_marker) is None
         or any(
-            not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None
-            for value in (helper_sha256, plist_sha256, state_sha256)
+            not _is_sha256(value)
+            for value in (
+                helper_sha256,
+                plist_sha256,
+                state_sha256,
+            )
         )
     ):
         raise ProbeError("launchd-ownership-state-invalid")
@@ -3684,24 +3667,13 @@ def _load_launchd_ownership_marker(
     plan: LaunchdPlan,
     state: Mapping[str, object],
 ) -> dict | None:
-    marker_path = plan.stage_root / "ownership.json"
-    if not _path_exists_no_follow(marker_path):
-        return None
-    if not _metadata_matches(
-        marker_path,
-        kind="file",
-        mode=0o600,
-        uid=0,
-        gid=0,
-        nlink=1,
-    ):
-        raise ProbeError("launchd-ownership-marker-drift")
-    document = _load_canonical_document(
-        marker_path,
+    document = _load_root_stage_document(
+        plan.stage_root / "ownership.json",
         MAX_OWNERSHIP_BYTES,
         "launchd-ownership-marker",
     )
-    _require_content_digest(document, "launchd-ownership-marker")
+    if document is None:
+        return None
     if document != _launchd_ownership_document(plan, state):
         raise ProbeError("launchd-ownership-marker-drift")
     return document
@@ -4123,6 +4095,33 @@ def _bounded_path_directory_names(
             os.close(descriptor)
 
 
+def _library_record_metadata(metadata: os.stat_result, kind: str) -> dict:
+    return {
+        "device": metadata.st_dev,
+        "flags": int(getattr(metadata, "st_flags", 0)),
+        "gid": metadata.st_gid,
+        "inode": metadata.st_ino,
+        "kind": kind,
+        "mode": metadata.st_mode,
+        "uid": metadata.st_uid,
+    }
+
+
+def _library_node_state(
+    metadata: os.stat_result,
+    raw: bytes | None = None,
+) -> dict:
+    state = {
+        "ctime_ns": metadata.st_ctime_ns,
+        "link_count": metadata.st_nlink,
+        "mtime_ns": metadata.st_mtime_ns,
+        "size": metadata.st_size,
+    }
+    if raw is not None:
+        state["content_sha256"] = hashlib.sha256(raw).hexdigest()
+    return state
+
+
 def _observe_bounded_library(
     account: DisposableAccount,
     leaf_name: str,
@@ -4197,23 +4196,11 @@ def _observe_bounded_library(
             scope = "root" if depth == 1 else kind
             record = {
                 "depth": depth,
-                "device": metadata.st_dev,
-                "flags": int(getattr(metadata, "st_flags", 0)),
-                "gid": metadata.st_gid,
-                "inode": metadata.st_ino,
-                "kind": kind,
-                "mode": metadata.st_mode,
+                **_library_record_metadata(metadata, kind),
                 "parent_sha256": parent_sha256,
                 "path_sha256": path_sha256,
-                "uid": metadata.st_uid,
             }
-            observed = {
-                **record,
-                "link_count": metadata.st_nlink,
-                "size": metadata.st_size,
-                "mtime_ns": metadata.st_mtime_ns,
-                "ctime_ns": metadata.st_ctime_ns,
-            }
+            observed = {**record, **_library_node_state(metadata)}
             if kind == "file":
                 raw, opened = _read_home_library_file(
                     descriptor,
@@ -4224,15 +4211,7 @@ def _observe_bounded_library(
                 total_bytes += len(raw)
                 if total_bytes > MAX_HOME_LIBRARY_TOTAL_BYTES:
                     raise ProbeError("home-library-bounds-exceeded")
-                record.update(
-                    {
-                        "content_sha256": hashlib.sha256(raw).hexdigest(),
-                        "ctime_ns": opened.st_ctime_ns,
-                        "link_count": opened.st_nlink,
-                        "mtime_ns": opened.st_mtime_ns,
-                        "size": opened.st_size,
-                    }
-                )
+                record.update(_library_node_state(opened, raw))
                 records.append(record)
                 stability.append(
                     {**observed, "content_sha256": record["content_sha256"]}
@@ -4350,9 +4329,7 @@ def _validated_library_inventory(
         or inventory.get("entry_count") != len(records)
         or type(inventory.get("regular_file_bytes")) is not int
         or any(
-            not isinstance(item, dict)
-            or not isinstance(item.get("path_sha256"), str)
-            or re.fullmatch(r"[0-9a-f]{64}", item["path_sha256"]) is None
+            not isinstance(item, dict) or not _is_sha256(item.get("path_sha256"))
             for item in records
         )
         or canonical_bytes(records)
@@ -4399,10 +4376,8 @@ def _validated_library_inventory(
         if (
             not isinstance(kind, str)
             or kind not in {"directory", "file"}
-            or not isinstance(path_sha256, str)
-            or re.fullmatch(r"[0-9a-f]{64}", path_sha256) is None
-            or not isinstance(parent_sha256, str)
-            or re.fullmatch(r"[0-9a-f]{64}", parent_sha256) is None
+            or not _is_sha256(path_sha256)
+            or not _is_sha256(parent_sha256)
             or path_sha256 in by_hash
             or any(type(record_value.get(name)) is not int for name in integer_names)
             or record_value.get("depth", 0) not in range(1, MAX_HOME_LIBRARY_DEPTH + 1)
@@ -4431,8 +4406,7 @@ def _validated_library_inventory(
                 or stat.S_IMODE(record_value["mode"]) & 0o022
                 or stat.S_IMODE(record_value["mode"]) & 0o400 != 0o400
                 or record_value.get("link_count") != 1
-                or not isinstance(digest, str)
-                or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+                or not _is_sha256(digest)
                 or not isinstance(size, int)
                 or not 0 <= size <= MAX_HOME_LIBRARY_FILE_BYTES
             ):
@@ -4557,15 +4531,7 @@ def _require_library_record_metadata(
 ) -> None:
     if any(
         record.get(name) != value
-        for name, value in {
-            "device": metadata.st_dev,
-            "flags": int(getattr(metadata, "st_flags", 0)),
-            "gid": metadata.st_gid,
-            "inode": metadata.st_ino,
-            "kind": kind,
-            "mode": metadata.st_mode,
-            "uid": metadata.st_uid,
-        }.items()
+        for name, value in _library_record_metadata(metadata, kind).items()
     ):
         raise ProbeError("home-library-inventory-drift")
 
@@ -4602,13 +4568,7 @@ def _delete_authorized_library_directory(
             )
             if any(
                 record.get(field) != value
-                for field, value in {
-                    "content_sha256": hashlib.sha256(raw).hexdigest(),
-                    "ctime_ns": opened.st_ctime_ns,
-                    "link_count": opened.st_nlink,
-                    "mtime_ns": opened.st_mtime_ns,
-                    "size": opened.st_size,
-                }.items()
+                for field, value in _library_node_state(opened, raw).items()
             ):
                 raise ProbeError("home-library-inventory-drift")
             try:
@@ -4849,7 +4809,7 @@ def _user_domain_reset_document(
     account_sha256 = account_binding.get("content_sha256")
     ownership_sha256 = ownership.get("content_sha256")
     if not isinstance(account_value, dict) or any(
-        not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None
+        not _is_sha256(value)
         for value in (state_sha256, account_sha256, ownership_sha256)
     ):
         raise ProbeError("user-domain-reset-binding-drift")
@@ -4893,24 +4853,13 @@ def _load_user_domain_reset_authorization(
     authorization_sha: object,
     environment: Mapping[str, str],
 ) -> dict | None:
-    path = plan.stage_root / "domain-reset.json"
-    if not _path_exists_no_follow(path):
-        return None
-    if not _metadata_matches(
-        path,
-        kind="file",
-        mode=0o600,
-        uid=0,
-        gid=0,
-        nlink=1,
-    ):
-        raise ProbeError("user-domain-reset-authorization-drift")
-    document = _load_canonical_document(
-        path,
+    document = _load_root_stage_document(
+        plan.stage_root / "domain-reset.json",
         MAX_USER_DOMAIN_RESET_BYTES,
         "user-domain-reset-authorization",
     )
-    _require_content_digest(document, "user-domain-reset-authorization")
+    if document is None:
+        return None
     try:
         expected = _user_domain_reset_document(
             plan,
@@ -5059,19 +5008,9 @@ def _home_cleanup_document(
             "generated_uid": account_value.get("generated_uid"),
         }
         or not isinstance(account_value.get("generated_uid"), str)
+        or any(not _is_sha256(value) for value in (state_sha256, account_sha256))
         or any(
-            not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None
-            for value in (
-                state_sha256,
-                account_sha256,
-            )
-        )
-        or any(
-            value != "none"
-            and (
-                not isinstance(value, str)
-                or re.fullmatch(r"[0-9a-f]{64}", value) is None
-            )
+            value != "none" and not _is_sha256(value)
             for value in (ownership_sha256, reset_sha256)
         )
         or (
@@ -5109,24 +5048,13 @@ def _load_home_cleanup_authorization(
     state: Mapping[str, object],
     bindings: ValidatedStageBindings,
 ) -> dict | None:
-    path = plan.stage_root / "home-cleanup.json"
-    if not _path_exists_no_follow(path):
-        return None
-    if not _metadata_matches(
-        path,
-        kind="file",
-        mode=0o600,
-        uid=0,
-        gid=0,
-        nlink=1,
-    ):
-        raise ProbeError("home-cleanup-authorization-drift")
-    document = _load_canonical_document(
-        path,
+    document = _load_root_stage_document(
+        plan.stage_root / "home-cleanup.json",
         MAX_HOME_CLEANUP_BYTES,
         "home-cleanup-authorization",
     )
-    _require_content_digest(document, "home-cleanup-authorization")
+    if document is None:
+        return None
     try:
         expected = _home_cleanup_document(
             plan,
@@ -5196,21 +5124,8 @@ def validate_prestaged_helper(stage_root: Path, expected_sha256: str) -> bytes:
         raise ProbeError("staged-helper-metadata-drift") from error
     if (
         names != {"helper.py"}
-        or not _metadata_matches(
-            stage_root,
-            kind="directory",
-            mode=0o755,
-            uid=0,
-            gid=0,
-        )
-        or not _metadata_matches(
-            helper,
-            kind="file",
-            mode=0o555,
-            uid=0,
-            gid=0,
-            nlink=1,
-        )
+        or not _directory_matches(stage_root, 0o755, 0, 0)
+        or not _root_file_matches(helper, 0o555)
     ):
         raise ProbeError("staged-helper-metadata-drift")
     raw = _read_stable_regular_file(helper, MAX_HELPER_BYTES, "staged-helper")
@@ -5338,14 +5253,7 @@ def _initialize_lifecycle(
                         raise ProbeError("stage-initialization-preserved")
                     continue
                 if (
-                    not _metadata_matches(
-                        path,
-                        kind="file",
-                        mode=mode,
-                        uid=0,
-                        gid=0,
-                        nlink=1,
-                    )
+                    not _root_file_matches(path, mode)
                     or _read_stable_regular_file(
                         path,
                         len(raw),
@@ -5765,19 +5673,9 @@ def _ensure_failed_child_files(
     secondary_code: str | None = None,
 ) -> None:
     probe_root = account.home / "launchd-probe"
-    if not _metadata_matches(
-        account.home,
-        kind="directory",
-        mode=0o700,
-        uid=account.uid,
-        gid=account.gid,
-    ) or not _metadata_matches(
-        probe_root,
-        kind="directory",
-        mode=0o700,
-        uid=account.uid,
-        gid=account.gid,
-    ):
+    if not _directory_matches(
+        account.home, 0o700, account.uid, account.gid
+    ) or not _directory_matches(probe_root, 0o700, account.uid, account.gid):
         raise ProbeError("home-cleanup-drift")
     try:
         probe_metadata = probe_root.lstat()
@@ -6161,14 +6059,7 @@ def _load_lifecycle_state(
     environment: Mapping[str, str],
 ) -> tuple[LaunchdPlan, dict]:
     state_path = stage_root / "state.json"
-    if not _metadata_matches(
-        state_path,
-        kind="file",
-        mode=0o600,
-        uid=0,
-        gid=0,
-        nlink=1,
-    ):
+    if not _root_file_matches(state_path, 0o600):
         raise ProbeError("lifecycle-state-drift")
     state = _load_canonical_document(state_path, 16 * 1024, "lifecycle-state")
     _require_content_digest(state, "lifecycle-state")
@@ -6239,46 +6130,21 @@ def _validate_exact_stage(
     except OSError as error:
         raise ProbeError("stage-cleanup-drift") from error
     base_names = {"helper.py", "job.plist", "state.json"}
-    account_names = base_names | {"account.json"}
-    ownership_names = account_names | {"ownership.json"}
-    reset_names = ownership_names | {"domain-reset.json"}
-    account_home_cleanup_names = account_names | {"home-cleanup.json"}
-    ownership_home_cleanup_names = ownership_names | {"home-cleanup.json"}
-    reset_home_cleanup_names = reset_names | {"home-cleanup.json"}
+    extra_names = names - base_names
     if (
-        names
-        not in (
-            base_names,
-            account_names,
-            ownership_names,
-            reset_names,
-            account_home_cleanup_names,
-            ownership_home_cleanup_names,
-            reset_home_cleanup_names,
-        )
-        or not _metadata_matches(
-            plan.stage_root,
-            kind="directory",
-            mode=0o755,
-            uid=0,
-            gid=0,
-        )
-        or not _metadata_matches(
-            plan.helper,
-            kind="file",
-            mode=0o555,
-            uid=0,
-            gid=0,
-            nlink=1,
-        )
-        or not _metadata_matches(
-            plan.plist,
-            kind="file",
-            mode=0o644,
-            uid=0,
-            gid=0,
-            nlink=1,
-        )
+        not base_names <= names
+        or extra_names
+        - {
+            "account.json",
+            "domain-reset.json",
+            "home-cleanup.json",
+            "ownership.json",
+        }
+        or (extra_names and "account.json" not in extra_names)
+        or ("domain-reset.json" in extra_names and "ownership.json" not in extra_names)
+        or not _directory_matches(plan.stage_root, 0o755, 0, 0)
+        or not _root_file_matches(plan.helper, 0o555)
+        or not _root_file_matches(plan.plist, 0o644)
     ):
         raise ProbeError("stage-cleanup-drift")
     helper = _read_stable_regular_file(plan.helper, MAX_HELPER_BYTES, "staged-helper")
@@ -6585,7 +6451,7 @@ def _domain_reset_evidence(marker: Mapping[str, object] | None) -> dict[str, str
             "precondition": "none",
         }
     digest = marker.get("content_sha256")
-    if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+    if not _is_sha256(digest):
         raise ProbeError("user-domain-reset-authorization-drift")
     return {
         "authorization_sha256": digest,
@@ -6628,8 +6494,7 @@ def _validated_domain_reset_evidence(value: object) -> dict[str, str]:
         or (
             disposition in {"performed", "recovered-to-stable-zero"}
             and (
-                not isinstance(authorization_sha256, str)
-                or re.fullmatch(r"[0-9a-f]{64}", authorization_sha256) is None
+                not _is_sha256(authorization_sha256)
                 or precondition != USER_DOMAIN_RESET_SURVIVOR_CODE
             )
         )
@@ -6654,7 +6519,7 @@ def _home_cleanup_evidence(
             "disposition": "not-needed",
         }
     digest = authorization.get("content_sha256")
-    if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+    if not _is_sha256(digest):
         raise ProbeError("home-cleanup-authorization-drift")
     return {
         "authorization_sha256": digest,
@@ -6676,10 +6541,7 @@ def _validated_home_cleanup_evidence(value: object) -> dict[str, str]:
         or (disposition == "not-needed" and authorization_sha256 != "none")
         or (
             disposition in {"performed", "recovered"}
-            and (
-                not isinstance(authorization_sha256, str)
-                or re.fullmatch(r"[0-9a-f]{64}", authorization_sha256) is None
-            )
+            and (not _is_sha256(authorization_sha256))
         )
     ):
         raise ProbeError("invalid-home-cleanup-evidence")
@@ -6921,23 +6783,10 @@ def _validate_precleanup_artifact(artifact_root: Path) -> None:
     except OSError as error:
         raise ProbeError("launchd-artifact-root-unreadable") from error
     expected = set(LAUNCHD_ARTIFACT_FILES) - {"cleanup.json"}
-    if names != expected or not _metadata_matches(
-        artifact_root,
-        kind="directory",
-        mode=0o700,
-        uid=0,
-        gid=0,
-    ):
+    if names != expected or not _directory_matches(artifact_root, 0o700, 0, 0):
         raise ProbeError("launchd-artifact-precleanup-drift")
     for name in expected:
-        if not _metadata_matches(
-            artifact_root / name,
-            kind="file",
-            mode=0o600,
-            uid=0,
-            gid=0,
-            nlink=1,
-        ):
+        if not _root_file_matches(artifact_root / name, 0o600):
             raise ProbeError("launchd-artifact-precleanup-drift")
 
 
@@ -7233,12 +7082,8 @@ def cleanup_launchd_user_lifecycle(
         error_code = error.code
         secondary_error_code = error.secondary_code
     try:
-        if _metadata_matches(
-            artifact_root,
-            kind="directory",
-            mode=0o700,
-            uid=0,
-            gid=0,
+        if _directory_matches(
+            artifact_root, 0o700, 0, 0
         ) and not _path_exists_no_follow(artifact_root / "cleanup.json"):
             cleanup = _document_with_digest(
                 {

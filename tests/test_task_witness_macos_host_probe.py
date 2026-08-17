@@ -144,6 +144,114 @@ class TaskWitnessMacOSHostProbeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.helper = load_helper()
 
+    def test_sha256_predicate_is_exact_and_value_free(self) -> None:
+        class Sha256Subclass(str):
+            pass
+
+        exact = "0123456789abcdef" * 4
+        cases = (
+            ("exact", exact, True),
+            ("str-subclass", Sha256Subclass(exact), True),
+            ("short", exact[:-1], False),
+            ("long", exact + "0", False),
+            ("newline-suffix", exact + "\n", False),
+            ("private-suffix", exact + "private-canary", False),
+            ("uppercase", exact.upper(), False),
+            ("nonhex", "g" * 64, False),
+            ("bytes", exact.encode(), False),
+            ("integer", 1, False),
+            ("boolean", True, False),
+            ("list", [exact], False),
+            ("mapping", {"digest": exact}, False),
+        )
+        for label, value, expected in cases:
+            with self.subTest(label=label):
+                self.assertIs(self.helper._is_sha256(value), expected)
+
+        with self.assertRaises(self.helper.ProbeError) as raised:
+            self.helper._require_content_digest(
+                {"content_sha256": exact + "private-canary"},
+                "account-binding",
+            )
+        self.assertEqual(
+            raised.exception.code,
+            "invalid-account-binding-digest",
+        )
+        self.assertIsNone(raised.exception.secondary_code)
+        self.assertNotIn("private-canary", str(raised.exception))
+
+    def test_directory_match_forwards_non_root_ownership(self) -> None:
+        path = Path("/Users/twq-0123456789ab/launchd-probe")
+        with mock.patch.object(
+            self.helper,
+            "_metadata_matches",
+            return_value=True,
+        ) as metadata:
+            self.assertTrue(
+                self.helper._directory_matches(
+                    path,
+                    0o700,
+                    502,
+                    20,
+                )
+            )
+        metadata.assert_called_once_with(
+            path,
+            kind="directory",
+            mode=0o700,
+            uid=502,
+            gid=20,
+        )
+
+    def test_write_root_file_forwards_requested_mode(self) -> None:
+        path = Path("/private/var/tmp/stage/job.plist")
+        raw = b"exact plist bytes"
+        with (
+            mock.patch.object(self.helper, "write_create_new") as write,
+            mock.patch.object(
+                self.helper,
+                "_root_file_matches",
+                return_value=True,
+            ) as matches,
+        ):
+            self.helper._write_root_file(path, raw, 0o644)
+        write.assert_called_once_with(path, raw, 0o644)
+        matches.assert_called_once_with(path, 0o644)
+
+        with tempfile.TemporaryDirectory() as directory:
+            rejected_path = Path(directory) / "job.plist"
+
+            def create(path: Path, payload: bytes, mode: int) -> None:
+                path.write_bytes(payload)
+                path.chmod(mode)
+
+            with (
+                mock.patch.object(
+                    self.helper,
+                    "write_create_new",
+                    side_effect=create,
+                ) as rejected_write,
+                mock.patch.object(
+                    self.helper,
+                    "_root_file_matches",
+                    return_value=False,
+                ) as rejected_match,
+                mock.patch.object(
+                    self.helper,
+                    "_load_canonical_document",
+                ) as downstream_load,
+                mock.patch.object(Path, "unlink") as unlink,
+                self.assertRaises(self.helper.ProbeError) as raised,
+            ):
+                self.helper._write_root_file(rejected_path, raw, 0o644)
+
+            self.assertEqual(raised.exception.code, "root-file-disagrees")
+            rejected_write.assert_called_once_with(rejected_path, raw, 0o644)
+            rejected_match.assert_called_once_with(rejected_path, 0o644)
+            downstream_load.assert_not_called()
+            unlink.assert_not_called()
+            self.assertEqual(rejected_path.read_bytes(), raw)
+
     def test_root_directory_normalizes_macos_parent_group_inheritance(self) -> None:
         path = Path("/private/tmp/task-witness-macos-launchd-user-probe")
         state = {"gid": 20, "mode": 0o600}
@@ -3109,6 +3217,92 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                     self.assertEqual(malformed.exception.code, expected_code)
                     (root / file_name).write_bytes(
                         self.helper.canonical_bytes(original)
+                    )
+                    reseal()
+
+            for label, invalid_digest in (
+                ("short", "4" * 63),
+                ("uppercase", "A" * 64),
+                ("private-suffix", "4" * 64 + "private-canary"),
+            ):
+                for evidence, disposition, expected_code in (
+                    (
+                        "domain-reset",
+                        "performed",
+                        "invalid-user-domain-reset-evidence",
+                    ),
+                    (
+                        "domain-reset",
+                        "recovered-to-stable-zero",
+                        "invalid-user-domain-reset-evidence",
+                    ),
+                    (
+                        "home-cleanup",
+                        "performed",
+                        "invalid-home-cleanup-evidence",
+                    ),
+                    (
+                        "home-cleanup",
+                        "recovered",
+                        "invalid-home-cleanup-evidence",
+                    ),
+                ):
+                    changed_lifecycle = {
+                        key: value
+                        for key, value in lifecycle.items()
+                        if key != "content_sha256"
+                    }
+                    changed_cleanup = {
+                        key: value
+                        for key, value in cleanup.items()
+                        if key != "content_sha256"
+                    }
+                    if evidence == "domain-reset":
+                        invalid_evidence = {
+                            "authorization_sha256": invalid_digest,
+                            "capability": (
+                                "github-hosted-ephemeral-user-domain-reset-v1"
+                            ),
+                            "disposition": disposition,
+                            "precondition": (
+                                "disposable-user-pid1-parented-processes-remain"
+                            ),
+                        }
+                        changed_lifecycle["domain_reset"] = invalid_evidence
+                        changed_cleanup["domain_reset"] = invalid_evidence
+                    else:
+                        changed_cleanup["home_cleanup"] = {
+                            "authorization_sha256": invalid_digest,
+                            "disposition": disposition,
+                        }
+                    (root / "lifecycle.json").write_bytes(
+                        self.helper.canonical_bytes(
+                            self.helper._document_with_digest(changed_lifecycle)
+                        )
+                    )
+                    (root / "cleanup.json").write_bytes(
+                        self.helper.canonical_bytes(
+                            self.helper._document_with_digest(changed_cleanup)
+                        )
+                    )
+                    reseal()
+                    with (
+                        self.subTest(
+                            evidence=evidence,
+                            disposition=disposition,
+                            digest=label,
+                        ),
+                        mock.patch.dict(os.environ, context, clear=True),
+                        self.assertRaises(self.helper.ProbeError) as invalid,
+                    ):
+                        self.helper.verify_launchd_success(root)
+                    self.assertEqual(invalid.exception.code, expected_code)
+                    self.assertNotIn("private-canary", str(invalid.exception))
+                    (root / "lifecycle.json").write_bytes(
+                        self.helper.canonical_bytes(lifecycle)
+                    )
+                    (root / "cleanup.json").write_bytes(
+                        self.helper.canonical_bytes(cleanup)
                     )
                     reseal()
 
@@ -6154,9 +6348,23 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             home.chmod(0o700)
             probe.chmod(0o700)
             name_canary = "private-library-name-canary.plist"
+            empty_name_canary = "private-empty-library-canary"
             value_canary = b"private-library-value-canary"
             payload = preferences / name_canary
+            empty_payload = caches / empty_name_canary
             payload.write_bytes(value_canary)
+            empty_payload.write_bytes(b"")
+            sentinel_mtime_ns = 1_600_000_000_123_456_789
+            os.utime(
+                payload,
+                ns=(sentinel_mtime_ns, sentinel_mtime_ns),
+                follow_symlinks=False,
+            )
+            payload_metadata = payload.lstat()
+            self.assertNotEqual(
+                payload_metadata.st_ctime_ns,
+                payload_metadata.st_mtime_ns,
+            )
             account = self.helper.DisposableAccount(
                 name="twq-0123456789ab",
                 uid=os.geteuid(),
@@ -6191,8 +6399,66 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             )
             for entry in first["entries"]:
                 self.assertRegex(entry["path_sha256"], r"[0-9a-f]{64}")
-            self.assertTrue(
-                any(entry.get("kind") == "file" for entry in first["entries"])
+            for path, kind in (
+                (home / "Library", "directory"),
+                (preferences, "directory"),
+                (caches, "directory"),
+                (payload, "file"),
+                (empty_payload, "file"),
+            ):
+                metadata = path.lstat()
+                matching = [
+                    entry
+                    for entry in first["entries"]
+                    if entry["inode"] == metadata.st_ino
+                ]
+                self.assertEqual(len(matching), 1)
+                record = matching[0]
+                self.assertEqual(record["device"], metadata.st_dev)
+                self.assertEqual(
+                    record["flags"],
+                    int(getattr(metadata, "st_flags", 0)),
+                )
+                self.assertEqual(record["gid"], metadata.st_gid)
+                self.assertEqual(record["kind"], kind)
+                self.assertEqual(record["mode"], metadata.st_mode)
+                self.assertEqual(record["uid"], metadata.st_uid)
+            file_entries = [
+                entry for entry in first["entries"] if entry.get("kind") == "file"
+            ]
+            self.assertEqual(len(file_entries), 2)
+            payload_entry = next(
+                entry
+                for entry in file_entries
+                if entry["inode"] == payload_metadata.st_ino
+            )
+            self.assertEqual(
+                payload_entry["ctime_ns"],
+                payload_metadata.st_ctime_ns,
+            )
+            self.assertEqual(
+                payload_entry["mtime_ns"],
+                payload_metadata.st_mtime_ns,
+            )
+            self.assertEqual(
+                payload_entry["link_count"],
+                payload_metadata.st_nlink,
+            )
+            self.assertEqual(payload_entry["size"], payload_metadata.st_size)
+            self.assertEqual(
+                payload_entry["content_sha256"],
+                hashlib.sha256(value_canary).hexdigest(),
+            )
+            empty_metadata = empty_payload.lstat()
+            empty_entry = next(
+                entry
+                for entry in file_entries
+                if entry["inode"] == empty_metadata.st_ino
+            )
+            self.assertEqual(empty_entry["size"], 0)
+            self.assertEqual(
+                empty_entry["content_sha256"],
+                hashlib.sha256(b"").hexdigest(),
             )
             self.helper._require_content_digest(
                 first,
@@ -6200,7 +6466,13 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             )
             raw = self.helper.canonical_bytes(first)
             self.assertEqual(json.loads(raw.decode("utf-8")), first)
-            for raw_name in ("Library", "Preferences", "Caches", name_canary):
+            for raw_name in (
+                "Library",
+                "Preferences",
+                "Caches",
+                name_canary,
+                empty_name_canary,
+            ):
                 self.assertNotIn(raw_name.encode(), raw)
             self.assertNotIn(value_canary, raw)
 
@@ -6211,6 +6483,98 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 changed["content_sha256"],
                 first["content_sha256"],
             )
+
+    def test_paired_library_observation_rejects_directory_state_only_drift(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "home"
+            probe = home / "launchd-probe"
+            preferences = home / "Library" / "Preferences"
+            probe.mkdir(parents=True, mode=0o700)
+            preferences.mkdir(parents=True)
+            home.chmod(0o700)
+            probe.chmod(0o700)
+            account = self.helper.DisposableAccount(
+                name="twq-0123456789ab",
+                uid=os.geteuid(),
+                gid=os.getegid(),
+                home=home,
+            )
+            original_observe = self.helper._observe_bounded_library
+            observations: list[object] = []
+            directory_metadata: list[os.stat_result] = []
+
+            def observe(*args: object, **kwargs: object):
+                result = original_observe(*args, **kwargs)
+                observations.append(result)
+                directory_metadata.append(preferences.lstat())
+                if len(observations) == 1:
+                    sentinel_ns = 1_600_000_000_123_456_789
+                    os.utime(
+                        preferences,
+                        ns=(sentinel_ns, sentinel_ns),
+                        follow_symlinks=False,
+                    )
+                return result
+
+            with (
+                mock.patch.object(
+                    self.helper,
+                    "_observe_bounded_library",
+                    side_effect=observe,
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_write_stage_create_new",
+                ) as publish,
+                mock.patch.object(
+                    self.helper,
+                    "_renameat_exclusive",
+                ) as rename,
+                mock.patch.object(self.helper.os, "unlink") as unlink,
+                mock.patch.object(self.helper.os, "rmdir") as rmdir,
+                self.assertRaises(self.helper.ProbeError) as raised,
+            ):
+                self.helper._bounded_library_inventory(account)
+
+            self.assertEqual(
+                raised.exception.code,
+                "home-library-observation-unstable",
+            )
+            self.assertIsNone(raised.exception.secondary_code)
+            self.assertEqual(len(observations), 2)
+            first, second = observations
+            self.assertEqual(first.inventory, second.inventory)
+            self.assertNotEqual(first.stability_sha256, second.stability_sha256)
+            before, after = directory_metadata
+            self.assertEqual(
+                (
+                    before.st_dev,
+                    before.st_ino,
+                    before.st_mode,
+                    before.st_uid,
+                    before.st_gid,
+                    int(getattr(before, "st_flags", 0)),
+                ),
+                (
+                    after.st_dev,
+                    after.st_ino,
+                    after.st_mode,
+                    after.st_uid,
+                    after.st_gid,
+                    int(getattr(after, "st_flags", 0)),
+                ),
+            )
+            self.assertNotEqual(
+                (before.st_ctime_ns, before.st_mtime_ns),
+                (after.st_ctime_ns, after.st_mtime_ns),
+            )
+            publish.assert_not_called()
+            rename.assert_not_called()
+            unlink.assert_not_called()
+            rmdir.assert_not_called()
+            self.assertTrue(preferences.is_dir())
 
     def test_bounded_library_inventory_rejects_malformed_records_before_mutation(
         self,
@@ -6960,6 +7324,181 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 with self.subTest(scope=scope, reject_call=reject_call):
                     exercise(relative_path, expected_cause, reject_call)
 
+    def test_bounded_library_delete_rejects_jit_file_content_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "home"
+            library = home / "Library"
+            library.mkdir(parents=True)
+            home.chmod(0o700)
+            target = library / "private-jit-content-canary"
+            authorized_content = b"authorized-content"
+            changed_content = b"changed-content!!!"
+            self.assertEqual(len(authorized_content), len(changed_content))
+            target.write_bytes(authorized_content)
+            account = self.helper.DisposableAccount(
+                name="twq-0123456789ab",
+                uid=os.geteuid(),
+                gid=os.getegid(),
+                home=home,
+            )
+            inventory = self.helper._bounded_library_inventory(account)
+            self.assertIsNotNone(inventory)
+            entries = inventory["entries"]
+            authorized = {entry["path_sha256"]: entry for entry in entries}
+            file_records = [entry for entry in entries if entry["kind"] == "file"]
+            self.assertEqual(len(file_records), 1)
+            self.assertEqual(
+                file_records[0]["content_sha256"],
+                hashlib.sha256(authorized_content).hexdigest(),
+            )
+            authorized_metadata = target.lstat()
+            target.write_bytes(changed_content)
+            changed_metadata = target.lstat()
+            self.assertEqual(
+                (
+                    changed_metadata.st_dev,
+                    changed_metadata.st_ino,
+                    changed_metadata.st_nlink,
+                    changed_metadata.st_size,
+                ),
+                (
+                    authorized_metadata.st_dev,
+                    authorized_metadata.st_ino,
+                    authorized_metadata.st_nlink,
+                    authorized_metadata.st_size,
+                ),
+            )
+            file_records[0].update(
+                {
+                    "ctime_ns": changed_metadata.st_ctime_ns,
+                    "link_count": changed_metadata.st_nlink,
+                    "mtime_ns": changed_metadata.st_mtime_ns,
+                    "size": changed_metadata.st_size,
+                }
+            )
+            self.assertEqual(
+                file_records[0]["content_sha256"],
+                hashlib.sha256(authorized_content).hexdigest(),
+            )
+
+            descriptor = os.open(
+                library,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+            )
+            try:
+                with (
+                    mock.patch.object(self.helper.os, "unlink") as unlink,
+                    mock.patch.object(self.helper.os, "rmdir") as rmdir,
+                    mock.patch.object(self.helper.os, "fsync") as fsync,
+                    mock.patch.object(
+                        self.helper,
+                        "_renameat_exclusive",
+                    ) as rename,
+                    self.assertRaises(self.helper.ProbeError) as raised,
+                ):
+                    self.helper._delete_authorized_library_directory(
+                        descriptor,
+                        (self.helper.HOME_LIBRARY_NAME,),
+                        authorized,
+                    )
+            finally:
+                os.close(descriptor)
+
+            self.assertEqual(
+                raised.exception.code,
+                "home-library-inventory-drift",
+            )
+            self.assertIsNone(raised.exception.secondary_code)
+            unlink.assert_not_called()
+            rmdir.assert_not_called()
+            fsync.assert_not_called()
+            rename.assert_not_called()
+            self.assertEqual(target.read_bytes(), changed_content)
+
+    def test_bounded_library_delete_rejects_jit_directory_identity_drift(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "home"
+            library = home / "Library"
+            target = library / "target-directory"
+            target.mkdir(parents=True)
+            home.chmod(0o700)
+            account = self.helper.DisposableAccount(
+                name="twq-0123456789ab",
+                uid=os.geteuid(),
+                gid=os.getegid(),
+                home=home,
+            )
+            inventory = self.helper._bounded_library_inventory(account)
+            self.assertIsNotNone(inventory)
+            entries = inventory["entries"]
+            authorized = {entry["path_sha256"]: entry for entry in entries}
+            directory_records = [
+                entry
+                for entry in entries
+                if entry["kind"] == "directory" and entry["depth"] == 2
+            ]
+            self.assertEqual(len(directory_records), 1)
+            original_metadata = target.lstat()
+            preserved = library / "zz-preserved-authorized-directory"
+            target.rename(preserved)
+            target.mkdir()
+            replacement_metadata = target.lstat()
+            self.assertEqual(
+                (
+                    replacement_metadata.st_dev,
+                    replacement_metadata.st_mode,
+                    replacement_metadata.st_uid,
+                    replacement_metadata.st_gid,
+                ),
+                (
+                    original_metadata.st_dev,
+                    original_metadata.st_mode,
+                    original_metadata.st_uid,
+                    original_metadata.st_gid,
+                ),
+            )
+            self.assertNotEqual(
+                replacement_metadata.st_ino,
+                original_metadata.st_ino,
+            )
+
+            descriptor = os.open(
+                library,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+            )
+            try:
+                with (
+                    mock.patch.object(self.helper.os, "unlink") as unlink,
+                    mock.patch.object(self.helper.os, "rmdir") as rmdir,
+                    mock.patch.object(self.helper.os, "fsync") as fsync,
+                    mock.patch.object(
+                        self.helper,
+                        "_renameat_exclusive",
+                    ) as rename,
+                    self.assertRaises(self.helper.ProbeError) as raised,
+                ):
+                    self.helper._delete_authorized_library_directory(
+                        descriptor,
+                        (self.helper.HOME_LIBRARY_NAME,),
+                        authorized,
+                    )
+            finally:
+                os.close(descriptor)
+
+            self.assertEqual(
+                raised.exception.code,
+                "home-library-inventory-drift",
+            )
+            self.assertIsNone(raised.exception.secondary_code)
+            unlink.assert_not_called()
+            rmdir.assert_not_called()
+            fsync.assert_not_called()
+            rename.assert_not_called()
+            self.assertEqual(target.lstat().st_ino, replacement_metadata.st_ino)
+            self.assertEqual(preserved.lstat().st_ino, original_metadata.st_ino)
+
     def test_bounded_library_delete_threads_file_and_directory_acl_causes(
         self,
     ) -> None:
@@ -7386,6 +7925,35 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 rmdir.assert_not_called()
                 self.assertTrue(canary.exists() or canary.is_symlink())
                 self.assertEqual(external.read_bytes(), b"preserve")
+
+    def test_bounded_library_quarantine_rejects_safe_mode_drift_without_mutation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            account, _identity, authorization, relative_files = (
+                self.bounded_library_cleanup_fixture(Path(directory))
+            )
+            source = account.home / self.helper.HOME_LIBRARY_NAME
+            target = source.joinpath(*relative_files[1])
+            target.chmod(0o600)
+
+            with (
+                mock.patch.object(self.helper, "_renameat_exclusive") as rename,
+                mock.patch.object(self.helper.os, "unlink") as unlink,
+                mock.patch.object(self.helper.os, "rmdir") as rmdir,
+                self.assertRaises(self.helper.ProbeError) as raised,
+            ):
+                self.helper._quarantine_and_remove_bounded_library(
+                    account,
+                    authorization,
+                )
+
+            self.assertEqual(raised.exception.code, "home-library-inventory-drift")
+            rename.assert_not_called()
+            unlink.assert_not_called()
+            rmdir.assert_not_called()
+            self.assertTrue(target.is_file())
+            self.assertEqual(stat.S_IMODE(target.lstat().st_mode), 0o600)
 
     def test_bounded_library_observer_requires_authorized_home_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -9743,6 +10311,35 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 mutation.assert_not_called()
 
         with tempfile.TemporaryDirectory() as directory:
+            account, identity, home, _probe = fixture(Path(directory))
+            library = home / self.helper.HOME_LIBRARY_NAME
+            library.mkdir(mode=0o755)
+            library.chmod(0o755)
+            inventory = self.helper._bounded_library_inventory(account)
+            self.assertIsInstance(inventory, dict)
+            library.chmod(0o700)
+            with ExitStack() as stack:
+                mutations = self.guard_home_validation_mutations(stack)
+                probe_children = stack.enter_context(
+                    mock.patch.object(
+                        self.helper,
+                        "_validated_launchd_probe_children",
+                    )
+                )
+                with self.assertRaises(self.helper.ProbeError) as raised:
+                    self.helper._validated_marker_bound_disposable_home(
+                        account,
+                        identity,
+                        diagnostic_phase="home-removal",
+                        library_inventory=inventory,
+                    )
+            self.assertEqual(raised.exception.code, "home-library-inventory-drift")
+            probe_children.assert_not_called()
+            for mutation in mutations:
+                mutation.assert_not_called()
+            self.assertEqual(stat.S_IMODE(library.lstat().st_mode), 0o700)
+
+        with tempfile.TemporaryDirectory() as directory:
             account, identity, home, probe = fixture(Path(directory))
             (home / self.helper.HOME_LIBRARY_NAME).mkdir()
             inventory = self.helper._bounded_library_inventory(account)
@@ -10435,6 +11032,100 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 )
             write.assert_called_once_with(stage / "account.json", raw, 0o600)
 
+            def create_partial(path: Path, payload: bytes, mode: int) -> None:
+                path.write_bytes(payload)
+                path.chmod(mode)
+
+            with (
+                mock.patch.object(
+                    self.helper,
+                    "_write_root_file",
+                    side_effect=create_partial,
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_load_account_binding",
+                    return_value={},
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_root_file_matches",
+                    return_value=True,
+                ) as rollback_matches,
+                mock.patch.object(
+                    self.helper,
+                    "_read_stable_regular_file",
+                    return_value=raw,
+                ) as rollback_read,
+                self.assertRaises(self.helper.ProbeError) as raised,
+            ):
+                self.helper._write_account_binding(plan, state, generated_uid)
+            self.assertEqual(raised.exception.code, "account-binding-disagrees")
+            rollback_matches.assert_called_once_with(stage / "account.json", 0o600)
+            rollback_read.assert_called_once_with(
+                stage / "account.json",
+                len(raw),
+                "partial-account-binding",
+            )
+            self.assertFalse((stage / "account.json").exists())
+
+            changed_raw = b"x" + raw[1:]
+            for label, metadata_matches, published_raw in (
+                ("metadata-drift", False, raw),
+                ("byte-drift", True, changed_raw),
+            ):
+                account_path = stage / "account.json"
+
+                def publish_drifted(
+                    path: Path,
+                    _payload: bytes,
+                    mode: int,
+                    observed: bytes = published_raw,
+                ) -> None:
+                    path.write_bytes(observed)
+                    path.chmod(mode)
+
+                with (
+                    self.subTest(label=label),
+                    mock.patch.object(
+                        self.helper,
+                        "_write_root_file",
+                        side_effect=publish_drifted,
+                    ),
+                    mock.patch.object(
+                        self.helper,
+                        "_load_account_binding",
+                        return_value={},
+                    ),
+                    mock.patch.object(
+                        self.helper,
+                        "_root_file_matches",
+                        return_value=metadata_matches,
+                    ) as preserve_matches,
+                    mock.patch.object(
+                        self.helper,
+                        "_read_stable_regular_file",
+                        return_value=published_raw,
+                    ) as preserve_read,
+                    mock.patch.object(Path, "unlink") as preserve_unlink,
+                    self.assertRaises(self.helper.ProbeError) as preserved,
+                ):
+                    self.helper._write_account_binding(plan, state, generated_uid)
+
+                self.assertEqual(preserved.exception.code, "account-binding-preserved")
+                preserve_matches.assert_called_once_with(account_path, 0o600)
+                if metadata_matches:
+                    preserve_read.assert_called_once_with(
+                        account_path,
+                        len(raw),
+                        "partial-account-binding",
+                    )
+                else:
+                    preserve_read.assert_not_called()
+                preserve_unlink.assert_not_called()
+                self.assertEqual(account_path.read_bytes(), published_raw)
+                account_path.unlink()
+
             (stage / "account.json").write_bytes(raw)
             with mock.patch.object(
                 self.helper,
@@ -10482,6 +11173,317 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                     ),
                 ):
                     self.helper._account_binding_document(plan, state, invalid)
+
+    def test_root_stage_document_checks_metadata_before_content(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            stage = Path(directory)
+            cases = (
+                (
+                    "account.json",
+                    self.helper.MAX_ACCOUNT_BINDING_BYTES,
+                    "account-binding",
+                ),
+                (
+                    "ownership.json",
+                    self.helper.MAX_OWNERSHIP_BYTES,
+                    "launchd-ownership-marker",
+                ),
+                (
+                    "domain-reset.json",
+                    self.helper.MAX_USER_DOMAIN_RESET_BYTES,
+                    "user-domain-reset-authorization",
+                ),
+                (
+                    "home-cleanup.json",
+                    self.helper.MAX_HOME_CLEANUP_BYTES,
+                    "home-cleanup-authorization",
+                ),
+            )
+
+            def observed(event_log: list[str], tag: str, result: object):
+                def observe(*_args: object, **_kwargs: object) -> object:
+                    event_log.append(tag)
+                    return result
+
+                return observe
+
+            def rejected(event_log: list[str], tag: str, code: str):
+                def reject(*_args: object, **_kwargs: object) -> object:
+                    event_log.append(tag)
+                    raise self.helper.ProbeError(code)
+
+                return reject
+
+            for filename, maximum, label in cases:
+                path = stage / filename
+                document = {"content_sha256": "a" * 64}
+
+                with self.subTest(filename=filename, state="missing"):
+                    events: list[str] = []
+                    with (
+                        mock.patch.object(
+                            self.helper,
+                            "_path_exists_no_follow",
+                            side_effect=observed(events, "exists", False),
+                        ) as exists,
+                        mock.patch.object(
+                            self.helper,
+                            "_root_file_matches",
+                        ) as metadata,
+                        mock.patch.object(
+                            self.helper,
+                            "_load_canonical_document",
+                        ) as canonical,
+                        mock.patch.object(
+                            self.helper,
+                            "_require_content_digest",
+                        ) as digest,
+                    ):
+                        self.assertIsNone(
+                            self.helper._load_root_stage_document(
+                                path,
+                                maximum,
+                                label,
+                            )
+                        )
+                    self.assertEqual(events, ["exists"])
+                    exists.assert_called_once_with(path)
+                    metadata.assert_not_called()
+                    canonical.assert_not_called()
+                    digest.assert_not_called()
+
+                with self.subTest(filename=filename, state="unsafe-metadata"):
+                    events = []
+                    with (
+                        mock.patch.object(
+                            self.helper,
+                            "_path_exists_no_follow",
+                            side_effect=observed(events, "exists", True),
+                        ),
+                        mock.patch.object(
+                            self.helper,
+                            "_root_file_matches",
+                            side_effect=observed(events, "metadata", False),
+                        ) as metadata,
+                        mock.patch.object(
+                            self.helper,
+                            "_load_canonical_document",
+                            side_effect=rejected(
+                                events,
+                                "canonical",
+                                "private-canonical-canary",
+                            ),
+                        ) as canonical,
+                        mock.patch.object(
+                            self.helper,
+                            "_require_content_digest",
+                        ) as digest,
+                        self.assertRaises(self.helper.ProbeError) as raised,
+                    ):
+                        self.helper._load_root_stage_document(
+                            path,
+                            maximum,
+                            label,
+                        )
+                    self.assertEqual(raised.exception.code, f"{label}-drift")
+                    self.assertNotIn(
+                        "private-canonical-canary",
+                        str(raised.exception),
+                    )
+                    self.assertEqual(events, ["exists", "metadata"])
+                    metadata.assert_called_once_with(path, 0o600)
+                    canonical.assert_not_called()
+                    digest.assert_not_called()
+
+                with self.subTest(filename=filename, state="canonical-error"):
+                    events = []
+                    with (
+                        mock.patch.object(
+                            self.helper,
+                            "_path_exists_no_follow",
+                            side_effect=observed(events, "exists", True),
+                        ),
+                        mock.patch.object(
+                            self.helper,
+                            "_root_file_matches",
+                            side_effect=observed(events, "metadata", True),
+                        ),
+                        mock.patch.object(
+                            self.helper,
+                            "_load_canonical_document",
+                            side_effect=rejected(
+                                events,
+                                "canonical",
+                                f"invalid-{label}",
+                            ),
+                        ) as canonical,
+                        mock.patch.object(
+                            self.helper,
+                            "_require_content_digest",
+                        ) as digest,
+                        self.assertRaises(self.helper.ProbeError) as raised,
+                    ):
+                        self.helper._load_root_stage_document(
+                            path,
+                            maximum,
+                            label,
+                        )
+                    self.assertEqual(raised.exception.code, f"invalid-{label}")
+                    self.assertEqual(
+                        events,
+                        ["exists", "metadata", "canonical"],
+                    )
+                    canonical.assert_called_once_with(path, maximum, label)
+                    digest.assert_not_called()
+
+                with self.subTest(filename=filename, state="digest-error"):
+                    events = []
+                    with (
+                        mock.patch.object(
+                            self.helper,
+                            "_path_exists_no_follow",
+                            side_effect=observed(events, "exists", True),
+                        ),
+                        mock.patch.object(
+                            self.helper,
+                            "_root_file_matches",
+                            side_effect=observed(events, "metadata", True),
+                        ),
+                        mock.patch.object(
+                            self.helper,
+                            "_load_canonical_document",
+                            side_effect=observed(events, "canonical", document),
+                        ),
+                        mock.patch.object(
+                            self.helper,
+                            "_require_content_digest",
+                            side_effect=rejected(
+                                events,
+                                "digest",
+                                f"{label}-digest-disagrees",
+                            ),
+                        ) as digest,
+                        self.assertRaises(self.helper.ProbeError) as raised,
+                    ):
+                        self.helper._load_root_stage_document(
+                            path,
+                            maximum,
+                            label,
+                        )
+                    self.assertEqual(
+                        raised.exception.code,
+                        f"{label}-digest-disagrees",
+                    )
+                    self.assertEqual(
+                        events,
+                        ["exists", "metadata", "canonical", "digest"],
+                    )
+                    digest.assert_called_once_with(document, label)
+
+                with self.subTest(filename=filename, state="valid"):
+                    events = []
+                    with (
+                        mock.patch.object(
+                            self.helper,
+                            "_path_exists_no_follow",
+                            side_effect=observed(events, "exists", True),
+                        ),
+                        mock.patch.object(
+                            self.helper,
+                            "_root_file_matches",
+                            side_effect=observed(events, "metadata", True),
+                        ),
+                        mock.patch.object(
+                            self.helper,
+                            "_load_canonical_document",
+                            side_effect=observed(events, "canonical", document),
+                        ),
+                        mock.patch.object(
+                            self.helper,
+                            "_require_content_digest",
+                            side_effect=observed(events, "digest", None),
+                        ),
+                    ):
+                        self.assertEqual(
+                            self.helper._load_root_stage_document(
+                                path,
+                                maximum,
+                                label,
+                            ),
+                            document,
+                        )
+                    self.assertEqual(
+                        events,
+                        ["exists", "metadata", "canonical", "digest"],
+                    )
+
+    def test_root_stage_document_callers_forward_exact_contracts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            stage = Path(directory) / "stage"
+            stage.mkdir()
+            plan = self.lifecycle_plan(stage)
+            state = self.lifecycle_state(plan)
+            account_binding = {"account": "exact"}
+            ownership = {"ownership": "exact"}
+            bindings = self.helper.ValidatedStageBindings(
+                account_binding,
+                ownership,
+            )
+            cases = (
+                (
+                    "account",
+                    lambda: self.helper._load_account_binding(plan, state),
+                    stage / "account.json",
+                    self.helper.MAX_ACCOUNT_BINDING_BYTES,
+                    "account-binding",
+                ),
+                (
+                    "ownership",
+                    lambda: self.helper._load_launchd_ownership_marker(
+                        plan,
+                        state,
+                    ),
+                    stage / "ownership.json",
+                    self.helper.MAX_OWNERSHIP_BYTES,
+                    "launchd-ownership-marker",
+                ),
+                (
+                    "domain-reset",
+                    lambda: self.helper._load_user_domain_reset_authorization(
+                        plan,
+                        state,
+                        account_binding,
+                        ownership,
+                        "1" * 40,
+                        eligible_context(),
+                    ),
+                    stage / "domain-reset.json",
+                    self.helper.MAX_USER_DOMAIN_RESET_BYTES,
+                    "user-domain-reset-authorization",
+                ),
+                (
+                    "home-cleanup",
+                    lambda: self.helper._load_home_cleanup_authorization(
+                        plan,
+                        state,
+                        bindings,
+                    ),
+                    stage / "home-cleanup.json",
+                    self.helper.MAX_HOME_CLEANUP_BYTES,
+                    "home-cleanup-authorization",
+                ),
+            )
+            for caller, operation, path, maximum, label in cases:
+                with (
+                    self.subTest(caller=caller),
+                    mock.patch.object(
+                        self.helper,
+                        "_load_root_stage_document",
+                        return_value=None,
+                    ) as load,
+                ):
+                    self.assertIsNone(operation())
+                load.assert_called_once_with(path, maximum, label)
 
     def test_lifecycle_command_diagnostics_are_fixed_and_do_not_persist_argv(
         self,
@@ -10803,7 +11805,12 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
     def test_home_creation_rolls_back_only_exact_empty_created_directories(
         self,
     ) -> None:
-        for label in ("first-chown", "final-metadata", "foreign-content"):
+        for label in (
+            "first-chown",
+            "home-metadata",
+            "probe-metadata",
+            "foreign-content",
+        ):
             with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
                 home = Path(directory) / "twq-0123456789ab"
                 probe = home / "launchd-probe"
@@ -10814,6 +11821,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                     home=home,
                 )
                 chown_count = 0
+                metadata_checks: list[tuple[Path, int, int, int]] = []
 
                 def chown(
                     *_args: object,
@@ -10829,32 +11837,259 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                         (expected_probe / "foreign").write_bytes(b"preserve")
                         raise OSError("synthetic second chown failure")
 
+                def directory_matches(
+                    path: Path,
+                    mode: int,
+                    uid: int,
+                    gid: int,
+                    case_label: str = label,
+                    expected_probe: Path = probe,
+                    observed: list[tuple[Path, int, int, int]] = metadata_checks,
+                ) -> bool:
+                    observed.append((path, mode, uid, gid))
+                    return case_label != "home-metadata" and not (
+                        case_label == "probe-metadata" and path == expected_probe
+                    )
+
                 metadata = (
                     mock.patch.object(
                         self.helper,
-                        "_metadata_matches",
-                        return_value=False,
+                        "_directory_matches",
+                        side_effect=directory_matches,
                     )
-                    if label == "final-metadata"
+                    if label in {"home-metadata", "probe-metadata"}
                     else nullcontext()
-                )
-                expected_error = (
-                    "home-create-new-preserved"
-                    if label == "foreign-content"
-                    else "home-create-new"
                 )
                 with (
                     mock.patch.object(self.helper.os, "chown", side_effect=chown),
                     metadata,
-                    self.assertRaisesRegex(self.helper.ProbeError, expected_error),
+                    self.assertRaises(self.helper.ProbeError) as raised,
                 ):
                     self.helper._create_disposable_home(account)
+
+                self.assertEqual(
+                    raised.exception.code,
+                    {
+                        "first-chown": "home-create-new-failed",
+                        "home-metadata": "home-create-new-disagrees",
+                        "probe-metadata": "home-create-new-disagrees",
+                        "foreign-content": "home-create-new-preserved",
+                    }[label],
+                )
+                if label in {"home-metadata", "probe-metadata"}:
+                    self.assertEqual(
+                        metadata_checks,
+                        [(home, 0o700, 502, 20)]
+                        if label == "home-metadata"
+                        else [
+                            (home, 0o700, 502, 20),
+                            (probe, 0o700, 502, 20),
+                        ],
+                    )
 
                 if label == "foreign-content":
                     self.assertTrue(home.is_dir())
                     self.assertEqual((probe / "foreign").read_bytes(), b"preserve")
                 else:
                     self.assertFalse(home.exists())
+
+    def test_home_creation_checks_generated_owner_on_home_and_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "twq-0123456789ab"
+            probe = home / "launchd-probe"
+            account = self.helper.DisposableAccount(
+                name=home.name,
+                uid=502,
+                gid=20,
+                home=home,
+            )
+            checks: list[tuple[Path, int, int, int]] = []
+
+            def directory_matches(
+                path: Path,
+                mode: int,
+                uid: int,
+                gid: int,
+            ) -> bool:
+                checks.append((path, mode, uid, gid))
+                return True
+
+            with (
+                mock.patch.object(
+                    self.helper,
+                    "_require_new_directory_no_acl",
+                ) as no_acl,
+                mock.patch.object(self.helper.os, "chown") as chown,
+                mock.patch.object(
+                    self.helper,
+                    "_directory_matches",
+                    side_effect=directory_matches,
+                ),
+            ):
+                self.helper._create_disposable_home(account)
+
+            self.assertEqual(
+                checks,
+                [
+                    (home, 0o700, 502, 20),
+                    (probe, 0o700, 502, 20),
+                ],
+            )
+            self.assertEqual(no_acl.call_count, 2)
+            self.assertEqual(
+                chown.call_args_list,
+                [
+                    mock.call(home, 502, 20, follow_symlinks=False),
+                    mock.call(probe, 502, 20, follow_symlinks=False),
+                ],
+            )
+            self.assertTrue(home.is_dir())
+            self.assertTrue(probe.is_dir())
+
+    def test_failed_child_writer_checks_generated_owner_before_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "twq-0123456789ab"
+            probe = home / "launchd-probe"
+            probe.mkdir(parents=True)
+            home.chmod(0o700)
+            probe.chmod(0o700)
+            probe_metadata = probe.lstat()
+            account = self.helper.DisposableAccount(
+                name=home.name,
+                uid=502,
+                gid=20,
+                home=home,
+            )
+            checks: list[tuple[Path, int, int, int]] = []
+            events: list[str] = []
+
+            def directory_matches(
+                path: Path,
+                mode: int,
+                uid: int,
+                gid: int,
+            ) -> bool:
+                checks.append((path, mode, uid, gid))
+                events.append("home-check" if path == home else "probe-check")
+                return True
+
+            def bounded_names(*_args: object, **_kwargs: object) -> tuple[str, ...]:
+                events.append("enumerate")
+                return ()
+
+            def write_account_file(path: Path, *_args: object) -> None:
+                events.append(f"write:{path.name}")
+
+            with (
+                mock.patch.object(
+                    self.helper,
+                    "_directory_matches",
+                    side_effect=directory_matches,
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_bounded_path_directory_names",
+                    side_effect=bounded_names,
+                ) as names,
+                mock.patch.object(
+                    self.helper,
+                    "_path_exists_no_follow",
+                    return_value=False,
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_write_account_file",
+                    side_effect=write_account_file,
+                ) as write,
+            ):
+                self.helper._ensure_failed_child_files(
+                    account,
+                    self.launchd_context(),
+                    "synthetic-child-failure",
+                    "synthetic-secondary",
+                )
+
+            self.assertEqual(
+                checks,
+                [
+                    (home, 0o700, 502, 20),
+                    (probe, 0o700, 502, 20),
+                ],
+            )
+            self.assertEqual(events[:3], ["home-check", "probe-check", "enumerate"])
+            self.assertTrue(all(event.startswith("write:") for event in events[3:]))
+            names.assert_called_once_with(
+                probe,
+                probe_metadata,
+                self.helper.MAX_LAUNCHD_PROBE_ENTRIES,
+                limit_code="home-cleanup-drift",
+                failure_code="home-cleanup-drift",
+            )
+            written = {call.args[0].name: call.args[1] for call in write.call_args_list}
+            self.assertEqual(set(written), set(self.helper.LAUNCHD_CHILD_FILES))
+            self.assertEqual(written["probe.status"], b"2\n")
+            self.assertEqual(written["probe.stdout"], b"probe-error\n")
+            self.assertEqual(
+                written["probe.stderr"],
+                b"task-witness macOS launchd-user probe: synthetic-child-failure\n",
+            )
+            probe_document = json.loads(written["probe.json"].decode())
+            self.assertEqual(
+                probe_document["error"],
+                {
+                    "code": "synthetic-child-failure",
+                    "secondary_code": "synthetic-secondary",
+                },
+            )
+            for call in write.call_args_list:
+                self.assertIs(call.args[2], account)
+
+            for rejected_check in range(2):
+                failure_events: list[str] = []
+
+                def reject_directory(
+                    path: Path,
+                    _mode: int,
+                    _uid: int,
+                    _gid: int,
+                    observed: list[str] = failure_events,
+                    rejected: int = rejected_check,
+                ) -> bool:
+                    observed.append("home-check" if path == home else "probe-check")
+                    return len(observed) - 1 != rejected
+
+                with (
+                    self.subTest(rejected_check=rejected_check),
+                    mock.patch.object(
+                        self.helper,
+                        "_directory_matches",
+                        side_effect=reject_directory,
+                    ),
+                    mock.patch.object(
+                        self.helper,
+                        "_bounded_path_directory_names",
+                    ) as failed_names,
+                    mock.patch.object(
+                        self.helper,
+                        "_write_account_file",
+                    ) as failed_write,
+                    self.assertRaises(self.helper.ProbeError) as raised,
+                ):
+                    self.helper._ensure_failed_child_files(
+                        account,
+                        self.launchd_context(),
+                        "synthetic-child-failure",
+                    )
+
+                self.assertEqual(raised.exception.code, "home-cleanup-drift")
+                self.assertEqual(
+                    failure_events,
+                    ["home-check"]
+                    if rejected_check == 0
+                    else ["home-check", "probe-check"],
+                )
+                failed_names.assert_not_called()
+                failed_write.assert_not_called()
 
     def test_home_creation_rejects_an_inherited_extended_acl(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -11217,6 +12452,251 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             ):
                 self.helper._load_launchd_ownership_marker(plan, state)
 
+    def test_exact_stage_forwards_root_metadata_contracts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            stage = Path(directory) / "stage"
+            stage.mkdir()
+            plan = self.lifecycle_plan(stage)
+            helper_raw = b"exact helper\n"
+            plist_raw = b"exact plist\n"
+            plan.helper.write_bytes(helper_raw)
+            plan.plist.write_bytes(plist_raw)
+            unsigned_state = {
+                name: value
+                for name, value in self.lifecycle_state(plan).items()
+                if name != "content_sha256"
+            }
+            unsigned_state["helper_sha256"] = hashlib.sha256(helper_raw).hexdigest()
+            unsigned_state["plist_sha256"] = hashlib.sha256(plist_raw).hexdigest()
+            state = self.helper._document_with_digest(unsigned_state)
+            (stage / "state.json").write_bytes(self.helper.canonical_bytes(state))
+
+            with (
+                mock.patch.object(
+                    self.helper,
+                    "_directory_matches",
+                    return_value=True,
+                ) as directory_matches,
+                mock.patch.object(
+                    self.helper,
+                    "_root_file_matches",
+                    return_value=True,
+                ) as root_file_matches,
+                mock.patch.object(
+                    self.helper,
+                    "_load_account_binding",
+                    return_value=None,
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_load_launchd_ownership_marker",
+                    return_value=None,
+                ),
+            ):
+                self.assertEqual(
+                    self.helper._validate_exact_stage(plan, state),
+                    self.helper.ValidatedStageBindings(None, None),
+                )
+
+            directory_matches.assert_called_once_with(stage, 0o755, 0, 0)
+            self.assertEqual(
+                root_file_matches.call_args_list,
+                [
+                    mock.call(plan.helper, 0o555),
+                    mock.call(plan.plist, 0o644),
+                ],
+            )
+
+            for label, directory_result, root_results, expected_root_calls in (
+                ("unsafe-stage", False, (), []),
+                ("unsafe-helper", True, (False,), [mock.call(plan.helper, 0o555)]),
+                (
+                    "unsafe-plist",
+                    True,
+                    (True, False),
+                    [
+                        mock.call(plan.helper, 0o555),
+                        mock.call(plan.plist, 0o644),
+                    ],
+                ),
+            ):
+                with (
+                    self.subTest(label=label),
+                    mock.patch.object(
+                        self.helper,
+                        "_directory_matches",
+                        return_value=directory_result,
+                    ) as rejected_directory,
+                    mock.patch.object(
+                        self.helper,
+                        "_root_file_matches",
+                        side_effect=root_results,
+                    ) as rejected_files,
+                    mock.patch.object(
+                        self.helper,
+                        "_read_stable_regular_file",
+                    ) as stable_read,
+                    mock.patch.object(
+                        self.helper,
+                        "_load_account_binding",
+                    ) as load_account,
+                    mock.patch.object(
+                        self.helper,
+                        "_load_launchd_ownership_marker",
+                    ) as load_ownership,
+                    mock.patch.object(
+                        self.helper,
+                        "_load_user_domain_reset_authorization",
+                    ) as load_reset,
+                    mock.patch.object(
+                        self.helper,
+                        "_load_home_cleanup_authorization",
+                    ) as load_home_cleanup,
+                    mock.patch.object(Path, "unlink") as path_unlink,
+                    mock.patch.object(self.helper.os, "unlink") as unlink,
+                    mock.patch.object(self.helper.os, "rmdir") as rmdir,
+                    mock.patch.object(self.helper.os, "rename") as rename,
+                    self.assertRaises(self.helper.ProbeError) as raised,
+                ):
+                    self.helper._validate_exact_stage(plan, state)
+
+                self.assertEqual(raised.exception.code, "stage-cleanup-drift")
+                rejected_directory.assert_called_once_with(stage, 0o755, 0, 0)
+                self.assertEqual(rejected_files.call_args_list, expected_root_calls)
+                stable_read.assert_not_called()
+                load_account.assert_not_called()
+                load_ownership.assert_not_called()
+                load_reset.assert_not_called()
+                load_home_cleanup.assert_not_called()
+                path_unlink.assert_not_called()
+                unlink.assert_not_called()
+                rmdir.assert_not_called()
+                rename.assert_not_called()
+
+    def test_lifecycle_state_checks_root_metadata_before_content(self) -> None:
+        stage = Path("/private/var/tmp/task-witness-macos-launchd-123456789-2")
+        state_path = stage / "state.json"
+        with (
+            mock.patch.object(
+                self.helper,
+                "_root_file_matches",
+                return_value=False,
+            ) as matches,
+            mock.patch.object(
+                self.helper,
+                "_load_canonical_document",
+            ) as canonical,
+            mock.patch.object(
+                self.helper,
+                "_require_content_digest",
+            ) as digest,
+            self.assertRaises(self.helper.ProbeError) as raised,
+        ):
+            self.helper._load_lifecycle_state(
+                stage,
+                runner_uid=501,
+                runner_gid=20,
+                environment=eligible_context(),
+            )
+        self.assertEqual(raised.exception.code, "lifecycle-state-drift")
+        self.assertIsNone(raised.exception.secondary_code)
+        matches.assert_called_once_with(state_path, 0o600)
+        canonical.assert_not_called()
+        digest.assert_not_called()
+
+    def test_precleanup_artifact_forwards_root_metadata_contracts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = Path(directory) / "artifact"
+            artifact.mkdir()
+            expected = set(self.helper.LAUNCHD_ARTIFACT_FILES) - {"cleanup.json"}
+            for name in expected:
+                (artifact / name).write_bytes(b"")
+
+            with (
+                mock.patch.object(
+                    self.helper,
+                    "_directory_matches",
+                    return_value=True,
+                ) as directory_matches,
+                mock.patch.object(
+                    self.helper,
+                    "_root_file_matches",
+                    return_value=True,
+                ) as root_file_matches,
+            ):
+                self.helper._validate_precleanup_artifact(artifact)
+
+            directory_matches.assert_called_once_with(artifact, 0o700, 0, 0)
+            self.assertCountEqual(
+                root_file_matches.call_args_list,
+                [mock.call(artifact / name, 0o600) for name in expected],
+            )
+
+            before = {path.name: path.read_bytes() for path in artifact.iterdir()}
+            for label, directory_result, rejected_name in (
+                ("unsafe-root", False, None),
+                *((f"unsafe-{name}", True, name) for name in sorted(expected)),
+            ):
+
+                def file_matches(
+                    path: Path,
+                    _mode: int,
+                    selected: str | None = rejected_name,
+                ) -> bool:
+                    return path.name != selected
+
+                with (
+                    self.subTest(label=label),
+                    mock.patch.object(
+                        self.helper,
+                        "_directory_matches",
+                        return_value=directory_result,
+                    ) as rejected_directory,
+                    mock.patch.object(
+                        self.helper,
+                        "_root_file_matches",
+                        side_effect=file_matches,
+                    ) as rejected_files,
+                    mock.patch.object(self.helper, "_write_root_file") as write,
+                    mock.patch.object(self.helper.os, "chown") as chown,
+                    mock.patch.object(Path, "unlink") as path_unlink,
+                    mock.patch.object(self.helper.os, "unlink") as unlink,
+                    mock.patch.object(self.helper.os, "rmdir") as rmdir,
+                    mock.patch.object(self.helper.os, "rename") as rename,
+                    self.assertRaises(self.helper.ProbeError) as raised,
+                ):
+                    self.helper._validate_precleanup_artifact(artifact)
+
+                self.assertEqual(
+                    raised.exception.code,
+                    "launchd-artifact-precleanup-drift",
+                )
+                rejected_directory.assert_called_once_with(artifact, 0o700, 0, 0)
+                if rejected_name is None:
+                    rejected_files.assert_not_called()
+                else:
+                    self.assertEqual(
+                        rejected_files.call_args_list[-1],
+                        mock.call(artifact / rejected_name, 0o600),
+                    )
+                    self.assertEqual(
+                        sum(
+                            call == mock.call(artifact / rejected_name, 0o600)
+                            for call in rejected_files.call_args_list
+                        ),
+                        1,
+                    )
+                write.assert_not_called()
+                chown.assert_not_called()
+                path_unlink.assert_not_called()
+                unlink.assert_not_called()
+                rmdir.assert_not_called()
+                rename.assert_not_called()
+                self.assertEqual(
+                    {path.name: path.read_bytes() for path in artifact.iterdir()},
+                    before,
+                )
+
     def test_stage_inventory_requires_account_binding_before_launchd_ownership(
         self,
     ) -> None:
@@ -11254,6 +12734,86 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                     self.helper._validate_exact_stage(plan, state),
                     self.helper.ValidatedStageBindings(None, None),
                 )
+
+                (stage / "state.json").unlink()
+                with (
+                    mock.patch.object(
+                        self.helper,
+                        "_read_stable_regular_file",
+                    ) as stable_read,
+                    mock.patch.object(
+                        self.helper,
+                        "_load_account_binding",
+                    ) as load_account,
+                    mock.patch.object(
+                        self.helper,
+                        "_load_launchd_ownership_marker",
+                    ) as load_ownership,
+                    mock.patch.object(
+                        self.helper,
+                        "_load_user_domain_reset_authorization",
+                    ) as load_reset,
+                    mock.patch.object(
+                        self.helper,
+                        "_load_home_cleanup_authorization",
+                    ) as load_home_cleanup,
+                    mock.patch.object(self.helper.os, "unlink") as unlink,
+                    mock.patch.object(self.helper.os, "rmdir") as rmdir,
+                    mock.patch.object(Path, "unlink") as path_unlink,
+                    self.assertRaises(self.helper.ProbeError) as raised,
+                ):
+                    self.helper._validate_exact_stage(plan, state)
+                self.assertEqual(raised.exception.code, "stage-cleanup-drift")
+                stable_read.assert_not_called()
+                load_account.assert_not_called()
+                load_ownership.assert_not_called()
+                load_reset.assert_not_called()
+                load_home_cleanup.assert_not_called()
+                unlink.assert_not_called()
+                rmdir.assert_not_called()
+                path_unlink.assert_not_called()
+                (stage / "state.json").write_bytes(self.helper.canonical_bytes(state))
+
+                unknown = stage / "private-unknown-stage-canary"
+                unknown.write_bytes(b"preserve")
+                with (
+                    mock.patch.object(
+                        self.helper,
+                        "_read_stable_regular_file",
+                    ) as stable_read,
+                    mock.patch.object(
+                        self.helper,
+                        "_load_account_binding",
+                    ) as load_account,
+                    mock.patch.object(
+                        self.helper,
+                        "_load_launchd_ownership_marker",
+                    ) as load_ownership,
+                    mock.patch.object(
+                        self.helper,
+                        "_load_user_domain_reset_authorization",
+                    ) as load_reset,
+                    mock.patch.object(
+                        self.helper,
+                        "_load_home_cleanup_authorization",
+                    ) as load_home_cleanup,
+                    mock.patch.object(self.helper.os, "unlink") as unlink,
+                    mock.patch.object(self.helper.os, "rmdir") as rmdir,
+                    mock.patch.object(Path, "unlink") as path_unlink,
+                    self.assertRaises(self.helper.ProbeError) as raised,
+                ):
+                    self.helper._validate_exact_stage(plan, state)
+                self.assertEqual(raised.exception.code, "stage-cleanup-drift")
+                stable_read.assert_not_called()
+                load_account.assert_not_called()
+                load_ownership.assert_not_called()
+                load_reset.assert_not_called()
+                load_home_cleanup.assert_not_called()
+                unlink.assert_not_called()
+                rmdir.assert_not_called()
+                path_unlink.assert_not_called()
+                self.assertEqual(unknown.read_bytes(), b"preserve")
+                unknown.unlink()
 
                 (stage / "ownership.json").write_bytes(
                     self.helper.canonical_bytes(ownership)
@@ -11364,6 +12924,59 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                             journal,
                         ),
                     )
+
+                (stage / "domain-reset.json").write_bytes(
+                    b"private-reset-without-ownership-canary"
+                )
+                (stage / "account.json").write_bytes(
+                    b"private-malformed-account-canary"
+                )
+                for home_cleanup_present in (True, False):
+                    with self.subTest(
+                        reset_without_ownership=True,
+                        home_cleanup_present=home_cleanup_present,
+                    ):
+                        if not home_cleanup_present:
+                            (stage / "home-cleanup.json").unlink()
+                        with (
+                            mock.patch.object(
+                                self.helper,
+                                "_load_account_binding",
+                                return_value=account_binding,
+                            ) as load_account,
+                            mock.patch.object(
+                                self.helper,
+                                "_load_launchd_ownership_marker",
+                                return_value=None,
+                            ) as load_ownership,
+                            mock.patch.object(
+                                self.helper,
+                                "_load_user_domain_reset_authorization",
+                                return_value=reset,
+                            ) as load_reset,
+                            mock.patch.object(
+                                self.helper,
+                                "_load_home_cleanup_authorization",
+                                return_value=journal,
+                            ) as load_home_cleanup,
+                            self.assertRaises(self.helper.ProbeError) as raised,
+                        ):
+                            self.helper._validate_exact_stage(
+                                plan,
+                                state,
+                                user_domain_reset_authorization="1" * 40,
+                                environment=eligible_context(),
+                            )
+                        self.assertEqual(
+                            raised.exception.code,
+                            "stage-cleanup-drift",
+                        )
+                        load_account.assert_not_called()
+                        load_ownership.assert_not_called()
+                        load_reset.assert_not_called()
+                        load_home_cleanup.assert_not_called()
+                (stage / "domain-reset.json").unlink()
+                (stage / "home-cleanup.json").write_bytes(b"exact home cleanup marker")
 
                 (stage / "account.json").unlink()
                 with self.assertRaisesRegex(
@@ -11897,6 +13510,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 account_name, label = self.helper._launchd_identity(context)
                 home = Path("/Users") / account_name
                 writes: list[str] = []
+                root_file_checks: list[tuple[str, int]] = []
 
                 def fail_initialization(
                     path: Path,
@@ -11918,11 +13532,24 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                         path.chmod(mode)
                     raise self.helper.ProbeError("synthetic-initialization-failure")
 
+                def root_file_matches(
+                    path: Path,
+                    mode: int,
+                    observed_checks: list[tuple[str, int]] = root_file_checks,
+                ) -> bool:
+                    observed_checks.append((path.name, mode))
+                    return True
+
                 with (
                     mock.patch.dict(os.environ, context, clear=True),
                     mock.patch.object(self.helper, "__file__", str(helper)),
                     mock.patch.object(
                         self.helper, "_metadata_matches", return_value=True
+                    ),
+                    mock.patch.object(
+                        self.helper,
+                        "_root_file_matches",
+                        side_effect=root_file_matches,
                     ),
                     mock.patch.object(
                         self.helper,
@@ -11966,6 +13593,22 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                     ["job.plist"]
                     if failure_point in {"before-state", "job-write-post-create"}
                     else ["job.plist", "state.json"],
+                )
+                self.assertEqual(
+                    [
+                        check
+                        for check in root_file_checks
+                        if check[0] in {"job.plist", "state.json"}
+                    ],
+                    {
+                        "before-state": [],
+                        "job-write-post-create": [("job.plist", 0o644)],
+                        "state-write-rollback": [("job.plist", 0o644)],
+                        "state-write-post-create": [
+                            ("state.json", 0o600),
+                            ("job.plist", 0o644),
+                        ],
+                    }[failure_point],
                 )
                 self.assertEqual(
                     {entry.name for entry in stage.iterdir()}, {"helper.py"}
@@ -12048,6 +13691,105 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 create_account.assert_not_called()
                 remove_home.assert_not_called()
                 write_artifact.assert_not_called()
+
+    def test_initialization_rollback_preserves_metadata_or_byte_drift(self) -> None:
+        for label, metadata_matches in (
+            ("metadata-drift", False),
+            ("byte-drift", True),
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                stage = Path(directory) / "stage"
+                stage.mkdir()
+                published_bytes: list[bytes] = []
+                published_maximum: list[int] = []
+
+                def fail_after_publish(
+                    path: Path,
+                    raw: bytes,
+                    mode: int,
+                    selected_label: str = label,
+                    observed_bytes: list[bytes] = published_bytes,
+                    observed_maximum: list[int] = published_maximum,
+                ) -> None:
+                    observed = (
+                        raw if selected_label == "metadata-drift" else b"x" + raw[1:]
+                    )
+                    path.write_bytes(observed)
+                    path.chmod(mode)
+                    observed_bytes.append(observed)
+                    observed_maximum.append(len(raw))
+                    raise self.helper.ProbeError("synthetic-initialization-failure")
+
+                def read_published(
+                    *_args: object,
+                    observed_bytes: list[bytes] = published_bytes,
+                    **_kwargs: object,
+                ) -> bytes:
+                    return observed_bytes[0]
+
+                account_name = "twq-0123456789ab"
+                launchd_label = "io.nisavid.task-witness.macos-probe.0123456789ab"
+                with (
+                    mock.patch.object(self.helper, "_require_nonroot_runner_gid"),
+                    mock.patch.object(
+                        self.helper,
+                        "validate_prestaged_helper",
+                        return_value=b"trusted helper",
+                    ),
+                    mock.patch.object(self.helper, "_list_accounts", return_value={}),
+                    mock.patch.object(self.helper, "_process_records", return_value=()),
+                    mock.patch.object(
+                        self.helper,
+                        "choose_disposable_uid",
+                        return_value=502,
+                    ),
+                    mock.patch.object(
+                        self.helper,
+                        "_launchd_identity",
+                        return_value=(account_name, launchd_label),
+                    ),
+                    mock.patch.object(
+                        self.helper,
+                        "_write_root_file",
+                        side_effect=fail_after_publish,
+                    ),
+                    mock.patch.object(
+                        self.helper,
+                        "_root_file_matches",
+                        return_value=metadata_matches,
+                    ) as rollback_matches,
+                    mock.patch.object(
+                        self.helper,
+                        "_read_stable_regular_file",
+                        side_effect=read_published,
+                    ) as rollback_read,
+                    mock.patch.object(Path, "unlink") as rollback_unlink,
+                    self.assertRaises(self.helper.ProbeError) as raised,
+                ):
+                    self.helper._initialize_lifecycle(
+                        stage_root=stage,
+                        expected_helper_sha256="1" * 64,
+                        runner_uid=501,
+                        runner_gid=20,
+                        environment=self.launchd_context(),
+                    )
+
+                path = stage / "job.plist"
+                self.assertEqual(
+                    raised.exception.code,
+                    "stage-initialization-preserved",
+                )
+                rollback_matches.assert_called_once_with(path, 0o644)
+                if metadata_matches:
+                    rollback_read.assert_called_once_with(
+                        path,
+                        published_maximum[0],
+                        "partial-stage-file",
+                    )
+                else:
+                    rollback_read.assert_not_called()
+                rollback_unlink.assert_not_called()
+                self.assertEqual(path.read_bytes(), published_bytes[0])
 
     def test_helper_only_cleanup_preserves_every_unproven_boundary(self) -> None:
         cases = (
@@ -12588,7 +14330,11 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                     remove_exact_disposable_home=mock.DEFAULT,
                     launchd_artifact_payloads=mock.DEFAULT,
                 ) as mutations,
-                mock.patch.object(self.helper, "_metadata_matches", return_value=True),
+                mock.patch.object(
+                    self.helper,
+                    "_directory_matches",
+                    return_value=True,
+                ) as artifact_matches,
                 mock.patch.object(self.helper, "_write_root_file") as write_cleanup,
                 mock.patch.object(self.helper.os, "chown") as transfer_artifact,
                 redirect_stderr(stderr),
@@ -12616,6 +14362,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             mutations["remove_exact_disposable_home"].assert_not_called()
             mutations["launchd_artifact_payloads"].assert_not_called()
             transfer_artifact.assert_not_called()
+            artifact_matches.assert_called_once_with(artifact, 0o700, 0, 0)
             self.assertEqual(
                 {entry.name: entry.read_bytes() for entry in stage.iterdir()},
                 stage_before,
@@ -12636,6 +14383,88 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 "task-witness macOS launchd-user cleanup: "
                 "disposable-user-pid1-parented-processes-remain\n",
             )
+
+    def test_cleanup_failure_record_requires_safe_root_and_absent_record(self) -> None:
+        for label, root_matches, cleanup_exists in (
+            ("unsafe-root", False, False),
+            ("preexisting-cleanup", True, True),
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                stage = root / "stage"
+                artifact = root / "artifact"
+                stage.mkdir()
+                artifact.mkdir()
+                preserved = artifact / (
+                    "cleanup.json" if cleanup_exists else "private-canary"
+                )
+                preserved.write_bytes(b"preserve")
+                before = {path.name: path.read_bytes() for path in artifact.iterdir()}
+                stderr = io.StringIO()
+
+                with (
+                    mock.patch.dict(os.environ, eligible_context(), clear=True),
+                    mock.patch.object(self.helper, "_normalized_context"),
+                    mock.patch.object(self.helper, "_validate_lifecycle_arguments"),
+                    mock.patch.object(
+                        self.helper,
+                        "_cleanup_helper_only_stage_before_state",
+                        return_value=False,
+                    ),
+                    mock.patch.object(
+                        self.helper,
+                        "_load_lifecycle_state",
+                        side_effect=self.helper.ProbeError("synthetic-cleanup-failure"),
+                    ),
+                    mock.patch.object(
+                        self.helper,
+                        "_directory_matches",
+                        return_value=root_matches,
+                    ) as artifact_matches,
+                    mock.patch.object(
+                        self.helper,
+                        "_path_exists_no_follow",
+                        return_value=cleanup_exists,
+                    ) as cleanup_probe,
+                    mock.patch.object(self.helper, "_write_root_file") as write,
+                    mock.patch.object(self.helper.os, "chown") as chown,
+                    mock.patch.object(Path, "unlink") as path_unlink,
+                    mock.patch.object(self.helper.os, "unlink") as unlink,
+                    mock.patch.object(self.helper.os, "rmdir") as rmdir,
+                    mock.patch.object(self.helper.os, "rename") as rename,
+                    redirect_stderr(stderr),
+                ):
+                    self.assertEqual(
+                        self.helper.cleanup_launchd_user_lifecycle(
+                            stage_root=stage,
+                            artifact_root=artifact,
+                            expected_helper_sha256="1" * 64,
+                            runner_uid=501,
+                            runner_gid=20,
+                        ),
+                        2,
+                    )
+
+                artifact_matches.assert_called_once_with(artifact, 0o700, 0, 0)
+                if root_matches:
+                    cleanup_probe.assert_called_once_with(artifact / "cleanup.json")
+                else:
+                    cleanup_probe.assert_not_called()
+                write.assert_not_called()
+                chown.assert_not_called()
+                path_unlink.assert_not_called()
+                unlink.assert_not_called()
+                rmdir.assert_not_called()
+                rename.assert_not_called()
+                self.assertEqual(
+                    {path.name: path.read_bytes() for path in artifact.iterdir()},
+                    before,
+                )
+                self.assertEqual(
+                    stderr.getvalue(),
+                    "task-witness macOS launchd-user cleanup: "
+                    "synthetic-cleanup-failure\n",
+                )
 
     def test_cleanup_revalidates_uid_immediately_before_account_delete(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -13436,30 +15265,59 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             expected = hashlib.sha256(helper.read_bytes()).hexdigest()
             source.write_bytes(b"post-check replacement\n")
 
-            with mock.patch.object(
-                self.helper,
-                "_metadata_matches",
-                return_value=True,
+            with (
+                mock.patch.object(
+                    self.helper,
+                    "_directory_matches",
+                    return_value=True,
+                ) as directory_matches,
+                mock.patch.object(
+                    self.helper,
+                    "_root_file_matches",
+                    return_value=True,
+                ) as root_file_matches,
             ):
                 self.assertEqual(
                     self.helper.validate_prestaged_helper(stage, expected),
                     b"trusted helper\n",
                 )
+            directory_matches.assert_called_once_with(stage, 0o755, 0, 0)
+            root_file_matches.assert_called_once_with(helper, 0o555)
 
-            for label, expected_metadata in (
-                ("owner", False),
-                ("mode", False),
+            for label, stage_matches, helper_matches in (
+                ("unsafe-stage", False, True),
+                ("unsafe-helper", True, False),
             ):
                 with (
                     self.subTest(label=label),
                     mock.patch.object(
                         self.helper,
-                        "_metadata_matches",
-                        return_value=expected_metadata,
-                    ),
-                    self.assertRaises(self.helper.ProbeError),
+                        "_directory_matches",
+                        return_value=stage_matches,
+                    ) as directory_matches,
+                    mock.patch.object(
+                        self.helper,
+                        "_root_file_matches",
+                        return_value=helper_matches,
+                    ) as root_file_matches,
+                    mock.patch.object(
+                        self.helper,
+                        "_read_stable_regular_file",
+                    ) as read_helper,
+                    self.assertRaises(self.helper.ProbeError) as raised,
                 ):
                     self.helper.validate_prestaged_helper(stage, expected)
+                self.assertEqual(
+                    raised.exception.code,
+                    "staged-helper-metadata-drift",
+                )
+                directory_matches.assert_called_once_with(stage, 0o755, 0, 0)
+                if stage_matches:
+                    root_file_matches.assert_called_once_with(helper, 0o555)
+                else:
+                    root_file_matches.assert_not_called()
+                read_helper.assert_not_called()
+                self.assertEqual(helper.read_bytes(), b"trusted helper\n")
 
             with (
                 mock.patch.object(

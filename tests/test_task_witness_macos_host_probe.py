@@ -2372,6 +2372,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             mock.patch.object(self.helper, "_require_launchd_absent") as job_absent,
             mock.patch.object(self.helper, "_create_disposable_account"),
             mock.patch.object(self.helper, "_create_disposable_home"),
+            mock.patch.object(self.helper, "_validate_disposable_home_root"),
             mock.patch.object(
                 self.helper,
                 "_require_disposable_uid_available",
@@ -3562,19 +3563,51 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             "disposition": "performed",
             "precondition": "disposable-user-pid1-parented-processes-remain",
         }
+        events: list[str] = []
 
         def command(argv: list[str], **_kwargs: object) -> str:
             if argv[:3] == ["/bin/launchctl", "bootstrap", "system"]:
+                events.append("bootstrap")
                 return ""
             if argv[:3] == ["/bin/launchctl", "kickstart", "-p"]:
+                events.append("kickstart")
                 return "4321"
             if argv == [
                 "/bin/launchctl",
                 "bootout",
                 f"system/{plan.label}",
             ]:
+                events.append("bootout")
                 return ""
             raise AssertionError(argv)
+
+        def create_home(_account: object) -> None:
+            events.append("create-home")
+
+        def validate_root(
+            _account: object,
+            *,
+            diagnostic_phase: str,
+        ) -> None:
+            events.append(f"validate:{diagnostic_phase}")
+
+        def write_marker(_plan: object, _state: object) -> None:
+            events.append("write-marker")
+
+        def poll_terminal(
+            _plan: object,
+            _state: object,
+        ) -> tuple[str, int]:
+            events.append("poll-terminal")
+            return loaded, 0
+
+        def load_child_probe(*_args: object, **_kwargs: object) -> dict[str, object]:
+            events.append("load-child-probe")
+            return {"observations": {"process": {"pid": 4321}}}
+
+        def quiesce_user(*_args: object, **_kwargs: object) -> dict[str, str]:
+            events.append("quiesce")
+            return reset_evidence
 
         with (
             mock.patch.dict(os.environ, self.launchd_context(), clear=True),
@@ -3592,7 +3625,16 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 return_value=self.helper.ValidatedStageBindings(None, None),
             ),
             mock.patch.object(self.helper, "_create_disposable_account"),
-            mock.patch.object(self.helper, "_create_disposable_home"),
+            mock.patch.object(
+                self.helper,
+                "_create_disposable_home",
+                side_effect=create_home,
+            ),
+            mock.patch.object(
+                self.helper,
+                "_validate_disposable_home_root",
+                side_effect=validate_root,
+            ) as validate_home_root,
             mock.patch.object(self.helper, "_require_disposable_uid_available"),
             mock.patch.object(self.helper, "_require_launchd_absent"),
             mock.patch.object(
@@ -3600,7 +3642,11 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 "_require_command_success",
                 side_effect=command,
             ),
-            mock.patch.object(self.helper, "_write_launchd_ownership_marker"),
+            mock.patch.object(
+                self.helper,
+                "_write_launchd_ownership_marker",
+                side_effect=write_marker,
+            ),
             mock.patch.object(
                 self.helper,
                 "_launchd_job_snapshot",
@@ -3609,17 +3655,17 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             mock.patch.object(
                 self.helper,
                 "_poll_launchd_terminal",
-                return_value=(loaded, 0),
+                side_effect=poll_terminal,
             ),
             mock.patch.object(
                 self.helper,
                 "_load_canonical_document",
-                return_value={"observations": {"process": {"pid": 4321}}},
+                side_effect=load_child_probe,
             ),
             mock.patch.object(
                 self.helper,
                 "_quiesce_disposable_user",
-                return_value=reset_evidence,
+                side_effect=quiesce_user,
             ) as quiesce,
             mock.patch.object(self.helper, "_write_lifecycle_artifact") as write,
         ):
@@ -3640,7 +3686,375 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
         self.assertEqual(write.call_args.kwargs["domain_reset"], reset_evidence)
         self.assertTrue(quiesce.call_args.kwargs["allow_create"])
         self.assertEqual(quiesce.call_args.args[3], "1" * 40)
+        self.assertEqual(
+            events,
+            [
+                "create-home",
+                "validate:post-home-create",
+                "bootstrap",
+                "validate:post-system-bootstrap",
+                "write-marker",
+                "kickstart",
+                "poll-terminal",
+                "load-child-probe",
+                "validate:post-child-terminal",
+                "bootout",
+                "validate:post-system-bootout",
+                "quiesce",
+            ],
+        )
+        self.assertTrue(
+            all(
+                call.args == (plan.account,)
+                for call in validate_home_root.call_args_list
+            )
+        )
         self.assertNotIn(secret, repr(write.call_args.kwargs))
+
+    def test_lifecycle_home_checkpoint_failures_preserve_order_and_precedence(
+        self,
+    ) -> None:
+        plan = self.lifecycle_plan(
+            Path("/private/var/tmp/task-witness-macos-launchd-123456789-2")
+        )
+        state = self.lifecycle_state(plan)
+        loaded = self.launchctl_job(plan, state)
+        reset_evidence = self.helper._domain_reset_evidence(None)
+        success_prefix = [
+            "create-home",
+            "validate:post-home-create",
+            "bootstrap",
+            "validate:post-system-bootstrap",
+            "write-marker",
+            "kickstart",
+            "poll-terminal",
+            "load-child-probe",
+            "validate:post-child-terminal",
+            "bootout",
+            "validate:post-system-bootout",
+            "quiesce",
+        ]
+        expected_events = {
+            "post-home-create": success_prefix[:2],
+            "post-system-bootstrap": [
+                *success_prefix[:4],
+                "bootout",
+                "validate:post-system-bootout",
+                "quiesce",
+            ],
+            "post-child-terminal": success_prefix[:9] + success_prefix[9:],
+            "post-system-bootout": success_prefix,
+        }
+
+        for failing_phase, events_expected in expected_events.items():
+            with self.subTest(failing_phase=failing_phase):
+                events: list[str] = []
+                phase_code = (
+                    f"home-cleanup-{failing_phase}-"
+                    "home-entry-known-library-owned-directory"
+                )
+
+                def command(
+                    argv: list[str],
+                    _events: list[str] = events,
+                    **_kwargs: object,
+                ) -> str:
+                    if argv[:3] == ["/bin/launchctl", "bootstrap", "system"]:
+                        _events.append("bootstrap")
+                        return ""
+                    if argv[:3] == ["/bin/launchctl", "kickstart", "-p"]:
+                        _events.append("kickstart")
+                        return "4321"
+                    raise AssertionError(argv)
+
+                def validate_root(
+                    _account: object,
+                    *,
+                    diagnostic_phase: str,
+                    _events: list[str] = events,
+                    _failing_phase: str = failing_phase,
+                    _phase_code: str = phase_code,
+                ) -> None:
+                    _events.append(f"validate:{diagnostic_phase}")
+                    if diagnostic_phase == _failing_phase:
+                        raise self.helper.ProbeError(_phase_code)
+
+                def poll_terminal(
+                    _plan: object,
+                    _state: object,
+                    _events: list[str] = events,
+                ) -> tuple[str, int]:
+                    _events.append("poll-terminal")
+                    return loaded, 0
+
+                def load_child_probe(
+                    *_args: object,
+                    _events: list[str] = events,
+                    **_kwargs: object,
+                ) -> dict[str, object]:
+                    _events.append("load-child-probe")
+                    return {"observations": {"process": {"pid": 4321}}}
+
+                def quiesce_user(
+                    *_args: object,
+                    _events: list[str] = events,
+                    **_kwargs: object,
+                ) -> dict[str, object]:
+                    _events.append("quiesce")
+                    return reset_evidence
+
+                with ExitStack() as stack:
+                    stack.enter_context(
+                        mock.patch.dict(
+                            os.environ,
+                            self.launchd_context(),
+                            clear=True,
+                        )
+                    )
+                    for name in (
+                        "_normalized_context",
+                        "_validate_lifecycle_arguments",
+                        "_create_root_directory",
+                        "_create_disposable_account",
+                        "_require_disposable_uid_available",
+                        "_require_launchd_absent",
+                        "_ensure_failed_child_files",
+                    ):
+                        stack.enter_context(mock.patch.object(self.helper, name))
+                    stack.enter_context(
+                        mock.patch.object(
+                            self.helper,
+                            "_load_lifecycle_state",
+                            return_value=(plan, state),
+                        )
+                    )
+                    stack.enter_context(
+                        mock.patch.object(
+                            self.helper,
+                            "_validate_exact_stage",
+                            return_value=self.helper.ValidatedStageBindings(None, None),
+                        )
+                    )
+                    stack.enter_context(
+                        mock.patch.object(
+                            self.helper,
+                            "_create_disposable_home",
+                            side_effect=lambda _account, _events=events: _events.append(
+                                "create-home"
+                            ),
+                        )
+                    )
+                    stack.enter_context(
+                        mock.patch.object(
+                            self.helper,
+                            "_validate_disposable_home_root",
+                            side_effect=validate_root,
+                        )
+                    )
+                    stack.enter_context(
+                        mock.patch.object(
+                            self.helper,
+                            "_require_command_success",
+                            side_effect=command,
+                        )
+                    )
+                    stack.enter_context(
+                        mock.patch.object(
+                            self.helper,
+                            "_write_launchd_ownership_marker",
+                            side_effect=lambda *_args, _events=events: _events.append(
+                                "write-marker"
+                            ),
+                        )
+                    )
+                    stack.enter_context(
+                        mock.patch.object(
+                            self.helper,
+                            "_launchd_job_snapshot",
+                            return_value=loaded,
+                        )
+                    )
+                    stack.enter_context(
+                        mock.patch.object(
+                            self.helper,
+                            "_poll_launchd_terminal",
+                            side_effect=poll_terminal,
+                        )
+                    )
+                    stack.enter_context(
+                        mock.patch.object(
+                            self.helper,
+                            "_load_canonical_document",
+                            side_effect=load_child_probe,
+                        )
+                    )
+                    stack.enter_context(
+                        mock.patch.object(
+                            self.helper,
+                            "_reconcile_in_process_bootstrap",
+                            side_effect=lambda *_args, _events=events: _events.append(
+                                "bootout"
+                            ),
+                        )
+                    )
+                    quiesce = stack.enter_context(
+                        mock.patch.object(
+                            self.helper,
+                            "_quiesce_disposable_user",
+                            side_effect=quiesce_user,
+                        )
+                    )
+                    write = stack.enter_context(
+                        mock.patch.object(
+                            self.helper,
+                            "_write_lifecycle_artifact",
+                        )
+                    )
+                    stack.enter_context(redirect_stderr(io.StringIO()))
+                    status = self.helper.run_launchd_user_lifecycle(
+                        stage_root=plan.stage_root,
+                        artifact_root=Path("/private/tmp/artifact"),
+                        candidate_sha=FROZEN_CANDIDATE_SHA,
+                        runner_uid=501,
+                        runner_gid=20,
+                        user_domain_reset_authorization="1" * 40,
+                    )
+
+                self.assertEqual(status, 2)
+                self.assertEqual(events, events_expected)
+                self.assertEqual(write.call_args.kwargs["error_code"], phase_code)
+                self.assertIsNone(write.call_args.kwargs["secondary_error_code"])
+                if failing_phase == "post-home-create":
+                    quiesce.assert_not_called()
+                else:
+                    self.assertFalse(quiesce.call_args.kwargs["allow_create"])
+
+        events = []
+        primary = "passwordless-sudo-probe-failed"
+        post_bootout = (
+            "home-cleanup-post-system-bootout-home-entry-known-library-owned-directory"
+        )
+
+        def command_with_terminal_error(
+            argv: list[str],
+            **_kwargs: object,
+        ) -> str:
+            if argv[:3] == ["/bin/launchctl", "bootstrap", "system"]:
+                events.append("bootstrap")
+                return ""
+            if argv[:3] == ["/bin/launchctl", "kickstart", "-p"]:
+                events.append("kickstart")
+                return "4321"
+            raise AssertionError(argv)
+
+        def validate_after_primary(
+            _account: object,
+            *,
+            diagnostic_phase: str,
+        ) -> None:
+            events.append(f"validate:{diagnostic_phase}")
+            if diagnostic_phase == "post-system-bootout":
+                raise self.helper.ProbeError(post_bootout)
+
+        with (
+            mock.patch.dict(os.environ, self.launchd_context(), clear=True),
+            mock.patch.object(self.helper, "_normalized_context"),
+            mock.patch.object(self.helper, "_validate_lifecycle_arguments"),
+            mock.patch.object(self.helper, "_create_root_directory"),
+            mock.patch.object(
+                self.helper,
+                "_load_lifecycle_state",
+                return_value=(plan, state),
+            ),
+            mock.patch.object(
+                self.helper,
+                "_validate_exact_stage",
+                return_value=self.helper.ValidatedStageBindings(None, None),
+            ),
+            mock.patch.object(self.helper, "_create_disposable_account"),
+            mock.patch.object(
+                self.helper,
+                "_create_disposable_home",
+                side_effect=lambda _account: events.append("create-home"),
+            ),
+            mock.patch.object(
+                self.helper,
+                "_validate_disposable_home_root",
+                side_effect=validate_after_primary,
+            ),
+            mock.patch.object(self.helper, "_require_disposable_uid_available"),
+            mock.patch.object(self.helper, "_require_launchd_absent"),
+            mock.patch.object(
+                self.helper,
+                "_require_command_success",
+                side_effect=command_with_terminal_error,
+            ),
+            mock.patch.object(
+                self.helper,
+                "_write_launchd_ownership_marker",
+                side_effect=lambda *_args: events.append("write-marker"),
+            ),
+            mock.patch.object(
+                self.helper,
+                "_launchd_job_snapshot",
+                return_value=loaded,
+            ),
+            mock.patch.object(
+                self.helper,
+                "_poll_launchd_terminal",
+                side_effect=lambda *_args: (
+                    events.append("poll-terminal"),
+                    (_ for _ in ()).throw(self.helper.ProbeError(primary)),
+                )[1],
+            ),
+            mock.patch.object(
+                self.helper,
+                "_reconcile_in_process_bootstrap",
+                side_effect=lambda *_args: events.append("bootout"),
+            ),
+            mock.patch.object(
+                self.helper,
+                "_quiesce_disposable_user",
+                side_effect=lambda *_args, **_kwargs: (
+                    events.append("quiesce"),
+                    reset_evidence,
+                )[1],
+            ) as quiesce,
+            mock.patch.object(self.helper, "_ensure_failed_child_files"),
+            mock.patch.object(self.helper, "_write_lifecycle_artifact") as write,
+            redirect_stderr(io.StringIO()),
+        ):
+            status = self.helper.run_launchd_user_lifecycle(
+                stage_root=plan.stage_root,
+                artifact_root=Path("/private/tmp/artifact"),
+                candidate_sha=FROZEN_CANDIDATE_SHA,
+                runner_uid=501,
+                runner_gid=20,
+                user_domain_reset_authorization="1" * 40,
+            )
+
+        self.assertEqual(status, 2)
+        self.assertEqual(
+            events,
+            [
+                "create-home",
+                "validate:post-home-create",
+                "bootstrap",
+                "validate:post-system-bootstrap",
+                "write-marker",
+                "kickstart",
+                "poll-terminal",
+                "bootout",
+                "validate:post-system-bootout",
+                "quiesce",
+            ],
+        )
+        self.assertEqual(write.call_args.kwargs["error_code"], primary)
+        self.assertEqual(
+            write.call_args.kwargs["secondary_error_code"],
+            post_bootout,
+        )
+        self.assertFalse(quiesce.call_args.kwargs["allow_create"])
 
     def test_child_probe_error_remains_primary_through_reconciliation(self) -> None:
         context = self.launchd_context()
@@ -3684,6 +4098,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             ),
             mock.patch.object(self.helper, "_create_disposable_account"),
             mock.patch.object(self.helper, "_create_disposable_home"),
+            mock.patch.object(self.helper, "_validate_disposable_home_root"),
             mock.patch.object(self.helper, "_require_disposable_uid_available"),
             mock.patch.object(self.helper, "_require_launchd_absent"),
             mock.patch.object(
@@ -3769,6 +4184,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             ),
             mock.patch.object(self.helper, "_create_disposable_account"),
             mock.patch.object(self.helper, "_create_disposable_home"),
+            mock.patch.object(self.helper, "_validate_disposable_home_root"),
             mock.patch.object(self.helper, "_require_disposable_uid_available"),
             mock.patch.object(self.helper, "_require_launchd_absent"),
             mock.patch.object(
@@ -3862,7 +4278,10 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 )
             self.assertEqual(
                 exact.exception.code,
-                "home-cleanup-pre-reset-marker-home-entry-set-drift",
+                (
+                    "home-cleanup-pre-reset-marker-"
+                    "home-entry-single-owned-directory-other"
+                ),
             )
             self.assertNotIn(canary, exact.exception.code)
 
@@ -3874,9 +4293,860 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 )
             self.assertEqual(
                 bound.exception.code,
-                "home-cleanup-post-reset-home-entry-set-drift",
+                "home-cleanup-post-reset-home-entry-single-owned-directory-other",
             )
             self.assertNotIn(canary, bound.exception.code)
+
+    def test_home_entry_diagnostics_classify_fixed_root_families(self) -> None:
+        def library(home: Path) -> None:
+            (home / "Library").mkdir()
+
+        def text_encoding(home: Path) -> None:
+            (home / ".CFUserTextEncoding").write_bytes(b"0:0")
+
+        def both(home: Path) -> None:
+            library(home)
+            text_encoding(home)
+
+        def unknown_directory(home: Path) -> None:
+            (home / "private-directory-canary").mkdir()
+
+        def unknown_file(home: Path) -> None:
+            (home / "private-file-canary").write_bytes(b"private")
+
+        def mixed(home: Path) -> None:
+            unknown_directory(home)
+            unknown_file(home)
+
+        def unsafe(home: Path) -> None:
+            (home / "private-symlink-canary").symlink_to(home / "launchd-probe")
+
+        scenarios = (
+            (library, "home-entry-known-library-owned-directory"),
+            (text_encoding, "home-entry-known-text-encoding-owned-file"),
+            (both, "home-entry-known-library-and-text-encoding"),
+            (unknown_directory, "home-entry-single-owned-directory-other"),
+            (unknown_file, "home-entry-single-owned-file-other"),
+            (mixed, "home-entry-multiple-or-mixed"),
+            (unsafe, "home-entry-unsafe-or-foreign"),
+        )
+        for arrange, detail in scenarios:
+            with (
+                self.subTest(detail=detail),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                home = Path(directory) / "home"
+                probe = home / "launchd-probe"
+                probe.mkdir(parents=True, mode=0o700)
+                home.chmod(0o700)
+                probe.chmod(0o700)
+                for name in self.helper.LAUNCHD_CHILD_FILES:
+                    (probe / name).write_bytes(b"value")
+                arrange(home)
+
+                with self.assertRaises(self.helper.ProbeError) as raised:
+                    self.helper._validate_exact_disposable_home(
+                        home,
+                        expected_uid=os.geteuid(),
+                        expected_gid=os.getegid(),
+                        diagnostic_phase="pre-reset-marker",
+                    )
+
+                self.assertEqual(
+                    raised.exception.code,
+                    f"home-cleanup-pre-reset-marker-{detail}",
+                )
+                self.assertNotIn("private", raised.exception.code)
+
+    def test_disposable_home_root_validator_checks_real_anchor_state(self) -> None:
+        def validate(
+            arrange,
+            expected_detail: str | None,
+            *,
+            uid_offset: int = 0,
+            gid_offset: int = 0,
+        ) -> None:
+            with tempfile.TemporaryDirectory() as directory:
+                home = Path(directory) / "home"
+                probe = home / "launchd-probe"
+                probe.mkdir(parents=True, mode=0o700)
+                home.chmod(0o700)
+                probe.chmod(0o700)
+                arrange(home, probe)
+                account = self.helper.DisposableAccount(
+                    name="task-witness-home-root-test",
+                    uid=os.geteuid() + uid_offset,
+                    gid=os.getegid() + gid_offset,
+                    home=home,
+                )
+                if expected_detail is None:
+                    self.helper._validate_disposable_home_root(
+                        account,
+                        diagnostic_phase="post-home-create",
+                    )
+                    return
+                with self.assertRaises(self.helper.ProbeError) as raised:
+                    self.helper._validate_disposable_home_root(
+                        account,
+                        diagnostic_phase="post-home-create",
+                    )
+                self.assertEqual(
+                    raised.exception.code,
+                    f"home-cleanup-post-home-create-{expected_detail}",
+                )
+                self.assertNotIn(account.name, raised.exception.code)
+
+        scenarios = (
+            ("valid", lambda _home, _probe: None, None, 0, 0),
+            (
+                "known-library",
+                lambda home, _probe: (home / "Library").mkdir(),
+                "home-entry-known-library-owned-directory",
+                0,
+                0,
+            ),
+            (
+                "home-mode",
+                lambda home, _probe: home.chmod(0o755),
+                "home-mode-drift",
+                0,
+                0,
+            ),
+            (
+                "home-uid",
+                lambda _home, _probe: None,
+                "home-owner-drift",
+                1,
+                0,
+            ),
+            (
+                "home-gid",
+                lambda _home, _probe: None,
+                "home-owner-drift",
+                0,
+                1,
+            ),
+            (
+                "probe-mode",
+                lambda _home, probe: probe.chmod(0o755),
+                "probe-mode-drift",
+                0,
+                0,
+            ),
+            (
+                "probe-kind",
+                lambda _home, probe: (probe.rmdir(), probe.write_bytes(b"private")),
+                "probe-kind-drift",
+                0,
+                0,
+            ),
+            (
+                "probe-missing",
+                lambda _home, probe: probe.rmdir(),
+                "probe-missing",
+                0,
+                0,
+            ),
+        )
+        for label, arrange, detail, uid_offset, gid_offset in scenarios:
+            with self.subTest(label=label):
+                validate(
+                    arrange,
+                    detail,
+                    uid_offset=uid_offset,
+                    gid_offset=gid_offset,
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "home"
+            probe = home / "launchd-probe"
+            probe.mkdir(parents=True, mode=0o700)
+            home.chmod(0o700)
+            probe.chmod(0o700)
+            account = self.helper.DisposableAccount(
+                name="task-witness-home-root-test",
+                uid=os.geteuid(),
+                gid=os.getegid(),
+                home=home,
+            )
+            path_type = type(probe)
+            original_lstat = path_type.lstat
+
+            def drift_probe_owner(path: Path):
+                metadata = original_lstat(path)
+                if path != probe:
+                    return metadata
+                values = list(metadata)
+                values[4] = metadata.st_uid + 1
+                return os.stat_result(values)
+
+            with (
+                mock.patch.object(
+                    path_type,
+                    "lstat",
+                    autospec=True,
+                    side_effect=drift_probe_owner,
+                ),
+                self.assertRaises(self.helper.ProbeError) as raised,
+            ):
+                self.helper._validate_disposable_home_root(
+                    account,
+                    diagnostic_phase="post-home-create",
+                )
+            self.assertEqual(
+                raised.exception.code,
+                "home-cleanup-post-home-create-probe-owner-drift",
+            )
+
+    def test_home_entry_diagnostics_reject_unsafe_known_entry_metadata(
+        self,
+    ) -> None:
+        scenarios = (
+            ("library-uid", "Library", 7, False),
+            ("library-gid", "Library", 8, False),
+            ("library-device", "Library", 9, False),
+            ("text-encoding-uid", ".CFUserTextEncoding", 7, False),
+            ("text-encoding-gid", ".CFUserTextEncoding", 8, False),
+            ("text-encoding-device", ".CFUserTextEncoding", 9, False),
+            ("text-encoding-link-count", ".CFUserTextEncoding", 4, 2),
+            (
+                "text-encoding-size",
+                ".CFUserTextEncoding",
+                5,
+                self.helper.MAX_HOME_ENTRY_OBSERVATION_FILE_BYTES + 1,
+            ),
+            ("text-encoding-content-proof", ".CFUserTextEncoding", 10, None),
+        )
+        for label, entry_name, field_index, replacement in scenarios:
+            with (
+                self.subTest(label=label),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                home = Path(directory) / "home"
+                probe = home / "launchd-probe"
+                probe.mkdir(parents=True, mode=0o700)
+                home.chmod(0o700)
+                probe.chmod(0o700)
+                for name in self.helper.LAUNCHD_CHILD_FILES:
+                    (probe / name).write_bytes(b"value")
+                entry = home / entry_name
+                if entry_name == "Library":
+                    entry.mkdir()
+                else:
+                    entry.write_bytes(b"0:0")
+                stable = self.helper._home_entry_observation_snapshot(
+                    home,
+                    expected_uid=os.geteuid(),
+                    expected_gid=os.getegid(),
+                )
+                self.assertEqual(len(stable[2]), 1)
+                mutated_entry = list(stable[2][0])
+                mutated_entry[field_index] = replacement
+                mutated = (stable[0], stable[1], (tuple(mutated_entry),))
+
+                with (
+                    mock.patch.object(
+                        self.helper,
+                        "_home_entry_observation_snapshot",
+                        side_effect=(mutated, mutated),
+                    ),
+                    self.assertRaises(self.helper.ProbeError) as raised,
+                ):
+                    self.helper._validate_exact_disposable_home(
+                        home,
+                        expected_uid=os.geteuid(),
+                        expected_gid=os.getegid(),
+                        diagnostic_phase="pre-reset-marker",
+                    )
+
+                self.assertEqual(
+                    raised.exception.code,
+                    ("home-cleanup-pre-reset-marker-home-entry-unsafe-or-foreign"),
+                )
+                self.assertNotIn(label, raised.exception.code)
+
+    def test_home_entry_snapshot_derives_unsafe_metadata_flags(self) -> None:
+        scenarios = (
+            ("private-uid-canary", 4),
+            ("private-gid-canary", 5),
+            ("private-device-canary", 2),
+        )
+        for label, stat_field in scenarios:
+            with (
+                self.subTest(label=label),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                home = Path(directory) / "home"
+                probe = home / "launchd-probe"
+                library = home / "Library"
+                probe.mkdir(parents=True, mode=0o700)
+                library.mkdir()
+                home.chmod(0o700)
+                probe.chmod(0o700)
+                for name in self.helper.LAUNCHD_CHILD_FILES:
+                    (probe / name).write_bytes(b"value")
+                path_type = type(home)
+                original_lstat = path_type.lstat
+
+                def drift_library_metadata(
+                    path: Path,
+                    *,
+                    field: int = stat_field,
+                    operation=original_lstat,
+                    target: Path = library,
+                ):
+                    metadata = operation(path)
+                    if path != target:
+                        return metadata
+                    values = list(metadata)
+                    values[field] += 1
+                    return os.stat_result(values)
+
+                with (
+                    mock.patch.object(
+                        path_type,
+                        "lstat",
+                        autospec=True,
+                        side_effect=drift_library_metadata,
+                    ),
+                    self.assertRaises(self.helper.ProbeError) as raised,
+                ):
+                    self.helper._validate_exact_disposable_home(
+                        home,
+                        expected_uid=os.geteuid(),
+                        expected_gid=os.getegid(),
+                        diagnostic_phase="pre-reset-marker",
+                    )
+
+                self.assertEqual(
+                    raised.exception.code,
+                    ("home-cleanup-pre-reset-marker-home-entry-unsafe-or-foreign"),
+                )
+                self.assertNotIn(label, raised.exception.code)
+
+    def test_home_entry_snapshot_does_not_read_foreign_file(self) -> None:
+        scenarios = (
+            ("private-uid-canary", 4),
+            ("private-gid-canary", 5),
+            ("private-device-canary", 2),
+        )
+        for label, stat_field in scenarios:
+            with (
+                self.subTest(label=label),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                home = Path(directory) / "home"
+                probe = home / "launchd-probe"
+                entry = home / ".CFUserTextEncoding"
+                probe.mkdir(parents=True, mode=0o700)
+                entry.write_bytes(b"0:0")
+                home.chmod(0o700)
+                probe.chmod(0o700)
+                for name in self.helper.LAUNCHD_CHILD_FILES:
+                    (probe / name).write_bytes(b"value")
+                path_type = type(home)
+                original_lstat = path_type.lstat
+
+                def drift_entry_metadata(
+                    path: Path,
+                    *,
+                    field: int = stat_field,
+                    operation=original_lstat,
+                    target: Path = entry,
+                ):
+                    metadata = operation(path)
+                    if path != target:
+                        return metadata
+                    values = list(metadata)
+                    values[field] += 1
+                    return os.stat_result(values)
+
+                with (
+                    mock.patch.object(
+                        path_type,
+                        "lstat",
+                        autospec=True,
+                        side_effect=drift_entry_metadata,
+                    ),
+                    mock.patch.object(
+                        self.helper,
+                        "_read_stable_regular_file",
+                        wraps=self.helper._read_stable_regular_file,
+                    ) as read,
+                    self.assertRaises(self.helper.ProbeError) as raised,
+                ):
+                    self.helper._validate_exact_disposable_home(
+                        home,
+                        expected_uid=os.geteuid(),
+                        expected_gid=os.getegid(),
+                        diagnostic_phase="pre-reset-marker",
+                    )
+
+                self.assertEqual(
+                    raised.exception.code,
+                    ("home-cleanup-pre-reset-marker-home-entry-unsafe-or-foreign"),
+                )
+                read.assert_not_called()
+                self.assertNotIn(label, raised.exception.code)
+
+    def test_stable_reader_rejects_replaced_metadata_before_read(self) -> None:
+        scenarios = (
+            ("uid", "st_uid"),
+            ("gid", "st_gid"),
+            ("device", "st_dev"),
+        )
+        for label, stat_field in scenarios:
+            with (
+                self.subTest(label=label),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                source = Path(directory) / "source"
+                source.write_bytes(b"private-content-canary")
+                expected_metadata = self.helper._stable_regular_file_metadata(
+                    source.lstat()
+                )
+                original_fstat = os.fstat
+
+                def drift_descriptor_metadata(
+                    descriptor: int,
+                    *,
+                    field: str = stat_field,
+                    operation=original_fstat,
+                ):
+                    metadata = operation(descriptor)
+                    values = {
+                        "st_dev": metadata.st_dev,
+                        "st_ino": metadata.st_ino,
+                        "st_mode": metadata.st_mode,
+                        "st_nlink": metadata.st_nlink,
+                        "st_size": metadata.st_size,
+                        "st_mtime_ns": metadata.st_mtime_ns,
+                        "st_uid": metadata.st_uid,
+                        "st_gid": metadata.st_gid,
+                    }
+                    values[field] += 1
+                    return SimpleNamespace(**values)
+
+                with (
+                    mock.patch.object(
+                        os,
+                        "fstat",
+                        side_effect=drift_descriptor_metadata,
+                    ),
+                    mock.patch.object(os, "read", wraps=os.read) as read,
+                    self.assertRaises(self.helper.ProbeError) as raised,
+                ):
+                    self.helper._read_stable_regular_file(
+                        source,
+                        1024,
+                        "home-entry-observation",
+                        expected_metadata=expected_metadata,
+                    )
+
+                self.assertEqual(
+                    raised.exception.code,
+                    "changed-home-entry-observation",
+                )
+                read.assert_not_called()
+                self.assertNotIn("private", raised.exception.code)
+
+    def test_stable_reader_rejects_metadata_drift_after_read(self) -> None:
+        scenarios = tuple(
+            ("descriptor", field)
+            for field in ("st_uid", "st_gid", "st_mode", "st_nlink")
+        ) + tuple(
+            ("path", field)
+            for field in (
+                "st_uid",
+                "st_gid",
+                "st_mode",
+                "st_nlink",
+                "st_size",
+                "st_mtime_ns",
+            )
+        )
+        for location, changed_field in scenarios:
+            with (
+                self.subTest(location=location, changed_field=changed_field),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                source = Path(directory) / "source"
+                source.write_bytes(b"private-content-canary")
+                expected_metadata = self.helper._stable_regular_file_metadata(
+                    source.lstat()
+                )
+
+                def changed(metadata, *, field: str = changed_field):
+                    values = {
+                        "st_dev": metadata.st_dev,
+                        "st_ino": metadata.st_ino,
+                        "st_mode": metadata.st_mode,
+                        "st_nlink": metadata.st_nlink,
+                        "st_size": metadata.st_size,
+                        "st_mtime_ns": metadata.st_mtime_ns,
+                        "st_uid": metadata.st_uid,
+                        "st_gid": metadata.st_gid,
+                    }
+                    values[field] += 1
+                    return SimpleNamespace(**values)
+
+                original_fstat = os.fstat
+                fstat_calls = 0
+
+                def descriptor_after_read(
+                    descriptor: int,
+                    *,
+                    operation=original_fstat,
+                    transform=changed,
+                ):
+                    nonlocal fstat_calls
+                    fstat_calls += 1
+                    metadata = operation(descriptor)
+                    return transform(metadata) if fstat_calls == 2 else metadata
+
+                path_type = type(source)
+                original_lstat = path_type.lstat
+
+                def path_after_read(
+                    path: Path,
+                    *,
+                    operation=original_lstat,
+                    target: Path = source,
+                    transform=changed,
+                ):
+                    metadata = operation(path)
+                    return transform(metadata) if path == target else metadata
+
+                with ExitStack() as stack:
+                    if location == "descriptor":
+                        stack.enter_context(
+                            mock.patch.object(
+                                os,
+                                "fstat",
+                                side_effect=descriptor_after_read,
+                            )
+                        )
+                    else:
+                        stack.enter_context(
+                            mock.patch.object(
+                                path_type,
+                                "lstat",
+                                autospec=True,
+                                side_effect=path_after_read,
+                            )
+                        )
+                    read = stack.enter_context(
+                        mock.patch.object(os, "read", wraps=os.read)
+                    )
+                    with self.assertRaises(self.helper.ProbeError) as raised:
+                        self.helper._read_stable_regular_file(
+                            source,
+                            1024,
+                            "home-entry-observation",
+                            expected_metadata=expected_metadata,
+                        )
+
+                self.assertEqual(
+                    raised.exception.code,
+                    "changed-home-entry-observation",
+                )
+                self.assertGreaterEqual(read.call_count, 1)
+                self.assertNotIn("private", raised.exception.code)
+
+    def test_home_entry_snapshot_rejects_unsafe_file_before_read(self) -> None:
+        def hardlink(root: Path, entry: Path) -> None:
+            entry.write_bytes(b"0:0")
+            os.link(entry, root / "private-hardlink-canary")
+
+        def oversized(_root: Path, entry: Path) -> None:
+            entry.write_bytes(
+                b"x" * (self.helper.MAX_HOME_ENTRY_OBSERVATION_FILE_BYTES + 1)
+            )
+
+        scenarios = (
+            ("hardlink", hardlink),
+            ("oversized", oversized),
+        )
+        for label, arrange in scenarios:
+            with (
+                self.subTest(label=label),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                home = root / "home"
+                probe = home / "launchd-probe"
+                entry = home / ".CFUserTextEncoding"
+                probe.mkdir(parents=True, mode=0o700)
+                home.chmod(0o700)
+                probe.chmod(0o700)
+                for name in self.helper.LAUNCHD_CHILD_FILES:
+                    (probe / name).write_bytes(b"value")
+                arrange(root, entry)
+
+                with (
+                    mock.patch.object(
+                        self.helper,
+                        "_read_stable_regular_file",
+                        wraps=self.helper._read_stable_regular_file,
+                    ) as read,
+                    self.assertRaises(self.helper.ProbeError) as raised,
+                ):
+                    self.helper._validate_exact_disposable_home(
+                        home,
+                        expected_uid=os.geteuid(),
+                        expected_gid=os.getegid(),
+                        diagnostic_phase="pre-reset-marker",
+                    )
+
+                self.assertEqual(
+                    raised.exception.code,
+                    ("home-cleanup-pre-reset-marker-home-entry-unsafe-or-foreign"),
+                )
+                read.assert_not_called()
+                self.assertNotIn("private", raised.exception.code)
+
+    def test_home_entry_snapshot_detects_metadata_replacement(self) -> None:
+        scenarios = (
+            ("private-home-identity-canary", "home", 3, "st_ino"),
+            ("private-home-device-canary", "home", 3, "st_dev"),
+            ("private-entry-identity-canary", "entry", 2, "st_ino"),
+            ("private-entry-mtime-canary", "entry", 2, "st_mtime_ns"),
+        )
+        for label, target_name, replace_on_call, changed_field in scenarios:
+            with (
+                self.subTest(label=label),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                home = Path(directory) / "home"
+                probe = home / "launchd-probe"
+                library = home / "Library"
+                probe.mkdir(parents=True, mode=0o700)
+                library.mkdir()
+                home.chmod(0o700)
+                probe.chmod(0o700)
+                for name in self.helper.LAUNCHD_CHILD_FILES:
+                    (probe / name).write_bytes(b"value")
+                target = home if target_name == "home" else library
+                path_type = type(home)
+                original_lstat = path_type.lstat
+                target_calls = 0
+
+                def replace_identity(
+                    path: Path,
+                    *,
+                    operation=original_lstat,
+                    expected_target: Path = target,
+                    replacement_call: int = replace_on_call,
+                    field: str = changed_field,
+                ):
+                    nonlocal target_calls
+                    metadata = operation(path)
+                    if path != expected_target:
+                        return metadata
+                    target_calls += 1
+                    if target_calls != replacement_call:
+                        return metadata
+                    values = {
+                        "st_dev": metadata.st_dev,
+                        "st_ino": metadata.st_ino,
+                        "st_mode": metadata.st_mode,
+                        "st_nlink": metadata.st_nlink,
+                        "st_size": metadata.st_size,
+                        "st_mtime_ns": metadata.st_mtime_ns,
+                        "st_uid": metadata.st_uid,
+                        "st_gid": metadata.st_gid,
+                    }
+                    values[field] += 1
+                    return SimpleNamespace(**values)
+
+                with (
+                    mock.patch.object(
+                        path_type,
+                        "lstat",
+                        autospec=True,
+                        side_effect=replace_identity,
+                    ),
+                    self.assertRaises(self.helper.ProbeError) as raised,
+                ):
+                    self.helper._validate_exact_disposable_home(
+                        home,
+                        expected_uid=os.geteuid(),
+                        expected_gid=os.getegid(),
+                        diagnostic_phase="pre-reset-marker",
+                    )
+
+                self.assertEqual(target_calls, replace_on_call)
+                self.assertEqual(
+                    raised.exception.code,
+                    ("home-cleanup-pre-reset-marker-home-entry-observation-unstable"),
+                )
+                self.assertNotIn(label, raised.exception.code)
+
+    def test_home_entry_snapshot_normalizes_directory_iteration_order(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "home"
+            probe = home / "launchd-probe"
+            library = home / "Library"
+            text_encoding = home / ".CFUserTextEncoding"
+            probe.mkdir(parents=True, mode=0o700)
+            library.mkdir()
+            text_encoding.write_bytes(b"0:0")
+            home.chmod(0o700)
+            probe.chmod(0o700)
+            for name in self.helper.LAUNCHD_CHILD_FILES:
+                (probe / name).write_bytes(b"value")
+            path_type = type(home)
+            original_iterdir = path_type.iterdir
+            home_listings = iter(
+                (
+                    (probe, library, text_encoding),
+                    (text_encoding, probe, library),
+                    (library, probe, text_encoding),
+                )
+            )
+            observed_home_listings = 0
+
+            def permuted_iterdir(
+                path: Path,
+                *,
+                operation=original_iterdir,
+            ):
+                nonlocal observed_home_listings
+                if path != home:
+                    return operation(path)
+                observed_home_listings += 1
+                return iter(next(home_listings))
+
+            with (
+                mock.patch.object(
+                    path_type,
+                    "iterdir",
+                    autospec=True,
+                    side_effect=permuted_iterdir,
+                ),
+                self.assertRaises(self.helper.ProbeError) as raised,
+            ):
+                self.helper._validate_exact_disposable_home(
+                    home,
+                    expected_uid=os.geteuid(),
+                    expected_gid=os.getegid(),
+                    diagnostic_phase="pre-reset-marker",
+                )
+
+            self.assertEqual(observed_home_listings, 3)
+            self.assertEqual(
+                raised.exception.code,
+                (
+                    "home-cleanup-pre-reset-marker-"
+                    "home-entry-known-library-and-text-encoding"
+                ),
+            )
+            self.assertNotIn("unstable", raised.exception.code)
+
+    def test_home_entry_diagnostics_fail_closed_on_unreadable_or_unstable_state(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "home"
+            probe = home / "launchd-probe"
+            probe.mkdir(parents=True, mode=0o700)
+            home.chmod(0o700)
+            probe.chmod(0o700)
+            for name in self.helper.LAUNCHD_CHILD_FILES:
+                (probe / name).write_bytes(b"value")
+            (home / "Library").mkdir()
+            text_encoding_raw = b"0:0"
+            (home / ".CFUserTextEncoding").write_bytes(text_encoding_raw)
+            stable = self.helper._home_entry_observation_snapshot(
+                home,
+                expected_uid=os.geteuid(),
+                expected_gid=os.getegid(),
+            )
+            stable_entries = list(stable[2])
+            text_encoding_index = next(
+                index
+                for index, entry in enumerate(stable_entries)
+                if entry[0] == ".CFUserTextEncoding"
+            )
+            text_encoding_entry = stable_entries[text_encoding_index]
+            self.assertEqual(
+                text_encoding_entry[10],
+                hashlib.sha256(text_encoding_raw).hexdigest(),
+            )
+            changed_digest = (
+                "0" * 64 if text_encoding_entry[10] != "0" * 64 else "1" * 64
+            )
+            stable_entries[text_encoding_index] = (
+                *text_encoding_entry[:10],
+                changed_digest,
+            )
+            digest_changed = (stable[0], stable[1], tuple(stable_entries))
+            scenarios = (
+                (
+                    "unreadable-os-error",
+                    mock.patch.object(
+                        self.helper,
+                        "_home_entry_observation_snapshot",
+                        side_effect=OSError("private-read-canary"),
+                    ),
+                    "home-entry-observation-unreadable",
+                ),
+                (
+                    "unreadable-probe-error",
+                    mock.patch.object(
+                        self.helper,
+                        "_home_entry_observation_snapshot",
+                        side_effect=self.helper.ProbeError(
+                            "private-stable-read-canary"
+                        ),
+                    ),
+                    "home-entry-observation-unreadable",
+                ),
+                (
+                    "unstable",
+                    mock.patch.object(
+                        self.helper,
+                        "_home_entry_observation_snapshot",
+                        side_effect=(stable, digest_changed),
+                    ),
+                    "home-entry-observation-unstable",
+                ),
+            )
+            for label, observation, detail in scenarios:
+                with self.subTest(label=label), observation:
+                    with self.assertRaises(self.helper.ProbeError) as raised:
+                        self.helper._validate_exact_disposable_home(
+                            home,
+                            expected_uid=os.geteuid(),
+                            expected_gid=os.getegid(),
+                            diagnostic_phase="pre-reset-marker",
+                        )
+                    self.assertEqual(
+                        raised.exception.code,
+                        f"home-cleanup-pre-reset-marker-{detail}",
+                    )
+                    self.assertNotIn("private", raised.exception.code)
+
+            (home / "private-outer-listing-canary").mkdir()
+            with (
+                mock.patch.object(
+                    self.helper,
+                    "_home_entry_observation_snapshot",
+                    side_effect=(stable, stable),
+                ),
+                self.assertRaises(self.helper.ProbeError) as raised,
+            ):
+                self.helper._validate_exact_disposable_home(
+                    home,
+                    expected_uid=os.geteuid(),
+                    expected_gid=os.getegid(),
+                    diagnostic_phase="pre-reset-marker",
+                )
+            self.assertEqual(
+                raised.exception.code,
+                "home-cleanup-pre-reset-marker-home-entry-observation-unstable",
+            )
+            self.assertNotIn("private", raised.exception.code)
 
     def test_home_drift_diagnostics_distinguish_exact_invariants(self) -> None:
         scenarios = (
@@ -4388,6 +5658,147 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 "home-cleanup-home-removal-probe-entry-set-drift",
             )
             self.assertEqual(foreign.read_bytes(), b"preserve")
+
+    def test_marker_bound_probe_absent_home_preserves_residual_entries(self) -> None:
+        scenarios = (
+            (
+                "known-library",
+                lambda home: (home / "Library").mkdir(),
+                "home-entry-known-library-owned-directory",
+                "Library",
+            ),
+            (
+                "unknown-file",
+                lambda home: (home / "private-canary").write_bytes(b"preserve"),
+                "home-entry-single-owned-file-other",
+                "private-canary",
+            ),
+        )
+        for label, arrange, detail, residual_name in scenarios:
+            with (
+                self.subTest(label=label),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                home = Path(directory) / "home"
+                probe = home / "launchd-probe"
+                probe.mkdir(parents=True, mode=0o700)
+                home.chmod(0o700)
+                probe.chmod(0o700)
+                home_metadata = home.lstat()
+                probe_metadata = probe.lstat()
+                identity = {
+                    "home_device": home_metadata.st_dev,
+                    "home_inode": home_metadata.st_ino,
+                    "probe_device": probe_metadata.st_dev,
+                    "probe_inode": probe_metadata.st_ino,
+                }
+                account = self.helper.DisposableAccount(
+                    name="twq-0123456789ab",
+                    uid=os.geteuid(),
+                    gid=os.getegid(),
+                    home=home,
+                )
+                authorization = {
+                    "disposition": "armed",
+                    "account": {
+                        "name": account.name,
+                        "uid": account.uid,
+                        "gid": account.gid,
+                        "home": str(account.home),
+                    },
+                    "home_identity": identity,
+                }
+                probe.rmdir()
+                arrange(home)
+
+                with (
+                    mock.patch.object(Path, "unlink") as unlink,
+                    mock.patch.object(Path, "rmdir") as rmdir,
+                    self.assertRaises(self.helper.ProbeError) as raised,
+                ):
+                    self.helper._remove_marker_bound_disposable_home(
+                        account,
+                        identity,
+                        authorization,
+                    )
+
+                self.assertEqual(
+                    raised.exception.code,
+                    f"home-cleanup-home-removal-{detail}",
+                )
+                unlink.assert_not_called()
+                rmdir.assert_not_called()
+                self.assertTrue((home / residual_name).exists())
+                self.assertNotIn("private", raised.exception.code)
+
+    def test_marker_bound_home_listing_race_stops_before_removal(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "home"
+            probe = home / "launchd-probe"
+            probe.mkdir(parents=True, mode=0o700)
+            home.chmod(0o700)
+            probe.chmod(0o700)
+            home_metadata = home.lstat()
+            probe_metadata = probe.lstat()
+            identity = {
+                "home_device": home_metadata.st_dev,
+                "home_inode": home_metadata.st_ino,
+                "probe_device": probe_metadata.st_dev,
+                "probe_inode": probe_metadata.st_ino,
+            }
+            account = self.helper.DisposableAccount(
+                name="twq-0123456789ab",
+                uid=os.geteuid(),
+                gid=os.getegid(),
+                home=home,
+            )
+            authorization = {
+                "disposition": "armed",
+                "account": {
+                    "name": account.name,
+                    "uid": account.uid,
+                    "gid": account.gid,
+                    "home": str(account.home),
+                },
+                "home_identity": identity,
+            }
+            path_type = type(home)
+            original_iterdir = path_type.iterdir
+            home_observations = 0
+
+            def raced_iterdir(path: Path):
+                nonlocal home_observations
+                if path == home:
+                    home_observations += 1
+                    if home_observations == 1:
+                        return iter(())
+                return original_iterdir(path)
+
+            with (
+                mock.patch.object(
+                    path_type,
+                    "iterdir",
+                    autospec=True,
+                    side_effect=raced_iterdir,
+                ),
+                mock.patch.object(Path, "unlink") as unlink,
+                mock.patch.object(Path, "rmdir") as rmdir,
+                self.assertRaises(self.helper.ProbeError) as raised,
+            ):
+                self.helper._remove_marker_bound_disposable_home(
+                    account,
+                    identity,
+                    authorization,
+                )
+
+            self.assertEqual(
+                raised.exception.code,
+                "home-cleanup-home-removal-home-entry-set-drift",
+            )
+            self.assertGreaterEqual(home_observations, 3)
+            unlink.assert_not_called()
+            rmdir.assert_not_called()
+            self.assertTrue(probe.is_dir())
 
     def test_no_reset_cleanup_recovers_after_interrupted_home_unlink(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -5178,6 +6589,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 mock.patch.object(self.helper, "_require_launchd_absent"),
                 mock.patch.object(self.helper, "_create_disposable_account"),
                 mock.patch.object(self.helper, "_create_disposable_home"),
+                mock.patch.object(self.helper, "_validate_disposable_home_root"),
                 mock.patch.object(
                     self.helper,
                     "_require_disposable_uid_available",
@@ -6106,6 +7518,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 ),
                 mock.patch.object(self.helper, "_create_disposable_account"),
                 mock.patch.object(self.helper, "_create_disposable_home"),
+                mock.patch.object(self.helper, "_validate_disposable_home_root"),
                 mock.patch.object(
                     self.helper,
                     "_require_disposable_uid_available",
@@ -6167,6 +7580,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             ),
             mock.patch.object(self.helper, "_create_disposable_account"),
             mock.patch.object(self.helper, "_create_disposable_home"),
+            mock.patch.object(self.helper, "_validate_disposable_home_root"),
             mock.patch.object(self.helper, "_require_disposable_uid_available"),
             mock.patch.object(
                 self.helper,
@@ -9063,6 +10477,7 @@ raise SystemExit(93)
                 _create_root_directory=mock.DEFAULT,
                 _create_disposable_account=mock.DEFAULT,
                 _create_disposable_home=mock.DEFAULT,
+                _validate_disposable_home_root=mock.DEFAULT,
                 _require_disposable_uid_available=mock.DEFAULT,
                 _require_launchd_absent=mock.DEFAULT,
                 _write_launchd_ownership_marker=mock.DEFAULT,

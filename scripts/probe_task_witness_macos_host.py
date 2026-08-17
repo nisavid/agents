@@ -46,6 +46,7 @@ MAX_ACCOUNT_BINDING_BYTES = 4 * 1024
 MAX_USER_DOMAIN_RESET_BYTES = 4 * 1024
 MAX_HOME_CLEANUP_BYTES = 4 * 1024
 MAX_PROCESS_LIST_BYTES = 64 * 1024
+MAX_HOME_ENTRY_OBSERVATION_FILE_BYTES = 4 * 1024
 COMMAND_TIMEOUT_SECONDS = 10
 LAUNCHD_POLL_INTERVAL_SECONDS = 0.25
 LAUNCHD_POLL_TIMEOUT_SECONDS = 30
@@ -174,7 +175,11 @@ HOME_CLEANUP_DIAGNOSTIC_PHASES = frozenset(
         "cleanup-entry",
         "home-removal",
         "marker-replay",
+        "post-child-terminal",
+        "post-home-create",
         "post-reset",
+        "post-system-bootstrap",
+        "post-system-bootout",
         "pre-account-delete",
         "pre-home-removal",
         "pre-journal",
@@ -185,6 +190,15 @@ HOME_CLEANUP_DIAGNOSTIC_PHASES = frozenset(
 HOME_CLEANUP_DIAGNOSTIC_DETAILS = frozenset(
     {
         "home-entry-set-drift",
+        "home-entry-known-library-and-text-encoding",
+        "home-entry-known-library-owned-directory",
+        "home-entry-known-text-encoding-owned-file",
+        "home-entry-multiple-or-mixed",
+        "home-entry-observation-unreadable",
+        "home-entry-observation-unstable",
+        "home-entry-single-owned-directory-other",
+        "home-entry-single-owned-file-other",
+        "home-entry-unsafe-or-foreign",
         "home-identity-drift",
         "home-kind-drift",
         "home-mode-drift",
@@ -223,6 +237,122 @@ def _home_cleanup_drift_error(phase: str, detail: str) -> ProbeError:
     ):
         return ProbeError("home-cleanup-diagnostic-invalid")
     return ProbeError(f"home-cleanup-{phase}-{detail}")
+
+
+def _home_entry_observation_snapshot(
+    home: Path,
+    *,
+    expected_uid: int,
+    expected_gid: int,
+) -> tuple:
+    home_metadata = home.lstat()
+    entries = []
+    for entry in sorted(home.iterdir(), key=lambda path: path.name):
+        if entry.name == "launchd-probe":
+            continue
+        metadata = entry.lstat()
+        digest = None
+        uid_matches = metadata.st_uid == expected_uid
+        gid_matches = metadata.st_gid == expected_gid
+        device_matches = metadata.st_dev == home_metadata.st_dev
+        if (
+            stat.S_ISREG(metadata.st_mode)
+            and metadata.st_nlink == 1
+            and 0 <= metadata.st_size <= MAX_HOME_ENTRY_OBSERVATION_FILE_BYTES
+            and uid_matches
+            and gid_matches
+            and device_matches
+        ):
+            digest = hashlib.sha256(
+                _read_stable_regular_file(
+                    entry,
+                    MAX_HOME_ENTRY_OBSERVATION_FILE_BYTES,
+                    "home-entry-observation",
+                    expected_metadata=_stable_regular_file_metadata(metadata),
+                )
+            ).hexdigest()
+        entries.append(
+            (
+                entry.name,
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_mode,
+                metadata.st_nlink,
+                metadata.st_size,
+                metadata.st_mtime_ns,
+                uid_matches,
+                gid_matches,
+                device_matches,
+                digest,
+            )
+        )
+    return (home_metadata.st_dev, home_metadata.st_ino, tuple(entries))
+
+
+def _classified_unexpected_home_entry_detail(
+    home: Path,
+    observed_names: set[str],
+    *,
+    expected_uid: int,
+    expected_gid: int,
+) -> str:
+    try:
+        first = _home_entry_observation_snapshot(
+            home,
+            expected_uid=expected_uid,
+            expected_gid=expected_gid,
+        )
+        second = _home_entry_observation_snapshot(
+            home,
+            expected_uid=expected_uid,
+            expected_gid=expected_gid,
+        )
+    except (OSError, ProbeError):
+        return "home-entry-observation-unreadable"
+    entries = first[2]
+    if first != second or {entry[0] for entry in entries} != observed_names - {
+        "launchd-probe"
+    }:
+        return "home-entry-observation-unstable"
+    if not entries:
+        return "home-entry-set-drift"
+
+    def owned_directory(entry: tuple) -> bool:
+        return stat.S_ISDIR(entry[3]) and entry[7] and entry[8] and entry[9]
+
+    def owned_file(entry: tuple) -> bool:
+        return (
+            stat.S_ISREG(entry[3])
+            and entry[4] == 1
+            and 0 <= entry[5] <= MAX_HOME_ENTRY_OBSERVATION_FILE_BYTES
+            and entry[7]
+            and entry[8]
+            and entry[9]
+            and isinstance(entry[10], str)
+        )
+
+    by_name = {entry[0]: entry for entry in entries}
+    if set(by_name) == {"Library"} and owned_directory(by_name["Library"]):
+        return "home-entry-known-library-owned-directory"
+    if set(by_name) == {".CFUserTextEncoding"} and owned_file(
+        by_name[".CFUserTextEncoding"]
+    ):
+        return "home-entry-known-text-encoding-owned-file"
+    if (
+        set(by_name) == {".CFUserTextEncoding", "Library"}
+        and owned_directory(by_name["Library"])
+        and owned_file(by_name[".CFUserTextEncoding"])
+    ):
+        return "home-entry-known-library-and-text-encoding"
+    if any(not owned_directory(entry) and not owned_file(entry) for entry in entries):
+        return "home-entry-unsafe-or-foreign"
+    if len(entries) == 1:
+        return (
+            "home-entry-single-owned-directory-other"
+            if owned_directory(entries[0])
+            else "home-entry-single-owned-file-other"
+        )
+    return "home-entry-multiple-or-mixed"
 
 
 def _merge_probe_error(
@@ -1385,6 +1515,65 @@ def remove_exact_disposable_home(
         raise ProbeError("home-cleanup-failed") from error
 
 
+def _validate_disposable_home_root(
+    account: DisposableAccount,
+    *,
+    diagnostic_phase: str,
+) -> None:
+    home = account.home
+    probe_root = home / "launchd-probe"
+    try:
+        home_metadata = home.lstat()
+    except OSError as error:
+        raise _home_cleanup_drift_error(
+            diagnostic_phase,
+            "home-read-failed",
+        ) from error
+    if not stat.S_ISDIR(home_metadata.st_mode):
+        raise _home_cleanup_drift_error(diagnostic_phase, "home-kind-drift")
+    if stat.S_IMODE(home_metadata.st_mode) != 0o700:
+        raise _home_cleanup_drift_error(diagnostic_phase, "home-mode-drift")
+    if home_metadata.st_uid != account.uid or home_metadata.st_gid != account.gid:
+        raise _home_cleanup_drift_error(diagnostic_phase, "home-owner-drift")
+    try:
+        home_names = {entry.name for entry in home.iterdir()}
+    except OSError as error:
+        raise _home_cleanup_drift_error(
+            diagnostic_phase,
+            "home-read-failed",
+        ) from error
+    if "launchd-probe" not in home_names:
+        raise _home_cleanup_drift_error(diagnostic_phase, "probe-missing")
+    if home_names != {"launchd-probe"}:
+        raise _home_cleanup_drift_error(
+            diagnostic_phase,
+            _classified_unexpected_home_entry_detail(
+                home,
+                home_names,
+                expected_uid=account.uid,
+                expected_gid=account.gid,
+            ),
+        )
+    try:
+        probe_metadata = probe_root.lstat()
+    except FileNotFoundError as error:
+        raise _home_cleanup_drift_error(
+            diagnostic_phase,
+            "probe-missing",
+        ) from error
+    except OSError as error:
+        raise _home_cleanup_drift_error(
+            diagnostic_phase,
+            "probe-read-failed",
+        ) from error
+    if not stat.S_ISDIR(probe_metadata.st_mode):
+        raise _home_cleanup_drift_error(diagnostic_phase, "probe-kind-drift")
+    if stat.S_IMODE(probe_metadata.st_mode) != 0o700:
+        raise _home_cleanup_drift_error(diagnostic_phase, "probe-mode-drift")
+    if probe_metadata.st_uid != account.uid or probe_metadata.st_gid != account.gid:
+        raise _home_cleanup_drift_error(diagnostic_phase, "probe-owner-drift")
+
+
 def _validate_exact_disposable_home(
     home: Path,
     *,
@@ -1419,7 +1608,12 @@ def _validate_exact_disposable_home(
     if home_names != {"launchd-probe"}:
         raise _home_cleanup_drift_error(
             diagnostic_phase,
-            "home-entry-set-drift",
+            _classified_unexpected_home_entry_detail(
+                home,
+                home_names,
+                expected_uid=expected_uid,
+                expected_gid=expected_gid,
+            ),
         )
     try:
         probe_metadata = probe_root.lstat()
@@ -1521,7 +1715,12 @@ def _validated_marker_bound_disposable_home(
     if "launchd-probe" in home_names and home_names != {"launchd-probe"}:
         raise _home_cleanup_drift_error(
             diagnostic_phase,
-            "home-entry-set-drift",
+            _classified_unexpected_home_entry_detail(
+                home,
+                home_names,
+                expected_uid=account.uid,
+                expected_gid=account.gid,
+            ),
         )
     try:
         probe_metadata = probe_root.lstat()
@@ -1529,7 +1728,12 @@ def _validated_marker_bound_disposable_home(
         if home_names:
             raise _home_cleanup_drift_error(
                 diagnostic_phase,
-                "home-entry-set-drift",
+                _classified_unexpected_home_entry_detail(
+                    home,
+                    home_names,
+                    expected_uid=account.uid,
+                    expected_gid=account.gid,
+                ),
             )
         return True, False, ()
     except OSError as error:
@@ -1540,7 +1744,12 @@ def _validated_marker_bound_disposable_home(
     if home_names != {"launchd-probe"}:
         raise _home_cleanup_drift_error(
             diagnostic_phase,
-            "home-entry-set-drift",
+            _classified_unexpected_home_entry_detail(
+                home,
+                home_names,
+                expected_uid=account.uid,
+                expected_gid=account.gid,
+            ),
         )
     if not stat.S_ISDIR(probe_metadata.st_mode):
         raise _home_cleanup_drift_error(diagnostic_phase, "probe-kind-drift")
@@ -2458,7 +2667,26 @@ def parse_dscl_uid_list(raw: str) -> dict[str, int]:
     return result
 
 
-def _read_stable_regular_file(path: Path, maximum: int, label: str) -> bytes:
+def _stable_regular_file_metadata(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        int(metadata.st_dev),
+        int(metadata.st_ino),
+        int(metadata.st_mode),
+        int(metadata.st_nlink),
+        int(metadata.st_size),
+        int(metadata.st_mtime_ns),
+        int(metadata.st_uid),
+        int(metadata.st_gid),
+    )
+
+
+def _read_stable_regular_file(
+    path: Path,
+    maximum: int,
+    label: str,
+    *,
+    expected_metadata: tuple[int, ...] | None = None,
+) -> bytes:
     descriptor = -1
     try:
         descriptor = os.open(
@@ -2473,6 +2701,11 @@ def _read_stable_regular_file(path: Path, maximum: int, label: str) -> bytes:
             or before.st_size > maximum
         ):
             raise ProbeError(f"unsafe-{label}")
+        if (
+            expected_metadata is not None
+            and _stable_regular_file_metadata(before) != expected_metadata
+        ):
+            raise ProbeError(f"changed-{label}")
         chunks = []
         remaining = before.st_size
         while remaining:
@@ -2490,12 +2723,18 @@ def _read_stable_regular_file(path: Path, maximum: int, label: str) -> bytes:
     finally:
         if descriptor >= 0:
             os.close(descriptor)
-    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
-        after.st_dev,
-        after.st_ino,
-        after.st_size,
-        after.st_mtime_ns,
-    ) or (after.st_dev, after.st_ino) != (current.st_dev, current.st_ino):
+    if (
+        (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+        != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        or (after.st_dev, after.st_ino) != (current.st_dev, current.st_ino)
+        or (
+            expected_metadata is not None
+            and (
+                _stable_regular_file_metadata(after) != expected_metadata
+                or _stable_regular_file_metadata(current) != expected_metadata
+            )
+        )
+    ):
         raise ProbeError(f"changed-{label}")
     return b"".join(chunks)
 
@@ -4409,6 +4648,10 @@ def run_launchd_user_lifecycle(
         _require_launchd_absent(plan.label)
         _create_disposable_account(plan, state)
         _create_disposable_home(plan.account)
+        _validate_disposable_home_root(
+            plan.account,
+            diagnostic_phase="post-home-create",
+        )
         _require_disposable_uid_available(
             plan.account.uid,
             active_code="disposable-uid-active-before-bootstrap",
@@ -4418,6 +4661,10 @@ def run_launchd_user_lifecycle(
         _require_command_success(
             ["/bin/launchctl", "bootstrap", "system", str(plan.plist)],
             command_id="launchd-bootstrap",
+        )
+        _validate_disposable_home_root(
+            plan.account,
+            diagnostic_phase="post-system-bootstrap",
         )
         _write_launchd_ownership_marker(plan, state)
         loaded_snapshot = _launchd_job_snapshot(plan.label)
@@ -4472,6 +4719,11 @@ def run_launchd_user_lifecycle(
             )
             if observed_pid != kickstart_pid:
                 raise ProbeError("launchd-child-pid-disagrees")
+        if status == 0 and error_code is None and secondary_error_code is None:
+            _validate_disposable_home_root(
+                plan.account,
+                diagnostic_phase="post-child-terminal",
+            )
     except ProbeError as error:
         error_code = error.code
         secondary_error_code = error.secondary_code
@@ -4490,6 +4742,18 @@ def run_launchd_user_lifecycle(
                 status = 2
     processes_absent = False
     if plan is not None and bootout_confirmed:
+        try:
+            _validate_disposable_home_root(
+                plan.account,
+                diagnostic_phase="post-system-bootout",
+            )
+        except ProbeError as error:
+            error_code, secondary_error_code = _merge_probe_error(
+                error_code,
+                secondary_error_code,
+                error,
+            )
+            status = 2
         try:
             current_bindings = _validate_exact_stage(
                 plan,

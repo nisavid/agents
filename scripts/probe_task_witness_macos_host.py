@@ -55,6 +55,7 @@ MAX_HOME_LIBRARY_PATH_BYTES = 2 * 1024
 MAX_HOME_LIBRARY_FILE_BYTES = 1024 * 1024
 MAX_HOME_LIBRARY_TOTAL_BYTES = 8 * 1024 * 1024
 MAX_HOME_LIBRARY_XATTR_LIST_BYTES = 4096
+MAX_HOME_LIBRARY_QUARANTINE_VALUE_BYTES = 4096
 MAX_DISPOSABLE_HOME_ENTRIES = 3
 MAX_LAUNCHD_PROBE_ENTRIES = 4
 COMMAND_TIMEOUT_SECONDS = 10
@@ -195,17 +196,16 @@ _XATTR_PATH_FAMILIES = (
     "group-containers metadata nested-other".split()
 )
 _XATTR_FAMILIES = (
-    "apple-provenance apple-quarantine apple-metadata apple-mixed apple-other "
-    "compression resource-fork finder-info nonapple-other mixed-other overflow "
-    "unstable unclassified".split()
+    "apple-provenance apple-quarantine apple-quarantine-stable-bounded "
+    "apple-quarantine-unreadable apple-metadata apple-mixed apple-other "
+    "compression resource-fork finder-info nonapple-other mixed-other "
+    "overflow unstable unclassified".split()
+)
+_HOME_LIBRARY_QUARANTINE_VALUE_DIGEST_DOMAIN = (
+    b"task-witness-macos-home-library-quarantine-value-v1\0"
 )
 _XATTR_PATH_FAMILY_BY_COMPONENT = {
-    "Preferences": "preferences",
-    "Caches": "caches",
-    "Application Support": "application-support",
-    "Containers": "containers",
-    "Group Containers": "group-containers",
-    "Metadata": "metadata",
+    family.replace("-", " ").title(): family for family in _XATTR_PATH_FAMILIES[1:-1]
 }
 HOME_LIBRARY_UNSAFE_CAUSES = frozenset(
     "bound-home-acl duplicate-identity entry-stat-unsupported-kind "
@@ -516,6 +516,11 @@ class ProcessRecord(NamedTuple):
 class ObservedHomeLibrary(NamedTuple):
     inventory: dict
     stability_sha256: str
+
+
+class _HomeLibraryQuarantineEvidence(NamedTuple):
+    value_length: int
+    value_sha256: str
 
 
 def canonical_bytes(value: object) -> bytes:
@@ -3706,9 +3711,7 @@ def _home_library_file_xattr_error(
     family: object,
 ) -> ProbeError:
     valid = (
-        type(phase) is str
-        and type(path_family) is str
-        and type(family) is str
+        type(phase) is type(path_family) is type(family) is str
         and phase in _XATTR_PHASES
         and path_family in _XATTR_PATH_FAMILIES
         and family in _XATTR_FAMILIES
@@ -3725,7 +3728,7 @@ def _home_library_file_xattr_path_family(components: object) -> str:
     if (
         type(components) is not tuple
         or len(components) < 2
-        or any(type(component) is not str for component in components)
+        or set(map(type, components)) != {str}
         or components[0] != HOME_LIBRARY_NAME
     ):
         return "nested-other"
@@ -3810,97 +3813,153 @@ def _require_no_extended_acl(descriptor: int, unsafe_cause: object) -> None:
                 pass
 
 
-def _file_xattr_family(call, fd):
-    def read(options: int) -> object:
-        buf = ctypes.create_string_buffer(MAX_HOME_LIBRARY_XATTR_LIST_BYTES)
-        ctypes.set_errno(0)
-        size = call(fd, buf, len(buf), options)
-        if size < 0:
-            if ctypes.get_errno() == errno.ERANGE:
-                return "overflow"
-            raise OSError(ctypes.get_errno(), "flistxattr failed")
-        if size == 0:
-            return ()
-        raw = buf.raw[:size]
-        if not raw.endswith(b"\0"):
-            return None
-        parts = raw[:-1].split(b"\0")
-        if (
-            not all(parts)
-            or max(map(len, parts)) > 127
-            or len(set(parts)) != len(parts)
-        ):
-            return None
-        try:
-            return tuple(sorted(part.decode() for part in parts))
-        except UnicodeDecodeError:
-            return None
+def _bind_xattr(call, value: bool):
+    int_, ptr, size = ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t
+    call.argtypes = (
+        [int_, ctypes.c_char_p, ptr, size, ctypes.c_uint32, int_]
+        if value
+        else [int_, ptr, size, int_]
+    )
+    call.restype = ctypes.c_ssize_t
+    return call
 
-    items = [read(flag) for flag in (0, XATTR_SHOWCOMPRESSION) * 2]
-    if "overflow" in items or None in items:
-        return "overflow" if "overflow" in items else "unclassified"
-    if items[0] != items[2] or items[1] != items[3]:
+
+def _xattr_names(call, fd: int, options: int) -> object:
+    buf = ctypes.create_string_buffer(MAX_HOME_LIBRARY_XATTR_LIST_BYTES)
+    ctypes.set_errno(0)
+    size = call(fd, buf, len(buf), options)
+    if size < 0:
+        if ctypes.get_errno() == errno.ERANGE:
+            return "overflow"
+        raise OSError(ctypes.get_errno(), "flistxattr failed")
+    if size == 0:
+        return ()
+    raw = buf.raw[:size]
+    if not raw.endswith(b"\0"):
+        return None
+    parts = raw[:-1].split(b"\0")
+    if not all(parts) or max(map(len, parts)) > 127 or len(set(parts)) != len(parts):
+        return None
+    try:
+        return tuple(sorted(map(bytes.decode, parts)))
+    except UnicodeDecodeError:
+        return None
+
+
+def _file_xattr_family(call, fd: int) -> str | None:
+    items = [_xattr_names(call, fd, flag) for flag in (0, XATTR_SHOWCOMPRESSION) * 2]
+    if "overflow" in items:
+        return "overflow"
+    if None in items:
+        return "unclassified"
+    if items[:2] != items[2:]:
         return "unstable"
     normal, shown = map(set, items[:2])
     if not normal <= shown or shown - normal - {"com.apple.decmpfs"}:
         return "unclassified"
     if not shown:
         return None
-    known = {
-        "com.apple.decmpfs": "compression",
-        "com.apple.ResourceFork": "resource-fork",
-        "com.apple.FinderInfo": "finder-info",
-        "com.apple.provenance": "apple-provenance",
-        "com.apple.quarantine": "apple-quarantine",
-    }
+    known = dict(
+        zip(
+            "decmpfs ResourceFork FinderInfo provenance quarantine".split(),
+            _XATTR_FAMILIES[7:10] + _XATTR_FAMILIES[:2],
+        )
+    )
     apple = {name for name in shown if name.startswith("com.apple.")}
     if not apple:
         return "nonapple-other"
     if apple != shown:
         return "mixed-other"
     categories = {
-        known.get(name)
+        known.get(suffix := name[10:])
         or (
             "apple-metadata"
-            if name.startswith("com.apple.metadata:") and name != "com.apple.metadata:"
+            if suffix.startswith("metadata:") and suffix != "metadata:"
             else "apple-other"
         )
         for name in shown
     }
-    return next(iter(categories)) if len(categories) == 1 else "apple-mixed"
+    return categories.pop() if len(categories) == 1 else "apple-mixed"
+
+
+def _home_library_file_xattr_state(
+    descriptor: int,
+    *,
+    diagnostic_phase: object,
+    diagnostic_path_family: object,
+) -> object:
+    failures = (AttributeError, TypeError, ValueError, OSError)
+    invalid = _home_library_file_xattr_error(
+        diagnostic_phase, diagnostic_path_family, "unclassified"
+    )
+    if invalid.secondary_code == "home-library-diagnostic-invalid":
+        raise invalid
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        flist = _bind_xattr(libc.flistxattr, False)
+        family = _file_xattr_family(flist, descriptor)
+    except failures as error:
+        raise ProbeError("home-library-observation-failed") from error
+    if family != "apple-quarantine":
+        return family
+    try:
+        fget = _bind_xattr(libc.fgetxattr, True)
+    except failures[:3]:
+        return _XATTR_FAMILIES[3]
+    name = b"com.apple.quarantine"
+
+    def names(options):
+        try:
+            return _xattr_names(flist, descriptor, options)
+        except failures:
+            return None
+
+    def value():
+        buf = ctypes.create_string_buffer(MAX_HOME_LIBRARY_QUARANTINE_VALUE_BYTES)
+        ctypes.set_errno(0)
+        try:
+            size = fget(descriptor, name, buf, len(buf), 0, 0)
+        except failures:
+            return None
+        if type(size) is not int:
+            return None
+        if size < 0:
+            return {
+                "ERANGE": "overflow",
+                "ENOATTR": "unstable",
+                "ENODATA": "unstable",
+            }.get(errno.errorcode.get(ctypes.get_errno()))
+        if size > len(buf):
+            return "overflow"
+        raw = buf.raw[:size]
+        digest = hashlib.sha256(
+            _HOME_LIBRARY_QUARANTINE_VALUE_DIGEST_DOMAIN + size.to_bytes(4, "big") + raw
+        ).hexdigest()
+        return _HomeLibraryQuarantineEvidence(size, digest)
+
+    observed = []
+    for _ in range(2):
+        observed.append(value())
+        observed.extend(map(names, (0, XATTR_SHOWCOMPRESSION)))
+    if "overflow" in observed:
+        return "overflow"
+    if None in observed:
+        return _XATTR_FAMILIES[3]
+    later = set(observed[1:3] + observed[4:])
+    if "unstable" in observed or later != {(name.decode(),)}:
+        return "unstable"
+    return observed[0] if observed[0] == observed[3] else "unstable"
 
 
 def _require_no_extended_attributes(
     descriptor: int,
     unsafe_cause: object,
-    *,
-    diagnostic_phase: object = None,
-    diagnostic_path_family: object = None,
 ) -> None:
     try:
         libc = ctypes.CDLL(None, use_errno=True)
-        flistxattr = libc.flistxattr
-        flistxattr.argtypes = [
-            ctypes.c_int,
-            ctypes.c_void_p,
-            ctypes.c_size_t,
-            ctypes.c_int,
-        ]
-        flistxattr.restype = ctypes.c_ssize_t
-        if unsafe_cause == "file-xattr":
-            invalid = _home_library_file_xattr_error(
-                diagnostic_phase, diagnostic_path_family, "unclassified"
-            )
-            if invalid.secondary_code == "home-library-diagnostic-invalid":
-                raise invalid
-            family = _file_xattr_family(flistxattr, descriptor)
-            if family is None:
-                return
-            raise _home_library_file_xattr_error(
-                diagnostic_phase, diagnostic_path_family, family
-            )
+        flist = _bind_xattr(libc.flistxattr, False)
         ctypes.set_errno(0)
-        observed = flistxattr(descriptor, None, 0, XATTR_SHOWCOMPRESSION)
+        observed = flist(descriptor, None, 0, XATTR_SHOWCOMPRESSION)
         if observed < 0:
             raise OSError(ctypes.get_errno(), "flistxattr failed")
         if observed != 0:
@@ -4020,7 +4079,7 @@ def _read_home_library_file(
     parent_descriptor: int,
     name: str,
     expected: os.stat_result,
-    diagnostic_context: tuple[object, object],
+    diagnostic: tuple[object, object],
 ) -> tuple[bytes, os.stat_result]:
     descriptor = -1
     try:
@@ -4029,16 +4088,19 @@ def _read_home_library_file(
             os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
             dir_fd=parent_descriptor,
         )
+        metadata = _home_library_metadata
         opened = os.fstat(descriptor)
-        if _home_library_metadata(opened) != _home_library_metadata(expected):
+        if metadata(opened) != metadata(expected):
             raise ProbeError("home-library-observation-unstable")
         _require_no_extended_acl(descriptor, "file-acl")
         context = {
-            "diagnostic_phase": diagnostic_context[0],
-            "diagnostic_path_family": diagnostic_context[1],
+            "diagnostic_phase": diagnostic[0],
+            "diagnostic_path_family": diagnostic[1],
         }
-        _require_no_extended_attributes(descriptor, "file-xattr", **context)
-        if opened.st_size < 0 or opened.st_size > MAX_HOME_LIBRARY_FILE_BYTES:
+        before = _home_library_file_xattr_state(descriptor, **context)
+        if before is not None and type(before) is not _HomeLibraryQuarantineEvidence:
+            raise _home_library_file_xattr_error(*diagnostic, before)
+        if not 0 <= opened.st_size <= MAX_HOME_LIBRARY_FILE_BYTES:
             raise ProbeError("home-library-bounds-exceeded")
         chunks: list[bytes] = []
         remaining = opened.st_size + 1
@@ -4053,12 +4115,26 @@ def _read_home_library_file(
         current = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
         if (
             len(raw) != opened.st_size
-            or _home_library_metadata(after) != _home_library_metadata(opened)
-            or _home_library_metadata(current) != _home_library_metadata(opened)
+            or metadata(after) != metadata(opened)
+            or metadata(current) != metadata(opened)
         ):
             raise ProbeError("home-library-observation-unstable")
-        _require_no_extended_attributes(descriptor, "file-xattr", **context)
-        return raw, opened
+        after = _home_library_file_xattr_state(descriptor, **context)
+        if before is None and after is None:
+            return raw, opened
+        if (
+            after is not None
+            and type(after) not in (str, _HomeLibraryQuarantineEvidence)
+            or type(after) is str
+            and (
+                before is None
+                or after in {"overflow", "apple-quarantine-unreadable", "unclassified"}
+            )
+        ):
+            family = after
+        else:
+            family = _XATTR_FAMILIES[2] if before == after else "unstable"
+        raise _home_library_file_xattr_error(*diagnostic, family)
     except ProbeError:
         raise
     except OSError as error:

@@ -54,6 +54,7 @@ MAX_HOME_LIBRARY_COMPONENT_BYTES = 255
 MAX_HOME_LIBRARY_PATH_BYTES = 2 * 1024
 MAX_HOME_LIBRARY_FILE_BYTES = 1024 * 1024
 MAX_HOME_LIBRARY_TOTAL_BYTES = 8 * 1024 * 1024
+MAX_HOME_LIBRARY_XATTR_LIST_BYTES = 4096
 MAX_DISPOSABLE_HOME_ENTRIES = 3
 MAX_LAUNCHD_PROBE_ENTRIES = 4
 COMMAND_TIMEOUT_SECONDS = 10
@@ -185,6 +186,15 @@ USER_DOMAIN_RESET_SURVIVOR_CODE = "disposable-user-pid1-parented-processes-remai
 HOME_LIBRARY_NAME = "Library"
 HOME_LIBRARY_QUARANTINE_NAME = ".task-witness-library-cleanup"
 _HOME_LIBRARY_SCOPES = ("root", "directory", "file")
+_XATTR_PHASES = (
+    "journal-inventory source-revalidation quarantine-revalidation "
+    "delete-boundary".split()
+)
+_XATTR_LOCI = ("direct", "nested")
+_XATTR_FAMILIES = (
+    "compression resource-fork finder-info apple-other nonapple-other "
+    "mixed-other overflow unstable unclassified".split()
+)
 HOME_LIBRARY_UNSAFE_CAUSES = frozenset(
     "bound-home-acl duplicate-identity entry-stat-unsupported-kind "
     "file-stat-link-count path-component root-kind".split()
@@ -1712,45 +1722,30 @@ def _validated_launchd_probe_children(
     return tuple(sorted(names))
 
 
+def _disposable_home_root(home: Path, uid: int, gid: int, phase: str):
+    probe_root = home / "launchd-probe"
+    try:
+        home_metadata = home.lstat()
+    except OSError as error:
+        raise _home_cleanup_drift_error(phase, "home-read-failed") from error
+    _require_disposable_directory_metadata("home", home_metadata, uid, gid, phase)
+    _validated_disposable_home_names(home, home_metadata, uid, gid, phase)
+    try:
+        probe_metadata = probe_root.lstat()
+    except FileNotFoundError as error:
+        raise _home_cleanup_drift_error(phase, "probe-missing") from error
+    except OSError as error:
+        raise _home_cleanup_drift_error(phase, "probe-read-failed") from error
+    _require_disposable_directory_metadata("probe", probe_metadata, uid, gid, phase)
+    return probe_root, probe_metadata
+
+
 def _validate_disposable_home_root(
     account: DisposableAccount,
     *,
     diagnostic_phase: str,
 ) -> None:
-    home = account.home
-    probe_root = home / "launchd-probe"
-    try:
-        home_metadata = home.lstat()
-    except OSError as error:
-        raise _home_cleanup_drift_error(
-            diagnostic_phase,
-            "home-read-failed",
-        ) from error
-    _require_disposable_directory_metadata(
-        "home", home_metadata, account.uid, account.gid, diagnostic_phase
-    )
-    _validated_disposable_home_names(
-        home,
-        home_metadata,
-        account.uid,
-        account.gid,
-        diagnostic_phase,
-    )
-    try:
-        probe_metadata = probe_root.lstat()
-    except FileNotFoundError as error:
-        raise _home_cleanup_drift_error(
-            diagnostic_phase,
-            "probe-missing",
-        ) from error
-    except OSError as error:
-        raise _home_cleanup_drift_error(
-            diagnostic_phase,
-            "probe-read-failed",
-        ) from error
-    _require_disposable_directory_metadata(
-        "probe", probe_metadata, account.uid, account.gid, diagnostic_phase
-    )
+    _disposable_home_root(account.home, account.uid, account.gid, diagnostic_phase)
 
 
 def _validate_exact_disposable_home(
@@ -1760,38 +1755,11 @@ def _validate_exact_disposable_home(
     expected_gid: int,
     diagnostic_phase: str,
 ) -> None:
-    probe_root = home / "launchd-probe"
-    try:
-        home_metadata = home.lstat()
-    except OSError as error:
-        raise _home_cleanup_drift_error(
-            diagnostic_phase,
-            "home-read-failed",
-        ) from error
-    _require_disposable_directory_metadata(
-        "home", home_metadata, expected_uid, expected_gid, diagnostic_phase
-    )
-    _validated_disposable_home_names(
+    probe_root, probe_metadata = _disposable_home_root(
         home,
-        home_metadata,
         expected_uid,
         expected_gid,
         diagnostic_phase,
-    )
-    try:
-        probe_metadata = probe_root.lstat()
-    except FileNotFoundError as error:
-        raise _home_cleanup_drift_error(
-            diagnostic_phase,
-            "probe-missing",
-        ) from error
-    except OSError as error:
-        raise _home_cleanup_drift_error(
-            diagnostic_phase,
-            "probe-read-failed",
-        ) from error
-    _require_disposable_directory_metadata(
-        "probe", probe_metadata, expected_uid, expected_gid, diagnostic_phase
     )
     _validated_launchd_probe_children(
         probe_root,
@@ -3748,6 +3716,27 @@ def _home_library_unsafe_error(cause: object) -> ProbeError:
     return ProbeError("home-library-unsafe-entry", secondary_code=secondary)
 
 
+def _home_library_file_xattr_error(
+    phase: object,
+    locus: object,
+    family: object,
+) -> ProbeError:
+    valid = (
+        type(phase) is str
+        and type(locus) is str
+        and type(family) is str
+        and phase in _XATTR_PHASES
+        and locus in _XATTR_LOCI
+        and family in _XATTR_FAMILIES
+    )
+    secondary = (
+        f"home-library-unsafe-entry-file-xattr-{phase}-{locus}-{family}"
+        if valid
+        else "home-library-diagnostic-invalid"
+    )
+    return ProbeError("home-library-unsafe-entry", secondary_code=secondary)
+
+
 def _home_library_path_sha256(components: Sequence[str]) -> str:
     digest = hashlib.sha256(b"task-witness-macos-home-library-path-v1\0")
     total = 0
@@ -3824,7 +3813,65 @@ def _require_no_extended_acl(descriptor: int, unsafe_cause: object) -> None:
                 pass
 
 
-def _require_no_extended_attributes(descriptor: int, unsafe_cause: object) -> None:
+def _file_xattr_family(call, fd):
+    def read(options: int) -> object:
+        buf = ctypes.create_string_buffer(MAX_HOME_LIBRARY_XATTR_LIST_BYTES)
+        ctypes.set_errno(0)
+        size = call(fd, buf, len(buf), options)
+        if size < 0:
+            if ctypes.get_errno() == errno.ERANGE:
+                return "overflow"
+            raise OSError(ctypes.get_errno(), "flistxattr failed")
+        if size == 0:
+            return ()
+        raw = buf.raw[:size]
+        if not raw.endswith(b"\0"):
+            return None
+        parts = raw[:-1].split(b"\0")
+        if (
+            not all(parts)
+            or max(map(len, parts)) > 127
+            or len(set(parts)) != len(parts)
+        ):
+            return None
+        try:
+            return tuple(sorted(part.decode() for part in parts))
+        except UnicodeDecodeError:
+            return None
+
+    items = [read(flag) for flag in (0, XATTR_SHOWCOMPRESSION) * 2]
+    if "overflow" in items or None in items:
+        return "overflow" if "overflow" in items else "unclassified"
+    if items[0] != items[2] or items[1] != items[3]:
+        return "unstable"
+    normal, shown = map(set, items[:2])
+    if not normal <= shown or shown - normal - {"com.apple.decmpfs"}:
+        return "unclassified"
+    if not shown or not normal:
+        return None if not shown else "compression"
+    known = {
+        "com.apple.decmpfs": "compression",
+        "com.apple.ResourceFork": "resource-fork",
+        "com.apple.FinderInfo": "finder-info",
+    }
+    family = known.get(next(iter(shown))) if len(shown) == 1 else None
+    if family:
+        return family
+    if shown & known.keys():
+        return "mixed-other"
+    apple = sum(name.startswith("com.apple.") for name in shown)
+    if not apple or apple == len(shown):
+        return "apple-other" if apple else "nonapple-other"
+    return "mixed-other"
+
+
+def _require_no_extended_attributes(
+    descriptor: int,
+    unsafe_cause: object,
+    *,
+    diagnostic_phase: object = None,
+    diagnostic_locus: object = None,
+) -> None:
     try:
         libc = ctypes.CDLL(None, use_errno=True)
         flistxattr = libc.flistxattr
@@ -3835,6 +3882,18 @@ def _require_no_extended_attributes(descriptor: int, unsafe_cause: object) -> No
             ctypes.c_int,
         ]
         flistxattr.restype = ctypes.c_ssize_t
+        if unsafe_cause == "file-xattr":
+            invalid = _home_library_file_xattr_error(
+                diagnostic_phase, diagnostic_locus, "unclassified"
+            )
+            if invalid.secondary_code == "home-library-diagnostic-invalid":
+                raise invalid
+            family = _file_xattr_family(flistxattr, descriptor)
+            if family is None:
+                return
+            raise _home_library_file_xattr_error(
+                diagnostic_phase, diagnostic_locus, family
+            )
         ctypes.set_errno(0)
         observed = flistxattr(descriptor, None, 0, XATTR_SHOWCOMPRESSION)
         if observed < 0:
@@ -3956,6 +4015,7 @@ def _read_home_library_file(
     parent_descriptor: int,
     name: str,
     expected: os.stat_result,
+    diagnostic_context: tuple[object, object],
 ) -> tuple[bytes, os.stat_result]:
     descriptor = -1
     try:
@@ -3968,7 +4028,11 @@ def _read_home_library_file(
         if _home_library_metadata(opened) != _home_library_metadata(expected):
             raise ProbeError("home-library-observation-unstable")
         _require_no_extended_acl(descriptor, "file-acl")
-        _require_no_extended_attributes(descriptor, "file-xattr")
+        context = {
+            "diagnostic_phase": diagnostic_context[0],
+            "diagnostic_locus": diagnostic_context[1],
+        }
+        _require_no_extended_attributes(descriptor, "file-xattr", **context)
         if opened.st_size < 0 or opened.st_size > MAX_HOME_LIBRARY_FILE_BYTES:
             raise ProbeError("home-library-bounds-exceeded")
         chunks: list[bytes] = []
@@ -3988,7 +4052,7 @@ def _read_home_library_file(
             or _home_library_metadata(current) != _home_library_metadata(opened)
         ):
             raise ProbeError("home-library-observation-unstable")
-        _require_no_extended_attributes(descriptor, "file-xattr")
+        _require_no_extended_attributes(descriptor, "file-xattr", **context)
         return raw, opened
     except ProbeError:
         raise
@@ -4063,6 +4127,7 @@ def _observe_bounded_library(
     account: DisposableAccount,
     leaf_name: str,
     expected_home_identity: Mapping[str, int] | None = None,
+    diagnostic_phase: object = None,
 ) -> ObservedHomeLibrary:
     home_descriptor = -1
     library_descriptor = -1
@@ -4154,6 +4219,7 @@ def _observe_bounded_library(
                     descriptor,
                     components[-1],
                     metadata,
+                    (diagnostic_phase, "direct" if depth == 2 else "nested"),
                 )
                 total_bytes += len(raw)
                 if total_bytes > MAX_HOME_LIBRARY_TOTAL_BYTES:
@@ -4404,10 +4470,9 @@ def _bounded_library_inventory(account: DisposableAccount) -> dict | None:
         raise ProbeError("home-library-quarantine-drift")
     if not _path_exists_no_follow(source):
         return None
-    first = _observe_bounded_library(account, HOME_LIBRARY_NAME)
-    second = _observe_bounded_library(account, HOME_LIBRARY_NAME)
-    if first != second:
-        raise ProbeError("home-library-observation-unstable")
+    first = _stable_home_library_observation(
+        account, HOME_LIBRARY_NAME, None, "journal-inventory"
+    )
     home_device = account.home.lstat().st_dev
     return _validated_library_inventory(first.inventory, account, home_device)
 
@@ -4439,6 +4504,21 @@ def _require_library_inventory_relation(
         raise ProbeError("home-library-inventory-drift")
 
 
+def _stable_home_library_observation(
+    account: DisposableAccount,
+    leaf_name: str,
+    home_identity: Mapping[str, int] | None,
+    diagnostic_phase: str,
+) -> ObservedHomeLibrary:
+    first, second = (
+        _observe_bounded_library(account, leaf_name, home_identity, diagnostic_phase)
+        for _ in range(2)
+    )
+    if first != second:
+        raise ProbeError("home-library-observation-unstable")
+    return first
+
+
 def _stable_observed_library(
     account: DisposableAccount,
     leaf_name: str,
@@ -4446,11 +4526,11 @@ def _stable_observed_library(
     home_identity: Mapping[str, int],
     *,
     exact: bool,
+    diagnostic_phase: str,
 ) -> dict:
-    first = _observe_bounded_library(account, leaf_name, home_identity)
-    second = _observe_bounded_library(account, leaf_name, home_identity)
-    if first != second:
-        raise ProbeError("home-library-observation-unstable")
+    first = _stable_home_library_observation(
+        account, leaf_name, home_identity, diagnostic_phase
+    )
     current = _validated_library_inventory(
         first.inventory,
         account,
@@ -4511,7 +4591,15 @@ def _delete_authorized_library_directory(
         kind = record.get("kind")
         if kind == "file":
             _require_library_record_metadata(record, metadata, "file")
-            raw, opened = _read_home_library_file(descriptor, name, metadata)
+            raw, opened = _read_home_library_file(
+                descriptor,
+                name,
+                metadata,
+                (
+                    "delete-boundary",
+                    "direct" if len(child_components) == 2 else "nested",
+                ),
+            )
             if any(
                 record.get(field) != value
                 for field, value in {
@@ -4606,6 +4694,7 @@ def _quarantine_and_remove_bounded_library(
                 inventory,
                 identity,
                 exact=True,
+                diagnostic_phase="source-revalidation",
             )
             _require_bound_home_descriptor(account, home_descriptor, identity)
             _renameat_exclusive(
@@ -4624,6 +4713,7 @@ def _quarantine_and_remove_bounded_library(
             inventory,
             identity,
             exact=False,
+            diagnostic_phase="quarantine-revalidation",
         )
         _require_bound_home_descriptor(account, home_descriptor, identity)
         authorized_entries = inventory.get("entries")

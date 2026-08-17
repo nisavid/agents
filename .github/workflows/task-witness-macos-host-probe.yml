@@ -31,7 +31,7 @@ jobs:
     timeout-minutes: 15
     env:
       CANDIDATE_SHA: b47f03519068b858cf0c070b5d331ee053ef6b7b
-      HELPER_SHA256: 77ab9464cd26b5f275839a8dc03d7f4fd874a6bc044f03d1209ad805288fb6bb
+      HELPER_SHA256: ec67a8b133dbce3884ec03eee691aa66f4a4129fed1c234cc4c45775cf4b42f5
       USER_DOMAIN_RESET_AUTHORIZATION_SHA: ${{ vars.TASK_WITNESS_MACOS_HOST_PROBE_RESET }}
     steps:
       - name: Check out the operator-owned harness

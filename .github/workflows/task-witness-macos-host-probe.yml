@@ -31,7 +31,7 @@ jobs:
     timeout-minutes: 15
     env:
       CANDIDATE_SHA: b47f03519068b858cf0c070b5d331ee053ef6b7b
-      HELPER_SHA256: 0cba047c2e0a7a93e771216dc68692edba200fd7ca6be2741683eaec74d66c45
+      HELPER_SHA256: 0d6b571d05b580aeb5570b5173457402d4748cc604f85e1bce6eb9d67c696b3e
       USER_DOMAIN_RESET_AUTHORIZATION_SHA: ${{ vars.TASK_WITNESS_MACOS_HOST_PROBE_RESET }}
     steps:
       - name: Check out the operator-owned harness
@@ -41,6 +41,8 @@ jobs:
           persist-credentials: false
 
       - name: Verify the exact harness inputs and local contract
+        env:
+          TASK_WITNESS_REQUIRE_EXACT_NATIVE_QUARANTINE_SINGLETON: "1"
         shell: bash
         run: |
           set -euo pipefail

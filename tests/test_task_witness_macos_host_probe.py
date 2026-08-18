@@ -28,6 +28,9 @@ LINUX_WORKFLOW = (
 FROZEN_CANDIDATE_SHA = "b47f03519068b858cf0c070b5d331ee053ef6b7b"
 MACOS_HARNESS_BRANCH = "ivan/task-witness-macos-qualification-harness"
 LINUX_HARNESS_BRANCH = "ivan/task-witness-linux-qualification-harness"
+HOSTED_EXACT_NATIVE_QUARANTINE_ENV = (
+    "TASK_WITNESS_REQUIRE_EXACT_NATIVE_QUARANTINE_SINGLETON"
+)
 
 
 def load_helper():
@@ -55,6 +58,13 @@ def workflow_step_script(name: str) -> str:
             raise AssertionError(f"unexpected workflow script indentation: {line}")
         body.append(line[10:] if line else "")
     return "\n".join(body) + "\n"
+
+
+def require_hosted_exact_native_quarantine(names: list[str]) -> None:
+    if os.environ.get(HOSTED_EXACT_NATIVE_QUARANTINE_ENV) == "1" and names != [
+        "com.apple.quarantine"
+    ]:
+        raise AssertionError("hosted native quarantine fixture is not exact")
 
 
 def eligible_context() -> dict[str, str]:
@@ -847,6 +857,17 @@ class TaskWitnessMacOSHostProbeTests(unittest.TestCase):
         self.assertNotIn("candidate-stage", workflow)
         self.assertNotIn("run_task_witness_qualification.py", workflow)
         self.assertNotIn("validate_task_witness.py", workflow)
+        verify_marker = (
+            "      - name: Verify the exact harness inputs and local contract\n"
+        )
+        capture_marker = "      - name: Capture the bounded direct-session probe\n"
+        verify = workflow[
+            workflow.index(verify_marker) : workflow.index(capture_marker)
+        ]
+        self.assertIn(
+            f'        env:\n          {HOSTED_EXACT_NATIVE_QUARANTINE_ENV}: "1"\n',
+            verify,
+        )
 
         test_command = (
             "          /usr/bin/python3 -I -B \\\n"
@@ -897,6 +918,18 @@ class TaskWitnessMacOSHostProbeTests(unittest.TestCase):
         self.assertNotIn(live_home_call, tests)
         self.assertNotIn(live_darwin_guard, tests)
         self.assertIn(deterministic_test, tests)
+
+    def test_hosted_native_quarantine_gate_requires_exact_singleton(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {HOSTED_EXACT_NATIVE_QUARANTINE_ENV: "1"},
+            clear=False,
+        ):
+            require_hosted_exact_native_quarantine(["com.apple.quarantine"])
+            with self.assertRaisesRegex(AssertionError, "fixture is not exact"):
+                require_hosted_exact_native_quarantine(
+                    ["com.apple.provenance", "com.apple.quarantine"]
+                )
 
     def test_workflow_uploads_only_successfully_sealed_diagnostics(self) -> None:
         workflow = WORKFLOW.read_text()
@@ -1123,7 +1156,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             identity,
             inventory,
         )
-        self.assertEqual(authorization["schema_version"], 2)
+        self.assertEqual(authorization["schema_version"], 3)
         self.assertEqual(authorization["library_inventory"], inventory)
         self.helper._require_content_digest(
             authorization,
@@ -6713,6 +6746,11 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
         assert evidence_type is not None
         first = evidence_type(7, "1" * 64)
         changed = evidence_type(7, "2" * 64)
+
+        class EvidenceSubclass(evidence_type):
+            pass
+
+        subclass = EvidenceSubclass(*first)
         phases = tuple(self.helper._XATTR_PHASES)
         path_families = tuple(self.helper._XATTR_PATH_FAMILIES)
         with tempfile.TemporaryDirectory() as directory:
@@ -6799,29 +6837,54 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                                 "_home_library_file_xattr_state",
                                 side_effect=observe,
                             ),
-                            mock.patch.object(self.helper.os, "read", side_effect=read),
-                            self.assertRaises(self.helper.ProbeError) as raised,
+                            mock.patch.object(
+                                self.helper.os,
+                                "read",
+                                side_effect=read,
+                            ),
                         ):
-                            self.helper._read_home_library_file(
-                                parent_descriptor,
-                                path.name,
-                                path.lstat(),
-                                (phase, path_family),
-                            )
-                        secondary = (
-                            "home-library-unsafe-entry-file-xattr-"
-                            f"{phase}-{path_family}-apple-quarantine-stable-bounded"
-                        )
-                        self.assertEqual(
-                            (raised.exception.code, raised.exception.secondary_code),
-                            ("home-library-unsafe-entry", secondary),
-                        )
+                            if path_family == "preferences":
+                                observed_raw, _opened, receipt = (
+                                    self.helper._read_home_library_file(
+                                        parent_descriptor,
+                                        path.name,
+                                        path.lstat(),
+                                        (phase, path_family),
+                                    )
+                                )
+                                self.assertEqual(observed_raw, payload)
+                                self.assertEqual(receipt, first)
+                            else:
+                                with self.assertRaises(
+                                    self.helper.ProbeError
+                                ) as raised:
+                                    self.helper._read_home_library_file(
+                                        parent_descriptor,
+                                        path.name,
+                                        path.lstat(),
+                                        (phase, path_family),
+                                    )
+                                secondary = (
+                                    "home-library-unsafe-entry-file-xattr-"
+                                    f"{phase}-{path_family}-"
+                                    "apple-quarantine-stable-bounded"
+                                )
+                                self.assertEqual(
+                                    (
+                                        raised.exception.code,
+                                        raised.exception.secondary_code,
+                                    ),
+                                    ("home-library-unsafe-entry", secondary),
+                                )
                         self.assertEqual(events[0][0], "xattr")
-                        self.assertEqual(events[-1], events[0])
-                        self.assertTrue(events[1:-1])
-                        self.assertTrue(
-                            all(event[0] == "read" for event in events[1:-1])
-                        )
+                        if path_family == "preferences":
+                            self.assertEqual(events[-1], events[0])
+                            self.assertTrue(events[1:-1])
+                            self.assertTrue(
+                                all(event[0] == "read" for event in events[1:-1])
+                            )
+                        else:
+                            self.assertEqual(events, [events[0]])
                         self.assertEqual(
                             {event[1] for event in events},
                             {events[0][1]},
@@ -6837,13 +6900,14 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                     "_home_library_file_xattr_state",
                     return_value=None,
                 ):
-                    raw, _metadata = self.helper._read_home_library_file(
+                    raw, _metadata, receipt = self.helper._read_home_library_file(
                         parent_descriptor,
                         path.name,
                         path.lstat(),
                         ("journal-inventory", "direct"),
                     )
                 self.assertEqual(raw, payload)
+                self.assertIsNone(receipt)
 
                 for before, after in (
                     (first, changed),
@@ -6866,13 +6930,78 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                             parent_descriptor,
                             path.name,
                             path.lstat(),
-                            ("delete-boundary", "nested-other"),
+                            ("delete-boundary", "preferences"),
                         )
                     self.assertEqual(
                         raised.exception.secondary_code,
                         "home-library-unsafe-entry-file-xattr-"
-                        "delete-boundary-nested-other-unstable",
+                        "delete-boundary-preferences-unstable",
                     )
+                    self.assertNotIn("private", str(raised.exception))
+
+                for invalid_evidence in (tuple(first), subclass):
+                    observations = iter((first, invalid_evidence))
+                    with (
+                        self.subTest(
+                            post_read_invalid_type=type(invalid_evidence).__name__
+                        ),
+                        mock.patch.object(
+                            self.helper,
+                            "_home_library_file_xattr_state",
+                            side_effect=lambda *_args, observations=observations, **_kwargs: (
+                                next(observations)
+                            ),
+                        ) as observer,
+                        self.assertRaises(self.helper.ProbeError) as raised,
+                    ):
+                        self.helper._read_home_library_file(
+                            parent_descriptor,
+                            path.name,
+                            path.lstat(),
+                            ("delete-boundary", "preferences"),
+                        )
+                    self.assertEqual(
+                        (raised.exception.code, raised.exception.secondary_code),
+                        (
+                            "home-library-unsafe-entry",
+                            "home-library-diagnostic-invalid",
+                        ),
+                    )
+                    self.assertEqual(observer.call_count, 2)
+                    self.assertNotIn("private", str(raised.exception))
+
+                for invalid_evidence in (tuple(first), subclass):
+                    with (
+                        self.subTest(
+                            pre_read_invalid_type=type(invalid_evidence).__name__
+                        ),
+                        mock.patch.object(
+                            self.helper,
+                            "_home_library_file_xattr_state",
+                            return_value=invalid_evidence,
+                        ) as observer,
+                        mock.patch.object(
+                            self.helper.os,
+                            "read",
+                            side_effect=AssertionError("private-content-read-canary"),
+                        ) as read,
+                        self.assertRaises(self.helper.ProbeError) as raised,
+                    ):
+                        self.helper._read_home_library_file(
+                            parent_descriptor,
+                            path.name,
+                            path.lstat(),
+                            ("delete-boundary", "preferences"),
+                        )
+                    self.assertEqual(
+                        (raised.exception.code, raised.exception.secondary_code),
+                        (
+                            "home-library-unsafe-entry",
+                            "home-library-diagnostic-invalid",
+                        ),
+                    )
+                    observer.assert_called_once()
+                    read.assert_not_called()
                     self.assertNotIn("private", str(raised.exception))
 
                 for family in (
@@ -6900,12 +7029,12 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                                 parent_descriptor,
                                 path.name,
                                 path.lstat(),
-                                ("delete-boundary", "nested-other"),
+                                ("delete-boundary", "preferences"),
                             )
                         self.assertEqual(
                             raised.exception.secondary_code,
                             "home-library-unsafe-entry-file-xattr-"
-                            f"delete-boundary-nested-other-{family}",
+                            f"delete-boundary-preferences-{family}",
                         )
                         self.assertEqual(observer.call_count, 2)
                         self.assertNotIn("private", str(raised.exception))
@@ -6953,7 +7082,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                             parent_descriptor,
                             path.name,
                             path.lstat(),
-                            ("delete-boundary", "nested-other"),
+                            ("delete-boundary", "preferences"),
                         )
                     self.assertEqual(
                         (
@@ -7003,28 +7132,36 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                                 parent_descriptor,
                                 path.name,
                                 path.lstat(),
-                                ("delete-boundary", "nested-other"),
+                                ("delete-boundary", "preferences"),
                             )
                         self.assertEqual(
                             raised.exception.secondary_code,
                             "home-library-unsafe-entry-file-xattr-"
-                            f"delete-boundary-nested-other-{expected}",
+                            f"delete-boundary-preferences-{expected}",
                         )
                         self.assertEqual(observer.call_count, 2)
                         self.assertNotIn("private", str(raised.exception))
             finally:
                 os.close(parent_descriptor)
 
-    def test_quarantine_value_evidence_is_not_inventory_or_replay_authority(
+    def test_preferences_quarantine_evidence_is_private_inventory_authority(
         self,
     ) -> None:
+        evidence_type = self.helper._HomeLibraryQuarantineEvidence
+        evidence = evidence_type(7, "1" * 64)
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory) / "home"
             probe = home / "launchd-probe"
             payload = home / "Library" / "Preferences" / "payload.bin"
+            deep_payload = payload.parent / "ByHost" / "deep.bin"
+            ordinary = home / "Library" / "Caches" / "ordinary.bin"
             probe.mkdir(parents=True, mode=0o700)
             payload.parent.mkdir(parents=True)
+            deep_payload.parent.mkdir()
+            ordinary.parent.mkdir(parents=True)
             payload.write_bytes(b"payload")
+            deep_payload.write_bytes(b"deep")
+            ordinary.write_bytes(b"ordinary")
             home.chmod(0o700)
             probe.chmod(0o700)
             account = self.helper.DisposableAccount(
@@ -7033,7 +7170,294 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 gid=os.getegid(),
                 home=home,
             )
-            inventory = self.helper._bounded_library_inventory(account)
+            target_inodes = {payload.lstat().st_ino, deep_payload.lstat().st_ino}
+
+            def observe(descriptor: int, **_context: object) -> object:
+                return (
+                    evidence if os.fstat(descriptor).st_ino in target_inodes else None
+                )
+
+            with mock.patch.object(
+                self.helper,
+                "_home_library_file_xattr_state",
+                side_effect=observe,
+            ):
+                inventory = self.helper._bounded_library_inventory(account)
+            self.assertIsInstance(inventory, dict)
+            assert isinstance(inventory, dict)
+            self.assertEqual(inventory["schema_version"], 2)
+            self.assertEqual(
+                inventory["contract"],
+                "task-witness-macos-bounded-library-inventory-v2",
+            )
+            files = {
+                item["inode"]: item
+                for item in inventory["entries"]
+                if item.get("kind") == "file"
+            }
+            self.assertEqual(
+                files[payload.lstat().st_ino]["xattr_receipt"],
+                {
+                    "family": "apple-quarantine-stable-bounded",
+                    "value_length": 7,
+                    "value_sha256": "1" * 64,
+                },
+            )
+            self.assertEqual(
+                files[deep_payload.lstat().st_ino]["xattr_receipt"],
+                files[payload.lstat().st_ino]["xattr_receipt"],
+            )
+            self.assertIsNone(files[ordinary.lstat().st_ino]["xattr_receipt"])
+            validated = self.helper._validated_library_inventory(
+                inventory,
+                account,
+                home.lstat().st_dev,
+            )
+            self.assertEqual(validated, inventory)
+
+            target_record = files[payload.lstat().st_ino]
+            ordinary_record = files[ordinary.lstat().st_ino]
+            root_record = next(
+                item for item in inventory["entries"] if item.get("depth") == 1
+            )
+            for boundary in (
+                0,
+                self.helper.MAX_HOME_LIBRARY_QUARANTINE_VALUE_BYTES,
+            ):
+                entries = [
+                    {
+                        **item,
+                        "xattr_receipt": {
+                            **target_record["xattr_receipt"],
+                            "value_length": boundary,
+                        },
+                    }
+                    if item is target_record
+                    else item
+                    for item in inventory["entries"]
+                ]
+                bounded = self.helper._document_with_digest(
+                    {
+                        **{
+                            key: value
+                            for key, value in inventory.items()
+                            if key != "content_sha256"
+                        },
+                        "entries": entries,
+                    }
+                )
+                with self.subTest(value_length_boundary=boundary):
+                    self.assertEqual(
+                        self.helper._validated_library_inventory(
+                            bounded,
+                            account,
+                            home.lstat().st_dev,
+                        ),
+                        bounded,
+                    )
+
+            preferences_file = {
+                **target_record,
+                "depth": 2,
+                "parent_sha256": root_record["path_sha256"],
+                "path_sha256": self.helper._home_library_path_sha256(
+                    (self.helper.HOME_LIBRARY_NAME, "Preferences")
+                ),
+            }
+            invalid_ancestor = self.helper._document_with_digest(
+                {
+                    "schema_version": 2,
+                    "contract": "task-witness-macos-bounded-library-inventory-v2",
+                    "entry_count": 2,
+                    "regular_file_bytes": preferences_file["size"],
+                    "entries": sorted(
+                        (root_record, preferences_file),
+                        key=lambda item: item["path_sha256"],
+                    ),
+                }
+            )
+            with self.assertRaises(self.helper.ProbeError) as raised:
+                self.helper._validated_library_inventory(
+                    invalid_ancestor,
+                    account,
+                    home.lstat().st_dev,
+                )
+            self.assertEqual(raised.exception.code, "home-library-inventory-invalid")
+
+            directory_receipt = self.helper._document_with_digest(
+                {
+                    **{
+                        key: value
+                        for key, value in inventory.items()
+                        if key != "content_sha256"
+                    },
+                    "entries": [
+                        {**item, "xattr_receipt": None} if item is root_record else item
+                        for item in inventory["entries"]
+                    ],
+                }
+            )
+            with self.assertRaises(self.helper.ProbeError) as raised:
+                self.helper._validated_library_inventory(
+                    directory_receipt,
+                    account,
+                    home.lstat().st_dev,
+                )
+            self.assertEqual(raised.exception.code, "home-library-inventory-invalid")
+
+            malformed_receipt = {
+                **inventory,
+                "entries": [
+                    (
+                        {**item, "xattr_receipt": None}
+                        if item is target_record
+                        else {
+                            **item,
+                            "xattr_receipt": target_record["xattr_receipt"],
+                        }
+                        if item is ordinary_record
+                        else item
+                    )
+                    for item in inventory["entries"]
+                ],
+            }
+            malformed_receipt = self.helper._document_with_digest(
+                {
+                    key: value
+                    for key, value in malformed_receipt.items()
+                    if key != "content_sha256"
+                }
+            )
+            with self.assertRaises(self.helper.ProbeError) as raised:
+                self.helper._validated_library_inventory(
+                    malformed_receipt,
+                    account,
+                    home.lstat().st_dev,
+                )
+            self.assertEqual(raised.exception.code, "home-library-inventory-invalid")
+
+            bad_receipts = (
+                False,
+                {},
+                {"family": "apple-quarantine-stable-bounded"},
+                {
+                    "family": "apple-quarantine",
+                    "value_length": 7,
+                    "value_sha256": "1" * 64,
+                },
+                {
+                    "family": "apple-quarantine-stable-bounded",
+                    "value_length": True,
+                    "value_sha256": "1" * 64,
+                },
+                {
+                    "family": "apple-quarantine-stable-bounded",
+                    "value_length": -1,
+                    "value_sha256": "1" * 64,
+                },
+                {
+                    "family": "apple-quarantine-stable-bounded",
+                    "value_length": 4097,
+                    "value_sha256": "1" * 64,
+                },
+                {
+                    "family": "apple-quarantine-stable-bounded",
+                    "value_length": 7,
+                    "value_sha256": "A" * 64,
+                },
+                {
+                    "family": "apple-quarantine-stable-bounded",
+                    "value_length": 7,
+                    "value_sha256": "1" * 64,
+                    "private": "private-receipt-shape-canary",
+                },
+            )
+            for bad_receipt in bad_receipts:
+                entries = [
+                    {**item, "xattr_receipt": bad_receipt}
+                    if item is target_record
+                    else item
+                    for item in inventory["entries"]
+                ]
+                malformed = self.helper._document_with_digest(
+                    {
+                        **{
+                            key: value
+                            for key, value in inventory.items()
+                            if key != "content_sha256"
+                        },
+                        "entries": entries,
+                    }
+                )
+                with (
+                    self.subTest(bad_receipt=bad_receipt),
+                    self.assertRaises(self.helper.ProbeError) as raised,
+                ):
+                    self.helper._validated_library_inventory(
+                        malformed,
+                        account,
+                        home.lstat().st_dev,
+                    )
+                self.assertEqual(
+                    raised.exception.code,
+                    "home-library-inventory-invalid",
+                )
+                self.assertNotIn("private", str(raised.exception))
+
+            missing_receipt = self.helper._document_with_digest(
+                {
+                    **{
+                        key: value
+                        for key, value in inventory.items()
+                        if key != "content_sha256"
+                    },
+                    "entries": [
+                        {
+                            key: value
+                            for key, value in item.items()
+                            if key != "xattr_receipt"
+                        }
+                        if item is target_record
+                        else item
+                        for item in inventory["entries"]
+                    ],
+                }
+            )
+            with self.assertRaises(self.helper.ProbeError) as raised:
+                self.helper._validated_library_inventory(
+                    missing_receipt,
+                    account,
+                    home.lstat().st_dev,
+                )
+            self.assertEqual(raised.exception.code, "home-library-inventory-invalid")
+
+            for legacy_field in (
+                {"schema_version": 1},
+                {"contract": "task-witness-macos-bounded-library-inventory-v1"},
+            ):
+                legacy = self.helper._document_with_digest(
+                    {
+                        **{
+                            key: value
+                            for key, value in inventory.items()
+                            if key != "content_sha256"
+                        },
+                        **legacy_field,
+                    }
+                )
+                with (
+                    self.subTest(legacy_field=legacy_field),
+                    self.assertRaises(self.helper.ProbeError) as raised,
+                ):
+                    self.helper._validated_library_inventory(
+                        legacy,
+                        account,
+                        home.lstat().st_dev,
+                    )
+                self.assertEqual(
+                    raised.exception.code,
+                    "home-library-inventory-invalid",
+                )
         self.assertEqual(
             set(inventory),
             {
@@ -7047,14 +7471,113 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
         )
         raw = self.helper.canonical_bytes(inventory)
         for forbidden in (
-            b"xattr",
-            b"quarantine",
-            b"value_length",
-            b"value_sha256",
+            b"com.apple.quarantine",
+            b"private-xattr-value-canary",
         ):
             self.assertNotIn(forbidden, raw)
+        helper_source = HELPER.read_text(encoding="utf-8")
+        for mutation_name in (
+            "setxattr",
+            "removexattr",
+            "fsetxattr",
+            "fremovexattr",
+        ):
+            self.assertNotIn(mutation_name, helper_source)
 
-    def test_native_quarantine_value_is_only_bounded_diagnostic_evidence(
+    def test_preferences_quarantine_receipt_returns_only_after_stable_read(
+        self,
+    ) -> None:
+        evidence = self.helper._HomeLibraryQuarantineEvidence(7, "2" * 64)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            payload = root / "payload.bin"
+            raw = b"private-quarantine-content-canary"
+            payload.write_bytes(raw)
+            descriptor = os.open(
+                root,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY,
+            )
+            try:
+                with mock.patch.object(
+                    self.helper,
+                    "_home_library_file_xattr_state",
+                    return_value=evidence,
+                ) as observer:
+                    observed_raw, opened, receipt = self.helper._read_home_library_file(
+                        descriptor,
+                        payload.name,
+                        payload.lstat(),
+                        ("journal-inventory", "preferences"),
+                    )
+                self.assertEqual(observed_raw, raw)
+                self.assertEqual(opened.st_ino, payload.lstat().st_ino)
+                self.assertEqual(receipt, evidence)
+                self.assertEqual(observer.call_count, 2)
+
+                with (
+                    mock.patch.object(
+                        self.helper,
+                        "_home_library_file_xattr_state",
+                        return_value=evidence,
+                    ) as observer,
+                    mock.patch.object(
+                        self.helper.os,
+                        "read",
+                        side_effect=AssertionError("private-content-read-canary"),
+                    ) as read,
+                    self.assertRaises(self.helper.ProbeError) as raised,
+                ):
+                    self.helper._read_home_library_file(
+                        descriptor,
+                        payload.name,
+                        payload.lstat(),
+                        ("journal-inventory", "caches"),
+                    )
+                self.assertEqual(
+                    raised.exception.secondary_code,
+                    "home-library-unsafe-entry-file-xattr-journal-inventory-"
+                    "caches-apple-quarantine-stable-bounded",
+                )
+                observer.assert_called_once()
+                read.assert_not_called()
+                self.assertNotIn(raw.decode(), str(raised.exception))
+
+                observations = 0
+
+                def drift_after_read(*_args: object, **_kwargs: object) -> object:
+                    nonlocal observations
+                    observations += 1
+                    if observations == 2:
+                        os.utime(
+                            payload,
+                            ns=(1_600_000_000_123_456_789,) * 2,
+                            follow_symlinks=False,
+                        )
+                    return evidence
+
+                with (
+                    mock.patch.object(
+                        self.helper,
+                        "_home_library_file_xattr_state",
+                        side_effect=drift_after_read,
+                    ),
+                    self.assertRaises(self.helper.ProbeError) as raised,
+                ):
+                    self.helper._read_home_library_file(
+                        descriptor,
+                        payload.name,
+                        payload.lstat(),
+                        ("journal-inventory", "preferences"),
+                    )
+                self.assertEqual(
+                    (raised.exception.code, raised.exception.secondary_code),
+                    ("home-library-observation-unstable", None),
+                )
+                self.assertEqual(observations, 2)
+            finally:
+                os.close(descriptor)
+
+    def test_native_preferences_quarantine_value_returns_private_receipt(
         self,
     ) -> None:
         if os.uname().sysname != "Darwin":
@@ -7069,8 +7592,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 check=False,
                 capture_output=True,
             )
-            if cleared.returncode != 0:
-                self.skipTest("host cannot clear a temporary file's attributes")
+            self.assertEqual(cleared.returncode, 0, cleared.stderr.decode())
             self.write_extended_attribute(path, "com.apple.quarantine")
             names = subprocess.run(
                 ["/usr/bin/xattr", str(path)],
@@ -7078,15 +7600,52 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 capture_output=True,
                 text=True,
             ).stdout.splitlines()
-            if names != ["com.apple.quarantine"]:
-                self.skipTest("host cannot fixture an exact quarantine singleton")
+            expected_names = ["com.apple.quarantine"]
+            require_hosted_exact_native_quarantine(names)
+            classification = nullcontext()
+            if names != expected_names:
+                self.assertEqual(
+                    names,
+                    ["com.apple.provenance", "com.apple.quarantine"],
+                )
+                file_descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+                try:
+                    self.assertEqual(
+                        native_helper._home_library_file_xattr_state(
+                            file_descriptor,
+                            diagnostic_phase="journal-inventory",
+                            diagnostic_path_family="preferences",
+                        ),
+                        "apple-mixed",
+                    )
+                finally:
+                    os.close(file_descriptor)
+                xattr_names = native_helper._xattr_names
+
+                def without_provenance(
+                    call: object,
+                    descriptor: int,
+                    options: int,
+                ) -> object:
+                    observed = xattr_names(call, descriptor, options)
+                    if type(observed) is tuple:
+                        return tuple(
+                            name for name in observed if name != "com.apple.provenance"
+                        )
+                    return observed
+
+                classification = mock.patch.object(
+                    native_helper,
+                    "_xattr_names",
+                    side_effect=without_provenance,
+                )
             parent_descriptor = os.open(
                 root,
                 os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY,
             )
             try:
-                with self.assertRaises(native_helper.ProbeError) as raised:
-                    native_helper._read_home_library_file(
+                with classification:
+                    raw, opened, receipt = native_helper._read_home_library_file(
                         parent_descriptor,
                         path.name,
                         path.lstat(),
@@ -7095,12 +7654,23 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             finally:
                 os.close(parent_descriptor)
             self.assertTrue(path.is_file())
+            path_inode = path.lstat().st_ino
+        value = b"private-xattr-canary"
+        expected_digest = hashlib.sha256(
+            native_helper._HOME_LIBRARY_QUARANTINE_VALUE_DIGEST_DOMAIN
+            + len(value).to_bytes(4, "big")
+            + value
+        ).hexdigest()
+        self.assertEqual(raw, b"payload")
+        self.assertEqual(opened.st_ino, path_inode)
         self.assertEqual(
-            raised.exception.secondary_code,
-            "home-library-unsafe-entry-file-xattr-"
-            "journal-inventory-preferences-apple-quarantine-stable-bounded",
+            receipt,
+            native_helper._HomeLibraryQuarantineEvidence(
+                len(value),
+                expected_digest,
+            ),
         )
-        self.assertNotIn("private-xattr-canary", str(raised.exception))
+        self.assertNotIn("private-xattr-canary", repr(receipt))
 
     def test_file_xattr_path_family_threads_all_file_check_surfaces(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -7235,7 +7805,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                         for phase, count in (
                             ("source-revalidation", 4),
                             ("quarantine-revalidation", 4),
-                            ("delete-boundary", 2),
+                            ("delete-boundary", 4),
                         )
                         for _ in range(count)
                     ]
@@ -7297,13 +7867,14 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                         ),
                         mock.patch.object(self.helper.os, "read", side_effect=read),
                     ):
-                        raw, _metadata = self.helper._read_home_library_file(
+                        raw, _metadata, receipt = self.helper._read_home_library_file(
                             parent_descriptor,
                             path.name,
                             path.lstat(),
                             (phase, path_family),
                         )
                     self.assertEqual(raw, payload)
+                    self.assertIsNone(receipt)
                     self.assertEqual(events[0][0], "xattr")
                     descriptor = events[0][1]
                     self.assertEqual(
@@ -7920,10 +8491,10 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                     "content_sha256",
                 },
             )
-            self.assertEqual(first["schema_version"], 1)
+            self.assertEqual(first["schema_version"], 2)
             self.assertEqual(
                 first["contract"],
-                "task-witness-macos-bounded-library-inventory-v1",
+                "task-witness-macos-bounded-library-inventory-v2",
             )
             self.assertEqual(first["entry_count"], len(first["entries"]))
             self.assertEqual(first["regular_file_bytes"], len(value_canary))
@@ -7961,6 +8532,9 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 entry for entry in first["entries"] if entry.get("kind") == "file"
             ]
             self.assertEqual(len(file_entries), 2)
+            self.assertTrue(
+                all(entry["xattr_receipt"] is None for entry in file_entries)
+            )
             payload_entry = next(
                 entry
                 for entry in file_entries
@@ -8140,6 +8714,19 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             root_record = next(
                 entry for entry in inventory["entries"] if entry.get("depth") == 1
             )
+            leaf_record = next(
+                entry for entry in inventory["entries"] if entry.get("kind") == "file"
+            )
+            invalid_path_entries = [
+                {**entry, "path_sha256": "not-a-sha256"}
+                if entry is leaf_record
+                else entry
+                for entry in inventory["entries"]
+            ]
+            non_string_path_entries = [
+                {**entry, "path_sha256": 7} if entry is leaf_record else entry
+                for entry in inventory["entries"]
+            ]
             file_root_record = {
                 **root_record,
                 "content_sha256": "0" * 64,
@@ -8149,6 +8736,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 "mode": stat.S_IFREG | 0o600,
                 "mtime_ns": 1,
                 "size": 0,
+                "xattr_receipt": None,
             }
 
             cases = {
@@ -8157,10 +8745,14 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                     "entry_count": 1,
                     "regular_file_bytes": 0,
                 },
+                "invalid-path-digest": {
+                    "entries": sorted(
+                        invalid_path_entries,
+                        key=lambda entry: entry["path_sha256"],
+                    ),
+                },
                 "non-string-path": {
-                    "entries": [{"path_sha256": 7}],
-                    "entry_count": 1,
-                    "regular_file_bytes": 0,
+                    "entries": non_string_path_entries,
                 },
                 "list-kind": {
                     "entries": [{**root_record, "kind": []}],
@@ -8178,7 +8770,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                     "regular_file_bytes": 0,
                 },
                 "boolean-schema": {"schema_version": True},
-                "floating-schema": {"schema_version": 1.0},
+                "floating-schema": {"schema_version": 2.0},
             }
             for label, changes in cases.items():
                 malformed = {
@@ -8361,10 +8953,11 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             ),
             self.assertRaises(self.helper.ProbeError) as raised,
         ):
-            self.helper._delete_authorized_library_directory(
+            self.helper._walk(
                 17,
                 (self.helper.HOME_LIBRARY_NAME,),
                 {"0" * 64: {"kind": "directory"}},
+                False,
             )
         self.assertEqual(raised.exception.code, "home-library-inventory-drift")
         self.assertEqual(deleting.consumed, 2)
@@ -8608,7 +9201,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                     self.assertEqual(preserved[0].lstat().st_nlink, 2)
                     self.assertEqual(preserved[1].lstat().st_nlink, 2)
 
-    def test_home_cleanup_v2_authorization_includes_bounded_library_inventory(
+    def test_home_cleanup_v3_authorization_includes_bounded_library_inventory(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -8686,10 +9279,10 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                     home_identity,
                 )
 
-            self.assertEqual(document["schema_version"], 2)
+            self.assertEqual(document["schema_version"], 3)
             self.assertEqual(
                 document["contract"],
-                "task-witness-macos-home-cleanup-authorization-v2",
+                "task-witness-macos-home-cleanup-authorization-v3",
             )
             self.assertEqual(document["library_inventory"], inventory)
             bounded.assert_called_once_with(account)
@@ -8704,6 +9297,34 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             self.helper._require_content_digest(
                 document,
                 "home-cleanup-authorization",
+            )
+            legacy = self.helper._document_with_digest(
+                {
+                    **{
+                        key: value
+                        for key, value in document.items()
+                        if key != "content_sha256"
+                    },
+                    "schema_version": 2,
+                    "contract": "task-witness-macos-home-cleanup-authorization-v2",
+                }
+            )
+            with (
+                mock.patch.object(
+                    self.helper,
+                    "_load_root_stage_document",
+                    return_value=legacy,
+                ),
+                self.assertRaises(self.helper.ProbeError) as raised,
+            ):
+                self.helper._load_home_cleanup_authorization(
+                    plan,
+                    state,
+                    bindings,
+                )
+            self.assertEqual(
+                raised.exception.code,
+                "home-cleanup-authorization-drift",
             )
 
     def test_bounded_library_cleanup_rejects_extended_attributes_before_mutation(
@@ -8830,7 +9451,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 rmdir.assert_not_called()
                 self.assertTrue(target.exists())
 
-    def test_quarantine_evidence_rejects_at_every_cleanup_mutation_boundary(
+    def test_unrecorded_quarantine_evidence_rejects_at_every_mutation_boundary(
         self,
     ) -> None:
         evidence_type = getattr(
@@ -8840,7 +9461,7 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
         )
         self.assertIsNotNone(evidence_type)
         assert evidence_type is not None
-        evidence = evidence_type(7, "private-evidence-digest-canary")
+        evidence = evidence_type(7, "3" * 64)
 
         def observer_for(
             target_inode: int,
@@ -8886,21 +9507,13 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                     account,
                     authorization,
                 )
-            expected_secondary = (
-                "home-library-unsafe-entry-file-xattr-"
-                "source-revalidation-preferences-"
-                "apple-quarantine-stable-bounded"
-            )
             self.assertEqual(
                 (raised.exception.code, raised.exception.secondary_code),
-                (
-                    "home-library-unsafe-entry",
-                    expected_secondary,
-                ),
+                ("home-library-inventory-drift", None),
             )
             self.assertEqual(
                 contexts,
-                [("source-revalidation", "preferences")] * 2,
+                [("source-revalidation", "preferences")] * 4,
             )
             self.assertNotIn("private", str(raised.exception))
             rename.assert_not_called()
@@ -8939,21 +9552,13 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                     account,
                     authorization,
                 )
-            expected_secondary = (
-                "home-library-unsafe-entry-file-xattr-"
-                "quarantine-revalidation-preferences-"
-                "apple-quarantine-stable-bounded"
-            )
             self.assertEqual(
                 (raised.exception.code, raised.exception.secondary_code),
-                (
-                    "home-library-unsafe-entry",
-                    expected_secondary,
-                ),
+                ("home-library-inventory-drift", None),
             )
             self.assertEqual(
                 contexts,
-                [("quarantine-revalidation", "preferences")] * 2,
+                [("quarantine-revalidation", "preferences")] * 4,
             )
             self.assertNotIn("private", str(raised.exception))
             rename.assert_not_called()
@@ -8992,10 +9597,11 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                     mock.patch.object(self.helper.os, "rmdir") as rmdir,
                     self.assertRaises(self.helper.ProbeError) as raised,
                 ):
-                    self.helper._delete_authorized_library_directory(
+                    self.helper._walk(
                         descriptor,
                         (self.helper.HOME_LIBRARY_NAME,),
                         authorized_by_path,
+                        False,
                     )
             finally:
                 os.close(descriptor)
@@ -9013,13 +9619,217 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
             )
             self.assertEqual(
                 contexts,
-                [("delete-boundary", "nested-other")] * 2,
+                [("delete-boundary", "nested-other")],
             )
             self.assertNotIn("private", str(raised.exception))
             unlink.assert_not_called()
             fsync.assert_not_called()
             rmdir.assert_not_called()
             self.assertTrue(target.is_file())
+
+    def test_recorded_preferences_quarantine_receipt_replays_and_deletes(
+        self,
+    ) -> None:
+        evidence = self.helper._HomeLibraryQuarantineEvidence(7, "4" * 64)
+        contexts: list[tuple[str, str]] = []
+
+        def observe(descriptor: int, **context: object) -> object:
+            if context["diagnostic_path_family"] == "preferences":
+                contexts.append(
+                    (
+                        str(context["diagnostic_phase"]),
+                        str(context["diagnostic_path_family"]),
+                    )
+                )
+                return evidence
+            return None
+
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(
+                self.helper,
+                "_home_library_file_xattr_state",
+                side_effect=observe,
+            ):
+                account, _identity, authorization, relative_files = (
+                    self.bounded_library_cleanup_fixture(Path(directory))
+                )
+                receipt_record = next(
+                    item
+                    for item in authorization["library_inventory"]["entries"]
+                    if item.get("xattr_receipt") is not None
+                )
+                self.assertEqual(
+                    receipt_record["xattr_receipt"],
+                    {
+                        "family": "apple-quarantine-stable-bounded",
+                        "value_length": 7,
+                        "value_sha256": "4" * 64,
+                    },
+                )
+                self.helper._quarantine_and_remove_bounded_library(
+                    account,
+                    authorization,
+                )
+
+            self.assertEqual(
+                contexts.count(("journal-inventory", "preferences")),
+                4,
+            )
+            self.assertEqual(
+                contexts.count(("source-revalidation", "preferences")),
+                4,
+            )
+            self.assertEqual(
+                contexts.count(("quarantine-revalidation", "preferences")),
+                4,
+            )
+            self.assertEqual(
+                contexts.count(("delete-boundary", "preferences")),
+                4,
+            )
+            self.assertFalse((account.home / self.helper.HOME_LIBRARY_NAME).exists())
+            self.assertFalse(
+                (account.home / self.helper.HOME_LIBRARY_QUARANTINE_NAME).exists()
+            )
+            self.assertFalse(account.home.joinpath(*relative_files[1]).exists())
+
+    def test_preferences_quarantine_receipt_drift_stops_before_jit_delete(
+        self,
+    ) -> None:
+        authorized = self.helper._HomeLibraryQuarantineEvidence(7, "5" * 64)
+        for changed in (
+            None,
+            self.helper._HomeLibraryQuarantineEvidence(8, "5" * 64),
+            self.helper._HomeLibraryQuarantineEvidence(7, "6" * 64),
+        ):
+            with (
+                self.subTest(changed=changed),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                home = Path(directory) / "home"
+                earlier = home / "Library" / "Container" / "Deep" / "payload.bin"
+                earlier.parent.mkdir(parents=True)
+                earlier.write_bytes(b"earlier")
+                probe = home / "launchd-probe"
+                probe.mkdir()
+                target = home / "Library" / "Preferences" / "payload.bin"
+                target.parent.mkdir(parents=True)
+                target.write_bytes(b"payload")
+                home.chmod(0o700)
+                account = self.helper.DisposableAccount(
+                    name="twq-0123456789ab",
+                    uid=os.geteuid(),
+                    gid=os.getegid(),
+                    home=home,
+                )
+                with mock.patch.object(
+                    self.helper,
+                    "_home_library_file_xattr_state",
+                    side_effect=lambda _descriptor, **context: (
+                        authorized
+                        if context["diagnostic_path_family"] == "preferences"
+                        else None
+                    ),
+                ):
+                    inventory = self.helper._bounded_library_inventory(account)
+                self.assertIsInstance(inventory, dict)
+                assert isinstance(inventory, dict)
+                home_metadata = home.lstat()
+                probe_metadata = probe.lstat()
+                authorization = {
+                    "home_identity": {
+                        "home_device": home_metadata.st_dev,
+                        "home_inode": home_metadata.st_ino,
+                        "probe_device": probe_metadata.st_dev,
+                        "probe_inode": probe_metadata.st_ino,
+                    },
+                    "library_inventory": inventory,
+                }
+                source = home / self.helper.HOME_LIBRARY_NAME
+                quarantine = home / self.helper.HOME_LIBRARY_QUARANTINE_NAME
+                with (
+                    mock.patch.object(
+                        self.helper,
+                        "_home_library_file_xattr_state",
+                        side_effect=lambda _descriptor, changed=changed, **context: (
+                            changed
+                            if context["diagnostic_phase"] == "delete-boundary"
+                            and context["diagnostic_path_family"] == "preferences"
+                            else (
+                                authorized
+                                if context["diagnostic_path_family"] == "preferences"
+                                else None
+                            )
+                        ),
+                    ) as observer,
+                    mock.patch.object(
+                        self.helper,
+                        "_renameat_exclusive",
+                        side_effect=self.rename_library_portably,
+                    ),
+                    mock.patch.object(self.helper.os, "unlink") as unlink,
+                    mock.patch.object(self.helper.os, "rmdir") as rmdir,
+                    mock.patch.object(self.helper.os, "fsync") as fsync,
+                    self.assertRaises(self.helper.ProbeError) as raised,
+                ):
+                    self.helper._quarantine_and_remove_bounded_library(
+                        account,
+                        authorization,
+                    )
+                self.assertEqual(raised.exception.code, "home-library-inventory-drift")
+                self.assertEqual(
+                    [
+                        call.kwargs["diagnostic_path_family"]
+                        for call in observer.call_args_list
+                        if call.kwargs["diagnostic_phase"] == "delete-boundary"
+                    ],
+                    ["nested-other"] * 2 + ["preferences"] * 2,
+                )
+                unlink.assert_not_called()
+                rmdir.assert_not_called()
+                fsync.assert_called_once()
+                self.assertFalse(source.exists())
+                self.assertTrue(
+                    quarantine.joinpath("Preferences", "payload.bin").is_file()
+                )
+                self.assertTrue(
+                    quarantine.joinpath("Container", "Deep", "payload.bin").is_file()
+                )
+
+    def test_preferences_quarantine_receipt_survives_partial_delete_replay(
+        self,
+    ) -> None:
+        evidence = self.helper._HomeLibraryQuarantineEvidence(7, "7" * 64)
+
+        def observe(_descriptor: int, **context: object) -> object:
+            return (
+                evidence if context["diagnostic_path_family"] == "preferences" else None
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(
+                self.helper,
+                "_home_library_file_xattr_state",
+                side_effect=observe,
+            ):
+                account, _identity, authorization, relative_files = (
+                    self.bounded_library_cleanup_fixture(Path(directory))
+                )
+                source = account.home / self.helper.HOME_LIBRARY_NAME
+                quarantine = account.home / self.helper.HOME_LIBRARY_QUARANTINE_NAME
+                source.rename(quarantine)
+                quarantine.joinpath(*relative_files[0]).unlink()
+                with mock.patch.object(
+                    self.helper,
+                    "_renameat_exclusive",
+                ) as rename:
+                    self.helper._quarantine_and_remove_bounded_library(
+                        account,
+                        authorization,
+                    )
+            rename.assert_not_called()
+            self.assertFalse(source.exists())
+            self.assertFalse(quarantine.exists())
 
     def test_bounded_library_cleanup_rechecks_xattrs_at_each_delete_boundary(
         self,
@@ -9031,16 +9841,27 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
         ) -> None:
             with tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
-                account, _identity, authorization, _relative_files = (
+                account, _identity, authorization, relative_files = (
                     self.bounded_library_cleanup_fixture(root)
                 )
                 source_target = account.home.joinpath(
                     self.helper.HOME_LIBRARY_NAME,
                     *relative_path,
                 )
+                preflight_file_calls = [
+                    account.home.joinpath(
+                        self.helper.HOME_LIBRARY_NAME,
+                        *path,
+                    )
+                    .lstat()
+                    .st_ino
+                    for path in relative_files
+                    for _ in range(2)
+                ]
                 target_inode = source_target.lstat().st_ino
                 after_quarantine_scan = False
                 target_calls: list[object] = []
+                post_scan_file_calls: list[int] = []
                 stable_observed = self.helper._stable_observed_library
 
                 def stable(*args: object, **kwargs: object) -> dict:
@@ -9067,10 +9888,10 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                     descriptor: int,
                     **_context: object,
                 ) -> object:
-                    if (
-                        after_quarantine_scan
-                        and os.fstat(descriptor).st_ino == target_inode
-                    ):
+                    inode = os.fstat(descriptor).st_ino
+                    if after_quarantine_scan:
+                        post_scan_file_calls.append(inode)
+                    if after_quarantine_scan and inode == target_inode:
                         target_calls.append("file-xattr")
                         if len(target_calls) == reject_call:
                             return "nonapple-other"
@@ -9100,13 +9921,12 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                     mock.patch.object(
                         self.helper,
                         "_home_library_file_xattr_state",
-                        side_effect=(
-                            reject_file_state
-                            if expected_cause == "file-xattr"
-                            else None
-                        ),
+                        side_effect=reject_file_state,
                         return_value=None,
                     ),
+                    mock.patch.object(self.helper.os, "unlink") as unlink,
+                    mock.patch.object(self.helper.os, "rmdir") as rmdir,
+                    mock.patch.object(self.helper.os, "fsync") as fsync,
                     self.assertRaises(self.helper.ProbeError) as raised,
                 ):
                     self.helper._quarantine_and_remove_bounded_library(
@@ -9131,21 +9951,543 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                     target_calls,
                     [expected_cause] * reject_call,
                 )
+                if expected_cause == "root-xattr":
+                    self.assertEqual(
+                        post_scan_file_calls,
+                        [] if reject_call == 1 else preflight_file_calls,
+                    )
+                elif expected_cause == "directory-xattr":
+                    self.assertEqual(
+                        post_scan_file_calls,
+                        [] if reject_call == 1 else preflight_file_calls[:2],
+                    )
                 quarantine_target = account.home.joinpath(
                     self.helper.HOME_LIBRARY_QUARANTINE_NAME,
                     *relative_path,
                 )
                 self.assertTrue(quarantine_target.exists())
+                quarantine = account.home / self.helper.HOME_LIBRARY_QUARANTINE_NAME
+                self.assertTrue(
+                    all(quarantine.joinpath(*path).is_file() for path in relative_files)
+                )
+                unlink.assert_not_called()
+                rmdir.assert_not_called()
+                fsync.assert_called_once()
 
         cases = (
             ("file", ("Preferences", "settings.plist"), "file-xattr"),
-            ("directory", ("Preferences",), "directory-xattr"),
+            ("directory", ("Container",), "directory-xattr"),
             ("root", (), "root-xattr"),
         )
         for scope, relative_path, expected_cause in cases:
             for reject_call in (1, 2):
                 with self.subTest(scope=scope, reject_call=reject_call):
                     exercise(relative_path, expected_cause, reject_call)
+
+    def test_root_xattr_drift_during_delete_preserves_quarantine_root(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            account, _identity, authorization, _relative_files = (
+                self.bounded_library_cleanup_fixture(Path(directory))
+            )
+            source = account.home / self.helper.HOME_LIBRARY_NAME
+            quarantine = account.home / self.helper.HOME_LIBRARY_QUARANTINE_NAME
+            root_inode = source.lstat().st_ino
+            after_quarantine_scan = False
+            root_calls = 0
+            stable_observed = self.helper._stable_observed_library
+
+            def stable(*args: object, **kwargs: object) -> dict:
+                nonlocal after_quarantine_scan
+                observed = stable_observed(*args, **kwargs)
+                if args[1] == self.helper.HOME_LIBRARY_QUARANTINE_NAME:
+                    after_quarantine_scan = True
+                return observed
+
+            def reject_final_root(
+                descriptor: int,
+                unsafe_cause: object = None,
+            ) -> None:
+                nonlocal root_calls
+                if after_quarantine_scan and os.fstat(descriptor).st_ino == root_inode:
+                    root_calls += 1
+                    if root_calls == 3:
+                        raise self.helper._home_library_unsafe_error(unsafe_cause)
+
+            with (
+                mock.patch.object(
+                    self.helper,
+                    "_renameat_exclusive",
+                    side_effect=self.rename_library_portably,
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_stable_observed_library",
+                    side_effect=stable,
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_require_no_extended_attributes",
+                    side_effect=reject_final_root,
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_home_library_file_xattr_state",
+                    return_value=None,
+                ),
+                self.assertRaises(self.helper.ProbeError) as raised,
+            ):
+                self.helper._quarantine_and_remove_bounded_library(
+                    account,
+                    authorization,
+                )
+
+            self.assertEqual(
+                (raised.exception.code, raised.exception.secondary_code),
+                ("home-library-unsafe-entry", "home-library-unsafe-entry-root-xattr"),
+            )
+            self.assertEqual(root_calls, 3)
+            self.assertFalse(source.exists())
+            self.assertTrue(quarantine.is_dir())
+            self.assertEqual(list(quarantine.iterdir()), [])
+            with (
+                mock.patch.object(self.helper, "_renameat_exclusive") as rename,
+                mock.patch.object(
+                    self.helper,
+                    "_require_no_extended_attributes",
+                ),
+            ):
+                self.helper._quarantine_and_remove_bounded_library(
+                    account,
+                    authorization,
+                )
+            rename.assert_not_called()
+            self.assertFalse(quarantine.exists())
+
+    def test_final_root_metadata_and_acl_drift_preserves_quarantine_root(
+        self,
+    ) -> None:
+        for drift in ("metadata", "acl"):
+            with self.subTest(drift=drift), tempfile.TemporaryDirectory() as directory:
+                account, _identity, authorization, relative_files = (
+                    self.bounded_library_cleanup_fixture(Path(directory))
+                )
+                source = account.home / self.helper.HOME_LIBRARY_NAME
+                quarantine = account.home / self.helper.HOME_LIBRARY_QUARANTINE_NAME
+                root_inode = source.lstat().st_ino
+                state = {
+                    "after_quarantine_scan": False,
+                    "file_calls": 0,
+                    "authority_drift": False,
+                }
+                stable_observed = self.helper._stable_observed_library
+                require_metadata = self.helper._require_library_record_metadata
+
+                def stable(
+                    *args: object,
+                    stable_observed: object = stable_observed,
+                    state: dict[str, object] = state,
+                    **kwargs: object,
+                ) -> dict:
+                    observed = stable_observed(*args, **kwargs)
+                    if args[1] == self.helper.HOME_LIBRARY_QUARANTINE_NAME:
+                        state["after_quarantine_scan"] = True
+                    return observed
+
+                def observe_file(
+                    _descriptor: int,
+                    state: dict[str, object] = state,
+                    relative_files: tuple[tuple[str, ...], ...] = relative_files,
+                    **_context: object,
+                ) -> None:
+                    if state["after_quarantine_scan"]:
+                        state["file_calls"] += 1
+                        if state["file_calls"] == len(relative_files) * 4:
+                            state["authority_drift"] = True
+
+                def check_metadata(
+                    record: object,
+                    metadata: os.stat_result,
+                    kind: str,
+                    state: dict[str, object] = state,
+                    drift: str = drift,
+                    root_inode: int = root_inode,
+                    require_metadata: object = require_metadata,
+                ) -> None:
+                    if (
+                        drift == "metadata"
+                        and state["authority_drift"]
+                        and metadata.st_ino == root_inode
+                    ):
+                        raise self.helper.ProbeError("home-library-inventory-drift")
+                    require_metadata(record, metadata, kind)
+
+                def check_acl(
+                    descriptor: int,
+                    unsafe_cause: object,
+                    state: dict[str, object] = state,
+                    drift: str = drift,
+                    root_inode: int = root_inode,
+                ) -> None:
+                    if (
+                        drift == "acl"
+                        and state["authority_drift"]
+                        and os.fstat(descriptor).st_ino == root_inode
+                    ):
+                        raise self.helper._home_library_unsafe_error(unsafe_cause)
+
+                with (
+                    mock.patch.object(
+                        self.helper,
+                        "_renameat_exclusive",
+                        side_effect=self.rename_library_portably,
+                    ),
+                    mock.patch.object(
+                        self.helper,
+                        "_stable_observed_library",
+                        side_effect=stable,
+                    ),
+                    mock.patch.object(
+                        self.helper,
+                        "_home_library_file_xattr_state",
+                        side_effect=observe_file,
+                    ),
+                    mock.patch.object(
+                        self.helper,
+                        "_require_library_record_metadata",
+                        side_effect=check_metadata,
+                    ),
+                    mock.patch.object(
+                        self.helper,
+                        "_require_no_extended_acl",
+                        side_effect=check_acl,
+                    ),
+                    mock.patch.object(
+                        self.helper,
+                        "_require_no_extended_attributes",
+                    ),
+                    self.assertRaises(self.helper.ProbeError) as raised,
+                ):
+                    self.helper._quarantine_and_remove_bounded_library(
+                        account,
+                        authorization,
+                    )
+
+                expected = (
+                    ("home-library-inventory-drift", None)
+                    if drift == "metadata"
+                    else (
+                        "home-library-unsafe-entry",
+                        "home-library-unsafe-entry-root-acl",
+                    )
+                )
+                self.assertEqual(
+                    (raised.exception.code, raised.exception.secondary_code),
+                    expected,
+                )
+                self.assertEqual(state["file_calls"], len(relative_files) * 4)
+                self.assertFalse(source.exists())
+                self.assertTrue(quarantine.is_dir())
+                self.assertEqual(list(quarantine.iterdir()), [])
+                with (
+                    mock.patch.object(self.helper, "_renameat_exclusive") as rename,
+                    mock.patch.object(
+                        self.helper,
+                        "_require_no_extended_acl",
+                    ),
+                    mock.patch.object(
+                        self.helper,
+                        "_require_no_extended_attributes",
+                    ),
+                ):
+                    self.helper._quarantine_and_remove_bounded_library(
+                        account,
+                        authorization,
+                    )
+                rename.assert_not_called()
+                self.assertFalse(quarantine.exists())
+
+    def test_bounded_library_cleanup_rebinds_root_before_preflight(self) -> None:
+        for drift in ("metadata", "acl"):
+            with self.subTest(drift=drift), tempfile.TemporaryDirectory() as directory:
+                account, _identity, authorization, relative_files = (
+                    self.bounded_library_cleanup_fixture(Path(directory))
+                )
+                source = account.home / self.helper.HOME_LIBRARY_NAME
+                quarantine = account.home / self.helper.HOME_LIBRARY_QUARANTINE_NAME
+                root_inode = source.lstat().st_ino
+                state = {
+                    "after_quarantine_scan": False,
+                    "authority_drift": False,
+                    "file_calls": 0,
+                }
+                stable_observed = self.helper._stable_observed_library
+                require_metadata = self.helper._require_library_record_metadata
+                open_path = self.helper.os.open
+
+                def stable(
+                    *args: object,
+                    stable_observed: object = stable_observed,
+                    state: dict[str, object] = state,
+                    **kwargs: object,
+                ) -> dict:
+                    observed = stable_observed(*args, **kwargs)
+                    if args[1] == self.helper.HOME_LIBRARY_QUARANTINE_NAME:
+                        state["after_quarantine_scan"] = True
+                    return observed
+
+                def open_root(
+                    path: object,
+                    *args: object,
+                    open_path: object = open_path,
+                    state: dict[str, object] = state,
+                    **kwargs: object,
+                ) -> int:
+                    descriptor = open_path(path, *args, **kwargs)
+                    if (
+                        state["after_quarantine_scan"]
+                        and path == self.helper.HOME_LIBRARY_QUARANTINE_NAME
+                    ):
+                        state["authority_drift"] = True
+                    return descriptor
+
+                def observe_file(
+                    _descriptor: int,
+                    state: dict[str, object] = state,
+                    **_context: object,
+                ) -> None:
+                    if state["after_quarantine_scan"]:
+                        state["file_calls"] += 1
+
+                def check_metadata(
+                    record: object,
+                    metadata: os.stat_result,
+                    kind: str,
+                    state: dict[str, object] = state,
+                    drift: str = drift,
+                    root_inode: int = root_inode,
+                    require_metadata: object = require_metadata,
+                ) -> None:
+                    if (
+                        drift == "metadata"
+                        and state["authority_drift"]
+                        and metadata.st_ino == root_inode
+                    ):
+                        raise self.helper.ProbeError("home-library-inventory-drift")
+                    require_metadata(record, metadata, kind)
+
+                def check_acl(
+                    descriptor: int,
+                    unsafe_cause: object,
+                    state: dict[str, object] = state,
+                    drift: str = drift,
+                    root_inode: int = root_inode,
+                ) -> None:
+                    if (
+                        drift == "acl"
+                        and state["authority_drift"]
+                        and os.fstat(descriptor).st_ino == root_inode
+                    ):
+                        raise self.helper._home_library_unsafe_error(unsafe_cause)
+
+                with (
+                    mock.patch.object(
+                        self.helper,
+                        "_renameat_exclusive",
+                        side_effect=self.rename_library_portably,
+                    ),
+                    mock.patch.object(
+                        self.helper,
+                        "_stable_observed_library",
+                        side_effect=stable,
+                    ),
+                    mock.patch.object(self.helper.os, "open", side_effect=open_root),
+                    mock.patch.object(
+                        self.helper,
+                        "_home_library_file_xattr_state",
+                        side_effect=observe_file,
+                    ),
+                    mock.patch.object(
+                        self.helper,
+                        "_require_library_record_metadata",
+                        side_effect=check_metadata,
+                    ),
+                    mock.patch.object(
+                        self.helper,
+                        "_require_no_extended_acl",
+                        side_effect=check_acl,
+                    ),
+                    mock.patch.object(
+                        self.helper,
+                        "_require_no_extended_attributes",
+                    ),
+                    mock.patch.object(self.helper.os, "unlink") as unlink,
+                    mock.patch.object(self.helper.os, "rmdir") as rmdir,
+                    mock.patch.object(self.helper.os, "fsync") as fsync,
+                    self.assertRaises(self.helper.ProbeError) as raised,
+                ):
+                    self.helper._quarantine_and_remove_bounded_library(
+                        account,
+                        authorization,
+                    )
+
+                expected = (
+                    ("home-library-inventory-drift", None)
+                    if drift == "metadata"
+                    else (
+                        "home-library-unsafe-entry",
+                        "home-library-unsafe-entry-root-acl",
+                    )
+                )
+                self.assertEqual(
+                    (raised.exception.code, raised.exception.secondary_code),
+                    expected,
+                )
+                self.assertEqual(state["file_calls"], 0)
+                self.assertTrue(
+                    all(quarantine.joinpath(*path).is_file() for path in relative_files)
+                )
+                unlink.assert_not_called()
+                rmdir.assert_not_called()
+                fsync.assert_called_once()
+                with (
+                    mock.patch.object(self.helper, "_renameat_exclusive") as rename,
+                    mock.patch.object(
+                        self.helper,
+                        "_require_no_extended_acl",
+                    ),
+                    mock.patch.object(
+                        self.helper,
+                        "_require_no_extended_attributes",
+                    ),
+                    mock.patch.object(
+                        self.helper,
+                        "_home_library_file_xattr_state",
+                        return_value=None,
+                    ),
+                ):
+                    self.helper._quarantine_and_remove_bounded_library(
+                        account,
+                        authorization,
+                    )
+                rename.assert_not_called()
+                self.assertFalse(quarantine.exists())
+
+    def test_bounded_library_cleanup_rebinds_root_before_delete(self) -> None:
+        for drift in ("metadata", "acl"):
+            with self.subTest(drift=drift), tempfile.TemporaryDirectory() as directory:
+                account, _identity, authorization, relative_files = (
+                    self.bounded_library_cleanup_fixture(Path(directory))
+                )
+                source = account.home / self.helper.HOME_LIBRARY_NAME
+                quarantine = account.home / self.helper.HOME_LIBRARY_QUARANTINE_NAME
+                root_inode = source.lstat().st_ino
+                original_mode = stat.S_IMODE(source.lstat().st_mode)
+                changed_mode = 0o700 if original_mode != 0o700 else 0o755
+                state = {
+                    "after_quarantine_scan": False,
+                    "preflight_calls": 0,
+                    "authority_drift": False,
+                }
+                stable_observed = self.helper._stable_observed_library
+
+                def stable(
+                    *args: object,
+                    stable_observed: object = stable_observed,
+                    state: dict[str, object] = state,
+                    **kwargs: object,
+                ) -> dict:
+                    observed = stable_observed(*args, **kwargs)
+                    if args[1] == self.helper.HOME_LIBRARY_QUARANTINE_NAME:
+                        state["after_quarantine_scan"] = True
+                    return observed
+
+                def observe_file(
+                    _descriptor: int,
+                    state: dict[str, object] = state,
+                    relative_files: tuple[tuple[str, ...], ...] = relative_files,
+                    drift: str = drift,
+                    quarantine: Path = quarantine,
+                    changed_mode: int = changed_mode,
+                    **_context: object,
+                ) -> None:
+                    if state["after_quarantine_scan"]:
+                        state["preflight_calls"] += 1
+                        if state["preflight_calls"] == len(relative_files) * 2:
+                            state["authority_drift"] = True
+                            if drift == "metadata":
+                                quarantine.chmod(changed_mode)
+
+                def require_acl(
+                    descriptor: int,
+                    unsafe_cause: object,
+                    state: dict[str, object] = state,
+                    drift: str = drift,
+                    root_inode: int = root_inode,
+                ) -> None:
+                    if (
+                        drift == "acl"
+                        and state["authority_drift"]
+                        and os.fstat(descriptor).st_ino == root_inode
+                    ):
+                        raise self.helper._home_library_unsafe_error(unsafe_cause)
+
+                with (
+                    mock.patch.object(
+                        self.helper,
+                        "_renameat_exclusive",
+                        side_effect=self.rename_library_portably,
+                    ),
+                    mock.patch.object(
+                        self.helper,
+                        "_stable_observed_library",
+                        side_effect=stable,
+                    ),
+                    mock.patch.object(
+                        self.helper,
+                        "_home_library_file_xattr_state",
+                        side_effect=observe_file,
+                    ),
+                    mock.patch.object(
+                        self.helper,
+                        "_require_no_extended_acl",
+                        side_effect=require_acl,
+                    ),
+                    mock.patch.object(
+                        self.helper,
+                        "_require_no_extended_attributes",
+                    ),
+                    mock.patch.object(self.helper.os, "unlink") as unlink,
+                    mock.patch.object(self.helper.os, "rmdir") as rmdir,
+                    mock.patch.object(self.helper.os, "fsync") as fsync,
+                    self.assertRaises(self.helper.ProbeError) as raised,
+                ):
+                    self.helper._quarantine_and_remove_bounded_library(
+                        account,
+                        authorization,
+                    )
+
+                expected = (
+                    ("home-library-inventory-drift", None)
+                    if drift == "metadata"
+                    else (
+                        "home-library-unsafe-entry",
+                        "home-library-unsafe-entry-root-acl",
+                    )
+                )
+                self.assertEqual(
+                    (raised.exception.code, raised.exception.secondary_code),
+                    expected,
+                )
+                self.assertEqual(
+                    state["preflight_calls"],
+                    len(relative_files) * 2,
+                )
+                self.assertTrue(
+                    all(quarantine.joinpath(*path).is_file() for path in relative_files)
+                )
+                unlink.assert_not_called()
+                rmdir.assert_not_called()
+                fsync.assert_called_once()
 
     def test_bounded_library_delete_rejects_jit_file_content_drift(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -9219,10 +10561,11 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                     ) as rename,
                     self.assertRaises(self.helper.ProbeError) as raised,
                 ):
-                    self.helper._delete_authorized_library_directory(
+                    self.helper._walk(
                         descriptor,
                         (self.helper.HOME_LIBRARY_NAME,),
                         authorized,
+                        False,
                     )
             finally:
                 os.close(descriptor)
@@ -9302,10 +10645,11 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                     ) as rename,
                     self.assertRaises(self.helper.ProbeError) as raised,
                 ):
-                    self.helper._delete_authorized_library_directory(
+                    self.helper._walk(
                         descriptor,
                         (self.helper.HOME_LIBRARY_NAME,),
                         authorized,
+                        False,
                     )
             finally:
                 os.close(descriptor)
@@ -9394,10 +10738,11 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                         mock.patch.object(self.helper.os, "rmdir") as rmdir,
                         self.assertRaises(self.helper.ProbeError) as raised,
                     ):
-                        self.helper._delete_authorized_library_directory(
+                        self.helper._walk(
                             descriptor,
                             (self.helper.HOME_LIBRARY_NAME,),
                             authorized,
+                            False,
                         )
                 finally:
                     os.close(descriptor)
@@ -9413,6 +10758,209 @@ class TaskWitnessMacOSLaunchdUserProbeTests(unittest.TestCase):
                 unlink.assert_not_called()
                 rmdir.assert_not_called()
                 self.assertTrue(target.exists())
+
+    def test_nested_directory_late_acl_drift_preserves_replay(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            account, _identity, authorization, _relative_files = (
+                self.bounded_library_cleanup_fixture(Path(directory))
+            )
+            source = account.home / self.helper.HOME_LIBRARY_NAME
+            quarantine = account.home / self.helper.HOME_LIBRARY_QUARANTINE_NAME
+            target_inode = source.joinpath("Container", "Deep").lstat().st_ino
+            after_quarantine_scan = False
+            target_calls: list[object] = []
+            stable_observed = self.helper._stable_observed_library
+
+            def stable(*args: object, **kwargs: object) -> dict:
+                nonlocal after_quarantine_scan
+                observed = stable_observed(*args, **kwargs)
+                if args[1] == self.helper.HOME_LIBRARY_QUARANTINE_NAME:
+                    after_quarantine_scan = True
+                return observed
+
+            def reject_late_acl(
+                descriptor: int,
+                unsafe_cause: object,
+            ) -> None:
+                if (
+                    after_quarantine_scan
+                    and os.fstat(descriptor).st_ino == target_inode
+                ):
+                    target_calls.append(unsafe_cause)
+                    if len(target_calls) == 4:
+                        raise self.helper._home_library_unsafe_error(unsafe_cause)
+
+            with (
+                mock.patch.object(
+                    self.helper,
+                    "_renameat_exclusive",
+                    side_effect=self.rename_library_portably,
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_stable_observed_library",
+                    side_effect=stable,
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_home_library_file_xattr_state",
+                    return_value=None,
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_require_no_extended_acl",
+                    side_effect=reject_late_acl,
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_require_no_extended_attributes",
+                ),
+                self.assertRaises(self.helper.ProbeError) as raised,
+            ):
+                self.helper._quarantine_and_remove_bounded_library(
+                    account,
+                    authorization,
+                )
+
+            self.assertEqual(
+                (raised.exception.code, raised.exception.secondary_code),
+                (
+                    "home-library-unsafe-entry",
+                    "home-library-unsafe-entry-directory-acl",
+                ),
+            )
+            self.assertEqual(target_calls, ["directory-acl"] * 4)
+            self.assertFalse(source.exists())
+            deep = quarantine.joinpath("Container", "Deep")
+            self.assertTrue(deep.is_dir())
+            self.assertEqual(list(deep.iterdir()), [])
+            self.assertTrue(
+                quarantine.joinpath("Preferences", "settings.plist").is_file()
+            )
+            with (
+                mock.patch.object(self.helper, "_renameat_exclusive") as rename,
+                mock.patch.object(
+                    self.helper,
+                    "_require_no_extended_acl",
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_require_no_extended_attributes",
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_home_library_file_xattr_state",
+                    return_value=None,
+                ),
+            ):
+                self.helper._quarantine_and_remove_bounded_library(
+                    account,
+                    authorization,
+                )
+            rename.assert_not_called()
+            self.assertFalse(quarantine.exists())
+
+    def test_nested_directory_late_xattr_drift_preserves_replay(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            account, _identity, authorization, _relative_files = (
+                self.bounded_library_cleanup_fixture(Path(directory))
+            )
+            source = account.home / self.helper.HOME_LIBRARY_NAME
+            quarantine = account.home / self.helper.HOME_LIBRARY_QUARANTINE_NAME
+            target_inode = source.joinpath("Container", "Deep").lstat().st_ino
+            after_quarantine_scan = False
+            target_calls: list[object] = []
+            stable_observed = self.helper._stable_observed_library
+
+            def stable(*args: object, **kwargs: object) -> dict:
+                nonlocal after_quarantine_scan
+                observed = stable_observed(*args, **kwargs)
+                if args[1] == self.helper.HOME_LIBRARY_QUARANTINE_NAME:
+                    after_quarantine_scan = True
+                return observed
+
+            def reject_late_xattr(
+                descriptor: int,
+                unsafe_cause: object,
+                **_context: object,
+            ) -> None:
+                if (
+                    after_quarantine_scan
+                    and os.fstat(descriptor).st_ino == target_inode
+                ):
+                    target_calls.append(unsafe_cause)
+                    if len(target_calls) == 4:
+                        raise self.helper._home_library_unsafe_error(unsafe_cause)
+
+            with (
+                mock.patch.object(
+                    self.helper,
+                    "_renameat_exclusive",
+                    side_effect=self.rename_library_portably,
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_stable_observed_library",
+                    side_effect=stable,
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_home_library_file_xattr_state",
+                    return_value=None,
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_require_no_extended_acl",
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_require_no_extended_attributes",
+                    side_effect=reject_late_xattr,
+                ),
+                self.assertRaises(self.helper.ProbeError) as raised,
+            ):
+                self.helper._quarantine_and_remove_bounded_library(
+                    account,
+                    authorization,
+                )
+
+            self.assertEqual(
+                (raised.exception.code, raised.exception.secondary_code),
+                (
+                    "home-library-unsafe-entry",
+                    "home-library-unsafe-entry-directory-xattr",
+                ),
+            )
+            self.assertEqual(target_calls, ["directory-xattr"] * 4)
+            self.assertFalse(source.exists())
+            deep = quarantine.joinpath("Container", "Deep")
+            self.assertTrue(deep.is_dir())
+            self.assertEqual(list(deep.iterdir()), [])
+            self.assertTrue(
+                quarantine.joinpath("Preferences", "settings.plist").is_file()
+            )
+            with (
+                mock.patch.object(self.helper, "_renameat_exclusive") as rename,
+                mock.patch.object(
+                    self.helper,
+                    "_require_no_extended_acl",
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_require_no_extended_attributes",
+                ),
+                mock.patch.object(
+                    self.helper,
+                    "_home_library_file_xattr_state",
+                    return_value=None,
+                ),
+            ):
+                self.helper._quarantine_and_remove_bounded_library(
+                    account,
+                    authorization,
+                )
+            rename.assert_not_called()
+            self.assertFalse(quarantine.exists())
 
     def test_home_cleanup_authorization_rejects_home_acl_before_publication(
         self,
@@ -20001,14 +21549,10 @@ raise SystemExit(93)
                         },
                     )
 
-    def test_cleanup_propagates_bounded_quarantine_evidence_from_inventory(
+    def test_cleanup_keeps_quarantine_receipt_private_on_journal_failure(
         self,
     ) -> None:
-        primary = "home-library-unsafe-entry"
-        secondary = (
-            "home-library-unsafe-entry-file-xattr-"
-            "journal-inventory-preferences-apple-quarantine-stable-bounded"
-        )
+        primary = "home-cleanup-authorization-disagrees"
         evidence_type = getattr(
             self.helper,
             "_HomeLibraryQuarantineEvidence",
@@ -20051,7 +21595,7 @@ raise SystemExit(93)
             )
             bindings = self.helper.ValidatedStageBindings(
                 binding,
-                {"ownership": "exact"},
+                self.helper._launchd_ownership_document(plan, state),
             )
             identity = {
                 "home_device": home.lstat().st_dev,
@@ -20178,6 +21722,9 @@ raise SystemExit(93)
                 publish = stack.enter_context(
                     mock.patch.object(self.helper, "_write_stage_create_new")
                 )
+                stack.enter_context(
+                    mock.patch.object(self.helper, "_fsync_stage_directory")
+                )
                 rename = stack.enter_context(
                     mock.patch.object(self.helper, "_renameat_exclusive")
                 )
@@ -20213,14 +21760,12 @@ raise SystemExit(93)
             self.assertEqual(status, 2)
             self.assertEqual(
                 stderr.getvalue(),
-                (
-                    "task-witness macOS launchd-user cleanup: "
-                    f"{primary}\n"
-                    "task-witness macOS launchd-user cleanup secondary: "
-                    f"{secondary}\n"
-                ),
+                (f"task-witness macOS launchd-user cleanup: {primary}\n"),
             )
-            bound_home.assert_called_once_with(account, identity)
+            self.assertEqual(
+                bound_home.call_args_list,
+                [mock.call(account, identity), mock.call(account, identity)],
+            )
             inventory.assert_called_once_with(account)
             self.assertEqual(
                 xattr_contexts,
@@ -20235,9 +21780,30 @@ raise SystemExit(93)
                         "journal-inventory",
                         "preferences",
                     ),
+                    (
+                        canary.lstat().st_ino,
+                        "journal-inventory",
+                        "preferences",
+                    ),
+                    (
+                        canary.lstat().st_ino,
+                        "journal-inventory",
+                        "preferences",
+                    ),
                 ],
             )
-            publish.assert_not_called()
+            publish.assert_called_once()
+            journal_path, journal_raw, journal_mode = publish.call_args.args
+            self.assertEqual(journal_path, stage / "home-cleanup.json")
+            self.assertEqual(journal_mode, 0o600)
+            journal = json.loads(journal_raw)
+            self.assertEqual(journal["schema_version"], 3)
+            receipt_records = [
+                item
+                for item in journal["library_inventory"]["entries"]
+                if item.get("xattr_receipt") is not None
+            ]
+            self.assertEqual(len(receipt_records), 1)
             rename.assert_not_called()
             unlink.assert_not_called()
             rmdir.assert_not_called()
@@ -20255,7 +21821,7 @@ raise SystemExit(93)
             self.assertEqual(cleanup["disposition"], "preserved-on-drift")
             self.assertEqual(
                 cleanup["error"],
-                {"code": primary, "secondary_code": secondary},
+                {"code": primary},
             )
             self.assertNotIn("private", stderr.getvalue())
             self.assertNotIn("private", cleanup_raw.decode("utf-8"))

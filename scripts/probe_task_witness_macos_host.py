@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Capture a bounded, non-qualifying GitHub-hosted macOS session probe."""
 # ruff: noqa: SIM905
 
 from __future__ import annotations
@@ -4080,7 +4079,7 @@ def _read_home_library_file(
     name: str,
     expected: os.stat_result,
     diagnostic: tuple[object, object],
-) -> tuple[bytes, os.stat_result]:
+):
     descriptor = -1
     try:
         descriptor = os.open(
@@ -4090,19 +4089,36 @@ def _read_home_library_file(
         )
         metadata = _home_library_metadata
         opened = os.fstat(descriptor)
-        if metadata(opened) != metadata(expected):
-            raise ProbeError("home-library-observation-unstable")
+        opened_state = metadata(opened)
+        unstable = ProbeError("home-library-observation-unstable")
+        if opened_state != metadata(expected):
+            raise unstable
+
+        def stable():
+            return (
+                metadata(os.fstat(descriptor))
+                == opened_state
+                == metadata(
+                    os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+                )
+            )
+
         _require_no_extended_acl(descriptor, "file-acl")
         context = {
             "diagnostic_phase": diagnostic[0],
             "diagnostic_path_family": diagnostic[1],
         }
         before = _home_library_file_xattr_state(descriptor, **context)
+        if (
+            type(before) is _HomeLibraryQuarantineEvidence
+            and diagnostic[1] != "preferences"
+        ):
+            raise _home_library_file_xattr_error(*diagnostic, _XATTR_FAMILIES[2])
         if before is not None and type(before) is not _HomeLibraryQuarantineEvidence:
             raise _home_library_file_xattr_error(*diagnostic, before)
         if not 0 <= opened.st_size <= MAX_HOME_LIBRARY_FILE_BYTES:
             raise ProbeError("home-library-bounds-exceeded")
-        chunks: list[bytes] = []
+        chunks = []
         remaining = opened.st_size + 1
         while remaining > 0:
             chunk = os.read(descriptor, min(64 * 1024, remaining))
@@ -4111,30 +4127,37 @@ def _read_home_library_file(
             chunks.append(chunk)
             remaining -= len(chunk)
         raw = b"".join(chunks)
-        after = os.fstat(descriptor)
-        current = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
-        if (
-            len(raw) != opened.st_size
-            or metadata(after) != metadata(opened)
-            or metadata(current) != metadata(opened)
-        ):
-            raise ProbeError("home-library-observation-unstable")
+        if len(raw) != opened.st_size or not stable():
+            raise unstable
         after = _home_library_file_xattr_state(descriptor, **context)
         if before is None and after is None:
-            return raw, opened
-        if (
-            after is not None
-            and type(after) not in (str, _HomeLibraryQuarantineEvidence)
-            or type(after) is str
-            and (
-                before is None
-                or after in {"overflow", "apple-quarantine-unreadable", "unclassified"}
-            )
+            receipt = None
+        elif (
+            type(before) is type(after) is _HomeLibraryQuarantineEvidence
+            and before == after
         ):
-            family = after
+            receipt = before
         else:
-            family = _XATTR_FAMILIES[2] if before == after else "unstable"
-        raise _home_library_file_xattr_error(*diagnostic, family)
+            family = (
+                after
+                if (
+                    after is not None
+                    and type(after) not in (str, _HomeLibraryQuarantineEvidence)
+                    or type(after) is str
+                    and (
+                        before is None
+                        or after
+                        in {"overflow", "apple-quarantine-unreadable", "unclassified"}
+                    )
+                )
+                else _XATTR_FAMILIES[2]
+                if before == after
+                else "unstable"
+            )
+            raise _home_library_file_xattr_error(*diagnostic, family)
+        if not stable():
+            raise unstable
+        return raw, opened, receipt
     except ProbeError:
         raise
     except OSError as error:
@@ -4216,10 +4239,7 @@ def _library_record_metadata(metadata: os.stat_result, kind: str) -> dict:
     }
 
 
-def _library_node_state(
-    metadata: os.stat_result,
-    raw: bytes | None = None,
-) -> dict:
+def _library_node_state(metadata, raw=None, receipt=None):
     state = {
         "ctime_ns": metadata.st_ctime_ns,
         "link_count": metadata.st_nlink,
@@ -4228,6 +4248,11 @@ def _library_node_state(
     }
     if raw is not None:
         state["content_sha256"] = hashlib.sha256(raw).hexdigest()
+        state["xattr_receipt"] = (
+            None
+            if receipt is None
+            else {"family": _XATTR_FAMILIES[2], **receipt._asdict()}
+        )
     return state
 
 
@@ -4311,7 +4336,7 @@ def _observe_bounded_library(
             }
             observed = {**record, **_library_node_state(metadata)}
             if kind == "file":
-                raw, opened = _read_home_library_file(
+                raw, opened, receipt = _read_home_library_file(
                     descriptor,
                     components[-1],
                     metadata,
@@ -4323,11 +4348,9 @@ def _observe_bounded_library(
                 total_bytes += len(raw)
                 if total_bytes > MAX_HOME_LIBRARY_TOTAL_BYTES:
                     raise ProbeError("home-library-bounds-exceeded")
-                record.update(_library_node_state(opened, raw))
+                record.update(_library_node_state(opened, raw, receipt))
                 records.append(record)
-                stability.append(
-                    {**observed, "content_sha256": record["content_sha256"]}
-                )
+                stability.append(dict(record))
                 return
             _require_no_extended_acl(descriptor, f"{scope}-acl")
             _require_no_extended_attributes(descriptor, f"{scope}-xattr")
@@ -4387,8 +4410,8 @@ def _observe_bounded_library(
         records.sort(key=lambda item: item["path_sha256"])
         inventory = _document_with_digest(
             {
-                "schema_version": 1,
-                "contract": "task-witness-macos-bounded-library-inventory-v1",
+                "schema_version": 2,
+                "contract": "task-witness-macos-bounded-library-inventory-v2",
                 "entry_count": node_count,
                 "regular_file_bytes": total_bytes,
                 "entries": records,
@@ -4410,31 +4433,47 @@ def _observe_bounded_library(
             os.close(home_descriptor)
 
 
-def _validated_library_inventory(
-    value: object,
-    account: DisposableAccount,
-    home_device: int,
-) -> dict:
+def _valid_library_xattr_receipt(record, by_hash):
+    receipt = record.get("xattr_receipt")
+    if receipt is None:
+        return True
+    if type(receipt) is not dict:
+        return False
+    length = receipt.get("value_length")
+    if (
+        set(receipt) != {"family", "value_length", "value_sha256"}
+        or receipt.get("family") != _XATTR_FAMILIES[2]
+        or type(length) is not int
+        or not 0 <= length <= MAX_HOME_LIBRARY_QUARANTINE_VALUE_BYTES
+        or not _is_sha256(receipt.get("value_sha256"))
+    ):
+        return False
+    while record["depth"] > 2:
+        record = by_hash[record["parent_sha256"]]
+    return (record["kind"], record["path_sha256"]) == (
+        "directory",
+        _home_library_path_sha256((HOME_LIBRARY_NAME, "Preferences")),
+    )
+
+
+def _validated_library_inventory(value, account, home_device):
     inventory = _require_exact_keys(
         value,
-        {
-            "content_sha256",
-            "contract",
-            "entries",
-            "entry_count",
-            "regular_file_bytes",
-            "schema_version",
-        },
+        set(
+            "content_sha256 contract entries entry_count regular_file_bytes "
+            "schema_version".split()
+        ),
         "home-library-inventory",
     )
     _require_content_digest(inventory, "home-library-inventory")
+    invalid = ProbeError("home-library-inventory-invalid")
     records = inventory.get("entries")
     root_path = _home_library_path_sha256((HOME_LIBRARY_NAME,))
     if (
         type(inventory.get("schema_version")) is not int
-        or inventory.get("schema_version") != 1
+        or inventory.get("schema_version") != 2
         or inventory.get("contract")
-        != "task-witness-macos-bounded-library-inventory-v1"
+        != "task-witness-macos-bounded-library-inventory-v2"
         or not isinstance(records, list)
         or not 1 <= len(records) <= MAX_HOME_LIBRARY_NODES
         or type(inventory.get("entry_count")) is not int
@@ -4447,48 +4486,30 @@ def _validated_library_inventory(
         or canonical_bytes(records)
         != canonical_bytes(sorted(records, key=lambda item: item["path_sha256"]))
     ):
-        raise ProbeError("home-library-inventory-invalid")
-    by_hash: dict[str, dict] = {}
-    identities: set[tuple[int, int]] = set()
+        raise invalid
+    by_hash = {}
+    identities = set()
     total_bytes = 0
+    common_keys = set(
+        "depth device flags gid inode kind mode parent_sha256 path_sha256 uid".split()
+    )
+    file_keys = common_keys | set(
+        "content_sha256 ctime_ns link_count mtime_ns size xattr_receipt".split()
+    )
     for record_value in records:
         if not isinstance(record_value, dict):
-            raise ProbeError("home-library-inventory-invalid")
+            raise invalid
         kind = record_value.get("kind")
-        common_keys = {
-            "depth",
-            "device",
-            "flags",
-            "gid",
-            "inode",
-            "kind",
-            "mode",
-            "parent_sha256",
-            "path_sha256",
-            "uid",
-        }
-        file_keys = common_keys | {
-            "content_sha256",
-            "ctime_ns",
-            "link_count",
-            "mtime_ns",
-            "size",
-        }
         if set(record_value) != (file_keys if kind == "file" else common_keys):
-            raise ProbeError("home-library-inventory-invalid")
+            raise invalid
         path_sha256 = record_value.get("path_sha256")
         parent_sha256 = record_value.get("parent_sha256")
-        integer_names = common_keys - {
-            "kind",
-            "parent_sha256",
-            "path_sha256",
-        }
+        integer_names = common_keys - set("kind parent_sha256 path_sha256".split())
         if kind == "file":
-            integer_names |= {"ctime_ns", "link_count", "mtime_ns", "size"}
+            integer_names |= set("ctime_ns link_count mtime_ns size".split())
         if (
             not isinstance(kind, str)
             or kind not in {"directory", "file"}
-            or not _is_sha256(path_sha256)
             or not _is_sha256(parent_sha256)
             or path_sha256 in by_hash
             or any(type(record_value.get(name)) is not int for name in integer_names)
@@ -4498,10 +4519,10 @@ def _validated_library_inventory(
             or record_value.get("gid") != account.gid
             or record_value.get("flags") != 0
         ):
-            raise ProbeError("home-library-inventory-invalid")
+            raise invalid
         identity = (record_value["device"], record_value["inode"])
         if record_value["inode"] <= 0 or identity in identities:
-            raise ProbeError("home-library-inventory-invalid")
+            raise invalid
         identities.add(identity)
         if kind == "directory":
             if (
@@ -4509,7 +4530,7 @@ def _validated_library_inventory(
                 or stat.S_IMODE(record_value["mode"]) & 0o022
                 or stat.S_IMODE(record_value["mode"]) & 0o700 != 0o700
             ):
-                raise ProbeError("home-library-inventory-invalid")
+                raise invalid
         else:
             digest = record_value.get("content_sha256")
             size = record_value.get("size")
@@ -4522,7 +4543,7 @@ def _validated_library_inventory(
                 or not isinstance(size, int)
                 or not 0 <= size <= MAX_HOME_LIBRARY_FILE_BYTES
             ):
-                raise ProbeError("home-library-inventory-invalid")
+                raise invalid
             total_bytes += size
         by_hash[path_sha256] = record_value
     empty_path = _home_library_path_sha256(())
@@ -4534,18 +4555,20 @@ def _validated_library_inventory(
                 or parent != empty_path
                 or record["kind"] != "directory"
             ):
-                raise ProbeError("home-library-inventory-invalid")
+                raise invalid
         elif (
             parent not in by_hash
             or by_hash[parent]["kind"] != "directory"
             or by_hash[parent]["depth"] != record["depth"] - 1
         ):
-            raise ProbeError("home-library-inventory-invalid")
+            raise invalid
+    if any(not _valid_library_xattr_receipt(record, by_hash) for record in records):
+        raise invalid
     if (
         total_bytes != inventory.get("regular_file_bytes")
         or total_bytes > MAX_HOME_LIBRARY_TOTAL_BYTES
     ):
-        raise ProbeError("home-library-inventory-invalid")
+        raise invalid
     return dict(inventory)
 
 
@@ -4648,10 +4671,19 @@ def _require_library_record_metadata(
         raise ProbeError("home-library-inventory-drift")
 
 
-def _delete_authorized_library_directory(
+def _require_library_directory(
+    record: Mapping[str, object], descriptor: int, scope: str
+) -> None:
+    _require_library_record_metadata(record, os.fstat(descriptor), "directory")
+    _require_no_extended_acl(descriptor, f"{scope}-acl")
+    _require_no_extended_attributes(descriptor, f"{scope}-xattr")
+
+
+def _walk(
     descriptor: int,
     components: tuple[str, ...],
     authorized_by_path: Mapping[str, Mapping[str, object]],
+    remove: bool,
 ) -> None:
     names = _bounded_directory_names(
         descriptor,
@@ -4669,7 +4701,7 @@ def _delete_authorized_library_directory(
         kind = record.get("kind")
         if kind == "file":
             _require_library_record_metadata(record, metadata, "file")
-            raw, opened = _read_home_library_file(
+            raw, opened, receipt = _read_home_library_file(
                 descriptor,
                 name,
                 metadata,
@@ -4680,9 +4712,11 @@ def _delete_authorized_library_directory(
             )
             if any(
                 record.get(field) != value
-                for field, value in _library_node_state(opened, raw).items()
+                for field, value in _library_node_state(opened, raw, receipt).items()
             ):
                 raise ProbeError("home-library-inventory-drift")
+            if not remove:
+                continue
             try:
                 os.unlink(name, dir_fd=descriptor)
                 os.fsync(descriptor)
@@ -4699,16 +4733,14 @@ def _delete_authorized_library_directory(
                 os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
                 dir_fd=descriptor,
             )
-            opened = os.fstat(child_descriptor)
-            _require_library_record_metadata(record, opened, "directory")
-            _require_no_extended_acl(child_descriptor, "directory-acl")
-            _require_no_extended_attributes(child_descriptor, "directory-xattr")
-            _delete_authorized_library_directory(
+            _require_library_directory(record, child_descriptor, "directory")
+            _walk(
                 child_descriptor,
                 child_components,
                 authorized_by_path,
+                remove,
             )
-            _require_no_extended_attributes(child_descriptor, "directory-xattr")
+            _require_library_directory(record, child_descriptor, "directory")
         except ProbeError:
             raise
         except OSError as error:
@@ -4719,8 +4751,9 @@ def _delete_authorized_library_directory(
         try:
             current = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
             _require_library_record_metadata(record, current, "directory")
-            os.rmdir(name, dir_fd=descriptor)
-            os.fsync(descriptor)
+            if remove:
+                os.rmdir(name, dir_fd=descriptor)
+                os.fsync(descriptor)
         except ProbeError:
             raise
         except OSError as error:
@@ -4816,18 +4849,15 @@ def _quarantine_and_remove_bounded_library(
                 os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
                 dir_fd=home_descriptor,
             )
-            _require_library_record_metadata(
-                root,
-                os.fstat(library_descriptor),
-                "directory",
-            )
-            _require_no_extended_attributes(library_descriptor, "root-xattr")
-            _delete_authorized_library_directory(
-                library_descriptor,
-                (HOME_LIBRARY_NAME,),
-                authorized_by_path,
-            )
-            _require_no_extended_attributes(library_descriptor, "root-xattr")
+            for remove in (False, True):
+                _require_library_directory(root, library_descriptor, "root")
+                _walk(
+                    library_descriptor,
+                    (HOME_LIBRARY_NAME,),
+                    authorized_by_path,
+                    remove,
+                )
+            _require_library_directory(root, library_descriptor, "root")
         finally:
             if library_descriptor >= 0:
                 os.close(library_descriptor)
@@ -5133,8 +5163,8 @@ def _home_cleanup_document(
         raise ProbeError("home-cleanup-authorization-binding-drift")
     return _document_with_digest(
         {
-            "schema_version": 2,
-            "contract": "task-witness-macos-home-cleanup-authorization-v2",
+            "schema_version": 3,
+            "contract": "task-witness-macos-home-cleanup-authorization-v3",
             "candidate_sha1": EXPECTED_CANDIDATE_SHA,
             "disposition": "armed",
             "account": {

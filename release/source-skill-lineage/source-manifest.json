@@ -1,0 +1,1134 @@
+{
+  "candidate": {
+    "basis": {
+      "commit_sha1": "8ec465ea915c6759a3693ac8515f0ee3901b8a4f",
+      "tree_sha1": "acd75254067861dc33ef4a754734138ae3c37af3"
+    },
+    "package_projection_contract": "agent-plugin-tree-v1",
+    "packages": [
+      {
+        "entry_count": 24,
+        "git_tree_sha1": "f874b4d7ee36c49ac09098fcacf7fa9c2601d1e4",
+        "id": "artifact-customs",
+        "identity_artifacts": [
+          {
+            "path": "release/plugin-content-locks/artifact-customs.json",
+            "sha256": "sha256:f9ae3a737f9ec7bae29df9926c5076d5a46e32b382a94800e48ae1ff57b532bd"
+          }
+        ],
+        "package_tree_sha256": "sha256:29abf2c8904e5b204fd5b2eace59213f5407cd2bfed269ae6e8459d6bfd921e4",
+        "plugin_manifest_sha256": "sha256:edbc33028f72571b4dd913e5d1eb53388f2071b9216bc69021b1ba4888d5be81",
+        "plugin_root": "plugins/artifact-customs",
+        "total_bytes": 76474,
+        "version": "1.0.0"
+      },
+      {
+        "entry_count": 64,
+        "git_tree_sha1": "82ef6a75c03d2794ea6c792dc348903a9ddfe51c",
+        "id": "mergecraft",
+        "identity_artifacts": [
+          {
+            "path": "release/plugin-content-locks/mergecraft.json",
+            "sha256": "sha256:cb51585ea1cd1693bd7fb57b164ba414841e87e8ba025b01f6461e9f4fd1253f"
+          }
+        ],
+        "package_tree_sha256": "sha256:b9a7e2114e443c919c4a6a6e965744046375cb96193bef1e20f9417c2ae28251",
+        "plugin_manifest_sha256": "sha256:799c181398e7eef8e2ec09e9fc158d94a78ca41d5e44ea27e608da4d0147f667",
+        "plugin_root": "plugins/mergecraft",
+        "total_bytes": 540847,
+        "version": "1.0.0"
+      },
+      {
+        "entry_count": 43,
+        "git_tree_sha1": "d4cdbaee1642cc0c388e49410e5332e3a74be1d1",
+        "id": "rolecasting",
+        "identity_artifacts": [
+          {
+            "path": "plugins/rolecasting/content-lock.json",
+            "sha256": "sha256:bb326245f255189c2516696b5b9f17ae0e4dafe296c5d02daaf2e09b9c642ade"
+          }
+        ],
+        "package_tree_sha256": "sha256:2638d4f2ba2023f98499510242c9a3c226dd20a694b2cef32c1bc83761d5cb54",
+        "plugin_manifest_sha256": "sha256:ab2726e06bada2c28d3bc98ae0e885e8a7dfd6fe72df242e351a7ce529b902d0",
+        "plugin_root": "plugins/rolecasting",
+        "total_bytes": 138238,
+        "version": "1.0.0"
+      },
+      {
+        "entry_count": 13,
+        "git_tree_sha1": "4ce4650fe524dfa817e715715bd7528639e0de04",
+        "id": "task-witness",
+        "identity_artifacts": [
+          {
+            "path": "release/task-witness/source-shape-review.json",
+            "sha256": "sha256:e9c62bf269301c610ef115c0c09136fc7553be8f663818632e1bae018952cb76"
+          },
+          {
+            "path": "release/task-witness/tw4-suite-inventory.json",
+            "sha256": "sha256:985e316e7b3d75f07f91a7bd766414f092340ee1006d57081a887026b1da37cd"
+          }
+        ],
+        "package_tree_sha256": "sha256:17b468cc4ca71075f20f40f334d342171ad7564e604df48d48b271ce932d6d85",
+        "plugin_manifest_sha256": "sha256:5be0a7bd385a4abe6cdfc5d0b3f945bc1a59394637e84c9f5f2e6b310aa95213",
+        "plugin_root": "plugins/task-witness",
+        "total_bytes": 1335867,
+        "version": "1.0.0"
+      },
+      {
+        "entry_count": 113,
+        "git_tree_sha1": "db58756a31a98fc8be81a226230a1eb9cef02df6",
+        "id": "tricritical",
+        "identity_artifacts": [
+          {
+            "path": "plugins/tricritical/content-lock.json",
+            "sha256": "sha256:910fea3dba7505b49d640f91a4a7b401af9718eab4924dcf9596e141f8a5715d"
+          }
+        ],
+        "package_tree_sha256": "sha256:f80de19383224291a2596a129ff2e2fc77f74916da0aa1da2a18ba11c067c609",
+        "plugin_manifest_sha256": "sha256:d4c12cd78b0631e1ea171b5254b5661d9d13f198bca28c4dd2d56d1744b982b7",
+        "plugin_root": "plugins/tricritical",
+        "total_bytes": 182135,
+        "version": "1.0.0"
+      },
+      {
+        "entry_count": 28,
+        "git_tree_sha1": "c46a89caa6a6bc842fe69eb2ff0037df1d75832c",
+        "id": "versionkeeping",
+        "identity_artifacts": [
+          {
+            "path": "release/plugin-content-locks/versionkeeping.json",
+            "sha256": "sha256:34a4d32b45b103b92e6cef5810d50d8a095841d1c7a12b815aa8659feef78482"
+          }
+        ],
+        "package_tree_sha256": "sha256:0ffc4575a0ffe15373f2eba555a044175ee21e19035bf1fcafbe13c6d47be369",
+        "plugin_manifest_sha256": "sha256:6fde278f2e58631c3873eb1c71007f71e3bbfa7ea8e3624c8547fde9ee477890",
+        "plugin_root": "plugins/versionkeeping",
+        "total_bytes": 340115,
+        "version": "1.0.0"
+      }
+    ],
+    "packages_sha256": "sha256:ed6726c4a1749f216f936b59b94263c18ac2dfe3e349fce9bc1a9bb4f33f07c5",
+    "repository_id": "nisavid/agents"
+  },
+  "content_sha256": "sha256:2b83fcd5767ba66e4613b21950f63251d1ced2201189dac88aa80183c1404a27",
+  "contract": "coordinated-source-skill-manifest-v1",
+  "observed_at_utc": "2026-08-18T06:07:48Z",
+  "schema_version": 1,
+  "scope": {
+    "distribution_ids": [
+      "artifact-customs",
+      "mergecraft",
+      "rolecasting",
+      "task-witness",
+      "tricritical",
+      "versionkeeping"
+    ],
+    "host_profile_ids": [
+      "initial-personal-cachyos-v1",
+      "initial-work-macos-v1"
+    ],
+    "source_families": [
+      "ivan-authored",
+      "matt-pocock",
+      "other",
+      "retained-specialist",
+      "superpowers"
+    ]
+  },
+  "sources": [
+    {
+      "authority": {
+        "kind": "git",
+        "refresh_ref": "refs/heads/main",
+        "repository_url": "https://github.com/cursor/plugins",
+        "skill_root": "thermos"
+      },
+      "baseline": {
+        "commit_sha1": "dc415439eebed0cd8fddb11e896dee43bce9d8b0",
+        "entry_count": 10,
+        "license": {
+          "attribution_requirement": "notice-required",
+          "evidence_ref": "https://github.com/cursor/plugins/blob/dc415439eebed0cd8fddb11e896dee43bce9d8b0/thermos/LICENSE",
+          "evidence_sha256": "sha256:702f5f331b56aff0e33d8c7826df5202559f894145eb70355c6477b55b5bb8a0",
+          "spdx_expression": "MIT",
+          "status": "resolved"
+        },
+        "skill_tree_sha256": "sha256:4bca185dbfec2ba648bfa6f3e7da3cd436933bf4c4661c67e36635c969087430",
+        "status": "resolved",
+        "total_bytes": 84447,
+        "tree_sha1": "82dd7121447abad1c551e5d6ba829de3c6f3e4c4"
+      },
+      "byte_drift": {
+        "status": "unchanged",
+        "summary": "The upstream Thermos subtree has not changed since the revision named by the retired port."
+      },
+      "current": {
+        "commit_sha1": "c7f203457c16815379130697c41e74fd202e9978",
+        "entry_count": 10,
+        "license": {
+          "attribution_requirement": "notice-required",
+          "evidence_ref": "https://github.com/cursor/plugins/blob/c7f203457c16815379130697c41e74fd202e9978/thermos/LICENSE",
+          "evidence_sha256": "sha256:702f5f331b56aff0e33d8c7826df5202559f894145eb70355c6477b55b5bb8a0",
+          "spdx_expression": "MIT",
+          "status": "resolved"
+        },
+        "skill_tree_sha256": "sha256:4bca185dbfec2ba648bfa6f3e7da3cd436933bf4c4661c67e36635c969087430",
+        "status": "resolved",
+        "total_bytes": 84447,
+        "tree_sha1": "82dd7121447abad1c551e5d6ba829de3c6f3e4c4"
+      },
+      "family": "other",
+      "id": "cursor-thermos",
+      "skill_ids": [
+        "thermo-nuclear-code-quality-review",
+        "thermo-nuclear-review",
+        "thermos"
+      ]
+    },
+    {
+      "authority": {
+        "kind": "git",
+        "refresh_ref": "refs/heads/main",
+        "repository_url": "https://github.com/firecrawl/cli",
+        "skill_root": "skills"
+      },
+      "baseline": {
+        "evidence_needed": [
+          "original baseline revision",
+          "original skill-root tree digest"
+        ],
+        "reason": "No candidate contribution baseline is established for the installed Firecrawl CLI skills.",
+        "status": "unresolved"
+      },
+      "byte_drift": {
+        "status": "unresolved",
+        "summary": "Material contribution to the six distributions remains unclassified."
+      },
+      "current": {
+        "commit_sha1": "870979ed9bfa2d7a26e411c4f6b27381e147ade3",
+        "entry_count": 12,
+        "license": {
+          "evidence_needed": [
+            "authoritative license boundary"
+          ],
+          "reason": "No root license file or detected repository license is present at the selected snapshot.",
+          "status": "unresolved"
+        },
+        "skill_tree_sha256": "sha256:251e137861b17bd3f385ed1b1900be2631ca45192cf00c4b2d33b39aa759117c",
+        "status": "resolved",
+        "total_bytes": 74137,
+        "tree_sha1": "ec3529a316462c8170410ee7106fc1db76a57fb9"
+      },
+      "family": "other",
+      "id": "firecrawl-cli",
+      "skill_ids": [
+        "firecrawl",
+        "firecrawl-agent",
+        "firecrawl-crawl",
+        "firecrawl-download",
+        "firecrawl-interact",
+        "firecrawl-map",
+        "firecrawl-monitor",
+        "firecrawl-parse",
+        "firecrawl-scrape",
+        "firecrawl-search"
+      ]
+    },
+    {
+      "authority": {
+        "kind": "git",
+        "refresh_ref": "refs/heads/main",
+        "repository_url": "https://github.com/firecrawl/skills",
+        "skill_root": "skills"
+      },
+      "baseline": {
+        "evidence_needed": [
+          "original baseline revision",
+          "original skill-root tree digest"
+        ],
+        "reason": "No candidate contribution baseline is established for this installed source set.",
+        "status": "unresolved"
+      },
+      "byte_drift": {
+        "status": "unresolved",
+        "summary": "Material contribution to the six distributions remains unclassified."
+      },
+      "current": {
+        "commit_sha1": "798926666a9a89645f0d618ab41d847f55fe3144",
+        "entry_count": 17,
+        "license": {
+          "attribution_requirement": "notice-required",
+          "evidence_ref": "https://github.com/firecrawl/skills/blob/798926666a9a89645f0d618ab41d847f55fe3144/LICENSE",
+          "evidence_sha256": "sha256:8db975b9d59274cd37f19d3f7fec9ce0f2d96daf71e0c69d48dc5358f55dd691",
+          "spdx_expression": "ISC",
+          "status": "resolved"
+        },
+        "skill_tree_sha256": "sha256:144a44be80d3b18b89483c19ea42b4ce168f259696b8fdfbbf72ffdbf1ce63aa",
+        "status": "resolved",
+        "total_bytes": 53541,
+        "tree_sha1": "c299305a7d26a900608805ee948e295ad4e2ecc0"
+      },
+      "family": "other",
+      "id": "firecrawl-skill-set",
+      "skill_ids": [
+        "firecrawl-build-interact",
+        "firecrawl-build-onboarding",
+        "firecrawl-build-scrape",
+        "firecrawl-build-search",
+        "firecrawl-research-index"
+      ]
+    },
+    {
+      "authority": {
+        "kind": "git",
+        "refresh_ref": "refs/heads/main",
+        "repository_url": "https://github.com/firecrawl/firecrawl-workflows",
+        "skill_root": "skills"
+      },
+      "baseline": {
+        "evidence_needed": [
+          "original baseline revision",
+          "original skill-root tree digest"
+        ],
+        "reason": "No candidate contribution baseline is established for this installed source set.",
+        "status": "unresolved"
+      },
+      "byte_drift": {
+        "status": "unresolved",
+        "summary": "Material contribution to the six distributions remains unclassified."
+      },
+      "current": {
+        "commit_sha1": "18c0185c16f7a714d0a37b65149ca0f09b13e0e8",
+        "entry_count": 16,
+        "license": {
+          "attribution_requirement": "notice-required",
+          "evidence_ref": "https://github.com/firecrawl/firecrawl-workflows/blob/18c0185c16f7a714d0a37b65149ca0f09b13e0e8/LICENSE",
+          "evidence_sha256": "sha256:7bb9acac4ebb53a0fda17dd8a764ae184ff8ebf2563a9dd7915a023f73d55c3a",
+          "spdx_expression": "ISC",
+          "status": "resolved"
+        },
+        "skill_tree_sha256": "sha256:6e5b4fa22f218b20e37ed047b8e09449e9de88e5c372e8918cc6a363d9a580fc",
+        "status": "resolved",
+        "total_bytes": 53285,
+        "tree_sha1": "7cb92fba77f76d4c244d990c1faa767b542a8521"
+      },
+      "family": "other",
+      "id": "firecrawl-workflows",
+      "skill_ids": [
+        "firecrawl-company-directories",
+        "firecrawl-competitive-intel",
+        "firecrawl-dashboard-reporting",
+        "firecrawl-deep-research",
+        "firecrawl-demo-walkthrough",
+        "firecrawl-knowledge-base",
+        "firecrawl-knowledge-ingest",
+        "firecrawl-lead-gen",
+        "firecrawl-lead-research",
+        "firecrawl-market-research",
+        "firecrawl-qa",
+        "firecrawl-research-papers",
+        "firecrawl-seo-audit",
+        "firecrawl-shop",
+        "firecrawl-website-design-clone",
+        "firecrawl-workflows"
+      ]
+    },
+    {
+      "authority": {
+        "kind": "git",
+        "refresh_ref": "refs/heads/main",
+        "repository_url": "https://github.com/heredotnow/skill",
+        "skill_root": "skills"
+      },
+      "baseline": {
+        "evidence_needed": [
+          "original baseline revision",
+          "original skill-root tree digest"
+        ],
+        "reason": "No candidate contribution baseline is established for Here.now.",
+        "status": "unresolved"
+      },
+      "byte_drift": {
+        "status": "unresolved",
+        "summary": "Material contribution to the six distributions remains unclassified."
+      },
+      "current": {
+        "commit_sha1": "8ec223e927bb2247636aa0653536f63385f05298",
+        "entry_count": 3,
+        "license": {
+          "evidence_needed": [
+            "authoritative license boundary"
+          ],
+          "reason": "No root license file or detected repository license is present at the selected snapshot.",
+          "status": "unresolved"
+        },
+        "skill_tree_sha256": "sha256:50d9d222e8d89cf7cc41b099ec4dc6d88415b9bbd4df44ef14eb2e969fa03c62",
+        "status": "resolved",
+        "total_bytes": 42756,
+        "tree_sha1": "989dff31ba49ee0a690b38ae2c3e63f54839c494"
+      },
+      "family": "other",
+      "id": "heredotnow-here-now",
+      "skill_ids": [
+        "here-now"
+      ]
+    },
+    {
+      "authority": {
+        "kind": "git",
+        "refresh_ref": "refs/heads/main",
+        "repository_url": "https://github.com/heygen-com/hyperframes",
+        "skill_root": "skills"
+      },
+      "baseline": {
+        "evidence_needed": [
+          "original baseline revision",
+          "original skill-root tree digest"
+        ],
+        "reason": "No candidate contribution baseline is established for Hyperframes.",
+        "status": "unresolved"
+      },
+      "byte_drift": {
+        "status": "unresolved",
+        "summary": "Material contribution to the six distributions remains unclassified."
+      },
+      "current": {
+        "commit_sha1": "0d874adc685a94a519311cf9ed9e4107bb0347c9",
+        "entry_count": 901,
+        "license": {
+          "attribution_requirement": "notice-required",
+          "evidence_ref": "https://github.com/heygen-com/hyperframes/blob/0d874adc685a94a519311cf9ed9e4107bb0347c9/LICENSE",
+          "evidence_sha256": "sha256:4259155fb06f127687ee7b0a8a3682d45132db0f2da26cbc0b7a2d1e796436b8",
+          "spdx_expression": "Apache-2.0",
+          "status": "resolved"
+        },
+        "skill_tree_sha256": "sha256:28d488b72e3080c083cc8e38fc2e42f0c7cd891dfbb645ca467351f639d2b894",
+        "status": "resolved",
+        "total_bytes": 16500606,
+        "tree_sha1": "c3f9a12e81f3a9d5ae790195af1de1bac9a301f6"
+      },
+      "family": "other",
+      "id": "heygen-hyperframes",
+      "skill_ids": [
+        "hyperframes",
+        "hyperframes-animation",
+        "hyperframes-cli",
+        "hyperframes-core",
+        "hyperframes-creative",
+        "hyperframes-keyframes",
+        "hyperframes-registry",
+        "media-use"
+      ]
+    },
+    {
+      "authority": {
+        "kind": "git",
+        "refresh_ref": "b47f03519068b858cf0c070b5d331ee053ef6b7b",
+        "repository_url": "https://github.com/nisavid/agents",
+        "skill_root": "plugins/artifact-customs"
+      },
+      "baseline": {
+        "commit_sha1": "998fe484208934554845cdcda6727c486fbc7467",
+        "entry_count": 16,
+        "license": {
+          "attribution_requirement": "none",
+          "evidence_ref": "plugins/artifact-customs/LICENSE",
+          "evidence_sha256": "sha256:68950fb14202e1a28da07612a6cc6978163fee3e678520c2740a0d1bde0680e8",
+          "spdx_expression": "MIT",
+          "status": "resolved"
+        },
+        "skill_tree_sha256": "sha256:14e6b97e1da0fad63411ff294c4bf8cadda9a4c5c2b260cd2136c98c4ca4b093",
+        "status": "resolved",
+        "total_bytes": 39282,
+        "tree_sha1": "1df6df911ee3744e498db4144b67408bd929f5af"
+      },
+      "byte_drift": {
+        "status": "changed",
+        "summary": "The package gained release, projection, and contract material after its original candidate baseline."
+      },
+      "current": {
+        "commit_sha1": "b47f03519068b858cf0c070b5d331ee053ef6b7b",
+        "entry_count": 24,
+        "license": {
+          "attribution_requirement": "none",
+          "evidence_ref": "plugins/artifact-customs/LICENSE",
+          "evidence_sha256": "sha256:68950fb14202e1a28da07612a6cc6978163fee3e678520c2740a0d1bde0680e8",
+          "spdx_expression": "MIT",
+          "status": "resolved"
+        },
+        "skill_tree_sha256": "sha256:29abf2c8904e5b204fd5b2eace59213f5407cd2bfed269ae6e8459d6bfd921e4",
+        "status": "resolved",
+        "total_bytes": 76474,
+        "tree_sha1": "f874b4d7ee36c49ac09098fcacf7fa9c2601d1e4"
+      },
+      "family": "ivan-authored",
+      "id": "ivan-artifact-customs",
+      "skill_ids": [
+        "adopting-third-party-components",
+        "assessing-third-party-components",
+        "maintaining-third-party-components"
+      ]
+    },
+    {
+      "authority": {
+        "kind": "git",
+        "refresh_ref": "b47f03519068b858cf0c070b5d331ee053ef6b7b",
+        "repository_url": "https://github.com/nisavid/agents",
+        "skill_root": "plugins/mergecraft"
+      },
+      "baseline": {
+        "commit_sha1": "d3f8837401591a2db85fa1abd0477ead64d030f2",
+        "entry_count": 62,
+        "license": {
+          "attribution_requirement": "none",
+          "evidence_ref": "plugins/mergecraft/LICENSE",
+          "evidence_sha256": "sha256:68950fb14202e1a28da07612a6cc6978163fee3e678520c2740a0d1bde0680e8",
+          "spdx_expression": "MIT",
+          "status": "resolved"
+        },
+        "skill_tree_sha256": "sha256:eb160c75edc7f36ac18c45c22bad438ed9a388aa923ca7a996774113788009fc",
+        "status": "resolved",
+        "total_bytes": 405515,
+        "tree_sha1": "20d4d1a1b2816e7382ba5594d55ca77ccae56472"
+      },
+      "byte_drift": {
+        "status": "changed",
+        "summary": "The package gained post-baseline privacy and publication corrections."
+      },
+      "current": {
+        "commit_sha1": "b47f03519068b858cf0c070b5d331ee053ef6b7b",
+        "entry_count": 63,
+        "license": {
+          "attribution_requirement": "none",
+          "evidence_ref": "plugins/mergecraft/LICENSE",
+          "evidence_sha256": "sha256:68950fb14202e1a28da07612a6cc6978163fee3e678520c2740a0d1bde0680e8",
+          "spdx_expression": "MIT",
+          "status": "resolved"
+        },
+        "skill_tree_sha256": "sha256:bcb12c475d86579f6014b9da765abcd44729e4f4655bf1d1d4fca2c31b57fa2c",
+        "status": "resolved",
+        "total_bytes": 493803,
+        "tree_sha1": "16051c291e314a69bc34cfbcdd48de98aceb2355"
+      },
+      "family": "ivan-authored",
+      "id": "ivan-mergecraft",
+      "skill_ids": [
+        "addressing-pr-review-feedback",
+        "getting-prs-merged",
+        "getting-prs-ready-for-review",
+        "graphite",
+        "interacting-with-pr-review-feedback",
+        "publishing-reviewable-prs",
+        "resuming-reviewed-prs",
+        "stacking-pr-fixups",
+        "writing-reviewable-pr-descriptions"
+      ]
+    },
+    {
+      "authority": {
+        "kind": "git",
+        "refresh_ref": "b47f03519068b858cf0c070b5d331ee053ef6b7b",
+        "repository_url": "https://github.com/nisavid/agents",
+        "skill_root": "plugins/rolecasting"
+      },
+      "baseline": {
+        "commit_sha1": "ca51933eabf83018d9c1c2b5e337e454fa60cbd5",
+        "entry_count": 30,
+        "license": {
+          "attribution_requirement": "none",
+          "evidence_ref": "plugins/rolecasting/LICENSE",
+          "evidence_sha256": "sha256:68950fb14202e1a28da07612a6cc6978163fee3e678520c2740a0d1bde0680e8",
+          "spdx_expression": "MIT",
+          "status": "resolved"
+        },
+        "skill_tree_sha256": "sha256:afd42f03424a44fc87f649010fc37fabd6eeaa598fc0d61e5061d94dae20bb60",
+        "status": "resolved",
+        "total_bytes": 44923,
+        "tree_sha1": "993557c22d72cfaa54c543f4dcee323e2517ba8e"
+      },
+      "byte_drift": {
+        "status": "changed",
+        "summary": "The package gained runtime evidence and qualification boundaries after its original baseline."
+      },
+      "current": {
+        "commit_sha1": "b47f03519068b858cf0c070b5d331ee053ef6b7b",
+        "entry_count": 43,
+        "license": {
+          "attribution_requirement": "none",
+          "evidence_ref": "plugins/rolecasting/LICENSE",
+          "evidence_sha256": "sha256:68950fb14202e1a28da07612a6cc6978163fee3e678520c2740a0d1bde0680e8",
+          "spdx_expression": "MIT",
+          "status": "resolved"
+        },
+        "skill_tree_sha256": "sha256:2638d4f2ba2023f98499510242c9a3c226dd20a694b2cef32c1bc83761d5cb54",
+        "status": "resolved",
+        "total_bytes": 138238,
+        "tree_sha1": "d4cdbaee1642cc0c388e49410e5332e3a74be1d1"
+      },
+      "family": "ivan-authored",
+      "id": "ivan-rolecasting",
+      "skill_ids": [
+        "choosing-agent-models",
+        "delegating-cross-agent-work"
+      ]
+    },
+    {
+      "authority": {
+        "kind": "git",
+        "refresh_ref": "b47f03519068b858cf0c070b5d331ee053ef6b7b",
+        "repository_url": "https://github.com/nisavid/agents",
+        "skill_root": "plugins/task-witness"
+      },
+      "baseline": {
+        "commit_sha1": "fcae93729ede8e21e1bdc1c774ff3e1d1e31e40b",
+        "entry_count": 7,
+        "license": {
+          "attribution_requirement": "none",
+          "evidence_ref": "LICENSE",
+          "evidence_sha256": "sha256:68950fb14202e1a28da07612a6cc6978163fee3e678520c2740a0d1bde0680e8",
+          "spdx_expression": "MIT",
+          "status": "resolved"
+        },
+        "skill_tree_sha256": "sha256:d2e0f5418b969568be524f727dba64bbef20eb7218d5967a8ae461a9380535bd",
+        "status": "resolved",
+        "total_bytes": 69137,
+        "tree_sha1": "5325ecf8af8642829f60e4088628eee11795487b"
+      },
+      "byte_drift": {
+        "status": "changed",
+        "summary": "The runtime gained migration, qualification, and deployment authority after its original baseline."
+      },
+      "current": {
+        "commit_sha1": "b47f03519068b858cf0c070b5d331ee053ef6b7b",
+        "entry_count": 12,
+        "license": {
+          "attribution_requirement": "none",
+          "evidence_ref": "LICENSE",
+          "evidence_sha256": "sha256:68950fb14202e1a28da07612a6cc6978163fee3e678520c2740a0d1bde0680e8",
+          "spdx_expression": "MIT",
+          "status": "resolved"
+        },
+        "skill_tree_sha256": "sha256:559586ca53256f08babeb08129571d819d5024c0c855f870a37113d56a870cf8",
+        "status": "resolved",
+        "total_bytes": 1334184,
+        "tree_sha1": "eac00106ab6a1b3ae6a1bbffd5e7904083d5199b"
+      },
+      "family": "ivan-authored",
+      "id": "ivan-task-witness",
+      "skill_ids": []
+    },
+    {
+      "authority": {
+        "kind": "git",
+        "refresh_ref": "b47f03519068b858cf0c070b5d331ee053ef6b7b",
+        "repository_url": "https://github.com/nisavid/agents",
+        "skill_root": "plugins/tricritical"
+      },
+      "baseline": {
+        "commit_sha1": "7e6db63f31b7160241b3de9c17ab363282feb1a6",
+        "entry_count": 84,
+        "license": {
+          "attribution_requirement": "notice-required",
+          "evidence_ref": "plugins/tricritical/LICENSE",
+          "evidence_sha256": "sha256:68950fb14202e1a28da07612a6cc6978163fee3e678520c2740a0d1bde0680e8",
+          "spdx_expression": "MIT",
+          "status": "resolved"
+        },
+        "skill_tree_sha256": "sha256:56dffeebaf4949e6e00e74473cadcccf36996a0040acba16a506008161b3ce51",
+        "status": "resolved",
+        "total_bytes": 81683,
+        "tree_sha1": "d1e5482fac3a17bffc9c4d20c4c3ad047ecc5b16"
+      },
+      "byte_drift": {
+        "status": "changed",
+        "summary": "The package gained evidence, projection, and source-resource bindings after its original baseline."
+      },
+      "current": {
+        "commit_sha1": "b47f03519068b858cf0c070b5d331ee053ef6b7b",
+        "entry_count": 113,
+        "license": {
+          "attribution_requirement": "notice-required",
+          "evidence_ref": "plugins/tricritical/LICENSE",
+          "evidence_sha256": "sha256:68950fb14202e1a28da07612a6cc6978163fee3e678520c2740a0d1bde0680e8",
+          "spdx_expression": "MIT",
+          "status": "resolved"
+        },
+        "skill_tree_sha256": "sha256:f80de19383224291a2596a129ff2e2fc77f74916da0aa1da2a18ba11c067c609",
+        "status": "resolved",
+        "total_bytes": 182135,
+        "tree_sha1": "db58756a31a98fc8be81a226230a1eb9cef02df6"
+      },
+      "family": "ivan-authored",
+      "id": "ivan-tricritical",
+      "skill_ids": [
+        "adjudicate",
+        "intent",
+        "loop",
+        "review",
+        "revise",
+        "runtime",
+        "structure"
+      ]
+    },
+    {
+      "authority": {
+        "kind": "git",
+        "refresh_ref": "b47f03519068b858cf0c070b5d331ee053ef6b7b",
+        "repository_url": "https://github.com/nisavid/agents",
+        "skill_root": "plugins/versionkeeping"
+      },
+      "baseline": {
+        "commit_sha1": "2bc50d31a85bd2094000a8b1929e901c840858c6",
+        "entry_count": 28,
+        "license": {
+          "attribution_requirement": "none",
+          "evidence_ref": "plugins/versionkeeping/LICENSE",
+          "evidence_sha256": "sha256:68950fb14202e1a28da07612a6cc6978163fee3e678520c2740a0d1bde0680e8",
+          "spdx_expression": "MIT",
+          "status": "resolved"
+        },
+        "skill_tree_sha256": "sha256:baa3561eac2e55fb8f1dfcee20a4620ef0333742b04248a64902eeef0fee03c7",
+        "status": "resolved",
+        "total_bytes": 304852,
+        "tree_sha1": "26747e4d534d944d7b6b7313b93dfd5cec165b65"
+      },
+      "byte_drift": {
+        "status": "changed",
+        "summary": "The package gained publication safety corrections after its original baseline."
+      },
+      "current": {
+        "commit_sha1": "b47f03519068b858cf0c070b5d331ee053ef6b7b",
+        "entry_count": 28,
+        "license": {
+          "attribution_requirement": "none",
+          "evidence_ref": "plugins/versionkeeping/LICENSE",
+          "evidence_sha256": "sha256:68950fb14202e1a28da07612a6cc6978163fee3e678520c2740a0d1bde0680e8",
+          "spdx_expression": "MIT",
+          "status": "resolved"
+        },
+        "skill_tree_sha256": "sha256:a88da9cdc73d72b42153f837923157b2761cde3e22d055e2c2896d7e3df0c1f3",
+        "status": "resolved",
+        "total_bytes": 313444,
+        "tree_sha1": "f95e14a276c6586874ba48c91ccc9fd34f62d924"
+      },
+      "family": "ivan-authored",
+      "id": "ivan-versionkeeping",
+      "skill_ids": [
+        "checkpointing-and-publishing-git-work",
+        "resolving-merge-conflicts",
+        "syncing-forks-with-upstream",
+        "using-persistent-git-worktrees"
+      ]
+    },
+    {
+      "authority": {
+        "kind": "git",
+        "refresh_ref": "refs/heads/main",
+        "repository_url": "https://github.com/mattpocock/skills",
+        "skill_root": "skills"
+      },
+      "baseline": {
+        "commit_sha1": "84fdeffd12f2ee307994d1eb6feb48173b6e0502",
+        "entry_count": 101,
+        "license": {
+          "attribution_requirement": "notice-required",
+          "evidence_ref": "https://github.com/mattpocock/skills/blob/84fdeffd12f2ee307994d1eb6feb48173b6e0502/LICENSE",
+          "evidence_sha256": "sha256:0e7ac423bf2c6e223b7c5b156f8cf72da49d748e56a1641402c31f22ad07dbb5",
+          "spdx_expression": "MIT",
+          "status": "resolved"
+        },
+        "skill_tree_sha256": "sha256:e02c40072abe3e97596f0e72fd3774d82e3cf8bb21fd42819280a6d22a665594",
+        "status": "resolved",
+        "total_bytes": 254480,
+        "tree_sha1": "5d76a9b8320eab13d8fc71037df154053e7fb3f7"
+      },
+      "byte_drift": {
+        "status": "changed",
+        "summary": "Thirteen of the 25 installed-lock skill routes differ from the current upstream source set."
+      },
+      "current": {
+        "commit_sha1": "9c9f36ccd3995266cd675468af71639c8dde1ec5",
+        "entry_count": 101,
+        "license": {
+          "attribution_requirement": "notice-required",
+          "evidence_ref": "https://github.com/mattpocock/skills/blob/9c9f36ccd3995266cd675468af71639c8dde1ec5/LICENSE",
+          "evidence_sha256": "sha256:0e7ac423bf2c6e223b7c5b156f8cf72da49d748e56a1641402c31f22ad07dbb5",
+          "spdx_expression": "MIT",
+          "status": "resolved"
+        },
+        "skill_tree_sha256": "sha256:89cb7d03dc582bb15ec3b737ee64d5a9987de26ad6ccb17e02eaa871c1e2819d",
+        "status": "resolved",
+        "total_bytes": 254382,
+        "tree_sha1": "0e082b060e7d1f5e5f9e6b3be9418658920f5672"
+      },
+      "family": "matt-pocock",
+      "id": "matt-pocock-skill-set",
+      "skill_ids": [
+        "ask-matt",
+        "code-review",
+        "codebase-design",
+        "diagnosing-bugs",
+        "domain-modeling",
+        "grill-me",
+        "grill-with-docs",
+        "grilling",
+        "handoff",
+        "implement",
+        "improve-codebase-architecture",
+        "prototype",
+        "research",
+        "resolving-merge-conflicts",
+        "setup-matt-pocock-skills",
+        "tdd",
+        "teach",
+        "to-questionnaire",
+        "to-spec",
+        "to-tickets",
+        "triage",
+        "wait-what",
+        "wayfinder",
+        "wizard",
+        "writing-for-agents"
+      ]
+    },
+    {
+      "authority": {
+        "kind": "git",
+        "refresh_ref": "refs/heads/main",
+        "repository_url": "https://github.com/obra/the-elements-of-style",
+        "skill_root": "skills"
+      },
+      "baseline": {
+        "evidence_needed": [
+          "original baseline revision",
+          "original skill-root tree digest"
+        ],
+        "reason": "No candidate contribution baseline is established for this installed source.",
+        "status": "unresolved"
+      },
+      "byte_drift": {
+        "status": "unresolved",
+        "summary": "Material contribution to the six distributions remains unclassified."
+      },
+      "current": {
+        "commit_sha1": "05fc4f0d2b97b7c042dd9949ad658568e4a1324e",
+        "entry_count": 2,
+        "license": {
+          "evidence_needed": [
+            "authoritative license boundary"
+          ],
+          "reason": "No root license file or detected repository license is present at the selected snapshot.",
+          "status": "unresolved"
+        },
+        "skill_tree_sha256": "sha256:94b86f5a8fa9ffb3d9d80906fd57fe3f719003a42b24b374554c13b0db94d052",
+        "status": "resolved",
+        "total_bytes": 73235,
+        "tree_sha1": "196709239a48199a808b6f73b62954f928abd1ec"
+      },
+      "family": "other",
+      "id": "obra-elements-of-style",
+      "skill_ids": [
+        "writing-clearly-and-concisely"
+      ]
+    },
+    {
+      "authority": {
+        "kind": "git",
+        "refresh_ref": "refs/heads/main",
+        "repository_url": "https://github.com/openai/plugins",
+        "skill_root": "plugins/github"
+      },
+      "baseline": {
+        "evidence_needed": [
+          "original baseline revision",
+          "original skill-root tree digest"
+        ],
+        "reason": "The exact GitHub plugin revision used during candidate comparison is not recorded.",
+        "status": "unresolved"
+      },
+      "byte_drift": {
+        "status": "unresolved",
+        "summary": "Retained and retired GitHub specialist behavior requires exact baseline-to-current comparison."
+      },
+      "current": {
+        "commit_sha1": "11c74d6ba24d3a6d48f54a194cd00ef3beea18f9",
+        "entry_count": 28,
+        "license": {
+          "evidence_needed": [
+            "authoritative package-level license boundary"
+          ],
+          "reason": "The plugin manifest declares MIT, the selected root has no package-level license file, and bundled specialist licenses are Apache-2.0.",
+          "status": "unresolved"
+        },
+        "skill_tree_sha256": "sha256:f60867fd38c5119ee7538be94ac65f6bc666328395aa17cb7caaed5a51c24385",
+        "status": "resolved",
+        "total_bytes": 140621,
+        "tree_sha1": "5c2b448611eaee12cb93323684f8461fa4ab78e2"
+      },
+      "family": "retained-specialist",
+      "id": "openai-github-specialists",
+      "skill_ids": [
+        "gh-address-comments",
+        "gh-fix-ci",
+        "github"
+      ]
+    },
+    {
+      "authority": {
+        "authority_id": "review-atlas-private-authority-v1",
+        "kind": "opaque",
+        "refresh_adapter_id": "private-review-atlas-refresh-v1",
+        "skill_root_id": "review-atlas-source-v1"
+      },
+      "baseline": {
+        "evidence_needed": [
+          "original private authority receipt",
+          "original private source digest"
+        ],
+        "reason": "The private source baseline is not publishable and lacks an opaque immutable receipt.",
+        "status": "unresolved"
+      },
+      "byte_drift": {
+        "status": "unresolved",
+        "summary": "Only the public-core and private-overlay contribution partition is checked in."
+      },
+      "current": {
+        "evidence_needed": [
+          "current private authority receipt",
+          "current private source digest"
+        ],
+        "reason": "A privacy-safe opaque current-source receipt has not been produced.",
+        "status": "unresolved"
+      },
+      "family": "other",
+      "id": "review-atlas-private",
+      "skill_ids": [
+        "review-atlas"
+      ]
+    },
+    {
+      "authority": {
+        "kind": "git",
+        "refresh_ref": "refs/heads/main",
+        "repository_url": "https://github.com/obra/superpowers",
+        "skill_root": "skills"
+      },
+      "baseline": {
+        "commit_sha1": "44c9b2d6e889982ac18c27d05a19fefe335194e1",
+        "entry_count": 50,
+        "license": {
+          "attribution_requirement": "notice-required",
+          "evidence_ref": "https://github.com/obra/superpowers/blob/44c9b2d6e889982ac18c27d05a19fefe335194e1/LICENSE",
+          "evidence_sha256": "sha256:a37e0e9697144819e1d965176ac4ae5bc3fa02d11e7812036bbcadf6dafe2400",
+          "spdx_expression": "MIT",
+          "status": "resolved"
+        },
+        "skill_tree_sha256": "sha256:e2480fa0bdca458a5392725b98160e5f703e422b5f97fcd54baaeb5bb4ea6b2c",
+        "status": "resolved",
+        "total_bytes": 351137,
+        "tree_sha1": "9a5bbc376a639d0ea24e2989d2f5eba754638adf"
+      },
+      "byte_drift": {
+        "status": "changed",
+        "summary": "Seven of the 14 installed-lock skill routes differ from the current upstream source set."
+      },
+      "current": {
+        "commit_sha1": "b36e0829c6d0140e93cfef2ca599b1b07d4a7797",
+        "entry_count": 51,
+        "license": {
+          "attribution_requirement": "notice-required",
+          "evidence_ref": "https://github.com/obra/superpowers/blob/b36e0829c6d0140e93cfef2ca599b1b07d4a7797/LICENSE",
+          "evidence_sha256": "sha256:a37e0e9697144819e1d965176ac4ae5bc3fa02d11e7812036bbcadf6dafe2400",
+          "spdx_expression": "MIT",
+          "status": "resolved"
+        },
+        "skill_tree_sha256": "sha256:05ba43277fe8e4a11acba456042ea9340e80c7da80c4c500fba5c203ebbd5842",
+        "status": "resolved",
+        "total_bytes": 369641,
+        "tree_sha1": "9483dd00b0bda60c6ea631d88900f0436630d064"
+      },
+      "family": "superpowers",
+      "id": "superpowers-skill-set",
+      "skill_ids": [
+        "brainstorming",
+        "dispatching-parallel-agents",
+        "executing-plans",
+        "finishing-a-development-branch",
+        "receiving-code-review",
+        "requesting-code-review",
+        "subagent-driven-development",
+        "systematic-debugging",
+        "test-driven-development",
+        "using-git-worktrees",
+        "using-superpowers",
+        "verification-before-completion",
+        "writing-plans",
+        "writing-skills"
+      ]
+    },
+    {
+      "authority": {
+        "kind": "git",
+        "refresh_ref": "refs/heads/main",
+        "repository_url": "https://github.com/vectorize-io/hindsight",
+        "skill_root": "skills"
+      },
+      "baseline": {
+        "evidence_needed": [
+          "original baseline revision",
+          "original skill-root tree digest"
+        ],
+        "reason": "No candidate contribution baseline is established for Hindsight skills.",
+        "status": "unresolved"
+      },
+      "byte_drift": {
+        "status": "unresolved",
+        "summary": "Hindsight is a separate program; any material contribution remains unclassified."
+      },
+      "current": {
+        "commit_sha1": "997f27f1bf8cd52aede4a78d84eb0a0580c95ea5",
+        "entry_count": 160,
+        "license": {
+          "attribution_requirement": "notice-required",
+          "evidence_ref": "https://github.com/vectorize-io/hindsight/blob/997f27f1bf8cd52aede4a78d84eb0a0580c95ea5/LICENSE",
+          "evidence_sha256": "sha256:01fde0bedf83bdc185065d7af524a61690efe576a67f922eaff3a1280c17b63a",
+          "spdx_expression": "MIT",
+          "status": "resolved"
+        },
+        "skill_tree_sha256": "sha256:1f6b290e90497ee4f5fbdb5b5bc4539bd5d6fb56cee3988b0a18acadf5b31d6d",
+        "status": "resolved",
+        "total_bytes": 2374484,
+        "tree_sha1": "2e09090def20ea429a5a094b6f7c09104768306d"
+      },
+      "family": "other",
+      "id": "vectorize-hindsight",
+      "skill_ids": [
+        "hindsight-architect",
+        "hindsight-cloud",
+        "hindsight-docs",
+        "hindsight-local",
+        "hindsight-self-hosted"
+      ]
+    },
+    {
+      "authority": {
+        "kind": "git",
+        "refresh_ref": "refs/heads/main",
+        "repository_url": "https://github.com/vercel-labs/skills",
+        "skill_root": "skills"
+      },
+      "baseline": {
+        "evidence_needed": [
+          "original baseline revision",
+          "original skill-root tree digest"
+        ],
+        "reason": "No candidate contribution baseline is established for this installed source.",
+        "status": "unresolved"
+      },
+      "byte_drift": {
+        "status": "unresolved",
+        "summary": "Material contribution to the six distributions remains unclassified."
+      },
+      "current": {
+        "commit_sha1": "c6f69c631292444cc541ac6d91e2226b0ff247da",
+        "entry_count": 1,
+        "license": {
+          "attribution_requirement": "notice-required",
+          "evidence_ref": "https://github.com/vercel-labs/skills/blob/c6f69c631292444cc541ac6d91e2226b0ff247da/LICENSE",
+          "evidence_sha256": "sha256:661142e53c313d2bb5e1b055f5c0a39001450ff1b5e27b89dc4bc7de9a6352ca",
+          "spdx_expression": "MIT",
+          "status": "resolved"
+        },
+        "skill_tree_sha256": "sha256:df64fe568729fe883bab6ff36ebac94e570a983c4836dd7f3471d5ae2c453cfc",
+        "status": "resolved",
+        "total_bytes": 5472,
+        "tree_sha1": "b69c9d5fa86802d47394b3d9f387e3c86365aa77"
+      },
+      "family": "other",
+      "id": "vercel-labs-skill-set",
+      "skill_ids": [
+        "find-skills"
+      ]
+    },
+    {
+      "authority": {
+        "kind": "git",
+        "refresh_ref": "refs/heads/main",
+        "repository_url": "https://github.com/withgraphite/agent-skills",
+        "skill_root": "skills"
+      },
+      "baseline": {
+        "commit_sha1": "df3c9a36ec90af0b78df991608b3700b53e38ee5",
+        "entry_count": 1,
+        "license": {
+          "evidence_needed": [
+            "authoritative license boundary"
+          ],
+          "reason": "No root license file or detected repository license is present at the selected snapshot.",
+          "status": "unresolved"
+        },
+        "skill_tree_sha256": "sha256:87adde7d78f8b972d1b0db6bacccb6a60bbe61853b1df91779acebea1a789066",
+        "status": "resolved",
+        "total_bytes": 8995,
+        "tree_sha1": "22a8c483deab5cbc33210f5b07e00a4312232426"
+      },
+      "byte_drift": {
+        "status": "unchanged",
+        "summary": "The installed-lock source snapshot and current upstream Graphite skill bytes are identical."
+      },
+      "current": {
+        "commit_sha1": "df3c9a36ec90af0b78df991608b3700b53e38ee5",
+        "entry_count": 1,
+        "license": {
+          "evidence_needed": [
+            "authoritative license boundary"
+          ],
+          "reason": "No root license file or detected repository license is present at the selected snapshot.",
+          "status": "unresolved"
+        },
+        "skill_tree_sha256": "sha256:87adde7d78f8b972d1b0db6bacccb6a60bbe61853b1df91779acebea1a789066",
+        "status": "resolved",
+        "total_bytes": 8995,
+        "tree_sha1": "22a8c483deab5cbc33210f5b07e00a4312232426"
+      },
+      "family": "retained-specialist",
+      "id": "withgraphite-agent-skills",
+      "skill_ids": [
+        "graphite"
+      ]
+    },
+    {
+      "authority": {
+        "authority_id": "legacy-yeet-source-v1",
+        "kind": "opaque",
+        "refresh_adapter_id": "manual-legacy-source-refresh-v1",
+        "skill_root_id": "yeet-skill-v1"
+      },
+      "baseline": {
+        "evidence_needed": [
+          "original authority identity",
+          "original source digest"
+        ],
+        "reason": "The retirement ledger names Yeet behavior but not its immutable source authority.",
+        "status": "unresolved"
+      },
+      "byte_drift": {
+        "status": "unresolved",
+        "summary": "The retirement evidence binds behavior but not original or current source bytes."
+      },
+      "current": {
+        "evidence_needed": [
+          "current authority identity",
+          "current source digest"
+        ],
+        "reason": "No current Yeet source authority has been established.",
+        "status": "unresolved"
+      },
+      "family": "other",
+      "id": "yeet",
+      "skill_ids": [
+        "yeet"
+      ]
+    }
+  ]
+}

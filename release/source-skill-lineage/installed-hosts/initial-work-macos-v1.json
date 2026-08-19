@@ -1,0 +1,467 @@
+{
+  "content_sha256": "sha256:6e14da05c73aa67a68b8c6bb5dacf06948c2daf32f9b7ce5d4b7c53a1b5c35b7",
+  "contract": "coordinated-installed-source-skill-manifest-v1",
+  "discovery_precedence": {
+    "evidence_needed": [
+      "active discovery precedence receipt"
+    ],
+    "reason": "Installed source presence was captured, but active discovery precedence was not.",
+    "status": "unresolved"
+  },
+  "observed_at_utc": "2026-08-18T05:17:05Z",
+  "profile_id": "initial-work-macos-v1",
+  "schema_version": 1,
+  "source_manifest": {
+    "path": "release/source-skill-lineage/source-manifest.json",
+    "sha256": "sha256:ff5811c43234416571b8ba27ab89c73f589f0c3865f9be68210841723e859503"
+  },
+  "source_observations": [
+    {
+      "installations": [
+        {
+          "entry_count": 8,
+          "installation_id": "route-sha256:59f32c419fd1a3054e12b62f82c41c34e3934fe10723f8c5a6126fc0d8dc1b3b",
+          "matched_snapshots": [],
+          "skill_ids": [
+            "thermo-nuclear-code-quality-review",
+            "thermo-nuclear-review",
+            "thermos"
+          ],
+          "skill_tree_sha256": "sha256:9d5ee3c3279068b5182235d6f7bc2482174a89e18f71d778775baa3806c9955e",
+          "total_bytes": 22900
+        }
+      ],
+      "source_id": "cursor-thermos",
+      "status": "installed",
+      "unobserved_skill_ids": []
+    },
+    {
+      "installations": [
+        {
+          "entry_count": 12,
+          "installation_id": "route-sha256:393f01fdee4814efcaac26d168835759d1418df36a01890ec7837a691c198144",
+          "matched_snapshots": [],
+          "skill_ids": [
+            "firecrawl",
+            "firecrawl-agent",
+            "firecrawl-crawl",
+            "firecrawl-download",
+            "firecrawl-interact",
+            "firecrawl-map",
+            "firecrawl-monitor",
+            "firecrawl-parse",
+            "firecrawl-scrape",
+            "firecrawl-search"
+          ],
+          "skill_tree_sha256": "sha256:a8c4d88b68557d7dbf007e3dbcc38025012f765f330f3943ef3b89e86efa7f8a",
+          "total_bytes": 69858
+        }
+      ],
+      "source_id": "firecrawl-cli",
+      "status": "installed",
+      "unobserved_skill_ids": []
+    },
+    {
+      "installations": [
+        {
+          "entry_count": 9,
+          "installation_id": "route-sha256:6bfff0a83e451110c89ca97b49a793c644cc773e410b5d9046a4b30a0d109cfc",
+          "matched_snapshots": [],
+          "skill_ids": [
+            "firecrawl-build-interact",
+            "firecrawl-build-onboarding",
+            "firecrawl-build-scrape",
+            "firecrawl-build-search",
+            "firecrawl-research-index"
+          ],
+          "skill_tree_sha256": "sha256:89791f2ec61f8dc564afbfd6ac14cb610592a6ef53c390c6678a13d1a56bd51f",
+          "total_bytes": 24851
+        }
+      ],
+      "source_id": "firecrawl-skill-set",
+      "status": "installed",
+      "unobserved_skill_ids": []
+    },
+    {
+      "installations": [
+        {
+          "entry_count": 16,
+          "installation_id": "route-sha256:c73597f745a859a3cafc0291c9ee618e71e8e273b461d73db23813804b9bdf2a",
+          "matched_snapshots": [],
+          "skill_ids": [
+            "firecrawl-company-directories",
+            "firecrawl-competitive-intel",
+            "firecrawl-dashboard-reporting",
+            "firecrawl-deep-research",
+            "firecrawl-demo-walkthrough",
+            "firecrawl-knowledge-base",
+            "firecrawl-knowledge-ingest",
+            "firecrawl-lead-gen",
+            "firecrawl-lead-research",
+            "firecrawl-market-research",
+            "firecrawl-qa",
+            "firecrawl-research-papers",
+            "firecrawl-seo-audit",
+            "firecrawl-shop",
+            "firecrawl-website-design-clone",
+            "firecrawl-workflows"
+          ],
+          "skill_tree_sha256": "sha256:6cab0bbdeb5fb79bfe603aef0a9c22fe5c4e528c3d8363337c658a9008e95546",
+          "total_bytes": 48606
+        }
+      ],
+      "source_id": "firecrawl-workflows",
+      "status": "installed",
+      "unobserved_skill_ids": []
+    },
+    {
+      "installations": [
+        {
+          "entry_count": 3,
+          "installation_id": "route-sha256:481bb44bf2ae2a9c3aa7dbcfb79b09685a1340260927f7edf61d16606b76c342",
+          "matched_snapshots": [],
+          "skill_ids": [
+            "here-now"
+          ],
+          "skill_tree_sha256": "sha256:706b28971a140b6827bf81fef3da5db5e7403436bc6d5b2b755c78617c7e307b",
+          "total_bytes": 41767
+        }
+      ],
+      "source_id": "heredotnow-here-now",
+      "status": "installed",
+      "unobserved_skill_ids": []
+    },
+    {
+      "installations": [
+        {
+          "entry_count": 376,
+          "installation_id": "route-sha256:864e945811c31069658e4c167c4b542c56c674d7106c8c9939c87058e923cb4e",
+          "matched_snapshots": [],
+          "skill_ids": [
+            "hyperframes",
+            "hyperframes-animation",
+            "hyperframes-cli",
+            "hyperframes-core",
+            "hyperframes-creative",
+            "hyperframes-keyframes",
+            "hyperframes-registry",
+            "media-use"
+          ],
+          "skill_tree_sha256": "sha256:501169873696f6aa4b146c3594536e1f0c1abc63d7191664b606862515a23a7d",
+          "total_bytes": 3494488
+        }
+      ],
+      "source_id": "heygen-hyperframes",
+      "status": "installed",
+      "unobserved_skill_ids": []
+    },
+    {
+      "source_id": "ivan-artifact-customs",
+      "status": "absent"
+    },
+    {
+      "installations": [
+        {
+          "entry_count": 53,
+          "installation_id": "route-sha256:c9c48d2ed6ddccceac25c8bef2907eaf573d8c79fdeab5b623e88fb6396dd7e0",
+          "matched_snapshots": [],
+          "skill_ids": [
+            "getting-prs-merged",
+            "getting-prs-ready-for-review",
+            "graphite",
+            "publishing-reviewable-prs",
+            "resuming-reviewed-prs",
+            "stacking-pr-fixups",
+            "writing-reviewable-pr-descriptions"
+          ],
+          "skill_tree_sha256": "sha256:107596c7192f583f486d7f891ff60b5ab46638bde9690f853ba5cc12708f5399",
+          "total_bytes": 274239
+        }
+      ],
+      "source_id": "ivan-mergecraft",
+      "status": "installed",
+      "unobserved_skill_ids": [
+        "addressing-pr-review-feedback",
+        "interacting-with-pr-review-feedback"
+      ]
+    },
+    {
+      "installations": [
+        {
+          "entry_count": 2,
+          "installation_id": "route-sha256:02481074e4bdeb2d0dbced13df7ca4a292a962feff63a1fd4c02f7e454025764",
+          "matched_snapshots": [],
+          "skill_ids": [
+            "choosing-agent-models",
+            "delegating-cross-agent-work"
+          ],
+          "skill_tree_sha256": "sha256:3f4b9d6904d355f0a5126496cc60a7e3d4cbde9c0ac468534e425c2358ffb625",
+          "total_bytes": 17550
+        }
+      ],
+      "source_id": "ivan-rolecasting",
+      "status": "installed",
+      "unobserved_skill_ids": []
+    },
+    {
+      "source_id": "ivan-task-witness",
+      "status": "absent"
+    },
+    {
+      "source_id": "ivan-tricritical",
+      "status": "absent"
+    },
+    {
+      "installations": [
+        {
+          "entry_count": 25,
+          "installation_id": "route-sha256:92951b709b9916048459ff407801f4bd9bf020dcc2055f98c5974f7fbecf6183",
+          "matched_snapshots": [],
+          "skill_ids": [
+            "checkpointing-and-publishing-git-work",
+            "resolving-merge-conflicts",
+            "syncing-forks-with-upstream",
+            "using-persistent-git-worktrees"
+          ],
+          "skill_tree_sha256": "sha256:3742f9d843dd1aca6bdde4d55b106c8786365a5753b8d3405417d7eca0c6a6a5",
+          "total_bytes": 128659
+        }
+      ],
+      "source_id": "ivan-versionkeeping",
+      "status": "installed",
+      "unobserved_skill_ids": []
+    },
+    {
+      "installations": [
+        {
+          "entry_count": 74,
+          "installation_id": "route-sha256:6081eeab29464a60131411effe1e35541aedb48e385e933ff22d8653d457631e",
+          "matched_snapshots": [],
+          "skill_ids": [
+            "ask-matt",
+            "code-review",
+            "codebase-design",
+            "diagnosing-bugs",
+            "domain-modeling",
+            "grill-me",
+            "grill-with-docs",
+            "grilling",
+            "handoff",
+            "implement",
+            "improve-codebase-architecture",
+            "prototype",
+            "research",
+            "resolving-merge-conflicts",
+            "setup-matt-pocock-skills",
+            "tdd",
+            "teach",
+            "to-questionnaire",
+            "to-spec",
+            "to-tickets",
+            "triage",
+            "wait-what",
+            "wayfinder",
+            "wizard",
+            "writing-for-agents"
+          ],
+          "skill_tree_sha256": "sha256:1c3bec9cd294a29a5365850caac7948de1b0bc78d992b535e8db780123242f04",
+          "total_bytes": 204143
+        }
+      ],
+      "source_id": "matt-pocock-skill-set",
+      "status": "installed",
+      "unobserved_skill_ids": []
+    },
+    {
+      "installations": [
+        {
+          "entry_count": 2,
+          "installation_id": "route-sha256:057826c53ca86d716a699d161d0f402d68e0e3b5e6ede58eac511edf269b001f",
+          "matched_snapshots": [
+            "current"
+          ],
+          "skill_ids": [
+            "writing-clearly-and-concisely"
+          ],
+          "skill_tree_sha256": "sha256:94b86f5a8fa9ffb3d9d80906fd57fe3f719003a42b24b374554c13b0db94d052",
+          "total_bytes": 73235
+        }
+      ],
+      "source_id": "obra-elements-of-style",
+      "status": "installed",
+      "unobserved_skill_ids": []
+    },
+    {
+      "installations": [
+        {
+          "entry_count": 16,
+          "installation_id": "route-sha256:4095ac3b29e75eec53719252e0bf165a1be37a8f58297b3cb583d5367edf2bc7",
+          "matched_snapshots": [],
+          "skill_ids": [
+            "gh-address-comments",
+            "gh-fix-ci",
+            "github"
+          ],
+          "skill_tree_sha256": "sha256:da22621dee80972a82c165c8f1f3d9bd98c11d4833521af3460fb845902cbdc8",
+          "total_bytes": 65156
+        },
+        {
+          "entry_count": 16,
+          "installation_id": "route-sha256:a64894d0dceb5a71bcff16a9425a558478c7b975a48090f7a58168f53794770d",
+          "matched_snapshots": [],
+          "skill_ids": [
+            "gh-address-comments",
+            "gh-fix-ci",
+            "github"
+          ],
+          "skill_tree_sha256": "sha256:da22621dee80972a82c165c8f1f3d9bd98c11d4833521af3460fb845902cbdc8",
+          "total_bytes": 65156
+        }
+      ],
+      "source_id": "openai-github-specialists",
+      "status": "installed",
+      "unobserved_skill_ids": []
+    },
+    {
+      "source_id": "review-atlas-private",
+      "status": "absent"
+    },
+    {
+      "installations": [
+        {
+          "entry_count": 60,
+          "installation_id": "route-sha256:c9b4910084530fd6397a4df61060f78449e739599f2debdc9110da41a01b47c7",
+          "matched_snapshots": [],
+          "skill_ids": [
+            "brainstorming",
+            "dispatching-parallel-agents",
+            "executing-plans",
+            "finishing-a-development-branch",
+            "receiving-code-review",
+            "requesting-code-review",
+            "subagent-driven-development",
+            "systematic-debugging",
+            "test-driven-development",
+            "using-git-worktrees",
+            "using-superpowers",
+            "verification-before-completion",
+            "writing-plans",
+            "writing-skills"
+          ],
+          "skill_tree_sha256": "sha256:c2e66ef67db332857392cb82c2b6bd422f777451818fce8fb57d333e212f317e",
+          "total_bytes": 298236
+        },
+        {
+          "entry_count": 50,
+          "installation_id": "route-sha256:f16e4fde13a5358793befa81036786736bd23cbdd74e7309c0895b10cdd3f072",
+          "matched_snapshots": [
+            "baseline"
+          ],
+          "skill_ids": [
+            "brainstorming",
+            "dispatching-parallel-agents",
+            "executing-plans",
+            "finishing-a-development-branch",
+            "receiving-code-review",
+            "requesting-code-review",
+            "subagent-driven-development",
+            "systematic-debugging",
+            "test-driven-development",
+            "using-git-worktrees",
+            "using-superpowers",
+            "verification-before-completion",
+            "writing-plans",
+            "writing-skills"
+          ],
+          "skill_tree_sha256": "sha256:e2480fa0bdca458a5392725b98160e5f703e422b5f97fcd54baaeb5bb4ea6b2c",
+          "total_bytes": 351137
+        }
+      ],
+      "source_id": "superpowers-skill-set",
+      "status": "installed",
+      "unobserved_skill_ids": []
+    },
+    {
+      "installations": [
+        {
+          "entry_count": 157,
+          "installation_id": "route-sha256:ba0f7656b1d909750143c5c940b47b31f870915e0c76bf74eaa11cb0a4889622",
+          "matched_snapshots": [],
+          "skill_ids": [
+            "hindsight-architect",
+            "hindsight-cloud",
+            "hindsight-docs",
+            "hindsight-local",
+            "hindsight-self-hosted"
+          ],
+          "skill_tree_sha256": "sha256:645fc133ecb49fef7c7bfe7989b80c974a8bd230a220d8635b025d347fcab353",
+          "total_bytes": 2295806
+        }
+      ],
+      "source_id": "vectorize-hindsight",
+      "status": "installed",
+      "unobserved_skill_ids": []
+    },
+    {
+      "installations": [
+        {
+          "entry_count": 1,
+          "installation_id": "route-sha256:f5dac895e6f6a672d948f86c06a858653caff357222f151b07e73018cc294ea3",
+          "matched_snapshots": [],
+          "skill_ids": [
+            "find-skills"
+          ],
+          "skill_tree_sha256": "sha256:e291660581949d832cd3b694b4f4e9ca0cdf589dcd42434714b92c950c8cf9d0",
+          "total_bytes": 5519
+        }
+      ],
+      "source_id": "vercel-labs-skill-set",
+      "status": "installed",
+      "unobserved_skill_ids": []
+    },
+    {
+      "installations": [
+        {
+          "entry_count": 1,
+          "installation_id": "route-sha256:db64eced4c99a3f81c4c6c2624abae68b0095fb2b66af88ec6544fc948584c07",
+          "matched_snapshots": [],
+          "skill_ids": [
+            "graphite"
+          ],
+          "skill_tree_sha256": "sha256:706c612c1402ae82a66cc5e7390473647476961eeae70e1aed80d78c27588f7f",
+          "total_bytes": 5402
+        }
+      ],
+      "source_id": "withgraphite-agent-skills",
+      "status": "installed",
+      "unobserved_skill_ids": []
+    },
+    {
+      "installations": [
+        {
+          "entry_count": 5,
+          "installation_id": "route-sha256:1549d9840b3f629cfcfe67dbb5d75a38868a7a9c381a89f07f006bc22d334c4c",
+          "matched_snapshots": [],
+          "skill_ids": [
+            "yeet"
+          ],
+          "skill_tree_sha256": "sha256:8544f1b3d63a81bf18201622d026123b1cd0b29817aeeb8ce158e631a82db375",
+          "total_bytes": 17314
+        },
+        {
+          "entry_count": 5,
+          "installation_id": "route-sha256:d07c3df29f90caa07ff5c2d5f5437e1cef0ebe6a9ffaf5a913268ebe5e9666bb",
+          "matched_snapshots": [],
+          "skill_ids": [
+            "yeet"
+          ],
+          "skill_tree_sha256": "sha256:d83dcfd5c102dfcf264092f7998d5f68ceb035b516ad0c3e2c66f6b9083545fd",
+          "total_bytes": 17322
+        }
+      ],
+      "source_id": "yeet",
+      "status": "installed",
+      "unobserved_skill_ids": []
+    }
+  ]
+}

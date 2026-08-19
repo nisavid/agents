@@ -37,7 +37,7 @@ from types import MappingProxyType, ModuleType
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 _RUNNING_AS_ENTRYPOINT = __name__ == "__main__"
-SOURCE_SHA256 = "544525bc4b786f9a8719b44642d069d7fe25cc024cb55b340fd1ce628a91e001"
+SOURCE_SHA256 = "024f2b7c57a029860c31c98b986ddb74bcad329e3d699c6dfd7fb1b73de666d1"
 PREPARED_SUPERVISOR_SOURCE_OPTION = "--prepared-supervisor-source-sha256"
 MAX_PROOF_SOURCE_BYTES = 2 * 1024 * 1024
 RELEASE_SUPPORT_SOURCES = (
@@ -104,8 +104,15 @@ COMMON_SUPPORT_PATHS = {
     "release/plugin-eval-baseline-v1.json",
 }
 SOURCE_STAGE_COMMON_SUPPORT_PATHS = {
+    "LICENSE",
+    "docs/superpowers/research/2026-08-18-source-skill-lineage-and-drift.md",
     "release/public-release-runtime-packages.json",
+    "release/source-skill-lineage",
+    "scripts/refresh_source_skill_lineage.py",
+    "scripts/validate_source_skill_lineage.py",
+    "tests/test_validate_source_skill_lineage.py",
 }
+SOURCE_STAGE_COMMON_VALIDATOR_PATHS = ("scripts/validate_source_skill_lineage.py",)
 RELEASE_CONTRACT_SUPPORT_MODULES = ("scripts/agent_plugins_standard.py",)
 BASE_PLUGIN_SUPPORT_PATHS = {
     "rolecasting": {
@@ -3364,6 +3371,18 @@ def run_source_stage_validators(snapshot: Path) -> None:
             require(
                 result.returncode == 0,
                 f"{plugin} source-stage validator failed:\n{result.stdout}{result.stderr}",
+            )
+        for relative in SOURCE_STAGE_COMMON_VALIDATOR_PATHS:
+            result = run_private_python_child(
+                snapshot,
+                [str(snapshot / relative), str(snapshot)],
+                environment=environment,
+                timeout=120,
+            )
+            require(
+                result.returncode == 0,
+                "common source-stage validator failed: "
+                f"{relative}\n{result.stdout}{result.stderr}",
             )
 
 

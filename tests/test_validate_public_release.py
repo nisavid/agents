@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import copy
 import fcntl
 import hashlib
 import importlib.util
 import inspect
+import io
 import json
 import os
 import py_compile
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -2336,14 +2339,20 @@ class ValidatePublicReleaseTests(unittest.TestCase):
         ) as run:
             self.module.run_source_stage_validators(snapshot)
 
-        self.assertEqual(
-            run.call_count,
-            len(self.module.SOURCE_STAGE_VALIDATED_PLUGINS),
-        )
-        for plugin, call in zip(
-            self.module.SOURCE_STAGE_VALIDATED_PLUGINS,
+        expected = [
+            (
+                self.module.VALIDATOR_PATHS[plugin],
+                self.module.SOURCE_STAGE_VALIDATOR_FLAGS[plugin],
+            )
+            for plugin in self.module.SOURCE_STAGE_VALIDATED_PLUGINS
+        ] + [
+            (relative, ())
+            for relative in self.module.SOURCE_STAGE_COMMON_VALIDATOR_PATHS
+        ]
+        self.assertEqual(run.call_count, len(expected))
+        for (relative, flags), call in zip(
+            expected,
             run.call_args_list,
-            strict=True,
         ):
             command = call.args[0]
             self.assertEqual(
@@ -2351,11 +2360,9 @@ class ValidatePublicReleaseTests(unittest.TestCase):
                 [self.module.sys.executable, "-I", "-B"],
             )
             self.assertEqual(Path(command[3]).parent, snapshot / "scripts")
+            self.assertEqual(command[3], str(snapshot / relative))
             self.assertEqual(command[4], str(snapshot))
-            self.assertEqual(
-                command[5:],
-                list(self.module.SOURCE_STAGE_VALIDATOR_FLAGS[plugin]),
-            )
+            self.assertEqual(command[5:], list(flags))
             self.assertEqual(call.kwargs["cwd"], snapshot)
             self.assertEqual(
                 set(call.kwargs["env"]),
@@ -2370,6 +2377,224 @@ class ValidatePublicReleaseTests(unittest.TestCase):
                     "PYTEST_DISABLE_PLUGIN_AUTOLOAD",
                 },
             )
+
+    def test_source_stage_scope_snapshots_root_license_evidence(self) -> None:
+        relative = "LICENSE"
+        self.assertIn(relative, self.module.SOURCE_STAGE_COMMON_SUPPORT_PATHS)
+        self.assertIn(
+            relative,
+            self.module.all_scope_paths(self.module.SOURCE_STAGE_VALIDATED_PLUGINS),
+        )
+        license_path = self.repository / relative
+        original = license_path.read_bytes()
+        observation_before = self.module.scope_observation_digest(
+            self.repository, self.module.SOURCE_STAGE_VALIDATED_PLUGINS
+        )
+        content_before = self.module.scope_content_digest(
+            self.repository, self.module.SOURCE_STAGE_VALIDATED_PLUGINS
+        )
+        snapshot = Path(self.temporary_directory.name).resolve() / "license-snapshot"
+
+        self.module.copy_release_scope(
+            self.repository,
+            snapshot,
+            self.module.SOURCE_STAGE_VALIDATED_PLUGINS,
+        )
+
+        self.assertEqual((snapshot / relative).read_bytes(), original)
+        license_path.write_bytes(original + b"private-license-scope-canary\n")
+        self.assertNotEqual(
+            self.module.scope_observation_digest(
+                self.repository, self.module.SOURCE_STAGE_VALIDATED_PLUGINS
+            ),
+            observation_before,
+        )
+        self.assertNotEqual(
+            self.module.scope_content_digest(
+                self.repository, self.module.SOURCE_STAGE_VALIDATED_PLUGINS
+            ),
+            content_before,
+        )
+        self.assertEqual((snapshot / relative).read_bytes(), original)
+
+    def test_source_stage_scope_and_common_validator_bind_mapped_evidence(
+        self,
+    ) -> None:
+        mapped_evidence = (
+            "evals/mergecraft/retirement-fixtures.json",
+            "release/mergecraft-retirement-contribution-ledger.json",
+            "release/mergecraft/review-atlas-contribution-ledger.json",
+        )
+        scope_paths = self.module.all_scope_paths(
+            self.module.SOURCE_STAGE_VALIDATED_PLUGINS
+        )
+        for relative in mapped_evidence:
+            with self.subTest(contract="scope", relative=relative):
+                self.assertTrue(
+                    any(
+                        relative == root or relative.startswith(root + "/")
+                        for root in scope_paths
+                    ),
+                    relative,
+                )
+
+        snapshot = (
+            Path(self.temporary_directory.name).resolve() / "mapped-evidence-snapshot"
+        )
+        self.module.copy_release_scope(
+            self.repository,
+            snapshot,
+            self.module.SOURCE_STAGE_VALIDATED_PLUGINS,
+        )
+        self.assertEqual(
+            {
+                relative: (snapshot / relative).read_bytes()
+                for relative in mapped_evidence
+            },
+            {
+                relative: (self.repository / relative).read_bytes()
+                for relative in mapped_evidence
+            },
+        )
+
+        relative = mapped_evidence[0]
+        target = self.repository / relative
+        original = target.read_bytes()
+        original_mode = stat.S_IMODE(target.stat().st_mode)
+        canary = "private-source-stage-evidence-canary"
+        cases = (
+            ("missing", "contribution evidence path is missing"),
+            ("byte-mutated", "contribution evidence content drift"),
+        )
+        for case, diagnostic in cases:
+            with self.subTest(contract="validator", case=case):
+                try:
+                    target.unlink()
+                    if case == "byte-mutated":
+                        target.write_bytes(
+                            b'{"private-source-stage-evidence-canary":true}\n'
+                        )
+                        os.chmod(target, original_mode)
+                    expected_state = (
+                        None if not target.exists() else target.read_bytes()
+                    )
+                    stdout = io.StringIO()
+                    stderr = io.StringIO()
+                    with (
+                        mock.patch.object(
+                            self.module, "SOURCE_STAGE_VALIDATED_PLUGINS", ()
+                        ),
+                        contextlib.redirect_stdout(stdout),
+                        contextlib.redirect_stderr(stderr),
+                        self.assertRaises(self.module.ReleaseError) as captured,
+                    ):
+                        self.module.run_source_stage_validators(self.repository)
+
+                    self.assertEqual(
+                        str(captured.exception),
+                        "common source-stage validator failed: "
+                        "scripts/validate_source_skill_lineage.py\n"
+                        f"source-skill-lineage: {diagnostic}\n",
+                    )
+                    self.assertIsNone(captured.exception.__cause__)
+                    self.assertEqual(stdout.getvalue(), "")
+                    self.assertEqual(stderr.getvalue(), "")
+                    rendered = (
+                        stdout.getvalue() + stderr.getvalue() + str(captured.exception)
+                    )
+                    for private_value in (
+                        str(self.repository),
+                        str(target),
+                        target.name,
+                        canary,
+                        "Traceback",
+                    ):
+                        self.assertNotIn(private_value, rendered)
+                    self.assertEqual(
+                        None if not target.exists() else target.read_bytes(),
+                        expected_state,
+                    )
+                finally:
+                    target.write_bytes(original)
+                    os.chmod(target, original_mode)
+
+        self.assertEqual(target.read_bytes(), original)
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), original_mode)
+
+    def test_common_source_stage_validator_binds_local_license_evidence(
+        self,
+    ) -> None:
+        license_path = self.repository / "LICENSE"
+        original = license_path.read_bytes()
+        public_artifacts = (
+            "docs/superpowers/research/2026-08-18-source-skill-lineage-and-drift.md",
+            "release/source-skill-lineage/source-manifest.json",
+            "release/source-skill-lineage/contribution-ledger.json",
+            "release/source-skill-lineage/installed-hosts/initial-personal-cachyos-v1.json",
+            "release/source-skill-lineage/installed-hosts/initial-work-macos-v1.json",
+        )
+        with mock.patch.object(self.module, "SOURCE_STAGE_VALIDATED_PLUGINS", ()):
+            self.module.run_source_stage_validators(self.repository)
+
+            for case, diagnostic in (
+                ("missing", "source license evidence is missing"),
+                ("byte-mutated", "source license evidence drift"),
+            ):
+                with self.subTest(case=case):
+                    if license_path.exists():
+                        license_path.unlink()
+                    if case == "byte-mutated":
+                        license_path.write_bytes(
+                            original + b"private-license-stage-canary\n"
+                        )
+                    before = {
+                        relative: (self.repository / relative).read_bytes()
+                        for relative in public_artifacts
+                    }
+                    expected_license = (
+                        None if not license_path.exists() else license_path.read_bytes()
+                    )
+                    stdout = io.StringIO()
+                    stderr = io.StringIO()
+                    with (
+                        contextlib.redirect_stdout(stdout),
+                        contextlib.redirect_stderr(stderr),
+                        self.assertRaises(self.module.ReleaseError) as captured,
+                    ):
+                        self.module.run_source_stage_validators(self.repository)
+
+                    self.assertEqual(
+                        str(captured.exception),
+                        "common source-stage validator failed: "
+                        "scripts/validate_source_skill_lineage.py\n"
+                        f"source-skill-lineage: {diagnostic}\n",
+                    )
+                    self.assertIsNone(captured.exception.__cause__)
+                    self.assertEqual(stdout.getvalue(), "")
+                    self.assertEqual(stderr.getvalue(), "")
+                    rendered = (
+                        stdout.getvalue() + stderr.getvalue() + str(captured.exception)
+                    )
+                    for private_value in (
+                        str(self.repository),
+                        str(license_path),
+                        "private-license-stage-canary",
+                        "Traceback",
+                    ):
+                        self.assertNotIn(private_value, rendered)
+                    self.assertEqual(
+                        {
+                            relative: (self.repository / relative).read_bytes()
+                            for relative in public_artifacts
+                        },
+                        before,
+                    )
+                    self.assertEqual(
+                        None
+                        if not license_path.exists()
+                        else license_path.read_bytes(),
+                        expected_license,
+                    )
 
     def test_isolated_frozen_validator_loads_shared_agent_plugins_contract(
         self,

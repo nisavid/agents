@@ -1,0 +1,210 @@
+{
+  "content_sha256": "sha256:0dd800dfd0958273b2fed7d28c430d79e7f3d9aa264ca28e2085cb7f7832b835",
+  "contract": "coordinated-installed-source-skill-manifest-v1",
+  "discovery_precedence": {
+    "evidence_needed": [
+      "restored read-only transport",
+      "active discovery precedence receipt"
+    ],
+    "reason": "The configured read-only route was unavailable, so active discovery precedence was not observed.",
+    "status": "unresolved"
+  },
+  "observed_at_utc": "2026-08-18T05:00:00Z",
+  "profile_id": "initial-personal-cachyos-v1",
+  "schema_version": 1,
+  "source_manifest": {
+    "path": "release/source-skill-lineage/source-manifest.json",
+    "sha256": "sha256:ff5811c43234416571b8ba27ab89c73f589f0c3865f9be68210841723e859503"
+  },
+  "source_observations": [
+    {
+      "evidence_needed": [
+        "restored read-only transport",
+        "two-pass installed-source observation"
+      ],
+      "reason": "The configured read-only route was unavailable, so no remote installed-source facts were collected.",
+      "source_id": "cursor-thermos",
+      "status": "unresolved"
+    },
+    {
+      "evidence_needed": [
+        "restored read-only transport",
+        "two-pass installed-source observation"
+      ],
+      "reason": "The configured read-only route was unavailable, so no remote installed-source facts were collected.",
+      "source_id": "firecrawl-cli",
+      "status": "unresolved"
+    },
+    {
+      "evidence_needed": [
+        "restored read-only transport",
+        "two-pass installed-source observation"
+      ],
+      "reason": "The configured read-only route was unavailable, so no remote installed-source facts were collected.",
+      "source_id": "firecrawl-skill-set",
+      "status": "unresolved"
+    },
+    {
+      "evidence_needed": [
+        "restored read-only transport",
+        "two-pass installed-source observation"
+      ],
+      "reason": "The configured read-only route was unavailable, so no remote installed-source facts were collected.",
+      "source_id": "firecrawl-workflows",
+      "status": "unresolved"
+    },
+    {
+      "evidence_needed": [
+        "restored read-only transport",
+        "two-pass installed-source observation"
+      ],
+      "reason": "The configured read-only route was unavailable, so no remote installed-source facts were collected.",
+      "source_id": "heredotnow-here-now",
+      "status": "unresolved"
+    },
+    {
+      "evidence_needed": [
+        "restored read-only transport",
+        "two-pass installed-source observation"
+      ],
+      "reason": "The configured read-only route was unavailable, so no remote installed-source facts were collected.",
+      "source_id": "heygen-hyperframes",
+      "status": "unresolved"
+    },
+    {
+      "evidence_needed": [
+        "restored read-only transport",
+        "two-pass installed-source observation"
+      ],
+      "reason": "The configured read-only route was unavailable, so no remote installed-source facts were collected.",
+      "source_id": "ivan-artifact-customs",
+      "status": "unresolved"
+    },
+    {
+      "evidence_needed": [
+        "restored read-only transport",
+        "two-pass installed-source observation"
+      ],
+      "reason": "The configured read-only route was unavailable, so no remote installed-source facts were collected.",
+      "source_id": "ivan-mergecraft",
+      "status": "unresolved"
+    },
+    {
+      "evidence_needed": [
+        "restored read-only transport",
+        "two-pass installed-source observation"
+      ],
+      "reason": "The configured read-only route was unavailable, so no remote installed-source facts were collected.",
+      "source_id": "ivan-rolecasting",
+      "status": "unresolved"
+    },
+    {
+      "evidence_needed": [
+        "restored read-only transport",
+        "two-pass installed-source observation"
+      ],
+      "reason": "The configured read-only route was unavailable, so no remote installed-source facts were collected.",
+      "source_id": "ivan-task-witness",
+      "status": "unresolved"
+    },
+    {
+      "evidence_needed": [
+        "restored read-only transport",
+        "two-pass installed-source observation"
+      ],
+      "reason": "The configured read-only route was unavailable, so no remote installed-source facts were collected.",
+      "source_id": "ivan-tricritical",
+      "status": "unresolved"
+    },
+    {
+      "evidence_needed": [
+        "restored read-only transport",
+        "two-pass installed-source observation"
+      ],
+      "reason": "The configured read-only route was unavailable, so no remote installed-source facts were collected.",
+      "source_id": "ivan-versionkeeping",
+      "status": "unresolved"
+    },
+    {
+      "evidence_needed": [
+        "restored read-only transport",
+        "two-pass installed-source observation"
+      ],
+      "reason": "The configured read-only route was unavailable, so no remote installed-source facts were collected.",
+      "source_id": "matt-pocock-skill-set",
+      "status": "unresolved"
+    },
+    {
+      "evidence_needed": [
+        "restored read-only transport",
+        "two-pass installed-source observation"
+      ],
+      "reason": "The configured read-only route was unavailable, so no remote installed-source facts were collected.",
+      "source_id": "obra-elements-of-style",
+      "status": "unresolved"
+    },
+    {
+      "evidence_needed": [
+        "restored read-only transport",
+        "two-pass installed-source observation"
+      ],
+      "reason": "The configured read-only route was unavailable, so no remote installed-source facts were collected.",
+      "source_id": "openai-github-specialists",
+      "status": "unresolved"
+    },
+    {
+      "evidence_needed": [
+        "restored read-only transport",
+        "two-pass installed-source observation"
+      ],
+      "reason": "The configured read-only route was unavailable, so no remote installed-source facts were collected.",
+      "source_id": "review-atlas-private",
+      "status": "unresolved"
+    },
+    {
+      "evidence_needed": [
+        "restored read-only transport",
+        "two-pass installed-source observation"
+      ],
+      "reason": "The configured read-only route was unavailable, so no remote installed-source facts were collected.",
+      "source_id": "superpowers-skill-set",
+      "status": "unresolved"
+    },
+    {
+      "evidence_needed": [
+        "restored read-only transport",
+        "two-pass installed-source observation"
+      ],
+      "reason": "The configured read-only route was unavailable, so no remote installed-source facts were collected.",
+      "source_id": "vectorize-hindsight",
+      "status": "unresolved"
+    },
+    {
+      "evidence_needed": [
+        "restored read-only transport",
+        "two-pass installed-source observation"
+      ],
+      "reason": "The configured read-only route was unavailable, so no remote installed-source facts were collected.",
+      "source_id": "vercel-labs-skill-set",
+      "status": "unresolved"
+    },
+    {
+      "evidence_needed": [
+        "restored read-only transport",
+        "two-pass installed-source observation"
+      ],
+      "reason": "The configured read-only route was unavailable, so no remote installed-source facts were collected.",
+      "source_id": "withgraphite-agent-skills",
+      "status": "unresolved"
+    },
+    {
+      "evidence_needed": [
+        "restored read-only transport",
+        "two-pass installed-source observation"
+      ],
+      "reason": "The configured read-only route was unavailable, so no remote installed-source facts were collected.",
+      "source_id": "yeet",
+      "status": "unresolved"
+    }
+  ]
+}

@@ -397,12 +397,14 @@ class DataIdentityRebindContractTest(unittest.TestCase):
                     )
                 )
                 self.transaction_arguments = None
+                self.fetchval_statements = []
 
             def transaction(self, **arguments):
                 self.transaction_arguments = arguments
                 return Transaction()
 
-            async def fetchval(self, _statement):
+            async def fetchval(self, statement):
+                self.fetchval_statements.append(" ".join(statement.split()))
                 return next(self.fetchval_results)
 
             async def fetch(self, _statement):
@@ -445,6 +447,10 @@ class DataIdentityRebindContractTest(unittest.TestCase):
         self.assertEqual(
             connection.transaction_arguments,
             {"isolation": "repeatable_read", "readonly": True},
+        )
+        self.assertEqual(
+            connection.fetchval_statements[0],
+            "SELECT floor(extract(epoch FROM clock_timestamp()))::bigint",
         )
         self.assertEqual(database["pending_operation_count"], 2)
         self.assertEqual(len(database["pending_operations"]), 2)

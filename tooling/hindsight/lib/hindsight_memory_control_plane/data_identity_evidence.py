@@ -208,7 +208,7 @@ async def read_database_evidence(
             profile_id,
         )
         observed_at = await connection.fetchval(
-            "SELECT extract(epoch FROM clock_timestamp())::bigint"
+            "SELECT floor(extract(epoch FROM clock_timestamp()))::bigint"
         )
         bank_rows = await connection.fetch(
             "SELECT bank_id FROM public.banks ORDER BY bank_id"

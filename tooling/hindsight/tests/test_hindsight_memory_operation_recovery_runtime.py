@@ -536,6 +536,63 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
                 object(),
             )
 
+    def test_runtime_guard_disables_upstream_retain_folding(self):
+        fold_calls = []
+
+        class WorkerPoller(_RunCapableWorkerPoller):
+            async def _execute_task_inner(self, _task, _holder):
+                return None
+
+            async def _claim_batch_for_schema_inner(self, *_arguments):
+                return []
+
+            async def _claim_batch_for_schema(self, *_arguments):
+                return []
+
+            async def _fold_retain_peers(self, *_arguments):
+                fold_calls.append(True)
+                return ["outside-plan"]
+
+        class Adapter:
+            _plan = {"progress_schema_version": 1}
+
+        install_exact_drain_runtime_guards(
+            type("PostgreSQLOps", (), {}),
+            WorkerPoller,
+            type("MemoryEngine", (), {}),
+            Adapter(),
+        )
+
+        self.assertEqual(
+            asyncio.run(
+                WorkerPoller()._fold_retain_peers(
+                    object(),
+                    "public.async_operations",
+                    object(),
+                    {},
+                )
+            ),
+            [],
+        )
+        self.assertEqual(fold_calls, [])
+
+    def test_claim_commit_rejects_folded_operations(self):
+        adapter = object.__new__(ExactDrainClaimAdapter)
+        operation_id = "00000000-0000-4000-8000-000000000001"
+        adapter._selected = {operation_id: {}}
+        task = SimpleNamespace(
+            operation_id=operation_id,
+            folded_operation_ids=[
+                "00000000-0000-4000-8000-000000000002"
+            ],
+        )
+
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "committed claim folded outside plan",
+        ):
+            adapter.claim_committed([task])
+
     def test_v8_runtime_guard_records_memory_initialization_failure(self):
         events = []
 

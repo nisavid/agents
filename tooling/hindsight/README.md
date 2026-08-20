@@ -267,8 +267,9 @@ Call `ProviderRuntimePolicy.load(...)`, then install
 `HindsightProviderAdapter` with the protected resolver during Hindsight process
 startup. Installation fails before changing Hindsight classes unless the
 installed `hindsight-api` version and the policy both name an adapter-supported
-version. The current adapter supports `0.8.4` and `0.9.0`; supporting another
-release requires an explicit compatibility update and contract tests.
+version. The current adapter supports `0.8.4`, `0.9.0`, and `0.9.1`;
+supporting another release requires an explicit compatibility update and
+contract tests.
 
 ### Exact-drain candidate runtime snapshot
 

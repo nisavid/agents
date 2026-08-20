@@ -1378,6 +1378,11 @@ def install_exact_drain_runtime_guards(
         "_claim_batch_for_schema",
         None,
     )
+    upstream_fold_retain_peers = getattr(
+        worker_poller_type,
+        "_fold_retain_peers",
+        None,
+    )
     upstream_cleanup_task = getattr(
         worker_poller_type,
         "_cleanup_task",
@@ -1408,6 +1413,13 @@ def install_exact_drain_runtime_guards(
     ):
         raise OperationRecoveryError(
             "operation-recovery required worker progress seam is unavailable"
+        )
+    if (
+        upstream_fold_retain_peers is not None
+        and not callable(upstream_fold_retain_peers)
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery retain-folding seam is invalid"
         )
 
     claim_release_disabled = False
@@ -1490,6 +1502,14 @@ def install_exact_drain_runtime_guards(
 
     async def claim_tasks(_ops: Any, *args: Any, **kwargs: Any) -> Any:
         return await adapter.claim_tasks(*args, **kwargs)
+
+    async def suppress_retain_folding(
+        _poller: Any,
+        *_args: Any,
+        **_kwargs: Any,
+    ) -> list[str]:
+        """Keep every exact-drain execution bound to one approved row."""
+        return []
 
     async def scan_active_schemas(
         _poller: Any,
@@ -2081,6 +2101,8 @@ def install_exact_drain_runtime_guards(
     worker_poller_type._execute_task_inner = execute_exact_task_inner
     worker_poller_type._claim_batch_for_schema_inner = claim_exact_batch
     worker_poller_type._claim_batch_for_schema = claim_exact_batch_public
+    if callable(upstream_fold_retain_peers):
+        worker_poller_type._fold_retain_peers = suppress_retain_folding
     if callable(upstream_cleanup_task):
         worker_poller_type._cleanup_task = cleanup_exact_task
     worker_poller_type.shutdown_graceful = shutdown_exact_worker
@@ -3008,17 +3030,38 @@ def _patch_exact_drain_memory_engine(source: bytes) -> bytes:
         raise OperationRecoveryError(
             "exact drain candidate memory engine source differs"
         ) from error
+    native_typed_errors = (
+        text.count(
+            "from ..worker.exceptions import DeferOperation, RetryTaskAt, "
+            "format_task_error"
+        )
+        == 1
+        and text.count("error_message = format_task_error(e)") == 1
+        and text.count(
+            "await self._mark_operation_failed(operation_id, "
+            "error_message, error_traceback)"
+        )
+        == 2
+        and text.count("message=error_message,") >= 2
+    )
+    typed_error_helper = (
+        ""
+        if native_typed_errors
+        else (
+            "def _operation_recovery_task_error_message(e: Exception) -> str:\n"
+            "    message = str(e)\n"
+            "    name = type(e).__name__\n"
+            "    return f\"{name}: {message}\" if message else name\n\n\n"
+        )
+    )
     text = _replace_exact_drain_source_fragment(
         text,
         "def _is_non_retryable_task_error(e: Exception) -> bool:\n"
         "    \"\"\"Classify deterministic task failures that should skip worker retry.\"\"\"\n"
         "    return (\n"
         "        isinstance(e, asyncpg.exceptions.IntegrityConstraintViolationError)\n",
-        "def _operation_recovery_task_error_message(e: Exception) -> str:\n"
-        "    message = str(e)\n"
-        "    name = type(e).__name__\n"
-        "    return f\"{name}: {message}\" if message else name\n\n\n"
-        "def _operation_recovery_http_status(e: Exception) -> int | None:\n"
+        typed_error_helper
+        + "def _operation_recovery_http_status(e: Exception) -> int | None:\n"
         "    seen = set()\n"
         "    candidate = e\n"
         "    while candidate is not None and id(candidate) not in seen:\n"
@@ -3038,30 +3081,31 @@ def _patch_exact_drain_memory_engine(source: bytes) -> bytes:
         "        or isinstance(e, asyncpg.exceptions.IntegrityConstraintViolationError)\n",
         "typed deterministic task error",
     )
-    for old, new, label in (
-        (
-            "await self._mark_operation_failed(operation_id, str(e), error_traceback)",
+    if not native_typed_errors:
+        for old, new, label in (
             (
-                "await self._mark_operation_failed(\n"
-                "                            operation_id,\n"
-                "                            _operation_recovery_task_error_message(e),\n"
-                "                            error_traceback,\n"
-                "                        )"
+                "await self._mark_operation_failed(operation_id, str(e), error_traceback)",
+                (
+                    "await self._mark_operation_failed(\n"
+                    "                            operation_id,\n"
+                    "                            _operation_recovery_task_error_message(e),\n"
+                    "                            error_traceback,\n"
+                    "                        )"
+                ),
+                "typed task terminal error",
             ),
-            "typed task terminal error",
-        ),
-        (
-            "                            message=str(e),",
-            "                            message=_operation_recovery_task_error_message(e),",
-            "typed task retry error",
-        ),
-    ):
-        expected_count = 2
-        if text.count(old) != expected_count:
-            raise OperationRecoveryError(
-                f"exact drain candidate {label} source differs"
-            )
-        text = text.replace(old, new)
+            (
+                "                            message=str(e),",
+                "                            message=_operation_recovery_task_error_message(e),",
+                "typed task retry error",
+            ),
+        ):
+            expected_count = 2
+            if text.count(old) != expected_count:
+                raise OperationRecoveryError(
+                    f"exact drain candidate {label} source differs"
+                )
+            text = text.replace(old, new)
     try:
         compile(text, "hindsight_api/engine/memory_engine.py", "exec")
     except SyntaxError as error:
@@ -3079,37 +3123,56 @@ def _patch_exact_drain_poller(source: bytes) -> bytes:
         raise OperationRecoveryError(
             "exact drain candidate poller source differs"
         ) from error
-    text = _replace_exact_drain_source_fragment(
-        text,
-        "def _wall_timeout_for(task_type: str) -> float | None:\n",
-        "def _operation_recovery_task_error_message(e: Exception) -> str:\n"
-        "    message = str(e)\n"
-        "    name = type(e).__name__\n"
-        "    return f\"{name}: {message}\" if message else name\n\n\n"
-        "def _wall_timeout_for(task_type: str) -> float | None:\n",
-        "poller typed error helper",
+    native_typed_errors = (
+        text.count(
+            "from .exceptions import DeferOperation, RetryTaskAt, "
+            "format_task_error"
+        )
+        == 1
+        and text.count("error_message = format_task_error(e)") == 1
+        and text.count("await self._mark_all_failed(task, error_message)") == 1
     )
-    text = _replace_exact_drain_source_fragment(
-        text,
-        "await self._schedule_retry(task.operation_id, e.retry_at, str(e), task.schema)",
-        "await self._schedule_retry(\n"
-        "                task.operation_id,\n"
-        "                e.retry_at,\n"
-        "                _operation_recovery_task_error_message(e),\n"
-        "                task.schema,\n"
-        "            )",
-        "poller typed retry error",
-    )
-    text = _replace_exact_drain_source_fragment(
-        text,
-        "await self._mark_failed(task.operation_id, str(e), task.schema)",
-        "await self._mark_failed(\n"
-        "                    task.operation_id,\n"
-        "                    _operation_recovery_task_error_message(e),\n"
-        "                    task.schema,\n"
-        "                )",
-        "poller typed terminal error",
-    )
+    if native_typed_errors:
+        text = _replace_exact_drain_source_fragment(
+            text,
+            "await self._schedule_retry_all(task, e.retry_at, str(e))",
+            "await self._schedule_retry_all(\n"
+            "                task, e.retry_at, format_task_error(e)\n"
+            "            )",
+            "poller typed retry error",
+        )
+    else:
+        text = _replace_exact_drain_source_fragment(
+            text,
+            "def _wall_timeout_for(task_type: str) -> float | None:\n",
+            "def _operation_recovery_task_error_message(e: Exception) -> str:\n"
+            "    message = str(e)\n"
+            "    name = type(e).__name__\n"
+            "    return f\"{name}: {message}\" if message else name\n\n\n"
+            "def _wall_timeout_for(task_type: str) -> float | None:\n",
+            "poller typed error helper",
+        )
+        text = _replace_exact_drain_source_fragment(
+            text,
+            "await self._schedule_retry(task.operation_id, e.retry_at, str(e), task.schema)",
+            "await self._schedule_retry(\n"
+            "                task.operation_id,\n"
+            "                e.retry_at,\n"
+            "                _operation_recovery_task_error_message(e),\n"
+            "                task.schema,\n"
+            "            )",
+            "poller typed retry error",
+        )
+        text = _replace_exact_drain_source_fragment(
+            text,
+            "await self._mark_failed(task.operation_id, str(e), task.schema)",
+            "await self._mark_failed(\n"
+            "                    task.operation_id,\n"
+            "                    _operation_recovery_task_error_message(e),\n"
+            "                    task.schema,\n"
+            "                )",
+            "poller typed terminal error",
+        )
     try:
         compile(text, "hindsight_api/worker/poller.py", "exec")
     except SyntaxError as error:
@@ -5243,6 +5306,18 @@ class ExactDrainClaimAdapter:
         """Record task ownership only after the upstream claim transaction commits."""
         for task in tasks:
             operation_id = str(getattr(task, "operation_id", ""))
+            folded_operation_ids = getattr(
+                task,
+                "folded_operation_ids",
+                None,
+            )
+            if folded_operation_ids is not None and (
+                type(folded_operation_ids) not in {list, tuple}
+                or len(folded_operation_ids) != 0
+            ):
+                raise OperationRecoveryError(
+                    "operation-recovery committed claim folded outside plan"
+                )
             if operation_id not in self._selected:
                 raise OperationRecoveryError(
                     "operation-recovery committed claim is outside plan"

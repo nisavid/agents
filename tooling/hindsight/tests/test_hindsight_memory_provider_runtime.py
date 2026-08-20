@@ -609,9 +609,9 @@ class HindsightProviderAdapterTest(unittest.TestCase):
         self.assertTrue(adapter.install())
         return classes
 
-    def test_install_supports_real_hindsight_090_provider_interfaces(self) -> None:
+    def test_install_supports_real_hindsight_091_provider_interfaces(self) -> None:
         value = policy_data()
-        value["hindsight_version"] = "0.9.0"
+        value["hindsight_version"] = "0.9.1"
         fallback = value["members"][2]
         fallback["identity"] = {
             "provider": "mock",
@@ -640,7 +640,7 @@ from hindsight_memory_control_plane.provider_runtime import (
     HindsightProviderAdapter,
     ProviderRuntimePolicy,
 )
-if importlib.metadata.version("hindsight-api") != "0.9.0":
+if importlib.metadata.version("hindsight-api") != "0.9.1":
     raise RuntimeError("real Hindsight test runtime differs")
 policy = ProviderRuntimePolicy.load(json.loads(sys.argv[2]))
 HindsightProviderAdapter(

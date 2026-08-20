@@ -3490,13 +3490,19 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 "_operation_recovery_http_status(e) == 400",
                 memory_engine_source,
             )
-            self.assertIn(
-                "_operation_recovery_task_error_message(e)",
-                memory_engine_source,
+            self.assertTrue(
+                "_operation_recovery_task_error_message(e)"
+                in memory_engine_source
+                or "error_message = format_task_error(e)"
+                in memory_engine_source
             )
-            self.assertIn(
-                "_operation_recovery_task_error_message(e)",
-                poller_source,
+            self.assertTrue(
+                "_operation_recovery_task_error_message(e)"
+                in poller_source
+                or "_schedule_retry_all(\n"
+                "                task, e.retry_at, format_task_error(e)\n"
+                "            )"
+                in poller_source
             )
             memory_tree = ast.parse(memory_engine_source)
             diagnostic_functions = ast.Module(
@@ -3550,12 +3556,17 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                     OpenAIStyleBadRequest()
                 )
             )
-            self.assertEqual(
-                diagnostic_namespace[
-                    "_operation_recovery_task_error_message"
-                ](TimeoutError()),
-                "TimeoutError",
+            typed_error = diagnostic_namespace.get(
+                "_operation_recovery_task_error_message"
             )
+            if typed_error is not None:
+                self.assertEqual(typed_error(TimeoutError()), "TimeoutError")
+            else:
+                self.assertIn(
+                    "from ..worker.exceptions import DeferOperation, "
+                    "RetryTaskAt, format_task_error",
+                    memory_engine_source,
+                )
             candidate_provider_root = (
                 site_packages / "exact_drain_runtime" / "provider"
             )

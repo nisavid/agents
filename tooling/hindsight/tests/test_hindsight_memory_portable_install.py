@@ -218,6 +218,37 @@ class DelayedLaunchdServiceRunner(RecordingRunner):
         return result
 
 
+class DelayedBootoutRunner(RecordingRunner):
+    def __init__(self, delayed_snapshots: int = 2) -> None:
+        super().__init__()
+        self.delayed_snapshots = delayed_snapshots
+        self.draining: dict[str, int] = {}
+
+    def __call__(self, argv: tuple[str, ...]) -> str | None:
+        if argv[:2] == ("/bin/launchctl", "bootout"):
+            self.calls.append(argv)
+            label = argv[2].rsplit("/", 1)[-1]
+            if label not in self.launchd_jobs:
+                raise _ManagedServiceCommandError(113)
+            self.draining[label] = self.delayed_snapshots
+            return None
+        if argv[:2] == ("/bin/launchctl", "print"):
+            label = argv[2].rsplit("/", 1)[-1]
+            remaining = self.draining.get(label)
+            if remaining is not None:
+                self.calls.append(argv)
+                if remaining > 0:
+                    self.draining[label] = remaining - 1
+                    return (
+                        f"path = {self.launchd_jobs[label]}\n"
+                        "state = SIGTERMed\n"
+                    )
+                del self.draining[label]
+                self.launchd_jobs.pop(label)
+                raise _ManagedServiceCommandError(113)
+        return super().__call__(argv)
+
+
 class ForeignManifestRunner(RecordingRunner):
     def __call__(self, argv: tuple[str, ...]) -> str | None:
         if argv[:2] == ("/bin/launchctl", "print"):
@@ -6210,6 +6241,59 @@ class PortableInstallationManagerTest(unittest.TestCase):
         self.assertIsNone(restored["transaction"])
         self.assertEqual(self.runner.launchd_jobs, {})
         self.assertFalse(manager._transaction_path.exists())
+
+    def test_failed_rebind_upgrade_waits_for_launchd_bootout_before_recovery(
+        self,
+    ) -> None:
+        manager, evidence, plan, _prestate, _sentinel = self.prepared_rebind()
+        manager.data_identity_rebind_apply(
+            plan,
+            approval_digest=plan["plan_digest"],
+            pre_apply_evidence_value=self.pre_apply_evidence(evidence),
+            now=1000,
+        )
+        manager.data_identity_rebind_verify(
+            plan,
+            self.post_rebind_evidence(evidence),
+            now=1001,
+        )
+        manager._deactivate_services()
+        delayed = DelayedBootoutRunner(delayed_snapshots=2)
+        manager._command_runner = delayed
+        manager._health_runner = (
+            lambda _check, release: release["version"] != "2.0.0"
+        )
+        state = manager._load_state()
+        assert state is not None
+
+        with (
+            mock.patch.object(portable_install_module.time, "sleep"),
+            self.assertRaisesRegex(
+                PortableInstallError,
+                "health verification failed",
+            ),
+        ):
+            manager.upgrade(
+                self.release("2.0.0"),
+                version="2.0.0",
+                expected_current_binding_generation_digest=state[
+                    "binding_generation_digest"
+                ],
+                verified_rebind_plan=plan,
+            )
+
+        restored = manager._load_state()
+        assert restored is not None
+        self.assertEqual(restored["current"]["version"], "1.0.0")
+        self.assertEqual(delayed.launchd_jobs, {})
+        self.assertFalse(manager._transaction_path.exists())
+        self.assertGreaterEqual(
+            sum(
+                call[:2] == ("/bin/launchctl", "print")
+                for call in delayed.calls
+            ),
+            6,
+        )
 
     def test_interrupted_verified_rebind_upgrade_retries_from_stopped_prestate(
         self,

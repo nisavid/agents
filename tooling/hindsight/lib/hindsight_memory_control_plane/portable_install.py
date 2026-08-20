@@ -4593,7 +4593,8 @@ class PortableInstallationManager:
                 )
         else:
             self._require_launchd_services_absent_for_rebind_upgrade(
-                prior_manager
+                prior_manager,
+                wait_for_absence=True,
             )
         prior_manager._verify_installed_locked(prior)
         self._clear_transaction()
@@ -6070,19 +6071,34 @@ class PortableInstallationManager:
     @staticmethod
     def _require_launchd_services_absent_for_rebind_upgrade(
         installed_manager: "PortableInstallationManager",
+        *,
+        wait_for_absence: bool = False,
     ) -> None:
-        for item in (
-            *installed_manager.config.services,
-            *installed_manager.config.timers,
-        ):
-            manifest = installed_manager.config.service_root / f"{item.label}.plist"
-            if (
-                installed_manager._launchd_loaded_manifest(item.label, manifest)
-                is not None
+        deadline = time.monotonic() + (
+            LAUNCHD_EXIT_TIMEOUT_SECONDS if wait_for_absence else 0
+        )
+        while True:
+            loaded = False
+            for item in (
+                *installed_manager.config.services,
+                *installed_manager.config.timers,
             ):
+                manifest = (
+                    installed_manager.config.service_root / f"{item.label}.plist"
+                )
+                if (
+                    installed_manager._launchd_loaded_manifest(item.label, manifest)
+                    is not None
+                ):
+                    loaded = True
+            if not loaded:
+                return
+            remaining = deadline - time.monotonic()
+            if not wait_for_absence or remaining <= 0:
                 raise PortableInstallError(
                     "verified rebind upgrade requires managed launchd jobs absent"
                 )
+            time.sleep(min(LAUNCHD_SERVICE_START_POLL_SECONDS, remaining))
 
     def _resume_applied_rebind(
         self,

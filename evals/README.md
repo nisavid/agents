@@ -91,9 +91,10 @@ under the evidence directory's `0700` attempt store. Public failure records
 contain only the stream digest, byte length, provider role, status, and attempt
 identity.
 
-The gate binds the selected runtime bytes and policy but does not authenticate
-their external authorization; that remains part of the evidence-authentication
-work required before production eligibility.
+Retained structural checks bind the selected runtime bytes and policy but do
+not authenticate their external authorization. The shipped evaluation-gate
+executable therefore rejects every invocation before reading evidence and
+grants no evaluation or release authority in this source-stage release.
 
 The production target contract requires 252 current executor coordinates:
 21 skills × 4 conditions × 3 repeats. Its required invalidation drill first
@@ -112,7 +113,8 @@ For an offline end-to-end pipeline test, use the fixture adapter with
 production-sized matrix, and limiting is rejected for model transports. The
 fixture path still writes deterministic full-tree archives, raw executor
 responses, blinded grader batches, an explicit invalidation/replacement event,
-adjudications, aggregates, and a schema-v2 manifest for the production gate.
+adjudications, aggregates, and a schema-v2 manifest for retained structural
+tests.
 
 ## Phase 2 observable routing
 

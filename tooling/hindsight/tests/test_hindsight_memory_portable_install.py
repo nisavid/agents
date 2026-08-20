@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import ctypes
 from dataclasses import replace
+from decimal import localcontext
 import errno
 import hashlib
 import io
@@ -1398,6 +1399,165 @@ class PortableInstallationManagerTest(unittest.TestCase):
         self.assertEqual(
             result["data_identity_digest"], manager.verify()["data_identity_digest"]
         )
+
+    def test_launchd_verify_tolerates_data_root_device_reassignment(self) -> None:
+        self.data_root.mkdir(mode=0o700)
+        (self.data_root / "existing.db").write_bytes(b"existing-database")
+        manager = self.manager(installation_mode="adopt")
+        original_lstat = Path.lstat
+        root_inode = original_lstat(self.data_root).st_ino
+        device = 11
+
+        class RemountedMetadata:
+            def __init__(self, metadata):
+                self._metadata = metadata
+                self.st_dev = device
+                self.st_birthtime = 1_786_203_815.3676865
+
+            def __getattr__(self, name):
+                return getattr(self._metadata, name)
+
+        def remounted_lstat(path):
+            metadata = original_lstat(path)
+            if path == self.data_root:
+                return RemountedMetadata(metadata)
+            return metadata
+
+        with mock.patch.object(Path, "lstat", remounted_lstat):
+            installed = manager.install(self.release("1.0.0"), version="1.0.0")
+            device = 12
+            verified = manager.verify()
+
+        self.assertEqual(verified["status"], "verified")
+        self.assertEqual(
+            verified["data_identity_digest"], installed["data_identity_digest"]
+        )
+        self.assertEqual(
+            installed["data_identity_digest"],
+            digest(
+                {
+                    "schema_version": 2,
+                    "path": str(self.data_root),
+                    "inode": root_inode,
+                    "birthtime_ns": "1786203815367686500",
+                }
+            ),
+        )
+
+    def test_launchd_data_identity_owns_decimal_precision(self) -> None:
+        self.data_root.mkdir(mode=0o700)
+        (self.data_root / "existing.db").write_bytes(b"existing-database")
+        manager = self.manager(installation_mode="adopt")
+
+        with localcontext() as decimal_context:
+            decimal_context.prec = 10
+            installed = manager.install(self.release("1.0.0"), version="1.0.0")
+        verified = manager.verify()
+
+        self.assertEqual(
+            installed["data_identity_digest"],
+            verified["data_identity_digest"],
+        )
+
+    def test_launchd_verify_rejects_data_root_inode_or_birthtime_change(
+        self,
+    ) -> None:
+        self.data_root.mkdir(mode=0o700)
+        (self.data_root / "existing.db").write_bytes(b"existing-database")
+        manager = self.manager(installation_mode="adopt")
+        original_lstat = Path.lstat
+        inode_delta = 0
+        birthtime_delta = 0.0
+
+        class ChangedMetadata:
+            def __init__(self, metadata):
+                self._metadata = metadata
+                self.st_ino = metadata.st_ino + inode_delta
+                self.st_birthtime = 1_786_203_815.3676865 + birthtime_delta
+
+            def __getattr__(self, name):
+                return getattr(self._metadata, name)
+
+        def changed_lstat(path):
+            metadata = original_lstat(path)
+            if path == self.data_root:
+                return ChangedMetadata(metadata)
+            return metadata
+
+        with mock.patch.object(Path, "lstat", changed_lstat):
+            manager.install(self.release("1.0.0"), version="1.0.0")
+            for inode_delta, birthtime_delta in ((1, 0.0), (0, 1.0)):
+                with (
+                    self.subTest(
+                        inode_delta=inode_delta,
+                        birthtime_delta=birthtime_delta,
+                    ),
+                    self.assertRaisesRegex(
+                        PortableInstallError,
+                        "data identity changed",
+                    ),
+                ):
+                    manager.verify()
+
+    def test_systemd_data_identity_keeps_legacy_device_inode_projection(
+        self,
+    ) -> None:
+        self.data_root.mkdir(mode=0o700)
+        (self.data_root / "existing.db").write_bytes(b"existing-database")
+        metadata = self.data_root.lstat()
+        manager = self.manager(
+            platform="systemd-user",
+            installation_mode="adopt",
+        )
+
+        installed = manager.install(self.release("1.0.0"), version="1.0.0")
+
+        self.assertEqual(
+            installed["data_identity_digest"],
+            digest(
+                {
+                    "path": str(self.data_root),
+                    "device": metadata.st_dev,
+                    "inode": metadata.st_ino,
+                }
+            ),
+        )
+
+    def test_launchd_data_identity_requires_a_finite_birthtime(self) -> None:
+        self.data_root.mkdir(mode=0o700)
+        (self.data_root / "existing.db").write_bytes(b"existing-database")
+        original_lstat = Path.lstat
+        release = self.release("1.0.0")
+
+        class InvalidBirthtimeMetadata:
+            def __init__(self, metadata, birthtime):
+                self._metadata = metadata
+                if birthtime is not None:
+                    self.st_birthtime = birthtime
+
+            def __getattr__(self, name):
+                if name == "st_birthtime":
+                    raise AttributeError(name)
+                return getattr(self._metadata, name)
+
+        for birthtime in (None, float("nan"), float("inf"), -1.0):
+            with self.subTest(birthtime=birthtime):
+                manager = self.manager(installation_mode="adopt")
+
+                def invalid_birthtime_lstat(path):
+                    metadata = original_lstat(path)
+                    if path == self.data_root:
+                        return InvalidBirthtimeMetadata(metadata, birthtime)
+                    return metadata
+
+                with (
+                    mock.patch.object(Path, "lstat", invalid_birthtime_lstat),
+                    self.assertRaisesRegex(
+                        PortableInstallError,
+                        "launchd data root birth time is unavailable",
+                    ),
+                ):
+                    manager.install(release, version="1.0.0")
 
     def test_adoption_rechecks_the_bound_data_root_before_activation(self) -> None:
         self.data_root.mkdir(mode=0o700)
@@ -5815,6 +5975,65 @@ class PortableInstallationManagerTest(unittest.TestCase):
         manager, evidence, prestate, sentinel = self.rebind_inputs()
         plan = manager.data_identity_rebind_plan(evidence, now=1000)
         return manager, evidence, dict(plan), prestate, sentinel
+
+    def test_data_identity_rebind_migrates_same_launchd_root_to_v2(self) -> None:
+        manager = self.rebind_manager()
+
+        def legacy_identity(path, metadata, *, platform):
+            self.assertEqual(platform, "launchd")
+            return digest(
+                {
+                    "path": str(path.resolve(strict=True)),
+                    "device": metadata.st_dev,
+                    "inode": metadata.st_ino,
+                }
+            )
+
+        with mock.patch.object(
+            portable_install_module,
+            "_data_root_identity_digest",
+            side_effect=legacy_identity,
+        ):
+            installed = manager.install(self.release("1.0.0"), version="1.0.0")
+        root_before = self.data_root.lstat()
+        (self.data_root / "data").mkdir(mode=0o700)
+        sentinel = self.data_root / "data" / "database-sentinel"
+        sentinel.write_bytes(b"database-unchanged")
+        backup_root = self.state_root / "data-identity-rebind" / "backups"
+        backup_root.mkdir(parents=True, mode=0o700)
+        artifact = backup_root / "fresh-full-schema.dump.age"
+        artifact.write_bytes(b"age-encryption.org/v1\nencrypted-full-schema")
+        evidence = self.rebind_evidence(artifact, now=1000)
+
+        plan = manager.data_identity_rebind_plan(evidence, now=1000)
+        self.assertEqual(
+            plan["old_data_identity_digest"],
+            installed["data_identity_digest"],
+        )
+        self.assertNotEqual(
+            plan["new_data_identity_digest"],
+            plan["old_data_identity_digest"],
+        )
+        manager.data_identity_rebind_apply(
+            plan,
+            approval_digest=plan["plan_digest"],
+            pre_apply_evidence_value=self.pre_apply_evidence(evidence),
+            now=1000,
+        )
+        verified = manager.data_identity_rebind_verify(
+            plan,
+            self.post_rebind_evidence(evidence),
+            now=1001,
+        )
+        root_after = self.data_root.lstat()
+
+        self.assertEqual(verified["status"], "verified")
+        self.assertEqual(manager.verify()["status"], "verified")
+        self.assertEqual(
+            (root_after.st_dev, root_after.st_ino, root_after.st_birthtime),
+            (root_before.st_dev, root_before.st_ino, root_before.st_birthtime),
+        )
+        self.assertEqual(sentinel.read_bytes(), b"database-unchanged")
 
     def test_data_identity_rebind_plan_refuses_evidence_profile_mismatch(
         self,

@@ -6,6 +6,7 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 import ctypes
 from dataclasses import dataclass
+from decimal import Context, Decimal, InvalidOperation, ROUND_HALF_EVEN, localcontext
 import errno
 import base64
 import fcntl
@@ -130,6 +131,46 @@ def _signal_process_group(process_group: int, signal_number: int) -> None:
 
 class PortableInstallError(ValueError):
     """A portable lifecycle contract was invalid or could not be completed."""
+
+
+def _data_root_identity_digest(
+    path: Path,
+    metadata: Any,
+    *,
+    platform: str,
+) -> str:
+    resolved_path = str(path.resolve(strict=True))
+    if platform != "launchd":
+        return digest(
+            {
+                "path": resolved_path,
+                "device": metadata.st_dev,
+                "inode": metadata.st_ino,
+            }
+        )
+    birthtime = getattr(metadata, "st_birthtime", None)
+    if type(birthtime) not in {int, float}:
+        raise PortableInstallError("launchd data root birth time is unavailable")
+    try:
+        with localcontext(Context(prec=64, rounding=ROUND_HALF_EVEN)):
+            exact_birthtime = Decimal(repr(birthtime))
+            birthtime_nanoseconds = (
+                exact_birthtime * Decimal(1_000_000_000)
+            ).to_integral_value(rounding=ROUND_HALF_EVEN)
+    except (InvalidOperation, ValueError) as error:
+        raise PortableInstallError(
+            "launchd data root birth time is unavailable"
+        ) from error
+    if not exact_birthtime.is_finite() or exact_birthtime < 0:
+        raise PortableInstallError("launchd data root birth time is unavailable")
+    return digest(
+        {
+            "schema_version": 2,
+            "path": resolved_path,
+            "inode": metadata.st_ino,
+            "birthtime_ns": format(birthtime_nanoseconds, "f"),
+        }
+    )
 
 
 class _ImmutableArtifactExistsError(PortableInstallError):
@@ -3310,12 +3351,10 @@ class PortableInstallationManager:
             raise PortableInstallError("data root is unavailable") from error
         if not stat.S_ISDIR(metadata.st_mode) or path.is_symlink():
             raise PortableInstallError("data root identity is invalid")
-        return digest(
-            {
-                "path": str(path.resolve(strict=True)),
-                "device": metadata.st_dev,
-                "inode": metadata.st_ino,
-            }
+        return _data_root_identity_digest(
+            path,
+            metadata,
+            platform=self.config.platform,
         )
 
     def _plan_release_record(self, source: Path, version: str) -> dict[str, Any]:
@@ -5617,12 +5656,10 @@ class PortableInstallationManager:
             or evidence["backup"]["artifact_root_device"] != backup_metadata.st_dev
             or evidence["backup"]["artifact_root_inode"] != backup_metadata.st_ino
             or observed_data_identity_digest
-            != digest(
-                {
-                    "path": str(data_root),
-                    "device": metadata.st_dev,
-                    "inode": metadata.st_ino,
-                }
+            != _data_root_identity_digest(
+                data_root,
+                metadata,
+                platform=self.config.platform,
             )
         ):
             raise PortableInstallError(

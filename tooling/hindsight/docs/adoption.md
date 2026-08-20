@@ -460,6 +460,13 @@ LaunchAgent or systemd-user files, starts the managed services and timers, and
 runs every declared health check. `verify` rechecks the release, configuration,
 inventory, service manifests, data identity, and managed health.
 
+On launchd, durable data identity binds the resolved root path, inode, and
+birth time; it excludes the mount-assigned device number, which can change
+across macOS boots without replacing the directory. Systemd-user retains its
+device-and-inode identity. An existing launchd installation must use the
+approved data-identity rebind workflow to move to the current projection;
+ordinary verification does not accept both projections.
+
 The managed supervisor health check covers the control service, broker,
 configured APIs and UIs, and the complete fleet. A launchd integration job runs
 once when loaded and at its configured daily time. A systemd-user timer runs two

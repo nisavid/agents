@@ -708,6 +708,7 @@ def write_content_lock(
         )
 
     replace_generated_artifacts(
+        repository,
         {destination: (content, mode)},
         recheck=recheck,
         verify=verify,

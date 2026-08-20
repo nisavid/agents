@@ -34,6 +34,53 @@ GIT_ENV_ALLOWLIST = {
 }
 
 
+def unsafe_git_config_class(key: str) -> str | None:
+    normalized = key.lower()
+    exact = {
+        "core.alternaterefscommand": "core.alternateRefsCommand",
+        "core.askpass": "core.askPass",
+        "core.attributesfile": "core.attributesFile",
+        "core.fsmonitor": "core.fsmonitor",
+        "core.gitproxy": "core.gitProxy",
+        "core.hookspath": "core.hooksPath",
+        "core.sshcommand": "core.sshCommand",
+        "core.worktree": "core.worktree",
+        "diff.external": "diff.external",
+        "gpg.program": "gpg.program",
+        "gpg.ssh.defaultkeycommand": "gpg.ssh.defaultKeyCommand",
+        "interactive.difffilter": "interactive.diffFilter",
+    }
+    if normalized in exact:
+        return exact[normalized]
+    if normalized.startswith("include.") or normalized.startswith("includeif."):
+        return "include*.path"
+    if re.fullmatch(r"protocol(?:\.[^.]+)?\.allow", normalized):
+        return "protocol.*.allow"
+    if re.fullmatch(r"filter\..+\.(?:clean|smudge|process)", normalized):
+        return "filter.*.(clean|smudge|process)"
+    if re.fullmatch(r"hook\..+\.command", normalized):
+        return "hook.*.command"
+    if re.fullmatch(r"gpg\..+\.program", normalized):
+        return "gpg.*.program"
+    if re.fullmatch(r"credential(?:\..+)?\.helper", normalized):
+        return "credential.*.helper"
+    if re.fullmatch(r"diff\..+\.(?:command|textconv)", normalized):
+        return "diff.*.(command|textconv)"
+    if re.fullmatch(r"difftool\..+\.cmd", normalized):
+        return "difftool.*.cmd"
+    if re.fullmatch(r"merge\..+\.driver", normalized):
+        return "merge.*.driver"
+    if re.fullmatch(r"mergetool\..+\.cmd", normalized):
+        return "mergetool.*.cmd"
+    if re.fullmatch(r"remote\..+\.(?:vcs|uploadpack|receivepack)", normalized):
+        return "remote.*.(vcs|uploadpack|receivepack)"
+    if re.fullmatch(r"url\..+\.(?:insteadof|pushinsteadof)", normalized):
+        return "url.*.(insteadOf|pushInsteadOf)"
+    if re.fullmatch(r"submodule\..+\.update", normalized):
+        return "submodule.*.update"
+    return None
+
+
 class InvalidTarget(ValueError):
     pass
 
@@ -164,13 +211,17 @@ def run_command(arguments: list[str], **options) -> subprocess.CompletedProcess[
     return subprocess.run(arguments, **options)
 
 
-def git_environment() -> dict[str, str]:
+def git_environment(hooks_path: Path) -> dict[str, str]:
     environment = {
         name: value for name, value in os.environ.items() if name in GIT_ENV_ALLOWLIST
     }
     environment.update(
         {
             "GIT_ASKPASS": "false",
+            "GIT_ATTR_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_SYSTEM": os.devnull,
             "GIT_EDITOR": "true",
             "GIT_PAGER": "cat",
             "GIT_TERMINAL_PROMPT": "0",
@@ -178,6 +229,26 @@ def git_environment() -> dict[str, str]:
             "LC_ALL": "C",
         }
     )
+    closed_config = (
+        ("core.hooksPath", str(hooks_path)),
+        ("core.fsmonitor", "false"),
+        ("core.attributesFile", os.devnull),
+        ("credential.helper", ""),
+        ("push.gpgSign", "false"),
+        ("commit.gpgSign", "false"),
+        ("tag.gpgSign", "false"),
+        ("protocol.allow", "never"),
+        ("protocol.ext.allow", "never"),
+        ("protocol.file.allow", "never"),
+        ("protocol.https.allow", "always"),
+        ("protocol.ssh.allow", "always"),
+        ("gc.auto", "0"),
+        ("maintenance.auto", "false"),
+    )
+    environment["GIT_CONFIG_COUNT"] = str(len(closed_config))
+    for index, (key, value) in enumerate(closed_config):
+        environment[f"GIT_CONFIG_KEY_{index}"] = key
+        environment[f"GIT_CONFIG_VALUE_{index}"] = value
     return environment
 
 
@@ -203,9 +274,84 @@ def invoke_git(
         check=False,
         capture_output=True,
         text=True,
-        env=git_environment(),
+        env=git_environment(hooks_path),
         stdin=subprocess.DEVNULL,
         timeout=GIT_TIMEOUT_SECONDS,
+    )
+
+
+def git_config_key_inventory(
+    runner: Runner,
+    clone: Path,
+    hooks_path: Path,
+    *,
+    includes: bool,
+) -> list[tuple[str, str, str]]:
+    try:
+        result = invoke_git(
+            runner,
+            clone,
+            hooks_path,
+            "config",
+            "--null",
+            "--show-origin",
+            "--show-scope",
+            "--includes" if includes else "--no-includes",
+            "--name-only",
+            "--list",
+        )
+    except subprocess.TimeoutExpired as error:
+        raise InvalidTarget("Git configuration preflight timed out") from error
+    require(result.returncode == 0, "Git configuration preflight failed")
+    fields = result.stdout.split("\0")
+    if fields and fields[-1] == "":
+        fields.pop()
+    require(
+        len(fields) % 3 == 0,
+        "Git configuration preflight returned malformed metadata",
+    )
+    return [
+        (fields[index], fields[index + 1], fields[index + 2])
+        for index in range(0, len(fields), 3)
+    ]
+
+
+def establish_inert_git_policy(
+    runner: Runner,
+    clone: Path,
+    hooks_path: Path,
+) -> None:
+    without_includes = git_config_key_inventory(
+        runner,
+        clone,
+        hooks_path,
+        includes=False,
+    )
+    include_classes = {
+        config_class
+        for scope, _origin, key in without_includes
+        if scope != "command"
+        if (config_class := unsafe_git_config_class(key)) == "include*.path"
+    }
+    require(
+        not include_classes,
+        "unsafe Git configuration: " + ",".join(sorted(include_classes)),
+    )
+    inventory = git_config_key_inventory(
+        runner,
+        clone,
+        hooks_path,
+        includes=True,
+    )
+    unsafe_classes = {
+        config_class
+        for scope, _origin, key in inventory
+        if scope != "command"
+        if (config_class := unsafe_git_config_class(key)) is not None
+    }
+    require(
+        not unsafe_classes,
+        "unsafe Git configuration: " + ",".join(sorted(unsafe_classes)),
     )
 
 
@@ -281,14 +427,6 @@ def create_worktree(
 
     parent_identity = directory_identity(clone.parent, "worktree root parent")
     clone_identity = directory_identity(clone, "main clone")
-    if not worktree_root.exists():
-        try:
-            worktree_root.mkdir(mode=0o700)
-        except FileExistsError:
-            pass
-    root_identity = directory_identity(worktree_root, "sibling worktree root")
-    require_same_directory(clone.parent, parent_identity, "worktree root parent")
-    require_same_directory(clone, clone_identity, "main clone")
     require(
         not target.exists() and not target.is_symlink(),
         "worktree target already exists",
@@ -296,6 +434,15 @@ def create_worktree(
 
     with tempfile.TemporaryDirectory(prefix="versionkeeping-empty-hooks-") as hooks:
         hooks_path = Path(hooks).resolve()
+        establish_inert_git_policy(runner, clone, hooks_path)
+        require_same_directory(clone.parent, parent_identity, "worktree root parent")
+        require_same_directory(clone, clone_identity, "main clone")
+        if not worktree_root.exists():
+            try:
+                worktree_root.mkdir(mode=0o700)
+            except FileExistsError:
+                pass
+        root_identity = directory_identity(worktree_root, "sibling worktree root")
         branch_before = local_branch_oid(runner, clone, hooks_path, branch)
         require(
             (branch_before is not None) == existing_branch,
@@ -325,7 +472,6 @@ def create_worktree(
                 "status": "unknown",
                 "reason": "git worktree add failed after mutation began",
                 "returncode": result.returncode,
-                "stderr": result.stderr,
                 "worktree_path": str(target),
             }
 

@@ -643,6 +643,29 @@ class ValidateMergecraftTests(unittest.TestCase):
         self.assertIn("manifest", result.stderr.lower())
         self.assertEqual(lock_path.read_bytes(), original_lock)
 
+    def test_write_content_lock_rejects_symlinked_release_ancestor_without_external_changes(
+        self,
+    ) -> None:
+        release = self.repo / "release"
+        external_release = self.repo.parent / "outside-release"
+        release.rename(external_release)
+        try:
+            release.symlink_to(external_release, target_is_directory=True)
+        except OSError as error:
+            self.skipTest(f"symlink creation is unavailable: {error}")
+        external_lock = external_release / "plugin-content-locks/mergecraft.json"
+        external_lock.write_bytes(b"outside sentinel\n")
+        original_entries = tuple(sorted(external_lock.parent.iterdir()))
+
+        result = self.run_validator("--source-stage", "--write-content-lock")
+
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(external_lock.read_bytes(), b"outside sentinel\n")
+        self.assertEqual(
+            tuple(sorted(external_lock.parent.iterdir())),
+            original_entries,
+        )
+
     def test_write_content_lock_accepts_relative_repository_root(self) -> None:
         lock_path = self.repo / CONTENT_LOCK
         expected_lock = lock_path.read_bytes()
@@ -699,9 +722,13 @@ class ValidateMergecraftTests(unittest.TestCase):
         )
         real_replace = os.replace
 
-        def replace_then_drift(source: object, destination: object) -> None:
-            real_replace(source, destination)
-            if Path(destination) == lock_path:
+        def replace_then_drift(
+            source: object,
+            destination: object,
+            **kwargs: object,
+        ) -> None:
+            real_replace(source, destination, **kwargs)
+            if Path(destination).name == lock_path.name:
                 skill.write_text(
                     skill.read_text(encoding="utf-8")
                     + "\nConcurrent semantic change.\n",

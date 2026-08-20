@@ -50,14 +50,27 @@ branch can be tracked without moving or deleting the worktree.
 2. Build a schema-v2 absolute-path JSON request for the exact bottom-to-top stack
    and run
    `scripts/submit_draft_stack.py plan`. Review its content-addressed private
-   plan. It binds the clean worktree, current branch, local base/head OIDs,
-   Graphite log/trunk snapshots, candidate inputs, existing PR preimages, and
-   each entry's mandatory `review_mode`, `review_bundle` (absolute only for
-   `required`, otherwise null), and sorted explicit `selected_specialists`.
+   plan. Before the first Git or Graphite command, the script isolates ambient
+   Git configuration, disables implicit commit/tag/push signing, and rejects
+   executable local/worktree configuration (including signing programs),
+   unsafe includes, and unsupported remotes without printing their values. The
+   plan binds the clean worktree, current branch, local base/head OIDs, the exact
+   current-to-trunk chain and revisions from validated read-only Graphite
+   metadata, Graphite 1.8.6's target repository, and the selected remote's exact
+   fetch/push endpoint hashes to the stack's single head repository. It also
+   binds diagnostic Graphite log/trunk hashes, candidate inputs, existing PR
+   preimages, and each entry's mandatory `review_mode`, `review_bundle`
+   (absolute only for `required`, otherwise null), and sorted explicit
+   `selected_specialists`. Stop if the typed mutation inventory differs from
+   the reviewed bottom-to-top request, the version or metadata schema is
+   unsupported, or either repository binding differs.
 3. Run `scripts/submit_draft_stack.py execute` on that unchanged plan. It invokes
-   exactly one `gt submit --stack --draft --no-edit --no-ai --no-interactive`,
-   never retries an ambiguous transport, maps every branch to one exact PR, and
-   writes a private repair handoff. Stop on any partial or mismatched result.
+   exactly one `gt submit --no-stack --draft --no-edit --no-ai
+   --no-interactive`. This submits the reviewed current branch and its exact
+   downstack chain without unreviewed descendants; add no branch selector or
+   broader stack flag. The script never retries an ambiguous transport, maps
+   every branch to one exact PR, and writes a private repair handoff. Stop on any
+   partial or mismatched result.
 4. Immediately run `scripts/submit_draft_stack.py repair` on the complete
    handoff. It executes only the owned publisher commands, bottom-to-top,
    preserves existing ready state, repairs the temporary Graphite text, and

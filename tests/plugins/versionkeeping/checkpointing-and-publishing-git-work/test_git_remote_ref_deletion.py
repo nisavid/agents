@@ -299,7 +299,15 @@ class RemoteRefDeletionTests(unittest.TestCase):
         self.assertTrue(any(item.startswith("core.hooksPath=") for item in command))
         self.assertNotIn("GIT_DIR", env)
         self.assertNotIn("GIT_INDEX_FILE", env)
-        self.assertNotIn("GIT_CONFIG_COUNT", env)
+        config_count = int(env["GIT_CONFIG_COUNT"])
+        closed_config = {
+            env[f"GIT_CONFIG_KEY_{index}"]: env[f"GIT_CONFIG_VALUE_{index}"]
+            for index in range(config_count)
+        }
+        self.assertNotIn("remote.publish.url", closed_config)
+        self.assertEqual(closed_config["protocol.allow"], "never")
+        self.assertEqual(closed_config["protocol.ext.allow"], "never")
+        self.assertEqual(closed_config["credential.helper"], "")
         self.assertNotIn("GIT_SSL_NO_VERIFY", env)
         self.assertEqual(env["GIT_ASKPASS"], "false")
         self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")

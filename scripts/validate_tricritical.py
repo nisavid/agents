@@ -2128,6 +2128,7 @@ def write_content_lock(repo_root: Path) -> None:
                 raise ValueError("generated artifact replacement identity is invalid")
 
         replace_generated_artifacts(
+            repository_root,
             replacements,
             recheck=recheck,
             verify=verify,

@@ -7,9 +7,13 @@ import argparse
 import hashlib
 import json
 import os
+import re
+import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
+import urllib.parse
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
@@ -50,6 +54,48 @@ VALIDATION_PR_NUMBER = 2_147_483_647
 VALIDATOR = WRITER_SCRIPTS / "validate_change_navigation.py"
 UPDATE = PUBLISHER_SCRIPTS / "update_reviewable_pr.py"
 AUDIT = PUBLISHER_SCRIPTS / "audit_reviewable_pr.py"
+CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+OBJECT_ID_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+SCP_ENDPOINT_RE = re.compile(
+    r"(?:(?P<user>[^/@:\s]+)@)?"
+    r"(?P<host>\[[0-9A-Fa-f:.]+\]|[^/:\s]+):"
+    r"(?P<path>[^:\s][^\s]*)"
+)
+GRAPHITE_METADATA_MAX_BYTES = 64 * 1024 * 1024
+SUPPORTED_GRAPHITE_VERSION = "1.8.6"
+GRAPHITE_METADATA_TABLES = {
+    "branch_metadata": (
+        ("branch_name", "text", 1, None, 1),
+        ("parent_branch_name", "text", 0, None, 0),
+        ("parent_branch_revision", "text", 0, None, 0),
+        ("last_submitted_version", "text", 0, None, 0),
+        ("state", "text", 0, None, 0),
+        ("children", "text", 0, None, 0),
+        ("branch_revision", "text", 0, None, 0),
+        ("validation_result", "text", 0, None, 0),
+        ("parent_head_revision", "text", 0, None, 0),
+    ),
+    "kysely_migration": (
+        ("name", "varchar(255)", 1, None, 1),
+        ("timestamp", "varchar(255)", 1, None, 0),
+    ),
+    "kysely_migration_lock": (
+        ("id", "varchar(255)", 1, None, 1),
+        ("is_locked", "integer", 1, "0", 0),
+    ),
+}
+GRAPHITE_METADATA_OBJECTS = {
+    ("index", "idx_branch_metadata_parent", "branch_metadata"),
+    ("table", "branch_metadata", "branch_metadata"),
+    ("table", "kysely_migration", "kysely_migration"),
+    ("table", "kysely_migration_lock", "kysely_migration_lock"),
+}
+GRAPHITE_METADATA_MIGRATIONS = (
+    "20260211_initial_schema",
+    "20260212_add_validation_columns",
+    "20260220_add_parent_head_revision",
+)
+_EMPTY_HOOKS: tempfile.TemporaryDirectory[str] | None = None
 
 
 class GraphiteTransportError(PublicationError):
@@ -138,8 +184,22 @@ def _write_private_json(path: Path, value: dict[str, Any]) -> None:
         raise GraphiteTransportError(f"cannot write output: {error}") from error
 
 
+def _empty_hooks_path() -> Path:
+    global _EMPTY_HOOKS
+    if _EMPTY_HOOKS is None:
+        _EMPTY_HOOKS = tempfile.TemporaryDirectory(
+            prefix="mergecraft-graphite-empty-hooks-"
+        )
+    return Path(_EMPTY_HOOKS.name).resolve()
+
+
 def _environment() -> dict[str, str]:
-    environment = os.environ.copy()
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.upper().startswith("GIT_")
+        and key.upper() not in {"SSH_ASKPASS", "SSH_ASKPASS_REQUIRE"}
+    }
     for key in tuple(environment):
         upper = key.upper()
         if (
@@ -150,11 +210,58 @@ def _environment() -> dict[str, str]:
             environment.pop(key, None)
     environment["GH_HOST"] = "github.com"
     environment["GITHUB_HOST"] = "github.com"
+    environment.update(
+        {
+            "GIT_ASKPASS": "false",
+            "GIT_ATTR_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_EDITOR": "true",
+            "GIT_NO_LAZY_FETCH": "1",
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_PAGER": "cat",
+            "GIT_PROTOCOL_FROM_USER": "0",
+            "GIT_SEQUENCE_EDITOR": "true",
+            "GIT_SSH_COMMAND": (
+                "ssh -oBatchMode=yes -oConnectionAttempts=1 "
+                f"-oConnectTimeout={READ_TIMEOUT_SECONDS}"
+            ),
+            "GIT_TERMINAL_PROMPT": "0",
+            "GCM_INTERACTIVE": "never",
+            "LC_ALL": "C",
+            "SSH_ASKPASS_REQUIRE": "never",
+        }
+    )
+    closed_config = (
+        ("core.hooksPath", str(_empty_hooks_path())),
+        ("core.fsmonitor", "false"),
+        ("core.attributesFile", os.devnull),
+        ("credential.helper", ""),
+        ("push.gpgSign", "false"),
+        ("commit.gpgSign", "false"),
+        ("tag.gpgSign", "false"),
+        ("protocol.allow", "never"),
+        ("protocol.ext.allow", "never"),
+        ("protocol.file.allow", "always"),
+        ("protocol.https.allow", "always"),
+        ("protocol.ssh.allow", "always"),
+        ("gc.auto", "0"),
+        ("maintenance.auto", "false"),
+    )
+    environment["GIT_CONFIG_COUNT"] = str(len(closed_config))
+    for index, (key, value) in enumerate(closed_config):
+        environment[f"GIT_CONFIG_KEY_{index}"] = key
+        environment[f"GIT_CONFIG_VALUE_{index}"] = value
     return environment
 
 
-def _run(
-    arguments: list[str], *, cwd: Path, timeout: int = READ_TIMEOUT_SECONDS
+def _run_raw(
+    arguments: list[str],
+    *,
+    cwd: Path,
+    timeout: int = READ_TIMEOUT_SECONDS,
+    allowed: tuple[int, ...] = (),
 ) -> subprocess.CompletedProcess[str]:
     try:
         result = subprocess.run(
@@ -166,15 +273,710 @@ def _run(
             check=False,
             timeout=timeout,
         )
-    except (OSError, subprocess.TimeoutExpired) as error:
+    except (OSError, subprocess.TimeoutExpired, UnicodeError) as error:
         raise GraphiteTransportError(
             f"command did not complete: {arguments[0]}"
         ) from error
-    if result.returncode != 0:
+    if result.returncode != 0 and result.returncode not in allowed:
         raise GraphiteTransportError(
             f"command failed with status {result.returncode}: {arguments[0]}"
         )
     return result
+
+
+def _unsafe_git_config_class(key: str) -> str | None:
+    normalized = key.lower()
+    exact = {
+        "core.alternaterefscommand": "core.alternateRefsCommand",
+        "core.askpass": "core.askPass",
+        "core.attributesfile": "core.attributesFile",
+        "core.fsmonitor": "core.fsmonitor",
+        "core.gitproxy": "core.gitProxy",
+        "core.hookspath": "core.hooksPath",
+        "core.sshcommand": "core.sshCommand",
+        "core.worktree": "core.worktree",
+        "diff.external": "diff.external",
+        "gpg.program": "gpg.program",
+        "gpg.ssh.defaultkeycommand": "gpg.ssh.defaultKeyCommand",
+        "interactive.difffilter": "interactive.diffFilter",
+    }
+    if normalized in exact:
+        return exact[normalized]
+    if normalized.startswith("include.") or normalized.startswith("includeif."):
+        return "include*.path"
+    patterns = (
+        (r"protocol(?:\.[^.]+)?\.allow", "protocol.*.allow"),
+        (
+            r"filter\..+\.(?:clean|smudge|process)",
+            "filter.*.(clean|smudge|process)",
+        ),
+        (r"hook\..+\.command", "hook.*.command"),
+        (r"gpg\..+\.program", "gpg.*.program"),
+        (r"credential(?:\..+)?\.helper", "credential.*.helper"),
+        (r"diff\..+\.(?:command|textconv)", "diff.*.(command|textconv)"),
+        (r"difftool\..+\.cmd", "difftool.*.cmd"),
+        (r"merge\..+\.driver", "merge.*.driver"),
+        (r"mergetool\..+\.cmd", "mergetool.*.cmd"),
+        (
+            r"remote\..+\.(?:vcs|uploadpack|receivepack)",
+            "remote.*.(vcs|uploadpack|receivepack)",
+        ),
+        (r"url\..+\.(?:insteadof|pushinsteadof)", "url.*.(insteadOf|pushInsteadOf)"),
+        (r"submodule\..+\.update", "submodule.*.update"),
+    )
+    for pattern, config_class in patterns:
+        if re.fullmatch(pattern, normalized):
+            return config_class
+    return None
+
+
+def _config_key_inventory(root: Path, *, includes: bool) -> list[tuple[str, str, str]]:
+    result = _run_raw(
+        [
+            "git",
+            "config",
+            "--null",
+            "--show-origin",
+            "--show-scope",
+            "--includes" if includes else "--no-includes",
+            "--name-only",
+            "--list",
+        ],
+        cwd=root,
+    )
+    fields = result.stdout.split("\0")
+    if fields and fields[-1] == "":
+        fields.pop()
+    if len(fields) % 3 != 0:
+        raise GraphiteTransportError("Git configuration inventory is malformed")
+    return [
+        (fields[index], fields[index + 1], fields[index + 2])
+        for index in range(0, len(fields), 3)
+    ]
+
+
+def _effective_config_sha256(root: Path) -> str:
+    result = _run_raw(
+        [
+            "git",
+            "config",
+            "--null",
+            "--show-origin",
+            "--show-scope",
+            "--includes",
+            "--list",
+        ],
+        cwd=root,
+    )
+    fields = result.stdout.split("\0")
+    if fields and fields[-1] == "":
+        fields.pop()
+    if len(fields) % 3 != 0:
+        raise GraphiteTransportError("Git configuration inventory is malformed")
+    inventory: list[dict[str, str]] = []
+    for index in range(0, len(fields), 3):
+        scope, origin, key_value = fields[index : index + 3]
+        if "\n" not in key_value:
+            raise GraphiteTransportError("Git configuration inventory is malformed")
+        key, value = key_value.split("\n", 1)
+        if scope != "command":
+            inventory.append(
+                {"scope": scope, "origin": origin, "key": key, "value": value}
+            )
+    return _sha_bytes(_canonical(inventory))
+
+
+def _local_remote_path(endpoint: str, root: Path) -> Path | None:
+    parsed = urllib.parse.urlsplit(endpoint)
+    if parsed.scheme == "file":
+        if (
+            parsed.netloc not in {"", "localhost"}
+            or parsed.query
+            or parsed.fragment
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            raise GraphiteTransportError("repository remote transport is unsupported")
+        value = urllib.parse.unquote(parsed.path)
+        if CONTROL_RE.search(value) or not Path(value).is_absolute():
+            raise GraphiteTransportError("repository remote transport is unsupported")
+        return Path(value)
+    if parsed.scheme:
+        return None
+    if _is_scp_endpoint(endpoint):
+        return None
+    path = Path(endpoint)
+    if path.is_absolute():
+        return path
+    if endpoint.startswith("-"):
+        raise GraphiteTransportError("repository remote transport is unsupported")
+    return root / path
+
+
+def _require_secure_local_ancestry(path: Path) -> None:
+    trusted_owners = {0, os.geteuid()}
+    child = path.lstat()
+    for parent in path.parents:
+        metadata = parent.lstat()
+        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid not in trusted_owners:
+            raise GraphiteTransportError(
+                "repository local remote is not owner-secure"
+            )
+        writable = stat.S_IMODE(metadata.st_mode) & 0o022
+        sticky_protection = bool(metadata.st_mode & stat.S_ISVTX) and (
+            child.st_uid in trusted_owners
+        )
+        if writable and not sticky_protection:
+            raise GraphiteTransportError(
+                "repository local remote is not owner-secure"
+            )
+        child = metadata
+
+
+def _reject_untrusted_local_symlink_ancestors(path: Path) -> None:
+    current = Path(path.anchor)
+    for component in path.parts[1:-1]:
+        current /= component
+        metadata = current.lstat()
+        if not stat.S_ISLNK(metadata.st_mode):
+            continue
+        parent = current.parent.lstat()
+        if (
+            metadata.st_uid != 0
+            or parent.st_uid != 0
+            or stat.S_IMODE(parent.st_mode) & 0o022
+        ):
+            raise GraphiteTransportError(
+                "repository local remote is not owner-secure"
+            )
+
+
+def _validate_local_remote(path: Path) -> None:
+    try:
+        lexical = Path(os.path.abspath(path))
+        if lexical.is_symlink():
+            raise OSError("symlinked local remote")
+        _reject_untrusted_local_symlink_ancestors(lexical)
+        resolved = lexical.resolve(strict=True)
+        metadata = resolved.lstat()
+    except (OSError, RuntimeError, ValueError) as error:
+        raise GraphiteTransportError(
+            "repository local remote is not owner-secure"
+        ) from error
+    if resolved.is_symlink() or metadata.st_uid != os.geteuid():
+        raise GraphiteTransportError("repository local remote is not owner-secure")
+    if not (stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode)):
+        raise GraphiteTransportError("repository local remote is not owner-secure")
+    if stat.S_ISREG(metadata.st_mode) and metadata.st_nlink != 1:
+        raise GraphiteTransportError("repository local remote is not owner-secure")
+    if stat.S_IMODE(metadata.st_mode) & 0o022:
+        raise GraphiteTransportError("repository local remote is not owner-secure")
+    _require_secure_local_ancestry(resolved)
+
+
+def _is_scp_endpoint(endpoint: str) -> bool:
+    if "://" in endpoint:
+        return False
+    match = SCP_ENDPOINT_RE.fullmatch(endpoint)
+    if match is None:
+        return False
+    user = match.group("user")
+    host = match.group("host")
+    return not host.startswith("-") and (user is None or not user.startswith("-"))
+
+
+def _validate_remote_endpoint(endpoint: str, root: Path) -> None:
+    if not endpoint or CONTROL_RE.search(endpoint):
+        raise GraphiteTransportError("repository remote transport is unsupported")
+    local = _local_remote_path(endpoint, root)
+    if local is not None:
+        _validate_local_remote(local)
+        return
+    parsed = urllib.parse.urlsplit(endpoint)
+    if parsed.scheme == "https":
+        try:
+            port = parsed.port
+        except ValueError as error:
+            raise GraphiteTransportError(
+                "repository remote transport is unsupported"
+            ) from error
+        if (
+            not parsed.hostname
+            or parsed.hostname.startswith("-")
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or port is not None and not 1 <= port <= 65535
+        ):
+            raise GraphiteTransportError("repository remote transport is unsupported")
+        return
+    if parsed.scheme == "ssh":
+        try:
+            port = parsed.port
+        except ValueError as error:
+            raise GraphiteTransportError(
+                "repository remote transport is unsupported"
+            ) from error
+        if (
+            not parsed.hostname
+            or parsed.hostname.startswith("-")
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or port is not None and not 1 <= port <= 65535
+        ):
+            raise GraphiteTransportError("repository remote transport is unsupported")
+        return
+    if _is_scp_endpoint(endpoint):
+        return
+    raise GraphiteTransportError("repository remote transport is unsupported")
+
+
+def _validate_repository_remotes(root: Path) -> None:
+    result = _run_raw(
+        [
+            "git",
+            "config",
+            "--null",
+            "--includes",
+            "--get-regexp",
+            r"^remote\..*\.(url|pushurl)$",
+        ],
+        cwd=root,
+        allowed=(1,),
+    )
+    fields = result.stdout.split("\0")
+    if fields and fields[-1] == "":
+        fields.pop()
+    for field in fields:
+        if "\n" not in field:
+            raise GraphiteTransportError("Git remote inventory is malformed")
+        _key, endpoint = field.split("\n", 1)
+        _validate_remote_endpoint(endpoint, root)
+
+
+def _establish_inert_git_policy(root: Path) -> str:
+    without_includes = _config_key_inventory(root, includes=False)
+    include_classes = {
+        config_class
+        for scope, _origin, key in without_includes
+        if scope != "command"
+        if (config_class := _unsafe_git_config_class(key)) == "include*.path"
+    }
+    if include_classes:
+        raise GraphiteTransportError(
+            "unsafe repository Git configuration: "
+            + ",".join(sorted(include_classes))
+        )
+    inventory = _config_key_inventory(root, includes=True)
+    unsafe_classes = {
+        config_class
+        for scope, _origin, key in inventory
+        if scope != "command"
+        if (config_class := _unsafe_git_config_class(key)) is not None
+    }
+    if unsafe_classes:
+        raise GraphiteTransportError(
+            "unsafe repository Git configuration: "
+            + ",".join(sorted(unsafe_classes))
+        )
+    _validate_repository_remotes(root)
+    return _effective_config_sha256(root)
+
+
+def _run(
+    arguments: list[str], *, cwd: Path, timeout: int = READ_TIMEOUT_SECONDS
+) -> subprocess.CompletedProcess[str]:
+    executable = Path(arguments[0]).name if arguments else ""
+    if executable in {"git", "gt"}:
+        _establish_inert_git_policy(cwd)
+    return _run_raw(arguments, cwd=cwd, timeout=timeout)
+
+
+def _strict_command_line(arguments: list[str], root: Path, label: str) -> str:
+    output = _run(arguments, cwd=root).stdout
+    if (
+        not output.endswith("\n")
+        or "\n" in output[:-1]
+        or not output[:-1]
+        or CONTROL_RE.search(output[:-1])
+    ):
+        raise GraphiteTransportError(f"{label} is unavailable")
+    return output[:-1]
+
+
+def _github_repository_for_endpoint(endpoint: str) -> str | None:
+    if _is_scp_endpoint(endpoint):
+        match = SCP_ENDPOINT_RE.fullmatch(endpoint)
+        assert match is not None
+        if match.group("host").lower() != "github.com":
+            return None
+        path = match.group("path")
+    else:
+        parsed = urllib.parse.urlsplit(endpoint)
+        host = (parsed.hostname or "").lower()
+        if parsed.scheme == "https" and host == "github.com":
+            path = parsed.path.removeprefix("/")
+        elif parsed.scheme == "ssh" and host in {"github.com", "ssh.github.com"}:
+            path = parsed.path.removeprefix("/")
+        else:
+            return None
+    if path.endswith(".git"):
+        path = path[:-4]
+    return path if path and path.count("/") == 1 else None
+
+
+def _graphite_repository_binding(
+    root: Path,
+    candidates: list[dict[str, Any]],
+    target_repository: str,
+) -> dict[str, str]:
+    version = _strict_command_line(
+        ["gt", "--version"],
+        root,
+        "Graphite version",
+    )
+    if version != SUPPORTED_GRAPHITE_VERSION:
+        raise GraphiteTransportError("unsupported Graphite version")
+    target_owner, target_name = target_repository.split("/", 1)
+    if (
+        _strict_command_line(
+            ["gt", "repo", "owner"],
+            root,
+            "Graphite target repository owner",
+        )
+        != target_owner
+        or _strict_command_line(
+            ["gt", "repo", "name"],
+            root,
+            "Graphite target repository name",
+        )
+        != target_name
+    ):
+        raise GraphiteTransportError("Graphite repository binding differs from plan")
+    head_repositories = {entry["head_repository"] for entry in candidates}
+    if len(head_repositories) != 1:
+        raise GraphiteTransportError("Graphite stack spans multiple head repositories")
+    head_repository = next(iter(head_repositories))
+    remote = _strict_command_line(
+        ["gt", "repo", "remote"],
+        root,
+        "Graphite publication remote",
+    )
+    if remote.startswith("-") or any(character.isspace() for character in remote):
+        raise GraphiteTransportError("Graphite publication remote is invalid")
+    fetch_endpoint = _strict_command_line(
+        ["git", "remote", "get-url", "--all", "--", remote],
+        root,
+        "Graphite fetch endpoint",
+    )
+    push_endpoint = _strict_command_line(
+        ["git", "remote", "get-url", "--push", "--all", "--", remote],
+        root,
+        "Graphite push endpoint",
+    )
+    for endpoint in (fetch_endpoint, push_endpoint):
+        _validate_remote_endpoint(endpoint, root)
+        if _github_repository_for_endpoint(endpoint) != head_repository:
+            raise GraphiteTransportError(
+                "Graphite repository binding differs from plan"
+            )
+    return {
+        "contract": "mergecraft-graphite-repository-binding-v1",
+        "graphite_version": version,
+        "target_repository": target_repository,
+        "head_repository": head_repository,
+        "remote_sha256": _sha_text(remote),
+        "fetch_endpoint_sha256": _sha_text(fetch_endpoint),
+        "push_endpoint_sha256": _sha_text(push_endpoint),
+    }
+
+
+def _graphite_metadata_path(root: Path) -> Path:
+    value = _run(
+        ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        cwd=root,
+    ).stdout
+    if not value.endswith("\n") or "\n" in value[:-1] or CONTROL_RE.search(value[:-1]):
+        raise GraphiteTransportError("Git common directory is unreadable")
+    common = Path(value[:-1])
+    if not common.is_absolute():
+        raise GraphiteTransportError("Git common directory is not absolute")
+    return common / ".graphite_metadata.db"
+
+
+def _metadata_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_uid,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _read_graphite_metadata(path: Path) -> bytes:
+    for suffix in ("-journal", "-wal", "-shm"):
+        if os.path.lexists(f"{path}{suffix}"):
+            raise GraphiteTransportError(
+                "Graphite metadata has an unsupported transactional sidecar"
+            )
+    flags = os.O_RDONLY
+    for name in ("O_CLOEXEC", "O_NOFOLLOW", "O_NONBLOCK"):
+        flags |= getattr(os, name, 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise GraphiteTransportError("Graphite metadata is unavailable") from error
+    try:
+        before = os.fstat(descriptor)
+        try:
+            parent = path.parent.stat()
+        except OSError as error:
+            raise GraphiteTransportError(
+                "Graphite metadata directory is unavailable"
+            ) from error
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_uid != os.geteuid()
+            or stat.S_IMODE(before.st_mode) & 0o022
+            or parent.st_uid != os.geteuid()
+            or stat.S_IMODE(parent.st_mode) & 0o022
+            or before.st_size <= 0
+            or before.st_size > GRAPHITE_METADATA_MAX_BYTES
+        ):
+            raise GraphiteTransportError("Graphite metadata is not owner-secure")
+        chunks: list[bytes] = []
+        remaining = before.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 1024 * 1024))
+            if not chunk:
+                raise GraphiteTransportError("Graphite metadata changed while read")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise GraphiteTransportError("Graphite metadata changed while read")
+        after = os.fstat(descriptor)
+        if _metadata_identity(after) != _metadata_identity(before):
+            raise GraphiteTransportError("Graphite metadata changed while read")
+    except OSError as error:
+        raise GraphiteTransportError("Graphite metadata could not be read") from error
+    finally:
+        os.close(descriptor)
+    for suffix in ("-journal", "-wal", "-shm"):
+        if os.path.lexists(f"{path}{suffix}"):
+            raise GraphiteTransportError(
+                "Graphite metadata changed while it was read"
+            )
+    return b"".join(chunks)
+
+
+def _graphite_schema_contract() -> dict[str, Any]:
+    return {
+        "objects": [list(item) for item in sorted(GRAPHITE_METADATA_OBJECTS)],
+        "tables": {
+            table: [list(column) for column in columns]
+            for table, columns in sorted(GRAPHITE_METADATA_TABLES.items())
+        },
+        "migrations": list(GRAPHITE_METADATA_MIGRATIONS),
+        "parent_index": [[0, 1, "parent_branch_name"]],
+        "migration_lock": ["migration_lock", 0],
+    }
+
+
+def _validate_graphite_schema(connection: sqlite3.Connection) -> None:
+    objects = {
+        (object_type, name, table)
+        for object_type, name, table in connection.execute(
+            """
+            SELECT type, name, tbl_name
+            FROM sqlite_master
+            WHERE name NOT LIKE 'sqlite_%'
+            """
+        )
+    }
+    if objects != GRAPHITE_METADATA_OBJECTS:
+        raise GraphiteTransportError("unsupported Graphite metadata schema")
+    for table, expected in GRAPHITE_METADATA_TABLES.items():
+        actual = tuple(
+            (name, str(column_type).lower(), not_null, default, primary_key)
+            for (
+                _column_id,
+                name,
+                column_type,
+                not_null,
+                default,
+                primary_key,
+            ) in connection.execute(f'PRAGMA table_info("{table}")')
+        )
+        if actual != expected:
+            raise GraphiteTransportError("unsupported Graphite metadata schema")
+    index = list(
+        connection.execute('PRAGMA index_info("idx_branch_metadata_parent")')
+    )
+    if index != [(0, 1, "parent_branch_name")]:
+        raise GraphiteTransportError("unsupported Graphite metadata schema")
+    migrations = tuple(
+        row[0]
+        for row in connection.execute(
+            "SELECT name FROM kysely_migration ORDER BY name"
+        )
+    )
+    if migrations != GRAPHITE_METADATA_MIGRATIONS:
+        raise GraphiteTransportError("unsupported Graphite metadata schema")
+    lock = list(connection.execute("SELECT id, is_locked FROM kysely_migration_lock"))
+    if lock != [("migration_lock", 0)]:
+        raise GraphiteTransportError("unsupported Graphite metadata schema")
+    if list(connection.execute("PRAGMA integrity_check")) != [("ok",)]:
+        raise GraphiteTransportError("Graphite metadata failed integrity validation")
+
+
+def _open_bound_graphite_metadata(raw: bytes) -> tuple[sqlite3.Connection, Path]:
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix="mergecraft-graphite-metadata-", suffix=".db"
+    )
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(raw)
+            output.flush()
+            os.fsync(output.fileno())
+        uri_path = urllib.parse.quote(str(temporary), safe="/")
+        connection = sqlite3.connect(
+            f"file:{uri_path}?mode=ro&immutable=1",
+            uri=True,
+        )
+        connection.execute("PRAGMA query_only=ON")
+        return connection, temporary
+    except (OSError, sqlite3.Error) as error:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        raise GraphiteTransportError("Graphite metadata is unreadable") from error
+
+
+def _graphite_mutation_inventory(
+    root: Path,
+    candidates: list[dict[str, Any]],
+    current_branch: str,
+) -> dict[str, Any]:
+    path = _graphite_metadata_path(root)
+    raw = _read_graphite_metadata(path)
+    connection, temporary = _open_bound_graphite_metadata(raw)
+    try:
+        _validate_graphite_schema(connection)
+        records: dict[str, dict[str, str | None]] = {}
+        for branch, parent, revision, validation in connection.execute(
+            """
+            SELECT branch_name, parent_branch_name, branch_revision,
+                   validation_result
+            FROM branch_metadata
+            """
+        ):
+            if (
+                not isinstance(branch, str)
+                or not branch
+                or CONTROL_RE.search(branch)
+                or parent is not None
+                and (
+                    not isinstance(parent, str)
+                    or not parent
+                    or CONTROL_RE.search(parent)
+                )
+                or not isinstance(revision, str)
+                or OBJECT_ID_RE.fullmatch(revision) is None
+                or validation is not None
+                and not isinstance(validation, str)
+                or branch in records
+            ):
+                raise GraphiteTransportError(
+                    "unsupported Graphite metadata contents"
+                )
+            records[branch] = {
+                "parent": parent,
+                "revision": revision,
+                "validation": validation,
+            }
+        trunks = [
+            branch
+            for branch, record in records.items()
+            if record["validation"] == "TRUNK"
+        ]
+        if len(trunks) != 1:
+            raise GraphiteTransportError(
+                "Graphite metadata does not identify exactly one trunk"
+            )
+        trunk = trunks[0]
+        trunk_record = records[trunk]
+        if trunk_record["parent"] is not None:
+            raise GraphiteTransportError("Graphite trunk metadata has a parent")
+        descendant_first: list[dict[str, str]] = []
+        visited: set[str] = set()
+        branch = current_branch
+        while branch != trunk:
+            if branch in visited:
+                raise GraphiteTransportError("Graphite metadata contains a cycle")
+            visited.add(branch)
+            record = records.get(branch)
+            if record is None or not isinstance(record["parent"], str):
+                raise GraphiteTransportError(
+                    "Graphite metadata chain does not reach its trunk"
+                )
+            descendant_first.append(
+                {
+                    "branch": branch,
+                    "parent": record["parent"],
+                    "revision": str(record["revision"]),
+                }
+            )
+            branch = record["parent"]
+        branches = list(reversed(descendant_first))
+        candidate_branches = [entry["local_branch"] for entry in candidates]
+        if [entry["branch"] for entry in branches] != candidate_branches:
+            raise GraphiteTransportError(
+                "reviewed stack does not exactly match Graphite metadata"
+            )
+        if candidates[0]["base"] != trunk:
+            raise GraphiteTransportError(
+                "reviewed stack does not start at the Graphite trunk"
+            )
+        if trunk_record["revision"] != candidates[0]["base_oid"]:
+            raise GraphiteTransportError(
+                "Graphite trunk revision differs from the reviewed base"
+            )
+        for inventory_entry, candidate in zip(branches, candidates, strict=True):
+            if inventory_entry["revision"] != candidate["head_oid"]:
+                raise GraphiteTransportError(
+                    "Graphite branch revision differs from the reviewed candidate"
+                )
+        return {
+            "contract": "mergecraft-graphite-mutation-inventory-v1",
+            "metadata_sha256": _sha_bytes(raw),
+            "schema_sha256": _sha_bytes(_canonical(_graphite_schema_contract())),
+            "trunk": {
+                "branch": trunk,
+                "revision": trunk_record["revision"],
+            },
+            "branches": branches,
+            "submit_scope": "current-and-downstack-only",
+        }
+    except sqlite3.Error as error:
+        raise GraphiteTransportError("Graphite metadata query failed") from error
+    finally:
+        connection.close()
+        try:
+            temporary.unlink()
+        except OSError as error:
+            raise GraphiteTransportError(
+                "Graphite metadata snapshot cleanup failed"
+            ) from error
 
 
 def _read_text(path: Path, label: str) -> str:
@@ -382,6 +1184,7 @@ def _candidate(entry: dict[str, Any], repository: str) -> dict[str, Any]:
 
 
 def _git_graphite_snapshot(root: Path, current_branch: str) -> dict[str, Any]:
+    config_sha256 = _establish_inert_git_policy(root)
     resolved = Path(
         _run(["git", "rev-parse", "--show-toplevel"], cwd=root).stdout.strip()
     ).resolve()
@@ -401,6 +1204,7 @@ def _git_graphite_snapshot(root: Path, current_branch: str) -> dict[str, Any]:
         "repository_root": str(root.resolve()),
         "current_branch": branch,
         "clean_status_sha256": _sha_text(status),
+        "git_config_sha256": config_sha256,
         "gt_log_short_sha256": _sha_text(log_short),
         "gt_trunk_sha256": _sha_text(trunk),
     }
@@ -477,6 +1281,7 @@ def build_plan(request: dict[str, Any]) -> dict[str, Any]:
     root = Path(request["repository_root"])
     if not root.is_absolute() or not root.is_dir():
         raise GraphiteTransportError("repository_root must be an absolute directory")
+    _establish_inert_git_policy(root)
     if not isinstance(request["current_branch"], str) or not request["current_branch"]:
         raise GraphiteTransportError("current_branch must be non-empty")
     if not isinstance(request["stack"], list) or not request["stack"]:
@@ -499,12 +1304,24 @@ def build_plan(request: dict[str, Any]) -> dict[str, Any]:
             raise GraphiteTransportError("local stack base OID differs from request")
         if index and entry["base"] != candidates[index - 1]["local_branch"]:
             raise GraphiteTransportError("stack entries are not a bottom-to-top chain")
+    repository_binding = _graphite_repository_binding(
+        root,
+        candidates,
+        request["repository"],
+    )
     snapshot = _git_graphite_snapshot(root, request["current_branch"])
+    mutation_inventory = _graphite_mutation_inventory(
+        root,
+        candidates,
+        request["current_branch"],
+    )
+    mutation_inventory["repository_binding"] = repository_binding
     preimages = [_live_preimage(entry, request["repository"]) for entry in candidates]
     unsigned = {
         "schema_version": SCHEMA_VERSION,
         "request": request,
         "candidates": candidates,
+        "mutation_inventory": mutation_inventory,
         "snapshot": snapshot,
         "preimages": preimages,
     }
@@ -519,6 +1336,7 @@ def _load_plan(path: Path) -> dict[str, Any]:
             "schema_version",
             "request",
             "candidates",
+            "mutation_inventory",
             "snapshot",
             "preimages",
             "content_sha256",
@@ -798,7 +1616,7 @@ def execute(plan: dict[str, Any], output_path: Path) -> dict[str, Any]:
                 [
                     "gt",
                     "submit",
-                    "--stack",
+                    "--no-stack",
                     "--draft",
                     "--no-edit",
                     "--no-ai",

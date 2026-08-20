@@ -11,8 +11,8 @@ from __future__ import annotations
 
 import hashlib
 import os
+import secrets
 import stat
-import tempfile
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -33,6 +33,28 @@ class InputEntry(NamedTuple):
 class _Preimage:
     content: bytes | None
     mode: int | None
+    identity: tuple[int, ...] | None
+
+
+@dataclass(frozen=True)
+class _Target:
+    path: Path
+    relative: Path
+    parent_path: Path
+    parent_components: tuple[str, ...]
+    name: str
+    parent_descriptor: int
+    content: bytes
+    mode: int
+
+
+@dataclass(frozen=True)
+class _Staged:
+    target: _Target
+    name: str
+    path: Path
+    descriptor: int
+    identity: tuple[int, ...]
 
 
 def _metadata_identity(metadata: os.stat_result) -> tuple[int, ...]:
@@ -41,6 +63,7 @@ def _metadata_identity(metadata: os.stat_result) -> tuple[int, ...]:
         metadata.st_ino,
         stat.S_IFMT(metadata.st_mode),
         stat.S_IMODE(metadata.st_mode),
+        metadata.st_nlink,
         metadata.st_size,
         metadata.st_mtime_ns,
         metadata.st_ctime_ns,
@@ -161,116 +184,505 @@ def snapshot_tree(
     return tuple(sorted(entries.items()))
 
 
-def _capture_preimage(path: Path) -> _Preimage:
+def _directory_flags() -> int:
+    if not hasattr(os, "O_DIRECTORY") or not hasattr(os, "O_NOFOLLOW"):
+        raise RefreshTransactionError(
+            "generated artifact confinement requires O_DIRECTORY and O_NOFOLLOW"
+        )
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    return flags | getattr(os, "O_CLOEXEC", 0)
+
+
+def _directory_identity(metadata: os.stat_result) -> tuple[int, int, int]:
+    return metadata.st_dev, metadata.st_ino, stat.S_IFMT(metadata.st_mode)
+
+
+def _open_parent_from_root(
+    root_descriptor: int,
+    components: tuple[str, ...],
+) -> int:
+    descriptor = os.dup(root_descriptor)
     try:
-        before = path.lstat()
+        for component in components:
+            if component in {"", ".", ".."}:
+                raise RefreshTransactionError(
+                    "generated artifact parent path is invalid"
+                )
+            try:
+                child = os.open(
+                    component,
+                    _directory_flags(),
+                    dir_fd=descriptor,
+                )
+            except OSError:
+                raise
+            metadata = os.fstat(child)
+            if not stat.S_ISDIR(metadata.st_mode):
+                os.close(child)
+                raise RefreshTransactionError(
+                    "generated artifact parent path is invalid"
+                )
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _open_transaction(
+    repository_root: Path,
+    replacements: Mapping[Path, tuple[bytes, int]],
+) -> tuple[Path, int, list[_Target]]:
+    root = Path(os.path.abspath(repository_root))
+    try:
+        root_descriptor = os.open(root, _directory_flags())
+    except OSError as error:
+        raise RefreshTransactionError(
+            f"generated artifact repository root is invalid: {root}"
+        ) from error
+    targets: list[_Target] = []
+    seen: set[Path] = set()
+    try:
+        if not stat.S_ISDIR(os.fstat(root_descriptor).st_mode):
+            raise RefreshTransactionError(
+                f"generated artifact repository root is invalid: {root}"
+            )
+        for destination, (content, mode) in replacements.items():
+            absolute = Path(os.path.abspath(destination))
+            try:
+                relative = absolute.relative_to(root)
+            except ValueError as error:
+                raise RefreshTransactionError(
+                    f"generated artifact path escapes repository root: {destination}"
+                ) from error
+            if relative == Path(".") or relative in seen:
+                raise RefreshTransactionError(
+                    f"generated artifact path is not a unique repository file: {destination}"
+                )
+            seen.add(relative)
+            try:
+                parent_descriptor = _open_parent_from_root(
+                    root_descriptor,
+                    tuple(relative.parts[:-1]),
+                )
+            except (OSError, RefreshTransactionError) as error:
+                raise RefreshTransactionError(
+                    f"generated artifact parent is invalid: {absolute.parent}"
+                ) from error
+            targets.append(
+                _Target(
+                    path=absolute,
+                    relative=relative,
+                    parent_path=absolute.parent,
+                    parent_components=tuple(relative.parts[:-1]),
+                    name=relative.name,
+                    parent_descriptor=parent_descriptor,
+                    content=content,
+                    mode=mode,
+                )
+            )
+    except BaseException:
+        for target in targets:
+            os.close(target.parent_descriptor)
+        os.close(root_descriptor)
+        raise
+    return root, root_descriptor, targets
+
+
+def _require_parent_binding(
+    root: Path,
+    root_descriptor: int,
+    target: _Target,
+) -> None:
+    try:
+        visible_root = os.open(root, _directory_flags())
+    except OSError as error:
+        raise RefreshTransactionError(
+            f"generated artifact parent changed: {target.parent_path}"
+        ) from error
+    try:
+        if _directory_identity(os.fstat(visible_root)) != _directory_identity(
+            os.fstat(root_descriptor)
+        ):
+            raise RefreshTransactionError(
+                f"generated artifact parent changed: {target.parent_path}"
+            )
+    finally:
+        os.close(visible_root)
+    try:
+        visible_parent = _open_parent_from_root(
+            root_descriptor,
+            target.parent_components,
+        )
+    except (OSError, RefreshTransactionError) as error:
+        raise RefreshTransactionError(
+            f"generated artifact parent changed: {target.parent_path}"
+        ) from error
+    try:
+        if _directory_identity(os.fstat(visible_parent)) != _directory_identity(
+            os.fstat(target.parent_descriptor)
+        ):
+            raise RefreshTransactionError(
+                f"generated artifact parent changed: {target.parent_path}"
+            )
+    finally:
+        os.close(visible_parent)
+
+
+def _capture_preimage(
+    root: Path,
+    root_descriptor: int,
+    target: _Target,
+    *,
+    require_binding: bool,
+) -> _Preimage:
+    if require_binding:
+        _require_parent_binding(root, root_descriptor, target)
+    try:
+        before = os.stat(
+            target.name,
+            dir_fd=target.parent_descriptor,
+            follow_symlinks=False,
+        )
     except FileNotFoundError:
-        return _Preimage(None, None)
+        return _Preimage(None, None, None)
     if not stat.S_ISREG(before.st_mode):
         raise RefreshTransactionError(
-            f"generated artifact is not a regular file: {path}"
+            f"generated artifact is not a regular file: {target.path}"
         )
-    content = path.read_bytes()
-    try:
-        after = path.lstat()
-    except FileNotFoundError as error:
+    if before.st_nlink != 1:
         raise RefreshTransactionError(
-            f"generated artifact changed while it was observed: {path}"
+            f"generated artifact is hard-linked: {target.path}"
+        )
+    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    try:
+        descriptor = os.open(
+            target.name,
+            flags,
+            dir_fd=target.parent_descriptor,
+        )
+    except OSError as error:
+        raise RefreshTransactionError(
+            f"generated artifact changed while it was observed: {target.path}"
         ) from error
-    if _metadata_identity(before) != _metadata_identity(after):
-        raise RefreshTransactionError(
-            f"generated artifact changed while it was observed: {path}"
-        )
-    return _Preimage(content, stat.S_IMODE(after.st_mode))
-
-
-def _stage(path: Path, content: bytes, mode: int) -> Path:
-    parent = path.parent
-    if parent.is_symlink() or not parent.is_dir():
-        raise RefreshTransactionError(
-            f"generated artifact parent is invalid: {parent}"
-        )
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", dir=parent
-    )
-    temporary = Path(temporary_name)
     try:
-        os.fchmod(descriptor, mode)
-        with os.fdopen(descriptor, "wb") as file:
-            descriptor = -1
-            file.write(content)
-            file.flush()
-            os.fsync(file.fileno())
-    except BaseException:
-        if descriptor >= 0:
-            os.close(descriptor)
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
-        raise
-    return temporary
-
-
-def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+            raise RefreshTransactionError(
+                f"generated artifact changed while it was observed: {target.path}"
+            )
+        with os.fdopen(descriptor, "rb", closefd=False) as file:
+            content = file.read()
+        after_read = os.fstat(descriptor)
     finally:
         os.close(descriptor)
-
-
-def _require_preimage(path: Path, expected: _Preimage) -> None:
-    if _capture_preimage(path) != expected:
+    try:
+        visible = os.stat(
+            target.name,
+            dir_fd=target.parent_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError as error:
         raise RefreshTransactionError(
-            f"generated artifact changed before replacement: {path}"
+            f"generated artifact changed while it was observed: {target.path}"
+        ) from error
+    identity = _metadata_identity(before)
+    if not (
+        identity
+        == _metadata_identity(opened)
+        == _metadata_identity(after_read)
+        == _metadata_identity(visible)
+    ):
+        raise RefreshTransactionError(
+            f"generated artifact changed while it was observed: {target.path}"
+        )
+    return _Preimage(content, stat.S_IMODE(opened.st_mode), identity)
+
+
+def _stage(
+    root: Path,
+    root_descriptor: int,
+    target: _Target,
+    *,
+    require_binding: bool = True,
+) -> _Staged:
+    if require_binding:
+        _require_parent_binding(root, root_descriptor, target)
+    descriptor = -1
+    temporary_name = ""
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    for _attempt in range(128):
+        temporary_name = f".{target.name}.{secrets.token_hex(16)}"
+        try:
+            descriptor = os.open(
+                temporary_name,
+                flags,
+                0o600,
+                dir_fd=target.parent_descriptor,
+            )
+        except FileExistsError:
+            continue
+        break
+    if descriptor < 0:
+        raise RefreshTransactionError(
+            f"generated artifact temporary file is unavailable: {target.path}"
+        )
+    try:
+        remaining = memoryview(target.content)
+        while remaining:
+            written = os.write(descriptor, remaining)
+            if written <= 0:
+                raise RefreshTransactionError(
+                    f"generated artifact staging failed: {target.path}"
+                )
+            remaining = remaining[written:]
+        os.fsync(descriptor)
+        os.fchmod(descriptor, target.mode)
+        os.fsync(descriptor)
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != target.mode
+        ):
+            raise RefreshTransactionError(
+                f"generated artifact staging identity is invalid: {target.path}"
+            )
+        identity = _metadata_identity(metadata)
+    except BaseException:
+        try:
+            try:
+                os.unlink(temporary_name, dir_fd=target.parent_descriptor)
+            except FileNotFoundError:
+                pass
+        finally:
+            os.close(descriptor)
+        raise
+    return _Staged(
+        target=target,
+        name=temporary_name,
+        path=root / target.relative.parent / temporary_name,
+        descriptor=descriptor,
+        identity=identity,
+    )
+
+
+def _require_staged(
+    root: Path,
+    root_descriptor: int,
+    staged: _Staged,
+) -> None:
+    target = staged.target
+    _require_parent_binding(root, root_descriptor, target)
+    try:
+        before = os.fstat(staged.descriptor)
+        os.lseek(staged.descriptor, 0, os.SEEK_SET)
+        chunks: list[bytes] = []
+        remaining = len(target.content)
+        while remaining:
+            chunk = os.read(staged.descriptor, min(remaining, 1024 * 1024))
+            if not chunk:
+                raise RefreshTransactionError(
+                    f"generated artifact staged file changed: {target.path}"
+                )
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(staged.descriptor, 1):
+            raise RefreshTransactionError(
+                f"generated artifact staged file changed: {target.path}"
+            )
+        after = os.fstat(staged.descriptor)
+        visible = os.stat(
+            staged.name,
+            dir_fd=target.parent_descriptor,
+            follow_symlinks=False,
+        )
+    except (OSError, FileNotFoundError) as error:
+        raise RefreshTransactionError(
+            f"generated artifact staged file changed: {target.path}"
+        ) from error
+    if not (
+        staged.identity
+        == _metadata_identity(before)
+        == _metadata_identity(after)
+        == _metadata_identity(visible)
+    ) or b"".join(chunks) != target.content:
+        raise RefreshTransactionError(
+            f"generated artifact staged file changed: {target.path}"
         )
 
 
-def _require_replacement(path: Path, content: bytes, mode: int) -> None:
-    if _capture_preimage(path) != _Preimage(content, mode):
+def _require_preimage(
+    root: Path,
+    root_descriptor: int,
+    target: _Target,
+    expected: _Preimage,
+) -> None:
+    if (
+        _capture_preimage(
+            root,
+            root_descriptor,
+            target,
+            require_binding=True,
+        )
+        != expected
+    ):
         raise RefreshTransactionError(
-            f"generated artifact replacement identity is invalid: {path}"
+            f"generated artifact changed before replacement: {target.path}"
+        )
+
+
+def _matches_content_and_mode(
+    observed: _Preimage,
+    content: bytes | None,
+    mode: int | None,
+) -> bool:
+    return observed.content == content and observed.mode == mode
+
+
+def _require_replacement(
+    root: Path,
+    root_descriptor: int,
+    target: _Target,
+    *,
+    require_binding: bool = True,
+) -> None:
+    observed = _capture_preimage(
+        root,
+        root_descriptor,
+        target,
+        require_binding=require_binding,
+    )
+    if not _matches_content_and_mode(observed, target.content, target.mode):
+        raise RefreshTransactionError(
+            f"generated artifact replacement identity is invalid: {target.path}"
+        )
+
+
+def _require_staged_replacement(
+    root: Path,
+    root_descriptor: int,
+    staged: _Staged,
+    *,
+    require_binding: bool,
+) -> None:
+    observed = _capture_preimage(
+        root,
+        root_descriptor,
+        staged.target,
+        require_binding=require_binding,
+    )
+    opened = os.fstat(staged.descriptor)
+    if (
+        observed.identity != _metadata_identity(opened)
+        or not _matches_content_and_mode(
+            observed,
+            staged.target.content,
+            staged.target.mode,
+        )
+    ):
+        raise RefreshTransactionError(
+            "generated artifact staged replacement identity is invalid: "
+            f"{staged.target.path}"
         )
 
 
 def _rollback(
-    committed: list[Path], preimages: Mapping[Path, _Preimage]
+    root: Path,
+    root_descriptor: int,
+    committed: list[_Staged],
+    preimages: Mapping[_Target, _Preimage],
 ) -> None:
-    rollback_temporaries: list[Path] = []
+    rollback_temporaries: list[_Staged] = []
     try:
-        for destination in reversed(committed):
-            preimage = preimages[destination]
+        for committed_stage in reversed(committed):
+            target = committed_stage.target
+            preimage = preimages[target]
+            _require_staged_replacement(
+                root,
+                root_descriptor,
+                committed_stage,
+                require_binding=False,
+            )
             if preimage.content is None:
-                try:
-                    destination.unlink()
-                except FileNotFoundError:
-                    pass
+                os.unlink(target.name, dir_fd=target.parent_descriptor)
             else:
                 assert preimage.mode is not None
+                rollback_target = _Target(
+                    path=target.path,
+                    relative=target.relative,
+                    parent_path=target.parent_path,
+                    parent_components=target.parent_components,
+                    name=target.name,
+                    parent_descriptor=target.parent_descriptor,
+                    content=preimage.content,
+                    mode=preimage.mode,
+                )
                 temporary = _stage(
-                    destination,
-                    preimage.content,
-                    preimage.mode,
+                    root,
+                    root_descriptor,
+                    rollback_target,
+                    require_binding=False,
                 )
                 rollback_temporaries.append(temporary)
-                os.replace(temporary, destination)
-            _fsync_directory(destination.parent)
-        for destination in committed:
-            _require_preimage(destination, preimages[destination])
+                os.replace(
+                    temporary.name,
+                    target.name,
+                    src_dir_fd=target.parent_descriptor,
+                    dst_dir_fd=target.parent_descriptor,
+                )
+                _require_staged_replacement(
+                    root,
+                    root_descriptor,
+                    temporary,
+                    require_binding=False,
+                )
+            os.fsync(target.parent_descriptor)
+        for committed_stage in committed:
+            target = committed_stage.target
+            observed = _capture_preimage(
+                root,
+                root_descriptor,
+                target,
+                require_binding=False,
+            )
+            preimage = preimages[target]
+            if not _matches_content_and_mode(
+                observed,
+                preimage.content,
+                preimage.mode,
+            ):
+                raise RefreshTransactionError(
+                    f"generated artifact rollback identity is invalid: {target.path}"
+                )
     except BaseException as error:
         raise RefreshTransactionError(
             "generated artifact rollback failed; changed generated paths may remain"
         ) from error
     finally:
+        cleanup_error: BaseException | None = None
         for temporary in rollback_temporaries:
             try:
-                temporary.unlink()
+                os.unlink(
+                    temporary.name,
+                    dir_fd=temporary.target.parent_descriptor,
+                )
             except FileNotFoundError:
                 pass
+            except BaseException as error:
+                if cleanup_error is None:
+                    cleanup_error = error
+            finally:
+                os.close(temporary.descriptor)
+        if cleanup_error is not None:
+            raise cleanup_error
 
 
 def replace_generated_artifacts(
+    repository_root: Path,
     replacements: Mapping[Path, tuple[bytes, int]],
     *,
     recheck: Callable[[frozenset[Path]], None],
@@ -281,44 +693,103 @@ def replace_generated_artifacts(
     if not replacements:
         raise RefreshTransactionError("generated artifact plan must not be empty")
     for destination, (content, mode) in replacements.items():
-        if not destination.is_absolute():
-            raise RefreshTransactionError(
-                f"generated artifact path must be absolute: {destination}"
-            )
         if not isinstance(content, bytes) or type(mode) is not int or mode < 0:
             raise RefreshTransactionError("generated artifact plan is invalid")
 
-    preimages = {
-        destination: _capture_preimage(destination) for destination in replacements
-    }
-    staged: dict[Path, Path] = {}
-    committed: list[Path] = []
+    root, root_descriptor, targets = _open_transaction(
+        repository_root,
+        replacements,
+    )
+    preimages: dict[_Target, _Preimage] = {}
+    staged: list[_Staged] = []
+    committed: list[_Staged] = []
     try:
-        for destination, (content, mode) in replacements.items():
-            staged[destination] = _stage(destination, content, mode)
-        temporary_paths = frozenset(staged.values())
+        for target in targets:
+            preimages[target] = _capture_preimage(
+                root,
+                root_descriptor,
+                target,
+                require_binding=True,
+            )
+        for target in targets:
+            _require_preimage(root, root_descriptor, target, preimages[target])
+        for target in targets:
+            staged.append(_stage(root, root_descriptor, target))
+        temporary_paths = frozenset(temporary.path for temporary in staged)
         try:
-            for destination, (content, mode) in replacements.items():
+            for temporary in staged:
+                target = temporary.target
                 recheck(temporary_paths)
-                _require_preimage(destination, preimages[destination])
+                _require_preimage(
+                    root,
+                    root_descriptor,
+                    target,
+                    preimages[target],
+                )
+                _require_staged(root, root_descriptor, temporary)
                 try:
-                    os.replace(staged[destination], destination)
+                    os.replace(
+                        temporary.name,
+                        target.name,
+                        src_dir_fd=target.parent_descriptor,
+                        dst_dir_fd=target.parent_descriptor,
+                    )
                 except BaseException:
-                    if _capture_preimage(destination) == _Preimage(content, mode):
-                        committed.append(destination)
+                    observed = _capture_preimage(
+                        root,
+                        root_descriptor,
+                        target,
+                        require_binding=False,
+                    )
+                    if _matches_content_and_mode(
+                        observed,
+                        target.content,
+                        target.mode,
+                    ) and observed.identity == _metadata_identity(
+                        os.fstat(temporary.descriptor)
+                    ):
+                        committed.append(temporary)
                     raise
-                committed.append(destination)
-                _fsync_directory(destination.parent)
-            for destination, (content, mode) in replacements.items():
-                _require_replacement(destination, content, mode)
+                committed.append(temporary)
+                os.fsync(target.parent_descriptor)
+                _require_parent_binding(root, root_descriptor, target)
+                _require_staged_replacement(
+                    root,
+                    root_descriptor,
+                    temporary,
+                    require_binding=True,
+                )
+            for temporary in staged:
+                _require_staged_replacement(
+                    root,
+                    root_descriptor,
+                    temporary,
+                    require_binding=True,
+                )
             verify()
         except BaseException:
             if committed:
-                _rollback(committed, preimages)
+                _rollback(root, root_descriptor, committed, preimages)
             raise
     finally:
-        for temporary in staged.values():
-            try:
-                temporary.unlink()
-            except FileNotFoundError:
-                pass
+        cleanup_error = None
+        try:
+            for temporary in staged:
+                try:
+                    os.unlink(
+                        temporary.name,
+                        dir_fd=temporary.target.parent_descriptor,
+                    )
+                except FileNotFoundError:
+                    pass
+                except BaseException as error:
+                    if cleanup_error is None:
+                        cleanup_error = error
+                finally:
+                    os.close(temporary.descriptor)
+        finally:
+            for target in targets:
+                os.close(target.parent_descriptor)
+            os.close(root_descriptor)
+        if cleanup_error is not None:
+            raise cleanup_error

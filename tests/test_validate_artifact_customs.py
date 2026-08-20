@@ -743,9 +743,13 @@ class ArtifactCustomsExactContractTests(unittest.TestCase):
         spec.loader.exec_module(validator)
         real_replace = validator.os.replace
 
-        def replace_then_drift(source: object, destination: object) -> None:
-            real_replace(source, destination)
-            if Path(destination) == lock_path:
+        def replace_then_drift(
+            source: object,
+            destination: object,
+            **kwargs: object,
+        ) -> None:
+            real_replace(source, destination, **kwargs)
+            if Path(destination).name == lock_path.name:
                 readme.write_text(
                     readme.read_text(encoding="utf-8")
                     + "\nConcurrent semantic change.\n",

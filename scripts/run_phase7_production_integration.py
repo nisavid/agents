@@ -35,7 +35,7 @@ from typing import Any
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 _RUNNING_AS_ENTRYPOINT = __name__ == "__main__"
-SOURCE_SHA256 = "8ab4fee6e5041c7838fcde794e125b37e3479a77c1536c9d063ae4d0644b599d"
+SOURCE_SHA256 = "642f4b3e0f4d418719ed998fafc19e320c829222427274e8a184081897fbcc30"
 PREPARED_SUPERVISOR_SOURCE_OPTION = "--prepared-supervisor-source-sha256"
 MAX_PROOF_SOURCE_BYTES = 2 * 1024 * 1024
 CANONICAL_REPOSITORY_URL = "https://github.com/nisavid/agents"
@@ -782,5 +782,15 @@ def main(arguments: list[str] | None = None) -> int:
     return 0
 
 
+def entrypoint_main() -> int:
+    if sys.argv[1:] in (["-h"], ["--help"]):
+        return main()
+    print(
+        "ERROR: Phase 7 production runtime is unavailable in this source-stage release",
+        file=sys.stderr,
+    )
+    return 1
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(entrypoint_main())

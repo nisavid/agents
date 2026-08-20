@@ -860,7 +860,7 @@ The immutable candidate owns
 
 It contains:
 
-- `schema_version` and `contract`;
+- `schema_version`, `contract`, and the current `runtime_status`;
 - one ordered, uniquely identified entry per suite or platform vertical;
 - one exact selector into a reviewed candidate-owned suite driver, with no
   inventory-selected script, module, executable, or shell interpolation;
@@ -888,16 +888,22 @@ counts freeze with the implementation bytes:
 15. `macos-acl`
 16. `linux-process-supervision`
 
-The root has exactly `schema_version`, `contract`, `entries`, and `aggregates`.
+The root has exactly `schema_version`, `contract`, `runtime_status`, `entries`,
+and `aggregates`.
 `schema_version` is integer `1`; `contract` is
-`task-witness-tw4-suite-inventory-v1`; `entries` is the exact 16-element
-ordered list; and `aggregates` has exactly `counts_sha256`, `entries_sha256`,
-`entry_count`, and `expected_count_total`. `entry_count` is integer `16`.
+`task-witness-tw4-suite-inventory-v1`; `runtime_status` is
+`retired-source-stage`; `entries` is the exact 16-element ordered source-design
+list; and `aggregates` has exactly `counts_sha256`, `entries_sha256`,
+`entry_count`, and `expected_count_total`. `entry_count` is integer `16`. The
+entry argv values are not current executable routes: the suite driver's real
+entrypoint fails closed before selector parsing until the later-release sandbox
+and review-authority dependencies exist.
 The runner exposes the pure public seam
 `parse_suite_inventory(value: object) -> dict[str, Any]` beside its existing
 platform-profile and runtime-closure parsers. Adding this parser does not make
-receipt publication reachable; `main()` stays at the explicit unsettled
-suite/receipt failure until every entry selector, count, and vertical freezes.
+receipt publication reachable; `main()` stays at the explicit source-stage
+retirement boundary until every later-release authority and sandbox dependency
+is supplied.
 
 Each entry has exactly these fields:
 

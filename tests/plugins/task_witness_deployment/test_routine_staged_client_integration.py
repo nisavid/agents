@@ -48,7 +48,7 @@ class RoutineStagedClientIntegrationTests(unittest.TestCase):
         self.assertEqual(client.installed_path.read_bytes(), client.raw)
         self.assertEqual(
             sha256(client.raw),
-            "0db397b5e2617ea06b696d36d9eb96a8795c4bb712592dcc28fab6a441ab98ca",
+            "2fabfdba708ea84c366b480c8a5d7aacf61706ba8e62e9cd97f2afe8dda87e9c",
         )
         self.assertEqual(launcher.installed_path.read_bytes(), launcher.raw)
         self.assertEqual(
@@ -142,7 +142,7 @@ class RoutineStagedClientIntegrationTests(unittest.TestCase):
         self.assertEqual(client.installed_path.read_bytes(), client.raw)
         self.assertEqual(
             sha256(client.raw),
-            "0db397b5e2617ea06b696d36d9eb96a8795c4bb712592dcc28fab6a441ab98ca",
+            "2fabfdba708ea84c366b480c8a5d7aacf61706ba8e62e9cd97f2afe8dda87e9c",
         )
         self.assertEqual(launcher.installed_path.read_bytes(), launcher.raw)
         self.assertEqual(

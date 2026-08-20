@@ -988,13 +988,20 @@ def parse_suite_inventory(value: object) -> dict[str, Any]:
 
     inventory = exact_object(
         value,
-        {"schema_version", "contract", "entries", "aggregates"},
+        {
+            "schema_version",
+            "contract",
+            "runtime_status",
+            "entries",
+            "aggregates",
+        },
         "suite inventory",
     )
     if (
         type(inventory["schema_version"]) is not int
         or inventory["schema_version"] != 1
         or inventory["contract"] != SUITE_INVENTORY_CONTRACT
+        or inventory["runtime_status"] != "retired-source-stage"
     ):
         raise QualificationError("suite inventory contract mismatch")
     entries = inventory["entries"]
@@ -3299,7 +3306,7 @@ def _candidate_required_raw(
         raise QualificationError(f"{label} is missing") from error
 
 
-def _candidate_derived_bridge_client(current: bytes) -> bytes:
+def _validate_candidate_current_client_boundary(current: bytes) -> None:
     profile = re.compile(rb'(?m)^CLIENT_RELEASE_PROFILE = "([a-z0-9-]+)"$')
     generation = re.compile(
         rb'(?m)^CLIENT_SOURCE_GENERATION_SHA256 = "([0-9a-f]{64})"$'
@@ -3307,15 +3314,14 @@ def _candidate_derived_bridge_client(current: bytes) -> bytes:
     profiles = list(profile.finditer(current))
     if len(profiles) != 1 or profiles[0].group(1) != b"tw4-current":
         raise QualificationError("candidate current client release profile disagrees")
-    start, end = profiles[0].span(1)
-    bridge = current[:start] + b"b1-transition" + current[end:]
-    generations = list(generation.finditer(bridge))
+    generations = list(generation.finditer(current))
     if len(generations) != 1:
         raise QualificationError("candidate current client identity disagrees")
     start, end = generations[0].span(1)
-    normalized = bridge[:start] + (b"0" * 64) + bridge[end:]
+    normalized = current[:start] + (b"0" * 64) + current[end:]
     digest = hashlib.sha256(normalized).hexdigest().encode("ascii")
-    return bridge[:start] + digest + bridge[end:]
+    if digest != generations[0].group(1):
+        raise QualificationError("candidate current client identity disagrees")
 
 
 def _walk_candidate_bridge_plugin(
@@ -3588,14 +3594,7 @@ def validate_bridge_history_evidence(
         f"{CANDIDATE_PLUGIN_ROOT}/client/task_witness_client.py",
         "candidate current client",
     )
-    if _candidate_derived_bridge_client(
-        current_client
-    ) != _candidate_bridge_source_bytes(
-        raw_files,
-        "bridge",
-        "client/task_witness_client.py",
-    ):
-        raise QualificationError("candidate bridge client derivation disagrees")
+    _validate_candidate_current_client_boundary(current_client)
     for generation in ("freeze5", "bridge"):
         directories, files = walked[generation]
         if set(files) != expected_files:
@@ -5637,7 +5636,9 @@ def execute_host_qualification(
         raise primary_error
 
 
-def main() -> int:
+def _retired_native_main() -> int:
+    """Retain the reviewed design for source-level validation only."""
+
     try:
         args = parse_args()
         receipt_output = cli_path_operand(
@@ -5705,6 +5706,16 @@ def main() -> int:
     except QualificationError as error:
         print(f"task-witness qualification: {error}", file=sys.stderr)
         return 1
+
+
+def main() -> int:
+    print(
+        "task-witness qualification: native qualification is unavailable in this "
+        "source-stage release; a host-owned content-pinned network-denied sandbox "
+        "and prior review authorization are required",
+        file=sys.stderr,
+    )
+    return 1
 
 
 if __name__ == "__main__":

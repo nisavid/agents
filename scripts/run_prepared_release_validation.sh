@@ -1,3 +1,5 @@
+#!/bin/sh
+
 set -eu
 umask 077
 
@@ -12,33 +14,17 @@ case "$0" in
 esac
 supervisor="$wrapper_directory/supervise_prepared_release_validation.py"
 
-if [ "$#" -lt 3 ]; then
-    fail 'usage: run_prepared_release_validation.sh MODE PREPARED_PYTHON REPOSITORY [ARGUMENT ...]'
+if [ "$#" -ne 3 ]; then
+    fail 'usage: run_prepared_release_validation.sh source-stage PREPARED_PYTHON REPOSITORY'
 fi
 
 mode=$1
 prepared_python=$2
 repository=$3
-shift 3
-
-case "$mode" in
-    public-release)
-        entrypoint='scripts/validate_public_release.py'
-        ;;
-    phase7-production)
-        entrypoint='scripts/run_phase7_production_integration.py'
-        for argument in "$@"; do
-            case "$argument" in
-                --public-root | --public-root=*)
-                    fail 'phase7-production receives --public-root from the entrypoint'
-                    ;;
-            esac
-        done
-        ;;
-    *)
-        fail 'mode must be public-release or phase7-production'
-        ;;
-esac
+if [ "$mode" != 'source-stage' ]; then
+    fail 'later-release prepared validation is unavailable in this source-stage release'
+fi
+entrypoint='scripts/validate_public_release.py'
 
 case "$prepared_python" in
     /*) ;;
@@ -70,4 +56,4 @@ exec /usr/bin/env -i \
     PATH=/usr/bin:/bin \
     TZ=UTC \
     "$prepared_python" -I -B "$supervisor" \
-    "$mode" "$repository" "$@"
+    "$mode" "$repository"

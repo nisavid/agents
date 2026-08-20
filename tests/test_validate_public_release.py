@@ -213,7 +213,7 @@ class PreparedReleaseCancellationFixture:
             [
                 "/bin/sh",
                 str(self.entrypoint),
-                "public-release",
+                "source-stage",
                 sys.executable,
                 str(self.repository),
             ],
@@ -2568,30 +2568,11 @@ class ValidatePublicReleaseTests(unittest.TestCase):
     ) -> None:
         for mode, script_name, expected_arguments in (
             (
-                "public-release",
+                "source-stage",
                 "validate_public_release.py",
                 lambda repository: [
                     str(repository),
-                    "--fixture",
-                    "public",
-                    "--prepared-supervisor-source-sha256",
-                    "sha256:"
-                    + hashlib.sha256(
-                        (
-                            repository
-                            / "scripts/supervise_prepared_release_validation.py"
-                        ).read_bytes()
-                    ).hexdigest(),
-                ],
-            ),
-            (
-                "phase7-production",
-                "run_phase7_production_integration.py",
-                lambda repository: [
-                    "--public-root",
-                    str(repository),
-                    "--fixture",
-                    "phase7",
+                    "--source-stage",
                     "--prepared-supervisor-source-sha256",
                     "sha256:"
                     + hashlib.sha256(
@@ -2672,8 +2653,6 @@ class ValidatePublicReleaseTests(unittest.TestCase):
                         mode,
                         sys.executable,
                         str(repository),
-                        "--fixture",
-                        "public" if mode == "public-release" else "phase7",
                     ],
                     capture_output=True,
                     env=hostile_environment,
@@ -2765,7 +2744,7 @@ class ValidatePublicReleaseTests(unittest.TestCase):
                 [
                     "/bin/sh",
                     str(PREPARED_RELEASE_ENTRYPOINT),
-                    "public-release",
+                    "source-stage",
                     sys.executable,
                     str(repository),
                 ],
@@ -2882,7 +2861,7 @@ class ValidatePublicReleaseTests(unittest.TestCase):
                 [
                     "/bin/sh",
                     str(entrypoint),
-                    "public-release",
+                    "source-stage",
                     sys.executable,
                     str(repository),
                 ],
@@ -2927,7 +2906,7 @@ class ValidatePublicReleaseTests(unittest.TestCase):
                     "-I",
                     "-B",
                     str(supervisor_path),
-                    "public-release",
+                    "source-stage",
                     str(repository),
                 ],
                 stdin=subprocess.DEVNULL,
@@ -3002,7 +2981,7 @@ class ValidatePublicReleaseTests(unittest.TestCase):
                     "-I",
                     "-B",
                     str(supervisor_path),
-                    "public-release",
+                    "source-stage",
                     str(repository),
                 ],
                 stdin=subprocess.DEVNULL,
@@ -3375,63 +3354,63 @@ class ValidatePublicReleaseTests(unittest.TestCase):
                     sys.executable,
                     str(repository),
                     (),
-                    "mode must be",
+                    "later-release prepared validation is unavailable",
                 ),
                 (
-                    "public-release",
+                    "source-stage",
                     "python",
                     str(repository),
                     (),
                     "absolute executable",
                 ),
                 (
-                    "public-release",
+                    "source-stage",
                     sys.executable,
                     "repository",
                     (),
                     "absolute directory",
                 ),
                 (
-                    "public-release",
+                    "source-stage",
                     str(root / "missing-python"),
                     str(repository),
                     (),
                     "absolute executable",
                 ),
                 (
-                    "public-release",
+                    "source-stage",
                     str(nonexecutable),
                     str(repository),
                     (),
                     "absolute executable",
                 ),
                 (
-                    "public-release",
+                    "source-stage",
                     sys.executable,
                     str(root / "missing-repository"),
                     (),
                     "absolute directory",
                 ),
                 (
+                    "public-release",
+                    sys.executable,
+                    str(repository),
+                    (),
+                    "later-release prepared validation is unavailable",
+                ),
+                (
                     "phase7-production",
                     sys.executable,
                     str(repository),
                     (),
-                    "selected release entrypoint is missing",
+                    "later-release prepared validation is unavailable",
                 ),
                 (
-                    "phase7-production",
+                    "source-stage",
                     sys.executable,
                     str(repository),
-                    ("--public-root", str(repository)),
-                    "receives --public-root",
-                ),
-                (
-                    "phase7-production",
-                    sys.executable,
-                    str(repository),
-                    (f"--public-root={repository}",),
-                    "receives --public-root",
+                    ("--private-evidence", "/private/owner-only/evidence"),
+                    "usage: run_prepared_release_validation.sh source-stage",
                 ),
             )
             for mode, prepared_python, candidate, arguments, expected_error in cases:
@@ -3533,18 +3512,24 @@ class ValidatePublicReleaseTests(unittest.TestCase):
                     )
                     self.assertFalse(marker.exists())
 
-    def test_readme_uses_only_the_prepared_release_entrypoint(self) -> None:
+    def test_readme_documents_only_the_source_stage_entrypoint(self) -> None:
         readme = (REPOSITORY / "README.md").read_text(encoding="utf-8")
         normalized_readme = " ".join(readme.split())
 
-        self.assertEqual(readme.count("run_prepared_release_validation.sh"), 2)
+        self.assertEqual(readme.count("run_prepared_release_validation.sh"), 1)
         self.assertIn(
             "/usr/bin/env -i LANG=C.UTF-8 LC_ALL=C.UTF-8 PATH=/usr/bin:/bin TZ=UTC /bin/sh",
             readme,
         )
-        self.assertIn("external trusted deployment TCB", readme)
-        self.assertIn("Dependency resolution, package provisioning", readme)
-        self.assertIn("Only an exact wrapper exit status of `0`", normalized_readme)
+        self.assertIn("external trusted deployment TCB", normalized_readme)
+        self.assertIn("source-stage validation only", readme)
+        self.assertIn(
+            "An exact wrapper exit status of `0` confirms only the source-stage checks",
+            normalized_readme,
+        )
+        self.assertIn("network-denied OS sandbox", readme)
+        self.assertNotIn("phase7-production", readme)
+        self.assertNotIn("--private-producer-witness", readme)
         self.assertNotIn("uv --no-config run", readme)
         self.assertNotIn("uv run --with PyYAML --with pytest", readme)
         self.assertIn(
@@ -3561,6 +3546,10 @@ class ValidatePublicReleaseTests(unittest.TestCase):
         )
         self.assertIn(
             "tests/test_agent_plugins_standard.py",
+            self.module.COMMON_SUPPORT_PATHS,
+        )
+        self.assertIn(
+            "tests/test_later_release_security_containment.py",
             self.module.COMMON_SUPPORT_PATHS,
         )
         self.assertIn(
@@ -3818,9 +3807,9 @@ class ValidatePublicReleaseTests(unittest.TestCase):
             check=False,
         )
 
-        self.assertEqual(completed.returncode, 2)
+        self.assertEqual(completed.returncode, 1)
         self.assertIn(
-            "unrecognized arguments: --task-witness-candidate",
+            "Public-release native validation is unavailable",
             completed.stderr,
         )
 
@@ -3878,9 +3867,9 @@ class ValidatePublicReleaseTests(unittest.TestCase):
             check=False,
         )
 
-        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.returncode, 1)
         self.assertEqual(result.stdout, "")
-        self.assertIn("unrecognized arguments: --source", result.stderr)
+        self.assertIn("Public-release native validation is unavailable", result.stderr)
 
     def test_prepared_release_rejects_abbreviated_source_stage_option(
         self,
@@ -3889,7 +3878,7 @@ class ValidatePublicReleaseTests(unittest.TestCase):
             [
                 "/bin/sh",
                 str(self.repository / "scripts" / PREPARED_RELEASE_ENTRYPOINT.name),
-                "public-release",
+                "source-stage",
                 sys.executable,
                 str(self.repository),
                 "--source",
@@ -3901,7 +3890,10 @@ class ValidatePublicReleaseTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 2)
         self.assertEqual(result.stdout, "")
-        self.assertIn("unrecognized arguments: --source", result.stderr)
+        self.assertIn(
+            "usage: run_prepared_release_validation.sh source-stage",
+            result.stderr,
+        )
 
     def test_cli_refuses_receipt_output_in_source_stage(self) -> None:
         with (
@@ -4532,7 +4524,7 @@ class ValidatePublicReleaseTests(unittest.TestCase):
             ("rolecasting", "versionkeeping", "mergecraft", "tricritical"),
         )
 
-    def test_root_readme_release_command_matches_the_v4_parser_contract(self) -> None:
+    def test_root_readme_withholds_retired_release_arguments(self) -> None:
         readme = (REPOSITORY / "README.md").read_text(encoding="utf-8")
         required = {
             "--routing-evidence",
@@ -4559,8 +4551,9 @@ class ValidatePublicReleaseTests(unittest.TestCase):
             and node.args[0].value.startswith("--")
         }
         self.assertTrue(required.issubset(parser_options))
-        self.assertTrue(required.issubset(documented))
-        self.assertTrue(documented.intersection(required).issubset(parser_options))
+        self.assertTrue(required.isdisjoint(documented))
+        self.assertIn("source-stage validation only", readme)
+        self.assertIn("private evidence pathnames", readme)
         self.assertFalse(
             {
                 "--private-receipt",

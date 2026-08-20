@@ -56,7 +56,7 @@ STAGED_DEPLOYMENT_CONTRACT = "task-witness-staged-deployment-v1"
 TRUST_CONTEXT_CONTRACT = "task-witness-trust-context-v2"
 VALIDATOR_ARTIFACT_MANIFEST_CONTRACT = "task-witness-validator-artifact-manifest-v1"
 # fmt: off
-CLIENT_SOURCE_GENERATION_SHA256 = "666370a435a0fa4cc51137c6843c26f0481631b39766d676826e3b199d9e4702"
+CLIENT_SOURCE_GENERATION_SHA256 = "ebef8fa79ba9491fbe24f8691f6e542699b3dd43ddc93236f208bd4f239ab936"
 # fmt: on
 CLIENT_RELEASE_PROFILE = "tw4-current"
 FREEZE5_COMMIT_SHA1 = "96608a9b91d4dcf3f468a4fab1f0e008c9c32b36"
@@ -8943,8 +8943,12 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+def entrypoint_main() -> int:
+    return EXIT_INSTALLATION
+
+
 def _main_no_return() -> NoReturn:
-    os._exit(main())
+    os._exit(entrypoint_main())
 
 
 if __name__ == "__main__":

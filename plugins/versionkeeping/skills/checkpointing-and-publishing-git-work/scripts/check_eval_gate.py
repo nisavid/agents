@@ -517,6 +517,8 @@ def validate_provider_stream(
     expected_result: str | None,
     expected_init_stream: dict[str, Any] | None,
     expected_grades: list[dict[str, Any]] | None = None,
+    *,
+    expected_credential_source: str | None = None,
 ) -> dict[str, Any]:
     events = read_json_lines(path, f"{location} raw transport")
     results = [event for event in events if event.get("type") == "result"]
@@ -565,6 +567,11 @@ def validate_provider_stream(
         init.get("model") == expected_model,
         f"{location} raw init does not bind observed model",
     )
+    if expected_credential_source is not None:
+        require(
+            init.get("apiKeySource") == expected_credential_source,
+            f"{location} raw init credential provenance drift",
+        )
     unknown_init_keys = set(init) - set(CAPABILITY_KEYS) - INIT_METADATA_KEYS
     require(
         not unknown_init_keys,
@@ -908,6 +915,8 @@ def validate_config(document: Any, kind: str) -> str:
     }
     expected_fields = base_fields | {
         "adapter",
+        "provider_execution_policy",
+        "provider_policy_sha256",
         "runtime",
         "system_prompt",
         "system_prompt_sha256",
@@ -948,6 +957,19 @@ def validate_config(document: Any, kind: str) -> str:
         ),
         f"{kind} runtime identity is invalid",
     )
+    provider_policy = document["provider_execution_policy"]
+    provider_policy_sha256 = document["provider_policy_sha256"]
+    require(
+        (
+            provider_policy is None
+            and provider_policy_sha256 is None
+        )
+        or (
+            isinstance(provider_policy, dict)
+            and provider_policy_sha256 == canonical_digest(provider_policy)
+        ),
+        f"{kind} provider execution policy identity is invalid",
+    )
     require(
         document["transport"]
         == {
@@ -966,7 +988,86 @@ def validate_config(document: Any, kind: str) -> str:
     return expected_digest
 
 
+def config_provider_credential_source(config: dict[str, Any]) -> str | None:
+    policy = config["provider_execution_policy"]
+    return None if policy is None else policy["credential"]["provider_init_source"]
+
+
 def validate_production_config(config_name: str, config: dict[str, Any]) -> None:
+    expected_policy = {
+        "credential": {
+            "inherited_descriptor": 9,
+            "mechanism": "anthropic-api-key-fd",
+            "provider_init_source": "ANTHROPIC_API_KEY",
+        },
+        "endpoint": {
+            "base_url": "provider-default",
+            "policy": "anthropic-public-api",
+            "proxy_inputs": "denied",
+        },
+        "environment": {
+            "allowed_keys": sorted(
+                {
+                    "HOME",
+                    "CLAUDE_CONFIG_DIR",
+                    "XDG_CONFIG_HOME",
+                    "XDG_CACHE_HOME",
+                    "XDG_DATA_HOME",
+                    "XDG_STATE_HOME",
+                    "TMPDIR",
+                    "TMP",
+                    "TEMP",
+                    "ANTHROPIC_API_KEY",
+                    "CLAUDE_CODE_DISABLE_BUNDLED_SKILLS",
+                    "CLAUDE_CODE_DISABLE_CLAUDE_MDS",
+                    "LANG",
+                    "LC_ALL",
+                    "PATH",
+                    "PYTHONDONTWRITEBYTECODE",
+                    "PYTHONNOUSERSITE",
+                    "TZ",
+                }
+            ),
+            "fresh_root_keys": [
+                "HOME",
+                "CLAUDE_CONFIG_DIR",
+                "XDG_CONFIG_HOME",
+                "XDG_CACHE_HOME",
+                "XDG_DATA_HOME",
+                "XDG_STATE_HOME",
+                "TMPDIR",
+                "TMP",
+                "TEMP",
+            ],
+            "inheritance": "none",
+        },
+        "runtime_probe": {
+            "allowed_keys": sorted(
+                {
+                    "HOME",
+                    "CLAUDE_CONFIG_DIR",
+                    "XDG_CONFIG_HOME",
+                    "XDG_CACHE_HOME",
+                    "XDG_DATA_HOME",
+                    "XDG_STATE_HOME",
+                    "TMPDIR",
+                    "TMP",
+                    "TEMP",
+                    "CLAUDE_CODE_DISABLE_BUNDLED_SKILLS",
+                    "CLAUDE_CODE_DISABLE_CLAUDE_MDS",
+                    "LANG",
+                    "LC_ALL",
+                    "PATH",
+                    "PYTHONDONTWRITEBYTECODE",
+                    "PYTHONNOUSERSITE",
+                    "TZ",
+                }
+            ),
+            "executable_selection": "absolute-resolved-path",
+            "inheritance": "none",
+        },
+        "schema_version": 1,
+    }
     require(
         config["model"] == config["model_version"]
         and EXACT_CLAUDE_MODEL.fullmatch(config["model"]),
@@ -979,6 +1080,8 @@ def validate_production_config(config_name: str, config: dict[str, Any]) -> None
             "config_sha256",
             "model",
             "model_version",
+            "provider_execution_policy",
+            "provider_policy_sha256",
             "reasoning_effort",
             "runtime",
             "system_prompt",
@@ -987,6 +1090,8 @@ def validate_production_config(config_name: str, config: dict[str, Any]) -> None
         }
         and config["adapter"] == "claude-cli"
         and config["runtime"] is not None
+        and config["provider_execution_policy"] == expected_policy
+        and config["provider_policy_sha256"] == canonical_digest(expected_policy)
         and config["transport"]
         == {
             "allowed": True,
@@ -1612,6 +1717,7 @@ def validate_attempt_history(
     winning_started_at: str,
     winning_finished_at: str,
     location: str,
+    expected_credential_source: str | None,
 ) -> None:
     """Validate every discovered durable transport attempt for one coordinate."""
     require(
@@ -1664,17 +1770,22 @@ def validate_attempt_history(
         "response_sha256",
         "session_id",
         "session_id_sha256",
+        "stderr_artifact_relpath",
+        "stderr_sha256",
         "transport_artifact_relpath",
         "transport_sha256",
     }
     failed_fields = base_fields | {
         "error",
+        "failure_identity",
         "provider_events",
         "provider_identity",
+        "returncode",
         "stderr_artifact_relpath",
         "stderr_sha256",
         "stdout_artifact_relpath",
         "stdout_sha256",
+        "timed_out",
     }
     for path_value in history:
         path = resolve_relative_regular_file(
@@ -1845,6 +1956,15 @@ def validate_attempt_history(
                     document["transport_sha256"] == file_digest(attempt_transport_path),
                     f"{location} completed attempt transport digest mismatch",
                 )
+                attempt_stderr_path = resolve_relative_regular_file(
+                    artifact_root,
+                    document["stderr_artifact_relpath"],
+                    f"{location} completed attempt stderr path is invalid",
+                )
+                require(
+                    document["stderr_sha256"] == file_digest(attempt_stderr_path),
+                    f"{location} completed attempt stderr digest mismatch",
+                )
                 try:
                     attempt_response_text = attempt_response.decode()
                 except UnicodeDecodeError as error:
@@ -1862,6 +1982,7 @@ def validate_attempt_history(
                     f"{location} completed attempt {attempt_id}",
                     attempt_response_text,
                     init_stream,
+                    expected_credential_source=expected_credential_source,
                 )
             else:
                 require(
@@ -1883,10 +2004,40 @@ def validate_attempt_history(
                     f"{location} failed attempt stderr path is invalid",
                 )
                 stdout = stdout_path.read_bytes()
+                stderr = stderr_path.read_bytes()
+                expected_classification = (
+                    "provider-transport-timeout"
+                    if status == "timeout"
+                    else "provider-transport-failure"
+                )
                 require(
                     document["stdout_sha256"] == bytes_digest(stdout)
-                    and document["stderr_sha256"] == file_digest(stderr_path),
+                    and document["stderr_sha256"] == bytes_digest(stderr),
                     f"{location} failed attempt raw artifact digest mismatch",
+                )
+                require(
+                    document["failure_identity"]
+                    == {
+                        "classification": expected_classification,
+                        "returncode": document["returncode"],
+                        "role": kind,
+                        "stderr": {
+                            "byte_count": len(stderr),
+                            "sha256": bytes_digest(stderr),
+                        },
+                        "stdout": {
+                            "byte_count": len(stdout),
+                            "sha256": bytes_digest(stdout),
+                        },
+                        "timed_out": status == "timeout",
+                    }
+                    and (
+                        document["returncode"] is None
+                        or type(document["returncode"]) is int
+                    )
+                    and type(document["timed_out"]) is bool
+                    and document["timed_out"] == (status == "timeout"),
+                    f"{location} failed attempt safe identity drift",
                 )
                 events = parse_provider_failure_events(stdout)
                 require(
@@ -2603,6 +2754,7 @@ def validate_evidence(
                 run["started_at"],
                 run["finished_at"],
                 f"executor {run_id}",
+                config_provider_credential_source(evidence["executor_config"]),
             )
             request_bytes = resolve_relative_regular_file(
                 artifact_root,
@@ -2680,6 +2832,9 @@ def validate_evidence(
                 f"executor {run_id}",
                 response_text,
                 raw_attestation.get("init_stream"),
+                expected_credential_source=config_provider_credential_source(
+                    evidence["executor_config"]
+                ),
             )
         elif production:
             raise MalformedInput(
@@ -3078,6 +3233,7 @@ def validate_evidence(
                 batch["started_at"],
                 batch["finished_at"],
                 f"grader {scenario_id}",
+                config_provider_credential_source(evidence["grader_config"]),
             )
             transport = resolve_relative_regular_file(
                 artifact_root,
@@ -3092,6 +3248,9 @@ def validate_evidence(
                 None,
                 None,
                 raw_grades,
+                expected_credential_source=config_provider_credential_source(
+                    evidence["grader_config"]
+                ),
             )
         elif production:
             raise MalformedInput(
@@ -3630,6 +3789,9 @@ def validate_evidence(
                         old["started_at"],
                         old["finished_at"],
                         f"superseded executor {old['id']}",
+                        config_provider_credential_source(
+                            evidence["executor_config"]
+                        ),
                     )
                     validate_identity_hashes(
                         old,
@@ -3675,6 +3837,9 @@ def validate_evidence(
                         f"superseded executor {old['id']}",
                         response_path.read_bytes().decode(),
                         retained_attestation.get("init_stream"),
+                        expected_credential_source=config_provider_credential_source(
+                            evidence["executor_config"]
+                        ),
                     )
                     coordinate = (scenario_id, condition, repetition)
                     require(
@@ -3983,6 +4148,7 @@ def validate_evidence(
                     document["started_at"],
                     document["finished_at"],
                     f"superseded grader {scenario_id}",
+                    config_provider_credential_source(evidence["grader_config"]),
                 )
                 validate_identity_hashes(
                     document,
@@ -4014,6 +4180,9 @@ def validate_evidence(
                     None,
                     None,
                     document["grades"],
+                    expected_credential_source=config_provider_credential_source(
+                        evidence["grader_config"]
+                    ),
                 )
             current_by_coordinate = {
                 (run["scenario_id"], run["condition"], run["repetition"]): run

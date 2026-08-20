@@ -720,7 +720,7 @@ class InvocationProfileTests(_TaskWitnessClientTestCase):
         self.assertFalse(post_main_callback_marker.exists())
         if sys.version_info[:2] == (3, 13):
             self.assertTrue(callback_armed_marker.exists())
-            self.assertTrue(main_returned_marker.exists())
+            self.assertFalse(main_returned_marker.exists())
             self.assertEqual(result.returncode, 70, result.stderr.decode())
             self.assertEqual(result.stdout, b"")
             self.assertEqual(result.stderr, b"")

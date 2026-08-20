@@ -64,32 +64,28 @@ def install_clean_public_candidate(source: Path, destination: Path) -> None:
 
 
 class Phase7ProductionIntegrationTests(unittest.TestCase):
-    def test_readme_documents_the_pinned_node_release_contract(self) -> None:
-        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    def test_readme_documents_source_stage_containment(self) -> None:
+        readme = " ".join(
+            (REPO_ROOT / "README.md").read_text(encoding="utf-8").split()
+        )
 
         for required in (
             "scripts/run_prepared_release_validation.sh",
             "public-release",
-            "phase7-production",
+            "source-stage",
             "/absolute/path/to/qualified/cpython",
-            "--node /absolute/path/to/physical/node",
-            "fixed system search path",
-            "resolved physical executable",
-            "main executable bytes and version",
-            "dynamic-loader or shared-library bytes",
-            "undetectable ABA swap",
-            "pathname-resolution boundary is not bound",
-            "--node-executable /absolute/path/to/physical/node",
-            "--expected-public-candidate-sha256 '<bare-64-hex-digest>'",
-            "--public-candidate-sha256 '<bare-64-hex-digest>'",
+            "network-denied OS sandbox",
+            "opaque inherited handles",
+            "managed signing-key custody",
+            "production_eligible: false",
         ):
             self.assertIn(required, readme)
-        self.assertEqual(readme.count("run_prepared_release_validation.sh"), 2)
+        self.assertEqual(readme.count("run_prepared_release_validation.sh"), 1)
+        self.assertNotIn("phase7-production", readme)
+        self.assertNotIn("--node-executable", readme)
         self.assertNotIn("scripts/run_phase7_production_integration.py", readme)
         self.assertNotIn("uv --no-config run", readme)
         self.assertNotIn("uv run --with PyYAML --with pytest", readme)
-        self.assertNotIn("--expected-public-candidate-sha256 'sha256:<digest>'", readme)
-        self.assertNotIn("--public-candidate-sha256 'sha256:<digest>'", readme)
 
     def test_public_candidate_identity_uses_bare_lowercase_sha256(self) -> None:
         coordinator = load_coordinator()

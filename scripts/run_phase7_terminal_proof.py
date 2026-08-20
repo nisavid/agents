@@ -298,5 +298,15 @@ def main(arguments: list[str] | None = None) -> int:
     return 0
 
 
+def entrypoint_main() -> int:
+    if sys.argv[1:] in (["-h"], ["--help"]):
+        return main()
+    print(
+        "ERROR: Phase 7 terminal runtime is unavailable in this source-stage release",
+        file=sys.stderr,
+    )
+    return 1
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(entrypoint_main())

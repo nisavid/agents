@@ -980,9 +980,11 @@ def _settle(
         time.sleep(min(0.01, remaining))
 
 
-def _supervised_process(
+def _retired_supervised_process(
     observation: object, bundle_root: Path
 ) -> tuple[int, bytes, bytes]:
+    # Retained for source-stage design validation only. The current-version
+    # boundary below never selects this implementation.
     if (
         type(observation) is not _AuthenticatedFrontDoorObservation
         or observation.capability is not _FRONT_DOOR_CALL_CAPABILITY
@@ -1100,9 +1102,22 @@ def _supervised_process(
                 )
 
 
-def _invoke_task_witness(bundle_root: Path) -> bytes:
+def _supervised_process(
+    observation: object, bundle_root: Path
+) -> tuple[int, bytes, bytes]:
+    raise PublicationError(
+        "canonical Task Witness native validation is unavailable in this "
+        "source-stage release"
+    )
+
+
+def _retired_invoke_task_witness(bundle_root: Path) -> bytes:
+    # Retained for source-stage design validation only. The current-version
+    # boundary below never selects this implementation.
     with _authenticated_front_door() as observation:
-        status, stdout, stderr = _supervised_process(observation, bundle_root)
+        status, stdout, stderr = _retired_supervised_process(
+            observation, bundle_root
+        )
         if status != 0 or stderr:
             raise PublicationError("canonical Task Witness validation did not succeed")
         envelope = _strict_envelope(stdout)
@@ -1113,6 +1128,13 @@ def _invoke_task_witness(bundle_root: Path) -> bytes:
         ):
             raise PublicationError("canonical Task Witness envelope framing drift")
     return stdout
+
+
+def _invoke_task_witness(bundle_root: Path) -> bytes:
+    raise PublicationError(
+        "canonical Task Witness native validation is unavailable in this "
+        "source-stage release"
+    )
 
 
 def _strict_envelope(raw: bytes) -> dict[str, Any]:

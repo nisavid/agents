@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 import sys
 import tempfile
@@ -567,6 +569,154 @@ class ArtifactCustomsBehaviorEvalTests(unittest.TestCase):
                     role="grader",
                     model="bounded-model",
                 )
+
+    def test_provider_stderr_is_private_attempt_evidence_not_a_public_error(
+        self,
+    ) -> None:
+        runner = load_runner()
+        secret_stderr = b"owner-only-provider-diagnostic:\xff\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            adapter = root / "adapter.py"
+            adapter.write_text(
+                textwrap.dedent(
+                    """
+                    import sys
+
+                    sys.stdout.buffer.write(b"partial provider output")
+                    sys.stderr.buffer.write(b"owner-only-provider-diagnostic:\\xff\\n")
+                    raise SystemExit(23)
+                    """
+                )
+            )
+            output = root / "evidence.json"
+            public_stderr = io.StringIO()
+
+            with contextlib.redirect_stderr(public_stderr):
+                status = runner.main(
+                    [
+                        "--scenario",
+                        "policy-revoked-before-write",
+                        "--adapter",
+                        "provider",
+                        "--provider-command",
+                        f"{sys.executable} {adapter} --model {{model}}",
+                        "--provider-model",
+                        "executor-model",
+                        "--grader-command",
+                        f"{sys.executable} {adapter} --model {{model}}",
+                        "--grader-model",
+                        "grader-model",
+                        "--output",
+                        str(output),
+                    ]
+                )
+
+            self.assertEqual(status, 2)
+            self.assertFalse(output.exists())
+            self.assertNotIn("owner-only-provider-diagnostic", public_stderr.getvalue())
+            attempt_root = root / ".evidence.json.provider-attempts"
+            journals = list(attempt_root.glob("attempts/*.json"))
+            self.assertEqual(len(journals), 1)
+            journal = json.loads(journals[0].read_text())
+            self.assertNotIn("owner-only-provider-diagnostic", json.dumps(journal))
+            self.assertEqual(journal["status"], "failed")
+            self.assertEqual(journal["returncode"], 23)
+            stderr_path = attempt_root / journal["stderr_relpath"]
+            stdout_path = attempt_root / journal["stdout_relpath"]
+            self.assertEqual(stderr_path.read_bytes(), secret_stderr)
+            self.assertEqual(stdout_path.read_bytes(), b"partial provider output")
+            self.assertEqual(stderr_path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(stdout_path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(journals[0].stat().st_mode & 0o777, 0o600)
+            self.assertEqual(attempt_root.stat().st_mode & 0o777, 0o700)
+
+    def test_malformed_success_is_failed_attempt_with_private_raw_streams(
+        self,
+    ) -> None:
+        runner = load_runner()
+        secret_stderr = b"owner-only-malformed-success:\xff\n"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            executor = root / "executor.py"
+            executor.write_text("import sys\nsys.stdout.write('safe response')\n")
+            grader = root / "grader.py"
+            grader.write_text(
+                "import sys\n"
+                "sys.stdout.write('{\"passed\":\"true\",\"failures\":[]}')\n"
+                "sys.stderr.buffer.write(b'owner-only-malformed-success:\\xff\\n')\n"
+            )
+            output = root / "evidence.json"
+
+            status = runner.main(
+                [
+                    "--scenario",
+                    "policy-revoked-before-write",
+                    "--adapter",
+                    "provider",
+                    "--provider-command",
+                    f"{sys.executable} {executor} --model {{model}}",
+                    "--provider-model",
+                    "executor-model",
+                    "--grader-command",
+                    f"{sys.executable} {grader} --model {{model}}",
+                    "--grader-model",
+                    "grader-model",
+                    "--output",
+                    str(output),
+                ]
+            )
+
+            self.assertEqual(status, 2)
+            attempt_root = root / ".evidence.json.provider-attempts"
+            journals = [
+                json.loads(path.read_text())
+                for path in attempt_root.glob("attempts/*.json")
+            ]
+            grader_journal = next(
+                journal for journal in journals if journal["role"] == "grader"
+            )
+            self.assertEqual(grader_journal["status"], "failed")
+            self.assertNotIn(
+                "owner-only-malformed-success", json.dumps(grader_journal)
+            )
+            self.assertEqual(
+                (attempt_root / grader_journal["stderr_relpath"]).read_bytes(),
+                secret_stderr,
+            )
+
+    def test_runtime_drift_is_failed_attempt_with_retained_streams(self) -> None:
+        runner = load_runner()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            adapter = root / "drifting-adapter.py"
+            adapter.write_text(
+                "from pathlib import Path\n"
+                "import sys\n"
+                "Path(__file__).write_text('# changed during execution\\n')\n"
+                "sys.stdout.write('observed-before-drift')\n"
+            )
+            attempt_root = root / "attempts"
+
+            with self.assertRaisesRegex(
+                runner.TransportFailure, "adapter file changed"
+            ):
+                runner.run_isolated_adapter(
+                    f"{sys.executable} {adapter} --model {{model}}",
+                    b"{}",
+                    role="executor",
+                    model="bounded-model",
+                    attempt_root=attempt_root,
+                )
+
+            journal = json.loads(
+                next(attempt_root.glob("attempts/*.json")).read_text()
+            )
+            self.assertEqual(journal["status"], "failed")
+            self.assertEqual(
+                (attempt_root / journal["stdout_relpath"]).read_bytes(),
+                b"observed-before-drift",
+            )
 
     def test_malformed_provider_verdict_returns_nonzero(self) -> None:
         runner = load_runner()

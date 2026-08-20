@@ -44,9 +44,10 @@ from evidence_transport import (  # noqa: E402
     private_atomic_write,
     prepare_private_directory,
     read_strict_json,
-    resolve_executable_identity,
     resolved_path_is_within,
     run_attempt_journal,
+    safe_provider_failure_identity,
+    safe_provider_failure_message,
     safe_regular_file,
     safe_relative_path,
     strict_json_bytes,
@@ -177,12 +178,108 @@ def timestamp_after(value: str) -> str:
 
 
 def resolve_claude_runtime_identity(executable: str) -> dict[str, Any]:
-    """Resolve and attest the exact Claude CLI bytes that will execute a call."""
-    return resolve_executable_identity(
-        executable,
-        error_factory=EvaluationError,
-        display_name="Claude CLI",
-    )
+    """Attest one explicit Claude CLI under a fresh, closed probe environment."""
+
+    if not isinstance(executable, str) or not os.path.isabs(executable):
+        raise EvaluationError("Claude CLI executable must be an absolute path")
+    try:
+        resolved = Path(executable).resolve(strict=True)
+    except OSError as error:
+        raise EvaluationError("Claude CLI executable cannot be resolved") from error
+    if not resolved.is_file() or not os.access(resolved, os.X_OK):
+        raise EvaluationError("Claude CLI executable is not executable")
+    with tempfile.TemporaryDirectory(prefix="control-plane-runtime-probe-") as temporary:
+        isolation_root = Path(temporary).resolve()
+        os.chmod(isolation_root, 0o700)
+        work = isolation_root / "work"
+        prepare_private_directory(work, error_factory=EvaluationError)
+        environment = _claude_closed_environment(
+            resolved, isolation_root, anthropic_api_key=None
+        )
+        try:
+            completed = subprocess.run(
+                [str(resolved), "--version"],
+                cwd=work,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise EvaluationError("Claude CLI version probe failed") from error
+    if completed.returncode != 0:
+        raise EvaluationError("Claude CLI version probe failed")
+    try:
+        version = completed.stdout.decode("utf-8", errors="strict").strip()
+    except UnicodeDecodeError as error:
+        raise EvaluationError("Claude CLI version identity is not UTF-8") from error
+    if not version or "\n" in version:
+        raise EvaluationError("Claude CLI version identity is invalid")
+    return {
+        "path": str(resolved),
+        "sha256": digest_bytes(resolved.read_bytes()),
+        "version": version,
+    }
+
+
+def read_anthropic_api_key_from_descriptor() -> str:
+    """Read one bounded API key from the host-owned fixed inherited descriptor."""
+
+    try:
+        descriptor = os.dup(ANTHROPIC_API_KEY_DESCRIPTOR)
+    except OSError as error:
+        raise EvaluationError(
+            f"credential descriptor {ANTHROPIC_API_KEY_DESCRIPTOR} is unavailable"
+        ) from error
+    try:
+        os.set_inheritable(descriptor, False)
+        credential = os.read(descriptor, MAX_ANTHROPIC_API_KEY_BYTES + 1)
+    except OSError as error:
+        raise EvaluationError("credential descriptor could not be read") from error
+    finally:
+        os.close(descriptor)
+    if not credential or len(credential) > MAX_ANTHROPIC_API_KEY_BYTES:
+        raise EvaluationError("credential descriptor content is empty or oversized")
+    if any(byte < 0x21 or byte > 0x7E for byte in credential):
+        raise EvaluationError("credential descriptor content is not visible ASCII")
+    try:
+        return credential.decode("ascii")
+    except UnicodeDecodeError as error:
+        raise EvaluationError("credential descriptor content is not ASCII") from error
+
+
+def claude_provider_policy_document(
+    credential_mechanism: str, endpoint_policy: str
+) -> dict[str, Any]:
+    if credential_mechanism != "anthropic-api-key-fd":
+        raise EvaluationError("Claude credential mechanism is not reviewed")
+    if endpoint_policy != "anthropic-public-api":
+        raise EvaluationError("Claude endpoint policy is not reviewed")
+    return {
+        "credential": {
+            "inherited_descriptor": ANTHROPIC_API_KEY_DESCRIPTOR,
+            "mechanism": credential_mechanism,
+            "provider_init_source": "ANTHROPIC_API_KEY",
+        },
+        "endpoint": {
+            "base_url": "provider-default",
+            "policy": endpoint_policy,
+            "proxy_inputs": "denied",
+        },
+        "environment": {
+            "allowed_keys": list(CLAUDE_PROVIDER_ENVIRONMENT_KEYS),
+            "fresh_root_keys": list(CLAUDE_PROVIDER_FRESH_ROOT_KEYS),
+            "inheritance": "none",
+        },
+        "runtime_probe": {
+            "allowed_keys": list(CLAUDE_PROVIDER_PROBE_ENVIRONMENT_KEYS),
+            "executable_selection": "absolute-resolved-path",
+            "inheritance": "none",
+        },
+        "schema_version": 1,
+    }
 
 
 def safe_relative(value: str) -> PurePosixPath:
@@ -310,6 +407,7 @@ class TransportResult:
     finished_at: str
     init_stream: dict[str, list[Any]]
     raw_transport: bytes
+    raw_stderr: bytes
 
 
 # This is the complete capability surface reported by the current Claude CLI
@@ -334,6 +432,81 @@ MODEL_ACCESS_CAPABILITY_KEYS = (
     "tools",
 )
 REVIEWED_BUILTIN_AGENTS = frozenset(("claude", "Explore", "general-purpose", "Plan"))
+ANTHROPIC_API_KEY_DESCRIPTOR = 9
+MAX_ANTHROPIC_API_KEY_BYTES = 512
+CLAUDE_PROVIDER_FRESH_ROOT_KEYS = (
+    "HOME",
+    "CLAUDE_CONFIG_DIR",
+    "XDG_CONFIG_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+)
+CLAUDE_PROVIDER_ENVIRONMENT_KEYS = tuple(
+    sorted(
+        {
+            *CLAUDE_PROVIDER_FRESH_ROOT_KEYS,
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CODE_DISABLE_BUNDLED_SKILLS",
+            "CLAUDE_CODE_DISABLE_CLAUDE_MDS",
+            "LANG",
+            "LC_ALL",
+            "PATH",
+            "PYTHONDONTWRITEBYTECODE",
+            "PYTHONNOUSERSITE",
+            "TZ",
+        }
+    )
+)
+CLAUDE_PROVIDER_PROBE_ENVIRONMENT_KEYS = tuple(
+    key for key in CLAUDE_PROVIDER_ENVIRONMENT_KEYS if key != "ANTHROPIC_API_KEY"
+)
+
+
+def _claude_closed_environment(
+    executable: Path,
+    isolation_root: Path,
+    *,
+    anthropic_api_key: str | None,
+) -> dict[str, str]:
+    directories = {
+        "HOME": isolation_root / "home",
+        "CLAUDE_CONFIG_DIR": isolation_root / "claude-config",
+        "XDG_CONFIG_HOME": isolation_root / "xdg-config",
+        "XDG_CACHE_HOME": isolation_root / "xdg-cache",
+        "XDG_DATA_HOME": isolation_root / "xdg-data",
+        "XDG_STATE_HOME": isolation_root / "xdg-state",
+        "TMPDIR": isolation_root / "tmp",
+    }
+    for directory in directories.values():
+        prepare_private_directory(directory, error_factory=EvaluationError)
+    environment = {name: str(path) for name, path in directories.items()}
+    environment.update(
+        {
+            "TMP": environment["TMPDIR"],
+            "TEMP": environment["TMPDIR"],
+            "CLAUDE_CODE_DISABLE_BUNDLED_SKILLS": "1",
+            "CLAUDE_CODE_DISABLE_CLAUDE_MDS": "1",
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "PATH": f"{executable.parent}:/usr/bin:/bin:/usr/sbin:/sbin",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONNOUSERSITE": "1",
+            "TZ": "UTC",
+        }
+    )
+    expected_keys = CLAUDE_PROVIDER_PROBE_ENVIRONMENT_KEYS
+    if anthropic_api_key is not None:
+        environment["ANTHROPIC_API_KEY"] = anthropic_api_key
+        expected_keys = CLAUDE_PROVIDER_ENVIRONMENT_KEYS
+    if set(environment) != set(expected_keys):
+        raise EvaluationError("closed Claude environment schema drift")
+    return environment
+
+
 INIT_METADATA_KEYS = {
     "analytics_disabled",
     "apiKeySource",
@@ -362,6 +535,8 @@ class TransportAdapter(Protocol):
     executor_system_prompt: str
     grader_system_prompt: str
     runtime_identity: dict[str, Any] | None
+    provider_execution_policy: dict[str, Any] | None
+    provider_policy_sha256: str | None
 
     def execute(
         self, request: bytes, workspace: Path, local_correlation_id: str | None = None
@@ -383,6 +558,8 @@ class FixtureAdapter:
     executor_system_prompt = EXECUTOR_SYSTEM_PROMPT
     grader_system_prompt = GRADER_SYSTEM_PROMPT
     runtime_identity = None
+    provider_execution_policy = None
+    provider_policy_sha256 = None
 
     def _result(
         self,
@@ -446,6 +623,7 @@ class FixtureAdapter:
             finished_at=now,
             init_stream=init_stream,
             raw_transport=raw,
+            raw_stderr=b"",
         )
 
     def execute(
@@ -507,6 +685,9 @@ class ClaudeCliAdapter:
         executor_model: str,
         grader_model: str,
         timeout_seconds: int = 300,
+        *,
+        credential_mechanism: str,
+        endpoint_policy: str,
     ) -> None:
         self.requested_executable = executable
         self.runtime_identity = resolve_claude_runtime_identity(executable)
@@ -520,11 +701,25 @@ class ClaudeCliAdapter:
         self.executor_model = executor_model
         self.grader_model = grader_model
         self.timeout_seconds = timeout_seconds
+        self.provider_execution_policy = claude_provider_policy_document(
+            credential_mechanism, endpoint_policy
+        )
+        self.provider_policy_sha256 = canonical_digest(
+            self.provider_execution_policy
+        )
+        self._anthropic_api_key = read_anthropic_api_key_from_descriptor()
 
     def _assert_runtime_identity(self) -> None:
         current = resolve_claude_runtime_identity(self.requested_executable)
         if current != self.runtime_identity:
             raise EvaluationError("Claude executable identity drift")
+
+    def _closed_environment(self, isolation_root: Path) -> dict[str, str]:
+        return _claude_closed_environment(
+            Path(self.executable),
+            isolation_root,
+            anthropic_api_key=self._anthropic_api_key,
+        )
 
     def _invoke(
         self,
@@ -537,13 +732,6 @@ class ClaudeCliAdapter:
     ) -> TransportResult:
         started_at = timestamp()
         local_correlation_id = local_correlation_id or str(uuid.uuid4())
-        environment = os.environ.copy()
-        environment.update(
-            {
-                "CLAUDE_CODE_DISABLE_BUNDLED_SKILLS": "1",
-                "CLAUDE_CODE_DISABLE_CLAUDE_MDS": "1",
-            }
-        )
         command = [
             self.executable,
             "-p",
@@ -570,40 +758,65 @@ class ClaudeCliAdapter:
             effort,
         ]
         self._assert_runtime_identity()
+        completed = None
+        observed_stdout = b""
+        observed_stderr = b""
+        observed_timed_out = False
         try:
-            completed = subprocess.run(
-                command,
-                input=request,
-                cwd=workspace,
-                env=environment,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
-                timeout=self.timeout_seconds,
-            )
-        except subprocess.TimeoutExpired as error:
-            raise TransportFailure(
-                f"Claude transport timed out after {self.timeout_seconds}s; "
-                "no checkpoint was written and a manual resume may replay the provider call",
-                error.stdout or b"",
-                error.stderr or b"",
-                timed_out=True,
-            ) from error
-        finished_at = timestamp()
-        try:
+            with tempfile.TemporaryDirectory(
+                prefix="control-plane-provider-"
+            ) as temporary:
+                isolation_root = Path(temporary).resolve()
+                os.chmod(isolation_root, 0o700)
+                environment = self._closed_environment(isolation_root)
+                try:
+                    completed = subprocess.run(
+                        command,
+                        input=request,
+                        cwd=workspace,
+                        env=environment,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        check=False,
+                        timeout=self.timeout_seconds,
+                    )
+                except subprocess.TimeoutExpired as error:
+                    observed_stdout = error.stdout or b""
+                    observed_stderr = error.stderr or b""
+                    observed_timed_out = True
+                    raise TransportFailure(
+                        safe_provider_failure_message(
+                            role="Claude CLI",
+                            stderr=observed_stderr,
+                            timed_out=True,
+                        ),
+                        observed_stdout,
+                        observed_stderr,
+                        timed_out=True,
+                    ) from error
+                observed_stdout = (
+                    completed.stdout if isinstance(completed.stdout, bytes) else b""
+                )
+                observed_stderr = (
+                    completed.stderr if isinstance(completed.stderr, bytes) else b""
+                )
+                if not isinstance(completed.stdout, bytes) or not isinstance(
+                    completed.stderr, bytes
+                ):
+                    raise EvaluationError("Claude provider streams are invalid")
+            finished_at = timestamp()
             self._assert_runtime_identity()
-        except EvaluationError as error:
-            raise TransportFailure(
-                str(error), completed.stdout, completed.stderr
-            ) from error
-        if completed.returncode != 0:
-            raise TransportFailure(
-                f"Claude transport failed ({completed.returncode}): "
-                + completed.stderr.decode(errors="replace")[-2000:],
-                completed.stdout,
-                completed.stderr,
-            )
-        try:
+            if completed.returncode != 0:
+                raise TransportFailure(
+                    safe_provider_failure_message(
+                        role="Claude CLI",
+                        stderr=completed.stderr,
+                        returncode=completed.returncode,
+                    ),
+                    completed.stdout,
+                    completed.stderr,
+                    returncode=completed.returncode,
+                )
             events = []
             for line in completed.stdout.splitlines():
                 if line.strip():
@@ -619,6 +832,8 @@ class ClaudeCliAdapter:
                     "Claude stream must contain exactly one init event"
                 )
             init = init_events[0]
+            if init.get("apiKeySource") != "ANTHROPIC_API_KEY":
+                raise EvaluationError("Claude credential provenance drift")
             unknown_init_keys = set(init) - set(CAPABILITY_KEYS) - INIT_METADATA_KEYS
             if unknown_init_keys:
                 raise EvaluationError(
@@ -698,7 +913,18 @@ class ClaudeCliAdapter:
                 raise EvaluationError("Claude result event did not report a session ID")
             if init_session_id != session_id:
                 raise EvaluationError("Claude init and result session IDs differ")
-            usage = result.get("usage") or {}
+            usage = result.get("usage")
+            if usage is None:
+                usage = {}
+            if not isinstance(usage, dict):
+                raise EvaluationError("Claude token usage is invalid")
+            input_tokens = usage.get("input_tokens", 0)
+            output_tokens = usage.get("output_tokens", 0)
+            if any(
+                type(value) is not int or value < 0
+                for value in (input_tokens, output_tokens)
+            ):
+                raise EvaluationError("Claude token usage is invalid")
             init_stream = {key: init[key] for key in CAPABILITY_KEYS}
             agents = init_stream["agents"]
             if (
@@ -717,23 +943,41 @@ class ClaudeCliAdapter:
                     "Claude model-access capability surface is not empty: "
                     f"{model_access_surface}"
                 )
+            transport_result = TransportResult(
+                response=response_text.encode(),
+                local_correlation_id=local_correlation_id,
+                response_id=response_id,
+                session_id=session_id,
+                model_version=observed_model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                started_at=started_at,
+                finished_at=finished_at,
+                init_stream=init_stream,
+                raw_transport=completed.stdout,
+                raw_stderr=completed.stderr,
+            )
+        except TransportFailure:
+            raise
         except Exception as error:
+            message = (
+                str(error)
+                if isinstance(error, EvaluationError)
+                else "Claude provider response validation failed"
+            )
+            returncode = (
+                completed.returncode
+                if completed is not None and type(completed.returncode) is int
+                else None
+            )
             raise TransportFailure(
-                str(error), completed.stdout, completed.stderr
+                message,
+                observed_stdout,
+                observed_stderr,
+                returncode=returncode,
+                timed_out=observed_timed_out,
             ) from error
-        return TransportResult(
-            response=response_text.encode(),
-            local_correlation_id=local_correlation_id,
-            response_id=response_id,
-            session_id=session_id,
-            model_version=observed_model,
-            input_tokens=int(usage.get("input_tokens", 0)),
-            output_tokens=int(usage.get("output_tokens", 0)),
-            started_at=started_at,
-            finished_at=finished_at,
-            init_stream=init_stream,
-            raw_transport=completed.stdout,
-        )
+        return transport_result
 
     def execute(
         self, request: bytes, workspace: Path, local_correlation_id: str | None = None
@@ -1851,6 +2095,13 @@ def build_bundles(
 def config_document(
     adapter: TransportAdapter, kind: str, model_version: str
 ) -> dict[str, Any]:
+    provider_policy = adapter.provider_execution_policy
+    provider_policy_sha256 = adapter.provider_policy_sha256
+    if provider_policy is None:
+        if provider_policy_sha256 is not None:
+            raise EvaluationError("fixture provider policy identity drift")
+    elif provider_policy_sha256 != canonical_digest(provider_policy):
+        raise EvaluationError("provider execution policy identity drift")
     document: dict[str, Any] = {
         "adapter": adapter.name,
         "config_sha256": "",
@@ -1860,6 +2111,8 @@ def config_document(
         if kind == "executor"
         else adapter.grader_effort,
         "runtime": adapter.runtime_identity,
+        "provider_execution_policy": provider_policy,
+        "provider_policy_sha256": provider_policy_sha256,
         "transport": {
             "allowed": True,
             "kind": "model_api",
@@ -1876,6 +2129,19 @@ def config_document(
         {key: value for key, value in document.items() if key != "config_sha256"}
     )
     return document
+
+
+def validate_provider_policy_arguments(args: argparse.Namespace) -> None:
+    credential_mechanism = getattr(args, "credential_mechanism", None)
+    endpoint_policy = getattr(args, "endpoint_policy", None)
+    if args.adapter == "claude":
+        claude_provider_policy_document(credential_mechanism, endpoint_policy)
+        executable = getattr(args, "claude_executable", None)
+        if not isinstance(executable, str) or not os.path.isabs(executable):
+            raise EvaluationError("Claude CLI executable must be an absolute path")
+        return
+    if credential_mechanism is not None or endpoint_policy is not None:
+        raise EvaluationError("fixture transport cannot declare provider policy")
 
 
 def request_bundle_file(logical_path: str, content: bytes) -> dict[str, Any]:
@@ -2074,33 +2340,51 @@ def run_transport_attempt(
 
     def invoke_attempt() -> AttemptSuccess:
         result = invoke(local_correlation_id)
-        return AttemptSuccess(
-            value=result,
-            streams={
-                "response": result.response,
-                "transport": result.raw_transport,
-            },
-            fields={
-                "init_stream": result.init_stream,
-                "init_stream_sha256": canonical_digest(result.init_stream),
-                "model_version": result.model_version,
-                "response_id": result.response_id,
-                "response_id_sha256": digest_bytes(result.response_id.encode()),
-                "session_id": result.session_id,
-                "session_id_sha256": digest_bytes(result.session_id.encode()),
-            },
-            finished_at=result.finished_at,
-        )
+        raw_transport = result.raw_transport
+        raw_stderr = result.raw_stderr
+        try:
+            if not isinstance(raw_transport, bytes) or not isinstance(
+                raw_stderr, bytes
+            ):
+                raise TypeError("provider attempt streams must be bytes")
+            return AttemptSuccess(
+                value=result,
+                streams={
+                    "stderr": raw_stderr,
+                    "response": result.response,
+                    "transport": raw_transport,
+                },
+                fields={
+                    "init_stream": result.init_stream,
+                    "init_stream_sha256": canonical_digest(result.init_stream),
+                    "model_version": result.model_version,
+                    "response_id": result.response_id,
+                    "response_id_sha256": digest_bytes(result.response_id.encode()),
+                    "session_id": result.session_id,
+                    "session_id_sha256": digest_bytes(result.session_id.encode()),
+                },
+                finished_at=result.finished_at,
+            )
+        except Exception as error:
+            raise TransportFailure(
+                "provider attempt evidence binding failed",
+                raw_transport if isinstance(raw_transport, bytes) else b"",
+                raw_stderr if isinstance(raw_stderr, bytes) else b"",
+            ) from error
 
     def failure_fields(error: BaseException, _classification: str) -> dict[str, Any]:
         try:
             stdout, _stderr = failure_streams(error)
         except TypeError as stream_error:
             raise EvaluationError(str(stream_error)) from error
+        failure_identity = safe_provider_failure_identity(error, role=kind)
         return {
-            "error": f"{type(error).__name__}: {error}",
+            "error": str(error),
+            "failure_identity": failure_identity,
             "provider_events": parse_provider_events(stdout),
             "provider_identity": parse_provider_identity(stdout),
+            "returncode": failure_identity["returncode"],
+            "timed_out": failure_identity["timed_out"],
         }
 
     result, _journal = run_attempt_journal(
@@ -2858,6 +3142,7 @@ def materialize_candidate_snapshot(
 
 
 def run(args: argparse.Namespace) -> int:
+    validate_provider_policy_arguments(args)
     repo = args.repo.resolve(strict=True)
     definition_path = args.definition.resolve(strict=True)
     try:
@@ -2966,19 +3251,30 @@ def run(args: argparse.Namespace) -> int:
             args.executor_model,
             args.grader_model,
             args.claude_timeout_seconds,
+            credential_mechanism=args.credential_mechanism,
+            endpoint_policy=args.endpoint_policy,
         )
     state_path = output / "state.json"
-    state = read_json(state_path) if state_path.exists() else {"schema_version": 1}
+    state_exists = state_path.exists()
+    state = read_json(state_path) if state_exists else {"schema_version": 1}
     if (
         "adapter_runtime" in state
         and state["adapter_runtime"] != adapter.runtime_identity
     ):
         raise EvaluationError("resume Claude executable identity drift")
     state["adapter_runtime"] = adapter.runtime_identity
+    if (
+        args.adapter == "claude"
+        and state_exists
+        and state.get("provider_policy_sha256") != adapter.provider_policy_sha256
+    ):
+        raise EvaluationError("resume provider execution policy identity drift")
+    state["provider_policy_sha256"] = adapter.provider_policy_sha256
     run_contract = canonical_digest(
         {
             "adapter": args.adapter,
             "adapter_runtime": adapter.runtime_identity,
+            "provider_policy_sha256": adapter.provider_policy_sha256,
             "bundles": bundles,
             "candidate_repository": args.candidate_repository,
             "candidate_revision": args.candidate_revision,
@@ -3201,10 +3497,18 @@ def build_parser() -> argparse.ArgumentParser:
     runner.add_argument("--candidate-repository", required=True)
     runner.add_argument("--candidate-revision", required=True)
     runner.add_argument("--scenario-limit", type=int)
-    runner.add_argument("--claude-executable", default="claude")
+    runner.add_argument("--claude-executable")
     runner.add_argument("--executor-model", default="claude-sonnet-5")
     runner.add_argument("--grader-model", default="claude-opus-4-8")
     runner.add_argument("--claude-timeout-seconds", type=int, default=300)
+    runner.add_argument(
+        "--credential-mechanism",
+        choices=("anthropic-api-key-fd",),
+    )
+    runner.add_argument(
+        "--endpoint-policy",
+        choices=("anthropic-public-api",),
+    )
     return parser
 
 

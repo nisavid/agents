@@ -68,6 +68,36 @@ def load_suite_driver_module():
     return module
 
 
+def run_retired_internal_main(
+    path: Path,
+    arguments: list[str],
+    *,
+    function: str = "main",
+    cwd: Path | None = None,
+    text: bool = False,
+    timeout: float | None = None,
+) -> subprocess.CompletedProcess:
+    """Exercise retained design code without reopening its executable entrypoint."""
+
+    script = (
+        "import json, runpy, sys\n"
+        "arguments = json.load(sys.stdin)\n"
+        f"namespace = runpy.run_path({str(path)!r})\n"
+        f"sys.argv = [{str(path)!r}, *arguments]\n"
+        f"raise SystemExit(namespace[{function!r}]())\n"
+    )
+    payload = json.dumps(arguments)
+    return subprocess.run(
+        [sys.executable, "-I", "-B", "-c", script],
+        cwd=cwd,
+        input=payload if text else payload.encode(),
+        capture_output=True,
+        text=text,
+        timeout=timeout,
+        check=False,
+    )
+
+
 def content_document(value: dict[str, object]) -> dict[str, object]:
     raw = json.dumps(
         value,
@@ -472,6 +502,7 @@ def suite_inventory_document() -> dict[str, object]:
     return {
         "schema_version": 1,
         "contract": "task-witness-tw4-suite-inventory-v1",
+        "runtime_status": "retired-source-stage",
         "entries": entries,
         "aggregates": {
             "counts_sha256": hashlib.sha256(canonical_document(counts)).hexdigest(),
@@ -723,6 +754,13 @@ def fail_opened_leaf_close(runner, message: str):
 
 
 class TaskWitnessQualificationTests(unittest.TestCase):
+    def invoke_suite(self, *arguments: str) -> subprocess.CompletedProcess[bytes]:
+        return run_retired_internal_main(
+            SUITE_DRIVER,
+            list(arguments),
+            cwd=REPOSITORY,
+        )
+
     def invoke(
         self,
         *,
@@ -731,11 +769,11 @@ class TaskWitnessQualificationTests(unittest.TestCase):
         runtime_evidence: Path | str,
         platform_profile: Path | str,
         receipt: Path | str,
+        timeout: float | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
+        return run_retired_internal_main(
+            RUNNER,
             [
-                sys.executable,
-                str(RUNNER),
                 "--candidate-root",
                 str(candidate),
                 "--runtime-executable",
@@ -747,9 +785,9 @@ class TaskWitnessQualificationTests(unittest.TestCase):
                 "--receipt-output",
                 str(receipt),
             ],
+            function="_retired_native_main",
             text=True,
-            capture_output=True,
-            check=False,
+            timeout=timeout,
         )
 
     def run_qualification(
@@ -781,19 +819,9 @@ class TaskWitnessQualificationTests(unittest.TestCase):
         return result, receipt
 
     def test_suite_driver_runs_only_the_nonrecursive_runner_contract(self) -> None:
-        process = subprocess.run(
-            [
-                sys.executable,
-                "-I",
-                "-B",
-                str(SUITE_DRIVER.relative_to(REPOSITORY)),
-                "--suite",
-                "qualification-runner-contract",
-            ],
-            cwd=REPOSITORY,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            check=False,
+        process = self.invoke_suite(
+            "--suite",
+            "qualification-runner-contract",
         )
 
         self.assertEqual(process.returncode, 0, process.stderr.decode())
@@ -815,19 +843,9 @@ class TaskWitnessQualificationTests(unittest.TestCase):
         )
 
     def test_suite_driver_runs_the_closed_client_common_contract(self) -> None:
-        process = subprocess.run(
-            [
-                sys.executable,
-                "-I",
-                "-B",
-                str(SUITE_DRIVER.relative_to(REPOSITORY)),
-                "--suite",
-                "client-common",
-            ],
-            cwd=REPOSITORY,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            check=False,
+        process = self.invoke_suite(
+            "--suite",
+            "client-common",
         )
 
         self.assertEqual(process.returncode, 0, process.stderr.decode())
@@ -849,19 +867,9 @@ class TaskWitnessQualificationTests(unittest.TestCase):
         )
 
     def test_suite_driver_runs_the_closed_deployment_common_contract(self) -> None:
-        process = subprocess.run(
-            [
-                sys.executable,
-                "-I",
-                "-B",
-                str(SUITE_DRIVER.relative_to(REPOSITORY)),
-                "--suite",
-                "deployment-common",
-            ],
-            cwd=REPOSITORY,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            check=False,
+        process = self.invoke_suite(
+            "--suite",
+            "deployment-common",
         )
 
         self.assertEqual(process.returncode, 0, process.stderr.decode())
@@ -899,19 +907,7 @@ class TaskWitnessQualificationTests(unittest.TestCase):
             ("--suite", "qualification-runner-contract", "unexpected"),
         )
         for arguments in invocations:
-            process = subprocess.run(
-                [
-                    sys.executable,
-                    "-I",
-                    "-B",
-                    str(SUITE_DRIVER.relative_to(REPOSITORY)),
-                    *arguments,
-                ],
-                cwd=REPOSITORY,
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                check=False,
-            )
+            process = self.invoke_suite(*arguments)
             with self.subTest(arguments=arguments):
                 self.assertNotEqual(process.returncode, 0)
                 self.assertEqual(process.stdout, b"")
@@ -1779,20 +1775,7 @@ else:
     def test_package_contract_cli_emits_the_current_canonical_result(
         self,
     ) -> None:
-        process = subprocess.run(
-            [
-                sys.executable,
-                "-I",
-                "-B",
-                str(SUITE_DRIVER.relative_to(REPOSITORY)),
-                "--suite",
-                "package-contract",
-            ],
-            cwd=REPOSITORY,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            check=False,
-        )
+        process = self.invoke_suite("--suite", "package-contract")
 
         self.assertEqual(process.returncode, 0, process.stderr.decode())
         self.assertEqual(process.stderr, b"")
@@ -1971,20 +1954,7 @@ else:
     def test_task_witness_source_stage_cli_emits_the_current_canonical_result(
         self,
     ) -> None:
-        process = subprocess.run(
-            [
-                sys.executable,
-                "-I",
-                "-B",
-                str(SUITE_DRIVER.relative_to(REPOSITORY)),
-                "--suite",
-                "task-witness-source-stage",
-            ],
-            cwd=REPOSITORY,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            check=False,
-        )
+        process = self.invoke_suite("--suite", "task-witness-source-stage")
 
         self.assertEqual(process.returncode, 0, process.stderr.decode())
         self.assertEqual(process.stderr, b"")
@@ -2014,9 +1984,8 @@ else:
                 "-I",
                 "-B",
                 "scripts/supervise_prepared_release_validation.py",
-                "public-release",
+                "source-stage",
                 str(REPOSITORY),
-                "--source-stage",
             ],
         )
 
@@ -2069,20 +2038,7 @@ else:
     def test_public_release_source_stage_cli_emits_the_current_canonical_result(
         self,
     ) -> None:
-        process = subprocess.run(
-            [
-                sys.executable,
-                "-I",
-                "-B",
-                str(SUITE_DRIVER.relative_to(REPOSITORY)),
-                "--suite",
-                "public-release-source-stage",
-            ],
-            cwd=REPOSITORY,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            check=False,
-        )
+        process = self.invoke_suite("--suite", "public-release-source-stage")
 
         self.assertEqual(process.returncode, 0, process.stderr.decode())
         self.assertEqual(process.stderr, b"")
@@ -2106,7 +2062,7 @@ else:
         )
         self.assertEqual(driver.SUITE_EXPECTED_COUNTS["literal-rendered-shim"], 1)
 
-    def test_literal_rendered_shim_executes_and_publishes_fixed_observation(
+    def test_literal_rendered_shim_publishes_without_candidate_execution(
         self,
     ) -> None:
         driver = load_suite_driver_module()
@@ -2404,20 +2360,7 @@ else:
         "macOS arm64 qualification host required",
     )
     def test_public_macos_acl_vertical_emits_a_canonical_result(self) -> None:
-        process = subprocess.run(
-            [
-                sys.executable,
-                "-I",
-                "-B",
-                str(SUITE_DRIVER.relative_to(REPOSITORY)),
-                "--suite",
-                "macos-acl",
-            ],
-            cwd=REPOSITORY,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            check=False,
-        )
+        process = self.invoke_suite("--suite", "macos-acl")
 
         self.assertEqual(process.returncode, 0, process.stderr.decode())
         self.assertEqual(process.stderr, b"")
@@ -2436,20 +2379,7 @@ else:
         "Darwin host required for the public wrong-host assertion",
     )
     def test_public_linux_process_supervision_rejects_the_wrong_host(self) -> None:
-        process = subprocess.run(
-            [
-                sys.executable,
-                "-I",
-                "-B",
-                str(SUITE_DRIVER.relative_to(REPOSITORY)),
-                "--suite",
-                "linux-process-supervision",
-            ],
-            cwd=REPOSITORY,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            check=False,
-        )
+        process = self.invoke_suite("--suite", "linux-process-supervision")
 
         self.assertNotEqual(process.returncode, 0)
         self.assertEqual(process.stdout, b"")
@@ -2472,20 +2402,7 @@ else:
             "migration-bridge-to-tw4": 15,
         }
         for suite_id, expected_count in expected_counts.items():
-            process = subprocess.run(
-                [
-                    sys.executable,
-                    "-I",
-                    "-B",
-                    str(SUITE_DRIVER.relative_to(REPOSITORY)),
-                    "--suite",
-                    suite_id,
-                ],
-                cwd=REPOSITORY,
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                check=False,
-            )
+            process = self.invoke_suite("--suite", suite_id)
             with self.subTest(suite_id=suite_id):
                 self.assertEqual(process.returncode, 0, process.stderr.decode())
                 self.assertEqual(process.stderr, b"")
@@ -6628,24 +6545,12 @@ else:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             receipt = root / "receipt.json"
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    str(RUNNER),
-                    "--candidate-root",
-                    str(root / "missing-candidate"),
-                    "--runtime-executable",
-                    str(root / "missing-runtime"),
-                    "--runtime-closure-evidence",
-                    str(root / "missing-runtime-evidence.json"),
-                    "--platform-profile",
-                    str(root / "missing-platform-profile.json"),
-                    "--receipt-output",
-                    str(receipt),
-                ],
-                text=True,
-                capture_output=True,
-                check=False,
+            result = self.invoke(
+                candidate=root / "missing-candidate",
+                runtime=root / "missing-runtime",
+                runtime_evidence=root / "missing-runtime-evidence.json",
+                platform_profile=root / "missing-platform-profile.json",
+                receipt=receipt,
             )
 
             self.assertNotEqual(result.returncode, 0)
@@ -6806,7 +6711,7 @@ else:
                 ),
                 redirect_stderr(stderr),
             ):
-                result = runner_module.main()
+                result = runner_module._retired_native_main()
 
             self.assertEqual(result, 0)
             self.assertEqual(stderr.getvalue(), "")
@@ -7036,37 +6941,26 @@ else:
             platform_profile = root / "platform-profile.json"
             platform_profile.write_bytes(b'{"execution_environment":"native"}')
             receipt = root / "receipt.json"
-            process = subprocess.Popen(
-                [
-                    sys.executable,
-                    str(RUNNER),
-                    "--candidate-root",
-                    str(candidate),
-                    "--runtime-executable",
-                    str(runtime),
-                    "--runtime-closure-evidence",
-                    str(runtime_evidence),
-                    "--platform-profile",
-                    str(platform_profile),
-                    "--receipt-output",
-                    str(receipt),
-                ],
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
             try:
-                stdout, stderr = process.communicate(timeout=1.0)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                stdout, stderr = process.communicate()
+                result = self.invoke(
+                    candidate=candidate,
+                    runtime=runtime,
+                    runtime_evidence=runtime_evidence,
+                    platform_profile=platform_profile,
+                    receipt=receipt,
+                    timeout=1.0,
+                )
+            except subprocess.TimeoutExpired as error:
                 self.fail(
                     "file-valued preflight blocked while opening a FIFO; "
-                    f"stdout={stdout!r}, stderr={stderr!r}"
+                    f"stdout={error.stdout!r}, stderr={error.stderr!r}"
                 )
 
-            self.assertNotEqual(process.returncode, 0)
-            self.assertIn("runtime executable must be a regular file", stderr)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                "runtime executable must be a regular file",
+                result.stderr,
+            )
             self.assertFalse(receipt.exists())
 
     def test_symlinked_file_inputs_and_output_parent_fail_closed(self) -> None:

@@ -3965,13 +3965,20 @@ def validate_suite_inventory(root: Path) -> dict:
     )
     require_exact_fields(
         inventory,
-        {"schema_version", "contract", "entries", "aggregates"},
+        {
+            "schema_version",
+            "contract",
+            "runtime_status",
+            "entries",
+            "aggregates",
+        },
         "Task Witness suite inventory",
     )
     if (
         type(inventory["schema_version"]) is not int
         or inventory["schema_version"] != 1
         or inventory["contract"] != SUITE_INVENTORY_CONTRACT
+        or inventory["runtime_status"] != "retired-source-stage"
     ):
         raise ValueError("Task Witness suite inventory contract drift")
     entries = inventory["entries"]
@@ -4178,7 +4185,7 @@ def _bridge_source_bytes(root: Path, generation: str, relative: str) -> bytes:
     ).read_bytes()
 
 
-def _derived_bridge_client(current: bytes) -> bytes:
+def _validate_current_client_boundary(current: bytes) -> None:
     profile = re.compile(rb'(?m)^CLIENT_RELEASE_PROFILE = "([a-z0-9-]+)"$')
     generation = re.compile(
         rb'(?m)^CLIENT_SOURCE_GENERATION_SHA256 = "([0-9a-f]{64})"$'
@@ -4186,15 +4193,14 @@ def _derived_bridge_client(current: bytes) -> bytes:
     matches = list(profile.finditer(current))
     if len(matches) != 1 or matches[0].group(1) != b"tw4-current":
         raise ValueError("Task Witness current client release profile drift")
-    start, end = matches[0].span(1)
-    bridge = current[:start] + b"b1-transition" + current[end:]
-    matches = list(generation.finditer(bridge))
+    matches = list(generation.finditer(current))
     if len(matches) != 1:
         raise ValueError("Task Witness current client generation identity drift")
     start, end = matches[0].span(1)
-    normalized = bridge[:start] + (b"0" * 64) + bridge[end:]
+    normalized = current[:start] + (b"0" * 64) + current[end:]
     digest = hashlib.sha256(normalized).hexdigest().encode("ascii")
-    return bridge[:start] + digest + bridge[end:]
+    if digest != matches[0].group(1):
+        raise ValueError("Task Witness current client generation identity drift")
 
 
 def _walk_plugin_tree(
@@ -4389,11 +4395,7 @@ def validate_bridge_history(root: Path) -> dict[str, object]:
     current_client = verified_reviewed_path(
         root, (PLUGIN_RELATIVE / "client/task_witness_client.py").as_posix()
     ).read_bytes()
-    if (
-        _derived_bridge_client(current_client)
-        != _bridge_snapshot(root, "bridge", "client/task_witness_client.py")[0]
-    ):
-        raise ValueError("Task Witness bridge client derivation drift")
+    _validate_current_client_boundary(current_client)
 
     encoded_objects = provenance["objects"]
     if not isinstance(encoded_objects, list):
@@ -4759,5 +4761,17 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
+def entrypoint_main(argv: list[str] | None = None) -> int:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if "--qualification" in arguments or "--final-release" in arguments:
+        print(
+            "Task Witness validation failed: native qualification and final-release "
+            "validation are unavailable in this source-stage release",
+            file=sys.stderr,
+        )
+        return 1
+    return main(arguments)
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(entrypoint_main())

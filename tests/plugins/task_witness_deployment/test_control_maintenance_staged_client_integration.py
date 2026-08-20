@@ -33,7 +33,7 @@ from ._routine_support import smoke_envelope
 from ._support import sha256
 
 SEALED_CLIENT_SHA256 = (
-    "0db397b5e2617ea06b696d36d9eb96a8795c4bb712592dcc28fab6a441ab98ca"
+    "2fabfdba708ea84c366b480c8a5d7aacf61706ba8e62e9cd97f2afe8dda87e9c"
 )
 SEALED_LAUNCHER_SHA256 = (
     "4d97e8df695276f8da9cb87ef1c27fa5979c5edf9f338127a0a19ae077d3172b"

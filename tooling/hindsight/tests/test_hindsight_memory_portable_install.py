@@ -8087,6 +8087,17 @@ class PortableInstallationManagerTest(unittest.TestCase):
             return {}, postgres, database
 
         write_private = mock.Mock()
+        verification_times = []
+        refresh_times = []
+
+        def verify(value, *, now):
+            verification_times.append(now)
+            return value
+
+        def refresh(value, **keywords):
+            refresh_times.append(keywords["now"])
+            return refreshed
+
         function_globals = module[
             "data_identity_rebind_observe_command"
         ].__globals__
@@ -8095,13 +8106,13 @@ class PortableInstallationManagerTest(unittest.TestCase):
             {
                 "_portable_manager": lambda _args: manager,
                 "read_json": lambda path: base if Path(path) == base_path else {},
-                "verify_rebind_evidence": lambda value, now: value,
+                "verify_rebind_evidence": verify,
                 "_read_live_data_identity_evidence": observe_live,
                 "_data_identity_safety_evidence": lambda value: base["safety"],
-                "refresh_rebind_evidence": lambda value, **_keywords: refreshed,
+                "refresh_rebind_evidence": refresh,
                 "write_private": write_private,
                 "_print_result": lambda value: 0,
-                "time": mock.Mock(time=lambda: 1000),
+                "time": mock.Mock(time=mock.Mock(side_effect=(1000, 1005))),
             },
         ):
             self.assertEqual(
@@ -8111,6 +8122,8 @@ class PortableInstallationManagerTest(unittest.TestCase):
 
         manager._preflight_lifecycle.assert_called_once_with()
         manager._validate_config_source.assert_called_once_with()
+        self.assertEqual(verification_times, [1000])
+        self.assertEqual(refresh_times, [1005])
         write_private.assert_called_once_with(
             str(output),
             refreshed,

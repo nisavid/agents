@@ -4330,10 +4330,10 @@ def data_identity_rebind_observe_command(args: argparse.Namespace) -> int:
     manager = _portable_manager(args)
     manager._preflight_lifecycle()
     manager._validate_config_source()
-    current_time = int(time.time())
+    verification_time = int(time.time())
     base = read_json(args.base_evidence)
     try:
-        checked = verify_rebind_evidence(base, now=current_time)
+        checked = verify_rebind_evidence(base, now=verification_time)
         _binding, postgres, database = asyncio.run(
             _read_live_data_identity_evidence(
                 profile_id=checked["profile_id"],
@@ -4353,11 +4353,12 @@ def data_identity_rebind_observe_command(args: argparse.Namespace) -> int:
             raise DataIdentityRebindError(
                 "data-identity safety evidence differs"
             )
+        observation_time = int(time.time())
         evidence = refresh_rebind_evidence(
             checked,
             postgres=postgres,
             database=database,
-            now=current_time,
+            now=observation_time,
         )
     except DataIdentityRebindError as error:
         raise PortableInstallError(str(error)) from error

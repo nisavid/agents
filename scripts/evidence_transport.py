@@ -263,6 +263,63 @@ def failure_streams(error: BaseException) -> tuple[bytes, bytes]:
     return stdout, stderr
 
 
+def _safe_provider_role(role: str) -> str:
+    if isinstance(role, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}", role):
+        return role
+    return "provider"
+
+
+def safe_provider_failure_message(
+    *,
+    role: str,
+    stderr: bytes,
+    returncode: int | None = None,
+    timed_out: bool = False,
+    reason: str = "failed",
+) -> str:
+    """Describe a provider failure without decoding provider-controlled bytes."""
+
+    if not isinstance(stderr, bytes):
+        raise TypeError("provider stderr must be bytes")
+    if reason not in {"failed", "could not start", "stream size limit exceeded"}:
+        reason = "failed"
+    if timed_out:
+        status = "timed out"
+    elif isinstance(returncode, int):
+        status = f"exited with status {returncode}"
+    else:
+        status = reason
+    identity = stream_identity(stderr)
+    return (
+        f"{_safe_provider_role(role)} provider transport {status}; "
+        f"stderr_byte_count={identity['byte_count']}; "
+        f"stderr_sha256={identity['sha256']}"
+    )
+
+
+def safe_provider_failure_identity(
+    error: BaseException, *, role: str
+) -> dict[str, Any]:
+    """Return public-safe status and byte identities for one provider failure."""
+
+    stdout, stderr = failure_streams(error)
+    returncode = getattr(error, "returncode", None)
+    return {
+        "classification": (
+            "provider-transport-timeout"
+            if isinstance(error, ProviderTransportFailure) and error.timed_out
+            else "provider-transport-failure"
+        ),
+        "returncode": returncode if isinstance(returncode, int) else None,
+        "role": _safe_provider_role(role),
+        "stderr": stream_identity(stderr),
+        "stdout": stream_identity(stdout),
+        "timed_out": bool(
+            isinstance(error, ProviderTransportFailure) and error.timed_out
+        ),
+    }
+
+
 class AttemptAllocation:
     """Lexical paths reserved for one transport attempt and its raw streams."""
 

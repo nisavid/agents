@@ -22,8 +22,10 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -31,10 +33,16 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from evidence_transport import (  # noqa: E402
+    AttemptSuccess,
+    ProviderTransportFailure,
+    allocate_attempt_journal,
     digest_bytes,
     json_file_bytes,
     prepare_private_directory,
     private_atomic_write,
+    run_attempt_journal,
+    safe_provider_failure_identity,
+    safe_provider_failure_message,
     safe_regular_file,
     stream_identity,
     strict_json_bytes,
@@ -240,6 +248,10 @@ class EvaluationError(RuntimeError):
     """Report an invalid evaluation input or provider result."""
 
 
+class TransportFailure(ProviderTransportFailure, EvaluationError):
+    """A safe public provider error retaining its exact private streams."""
+
+
 def canonical(value: object) -> bytes:
     return json_file_bytes(value)
 
@@ -269,6 +281,13 @@ def parse_verdict(payload: bytes) -> dict[str, Any]:
             "grader verdict passed must agree with whether failures is empty"
         )
     return verdict
+
+
+def decode_executor_response(payload: bytes) -> str:
+    try:
+        return payload.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise EvaluationError("executor response is not UTF-8") from error
 
 
 def _read_bounded_file(path: Path, *, label: str) -> bytes:
@@ -647,6 +666,7 @@ def _bounded_process(
     *,
     work: Path,
     environment: dict[str, str],
+    role: str,
 ) -> tuple[bytes, bytes]:
     if len(request) > MAX_REQUEST_BYTES:
         raise EvaluationError("adapter request exceeds the input size limit")
@@ -670,7 +690,13 @@ def _bounded_process(
                 umask=0o077,
             )
         except OSError as error:
-            raise EvaluationError("adapter process could not start") from error
+            raise TransportFailure(
+                safe_provider_failure_message(
+                    role=role,
+                    stderr=b"",
+                    reason="could not start",
+                )
+            ) from error
         assert process.stdout is not None and process.stderr is not None
         selector = selectors.DefaultSelector()
         selector.register(process.stdout, selectors.EVENT_READ, "stdout")
@@ -683,7 +709,16 @@ def _bounded_process(
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     _terminate_process_group(process)
-                    raise EvaluationError("adapter process timed out")
+                    raise TransportFailure(
+                        safe_provider_failure_message(
+                            role=role,
+                            stderr=b"".join(streams["stderr"]),
+                            timed_out=True,
+                        ),
+                        stdout=b"".join(streams["stdout"]),
+                        stderr=b"".join(streams["stderr"]),
+                        timed_out=True,
+                    )
                 events = selector.select(timeout=remaining)
                 for key, _mask in events:
                     chunk = os.read(key.fileobj.fileno(), 65536)
@@ -692,21 +727,45 @@ def _bounded_process(
                         continue
                     name = key.data
                     sizes[name] += len(chunk)
+                    streams[name].append(chunk)
                     if sizes[name] > MAX_STREAM_BYTES:
                         _terminate_process_group(process)
-                        raise EvaluationError(
-                            f"adapter {name} exceeded the stream size limit"
+                        raise TransportFailure(
+                            safe_provider_failure_message(
+                                role=role,
+                                stderr=b"".join(streams["stderr"]),
+                                reason="stream size limit exceeded",
+                            ),
+                            stdout=b"".join(streams["stdout"]),
+                            stderr=b"".join(streams["stderr"]),
                         )
-                    streams[name].append(chunk)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 _terminate_process_group(process)
-                raise EvaluationError("adapter process timed out")
+                raise TransportFailure(
+                    safe_provider_failure_message(
+                        role=role,
+                        stderr=b"".join(streams["stderr"]),
+                        timed_out=True,
+                    ),
+                    stdout=b"".join(streams["stdout"]),
+                    stderr=b"".join(streams["stderr"]),
+                    timed_out=True,
+                )
             try:
                 returncode = process.wait(timeout=remaining)
             except subprocess.TimeoutExpired as error:
                 _terminate_process_group(process)
-                raise EvaluationError("adapter process timed out") from error
+                raise TransportFailure(
+                    safe_provider_failure_message(
+                        role=role,
+                        stderr=b"".join(streams["stderr"]),
+                        timed_out=True,
+                    ),
+                    stdout=b"".join(streams["stdout"]),
+                    stderr=b"".join(streams["stderr"]),
+                    timed_out=True,
+                ) from error
         finally:
             selector.close()
             process.stdout.close()
@@ -714,9 +773,15 @@ def _bounded_process(
         stdout = b"".join(streams["stdout"])
         stderr = b"".join(streams["stderr"])
         if returncode:
-            message = stderr.decode("utf-8", errors="replace").strip()
-            raise EvaluationError(
-                f"adapter process exited {returncode}: {message or 'no stderr'}"
+            raise TransportFailure(
+                safe_provider_failure_message(
+                    role=role,
+                    stderr=stderr,
+                    returncode=returncode,
+                ),
+                stdout=stdout,
+                stderr=stderr,
+                returncode=returncode,
             )
         return stdout, stderr
     finally:
@@ -729,6 +794,8 @@ def run_isolated_adapter(
     *,
     role: str,
     model: str,
+    attempt_root: Path | None = None,
+    validator: Callable[[bytes], Any] | None = None,
 ) -> dict[str, Any]:
     """Run one adapter in a new process and a new private workspace."""
     arguments, identity = _resolve_executable(command, role=role, model=model)
@@ -756,30 +823,128 @@ def run_isolated_adapter(
             "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONNOUSERSITE": "1",
         }
-        stdout, stderr = _bounded_process(
-            arguments, request, work=work, environment=environment
-        )
-        if (
-            _executable_digest(executable, role=role)
-            != identity["executable"]["sha256"]
-        ):
-            raise EvaluationError(f"{role} executable changed during evaluation")
-        for argument_file in identity["argument_files"]:
-            if (
-                _executable_digest(Path(argument_file["path"]), role=role)
-                != argument_file["sha256"]
-            ):
-                raise EvaluationError(f"{role} adapter file changed during evaluation")
+
+        def invoke() -> dict[str, Any]:
+            stdout, stderr = _bounded_process(
+                arguments,
+                request,
+                work=work,
+                environment=environment,
+                role=role,
+            )
+            try:
+                if (
+                    _executable_digest(executable, role=role)
+                    != identity["executable"]["sha256"]
+                ):
+                    raise EvaluationError(
+                        f"{role} executable changed during evaluation"
+                    )
+                for argument_file in identity["argument_files"]:
+                    if (
+                        _executable_digest(Path(argument_file["path"]), role=role)
+                        != argument_file["sha256"]
+                    ):
+                        raise EvaluationError(
+                            f"{role} adapter file changed during evaluation"
+                        )
+                validated = validator(stdout) if validator is not None else None
+            except Exception as error:
+                raise TransportFailure(
+                    str(error), stdout=stdout, stderr=stderr
+                ) from error
+            return {
+                "stdout": stdout,
+                "stderr": stderr,
+                "validated": validated,
+            }
+
+        attempt_id: str | None = None
+        attempt_document: dict[str, Any] | None = None
+        if attempt_root is None:
+            streams = invoke()
+        else:
+            prepare_private_directory(attempt_root, error_factory=EvaluationError)
+            attempt_id = f"{role}-{uuid.uuid4()}"
+            allocation = allocate_attempt_journal(
+                attempt_root,
+                attempt_relpath=f"attempts/{attempt_id}.json",
+                stream_relpaths={
+                    "stdout": f"streams/{attempt_id}.stdout.bin",
+                    "stderr": f"streams/{attempt_id}.stderr.bin",
+                },
+                error_factory=EvaluationError,
+            )
+
+            def invoke_attempt() -> AttemptSuccess:
+                result = invoke()
+                return AttemptSuccess(
+                    value=result,
+                    streams={
+                        "stdout": result["stdout"],
+                        "stderr": result["stderr"],
+                    },
+                    fields={"returncode": 0, "timed_out": False},
+                )
+
+            def write_document(path: Path, value: dict[str, Any]) -> None:
+                private_atomic_write(
+                    path,
+                    json_file_bytes(value),
+                    error_factory=EvaluationError,
+                )
+
+            def failure_fields(
+                error: BaseException, _classification: str
+            ) -> dict[str, Any]:
+                identity = safe_provider_failure_identity(error, role=role)
+                return {
+                    "failure_identity": identity,
+                    "returncode": identity["returncode"],
+                    "timed_out": identity["timed_out"],
+                }
+
+            streams, attempt_document = run_attempt_journal(
+                allocation,
+                initial={
+                    "attempt_id": attempt_id,
+                    "model": model,
+                    "role": role,
+                },
+                invoke=invoke_attempt,
+                document_writer=write_document,
+                artifact_writer=lambda path, content: private_atomic_write(
+                    path, content, error_factory=EvaluationError
+                ),
+                clock=lambda: datetime.now(timezone.utc).isoformat().replace(
+                    "+00:00", "Z"
+                ),
+                status_names={
+                    "started": "started",
+                    "success": "completed",
+                    "failure": "failed",
+                    "timeout": "timeout",
+                },
+                stream_fields={
+                    "stdout": ("stdout_relpath", "stdout_sha256"),
+                    "stderr": ("stderr_relpath", "stderr_sha256"),
+                },
+                digest=digest_bytes,
+                failure_fields=failure_fields,
+            )
+        stdout = streams["stdout"]
+        stderr = streams["stderr"]
         workspace = {
             "working_directory": str(work),
             "home_directory": str(home),
             "temporary_directory": str(temporary_root),
         }
-        return {
+        result = {
             "stdout": stdout,
             "stderr": stderr,
             "stdout_identity": stream_identity(stdout),
             "stderr_identity": stream_identity(stderr),
+            "validated": streams["validated"],
             "adapter_identity": identity,
             "workspace": workspace,
             "workspace_sha256": digest(canonical(workspace)),
@@ -791,6 +956,13 @@ def run_isolated_adapter(
                 "os_sandbox": "not-claimed",
             },
         }
+        if attempt_id is not None and attempt_document is not None:
+            result["attempt"] = {
+                "attempt_id": attempt_id,
+                "journal_sha256": digest_bytes(json_file_bytes(attempt_document)),
+                "status": attempt_document["status"],
+            }
+        return result
 
 
 def _request_separation(executor: bytes, grader: bytes) -> dict[str, Any]:
@@ -850,7 +1022,7 @@ def _public_adapter_result(result: dict[str, Any]) -> dict[str, Any]:
     return {
         key: value
         for key, value in result.items()
-        if key not in {"stdout", "stderr", "workspace"}
+        if key not in {"stdout", "stderr", "validated", "workspace"}
     }
 
 
@@ -874,6 +1046,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", type=Path, required=True)
     arguments = parser.parse_args(argv)
     try:
+        try:
+            output = (
+                arguments.output.parent.resolve(strict=True) / arguments.output.name
+            )
+        except OSError as error:
+            raise EvaluationError("evaluation output parent is unavailable") from error
         scenarios = load_scenarios(arguments.scenario)
         if arguments.adapter == "fixture":
             if arguments.fixture_responses is None:
@@ -894,6 +1072,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
             responses = {}
             execution_mode = "provider-process-and-workspace-isolated"
+            attempt_root = output.parent / f".{output.name}.provider-attempts"
         runs = []
         for scenario in scenarios:
             loaded = load_case(scenario)
@@ -915,11 +1094,10 @@ def main(argv: list[str] | None = None) -> int:
                     execute,
                     role="executor",
                     model=arguments.provider_model,
+                    attempt_root=attempt_root,
+                    validator=decode_executor_response,
                 )
-                try:
-                    response = executor_result["stdout"].decode("utf-8")
-                except UnicodeDecodeError as error:
-                    raise EvaluationError("executor response is not UTF-8") from error
+                response = executor_result["validated"]
             grader = grader_request(scenario, response)
             separation = _request_separation(execute, grader)
             if arguments.adapter == "fixture":
@@ -930,10 +1108,12 @@ def main(argv: list[str] | None = None) -> int:
                     grader,
                     role="grader",
                     model=arguments.grader_model,
+                    attempt_root=attempt_root,
+                    validator=parse_verdict,
                 )
                 verdict = {
                     "checked": True,
-                    **parse_verdict(grader_result["stdout"]),
+                    **grader_result["validated"],
                 }
             run = {
                 "scenario_id": scenario["id"],
@@ -982,18 +1162,13 @@ def main(argv: list[str] | None = None) -> int:
             "passed": behavioral_passed,
             "runs": runs,
         }
-        try:
-            output = (
-                arguments.output.parent.resolve(strict=True) / arguments.output.name
-            )
-        except OSError as error:
-            raise EvaluationError("evaluation output parent is unavailable") from error
         private_atomic_write(output, canonical(evidence), error_factory=EvaluationError)
         return 2 if has_checked_failure else 0
     except (
         EvaluationError,
         KeyError,
         OSError,
+        ProviderTransportFailure,
         TypeError,
         UnicodeDecodeError,
         ValueError,

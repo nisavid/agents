@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import importlib.util
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -30,6 +31,70 @@ def load_runner():
     return module
 
 
+def explicit_claude_adapter(runner, monkeypatch):
+    monkeypatch.setattr(
+        runner,
+        "read_anthropic_api_key_from_descriptor",
+        lambda: "explicit-test-api-key",
+    )
+    return runner.ClaudeCliAdapter(
+        "claude",
+        "claude-sonnet-5",
+        "claude-opus-4-8",
+        credential_mechanism="anthropic-api-key-fd",
+        endpoint_policy="anthropic-public-api",
+    )
+
+
+def test_claude_runtime_identity_requires_absolute_path_and_closed_probe_environment(
+    monkeypatch, tmp_path: Path
+):
+    runner = load_runner()
+    executable = tmp_path / "claude"
+    executable.write_bytes(b"#!/bin/sh\nexit 0\n")
+    executable.chmod(0o700)
+    for name, value in {
+        "HOME": "/private/ambient-home",
+        "ANTHROPIC_API_KEY": "ambient-secret",
+        "ANTHROPIC_BASE_URL": "https://attacker.invalid",
+        "HTTPS_PROXY": "https://attacker.invalid",
+        "NODE_OPTIONS": "--require=/private/attacker.js",
+    }.items():
+        monkeypatch.setenv(name, value)
+    observed = {}
+
+    def fake_run(command, **kwargs):
+        observed["command"] = command
+        observed["cwd"] = kwargs["cwd"]
+        observed["environment"] = dict(kwargs["env"])
+        return SimpleNamespace(
+            returncode=0,
+            stdout=b"2.1.215 (Claude Code)\n",
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+
+    with pytest.raises(runner.EvaluationError, match="absolute"):
+        runner.resolve_claude_runtime_identity("claude")
+
+    identity = runner.resolve_claude_runtime_identity(str(executable))
+
+    assert observed["command"] == [str(executable), "--version"]
+    assert set(observed["environment"]) == set(
+        runner.CLAUDE_PROVIDER_PROBE_ENVIRONMENT_KEYS
+    )
+    assert not {
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_BASE_URL",
+        "HTTPS_PROXY",
+        "NODE_OPTIONS",
+    } & set(observed["environment"])
+    assert observed["environment"]["HOME"] != "/private/ambient-home"
+    assert not Path(observed["cwd"]).exists()
+    assert identity["path"] == str(executable)
+
+
 class LocalProductionAdapter:
     name = "claude-cli"
     executor_model = "claude-sonnet-5"
@@ -49,6 +114,12 @@ class LocalProductionAdapter:
 
     def __init__(self, runner):
         self.runner = runner
+        self.provider_execution_policy = runner.claude_provider_policy_document(
+            "anthropic-api-key-fd", "anthropic-public-api"
+        )
+        self.provider_policy_sha256 = runner.canonical_digest(
+            self.provider_execution_policy
+        )
 
     def result(self, response, request, model_version, local_correlation_id):
         local_correlation_id = local_correlation_id or str(self.runner.uuid.uuid4())
@@ -69,6 +140,7 @@ class LocalProductionAdapter:
                 "subtype": "init",
                 "session_id": session_id,
                 "model": model_version,
+                "apiKeySource": "ANTHROPIC_API_KEY",
                 **init_stream,
             },
             {
@@ -100,6 +172,7 @@ class LocalProductionAdapter:
             raw_transport=b"\n".join(
                 self.runner.canonical_bytes(event) for event in events
             ),
+            raw_stderr=b"",
         )
 
     def execute(self, request, workspace, local_correlation_id=None):
@@ -217,7 +290,7 @@ def build_local_production_evidence(tmp_path: Path, monkeypatch):
         adapter="claude",
         candidate_repository="https://github.com/nisavid/agents",
         candidate_revision=head,
-        claude_executable="claude",
+        claude_executable="/opt/claude/bin/claude",
         claude_timeout_seconds=300,
         definition=definition_path,
         executor_model="claude-sonnet-5",
@@ -226,6 +299,8 @@ def build_local_production_evidence(tmp_path: Path, monkeypatch):
         output=output,
         repo=repository,
         scenario_limit=None,
+        credential_mechanism="anthropic-api-key-fd",
+        endpoint_policy="anthropic-public-api",
     )
     assert runner.run(args) == 0
     return runner, output
@@ -683,6 +758,7 @@ def test_claude_adapter_empties_model_visible_capabilities(monkeypatch, tmp_path
             "subtype": "init",
             "session_id": "session-1",
             "model": "claude-sonnet-5",
+            "apiKeySource": "ANTHROPIC_API_KEY",
             "agents": ["claude", "Explore", "general-purpose", "Plan"],
             "tools": [],
             "mcp_servers": [],
@@ -722,7 +798,7 @@ def test_claude_adapter_empties_model_visible_capabilities(monkeypatch, tmp_path
         )
 
     monkeypatch.setattr(runner.subprocess, "run", fake_run)
-    adapter = runner.ClaudeCliAdapter("claude", "claude-sonnet-5", "claude-opus-4-8")
+    adapter = explicit_claude_adapter(runner, monkeypatch)
     result = adapter.execute(b"{}", tmp_path)
     command = captured["command"]
     assert command[command.index("--tools") + 1] == ""
@@ -818,6 +894,186 @@ def test_claude_adapter_empties_model_visible_capabilities(monkeypatch, tmp_path
         raise AssertionError("Claude init/result session mismatch was accepted")
 
 
+def test_claude_adapter_uses_fresh_closed_policy_bound_environment(
+    monkeypatch, tmp_path: Path
+):
+    runner = load_runner()
+    secret = "explicit-test-api-key"
+    ambient_values = {
+        "HOME": str(tmp_path / "ambient-home"),
+        "CLAUDE_CONFIG_DIR": str(tmp_path / "ambient-claude"),
+        "ANTHROPIC_API_KEY": "ambient-wrong-key",
+        "ANTHROPIC_BASE_URL": "https://attacker.invalid",
+        "HTTP_PROXY": "http://attacker.invalid:8080",
+        "HTTPS_PROXY": "http://attacker.invalid:8080",
+        "ALL_PROXY": "socks5://attacker.invalid:1080",
+        "NO_PROXY": "*",
+        "NODE_OPTIONS": "--require=/private/attacker-loader.js",
+        "CLAUDE_SETTINGS": str(tmp_path / "attacker-settings.json"),
+        "AWS_ACCESS_KEY_ID": "ambient-routing-credential",
+    }
+    for name, value in ambient_values.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(
+        runner,
+        "read_anthropic_api_key_from_descriptor",
+        lambda: secret,
+    )
+    runtime_identity = {
+        "path": "/opt/claude/bin/claude",
+        "sha256": "sha256:" + "1" * 64,
+        "version": "2.1.215 (Claude Code)",
+    }
+    monkeypatch.setattr(
+        runner,
+        "resolve_claude_runtime_identity",
+        lambda _executable: runtime_identity,
+    )
+    events = [
+        {
+            "type": "system",
+            "subtype": "init",
+            "session_id": "session-1",
+            "model": "claude-sonnet-5",
+            "apiKeySource": "ANTHROPIC_API_KEY",
+            "agents": [],
+            "tools": [],
+            "mcp_servers": [],
+            "plugins": [],
+            "slash_commands": [],
+            "skills": [],
+        },
+        {
+            "type": "assistant",
+            "message": {
+                "id": "response-1",
+                "model": "claude-sonnet-5",
+                "content": [{"type": "text", "text": "answer"}],
+            },
+        },
+        {
+            "type": "result",
+            "result": "answer",
+            "session_id": "session-1",
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        },
+    ]
+    observed_environments = []
+
+    def fake_run(_command, **kwargs):
+        observed_environments.append(dict(kwargs["env"]))
+        return SimpleNamespace(
+            returncode=0,
+            stdout=b"\n".join(json.dumps(event).encode() for event in events),
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_run)
+    adapter = runner.ClaudeCliAdapter(
+        "claude",
+        "claude-sonnet-5",
+        "claude-opus-4-8",
+        credential_mechanism="anthropic-api-key-fd",
+        endpoint_policy="anthropic-public-api",
+    )
+
+    adapter.execute(b"{}", tmp_path)
+    adapter.execute(b"{}", tmp_path)
+
+    assert len(observed_environments) == 2
+    assert set(observed_environments[0]) == set(runner.CLAUDE_PROVIDER_ENVIRONMENT_KEYS)
+    assert observed_environments[0]["ANTHROPIC_API_KEY"] == secret
+    for name, ambient_value in ambient_values.items():
+        if name in {"HOME", "CLAUDE_CONFIG_DIR"}:
+            assert observed_environments[0][name] != ambient_value
+        elif name != "ANTHROPIC_API_KEY":
+            assert name not in observed_environments[0]
+    fresh_keys = runner.CLAUDE_PROVIDER_FRESH_ROOT_KEYS
+    first_roots = {observed_environments[0][name] for name in fresh_keys}
+    second_roots = {observed_environments[1][name] for name in fresh_keys}
+    assert first_roots.isdisjoint(second_roots)
+    assert not any(Path(path).exists() for path in first_roots | second_roots)
+    assert adapter.provider_execution_policy["credential"] == {
+        "inherited_descriptor": runner.ANTHROPIC_API_KEY_DESCRIPTOR,
+        "mechanism": "anthropic-api-key-fd",
+        "provider_init_source": "ANTHROPIC_API_KEY",
+    }
+    assert adapter.provider_execution_policy["endpoint"]["policy"] == (
+        "anthropic-public-api"
+    )
+    assert adapter.provider_policy_sha256 == runner.canonical_digest(
+        adapter.provider_execution_policy
+    )
+
+
+def test_claude_adapter_rejects_credential_provenance_drift(
+    monkeypatch, tmp_path: Path
+):
+    runner = load_runner()
+    monkeypatch.setattr(
+        runner,
+        "read_anthropic_api_key_from_descriptor",
+        lambda: "explicit-test-api-key",
+    )
+    monkeypatch.setattr(
+        runner,
+        "resolve_claude_runtime_identity",
+        lambda _executable: {
+            "path": "/opt/claude/bin/claude",
+            "sha256": "sha256:" + "1" * 64,
+            "version": "2.1.215 (Claude Code)",
+        },
+    )
+    events = [
+        {
+            "type": "system",
+            "subtype": "init",
+            "session_id": "session-1",
+            "model": "claude-sonnet-5",
+            "apiKeySource": "/login managed key",
+            "agents": [],
+            "tools": [],
+            "mcp_servers": [],
+            "plugins": [],
+            "slash_commands": [],
+            "skills": [],
+        },
+        {
+            "type": "assistant",
+            "message": {
+                "id": "response-1",
+                "model": "claude-sonnet-5",
+                "content": [{"type": "text", "text": "answer"}],
+            },
+        },
+        {
+            "type": "result",
+            "result": "answer",
+            "session_id": "session-1",
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        },
+    ]
+    monkeypatch.setattr(
+        runner.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=b"\n".join(json.dumps(event).encode() for event in events),
+            stderr=b"",
+        ),
+    )
+    adapter = runner.ClaudeCliAdapter(
+        "claude",
+        "claude-sonnet-5",
+        "claude-opus-4-8",
+        credential_mechanism="anthropic-api-key-fd",
+        endpoint_policy="anthropic-public-api",
+    )
+
+    with pytest.raises(runner.TransportFailure, match="credential provenance"):
+        adapter.execute(b"{}", tmp_path)
+
+
 def test_claude_adapter_rejects_mixed_assistant_identity_and_result_content(
     monkeypatch, tmp_path: Path
 ):
@@ -838,6 +1094,7 @@ def test_claude_adapter_rejects_mixed_assistant_identity_and_result_content(
             "subtype": "init",
             "session_id": "session-1",
             "model": "claude-sonnet-5",
+            "apiKeySource": "ANTHROPIC_API_KEY",
             "agents": [],
             "tools": [],
             "mcp_servers": [],
@@ -878,7 +1135,7 @@ def test_claude_adapter_rejects_mixed_assistant_identity_and_result_content(
             stderr=b"",
         ),
     )
-    adapter = runner.ClaudeCliAdapter("claude", "claude-sonnet-5", "claude-opus-4-8")
+    adapter = explicit_claude_adapter(runner, monkeypatch)
 
     try:
         adapter.execute(b"{}", tmp_path)
@@ -920,6 +1177,8 @@ def test_claude_adapter_rejects_executable_drift_after_provider_call(
             "type": "system",
             "subtype": "init",
             "session_id": "session-1",
+            "model": "claude-sonnet-5",
+            "apiKeySource": "ANTHROPIC_API_KEY",
             "agents": [],
             "tools": [],
             "mcp_servers": [],
@@ -952,7 +1211,7 @@ def test_claude_adapter_rejects_executable_drift_after_provider_call(
         ),
     )
 
-    adapter = runner.ClaudeCliAdapter("claude", "claude-sonnet-5", "claude-opus-4-8")
+    adapter = explicit_claude_adapter(runner, monkeypatch)
     try:
         adapter.execute(b"{}", tmp_path)
     except runner.TransportFailure as error:
@@ -968,6 +1227,9 @@ def test_checkpoint_resume_rejects_claude_runtime_identity_drift(tmp_path: Path)
         "sha256": "sha256:" + "1" * 64,
         "version": "2.1.215 (Claude Code)",
     }
+    policy = runner.claude_provider_policy_document(
+        "anthropic-api-key-fd", "anthropic-public-api"
+    )
     adapter = SimpleNamespace(
         name="claude-cli",
         executor_model="sonnet",
@@ -977,6 +1239,8 @@ def test_checkpoint_resume_rejects_claude_runtime_identity_drift(tmp_path: Path)
         executor_system_prompt=runner.EXECUTOR_SYSTEM_PROMPT,
         grader_system_prompt=runner.GRADER_SYSTEM_PROMPT,
         runtime_identity=baseline,
+        provider_execution_policy=policy,
+        provider_policy_sha256=runner.canonical_digest(policy),
     )
     output = tmp_path / "evidence"
     identity = {
@@ -1019,6 +1283,165 @@ def test_checkpoint_resume_rejects_claude_runtime_identity_drift(tmp_path: Path)
         raise AssertionError("checkpoint resumed after Claude runtime identity drift")
 
 
+def test_config_and_checkpoint_bind_exact_provider_execution_policy(tmp_path: Path):
+    runner = load_runner()
+    policy = runner.claude_provider_policy_document(
+        "anthropic-api-key-fd", "anthropic-public-api"
+    )
+    adapter = SimpleNamespace(
+        name="claude-cli",
+        executor_model="claude-sonnet-5",
+        grader_model="claude-opus-4-8",
+        executor_effort="high",
+        grader_effort="high",
+        executor_system_prompt=runner.EXECUTOR_SYSTEM_PROMPT,
+        grader_system_prompt=runner.GRADER_SYSTEM_PROMPT,
+        runtime_identity={
+            "path": "/opt/claude/bin/claude",
+            "sha256": "sha256:" + "1" * 64,
+            "version": "2.1.215 (Claude Code)",
+        },
+        provider_execution_policy=policy,
+        provider_policy_sha256=runner.canonical_digest(policy),
+    )
+    config = runner.config_document(adapter, "executor", "claude-sonnet-5")
+
+    assert config["provider_execution_policy"] == policy
+    assert config["provider_policy_sha256"] == runner.canonical_digest(policy)
+    assert config["config_sha256"] == runner.canonical_digest(
+        {key: value for key, value in config.items() if key != "config_sha256"}
+    )
+
+    output = tmp_path / "evidence"
+    identity = {
+        "local_correlation_id": "local-1",
+        "model_version": "claude-sonnet-5",
+        "response_id": "response-1",
+        "session_id": "session-1",
+    }
+    identity_relpath, identity_sha256 = runner.frozen_json_artifact(
+        output, "artifacts/identity.json", identity
+    )
+    config_relpath, config_artifact_sha256 = runner.frozen_json_artifact(
+        output, "artifacts/config.json", config
+    )
+    record = {
+        "config_artifact_relpath": config_relpath,
+        "config_artifact_sha256": config_artifact_sha256,
+        "config_sha256": config["config_sha256"],
+        "identity_artifact_relpath": identity_relpath,
+        "identity_sha256": identity_sha256,
+        "local_correlation_id_sha256": runner.digest_bytes(b"local-1"),
+        "response_id_sha256": runner.digest_bytes(b"response-1"),
+        "session_id_sha256": runner.digest_bytes(b"session-1"),
+    }
+    state = {"schema_version": 1}
+    runner.validate_checkpoint_model_lock(output, state, adapter, "executor", record)
+
+    adapter.provider_execution_policy = {
+        **policy,
+        "endpoint": {**policy["endpoint"], "policy": "alternate-endpoint"},
+    }
+    adapter.provider_policy_sha256 = runner.canonical_digest(
+        adapter.provider_execution_policy
+    )
+    with pytest.raises(
+        runner.EvaluationError, match="checkpoint model/config binding drift"
+    ):
+        runner.validate_checkpoint_model_lock(
+            output, state, adapter, "executor", record
+        )
+
+
+def test_claude_run_requires_explicit_reviewed_credential_and_endpoint_policy():
+    runner = load_runner()
+    base = {
+        "adapter": "claude",
+        "claude_executable": "/opt/claude/bin/claude",
+        "credential_mechanism": None,
+        "endpoint_policy": None,
+    }
+    with pytest.raises(runner.EvaluationError, match="credential mechanism"):
+        runner.validate_provider_policy_arguments(SimpleNamespace(**base))
+    with pytest.raises(runner.EvaluationError, match="endpoint policy"):
+        runner.validate_provider_policy_arguments(
+            SimpleNamespace(
+                **{**base, "credential_mechanism": "anthropic-api-key-fd"}
+            )
+        )
+
+
+def test_fixed_credential_descriptor_accepts_only_bounded_visible_ascii():
+    runner = load_runner()
+
+    def read_from_descriptor(content: bytes):
+        try:
+            saved = os.dup(runner.ANTHROPIC_API_KEY_DESCRIPTOR)
+        except OSError:
+            saved = None
+        reader, writer = os.pipe()
+        try:
+            os.write(writer, content)
+            os.close(writer)
+            writer = -1
+            if reader != runner.ANTHROPIC_API_KEY_DESCRIPTOR:
+                os.dup2(reader, runner.ANTHROPIC_API_KEY_DESCRIPTOR)
+                os.close(reader)
+                reader = -1
+            return runner.read_anthropic_api_key_from_descriptor()
+        finally:
+            if writer >= 0:
+                os.close(writer)
+            if reader >= 0 and reader != runner.ANTHROPIC_API_KEY_DESCRIPTOR:
+                os.close(reader)
+            if saved is None:
+                try:
+                    os.close(runner.ANTHROPIC_API_KEY_DESCRIPTOR)
+                except OSError:
+                    pass
+            else:
+                os.dup2(saved, runner.ANTHROPIC_API_KEY_DESCRIPTOR)
+                os.close(saved)
+
+    assert read_from_descriptor(b"sk-ant-explicit-test-key") == (
+        "sk-ant-explicit-test-key"
+    )
+    for unsafe in (
+        b"",
+        b"key with spaces",
+        b"key\n",
+        b"x" * (runner.MAX_ANTHROPIC_API_KEY_BYTES + 1),
+    ):
+        with pytest.raises(runner.EvaluationError):
+            read_from_descriptor(unsafe)
+    runner.validate_provider_policy_arguments(
+        SimpleNamespace(
+            adapter="claude",
+            claude_executable="/opt/claude/bin/claude",
+            credential_mechanism="anthropic-api-key-fd",
+            endpoint_policy="anthropic-public-api",
+        )
+    )
+    with pytest.raises(runner.EvaluationError, match="fixture"):
+        runner.validate_provider_policy_arguments(
+            SimpleNamespace(
+                adapter="fixture",
+                credential_mechanism="anthropic-api-key-fd",
+                endpoint_policy="anthropic-public-api",
+            )
+        )
+
+    with pytest.raises(runner.EvaluationError, match="absolute"):
+        runner.validate_provider_policy_arguments(
+            SimpleNamespace(
+                adapter="claude",
+                claude_executable="claude",
+                credential_mechanism="anthropic-api-key-fd",
+                endpoint_policy="anthropic-public-api",
+            )
+        )
+
+
 def test_successful_malformed_provider_stream_becomes_retained_transport_failure(
     monkeypatch, tmp_path: Path
 ):
@@ -1044,7 +1467,7 @@ def test_successful_malformed_provider_stream_becomes_retained_transport_failure
             stderr=b"provider diagnostic",
         ),
     )
-    adapter = runner.ClaudeCliAdapter("claude", "claude-sonnet-5", "claude-opus-4-8")
+    adapter = explicit_claude_adapter(runner, monkeypatch)
     output = tmp_path / "evidence"
     request_relpath = "artifacts/requests/executors/example.json"
     request = runner.canonical_bytes({"fixture": "fixture", "prompt": "prompt"})
@@ -1074,6 +1497,526 @@ def test_successful_malformed_provider_stream_becomes_retained_transport_failure
         output / journal["stderr_artifact_relpath"]
     ).read_bytes() == b"provider diagnostic"
     assert journal["provider_events"] == [{"type": "system"}]
+
+
+def _successful_claude_stream(
+    *,
+    usage: dict,
+    response_id: str = "response-1",
+    session_id: str = "session-1",
+) -> bytes:
+    events = [
+        {
+            "type": "system",
+            "subtype": "init",
+            "session_id": session_id,
+            "model": "claude-sonnet-5",
+            "apiKeySource": "ANTHROPIC_API_KEY",
+            "agents": [],
+            "tools": [],
+            "mcp_servers": [],
+            "plugins": [],
+            "slash_commands": [],
+            "skills": [],
+        },
+        {
+            "type": "assistant",
+            "message": {
+                "id": response_id,
+                "model": "claude-sonnet-5",
+                "content": [{"type": "text", "text": "answer"}],
+            },
+        },
+        {
+            "type": "result",
+            "result": "answer",
+            "session_id": session_id,
+            "usage": usage,
+        },
+    ]
+    return b"\n".join(json.dumps(event).encode() for event in events)
+
+
+def _assert_failed_attempt_retained_streams(
+    output: Path, *, stdout: bytes, stderr: bytes, status: str = "failed"
+) -> dict:
+    journal = json.loads(
+        next((output / "artifacts/attempts/executors").glob("*.json")).read_text()
+    )
+    assert journal["status"] == status
+    stdout_path = output / journal["stdout_artifact_relpath"]
+    stderr_path = output / journal["stderr_artifact_relpath"]
+    assert stdout_path.read_bytes() == stdout
+    assert stderr_path.read_bytes() == stderr
+    assert stdout_path.stat().st_mode & 0o777 == 0o600
+    assert stderr_path.stat().st_mode & 0o777 == 0o600
+    return journal
+
+
+def _temporary_directory_with_failing_exit(real_temporary_directory, message: str):
+    class FailingTemporaryDirectory:
+        def __init__(self, *args, **kwargs):
+            self.inner = real_temporary_directory(*args, **kwargs)
+
+        def __enter__(self):
+            return self.inner.__enter__()
+
+        def __exit__(self, exception_type, exception, traceback):
+            self.inner.__exit__(exception_type, exception, traceback)
+            raise OSError(message)
+
+    return FailingTemporaryDirectory
+
+
+def test_malformed_success_usage_retains_streams_without_public_error_disclosure(
+    monkeypatch, tmp_path: Path
+):
+    runner = load_runner()
+    provider_value = "owner-only-provider-output"
+    secret_stderr = b"owner-only-success-stderr:\xff\n"
+    stdout = _successful_claude_stream(
+        usage={"input_tokens": provider_value, "output_tokens": 2}
+    )
+    monkeypatch.setattr(
+        runner,
+        "resolve_claude_runtime_identity",
+        lambda _executable: {
+            "path": "/opt/claude/bin/claude",
+            "sha256": "sha256:" + "1" * 64,
+            "version": "2.1.215 (Claude Code)",
+        },
+    )
+    monkeypatch.setattr(
+        runner.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=stdout,
+            stderr=secret_stderr,
+        ),
+    )
+    adapter = explicit_claude_adapter(runner, monkeypatch)
+    output = tmp_path / "evidence"
+    request_relpath = "artifacts/requests/executors/example.json"
+    request = runner.canonical_bytes({"fixture": "fixture", "prompt": "prompt"})
+    runner.write_frozen(output / request_relpath, request)
+
+    with pytest.raises(runner.TransportFailure) as raised:
+        runner.run_transport_attempt(
+            output,
+            "executors",
+            "example",
+            request_relpath,
+            runner.digest_bytes(request),
+            "sha256:" + "1" * 64,
+            lambda correlation_id: adapter.execute(
+                b"{}", tmp_path, correlation_id
+            ),
+        )
+
+    assert provider_value not in str(raised.value)
+    assert "owner-only-success-stderr" not in str(raised.value)
+    journal = _assert_failed_attempt_retained_streams(
+        output, stdout=stdout, stderr=secret_stderr
+    )
+    assert provider_value not in journal["error"]
+    assert "owner-only-success-stderr" not in journal["error"]
+
+
+def test_post_call_runtime_probe_failure_retains_streams_without_public_disclosure(
+    monkeypatch, tmp_path: Path
+):
+    runner = load_runner()
+    secret_probe = "owner-only-post-call-probe-state"
+    secret_stderr = b"owner-only-post-call-stderr:\xff\n"
+    stdout = _successful_claude_stream(
+        usage={"input_tokens": 3, "output_tokens": 2}
+    )
+    runtime_calls = 0
+
+    def runtime_identity(_executable):
+        nonlocal runtime_calls
+        runtime_calls += 1
+        if runtime_calls == 3:
+            raise OSError(secret_probe)
+        return {
+            "path": "/opt/claude/bin/claude",
+            "sha256": "sha256:" + "1" * 64,
+            "version": "2.1.215 (Claude Code)",
+        }
+
+    monkeypatch.setattr(runner, "resolve_claude_runtime_identity", runtime_identity)
+    monkeypatch.setattr(
+        runner.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=stdout,
+            stderr=secret_stderr,
+        ),
+    )
+    adapter = explicit_claude_adapter(runner, monkeypatch)
+    output = tmp_path / "evidence"
+    request_relpath = "artifacts/requests/executors/example.json"
+    request = runner.canonical_bytes({"fixture": "fixture", "prompt": "prompt"})
+    runner.write_frozen(output / request_relpath, request)
+
+    with pytest.raises(runner.TransportFailure) as raised:
+        runner.run_transport_attempt(
+            output,
+            "executors",
+            "example",
+            request_relpath,
+            runner.digest_bytes(request),
+            "sha256:" + "1" * 64,
+            lambda correlation_id: adapter.execute(
+                b"{}", tmp_path, correlation_id
+            ),
+        )
+
+    assert secret_probe not in str(raised.value)
+    assert "owner-only-post-call-stderr" not in str(raised.value)
+    journal = _assert_failed_attempt_retained_streams(
+        output, stdout=stdout, stderr=secret_stderr
+    )
+    assert secret_probe not in journal["error"]
+    assert "owner-only-post-call-stderr" not in journal["error"]
+
+
+def test_post_call_clock_failure_retains_streams_without_public_disclosure(
+    monkeypatch, tmp_path: Path
+):
+    runner = load_runner()
+    secret_clock = "owner-only-post-call-clock-state"
+    secret_stderr = b"owner-only-clock-stderr:\xff\n"
+    stdout = _successful_claude_stream(
+        usage={"input_tokens": 3, "output_tokens": 2}
+    )
+    monkeypatch.setattr(
+        runner,
+        "resolve_claude_runtime_identity",
+        lambda _executable: {
+            "path": "/opt/claude/bin/claude",
+            "sha256": "sha256:" + "1" * 64,
+            "version": "2.1.215 (Claude Code)",
+        },
+    )
+    monkeypatch.setattr(
+        runner.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=stdout,
+            stderr=secret_stderr,
+        ),
+    )
+    clock_calls = 0
+
+    def clock():
+        nonlocal clock_calls
+        clock_calls += 1
+        if clock_calls == 3:
+            raise OSError(secret_clock)
+        return f"2026-08-20T00:00:0{clock_calls}Z"
+
+    monkeypatch.setattr(runner, "timestamp", clock)
+    adapter = explicit_claude_adapter(runner, monkeypatch)
+    output = tmp_path / "evidence"
+    request_relpath = "artifacts/requests/executors/example.json"
+    request = runner.canonical_bytes({"fixture": "fixture", "prompt": "prompt"})
+    runner.write_frozen(output / request_relpath, request)
+
+    with pytest.raises(runner.TransportFailure) as raised:
+        runner.run_transport_attempt(
+            output,
+            "executors",
+            "example",
+            request_relpath,
+            runner.digest_bytes(request),
+            "sha256:" + "1" * 64,
+            lambda correlation_id: adapter.execute(
+                b"{}", tmp_path, correlation_id
+            ),
+        )
+
+    assert secret_clock not in str(raised.value)
+    assert "owner-only-clock-stderr" not in str(raised.value)
+    journal = _assert_failed_attempt_retained_streams(
+        output, stdout=stdout, stderr=secret_stderr
+    )
+    assert secret_clock not in journal["error"]
+    assert "owner-only-clock-stderr" not in journal["error"]
+
+
+def test_post_adapter_identity_binding_failure_retains_private_streams(
+    monkeypatch, tmp_path: Path
+):
+    runner = load_runner()
+    secret_stderr = b"owner-only-identity-binding-stderr:\xff\n"
+    stdout = _successful_claude_stream(
+        usage={"input_tokens": 3, "output_tokens": 2},
+        response_id="owner-only-\ud800",
+    )
+    monkeypatch.setattr(
+        runner,
+        "resolve_claude_runtime_identity",
+        lambda _executable: {
+            "path": "/opt/claude/bin/claude",
+            "sha256": "sha256:" + "1" * 64,
+            "version": "2.1.215 (Claude Code)",
+        },
+    )
+    monkeypatch.setattr(
+        runner.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=stdout,
+            stderr=secret_stderr,
+        ),
+    )
+    adapter = explicit_claude_adapter(runner, monkeypatch)
+    output = tmp_path / "evidence"
+    request_relpath = "artifacts/requests/executors/example.json"
+    request = runner.canonical_bytes({"fixture": "fixture", "prompt": "prompt"})
+    runner.write_frozen(output / request_relpath, request)
+
+    with pytest.raises(runner.TransportFailure) as raised:
+        runner.run_transport_attempt(
+            output,
+            "executors",
+            "example",
+            request_relpath,
+            runner.digest_bytes(request),
+            "sha256:" + "1" * 64,
+            lambda correlation_id: adapter.execute(
+                b"{}", tmp_path, correlation_id
+            ),
+        )
+
+    assert str(raised.value) == "provider attempt evidence binding failed"
+    assert "owner-only-identity-binding-stderr" not in str(raised.value)
+    journal = _assert_failed_attempt_retained_streams(
+        output, stdout=stdout, stderr=secret_stderr
+    )
+    assert journal["error"] == "provider attempt evidence binding failed"
+    assert "owner-only-identity-binding-stderr" not in journal["error"]
+
+
+def test_provider_workspace_teardown_failure_retains_private_streams(
+    monkeypatch, tmp_path: Path
+):
+    runner = load_runner()
+    secret_teardown = "owner-only-provider-workspace-teardown"
+    secret_stderr = b"owner-only-teardown-stderr:\xff\n"
+    stdout = _successful_claude_stream(
+        usage={"input_tokens": 3, "output_tokens": 2}
+    )
+    monkeypatch.setattr(
+        runner,
+        "resolve_claude_runtime_identity",
+        lambda _executable: {
+            "path": "/opt/claude/bin/claude",
+            "sha256": "sha256:" + "1" * 64,
+            "version": "2.1.215 (Claude Code)",
+        },
+    )
+    monkeypatch.setattr(
+        runner.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=stdout,
+            stderr=secret_stderr,
+        ),
+    )
+    monkeypatch.setattr(
+        runner.tempfile,
+        "TemporaryDirectory",
+        _temporary_directory_with_failing_exit(
+            runner.tempfile.TemporaryDirectory, secret_teardown
+        ),
+    )
+    adapter = explicit_claude_adapter(runner, monkeypatch)
+    output = tmp_path / "evidence"
+    request_relpath = "artifacts/requests/executors/example.json"
+    request = runner.canonical_bytes({"fixture": "fixture", "prompt": "prompt"})
+    runner.write_frozen(output / request_relpath, request)
+
+    with pytest.raises(runner.TransportFailure) as raised:
+        runner.run_transport_attempt(
+            output,
+            "executors",
+            "example",
+            request_relpath,
+            runner.digest_bytes(request),
+            "sha256:" + "1" * 64,
+            lambda correlation_id: adapter.execute(
+                b"{}", tmp_path, correlation_id
+            ),
+        )
+
+    assert str(raised.value) == "Claude provider response validation failed"
+    assert secret_teardown not in str(raised.value)
+    assert "owner-only-teardown-stderr" not in str(raised.value)
+    journal = _assert_failed_attempt_retained_streams(
+        output, stdout=stdout, stderr=secret_stderr
+    )
+    assert journal["error"] == "Claude provider response validation failed"
+    assert secret_teardown not in journal["error"]
+    assert "owner-only-teardown-stderr" not in journal["error"]
+
+
+def test_provider_workspace_teardown_does_not_mask_timeout_classification(
+    monkeypatch, tmp_path: Path
+):
+    runner = load_runner()
+    secret_teardown = "owner-only-timeout-workspace-teardown"
+    secret_stderr = b"owner-only-timeout-stderr:\xff\n"
+    stdout = b'{"type":"system","subtype":"partial"}\n'
+    monkeypatch.setattr(
+        runner,
+        "resolve_claude_runtime_identity",
+        lambda _executable: {
+            "path": "/opt/claude/bin/claude",
+            "sha256": "sha256:" + "1" * 64,
+            "version": "2.1.215 (Claude Code)",
+        },
+    )
+
+    def time_out(command, **kwargs):
+        raise subprocess.TimeoutExpired(
+            command,
+            kwargs["timeout"],
+            output=stdout,
+            stderr=secret_stderr,
+        )
+
+    monkeypatch.setattr(runner.subprocess, "run", time_out)
+    monkeypatch.setattr(
+        runner.tempfile,
+        "TemporaryDirectory",
+        _temporary_directory_with_failing_exit(
+            runner.tempfile.TemporaryDirectory, secret_teardown
+        ),
+    )
+    adapter = explicit_claude_adapter(runner, monkeypatch)
+    output = tmp_path / "evidence"
+    request_relpath = "artifacts/requests/executors/example.json"
+    request = runner.canonical_bytes({"fixture": "fixture", "prompt": "prompt"})
+    runner.write_frozen(output / request_relpath, request)
+
+    with pytest.raises(runner.TransportFailure) as raised:
+        runner.run_transport_attempt(
+            output,
+            "executors",
+            "example",
+            request_relpath,
+            runner.digest_bytes(request),
+            "sha256:" + "1" * 64,
+            lambda correlation_id: adapter.execute(
+                b"{}", tmp_path, correlation_id
+            ),
+        )
+
+    assert raised.value.timed_out is True
+    assert secret_teardown not in str(raised.value)
+    assert "owner-only-timeout-stderr" not in str(raised.value)
+    journal = _assert_failed_attempt_retained_streams(
+        output, stdout=stdout, stderr=secret_stderr, status="timeout"
+    )
+    assert journal["timed_out"] is True
+    assert secret_teardown not in journal["error"]
+    assert "owner-only-timeout-stderr" not in journal["error"]
+
+
+def test_nonzero_provider_stderr_is_redacted_from_public_failure_and_journal(
+    monkeypatch, tmp_path: Path
+):
+    runner = load_runner()
+    secret_stderr = b"owner-only-control-plane-diagnostic:\xff\n"
+    monkeypatch.setattr(
+        runner,
+        "resolve_claude_runtime_identity",
+        lambda _executable: {
+            "path": "/opt/claude/bin/claude",
+            "sha256": "sha256:" + "1" * 64,
+            "version": "2.1.215 (Claude Code)",
+        },
+    )
+    monkeypatch.setattr(
+        runner.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=23,
+            stdout=b"partial provider output",
+            stderr=secret_stderr,
+        ),
+    )
+    adapter = explicit_claude_adapter(runner, monkeypatch)
+    output = tmp_path / "evidence"
+    request_relpath = "artifacts/requests/executors/example.json"
+    request = runner.canonical_bytes({"fixture": "fixture", "prompt": "prompt"})
+    runner.write_frozen(output / request_relpath, request)
+
+    with pytest.raises(runner.TransportFailure) as raised:
+        runner.run_transport_attempt(
+            output,
+            "executors",
+            "example",
+            request_relpath,
+            runner.digest_bytes(request),
+            "sha256:" + "1" * 64,
+            lambda correlation_id: adapter.execute(
+                b"{}", tmp_path, correlation_id
+            ),
+        )
+
+    public_failure = str(raised.value)
+    assert "owner-only-control-plane-diagnostic" not in public_failure
+    assert "23" in public_failure
+    journal_path = next(
+        (output / "artifacts/attempts/executors").glob("*.json")
+    )
+    journal = json.loads(journal_path.read_text())
+    assert "owner-only-control-plane-diagnostic" not in json.dumps(journal)
+    assert journal["returncode"] == 23
+    stderr_path = output / journal["stderr_artifact_relpath"]
+    assert stderr_path.read_bytes() == secret_stderr
+    assert stderr_path.stat().st_mode & 0o777 == 0o600
+
+
+def test_successful_provider_stderr_is_retained_only_in_private_attempt_artifact(
+    tmp_path: Path,
+):
+    runner = load_runner()
+    output = tmp_path / "evidence"
+    request_relpath = "artifacts/requests/executors/example.json"
+    request = runner.canonical_bytes({"fixture": "fixture", "prompt": "prompt"})
+    runner.write_frozen(output / request_relpath, request)
+    base = runner.FixtureAdapter().execute(b"{}", tmp_path, "local-1")
+    secret_stderr = b"owner-only-success-diagnostic:\xff\n"
+    result = SimpleNamespace(**{**base.__dict__, "raw_stderr": secret_stderr})
+
+    runner.run_transport_attempt(
+        output,
+        "executors",
+        "example",
+        request_relpath,
+        runner.digest_bytes(request),
+        "sha256:" + "1" * 64,
+        lambda _correlation_id: result,
+    )
+
+    journal_path = next(
+        (output / "artifacts/attempts/executors").glob("*.json")
+    )
+    journal = json.loads(journal_path.read_text())
+    assert journal["status"] == "completed"
+    assert "owner-only-success-diagnostic" not in json.dumps(journal)
+    stderr_path = output / journal["stderr_artifact_relpath"]
+    assert stderr_path.read_bytes() == secret_stderr
+    assert stderr_path.stat().st_mode & 0o777 == 0o600
 
 
 def test_failed_provider_attempt_retains_bound_raw_streams_and_unavailable_identity(

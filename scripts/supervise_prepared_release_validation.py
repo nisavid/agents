@@ -39,7 +39,7 @@ TERMINATION_GRACE_SECONDS = 0.25
 TERMINAL_WAIT_OPTIONS = os.WEXITED | os.WNOHANG | os.WNOWAIT
 VALIDATION_CHILD_MODE = "--validation-child"
 PREPARED_SUPERVISOR_SOURCE_OPTION = "--prepared-supervisor-source-sha256"
-SOURCE_SHA256 = "07f591426c8ba604c4df5b117b60658244a42180ce7519aae446e89181768199"
+SOURCE_SHA256 = "a18cdc976d9ba892b31b783dcf8b4e78763d8dbc43f8478256503ffe1db6d4bb"
 MAX_SUPERVISOR_SOURCE_BYTES = 1024 * 1024
 SignalHandler = int | Callable[[int, FrameType | None], None]
 
@@ -232,7 +232,19 @@ def validation_command(
         for argument in arguments
     ):
         raise ValueError("prepared supervisor source identity is entrypoint-owned")
-    if mode == "public-release":
+    if mode == "source-stage":
+        if arguments:
+            raise ValueError(
+                "source-stage prepared validation accepts no extra arguments"
+            )
+        entrypoint = repository / "scripts" / "validate_public_release.py"
+        entrypoint_arguments = [
+            str(repository),
+            "--source-stage",
+            PREPARED_SUPERVISOR_SOURCE_OPTION,
+            str(_LOADED_SUPERVISOR_SOURCE["source_sha256"]),
+        ]
+    elif mode == "public-release":
         entrypoint = repository / "scripts" / "validate_public_release.py"
         entrypoint_arguments = [
             str(repository),
@@ -257,7 +269,9 @@ def validation_command(
             str(_LOADED_SUPERVISOR_SOURCE["source_sha256"]),
         ]
     else:
-        raise ValueError("mode must be public-release or phase7-production")
+        raise ValueError(
+            "mode must be source-stage, public-release, or phase7-production"
+        )
 
     if not entrypoint.is_file():
         raise ValueError("selected release entrypoint is missing")
@@ -497,9 +511,23 @@ def run_prepared_validation(command: list[str]) -> int:
         )
 
 
-def run_validation_child(command: list[str]) -> int:
+def run_validation_child(
+    command: list[str], *, source_stage_only: bool = False
+) -> int:
     if len(command) < 4 or command[0] != sys.executable or command[1:3] != ["-I", "-B"]:
         return fail("prepared release validation child invocation is invalid")
+    if source_stage_only:
+        if len(command) != 8:
+            return fail("prepared release validation child invocation is invalid")
+        repository = Path(command[4])
+        if not repository.is_absolute() or not repository.is_dir():
+            return fail("prepared release validation child invocation is invalid")
+        try:
+            expected = validation_command("source-stage", repository, [])
+        except ValueError:
+            return fail("prepared release validation child invocation is invalid")
+        if command != expected or not supervisor_belongs_to_repository(repository):
+            return fail("prepared release validation child invocation is invalid")
 
     signal.pthread_sigmask(signal.SIG_BLOCK, OWNED_SIGNAL_SET)
     for signal_number in OWNED_DISPOSITION_SIGNALS:
@@ -542,5 +570,16 @@ def main(arguments: list[str]) -> int:
     return returncode
 
 
+def entrypoint_main(arguments: list[str]) -> int:
+    if arguments[:1] == [VALIDATION_CHILD_MODE]:
+        return run_validation_child(arguments[1:], source_stage_only=True)
+    if not arguments or arguments[0] != "source-stage":
+        return fail(
+            "later-release prepared validation is unavailable in this source-stage "
+            "release"
+        )
+    return main(arguments)
+
+
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1:]))
+    raise SystemExit(entrypoint_main(sys.argv[1:]))

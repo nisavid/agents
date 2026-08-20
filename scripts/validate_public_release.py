@@ -37,7 +37,7 @@ from types import MappingProxyType, ModuleType
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 _RUNNING_AS_ENTRYPOINT = __name__ == "__main__"
-SOURCE_SHA256 = "50bcc93534210ba4aa209da44dbc0b575e7a6f0e55b661437e0d3e4ab9462492"
+SOURCE_SHA256 = "544525bc4b786f9a8719b44642d069d7fe25cc024cb55b340fd1ce628a91e001"
 PREPARED_SUPERVISOR_SOURCE_OPTION = "--prepared-supervisor-source-sha256"
 MAX_PROOF_SOURCE_BYTES = 2 * 1024 * 1024
 RELEASE_SUPPORT_SOURCES = (
@@ -80,6 +80,7 @@ COMMON_SUPPORT_PATHS = {
     "scripts/run_skill_routing_eval.py",
     "scripts/agent_plugins_standard.py",
     "tests/test_evidence_transport.py",
+    "tests/test_later_release_security_containment.py",
     "tests/test_phase7_control_plane.py",
     "tests/test_phase7_compatibility_projection.py",
     "tests/test_phase7_composed_matrix.py",
@@ -3387,6 +3388,42 @@ def validate_source_stage(
     return identities
 
 
+def _source_stage_cli_shape(raw_arguments: list[str]) -> bool:
+    if raw_arguments in (["-h"], ["--help"]):
+        return True
+    source_stage_count = 0
+    supervisor_identity_count = 0
+    repository_count = 0
+    index = 0
+    while index < len(raw_arguments):
+        argument = raw_arguments[index]
+        if argument == "--source-stage":
+            source_stage_count += 1
+        elif argument == PREPARED_SUPERVISOR_SOURCE_OPTION:
+            index += 1
+            if (
+                index >= len(raw_arguments)
+                or SHA256.fullmatch(raw_arguments[index]) is None
+            ):
+                return False
+            supervisor_identity_count += 1
+        elif argument.startswith(f"{PREPARED_SUPERVISOR_SOURCE_OPTION}="):
+            value = argument.partition("=")[2]
+            if SHA256.fullmatch(value) is None:
+                return False
+            supervisor_identity_count += 1
+        elif argument.startswith("-"):
+            return False
+        else:
+            repository_count += 1
+        index += 1
+    return (
+        source_stage_count == 1
+        and supervisor_identity_count <= 1
+        and repository_count <= 1
+    )
+
+
 def main() -> int:
     raw_arguments = sys.argv[1:]
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
@@ -3553,5 +3590,16 @@ def main() -> int:
     return 0
 
 
+def entrypoint_main() -> int:
+    if not _source_stage_cli_shape(sys.argv[1:]):
+        print(
+            "Public-release native validation is unavailable in this source-stage "
+            "release; invoke only --source-stage validation",
+            file=sys.stderr,
+        )
+        return 1
+    return main()
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(entrypoint_main())

@@ -524,7 +524,7 @@ class RequiredReviewTests(unittest.TestCase):
                     REQUIRED_REVIEW.PublicationError, "output exceeded"
                 ),
             ):
-                REQUIRED_REVIEW._supervised_process(
+                REQUIRED_REVIEW._retired_supervised_process(
                     observation, Path("/absolute/review-bundle")
                 )
         self.assertLess(time.monotonic() - started, 2)
@@ -553,7 +553,7 @@ class RequiredReviewTests(unittest.TestCase):
                 mock.patch.object(REQUIRED_REVIEW, "TERMINATION_GRACE_SECONDS", 0.1),
                 self.assertRaisesRegex(REQUIRED_REVIEW.PublicationError, "timed out"),
             ):
-                REQUIRED_REVIEW._supervised_process(
+                REQUIRED_REVIEW._retired_supervised_process(
                     observation, Path("/absolute/review-bundle")
                 )
 
@@ -577,7 +577,7 @@ class RequiredReviewTests(unittest.TestCase):
                 REQUIRED_REVIEW.PublicationError, "closed internal call shape"
             ),
         ):
-            REQUIRED_REVIEW._supervised_process(
+            REQUIRED_REVIEW._retired_supervised_process(
                 object(), Path("/absolute/review-bundle")
             )
         launch.assert_not_called()
@@ -598,7 +598,9 @@ class RequiredReviewTests(unittest.TestCase):
                     REQUIRED_REVIEW.PublicationError, "envelope framing"
                 ),
             ):
-                REQUIRED_REVIEW._invoke_task_witness(Path("/absolute/review-bundle"))
+                REQUIRED_REVIEW._retired_invoke_task_witness(
+                    Path("/absolute/review-bundle")
+                )
 
     def test_invoke_accepts_exact_canonical_envelope_fixture(self) -> None:
         envelope = self.envelope()
@@ -609,7 +611,7 @@ class RequiredReviewTests(unittest.TestCase):
             passwd, effective, group = self.front_door_identity(home)
             with passwd, effective, group:
                 self.assertEqual(
-                    REQUIRED_REVIEW._invoke_task_witness(
+                    REQUIRED_REVIEW._retired_invoke_task_witness(
                         Path("/absolute/review-bundle")
                     ),
                     envelope,
@@ -663,7 +665,7 @@ class RequiredReviewTests(unittest.TestCase):
                     REQUIRED_REVIEW.PublicationError, "process cleanup failed"
                 ) as raised,
             ):
-                REQUIRED_REVIEW._supervised_process(
+                REQUIRED_REVIEW._retired_supervised_process(
                     observation, Path("/absolute/review-bundle")
                 )
         self.assertEqual(events, ["settle", "selector", "stdout", "stderr"])
@@ -691,7 +693,7 @@ class RequiredReviewTests(unittest.TestCase):
                 ),
                 self.assertRaisesRegex(KeyboardInterrupt, "primary") as raised,
             ):
-                REQUIRED_REVIEW._supervised_process(
+                REQUIRED_REVIEW._retired_supervised_process(
                     observation, Path("/absolute/review-bundle")
                 )
         self.assertTrue(
@@ -826,14 +828,16 @@ class RequiredReviewTests(unittest.TestCase):
                 group,
                 mock.patch.object(
                     REQUIRED_REVIEW,
-                    "_supervised_process",
+                    "_retired_supervised_process",
                     side_effect=replace_after_launch,
                 ),
                 self.assertRaisesRegex(
                     REQUIRED_REVIEW.PublicationError, "changed during validation"
                 ),
             ):
-                REQUIRED_REVIEW._invoke_task_witness(Path("/absolute/bundle"))
+                REQUIRED_REVIEW._retired_invoke_task_witness(
+                    Path("/absolute/bundle")
+                )
 
     def test_front_door_identity_is_rechecked_after_failed_process_settlement(
         self,
@@ -853,14 +857,16 @@ class RequiredReviewTests(unittest.TestCase):
                 group,
                 mock.patch.object(
                     REQUIRED_REVIEW,
-                    "_supervised_process",
+                    "_retired_supervised_process",
                     side_effect=fail_after_launch,
                 ),
                 self.assertRaisesRegex(
                     REQUIRED_REVIEW.PublicationError, "changed during validation"
                 ),
             ):
-                REQUIRED_REVIEW._invoke_task_witness(Path("/absolute/bundle"))
+                REQUIRED_REVIEW._retired_invoke_task_witness(
+                    Path("/absolute/bundle")
+                )
 
 
 class ReviewablePrStateTests(unittest.TestCase):

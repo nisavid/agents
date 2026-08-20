@@ -552,5 +552,15 @@ def main() -> int:
     return 0 if receipt["passed"] else 1
 
 
+def entrypoint_main() -> int:
+    if sys.argv[1:] in (["-h"], ["--help"]):
+        return main()
+    print(
+        "ERROR: Phase 7 composed runtime is unavailable in this source-stage release",
+        file=sys.stderr,
+    )
+    return 1
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(entrypoint_main())

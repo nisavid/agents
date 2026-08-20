@@ -386,6 +386,7 @@ class TaskWitnessPackageTests(unittest.TestCase):
         value: dict[str, object] = {
             "schema_version": 1,
             "contract": "task-witness-tw4-suite-inventory-v1",
+            "runtime_status": "retired-source-stage",
             "entries": entries,
             "aggregates": {
                 "counts_sha256": hashlib.sha256(canonical(counts)).hexdigest(),
@@ -1430,10 +1431,10 @@ class TaskWitnessPackageTests(unittest.TestCase):
         qualification = self.validate("--qualification", str(receipt))
         self.assertNotEqual(qualification.returncode, 0)
         self.assertIn(
-            "host qualification receipt is unavailable",
+            "native qualification and final-release validation are unavailable",
             qualification.stderr,
         )
-        self.assertNotIn("validation is not yet available", qualification.stderr)
+        self.assertNotIn(str(receipt), qualification.stderr)
 
         receipt_value = self.host_receipt_document()
         receipt_value["observations"]["inputs"]["candidate"]["root_path"] = str(root)
@@ -2754,9 +2755,11 @@ class TaskWitnessPackageTests(unittest.TestCase):
         final_release = self.validate(*final_argv[1:])
         self.assertNotEqual(final_release.returncode, 0)
         self.assertIn(
-            "TW4 release manifest is unavailable",
+            "native qualification and final-release validation are unavailable",
             final_release.stderr,
         )
+        for private_operand in final_argv[2::2]:
+            self.assertNotIn(private_operand, final_release.stderr)
         self.assertNotIn("validation is not yet available", final_release.stderr)
 
     def test_source_stage_cli_is_closed_and_requires_the_suite_inventory(self) -> None:
@@ -3222,11 +3225,20 @@ class TaskWitnessPackageTests(unittest.TestCase):
         manifest["skills"] = "./skills/"
         manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
 
-        for flags in ((), ("--source-stage",), ("--qualification", str(receipt))):
+        for flags in ((), ("--source-stage",)):
             with self.subTest(flags=flags):
                 result = self.validate(*flags)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("Agent Plugins v1 manifest", result.stderr)
+
+        qualification = self.validate("--qualification", str(receipt))
+        self.assertNotEqual(qualification.returncode, 0)
+        self.assertIn(
+            "native qualification and final-release validation are unavailable",
+            qualification.stderr,
+        )
+        self.assertNotIn("Agent Plugins v1 manifest", qualification.stderr)
+        self.assertNotIn(str(receipt), qualification.stderr)
 
     def test_claude_manifest_is_exact_canonical_projection(self) -> None:
         canonical = json.loads((self.plugin / "plugin.json").read_text())
@@ -3554,7 +3566,7 @@ class TaskWitnessPackageTests(unittest.TestCase):
                 "current_control_set": 35050,
                 "direct_release_owned_tests": 60382,
                 "public_release_registration": 25,
-                "release_documentation": 3250,
+                "release_documentation": 3300,
                 "release_integration": 10975,
                 "release_integration_tests": 10950,
                 "release_validator": 4550,

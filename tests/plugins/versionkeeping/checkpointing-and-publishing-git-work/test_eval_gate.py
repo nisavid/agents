@@ -48,6 +48,68 @@ def canonical_bytes(value: object) -> bytes:
     ).encode()
 
 
+def production_provider_policy() -> dict[str, object]:
+    fresh_root_keys = [
+        "HOME",
+        "CLAUDE_CONFIG_DIR",
+        "XDG_CONFIG_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+    ]
+    return {
+        "credential": {
+            "inherited_descriptor": 9,
+            "mechanism": "anthropic-api-key-fd",
+            "provider_init_source": "ANTHROPIC_API_KEY",
+        },
+        "endpoint": {
+            "base_url": "provider-default",
+            "policy": "anthropic-public-api",
+            "proxy_inputs": "denied",
+        },
+        "environment": {
+            "allowed_keys": sorted(
+                {
+                    *fresh_root_keys,
+                    "ANTHROPIC_API_KEY",
+                    "CLAUDE_CODE_DISABLE_BUNDLED_SKILLS",
+                    "CLAUDE_CODE_DISABLE_CLAUDE_MDS",
+                    "LANG",
+                    "LC_ALL",
+                    "PATH",
+                    "PYTHONDONTWRITEBYTECODE",
+                    "PYTHONNOUSERSITE",
+                    "TZ",
+                }
+            ),
+            "fresh_root_keys": fresh_root_keys,
+            "inheritance": "none",
+        },
+        "runtime_probe": {
+            "allowed_keys": sorted(
+                {
+                    *fresh_root_keys,
+                    "CLAUDE_CODE_DISABLE_BUNDLED_SKILLS",
+                    "CLAUDE_CODE_DISABLE_CLAUDE_MDS",
+                    "LANG",
+                    "LC_ALL",
+                    "PATH",
+                    "PYTHONDONTWRITEBYTECODE",
+                    "PYTHONNOUSERSITE",
+                    "TZ",
+                }
+            ),
+            "executable_selection": "absolute-resolved-path",
+            "inheritance": "none",
+        },
+        "schema_version": 1,
+    }
+
+
 class EvalGateV2Tests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
@@ -132,6 +194,8 @@ class EvalGateV2Tests(unittest.TestCase):
             "adapter": "fixture",
             "model": f"fixture-{kind}",
             "model_version": "fixture-1",
+            "provider_execution_policy": None,
+            "provider_policy_sha256": None,
             "reasoning_effort": "fixture",
             "runtime": None,
             "system_prompt": system_prompt,
@@ -516,6 +580,10 @@ class EvalGateV2Tests(unittest.TestCase):
                 "adapter": "claude-cli",
                 "model": "claude-sonnet-5",
                 "model_version": "claude-sonnet-5",
+                "provider_execution_policy": production_provider_policy(),
+                "provider_policy_sha256": canonical_digest(
+                    production_provider_policy()
+                ),
                 "runtime": {
                     "path": "/usr/local/bin/claude",
                     "sha256": "sha256:" + "a" * 64,
@@ -545,6 +613,24 @@ class EvalGateV2Tests(unittest.TestCase):
                 gate.validate_config(drifted, "executor")
                 with self.assertRaisesRegex(gate.MalformedInput, "one exact identity"):
                     gate.validate_production_config("executor", drifted)
+
+        drifted_policy = copy.deepcopy(config)
+        drifted_policy["provider_execution_policy"]["endpoint"]["policy"] = (
+            "alternate-endpoint"
+        )
+        drifted_policy["provider_policy_sha256"] = canonical_digest(
+            drifted_policy["provider_execution_policy"]
+        )
+        drifted_policy["config_sha256"] = canonical_digest(
+            {
+                key: value
+                for key, value in drifted_policy.items()
+                if key != "config_sha256"
+            }
+        )
+        gate.validate_config(drifted_policy, "executor")
+        with self.assertRaisesRegex(gate.MalformedInput, "transport configuration"):
+            gate.validate_production_config("executor", drifted_policy)
 
     def test_retirement_evaluation_requires_the_bound_provider_contract(self) -> None:
         gate = load_gate()
@@ -656,6 +742,10 @@ class EvalGateV2Tests(unittest.TestCase):
             f"artifacts/attempt-transports/{kind}/{attempt_stem}.jsonl",
             raw_transport,
         )
+        stderr_relpath, stderr_sha256 = self.write_bytes(
+            f"artifacts/attempt-stderr/{kind}/{attempt_stem}.bin",
+            b"",
+        )
         init_stream = self.init_stream()
         document = {
             "attempt_id": attempt_id,
@@ -677,6 +767,8 @@ class EvalGateV2Tests(unittest.TestCase):
             "session_id_sha256": byte_digest(session_id),
             "started_at": started_at,
             "status": "completed",
+            "stderr_artifact_relpath": stderr_relpath,
+            "stderr_sha256": stderr_sha256,
             "transport_artifact_relpath": transport_relpath,
             "transport_sha256": transport_sha256,
         }
@@ -1462,6 +1554,20 @@ class EvalGateV2Tests(unittest.TestCase):
             "attempt_id": attempt_id,
             "coordinate": coordinate,
             "error": "TransportFailure: provider failed",
+            "failure_identity": {
+                "classification": "provider-transport-failure",
+                "returncode": 7,
+                "role": "executors",
+                "stderr": {
+                    "byte_count": 0,
+                    "sha256": stderr_sha256,
+                },
+                "stdout": {
+                    "byte_count": 0,
+                    "sha256": stdout_sha256,
+                },
+                "timed_out": False,
+            },
             "finished_at": run["finished_at"],
             "input_sha256": run["input_sha256"],
             "kind": "executors",
@@ -1472,6 +1578,7 @@ class EvalGateV2Tests(unittest.TestCase):
                 "response_id": None,
                 "session_id": None,
             },
+            "returncode": 7,
             "request_artifact_relpath": run["request_artifact_relpath"],
             "request_sha256": run["request_sha256"],
             "response_id": None,
@@ -1482,6 +1589,7 @@ class EvalGateV2Tests(unittest.TestCase):
             "stderr_sha256": stderr_sha256,
             "stdout_artifact_relpath": stdout_relpath,
             "stdout_sha256": stdout_sha256,
+            "timed_out": False,
         }
         failed_relpath, _ = self.write_bytes(
             f"artifacts/attempts/executors/{stem}.json",

@@ -43,6 +43,8 @@ calls:
 ```sh
 python3 scripts/run_control_plane_eval.py run \
   --adapter claude \
+  --credential-mechanism anthropic-api-key-fd \
+  --endpoint-policy anthropic-public-api \
   --incumbents /absolute/path/to/incumbents.json \
   --output /absolute/path/to/evidence \
   --candidate-repository https://github.com/nisavid/agents \
@@ -52,6 +54,10 @@ python3 scripts/run_control_plane_eval.py run \
   --grader-model claude-opus-4-8
 ```
 
+A trusted launcher must map the Anthropic API key to inherited descriptor `9`
+without placing the credential or its pathname in the runner's arguments or
+environment. The runner rejects ambient credential mechanisms.
+
 For model-backed runs, the candidate revision must equal the clean checkout's
 exact Git `HEAD`, and the evidence directory must be outside that checkout.
 The runner archives that exact Git tree to a private temporary snapshot before
@@ -60,14 +66,34 @@ the gate binds the retained source archive, its digest, normalized origin, and
 Git IDs. The incumbent mapping must likewise carry a verified immutable
 `full_tree_lock_sha256` for each installed snapshot.
 
-The Claude adapter uses an ephemeral working directory and disables tools,
-skills, slash commands, MCP, and session persistence. The evidence attests only
-to observed invocation and init-stream capability surfaces; it does not claim
-an OS sandbox, hidden provider context, or a provider request ID. The harness
-generates a local correlation ID, while response and session IDs are bound to
-the retained raw provider stream. Every request, raw transport stream, parsed
-response, identity record, config, seed, isolation record, and relevant digest
-is gate-checked.
+The Claude executable must be an explicit absolute path. Every runtime identity
+probe runs in a fresh, credential-free closed environment, and every provider
+call receives fresh private home, config, cache, data, state, temporary, and
+working roots. Calls use an exact closed environment and disable tools, skills,
+slash commands, MCP, and session persistence. Ambient executable lookup, proxy,
+provider-base-URL, loader, routing, configuration, and credential variables do
+not reach either boundary. The gate binds the credential mechanism, endpoint
+policy, probe/call environment policy, and provider initialization credential
+source to the evidence.
+
+The endpoint policy permits only the provider's public default endpoint and
+denies proxy configuration. It records policy identity; it does not impose an
+OS network sandbox. The evidence attests only to observed invocation and
+init-stream capability surfaces. It does not claim hidden provider context or
+a provider request ID. The harness generates a local correlation ID, while
+response and session IDs are bound to the retained raw provider stream. Every
+request, raw transport stream, parsed response, identity record, config, seed,
+isolation record, and relevant digest is gate-checked.
+
+Provider stderr never enters public errors, logs, or evidence. Each attempt
+stores the exact stderr bytes only in its owner-private `0600` raw artifact
+under the evidence directory's `0700` attempt store. Public failure records
+contain only the stream digest, byte length, provider role, status, and attempt
+identity.
+
+The gate binds the selected runtime bytes and policy but does not authenticate
+their external authorization; that remains part of the evidence-authentication
+work required before production eligibility.
 
 The production target contract requires 252 current executor coordinates:
 21 skills × 4 conditions × 3 repeats. Its required invalidation drill first
@@ -154,4 +180,6 @@ runtime, and scrubbed minimal environments. This prevents ambient
 repository-path and rubric transport; it does not provide or claim operating
 system containment. Evidence records the actual executable digest, the
 model-bound command identity, request and stream digests, and the derived
-request-separation result.
+request-separation result. Raw provider stderr is retained only in the sibling
+owner-private `.<output-name>.provider-attempts` directory. Public failures
+expose its digest and length, never its bytes or decoded text.

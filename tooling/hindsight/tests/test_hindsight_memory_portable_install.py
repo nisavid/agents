@@ -5931,6 +5931,43 @@ class PortableInstallationManagerTest(unittest.TestCase):
             expected_current_binding_generation_digest="b" * 64,
         )
 
+        manager.reset_mock()
+        rebind_plan_path = self.root / "verified-rebind-plan.json"
+        rebind_plan = {"plan_digest": "c" * 64}
+        candidate_with_handoff = argument_parser.parse_args(
+            [
+                "upgrade",
+                "--config",
+                str(self.config_path),
+                "--release-root",
+                str(ROOT),
+                "--version",
+                "2.0.0",
+                "--expected-current-binding-generation-digest",
+                "b" * 64,
+                "--verified-rebind-plan",
+                str(rebind_plan_path),
+            ]
+        )
+        with mock.patch.dict(
+            function_globals,
+            {
+                "_portable_manager": lambda _args: manager,
+                "_print_result": lambda _result: 0,
+                "read_json": lambda path: rebind_plan,
+            },
+        ):
+            self.assertEqual(
+                module["portable_upgrade_command"](candidate_with_handoff),
+                0,
+            )
+        manager.upgrade.assert_called_once_with(
+            str(ROOT),
+            version="2.0.0",
+            expected_current_binding_generation_digest="b" * 64,
+            verified_rebind_plan=rebind_plan,
+        )
+
     def test_candidate_cli_does_not_mutate_release_with_bytecode(self) -> None:
         release = self.root / "candidate-release"
         shutil.copytree(
@@ -6093,6 +6130,202 @@ class PortableInstallationManagerTest(unittest.TestCase):
             (root_before.st_dev, root_before.st_ino, root_before.st_birthtime),
         )
         self.assertEqual(sentinel.read_bytes(), b"database-unchanged")
+
+    def test_verified_rebind_handoff_upgrades_from_stopped_old_release(
+        self,
+    ) -> None:
+        manager, evidence, plan, _prestate, _sentinel = self.prepared_rebind()
+        manager.data_identity_rebind_apply(
+            plan,
+            approval_digest=plan["plan_digest"],
+            pre_apply_evidence_value=self.pre_apply_evidence(evidence),
+            now=1000,
+        )
+        manager.data_identity_rebind_verify(
+            plan,
+            self.post_rebind_evidence(evidence),
+            now=1001,
+        )
+        manager._deactivate_services()
+        state = manager._load_state()
+        assert state is not None
+
+        upgraded = manager.upgrade(
+            self.release("2.0.0"),
+            version="2.0.0",
+            expected_current_binding_generation_digest=state[
+                "binding_generation_digest"
+            ],
+            verified_rebind_plan=plan,
+        )
+
+        self.assertEqual(upgraded["status"], "upgraded")
+        self.assertEqual(manager.verify()["current"]["version"], "2.0.0")
+        self.assertEqual(
+            set(self.runner.launchd_jobs),
+            {
+                "io.nisavid.hindsight.synthetic.broker",
+                "io.nisavid.hindsight.synthetic.integration-upgrades",
+            },
+        )
+
+    def test_failed_verified_rebind_upgrade_restores_stopped_old_release(
+        self,
+    ) -> None:
+        manager, evidence, plan, _prestate, _sentinel = self.prepared_rebind()
+        manager.data_identity_rebind_apply(
+            plan,
+            approval_digest=plan["plan_digest"],
+            pre_apply_evidence_value=self.pre_apply_evidence(evidence),
+            now=1000,
+        )
+        manager.data_identity_rebind_verify(
+            plan,
+            self.post_rebind_evidence(evidence),
+            now=1001,
+        )
+        manager._deactivate_services()
+        manager._health_runner = (
+            lambda _check, release: release["version"] != "2.0.0"
+        )
+        state = manager._load_state()
+        assert state is not None
+
+        with self.assertRaisesRegex(
+            PortableInstallError,
+            "health verification failed",
+        ):
+            manager.upgrade(
+                self.release("2.0.0"),
+                version="2.0.0",
+                expected_current_binding_generation_digest=state[
+                    "binding_generation_digest"
+                ],
+                verified_rebind_plan=plan,
+            )
+
+        restored = manager._load_state()
+        assert restored is not None
+        self.assertEqual(restored["current"]["version"], "1.0.0")
+        self.assertIsNone(restored["transaction"])
+        self.assertEqual(self.runner.launchd_jobs, {})
+        self.assertFalse(manager._transaction_path.exists())
+
+    def test_interrupted_verified_rebind_upgrade_retries_from_stopped_prestate(
+        self,
+    ) -> None:
+        manager, evidence, plan, _prestate, _sentinel = self.prepared_rebind()
+        manager.data_identity_rebind_apply(
+            plan,
+            approval_digest=plan["plan_digest"],
+            pre_apply_evidence_value=self.pre_apply_evidence(evidence),
+            now=1000,
+        )
+        manager.data_identity_rebind_verify(
+            plan,
+            self.post_rebind_evidence(evidence),
+            now=1001,
+        )
+        manager._deactivate_services()
+        state = manager._load_state()
+        assert state is not None
+        release = self.release("2.0.0")
+
+        def interrupt_candidate(_check, candidate):
+            if candidate["version"] == "2.0.0":
+                raise KeyboardInterrupt
+            return True
+
+        manager._health_runner = interrupt_candidate
+        with self.assertRaises(KeyboardInterrupt):
+            manager.upgrade(
+                release,
+                version="2.0.0",
+                expected_current_binding_generation_digest=state[
+                    "binding_generation_digest"
+                ],
+                verified_rebind_plan=plan,
+            )
+        self.assertTrue(manager._transaction_path.is_file())
+
+        manager._health_runner = lambda _check, _release: True
+        upgraded = manager.upgrade(
+            release,
+            version="2.0.0",
+            expected_current_binding_generation_digest=state[
+                "binding_generation_digest"
+            ],
+            verified_rebind_plan=plan,
+        )
+
+        self.assertEqual(upgraded["status"], "upgraded")
+        self.assertEqual(manager.verify()["current"]["version"], "2.0.0")
+        self.assertFalse(manager._transaction_path.exists())
+
+    def test_rebind_handoff_upgrade_requires_verification_before_mutation(
+        self,
+    ) -> None:
+        manager, evidence, plan, _prestate, _sentinel = self.prepared_rebind()
+        manager.data_identity_rebind_apply(
+            plan,
+            approval_digest=plan["plan_digest"],
+            pre_apply_evidence_value=self.pre_apply_evidence(evidence),
+            now=1000,
+        )
+        manager._deactivate_services()
+        state = manager._load_state()
+        assert state is not None
+
+        with self.assertRaisesRegex(
+            PortableInstallError,
+            "verification receipt is unavailable",
+        ):
+            manager.upgrade(
+                self.release("2.0.0"),
+                version="2.0.0",
+                expected_current_binding_generation_digest=state[
+                    "binding_generation_digest"
+                ],
+                verified_rebind_plan=plan,
+            )
+
+        self.assertEqual(manager._load_state(), state)
+        self.assertFalse(manager._transaction_path.exists())
+        self.assertEqual(self.runner.launchd_jobs, {})
+
+    def test_rebind_handoff_upgrade_requires_jobs_absent_before_mutation(
+        self,
+    ) -> None:
+        manager, evidence, plan, _prestate, _sentinel = self.prepared_rebind()
+        manager.data_identity_rebind_apply(
+            plan,
+            approval_digest=plan["plan_digest"],
+            pre_apply_evidence_value=self.pre_apply_evidence(evidence),
+            now=1000,
+        )
+        manager.data_identity_rebind_verify(
+            plan,
+            self.post_rebind_evidence(evidence),
+            now=1001,
+        )
+        state = manager._load_state()
+        assert state is not None
+
+        with self.assertRaisesRegex(
+            PortableInstallError,
+            "requires managed launchd jobs absent",
+        ):
+            manager.upgrade(
+                self.release("2.0.0"),
+                version="2.0.0",
+                expected_current_binding_generation_digest=state[
+                    "binding_generation_digest"
+                ],
+                verified_rebind_plan=plan,
+            )
+
+        self.assertEqual(manager._load_state(), state)
+        self.assertFalse(manager._transaction_path.exists())
 
     def test_data_identity_rebind_plan_refuses_evidence_profile_mismatch(
         self,

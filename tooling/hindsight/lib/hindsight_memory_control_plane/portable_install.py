@@ -4314,30 +4314,41 @@ class PortableInstallationManager:
         if not self._transaction_path.exists():
             return
         journal = _read_json(self._transaction_path, "installation transaction")
+        journal_keys = {
+            "schema_version",
+            "consumer_id",
+            "operation",
+            "candidate",
+            "candidate_install_paths",
+            "candidate_manifest_paths",
+            "prior_state",
+            "active_preimage",
+            "manifest_preimage",
+            "install_preimage",
+            "release_preexisting",
+            "release_staging_path",
+        }
+        legacy_journal = (
+            type(journal.get("schema_version")) is int
+            and journal.get("schema_version") == 2
+            and set(journal) == journal_keys
+        )
+        stopped_rebind_journal = (
+            type(journal.get("schema_version")) is int
+            and journal.get("schema_version") == 3
+            and set(journal) == journal_keys | {"restore_prior_services"}
+            and journal.get("operation") == "upgrade"
+            and journal.get("restore_prior_services") is False
+        )
         if (
-            set(journal)
-            != {
-                "schema_version",
-                "consumer_id",
-                "operation",
-                "candidate",
-                "candidate_install_paths",
-                "candidate_manifest_paths",
-                "prior_state",
-                "active_preimage",
-                "manifest_preimage",
-                "install_preimage",
-                "release_preexisting",
-                "release_staging_path",
-            }
-            or type(journal.get("schema_version")) is not int
-            or journal.get("schema_version") != 2
+            not (legacy_journal or stopped_rebind_journal)
             or journal.get("consumer_id") != self.config.consumer_id
             or journal.get("operation") not in {"install", "upgrade", "rollback"}
             or not isinstance(journal.get("candidate"), Mapping)
             or not isinstance(journal.get("release_preexisting"), bool)
         ):
             raise PortableInstallError("installation transaction identity is invalid")
+        restore_prior_services = journal.get("restore_prior_services", True)
         current_state = self._load_state()
         candidate = journal["candidate"]
         candidate_root = _release_record_root(self.config.install_root, candidate)
@@ -4573,11 +4584,16 @@ class PortableInstallationManager:
             self._remove_release_record(candidate)
         if prior_manager is None:
             raise PortableInstallError("installation transaction prestate is invalid")
-        prior_manager._activate_services(retry_bootstrap_after_stop=True)
-        prior_manager._verify_service_manager()
-        if not prior_manager._health(prior["current"]):
-            raise PortableInstallError(
-                "interrupted installation recovery health check failed"
+        if restore_prior_services:
+            prior_manager._activate_services(retry_bootstrap_after_stop=True)
+            prior_manager._verify_service_manager()
+            if not prior_manager._health(prior["current"]):
+                raise PortableInstallError(
+                    "interrupted installation recovery health check failed"
+                )
+        else:
+            self._require_launchd_services_absent_for_rebind_upgrade(
+                prior_manager
             )
         prior_manager._verify_installed_locked(prior)
         self._clear_transaction()
@@ -4617,6 +4633,7 @@ class PortableInstallationManager:
         *,
         operation: str,
         expected_current_binding_generation_digest: str | None = None,
+        verified_rebind_plan: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         self._validate_external_bindings()
         with self._lock():
@@ -4646,6 +4663,7 @@ class PortableInstallationManager:
                 raise PortableInstallError("upgrade requires an existing installation")
             external_bindings = self._validate_external_bindings()
             data_identity = self._prepare_data_identity(initial=prior is None)
+            restore_prior_services = True
             if prior is not None:
                 self._verify_installed_locked(prior)
                 installed_manager = self._installed_manager(prior)
@@ -4657,12 +4675,30 @@ class PortableInstallationManager:
                     )
                 if data_identity != prior["data_identity_digest"]:
                     raise PortableInstallError("data identity changed")
-                installed_manager._preflight_service_manager()
                 self._preflight_added_service_manager(installed_manager.config)
-                installed_manager._verify_service_manager()
-                if not installed_manager._health(prior["current"]):
-                    raise PortableInstallError("health verification failed")
+                if verified_rebind_plan is None:
+                    installed_manager._preflight_service_manager()
+                    installed_manager._verify_service_manager()
+                    if not installed_manager._health(prior["current"]):
+                        raise PortableInstallError("health verification failed")
+                else:
+                    if operation != "upgrade":
+                        raise PortableInstallError(
+                            "verified rebind handoff is valid only for upgrade"
+                        )
+                    self._validate_verified_rebind_upgrade_handoff(
+                        verified_rebind_plan,
+                        prior,
+                    )
+                    self._require_launchd_services_absent_for_rebind_upgrade(
+                        installed_manager
+                    )
+                    restore_prior_services = False
             else:
+                if verified_rebind_plan is not None:
+                    raise PortableInstallError(
+                        "verified rebind handoff requires an existing installation"
+                    )
                 self._preflight_service_manager(require_absent=True)
             if prior is None:
                 if self.config.install_root.exists() and any(
@@ -4727,7 +4763,7 @@ class PortableInstallationManager:
                 },
             }
             journal = {
-                "schema_version": 2,
+                "schema_version": 2 if restore_prior_services else 3,
                 "consumer_id": self.config.consumer_id,
                 "operation": operation,
                 "candidate": release,
@@ -4746,10 +4782,14 @@ class PortableInstallationManager:
                 "release_preexisting": release_preexisting,
                 "release_staging_path": str(release_staging),
             }
+            if not restore_prior_services:
+                journal["restore_prior_services"] = False
             _atomic_json(self._transaction_path, journal)
             try:
                 if prior is not None:
-                    installed_manager._deactivate_services()
+                    installed_manager._deactivate_services(
+                        absent_ok=not restore_prior_services
+                    )
                 self._publish_release_record(release_root, release, release_staging)
                 if self._install_launchers(launcher_payloads) != launcher_owned:
                     raise PortableInstallError("installed launcher digest mismatch")
@@ -4806,6 +4846,7 @@ class PortableInstallationManager:
         *,
         version: str,
         expected_current_binding_generation_digest: str,
+        verified_rebind_plan: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         self._preflight_lifecycle()
         if SHA256.fullmatch(expected_current_binding_generation_digest) is None:
@@ -4819,6 +4860,7 @@ class PortableInstallationManager:
             expected_current_binding_generation_digest=(
                 expected_current_binding_generation_digest
             ),
+            verified_rebind_plan=verified_rebind_plan,
         )
 
     def _verify_release(self, release: Mapping[str, Any]) -> None:
@@ -5844,6 +5886,52 @@ class PortableInstallationManager:
             raise PortableInstallError("data-identity application receipt differs")
         return receipt
 
+    def _validate_rebind_verification_receipt(
+        self,
+        plan: Mapping[str, Any],
+        application_receipt: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        receipt = self._read_rebind_artifact(
+            Path(plan["verification_receipt_path"]),
+            "data-identity verification receipt",
+        )
+        expected_keys = {
+            "schema_version",
+            "action",
+            "plan_digest",
+            "installation_state_digest",
+            "post_evidence_digest",
+            "postgres_system_identifier",
+            "database_continuity_digest",
+            "verified_at",
+            "verification_receipt_digest",
+        }
+        body = {
+            key: value
+            for key, value in receipt.items()
+            if key != "verification_receipt_digest"
+        }
+        if (
+            set(receipt) != expected_keys
+            or type(receipt.get("schema_version")) is not int
+            or receipt.get("schema_version") != 1
+            or receipt.get("action") != "verify-data-identity-rebind"
+            or receipt.get("plan_digest") != plan["plan_digest"]
+            or receipt.get("installation_state_digest")
+            != plan["expected_post_state_digest"]
+            or not isinstance(receipt.get("post_evidence_digest"), str)
+            or SHA256.fullmatch(receipt["post_evidence_digest"]) is None
+            or receipt.get("postgres_system_identifier")
+            != plan["postgres_system_identifier"]
+            or receipt.get("database_continuity_digest")
+            != plan["database_continuity_digest"]
+            or type(receipt.get("verified_at")) is not int
+            or receipt["verified_at"] < application_receipt["applied_at"]
+            or digest(body) != receipt.get("verification_receipt_digest")
+        ):
+            raise PortableInstallError("data-identity verification receipt differs")
+        return receipt
+
     def _validate_rebind_authorization_receipt(
         self,
         plan: Mapping[str, Any],
@@ -5931,6 +6019,69 @@ class PortableInstallationManager:
             ):
                 raise PortableInstallError(
                     "data-identity plan artifact path is outside controller state"
+                )
+
+    def _validate_verified_rebind_upgrade_handoff(
+        self,
+        plan_value: Mapping[str, Any],
+        state: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        if self.config.platform != "launchd":
+            raise PortableInstallError(
+                "verified rebind upgrade handoff is supported only on launchd"
+            )
+        try:
+            plan = verify_rebind_plan(plan_value, allow_expired=True)
+        except DataIdentityRebindError as error:
+            raise PortableInstallError(str(error)) from error
+        self._validate_rebind_authority(plan)
+        self._validate_rebind_paths(plan)
+        state_bytes = _snapshot_regular_file(
+            self._state_path,
+            "installation state",
+        )
+        if _strict_json_mapping(state_bytes, "installation state") != state:
+            raise PortableInstallError("installation state changed")
+        state_digest = hashlib.sha256(state_bytes).hexdigest()
+        bindings = self._validate_external_bindings()
+        if (
+            state_digest != plan["expected_post_state_digest"]
+            or state.get("transaction") is not None
+            or state.get("data_identity_digest")
+            != plan["new_data_identity_digest"]
+            or state.get("binding_generation_digest")
+            != plan["binding_generation_digest"]
+            or bindings.generation_digest != plan["binding_generation_digest"]
+            or state.get("current", {}).get("release_digest")
+            != plan["current_release_digest"]
+        ):
+            raise PortableInstallError(
+                "verified rebind upgrade handoff does not match installation state"
+            )
+        self._validate_rebind_rollback_bundle(plan)
+        authorization = self._validate_rebind_authorization_receipt(plan)
+        application = self._validate_rebind_application_receipt(
+            plan,
+            authorization,
+        )
+        self._validate_rebind_verification_receipt(plan, application)
+        return plan
+
+    @staticmethod
+    def _require_launchd_services_absent_for_rebind_upgrade(
+        installed_manager: "PortableInstallationManager",
+    ) -> None:
+        for item in (
+            *installed_manager.config.services,
+            *installed_manager.config.timers,
+        ):
+            manifest = installed_manager.config.service_root / f"{item.label}.plist"
+            if (
+                installed_manager._launchd_loaded_manifest(item.label, manifest)
+                is not None
+            ):
+                raise PortableInstallError(
+                    "verified rebind upgrade requires managed launchd jobs absent"
                 )
 
     def _resume_applied_rebind(
@@ -6404,29 +6555,10 @@ class PortableInstallationManager:
             except _ImmutableArtifactExistsError:
                 # The first verification receipt wins: its timestamp and digest
                 # remain stable on idempotent reuse.
-                existing = self._read_rebind_artifact(
-                    receipt_path, "data-identity verification receipt"
+                receipt = self._validate_rebind_verification_receipt(
+                    plan,
+                    application,
                 )
-                if (
-                    set(existing) != set(receipt)
-                    or any(
-                        existing.get(key) != value
-                        for key, value in receipt.items()
-                        if key not in {"verified_at", "verification_receipt_digest"}
-                    )
-                    or digest(
-                        {
-                            key: value
-                            for key, value in existing.items()
-                            if key != "verification_receipt_digest"
-                        }
-                    )
-                    != existing.get("verification_receipt_digest")
-                ):
-                    raise PortableInstallError(
-                        "data-identity verification receipt differs"
-                    )
-                receipt = existing
             return {
                 "status": "verified",
                 "plan_digest": plan["plan_digest"],

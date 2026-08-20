@@ -4134,6 +4134,14 @@ def portable_install_command(args: argparse.Namespace) -> int:
 
 def portable_upgrade_command(args: argparse.Namespace) -> int:
     _require_candidate_install_runtime(args.release_root)
+    handoff = (
+        None
+        if args.verified_rebind_plan is None
+        else read_json(args.verified_rebind_plan)
+    )
+    optional: dict[str, Any] = {}
+    if handoff is not None:
+        optional["verified_rebind_plan"] = handoff
     return _print_result(
         _portable_manager(args).upgrade(
             args.release_root,
@@ -4141,6 +4149,7 @@ def portable_upgrade_command(args: argparse.Namespace) -> int:
             expected_current_binding_generation_digest=(
                 args.expected_current_binding_generation_digest
             ),
+            **optional,
         )
     )
 
@@ -13296,6 +13305,7 @@ def parser() -> argparse.ArgumentParser:
     upgrade.add_argument("--release-root", required=True)
     upgrade.add_argument("--version", required=True)
     upgrade.add_argument("--expected-current-binding-generation-digest", required=True)
+    upgrade.add_argument("--verified-rebind-plan")
     upgrade.set_defaults(run=portable_upgrade_command)
 
     verify_installation = commands.add_parser("verify")

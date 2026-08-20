@@ -55,6 +55,18 @@ from hindsight_memory_control_plane.canonical import (  # noqa: E402
     digest,
     strict_json_loads,
 )
+from hindsight_memory_control_plane.data_identity_evidence import (  # noqa: E402
+    build_postgres_evidence,
+    build_rebind_evidence as build_collected_rebind_evidence,
+    database_continuity_projection,
+    read_database_evidence,
+    refresh_rebind_evidence,
+)
+from hindsight_memory_control_plane.data_identity_rebind import (  # noqa: E402
+    AGE_HEADER,
+    DataIdentityRebindError,
+    verify_rebind_evidence,
+)
 from hindsight_memory_control_plane.http_adapter import HttpAdapter  # noqa: E402
 from hindsight_memory_control_plane.generic_import import (  # noqa: E402
     GenericImportError,
@@ -4198,6 +4210,168 @@ def data_identity_rebind_rollback_command(args: argparse.Namespace) -> int:
     )
 
 
+DATA_IDENTITY_QUIESCENT_LAUNCHD_LABELS = (
+    "io.nisavid.hindsight.stlz-ivan-mbp.stack",
+    "io.nisavid.hindsight.stlz-ivan-mbp.hook-authority",
+    "com.hindsight.embed.stack",
+)
+
+
+def _data_identity_safety_evidence(
+    database: Mapping[str, Any],
+) -> dict[str, Any]:
+    if sys.platform != "darwin":
+        raise DataIdentityRebindError(
+            "data-identity safety observation is unsupported"
+        )
+    domain = f"gui/{os.getuid()}"
+    for label in DATA_IDENTITY_QUIESCENT_LAUNCHD_LABELS:
+        try:
+            result = subprocess.run(
+                (
+                    "/bin/launchctl",
+                    "print",
+                    f"{domain}/{label}",
+                ),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            raise DataIdentityRebindError(
+                "data-identity launchd safety state is unavailable"
+            ) from error
+        if result.returncode == 0:
+            raise DataIdentityRebindError(
+                "data-identity launchd safety state is active"
+            )
+        if result.returncode != 113:
+            raise DataIdentityRebindError(
+                "data-identity launchd safety state is unavailable"
+            )
+    if database.get("generic_import_receipt_count") != 0:
+        raise DataIdentityRebindError(
+            "generic import authority is already present"
+        )
+    return {
+        "hooks_disabled": True,
+        "controller_authority_disabled": True,
+        "no_serena_import_authority": True,
+        "target_bank_inspected": False,
+        "database_mutation_performed": False,
+    }
+
+
+async def _read_live_data_identity_evidence(
+    *,
+    profile_id: str,
+    expected_system_identifier: str,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    binding = read_pg0_registration(profile_id)
+    password = binding.pop("_password")
+    asyncpg = _load_asyncpg()
+    connection = await connect_verified_local_postgres(
+        asyncpg,
+        binding,
+        password=password,
+        readonly=True,
+    )
+    try:
+        await assert_connected_live_database(
+            connection,
+            binding,
+            expected_system_identifier=expected_system_identifier,
+        )
+        system_identifier = await connection.fetchval(
+            "SELECT system_identifier::text FROM pg_control_system()"
+        )
+        postgres = build_postgres_evidence(
+            binding,
+            system_identifier=system_identifier,
+        )
+        database = await read_database_evidence(
+            connection,
+            postgres=postgres,
+            profile_id=profile_id,
+        )
+        return binding, postgres, database
+    finally:
+        password = ""
+        await connection.close()
+
+
+def data_identity_rebind_evidence_command(args: argparse.Namespace) -> int:
+    paths = (args.artifact, args.backup_attestation, args.output)
+    if (
+        any(not Path(value).is_absolute() for value in paths)
+        or len(
+            {
+                unicodedata.normalize(
+                    "NFD",
+                    str(Path(value).resolve(strict=False)).casefold(),
+                )
+                for value in paths
+            }
+        )
+        != len(paths)
+    ):
+        raise PortableInstallError(
+            "data-identity evidence path aliases an artifact"
+        )
+    args.data_identity_output = args.output
+    args.output = args.backup_attestation
+    args.data_identity_collected_at = int(time.time())
+    return operation_recovery_backup_live_command(args)
+
+
+def data_identity_rebind_observe_command(args: argparse.Namespace) -> int:
+    manager = _portable_manager(args)
+    manager._preflight_lifecycle()
+    manager._validate_config_source()
+    current_time = int(time.time())
+    base = read_json(args.base_evidence)
+    try:
+        checked = verify_rebind_evidence(base, now=current_time)
+        _binding, postgres, database = asyncio.run(
+            _read_live_data_identity_evidence(
+                profile_id=checked["profile_id"],
+                expected_system_identifier=checked["postgres"][
+                    "system_identifier"
+                ],
+            )
+        )
+        if Path(postgres["data_root"]).resolve(strict=True) != (
+            manager.config.data_root.resolve(strict=True)
+        ):
+            raise DataIdentityRebindError(
+                "data-identity evidence data root differs"
+            )
+        safety = _data_identity_safety_evidence(database)
+        if safety != checked["safety"]:
+            raise DataIdentityRebindError(
+                "data-identity safety evidence differs"
+            )
+        evidence = refresh_rebind_evidence(
+            checked,
+            postgres=postgres,
+            database=database,
+            now=current_time,
+        )
+    except DataIdentityRebindError as error:
+        raise PortableInstallError(str(error)) from error
+    write_private(args.output, evidence, create_only=True)
+    return _print_result(
+        {
+            "status": "observed",
+            "evidence_digest": digest(evidence),
+            "expires_at": evidence["expires_at"],
+            "output": str(Path(args.output).resolve()),
+        }
+    )
+
+
 EXPECTED_OPERATION_RECOVERY_INSTALLATION = {
     "consumer_id": "stlz-ivan-mbp",
     "installed_release_version": "2026.07.28+fc7dfa9",
@@ -5433,8 +5607,10 @@ def _disposable_postgres_binding(
         lines = payload.decode("ascii").splitlines()
         pid = int(lines[0])
         data_line = Path(lines[1]).resolve(strict=True)
+        started_at = int(lines[2])
         bound_port = int(lines[3])
         socket_dir = Path(lines[4])
+        data_metadata = data_dir.lstat()
     except (IndexError, OSError, UnicodeError, ValueError) as error:
         raise OperationRecoveryError(
             "disposable PostgreSQL process identity is invalid"
@@ -5449,6 +5625,7 @@ def _disposable_postgres_binding(
         ) from error
     if (
         pid <= 0
+        or started_at <= 0
         or bound_port != port
         or data_line != data_dir.resolve(strict=True)
         or socket_dir != root / "socket"
@@ -5460,6 +5637,9 @@ def _disposable_postgres_binding(
         )
     return {
         "pid": pid,
+        "started_at": started_at,
+        "data_device": data_metadata.st_dev,
+        "data_inode": data_metadata.st_ino,
         "socket_dir": str(socket_dir),
         "socket_path": str(socket_path),
         "port": port,
@@ -5472,7 +5652,13 @@ def _disposable_postgres_binding(
 async def _classify_disposable_restore(
     *,
     binding: Mapping[str, Any],
-) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
+    include_data_identity: bool = False,
+) -> tuple[
+    str,
+    list[dict[str, Any]],
+    dict[str, Any],
+    dict[str, Any] | None,
+]:
     asyncpg = _load_asyncpg()
     connection = await connect_verified_local_postgres(
         asyncpg,
@@ -5499,7 +5685,25 @@ async def _classify_disposable_restore(
             connection,
             schema="public",
         )
-        return generation_before, rows, restore_identity
+        data_identity = None
+        if include_data_identity:
+            system_identifier = await connection.fetchval(
+                "SELECT system_identifier::text FROM pg_control_system()"
+            )
+            postgres = build_postgres_evidence(
+                binding,
+                system_identifier=system_identifier,
+            )
+            data_identity = {
+                "postgres": postgres,
+                "database": await read_database_evidence(
+                    connection,
+                    postgres=postgres,
+                    profile_id="systalyze",
+                ),
+                "restored_at": int(time.time()),
+            }
+        return generation_before, rows, restore_identity, data_identity
     finally:
         await connection.close()
 
@@ -5572,6 +5776,7 @@ def operation_recovery_classify_backup_command(
     generation = ""
     rows: list[dict[str, Any]] = []
     restore_identity: dict[str, Any] = {}
+    restored_data_identity: dict[str, Any] | None = None
     try:
         identity_descriptor = _private_identity_descriptor(
             Path(args.age_identity).resolve(strict=True)
@@ -5716,9 +5921,12 @@ def operation_recovery_classify_backup_command(
             root_descriptor,
             root_identity,
         )
-        generation, rows, restore_identity = asyncio.run(
+        generation, rows, restore_identity, restored_data_identity = asyncio.run(
             _classify_disposable_restore(
                 binding=disposable_binding,
+                include_data_identity=bool(
+                    getattr(args, "data_identity_output", None)
+                ),
             )
         )
     finally:
@@ -5828,19 +6036,113 @@ def operation_recovery_classify_backup_command(
         "restore_tested": True,
         "plaintext_disposed": True,
     }
-    if getattr(args, "attest_only", False):
-        write_private(args.output, backup, create_only=True)
-        return _print_result(
-            {
-                "status": "attested",
+    data_identity_evidence = None
+    data_identity_output = getattr(args, "data_identity_output", None)
+    if data_identity_output:
+        try:
+            context = getattr(args, "data_identity_context", None)
+            if (
+                not isinstance(context, Mapping)
+                or not isinstance(restored_data_identity, Mapping)
+                or not root_removed
+                or database_continuity_projection(
+                    context.get("database", {})
+                )
+                != database_continuity_projection(
+                    restored_data_identity.get("database", {})
+                )
+            ):
+                raise DataIdentityRebindError(
+                    "data-identity disposable restore differs"
+                )
+            artifact_path = Path(args.backup).resolve(strict=True)
+            artifact_root = artifact_path.parent.resolve(strict=True)
+            artifact_metadata = artifact_path.lstat()
+            artifact_root_metadata = artifact_root.lstat()
+            current_time = int(time.time())
+            backup_evidence = {
+                "artifact_root": str(artifact_root),
+                "artifact_root_device": artifact_root_metadata.st_dev,
+                "artifact_root_inode": artifact_root_metadata.st_ino,
+                "artifact_path": str(artifact_path),
                 "artifact_sha256": backup_digest,
+                "ciphertext_size": artifact_metadata.st_size,
+                "full_schema": True,
+                "encryption_format": "age",
+                "encryption_recipient_digest": (
+                    EXPECTED_OPERATION_RECOVERY_RECIPIENT_SHA256
+                ),
+                "ciphertext_header_digest": hashlib.sha256(
+                    AGE_HEADER
+                ).hexdigest(),
+                "plaintext_disposed": True,
+                "created_at": context["backup_created_at"],
+            }
+            restore_database = restored_data_identity["database"]
+            restore_evidence = {
+                "artifact_sha256": backup_digest,
+                "schema_digest": restore_database["schema_digest"],
+                "bank_set_digest": restore_database["bank_set_digest"],
+                "codex_document_count": restore_database[
+                    "codex_document_count"
+                ],
+                "codex_manifest_digest": restore_database[
+                    "codex_manifest_digest"
+                ],
                 "restore_identity_digest": backup[
                     "restore_identity_digest"
                 ],
-                "output": str(Path(args.output).resolve()),
-                "disposable_restore_removed": root_removed,
+                "decryption_recipient_digest": (
+                    EXPECTED_OPERATION_RECOVERY_RECIPIENT_SHA256
+                ),
+                "dropped": True,
+                "restored_at": restored_data_identity["restored_at"],
             }
+            safety = _data_identity_safety_evidence(context["database"])
+            data_identity_evidence = build_collected_rebind_evidence(
+                profile_id="systalyze",
+                collected_at=context["collected_at"],
+                expires_at=context["collected_at"] + 3600,
+                postgres=context["postgres"],
+                database=context["database"],
+                backup=backup_evidence,
+                restore=restore_evidence,
+                safety=safety,
+                now=current_time,
+            )
+        except (DataIdentityRebindError, KeyError, OSError) as error:
+            raise OperationRecoveryError(str(error)) from error
+        write_private(
+            data_identity_output,
+            data_identity_evidence,
+            create_only=True,
         )
+    if getattr(args, "attest_only", False):
+        write_private(args.output, backup, create_only=True)
+        result = {
+            "status": "attested",
+            "artifact_sha256": backup_digest,
+            "restore_identity_digest": backup[
+                "restore_identity_digest"
+            ],
+            "output": str(Path(args.output).resolve()),
+            "disposable_restore_removed": root_removed,
+        }
+        if data_identity_evidence is not None:
+            result.update(
+                {
+                    "data_identity_evidence_digest": digest(
+                        data_identity_evidence
+                    ),
+                    "data_identity_evidence_output": str(
+                        Path(data_identity_output).resolve()
+                    ),
+                    "data_identity_evidence_expires_at": (
+                        data_identity_evidence["expires_at"]
+                    ),
+                }
+            )
+        return _print_result(result)
     cohort = create_cohort_manifest(
         rows,
         profile_id="systalyze",
@@ -5863,13 +6165,21 @@ def operation_recovery_classify_backup_command(
 
 def operation_recovery_backup_live_command(args: argparse.Namespace) -> int:
     _operation_recovery_candidate(args)
+    collect_data_identity = bool(
+        getattr(args, "data_identity_output", None)
+    )
     args.age_identity = str(
         _operation_recovery_rollback_identity_path(args.age_identity)
     )
     binding = read_pg0_registration("systalyze")
     password = binding.pop("_password")
 
-    async def verify_source() -> tuple[dict[str, Any], str]:
+    async def verify_source() -> tuple[
+        dict[str, Any],
+        str,
+        dict[str, Any] | None,
+        dict[str, Any] | None,
+    ]:
         asyncpg = _load_asyncpg()
         connection = await connect_verified_local_postgres(
             asyncpg,
@@ -5890,15 +6200,30 @@ def operation_recovery_backup_live_command(args: argparse.Namespace) -> int:
             system_identifier = await connection.fetchval(
                 "SELECT system_identifier::text FROM pg_control_system()"
             )
-            generation_before, generation_after, _rows = (
-                await read_operation_recovery_snapshot(
-                    connection,
-                    profile_id="systalyze",
-                    schema="public",
-                    bank_id="engineering",
-                    operation_ids=[],
+            postgres = None
+            database = None
+            if collect_data_identity:
+                postgres = build_postgres_evidence(
+                    binding,
+                    system_identifier=system_identifier,
                 )
-            )
+                database = await read_database_evidence(
+                    connection,
+                    postgres=postgres,
+                    profile_id="systalyze",
+                )
+                generation_before = database["generation_before"]
+                generation_after = database["generation_after"]
+            else:
+                generation_before, generation_after, _rows = (
+                    await read_operation_recovery_snapshot(
+                        connection,
+                        profile_id="systalyze",
+                        schema="public",
+                        bank_id="engineering",
+                        operation_ids=[],
+                    )
+                )
             competing_connections = await connection.fetchval(
                 """
                 SELECT count(*)
@@ -5921,11 +6246,18 @@ def operation_recovery_backup_live_command(args: argparse.Namespace) -> int:
                     postgres_system_identifier=system_identifier,
                 ),
                 generation_before,
+                postgres,
+                database,
             )
         finally:
             await connection.close()
 
-    authority, source_generation_before = asyncio.run(verify_source())
+    (
+        authority,
+        source_generation_before,
+        source_postgres_before,
+        source_database_before,
+    ) = asyncio.run(verify_source())
     run_root = Path(args.run_root)
     restore_root = Path(args.restore_run_root)
     artifact = Path(args.artifact)
@@ -5983,6 +6315,7 @@ def operation_recovery_backup_live_command(args: argparse.Namespace) -> int:
     success = False
     root_removed = False
     digest_value = ""
+    backup_created_at = 0
     try:
         root_descriptor, root_identity = _create_pinned_recovery_root(run_root)
         pgpass_descriptor = os.open(
@@ -6049,15 +6382,30 @@ def operation_recovery_backup_live_command(args: argparse.Namespace) -> int:
                 tool_key="pg_dump",
                 pinned_dependencies=postgres_dependencies,
             )
-        post_authority, source_generation_after = asyncio.run(
-            verify_source()
-        )
+        (
+            post_authority,
+            source_generation_after,
+            source_postgres_after,
+            source_database_after,
+        ) = asyncio.run(verify_source())
         current_binding = read_pg0_registration("systalyze")
         current_binding.pop("_password")
         if (
             post_authority != authority
             or source_generation_after != source_generation_before
             or current_binding != binding
+            or (
+                collect_data_identity
+                and (
+                    source_postgres_after != source_postgres_before
+                    or database_continuity_projection(
+                        source_database_after or {}
+                    )
+                    != database_continuity_projection(
+                        source_database_before or {}
+                    )
+                )
+            )
         ):
             raise OperationRecoveryError(
                 "live backup source changed during snapshot"
@@ -6092,6 +6440,7 @@ def operation_recovery_backup_live_command(args: argparse.Namespace) -> int:
         )
         os.fsync(artifact_descriptor)
         digest_value = _operation_recovery_fd_sha256(artifact_descriptor)
+        backup_created_at = int(time.time())
         success = True
     finally:
         password = ""
@@ -6163,6 +6512,21 @@ def operation_recovery_backup_live_command(args: argparse.Namespace) -> int:
         "generation_after": source_generation_after,
         "binding": live_binding,
     }
+    if collect_data_identity:
+        if (
+            source_postgres_after is None
+            or source_database_after is None
+            or backup_created_at <= 0
+        ):
+            raise OperationRecoveryError(
+                "data-identity live evidence is unavailable"
+            )
+        args.data_identity_context = {
+            "collected_at": args.data_identity_collected_at,
+            "backup_created_at": backup_created_at,
+            "postgres": source_postgres_after,
+            "database": source_database_after,
+        }
     return operation_recovery_classify_backup_command(args)
 
 
@@ -12805,6 +13169,47 @@ def parser() -> argparse.ArgumentParser:
     data_identity_commands = data_identity.add_subparsers(
         dest="data_identity_command", required=True
     )
+    data_identity_evidence = data_identity_commands.add_parser("evidence")
+    data_identity_evidence.add_argument("--config", required=True)
+    data_identity_evidence.add_argument(
+        "--candidate-release-root",
+        required=True,
+    )
+    data_identity_evidence.add_argument(
+        "--candidate-release-identity",
+        required=True,
+    )
+    data_identity_evidence.add_argument("--artifact", required=True)
+    data_identity_evidence.add_argument(
+        "--backup-attestation",
+        required=True,
+    )
+    data_identity_evidence.add_argument("--output", required=True)
+    data_identity_evidence.add_argument("--age", required=True)
+    data_identity_evidence.add_argument("--age-identity", required=True)
+    data_identity_evidence.add_argument("--recipient", required=True)
+    data_identity_evidence.add_argument(
+        "--postgres-bin-dir",
+        required=True,
+    )
+    data_identity_evidence.add_argument("--run-root", required=True)
+    data_identity_evidence.add_argument(
+        "--restore-run-root",
+        required=True,
+    )
+    data_identity_evidence.add_argument("--port", required=True, type=int)
+    data_identity_evidence.set_defaults(
+        run=data_identity_rebind_evidence_command
+    )
+
+    data_identity_observe = data_identity_commands.add_parser("observe")
+    data_identity_observe.add_argument("--config", required=True)
+    data_identity_observe.add_argument("--base-evidence", required=True)
+    data_identity_observe.add_argument("--output", required=True)
+    data_identity_observe.set_defaults(
+        run=data_identity_rebind_observe_command
+    )
+
     data_identity_plan = data_identity_commands.add_parser("plan")
     data_identity_plan.add_argument("--config", required=True)
     data_identity_plan.add_argument("--evidence", required=True)

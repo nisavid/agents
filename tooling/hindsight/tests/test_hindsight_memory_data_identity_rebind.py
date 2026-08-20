@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import os
 from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -19,6 +21,12 @@ from hindsight_memory_control_plane.data_identity_rebind import (  # noqa: E402
     verify_rebind_backup_artifact,
     verify_rebind_evidence,
     verify_rebind_plan,
+)
+from hindsight_memory_control_plane.data_identity_evidence import (  # noqa: E402
+    build_postgres_evidence,
+    database_continuity_projection,
+    read_database_evidence,
+    refresh_rebind_evidence,
 )
 from hindsight_memory_control_plane.canonical import digest  # noqa: E402
 from tooling.hindsight.tests.hindsight_data_identity_test_support import (  # noqa: E402
@@ -92,6 +100,213 @@ class DataIdentityRebindContractTest(unittest.TestCase):
         evidence["database"]["bank_ids"] = [1, "codex"]
         with self.assertRaisesRegex(DataIdentityRebindError, "bank inventory"):
             verify_rebind_evidence(evidence, now=1000)
+
+    def test_supported_collector_builds_postgres_identity_from_live_binding(
+        self,
+    ) -> None:
+        data_root = self.root / "data"
+        postgres_root = data_root / "data"
+        postgres_root.mkdir(parents=True)
+        binding = {
+            "data_dir": str(postgres_root),
+            "data_device": postgres_root.lstat().st_dev,
+            "data_inode": postgres_root.lstat().st_ino,
+            "pid": 101,
+            "started_at": 901,
+        }
+
+        evidence = build_postgres_evidence(
+            binding,
+            system_identifier="7659746962107358086",
+        )
+
+        self.assertEqual(evidence["data_root"], str(data_root))
+        self.assertEqual(evidence["data_root_device"], data_root.lstat().st_dev)
+        self.assertEqual(evidence["data_root_inode"], data_root.lstat().st_ino)
+        self.assertEqual(evidence["postgres_data_root"], str(postgres_root))
+        self.assertEqual(evidence["postmaster_pid"], 101)
+        self.assertEqual(
+            evidence["connection_identity_digest"],
+            digest(
+                {
+                    key: value
+                    for key, value in evidence.items()
+                    if key != "connection_identity_digest"
+                }
+            ),
+        )
+
+    def test_supported_observation_refreshes_only_live_identity_and_time(
+        self,
+    ) -> None:
+        initial = self.evidence()
+        postgres = dict(initial["postgres"])
+        postgres["postmaster_pid"] = 101
+        postgres["postmaster_start_time"] = 901
+        postgres["connection_identity_digest"] = digest(
+            {
+                key: value
+                for key, value in postgres.items()
+                if key != "connection_identity_digest"
+            }
+        )
+        database = dict(initial["database"])
+        database["observed_at"] = 1000
+        database["snapshot_digest"] = digest(
+            {
+                "postgres": postgres,
+                "generation": database["generation_before"],
+                "observed_at": database["observed_at"],
+                "bank_set_digest": database["bank_set_digest"],
+                "codex_document_count": database["codex_document_count"],
+                "codex_manifest_digest": database["codex_manifest_digest"],
+                "schema_digest": database["schema_digest"],
+            }
+        )
+
+        refreshed = refresh_rebind_evidence(
+            initial,
+            postgres=postgres,
+            database=database,
+            now=1000,
+        )
+
+        self.assertEqual(refreshed["postgres"], postgres)
+        self.assertEqual(refreshed["database"], database)
+        self.assertEqual(refreshed["backup"], initial["backup"])
+        self.assertEqual(refreshed["restore"], initial["restore"])
+        self.assertEqual(refreshed["safety"], initial["safety"])
+        self.assertEqual(refreshed["collected_at"], initial["collected_at"])
+        self.assertEqual(refreshed["expires_at"], initial["expires_at"])
+
+        drifted = dict(database)
+        drifted["generation_before"] = "generation-2"
+        drifted["generation_after"] = "generation-2"
+        drifted["snapshot_digest"] = digest(
+            {
+                "postgres": postgres,
+                "generation": drifted["generation_before"],
+                "observed_at": drifted["observed_at"],
+                "bank_set_digest": drifted["bank_set_digest"],
+                "codex_document_count": drifted["codex_document_count"],
+                "codex_manifest_digest": drifted["codex_manifest_digest"],
+                "schema_digest": drifted["schema_digest"],
+            }
+        )
+        with self.assertRaisesRegex(
+            DataIdentityRebindError,
+            "database continuity differs",
+        ):
+            refresh_rebind_evidence(
+                initial,
+                postgres=postgres,
+                database=drifted,
+                now=1000,
+            )
+
+    def test_database_continuity_excludes_observation_and_connection_identity(
+        self,
+    ) -> None:
+        initial = self.evidence()["database"]
+        later = dict(initial)
+        later["observed_at"] = 1001
+        later["snapshot_digest"] = "f" * 64
+
+        self.assertEqual(
+            database_continuity_projection(initial),
+            database_continuity_projection(later),
+        )
+
+    def test_supported_database_reader_uses_one_payload_free_snapshot(
+        self,
+    ) -> None:
+        class Transaction:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_arguments):
+                return False
+
+        class Connection:
+            def __init__(self) -> None:
+                self.fetchval_results = iter((1000, 0, 0))
+                self.fetch_results = iter(
+                    (
+                        [{"bank_id": "codex"}, {"bank_id": "engineering"}],
+                        [
+                            {
+                                "table_name": "documents",
+                                "column_name": "id",
+                                "data_type": "uuid",
+                                "udt_schema": "pg_catalog",
+                                "udt_name": "uuid",
+                                "is_nullable": "NO",
+                                "column_default": "",
+                                "is_identity": "NO",
+                                "is_generated": "NEVER",
+                            }
+                        ],
+                    )
+                )
+                self.transaction_arguments = None
+
+            def transaction(self, **arguments):
+                self.transaction_arguments = arguments
+                return Transaction()
+
+            async def fetchval(self, _statement):
+                return next(self.fetchval_results)
+
+            async def fetch(self, _statement):
+                return next(self.fetch_results)
+
+            async def fetchrow(self, _statement):
+                return {
+                    "document_count": 5,
+                    "manifest_digest": "a" * 64,
+                }
+
+        connection = Connection()
+        postgres = self.evidence()["postgres"]
+        module = sys.modules[read_database_evidence.__module__]
+        with mock.patch.object(
+            module,
+            "read_generation",
+            mock.AsyncMock(side_effect=("systalyze:public:1",) * 2),
+        ):
+            database = asyncio.run(
+                read_database_evidence(
+                    connection,
+                    postgres=postgres,
+                    profile_id="systalyze",
+                )
+            )
+
+        self.assertEqual(
+            connection.transaction_arguments,
+            {"isolation": "repeatable_read", "readonly": True},
+        )
+        self.assertEqual(database["pending_operation_count"], 0)
+        self.assertEqual(database["generic_import_receipt_count"], 0)
+        self.assertEqual(database["codex_document_count"], 5)
+        self.assertEqual(
+            database["bank_set_digest"],
+            digest({"bank_ids": ["codex", "engineering"]}),
+        )
+        self.assertEqual(
+            database["snapshot_digest"],
+            digest(
+                {
+                    "postgres": postgres,
+                    "generation": "systalyze:public:1",
+                    "observed_at": 1000,
+                    "bank_set_digest": database["bank_set_digest"],
+                    "codex_document_count": 5,
+                    "codex_manifest_digest": "a" * 64,
+                    "schema_digest": database["schema_digest"],
+                }
+            ),
+        )
 
     def test_boolean_and_integer_fields_reject_python_subclass_aliases(self) -> None:
         evidence = self.evidence()

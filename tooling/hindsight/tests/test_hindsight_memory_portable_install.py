@@ -5823,6 +5823,65 @@ class PortableInstallationManagerTest(unittest.TestCase):
                 argument_parser, portable_with_ambient
             )
 
+    def test_cli_exposes_supported_data_identity_evidence_commands(self) -> None:
+        module = runpy.run_path(str(ROOT / "bin" / "hindsight-memory"))
+        argument_parser = module["parser"]()
+        evidence = argument_parser.parse_args(
+            [
+                "data-identity",
+                "evidence",
+                "--config",
+                str(self.config_path),
+                "--candidate-release-root",
+                str(self.root),
+                "--candidate-release-identity",
+                str(self.root / "identity.json"),
+                "--artifact",
+                str(self.root / "backup.age"),
+                "--backup-attestation",
+                str(self.root / "backup.json"),
+                "--output",
+                str(self.root / "evidence.json"),
+                "--age",
+                str(self.root / "age"),
+                "--age-identity",
+                str(self.root / "key.txt"),
+                "--recipient",
+                "age1example",
+                "--postgres-bin-dir",
+                str(self.root / "postgres"),
+                "--run-root",
+                "/private/tmp/hindsight-operation-recovery-"
+                + "1" * 32,
+                "--restore-run-root",
+                "/private/tmp/hindsight-operation-recovery-"
+                + "2" * 32,
+                "--port",
+                "55432",
+            ]
+        )
+        observe = argument_parser.parse_args(
+            [
+                "data-identity",
+                "observe",
+                "--config",
+                str(self.config_path),
+                "--base-evidence",
+                str(self.root / "evidence.json"),
+                "--output",
+                str(self.root / "observation.json"),
+            ]
+        )
+
+        self.assertIs(
+            evidence.run,
+            module["data_identity_rebind_evidence_command"],
+        )
+        self.assertIs(
+            observe.run,
+            module["data_identity_rebind_observe_command"],
+        )
+
     def test_cli_requires_upgrade_to_run_from_the_candidate_release(self) -> None:
         module = runpy.run_path(str(ROOT / "bin" / "hindsight-memory"))
         argument_parser = module["parser"]()
@@ -7992,6 +8051,231 @@ class PortableInstallationManagerTest(unittest.TestCase):
             {"path": str(self.root / "plan.json")},
             {"path": str(self.root / "post-evidence.json")},
         )
+
+    def test_data_identity_observe_cli_refreshes_without_renewing_window(
+        self,
+    ) -> None:
+        self.data_root.mkdir(mode=0o700)
+        module = runpy.run_path(str(ROOT / "bin" / "hindsight-memory"))
+        output = self.root / "observation.json"
+        base_path = self.root / "base-evidence.json"
+        args = module["parser"]().parse_args(
+            [
+                "data-identity",
+                "observe",
+                "--config",
+                str(self.config_path),
+                "--base-evidence",
+                str(base_path),
+                "--output",
+                str(output),
+            ]
+        )
+        base = {
+            "profile_id": "systalyze",
+            "expires_at": 1200,
+            "postgres": {"system_identifier": "7659746962107358086"},
+            "safety": {"controller_authority_disabled": True},
+        }
+        postgres = {"data_root": str(self.data_root)}
+        database = {"observed_at": 1000}
+        refreshed = {**base, "postgres": postgres, "database": database}
+        manager = mock.Mock()
+        manager.config.data_root = self.data_root
+
+        async def observe_live(**_keywords):
+            return {}, postgres, database
+
+        write_private = mock.Mock()
+        function_globals = module[
+            "data_identity_rebind_observe_command"
+        ].__globals__
+        with mock.patch.dict(
+            function_globals,
+            {
+                "_portable_manager": lambda _args: manager,
+                "read_json": lambda path: base if Path(path) == base_path else {},
+                "verify_rebind_evidence": lambda value, now: value,
+                "_read_live_data_identity_evidence": observe_live,
+                "_data_identity_safety_evidence": lambda value: base["safety"],
+                "refresh_rebind_evidence": lambda value, **_keywords: refreshed,
+                "write_private": write_private,
+                "_print_result": lambda value: 0,
+                "time": mock.Mock(time=lambda: 1000),
+            },
+        ):
+            self.assertEqual(
+                module["data_identity_rebind_observe_command"](args),
+                0,
+            )
+
+        manager._preflight_lifecycle.assert_called_once_with()
+        manager._validate_config_source.assert_called_once_with()
+        write_private.assert_called_once_with(
+            str(output),
+            refreshed,
+            create_only=True,
+        )
+
+    def test_data_identity_evidence_cli_binds_backup_and_evidence_outputs(
+        self,
+    ) -> None:
+        module = runpy.run_path(str(ROOT / "bin" / "hindsight-memory"))
+        output = self.root / "evidence.json"
+        backup_attestation = self.root / "backup.json"
+        args = module["parser"]().parse_args(
+            [
+                "data-identity",
+                "evidence",
+                "--config",
+                str(self.config_path),
+                "--candidate-release-root",
+                str(self.root),
+                "--candidate-release-identity",
+                str(self.root / "identity.json"),
+                "--artifact",
+                str(self.root / "backup.age"),
+                "--backup-attestation",
+                str(backup_attestation),
+                "--output",
+                str(output),
+                "--age",
+                str(self.root / "age"),
+                "--age-identity",
+                str(self.root / "key.txt"),
+                "--recipient",
+                "age1example",
+                "--postgres-bin-dir",
+                str(self.root / "postgres"),
+                "--run-root",
+                "/private/tmp/hindsight-operation-recovery-"
+                + "1" * 32,
+                "--restore-run-root",
+                "/private/tmp/hindsight-operation-recovery-"
+                + "2" * 32,
+                "--port",
+                "55432",
+            ]
+        )
+        backup_live = mock.Mock(return_value=0)
+        function_globals = module[
+            "data_identity_rebind_evidence_command"
+        ].__globals__
+        with mock.patch.dict(
+            function_globals,
+            {
+                "operation_recovery_backup_live_command": backup_live,
+                "time": mock.Mock(time=lambda: 1000),
+            },
+        ):
+            self.assertEqual(
+                module["data_identity_rebind_evidence_command"](args),
+                0,
+            )
+
+        backup_live.assert_called_once_with(args)
+        self.assertEqual(args.data_identity_output, str(output))
+        self.assertEqual(args.output, str(backup_attestation))
+        self.assertEqual(args.data_identity_collected_at, 1000)
+
+    def test_data_identity_evidence_cli_rejects_artifact_path_aliases(
+        self,
+    ) -> None:
+        module = runpy.run_path(str(ROOT / "bin" / "hindsight-memory"))
+        shared = self.root / "shared.json"
+        args = module["parser"]().parse_args(
+            [
+                "data-identity",
+                "evidence",
+                "--config",
+                str(self.config_path),
+                "--candidate-release-root",
+                str(self.root),
+                "--candidate-release-identity",
+                str(self.root / "identity.json"),
+                "--artifact",
+                str(self.root / "backup.age"),
+                "--backup-attestation",
+                str(shared),
+                "--output",
+                str(shared),
+                "--age",
+                str(self.root / "age"),
+                "--age-identity",
+                str(self.root / "key.txt"),
+                "--recipient",
+                "age1example",
+                "--postgres-bin-dir",
+                str(self.root / "postgres"),
+                "--run-root",
+                "/private/tmp/hindsight-operation-recovery-" + "1" * 32,
+                "--restore-run-root",
+                "/private/tmp/hindsight-operation-recovery-" + "2" * 32,
+                "--port",
+                "55432",
+            ]
+        )
+
+        with self.assertRaisesRegex(
+            PortableInstallError,
+            "path aliases an artifact",
+        ):
+            module["data_identity_rebind_evidence_command"](args)
+
+    def test_data_identity_safety_evidence_requires_all_authorities_absent(
+        self,
+    ) -> None:
+        module = runpy.run_path(str(ROOT / "bin" / "hindsight-memory"))
+        classify = module["_data_identity_safety_evidence"]
+        globals_ = classify.__globals__
+        absent = subprocess.CompletedProcess([], 113)
+        with mock.patch.dict(
+            globals_,
+            {
+                "subprocess": mock.Mock(
+                    run=mock.Mock(side_effect=(absent, absent, absent)),
+                    DEVNULL=subprocess.DEVNULL,
+                    SubprocessError=subprocess.SubprocessError,
+                )
+            },
+        ):
+            self.assertEqual(
+                classify({"generic_import_receipt_count": 0}),
+                {
+                    "hooks_disabled": True,
+                    "controller_authority_disabled": True,
+                    "no_serena_import_authority": True,
+                    "target_bank_inspected": False,
+                    "database_mutation_performed": False,
+                },
+            )
+
+        for returncode, message in (
+            (0, "is active"),
+            (3, "is unavailable"),
+        ):
+            with (
+                self.subTest(returncode=returncode),
+                mock.patch.dict(
+                    globals_,
+                    {
+                        "subprocess": mock.Mock(
+                            run=mock.Mock(
+                                return_value=subprocess.CompletedProcess(
+                                    [], returncode
+                                )
+                            ),
+                            DEVNULL=subprocess.DEVNULL,
+                            SubprocessError=subprocess.SubprocessError,
+                        )
+                    },
+                ),
+                self.assertRaisesRegex(
+                    module["DataIdentityRebindError"],
+                    message,
+                ),
+            ):
+                classify({"generic_import_receipt_count": 0})
 
 
 if __name__ == "__main__":

@@ -8,9 +8,8 @@ import hashlib
 import json
 import re
 import sys
-import tempfile
 from pathlib import Path
-from typing import IO, Any
+from typing import Any
 
 WRITER_SCRIPTS = (
     Path(__file__).parents[2] / "writing-reviewable-pr-descriptions/scripts"
@@ -34,6 +33,15 @@ from publication_receipts import (  # noqa: E402
     resolve_receipt_root,
     verified_transition,
 )
+from publication_support import (  # noqa: E402
+    expected_identity as _expected_identity,
+)
+from publication_support import (  # noqa: E402
+    temporary_body as _write_temporary_body,
+)
+from publication_support import (  # noqa: E402
+    validate_pr_content as _validate_body,
+)
 from required_review import (  # noqa: E402
     PublicationCandidate,
     validate_review_input_binding,
@@ -51,19 +59,14 @@ from reviewable_pr_state import (  # noqa: E402
     github_repository,
     identity_matches,
     state_matches,
-    validate_identity_inputs,
 )
 from reviewable_pr_state import (  # noqa: E402
     run_mutation as _run_mutation,
 )
 from reviewable_pr_state import (  # noqa: E402
-    run_read as _run_read,
-)
-from reviewable_pr_state import (  # noqa: E402
     stored_pr as _stored_pr,
 )
 
-VALIDATOR = WRITER_SCRIPTS / "validate_change_navigation.py"
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 
@@ -109,34 +112,6 @@ def _reject_secret_text(*values: str) -> None:
             "PR publication text contains a suspected credential or secret; "
             "publication is blocked pending authorized removal and rotation"
         )
-
-
-def _validate_body(
-    body: str,
-    repository: str,
-    pr_number: int,
-    title: str,
-    review_input_path: Path,
-    template_path: Path | None = None,
-) -> None:
-    if not VALIDATOR.is_file():
-        raise PublicationError(f"validator is missing: {VALIDATOR}")
-    arguments = [
-        sys.executable,
-        str(VALIDATOR),
-        "/dev/stdin",
-        "--repository",
-        repository,
-        "--pr",
-        str(pr_number),
-        "--title",
-        title,
-        "--review-input",
-        str(review_input_path),
-    ]
-    if template_path is not None:
-        arguments.extend(["--template-body", str(template_path)])
-    _run_read(arguments, input_text=body)
 
 
 def _preflight(
@@ -200,13 +175,6 @@ def _bind_review_input(
         return int(manifest.raw["version"]), manifest.content_sha256
     except ReviewInputError as error:
         raise PublicationError(f"review input drift: {error}") from error
-
-
-def _write_temporary_body(body: str) -> IO[str]:
-    temporary = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8")
-    temporary.write(body)
-    temporary.flush()
-    return temporary
 
 
 def _update_text_locked(
@@ -577,17 +545,7 @@ def mark_ready(
 
 
 def _expected(args: argparse.Namespace) -> ExpectedIdentity:
-    validate_identity_inputs(
-        repository=args.repository,
-        pr_number=args.pr,
-        base=args.base,
-        base_oid=args.base_oid,
-        head=args.head,
-        head_oid=args.head_oid,
-        head_owner=args.head_owner,
-        head_repository=args.head_repository,
-    )
-    return ExpectedIdentity(
+    return _expected_identity(
         repository=args.repository,
         pr_number=args.pr,
         base=args.base,

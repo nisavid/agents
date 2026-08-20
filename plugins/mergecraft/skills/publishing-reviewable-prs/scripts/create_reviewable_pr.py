@@ -7,7 +7,6 @@ import argparse
 import json
 import secrets
 import sys
-import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +30,15 @@ from publication_receipts import (  # noqa: E402
     record_verified_publication,
     resolve_receipt_root,
     verified_transition,
+)
+from publication_support import (  # noqa: E402
+    expected_identity as _expected_identity,
+)
+from publication_support import (  # noqa: E402
+    temporary_body as _write_temporary_body,
+)
+from publication_support import (  # noqa: E402
+    validate_pr_content as _validate,
 )
 from required_review import (  # noqa: E402
     build_candidate as _build_candidate,
@@ -59,15 +67,11 @@ from reviewable_pr_state import (  # noqa: E402
     run_mutation as _run_mutation,
 )
 from reviewable_pr_state import (  # noqa: E402
-    run_read as _run_read,
-)
-from reviewable_pr_state import (  # noqa: E402
     stored_pr as _stored_pr,
 )
 
 PR_NUMBER_TOKEN = "__PUBLISHING_REVIEWABLE_PRS_PR_NUMBER__"
 VALIDATION_PR_NUMBER = 2_147_483_647
-VALIDATOR = WRITER_SCRIPTS / "validate_change_navigation.py"
 
 
 def _transport_body(nonce: str) -> str:
@@ -79,34 +83,6 @@ def _transport_body(nonce: str) -> str:
 
 def _new_nonce() -> str:
     return secrets.token_hex(16)
-
-
-def _validate(
-    body: str,
-    repository: str,
-    pr_number: int,
-    title: str,
-    review_input_path: Path,
-    template_path: Path | None = None,
-) -> None:
-    if not VALIDATOR.is_file():
-        raise PublicationError(f"validator is missing: {VALIDATOR}")
-    arguments = [
-        sys.executable,
-        str(VALIDATOR),
-        "/dev/stdin",
-        "--repository",
-        repository,
-        "--pr",
-        str(pr_number),
-        "--title",
-        title,
-        "--review-input",
-        str(review_input_path),
-    ]
-    if template_path is not None:
-        arguments.extend(["--template-body", str(template_path)])
-    _run_read(arguments, input_text=body)
 
 
 def _body_template(path: Path) -> tuple[str, bytes]:
@@ -171,13 +147,6 @@ def _review_input(
         raise PublicationError(f"review input drift: {error}") from error
 
 
-def _write_temporary_body(body: str) -> tempfile.NamedTemporaryFile[str]:
-    temporary = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8")
-    temporary.write(body)
-    temporary.flush()
-    return temporary
-
-
 def _matching_head_prs(
     *,
     repository: str,
@@ -222,7 +191,7 @@ def _recover_created(
         number = stored.get("number")
         if type(number) is not int or number <= 0:
             continue
-        expected = ExpectedIdentity(
+        expected = _expected_identity(
             repository=repository,
             pr_number=number,
             base=base,
@@ -492,15 +461,15 @@ def publish(
             title=title,
             nonce=nonce,
         )
-        expected = ExpectedIdentity(
-            repository,
-            pr_number,
-            base,
-            base_oid,
-            head,
-            head_oid,
-            head_owner,
-            head_repository,
+        expected = _expected_identity(
+            repository=repository,
+            pr_number=pr_number,
+            base=base,
+            base_oid=base_oid,
+            head=head,
+            head_oid=head_oid,
+            head_owner=head_owner,
+            head_repository=head_repository,
         )
         prepare_receipt_ledger(receipt_root, expected)
         body = template.replace(PR_NUMBER_TOKEN, str(pr_number))
@@ -651,7 +620,7 @@ def main() -> int:
     except PublicationError as error:
         print(f"ERROR: {error}", file=sys.stderr)
         return 1
-    expected = ExpectedIdentity(
+    expected = _expected_identity(
         repository=args.repository,
         pr_number=int(stored["number"]),
         base=args.base,

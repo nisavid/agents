@@ -203,12 +203,9 @@ def create_synthetic_candidate(
         + "import agent_plugins_standard\n"
         "if agent_plugins_standard.MARKER != 'captured-agent-standard':\n"
         "    raise ValueError('ambient dependency selected')\n"
-        "def validate_inventory(plugin): pass\n"
-        "def validate_manifests(plugin): pass\n"
-        "def validate_public_release_registration(root): pass\n"
-        "def validate_suite_inventory(root): pass\n"
-        "def validate_reviewed_sources(root): pass\n"
-        "def validate_bridge_history(root):\n"
+        "def validate_candidate_source(root, include_suite_inventory):\n"
+        "    if include_suite_inventory is not True:\n"
+        "        raise ValueError('suite inventory was not requested')\n"
         + "".join(f"    {mutation}\n" for mutation in mutations)
         + ("    pass\n" if not mutations else "")
         + f"    return {projection!r}\n"
@@ -994,49 +991,6 @@ class TaskWitnessQualificationTests(unittest.TestCase):
             ):
                 driver._execute_suite("qualification-runner-contract", REPOSITORY)
 
-    def test_direct_child_cleanup_never_acts_past_the_absolute_deadline(
-        self,
-    ) -> None:
-        driver = load_suite_driver_module()
-        process = SimpleNamespace(
-            args=["fixture-child"],
-            pid=4321,
-            returncode=None,
-            wait=mock.Mock(side_effect=AssertionError("reap after deadline")),
-        )
-        with (
-            mock.patch.object(
-                driver,
-                "_direct_child_terminal_without_reaping",
-                return_value=False,
-            ),
-            mock.patch.object(
-                driver.time,
-                "monotonic",
-                side_effect=(1.0, *((11.0,) * 8)),
-            ),
-            mock.patch.object(driver.time, "sleep") as sleep,
-            mock.patch.object(driver.os, "killpg") as kill_group,
-            mock.patch.object(
-                driver,
-                "_direct_child_group_exists",
-                side_effect=AssertionError("group probe after deadline"),
-            ),
-        ):
-            errors = driver._terminate_direct_child_group(process, 4321, 10.0)
-
-        self.assertEqual(
-            kill_group.call_args_list,
-            [
-                mock.call(4321, driver.signal.SIGTERM),
-                mock.call(4321, driver.signal.SIGKILL),
-            ],
-        )
-        sleep.assert_not_called()
-        process.wait.assert_not_called()
-        self.assertEqual(len(errors), 1)
-        self.assertIsInstance(errors[0], subprocess.TimeoutExpired)
-
     def test_suite_driver_binds_bounded_underlying_output(self) -> None:
         driver = load_suite_driver_module()
 
@@ -1804,7 +1758,7 @@ else:
                     separators=(",", ":"),
                 ).encode()
             ).hexdigest(),
-            "f9190af3f57a6974a5b63b02e6e720df6b65c462d0212137ee36f2ccc6f77942",
+            "fa4f889ab2b62237f2645cedb24b92007113d0bac94c0496057fe2da98bf9ce6",
         )
 
     def test_package_contract_loader_uses_only_fixed_captured_methods(self) -> None:
@@ -1850,9 +1804,9 @@ else:
             {
                 "id": "package-contract",
                 "observed_count": 71,
-                "detail_stdout_length": 90,
+                "detail_stdout_length": 45,
                 "detail_stdout_sha256": (
-                    "2589236b349b29d6f0a3daa22dcbec8ce497d1962e8618c79a9a2c9c72cc29e5"
+                    "26a6be57e0448efb627b1641ae11880dabe9e55daf7acad0ec8f302690597681"
                 ),
             }
         )

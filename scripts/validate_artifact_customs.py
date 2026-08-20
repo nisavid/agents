@@ -12,6 +12,7 @@ import re
 import stat
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIRECTORY))
@@ -21,6 +22,12 @@ from agent_plugins_standard import (  # noqa: E402
     discover_direct_skills,
     load_agent_plugin_manifest,
     validate_skill_resource_links,
+)
+from refresh_transaction import (  # noqa: E402
+    InputEntry,
+    capture_input_entry,
+    replace_generated_artifacts,
+    snapshot_tree,
 )
 
 PLUGIN_RELATIVE = Path("plugins/artifact-customs")
@@ -603,28 +610,116 @@ def validate_content_lock(repository: Path, files: dict[str, Path]) -> None:
         )
 
 
-def content_lock_document(files: dict[str, Path]) -> dict:
+class ContentLockWriteSnapshot(NamedTuple):
+    plugin_entries: tuple[tuple[str, InputEntry], ...]
+    lock_parent: InputEntry
+    lock_entry: InputEntry
+
+
+def capture_content_lock_write_snapshot(
+    repository: Path,
+) -> ContentLockWriteSnapshot:
+    root = plugin_root(repository)
+    destination = repository / CONTENT_LOCK_RELATIVE
+    return ContentLockWriteSnapshot(
+        plugin_entries=snapshot_tree(root, error_type=ContractError),
+        lock_parent=capture_input_entry(
+            destination.parent,
+            error_type=ContractError,
+        ),
+        lock_entry=capture_input_entry(
+            destination,
+            error_type=ContractError,
+        ),
+    )
+
+
+def require_content_lock_write_snapshot_unchanged(
+    repository: Path,
+    snapshot: ContentLockWriteSnapshot,
+) -> None:
+    require(
+        capture_content_lock_write_snapshot(repository) == snapshot,
+        "validated inputs changed before content lock replacement",
+    )
+
+
+def content_lock_document_from_snapshot(snapshot: ContentLockWriteSnapshot) -> dict:
+    files = {
+        relative: entry.sha256
+        for relative, entry in snapshot.plugin_entries
+        if relative != "." and entry.kind == "regular"
+    }
+    require(
+        all(
+            isinstance(digest, str) and SHA256.fullmatch(digest)
+            for digest in files.values()
+        ),
+        "content lock snapshot contains an invalid regular file",
+    )
     return {
         "schema_version": 1,
         "algorithm": "sha256",
-        "files": {
-            relative: hashlib.sha256(path.read_bytes()).hexdigest()
-            for relative, path in sorted(files.items())
-        },
+        "files": files,
     }
 
 
-def write_content_lock(repository: Path) -> None:
-    root = plugin_root(repository)
-    document = content_lock_document(runtime_files(root))
+def write_content_lock(
+    repository: Path,
+    snapshot: ContentLockWriteSnapshot | None = None,
+) -> None:
+    if snapshot is None:
+        snapshot = capture_content_lock_write_snapshot(repository)
     destination = repository / CONTENT_LOCK_RELATIVE
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    temporary = destination.with_suffix(".tmp")
-    temporary.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
-    temporary.replace(destination)
+    require(
+        snapshot.lock_parent.kind == "directory"
+        and not destination.parent.is_symlink(),
+        "external content lock parent is invalid",
+    )
+    require(
+        snapshot.lock_entry.kind in {"missing", "regular"},
+        "external content lock is not a regular file",
+    )
+    content = (
+        json.dumps(content_lock_document_from_snapshot(snapshot), indent=2) + "\n"
+    ).encode("utf-8")
+    mode = snapshot.lock_entry.mode if snapshot.lock_entry.mode is not None else 0o644
+
+    def recheck(_temporary_paths: frozenset[Path]) -> None:
+        require_content_lock_write_snapshot_unchanged(repository, snapshot)
+
+    def verify() -> None:
+        require(
+            snapshot_tree(
+                plugin_root(repository),
+                error_type=ContractError,
+            )
+            == snapshot.plugin_entries,
+            "validated inputs changed during content lock replacement",
+        )
+        replacement = capture_input_entry(
+            destination,
+            error_type=ContractError,
+        )
+        require(
+            replacement
+            == InputEntry("regular", mode, hashlib.sha256(content).hexdigest()),
+            "external content lock replacement identity is invalid",
+        )
+
+    replace_generated_artifacts(
+        {destination: (content, mode)},
+        recheck=recheck,
+        verify=verify,
+    )
 
 
-def validate(repository: Path, *, source_stage: bool) -> str:
+def validate(
+    repository: Path,
+    *,
+    source_stage: bool,
+    check_content_lock: bool = True,
+) -> str:
     require(type(source_stage) is bool, "validation stage must be explicit")
     validation_stage = "source-stage" if source_stage else "release-stage"
     root = plugin_root(repository)
@@ -635,7 +730,8 @@ def validate(repository: Path, *, source_stage: bool) -> str:
     validate_topology(root)
     validate_references(root)
     validate_reference_projections(root)
-    validate_content_lock(repository, files)
+    if check_content_lock:
+        validate_content_lock(repository, files)
     return validation_stage
 
 
@@ -648,7 +744,14 @@ def main(argv: list[str] | None = None) -> int:
     try:
         repository = Path(os.path.abspath(arguments.repository.expanduser()))
         if arguments.write_content_lock:
-            write_content_lock(repository)
+            snapshot = capture_content_lock_write_snapshot(repository)
+            validate(
+                repository,
+                source_stage=arguments.source_stage,
+                check_content_lock=False,
+            )
+            require_content_lock_write_snapshot_unchanged(repository, snapshot)
+            write_content_lock(repository, snapshot)
         validation_stage = validate(repository, source_stage=arguments.source_stage)
     except (
         AgentPluginContractError,

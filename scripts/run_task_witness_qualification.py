@@ -288,23 +288,10 @@ try:
     sys.modules[validator_name] = validator
     exec(compile(validator_raw, validator.__file__, "exec"), validator.__dict__)
     root_path = Path(root)
-    plugin = root_path / "plugins/task-witness"
-    calls = (
-        ("validate_inventory", (plugin,)),
-        ("validate_manifests", (plugin,)),
-        ("validate_public_release_registration", (root_path,)),
-        ("validate_suite_inventory", (root_path,)),
-        ("validate_reviewed_sources", (root_path,)),
-    )
-    for name, arguments in calls:
-        function = validator.__dict__.get(name)
-        if not callable(function):
-            fail()
-        function(*arguments)
-    function = validator.__dict__.get("validate_bridge_history")
+    function = validator.__dict__.get("validate_candidate_source")
     if not callable(function):
         fail()
-    result = function(root_path)
+    result = function(root_path, True)
     raw = json.dumps(result, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False).encode("utf-8")
     sys.stdout.buffer.write(raw)
 except BaseException:

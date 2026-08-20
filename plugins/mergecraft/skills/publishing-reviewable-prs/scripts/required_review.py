@@ -1525,7 +1525,7 @@ def validate_required_review(
     if review_bundle_root is None or not review_bundle_root.is_absolute():
         raise PublicationError("required review needs an absolute evidence bundle root")
     raw = _invoke_task_witness(review_bundle_root)
-    observation = _validate_envelope(_strict_envelope(raw), raw, candidate)
+    observation = validate_required_review_envelope(raw, candidate)
     if expected_observation is not None and observation != expected_observation:
         raise PublicationError(
             "required review evidence changed under publication lease"
@@ -1536,6 +1536,14 @@ def validate_required_review(
         observation,
         transition_validated=True,
     )
+
+
+def validate_required_review_envelope(
+    raw: bytes, candidate: PublicationCandidate
+) -> RequiredReviewObservation:
+    """Validate canonical Task Witness output against one frozen candidate."""
+
+    return _validate_envelope(_strict_envelope(raw), raw, candidate)
 
 
 def parse_publication_review(value: Any) -> PublicationReview:

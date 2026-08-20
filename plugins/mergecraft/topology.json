@@ -74,11 +74,12 @@
       "scripts": [
         "skills/publishing-reviewable-prs/scripts/audit_reviewable_pr.py",
         "skills/publishing-reviewable-prs/scripts/create_reviewable_pr.py",
-        "skills/publishing-reviewable-prs/scripts/reviewable_pr_state.py",
         "skills/publishing-reviewable-prs/scripts/update_reviewable_pr.py"
       ],
       "modules": [
         "skills/publishing-reviewable-prs/scripts/publication_receipts.py",
+        "skills/publishing-reviewable-prs/scripts/publication_support.py",
+        "skills/publishing-reviewable-prs/scripts/reviewable_pr_state.py",
         "skills/publishing-reviewable-prs/scripts/required_review.py"
       ],
       "calls": ["operation:pr-content"],

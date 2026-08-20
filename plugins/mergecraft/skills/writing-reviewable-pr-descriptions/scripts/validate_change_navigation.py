@@ -10,12 +10,7 @@ from pathlib import Path
 
 from change_navigation.badges import validate_badges
 from change_navigation.diff import touched_file_count, validate_diff
-from change_navigation.diff_files import file_operation_counts, _groups
-from change_navigation.diff_metrics import (
-    atomic_totals,
-    file_operation_kind,
-    parse_file_link,
-)
+from change_navigation.diff_files import file_operation_counts, manifest_rows
 from change_navigation.metrics import category_metric_map
 from change_navigation.model import alt_values
 from change_navigation.parsing import (
@@ -32,9 +27,9 @@ from change_navigation.sensitive_content import suspected_secret_error
 from change_navigation.stack import validate_stack
 from change_navigation.stack_inventory import (
     STACK_FILE_OPERATIONS_RE,
-    current_item_identity,
     current_item_file_operation_count,
     current_item_file_operations,
+    current_item_identity,
     current_item_metrics,
     inventory,
 )
@@ -156,27 +151,6 @@ def _has_stack_heading(lines: list[str]) -> bool:
     return False
 
 
-def _manifest_rows(block: list[str]) -> list[dict[str, object]]:
-    rows: list[dict[str, object]] = []
-    for group in _groups(block):
-        for _, line in group.file_lines:
-            link = parse_file_link(line)
-            if not link:
-                continue
-            additions, deletions = atomic_totals([(0, line)])
-            rows.append(
-                {
-                    "category": group.category,
-                    "operation": file_operation_kind(line),
-                    "source_path": link.source_path,
-                    "target_path": link.target_path,
-                    "additions": additions,
-                    "deletions": deletions,
-                }
-            )
-    return rows
-
-
 def _validate_manifest_semantics(
     body: str,
     blocks: list[list[str]],
@@ -211,7 +185,7 @@ def _validate_manifest_semantics(
     if not blocks or (labels[:1] == ["STACK"] and len(blocks) < 2):
         return ["rendered Diff disclosure is missing"]
     diff_block = blocks[1] if labels[:2] == ["STACK", "DIFF"] else blocks[0]
-    if _manifest_rows(diff_block) != review_input.raw["diff"]:
+    if manifest_rows(diff_block) != review_input.raw["diff"]:
         errors.append("rendered Diff rows do not match the review input")
     stack = review_input.raw["stack"]
     if labels[:1] == ["STACK"]:

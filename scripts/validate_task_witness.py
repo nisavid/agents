@@ -317,6 +317,7 @@ PUBLIC_RELEASE_REGISTRATION_PATHS = (PUBLIC_RELEASE_REGISTRATION_RELATIVE.as_pos
 RELEASE_DOCUMENTATION_PATHS = (
     "docs/superpowers/specs/2026-07-27-task-witness-canonical-client-design.md",
     "docs/superpowers/specs/2026-08-12-task-witness-tw4-migration-and-qualification-design.md",
+    "plugins/task-witness/README.md",
 )
 TW4_MIGRATION_EVIDENCE_PATHS = tuple(
     sorted(
@@ -433,6 +434,7 @@ REQUIRED_RUNTIME_DEPENDENCY_CLASSES = {
 }
 EXPECTED_FILES = {
     ".claude-plugin/plugin.json",
+    "README.md",
     "plugin.json",
 } | REVIEWED_SOURCE_FILES
 CANONICAL_IDENTITY_FIELDS = {
@@ -487,6 +489,7 @@ EXPECTED_PUBLIC_RELEASE_REGISTRATION = {
     "support_paths": [
         "docs/superpowers/specs/2026-07-27-task-witness-canonical-client-design.md",
         "docs/superpowers/specs/2026-08-12-task-witness-tw4-migration-and-qualification-design.md",
+        "plugins/task-witness/README.md",
         "release/task-witness/migration",
         SOURCE_SHAPE_RECORD_RELATIVE.as_posix(),
         BRIDGE_IDENTITY_RELATIVE.as_posix(),
@@ -3883,13 +3886,10 @@ def validate_final_release_evidence(
     )
     validate_final_receipt_candidate_binding(macos_receipt, candidate_evidence)
     validate_final_receipt_candidate_binding(linux_receipt, candidate_evidence)
-    plugin = candidate_root / PLUGIN_RELATIVE
-    validate_inventory(plugin)
-    validate_manifests(plugin)
-    validate_public_release_registration(candidate_root)
-    validate_suite_inventory(candidate_root)
-    validate_reviewed_sources(candidate_root)
-    derived_bridge_history = validate_bridge_history(candidate_root)
+    derived_bridge_history = validate_candidate_source(
+        candidate_root,
+        include_suite_inventory=True,
+    )
     if derived_bridge_history != manifest["bridge_history"]:
         raise ValueError("Task Witness final-release bridge history drift")
 
@@ -4604,6 +4604,22 @@ def validate_reviewed_sources(
         raise ValueError("Task Witness source byte identity drift")
 
 
+def validate_candidate_source(
+    root: Path,
+    include_suite_inventory: bool,
+) -> dict[str, object]:
+    """Validate one candidate source closure and return its bridge history."""
+
+    plugin = root / PLUGIN_RELATIVE
+    validate_inventory(plugin)
+    validate_manifests(plugin)
+    validate_public_release_registration(root)
+    if include_suite_inventory:
+        validate_suite_inventory(root)
+    validate_reviewed_sources(root)
+    return validate_bridge_history(root)
+
+
 def _validator_invocation(
     argv: list[str] | None,
 ) -> tuple[Path, str, dict[str, Path]]:
@@ -4726,14 +4742,10 @@ def main(argv: list[str] | None = None) -> int:
             )
             parse_host_qualification_receipt(qualification_receipt)
         if mode != "final-release":
-            plugin = root / PLUGIN_RELATIVE
-            validate_inventory(plugin)
-            validate_manifests(plugin)
-            validate_public_release_registration(root)
-            if mode in {"source-stage", "qualification"}:
-                validate_suite_inventory(root)
-            validate_reviewed_sources(root)
-            validate_bridge_history(root)
+            validate_candidate_source(
+                root,
+                include_suite_inventory=mode in {"source-stage", "qualification"},
+            )
             if qualification_receipt is not None:
                 validate_qualification_candidate_binding(
                     root,

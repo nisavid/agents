@@ -7,6 +7,7 @@
   "support_paths": [
     "docs/superpowers/specs/2026-07-27-task-witness-canonical-client-design.md",
     "docs/superpowers/specs/2026-08-12-task-witness-tw4-migration-and-qualification-design.md",
+    "plugins/task-witness/README.md",
     "release/task-witness/migration",
     "release/task-witness/source-shape-review.json",
     "release/task-witness/tw4-bridge-identity.json",

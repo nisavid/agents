@@ -17,12 +17,12 @@ from publication_receipts import (
     record_reconciliation,
     verified_transition,
 )
+from publication_support import expected_identity as _expected_identity
+from publication_support import validate_pr_content
 from reviewable_pr_state import (
     ExpectedIdentity,
     PublicationError,
-    run_read,
     stored_pr,
-    validate_identity_inputs,
 )
 
 WRITER_SCRIPTS = (
@@ -37,21 +37,9 @@ from change_navigation.review_input import (  # noqa: E402
 )
 from change_navigation.sensitive_content import suspected_secret_error  # noqa: E402
 
-VALIDATOR = WRITER_SCRIPTS / "validate_change_navigation.py"
-
 
 def _expected(args: argparse.Namespace) -> ExpectedIdentity:
-    validate_identity_inputs(
-        repository=args.repository,
-        pr_number=args.pr,
-        base=args.base,
-        base_oid=args.base_oid,
-        head=args.head,
-        head_oid=args.head_oid,
-        head_owner=args.head_owner,
-        head_repository=args.head_repository,
-    )
-    return ExpectedIdentity(
+    return _expected_identity(
         repository=args.repository,
         pr_number=args.pr,
         base=args.base,
@@ -78,8 +66,6 @@ def audit(
 def _validate_live_state(
     *, expected: ExpectedIdentity, title: str, body: str, review_input_path: Path
 ) -> tuple[int, str]:
-    if not VALIDATOR.is_file():
-        raise PublicationError(f"validator is missing: {VALIDATOR}")
     try:
         manifest = load_review_input(review_input_path)
         bind_review_input(
@@ -100,21 +86,12 @@ def _validate_live_state(
         review_input_sha256 = manifest.content_sha256
     except ReviewInputError as error:
         raise PublicationError(f"review input drift: {error}") from error
-    run_read(
-        [
-            sys.executable,
-            str(VALIDATOR),
-            "/dev/stdin",
-            "--repository",
-            expected.repository,
-            "--pr",
-            str(expected.pr_number),
-            "--title",
-            title,
-            "--review-input",
-            str(review_input_path),
-        ],
-        input_text=body,
+    validate_pr_content(
+        body,
+        expected.repository,
+        expected.pr_number,
+        title,
+        review_input_path,
     )
     return review_input_version, review_input_sha256
 

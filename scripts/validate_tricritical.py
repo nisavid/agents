@@ -23,6 +23,7 @@ from agent_plugins_standard import (  # noqa: E402
     load_agent_plugin_manifest,
     validate_skill_resource_links,
 )
+from refresh_transaction import replace_generated_artifacts  # noqa: E402
 
 try:
     import yaml
@@ -1905,7 +1906,7 @@ def validate_eval_corpus(root: Path) -> None:
         validate_eval_scenario(root, fixture, scenario)
 
 
-def validate(repo_root: Path) -> None:
+def validate(repo_root: Path, *, emit_success: bool = True) -> None:
     anchor = open_repository_anchor(repo_root)
     try:
         source_observation = anchored_validation_input_observation_digest(anchor)
@@ -1960,17 +1961,85 @@ def validate(repo_root: Path) -> None:
             ):
                 fail("validation input tree drifted; concurrent writers are forbidden")
             verify_repository_anchor_binding(anchor)
-            print(
-                "Tricritical contract validation passed: "
-                f"snapshot_sha256={snapshot_identity} "
-                f"plugin_sha256={plugin_identity}"
-            )
+            if emit_success:
+                print(
+                    "Tricritical contract validation passed: "
+                    f"snapshot_sha256={snapshot_identity} "
+                    f"plugin_sha256={plugin_identity}"
+                )
     finally:
         anchor.close()
 
 
-def write_content_lock(repo_root: Path) -> None:
-    _, root = locate_roots(repo_root)
+def generated_artifact_paths(root: Path) -> tuple[Path, ...]:
+    paths = {root / CONTENT_LOCK_PATH}
+    for skill in CORE_SKILLS:
+        for local_path in skill_local_projection_sources(skill):
+            paths.add(root / "skills" / skill / local_path)
+    return tuple(sorted(paths, key=lambda path: path.as_posix()))
+
+
+def _refresh_input_observation(
+    repository_root: Path,
+    root: Path,
+    ignored: set[Path],
+) -> str:
+    """Observe authored bytes and identities while ignoring owned artifacts."""
+
+    digest = hashlib.sha256()
+    paths = [root, *sorted(root.rglob("*"), key=lambda path: path.as_posix())]
+    for path in paths:
+        if path in ignored:
+            continue
+        relative = "." if path == root else path.relative_to(root).as_posix()
+        before = path.lstat()
+        if stat.S_ISDIR(before.st_mode):
+            fields = (
+                before.st_dev,
+                before.st_ino,
+                stat.S_IFMT(before.st_mode),
+                stat.S_IMODE(before.st_mode),
+            )
+            payload = b""
+        elif stat.S_ISREG(before.st_mode):
+            payload = read_regular_bytes(root, relative)
+            after = path.lstat()
+            if metadata_changed(before, after):
+                raise ValueError("refresh input changed while it was observed")
+            fields = tuple(getattr(after, name) for name in STABLE_METADATA_FIELDS)
+        elif stat.S_ISLNK(before.st_mode):
+            fields = tuple(getattr(before, name) for name in STABLE_METADATA_FIELDS)
+            payload = os.fsencode(os.readlink(path))
+        else:
+            fields = tuple(getattr(before, name) for name in STABLE_METADATA_FIELDS)
+            payload = b""
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update("\0".join(str(field) for field in fields).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(payload)
+        digest.update(b"\0")
+
+    marketplace = repository_root / ".claude-plugin" / "marketplace.json"
+    before = marketplace.lstat()
+    payload = read_regular_bytes(
+        repository_root, ".claude-plugin/marketplace.json"
+    )
+    after = marketplace.lstat()
+    if metadata_changed(before, after):
+        raise ValueError("refresh input changed while it was observed")
+    digest.update(b"marketplace\0")
+    digest.update(
+        "\0".join(
+            str(getattr(after, name)) for name in STABLE_METADATA_FIELDS
+        ).encode("ascii")
+    )
+    digest.update(b"\0")
+    digest.update(payload)
+    return digest.hexdigest()
+
+
+def _materialize_generated_artifacts(root: Path) -> None:
     for skill in CORE_SKILLS:
         for local_path, source_path in skill_local_projection_sources(skill).items():
             projection_path = root / "skills" / skill / local_path
@@ -1981,6 +2050,90 @@ def write_content_lock(repo_root: Path) -> None:
         json.dumps(content_lock_document(root), indent=2) + "\n",
         encoding="utf-8",
     )
+
+
+def _generated_artifact_plan(root: Path) -> dict[Path, tuple[bytes, int]]:
+    return {
+        path.relative_to(root): (
+            read_regular_bytes(root, path.relative_to(root)),
+            stat.S_IMODE(path.lstat().st_mode),
+        )
+        for path in generated_artifact_paths(root)
+    }
+
+
+def write_content_lock(repo_root: Path) -> None:
+    repository_root, root = locate_roots(repo_root)
+    generated = set(generated_artifact_paths(root))
+    authored_snapshot = _refresh_input_observation(
+        repository_root, root, generated
+    )
+    anchor = open_repository_anchor(repository_root)
+    try:
+        source_observation = anchored_validation_input_observation_digest(anchor)
+        with tempfile.TemporaryDirectory(
+            prefix="tricritical-refresh-", dir=Path(tempfile.gettempdir()).resolve()
+        ) as temporary_directory:
+            snapshot_repository = Path(temporary_directory) / "repository"
+            create_private_validation_snapshot_from_anchor(
+                anchor, snapshot_repository
+            )
+            if (
+                anchored_validation_input_observation_digest(anchor)
+                != source_observation
+            ):
+                raise ValueError(
+                    "validation input tree drifted; concurrent writers are forbidden"
+                )
+            snapshot_repository_root, snapshot_root = locate_roots(
+                snapshot_repository
+            )
+            _materialize_generated_artifacts(snapshot_root)
+            validate(snapshot_repository_root, emit_success=False)
+            plan = _generated_artifact_plan(snapshot_root)
+            expected_identity = validation_input_digest(
+                snapshot_repository_root, snapshot_root
+            )
+
+        if anchored_validation_input_observation_digest(anchor) != source_observation:
+            raise ValueError(
+                "validation input tree drifted; concurrent writers are forbidden"
+            )
+        verify_repository_anchor_binding(anchor)
+
+        replacements = {
+            root / relative: (content, mode)
+            for relative, (content, mode) in plan.items()
+        }
+
+        def recheck(temporary_paths: frozenset[Path]) -> None:
+            ignored = generated | set(temporary_paths)
+            if (
+                _refresh_input_observation(repository_root, root, ignored)
+                != authored_snapshot
+            ):
+                raise ValueError(
+                    "validated inputs changed before generated artifact replacement"
+                )
+
+        def verify() -> None:
+            if (
+                _refresh_input_observation(repository_root, root, generated)
+                != authored_snapshot
+            ):
+                raise ValueError(
+                    "validated inputs changed during generated artifact replacement"
+                )
+            if validation_input_digest(repository_root, root) != expected_identity:
+                raise ValueError("generated artifact replacement identity is invalid")
+
+        replace_generated_artifacts(
+            replacements,
+            recheck=recheck,
+            verify=verify,
+        )
+    finally:
+        anchor.close()
 
 
 def usage() -> None:

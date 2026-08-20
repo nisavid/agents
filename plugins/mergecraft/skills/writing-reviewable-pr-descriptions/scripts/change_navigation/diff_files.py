@@ -6,6 +6,7 @@ import re
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
+from .categories import CATEGORY_BY_LABEL, CATEGORY_LABELS, TAXONOMY_NOTE
 from .diff_metrics import (
     FileKey,
     Identity,
@@ -17,8 +18,6 @@ from .diff_metrics import (
     validate_file_line,
 )
 from .metrics import Metric
-from .categories import CATEGORY_BY_LABEL, CATEGORY_LABELS, TAXONOMY_NOTE
-
 
 GROUP_RE = re.compile(
     r'^- <picture><img alt="(IMPL|TEST|DOC|GEN|OTHER): (\d+) additions, '
@@ -239,6 +238,29 @@ def file_operation_counts(block: list[str]) -> FileOperationCounts:
         copied=copied,
         consistent=consistent,
     )
+
+
+def manifest_rows(block: list[str]) -> list[dict[str, object]]:
+    """Return the semantic manifest rows represented by one Diff disclosure."""
+
+    rows: list[dict[str, object]] = []
+    for group in _groups(block):
+        for _, line in group.file_lines:
+            link = parse_file_link(line)
+            if not link:
+                continue
+            additions, deletions = atomic_totals([(0, line)])
+            rows.append(
+                {
+                    "category": group.category,
+                    "operation": file_operation_kind(line),
+                    "source_path": link.source_path,
+                    "target_path": link.target_path,
+                    "additions": additions,
+                    "deletions": deletions,
+                }
+            )
+    return rows
 
 
 def _groups(block: list[str]) -> list[Group]:

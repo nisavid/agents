@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import contextlib
+import importlib.util
+import io
 import json
 import shutil
 import subprocess
@@ -7,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPOSITORY = Path(__file__).resolve().parents[1]
 VALIDATOR = REPOSITORY / "scripts" / "validate_artifact_customs.py"
@@ -682,6 +686,82 @@ class ArtifactCustomsExactContractTests(unittest.TestCase):
         lock["files"].pop(next(iter(lock["files"])))
         lock_path.write_text(json.dumps(lock, indent=2) + "\n", encoding="utf-8")
         self.assert_rejected("content lock")
+
+    def test_invalid_write_candidate_preserves_existing_content_lock_bytes(
+        self,
+    ) -> None:
+        lock_path = (
+            self.repository
+            / "release"
+            / "plugin-content-locks"
+            / "artifact-customs.json"
+        )
+        original_lock = lock_path.read_bytes()
+        manifest_path = self.plugin / "plugin.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["version"] = "invalid-candidate"
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+        )
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(self.validator),
+                str(self.repository),
+                "--write-content-lock",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("manifest", result.stderr.lower())
+        self.assertEqual(lock_path.read_bytes(), original_lock)
+
+    def test_detected_late_refresh_failure_restores_content_lock_bytes(
+        self,
+    ) -> None:
+        lock_path = (
+            self.repository
+            / "release"
+            / "plugin-content-locks"
+            / "artifact-customs.json"
+        )
+        original_lock = lock_path.read_bytes()
+        readme = self.plugin / "README.md"
+        readme.write_text(
+            readme.read_text(encoding="utf-8") + "\nValid semantic change.\n",
+            encoding="utf-8",
+        )
+        spec = importlib.util.spec_from_file_location(
+            "artifact_customs_refresh_probe", self.validator
+        )
+        assert spec is not None and spec.loader is not None
+        validator = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(validator)
+        real_replace = validator.os.replace
+
+        def replace_then_drift(source: object, destination: object) -> None:
+            real_replace(source, destination)
+            if Path(destination) == lock_path:
+                readme.write_text(
+                    readme.read_text(encoding="utf-8")
+                    + "\nConcurrent semantic change.\n",
+                    encoding="utf-8",
+                )
+
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(validator.os, "replace", side_effect=replace_then_drift),
+            contextlib.redirect_stderr(stderr),
+        ):
+            result = validator.main([str(self.repository), "--write-content-lock"])
+
+        self.assertNotEqual(result, 0)
+        self.assertIn("validated inputs changed", stderr.getvalue())
+        self.assertEqual(lock_path.read_bytes(), original_lock)
 
     def test_validator_regenerates_the_external_content_lock_deterministically(
         self,

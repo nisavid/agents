@@ -3214,7 +3214,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 ):
                     create(invalid)
 
-    def test_exact_drain_v10_binds_verified_post_abort_retry_lineage(self):
+    def test_exact_drain_binds_verified_post_abort_retry_lineage(self):
         reference = self.drain_plan(
             snapshot=self.drain_snapshot(
                 completed_positions=set(range(7)),
@@ -3223,6 +3223,30 @@ class OperationRecoveryContractTest(unittest.TestCase):
             created_at=1_786_390_001,
         )
         interrupted = self.post_abort_v10_snapshot(reference)
+        reference_rows = {
+            item["operation_id"]: item
+            for item in reference["live_snapshot"]["operations"]
+        }
+        interrupted["operations"] = [
+            deepcopy(reference_rows[item["operation_id"]])
+            if item["current_status"] == "pending"
+            else item
+            for item in interrupted["operations"]
+        ]
+        interrupted["status_counts"] = {
+            status: sum(
+                item["current_status"] == status
+                for item in interrupted["operations"]
+            )
+            for status in recovery_contract.OPERATION_STATUSES
+        }
+        interrupted["snapshot_digest"] = digest(
+            {
+                key: value
+                for key, value in interrupted.items()
+                if key != "snapshot_digest"
+            }
+        )
         recovery_backup = rollback_backup_evidence()
         for key in ("generation_before", "generation_after"):
             recovery_backup["source_authority"][key] = interrupted[
@@ -3256,6 +3280,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
             item["operation_id"]
             for item in recovery_plan["selected_operations"]
         }
+        self.assertEqual(len(selected_ids), 23)
         retry_after = {
             item["operation_id"]: item["retry_count_after"]
             for item in recovery_plan["retry_recovery"]["operations"]
@@ -3308,6 +3333,12 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 observed_at=1_786_390_700,
             )
         )
+        fresh_selected_ids = {
+            item["operation_id"]
+            for item in recovered_snapshot["operations"]
+            if item["current_status"] == "pending"
+        }
+        self.assertEqual(len(fresh_selected_ids), 39)
         recovery_context = {
             "schema_version": 1,
             "kind": "operation-recovery-exact-drain-recovery-context",
@@ -3316,7 +3347,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
             "recovery_epoch": 1,
             "candidate_release_digest": release_identity()["release_digest"],
             "selected_operation_ids_digest": digest(
-                sorted(selected_ids)
+                sorted(fresh_selected_ids)
             ),
             "initial_origin_digest": None,
             "post_abort_selected_operation_ids_digest": digest(
@@ -3362,9 +3393,16 @@ class OperationRecoveryContractTest(unittest.TestCase):
         )
 
         self.assertEqual(plan["selected_operation_count"], 39)
+        plan_selected_ids = {
+            item["operation_id"] for item in plan["selected_operations"]
+        }
         self.assertEqual(
             plan["execution_window"]["remaining_attempt_count"],
-            105,
+            sum(
+                plan["worker_max_retries"] - item["retry_count"] + 1
+                for item in plan["live_snapshot"]["operations"]
+                if item["operation_id"] in plan_selected_ids
+            ),
         )
         window = plan["execution_window"]
         self.assertEqual(
@@ -3387,28 +3425,27 @@ class OperationRecoveryContractTest(unittest.TestCase):
         )
 
         second_rows = deepcopy(recovered_rows)
-        second_selected_id = plan["selected_operations"][0]["operation_id"]
         second_worker_digest = hashlib.sha256(
             (
                 "operation-recovery-exact-drain-"
                 f"{plan['plan_digest'][:12]}"
             ).encode()
         ).hexdigest()
-        second_failed = next(
-            item
-            for item in second_rows
-            if item["operation_id"] == second_selected_id
-        )
-        second_failed.update(
-            status="failed",
-            updated_at="2026-08-15T21:10:00.000000Z",
-            completed_at="2026-08-15T21:10:00.000000Z",
-            worker_id_present=True,
-            worker_id_digest=second_worker_digest,
-            claimed_at="2026-08-15T21:05:00.000000Z",
-            error_category="provider_transport",
-            error_digest="c" * 64,
-        )
+        for second_failed in second_rows:
+            if second_failed["operation_id"] not in plan_selected_ids:
+                continue
+            second_failed.update(
+                status="failed",
+                updated_at="2026-08-20T14:10:00.000000Z",
+                completed_at="2026-08-20T14:10:00.000000Z",
+                retry_count=3,
+                next_retry_at=None,
+                worker_id_present=True,
+                worker_id_digest=second_worker_digest,
+                claimed_at="2026-08-20T14:05:00.000000Z",
+                error_category="provider_transport",
+                error_digest="c" * 64,
+            )
         second_interrupted = dict(
             create_live_snapshot(
                 self.cohort(),
@@ -3449,6 +3486,301 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 ),
                 reference_application_progress_digest="d" * 64,
                 created_at=1_786_829_600,
+            )
+
+        epoch_two_recovery = create_post_abort_recovery_plan(
+            plan,
+            second_interrupted,
+            candidate_release=release_identity(),
+            rollback_backup=second_backup,
+            rollback_encryption=rollback_encryption(),
+            rollback_backup_path="/private/tmp/v11-epoch2-backup.age",
+            rollback_bundle_path="/private/tmp/v11-epoch2-bundle.age",
+            authorization_receipt_path="/private/tmp/v11-epoch2-auth.json",
+            application_receipt_path="/private/tmp/v11-epoch2-app.json",
+            verification_receipt_path="/private/tmp/v11-epoch2-verify.json",
+            rollback_receipt_path="/private/tmp/v11-epoch2-rollback.json",
+            reference_application_authorization=(
+                exact_drain_authorization(plan)
+            ),
+            reference_application_journal=(
+                exact_drain_application_journal(plan)
+            ),
+            reference_application_progress_digest="d" * 64,
+            prior_retry_recovery=recovery_plan["retry_recovery"],
+            schema_version=11,
+            created_at=1_786_829_600,
+        )
+        self.assertEqual(epoch_two_recovery["schema_version"], 11)
+        self.assertEqual(
+            epoch_two_recovery["selected_status_counts"],
+            {"failed": 39},
+        )
+        epoch_two_retry = epoch_two_recovery["retry_recovery"]
+        self.assertEqual(epoch_two_retry["schema_version"], 2)
+        self.assertEqual(epoch_two_retry["recovery_epoch_before"], 1)
+        self.assertEqual(epoch_two_retry["recovery_epoch_after"], 2)
+        self.assertEqual(epoch_two_retry["recovery_epoch_ceiling"], 2)
+        self.assertEqual(epoch_two_retry["failed_reset_count"], 39)
+        self.assertEqual(
+            epoch_two_retry["prior_retry_recovery_digest"],
+            recovery_plan["retry_recovery_digest"],
+        )
+        self.assertEqual(
+            epoch_two_retry["prior_retry_recovery"],
+            recovery_plan["retry_recovery"],
+        )
+        self.assertEqual(
+            verify_post_abort_recovery_plan(
+                epoch_two_recovery,
+                now=epoch_two_recovery["created_at"],
+            ),
+            epoch_two_recovery,
+        )
+        first_cycle_by_id = {
+            item["operation_id"]: item
+            for item in recovery_plan["retry_recovery"]["operations"]
+        }
+        reference_retry_by_id = {
+            item["operation_id"]: item["retry_count"]
+            for item in plan["live_snapshot"]["operations"]
+        }
+        for item in epoch_two_retry["operations"]:
+            self.assertEqual(
+                item["prior_attempts_consumed"],
+                (
+                    first_cycle_by_id[item["operation_id"]][
+                        "attempts_consumed_before"
+                    ]
+                    if item["operation_id"] in first_cycle_by_id
+                    else reference_retry_by_id[item["operation_id"]]
+                ),
+            )
+            self.assertEqual(
+                item["attempts_consumed_before"],
+                item["prior_attempts_consumed"]
+                + item["attempts_consumed_during_reference"],
+            )
+            self.assertLessEqual(item["cumulative_attempt_ceiling"], 12)
+
+        for label, path, value in (
+            (
+                "prior-digest",
+                ("prior_retry_recovery_digest",),
+                "0" * 64,
+            ),
+            (
+                "attempt-type",
+                ("operations", 0, "prior_attempts_consumed"),
+                False,
+            ),
+        ):
+            with self.subTest(epoch_two_tamper=label):
+                tampered = deepcopy(epoch_two_recovery)
+                target = tampered["retry_recovery"]
+                for key in path[:-1]:
+                    target = target[key]
+                target[path[-1]] = value
+                tampered["retry_recovery_digest"] = digest(
+                    tampered["retry_recovery"]
+                )
+                tampered["plan_digest"] = digest(
+                    {
+                        key: item
+                        for key, item in tampered.items()
+                        if key != "plan_digest"
+                    }
+                )
+                with self.assertRaisesRegex(
+                    OperationRecoveryError,
+                    "retry recovery is invalid",
+                ):
+                    verify_post_abort_recovery_plan(
+                        tampered,
+                        now=tampered["created_at"],
+                    )
+
+        epoch_two_selected_ids = {
+            item["operation_id"]
+            for item in epoch_two_recovery["selected_operations"]
+        }
+        epoch_two_recovered_rows = []
+        for item in second_interrupted["operations"]:
+            row = {
+                "operation_id": item["operation_id"],
+                "bank_id": "engineering",
+                "operation_type": item["operation_type"],
+                "status": item["current_status"],
+                "created_at": item["created_at"],
+                "updated_at": item["updated_at"],
+                "completed_at": item["completed_at"],
+                "retry_count": item["retry_count"],
+                "next_retry_at": item["next_retry_at"],
+                "worker_id_present": item["worker_id_present"],
+                "worker_id_digest": item["worker_id_digest"],
+                "claimed_at": item["claimed_at"],
+                "task_payload_present": item["task_payload_present"],
+                "task_payload_digest": item["task_payload_digest"],
+                "result_metadata_digest": item[
+                    "result_metadata_digest"
+                ],
+                "error_category": item["error_category"],
+                "error_digest": item["error_digest"],
+            }
+            if item["operation_id"] in epoch_two_selected_ids:
+                row.update(
+                    status="pending",
+                    updated_at="2026-08-20T14:20:00.000000Z",
+                    completed_at=None,
+                    retry_count=0,
+                    next_retry_at=None,
+                    worker_id_present=False,
+                    worker_id_digest=None,
+                    claimed_at=None,
+                    error_category="none",
+                    error_digest=None,
+                )
+            epoch_two_recovered_rows.append(row)
+        epoch_two_recovered_snapshot = dict(
+            create_live_snapshot(
+                self.cohort(),
+                epoch_two_recovered_rows,
+                generation_before="systalyze:public:81702",
+                generation_after="systalyze:public:81702",
+                installation_authority=installation_authority(),
+                observed_at=1_786_829_700,
+            )
+        )
+        epoch_two_context = {
+            "schema_version": 2,
+            "kind": "operation-recovery-exact-drain-recovery-context",
+            "origin": "post-abort",
+            "generation": epoch_two_recovered_snapshot[
+                "generation_before"
+            ],
+            "recovery_epoch": 2,
+            "candidate_release_digest": release_identity()[
+                "release_digest"
+            ],
+            "selected_operation_ids_digest": digest(
+                sorted(epoch_two_selected_ids)
+            ),
+            "initial_origin_digest": None,
+            "post_abort_selected_operation_ids_digest": digest(
+                sorted(epoch_two_selected_ids)
+            ),
+            "post_abort_plan_digest": epoch_two_recovery["plan_digest"],
+            "post_abort_application_receipt_digest": "e" * 64,
+            "post_abort_verification_receipt_digest": "f" * 64,
+            "retry_recovery_digest": epoch_two_recovery[
+                "retry_recovery_digest"
+            ],
+            "selected_checkpoint_set_digest": epoch_two_recovery[
+                "selected_checkpoint_set_digest"
+            ],
+            "preserved_row_set_digest": epoch_two_recovery[
+                "preserved_row_set_digest"
+            ],
+        }
+        epoch_two_drain_backup = drain_backup_evidence()
+        for key in ("generation_before", "generation_after"):
+            epoch_two_drain_backup["source_authority"][key] = (
+                epoch_two_recovered_snapshot[key]
+            )
+        epoch_two_drain_backup["source_authority_digest"] = digest(
+            epoch_two_drain_backup["source_authority"]
+        )
+        epoch_two_plan = recovery_contract.create_exact_drain_plan(
+            self.cohort(),
+            epoch_two_recovered_snapshot,
+            candidate_release=release_identity(),
+            rollback_backup=epoch_two_drain_backup,
+            rollback_backup_path="/private/tmp/v11-epoch2-drain-backup.age",
+            provider_policy_digest="9" * 64,
+            effective_profile_digest="7" * 64,
+            worker_runtime_digest="8" * 64,
+            authorization_receipt_path="/private/tmp/v11-epoch2-drain-auth.json",
+            application_receipt_path="/private/tmp/v11-epoch2-drain-app.json",
+            status_artifact_path="/private/tmp/v11-epoch2-drain-status.json",
+            verification_receipt_path="/private/tmp/v11-epoch2-drain-verify.json",
+            recovery_context=epoch_two_context,
+            created_at=1_786_829_701,
+            schema_version=11,
+        )
+        self.assertEqual(epoch_two_plan["recovery_context"], epoch_two_context)
+        self.assertEqual(
+            recovery_contract.verify_exact_drain_plan(
+                epoch_two_plan,
+                now=epoch_two_plan["created_at"],
+            ),
+            epoch_two_plan,
+        )
+
+        epoch_three_worker_digest = hashlib.sha256(
+            (
+                "operation-recovery-exact-drain-"
+                f"{epoch_two_plan['plan_digest'][:12]}"
+            ).encode()
+        ).hexdigest()
+        epoch_three_rows = deepcopy(epoch_two_recovered_rows)
+        for item in epoch_three_rows:
+            if item["operation_id"] not in epoch_two_selected_ids:
+                continue
+            item.update(
+                status="failed",
+                updated_at="2026-08-20T14:30:00.000000Z",
+                completed_at="2026-08-20T14:30:00.000000Z",
+                retry_count=3,
+                worker_id_present=True,
+                worker_id_digest=epoch_three_worker_digest,
+                claimed_at="2026-08-20T14:25:00.000000Z",
+                error_category="provider_transport",
+                error_digest="1" * 64,
+            )
+        epoch_three_interrupted = dict(
+            create_live_snapshot(
+                self.cohort(),
+                epoch_three_rows,
+                generation_before="systalyze:public:81703",
+                generation_after="systalyze:public:81703",
+                installation_authority=installation_authority(),
+                observed_at=1_786_829_900,
+            )
+        )
+        epoch_three_backup = rollback_backup_evidence()
+        for key in ("generation_before", "generation_after"):
+            epoch_three_backup["source_authority"][key] = (
+                epoch_three_interrupted[key]
+            )
+        epoch_three_backup["source_authority_digest"] = digest(
+            epoch_three_backup["source_authority"]
+        )
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "retry recovery is invalid",
+        ):
+            create_post_abort_recovery_plan(
+                epoch_two_plan,
+                epoch_three_interrupted,
+                candidate_release=release_identity(),
+                rollback_backup=epoch_three_backup,
+                rollback_encryption=rollback_encryption(),
+                rollback_backup_path="/private/tmp/v11-epoch3-backup.age",
+                rollback_bundle_path="/private/tmp/v11-epoch3-bundle.age",
+                authorization_receipt_path="/private/tmp/v11-epoch3-auth.json",
+                application_receipt_path="/private/tmp/v11-epoch3-app.json",
+                verification_receipt_path="/private/tmp/v11-epoch3-verify.json",
+                rollback_receipt_path="/private/tmp/v11-epoch3-rollback.json",
+                reference_application_authorization=(
+                    exact_drain_authorization(epoch_two_plan)
+                ),
+                reference_application_journal=(
+                    exact_drain_application_journal(epoch_two_plan)
+                ),
+                reference_application_progress_digest="2" * 64,
+                prior_retry_recovery=epoch_two_retry,
+                schema_version=11,
+                created_at=1_786_830_000,
             )
 
         for legacy_schema_version in range(4, 10):
@@ -3501,6 +3833,32 @@ class OperationRecoveryContractTest(unittest.TestCase):
             created_at=1_786_390_701,
             schema_version=11,
         )
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "retry recovery is invalid",
+        ):
+            create_post_abort_recovery_plan(
+                schema_eleven_plan,
+                second_interrupted,
+                candidate_release=release_identity(),
+                rollback_backup=second_backup,
+                rollback_encryption=rollback_encryption(),
+                rollback_backup_path="/private/tmp/v10-v11-replay-backup.age",
+                rollback_bundle_path="/private/tmp/v10-v11-replay-bundle.age",
+                authorization_receipt_path="/private/tmp/v10-v11-replay-auth.json",
+                application_receipt_path="/private/tmp/v10-v11-replay-app.json",
+                verification_receipt_path="/private/tmp/v10-v11-replay-verify.json",
+                rollback_receipt_path="/private/tmp/v10-v11-replay-rollback.json",
+                reference_application_authorization=(
+                    exact_drain_authorization(schema_eleven_plan)
+                ),
+                reference_application_journal=(
+                    exact_drain_application_journal(schema_eleven_plan)
+                ),
+                reference_application_progress_digest="d" * 64,
+                schema_version=10,
+                created_at=1_786_829_600,
+            )
         with self.assertRaisesRegex(
             OperationRecoveryError,
             "legacy post-abort schema cannot reference schema 10",

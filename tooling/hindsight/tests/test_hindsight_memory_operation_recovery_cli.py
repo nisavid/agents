@@ -222,6 +222,30 @@ class OperationRecoveryCliTest(unittest.TestCase):
             reference,
             observed_at=now - 80,
         )
+        reference_rows = {
+            item["operation_id"]: item
+            for item in reference["live_snapshot"]["operations"]
+        }
+        interrupted["operations"] = [
+            deepcopy(reference_rows[item["operation_id"]])
+            if item["current_status"] == "pending"
+            else item
+            for item in interrupted["operations"]
+        ]
+        interrupted["status_counts"] = {
+            status: sum(
+                item["current_status"] == status
+                for item in interrupted["operations"]
+            )
+            for status in recovery_fixtures.recovery_contract.OPERATION_STATUSES
+        }
+        interrupted["snapshot_digest"] = self.controller["digest"](
+            {
+                key: value
+                for key, value in interrupted.items()
+                if key != "snapshot_digest"
+            }
+        )
         recovery_backup_path = root / "recovery-backup.age"
         recovery_backup_path.write_bytes(b"synthetic-recovery-backup")
         recovery_backup_path.chmod(0o600)
@@ -504,6 +528,8 @@ class OperationRecoveryCliTest(unittest.TestCase):
                 *authority,
                 "--reference-plan",
                 "/private/tmp/reference-plan.json",
+                "--prior-recovery-plan",
+                "/private/tmp/prior-recovery-plan.json",
                 "--snapshot",
                 "/private/tmp/live-snapshot.json",
                 "--rollback-backup-evidence",
@@ -531,6 +557,10 @@ class OperationRecoveryCliTest(unittest.TestCase):
         self.assertIs(
             plan.run,
             self.controller["operation_recovery_post_abort_plan_command"],
+        )
+        self.assertEqual(
+            plan.prior_recovery_plan,
+            "/private/tmp/prior-recovery-plan.json",
         )
         for command, extra, function in (
             (
@@ -2129,6 +2159,374 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 globals_.update(originals)
             self.assertEqual(written, {})
 
+    def test_post_abort_plan_command_authenticates_epoch_two_lineage(self):
+        command = self.controller[
+            "operation_recovery_post_abort_plan_command"
+        ]
+        globals_ = command.__globals__
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        now = int(time.time())
+        with tempfile.TemporaryDirectory(
+            dir="/private/tmp",
+            prefix="post-abort-v11-epoch-two-",
+        ) as directory:
+            root = Path(directory)
+            root.chmod(0o700)
+            (
+                prior_recovery,
+                recovered_snapshot,
+                documents,
+                prior_recovery_path,
+            ) = self._schema_10_recovery_handoff(root)
+            prior_application = documents[
+                prior_recovery["application_receipt_path"]
+            ]
+            prior_verification = documents[
+                prior_recovery["verification_receipt_path"]
+            ]
+            selected_ids = {
+                item["operation_id"]
+                for item in prior_recovery["selected_operations"]
+            }
+            fresh_selected_ids = {
+                item["operation_id"]
+                for item in recovered_snapshot["operations"]
+                if item["current_status"] == "pending"
+            }
+            self.assertEqual(len(selected_ids), 23)
+            self.assertEqual(len(fresh_selected_ids), 39)
+            recovery_context = {
+                "schema_version": 1,
+                "kind": "operation-recovery-exact-drain-recovery-context",
+                "origin": "post-abort",
+                "generation": recovered_snapshot["generation_before"],
+                "recovery_epoch": 1,
+                "candidate_release_digest": prior_recovery[
+                    "candidate_release"
+                ]["release_digest"],
+                "selected_operation_ids_digest": self.controller["digest"](
+                    sorted(fresh_selected_ids)
+                ),
+                "initial_origin_digest": None,
+                "post_abort_selected_operation_ids_digest": self.controller[
+                    "digest"
+                ](sorted(selected_ids)),
+                "post_abort_plan_digest": prior_recovery["plan_digest"],
+                "post_abort_application_receipt_digest": prior_application[
+                    "receipt_digest"
+                ],
+                "post_abort_verification_receipt_digest": prior_verification[
+                    "receipt_digest"
+                ],
+                "retry_recovery_digest": prior_recovery[
+                    "retry_recovery_digest"
+                ],
+                "selected_checkpoint_set_digest": prior_recovery[
+                    "selected_checkpoint_set_digest"
+                ],
+                "preserved_row_set_digest": prior_recovery[
+                    "preserved_row_set_digest"
+                ],
+            }
+            exact_backup = recovery_fixtures.drain_backup_evidence()
+            for key in ("generation_before", "generation_after"):
+                exact_backup["source_authority"][key] = recovered_snapshot[key]
+            exact_backup["source_authority_digest"] = self.controller[
+                "digest"
+            ](exact_backup["source_authority"])
+            reference = self.controller["create_exact_drain_plan"](
+                fixtures.cohort(),
+                recovered_snapshot,
+                candidate_release=prior_recovery["candidate_release"],
+                rollback_backup=exact_backup,
+                rollback_backup_path=str(root / "exact-backup.age"),
+                provider_policy_digest="9" * 64,
+                effective_profile_digest="7" * 64,
+                worker_runtime_digest="8" * 64,
+                authorization_receipt_path=str(root / "exact-auth.json"),
+                application_receipt_path=str(root / "exact-app.json"),
+                status_artifact_path=str(root / "exact-status.json"),
+                verification_receipt_path=str(root / "exact-verify.json"),
+                recovery_context=recovery_context,
+                created_at=now - 59,
+                schema_version=10,
+            )
+            worker_digest = hashlib.sha256(
+                (
+                    "operation-recovery-exact-drain-"
+                    f"{reference['plan_digest'][:12]}"
+                ).encode()
+            ).hexdigest()
+            interrupted_rows = []
+            for item in recovered_snapshot["operations"]:
+                row = {
+                    "operation_id": item["operation_id"],
+                    "bank_id": "engineering",
+                    "operation_type": item["operation_type"],
+                    "status": item["current_status"],
+                    "created_at": item["created_at"],
+                    "updated_at": item["updated_at"],
+                    "completed_at": item["completed_at"],
+                    "retry_count": item["retry_count"],
+                    "next_retry_at": item["next_retry_at"],
+                    "worker_id_present": item["worker_id_present"],
+                    "worker_id_digest": item["worker_id_digest"],
+                    "claimed_at": item["claimed_at"],
+                    "task_payload_present": item["task_payload_present"],
+                    "task_payload_digest": item["task_payload_digest"],
+                    "result_metadata_digest": item[
+                        "result_metadata_digest"
+                    ],
+                    "error_category": item["error_category"],
+                    "error_digest": item["error_digest"],
+                }
+                if item["operation_id"] in fresh_selected_ids:
+                    row.update(
+                        status="failed",
+                        updated_at="2026-08-20T14:10:00.000000Z",
+                        completed_at="2026-08-20T14:10:00.000000Z",
+                        retry_count=3,
+                        next_retry_at=None,
+                        worker_id_present=True,
+                        worker_id_digest=worker_digest,
+                        claimed_at="2026-08-20T14:05:00.000000Z",
+                        error_category="provider_transport",
+                        error_digest="c" * 64,
+                    )
+                interrupted_rows.append(row)
+            interrupted = dict(
+                recovery_fixtures.create_live_snapshot(
+                    fixtures.cohort(),
+                    interrupted_rows,
+                    generation_before="systalyze:public:81701",
+                    generation_after="systalyze:public:81701",
+                    installation_authority=(
+                        recovery_fixtures.installation_authority()
+                    ),
+                    observed_at=now - 20,
+                )
+            )
+            rollback_path = root / "epoch-two-backup.age"
+            rollback_path.write_bytes(b"synthetic-epoch-two-backup")
+            rollback_path.chmod(0o600)
+            backup = recovery_fixtures.rollback_backup_evidence()
+            backup["artifact_sha256"] = hashlib.sha256(
+                rollback_path.read_bytes()
+            ).hexdigest()
+            for key in ("generation_before", "generation_after"):
+                backup["source_authority"][key] = interrupted[key]
+            backup["source_authority_digest"] = self.controller["digest"](
+                backup["source_authority"]
+            )
+            authorization = recovery_fixtures.exact_drain_authorization(
+                reference
+            )
+            journal = recovery_fixtures.exact_drain_application_journal(
+                reference
+            )
+            documents.update(
+                {
+                    "reference": reference,
+                    "snapshot": interrupted,
+                    "backup": backup,
+                    reference["authorization_receipt_path"]: authorization,
+                    reference["application_receipt_path"]: journal,
+                }
+            )
+            encryption = recovery_fixtures.rollback_encryption()
+            registration = {
+                **backup["source_authority"]["binding"],
+                "_password": "not-observable",
+            }
+            progress = {
+                "plan_digest": reference["plan_digest"],
+                "progress_digest": "d" * 64,
+                "worker_pid": journal["worker_pid"],
+                "worker_start_time": journal["worker_start_time"],
+                "worker_attempt": journal["worker_attempt"],
+                "tasks": [
+                    {
+                        "operation_id": item["operation_id"],
+                        "operation_type": item["operation_type"],
+                        "row_digest": item["row_digest"],
+                    }
+                    for item in reference["selected_operations"]
+                ],
+            }
+            written = {}
+            replacements = {
+                "_operation_recovery_candidate": (
+                    lambda _args: prior_recovery["candidate_release"]
+                ),
+                "_operation_recovery_read_private_json": (
+                    lambda path, _label: documents[str(path)]
+                ),
+                "_operation_recovery_tool": lambda path, _name: Path(path),
+                "_operation_recovery_rollback_encryption": (
+                    lambda _recipient: encryption
+                ),
+                "_operation_recovery_toolchain_digest": (
+                    lambda: backup["toolchain_digest"]
+                ),
+                "_operation_recovery_exact_journal_worker_active": (
+                    lambda _journal: False
+                ),
+                "read_exact_drain_progress": (
+                    lambda _path, *, plan_digest, progress_schema_version=1: dict(
+                        progress
+                    )
+                ),
+                "read_pg0_registration": lambda _profile: dict(registration),
+                "write_private": (
+                    lambda path, value, *, create_only: written.update(
+                        {str(path): (value, create_only)}
+                    )
+                ),
+                "_print_result": lambda value: value,
+            }
+            originals = {key: globals_[key] for key in replacements}
+            globals_.update(replacements)
+            args = SimpleNamespace(
+                reference_plan="reference",
+                prior_recovery_plan=str(prior_recovery_path),
+                snapshot="snapshot",
+                rollback_backup_evidence="backup",
+                rollback_backup=str(rollback_path),
+                age=encryption["age_path"],
+                rollback_recipient=encryption["recipient"],
+                rollback_bundle=str(root / "epoch-two-bundle.age"),
+                authorization_receipt=str(root / "epoch-two-auth.json"),
+                application_receipt=str(root / "epoch-two-app.json"),
+                verification_receipt=str(root / "epoch-two-verify.json"),
+                rollback_receipt=str(root / "epoch-two-rollback.json"),
+                output=str(root / "epoch-two-plan.json"),
+            )
+            try:
+                result = command(args)
+            finally:
+                globals_.update(originals)
+
+            plan, create_only = written[args.output]
+            self.assertTrue(create_only)
+            self.assertEqual(result["recovery_epoch"], 2)
+            self.assertEqual(plan["schema_version"], 11)
+            self.assertEqual(plan["selected_status_counts"], {"failed": 39})
+            self.assertEqual(plan["retry_recovery"]["schema_version"], 2)
+            self.assertEqual(
+                plan["retry_recovery"]["prior_retry_recovery_digest"],
+                prior_recovery["retry_recovery_digest"],
+            )
+
+            missing_prior_args = SimpleNamespace(**vars(args))
+            missing_prior_args.prior_recovery_plan = None
+            written.clear()
+            globals_.update(replacements)
+            try:
+                with self.assertRaisesRegex(
+                    Exception,
+                    "prior recovery handoff differs",
+                ):
+                    command(missing_prior_args)
+            finally:
+                globals_.update(originals)
+            self.assertEqual(written, {})
+
+            alias_args = SimpleNamespace(**vars(args))
+            alias_args.output = str(prior_recovery_path)
+            globals_.update(replacements)
+            try:
+                with self.assertRaisesRegex(
+                    Exception,
+                    "plan path aliases an artifact",
+                ):
+                    command(alias_args)
+            finally:
+                globals_.update(originals)
+            self.assertEqual(written, {})
+
+            prior_reads = 0
+
+            def read_with_prior_drift(path, _label):
+                nonlocal prior_reads
+                if str(path) == str(prior_recovery_path):
+                    prior_reads += 1
+                    if prior_reads == 2:
+                        drifted = deepcopy(prior_recovery)
+                        drifted["retry_recovery_digest"] = "0" * 64
+                        return drifted
+                return documents[str(path)]
+
+            globals_.update(replacements)
+            globals_["_operation_recovery_read_private_json"] = (
+                read_with_prior_drift
+            )
+            try:
+                with self.assertRaisesRegex(Exception, "invalid|differs"):
+                    command(args)
+            finally:
+                globals_.update(originals)
+            self.assertEqual(prior_reads, 2)
+            self.assertEqual(written, {})
+
+    def test_exact_drain_recovery_handoff_projects_epoch_two_context(self):
+        helper = self.controller[
+            "_operation_recovery_exact_recovery_context"
+        ]
+        globals_ = helper.__globals__
+        with tempfile.TemporaryDirectory(
+            dir="/private/tmp",
+            prefix="exact-drain-epoch-two-handoff-",
+        ) as directory:
+            root = Path(directory)
+            root.chmod(0o700)
+            recovery, snapshot, documents, recovery_path = (
+                self._schema_10_recovery_handoff(root)
+            )
+            recovery = deepcopy(recovery)
+            recovery["schema_version"] = 11
+            recovery["retry_recovery"] = {
+                **recovery["retry_recovery"],
+                "schema_version": 2,
+                "recovery_epoch_before": 1,
+                "recovery_epoch_after": 2,
+                "recovery_epoch_ceiling": 2,
+            }
+            application = documents[recovery["application_receipt_path"]]
+            verification = documents[
+                recovery["verification_receipt_path"]
+            ]
+            replacements = {
+                "verify_post_abort_recovery_plan": (
+                    lambda _value, *, allow_expired: recovery
+                ),
+                "_operation_recovery_read_private_json": (
+                    lambda path, _label: documents[str(path)]
+                ),
+                "_operation_recovery_validate_application": (
+                    lambda _value, *, plan: application
+                ),
+                "_operation_recovery_post_abort_validate_verification": (
+                    lambda _value, *, plan, application, authority: verification
+                ),
+            }
+            originals = {key: globals_[key] for key in replacements}
+            globals_.update(replacements)
+            try:
+                context = helper(
+                    SimpleNamespace(recovery_plan=str(recovery_path)),
+                    snapshot=snapshot,
+                    candidate_release=recovery["candidate_release"],
+                )
+            finally:
+                globals_.update(originals)
+
+            self.assertEqual(context["schema_version"], 2)
+            self.assertEqual(context["recovery_epoch"], 2)
+            self.assertEqual(
+                context["post_abort_plan_digest"],
+                recovery["plan_digest"],
+            )
+
     def test_exact_drain_plan_command_hands_off_verified_recovery_sources(self):
         command = self.controller["operation_recovery_drain_plan_command"]
         globals_ = command.__globals__
@@ -2147,7 +2545,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             ) = self._schema_10_recovery_handoff(root)
             self.assertEqual(
                 recovery_plan["selected_status_counts"],
-                {"failed": 22, "pending": 16, "processing": 1},
+                {"failed": 22, "processing": 1},
             )
             rollback_path = root / "fresh-backup.age"
             rollback_path.write_bytes(b"synthetic-fresh-backup")

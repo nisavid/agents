@@ -16,6 +16,16 @@ documentation. It did not inspect task payloads or raw errors, import the bound
 worker runtime, signal the worker, change provider policy, or mutate operation
 state.
 
+## Implementation disposition
+
+The referenced run later interrupted with all 39 selected operations failed.
+Schema 11 now provides one bounded recovery from that schema 10 plan at epoch
+one. Planning requires the authenticated schema 10 recovery plan and its
+application and verification receipts, chains the prior retry ledger with the
+reference snapshot's preserved-row retry counts, advances epoch one to two,
+and caps cumulative attempts at twelve per operation. The resulting schema 11
+exact plan cannot authorize another post-abort recovery.
+
 ## Conclusion
 
 **Continue the current run without intervention. Do not terminate it, change

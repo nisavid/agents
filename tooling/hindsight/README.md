@@ -323,13 +323,20 @@ again. The third transient retry seals a terminal failure; no transient failure
 bypasses that ceiling or creates an unbounded retry loop. Candidate error
 records retain the exception type even when the exception text is empty.
 
-Post-abort recovery preserves every completed exact-drain checkpoint. A current
-recovery plan selects only the reference worker's failed, owned-pending, and
+Post-abort recovery preserves every completed exact-drain checkpoint. A schema
+10 recovery plan selects only the reference worker's failed, owned-pending, and
 processing rows; completed rows and all other cohort rows remain digest-exact.
-The whole post-abort recovery consumes the single recovery epoch, advancing it
-from zero to one. Within that transaction, failed rows may reset once while
-pending and processing rows preserve their retry counts. A second post-abort
-recovery or a cumulative attempt count beyond the closed ceiling is rejected.
+It advances recovery epoch zero to one. Within that transaction, failed rows
+may reset once while pending and processing rows preserve their retry counts.
+
+Schema 11 permits one final recovery from a schema 10 exact plan at epoch one.
+Every reference-selected row must be failed and owned by that exact worker. The
+operator must provide `--prior-recovery-plan`; planning authenticates that
+plan's application and verification receipts and carries its complete retry
+ledger into the epoch-one-to-two transition. The chained per-operation ledger
+caps cumulative attempts at twelve, including the four attempts newly made
+available by the reset. A schema 11 exact plan at epoch two cannot be recovered
+again, so an epoch-three reset is not representable.
 
 A current exact-drain plan uses a fixed, nonrenewing execution window instead
 of the legacy 24-hour lease. Planning recomputes the window from the selected

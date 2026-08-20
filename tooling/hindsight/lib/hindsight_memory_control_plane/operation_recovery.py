@@ -766,6 +766,7 @@ POST_ABORT_PLAN_V10_KEYS = POST_ABORT_PLAN_V9_KEYS | frozenset(
         "retry_recovery_digest",
     }
 )
+POST_ABORT_PLAN_V11_KEYS = POST_ABORT_PLAN_V10_KEYS
 POST_ABORT_V10_RETRY_RECOVERY_KEYS = frozenset(
     {
         "schema_version",
@@ -788,6 +789,30 @@ POST_ABORT_V10_RETRY_OPERATION_KEYS = frozenset(
         "expected_status",
         "retry_count_before",
         "retry_count_after",
+        "attempts_consumed_before",
+        "attempts_available_after",
+        "cumulative_attempt_ceiling",
+        "reset_applied",
+    }
+)
+POST_ABORT_V11_RETRY_RECOVERY_KEYS = (
+    POST_ABORT_V10_RETRY_RECOVERY_KEYS
+    | frozenset(
+        {
+            "prior_retry_recovery",
+            "prior_retry_recovery_digest",
+        }
+    )
+)
+POST_ABORT_V11_RETRY_OPERATION_KEYS = frozenset(
+    {
+        "operation_id",
+        "expected_status",
+        "reference_retry_count",
+        "retry_count_before",
+        "retry_count_after",
+        "prior_attempts_consumed",
+        "attempts_consumed_during_reference",
         "attempts_consumed_before",
         "attempts_available_after",
         "cumulative_attempt_ceiling",
@@ -2513,6 +2538,7 @@ def _exact_drain_recovery_context(
     snapshot: Mapping[str, Any],
     selected: Sequence[Mapping[str, Any]],
     candidate_release: Mapping[str, Any],
+    plan_schema_version: int,
 ) -> dict[str, Any]:
     selected_operation_ids_digest = digest(
         sorted(item["operation_id"] for item in selected)
@@ -2671,8 +2697,7 @@ def _exact_drain_recovery_context(
         **provenance,
     }
     common_invalid = (
-        body["schema_version"] != 1
-        or body["kind"]
+        body["kind"]
         != "operation-recovery-exact-drain-recovery-context"
         or body["generation"] != snapshot["generation_before"]
         or body["candidate_release_digest"]
@@ -2683,7 +2708,8 @@ def _exact_drain_recovery_context(
     origin_invalid = (
         body["origin"] == "initial-snapshot"
         and (
-            body["recovery_epoch"] != 0
+            body["schema_version"] != 1
+            or body["recovery_epoch"] != 0
             or any(provenance.values())
             or not initial_origin_valid
             or body["initial_origin_digest"] != initial_origin_digest
@@ -2691,7 +2717,12 @@ def _exact_drain_recovery_context(
     ) or (
         body["origin"] == "post-abort"
         and (
-            body["recovery_epoch"] != 1
+            (body["schema_version"], body["recovery_epoch"])
+            not in {(1, 1), (2, 2)}
+            or (
+                body["schema_version"] == 2
+                and plan_schema_version != 11
+            )
             or not all(provenance.values())
             or body["initial_origin_digest"] is not None
         )
@@ -2894,6 +2925,7 @@ def create_exact_drain_plan(
         snapshot=snapshot,
         selected=selected,
         candidate_release=release,
+        plan_schema_version=schema_version,
     )
     body = {
         "schema_version": schema_version,
@@ -3148,6 +3180,7 @@ def verify_exact_drain_plan(
             snapshot=snapshot,
             selected=selected,
             candidate_release=release,
+            plan_schema_version=schema_version,
         )
         recovery_context_digest = _sha(
             plan["recovery_context_digest"],
@@ -3720,6 +3753,324 @@ def _post_abort_v10_retry_recovery(
     return body
 
 
+def _verified_post_abort_retry_recovery(
+    value: Any,
+    *,
+    expected_schema_version: int,
+) -> dict[str, Any]:
+    if expected_schema_version not in {1, 2}:
+        raise OperationRecoveryError(
+            "operation-recovery post-abort retry recovery is invalid"
+        )
+    retry_recovery_value = _closed(
+        _normalized(value),
+        (
+            POST_ABORT_V10_RETRY_RECOVERY_KEYS
+            if expected_schema_version == 1
+            else POST_ABORT_V11_RETRY_RECOVERY_KEYS
+        ),
+        "post-abort retry recovery",
+    )
+    operations_value = retry_recovery_value.get("operations")
+    if not isinstance(operations_value, list):
+        raise OperationRecoveryError(
+            "operation-recovery post-abort retry recovery is invalid"
+        )
+    operations = []
+    operation_keys = (
+        POST_ABORT_V10_RETRY_OPERATION_KEYS
+        if expected_schema_version == 1
+        else POST_ABORT_V11_RETRY_OPERATION_KEYS
+    )
+    for item_value in operations_value:
+        item = _closed(
+            _normalized(item_value),
+            operation_keys,
+            "post-abort retry operation",
+        )
+        reset_applied = item["reset_applied"]
+        if type(reset_applied) is not bool:
+            raise OperationRecoveryError(
+                "operation-recovery post-abort retry recovery is invalid"
+            )
+        normalized_item = {
+            "operation_id": _operation_id(item["operation_id"]),
+            "expected_status": _text(
+                item["expected_status"],
+                "post-abort retry operation status",
+                maximum=32,
+            ),
+            **(
+                {}
+                if expected_schema_version == 1
+                else {
+                    "reference_retry_count": _integer(
+                        item["reference_retry_count"],
+                        "post-abort reference retry count",
+                    )
+                }
+            ),
+            "retry_count_before": _integer(
+                item["retry_count_before"],
+                "post-abort retry count before",
+            ),
+            "retry_count_after": _integer(
+                item["retry_count_after"],
+                "post-abort retry count after",
+            ),
+            **(
+                {}
+                if expected_schema_version == 1
+                else {
+                    "prior_attempts_consumed": _integer(
+                        item["prior_attempts_consumed"],
+                        "post-abort prior attempts consumed",
+                    ),
+                    "attempts_consumed_during_reference": _integer(
+                        item["attempts_consumed_during_reference"],
+                        "post-abort attempts consumed during reference",
+                    ),
+                }
+            ),
+            "attempts_consumed_before": _integer(
+                item["attempts_consumed_before"],
+                "post-abort attempts consumed before",
+            ),
+            "attempts_available_after": _integer(
+                item["attempts_available_after"],
+                "post-abort attempts available after",
+            ),
+            "cumulative_attempt_ceiling": _integer(
+                item["cumulative_attempt_ceiling"],
+                "post-abort cumulative attempt ceiling",
+            ),
+            "reset_applied": reset_applied,
+        }
+        operations.append(normalized_item)
+    body = {
+        "schema_version": _integer(
+            retry_recovery_value["schema_version"],
+            "post-abort retry recovery schema version",
+        ),
+        "kind": _text(
+            retry_recovery_value["kind"],
+            "post-abort retry recovery kind",
+        ),
+        "recovery_epoch_before": _integer(
+            retry_recovery_value["recovery_epoch_before"],
+            "post-abort recovery epoch before",
+        ),
+        "recovery_epoch_after": _integer(
+            retry_recovery_value["recovery_epoch_after"],
+            "post-abort recovery epoch after",
+        ),
+        "recovery_epoch_ceiling": _integer(
+            retry_recovery_value["recovery_epoch_ceiling"],
+            "post-abort recovery epoch ceiling",
+        ),
+        "ordinary_retry_ceiling": _integer(
+            retry_recovery_value["ordinary_retry_ceiling"],
+            "post-abort ordinary retry ceiling",
+        ),
+        "ordinary_attempt_ceiling": _integer(
+            retry_recovery_value["ordinary_attempt_ceiling"],
+            "post-abort ordinary attempt ceiling",
+        ),
+        "maximum_cumulative_attempts": _integer(
+            retry_recovery_value["maximum_cumulative_attempts"],
+            "post-abort maximum cumulative attempts",
+        ),
+        "operation_count": _integer(
+            retry_recovery_value["operation_count"],
+            "post-abort retry operation count",
+        ),
+        "failed_reset_count": _integer(
+            retry_recovery_value["failed_reset_count"],
+            "post-abort failed reset count",
+        ),
+        **(
+            {}
+            if expected_schema_version == 1
+            else {
+                "prior_retry_recovery": _verified_post_abort_retry_recovery(
+                    retry_recovery_value["prior_retry_recovery"],
+                    expected_schema_version=1,
+                ),
+                "prior_retry_recovery_digest": _sha(
+                    retry_recovery_value["prior_retry_recovery_digest"],
+                    "post-abort prior retry recovery digest",
+                ),
+            }
+        ),
+        "operations": operations,
+        "operation_set_digest": _sha(
+            retry_recovery_value["operation_set_digest"],
+            "post-abort retry operation set digest",
+        ),
+    }
+    invalid = (
+        body["schema_version"] != expected_schema_version
+        or body["kind"]
+        != "operation-recovery-post-abort-retry-recovery"
+        or body["operation_count"] != len(operations)
+        or body["failed_reset_count"]
+        != sum(item["reset_applied"] for item in operations)
+        or len({item["operation_id"] for item in operations})
+        != len(operations)
+        or body["operation_set_digest"] != digest(operations)
+    )
+    if expected_schema_version == 2:
+        invalid = invalid or body["prior_retry_recovery_digest"] != digest(
+            body["prior_retry_recovery"]
+        )
+    if invalid:
+        raise OperationRecoveryError(
+            "operation-recovery post-abort retry recovery is invalid"
+        )
+    return body
+
+
+def _post_abort_v11_retry_recovery(
+    reference_plan: Mapping[str, Any],
+    selected: Sequence[Mapping[str, Any]],
+    current: Mapping[str, Mapping[str, Any]],
+    prior_retry_recovery_value: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    context = reference_plan.get("recovery_context")
+    if (
+        reference_plan["schema_version"] != 10
+        or not isinstance(context, Mapping)
+        or context.get("schema_version") != 1
+        or context.get("origin") != "post-abort"
+        or context.get("recovery_epoch") != 1
+        or prior_retry_recovery_value is None
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery post-abort retry recovery is invalid"
+        )
+    prior_retry_recovery = _verified_post_abort_retry_recovery(
+        prior_retry_recovery_value,
+        expected_schema_version=1,
+    )
+    prior_digest = digest(prior_retry_recovery)
+    reference_selected = {
+        item["operation_id"]: item
+        for item in reference_plan["selected_operations"]
+    }
+    reference_snapshot = {
+        item["operation_id"]: item
+        for item in reference_plan["live_snapshot"]["operations"]
+    }
+    prior_by_id = {
+        item["operation_id"]: item
+        for item in prior_retry_recovery["operations"]
+    }
+    selected_ids = {item["operation_id"] for item in selected}
+    ordinary_retry_ceiling = reference_plan["worker_max_retries"]
+    ordinary_attempt_ceiling = reference_plan["worker_max_attempts"]
+    maximum_cumulative_attempts = ordinary_attempt_ceiling * 3
+    if (
+        context.get("retry_recovery_digest") != prior_digest
+        or prior_retry_recovery["recovery_epoch_before"] != 0
+        or prior_retry_recovery["recovery_epoch_after"] != 1
+        or prior_retry_recovery["recovery_epoch_ceiling"] != 1
+        or prior_retry_recovery["ordinary_retry_ceiling"]
+        != ordinary_retry_ceiling
+        or prior_retry_recovery["ordinary_attempt_ceiling"]
+        != ordinary_attempt_ceiling
+        or prior_retry_recovery["maximum_cumulative_attempts"]
+        != ordinary_attempt_ceiling * 2
+        or selected_ids != set(reference_selected)
+        or not set(prior_by_id).issubset(selected_ids)
+        or digest(sorted(prior_by_id))
+        != context.get("post_abort_selected_operation_ids_digest")
+        or digest(sorted(selected_ids))
+        != context.get("selected_operation_ids_digest")
+        or any(item["expected_status"] != "failed" for item in selected)
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery post-abort retry recovery is invalid"
+        )
+    operations = []
+    for item in selected:
+        operation_id = item["operation_id"]
+        row = current[operation_id]
+        prior = prior_by_id.get(operation_id)
+        reference_retry_count = reference_snapshot[operation_id][
+            "retry_count"
+        ]
+        retry_count_before = row["retry_count"]
+        prior_attempts_consumed = (
+            prior["attempts_consumed_before"]
+            if prior is not None
+            else reference_retry_count
+        )
+        attempts_consumed_during_reference = (
+            retry_count_before - reference_retry_count + 1
+        )
+        attempts_consumed_before = (
+            prior_attempts_consumed
+            + attempts_consumed_during_reference
+        )
+        retry_count_after = 0
+        attempts_available_after = ordinary_attempt_ceiling
+        cumulative_attempt_ceiling = (
+            attempts_consumed_before + attempts_available_after
+        )
+        if (
+            (
+                prior is not None
+                and (
+                    prior["retry_count_after"] != reference_retry_count
+                    or prior["cumulative_attempt_ceiling"]
+                    > ordinary_attempt_ceiling * 2
+                )
+            )
+            or not 0
+            <= reference_retry_count
+            <= retry_count_before
+            <= ordinary_retry_ceiling
+            or attempts_consumed_during_reference < 1
+            or cumulative_attempt_ceiling > maximum_cumulative_attempts
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery post-abort retry recovery is invalid"
+            )
+        operations.append(
+            {
+                "operation_id": operation_id,
+                "expected_status": "failed",
+                "reference_retry_count": reference_retry_count,
+                "retry_count_before": retry_count_before,
+                "retry_count_after": retry_count_after,
+                "prior_attempts_consumed": prior_attempts_consumed,
+                "attempts_consumed_during_reference": (
+                    attempts_consumed_during_reference
+                ),
+                "attempts_consumed_before": attempts_consumed_before,
+                "attempts_available_after": attempts_available_after,
+                "cumulative_attempt_ceiling": cumulative_attempt_ceiling,
+                "reset_applied": True,
+            }
+        )
+    return {
+        "schema_version": 2,
+        "kind": "operation-recovery-post-abort-retry-recovery",
+        "recovery_epoch_before": 1,
+        "recovery_epoch_after": 2,
+        "recovery_epoch_ceiling": 2,
+        "ordinary_retry_ceiling": ordinary_retry_ceiling,
+        "ordinary_attempt_ceiling": ordinary_attempt_ceiling,
+        "maximum_cumulative_attempts": maximum_cumulative_attempts,
+        "operation_count": len(operations),
+        "failed_reset_count": len(operations),
+        "prior_retry_recovery": prior_retry_recovery,
+        "prior_retry_recovery_digest": prior_digest,
+        "operations": operations,
+        "operation_set_digest": digest(operations),
+    }
+
+
 def _post_abort_timestamp(value: Any) -> float | None:
     if not isinstance(value, str) or not value:
         return None
@@ -3736,6 +4087,9 @@ def _post_abort_timestamp(value: Any) -> float | None:
 def _post_abort_v10_contract(
     reference_plan: Mapping[str, Any],
     snapshot: Mapping[str, Any],
+    *,
+    schema_version: int,
+    prior_retry_recovery: Mapping[str, Any] | None,
 ) -> tuple[
     list[dict[str, Any]],
     str,
@@ -3904,10 +4258,19 @@ def _post_abort_v10_contract(
         for status, count in preserved_status_counts.items()
         if count
     }
-    retry_recovery = _post_abort_v10_retry_recovery(
-        reference_plan,
-        selected,
-        current,
+    retry_recovery = (
+        _post_abort_v10_retry_recovery(
+            reference_plan,
+            selected,
+            current,
+        )
+        if schema_version == 10
+        else _post_abort_v11_retry_recovery(
+            reference_plan,
+            selected,
+            current,
+            prior_retry_recovery,
+        )
     )
     derived = {
         "selection_contract_digest": (
@@ -3951,6 +4314,7 @@ def _post_abort_contract(
     snapshot: Mapping[str, Any],
     *,
     schema_version: int,
+    prior_retry_recovery: Mapping[str, Any] | None = None,
 ) -> tuple[
     list[dict[str, Any]],
     str,
@@ -3960,15 +4324,27 @@ def _post_abort_contract(
     dict[str, Any],
 ]:
     if (
-        schema_version != 10
+        schema_version not in {10, 11}
         and reference_plan["schema_version"] in {10, 11}
     ):
         raise OperationRecoveryError(
             "operation-recovery legacy post-abort schema cannot reference "
             "schema 10 or later"
         )
-    if schema_version == 10:
-        return _post_abort_v10_contract(reference_plan, snapshot)
+    if schema_version in {10, 11}:
+        if schema_version == 10 and (
+            prior_retry_recovery is not None
+            or reference_plan["schema_version"] == 11
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery post-abort retry recovery is invalid"
+            )
+        return _post_abort_v10_contract(
+            reference_plan,
+            snapshot,
+            schema_version=schema_version,
+            prior_retry_recovery=prior_retry_recovery,
+        )
     worker_digest = _post_abort_worker_digest(reference_plan["plan_digest"])
     selected = _post_abort_selected(snapshot)
     if schema_version in {7, 9}:
@@ -4294,6 +4670,7 @@ def create_post_abort_recovery_plan(
     reference_application_authorization: Mapping[str, Any],
     reference_application_journal: Mapping[str, Any],
     reference_application_progress_digest: str,
+    prior_retry_recovery: Mapping[str, Any] | None = None,
     schema_version: int = 10,
     created_at: int | None = None,
 ) -> Mapping[str, Any]:
@@ -4316,7 +4693,7 @@ def create_post_abort_recovery_plan(
         reference_application_progress_digest,
         "post-abort reference application progress digest",
     )
-    if schema_version not in {4, 5, 6, 7, 8, 9, 10}:
+    if schema_version not in {4, 5, 6, 7, 8, 9, 10, 11}:
         raise OperationRecoveryError(
             "operation-recovery post-abort creation schema is invalid"
         )
@@ -4331,6 +4708,7 @@ def create_post_abort_recovery_plan(
         reference,
         snapshot,
         schema_version=schema_version,
+        prior_retry_recovery=prior_retry_recovery,
     )
     authority = snapshot["installation_authority"]
     backup = _backup(
@@ -4467,6 +4845,7 @@ def verify_post_abort_recovery_plan(
         8,
         9,
         10,
+        11,
     }:
         raise OperationRecoveryError(
             "operation-recovery post-abort plan is invalid"
@@ -4484,6 +4863,7 @@ def verify_post_abort_recovery_plan(
             8: POST_ABORT_PLAN_V8_KEYS,
             9: POST_ABORT_PLAN_V9_KEYS,
             10: POST_ABORT_PLAN_V10_KEYS,
+            11: POST_ABORT_PLAN_V11_KEYS,
         }[schema_version],
         "operation-recovery post-abort plan",
     )
@@ -4491,10 +4871,13 @@ def verify_post_abort_recovery_plan(
         plan["reference_plan"],
         allow_expired=True,
     )
-    if schema_version != 10 and reference["schema_version"] == 10:
+    if (
+        schema_version not in {10, 11}
+        and reference["schema_version"] in {10, 11}
+    ):
         raise OperationRecoveryError(
             "operation-recovery legacy post-abort schema cannot reference "
-            "schema 10"
+            "schema 10 or later"
         )
     snapshot = verify_live_snapshot(plan["live_snapshot"])
     reference_authorization = (
@@ -4516,7 +4899,7 @@ def verify_post_abort_recovery_plan(
     )
     reference_progress_digest = (
         None
-        if schema_version not in {3, 4, 5, 6, 7, 8, 9, 10}
+        if schema_version not in {3, 4, 5, 6, 7, 8, 9, 10, 11}
         else _sha(
             plan["reference_application_progress_digest"],
             "post-abort reference application progress digest",
@@ -4533,6 +4916,12 @@ def verify_post_abort_recovery_plan(
         reference,
         snapshot,
         schema_version=schema_version,
+        prior_retry_recovery=(
+            plan["retry_recovery"].get("prior_retry_recovery")
+            if schema_version == 11
+            and isinstance(plan["retry_recovery"], Mapping)
+            else None
+        ),
     )
     selected_value = plan["selected_operations"]
     if not isinstance(selected_value, list):
@@ -4579,108 +4968,14 @@ def verify_post_abort_recovery_plan(
         "post-abort preserved status counts",
     )
     derived_fields = {}
-    if schema_version == 10:
+    if schema_version in {10, 11}:
         try:
-            retry_recovery_value = _closed(
-                _normalized(plan["retry_recovery"]),
-                POST_ABORT_V10_RETRY_RECOVERY_KEYS,
-                "post-abort retry recovery",
+            retry_recovery = _verified_post_abort_retry_recovery(
+                plan["retry_recovery"],
+                expected_schema_version=(
+                    1 if schema_version == 10 else 2
+                ),
             )
-            operations_value = retry_recovery_value.get("operations")
-            if not isinstance(operations_value, list):
-                raise OperationRecoveryError(
-                    "operation-recovery post-abort retry recovery is invalid"
-                )
-            operations = []
-            for item_value in operations_value:
-                item = _closed(
-                    _normalized(item_value),
-                    POST_ABORT_V10_RETRY_OPERATION_KEYS,
-                    "post-abort retry operation",
-                )
-                reset_applied = item["reset_applied"]
-                if type(reset_applied) is not bool:
-                    raise OperationRecoveryError(
-                        "operation-recovery post-abort retry recovery is invalid"
-                    )
-                operations.append(
-                    {
-                        "operation_id": _operation_id(item["operation_id"]),
-                        "expected_status": _text(
-                            item["expected_status"],
-                            "post-abort retry operation status",
-                            maximum=32,
-                        ),
-                        "retry_count_before": _integer(
-                            item["retry_count_before"],
-                            "post-abort retry count before",
-                        ),
-                        "retry_count_after": _integer(
-                            item["retry_count_after"],
-                            "post-abort retry count after",
-                        ),
-                        "attempts_consumed_before": _integer(
-                            item["attempts_consumed_before"],
-                            "post-abort attempts consumed before",
-                        ),
-                        "attempts_available_after": _integer(
-                            item["attempts_available_after"],
-                            "post-abort attempts available after",
-                        ),
-                        "cumulative_attempt_ceiling": _integer(
-                            item["cumulative_attempt_ceiling"],
-                            "post-abort cumulative attempt ceiling",
-                        ),
-                        "reset_applied": reset_applied,
-                    }
-                )
-            retry_recovery = {
-                "schema_version": _integer(
-                    retry_recovery_value["schema_version"],
-                    "post-abort retry recovery schema version",
-                ),
-                "kind": _text(
-                    retry_recovery_value["kind"],
-                    "post-abort retry recovery kind",
-                ),
-                "recovery_epoch_before": _integer(
-                    retry_recovery_value["recovery_epoch_before"],
-                    "post-abort recovery epoch before",
-                ),
-                "recovery_epoch_after": _integer(
-                    retry_recovery_value["recovery_epoch_after"],
-                    "post-abort recovery epoch after",
-                ),
-                "recovery_epoch_ceiling": _integer(
-                    retry_recovery_value["recovery_epoch_ceiling"],
-                    "post-abort recovery epoch ceiling",
-                ),
-                "ordinary_retry_ceiling": _integer(
-                    retry_recovery_value["ordinary_retry_ceiling"],
-                    "post-abort ordinary retry ceiling",
-                ),
-                "ordinary_attempt_ceiling": _integer(
-                    retry_recovery_value["ordinary_attempt_ceiling"],
-                    "post-abort ordinary attempt ceiling",
-                ),
-                "maximum_cumulative_attempts": _integer(
-                    retry_recovery_value["maximum_cumulative_attempts"],
-                    "post-abort maximum cumulative attempts",
-                ),
-                "operation_count": _integer(
-                    retry_recovery_value["operation_count"],
-                    "post-abort retry operation count",
-                ),
-                "failed_reset_count": _integer(
-                    retry_recovery_value["failed_reset_count"],
-                    "post-abort failed reset count",
-                ),
-                "operations": operations,
-                "operation_set_digest": _sha(
-                    retry_recovery_value["operation_set_digest"],
-                    "post-abort retry operation set digest",
-                ),
-            }
             retry_recovery_digest = _sha(
                 plan["retry_recovery_digest"],
                 "post-abort retry recovery digest",
@@ -4689,10 +4984,7 @@ def verify_post_abort_recovery_plan(
             raise OperationRecoveryError(
                 "operation-recovery post-abort retry recovery is invalid"
             ) from error
-        if (
-            retry_recovery["operation_set_digest"] != digest(operations)
-            or retry_recovery_digest != digest(retry_recovery)
-        ):
+        if retry_recovery_digest != digest(retry_recovery):
             raise OperationRecoveryError(
                 "operation-recovery post-abort retry recovery is invalid"
             )
@@ -4835,7 +5127,9 @@ def verify_post_abort_recovery_plan(
                 ),
                 **(
                     {}
-                    if schema_version not in {3, 4, 5, 6, 7, 8, 9, 10}
+                    if schema_version not in {
+                        3, 4, 5, 6, 7, 8, 9, 10, 11
+                    }
                     else {
                         "reference_application_progress_digest": (
                             reference_progress_digest

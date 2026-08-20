@@ -5896,7 +5896,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
                         )
                     )
 
-    def test_post_abort_v10_retry_postcondition_reads_the_selected_row(self):
+    def test_post_abort_retry_postcondition_reads_the_selected_row(self):
         before = {
             "operation_id": "00000000-0000-4000-8000-000000000001",
             "bank_id": "engineering",
@@ -5956,7 +5956,6 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
             "task_payload_digest": before["task_payload_digest"],
         }
         plan = {
-            "schema_version": 10,
             "pre_generation": "systalyze:public:123",
             "selected_operations": [selected],
             "live_snapshot": {
@@ -5981,25 +5980,28 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
             "transaction_timeout_seconds": 120,
             "expires_at": int(time.time()) + 60,
         }
-        with patch.object(
-            operation_recovery_runtime,
-            "verify_post_abort_recovery_plan",
-            side_effect=lambda value: value,
-        ):
-            generations = asyncio.run(
-                apply_post_abort_recovery_transaction(
-                    PostAbortConnection(),
-                    profile_id="systalyze",
-                    schema="public",
-                    bank_id="engineering",
-                    plan=plan,
+        for schema_version in (10, 11):
+            with (
+                self.subTest(schema_version=schema_version),
+                patch.object(
+                    operation_recovery_runtime,
+                    "verify_post_abort_recovery_plan",
+                    side_effect=lambda value: value,
+                ),
+            ):
+                generations = asyncio.run(
+                    apply_post_abort_recovery_transaction(
+                        PostAbortConnection(),
+                        profile_id="systalyze",
+                        schema="public",
+                        bank_id="engineering",
+                        plan={**plan, "schema_version": schema_version},
+                    )
                 )
-            )
-
-        self.assertEqual(
-            generations,
-            ("systalyze:public:123", "systalyze:public:124"),
-        )
+                self.assertEqual(
+                    generations,
+                    ("systalyze:public:123", "systalyze:public:124"),
+                )
 
     def test_rollback_reconciles_claimed_selected_preimage(self):
         restored = {

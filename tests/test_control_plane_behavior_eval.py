@@ -15,10 +15,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / "scripts/run_control_plane_eval.py"
-GATE = (
-    ROOT
-    / "plugins/versionkeeping/skills/checkpointing-and-publishing-git-work/scripts/check_eval_gate.py"
-)
+GATE = ROOT / "tests/_retired_eval_gate.py"
 DEFINITION = ROOT / "evals/control-plane-matrix.json"
 
 

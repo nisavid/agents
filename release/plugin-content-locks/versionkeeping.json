@@ -23,7 +23,7 @@
       "mode": 420
     },
     "skills/checkpointing-and-publishing-git-work/references/evaluation-integrity.md": {
-      "sha256": "f2f1a5b7189ff4b6948e72425395faee85d4f35db652b4d6b92db764852586eb",
+      "sha256": "f3e3f77986f229a0efebd33304c18f400ecb9852fd194ad46575133a29c21d00",
       "mode": 420
     },
     "skills/checkpointing-and-publishing-git-work/references/publication-execution.md": {
@@ -35,7 +35,7 @@
       "mode": 420
     },
     "skills/checkpointing-and-publishing-git-work/scripts/check_eval_gate.py": {
-      "sha256": "e7edd154da57aab9328e1f834a391a7b61465973855e18e0242b7824ececb98c",
+      "sha256": "28d3061e694fcb3a0ff71439417ffb206aea3fbda815a8c32bcc0e96c815a5f3",
       "mode": 420
     },
     "skills/checkpointing-and-publishing-git-work/scripts/execute_git_publication.py": {

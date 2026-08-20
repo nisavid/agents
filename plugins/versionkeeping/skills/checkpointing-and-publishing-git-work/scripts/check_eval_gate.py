@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate schema-v2 four-condition behavior-evaluation evidence."""
+"""Retain schema-v2 evidence checks behind a fail-closed source-stage CLI."""
 
 from __future__ import annotations
 
@@ -679,6 +679,8 @@ def emit(passed: bool, errors: list[str], scenarios: list[dict[str, Any]]) -> No
     print(
         json.dumps(
             {
+                "authority": "none",
+                "production_eligible": False,
                 "version": VERSION,
                 "passed": passed,
                 "errors": errors,
@@ -4233,7 +4235,9 @@ def validate_evidence(
     return errors, scenario_results
 
 
-def main(argv: list[str] | None = None) -> int:
+def _retired_evidence_main(argv: list[str] | None = None) -> int:
+    """Exercise retained structural checks without granting release authority."""
+
     parser = JsonArgumentParser(add_help=True)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--matrix", type=Path, required=True)
@@ -4273,6 +4277,23 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     emit(not errors, errors, results)
     return 0 if not errors else 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Fail closed until independent producer and candidate authority exists."""
+
+    del argv
+    emit(
+        False,
+        [
+            (
+                "evaluation authority is unavailable in this source-stage release; "
+                "self-authenticating evidence cannot authorize evaluation or release"
+            )
+        ],
+        [],
+    )
+    return 2
 
 
 if __name__ == "__main__":

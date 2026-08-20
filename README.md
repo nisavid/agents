@@ -80,8 +80,10 @@ therefore remains `production_eligible: false`.
 A later release must supply external authority that this repository does not
 own: an installed, host-owned, content-pinned, network-denied OS sandbox;
 review authorization bound to the candidate bytes; opaque inherited handles
-for private evidence; and authenticated evidence with managed signing-key
-custody. The source-stage checks do not claim those controls.
+for private evidence; authenticated host and evaluation evidence with managed
+signing-key custody and anti-replay state; and independent provider
+authorization bound to the exact candidate, policy, runtime, and endpoint. The
+source-stage checks do not claim those controls.
 
 ## License
 

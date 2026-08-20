@@ -18,11 +18,12 @@ REPOSITORY = Path(__file__).resolve().parents[4]
 SKILL_DIR = (
     REPOSITORY / "plugins/versionkeeping/skills/checkpointing-and-publishing-git-work"
 )
-SCRIPT = SKILL_DIR / "scripts" / "check_eval_gate.py"
+SCRIPT = REPOSITORY / "tests/_retired_eval_gate.py"
+GATE_SOURCE = SKILL_DIR / "scripts" / "check_eval_gate.py"
 
 
 def load_gate():
-    specification = importlib.util.spec_from_file_location("check_eval_gate", SCRIPT)
+    specification = importlib.util.spec_from_file_location("check_eval_gate", GATE_SOURCE)
     assert specification and specification.loader
     module = importlib.util.module_from_spec(specification)
     specification.loader.exec_module(module)

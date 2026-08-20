@@ -565,24 +565,29 @@ def candidate_content_identity(root: Path, *, error_factory: ErrorFactory) -> st
         _raise(error_factory, "cannot enumerate the candidate")
     files = sorted(item for item in result.stdout.split(b"\0") if item)
     digest = hashlib.sha256()
+    digest.update(b"candidate-content-identity-v2\0")
+    digest.update(len(files).to_bytes(8, "big"))
     for encoded in files:
         try:
             relative = encoded.decode("utf-8")
         except UnicodeDecodeError as error:
             raise error_factory("candidate path is not UTF-8") from error
+        parsed = PurePosixPath(relative)
+        if (
+            parsed.is_absolute()
+            or ".." in parsed.parts
+            or parsed.as_posix() != relative
+        ):
+            _raise(error_factory, "candidate path is not canonical")
         path = root / relative
+        digest.update(b"D" if not path.exists() and not path.is_symlink() else b"F")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
         if not path.exists() and not path.is_symlink():
-            digest.update(hashlib.sha256(b"deleted").hexdigest().encode())
-            digest.update(b"  ")
-            digest.update(encoded)
-            digest.update(b"\n")
             continue
         if path.is_symlink() or not path.is_file():
             _raise(error_factory, "candidate contains an unsafe entry")
-        digest.update(hashlib.sha256(path.read_bytes()).hexdigest().encode())
-        digest.update(b"  ")
-        digest.update(encoded)
-        digest.update(b"\n")
+        digest.update(hashlib.sha256(path.read_bytes()).digest())
     return digest.hexdigest()
 
 

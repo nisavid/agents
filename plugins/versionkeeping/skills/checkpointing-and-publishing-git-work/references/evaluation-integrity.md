@@ -1,5 +1,9 @@
 # Evaluation integrity
 
+The requirements below define the retained evaluation-evidence structure. In
+this source-stage release, they support tests and later-release design review;
+they do not authorize evaluation, publication, or release.
+
 Give each executor only the raw prompt, fixture, and its condition's immutable
 bundle. A candidate bundle contains the candidate skill and its explicitly
 routed references. A composed bundle is the exact union of the candidate,
@@ -48,14 +52,14 @@ invalidation event occurs, replace every executor run for its source scenario
 and the matrix-declared reverse dependencies before recording resolution and
 closing the evidence.
 
-Resolve `scripts/check_eval_gate.py` relative to this skill and run:
+The shipped `scripts/check_eval_gate.py` executable is unavailable in this
+source-stage release. It rejects every invocation before reading a manifest or
+matrix, emits `authority: "none"`, `production_eligible: false`, and
+`passed: false`, and exits nonzero. Retained structural checks run only in the
+repository's tests and grant no evaluation or release authority.
 
-```sh
-python3 "<skill>/scripts/check_eval_gate.py" \
-  --manifest /absolute/path/to/evidence-v2.json \
-  --matrix /absolute/path/to/matrix-v2.json
-```
-
-The command emits schema-v2 JSON. Exit 0 means every safety, quality,
-nonregression, utility, and invalidation gate passed; exit 1 is a well-formed
-non-passing matrix; exit 2 is malformed input or CLI usage.
+A later positive gate must receive the expected repository, revision, tree,
+archive, policy, and runtime identities from an independently trusted caller.
+It must authenticate an authorized producer and provider, enforce freshness
+and anti-replay state, and bind those authorities to the exact evidence. The
+evidence under review cannot supply or authorize those values itself.

@@ -130,6 +130,7 @@ PUBLIC_RELEASE_REGISTRATION_PATHS = (PUBLIC_RELEASE_REGISTRATION.as_posix(),)
 RELEASE_DOCUMENTATION_PATHS = (
     "docs/superpowers/specs/2026-07-27-task-witness-canonical-client-design.md",
     "docs/superpowers/specs/2026-08-12-task-witness-tw4-migration-and-qualification-design.md",
+    "plugins/task-witness/README.md",
 )
 TW4_MIGRATION_EVIDENCE_PATHS = tuple(
     sorted(
@@ -1521,46 +1522,6 @@ class TaskWitnessPackageTests(unittest.TestCase):
         candidate_evidence["candidate_observation"] = copy.deepcopy(
             receipt_value["observations"]["inputs"]["candidate"]
         )
-        validator_globals = validator["main"].__globals__
-        replaced = {
-            name: validator_globals[name]
-            for name in (
-                "_bounded_external_canonical_json_object",
-                "_qualification_candidate_evidence",
-                "validate_inventory",
-                "validate_manifests",
-                "validate_public_release_registration",
-                "validate_suite_inventory",
-                "validate_reviewed_sources",
-                "validate_bridge_history",
-            )
-        }
-        validator_globals.update(
-            {
-                "_bounded_external_canonical_json_object": lambda *_args, **_kwargs: (
-                    receipt_value,
-                    json.dumps(
-                        receipt_value, sort_keys=True, separators=(",", ":")
-                    ).encode(),
-                ),
-                "_qualification_candidate_evidence": lambda *_args: candidate_evidence,
-                "validate_inventory": lambda *_args: None,
-                "validate_manifests": lambda *_args: None,
-                "validate_public_release_registration": lambda *_args: None,
-                "validate_suite_inventory": lambda *_args: None,
-                "validate_reviewed_sources": lambda *_args: None,
-                "validate_bridge_history": lambda *_args: None,
-            }
-        )
-        try:
-            self.assertEqual(
-                validator["main"](
-                    [str(root), "--qualification", "/tmp/host-receipt.json"]
-                ),
-                0,
-            )
-        finally:
-            validator_globals.update(replaced)
 
         promotion_paths = (
             ".claude-plugin/marketplace.json",
@@ -1736,6 +1697,7 @@ class TaskWitnessPackageTests(unittest.TestCase):
             {key: value for key, value in final_manifest.items() if key != "content_sha256"}
         )
         final_manifest_raw = canonical(final_manifest)
+        shutil.copytree(root, candidate)
         fake_checkouts = {
             candidate: {
                 "commit_sha1": macos_receipt["qualification_candidate"]["commit_sha1"],
@@ -1762,12 +1724,6 @@ class TaskWitnessPackageTests(unittest.TestCase):
                 "_load_qualification_runner",
                 "_checkout_projection",
                 "_promotion_raw_bytes",
-                "validate_inventory",
-                "validate_manifests",
-                "validate_public_release_registration",
-                "validate_suite_inventory",
-                "validate_reviewed_sources",
-                "validate_bridge_history",
             )
         }
         final_globals.update(
@@ -1777,14 +1733,6 @@ class TaskWitnessPackageTests(unittest.TestCase):
                 "_load_qualification_runner": lambda *_args: {},
                 "_checkout_projection": lambda checkout, *_args: fake_checkouts[checkout],
                 "_promotion_raw_bytes": lambda checkout, *_args: fake_raw[checkout],
-                "validate_inventory": lambda *_args: None,
-                "validate_manifests": lambda *_args: None,
-                "validate_public_release_registration": lambda *_args: None,
-                "validate_suite_inventory": lambda *_args: None,
-                "validate_reviewed_sources": lambda *_args: None,
-                "validate_bridge_history": lambda *_args: candidate_evidence[
-                    "bridge_history"
-                ],
             }
         )
         final_arguments = (
@@ -1799,6 +1747,21 @@ class TaskWitnessPackageTests(unittest.TestCase):
             review,
         )
         try:
+            candidate_manifest = candidate / "plugins/task-witness/plugin.json"
+            original_candidate_manifest = candidate_manifest.read_bytes()
+            malformed_candidate_manifest = json.loads(original_candidate_manifest)
+            malformed_candidate_manifest["skills"] = "./skills/"
+            candidate_manifest.write_text(
+                json.dumps(malformed_candidate_manifest, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            try:
+                with self.assertRaisesRegex(
+                    ValueError, "Agent Plugins v1 manifest"
+                ):
+                    validator["validate_final_release_evidence"](*final_arguments)
+            finally:
+                candidate_manifest.write_bytes(original_candidate_manifest)
             with self.assertRaisesRegex(ValueError, "canonical byte identity drift"):
                 validator["validate_final_release_evidence"](
                     *final_arguments[:3],
@@ -3246,6 +3209,25 @@ class TaskWitnessPackageTests(unittest.TestCase):
         self.assertFalse((self.plugin / "skills").exists())
         self.assertFalse((self.plugin / ".mcp.json").exists())
 
+    def test_candidate_validation_is_shared_by_package_source_stage_and_qualification_clis(
+        self,
+    ) -> None:
+        receipt = Path(self.temporary.name).resolve() / "host-receipt.json"
+        receipt.write_bytes(
+            json.dumps(self.host_receipt_document(), sort_keys=True, separators=(",", ":")).encode()
+        )
+        receipt.chmod(0o600)
+        manifest_path = self.plugin / "plugin.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["skills"] = "./skills/"
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+
+        for flags in ((), ("--source-stage",), ("--qualification", str(receipt))):
+            with self.subTest(flags=flags):
+                result = self.validate(*flags)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Agent Plugins v1 manifest", result.stderr)
+
     def test_claude_manifest_is_exact_canonical_projection(self) -> None:
         canonical = json.loads((self.plugin / "plugin.json").read_text())
         claude = json.loads(
@@ -3520,7 +3502,7 @@ class TaskWitnessPackageTests(unittest.TestCase):
         validator = runpy.run_path(str(VALIDATOR))
         self.assertEqual(validator["SOURCE_SHAPE_SETS"], expected_sets)
         self.assertEqual(validator["REVIEWED_SHAPE_PATHS"], REVIEWED_PATHS)
-        self.assertEqual(len(REVIEWED_PATHS), 100)
+        self.assertEqual(len(REVIEWED_PATHS), 101)
 
         record = json.loads((REPOSITORY / SOURCE_SHAPE_RECORD).read_text())
         self.assertEqual(record["schema_version"], 4)
@@ -3616,58 +3598,72 @@ class TaskWitnessPackageTests(unittest.TestCase):
             },
         )
 
-    def test_public_contracts_are_documented_in_canonical_sources(self) -> None:
+    def test_public_contract_documentation_ownership_is_local_and_registered(
+        self,
+    ) -> None:
         readme = (REPOSITORY / "README.md").read_text(encoding="utf-8")
+        package_readme = (
+            REPOSITORY / "plugins/task-witness/README.md"
+        ).read_text(encoding="utf-8")
+        registration = json.loads(
+            (
+                REPOSITORY
+                / "release/task-witness/public-release-registration.json"
+            ).read_text(encoding="utf-8")
+        )
         design = (
             REPOSITORY
             / "docs/superpowers/specs/2026-07-27-task-witness-canonical-client-design.md"
         ).read_text(encoding="utf-8")
-        normalized_readme = " ".join(readme.split())
-        self.assertIn("externally qualified deployment TCB", normalized_readme)
-        self.assertIn(
-            "already-running client does not authenticate that code",
-            normalized_readme,
+        qualification = (
+            REPOSITORY
+            / "docs/superpowers/specs/"
+            "2026-08-12-task-witness-tw4-migration-and-qualification-design.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("plugins/task-witness/README.md", readme)
+        self.assertIs(registration["production_eligible"], False)
+        self.assertEqual(
+            registration["source_stage_validator_flags"], ["--source-stage"]
         )
+        self.assertIn(
+            "plugins/task-witness/README.md", registration["support_paths"]
+        )
+        self.assertIn(
+            "../../docs/superpowers/specs/"
+            "2026-07-27-task-witness-canonical-client-design.md",
+            package_readme,
+        )
+        self.assertIn(
+            "../../docs/superpowers/specs/"
+            "2026-08-12-task-witness-tw4-migration-and-qualification-design.md",
+            package_readme,
+        )
+        self.assertIn("plugins/task-witness/README.md", RELEASE_DOCUMENTATION_PATHS)
+        normalized_design = " ".join(design.split())
+        normalized_qualification = " ".join(qualification.split())
+        self.assertIn("externally qualified deployment TCB", normalized_design)
         bundle_privacy_contract = (
             "supplied bundle directory and every direct child are "
             "current-EUID-owned and inaccessible to group and other users"
         )
-        self.assertIn(bundle_privacy_contract, normalized_readme)
+        self.assertIn(bundle_privacy_contract, normalized_design)
         mount_alias_contract = (
             "Link-count-one enforcement rejects ordinary hard-link aliases; "
             "it does not detect bind-mount aliases"
         )
-        self.assertIn(mount_alias_contract, normalized_readme)
-        self.assertIn(
-            "Deployment qualification must ensure caller bundles contain no "
-            "mount alias to canonical installation state",
-            normalized_readme,
-        )
-        self.assertIn("same-EUID deployment boundary", normalized_readme)
-        self.assertIn(
-            "without returning an accepted stage receipt",
-            normalized_readme,
-        )
-        receipt_residue_contract = (
-            "Fail-stop residue may include an unaccepted receipt-shaped file"
-        )
-        self.assertIn(receipt_residue_contract, normalized_readme)
-        self.assertEqual(readme.count("- `plugins/task-witness/` contains"), 1)
-        normalized_design = " ".join(design.split())
-        self.assertIn(
-            "docs/superpowers/specs/2026-07-27-task-witness-canonical-client-design.md",
-            readme,
-        )
-        self.assertIn(bundle_privacy_contract, normalized_design)
         self.assertIn(mount_alias_contract, normalized_design)
         self.assertIn(
             "Deployment qualification must ensure caller bundles contain no "
             "mount alias to canonical installation state",
             normalized_design,
         )
+        receipt_residue_contract = (
+            "Fail-stop residue may include an unaccepted receipt-shaped file"
+        )
+        self.assertIn(receipt_residue_contract, normalized_design)
+        self.assertEqual(readme.count("- `plugins/task-witness/` contains"), 1)
         self.assertIn("TW1–TW3 may freeze immutable stage-local candidates", design)
         self.assertIn("emits no accepted stage receipt", normalized_design)
-        self.assertIn(receipt_residue_contract, normalized_design)
         self.assertIn(
             "Only TW4 may freeze a complete implementation and final public release",
             normalized_design,
@@ -3793,7 +3789,7 @@ class TaskWitnessPackageTests(unittest.TestCase):
             "process-global `umask` change and makes no arbitrary same-EUID "
             "authenticity claim."
         )
-        for content in (normalized_readme, normalized_design):
+        for content in (normalized_design,):
             with self.subTest(contract="implemented activation and recovery scope"):
                 self.assertIn(implemented_activation_scope, content)
                 self.assertIn(routine_selector_ordering, content)
@@ -3822,6 +3818,7 @@ class TaskWitnessPackageTests(unittest.TestCase):
             "oracle or claim literal rendered-shim or host passwd-database coverage."
         )
         self.assertIn(test_only_adapter_contract, normalized_design)
+        self.assertIn("production_eligible", normalized_qualification)
 
     def test_source_shape_record_keeps_only_machine_enforced_review_context(
         self,
@@ -4012,7 +4009,6 @@ class TaskWitnessPackageTests(unittest.TestCase):
             "`candidate` field still bind its committed bytes"
         )
         for relative in (
-            "README.md",
             "docs/superpowers/specs/2026-07-27-task-witness-canonical-client-design.md",
         ):
             with self.subTest(relative=relative):
@@ -4185,6 +4181,27 @@ class TaskWitnessPackageTests(unittest.TestCase):
             check=False,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        manifest_path = snapshot / "plugins/task-witness/plugin.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["skills"] = "./skills/"
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+        )
+        captured_validation = subprocess.run(
+            [
+                sys.executable,
+                str(snapshot / "scripts/validate_task_witness.py"),
+                str(snapshot),
+                "--source-stage",
+            ],
+            cwd=snapshot,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertNotEqual(captured_validation.returncode, 0)
+        self.assertIn("Agent Plugins v1 manifest", captured_validation.stderr)
 
     def test_rejects_public_release_registration_drift(self) -> None:
         registration_path = self.repository / PUBLIC_RELEASE_REGISTRATION

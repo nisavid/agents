@@ -456,6 +456,89 @@ class ValidateTricriticalTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("semantic content lock updated", result.stdout)
 
+    def test_invalid_write_candidate_preserves_generated_bytes(self):
+        canonical = self.plugin_root / "references" / "review-input-boundary.md"
+        projection = (
+            self.plugin_root
+            / "skills"
+            / "runtime"
+            / "references"
+            / "review-input-boundary.md"
+        )
+        lock_path = self.plugin_root / "content-lock.json"
+        original_projection = projection.read_bytes()
+        original_lock = lock_path.read_bytes()
+        canonical.write_text(
+            canonical.read_text(encoding="utf-8") + "\n/Users/example/private\n",
+            encoding="utf-8",
+        )
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(VALIDATOR),
+                "--write-content-lock",
+                str(self.repo),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("portability leak", result.stderr)
+        self.assertEqual(projection.read_bytes(), original_projection)
+        self.assertEqual(lock_path.read_bytes(), original_lock)
+
+    def test_detected_late_refresh_failure_restores_all_generated_bytes(self):
+        generated = validator_module.generated_artifact_paths(self.plugin_root)
+        originals = {
+            path: (path.read_bytes(), path.stat().st_mode & 0o777)
+            for path in generated
+        }
+        canonical = self.plugin_root / "references" / "review-input-boundary.md"
+        canonical.write_text(
+            canonical.read_text(encoding="utf-8") + "\nValid semantic change.\n",
+            encoding="utf-8",
+        )
+        projection = (
+            self.plugin_root
+            / "skills"
+            / "runtime"
+            / "references"
+            / "review-input-boundary.md"
+        )
+        readme = self.plugin_root / "README.md"
+        real_replace = validator_module.os.replace
+
+        def replace_then_drift(source: object, destination: object) -> None:
+            real_replace(source, destination)
+            if Path(destination) == projection:
+                readme.write_text(
+                    readme.read_text(encoding="utf-8")
+                    + "\nConcurrent semantic change.\n",
+                    encoding="utf-8",
+                )
+
+        with (
+            mock.patch.object(
+                validator_module.os,
+                "replace",
+                side_effect=replace_then_drift,
+            ),
+            self.assertRaisesRegex(ValueError, "validated inputs changed"),
+        ):
+            validator_module.write_content_lock(self.repo)
+
+        self.assertEqual(
+            {
+                path: (path.read_bytes(), path.stat().st_mode & 0o777)
+                for path in generated
+            },
+            originals,
+        )
+
     def test_rejects_missing_undeclared_invocation_boundary(self):
         skill_path = self.plugin_root / "skills" / "adjudicate" / "SKILL.md"
         skill_path.write_text(

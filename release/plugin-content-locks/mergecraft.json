@@ -24,12 +24,13 @@
     "skills/interacting-with-pr-review-feedback/references/interaction-authority.md": "a72100e840be85bfd4a44719a4995ec521428d374b94135effbee5d7bbac62da",
     "skills/publishing-reviewable-prs/SKILL.md": "cb7e0c8442b1ea7b5e2dc3a52024aa08b41a8ae1b275732fc3f6238ab4997755",
     "skills/publishing-reviewable-prs/agents/openai.yaml": "826ef6ef622d0d889235a5269997b73395f9ec452b64915eded4dd3ec8464af3",
-    "skills/publishing-reviewable-prs/scripts/audit_reviewable_pr.py": "aee88dbd468efbeb957af8d7b237fe39b064413efcc8fec4e94bcf6066426c53",
-    "skills/publishing-reviewable-prs/scripts/create_reviewable_pr.py": "a797c0e83e29482cc66e2904cb46cabf8a49d56c6a1eadf931e36f3e603a7fd2",
+    "skills/publishing-reviewable-prs/scripts/audit_reviewable_pr.py": "3fa7c557c1409dda2afb42eed85729da3060680e82549c593e945682c725791f",
+    "skills/publishing-reviewable-prs/scripts/create_reviewable_pr.py": "e0a096309f9775798257b9a17bc4e12ec25d3283f688ff84c48dafd94182bc4f",
     "skills/publishing-reviewable-prs/scripts/publication_receipts.py": "1de3ec6ec5db03f5b080477c082f8ecf7b264db013009e8063170ce399642169",
-    "skills/publishing-reviewable-prs/scripts/required_review.py": "7411edc0ec2027fba80d585806d061a668f0a527421e7c872ee0267f36b396dd",
+    "skills/publishing-reviewable-prs/scripts/publication_support.py": "25dfcf36acdc46dde5962bf3b6b0eb02f6191eb59547d23a89371b46473fb205",
+    "skills/publishing-reviewable-prs/scripts/required_review.py": "0232355c575580e567e2ca682372b017142fd01347ce3fc02e7c4356f90312e3",
     "skills/publishing-reviewable-prs/scripts/reviewable_pr_state.py": "37f156fe3277d3c9017d6f716a29af8934539c95e691a6de4e6d6376e4a880a8",
-    "skills/publishing-reviewable-prs/scripts/update_reviewable_pr.py": "781fa3934d98e8b45ef976046f54df6273ecd38737a15943c46f787ca6ee2e42",
+    "skills/publishing-reviewable-prs/scripts/update_reviewable_pr.py": "58b054f9bc15bbbc84c16e0f0c11494e4454496fda5fe4e8f6e24051b2501c8d",
     "skills/resuming-reviewed-prs/SKILL.md": "7f3eceda661698e6993c509bc5f218b780836cb6c2d4ff6e2aefbc284ea291f9",
     "skills/resuming-reviewed-prs/agents/openai.yaml": "721ebb46b013e7114efbf5f6e9f7d826fdcaf4a3ae9f8dbe66bb5f73fe65172f",
     "skills/stacking-pr-fixups/SKILL.md": "70ec77790c153ab95a4c784aa7f5d08dd30f68f8f9e3e298f335dbfcf1a4b1fa",
@@ -48,7 +49,7 @@
     "skills/writing-reviewable-pr-descriptions/scripts/change_navigation/badges.py": "bd36ba920402170eeab22c9ba0fc5897d40ff1bae80ce279b9d5a29ca056eba3",
     "skills/writing-reviewable-pr-descriptions/scripts/change_navigation/categories.py": "daad3fe0f359b5dbc05a709b5f434e5cd9de1148dbafe0b03182ddb7bae3678a",
     "skills/writing-reviewable-pr-descriptions/scripts/change_navigation/diff.py": "bba14c8b8cbe8ecbf548800726e6081e27622bb7c3a7927809389103475e8189",
-    "skills/writing-reviewable-pr-descriptions/scripts/change_navigation/diff_files.py": "cbdbf6df5a3d9d333e93905e2bd5b49dbeb438633bcd5fb2212c01e110726f15",
+    "skills/writing-reviewable-pr-descriptions/scripts/change_navigation/diff_files.py": "5fc98b6070ab775772721460e97baf17e5271aaca6fc4848f7e75bd6e29b61d5",
     "skills/writing-reviewable-pr-descriptions/scripts/change_navigation/diff_metrics.py": "16df8010c0509febcb6b6be7d71488deaee4ca494cad1b39cfda2b7a41fbae53",
     "skills/writing-reviewable-pr-descriptions/scripts/change_navigation/git_observer.py": "11e9df148e200d49ce5dba6e09b06693eab5901f255d1039d164709813cedbd9",
     "skills/writing-reviewable-pr-descriptions/scripts/change_navigation/html.py": "ee0bc25298942a22eeb9090ce8ba7b885d7d356d969872d634df8aad906cc77a",
@@ -61,7 +62,7 @@
     "skills/writing-reviewable-pr-descriptions/scripts/change_navigation/stack_inventory.py": "d41a89fb4d6c4e44b7e0fc452511080cb9ad52eddf976ff556a92ad6ef15e984",
     "skills/writing-reviewable-pr-descriptions/scripts/change_navigation/types.py": "5a8a32bbaf5c0a29b97afd9280c366e149383712628a55155eda0acd6aa4ee81",
     "skills/writing-reviewable-pr-descriptions/scripts/change_navigation/urls.py": "ca1fd7b3210320967e47ed5696dc3fb12d1005f3cbbbd4214845247b5a895bf6",
-    "skills/writing-reviewable-pr-descriptions/scripts/validate_change_navigation.py": "5073ccd36c2f56af126b050131eb9b463e3e1594ff1d971b6a83145bb67844e3",
-    "topology.json": "0336b660eeed509dc293e2087ef3ee6ae3e729c7ba0cd52e22e3e4b0e1aeff4b"
+    "skills/writing-reviewable-pr-descriptions/scripts/validate_change_navigation.py": "f963f7489acad8f90bd42e045a4b581b36500ce1ea1a9ac31b0f0a044b743d4a",
+    "topology.json": "cc58595b94bf483450b6cc473bbce7b6a20500359f5f9ee9f6ec8b16e017e4c7"
   }
 }

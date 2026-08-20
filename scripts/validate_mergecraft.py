@@ -7,11 +7,14 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import re
 import stat
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIRECTORY))
@@ -21,6 +24,13 @@ from agent_plugins_standard import (  # noqa: E402
     discover_direct_skills,
     load_agent_plugin_manifest,
     validate_skill_resource_links,
+)
+from refresh_transaction import (  # noqa: E402
+    InputEntry,
+    RefreshTransactionError,
+    capture_input_entry,
+    replace_generated_artifacts,
+    snapshot_tree,
 )
 
 try:
@@ -46,6 +56,10 @@ ATLAS_RELEASE_FILES = {
     "review-atlas-contract.json",
     "review-atlas-contribution-ledger.json",
 }
+EXTERNAL_TOPOLOGY_RELATIVES = (
+    Path("plugins/tricritical/topology.json"),
+    Path("plugins/versionkeeping/topology.json"),
+)
 CONTENT_LOCK_EXCLUSIONS = {"CHANGELOG.md", "LICENSE"}
 PUBLIC_SKILLS = (
     "writing-reviewable-pr-descriptions",
@@ -190,6 +204,7 @@ EXPECTED_SKILL_FILES = {
         "scripts/audit_reviewable_pr.py",
         "scripts/create_reviewable_pr.py",
         "scripts/publication_receipts.py",
+        "scripts/publication_support.py",
         "scripts/required_review.py",
         "scripts/reviewable_pr_state.py",
         "scripts/update_reviewable_pr.py",
@@ -2458,48 +2473,987 @@ def validate_raw_skill_eval_isolation(repo_root: Path) -> None:
                 )
 
 
+CANDIDATE_RUNTIME_PROBE = r'''
+import copy
+import hashlib
+import json
+import os
+import re
+import sys
+import tempfile
+from pathlib import Path
+
+root = Path(sys.argv[1])
+publication_scripts = root / "skills/publishing-reviewable-prs/scripts"
+writer_scripts = root / "skills/writing-reviewable-pr-descriptions/scripts"
+feedback_scripts = root / "skills/addressing-pr-review-feedback/scripts"
+graphite_scripts = root / "skills/graphite/scripts"
+comment_scripts = root / "skills/getting-prs-merged/scripts"
+for directory in (
+    publication_scripts,
+    writer_scripts,
+    feedback_scripts,
+    graphite_scripts,
+    comment_scripts,
+):
+    sys.path.insert(0, str(directory))
+
+import publication_receipts as receipts
+import required_review
+import audit_reviewable_pr as audit
+import create_reviewable_pr as create
+import post_coderabbit_comment as comments
+import publication_support as support
+import reviewable_pr_state as state
+import review_feedback_state as feedback
+import submit_draft_stack as graphite
+import update_reviewable_pr as update
+from change_navigation import review_input
+
+
+def must_reject(action, error_type, expected_message=None):
+    try:
+        action()
+    except error_type as error:
+        if expected_message is not None and str(error) != expected_message:
+            raise AssertionError("candidate failed at the wrong behavior seam")
+        return
+    raise AssertionError("malformed candidate input was accepted")
+
+
+for parser, error_type in (
+    (state.strict_json, state.StateReadError),
+    (feedback.strict_json, feedback.ResponseShapeError),
+):
+    must_reject(lambda parser=parser: parser('{"key":1,"key":2}', "probe"), error_type)
+    must_reject(lambda parser=parser: parser('{"key":NaN}', "probe"), error_type)
+
+with tempfile.TemporaryDirectory() as directory:
+    duplicate = Path(directory) / "duplicate.json"
+    duplicate.write_text('{"version":1,"version":2}', encoding="utf-8")
+    must_reject(
+        lambda: review_input.load_review_input(duplicate),
+        review_input.ReviewInputError,
+    )
+    non_finite = Path(directory) / "non-finite.json"
+    non_finite.write_text('{"version":NaN}', encoding="utf-8")
+    must_reject(
+        lambda: review_input.load_review_input(non_finite),
+        review_input.ReviewInputError,
+    )
+
+expected = support.expected_identity(
+    repository="acme/app",
+    pr_number=7,
+    base="main",
+    base_oid="a" * 40,
+    head="fork:topic",
+    head_oid="b" * 40,
+    head_owner="fork",
+    head_repository="fork/app",
+)
+stored = {
+    "number": 7,
+    "url": expected.url,
+    "baseRefName": "main",
+    "baseRefOid": "a" * 40,
+    "headRefName": "topic",
+    "headRefOid": "b" * 40,
+    "headRepositoryOwner": {"login": "fork"},
+    "headRepository": {"nameWithOwner": "fork/app"},
+    "title": "Candidate title",
+    "body": "Candidate body",
+    "isDraft": True,
+    "state": "OPEN",
+}
+assert state.identity_matches(stored, expected)
+wrong_repository = copy.deepcopy(stored)
+wrong_repository["headRepository"]["nameWithOwner"] = "other/app"
+assert not state.identity_matches(wrong_repository, expected)
+boolean_number = copy.deepcopy(stored)
+boolean_number["number"] = True
+assert not state.identity_matches(boolean_number, expected)
+assert state.state_matches(
+    stored,
+    expected,
+    title="Candidate title",
+    body="Candidate body",
+    is_draft=True,
+)
+
+with support.temporary_body("candidate body bytes") as temporary:
+    assert Path(temporary.name).read_text(encoding="utf-8") == "candidate body bytes"
+
+def badge(alt, path, *, style="flat", title=None, label_color=None):
+    category = re.fullmatch(
+        r"(IMPL|TEST|DOC|GEN|OTHER): (\d+) additions, (\d+) deletions", alt
+    )
+    if category and title is None:
+        label, additions, deletions = category.groups()
+        from change_navigation.categories import category_title
+        title = category_title(label, int(additions), int(deletions))
+    query = f"style={style}"
+    if label_color:
+        query += f"&labelColor={label_color}"
+    title_attribute = f' title="{title}"' if title else ""
+    return (
+        f'<picture><img alt="{alt}"{title_attribute} '
+        f'src="https://img.shields.io/badge/{path}?{query}" height="16"></picture>'
+    )
+
+
+def candidate_body(pr_number=7):
+    anchor = hashlib.sha256(b"candidate.txt").hexdigest()
+    summary = " ".join([
+        badge("DIFF", "DIFF-57606A", style="for-the-badge"),
+        badge("IMPL: 9 additions, 3 deletions", "IMPL-%2B9%20%E2%88%923-0969DA"),
+        badge("FILES: 1 touched", "FILES-1-5F6B78"),
+    ]).replace("</picture> ", "</picture>&nbsp;", 1)
+    category = " ".join([
+        badge("IMPL: 9 additions, 3 deletions", "IMPL-%2B9%20%E2%88%923-0969DA"),
+        badge("FILES: 1 implementation file", "FILES-1-5F6B78"),
+    ])
+    atomic = badge(
+        "9 additions, 3 deletions",
+        "%2B9-%E2%88%923-CF222E",
+        title="9 additions, 3 deletions",
+        label_color="1A7F37",
+    )
+    return "\n".join([
+        "<details>",
+        f"<summary>{summary}</summary>",
+        "",
+        f"- {category}",
+        f"  - [`candidate.txt`](https://github.com/acme/app/pull/{pr_number}/files#diff-"
+        f"{anchor}) {atomic}",
+        "",
+        "<sup>IMPL means non-test source and configuration. TEST means automated "
+        "verification. DOC means reviewer and user documentation. GEN means generated "
+        "artifacts. OTHER means files outside those categories. FILES shows added, "
+        "modified, and removed files as +, ~, and −.</sup>",
+        "",
+        "</details>",
+        "",
+        "## Summary",
+        "- Exercise candidate publication behavior.",
+        "",
+    ])
+
+
+body = candidate_body()
+body_sha256 = hashlib.sha256(body.encode("utf-8")).hexdigest()
+stored["body"] = body
+
+
+def write_review_input(
+    path,
+    *,
+    candidate_title,
+    baseline_title,
+    candidate_body_value=body,
+    pr_number=7,
+    baseline_mode="existing",
+):
+    if baseline_mode == "new":
+        baseline = {
+            "mode": "new",
+            "title_sha256": None,
+            "body_sha256": None,
+            "fragments": [],
+        }
+    else:
+        baseline = {
+            "mode": "existing",
+            "title_sha256": hashlib.sha256(baseline_title.encode()).hexdigest(),
+            "body_sha256": body_sha256,
+            "fragments": [{
+                "id": "body",
+                "text": body,
+                "sha256": body_sha256,
+                "disposition": "retain",
+                "replacement": None,
+                "reason": None,
+            }],
+        }
+    document = {
+        "version": review_input.VERSION,
+        "repository": "acme/app",
+        "pr_number": pr_number,
+        "base": {"ref": "main", "oid": "a" * 40},
+        "head": {
+            "ref": "fork:topic",
+            "oid": "b" * 40,
+            "owner": "fork",
+            "repository": "fork/app",
+        },
+        "candidate": {
+            "title": candidate_title,
+            "body_sha256": hashlib.sha256(
+                candidate_body_value.encode("utf-8")
+            ).hexdigest(),
+        },
+        "git_diff": [{
+            "source_path": None,
+            "target_path": "candidate.txt",
+            "operation": "modified",
+            "additions": 9,
+            "deletions": 3,
+            "binary": False,
+        }],
+        "diff": [{
+            "category": "IMPL",
+            "operation": "ATOMIC",
+            "source_path": None,
+            "target_path": "candidate.txt",
+            "additions": 9,
+            "deletions": 3,
+        }],
+        "stack": [],
+        "baseline": baseline,
+    }
+    unsigned = json.dumps(
+        document,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    document["content_sha256"] = hashlib.sha256(unsigned).hexdigest()
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+
+def required_review_envelope(candidate, *, producer_id="tricritical-review-loop-v2"):
+    executions = {}
+    roles = (
+        "critic-intent",
+        "critic-runtime",
+        "critic-structure",
+        "specialist-security",
+    )
+    for index, role in enumerate(roles):
+        executions[f"execution-{index}"] = {
+            "execution_id": f"execution-{index}",
+            "role": role,
+            "candidate": candidate.candidate_identity,
+            "target": {
+                "product_family": "codex",
+                "surface": "chatgpt-codex",
+                "executor": "codex",
+                "version": "2026.08.13",
+            },
+            "topology": {
+                "relationship": "child",
+                "ownership": "leader-owned",
+                "transport": "native-tool",
+            },
+            "model": "gpt-5.6-sol",
+            "reasoning_effort": "high",
+            "user_authority": None,
+            "return_contract": "tricritical-raw-report-v1",
+            "scope": {
+                "kind": "review-scope-v1",
+                "value": role,
+                "content_sha256": "a" * 64,
+            },
+            "request": {
+                "kind": "review-request-v1",
+                "value": role,
+                "content_sha256": "b" * 64,
+            },
+            "authority": {
+                "access": "read-only",
+                "subdelegation": False,
+                "external_action": False,
+                "evidence": {
+                    "kind": "authority-evidence-v1",
+                    "value": role,
+                    "content_sha256": f"{index + 1:x}" * 64,
+                },
+            },
+            "isolation": {
+                "session": f"session-{index}",
+                "context": f"context-{index}",
+                "enforceable": True,
+            },
+            "assurance": {
+                "target": "product-attested",
+                "model": "product-attested",
+                "topology": "product-attested",
+                "authority": "product-attested",
+                "execution_result": "product-attested",
+                "evidence": {
+                    "kind": "product-attestation-v1",
+                    "value": role,
+                    "content_sha256": hashlib.sha256(
+                        f"assurance-{role}".encode()
+                    ).hexdigest(),
+                },
+            },
+            "assurance_minimum": {
+                "target": "product-attested",
+                "model": "product-attested",
+                "topology": "product-attested",
+                "authority": "product-attested",
+                "execution_result": "product-attested",
+            },
+            "verification_contract": "review-verification-v1",
+            "stop_contract": "review-stop-v1",
+            "usable": True,
+            "returned": {
+                "kind": "tricritical-raw-report-v1",
+                "value": role,
+                "content_sha256": f"{index + 5:x}" * 64,
+            },
+            "verification": {
+                "kind": "review-verification-v1",
+                "value": role,
+                "content_sha256": f"{index + 9:x}" * 64,
+            },
+            "stop": {
+                "kind": "review-stop-v1",
+                "value": role,
+                "content_sha256": f"{index + 12:x}" * 64,
+            },
+        }
+    projection = {
+        "schema_version": 1,
+        "contract": "tricritical-terminal-review-projection-v2",
+        "evidence_contract": "tricritical-terminal-review-evidence-v2",
+        "manifest_sha256": "d" * 64,
+        "subject": {
+            "candidate": candidate.candidate_identity,
+            "review_input": candidate.review_input_identity,
+            "requirements": candidate.requirements_identity,
+        },
+        "review_profile": {
+            "contract": "tricritical-review-profile-v1",
+            "execution_mode": "independent",
+            "required_axes": ["intent", "runtime", "structure"],
+            "selected_specialists": ["security"],
+        },
+        "final_dispatch": {
+            "contract": "rolecasting-dispatch-projection-v2",
+            "evidence_contract": "rolecasting-dispatch-evidence-v2",
+            "executions": executions,
+        },
+        "terminal": {
+            "state": "clean",
+            "owner": "none",
+            "limitations": [],
+            "missing_executions": [],
+            "unresolved_actionable_findings": 0,
+            "verification": {
+                "status": "passed",
+                "candidate": candidate.candidate_identity,
+                "evidence": {
+                    "kind": "verification-evidence-v1",
+                    "value": "passed",
+                    "content_sha256": "e" * 64,
+                },
+                "unchanged": True,
+            },
+        },
+    }
+    def canonical(value):
+        return json.dumps(
+            value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+    projection["content_sha256"] = hashlib.sha256(canonical(projection)).hexdigest()
+    return canonical({
+        "contract": "task-witness-launch-envelope-v1",
+        "anchor": {
+            "contract": "task-witness-complete-anchor-v1",
+            "generation": "sha256-" + "1" * 64,
+            "active_record_sha256": "2" * 64,
+            "runtime_contract": "task-witness-runtime-v1",
+            "interpreter": {
+                "executable": "/usr/bin/python3",
+                "implementation": "cpython",
+                "version": {"major": 3, "minor": 13, "micro": 7},
+            },
+            "public_release": {
+                "repository": "nisavid/agents",
+                "revision": "3" * 40,
+            },
+            "runtime_implementation_sha256": "4" * 64,
+            "trust_context_sha256": "5" * 64,
+            "bundle_sha256": "6" * 64,
+            "historical": False,
+        },
+        "witness": {
+            "contract": "task-witness-canonical-projection-v2",
+            "bundle_sha256": "6" * 64,
+            "producer": {
+                "producer_id": producer_id,
+                "contract": "tricritical-terminal-review-evidence-v2",
+                "implementation_sha256": "7" * 64,
+                "validator_id": "tricritical-terminal-review-evidence-validator-v2",
+                "validator_contract": "tricritical-terminal-review-evidence-v2",
+                "validator_implementation_sha256": "8" * 64,
+            },
+            "validator": {
+                "validator_id": "tricritical-terminal-review-evidence-validator-v2",
+                "contract": "tricritical-terminal-review-evidence-v2",
+                "implementation_sha256": "8" * 64,
+            },
+            "projection": projection,
+            "trust_context_sha256": "5" * 64,
+            "historical": False,
+        },
+    }) + b"\n"
+
+
+with tempfile.TemporaryDirectory() as raw_directory:
+    directory = Path(raw_directory)
+    fake_bin = directory / "bin"
+    fake_bin.mkdir()
+    state_path = directory / "states.json"
+    count_path = directory / "read-count"
+    fake_gh = fake_bin / "gh"
+    fake_gh.write_text(
+        "\n".join((
+            f"#!{sys.executable}",
+            "import json, os, sys",
+            "from pathlib import Path",
+            "arguments = sys.argv[1:]",
+            "state_path = Path(os.environ['MERGECRAFT_PROBE_STATES'])",
+            "counter = Path(os.environ['MERGECRAFT_PROBE_COUNT'])",
+            "comment_path = Path(os.environ['MERGECRAFT_PROBE_COMMENT'])",
+            "def load_state(increment=False):",
+            "    states = json.loads(state_path.read_text())",
+            "    index = int(counter.read_text()) if counter.exists() else 0",
+            "    if increment:",
+            "        counter.write_text(str(index + 1))",
+            "    return states[min(index, len(states) - 1)]",
+            "def store(value):",
+            "    state_path.write_text(json.dumps([value]))",
+            "    counter.write_text('0')",
+            "def option(name):",
+            "    return arguments[arguments.index(name) + 1]",
+            "def rest(value):",
+            "    return {",
+            "        'number': value['number'],",
+            "        'html_url': value['url'],",
+            "        'title': value['title'],",
+            "        'body': value['body'],",
+            "        'draft': value['isDraft'],",
+            "        'state': value['state'].lower(),",
+            "        'base': {",
+            "            'ref': value['baseRefName'],",
+            "            'sha': value['baseRefOid'],",
+            "            'repo': {'full_name': 'acme/app'},",
+            "        },",
+            "        'head': {",
+            "            'ref': value['headRefName'],",
+            "            'sha': value['headRefOid'],",
+            "            'repo': {",
+            "                'full_name': value['headRepository']['nameWithOwner'],",
+            "                'owner': value['headRepositoryOwner'],",
+            "            },",
+            "        },",
+            "    }",
+            "if 'pr' in arguments and 'view' in arguments:",
+            "    print(json.dumps(load_state(True)))",
+            "elif 'pr' in arguments and 'create' in arguments:",
+            "    value = {",
+            "        'number': 7,",
+            "        'url': 'https://github.com/acme/app/pull/7',",
+            "        'baseRefName': option('--base'),",
+            "        'baseRefOid': 'a' * 40,",
+            "        'headRefName': option('--head').split(':', 1)[1],",
+            "        'headRefOid': 'b' * 40,",
+            "        'headRepositoryOwner': {'login': 'fork'},",
+            "        'headRepository': {'nameWithOwner': 'fork/app'},",
+            "        'title': option('--title'),",
+            "        'body': Path(option('--body-file')).read_text(),",
+            "        'isDraft': True,",
+            "        'state': 'OPEN',",
+            "    }",
+            "    store(value)",
+            "    print(value['url'])",
+            "elif 'pr' in arguments and 'edit' in arguments:",
+            "    value = load_state()",
+            "    value['title'] = option('--title')",
+            "    value['body'] = Path(option('--body-file')).read_text()",
+            "    store(value)",
+            "elif 'api' in arguments:",
+            "    endpoint = next(",
+            "        item for item in arguments",
+            "        if item == 'user' or item.startswith('repos/')",
+            "    )",
+            "    method = option('--method')",
+            "    if endpoint == 'user' and method == 'GET':",
+            "        print(json.dumps({'login': 'probe-user'}))",
+            "    elif endpoint.endswith('/pulls') and method == 'GET':",
+            "        value = load_state()",
+            "        print(json.dumps([[] if value is None else [rest(value)]]))",
+            "    elif endpoint.endswith('/comments') and method == 'POST':",
+            "        payload = json.load(sys.stdin)",
+            "        receipt = {",
+            "            'id': 91,",
+            "            'html_url': 'https://github.com/acme/app/pull/7#issuecomment-91',",
+            "            'body': payload['body'],",
+            "            'user': {'login': 'probe-user'},",
+            "            'created_at': '2026-08-20T12:00:00Z',",
+            "        }",
+            "        comment_path.write_text(json.dumps(receipt))",
+            "        print(json.dumps(receipt))",
+            "    elif '/issues/comments/' in endpoint and method == 'GET':",
+            "        print(comment_path.read_text())",
+            "    else:",
+            "        raise SystemExit(96)",
+            "else:",
+            "    raise SystemExit(99)",
+        )) + "\n",
+        encoding="utf-8",
+    )
+    fake_gh.chmod(0o700)
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        f"#!{sys.executable}\n"
+        "import sys\n"
+        "from pathlib import Path\n"
+        "arguments = sys.argv[1:]\n"
+        "if arguments[:1] == ['-C'] and len(arguments) >= 3:\n"
+        "    repository = Path(arguments[1]).resolve()\n"
+        "    command = arguments[2:]\n"
+        "else:\n"
+        "    repository = Path.cwd().resolve()\n"
+        "    command = arguments\n"
+        "if command[:2] == ['rev-parse', '--show-toplevel']:\n"
+        "    print(repository)\n"
+        "elif command[:1] == ['rev-parse'] and 'refs/heads/topic' in command[1]:\n"
+        "    print('b' * 40)\n"
+        "elif command[:1] == ['rev-parse'] and 'refs/heads/main' in command[1]:\n"
+        "    print('a' * 40)\n"
+        "elif command[:4] == ['symbolic-ref', '--quiet', '--short', 'HEAD']:\n"
+        "    print('topic')\n"
+        "elif command[:2] == ['cat-file', '-e']:\n"
+        "    pass\n"
+        "elif command[:2] == ['status', '--porcelain=v1']:\n"
+        "    pass\n"
+        "elif command[:2] == ['diff', '--numstat']:\n"
+        "    sys.stdout.buffer.write(b'9\\t3\\tcandidate.txt\\0')\n"
+        "elif command[:2] == ['diff', '--name-status']:\n"
+        "    sys.stdout.buffer.write(b'M\\0candidate.txt\\0')\n"
+        "else:\n"
+        "    raise SystemExit(97)\n",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o700)
+    fake_gt = fake_bin / "gt"
+    fake_gt.write_text(
+        f"#!{sys.executable}\n"
+        "import sys\n"
+        "arguments = sys.argv[1:]\n"
+        "if arguments == ['log', 'short']:\n"
+        "    print('topic')\n"
+        "elif arguments == ['trunk']:\n"
+        "    print('main')\n"
+        "elif arguments == ['submit', '--stack', '--draft', '--no-edit', '--no-ai', '--no-interactive']:\n"
+        "    print('submitted')\n"
+        "else:\n"
+        "    raise SystemExit(95)\n",
+        encoding="utf-8",
+    )
+    fake_gt.chmod(0o700)
+    os.environ["PATH"] = f"{fake_bin}:{os.environ['PATH']}"
+    os.environ["MERGECRAFT_PROBE_STATES"] = str(state_path)
+    os.environ["MERGECRAFT_PROBE_COUNT"] = str(count_path)
+    os.environ["MERGECRAFT_PROBE_COMMENT"] = str(directory / "comment.json")
+    os.environ["XDG_STATE_HOME"] = str(directory / "state-home")
+
+    def set_states(*values):
+        state_path.write_text(json.dumps(values), encoding="utf-8")
+        count_path.write_text("0", encoding="utf-8")
+
+    body_path = directory / "body.md"
+    body_path.write_text(body, encoding="utf-8")
+    live_review = directory / "live-review.json"
+    write_review_input(
+        live_review,
+        candidate_title="Candidate title",
+        baseline_title="Candidate title",
+    )
+    update_review = directory / "update-review.json"
+    write_review_input(
+        update_review,
+        candidate_title="Changed title",
+        baseline_title="Candidate title",
+    )
+    git_root = directory / "git-root"
+    git_root.mkdir()
+    os.chdir(git_root)
+
+    support.validate_pr_content(
+        body,
+        "acme/app",
+        7,
+        "Candidate title",
+        live_review,
+    )
+
+    clean_page = {
+        "data": {
+            "repository": {
+                "nameWithOwner": "base-owner/base-repo",
+                "owner": {"login": "base-owner"},
+                "pullRequest": {
+                    "number": 7,
+                    "url": "https://github.com/base-owner/base-repo/pull/7",
+                    "isDraft": False,
+                    "baseRefName": "main",
+                    "headRefName": "feature",
+                    "baseRefOid": "base-sha",
+                    "headRefOid": "head-sha",
+                    "headRepository": {
+                        "nameWithOwner": "base-owner/base-repo",
+                        "owner": {"login": "base-owner"},
+                    },
+                    "reviewDecision": "APPROVED",
+                    "mergeStateStatus": "CLEAN",
+                    "mergeable": "MERGEABLE",
+                    "comments": {
+                        "nodes": [],
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    },
+                    "reviewThreads": {
+                        "nodes": [],
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    },
+                    "reviews": {
+                        "nodes": [{
+                            "author": {"login": "review-bot"},
+                            "state": "APPROVED",
+                            "submittedAt": "2026-08-20T00:00:00Z",
+                        }],
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    },
+                    "reviewRequests": {
+                        "nodes": [],
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    },
+                    "statusCheckRollup": {
+                        "contexts": {
+                            "nodes": [{
+                                "__typename": "CheckRun",
+                                "name": "CI",
+                                "status": "COMPLETED",
+                                "conclusion": "SUCCESS",
+                            }],
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                        }
+                    },
+                },
+            }
+        }
+    }
+    feedback_state = feedback.state_from_pages(
+        "base-owner/base-repo", [clean_page], pr_number=7
+    )
+    assert feedback_state["schema_version"] == 2
+    assert feedback_state["github_state"]["pagination_complete"] is True
+    assert feedback_state["next_blocker"] is None
+
+    required_candidate = required_review.build_candidate(
+        operation="update-text",
+        repository="acme/app",
+        pr_number=7,
+        base="main",
+        base_oid="a" * 40,
+        head="fork:topic",
+        head_oid="b" * 40,
+        head_owner="fork",
+        head_repository="fork/app",
+        title="Candidate title",
+        body_source_kind="body",
+        body_source_raw=body.encode("utf-8"),
+        published_body=body,
+        review_input_path=live_review,
+        review_mode="required",
+        selected_specialists=["security"],
+    )
+    envelope = required_review_envelope(required_candidate)
+    observation = required_review.validate_required_review_envelope(
+        envelope, required_candidate
+    )
+    assert observation.launch_envelope_sha256 == hashlib.sha256(envelope).hexdigest()
+
+    def independently_weakened_authority_envelope(field, weakened_value):
+        weakened_envelope = json.loads(envelope)
+        weakened_projection = weakened_envelope["witness"]["projection"]
+        weakened_authority = (
+            weakened_projection["final_dispatch"]["executions"]["execution-0"][
+                "authority"
+            ]
+        )
+        weakened_authority[field] = weakened_value
+        weakened_unsigned = dict(weakened_projection)
+        del weakened_unsigned["content_sha256"]
+        weakened_projection["content_sha256"] = hashlib.sha256(
+            json.dumps(
+                weakened_unsigned,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        return (
+            json.dumps(
+                weakened_envelope,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+            + b"\n"
+        )
+
+    for authority_field, weakened_value in (
+        ("access", "read-write"),
+        ("subdelegation", True),
+        ("external_action", True),
+    ):
+        weakened_raw = independently_weakened_authority_envelope(
+            authority_field, weakened_value
+        )
+        must_reject(
+            lambda weakened_raw=weakened_raw: (
+                required_review.validate_required_review_envelope(
+                    weakened_raw, required_candidate
+                )
+            ),
+            state.PublicationError,
+            "Rolecasting publication execution authority drift",
+        )
+    must_reject(
+        lambda: required_review.validate_required_review_envelope(
+            required_review_envelope(
+                required_candidate, producer_id="unregistered-review-producer"
+            ),
+            required_candidate,
+        ),
+        state.PublicationError,
+        "Task Witness registered producer chain drift",
+    )
+    other_candidate = required_review.build_candidate(
+        operation="update-text",
+        repository="acme/app",
+        pr_number=7,
+        base="main",
+        base_oid="a" * 40,
+        head="fork:topic",
+        head_oid="b" * 40,
+        head_owner="fork",
+        head_repository="fork/app",
+        title="Different candidate title",
+        body_source_kind="body",
+        body_source_raw=body.encode("utf-8"),
+        published_body=body,
+        review_input_path=live_review,
+        review_mode="required",
+        selected_specialists=["security"],
+    )
+    must_reject(
+        lambda: required_review.validate_required_review_envelope(
+            envelope, other_candidate
+        ),
+        state.PublicationError,
+        "Tricritical publication subject drift",
+    )
+    must_reject(
+        lambda: required_review.validate_required_review(
+            review_mode="required",
+            review_bundle_root=None,
+            candidate=required_candidate,
+        ),
+        state.PublicationError,
+        "required review needs an absolute evidence bundle root",
+    )
+
+    set_states(stored)
+    must_reject(
+        lambda: update.update_text(
+            expected=expected,
+            expected_title_sha256=hashlib.sha256(b"Candidate title").hexdigest(),
+            expected_body_sha256=body_sha256,
+            expected_draft=True,
+            title="Changed title",
+            body_path=body_path,
+            review_input_path=update_review,
+            review_mode="not-required",
+            review_bundle_root=None,
+            selected_specialists=[],
+            text_scope="body-only",
+            receipt_directory=directory / "update-receipts",
+        ),
+        state.PublicationError,
+        "body-only edit changed the live title",
+    )
+
+    set_states(stored, stored)
+    receipt = audit.reconcile(
+        expected=expected,
+        receipt_directory=directory / "valid-receipts",
+        review_input_path=live_review,
+    )
+    assert receipt.operation == "reconcile"
+    assert receipt.provenance == "reconciled-unreceipted"
+    set_states(stored)
+    must_reject(
+        lambda: audit.reconcile(
+            expected=expected,
+            receipt_directory=directory / "valid-receipts",
+            review_input_path=live_review,
+        ),
+        receipts.ReceiptError,
+        "authoritative latest receipt already matches live state",
+    )
+
+    changed = copy.deepcopy(stored)
+    changed["body"] = "changed during reconciliation"
+    set_states(stored, changed)
+    receipt_root = directory / "drift-receipts"
+    must_reject(
+        lambda: audit.reconcile(
+            expected=expected,
+            receipt_directory=receipt_root,
+            review_input_path=live_review,
+        ),
+        state.PublicationError,
+        "live PR state changed during reconciliation; no receipt was written",
+    )
+    assert not list(receipt_root.rglob("*.json"))
+
+    template = candidate_body(review_input.PR_NUMBER_TOKEN)
+    template_path = directory / "body-template.md"
+    template_path.write_text(template, encoding="utf-8")
+    create_review = directory / "create-review.json"
+    write_review_input(
+        create_review,
+        candidate_title="Candidate title",
+        baseline_title="Candidate title",
+        candidate_body_value=template,
+        pr_number=review_input.PR_NUMBER_TOKEN,
+        baseline_mode="new",
+    )
+    create_receipts = directory / "create-receipts"
+    set_states(None)
+    created = create.publish(
+        repository="acme/app",
+        base="main",
+        base_oid="a" * 40,
+        head="fork:topic",
+        head_oid="b" * 40,
+        head_owner="fork",
+        head_repository="fork/app",
+        title="Candidate title",
+        template_path=template_path,
+        review_input_path=create_review,
+        review_mode="not-required",
+        review_bundle_root=None,
+        selected_specialists=[],
+        receipt_directory=create_receipts,
+    )
+    assert state.state_matches(
+        created,
+        expected,
+        title="Candidate title",
+        body=body,
+        is_draft=True,
+    )
+    publication_audit = receipts.audit_publication(
+        root=create_receipts,
+        expected=expected,
+        read_live=lambda: created,
+    )
+    assert publication_audit.status == "verified"
+    assert publication_audit.receipt is not None
+    assert publication_audit.receipt.operation == "create"
+    assert publication_audit.receipt.provenance == "canonical"
+
+    set_states(created)
+    comment_body = "@coderabbitai review"
+    comment_receipt = comments.post_comment(
+        expected=expected,
+        expected_authenticated_login="probe-user",
+        body=comment_body,
+        body_sha256=hashlib.sha256(comment_body.encode("utf-8")).hexdigest(),
+    )
+    assert comment_receipt["id"] == 91
+    assert comment_receipt["body"] == comment_body
+
+    set_states(created)
+    request = {
+        "schema_version": graphite.SCHEMA_VERSION,
+        "repository": "acme/app",
+        "repository_root": str(git_root),
+        "current_branch": "topic",
+        "stack": [{
+            "base": "main",
+            "base_oid": "a" * 40,
+            "head": "fork:topic",
+            "head_oid": "b" * 40,
+            "head_owner": "fork",
+            "head_repository": "fork/app",
+            "title": "Candidate title",
+            "body_source": {"mode": "file", "path": str(body_path)},
+            "review_input": str(live_review),
+            "review_mode": "not-required",
+            "review_bundle": None,
+            "selected_specialists": [],
+        }],
+    }
+    plan = graphite.build_plan(request)
+    assert plan["request"] == request
+    assert plan["candidates"][0]["local_branch"] == "topic"
+    assert plan["preimages"][0]["number"] == 7
+    handoff = graphite.execute(plan, directory / "graphite-handoff.json")
+    assert handoff["status"] == "transport-complete-repair-required"
+    assert not handoff["failures"]
+    item = handoff["pull_requests"][0]
+    assert item["target_identity_epoch"]["head_repository"] == "fork/app"
+    assert item["publisher_commands"] == []
+    assert "audit_reviewable_pr.py" in item["final_audit_command"][1]
+    assert all("gh" not in argument for argument in item["final_audit_command"])
+'''
+
+
+def validate_candidate_runtime_behaviors(root: Path) -> None:
+    environment = {
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/usr/bin:/bin",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONHASHSEED": "0",
+        "PYTHONNOUSERSITE": "1",
+        "TZ": "UTC",
+    }
+    try:
+        with tempfile.TemporaryDirectory(prefix="mergecraft-runtime-probe-") as cwd:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-B",
+                    "-c",
+                    CANDIDATE_RUNTIME_PROBE,
+                    str(root),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+                cwd=cwd,
+                env=environment,
+            )
+    except subprocess.TimeoutExpired as error:
+        raise ContractError("candidate runtime behavior probe timed out") from error
+    require(
+        result.returncode == 0,
+        "candidate runtime behavior drift",
+    )
+
+
 def validate_runtime_contracts(root: Path) -> None:
-    state = read(
-        root,
-        "skills/publishing-reviewable-prs/scripts/reviewable_pr_state.py",
-    )
-    create = read(
-        root,
-        "skills/publishing-reviewable-prs/scripts/create_reviewable_pr.py",
-    )
-    update = read(
-        root,
-        "skills/publishing-reviewable-prs/scripts/update_reviewable_pr.py",
-    )
-    graphite = read(
-        root,
-        "skills/graphite/scripts/submit_draft_stack.py",
-    )
-    audit = read(
-        root,
-        "skills/publishing-reviewable-prs/scripts/audit_reviewable_pr.py",
-    )
-    receipts = read(
-        root,
-        "skills/publishing-reviewable-prs/scripts/publication_receipts.py",
-    )
-    required_review = read(
-        root,
-        "skills/publishing-reviewable-prs/scripts/required_review.py",
-    )
-    comment = read(
-        root,
-        "skills/getting-prs-merged/scripts/post_coderabbit_comment.py",
-    )
-    review_input = read(
-        root,
-        "skills/writing-reviewable-pr-descriptions/scripts/"
-        "change_navigation/review_input.py",
-    )
-    feedback = read(
-        root,
-        "skills/addressing-pr-review-feedback/scripts/review_feedback_state.py",
-    )
     writer = read(root, "skills/writing-reviewable-pr-descriptions/SKILL.md")
     body_contract = read(
         root,
@@ -2600,175 +3554,7 @@ def validate_runtime_contracts(root: Path) -> None:
         ),
         "merge actuator authority drift",
     )
-    for term in (
-        "head_repository",
-        "nameWithOwner",
-        "def run_read(",
-        "def run_mutation(",
-        "def strict_json(",
-        "timeout=READ_TIMEOUT_SECONDS",
-        "timeout=MUTATION_TIMEOUT_SECONDS",
-        "GH_PROMPT_DISABLED",
-    ):
-        require(term in state, f"publisher runtime contract missing: {term}")
-    for term in (
-        "VALIDATION_PR_NUMBER",
-        "template_path",
-        "_run_read",
-        "_run_mutation",
-        "head_repository",
-    ):
-        require(term in create, f"publisher create contract missing: {term}")
-    publish = create[create.index("def publish(") :]
-    first_validation = publish.index("_validate(")
-    creation = publish.index("_create(")
-    second_validation = publish.index("_validate(", first_validation + 1)
-    require(
-        first_validation < creation < second_validation,
-        "publisher create validation order drift",
-    )
-    require(
-        publish.index("prepare_receipt_store(") < creation
-        and "prepare_receipt_ledger(receipt_root, expected)" in publish,
-        "publisher receipt store must be prepared before forge mutation",
-    )
-    require(
-        "_run_read" in update and "_run_mutation" in update,
-        "publisher update timeout classification drift",
-    )
-    for term in (
-        'choices=("body-only", "title-only", "title-body")',
-        'text_scope == "body-only" and title != before["title"]',
-        'text_scope == "title-only" and body != before["body"]',
-    ):
-        require(term in update, f"publisher text-scope contract missing: {term}")
-    for term in (
-        "text publication is a no-op",
-        "prepare_receipt_store(receipt_directory)",
-        "prepare_receipt_ledger(receipt_root, expected)",
-        "verified_transition(",
-        "preimage=before",
-        "final_reread=after",
-    ):
-        require(term in update, f"publisher transition contract missing: {term}")
-    for term in (
-        "SCHEMA_VERSION = 3",
-        "PUBLISHER_VERSION = 1",
-        "POLICY_VERSION = 1",
-        '"sequence"',
-        '"predecessor_sha256"',
-        '"content_sha256"',
-        "RECEIPT_NAME_RE",
-        "TEMP_NAME_RE",
-        'uuid.UUID(value["receipt_id"]).version != 4',
-        '"mergecraft/pr-publication-receipts"',
-        "receipts[-1]",
-        "actual state transition",
-    ):
-        require(term in receipts, f"publisher receipt-ledger contract missing: {term}")
-    for term in (
-        'CANDIDATE_CONTRACT = "mergecraft-publication-candidate-v1"',
-        "".join(
-            (
-                "REQUIRED_PROFILE_CONTRACT = ",
-                '"mergecraft-required-publication-review-profile-v2"',
-            )
-        ),
-        'ENVELOPE_CONTRACT = "task-witness-launch-envelope-v1"',
-        'WITNESS_CONTRACT = "task-witness-canonical-projection-v2"',
-        'PROJECTION_CONTRACT = "tricritical-terminal-review-projection-v2"',
-        'PRODUCER_ID = "tricritical-review-loop-v2"',
-        "pwd.getpwuid(os.geteuid())",
-        "class _AuthenticatedFrontDoorObservation",
-        "_FRONT_DOOR_CALL_CAPABILITY = object()",
-        "def _authenticated_front_door(",
-        "def _supervised_process(",
-        "canonical Task Witness supervisor requires its closed internal call shape",
-        "envelope = _strict_envelope(stdout)",
-        "def validate_transition_candidate(",
-        '"gpt-5.6-sol"',
-        '"reasoning_effort": "high"',
-        '"surface": "chatgpt-codex"',
-        '"execution_result": "product-attested"',
-        '"assurance_minimum"',
-        "Rolecasting publication execution assurance minimum drift",
-        '"selected_specialists"',
-        "def _make_publication_review(",
-    ):
-        require(
-            term in required_review,
-            f"publisher required-review contract missing: {term}",
-        )
-    for term in (
-        "first = stored_pr(",
-        "second = stored_pr(",
-        "if second != first",
-        "record_reconciliation(",
-        "suspected_secret_error(value)",
-    ):
-        require(term in audit, f"publisher reconciliation contract missing: {term}")
-    for term in (
-        "def build_plan(",
-        "def execute(",
-        "def repair(",
-        '"gt",',
-        '"submit",',
-        '"--stack",',
-        '"--draft",',
-        '"--no-edit",',
-        '"--no-ai",',
-        '"--no-interactive",',
-        "prepare_receipt_store()",
-        '"final_audit_command"',
-        '"target_review_mode"',
-        '"target_publication_candidate_sha256"',
-        '"target_selected_specialists"',
-        "SCHEMA_VERSION = 2",
-        "not _audit_matches_target(audit, item)",
-    ):
-        require(term in graphite, f"Graphite helper contract missing: {term}")
-    for term in (
-        "copy.deepcopy",
-        '"repository"',
-        "head_repository",
-        "exact ordered fragment derivation",
-    ):
-        require(term in review_input, f"review-input contract missing: {term}")
-    for term in (
-        "def post_comment(",
-        "body_sha256",
-        "_run_mutation",
-        "_run_read",
-        "must not be retried",
-    ):
-        require(term in comment, f"comment actuator contract missing: {term}")
-    require(
-        feedback.count("json.loads(") == 1
-        and "object_pairs_hook=unique_object" in feedback
-        and "timeout=READ_TIMEOUT_SECONDS" in feedback
-        and "copy.deepcopy" in feedback
-        and "headRepository" in feedback
-        and "head_repo" in feedback
-        and "head_owner" in feedback
-        and "validate_head_repository_identity" in feedback,
-        "feedback trust-boundary contract drift",
-    )
-    require(
-        state.count("json.loads(") == 1,
-        "publisher forge JSON must use one strict decoder",
-    )
-    require(
-        review_input.count("json.loads(") == 1,
-        "review input must use one strict decoder",
-    )
-    combined = (
-        f"{state}\n{create}\n{update}\n{required_review}\n{comment}\n{review_input}"
-    )
-    for forbidden in ("$HOME/.agents", "run as _run"):
-        require(
-            forbidden not in combined,
-            f"publisher runtime contract contains forbidden route: {forbidden}",
-        )
+    validate_candidate_runtime_behaviors(root)
 
 
 def semantic_release_paths(root: Path) -> tuple[str, ...]:
@@ -2782,6 +3568,100 @@ def semantic_release_paths(root: Path) -> tuple[str, ...]:
     )
 
 
+class ContentLockWriteSnapshot(NamedTuple):
+    plugin_entries: tuple[tuple[str, InputEntry], ...]
+    eval_entries: tuple[tuple[str, InputEntry], ...]
+    atlas_entries: tuple[tuple[str, InputEntry], ...]
+    external_topologies: tuple[tuple[str, InputEntry], ...]
+    retirement_ledger: InputEntry
+    lock_parent: InputEntry
+    lock_entry: InputEntry
+
+
+def capture_external_topologies(
+    repo_root: Path,
+) -> tuple[tuple[str, InputEntry], ...]:
+    relatives = {Path("plugins")}
+    for relative in EXTERNAL_TOPOLOGY_RELATIVES:
+        relatives.update((relative.parent, relative))
+    return tuple(
+        (
+            relative.as_posix(),
+            capture_input_entry(
+                repo_root / relative,
+                error_type=ContractError,
+            ),
+        )
+        for relative in sorted(relatives, key=lambda path: path.as_posix())
+    )
+
+
+def capture_content_lock_write_snapshot(
+    repo_root: Path,
+) -> ContentLockWriteSnapshot:
+    root = locate_plugin(repo_root)
+    destination = repo_root / CONTENT_LOCK_RELATIVE
+    return ContentLockWriteSnapshot(
+        plugin_entries=snapshot_tree(root, error_type=ContractError),
+        eval_entries=snapshot_tree(
+            repo_root / EVAL_RELATIVE,
+            error_type=ContractError,
+        ),
+        atlas_entries=snapshot_tree(
+            repo_root / ATLAS_RELEASE_RELATIVE,
+            error_type=ContractError,
+        ),
+        external_topologies=capture_external_topologies(repo_root),
+        retirement_ledger=capture_input_entry(
+            repo_root / RETIREMENT_LEDGER_RELATIVE,
+            error_type=ContractError,
+        ),
+        lock_parent=capture_input_entry(
+            destination.parent,
+            error_type=ContractError,
+        ),
+        lock_entry=capture_input_entry(
+            destination,
+            error_type=ContractError,
+        ),
+    )
+
+
+def require_content_lock_write_snapshot_unchanged(
+    repo_root: Path,
+    snapshot: ContentLockWriteSnapshot,
+) -> None:
+    require(
+        capture_content_lock_write_snapshot(repo_root) == snapshot,
+        "validated inputs changed before semantic content lock replacement",
+    )
+
+
+def content_lock_document_from_snapshot(
+    snapshot: ContentLockWriteSnapshot,
+) -> dict:
+    files = {
+        relative: entry.sha256
+        for relative, entry in snapshot.plugin_entries
+        if relative != "."
+        and entry.kind == "regular"
+        and relative not in CONTENT_LOCK_EXCLUSIONS
+    }
+    require(
+        all(
+            isinstance(digest, str)
+            and re.fullmatch(r"[0-9a-f]{64}", digest) is not None
+            for digest in files.values()
+        ),
+        "semantic content lock snapshot digest is invalid",
+    )
+    return {
+        "schema_version": 1,
+        "algorithm": "sha256",
+        "files": files,
+    }
+
+
 def content_lock_document(root: Path) -> dict:
     return {
         "schema_version": 1,
@@ -2793,12 +3673,78 @@ def content_lock_document(root: Path) -> dict:
     }
 
 
-def write_content_lock(repo_root: Path, root: Path) -> None:
+def write_content_lock(
+    repo_root: Path,
+    root: Path | None = None,
+    *,
+    snapshot: ContentLockWriteSnapshot | None = None,
+) -> None:
+    located_root = locate_plugin(repo_root)
+    if root is not None:
+        require(root.resolve() == located_root, "Mergecraft plugin root drift")
+    if snapshot is None:
+        snapshot = capture_content_lock_write_snapshot(repo_root)
     path = repo_root / CONTENT_LOCK_RELATIVE
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(content_lock_document(root), indent=2) + "\n",
-        encoding="utf-8",
+    require(
+        snapshot.lock_parent.kind == "directory" and not path.parent.is_symlink(),
+        "semantic content lock parent is invalid",
+    )
+    require(
+        snapshot.lock_entry.kind in {"missing", "regular"},
+        "semantic content lock is not a regular file",
+    )
+    content = (
+        json.dumps(content_lock_document_from_snapshot(snapshot), indent=2) + "\n"
+    ).encode("utf-8")
+    mode = snapshot.lock_entry.mode if snapshot.lock_entry.mode is not None else 0o644
+
+    def recheck(_temporary_paths: frozenset[Path]) -> None:
+        require_content_lock_write_snapshot_unchanged(repo_root, snapshot)
+
+    def verify() -> None:
+        require(
+            snapshot_tree(
+                located_root,
+                error_type=ContractError,
+            )
+            == snapshot.plugin_entries
+            and snapshot_tree(
+                repo_root / EVAL_RELATIVE,
+                error_type=ContractError,
+            )
+            == snapshot.eval_entries
+            and snapshot_tree(
+                repo_root / ATLAS_RELEASE_RELATIVE,
+                error_type=ContractError,
+            )
+            == snapshot.atlas_entries
+            and capture_external_topologies(repo_root)
+            == snapshot.external_topologies
+            and capture_input_entry(
+                repo_root / RETIREMENT_LEDGER_RELATIVE,
+                error_type=ContractError,
+            )
+            == snapshot.retirement_ledger,
+            "validated inputs changed during semantic content lock replacement",
+        )
+        replacement = capture_input_entry(
+            path,
+            error_type=ContractError,
+        )
+        require(
+            replacement
+            == InputEntry(
+                "regular",
+                mode,
+                hashlib.sha256(content).hexdigest(),
+            ),
+            "semantic content lock replacement identity is invalid",
+        )
+
+    replace_generated_artifacts(
+        {path: (content, mode)},
+        recheck=recheck,
+        verify=verify,
     )
 
 
@@ -2831,7 +3777,12 @@ def validate_content_lock(repo_root: Path, root: Path) -> None:
 
 
 def validate(
-    repo_root: Path, selected_skill: str | None = None, *, source_stage: bool = False
+    repo_root: Path,
+    selected_skill: str | None = None,
+    *,
+    source_stage: bool = False,
+    check_content_lock: bool | None = None,
+    emit_success: bool = True,
 ) -> None:
     root = locate_plugin(repo_root)
     validate_tree_entries(root)
@@ -2854,12 +3805,14 @@ def validate(
     validate_merge_eval_isolation(repo_root)
     validate_raw_skill_eval_isolation(repo_root)
     validate_runtime_contracts(root)
-    if not source_stage:
+    if check_content_lock is None:
+        check_content_lock = not source_stage
+    if check_content_lock:
         validate_content_lock(repo_root, root)
-    if selected_skill is not None:
+    if selected_skill is not None and emit_success:
         require(selected_skill in PUBLIC_SKILLS, "unknown public skill")
         print(f"Mergecraft quick validation passed: {selected_skill}")
-    else:
+    elif selected_skill is None and emit_success:
         print("Mergecraft contract validation passed")
 
 
@@ -2875,15 +3828,27 @@ def main() -> int:
     )
     args = parser.parse_args()
     try:
+        try:
+            repository = Path(os.path.abspath(args.repository.expanduser()))
+        except RuntimeError as error:
+            raise ContractError(str(error)) from error
         if args.write_content_lock:
-            root = locate_plugin(args.repository)
-            validate_tree_entries(root)
-            write_content_lock(args.repository, root)
-        validate(args.repository, args.skill, source_stage=args.source_stage)
+            snapshot = capture_content_lock_write_snapshot(repository)
+            validate(
+                repository,
+                args.skill,
+                source_stage=args.source_stage,
+                check_content_lock=False,
+                emit_success=False,
+            )
+            require_content_lock_write_snapshot_unchanged(repository, snapshot)
+            write_content_lock(repository, snapshot=snapshot)
+        validate(repository, args.skill, source_stage=args.source_stage)
     except (
         AgentPluginContractError,
         ContractError,
         FileNotFoundError,
+        RefreshTransactionError,
         json.JSONDecodeError,
         UnicodeDecodeError,
         YAML_ERROR,

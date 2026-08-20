@@ -9,20 +9,27 @@ import tempfile
 import unittest
 from pathlib import Path
 
+REPOSITORY = Path(__file__).resolve().parents[4]
+PRODUCTION_SCRIPTS = (
+    REPOSITORY
+    / "plugins/mergecraft/skills/writing-reviewable-pr-descriptions/scripts"
+)
+sys.path.insert(0, str(PRODUCTION_SCRIPTS))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from change_navigation.diff_files import manifest_rows  # noqa: E402
+from change_navigation.review_input import (  # noqa: E402
+    PR_NUMBER_TOKEN,
+    VERSION,
+    ReviewInputError,
+    bind_review_input,
+    load_review_input,
+)
 from test_validate_change_navigation import (  # noqa: E402
     DIFF,
     MODULE,
     PRODUCTION_VALIDATE,
     SCRIPT,
-)
-from change_navigation.review_input import (  # noqa: E402
-    PR_NUMBER_TOKEN,
-    ReviewInputError,
-    VERSION,
-    bind_review_input,
-    load_review_input,
 )
 
 
@@ -74,7 +81,7 @@ def manifest(
                     }
                 ],
             }
-    diff = MODULE._manifest_rows(MODULE.extract_leading_details(body.splitlines())[0])
+    diff = manifest_rows(MODULE.extract_leading_details(body.splitlines())[0])
     git_diff_by_target: dict[str, dict[str, object]] = {}
     for row in diff:
         target = str(row["target_path"])

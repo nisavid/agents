@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import ast
+import contextlib
 import copy
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -11,6 +14,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 VALIDATOR = REPO_ROOT / "scripts" / "validate_mergecraft.py"
@@ -35,6 +39,26 @@ SPEC = importlib.util.spec_from_file_location("validate_mergecraft", VALIDATOR)
 assert SPEC is not None and SPEC.loader is not None
 VALIDATE_MERGECRAFT = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(VALIDATE_MERGECRAFT)
+
+
+class AuthorityGuardRemover(ast.NodeTransformer):
+    def __init__(self, field: str) -> None:
+        self.field = field
+        self.removed = 0
+
+    def visit_Compare(self, node: ast.Compare) -> ast.expr:
+        self.generic_visit(node)
+        left = node.left
+        if (
+            isinstance(left, ast.Subscript)
+            and isinstance(left.value, ast.Name)
+            and left.value.id == "authority"
+            and isinstance(left.slice, ast.Constant)
+            and left.slice.value == self.field
+        ):
+            self.removed += 1
+            return ast.copy_location(ast.Constant(value=False), node)
+        return node
 
 
 class CheckedInMergecraftReleaseTests(unittest.TestCase):
@@ -601,6 +625,113 @@ class ValidateMergecraftTests(unittest.TestCase):
         )
         self.assert_rejected("semantic content lock mismatch")
 
+    def test_invalid_write_candidate_preserves_existing_content_lock_bytes(
+        self,
+    ) -> None:
+        lock_path = self.repo / CONTENT_LOCK
+        original_lock = lock_path.read_bytes()
+        manifest_path = self.plugin / "plugin.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["version"] = "invalid-candidate"
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+        )
+
+        result = self.run_validator("--write-content-lock")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("manifest", result.stderr.lower())
+        self.assertEqual(lock_path.read_bytes(), original_lock)
+
+    def test_write_content_lock_accepts_relative_repository_root(self) -> None:
+        lock_path = self.repo / CONTENT_LOCK
+        expected_lock = lock_path.read_bytes()
+        lock_path.write_text("{}\n", encoding="utf-8")
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(VALIDATOR),
+                ".",
+                "--write-content-lock",
+            ],
+            cwd=self.repo,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Mergecraft semantic content lock updated", result.stdout)
+        self.assertEqual(lock_path.read_bytes(), expected_lock)
+
+    def test_unknown_repository_user_uses_contract_error_surface(self) -> None:
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(VALIDATOR),
+                "~mergecraft-path-regression-user-2f74c3db2e5b4b8cb6d0",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertNotIn("Traceback (most recent call last)", result.stderr)
+        self.assertTrue(
+            result.stderr.startswith("Mergecraft contract validation failed: "),
+            result.stderr,
+        )
+        self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
+
+    def test_detected_late_refresh_failure_restores_content_lock_bytes(
+        self,
+    ) -> None:
+        lock_path = self.repo / CONTENT_LOCK
+        original_lock = lock_path.read_bytes()
+        skill = self.plugin / "skills/getting-prs-merged/SKILL.md"
+        skill.write_text(
+            skill.read_text(encoding="utf-8") + "\nValid semantic change.\n",
+            encoding="utf-8",
+        )
+        real_replace = os.replace
+
+        def replace_then_drift(source: object, destination: object) -> None:
+            real_replace(source, destination)
+            if Path(destination) == lock_path:
+                skill.write_text(
+                    skill.read_text(encoding="utf-8")
+                    + "\nConcurrent semantic change.\n",
+                    encoding="utf-8",
+                )
+
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                os,
+                "replace",
+                side_effect=replace_then_drift,
+            ),
+            mock.patch.object(
+                VALIDATE_MERGECRAFT.sys,
+                "argv",
+                [
+                    "validate_mergecraft.py",
+                    str(self.repo),
+                    "--write-content-lock",
+                ],
+            ),
+            contextlib.redirect_stderr(stderr),
+        ):
+            result = VALIDATE_MERGECRAFT.main()
+
+        self.assertNotEqual(result, 0)
+        self.assertIn("validated inputs changed", stderr.getvalue())
+        self.assertEqual(lock_path.read_bytes(), original_lock)
+
     def test_github_operation_inventory_is_complete_and_collision_free(self) -> None:
         topology = json.loads((self.plugin / "topology.json").read_text())
         operations = {
@@ -833,18 +964,16 @@ class ValidateMergecraftTests(unittest.TestCase):
         path.write_text(path.read_text() + "\nCall pr-review-orchestration.\n")
         self.assert_rejected("retired route")
 
-    def test_rejects_publisher_text_scope_regression(self) -> None:
+    def test_rejects_publisher_text_scope_behavior_drift(self) -> None:
         path = (
             self.plugin
             / "skills/publishing-reviewable-prs/scripts/update_reviewable_pr.py"
         )
         path.write_text(
-            path.read_text().replace(
-                'text_scope == "body-only" and title != before["title"]',
-                'text_scope == "body-only" and False',
-            )
+            path.read_text()
+            + "\nupdate_text = lambda **kwargs: {'accepted': True}\n"
         )
-        self.assert_rejected("publisher text-scope contract missing")
+        self.assert_rejected("candidate runtime behavior")
 
     def test_rejects_boolean_topology_schema_version(self) -> None:
         path = self.plugin / "topology.json"
@@ -1096,66 +1225,147 @@ class ValidateMergecraftTests(unittest.TestCase):
                 self.write_eval_json("corpus.json", corpus)
                 self.assert_rejected("behavior corpus schema drift")
 
-    def test_rejects_publisher_runtime_contract_drift(self) -> None:
+    def test_rejects_publisher_parser_behavior_drift(self) -> None:
         state = (
             self.plugin
             / "skills/publishing-reviewable-prs/scripts/reviewable_pr_state.py"
         )
-        state.write_text(state.read_text().replace("head_repository", "fork_repo"))
-        self.assert_rejected("publisher runtime contract")
-
-        shutil.copy2(
-            REPO_ROOT
-            / PLUGIN
-            / "skills/publishing-reviewable-prs/scripts/reviewable_pr_state.py",
-            state,
+        state.write_text(
+            state.read_text()
+            + "\nstrict_json = lambda output, source: {'accepted': True}\n"
         )
+        self.assert_rejected("candidate runtime behavior")
+
+    def test_rejects_reconciliation_behavior_drift(self) -> None:
+        audit = (
+            self.plugin
+            / "skills/publishing-reviewable-prs/scripts/audit_reviewable_pr.py"
+        )
+        audit.write_text(audit.read_text() + "\nreconcile = lambda **kwargs: None\n")
+        self.assert_rejected("candidate runtime behavior")
+
+    def test_rejects_required_review_authority_behavior_drift(self) -> None:
+        required_review = (
+            self.plugin
+            / "skills/publishing-reviewable-prs/scripts/required_review.py"
+        )
+        required_review.write_text(
+            required_review.read_text()
+            + "\nvalidate_required_review = lambda **kwargs: None\n"
+        )
+        self.assert_rejected("candidate runtime behavior")
+
+    def assert_removed_authority_guard_rejected(self, field: str) -> None:
+        required_review = (
+            self.plugin
+            / "skills/publishing-reviewable-prs/scripts/required_review.py"
+        )
+        tree = ast.parse(required_review.read_text(encoding="utf-8"))
+        remover = AuthorityGuardRemover(field)
+        tree = remover.visit(tree)
+        self.assertEqual(remover.removed, 1)
+        required_review.write_text(
+            ast.unparse(ast.fix_missing_locations(tree)) + "\n",
+            encoding="utf-8",
+        )
+
+        result = self.run_validator("--source-stage")
+
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("candidate runtime behavior", result.stderr)
+
+    def test_source_stage_rejects_removed_required_review_access_guard(self) -> None:
+        self.assert_removed_authority_guard_rejected("access")
+
+    def test_source_stage_rejects_removed_required_review_subdelegation_guard(
+        self,
+    ) -> None:
+        self.assert_removed_authority_guard_rejected("subdelegation")
+
+    def test_source_stage_rejects_removed_required_review_external_action_guard(
+        self,
+    ) -> None:
+        self.assert_removed_authority_guard_rejected("external_action")
+
+    def test_rejects_create_lifecycle_behavior_drift(self) -> None:
+        create = (
+            self.plugin
+            / "skills/publishing-reviewable-prs/scripts/create_reviewable_pr.py"
+        )
+        create.write_text(
+            create.read_text() + "\npublish = lambda **kwargs: {'accepted': True}\n"
+        )
+        self.assert_rejected("candidate runtime behavior")
+
+    def test_rejects_receipt_audit_behavior_drift(self) -> None:
+        receipts = (
+            self.plugin
+            / "skills/publishing-reviewable-prs/scripts/publication_receipts.py"
+        )
+        receipts.write_text(
+            receipts.read_text()
+            + "\naudit_publication = lambda **kwargs: {'accepted': True}\n"
+        )
+        self.assert_rejected("candidate runtime behavior")
+
+    def test_rejects_graphite_scope_and_authority_behavior_drift(self) -> None:
+        graphite = self.plugin / "skills/graphite/scripts/submit_draft_stack.py"
+        graphite.write_text(
+            graphite.read_text() + "\nbuild_plan = lambda request: {'accepted': True}\n"
+        )
+        self.assert_rejected("candidate runtime behavior")
+
+    def test_rejects_comment_publication_behavior_drift(self) -> None:
         comment = (
-            self.plugin / "skills/getting-prs-merged/scripts/post_coderabbit_comment.py"
+            self.plugin
+            / "skills/getting-prs-merged/scripts/post_coderabbit_comment.py"
         )
-        comment.unlink()
-        self.assert_rejected("required regular file is missing")
+        comment.write_text(
+            comment.read_text() + "\npost_comment = lambda **kwargs: {'accepted': True}\n"
+        )
+        self.assert_rejected("candidate runtime behavior")
 
-    def test_rejects_graphite_helper_contract_drift(self) -> None:
-        helper = self.plugin / "skills/graphite/scripts/submit_draft_stack.py"
-        helper.write_text(
-            helper.read_text().replace('"final_audit_command"', '"audit_command"')
+    def test_rejects_publisher_exact_identity_behavior_drift(self) -> None:
+        state = (
+            self.plugin
+            / "skills/publishing-reviewable-prs/scripts/reviewable_pr_state.py"
         )
-        self.assert_rejected("Graphite helper contract missing")
+        state.write_text(
+            state.read_text()
+            + "\nidentity_matches = lambda stored, expected: True\n"
+        )
+        self.assert_rejected("candidate runtime behavior")
 
-    def test_rejects_required_review_consumer_contract_drift(self) -> None:
-        consumer = (
-            self.plugin / "skills/publishing-reviewable-prs/scripts/required_review.py"
-        )
-        original = consumer.read_text()
-        mutations = (
-            (
-                'PRODUCER_ID = "tricritical-review-loop-v2"',
-                'PRODUCER_ID = "untrusted-review-loop-v1"',
-            ),
-            (
-                "canonical Task Witness supervisor requires its closed internal "
-                "call shape",
-                "canonical Task Witness supervisor accepts an open call shape",
-            ),
-        )
-        for old, new in mutations:
-            with self.subTest(term=old):
-                consumer.write_text(original.replace(old, new))
-                self.assert_rejected("publisher required-review contract missing")
-
-    def test_rejects_feedback_head_repository_contract_drift(self) -> None:
+    def test_rejects_feedback_parser_behavior_drift(self) -> None:
         state = (
             self.plugin
             / "skills/addressing-pr-review-feedback/scripts/review_feedback_state.py"
         )
         state.write_text(
-            state.read_text().replace(
-                "validate_head_repository_identity", "validate_fork_identity"
-            )
+            state.read_text()
+            + "\nstrict_json = lambda content, source: {'accepted': True}\n"
         )
+        self.assert_rejected("candidate runtime behavior")
 
-        self.assert_rejected("feedback trust-boundary contract drift")
+    def test_rejects_feedback_state_behavior_drift(self) -> None:
+        state = (
+            self.plugin
+            / "skills/addressing-pr-review-feedback/scripts/review_feedback_state.py"
+        )
+        state.write_text(
+            state.read_text() + "\nstate_from_pages = lambda *args, **kwargs: {}\n"
+        )
+        self.assert_rejected("candidate runtime behavior")
+
+    def test_rejects_review_input_parser_behavior_drift(self) -> None:
+        parser = self.plugin / (
+            "skills/writing-reviewable-pr-descriptions/scripts/"
+            "change_navigation/review_input.py"
+        )
+        parser.write_text(
+            parser.read_text() + "\nload_review_input = lambda path: object()\n"
+        )
+        self.assert_rejected("candidate runtime behavior")
 
     def test_rejects_semantic_drift_not_named_by_phrase_checks(self) -> None:
         path = self.plugin / "README.md"

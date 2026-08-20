@@ -37,7 +37,7 @@ from types import MappingProxyType, ModuleType
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 _RUNNING_AS_ENTRYPOINT = __name__ == "__main__"
-SOURCE_SHA256 = "1f37e8a27aed32d932a2a58d287b2ac31fb2d8f8448c361c2bb6cc5e40aae6d5"
+SOURCE_SHA256 = "50bcc93534210ba4aa209da44dbc0b575e7a6f0e55b661437e0d3e4ab9462492"
 PREPARED_SUPERVISOR_SOURCE_OPTION = "--prepared-supervisor-source-sha256"
 MAX_PROOF_SOURCE_BYTES = 2 * 1024 * 1024
 RELEASE_SUPPORT_SOURCES = (
@@ -120,6 +120,7 @@ BASE_PLUGIN_SUPPORT_PATHS = {
         "release/plugin-content-locks/versionkeeping.json",
     },
     "mergecraft": {
+        "scripts/refresh_transaction.py",
         "scripts/validate_mergecraft.py",
         "tests/test_validate_mergecraft.py",
         "evals/mergecraft",
@@ -129,11 +130,13 @@ BASE_PLUGIN_SUPPORT_PATHS = {
         "release/mergecraft",
     },
     "tricritical": {
+        "scripts/refresh_transaction.py",
         "scripts/validate_tricritical.py",
         "tests/test_validate_tricritical.py",
         "tests/test_tricritical_eval_corpus.py",
     },
     "artifact-customs": {
+        "scripts/refresh_transaction.py",
         "scripts/validate_artifact_customs.py",
         "tests/test_validate_artifact_customs.py",
         "tests/test_artifact_customs_eval_corpus.py",

@@ -94,7 +94,7 @@ PACKAGE_CONTRACT_TESTS = (
             "test_rejects_invocation_profile_driver_line_neutral_byte_drift",
             "test_rejects_malformed_source_shape_record",
             "test_record_preserves_the_reviewed_source_identity_contract",
-            "test_public_contracts_are_documented_in_canonical_sources",
+            "test_public_contract_documentation_ownership_is_local_and_registered",
             "test_source_shape_record_keeps_only_machine_enforced_review_context",
             "test_launcher_behavior_driver_exports_only_runtime_behavior",
             "test_task_witness_release_inventory_is_exact_and_measured",
@@ -1417,16 +1417,6 @@ def _public_release_source_stage_argv(repository: Path) -> list[str]:
         str(repository),
         "--source-stage",
     ]
-
-
-def _direct_child_group_exists(process_group: int) -> bool:
-    try:
-        os.killpg(process_group, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
 
 
 class _DirectChildGroupCensusDeadlineExpired(TimeoutError):

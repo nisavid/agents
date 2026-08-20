@@ -6370,10 +6370,6 @@ class PortableInstallationManager:
                 observed_data_identity_digest=plan["new_data_identity_digest"],
             )
             verification = self._verify_locked(state)
-            installed = self._installed_manager(state)
-            installed._verify_service_manager()
-            if not installed._health(state["current"]):
-                raise PortableInstallError("health verification failed")
             try:
                 verify_rebind_backup_artifact(plan["backup"])
             except DataIdentityRebindError as error:

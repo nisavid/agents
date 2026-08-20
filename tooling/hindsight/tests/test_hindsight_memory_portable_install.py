@@ -7478,6 +7478,30 @@ class PortableInstallationManagerTest(unittest.TestCase):
         self.assertTrue(status["rollback_bundle_present"])
         self.assertTrue(status["verification_receipt_present"])
 
+    def test_data_identity_rebind_verify_is_offline(self) -> None:
+        manager, evidence, plan, _prestate, _sentinel, _applied = (
+            self.applied_rebind()
+        )
+        with (
+            mock.patch.object(
+                PortableInstallationManager,
+                "_verify_service_manager",
+                side_effect=AssertionError("service verification attempted"),
+            ),
+            mock.patch.object(
+                PortableInstallationManager,
+                "_health",
+                side_effect=AssertionError("runtime health attempted"),
+            ),
+        ):
+            verified = manager.data_identity_rebind_verify(
+                plan,
+                self.post_rebind_evidence(evidence),
+                now=1001,
+            )
+
+        self.assertEqual(verified["status"], "verified")
+
     def test_data_identity_rebind_verify_rejects_expired_plan(self) -> None:
         manager, evidence, plan, _prestate, _sentinel, _applied = self.applied_rebind()
         with self.assertRaisesRegex(PortableInstallError, "plan is expired"):

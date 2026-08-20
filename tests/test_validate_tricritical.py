@@ -512,9 +512,13 @@ class ValidateTricriticalTests(unittest.TestCase):
         readme = self.plugin_root / "README.md"
         real_replace = validator_module.os.replace
 
-        def replace_then_drift(source: object, destination: object) -> None:
-            real_replace(source, destination)
-            if Path(destination) == projection:
+        def replace_then_drift(
+            source: object,
+            destination: object,
+            **kwargs: object,
+        ) -> None:
+            real_replace(source, destination, **kwargs)
+            if Path(destination).name == projection.name:
                 readme.write_text(
                     readme.read_text(encoding="utf-8")
                     + "\nConcurrent semantic change.\n",

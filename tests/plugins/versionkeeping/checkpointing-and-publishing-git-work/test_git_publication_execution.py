@@ -161,9 +161,18 @@ class PublicationExecutionTests(unittest.TestCase):
         self.assertNotIn("GIT_DIR", env)
         self.assertNotIn("GIT_INDEX_FILE", env)
         self.assertNotIn("GIT_OBJECT_DIRECTORY", env)
-        self.assertNotIn("GIT_CONFIG_COUNT", env)
-        self.assertNotIn("GIT_CONFIG_KEY_0", env)
-        self.assertNotIn("GIT_CONFIG_VALUE_0", env)
+        config_count = int(env["GIT_CONFIG_COUNT"])
+        closed_config = {
+            env[f"GIT_CONFIG_KEY_{index}"]: env[f"GIT_CONFIG_VALUE_{index}"]
+            for index in range(config_count)
+        }
+        self.assertNotIn("remote.publish.url", closed_config)
+        self.assertEqual(closed_config["protocol.allow"], "never")
+        self.assertEqual(closed_config["protocol.ext.allow"], "never")
+        self.assertEqual(closed_config["credential.helper"], "")
+        self.assertEqual(closed_config["push.gpgSign"], "false")
+        self.assertEqual(closed_config["commit.gpgSign"], "false")
+        self.assertEqual(closed_config["tag.gpgSign"], "false")
         self.assertNotIn("GIT_SSL_NO_VERIFY", env)
         self.assertNotIn("GIT_SSL_CAINFO", env)
         self.assertNotIn("GIT_SSL_CAPATH", env)
@@ -171,6 +180,27 @@ class PublicationExecutionTests(unittest.TestCase):
         self.assertEqual(env["GIT_ASKPASS"], "false")
         self.assertIn("BatchMode=yes", env["GIT_SSH_COMMAND"])
         self.assertEqual(git(self.remote, "rev-parse", "refs/heads/topic"), self.source)
+
+    def test_signing_helper_is_blocked_before_push(self) -> None:
+        marker = self.root / "signing-helper-ran"
+        secret = "signer-secret-c72941"
+        helper = self.root / f"signer-{secret}"
+        helper.write_text(f"#!/bin/sh\ntouch '{marker}'\nexit 1\n", encoding="utf-8")
+        helper.chmod(0o700)
+        git(self.remote, "config", "receive.certNonceSeed", "test-seed")
+        git(self.repo, "config", "push.gpgSign", "true")
+        git(self.repo, "config", "gpg.program", str(helper))
+
+        result = execute(self.repo, self.plan)
+
+        self.assertFalse(marker.exists())
+        self.assertEqual(result["status"], "blocked")
+        self.assertFalse(result["push_attempted"])
+        self.assertEqual(
+            result["reasons"][0]["code"],
+            "UNSAFE_GIT_CONFIGURATION",
+        )
+        self.assertNotIn(secret, json.dumps(result))
 
     def test_endpoint_change_after_review_blocks_before_push(self) -> None:
         changed = self.root / "changed.git"
@@ -477,7 +507,7 @@ class PublicationExecutionTests(unittest.TestCase):
         )
         self.assertIn(unowned, fresh["reasons"][0]["evidence"]["shas"])
 
-    def test_post_review_hooks_path_cannot_run_pre_push_hook(self) -> None:
+    def test_post_review_hooks_path_blocks_before_pre_push_hook(self) -> None:
         hooks = self.root / "ambient-hooks"
         hooks.mkdir()
         sentinel = self.root / "pre-push-environment"
@@ -499,8 +529,21 @@ class PublicationExecutionTests(unittest.TestCase):
         ):
             result = execute(self.repo, self.plan)
 
-        self.assertEqual(result["status"], "verified")
+        self.assertEqual(result["status"], "blocked")
+        self.assertFalse(result["push_attempted"])
+        self.assertEqual(
+            result["reasons"],
+            [
+                {
+                    "code": "UNSAFE_GIT_CONFIGURATION",
+                    "evidence": {"config_classes": ["core.hooksPath"]},
+                }
+            ],
+        )
         self.assertFalse(sentinel.exists())
+        diagnostics = json.dumps(result)
+        self.assertNotIn(str(hooks), diagnostics)
+        self.assertNotIn(ambient_credential, diagnostics)
 
     def test_cli_duplicate_plan_key_is_malformed(self) -> None:
         plan_path = self.root / "duplicate-plan.json"

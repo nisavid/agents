@@ -50,10 +50,12 @@ present destinations and unsafe branch refs. It requires the sibling parent,
 main clone, and worktree root to be current-user-owned and not group- or
 world-writable; creates a missing root with mode `0700`; revalidates the parent,
 clone, root, and target immediately around `git worktree add`; disables ambient
-Git hooks and terminal prompts; uses a credential-minimized environment; closes
-stdin; bounds every Git call; and verifies the resulting worktree's exact
-symbolic branch. Any timeout or failure after the mutator starts is `unknown`,
-even when no target directory remains.
+Git hooks and terminal prompts; disables implicit signing; rejects configured
+hooks, filters, signing programs, helpers, and unsafe includes without exposing
+config values; uses a credential-minimized environment; closes stdin; bounds
+every Git call; and verifies the resulting worktree's exact symbolic branch. Any
+timeout or failure after the mutator starts is `unknown`, even when no target
+directory remains; raw Git stderr is not returned.
 Do not reconstruct a receipt, run the Git command separately, or override a
 blocked or `unknown` result by hand.
 

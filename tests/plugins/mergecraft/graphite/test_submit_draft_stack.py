@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import shlex
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -66,6 +69,178 @@ class GraphiteTransportTests(unittest.TestCase):
         candidate_builder.start()
         self.addCleanup(candidate_builder.stop)
 
+    def test_executable_git_configuration_classes_are_closed(self) -> None:
+        cases = {
+            "core.alternateRefsCommand": "core.alternateRefsCommand",
+            "core.askPass": "core.askPass",
+            "core.fsmonitor": "core.fsmonitor",
+            "core.gitProxy": "core.gitProxy",
+            "core.hooksPath": "core.hooksPath",
+            "core.sshCommand": "core.sshCommand",
+            "include.path": "include*.path",
+            "includeIf.onbranch:topic.path": "include*.path",
+            "protocol.ext.allow": "protocol.*.allow",
+            "filter.attack.clean": "filter.*.(clean|smudge|process)",
+            "filter.attack.smudge": "filter.*.(clean|smudge|process)",
+            "filter.attack.process": "filter.*.(clean|smudge|process)",
+            "hook.attack.command": "hook.*.command",
+            "gpg.program": "gpg.program",
+            "gpg.openpgp.program": "gpg.*.program",
+            "gpg.ssh.defaultKeyCommand": "gpg.ssh.defaultKeyCommand",
+            "credential.helper": "credential.*.helper",
+            "credential.example.com.helper": "credential.*.helper",
+            "diff.external": "diff.external",
+            "diff.attack.command": "diff.*.(command|textconv)",
+            "diff.attack.textconv": "diff.*.(command|textconv)",
+            "difftool.attack.cmd": "difftool.*.cmd",
+            "merge.attack.driver": "merge.*.driver",
+            "mergetool.attack.cmd": "mergetool.*.cmd",
+            "remote.origin.vcs": "remote.*.(vcs|uploadpack|receivepack)",
+            "remote.origin.uploadpack": "remote.*.(vcs|uploadpack|receivepack)",
+            "remote.origin.receivepack": "remote.*.(vcs|uploadpack|receivepack)",
+            "url.ext::.insteadOf": "url.*.(insteadOf|pushInsteadOf)",
+            "submodule.attack.update": "submodule.*.update",
+        }
+        for key, config_class in cases.items():
+            with self.subTest(key=key):
+                self.assertEqual(
+                    GRAPHITE._unsafe_git_config_class(key),
+                    config_class,
+                )
+        self.assertIsNone(GRAPHITE._unsafe_git_config_class("remote.origin.url"))
+
+    def test_closed_environment_disables_implicit_signing(self) -> None:
+        environment = GRAPHITE._environment()
+        closed = {
+            environment[f"GIT_CONFIG_KEY_{index}"]: environment[
+                f"GIT_CONFIG_VALUE_{index}"
+            ]
+            for index in range(int(environment["GIT_CONFIG_COUNT"]))
+        }
+        self.assertEqual(closed["push.gpgSign"], "false")
+        self.assertEqual(closed["commit.gpgSign"], "false")
+        self.assertEqual(closed["tag.gpgSign"], "false")
+
+    def test_transport_protocol_allowlist_preserves_https_and_ssh(self) -> None:
+        for endpoint in (
+            "https://example.com/acme/app.git",
+            "ssh://git@example.com/acme/app.git",
+            "git@example.com:acme/app.git",
+        ):
+            with self.subTest(endpoint=endpoint):
+                GRAPHITE._validate_remote_endpoint(endpoint, self.root)
+
+        for endpoint in (
+            "ext::/tmp/helper",
+            "git://example.com/acme/app.git",
+            "https://user:secret@example.com/acme/app.git",
+            "ssh://-oProxyCommand=helper/acme/app.git",
+        ):
+            with self.subTest(endpoint=endpoint):
+                with self.assertRaises(GRAPHITE.GraphiteTransportError) as raised:
+                    GRAPHITE._validate_remote_endpoint(endpoint, self.root)
+                self.assertNotIn(endpoint, str(raised.exception))
+
+    def test_repository_binding_rejects_a_safe_wrong_remote(self) -> None:
+        def completed(value: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess([], 0, value, "")
+
+        def wrong_remote(arguments, **_kwargs):
+            outputs = {
+                ("gt", "--version"): "1.8.6\n",
+                ("gt", "repo", "remote"): "origin\n",
+                ("gt", "repo", "owner"): "acme\n",
+                ("gt", "repo", "name"): "app\n",
+                (
+                    "git",
+                    "remote",
+                    "get-url",
+                    "--all",
+                    "--",
+                    "origin",
+                ): "https://github.com/acme/wrong.git\n",
+                (
+                    "git",
+                    "remote",
+                    "get-url",
+                    "--push",
+                    "--all",
+                    "--",
+                    "origin",
+                ): "https://github.com/acme/wrong.git\n",
+            }
+            return completed(outputs[tuple(arguments)])
+
+        with (
+            mock.patch.object(GRAPHITE, "_run", side_effect=wrong_remote),
+            self.assertRaisesRegex(
+                GRAPHITE.GraphiteTransportError,
+                "repository binding",
+            ),
+        ):
+            GRAPHITE._graphite_repository_binding(
+                self.root,
+                [self.candidate],
+                self.repository,
+            )
+
+    def test_repository_binding_accepts_exact_version_target_and_head(self) -> None:
+        def completed(value: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess([], 0, value, "")
+
+        def exact_remote(arguments, **_kwargs):
+            outputs = {
+                ("gt", "--version"): "1.8.6\n",
+                ("gt", "repo", "remote"): "origin\n",
+                ("gt", "repo", "owner"): "acme\n",
+                ("gt", "repo", "name"): "app\n",
+                (
+                    "git",
+                    "remote",
+                    "get-url",
+                    "--all",
+                    "--",
+                    "origin",
+                ): "git@github.com:acme/app.git\n",
+                (
+                    "git",
+                    "remote",
+                    "get-url",
+                    "--push",
+                    "--all",
+                    "--",
+                    "origin",
+                ): "ssh://git@github.com/acme/app.git\n",
+            }
+            return completed(outputs[tuple(arguments)])
+
+        with mock.patch.object(GRAPHITE, "_run", side_effect=exact_remote):
+            binding = GRAPHITE._graphite_repository_binding(
+                self.root,
+                [self.candidate],
+                self.repository,
+            )
+
+        self.assertEqual(binding["graphite_version"], "1.8.6")
+        self.assertEqual(binding["target_repository"], self.repository)
+        self.assertEqual(binding["head_repository"], self.repository)
+        self.assertNotIn("github.com", json.dumps(binding))
+
+    def test_repository_binding_rejects_unsupported_graphite_version(self) -> None:
+        completed = subprocess.CompletedProcess([], 0, "1.8.7\n", "")
+        with (
+            mock.patch.object(GRAPHITE, "_run", return_value=completed),
+            self.assertRaisesRegex(
+                GRAPHITE.GraphiteTransportError,
+                "unsupported Graphite version",
+            ),
+        ):
+            GRAPHITE._graphite_repository_binding(
+                self.root,
+                [self.candidate],
+                self.repository,
+            )
+
     def stored(
         self,
         *,
@@ -97,6 +272,134 @@ class GraphiteTransportTests(unittest.TestCase):
             "current_branch": "feature",
             "stack": [self.entry],
         }
+
+    def graphite_metadata(
+        self,
+        rows: list[tuple[str, str | None, str, str]],
+        *,
+        supported_schema: bool = True,
+    ) -> Path:
+        path = self.root / ".graphite_metadata.db"
+        connection = sqlite3.connect(path)
+        if supported_schema:
+            connection.executescript(
+                """
+                CREATE TABLE "branch_metadata" (
+                    "branch_name" text not null primary key,
+                    "parent_branch_name" text,
+                    "parent_branch_revision" text,
+                    "last_submitted_version" text,
+                    "state" text,
+                    "children" text,
+                    "branch_revision" text,
+                    "validation_result" text,
+                    "parent_head_revision" text
+                );
+                CREATE INDEX "idx_branch_metadata_parent"
+                    on "branch_metadata" ("parent_branch_name");
+                CREATE TABLE "kysely_migration" (
+                    "name" varchar(255) not null primary key,
+                    "timestamp" varchar(255) not null
+                );
+                CREATE TABLE "kysely_migration_lock" (
+                    "id" varchar(255) not null primary key,
+                    "is_locked" integer default 0 not null
+                );
+                """
+            )
+            connection.executemany(
+                "INSERT INTO kysely_migration(name, timestamp) VALUES (?, ?)",
+                [
+                    ("20260211_initial_schema", "fixture"),
+                    ("20260212_add_validation_columns", "fixture"),
+                    ("20260220_add_parent_head_revision", "fixture"),
+                ],
+            )
+            connection.execute(
+                "INSERT INTO kysely_migration_lock(id, is_locked) VALUES (?, ?)",
+                ("migration_lock", 0),
+            )
+            connection.executemany(
+                """
+                INSERT INTO branch_metadata(
+                    branch_name,
+                    parent_branch_name,
+                    branch_revision,
+                    validation_result
+                ) VALUES (?, ?, ?, ?)
+                """,
+                rows,
+            )
+        else:
+            connection.execute(
+                "CREATE TABLE branch_metadata(branch_name TEXT PRIMARY KEY)"
+            )
+        connection.commit()
+        connection.close()
+        return path
+
+    def initialize_git_repository(self) -> None:
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_SYSTEM": os.devnull,
+            }
+        )
+        subprocess.run(
+            ["git", "init", "--quiet", str(self.root)],
+            check=True,
+            capture_output=True,
+            env=environment,
+        )
+
+    def configure_git(self, key: str, value: str) -> None:
+        subprocess.run(
+            ["git", "-C", str(self.root), "config", "--local", key, value],
+            check=True,
+            capture_output=True,
+        )
+
+    def build_plan_with_metadata(self, metadata: Path) -> dict[str, object]:
+        def completed(value: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess([], 0, value, "")
+
+        with (
+            mock.patch.object(GRAPHITE, "_candidate", return_value=self.candidate),
+            mock.patch.object(
+                GRAPHITE,
+                "_run",
+                side_effect=[
+                    completed(self.head_oid + "\n"),
+                    completed(self.base_oid + "\n"),
+                ],
+            ),
+            mock.patch.object(
+                GRAPHITE,
+                "_git_graphite_snapshot",
+                return_value={"snapshot": "bound"},
+            ),
+            mock.patch.object(
+                GRAPHITE,
+                "_graphite_repository_binding",
+                return_value={"binding": "bound"},
+            ),
+            mock.patch.object(GRAPHITE, "_live_preimage", return_value=None),
+            mock.patch.object(
+                GRAPHITE,
+                "_graphite_metadata_path",
+                return_value=metadata,
+                create=True,
+            ),
+            mock.patch.object(
+                GRAPHITE,
+                "_establish_inert_git_policy",
+                return_value="1" * 64,
+                create=True,
+            ),
+        ):
+            return GRAPHITE.build_plan(self.request())
 
     def audit_for(
         self,
@@ -150,10 +453,34 @@ class GraphiteTransportTests(unittest.TestCase):
             "schema_version": GRAPHITE.SCHEMA_VERSION,
             "request": self.request(),
             "candidates": [self.candidate],
+            "mutation_inventory": {
+                "contract": "mergecraft-graphite-mutation-inventory-v1",
+                "metadata_sha256": "1" * 64,
+                "schema_sha256": "2" * 64,
+                "trunk": {"branch": "main", "revision": self.base_oid},
+                "branches": [
+                    {
+                        "branch": "feature",
+                        "parent": "main",
+                        "revision": self.head_oid,
+                    }
+                ],
+                "repository_binding": {
+                    "contract": "mergecraft-graphite-repository-binding-v1",
+                    "graphite_version": "1.8.6",
+                    "target_repository": self.repository,
+                    "head_repository": self.repository,
+                    "remote_sha256": "4" * 64,
+                    "fetch_endpoint_sha256": "5" * 64,
+                    "push_endpoint_sha256": "6" * 64,
+                },
+                "submit_scope": "current-and-downstack-only",
+            },
             "snapshot": {
                 "repository_root": str(self.root),
                 "current_branch": "feature",
                 "clean_status_sha256": GRAPHITE._sha_text(""),
+                "git_config_sha256": "3" * 64,
                 "gt_log_short_sha256": "d" * 64,
                 "gt_trunk_sha256": "e" * 64,
             },
@@ -183,13 +510,236 @@ class GraphiteTransportTests(unittest.TestCase):
                 "_git_graphite_snapshot",
                 return_value={"snapshot": "bound"},
             ),
+            mock.patch.object(
+                GRAPHITE,
+                "_graphite_mutation_inventory",
+                return_value={"inventory": "bound"},
+            ),
+            mock.patch.object(
+                GRAPHITE,
+                "_graphite_repository_binding",
+                return_value={"binding": "bound"},
+            ),
+            mock.patch.object(
+                GRAPHITE,
+                "_establish_inert_git_policy",
+                return_value="1" * 64,
+            ),
             mock.patch.object(GRAPHITE, "_live_preimage", return_value=None),
         ):
             plan = GRAPHITE.build_plan(self.request())
 
         self.assertEqual(plan["request"], self.request())
         self.assertEqual(plan["candidates"], [self.candidate])
+        self.assertEqual(
+            plan["mutation_inventory"]["repository_binding"],
+            {"binding": "bound"},
+        )
         self.assertNotEqual(plan["request"]["stack"], plan["candidates"])
+
+    def test_plan_rejects_an_omitted_graphite_ancestor(self) -> None:
+        metadata = self.graphite_metadata(
+            [
+                ("main", None, self.base_oid, "TRUNK"),
+                ("middle", "main", "c" * 40, "VALID"),
+                ("feature", "middle", self.head_oid, "VALID"),
+            ]
+        )
+
+        with self.assertRaisesRegex(
+            GRAPHITE.GraphiteTransportError,
+            "exactly match",
+        ):
+            self.build_plan_with_metadata(metadata)
+
+    def test_plan_rejects_metadata_revision_drift(self) -> None:
+        metadata = self.graphite_metadata(
+            [
+                ("main", None, self.base_oid, "TRUNK"),
+                ("feature", "main", "c" * 40, "VALID"),
+            ]
+        )
+
+        with self.assertRaisesRegex(
+            GRAPHITE.GraphiteTransportError,
+            "revision",
+        ):
+            self.build_plan_with_metadata(metadata)
+
+    def test_plan_fails_closed_on_unsupported_graphite_metadata(self) -> None:
+        metadata = self.graphite_metadata([], supported_schema=False)
+
+        with self.assertRaisesRegex(
+            GRAPHITE.GraphiteTransportError,
+            "unsupported Graphite metadata",
+        ):
+            self.build_plan_with_metadata(metadata)
+
+    def test_plan_accepts_the_exact_metadata_chain(self) -> None:
+        metadata = self.graphite_metadata(
+            [
+                ("main", None, self.base_oid, "TRUNK"),
+                ("feature", "main", self.head_oid, "VALID"),
+            ]
+        )
+
+        plan = self.build_plan_with_metadata(metadata)
+
+        self.assertEqual(
+            plan["mutation_inventory"]["branches"],
+            [
+                {
+                    "branch": "feature",
+                    "parent": "main",
+                    "revision": self.head_oid,
+                }
+            ],
+        )
+
+    def test_graphite_blocks_a_smudge_filter_before_it_executes(self) -> None:
+        self.initialize_git_repository()
+        payload = self.root / "payload.txt"
+        attributes = self.root / ".gitattributes"
+        payload.write_text("payload\n", encoding="utf-8")
+        attributes.write_text("payload.txt filter=attack\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "-C", str(self.root), "add", ".gitattributes", "payload.txt"],
+            check=True,
+            capture_output=True,
+        )
+        marker = Path(self.temporary.name) / "smudge-executed"
+        helper = Path(self.temporary.name) / "smudge.py"
+        helper.write_text(
+            """import pathlib
+import sys
+
+pathlib.Path(sys.argv[1]).write_text("executed", encoding="utf-8")
+sys.stdout.buffer.write(sys.stdin.buffer.read())
+""",
+            encoding="utf-8",
+        )
+        self.configure_git(
+            "filter.attack.smudge",
+            shlex.join([sys.executable, str(helper), str(marker)]),
+        )
+        payload.unlink()
+
+        with self.assertRaisesRegex(
+            GRAPHITE.GraphiteTransportError,
+            "unsafe repository Git configuration",
+        ):
+            GRAPHITE._run(
+                ["git", "checkout-index", "--force", "--", "payload.txt"],
+                cwd=self.root,
+            )
+
+        self.assertFalse(marker.exists())
+
+    def test_graphite_blocks_helper_config_without_disclosing_its_value(
+        self,
+    ) -> None:
+        self.initialize_git_repository()
+        secret = "TOP-SECRET-MERGE-HELPER-VALUE"
+        self.configure_git("mergetool.attack.cmd", f"printf {secret}")
+
+        with self.assertRaises(GRAPHITE.GraphiteTransportError) as raised:
+            GRAPHITE._run(["git", "status", "--short"], cwd=self.root)
+
+        self.assertIn("unsafe repository Git configuration", str(raised.exception))
+        self.assertNotIn(secret, str(raised.exception))
+
+    def test_graphite_blocks_signing_helper_before_gt_starts(self) -> None:
+        self.initialize_git_repository()
+        marker = Path(self.temporary.name) / "gt-signing-helper-ran"
+        secret = "TOP-SECRET-GRAPHITE-SIGNER"
+        self.configure_git("push.gpgSign", "true")
+        self.configure_git("gpg.program", f"{marker}-{secret}")
+        real_run = GRAPHITE.subprocess.run
+
+        def execute_marker_if_gt_starts(arguments, **options):
+            if Path(arguments[0]).name == "gt":
+                marker.write_text("executed", encoding="utf-8")
+                return subprocess.CompletedProcess(arguments, 0, "submitted\n", "")
+            return real_run(arguments, **options)
+
+        with (
+            mock.patch.object(
+                GRAPHITE.subprocess,
+                "run",
+                side_effect=execute_marker_if_gt_starts,
+            ),
+            self.assertRaises(GRAPHITE.GraphiteTransportError) as raised,
+        ):
+            GRAPHITE._run(["gt", "submit", "--no-stack"], cwd=self.root)
+
+        self.assertFalse(marker.exists())
+        self.assertNotIn(secret, str(raised.exception))
+
+    def test_graphite_blocks_an_insecure_local_remote(self) -> None:
+        self.initialize_git_repository()
+        remote = Path(self.temporary.name) / "insecure.git"
+        subprocess.run(
+            ["git", "init", "--quiet", "--bare", str(remote)],
+            check=True,
+            capture_output=True,
+        )
+        remote.chmod(0o777)
+        self.configure_git("remote.origin.url", str(remote))
+
+        with self.assertRaisesRegex(
+            GRAPHITE.GraphiteTransportError,
+            "owner-secure",
+        ):
+            GRAPHITE._run(["git", "status", "--short"], cwd=self.root)
+
+    def test_graphite_blocks_remote_beneath_other_owned_writable_parent(
+        self,
+    ) -> None:
+        remote = Path(self.temporary.name) / "replaceable.git"
+        subprocess.run(
+            ["git", "init", "--quiet", "--bare", str(remote)],
+            check=True,
+            capture_output=True,
+        )
+        remote.chmod(0o700)
+        parent = remote.parent.resolve()
+        parent.chmod(0o777)
+        real_lstat = Path.lstat
+
+        def other_owned_parent(path: Path, *args, **kwargs):
+            metadata = real_lstat(path, *args, **kwargs)
+            if path == parent:
+                fields = list(metadata)
+                fields[4] = os.geteuid() + 1
+                return os.stat_result(fields)
+            return metadata
+
+        try:
+            with (
+                mock.patch.object(Path, "lstat", other_owned_parent),
+                self.assertRaisesRegex(
+                    GRAPHITE.GraphiteTransportError,
+                    "owner-secure",
+                ),
+            ):
+                GRAPHITE._validate_local_remote(remote)
+        finally:
+            parent.chmod(0o700)
+
+    def test_graphite_allows_an_owner_secure_local_remote(self) -> None:
+        self.initialize_git_repository()
+        remote = Path(self.temporary.name) / "secure.git"
+        subprocess.run(
+            ["git", "init", "--quiet", "--bare", str(remote)],
+            check=True,
+            capture_output=True,
+        )
+        remote.chmod(0o700)
+        self.configure_git("remote.origin.url", str(remote))
+
+        result = GRAPHITE._run(["git", "status", "--short"], cwd=self.root)
+
+        self.assertEqual(result.returncode, 0)
 
     def test_stack_entry_requires_an_explicit_specialist_selection(self) -> None:
         entry = dict(self.entry)
@@ -249,7 +799,7 @@ class GraphiteTransportTests(unittest.TestCase):
             [
                 "gt",
                 "submit",
-                "--stack",
+                "--no-stack",
                 "--draft",
                 "--no-edit",
                 "--no-ai",

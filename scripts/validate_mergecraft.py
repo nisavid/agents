@@ -2479,6 +2479,7 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import sys
 import tempfile
 from pathlib import Path
@@ -3019,7 +3020,17 @@ with tempfile.TemporaryDirectory() as raw_directory:
         "else:\n"
         "    repository = Path.cwd().resolve()\n"
         "    command = arguments\n"
-        "if command[:2] == ['rev-parse', '--show-toplevel']:\n"
+        "if command[:2] == ['config', '--null'] and '--get-regexp' in command:\n"
+        "    raise SystemExit(1)\n"
+        "elif command[:2] == ['config', '--null']:\n"
+        "    pass\n"
+        "elif command == ['remote', 'get-url', '--all', '--', 'origin']:\n"
+        "    print('https://github.com/fork/app.git')\n"
+        "elif command == ['remote', 'get-url', '--push', '--all', '--', 'origin']:\n"
+        "    print('git@github.com:fork/app.git')\n"
+        "elif command[:3] == ['rev-parse', '--path-format=absolute', '--git-common-dir']:\n"
+        "    print(repository)\n"
+        "elif command[:2] == ['rev-parse', '--show-toplevel']:\n"
         "    print(repository)\n"
         "elif command[:1] == ['rev-parse'] and 'refs/heads/topic' in command[1]:\n"
         "    print('b' * 40)\n"
@@ -3045,11 +3056,19 @@ with tempfile.TemporaryDirectory() as raw_directory:
         f"#!{sys.executable}\n"
         "import sys\n"
         "arguments = sys.argv[1:]\n"
-        "if arguments == ['log', 'short']:\n"
+        "if arguments == ['--version']:\n"
+        "    print('1.8.6')\n"
+        "elif arguments == ['repo', 'remote']:\n"
+        "    print('origin')\n"
+        "elif arguments == ['repo', 'owner']:\n"
+        "    print('acme')\n"
+        "elif arguments == ['repo', 'name']:\n"
+        "    print('app')\n"
+        "elif arguments == ['log', 'short']:\n"
         "    print('topic')\n"
         "elif arguments == ['trunk']:\n"
         "    print('main')\n"
-        "elif arguments == ['submit', '--stack', '--draft', '--no-edit', '--no-ai', '--no-interactive']:\n"
+        "elif arguments == ['submit', '--no-stack', '--draft', '--no-edit', '--no-ai', '--no-interactive']:\n"
         "    print('submitted')\n"
         "else:\n"
         "    raise SystemExit(95)\n",
@@ -3082,6 +3101,55 @@ with tempfile.TemporaryDirectory() as raw_directory:
     )
     git_root = directory / "git-root"
     git_root.mkdir()
+    metadata = sqlite3.connect(git_root / ".graphite_metadata.db")
+    metadata.executescript(
+        'CREATE TABLE "branch_metadata" ('
+        '"branch_name" text not null primary key,'
+        '"parent_branch_name" text,'
+        '"parent_branch_revision" text,'
+        '"last_submitted_version" text,'
+        '"state" text,'
+        '"children" text,'
+        '"branch_revision" text,'
+        '"validation_result" text,'
+        '"parent_head_revision" text);'
+        'CREATE INDEX "idx_branch_metadata_parent" '
+        'on "branch_metadata" ("parent_branch_name");'
+        'CREATE TABLE "kysely_migration" ('
+        '"name" varchar(255) not null primary key,'
+        '"timestamp" varchar(255) not null);'
+        'CREATE TABLE "kysely_migration_lock" ('
+        '"id" varchar(255) not null primary key,'
+        '"is_locked" integer default 0 not null);'
+    )
+    metadata.executemany(
+        "INSERT INTO kysely_migration(name, timestamp) VALUES (?, ?)",
+        [
+            ("20260211_initial_schema", "fixture"),
+            ("20260212_add_validation_columns", "fixture"),
+            ("20260220_add_parent_head_revision", "fixture"),
+        ],
+    )
+    metadata.execute(
+        "INSERT INTO kysely_migration_lock(id, is_locked) VALUES (?, ?)",
+        ("migration_lock", 0),
+    )
+    metadata.executemany(
+        """
+        INSERT INTO branch_metadata(
+            branch_name,
+            parent_branch_name,
+            branch_revision,
+            validation_result
+        ) VALUES (?, ?, ?, ?)
+        """,
+        [
+            ("main", None, "a" * 40, "TRUNK"),
+            ("topic", "main", "b" * 40, "VALID"),
+        ],
+    )
+    metadata.commit()
+    metadata.close()
     os.chdir(git_root)
 
     support.validate_pr_content(
@@ -3405,6 +3473,15 @@ with tempfile.TemporaryDirectory() as raw_directory:
     plan = graphite.build_plan(request)
     assert plan["request"] == request
     assert plan["candidates"][0]["local_branch"] == "topic"
+    assert plan["mutation_inventory"]["branches"] == [{
+        "branch": "topic",
+        "parent": "main",
+        "revision": "b" * 40,
+    }]
+    binding = plan["mutation_inventory"]["repository_binding"]
+    assert binding["graphite_version"] == "1.8.6"
+    assert binding["target_repository"] == "acme/app"
+    assert binding["head_repository"] == "fork/app"
     assert plan["preimages"][0]["number"] == 7
     handoff = graphite.execute(plan, directory / "graphite-handoff.json")
     assert handoff["status"] == "transport-complete-repair-required"
@@ -3742,6 +3819,7 @@ def write_content_lock(
         )
 
     replace_generated_artifacts(
+        repo_root,
         {path: (content, mode)},
         recheck=recheck,
         verify=verify,

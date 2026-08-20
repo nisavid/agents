@@ -77,6 +77,10 @@ preservation. Mixed path ownership blocks.
 
 Before planning/executing, read [publication execution](references/publication-execution.md)
 for script routes, effects, trusted handoff, transport, push, and verification.
+The adapter establishes a closed Git configuration before inspection, disables
+implicit commit/tag/push signing, rejects command-valued local/worktree settings
+(including signing programs) and unsafe includes without exposing their values,
+and permits only HTTPS, SSH, or ancestry-guarded local endpoints.
 
 Follow its typed gates exactly. Ordinary publication never deletes a remote ref;
 the separate terminal route requires verified merge and explicit

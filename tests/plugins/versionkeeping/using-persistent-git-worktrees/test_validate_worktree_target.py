@@ -34,6 +34,60 @@ class ValidateWorktreeTargetTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tempdir.cleanup()
 
+    def test_executable_git_configuration_classes_are_closed(self) -> None:
+        module = load_validator_module()
+        cases = {
+            "core.alternateRefsCommand": "core.alternateRefsCommand",
+            "core.askPass": "core.askPass",
+            "core.fsmonitor": "core.fsmonitor",
+            "core.gitProxy": "core.gitProxy",
+            "core.hooksPath": "core.hooksPath",
+            "core.sshCommand": "core.sshCommand",
+            "include.path": "include*.path",
+            "includeIf.onbranch:topic.path": "include*.path",
+            "protocol.ext.allow": "protocol.*.allow",
+            "filter.attack.clean": "filter.*.(clean|smudge|process)",
+            "filter.attack.smudge": "filter.*.(clean|smudge|process)",
+            "filter.attack.process": "filter.*.(clean|smudge|process)",
+            "hook.attack.command": "hook.*.command",
+            "gpg.program": "gpg.program",
+            "gpg.openpgp.program": "gpg.*.program",
+            "gpg.ssh.defaultKeyCommand": "gpg.ssh.defaultKeyCommand",
+            "credential.helper": "credential.*.helper",
+            "credential.example.com.helper": "credential.*.helper",
+            "diff.external": "diff.external",
+            "diff.attack.command": "diff.*.(command|textconv)",
+            "diff.attack.textconv": "diff.*.(command|textconv)",
+            "difftool.attack.cmd": "difftool.*.cmd",
+            "merge.attack.driver": "merge.*.driver",
+            "mergetool.attack.cmd": "mergetool.*.cmd",
+            "remote.origin.vcs": "remote.*.(vcs|uploadpack|receivepack)",
+            "remote.origin.uploadpack": "remote.*.(vcs|uploadpack|receivepack)",
+            "remote.origin.receivepack": "remote.*.(vcs|uploadpack|receivepack)",
+            "url.ext::.insteadOf": "url.*.(insteadOf|pushInsteadOf)",
+            "submodule.attack.update": "submodule.*.update",
+        }
+        for key, config_class in cases.items():
+            with self.subTest(key=key):
+                self.assertEqual(
+                    module.unsafe_git_config_class(key),
+                    config_class,
+                )
+        self.assertIsNone(module.unsafe_git_config_class("remote.origin.url"))
+
+    def test_closed_environment_disables_implicit_signing(self) -> None:
+        module = load_validator_module()
+        environment = module.git_environment(self.root / "empty-hooks")
+        closed = {
+            environment[f"GIT_CONFIG_KEY_{index}"]: environment[
+                f"GIT_CONFIG_VALUE_{index}"
+            ]
+            for index in range(int(environment["GIT_CONFIG_COUNT"]))
+        }
+        self.assertEqual(closed["push.gpgSign"], "false")
+        self.assertEqual(closed["commit.gpgSign"], "false")
+        self.assertEqual(closed["tag.gpgSign"], "false")
+
     def run_validator(
         self,
         *,
@@ -192,7 +246,10 @@ class ValidateWorktreeTargetTests(unittest.TestCase):
             ],
         )
         self.assertTrue(add_command[2].startswith("core.hooksPath="))
-        self.assertEqual(len(commands), 5)
+        self.assertEqual(len(commands), 7)
+        self.assertTrue(
+            all("config" in command and "--name-only" in command for command in commands[:2])
+        )
         for _, options in calls:
             self.assertIs(options["stdin"], subprocess.DEVNULL)
             self.assertEqual(options["timeout"], module.GIT_TIMEOUT_SECONDS)
@@ -209,6 +266,8 @@ class ValidateWorktreeTargetTests(unittest.TestCase):
                 )
 
                 def runner(command, **kwargs):
+                    if "config" in command and "--name-only" in command:
+                        return subprocess.CompletedProcess(command, 0, "", "")
                     if "show-ref" in command:
                         return subprocess.CompletedProcess(command, 1, "", "")
                     if outcome == "timeout":
@@ -294,6 +353,180 @@ class ValidateWorktreeTargetTests(unittest.TestCase):
         self.assertEqual(json.loads(result.stdout)["status"], "created")
         self.assertFalse(marker.exists())
         self.assertTrue((self.root / "project.wt/feature").is_dir())
+
+    def test_creation_blocks_smudge_filter_before_checkout(self) -> None:
+        subprocess.run(
+            ["git", "init", str(self.clone)], check=True, capture_output=True
+        )
+        marker = self.root / "smudge-ran"
+        helper = self.root / "smudge-filter"
+        helper.write_text(f"#!/bin/sh\ntouch '{marker}'\ncat\n")
+        helper.chmod(0o700)
+        (self.clone / ".gitattributes").write_text("tracked.txt filter=attack\n")
+        (self.clone / "tracked.txt").write_text("tracked\n")
+        subprocess.run(
+            ["git", "-C", str(self.clone), "config", "filter.attack.smudge", str(helper)],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(self.clone), "add", ".gitattributes", "tracked.txt"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.clone),
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "test",
+            ],
+            check=True,
+            capture_output=True,
+        )
+
+        result = self.run_validator(create=True)
+
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(json.loads(result.stdout)["status"], "blocked")
+        self.assertFalse(marker.exists())
+        self.assertFalse((self.root / "project.wt/feature").exists())
+
+    def test_creation_blocks_named_post_checkout_hook_before_mutation(self) -> None:
+        subprocess.run(
+            ["git", "init", str(self.clone)], check=True, capture_output=True
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.clone),
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "test",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        marker = self.root / "named-hook-ran"
+        secret = "named-hook-config-secret-605a46"
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.clone),
+                "config",
+                "hook.attack.command",
+                f"touch '{marker}' # {secret}",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.clone),
+                "config",
+                "--add",
+                "hook.attack.event",
+                "post-checkout",
+            ],
+            check=True,
+            capture_output=True,
+        )
+
+        result = self.run_validator(create=True)
+
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(json.loads(result.stdout)["status"], "blocked")
+        self.assertFalse(marker.exists())
+        self.assertFalse((self.root / "project.wt").exists())
+        self.assertNotIn(secret, result.stdout + result.stderr)
+
+    def test_mutation_failure_does_not_expose_config_value_from_git_stderr(
+        self,
+    ) -> None:
+        subprocess.run(
+            ["git", "init", str(self.clone)], check=True, capture_output=True
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.clone),
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "test",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        secret = "inert-config-secret-c74dbd"
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.clone),
+                "config",
+                "checkout.workers",
+                secret,
+            ],
+            check=True,
+            capture_output=True,
+        )
+
+        result = self.run_validator(create=True)
+
+        self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["status"], "unknown")
+        self.assertNotIn("stderr", payload)
+        self.assertNotIn(secret, result.stdout + result.stderr)
+
+    def test_creation_blocks_merge_tool_command_without_exposing_its_value(self) -> None:
+        subprocess.run(
+            ["git", "init", str(self.clone)], check=True, capture_output=True
+        )
+        marker = self.root / "merge-tool-ran"
+        secret = "config-value-secret-7f70f8"
+        command = f"touch '{marker}' # {secret}"
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.clone),
+                "config",
+                "mergetool.attack.cmd",
+                command,
+            ],
+            check=True,
+            capture_output=True,
+        )
+
+        result = self.run_validator(create=True)
+
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(json.loads(result.stdout)["status"], "blocked")
+        self.assertNotIn(secret, result.stdout + result.stderr)
+        self.assertFalse(marker.exists())
+        self.assertFalse((self.root / "project.wt").exists())
 
     def test_creation_rejects_insecure_sibling_parent(self) -> None:
         module = load_validator_module()

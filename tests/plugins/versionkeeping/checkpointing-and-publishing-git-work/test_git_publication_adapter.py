@@ -71,6 +71,66 @@ def raw_request(start, source, **overrides):
 
 
 class RequestTests(unittest.TestCase):
+    def test_executable_git_configuration_classes_are_closed(self):
+        cases = {
+            "core.alternateRefsCommand": "core.alternateRefsCommand",
+            "core.askPass": "core.askPass",
+            "core.fsmonitor": "core.fsmonitor",
+            "core.gitProxy": "core.gitProxy",
+            "core.hooksPath": "core.hooksPath",
+            "core.sshCommand": "core.sshCommand",
+            "include.path": "include*.path",
+            "includeIf.onbranch:topic.path": "include*.path",
+            "protocol.ext.allow": "protocol.*.allow",
+            "filter.attack.clean": "filter.*.(clean|smudge|process)",
+            "filter.attack.smudge": "filter.*.(clean|smudge|process)",
+            "filter.attack.process": "filter.*.(clean|smudge|process)",
+            "hook.attack.command": "hook.*.command",
+            "gpg.program": "gpg.program",
+            "gpg.openpgp.program": "gpg.*.program",
+            "gpg.ssh.defaultKeyCommand": "gpg.ssh.defaultKeyCommand",
+            "credential.helper": "credential.*.helper",
+            "credential.example.com.helper": "credential.*.helper",
+            "diff.external": "diff.external",
+            "diff.attack.command": "diff.*.(command|textconv)",
+            "diff.attack.textconv": "diff.*.(command|textconv)",
+            "difftool.attack.cmd": "difftool.*.cmd",
+            "merge.attack.driver": "merge.*.driver",
+            "mergetool.attack.cmd": "mergetool.*.cmd",
+            "remote.origin.vcs": "remote.*.(vcs|uploadpack|receivepack)",
+            "remote.origin.uploadpack": "remote.*.(vcs|uploadpack|receivepack)",
+            "remote.origin.receivepack": "remote.*.(vcs|uploadpack|receivepack)",
+            "url.ext::.insteadOf": "url.*.(insteadOf|pushInsteadOf)",
+            "submodule.attack.update": "submodule.*.update",
+        }
+        for key, config_class in cases.items():
+            with self.subTest(key=key):
+                self.assertEqual(
+                    adapter._unsafe_git_config_class(key),
+                    config_class,
+                )
+        self.assertIsNone(adapter._unsafe_git_config_class("remote.origin.url"))
+
+    def test_transport_protocol_allowlist_preserves_https_and_ssh(self):
+        for endpoint in (
+            "https://example.com/acme/app.git",
+            "ssh://git@example.com/acme/app.git",
+            "git@example.com:acme/app.git",
+        ):
+            with self.subTest(endpoint=endpoint):
+                adapter._validate_transport_endpoint(endpoint)
+
+        for endpoint in (
+            "ext::/tmp/helper",
+            "git://example.com/acme/app.git",
+            "https://user:secret@example.com/acme/app.git",
+            "ssh://-oProxyCommand=helper/acme/app.git",
+        ):
+            with self.subTest(endpoint=endpoint):
+                with self.assertRaises(adapter.PolicyGate) as raised:
+                    adapter._validate_transport_endpoint(endpoint)
+                self.assertNotIn(endpoint, str(raised.exception))
+
     def test_rejects_missing_extra_and_short_sha_fields(self):
         complete = raw_request("a" * 40, "b" * 40)
         for bad in (
@@ -321,6 +381,20 @@ class RepositoryPlanningTests(unittest.TestCase):
         self.assertEqual(verified["status"], "verified")
         self.assertIsNone(verified["push"])
 
+    def test_owner_secure_relative_local_remote_is_supported(self):
+        git(
+            self.repo,
+            "remote",
+            "set-url",
+            "publish",
+            os.path.relpath(self.remote, self.repo),
+        )
+        source = commit(self.repo, "relative-remote-change")
+
+        result = self.plan(raw_request(self.start, source))
+
+        self.assertEqual(result["status"], "ready")
+
     def test_observed_default_branch_cannot_become_ready_without_permission(self):
         source = commit(self.repo, "default-branch-change")
         destination = {"remote": "publish", "ref": "refs/heads/main"}
@@ -517,6 +591,101 @@ class RepositoryPlanningTests(unittest.TestCase):
         self.assertNotIn("secret", serialized)
         self.assertNotIn(str(self.remote), serialized)
 
+    def test_ext_remote_is_blocked_before_its_helper_executes(self):
+        marker = self.root / "ext-helper-ran"
+        helper = self.root / "remote-helper"
+        helper.write_text(f"#!/bin/sh\ntouch '{marker}'\nexit 1\n")
+        helper.chmod(0o700)
+        git(self.repo, "config", "protocol.ext.allow", "always")
+        git(self.repo, "remote", "set-url", "publish", f"ext::{helper}")
+        source = commit(self.repo, "change")
+
+        result = self.plan(raw_request(self.start, source))
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertFalse(marker.exists())
+        self.assertEqual(
+            result["reasons"][0]["code"],
+            "UNSAFE_GIT_CONFIGURATION",
+        )
+
+    def test_alternate_refs_command_is_blocked_before_fetch_executes_it(self):
+        source = commit(self.repo, "change")
+        peer = self.root / "alternate-command-peer"
+        git(
+            self.root,
+            "clone",
+            "--branch",
+            "topic",
+            str(self.remote),
+            str(peer),
+        )
+        remote_only = commit(peer, "remote-only")
+        git(peer, "push", "origin", f"{remote_only}:refs/heads/topic")
+        alternate = self.root / "alternate.git"
+        git(self.root, "init", "--bare", str(alternate))
+        object_info = self.repo / ".git/objects/info"
+        object_info.mkdir(parents=True, exist_ok=True)
+        (object_info / "alternates").write_text(
+            str(alternate / "objects") + "\n",
+            encoding="utf-8",
+        )
+        marker = self.root / "alternate-command-ran"
+        helper = self.root / "alternate-command"
+        helper.write_text(f"#!/bin/sh\ntouch '{marker}'\n", encoding="utf-8")
+        helper.chmod(0o700)
+        secret = "alternate-config-secret-10d339"
+        git(
+            self.repo,
+            "config",
+            "core.alternateRefsCommand",
+            f"{helper} {secret}",
+        )
+
+        result = self.plan(raw_request(self.start, source))
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(
+            result["reasons"][0]["code"],
+            "UNSAFE_GIT_CONFIGURATION",
+        )
+        self.assertFalse(marker.exists())
+        self.assertNotIn(secret, json.dumps(result))
+
+    def test_insecure_local_remote_is_blocked_before_transport(self):
+        source = commit(self.repo, "change")
+        self.remote.chmod(0o777)
+        try:
+            result = self.plan(raw_request(self.start, source))
+        finally:
+            self.remote.chmod(0o700)
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["reasons"][0]["code"], "UNSAFE_GIT_REMOTE")
+
+    def test_other_owned_writable_remote_parent_is_blocked(self):
+        self.remote.chmod(0o700)
+        parent = self.remote.parent.resolve()
+        parent.chmod(0o777)
+        real_lstat = Path.lstat
+
+        def other_owned_parent(path: Path, *args, **kwargs):
+            metadata = real_lstat(path, *args, **kwargs)
+            if path == parent:
+                fields = list(metadata)
+                fields[4] = os.geteuid() + 1
+                return os.stat_result(fields)
+            return metadata
+
+        try:
+            with (
+                mock.patch.object(Path, "lstat", other_owned_parent),
+                self.assertRaises(adapter.PolicyGate),
+            ):
+                adapter._guard_local_remote(self.remote)
+        finally:
+            parent.chmod(0o700)
+
     def test_temporary_refs_and_fetch_head_are_untouched(self):
         source = commit(self.repo, "change")
         peer = Path(self.temp.name) / "peer"
@@ -626,10 +795,16 @@ class RepositoryPlanningTests(unittest.TestCase):
                 and "GIT_INDEX_FILE" not in env
                 and "GIT_OBJECT_DIRECTORY" not in env
                 and "GIT_ALTERNATE_OBJECT_DIRECTORIES" not in env
-                and "GIT_CONFIG_GLOBAL" not in env
-                and "GIT_CONFIG_COUNT" not in env
-                and "GIT_CONFIG_KEY_0" not in env
-                and "GIT_CONFIG_VALUE_0" not in env
+                and env.get("GIT_CONFIG_GLOBAL") == os.devnull
+                and env.get("GIT_CONFIG_SYSTEM") == os.devnull
+                and env.get("GIT_CONFIG_NOSYSTEM") == "1"
+                and int(env.get("GIT_CONFIG_COUNT", "0")) >= 8
+                and "remote.publish.url"
+                not in {
+                    env.get(f"GIT_CONFIG_KEY_{index}")
+                    for index in range(int(env.get("GIT_CONFIG_COUNT", "0")))
+                }
+                and "https://attacker.invalid/repo" not in env.values()
                 and "GIT_SSL_NO_VERIFY" not in env
                 and "GIT_SSL_CAINFO" not in env
                 and "GIT_SSL_CAPATH" not in env
@@ -670,7 +845,7 @@ class RepositoryPlanningTests(unittest.TestCase):
         self.assertEqual(calls, 1)
         self.assertEqual(result["status"], "blocked")
         self.assertEqual(result["reasons"][0]["code"], "GIT_COMMAND_TIMEOUT")
-        self.assertEqual(result["reasons"][0]["evidence"]["operation"], "rev-parse")
+        self.assertEqual(result["reasons"][0]["evidence"]["operation"], "config")
 
     def test_target_change_after_exact_fetch_gates_and_cleans_temp_ref(self):
         source = commit(self.repo, "change")

@@ -10,8 +10,10 @@ import json
 import os
 import re
 import secrets
+import stat
 import subprocess
 import tempfile
+import urllib.parse
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, IO, Iterator, List, Optional, Sequence, Tuple
@@ -43,6 +45,11 @@ EXPECTED_KEYS = {
     "creation_base_ref",
 }
 CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+SCP_ENDPOINT_RE = re.compile(
+    r"(?:(?P<user>[^/@:\s]+)@)?"
+    r"(?P<host>\[[0-9A-Fa-f:.]+\]|[^/:\s]+):"
+    r"(?P<path>[^:\s][^\s]*)"
+)
 DEFAULT_GIT_TIMEOUT_SECONDS = 30
 SCRUBBED_GIT_ENV_NAMES = {
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
@@ -88,6 +95,53 @@ SCRUBBED_GIT_ENV_NAMES = {
     "SSH_ASKPASS",
     "VERSIONKEEPING_PUBLICATION_ENDPOINT",
 }
+
+
+def _unsafe_git_config_class(key: str) -> str | None:
+    normalized = key.lower()
+    exact = {
+        "core.alternaterefscommand": "core.alternateRefsCommand",
+        "core.askpass": "core.askPass",
+        "core.attributesfile": "core.attributesFile",
+        "core.fsmonitor": "core.fsmonitor",
+        "core.gitproxy": "core.gitProxy",
+        "core.hookspath": "core.hooksPath",
+        "core.sshcommand": "core.sshCommand",
+        "core.worktree": "core.worktree",
+        "diff.external": "diff.external",
+        "gpg.program": "gpg.program",
+        "gpg.ssh.defaultkeycommand": "gpg.ssh.defaultKeyCommand",
+        "interactive.difffilter": "interactive.diffFilter",
+    }
+    if normalized in exact:
+        return exact[normalized]
+    if normalized.startswith("include.") or normalized.startswith("includeif."):
+        return "include*.path"
+    if re.fullmatch(r"protocol(?:\.[^.]+)?\.allow", normalized):
+        return "protocol.*.allow"
+    if re.fullmatch(r"filter\..+\.(?:clean|smudge|process)", normalized):
+        return "filter.*.(clean|smudge|process)"
+    if re.fullmatch(r"hook\..+\.command", normalized):
+        return "hook.*.command"
+    if re.fullmatch(r"gpg\..+\.program", normalized):
+        return "gpg.*.program"
+    if re.fullmatch(r"credential(?:\..+)?\.helper", normalized):
+        return "credential.*.helper"
+    if re.fullmatch(r"diff\..+\.(?:command|textconv)", normalized):
+        return "diff.*.(command|textconv)"
+    if re.fullmatch(r"difftool\..+\.cmd", normalized):
+        return "difftool.*.cmd"
+    if re.fullmatch(r"merge\..+\.driver", normalized):
+        return "merge.*.driver"
+    if re.fullmatch(r"mergetool\..+\.cmd", normalized):
+        return "mergetool.*.cmd"
+    if re.fullmatch(r"remote\..+\.(?:vcs|uploadpack|receivepack)", normalized):
+        return "remote.*.(vcs|uploadpack|receivepack)"
+    if re.fullmatch(r"url\..+\.(?:insteadof|pushinsteadof)", normalized):
+        return "url.*.(insteadOf|pushInsteadOf)"
+    if re.fullmatch(r"submodule\..+\.update", normalized):
+        return "submodule.*.update"
+    return None
 
 
 class MalformedRequest(ValueError):
@@ -286,6 +340,7 @@ class GitRepository:
             prefix="versionkeeping-empty-hooks-"
         )
         self.hooks_path = Path(self._empty_hooks.name).resolve()
+        self._policy_established = False
         self.env = {
             key: value
             for key, value in os.environ.items()
@@ -298,6 +353,10 @@ class GitRepository:
         self.env.update(
             {
                 "GIT_ASKPASS": "false",
+                "GIT_ATTR_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_SYSTEM": os.devnull,
                 "GIT_EDITOR": "true",
                 "GIT_NO_LAZY_FETCH": "1",
                 "GIT_NO_REPLACE_OBJECTS": "1",
@@ -313,6 +372,26 @@ class GitRepository:
                 "SSH_ASKPASS_REQUIRE": "never",
             }
         )
+        closed_config = (
+            ("core.hooksPath", str(self.hooks_path)),
+            ("core.fsmonitor", "false"),
+            ("core.attributesFile", os.devnull),
+            ("credential.helper", ""),
+            ("push.gpgSign", "false"),
+            ("commit.gpgSign", "false"),
+            ("tag.gpgSign", "false"),
+            ("protocol.allow", "never"),
+            ("protocol.ext.allow", "never"),
+            ("protocol.file.allow", "always"),
+            ("protocol.https.allow", "always"),
+            ("protocol.ssh.allow", "always"),
+            ("gc.auto", "0"),
+            ("maintenance.auto", "false"),
+        )
+        self.env["GIT_CONFIG_COUNT"] = str(len(closed_config))
+        for index, (key, value) in enumerate(closed_config):
+            self.env[f"GIT_CONFIG_KEY_{index}"] = key
+            self.env[f"GIT_CONFIG_VALUE_{index}"] = value
 
     def __enter__(self) -> "GitRepository":
         return self
@@ -323,7 +402,7 @@ class GitRepository:
     def close(self) -> None:
         self._empty_hooks.cleanup()
 
-    def run(
+    def _run_raw(
         self,
         args: Sequence[str],
         check: bool = True,
@@ -332,6 +411,13 @@ class GitRepository:
     ) -> subprocess.CompletedProcess:
         env = self.env.copy()
         if env_overrides:
+            if any(
+                key == "GIT_CONFIG_COUNT"
+                or key.startswith("GIT_CONFIG_KEY_")
+                or key.startswith("GIT_CONFIG_VALUE_")
+                for key in env_overrides
+            ):
+                raise PolicyGate("GIT_CONFIG_ENVIRONMENT_OVERRIDE_REJECTED")
             env.update(env_overrides)
         try:
             completed = subprocess.run(
@@ -353,10 +439,83 @@ class GitRepository:
         if check and completed.returncode != 0 and completed.returncode not in allowed:
             raise RuntimeError(
                 f"git command failed ({completed.returncode}): "
-                f"{args[0] if args else 'git'}: "
-                f"{completed.stderr.strip()}"
+                f"{args[0] if args else 'git'}"
             )
         return completed
+
+    def _config_key_inventory(
+        self,
+        *,
+        includes: bool,
+    ) -> list[tuple[str, str, str]]:
+        result = self._run_raw(
+            [
+                "config",
+                "--null",
+                "--show-origin",
+                "--show-scope",
+                "--includes" if includes else "--no-includes",
+                "--name-only",
+                "--list",
+            ],
+            check=False,
+        )
+        if result.returncode != 0:
+            raise PolicyGate("GIT_CONFIGURATION_UNAVAILABLE")
+        fields = result.stdout.split("\0")
+        if fields and fields[-1] == "":
+            fields.pop()
+        if len(fields) % 3 != 0:
+            raise PolicyGate("GIT_CONFIGURATION_INVENTORY_MALFORMED")
+        return [
+            (fields[index], fields[index + 1], fields[index + 2])
+            for index in range(0, len(fields), 3)
+        ]
+
+    def _establish_inert_policy(self) -> None:
+        if self._policy_established:
+            return
+        without_includes = self._config_key_inventory(includes=False)
+        include_classes = {
+            config_class
+            for scope, _origin, key in without_includes
+            if scope != "command"
+            if (config_class := _unsafe_git_config_class(key))
+            == "include*.path"
+        }
+        if include_classes:
+            raise PolicyGate(
+                "UNSAFE_GIT_CONFIGURATION",
+                config_classes=sorted(include_classes),
+            )
+        inventory = self._config_key_inventory(includes=True)
+        unsafe_classes = {
+            config_class
+            for scope, _origin, key in inventory
+            if scope != "command"
+            if (config_class := _unsafe_git_config_class(key)) is not None
+        }
+        if unsafe_classes:
+            raise PolicyGate(
+                "UNSAFE_GIT_CONFIGURATION",
+                config_classes=sorted(unsafe_classes),
+            )
+        self._policy_established = True
+
+    def run(
+        self,
+        args: Sequence[str],
+        check: bool = True,
+        allowed: Sequence[int] = (),
+        env_overrides: Optional[Dict[str, str]] = None,
+    ) -> subprocess.CompletedProcess:
+        self._establish_inert_policy()
+        return self._run_raw(
+            args,
+            check=check,
+            allowed=allowed,
+            env_overrides=env_overrides,
+        )
 
     def output(self, args: Sequence[str], allowed: Sequence[int] = ()) -> str:
         return self.run(args, allowed=allowed).stdout.strip()
@@ -620,6 +779,158 @@ def _fingerprint(endpoint: str) -> str:
     return "sha256:" + hashlib.sha256(endpoint.encode("utf-8")).hexdigest()
 
 
+def _require_secure_local_ancestry(path: Path) -> None:
+    trusted_owners = {0, os.geteuid()}
+    child = path.lstat()
+    for parent in path.parents:
+        metadata = parent.lstat()
+        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid not in trusted_owners:
+            raise PolicyGate(
+                "UNSAFE_GIT_REMOTE",
+                remote_kind="local",
+                reason="ownership_or_mode",
+            )
+        writable = stat.S_IMODE(metadata.st_mode) & 0o022
+        sticky_protection = bool(metadata.st_mode & stat.S_ISVTX) and (
+            child.st_uid in trusted_owners
+        )
+        if writable and not sticky_protection:
+            raise PolicyGate(
+                "UNSAFE_GIT_REMOTE",
+                remote_kind="local",
+                reason="ownership_or_mode",
+            )
+        child = metadata
+
+
+def _reject_untrusted_local_symlink_ancestors(path: Path) -> None:
+    current = Path(path.anchor)
+    for component in path.parts[1:-1]:
+        current /= component
+        metadata = current.lstat()
+        if not stat.S_ISLNK(metadata.st_mode):
+            continue
+        parent = current.parent.lstat()
+        if (
+            metadata.st_uid != 0
+            or parent.st_uid != 0
+            or stat.S_IMODE(parent.st_mode) & 0o022
+        ):
+            raise PolicyGate(
+                "UNSAFE_GIT_REMOTE",
+                remote_kind="local",
+                reason="ownership_or_mode",
+            )
+
+
+def _guard_local_remote(path: Path) -> None:
+    try:
+        lexical = Path(os.path.abspath(path))
+        if lexical.is_symlink():
+            raise OSError("symlinked local remote")
+        _reject_untrusted_local_symlink_ancestors(lexical)
+        resolved = lexical.resolve(strict=True)
+        metadata = resolved.lstat()
+    except (OSError, RuntimeError, ValueError) as error:
+        raise PolicyGate(
+            "UNSAFE_GIT_REMOTE",
+            remote_kind="local",
+            reason="unavailable",
+        ) from error
+    safe_kind = stat.S_ISDIR(metadata.st_mode) or (
+        stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1
+    )
+    if (
+        not safe_kind
+        or resolved.is_symlink()
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+    ):
+        raise PolicyGate(
+            "UNSAFE_GIT_REMOTE",
+            remote_kind="local",
+            reason="ownership_or_mode",
+        )
+    _require_secure_local_ancestry(resolved)
+
+
+def _is_scp_endpoint(endpoint: str) -> bool:
+    if "://" in endpoint:
+        return False
+    match = SCP_ENDPOINT_RE.fullmatch(endpoint)
+    if match is None:
+        return False
+    user = match.group("user")
+    host = match.group("host")
+    return not host.startswith("-") and (user is None or not user.startswith("-"))
+
+
+def _validate_transport_endpoint(
+    endpoint: str,
+    repository_root: Path | None = None,
+) -> None:
+    if not endpoint or CONTROL_RE.search(endpoint):
+        raise PolicyGate("UNSAFE_GIT_REMOTE", reason="malformed")
+    lowered = endpoint.lower()
+    if lowered.startswith("https://"):
+        parsed = urllib.parse.urlsplit(endpoint)
+        try:
+            port = parsed.port
+        except ValueError as error:
+            raise PolicyGate("UNSAFE_GIT_REMOTE", remote_kind="https") from error
+        if (
+            parsed.scheme.lower() != "https"
+            or not parsed.hostname
+            or parsed.hostname.startswith("-")
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or (port is not None and not 1 <= port <= 65535)
+        ):
+            raise PolicyGate("UNSAFE_GIT_REMOTE", remote_kind="https")
+        return
+    if lowered.startswith("ssh://"):
+        parsed = urllib.parse.urlsplit(endpoint)
+        try:
+            port = parsed.port
+        except ValueError as error:
+            raise PolicyGate("UNSAFE_GIT_REMOTE", remote_kind="ssh") from error
+        if (
+            parsed.scheme.lower() != "ssh"
+            or not parsed.hostname
+            or parsed.hostname.startswith("-")
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or (port is not None and not 1 <= port <= 65535)
+        ):
+            raise PolicyGate("UNSAFE_GIT_REMOTE", remote_kind="ssh")
+        return
+    if _is_scp_endpoint(endpoint):
+        return
+    if lowered.startswith("file://"):
+        parsed = urllib.parse.urlsplit(endpoint)
+        decoded = urllib.parse.unquote(parsed.path)
+        if (
+            parsed.netloc not in {"", "localhost"}
+            or parsed.query
+            or parsed.fragment
+            or CONTROL_RE.search(decoded)
+        ):
+            raise PolicyGate("UNSAFE_GIT_REMOTE", remote_kind="local")
+        local = Path(decoded)
+    else:
+        if urllib.parse.urlsplit(endpoint).scheme:
+            raise PolicyGate("UNSAFE_GIT_REMOTE", reason="unsupported_protocol")
+        local = Path(endpoint)
+    if not local.is_absolute():
+        if repository_root is None:
+            raise PolicyGate("UNSAFE_GIT_REMOTE", reason="unsupported_protocol")
+        local = repository_root / local
+    _guard_local_remote(local)
+
+
 def _endpoint(repo: GitRepository, remote: str) -> Tuple[str, str]:
     result = repo.run(
         ["remote", "get-url", "--push", "--all", "--", remote], check=False
@@ -629,6 +940,7 @@ def _endpoint(repo: GitRepository, remote: str) -> Tuple[str, str]:
     urls = result.stdout.splitlines()
     if len(urls) != 1 or not urls[0]:
         raise PolicyGate("PUSH_ENDPOINT_AMBIGUOUS", count=len(urls))
+    _validate_transport_endpoint(urls[0], repo.path)
     return urls[0], _fingerprint(urls[0])
 
 

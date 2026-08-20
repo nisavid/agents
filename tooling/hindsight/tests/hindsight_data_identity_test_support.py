@@ -104,15 +104,18 @@ def reseal_rebind_evidence(evidence: dict[str, Any]) -> dict[str, Any]:
             if key != "connection_identity_digest"
         }
     )
-    evidence["database"]["snapshot_digest"] = digest(
-        {
-            "postgres": evidence["postgres"],
-            "generation": evidence["database"]["generation_before"],
-            "observed_at": evidence["database"]["observed_at"],
-            "bank_set_digest": evidence["database"]["bank_set_digest"],
-            "codex_document_count": evidence["database"]["codex_document_count"],
-            "codex_manifest_digest": evidence["database"]["codex_manifest_digest"],
-            "schema_digest": evidence["database"]["schema_digest"],
-        }
-    )
+    snapshot = {
+        "postgres": evidence["postgres"],
+        "generation": evidence["database"]["generation_before"],
+        "observed_at": evidence["database"]["observed_at"],
+        "bank_set_digest": evidence["database"]["bank_set_digest"],
+        "codex_document_count": evidence["database"]["codex_document_count"],
+        "codex_manifest_digest": evidence["database"]["codex_manifest_digest"],
+        "schema_digest": evidence["database"]["schema_digest"],
+    }
+    if "pending_operation_set_digest" in evidence["database"]:
+        snapshot["pending_operation_set_digest"] = evidence["database"][
+            "pending_operation_set_digest"
+        ]
+    evidence["database"]["snapshot_digest"] = digest(snapshot)
     return evidence

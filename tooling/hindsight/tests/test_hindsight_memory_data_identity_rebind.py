@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 import os
 from pathlib import Path
 import sys
@@ -29,8 +30,12 @@ from hindsight_memory_control_plane.data_identity_evidence import (  # noqa: E40
     refresh_rebind_evidence,
 )
 from hindsight_memory_control_plane.canonical import digest  # noqa: E402
+from hindsight_memory_control_plane.operation_recovery_runtime import (  # noqa: E402
+    live_row_digest,
+)
 from tooling.hindsight.tests.hindsight_data_identity_test_support import (  # noqa: E402
     build_rebind_evidence,
+    reseal_rebind_evidence,
 )
 
 
@@ -60,6 +65,57 @@ class DataIdentityRebindContractTest(unittest.TestCase):
             postmaster_pid=100,
             postmaster_start_time=900,
         )
+
+    @staticmethod
+    def passive_pending_row(index: int, *, retry_count: int = 0) -> dict[str, object]:
+        row = {
+            "operation_id": f"00000000-0000-4000-8000-{index:012d}",
+            "bank_id": "engineering",
+            "operation_type": "consolidation",
+            "status": "pending",
+            "created_at": "1970-01-01T00:15:00.000000Z",
+            "updated_at": "1970-01-01T00:15:40.000000Z",
+            "completed_at": None,
+            "retry_count": retry_count,
+            "next_retry_at": None,
+            "worker_id_present": False,
+            "worker_id_digest": None,
+            "claimed_at": None,
+            "task_payload_present": True,
+            "task_payload_digest": f"{index:x}" * 64,
+            "result_metadata_digest": f"{index + 2:x}" * 64,
+            "error_category": "none",
+            "error_digest": None,
+        }
+        return row
+
+    def evidence_with_passive_pending(self) -> dict[str, object]:
+        evidence = self.evidence()
+        operations = []
+        for row in (
+            self.passive_pending_row(1),
+            self.passive_pending_row(2, retry_count=1),
+        ):
+            operations.append(
+                {
+                    **row,
+                    "current_status": row["status"],
+                    "row_digest": live_row_digest(row),
+                }
+            )
+            operations[-1].pop("status")
+        operations.sort(key=lambda item: item["operation_id"])
+        evidence["schema_version"] = 2
+        evidence["database"].update(
+            {
+                "pending_operation_count": len(operations),
+                "pending_operations": operations,
+                "pending_operation_set_digest": digest(
+                    {"operations": operations}
+                ),
+            }
+        )
+        return reseal_rebind_evidence(evidence)
 
     def plan_arguments(self) -> dict[str, object]:
         return {
@@ -100,6 +156,98 @@ class DataIdentityRebindContractTest(unittest.TestCase):
         evidence["database"]["bank_ids"] = [1, "codex"]
         with self.assertRaisesRegex(DataIdentityRebindError, "bank inventory"):
             verify_rebind_evidence(evidence, now=1000)
+
+    def test_schema2_binds_exact_passive_pending_consolidations(self) -> None:
+        evidence = self.evidence_with_passive_pending()
+
+        verified = verify_rebind_evidence(evidence, now=1000)
+
+        self.assertEqual(verified["database"]["pending_operation_count"], 2)
+        self.assertIn(
+            "pending_operation_set_digest",
+            database_continuity_projection(verified["database"]),
+        )
+
+        cases = {
+            "type": {"operation_type": "retain"},
+            "status": {"current_status": "processing"},
+            "ownership": {"worker_id_present": True},
+            "claim": {"claimed_at": "2026-08-09T19:11:20.882272Z"},
+            "future retry": {"next_retry_at": "2030-01-01T00:00:00.000000Z"},
+            "row digest": {"retry_count": 2},
+        }
+        for label, change in cases.items():
+            with self.subTest(label=label):
+                changed = deepcopy(evidence)
+                changed["database"]["pending_operations"][0].update(change)
+                changed["database"]["pending_operation_set_digest"] = digest(
+                    {"operations": changed["database"]["pending_operations"]}
+                )
+                reseal_rebind_evidence(changed)
+                with self.assertRaises(DataIdentityRebindError):
+                    verify_rebind_evidence(changed, now=1000)
+
+        too_many = deepcopy(evidence)
+        extra = deepcopy(too_many["database"]["pending_operations"][0])
+        extra["operation_id"] = "00000000-0000-4000-8000-000000000003"
+        extra_body = {key: value for key, value in extra.items() if key not in {"bank_id", "row_digest"}}
+        extra_body["status"] = extra_body.pop("current_status")
+        extra["row_digest"] = live_row_digest(extra_body)
+        too_many["database"]["pending_operations"].append(extra)
+        too_many["database"]["pending_operation_count"] = 3
+        too_many["database"]["pending_operation_set_digest"] = digest(
+            {"operations": too_many["database"]["pending_operations"]}
+        )
+        reseal_rebind_evidence(too_many)
+        with self.assertRaisesRegex(DataIdentityRebindError, "pending operation"):
+            verify_rebind_evidence(too_many, now=1000)
+
+    def test_schema2_refresh_rejects_pending_operation_drift(self) -> None:
+        initial = self.evidence_with_passive_pending()
+        postgres = dict(initial["postgres"])
+        database = deepcopy(initial["database"])
+        database["observed_at"] = 1000
+        reseal_rebind_evidence(
+            {"postgres": postgres, "database": database}
+        )
+
+        refreshed = refresh_rebind_evidence(
+            initial,
+            postgres=postgres,
+            database=database,
+            now=1000,
+        )
+        self.assertEqual(
+            refreshed["database"]["pending_operation_set_digest"],
+            initial["database"]["pending_operation_set_digest"],
+        )
+
+        drifted = deepcopy(database)
+        drifted["pending_operations"][0]["updated_at"] = (
+            "1970-01-01T00:15:41.000000Z"
+        )
+        descriptor = drifted["pending_operations"][0]
+        row = {
+            key: value
+            for key, value in descriptor.items()
+            if key not in {"bank_id", "row_digest", "current_status"}
+        }
+        row["status"] = descriptor["current_status"]
+        descriptor["row_digest"] = live_row_digest(row)
+        drifted["pending_operation_set_digest"] = digest(
+            {"operations": drifted["pending_operations"]}
+        )
+        reseal_rebind_evidence({"postgres": postgres, "database": drifted})
+        with self.assertRaisesRegex(
+            DataIdentityRebindError,
+            "database continuity differs",
+        ):
+            refresh_rebind_evidence(
+                initial,
+                postgres=postgres,
+                database=drifted,
+                now=1000,
+            )
 
     def test_supported_collector_builds_postgres_identity_from_live_binding(
         self,
@@ -229,7 +377,7 @@ class DataIdentityRebindContractTest(unittest.TestCase):
 
         class Connection:
             def __init__(self) -> None:
-                self.fetchval_results = iter((1000, 0, 0))
+                self.fetchval_results = iter((1000, 2, 0))
                 self.fetch_results = iter(
                     (
                         [{"bank_id": "codex"}, {"bank_id": "engineering"}],
@@ -269,10 +417,22 @@ class DataIdentityRebindContractTest(unittest.TestCase):
         connection = Connection()
         postgres = self.evidence()["postgres"]
         module = sys.modules[read_database_evidence.__module__]
-        with mock.patch.object(
-            module,
-            "read_generation",
-            mock.AsyncMock(side_effect=("systalyze:public:1",) * 2),
+        pending_rows = [
+            self.passive_pending_row(1),
+            self.passive_pending_row(2, retry_count=1),
+        ]
+        with (
+            mock.patch.object(
+                module,
+                "read_generation",
+                mock.AsyncMock(side_effect=("systalyze:public:1",) * 2),
+            ),
+            mock.patch.object(
+                module,
+                "read_safe_operation_rows",
+                mock.AsyncMock(return_value=pending_rows),
+                create=True,
+            ) as read_pending,
         ):
             database = asyncio.run(
                 read_database_evidence(
@@ -286,7 +446,13 @@ class DataIdentityRebindContractTest(unittest.TestCase):
             connection.transaction_arguments,
             {"isolation": "repeatable_read", "readonly": True},
         )
-        self.assertEqual(database["pending_operation_count"], 0)
+        self.assertEqual(database["pending_operation_count"], 2)
+        self.assertEqual(len(database["pending_operations"]), 2)
+        self.assertEqual(
+            database["pending_operation_set_digest"],
+            digest({"operations": database["pending_operations"]}),
+        )
+        read_pending.assert_awaited_once()
         self.assertEqual(database["generic_import_receipt_count"], 0)
         self.assertEqual(database["codex_document_count"], 5)
         self.assertEqual(
@@ -304,6 +470,9 @@ class DataIdentityRebindContractTest(unittest.TestCase):
                     "codex_document_count": 5,
                     "codex_manifest_digest": "a" * 64,
                     "schema_digest": database["schema_digest"],
+                    "pending_operation_set_digest": database[
+                        "pending_operation_set_digest"
+                    ],
                 }
             ),
         )

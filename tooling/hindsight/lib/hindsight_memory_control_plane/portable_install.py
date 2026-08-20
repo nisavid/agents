@@ -34,6 +34,7 @@ from .canonical import canonical_bytes, digest, strict_json_loads
 from .data_identity_rebind import (
     DataIdentityRebindError,
     create_rebind_plan,
+    database_continuity_projection,
     verify_rebind_backup_artifact,
     verify_rebind_evidence,
     verify_rebind_plan,
@@ -5679,18 +5680,7 @@ class PortableInstallationManager:
             or evidence["postgres"]["system_identifier"]
             != plan["postgres_system_identifier"]
             or database["observed_at"] < minimum_observed_at
-            or digest(
-                {
-                    field: database[field]
-                    for field in (
-                        "generation_before",
-                        "bank_set_digest",
-                        "codex_document_count",
-                        "codex_manifest_digest",
-                        "schema_digest",
-                    )
-                }
-            )
+            or digest(database_continuity_projection(database))
             != plan["database_continuity_digest"]
             or evidence["backup"]["artifact_sha256"] != plan["backup_artifact_digest"]
             or evidence["safety"]["database_mutation_performed"] is not False
@@ -6339,16 +6329,7 @@ class PortableInstallationManager:
             or post_evidence["postgres"]["system_identifier"]
             != plan["postgres_system_identifier"]
             or digest(
-                {
-                    field: post_evidence["database"][field]
-                    for field in (
-                        "generation_before",
-                        "bank_set_digest",
-                        "codex_document_count",
-                        "codex_manifest_digest",
-                        "schema_digest",
-                    )
-                }
+                database_continuity_projection(post_evidence["database"])
             )
             != plan["database_continuity_digest"]
             or post_evidence["safety"]["database_mutation_performed"] is not False

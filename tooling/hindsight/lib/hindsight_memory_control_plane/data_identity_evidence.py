@@ -11,17 +11,13 @@ from typing import Any
 from .canonical import digest
 from .data_identity_rebind import (
     DataIdentityRebindError,
+    database_continuity_projection,
     verify_rebind_evidence,
 )
-from .operation_recovery_runtime import read_generation
-
-
-CONTINUITY_FIELDS = (
-    "generation_before",
-    "bank_set_digest",
-    "codex_document_count",
-    "codex_manifest_digest",
-    "schema_digest",
+from .operation_recovery_runtime import (
+    live_row_digest,
+    read_generation,
+    read_safe_operation_rows,
 )
 
 
@@ -29,18 +25,6 @@ def _positive_integer(value: object, label: str) -> int:
     if type(value) is not int or value <= 0:
         raise DataIdentityRebindError(f"{label} is invalid")
     return value
-
-
-def database_continuity_projection(
-    database: Mapping[str, Any],
-) -> dict[str, Any]:
-    """Return the stable database fields bound by one rebind plan."""
-    try:
-        return {field: database[field] for field in CONTINUITY_FIELDS}
-    except (KeyError, TypeError) as error:
-        raise DataIdentityRebindError(
-            "database continuity is invalid"
-        ) from error
 
 
 def build_postgres_evidence(
@@ -126,6 +110,10 @@ def _seal_database_evidence(
             "codex_manifest_digest": body["codex_manifest_digest"],
             "schema_digest": body["schema_digest"],
         }
+        if "pending_operation_set_digest" in body:
+            snapshot["pending_operation_set_digest"] = body[
+                "pending_operation_set_digest"
+            ]
     except (KeyError, TypeError) as error:
         raise DataIdentityRebindError(
             "database evidence is invalid"
@@ -148,7 +136,7 @@ def build_rebind_evidence(
 ) -> dict[str, Any]:
     """Seal and verify one complete rebind evidence artifact."""
     value = {
-        "schema_version": 1,
+        "schema_version": 2,
         "profile_id": profile_id,
         "collected_at": collected_at,
         "expires_at": expires_at,
@@ -170,17 +158,32 @@ def refresh_rebind_evidence(
 ) -> dict[str, Any]:
     """Refresh live identity and observation without renewing authority."""
     base = verify_rebind_evidence(base_evidence, now=now)
+    try:
+        database_body = (
+            dict(database)
+            if base["schema_version"] == 2
+            else {
+                key: database[key]
+                for key in base["database"]
+                if key != "snapshot_digest"
+            }
+        )
+    except (KeyError, TypeError) as error:
+        raise DataIdentityRebindError(
+            "database evidence is invalid"
+        ) from error
+    sealed_database = _seal_database_evidence(postgres, database_body)
     if (
         database_continuity_projection(base["database"])
-        != database_continuity_projection(database)
-        or type(database.get("observed_at")) is not int
-        or database["observed_at"] < base["database"]["observed_at"]
+        != database_continuity_projection(sealed_database)
+        or type(sealed_database.get("observed_at")) is not int
+        or sealed_database["observed_at"] < base["database"]["observed_at"]
     ):
         raise DataIdentityRebindError("database continuity differs")
     value = {
         **base,
         "postgres": dict(postgres),
-        "database": _seal_database_evidence(postgres, database),
+        "database": sealed_database,
     }
     return dict(verify_rebind_evidence(value, now=now))
 
@@ -264,6 +267,13 @@ async def read_database_evidence(
             WHERE id::text LIKE 'generic-import:%'
             """
         )
+        pending_rows = await read_safe_operation_rows(
+            connection,
+            schema=schema,
+            bank_id="engineering",
+            operation_ids=None,
+            statuses=("pending", "processing"),
+        )
         schema_rows = await connection.fetch(
             """
             SELECT table_name,
@@ -298,6 +308,40 @@ async def read_database_evidence(
         raise DataIdentityRebindError(
             "database evidence is invalid"
         ) from error
+    if type(pending_operation_count) is not int or pending_operation_count != len(
+        pending_rows
+    ):
+        raise DataIdentityRebindError(
+            "database pending operation inventory differs"
+        )
+    pending_operations = []
+    for row in pending_rows:
+        body = {
+            "operation_id": row["operation_id"],
+            "operation_type": row["operation_type"],
+            "current_status": row["status"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "completed_at": row["completed_at"],
+            "retry_count": row["retry_count"],
+            "next_retry_at": row["next_retry_at"],
+            "worker_id_present": row["worker_id_present"],
+            "worker_id_digest": row["worker_id_digest"],
+            "claimed_at": row["claimed_at"],
+            "task_payload_present": row["task_payload_present"],
+            "task_payload_digest": row["task_payload_digest"],
+            "result_metadata_digest": row["result_metadata_digest"],
+            "error_category": row["error_category"],
+            "error_digest": row["error_digest"],
+        }
+        pending_operations.append(
+            {
+                "bank_id": row["bank_id"],
+                **body,
+                "row_digest": live_row_digest(row),
+            }
+        )
+    pending_operations.sort(key=lambda item: item["operation_id"])
     body = {
         "observed_at": observed_at,
         "generation_before": generation_before,
@@ -307,6 +351,10 @@ async def read_database_evidence(
         "codex_document_count": document_count,
         "codex_manifest_digest": manifest_digest,
         "pending_operation_count": pending_operation_count,
+        "pending_operations": pending_operations,
+        "pending_operation_set_digest": digest(
+            {"operations": pending_operations}
+        ),
         "generic_import_receipt_count": generic_import_receipt_count,
         "schema_digest": digest(schema_projection),
     }

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence, Set
+from datetime import datetime, timezone
 import hashlib
 import hmac
 import os
@@ -10,6 +11,7 @@ from pathlib import Path
 import stat
 import time
 from typing import Any
+import uuid
 
 from .canonical import canonical_bytes, digest, strict_json_loads
 
@@ -50,7 +52,7 @@ POSTGRES_KEYS = frozenset(
         "connection_identity_digest",
     }
 )
-DATABASE_KEYS = frozenset(
+DATABASE_V1_KEYS = frozenset(
     {
         "observed_at",
         "generation_before",
@@ -65,6 +67,36 @@ DATABASE_KEYS = frozenset(
         "snapshot_digest",
     }
 )
+PENDING_OPERATION_KEYS = frozenset(
+    {
+        "operation_id",
+        "bank_id",
+        "operation_type",
+        "current_status",
+        "created_at",
+        "updated_at",
+        "completed_at",
+        "retry_count",
+        "next_retry_at",
+        "worker_id_present",
+        "worker_id_digest",
+        "claimed_at",
+        "task_payload_present",
+        "task_payload_digest",
+        "result_metadata_digest",
+        "error_category",
+        "error_digest",
+        "row_digest",
+    }
+)
+DATABASE_V2_KEYS = DATABASE_V1_KEYS | frozenset(
+    {
+        "pending_operations",
+        "pending_operation_set_digest",
+    }
+)
+MAX_PASSIVE_PENDING_OPERATIONS = 2
+MAX_PASSIVE_PENDING_RETRY_COUNT = 3
 BACKUP_KEYS = frozenset(
     {
         "artifact_root",
@@ -189,6 +221,49 @@ def _integer(value: object, label: str, *, minimum: int = 0) -> int:
 def _literal_bool(value: object, label: str, *, expected: bool) -> None:
     if type(value) is not bool or value is not expected:
         raise DataIdentityRebindError(f"{label} is invalid")
+
+
+def _utc_timestamp(value: object, label: str) -> float:
+    text = _text(value, label, maximum=32)
+    try:
+        parsed = datetime.strptime(
+            text,
+            "%Y-%m-%dT%H:%M:%S.%fZ",
+        ).replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+    except (OverflowError, OSError, ValueError) as error:
+        raise DataIdentityRebindError(f"{label} is invalid") from error
+
+
+def database_continuity_projection(
+    database: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return immutable database fields bound by one rebind approval."""
+    fields = (
+        "generation_before",
+        "bank_set_digest",
+        "codex_document_count",
+        "codex_manifest_digest",
+        "schema_digest",
+    )
+    try:
+        projection = {field: database[field] for field in fields}
+        if "pending_operation_set_digest" in database:
+            projection.update(
+                {
+                    "pending_operation_count": database[
+                        "pending_operation_count"
+                    ],
+                    "pending_operation_set_digest": database[
+                        "pending_operation_set_digest"
+                    ],
+                }
+            )
+        return projection
+    except (KeyError, TypeError) as error:
+        raise DataIdentityRebindError(
+            "database continuity is invalid"
+        ) from error
 
 
 def _absolute_path(value: object, label: str) -> Path:
@@ -351,9 +426,154 @@ def _verify_postgres_evidence(value: object) -> Mapping[str, Any]:
     return postgres
 
 
-def _verify_database_evidence(value: object) -> Mapping[str, Any]:
-    database = _closed(value, DATABASE_KEYS, "database evidence")
-    _integer(database.get("observed_at"), "database observation time")
+def _verify_passive_pending_operation(
+    value: object,
+    *,
+    observed_at: int,
+) -> Mapping[str, Any]:
+    operation = _closed(
+        value,
+        PENDING_OPERATION_KEYS,
+        "passive pending operation",
+    )
+    operation_id = _text(
+        operation.get("operation_id"),
+        "pending operation ID",
+        maximum=36,
+    )
+    try:
+        if str(uuid.UUID(operation_id)) != operation_id:
+            raise ValueError
+    except (AttributeError, TypeError, ValueError) as error:
+        raise DataIdentityRebindError(
+            "pending operation ID is invalid"
+        ) from error
+    if (
+        operation.get("bank_id") != "engineering"
+        or operation.get("operation_type") != "consolidation"
+        or operation.get("current_status") != "pending"
+        or operation.get("completed_at") is not None
+        or operation.get("worker_id_digest") is not None
+        or operation.get("claimed_at") is not None
+    ):
+        raise DataIdentityRebindError(
+            "passive pending operation shape is invalid"
+        )
+    _literal_bool(
+        operation.get("worker_id_present"),
+        "pending operation ownership",
+        expected=False,
+    )
+    _literal_bool(
+        operation.get("task_payload_present"),
+        "pending operation task payload marker",
+        expected=True,
+    )
+    retry_count = _integer(
+        operation.get("retry_count"),
+        "pending operation retry count",
+    )
+    if retry_count > MAX_PASSIVE_PENDING_RETRY_COUNT:
+        raise DataIdentityRebindError(
+            "pending operation retry count is invalid"
+        )
+    created_at = _utc_timestamp(
+        operation.get("created_at"),
+        "pending operation creation time",
+    )
+    updated_at = _utc_timestamp(
+        operation.get("updated_at"),
+        "pending operation update time",
+    )
+    if created_at > updated_at or updated_at > observed_at + 1:
+        raise DataIdentityRebindError(
+            "pending operation timestamps are invalid"
+        )
+    next_retry_at = operation.get("next_retry_at")
+    if (
+        next_retry_at is not None
+        and _utc_timestamp(
+            next_retry_at,
+            "pending operation retry time",
+        )
+        > observed_at
+    ):
+        raise DataIdentityRebindError(
+            "pending operation is not due"
+        )
+    _sha(
+        operation.get("task_payload_digest"),
+        "pending operation task payload digest",
+    )
+    _sha(
+        operation.get("result_metadata_digest"),
+        "pending operation result metadata digest",
+    )
+    error_category = operation.get("error_category")
+    if error_category not in {
+        "none",
+        "authentication",
+        "provider_capacity",
+        "provider_transport",
+        "internal",
+        "unknown",
+    }:
+        raise DataIdentityRebindError(
+            "pending operation error category is invalid"
+        )
+    error_digest = operation.get("error_digest")
+    if (error_category == "none") != (error_digest is None):
+        raise DataIdentityRebindError(
+            "pending operation error evidence is invalid"
+        )
+    if error_digest is not None:
+        _sha(error_digest, "pending operation error digest")
+    row_digest = _sha(
+        operation.get("row_digest"),
+        "pending operation row digest",
+    )
+    row_body = {
+        key: operation[key]
+        for key in (
+            "operation_id",
+            "operation_type",
+            "current_status",
+            "created_at",
+            "updated_at",
+            "completed_at",
+            "retry_count",
+            "next_retry_at",
+            "worker_id_present",
+            "worker_id_digest",
+            "claimed_at",
+            "task_payload_present",
+            "task_payload_digest",
+            "result_metadata_digest",
+            "error_category",
+            "error_digest",
+        )
+    }
+    if row_digest != digest(row_body):
+        raise DataIdentityRebindError(
+            "pending operation row digest differs"
+        )
+    return operation
+
+
+def _verify_database_evidence(
+    value: object,
+    *,
+    schema_version: int,
+) -> Mapping[str, Any]:
+    database = _closed(
+        value,
+        DATABASE_V1_KEYS if schema_version == 1 else DATABASE_V2_KEYS,
+        "database evidence",
+    )
+    observed_at = _integer(
+        database.get("observed_at"),
+        "database observation time",
+    )
     before = _text(database.get("generation_before"), "pre-snapshot generation")
     after = _text(database.get("generation_after"), "post-snapshot generation")
     if not hmac.compare_digest(before.encode(), after.encode()):
@@ -374,8 +594,45 @@ def _verify_database_evidence(value: object) -> Mapping[str, Any]:
         raise DataIdentityRebindError("database bank-set digest differs")
     _integer(database.get("codex_document_count"), "codex document count", minimum=1)
     _sha(database.get("codex_manifest_digest"), "codex manifest digest")
-    if _integer(database.get("pending_operation_count"), "pending operation count"):
-        raise DataIdentityRebindError("database has pending operations")
+    pending_operation_count = _integer(
+        database.get("pending_operation_count"),
+        "pending operation count",
+    )
+    if schema_version == 1:
+        if pending_operation_count:
+            raise DataIdentityRebindError("database has pending operations")
+    else:
+        pending_operations = database.get("pending_operations")
+        if (
+            not isinstance(pending_operations, Sequence)
+            or isinstance(pending_operations, (str, bytes))
+            or len(pending_operations) != pending_operation_count
+            or len(pending_operations) > MAX_PASSIVE_PENDING_OPERATIONS
+        ):
+            raise DataIdentityRebindError(
+                "database pending operation exception is invalid"
+            )
+        checked_pending = [
+            _verify_passive_pending_operation(
+                item,
+                observed_at=observed_at,
+            )
+            for item in pending_operations
+        ]
+        if [item["operation_id"] for item in checked_pending] != sorted(
+            {item["operation_id"] for item in checked_pending}
+        ):
+            raise DataIdentityRebindError(
+                "database pending operation set is invalid"
+            )
+        pending_digest = _sha(
+            database.get("pending_operation_set_digest"),
+            "pending operation set digest",
+        )
+        if pending_digest != digest({"operations": checked_pending}):
+            raise DataIdentityRebindError(
+                "pending operation set digest differs"
+            )
     if _integer(
         database.get("generic_import_receipt_count"),
         "generic-import receipt count",
@@ -558,10 +815,8 @@ def verify_rebind_evidence(
     """Validate payload-free live, backup, restore, and safety evidence."""
     evidence = _normalized(value)
     _closed(evidence, EVIDENCE_KEYS, "data-identity evidence")
-    if (
-        type(evidence.get("schema_version")) is not int
-        or evidence.get("schema_version") != 1
-    ):
+    schema_version = evidence.get("schema_version")
+    if type(schema_version) is not int or schema_version not in {1, 2}:
         raise DataIdentityRebindError("data-identity evidence is invalid")
     _text(evidence.get("profile_id"), "profile ID", maximum=127)
     collected_at = _integer(evidence.get("collected_at"), "collection time")
@@ -576,7 +831,10 @@ def verify_rebind_evidence(
         raise DataIdentityRebindError("data-identity evidence is expired")
 
     postgres = _verify_postgres_evidence(evidence.get("postgres"))
-    database = _verify_database_evidence(evidence.get("database"))
+    database = _verify_database_evidence(
+        evidence.get("database"),
+        schema_version=schema_version,
+    )
     if not collected_at <= database["observed_at"] <= current_time:
         raise DataIdentityRebindError(
             "database observation time is outside evidence window"
@@ -605,6 +863,15 @@ def verify_rebind_evidence(
             "codex_document_count": database["codex_document_count"],
             "codex_manifest_digest": database["codex_manifest_digest"],
             "schema_digest": database["schema_digest"],
+            **(
+                {
+                    "pending_operation_set_digest": database[
+                        "pending_operation_set_digest"
+                    ]
+                }
+                if schema_version == 2
+                else {}
+            ),
         }
     )
     if database["snapshot_digest"] != expected_snapshot:
@@ -658,16 +925,7 @@ def create_rebind_plan(
         ),
         "evidence_digest": digest(checked),
         "database_continuity_digest": digest(
-            {
-                field: checked["database"][field]
-                for field in (
-                    "generation_before",
-                    "bank_set_digest",
-                    "codex_document_count",
-                    "codex_manifest_digest",
-                    "schema_digest",
-                )
-            }
+            database_continuity_projection(checked["database"])
         ),
         "postgres_system_identifier": checked["postgres"]["system_identifier"],
         "backup_artifact_digest": checked["backup"]["artifact_sha256"],

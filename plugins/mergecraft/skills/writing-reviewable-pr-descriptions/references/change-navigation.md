@@ -150,6 +150,9 @@ exact pushed base/head first; stop rather than publish when it is unavailable:
 - Use singular `file` and plural `files` correctly in group badges.
 - The expansion contains only canonical category rows and their indented file
   rows. Reject alternate list markers, prose, or other residual content.
+- Authenticate the summary touched count, summary category totals, and expanded
+  category file counts against the complete sealed Git and categorized
+  inventories, including when only a bounded subset of file rows is rendered.
 
 ## Edge Checks
 
@@ -167,8 +170,17 @@ exact pushed base/head first; stop rather than publish when it is unavailable:
   removed in Stack operations.
 - Renamed stack title: refresh every linked title's `alt` and `title`, not only
   the visible list link.
-- Large stack or diff: keep the disclosures collapsed by default; do not truncate
-  the complete inventory merely to shorten the source.
+- Large stack or diff: keep disclosures collapsed. For at most 100 files,
+  render the complete inventory. For more than 100, retain the complete exact
+  Git and categorized inventories in review input, render only the first 100
+  target paths in deterministic Git path order, then add exactly
+  `- **N files omitted from this bounded inventory.** [View the complete immutable comparison](https://github.com/OWNER/REPO/compare/BASE_OID...HEAD_OID)`.
+  A schema-v3 review input over 100 files must contain that canonical bounded
+  presentation; one with at most 100 files must not. Place the omission record
+  exactly once after every rendered category and file row, immediately before
+  the taxonomy note except for blank lines. The count, repository, and
+  immutable OIDs must match, and the complete body must not exceed 65,536
+  characters.
 - Shields unavailable: meaningful `alt` text must leave the summaries and file
   metrics understandable.
 
@@ -185,3 +197,12 @@ python3 "<plugin>/skills/writing-reviewable-pr-descriptions/scripts/validate_cha
 
 Both the Stack current item and every Diff file link must match that repository
 and PR number.
+
+For a new stacked PR, the manifest may use
+`__PUBLISHING_REVIEWABLE_PRS_PR_NUMBER__` only as the number and matching URL
+suffix of its sole current Stack row. Validation projects that row to the
+supplied sentinel or assigned PR number before exact Stack comparison. Existing
+manifests and noncurrent rows require positive integer PR numbers. A new,
+unstacked PR may use an empty Stack inventory. Whenever a Stack inventory is
+present, its sole current row's category and file-operation totals must match
+the complete sealed categorized and Git inventories.

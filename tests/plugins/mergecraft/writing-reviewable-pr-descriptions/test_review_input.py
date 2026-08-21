@@ -11,13 +11,13 @@ from pathlib import Path
 
 REPOSITORY = Path(__file__).resolve().parents[4]
 PRODUCTION_SCRIPTS = (
-    REPOSITORY
-    / "plugins/mergecraft/skills/writing-reviewable-pr-descriptions/scripts"
+    REPOSITORY / "plugins/mergecraft/skills/writing-reviewable-pr-descriptions/scripts"
 )
 sys.path.insert(0, str(PRODUCTION_SCRIPTS))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from change_navigation.diff_files import manifest_rows  # noqa: E402
+from change_navigation.git_observer import observe_git_diff  # noqa: E402
 from change_navigation.review_input import (  # noqa: E402
     PR_NUMBER_TOKEN,
     VERSION,
@@ -30,6 +30,9 @@ from test_validate_change_navigation import (  # noqa: E402
     MODULE,
     PRODUCTION_VALIDATE,
     SCRIPT,
+    STACK,
+    atomic_metric,
+    badge,
 )
 
 
@@ -129,6 +132,159 @@ def manifest(
     )
 
 
+def reseal(value: dict[str, object]) -> dict[str, object]:
+    return seal({key: item for key, item in value.items() if key != "content_sha256"})
+
+
+def bounded_body(total: int = 101) -> str:
+    summary = " ".join(
+        [
+            badge("DIFF", "DIFF-57606A", style="for-the-badge"),
+            badge(
+                f"IMPL: {total} additions, 0 deletions",
+                f"IMPL-%2B{total}%20%E2%88%920-0969DA",
+            ),
+            badge(f"FILES: {total} touched", f"FILES-{total}-5F6B78"),
+        ]
+    ).replace("</picture> ", "</picture>&nbsp;", 1)
+    category = " ".join(
+        [
+            badge(
+                f"IMPL: {total} additions, 0 deletions",
+                f"IMPL-%2B{total}%20%E2%88%920-0969DA",
+            ),
+            badge(f"FILES: {total} implementation files", f"FILES-{total}-5F6B78"),
+        ]
+    )
+    rows = [
+        f"  - [`src/{index:03d}.ts`](https://github.com/acme/app/pull/2/files#diff-"
+        f"{hashlib.sha256(f'src/{index:03d}.ts'.encode()).hexdigest()}) {atomic_metric(1, 0)}"
+        for index in range(100)
+    ]
+    comparison = "https://github.com/acme/app/compare/" + "a" * 40 + "..." + "b" * 40
+    return "\n".join(
+        [
+            "<details>",
+            f"<summary>{summary}</summary>",
+            "",
+            f"- {category}",
+            *rows,
+            f"- **{total - 100} files omitted from this bounded inventory.** "
+            f"[View the complete immutable comparison]({comparison})",
+            "",
+            "<sup>IMPL means non-test source and configuration. TEST means automated verification. "
+            "DOC means reviewer and user documentation. GEN means generated artifacts. OTHER means "
+            "files outside those categories. FILES shows added, modified, and removed files as +, ~, and −.</sup>",
+            "",
+            "</details>",
+            "",
+            "## Summary",
+            "- Bounded inventory.",
+            "",
+        ]
+    )
+
+
+def exact_pr39_body(
+    git_diff: list[dict[str, object]],
+) -> tuple[str, list[dict[str, object]]]:
+    additions = sum(int(row["additions"] or 0) for row in git_diff)
+    deletions = sum(int(row["deletions"] or 0) for row in git_diff)
+    summary = " ".join(
+        [
+            badge("DIFF", "DIFF-57606A", style="for-the-badge"),
+            badge(
+                f"OTHER: {additions} additions, {deletions} deletions",
+                f"OTHER-%2B{additions}%20%E2%88%92{deletions}-57606A",
+            ),
+            badge("FILES: 592 touched", "FILES-592-5F6B78"),
+        ]
+    ).replace("</picture> ", "</picture>&nbsp;", 1)
+    category = " ".join(
+        [
+            badge(
+                f"OTHER: {additions} additions, {deletions} deletions",
+                f"OTHER-%2B{additions}%20%E2%88%92{deletions}-57606A",
+            ),
+            badge("FILES: 592 other files", "FILES-592-5F6B78"),
+        ]
+    )
+    rows, categorized = [], []
+    for row in git_diff:
+        operation = (
+            "MOVED"
+            if row["operation"] == "renamed"
+            else "COPIED"
+            if row["operation"] == "copied"
+            else "BINARY"
+            if row["binary"]
+            else "ATOMIC"
+        )
+        categorized.append(
+            {
+                "category": "OTHER",
+                "operation": operation,
+                "source_path": row["source_path"]
+                if operation in {"MOVED", "COPIED"}
+                else None,
+                "target_path": row["target_path"],
+                "additions": int(row["additions"] or 0),
+                "deletions": int(row["deletions"] or 0),
+            }
+        )
+    for row in categorized[:100]:
+        target = str(row["target_path"])
+        anchor = hashlib.sha256(target.encode()).hexdigest()
+        if row["operation"] in {"MOVED", "COPIED"}:
+            label = f"[`{row['source_path']}` → `{target}`]"
+        else:
+            label = f"[`{target}`]"
+        metric = (
+            badge(
+                str(row["operation"]),
+                f"{row['operation']}-5F6B78",
+                title=str(row["operation"]),
+            )
+            if row["operation"] == "BINARY"
+            else (
+                (
+                    badge(
+                        str(row["operation"]),
+                        f"{row['operation']}-5F6B78",
+                        title=str(row["operation"]),
+                    )
+                    + " "
+                )
+                if row["operation"] in {"MOVED", "COPIED"}
+                else ""
+            )
+            + atomic_metric(int(row["additions"]), int(row["deletions"]))
+        )
+        rows.append(
+            f"  - {label}(https://github.com/nisavid/agents/pull/39/files#diff-{anchor}) {metric}"
+        )
+    comparison = "https://github.com/nisavid/agents/compare/29eb536f04a428d8b84a04c443c99223abb7a8e7...74772595e20dc9b218131f364dd68f762c1dfbc2"
+    body = "\n".join(
+        [
+            "<details>",
+            f"<summary>{summary}</summary>",
+            "",
+            f"- {category}",
+            *rows,
+            f"- **492 files omitted from this bounded inventory.** [View the complete immutable comparison]({comparison})",
+            "",
+            "<sup>IMPL means non-test source and configuration. TEST means automated verification. DOC means reviewer and user documentation. GEN means generated artifacts. OTHER means files outside those categories. FILES shows added, modified, and removed files as +, ~, and −.</sup>",
+            "",
+            "</details>",
+            "",
+            "## Summary",
+            "- Exact PR #39 bounded inventory.",
+            "",
+        ]
+    )
+    return body, categorized
+
+
 class ReviewInputTests(unittest.TestCase):
     def write(self, value: dict[str, object], *, raw: str | None = None) -> Path:
         directory = tempfile.TemporaryDirectory()
@@ -194,6 +350,479 @@ class ReviewInputTests(unittest.TestCase):
                 title="feat: widget",
                 review_input_path=path,
             )
+        )
+
+    def test_large_diff_presentation_binds_first_100_git_targets(self) -> None:
+        value = manifest(DIFF)
+        seed_git = value["git_diff"][0]  # type: ignore[index]
+        seed_diff = value["diff"][0]  # type: ignore[index]
+        value["git_diff"] = []
+        value["diff"] = []
+        for index in range(101):
+            target = f"src/{index:03d}.ts"
+            value["git_diff"].append({**seed_git, "target_path": target})  # type: ignore[union-attr]
+            value["diff"].append({**seed_diff, "target_path": target})  # type: ignore[union-attr]
+        value["presentation"] = {
+            "selected_targets": [f"src/{index:03d}.ts" for index in range(100)],
+            "omitted_count": 1,
+            "comparison_url": "https://github.com/acme/app/compare/"
+            + "a" * 40
+            + "..."
+            + "b" * 40,
+        }
+        loaded = load_review_input(self.write(reseal(value)))
+        self.assertEqual(loaded.raw["presentation"]["omitted_count"], 1)
+
+        for mutation, message in (
+            (lambda item: item["selected_targets"].reverse(), "first 100"),
+            (lambda item: item.__setitem__("omitted_count", 2), "omitted_count"),
+            (
+                lambda item: item.__setitem__(
+                    "comparison_url",
+                    "https://github.com/other/app/compare/"
+                    + "a" * 40
+                    + "..."
+                    + "b" * 40,
+                ),
+                "comparison URL",
+            ),
+        ):
+            broken = copy.deepcopy(value)
+            mutation(broken["presentation"])
+            with self.assertRaisesRegex(ReviewInputError, message):
+                load_review_input(self.write(reseal(broken)))
+
+    def test_rejects_presentation_for_100_or_fewer_files(self) -> None:
+        value = manifest(DIFF)
+        value["presentation"] = {
+            "selected_targets": ["src/widget.ts"],
+            "omitted_count": 0,
+            "comparison_url": "https://github.com/acme/app/compare/"
+            + "a" * 40
+            + "..."
+            + "b" * 40,
+        }
+        with self.assertRaisesRegex(ReviewInputError, "over 100"):
+            load_review_input(self.write(reseal(value)))
+
+    def test_requires_presentation_for_more_than_100_files(self) -> None:
+        value = manifest(bounded_body())
+        value["git_diff"].append(
+            {
+                "source_path": None,
+                "target_path": "src/100.ts",
+                "operation": "modified",
+                "additions": 1,
+                "deletions": 0,
+                "binary": False,
+            }
+        )
+        value["diff"].append(
+            {
+                "category": "IMPL",
+                "operation": "ATOMIC",
+                "source_path": None,
+                "target_path": "src/100.ts",
+                "additions": 1,
+                "deletions": 0,
+            }
+        )
+
+        with self.assertRaisesRegex(ReviewInputError, "requires presentation"):
+            load_review_input(self.write(reseal(value)))
+
+    def test_new_pr_stack_token_is_only_allowed_on_sole_current_row(self) -> None:
+        template = DIFF + "\n" + PR_NUMBER_TOKEN
+        value = manifest(template, pr_number=PR_NUMBER_TOKEN)
+        value["stack"] = [
+            {
+                "number": PR_NUMBER_TOKEN,
+                "title": "feat: widget",
+                "url": f"https://github.com/acme/app/pull/{PR_NUMBER_TOKEN}",
+                "current": True,
+                "metrics": {"IMPL": [9, 3]},
+                "file_operations": {
+                    "added": 0,
+                    "modified": 1,
+                    "removed": 0,
+                    "moved": 0,
+                    "copied": 0,
+                },
+            }
+        ]
+        self.assertEqual(
+            load_review_input(self.write(reseal(value))).raw["stack"][0]["number"],
+            PR_NUMBER_TOKEN,
+        )
+
+        for change in ("noncurrent", "wrong-url", "second-current", "existing"):
+            broken = copy.deepcopy(value)
+            if change == "noncurrent":
+                broken["stack"][0]["current"] = False
+            elif change == "wrong-url":
+                broken["stack"][0]["url"] = (
+                    f"https://github.com/other/app/pull/{PR_NUMBER_TOKEN}"
+                )
+            elif change == "second-current":
+                broken["stack"].append(
+                    {
+                        **broken["stack"][0],
+                        "number": 1,
+                        "url": "https://github.com/acme/app/pull/1",
+                    }
+                )
+            else:
+                broken["pr_number"] = 2
+                broken["baseline"] = manifest(DIFF)["baseline"]
+            with self.subTest(change=change), self.assertRaises(ReviewInputError):
+                load_review_input(self.write(reseal(broken)))
+
+    def test_new_pr_nonempty_stack_requires_token_current_identity(self) -> None:
+        value = manifest(DIFF, pr_number=PR_NUMBER_TOKEN)
+        value["stack"] = [
+            {
+                "number": 123,
+                "title": "feat: widget",
+                "url": "https://github.com/acme/app/pull/123",
+                "current": True,
+                "metrics": {"IMPL": [9, 3]},
+                "file_operations": {
+                    "added": 0,
+                    "modified": 1,
+                    "removed": 0,
+                    "moved": 0,
+                    "copied": 0,
+                },
+            }
+        ]
+
+        with self.assertRaisesRegex(ReviewInputError, "new-PR token"):
+            load_review_input(self.write(reseal(value)))
+
+        value["stack"] = []
+        self.assertEqual(load_review_input(self.write(reseal(value))).raw["stack"], [])
+
+    def test_current_stack_aggregates_must_match_full_sealed_diff(self) -> None:
+        value = manifest(DIFF)
+        value["stack"] = [
+            {
+                "number": 2,
+                "title": "feat: widget",
+                "url": "https://github.com/acme/app/pull/2",
+                "current": True,
+                "metrics": {"IMPL": [8, 3]},
+                "file_operations": {
+                    "added": 1,
+                    "modified": 0,
+                    "removed": 0,
+                    "moved": 0,
+                    "copied": 0,
+                },
+            }
+        ]
+
+        with self.assertRaisesRegex(ReviewInputError, "current Stack aggregates"):
+            load_review_input(self.write(reseal(value)))
+
+    def test_public_validator_projects_new_pr_stack_token_to_assigned_number(
+        self,
+    ) -> None:
+        token_stack = STACK.replace("#2", f"#{PR_NUMBER_TOKEN}").replace(
+            "/pull/2", f"/pull/{PR_NUMBER_TOKEN}"
+        )
+        token_diff = DIFF.replace("/pull/2", f"/pull/{PR_NUMBER_TOKEN}")
+        template = token_stack + token_diff
+        value = manifest(DIFF, pr_number=PR_NUMBER_TOKEN)
+        value["candidate"]["body_sha256"] = digest(template)
+        value["stack"] = [
+            {
+                "number": 1,
+                "title": "feat: base",
+                "url": "https://github.com/acme/app/pull/1",
+                "current": False,
+                "metrics": {"IMPL": [1, 0]},
+                "file_operations": {
+                    "added": 1,
+                    "modified": 0,
+                    "removed": 0,
+                    "moved": 0,
+                    "copied": 0,
+                },
+            },
+            {
+                "number": PR_NUMBER_TOKEN,
+                "title": "feat: top",
+                "url": f"https://github.com/acme/app/pull/{PR_NUMBER_TOKEN}",
+                "current": True,
+                "metrics": {"IMPL": [9, 3]},
+                "file_operations": {
+                    "added": 0,
+                    "modified": 1,
+                    "removed": 0,
+                    "moved": 0,
+                    "copied": 0,
+                },
+            },
+        ]
+        value = reseal(value)
+        path = self.write(value)
+        for assigned in (2_147_483_647, 41):
+            with self.subTest(assigned=assigned):
+                rendered = template.replace(PR_NUMBER_TOKEN, str(assigned))
+                self.assertEqual(
+                    PRODUCTION_VALIDATE(
+                        rendered,
+                        "acme/app",
+                        assigned,
+                        title="feat: widget",
+                        review_input_path=path,
+                        template_body=template,
+                    ),
+                    [],
+                )
+
+    def test_public_validator_rejects_guessed_current_stack_row_number(self) -> None:
+        guessed = 2_147_483_647
+        token_stack = STACK.replace("#2", f"#{guessed}").replace(
+            "/pull/2", f"/pull/{guessed}"
+        )
+        token_diff = DIFF.replace("/pull/2", f"/pull/{PR_NUMBER_TOKEN}")
+        template = token_stack + token_diff
+        value = manifest(DIFF, pr_number=PR_NUMBER_TOKEN)
+        value["candidate"]["body_sha256"] = digest(template)
+        value["stack"] = [
+            {
+                "number": PR_NUMBER_TOKEN,
+                "title": "feat: top",
+                "url": f"https://github.com/acme/app/pull/{PR_NUMBER_TOKEN}",
+                "current": True,
+                "metrics": {"IMPL": [9, 3]},
+                "file_operations": {
+                    "added": 0,
+                    "modified": 1,
+                    "removed": 0,
+                    "moved": 0,
+                    "copied": 0,
+                },
+            }
+        ]
+        rendered = template.replace(PR_NUMBER_TOKEN, str(guessed))
+
+        errors = PRODUCTION_VALIDATE(
+            rendered,
+            "acme/app",
+            guessed,
+            title="feat: widget",
+            review_input_path=self.write(reseal(value)),
+            template_body=template,
+        )
+
+        self.assertTrue(any("current Stack row" in error for error in errors))
+
+    def test_public_validator_rejects_body_over_github_limit(self) -> None:
+        errors = PRODUCTION_VALIDATE(
+            DIFF + "x" * 65536,
+            "acme/app",
+            2,
+            title="feat: widget",
+            review_input_path=self.write(manifest(DIFF)),
+        )
+        self.assertTrue(any("65536" in error for error in errors))
+
+    def test_public_validator_accepts_canonical_bounded_diff(self) -> None:
+        body = bounded_body()
+        value = manifest(body)
+        value["git_diff"].append(
+            {
+                "source_path": None,
+                "target_path": "src/100.ts",
+                "operation": "modified",
+                "additions": 1,
+                "deletions": 0,
+                "binary": False,
+            }
+        )
+        value["diff"].append(
+            {
+                "category": "IMPL",
+                "operation": "ATOMIC",
+                "source_path": None,
+                "target_path": "src/100.ts",
+                "additions": 1,
+                "deletions": 0,
+            }
+        )
+        value["presentation"] = {
+            "selected_targets": [f"src/{index:03d}.ts" for index in range(100)],
+            "omitted_count": 1,
+            "comparison_url": "https://github.com/acme/app/compare/"
+            + "a" * 40
+            + "..."
+            + "b" * 40,
+        }
+        self.assertLessEqual(len(body), 65536)
+        self.assertEqual(
+            PRODUCTION_VALIDATE(
+                body,
+                "acme/app",
+                2,
+                title="feat: widget",
+                review_input_path=self.write(reseal(value)),
+            ),
+            [],
+        )
+
+    def test_bounded_diff_aggregates_match_full_sealed_inventories(self) -> None:
+        canonical = bounded_body()
+        value = manifest(canonical)
+        value["git_diff"].append(
+            {
+                "source_path": None,
+                "target_path": "src/100.ts",
+                "operation": "modified",
+                "additions": 1,
+                "deletions": 0,
+                "binary": False,
+            }
+        )
+        value["diff"].append(
+            {
+                "category": "IMPL",
+                "operation": "ATOMIC",
+                "source_path": None,
+                "target_path": "src/100.ts",
+                "additions": 1,
+                "deletions": 0,
+            }
+        )
+        value["presentation"] = {
+            "selected_targets": [f"src/{index:03d}.ts" for index in range(100)],
+            "omitted_count": 1,
+            "comparison_url": "https://github.com/acme/app/compare/"
+            + "a" * 40
+            + "..."
+            + "b" * 40,
+        }
+        mutations = {
+            "touched": canonical.replace(
+                badge("FILES: 101 touched", "FILES-101-5F6B78"),
+                badge("FILES: 100 touched", "FILES-100-5F6B78"),
+            ),
+            "category totals": canonical.replace(
+                badge(
+                    "IMPL: 101 additions, 0 deletions",
+                    "IMPL-%2B101%20%E2%88%920-0969DA",
+                ),
+                badge(
+                    "IMPL: 100 additions, 0 deletions",
+                    "IMPL-%2B100%20%E2%88%920-0969DA",
+                ),
+            ),
+            "category file counts": canonical.replace(
+                badge(
+                    "FILES: 101 implementation files", "FILES-101-5F6B78"
+                ),
+                badge(
+                    "FILES: 100 implementation files", "FILES-100-5F6B78"
+                ),
+            ),
+        }
+        for expected_error, body in mutations.items():
+            broken = copy.deepcopy(value)
+            broken["candidate"]["body_sha256"] = digest(body)
+            with self.subTest(aggregate=expected_error):
+                errors = PRODUCTION_VALIDATE(
+                    body,
+                    "acme/app",
+                    2,
+                    title="feat: widget",
+                    review_input_path=self.write(reseal(broken)),
+                )
+                self.assertTrue(
+                    any(expected_error in error for error in errors), errors
+                )
+
+    def test_bounded_omission_record_must_follow_all_category_rows(self) -> None:
+        body = bounded_body()
+        lines = body.splitlines()
+        omission = next(line for line in lines if "files omitted" in line)
+        taxonomy_index = next(
+            index for index, line in enumerate(lines) if line.startswith("<sup>")
+        )
+        category = next(line for line in lines if "implementation files" in line)
+        file_row = next(line for line in lines if line.startswith("  - "))
+        lines[taxonomy_index:taxonomy_index] = [category, file_row]
+        body = "\n".join(lines)
+        errors = MODULE._validate_markup(body, "acme/app", 2, bounded=True)
+        self.assertTrue(any("omission record" in error for error in errors), errors)
+
+    def test_exact_pr39_592_file_body_validates_within_github_limit(self) -> None:
+        git_diff = observe_git_diff(
+            REPOSITORY,
+            base_oid="29eb536f04a428d8b84a04c443c99223abb7a8e7",
+            head_oid="74772595e20dc9b218131f364dd68f762c1dfbc2",
+            require_clean=False,
+        )
+        self.assertEqual(len(git_diff), 592)
+        body, categorized = exact_pr39_body(git_diff)
+        value = manifest(
+            DIFF,
+            title="feat(plugins/release): adopt the Agent Plugins v1 stack",
+            pr_number=39,
+        )
+        value.update(
+            {
+                "repository": "nisavid/agents",
+                "base": {
+                    "ref": "main",
+                    "oid": "29eb536f04a428d8b84a04c443c99223abb7a8e7",
+                },
+                "head": {
+                    "ref": "nisavid:ivan/pr-publication-review-stack-successor",
+                    "oid": "74772595e20dc9b218131f364dd68f762c1dfbc2",
+                    "owner": "nisavid",
+                    "repository": "nisavid/agents",
+                },
+                "candidate": {
+                    "title": "feat(plugins/release): adopt the Agent Plugins v1 stack",
+                    "body_sha256": digest(body),
+                },
+                "git_diff": git_diff,
+                "diff": categorized,
+                "presentation": {
+                    "selected_targets": [row["target_path"] for row in git_diff[:100]],
+                    "omitted_count": 492,
+                    "comparison_url": "https://github.com/nisavid/agents/compare/29eb536f04a428d8b84a04c443c99223abb7a8e7...74772595e20dc9b218131f364dd68f762c1dfbc2",
+                },
+                "baseline": {
+                    "mode": "existing",
+                    "title_sha256": digest(
+                        "feat(plugins/release): adopt the Agent Plugins v1 stack"
+                    ),
+                    "body_sha256": digest(body),
+                    "fragments": [
+                        {
+                            "id": "body",
+                            "text": body,
+                            "sha256": digest(body),
+                            "disposition": "retain",
+                            "replacement": None,
+                            "reason": None,
+                        }
+                    ],
+                },
+            }
+        )
+        self.assertLessEqual(len(body), 65536)
+        self.assertEqual(
+            PRODUCTION_VALIDATE(
+                body,
+                "nisavid/agents",
+                39,
+                title="feat(plugins/release): adopt the Agent Plugins v1 stack",
+                review_input_path=self.write(reseal(value)),
+            ),
+            [],
         )
 
     def test_rejects_content_digest_and_unsafe_paths(self) -> None:

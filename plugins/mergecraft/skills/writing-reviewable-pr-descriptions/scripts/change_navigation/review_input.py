@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .git_observer import GitObservationError, observe_git_diff
+from .parsing import extract_leading_details
 
 
 VERSION = 3
@@ -31,6 +32,23 @@ def _canonical(value: Any) -> bytes:
 
 def digest(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _validate_new_pr_stack_template(template: str, repository: str) -> None:
+    blocks = extract_leading_details(template.splitlines())
+    stack = blocks[0] if blocks else []
+    current_rows = [line for line in stack if " **← this PR**<br>" in line]
+    token = re.escape(PR_NUMBER_TOKEN)
+    expected = re.compile(
+        rf"^- \*\*\[#{token} — .+\]"
+        rf"\(https://github\.com/{re.escape(repository)}/pull/{token}\)\*\*"
+        rf" \*\*← this PR\*\*<br>.+$"
+    )
+    if len(current_rows) != 1 or expected.fullmatch(current_rows[0]) is None:
+        raise ReviewInputError(
+            "new-PR template current Stack row must use the PR-number token in "
+            "its identity and same-repository URL"
+        )
 
 
 def _object(value: Any, name: str) -> dict[str, Any]:
@@ -82,23 +100,26 @@ class ReviewInput:
 
 def parse_review_input(value: Any) -> ReviewInput:  # noqa: C901
     raw = _object(value, "manifest")
-    _exact_keys(
-        raw,
-        {
-            "version",
-            "content_sha256",
-            "repository",
-            "pr_number",
-            "base",
-            "head",
-            "candidate",
-            "git_diff",
-            "diff",
-            "stack",
-            "baseline",
-        },
-        "manifest",
-    )
+    manifest_keys = {
+        "version",
+        "content_sha256",
+        "repository",
+        "pr_number",
+        "base",
+        "head",
+        "candidate",
+        "git_diff",
+        "diff",
+        "stack",
+        "baseline",
+    }
+    if set(raw) not in {
+        frozenset(manifest_keys),
+        frozenset(manifest_keys | {"presentation"}),
+    }:
+        raise ReviewInputError(
+            "review input manifest has unsupported or missing fields"
+        )
     if type(raw["version"]) is not int or raw["version"] != VERSION:
         raise ReviewInputError(f"review input version must be {VERSION}")
     supplied = _sha(raw["content_sha256"], "content_sha256")
@@ -309,8 +330,49 @@ def parse_review_input(value: Any) -> ReviewInput:  # noqa: C901
             or sum(row["deletions"] for row in presented) != git_row["deletions"]
         ):
             raise ReviewInputError("review input categorized diff metrics drift")
+    presentation = raw.get("presentation")
+    if len(git_diff) > 100 and presentation is None:
+        raise ReviewInputError(
+            "review input over 100 files requires presentation"
+        )
+    if presentation is not None:
+        presentation = _object(presentation, "presentation")
+        _exact_keys(
+            presentation,
+            {"selected_targets", "omitted_count", "comparison_url"},
+            "presentation",
+        )
+        if len(git_diff) <= 100:
+            raise ReviewInputError(
+                "review input presentation is only valid over 100 files"
+            )
+        expected_targets = [row["target_path"] for row in git_diff[:100]]
+        if presentation["selected_targets"] != expected_targets:
+            raise ReviewInputError(
+                "review input presentation must select the first 100 Git targets"
+            )
+        if (
+            type(presentation["omitted_count"]) is not int
+            or presentation["omitted_count"] != len(git_diff) - 100
+        ):
+            raise ReviewInputError(
+                "review input presentation omitted_count is incorrect"
+            )
+        expected_url = (
+            f"https://github.com/{repository}/compare/{base['oid']}...{head['oid']}"
+        )
+        if presentation["comparison_url"] != expected_url:
+            raise ReviewInputError(
+                "review input presentation comparison URL is invalid"
+            )
     if not isinstance(raw["stack"], list):
         raise ReviewInputError("review input stack must be a list")
+    current_items = [
+        item
+        for item in raw["stack"]
+        if isinstance(item, dict) and item.get("current") is True
+    ]
+    current_count = len(current_items)
     for index, item in enumerate(raw["stack"]):
         item = _object(item, f"stack[{index}]")
         _exact_keys(
@@ -318,19 +380,74 @@ def parse_review_input(value: Any) -> ReviewInput:  # noqa: C901
             {"number", "title", "url", "current", "metrics", "file_operations"},
             f"stack[{index}]",
         )
-        if (
-            type(item["number"]) is not int
-            or item["number"] < 1
-            or not isinstance(item["current"], bool)
-        ):
+        token_number = item["number"] == PR_NUMBER_TOKEN
+        valid_integer = type(item["number"]) is int and item["number"] > 0
+        if not isinstance(item["current"], bool) or not (valid_integer or token_number):
             raise ReviewInputError(f"review input stack[{index}] has invalid identity")
         _string(item["title"], f"stack[{index}].title")
-        _string(item["url"], f"stack[{index}].url")
+        url = _string(item["url"], f"stack[{index}].url")
+        expected_number = PR_NUMBER_TOKEN if token_number else str(item["number"])
+        if url != f"https://github.com/{repository}/pull/{expected_number}":
+            raise ReviewInputError(f"review input stack[{index}] URL is invalid")
+        if token_number and not (
+            raw["pr_number"] == PR_NUMBER_TOKEN
+            and item["current"]
+            and current_count == 1
+        ):
+            raise ReviewInputError(
+                "new-PR token is allowed only in the sole current stack row"
+            )
         if not isinstance(item["metrics"], dict) or not isinstance(
             item["file_operations"], dict
         ):
             raise ReviewInputError(
                 f"review input stack[{index}] metrics must be objects"
+            )
+    if raw["stack"] and current_count != 1:
+        raise ReviewInputError("review input stack must have exactly one current row")
+    if raw["pr_number"] == PR_NUMBER_TOKEN and raw["stack"]:
+        current = current_items[0]
+        if current["number"] != PR_NUMBER_TOKEN or current["url"] != (
+            f"https://github.com/{repository}/pull/{PR_NUMBER_TOKEN}"
+        ):
+            raise ReviewInputError(
+                "new-PR token must identify the sole current stack row"
+            )
+    if current_items:
+        category_totals: dict[str, list[int]] = {}
+        for row in raw["diff"]:
+            totals = category_totals.setdefault(row["category"], [0, 0])
+            totals[0] += row["additions"]
+            totals[1] += row["deletions"]
+        category_totals = {
+            category: totals
+            for category, totals in category_totals.items()
+            if totals != [0, 0]
+        }
+        operation_totals = {
+            "added": 0,
+            "modified": 0,
+            "removed": 0,
+            "moved": 0,
+            "copied": 0,
+        }
+        operation_names = {
+            "added": "added",
+            "modified": "modified",
+            "deleted": "removed",
+            "renamed": "moved",
+            "copied": "copied",
+            "type-changed": "modified",
+        }
+        for row in git_diff:
+            operation_totals[operation_names[row["operation"]]] += 1
+        current = current_items[0]
+        if (
+            current["metrics"] != category_totals
+            or current["file_operations"] != operation_totals
+        ):
+            raise ReviewInputError(
+                "review input current Stack aggregates drift from sealed diff"
             )
     baseline = _object(raw["baseline"], "baseline")
     _exact_keys(
@@ -499,7 +616,9 @@ def bind_review_input(  # noqa: C901
             raise ReviewInputError(
                 "new-PR review input requires the original token-bearing template"
             )
-        if template_body.count(PR_NUMBER_TOKEN) < 1:
+        if raw["stack"]:
+            _validate_new_pr_stack_template(template_body, repository)
+        elif PR_NUMBER_TOKEN not in template_body:
             raise ReviewInputError("new-PR template has no PR-number token")
         if body != template_body.replace(PR_NUMBER_TOKEN, str(pr_number)):
             raise ReviewInputError(

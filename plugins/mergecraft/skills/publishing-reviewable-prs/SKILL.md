@@ -66,6 +66,8 @@ ordinary success.
 Use `scripts/create_reviewable_pr.py` with exact identity, existing absolute
 review-input, and an absolute template containing
 `__PUBLISHING_REVIEWABLE_PRS_PR_NUMBER__` wherever the assigned number belongs.
+In new-PR Stack review input, use it only for the sole current row's number and
+same-repository URL; never use it in an existing or noncurrent row.
 Preserve original template bytes and perform token-only rendering; never
 reverse-replace an assigned number. It validates sentinel rendering,
 rejects a matching PR, and creates one nonce

@@ -12,7 +12,11 @@ from .types import validate_category_order
 
 
 def validate_diff(
-    block: list[str], errors: list[str], expected_identity: Identity | None = None
+    block: list[str],
+    errors: list[str],
+    expected_identity: Identity | None = None,
+    *,
+    bounded: bool = False,
 ) -> None:
     diff_summary = summary(block, errors, "Diff")
     if 'alt="DIFF"' not in diff_summary:
@@ -35,7 +39,7 @@ def validate_diff(
     summary_metrics = category_metric_map(diff_summary)
     expected_files = int(files_match.group(1)) if files_match else None
     validate_diff_file_items(
-        block, errors, expected_files, summary_metrics, expected_identity
+        block, errors, expected_files, summary_metrics, expected_identity, bounded
     )
 
 

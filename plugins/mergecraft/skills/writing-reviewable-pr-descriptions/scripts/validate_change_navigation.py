@@ -10,7 +10,12 @@ from pathlib import Path
 
 from change_navigation.badges import validate_badges
 from change_navigation.diff import touched_file_count, validate_diff
-from change_navigation.diff_files import file_operation_counts, manifest_rows
+from change_navigation.diff_files import (
+    category_file_counts,
+    file_operation_counts,
+    manifest_rows,
+    omission_record,
+)
 from change_navigation.metrics import category_metric_map
 from change_navigation.model import alt_values
 from change_navigation.parsing import (
@@ -37,7 +42,7 @@ from change_navigation.types import classify_disclosures
 
 
 def _validate_markup(  # noqa: C901
-    body: str, expected_repository: str, expected_pr: int
+    body: str, expected_repository: str, expected_pr: int, *, bounded: bool = False
 ) -> list[str]:
     """Return markup-only errors; this private helper is never publication proof."""
     errors: list[str] = []
@@ -84,7 +89,7 @@ def _validate_markup(  # noqa: C901
         if len(blocks) < 2:
             errors.append("stacked PR is missing its Diff disclosure")
         else:
-            validate_diff(blocks[1], errors, expected_identity)
+            validate_diff(blocks[1], errors, expected_identity, bounded=bounded)
             stack_metrics = current_item_metrics(blocks[0])
             diff_metrics = category_metric_map("\n".join(blocks[1][:2]))
             if stack_metrics != diff_metrics:
@@ -97,6 +102,7 @@ def _validate_markup(  # noqa: C901
                 stack_files is not None
                 and diff_files is not None
                 and stack_files != diff_files
+                and not bounded
             ):
                 errors.append(
                     "current Stack item file-operation total must match Diff "
@@ -104,7 +110,11 @@ def _validate_markup(  # noqa: C901
                 )
             stack_operations = current_item_file_operations(blocks[0])
             diff_operations = file_operation_counts(blocks[1])
-            if stack_operations is not None and diff_operations.consistent:
+            if (
+                stack_operations is not None
+                and diff_operations.consistent
+                and not bounded
+            ):
                 ordinary = sum(
                     stack_operations[kind] for kind in ("added", "modified", "removed")
                 )
@@ -122,7 +132,7 @@ def _validate_markup(  # noqa: C901
                 f"current Stack item must be PR #{expected_pr} in {expected_repository}"
             )
     elif blocks:
-        validate_diff(blocks[0], errors, expected_identity)
+        validate_diff(blocks[0], errors, expected_identity, bounded=bounded)
     else:
         errors.append("Diff disclosure is missing")
 
@@ -185,7 +195,44 @@ def _validate_manifest_semantics(
     if not blocks or (labels[:1] == ["STACK"] and len(blocks) < 2):
         return ["rendered Diff disclosure is missing"]
     diff_block = blocks[1] if labels[:2] == ["STACK", "DIFF"] else blocks[0]
-    if manifest_rows(diff_block) != review_input.raw["diff"]:
+    expected_category_totals: dict[str, tuple[int, int]] = {}
+    expected_category_files: dict[str, set[str]] = {}
+    for row in review_input.raw["diff"]:
+        additions, deletions = expected_category_totals.get(row["category"], (0, 0))
+        expected_category_totals[row["category"]] = (
+            additions + row["additions"],
+            deletions + row["deletions"],
+        )
+        expected_category_files.setdefault(row["category"], set()).add(
+            row["target_path"]
+        )
+    expected_summary = {
+        category: totals
+        for category, totals in expected_category_totals.items()
+        if totals != (0, 0)
+    }
+    rendered_summary = category_metric_map("\n".join(diff_block[:2]))
+    if touched_file_count(diff_block) != len(review_input.raw["git_diff"]):
+        errors.append("rendered Diff touched count does not match sealed git_diff")
+    if rendered_summary != expected_summary:
+        errors.append("rendered Diff category totals do not match sealed diff")
+    if category_file_counts(diff_block) != {
+        category: len(targets) for category, targets in expected_category_files.items()
+    }:
+        errors.append("rendered Diff category file counts do not match sealed diff")
+    presentation = review_input.raw.get("presentation")
+    expected_rows = review_input.raw["diff"]
+    if presentation is not None:
+        selected = set(presentation["selected_targets"])
+        expected_rows = [row for row in expected_rows if row["target_path"] in selected]
+        if omission_record(diff_block) != (
+            presentation["omitted_count"],
+            presentation["comparison_url"],
+        ):
+            errors.append("rendered Diff omission/comparison record is not canonical")
+    elif omission_record(diff_block) is not None:
+        errors.append("rendered Diff invents an omission/comparison record")
+    if manifest_rows(diff_block) != expected_rows:
         errors.append("rendered Diff rows do not match the review input")
     stack = review_input.raw["stack"]
     if labels[:1] == ["STACK"]:
@@ -214,8 +261,16 @@ def _validate_manifest_semantics(
                     "file_operations": operations,
                 }
             )
-        if len(actual) != len(stack) or any(
-            actual_item != expected for actual_item, expected in zip(actual, stack)
+        projected_stack = []
+        for expected in stack:
+            projected = dict(expected)
+            if projected["number"] == "__PUBLISHING_REVIEWABLE_PRS_PR_NUMBER__":
+                projected["number"] = pr_number
+                projected["url"] = f"https://github.com/{repository}/pull/{pr_number}"
+            projected_stack.append(projected)
+        if len(actual) != len(projected_stack) or any(
+            actual_item != expected
+            for actual_item, expected in zip(actual, projected_stack)
         ):
             errors.append(
                 "rendered Stack topology, titles, URLs, metrics, file operations, "
@@ -237,10 +292,17 @@ def validate(
     git_repository: Path | None = None,
 ) -> list[str]:
     """Validate publishable review text against its immutable review input."""
+    if len(body) > 65536:
+        return ["PR body exceeds GitHub's 65536-character limit"]
     secret_error = suspected_secret_error(body)
     if secret_error is not None:
         return [secret_error]
-    errors = _validate_markup(body, expected_repository, expected_pr)
+    try:
+        review_input = load_review_input(review_input_path)
+        bounded = review_input.raw.get("presentation") is not None
+    except ReviewInputError:
+        bounded = False
+    errors = _validate_markup(body, expected_repository, expected_pr, bounded=bounded)
     blocks = extract_leading_details(body.splitlines())
     if not title.strip():
         errors.append("candidate title is empty")

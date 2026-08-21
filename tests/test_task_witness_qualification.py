@@ -1006,6 +1006,7 @@ class TaskWitnessQualificationTests(unittest.TestCase):
                 )
                 self.assertGreaterEqual(ctypes.CDLL(None).printf(b"native-out"), 0)
 
+        self.assertGreaterEqual(ctypes.CDLL(None).printf(b"prior-native-out"), 0)
         with (
             mock.patch.object(
                 driver,

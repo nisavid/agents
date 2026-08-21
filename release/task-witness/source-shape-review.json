@@ -41,7 +41,7 @@
       "release/task-witness/tw4-bridge-provenance.json": 111,
       "release/task-witness/tw4-suite-inventory.json": 1,
       "scripts/run_task_witness_qualification.py": 5419,
-      "scripts/run_task_witness_qualification_suite.py": 3947,
+      "scripts/run_task_witness_qualification_suite.py": 3952,
       "scripts/validate_task_witness.py": 4517,
       "tests/plugins/task_witness_client/__init__.py": 0,
       "tests/plugins/task_witness_client/_activation_smoke_driver.py": 127,
@@ -114,7 +114,7 @@
       "tests/plugins/task_witness_deployment/test_staged_client_integration.py": 265,
       "tests/plugins/task_witness_deployment/test_transaction_result_reconciliation.py": 1452,
       "tests/test_task_witness_package.py": 4238,
-      "tests/test_task_witness_qualification.py": 6572
+      "tests/test_task_witness_qualification.py": 6600
     },
     "sets": {
       "current_control_set": {
@@ -133,7 +133,7 @@
         ]
       },
       "direct_release_owned_tests": {
-        "aggregate_nonblank_noncomment_lines": 60254,
+        "aggregate_nonblank_noncomment_lines": 60282,
         "paths": [
           "tests/plugins/task_witness_client/__init__.py",
           "tests/plugins/task_witness_client/_activation_smoke_driver.py",
@@ -224,7 +224,7 @@
         ]
       },
       "release_integration": {
-        "aggregate_nonblank_noncomment_lines": 10833,
+        "aggregate_nonblank_noncomment_lines": 10861,
         "paths": [
           "release/task-witness/public-release-registration.json",
           "tests/test_task_witness_package.py",
@@ -232,7 +232,7 @@
         ]
       },
       "release_integration_tests": {
-        "aggregate_nonblank_noncomment_lines": 10810,
+        "aggregate_nonblank_noncomment_lines": 10838,
         "paths": [
           "tests/test_task_witness_package.py",
           "tests/test_task_witness_qualification.py"
@@ -286,7 +286,7 @@
         ]
       },
       "tw4_qualification_contract": {
-        "aggregate_nonblank_noncomment_lines": 15939,
+        "aggregate_nonblank_noncomment_lines": 15972,
         "paths": [
           "release/task-witness/tw4-suite-inventory.json",
           "scripts/run_task_witness_qualification.py",
@@ -300,17 +300,17 @@
   "source_byte_identity": {
     "aggregate_sha256_by_set": {
       "current_control_set": "d0489389b7215d2f17342e430450d551989e9d445ad843475af0b0caa2feeba7",
-      "direct_release_owned_tests": "f9efb9457dcce4864544c3b2d7ed2680857c8d7385e79b589e1f86be9cae6f12",
+      "direct_release_owned_tests": "3070c733e5edd96ca5ca4f050a8da6d844c76aed4451b61d20f987e4a1a85cde",
       "public_release_registration": "e3e97ca609e4806d3d6445f0f9e4b07a6cac739fa828f6d5f432824511e8390e",
       "release_documentation": "7ea203d49d02481f1ab666dbf9a9d1e152d86d0ce7120ab98c057b1a563048c0",
-      "release_integration": "3469bbb00d81703279d3b47c69d4a67b28b4d24d57d05537507fe281266e4f1f",
-      "release_integration_tests": "9c7e1c7e2f14ff22f65b8aa91f13c8bc96dd012f8855dc971d667250d0674ddb",
+      "release_integration": "270ca6433743bb58140bc22743bf181fa4947ff87ff9c1e96bd0c94757d9c114",
+      "release_integration_tests": "d9584150fe9fb7009026d6db951aae56553c4e5d9f70a94b89985c70ec739c09",
       "release_validator": "4cce02a06b055e10fa1a05ea123279ac3c16ba3e94c562bf1a94523f940667cc",
       "tw0": "3559210111eaab4a310bd4db2b3ce7133aeff4bde35dbb4821db5bb2fc5fc0b3",
       "tw1_client": "5cfaa63fa55edaaf891e6e52cbbc9eaaaa72baf4e15beee0eb6509396c3fb37d",
       "tw2_control_plane": "dc841c2ab600dec76cca0e3c0690b1b08f8d230d2006297ccc450960a2e6c0fe",
       "tw4_migration_evidence": "1c2c85bd317af0c0fcdeb2f642c435af50e620948d3dd99a6af974cedf34059c",
-      "tw4_qualification_contract": "af44bf5301711e5e1385ec0b08fc0eb073b985ec8412bab2e849781126b4241d"
+      "tw4_qualification_contract": "a3b440ce6a7092fbb639b99b0014e9db20563c3128a1897c03cb79b3d8e47540"
     },
     "algorithm": "sha256",
     "entries": [
@@ -424,7 +424,7 @@
       },
       {
         "path": "scripts/run_task_witness_qualification_suite.py",
-        "sha256": "b9495e114d3fc0c9041d1cff1e2e2376b93233e87f9b789987e7808353da07b6"
+        "sha256": "eb307d118756689784df4a0b65c67643046da82fb9a6d7bea7074efde96d21bc"
       },
       {
         "path": "scripts/validate_task_witness.py",
@@ -716,7 +716,7 @@
       },
       {
         "path": "tests/test_task_witness_qualification.py",
-        "sha256": "40eeef890f3222489fd6466e6405f968f6ae11f9cca160896822d6078b328802"
+        "sha256": "872dbc49eaa20c6cc0e787b809151891811a35b7c32798994ece899a24354e88"
       }
     ],
     "framing": "path-utf8-nul-sha256-hex-nul-v1"

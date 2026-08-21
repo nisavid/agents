@@ -4595,14 +4595,37 @@ def _post_abort_v10_contract(
                 if row["next_retry_at"] is None
                 else _post_abort_timestamp(row["next_retry_at"])
             )
+            released_retry_checkpoint_advanced = (
+                schema_version == 12
+                and row["result_metadata_digest"] is not None
+                and row["result_metadata_digest"]
+                != reference_row["result_metadata_digest"]
+                and reference_row["retry_count"] < row["retry_count"]
+                and row["error_category"] != "none"
+                and row["error_digest"] is not None
+                and row["next_retry_at"] is not None
+                and next_retry_at is not None
+                and next_retry_at <= snapshot["observed_at"]
+                and reference_updated_at is not None
+                and current_updated_at is not None
+                and current_updated_at > reference_updated_at
+            )
             if (
                 reference_row["current_status"] != "pending"
                 or not reference_wholly_unowned
                 or reference_row["completed_at"] is not None
                 or row["completed_at"] is not None
                 or row["created_at"] != reference_row["created_at"]
-                or row["result_metadata_digest"]
-                != reference_row["result_metadata_digest"]
+                or (
+                    schema_version == 12
+                    and row["row_digest"] != reference_row["row_digest"]
+                    and not released_retry_checkpoint_advanced
+                )
+                or (
+                    row["result_metadata_digest"]
+                    != reference_row["result_metadata_digest"]
+                    and not released_retry_checkpoint_advanced
+                )
                 or row["task_payload_present"]
                 is not reference_row["task_payload_present"]
                 or not 0

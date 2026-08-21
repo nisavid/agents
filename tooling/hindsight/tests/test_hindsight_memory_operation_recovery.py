@@ -4433,6 +4433,9 @@ class OperationRecoveryContractTest(unittest.TestCase):
         ).hexdigest()
         epoch_three_rows = deepcopy(epoch_two_recovered_rows)
         owned_pending_id = min(epoch_two_selected_ids)
+        released_pending_id = min(
+            epoch_two_selected_ids - {owned_pending_id}
+        )
         for item in epoch_three_rows:
             if item["operation_id"] not in epoch_two_selected_ids:
                 continue
@@ -4448,6 +4451,20 @@ class OperationRecoveryContractTest(unittest.TestCase):
                     claimed_at="2026-08-20T14:25:00.000000Z",
                     error_category="provider_transport",
                     error_digest="2" * 64,
+                )
+            elif item["operation_id"] == released_pending_id:
+                item.update(
+                    status="pending",
+                    updated_at="2026-08-20T14:30:00.000000Z",
+                    completed_at=None,
+                    retry_count=3,
+                    next_retry_at="2026-08-15T21:37:00.000000Z",
+                    worker_id_present=False,
+                    worker_id_digest=None,
+                    claimed_at=None,
+                    result_metadata_digest="4" * 64,
+                    error_category="provider_transport",
+                    error_digest="3" * 64,
                 )
             else:
                 item.update(
@@ -4512,28 +4529,37 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 created_at=1_786_830_000,
             )
 
-        epoch_three_recovery = create_post_abort_recovery_plan(
-            epoch_two_plan,
-            epoch_three_interrupted,
-            candidate_release=release_identity(),
-            rollback_backup=epoch_three_backup,
-            rollback_encryption=rollback_encryption(),
-            rollback_backup_path="/private/tmp/v12-epoch3-backup.age",
-            rollback_bundle_path="/private/tmp/v12-epoch3-bundle.age",
-            authorization_receipt_path="/private/tmp/v12-epoch3-auth.json",
-            application_receipt_path="/private/tmp/v12-epoch3-app.json",
-            verification_receipt_path="/private/tmp/v12-epoch3-verify.json",
-            rollback_receipt_path="/private/tmp/v12-epoch3-rollback.json",
-            reference_application_authorization=(
-                exact_drain_authorization(epoch_two_plan)
-            ),
-            reference_application_journal=(
-                exact_drain_application_journal(epoch_two_plan)
-            ),
-            reference_application_progress_digest="2" * 64,
-            prior_retry_recovery=epoch_two_retry,
-            schema_version=12,
-            created_at=1_786_830_000,
+        def create_epoch_three_recovery(value):
+            return create_post_abort_recovery_plan(
+                epoch_two_plan,
+                value,
+                candidate_release=release_identity(),
+                rollback_backup=epoch_three_backup,
+                rollback_encryption=rollback_encryption(),
+                rollback_backup_path="/private/tmp/v12-epoch3-backup.age",
+                rollback_bundle_path="/private/tmp/v12-epoch3-bundle.age",
+                authorization_receipt_path="/private/tmp/v12-epoch3-auth.json",
+                application_receipt_path="/private/tmp/v12-epoch3-app.json",
+                verification_receipt_path=(
+                    "/private/tmp/v12-epoch3-verify.json"
+                ),
+                rollback_receipt_path=(
+                    "/private/tmp/v12-epoch3-rollback.json"
+                ),
+                reference_application_authorization=(
+                    exact_drain_authorization(epoch_two_plan)
+                ),
+                reference_application_journal=(
+                    exact_drain_application_journal(epoch_two_plan)
+                ),
+                reference_application_progress_digest="2" * 64,
+                prior_retry_recovery=epoch_two_retry,
+                schema_version=12,
+                created_at=1_786_830_000,
+            )
+
+        epoch_three_recovery = create_epoch_three_recovery(
+            epoch_three_interrupted
         )
         epoch_three_retry = epoch_three_recovery["retry_recovery"]
         self.assertEqual(epoch_three_recovery["schema_version"], 12)
@@ -4544,9 +4570,20 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 for item in epoch_three_recovery["selected_operations"]
             },
         )
+        self.assertNotIn(
+            released_pending_id,
+            {
+                item["operation_id"]
+                for item in epoch_three_recovery["selected_operations"]
+            },
+        )
         self.assertEqual(
             epoch_three_recovery["selected_status_counts"],
-            {"failed": len(epoch_two_selected_ids) - 1, "pending": 1},
+            {"failed": len(epoch_two_selected_ids) - 2, "pending": 1},
+        )
+        self.assertEqual(
+            epoch_three_recovery["preserved_status_counts"],
+            {"completed": 9, "pending": 1},
         )
         self.assertEqual(epoch_three_retry["schema_version"], 3)
         self.assertEqual(epoch_three_retry["recovery_epoch_before"], 2)
@@ -4568,6 +4605,66 @@ class OperationRecoveryContractTest(unittest.TestCase):
             ),
             epoch_three_recovery,
         )
+
+        reference_released_row = next(
+            item
+            for item in epoch_two_plan["live_snapshot"]["operations"]
+            if item["operation_id"] == released_pending_id
+        )
+        for label, updates in (
+            (
+                "unchanged-result-checkpoint",
+                {
+                    "result_metadata_digest": reference_released_row[
+                        "result_metadata_digest"
+                    ]
+                },
+            ),
+            (
+                "unchanged-retry-count",
+                {"retry_count": reference_released_row["retry_count"]},
+            ),
+            (
+                "unchanged-updated-at",
+                {"updated_at": reference_released_row["updated_at"]},
+            ),
+            ("missing-due-time", {"next_retry_at": None}),
+            (
+                "future-due-time",
+                {"next_retry_at": "2026-08-21T00:00:00.000000Z"},
+            ),
+            (
+                "missing-error-evidence",
+                {"error_category": "none", "error_digest": None},
+            ),
+        ):
+            with self.subTest(invalid_released_checkpoint=label):
+                invalid = deepcopy(epoch_three_interrupted)
+                invalid_row = next(
+                    item
+                    for item in invalid["operations"]
+                    if item["operation_id"] == released_pending_id
+                )
+                invalid_row.update(updates)
+                invalid_row["row_digest"] = digest(
+                    {
+                        key: value
+                        for key, value in invalid_row.items()
+                        if key != "row_digest"
+                    }
+                )
+                invalid["snapshot_digest"] = digest(
+                    {
+                        key: value
+                        for key, value in invalid.items()
+                        if key != "snapshot_digest"
+                    }
+                )
+                with self.assertRaisesRegex(
+                    OperationRecoveryError,
+                    "row set is invalid",
+                ):
+                    create_epoch_three_recovery(invalid)
 
         replay = deepcopy(epoch_three_recovery)
         replay["retry_recovery"]["prior_retry_recovery_digest"] = "0" * 64

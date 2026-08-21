@@ -1016,11 +1016,6 @@ def _exact_drain_failure_evidence(
         is not None
     ):
         category = "upstream_timeout"
-    elif re.search(
-        r"(^|[^a-z])timeout([^a-z]|$)|timed.?out",
-        lowered,
-    ) is not None:
-        category = "provider_transport"
     elif EXACT_DRAIN_TRANSPORT_ERROR.search(safe_error) is not None:
         category = "provider_transport"
     elif not safe_error:

@@ -355,6 +355,11 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
                 "upstream_timeout",
             ),
             (
+                "ConnectionError: provider unavailable",
+                "provider_transport",
+                "provider_transport",
+            ),
+            (
                 "OperationRecoveryError: provider_queue_timeout\n\n"
                 "Traceback: request timeout after 401 response",
                 "provider_queue_timeout",

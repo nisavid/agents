@@ -59,6 +59,10 @@ TRUSTED_SYSTEM_EXECUTABLES = {
 }
 TRUSTED_COMMAND_PATH = "/usr/bin:/bin"
 MACOS_CREDENTIAL_HELPER = "git-credential-osxkeychain"
+MACOS_CODESIGN = Path("/usr/bin/codesign")
+MACOS_CREDENTIAL_REQUIREMENT = (
+    '=identifier "com.apple.git-credential-osxkeychain" and anchor apple'
+)
 LINUX_CREDENTIAL_HELPER = "git-credential-cache"
 WINDOWS_GCM_HELPERS = (
     Path("mingw64/bin/git-credential-manager.exe"),
@@ -113,13 +117,24 @@ def _trusted_root_owned_executable(
     *,
     allowed_path: re.Pattern[str] | None = None,
     reject_set_id: bool = False,
+    allow_root_owned_symlink: bool = False,
 ) -> str:
     if allowed_path is not None and allowed_path.fullmatch(str(path)) is None:
         raise OSError("executable path is not closed")
     resolved = path.resolve(strict=True)
-    if resolved != path:
-        raise OSError("executable path is redirected")
-    for parent in resolved.parents:
+    redirected = resolved != path
+    if redirected:
+        link_metadata = path.lstat()
+        if (
+            not allow_root_owned_symlink
+            or not stat.S_ISLNK(link_metadata.st_mode)
+            or link_metadata.st_uid != 0
+        ):
+            raise OSError("executable path is redirected")
+    ancestry = set(resolved.parents)
+    if redirected:
+        ancestry.update(path.parents)
+    for parent in ancestry:
         metadata = parent.lstat()
         if (
             not stat.S_ISDIR(metadata.st_mode)
@@ -136,7 +151,7 @@ def _trusted_root_owned_executable(
         or reject_set_id and metadata.st_mode & (stat.S_ISUID | stat.S_ISGID)
     ):
         raise OSError("executable file is not trusted")
-    return str(resolved)
+    return str(path if redirected else resolved)
 
 
 def _trusted_system_executable(name: str) -> str:
@@ -152,11 +167,41 @@ def _require_trusted_credential_helper(path: Path) -> str:
     try:
         if not path.is_absolute():
             raise OSError("credential helper path is not absolute")
-        return _trusted_root_owned_executable(
-            path,
-            allowed_path=TRUSTED_HELPER_PATH_RE,
-            reject_set_id=True,
-        )
+        try:
+            return _trusted_root_owned_executable(
+                path,
+                allowed_path=TRUSTED_HELPER_PATH_RE,
+                reject_set_id=True,
+            )
+        except OSError:
+            resolved = path.resolve(strict=True)
+            metadata = resolved.lstat()
+            if (
+                resolved != path
+                or not stat.S_ISREG(metadata.st_mode)
+                or stat.S_IMODE(metadata.st_mode) & 0o111 == 0
+                or metadata.st_mode & (stat.S_ISUID | stat.S_ISGID)
+            ):
+                raise OSError("credential helper file is not trusted")
+            codesign = _trusted_root_owned_executable(MACOS_CODESIGN)
+            completed = subprocess.run(
+                [
+                    codesign,
+                    "--verify",
+                    "--strict",
+                    "--test-requirement",
+                    MACOS_CREDENTIAL_REQUIREMENT,
+                    str(resolved),
+                ],
+                env={"PATH": TRUSTED_COMMAND_PATH},
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+            if completed.returncode != 0:
+                raise OSError("credential helper signature is not trusted")
+            return str(resolved)
     except OSError as error:
         raise PolicyGate(
             "HTTPS_CREDENTIAL_PROVIDER_UNAVAILABLE",
@@ -177,6 +222,7 @@ def _require_linux_credential_provider(
                 candidate,
                 allowed_path=TRUSTED_HELPER_PATH_RE,
                 reject_set_id=True,
+                allow_root_owned_symlink=True,
             )
         except OSError:
             continue

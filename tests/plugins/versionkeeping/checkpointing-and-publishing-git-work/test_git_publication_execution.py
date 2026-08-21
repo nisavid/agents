@@ -236,6 +236,14 @@ def run_credential_helper(
     )
 
 
+def credential_protocol_fields(output: str) -> dict[str, str]:
+    return dict(
+        line.split("=", 1)
+        for line in output.splitlines()
+        if "=" in line
+    )
+
+
 class PublicationExecutionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
@@ -342,6 +350,89 @@ class PublicationExecutionTests(unittest.TestCase):
             ["", trusted_helper],
         )
         self.assertNotIn("credential.credentialStore", dict(closed_config))
+
+    def test_macos_accepts_the_apple_signed_helper_when_ancestry_is_mutable(
+        self,
+    ) -> None:
+        helper = self.root.resolve() / adapter.MACOS_CREDENTIAL_HELPER
+        helper.write_bytes(b"signed helper")
+        helper.chmod(0o755)
+        codesign = "/usr/bin/codesign"
+
+        def trust_executable(path, **_kwargs):
+            if path == helper:
+                raise OSError("runner-managed Xcode ancestry")
+            if path == adapter.MACOS_CODESIGN:
+                return codesign
+            raise AssertionError(f"unexpected trust candidate: {path}")
+
+        with mock.patch.object(
+            adapter,
+            "_trusted_root_owned_executable",
+            side_effect=trust_executable,
+        ):
+            with mock.patch.object(
+                adapter.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess([], 0),
+            ) as run:
+                trusted = adapter._require_trusted_credential_helper(helper)
+
+        self.assertEqual(trusted, str(helper.resolve()))
+        self.assertEqual(run.call_args.args[0][0], codesign)
+        self.assertIn("anchor apple", " ".join(run.call_args.args[0]))
+        self.assertEqual(run.call_args.kwargs["env"], {"PATH": "/usr/bin:/bin"})
+
+    def test_macos_rejects_a_helper_without_the_apple_signature(self) -> None:
+        helper = self.root.resolve() / adapter.MACOS_CREDENTIAL_HELPER
+        helper.write_bytes(b"unsigned helper")
+        helper.chmod(0o755)
+
+        def trust_executable(path, **_kwargs):
+            if path == helper:
+                raise OSError("mutable ancestry")
+            return str(path)
+
+        with mock.patch.object(
+            adapter,
+            "_trusted_root_owned_executable",
+            side_effect=trust_executable,
+        ):
+            with mock.patch.object(
+                adapter.subprocess,
+                "run",
+                return_value=subprocess.CompletedProcess([], 1),
+            ):
+                with self.assertRaises(adapter.PolicyGate) as raised:
+                    adapter._require_trusted_credential_helper(helper)
+
+        self.assertEqual(
+            raised.exception.code,
+            "HTTPS_CREDENTIAL_PROVIDER_UNAVAILABLE",
+        )
+
+    def test_linux_provider_admits_only_a_root_owned_package_link(self) -> None:
+        exec_path = self.root / "git-core"
+        exec_path.mkdir()
+        candidate = exec_path / adapter.LINUX_CREDENTIAL_HELPER
+        candidate.symlink_to("git")
+        observed = []
+
+        def trust_executable(path, **kwargs):
+            observed.append((path, kwargs))
+            if path == candidate and kwargs.get("allow_root_owned_symlink"):
+                return str(candidate)
+            raise OSError("untrusted")
+
+        with mock.patch.object(
+            adapter,
+            "_trusted_root_owned_executable",
+            side_effect=trust_executable,
+        ):
+            trusted = adapter._require_linux_credential_provider(exec_path)
+
+        self.assertEqual(trusted, str(candidate))
+        self.assertTrue(observed[0][1]["allow_root_owned_symlink"])
 
     def test_windows_https_uses_gcm_from_the_trusted_git_installation(self) -> None:
         git_root = self.root / "Program Files" / "Git"
@@ -767,14 +858,15 @@ class PublicationExecutionTests(unittest.TestCase):
                     f"username={username}\n\n"
                 )
                 credential = lookup.removesuffix("\n") + f"password={secret}\n\n"
-                stored = run_credential_helper(
-                    helper,
-                    "store",
-                    credential,
-                    repository.env,
-                )
                 erased = None
+                active_failure = False
                 try:
+                    stored = run_credential_helper(
+                        helper,
+                        "store",
+                        credential,
+                        repository.env,
+                    )
                     if (
                         stored.returncode != 0
                         and os.environ.get(
@@ -796,10 +888,8 @@ class PublicationExecutionTests(unittest.TestCase):
                         lookup,
                         repository.env,
                     )
-                    retrieved_fields = dict(
-                        line.split("=", 1)
-                        for line in retrieved.stdout.splitlines()
-                        if "=" in line
+                    retrieved_fields = credential_protocol_fields(
+                        retrieved.stdout
                     )
                     self.assertEqual(
                         retrieved.returncode,
@@ -818,27 +908,30 @@ class PublicationExecutionTests(unittest.TestCase):
                         endpoint,
                         ["ls-remote", "--heads"],
                     )
+                except BaseException:
+                    active_failure = True
+                    raise
                 finally:
-                    erased = run_credential_helper(
-                        helper,
-                        "erase",
-                        lookup,
-                        repository.env,
-                    )
-                    after_erase = run_credential_helper(
-                        helper,
-                        "get",
-                        lookup,
-                        repository.env,
-                    )
+                    try:
+                        erased = run_credential_helper(
+                            helper,
+                            "erase",
+                            lookup,
+                            repository.env,
+                        )
+                        after_erase = run_credential_helper(
+                            helper,
+                            "get",
+                            lookup,
+                            repository.env,
+                        )
+                    except Exception:
+                        if not active_failure:
+                            raise
 
         self.assertIsNotNone(erased)
         self.assertEqual(erased.returncode, 0, "native credential cleanup failed")
-        after_erase_fields = dict(
-            line.split("=", 1)
-            for line in after_erase.stdout.splitlines()
-            if "=" in line
-        )
+        after_erase_fields = credential_protocol_fields(after_erase.stdout)
         self.assertFalse(
             secrets.compare_digest(
                 after_erase_fields.get("password", ""),
@@ -995,28 +1088,38 @@ class PublicationExecutionTests(unittest.TestCase):
 
         with mock.patch.object(adapter.sys, "platform", "linux"):
             with mock.patch.object(
-                execution,
-                "_endpoint",
-                return_value=(endpoint, fingerprint),
+                adapter,
+                "_require_linux_credential_provider",
+                side_effect=adapter.PolicyGate(
+                    "HTTPS_CREDENTIAL_PROVIDER_UNAVAILABLE",
+                    provider="linux-credential-cache",
+                ),
             ):
                 with mock.patch.object(
                     execution,
-                    "_probe_default_branch",
-                    return_value=self.plan["destination"]["default_branch_ref"],
+                    "_endpoint",
+                    return_value=(endpoint, fingerprint),
                 ):
                     with mock.patch.object(
                         execution,
-                        "_probe_ref",
-                        side_effect=(self.start, self.source),
+                        "_probe_default_branch",
+                        return_value=self.plan[
+                            "destination"
+                        ]["default_branch_ref"],
                     ):
                         with mock.patch.object(
                             execution,
-                            "_run_endpoint",
-                            return_value=subprocess.CompletedProcess(
-                                ["git", "push"], 0, "", ""
-                            ),
-                        ) as run_endpoint:
-                            result = execute(self.repo, self.plan)
+                            "_probe_ref",
+                            side_effect=(self.start, self.source),
+                        ):
+                            with mock.patch.object(
+                                execution,
+                                "_run_endpoint",
+                                return_value=subprocess.CompletedProcess(
+                                    ["git", "push"], 0, "", ""
+                                ),
+                            ) as run_endpoint:
+                                result = execute(self.repo, self.plan)
 
         self.assertEqual(result["status"], "blocked")
         self.assertFalse(result["push_attempted"])

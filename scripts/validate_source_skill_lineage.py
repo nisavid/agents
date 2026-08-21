@@ -71,7 +71,7 @@ RESEARCH_REPORT = Path(
     "docs/superpowers/research/2026-08-18-source-skill-lineage-and-drift.md"
 )
 RESEARCH_REPORT_SHA256 = (
-    "sha256:fd27baa90363c27cedd3a1ffeb0734aa01d207535874dd02d2d6ad9f92240dff"
+    "sha256:6c071cb3d9455d3c3911e1d7792f0467bf6e9d8296a48690e5c6a1b6b6a9b27a"
 )
 LINEAGE_TREE = {
     LINEAGE_ROOT / "installed-hosts",

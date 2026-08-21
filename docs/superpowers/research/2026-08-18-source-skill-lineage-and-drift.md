@@ -298,14 +298,15 @@ and the public-commit cache is
 `sha256:d83dcfd5c102dfcf264092f7998d5f68ceb035b516ad0c3e2c66f6b9083545fd`.
 
 Both manifests declare MIT, but the public package has no package-root license.
-The embedded licenses for
+The embedded license for
 [`gh-address-comments`](https://github.com/openai/plugins/blob/11c74d6ba24d3a6d48f54a194cd00ef3beea18f9/plugins/github/skills/gh-address-comments/LICENSE.txt),
-[`gh-fix-ci`](https://github.com/openai/plugins/blob/11c74d6ba24d3a6d48f54a194cd00ef3beea18f9/plugins/github/skills/gh-fix-ci/LICENSE.txt),
+is Apache-2.0 blob `7a4a3ea2424c09fbe48d455aed1eaa94d9124835`.
+The embedded licenses for
+[`gh-fix-ci`](https://github.com/openai/plugins/blob/11c74d6ba24d3a6d48f54a194cd00ef3beea18f9/plugins/github/skills/gh-fix-ci/LICENSE.txt)
 and
 [`yeet`](https://github.com/openai/plugins/blob/11c74d6ba24d3a6d48f54a194cd00ef3beea18f9/plugins/github/skills/yeet/LICENSE.txt)
-are Apache-2.0 blobs
-`7a4a3ea2424c09fbe48d455aed1eaa94d9124835` and
-`13e25df86ce06eb6488e6a6bc5c5847f5dedc352`. The ledger does not bind either
+share Apache-2.0 blob `13e25df86ce06eb6488e6a6bc5c5847f5dedc352`.
+The ledger does not bind either
 cache identity. Its selected package revision and package-level license
 boundary therefore remain `unresolved`.
 

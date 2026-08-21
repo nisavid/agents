@@ -43,9 +43,11 @@ from .operation_recovery import (
     EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V5_DIGEST,
     EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V6_DIGEST,
     EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V7_DIGEST,
+    EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V8_DIGEST,
     EXACT_DRAIN_TRANSACTION_TIMEOUT_SECONDS,
     EXPECTED_CLAIM_RELEASE_ROW_COUNT,
     EXPECTED_OPERATION_COUNTS,
+    FAILURE_CAUSE_FAMILIES,
     OperationRecoveryError,
     exact_drain_execution_deadline,
     verify_exact_drain_authorization_receipt,
@@ -390,7 +392,7 @@ def validate_exact_drain_provider_policy(
     if (
         policy.schema_version not in {1, 2}
         or (
-            plan_schema_version == 11
+            plan_schema_version in {11, 12}
             and policy.schema_version != 2
         )
         or (
@@ -580,6 +582,67 @@ WHERE bank_id = $1
   AND ($3::uuid[] IS NULL OR operation_id = ANY($3::uuid[]))
   AND ($4::text[] IS NULL OR status = ANY($4::text[]))
 ORDER BY created_at, operation_id
+"""
+FAILURE_CLASSIFICATION_QUERY = """
+SELECT
+    cause_family,
+    error_digest,
+    count(*)::bigint AS occurrence_count
+FROM (
+    SELECT
+        CASE
+            WHEN lower(error_message) LIKE
+                 '%operation-recovery exact drain operation attempt exceeded%'
+                THEN 'operation_attempt_deadline'
+            WHEN lower(error_message) LIKE
+                 '%exact drain retain phase one exceeded%'
+                OR lower(error_message) LIKE
+                   '%operation-recovery exact drain phase-one query timed out%'
+                THEN 'phase_one_deadline'
+            WHEN lower(error_message) LIKE '%statement timeout%'
+                OR lower(error_message) LIKE '%sqlstate 57014%'
+                THEN 'database_statement_timeout'
+            WHEN lower(error_message) LIKE '%provider_queue_timeout%'
+                THEN 'provider_queue_timeout'
+            WHEN lower(error_message) LIKE '%provider_execution_timeout%'
+                THEN 'provider_execution_timeout'
+            WHEN lower(error_message) ~
+                 '(auth|credential|token|unauthori[sz]ed|forbidden|401|403)'
+                THEN 'provider_authentication'
+            WHEN lower(error_message) ~
+                 '(capacity|quota|rate.?limit|usage.?limit|429|exhaust)'
+                THEN 'provider_capacity'
+            WHEN lower(error_message) ~
+                 '(bad.?request|client.?error|status.?400|error.?400)'
+                THEN 'provider_bad_request'
+            WHEN lower(error_message) ~
+                 '(connect|network|transport|unavailable|hatchery|502|503|504)'
+                THEN 'provider_transport'
+            WHEN lower(error_message) ~
+                 '(validation|invalid.?json|json.?decode|structured.?output|schema)'
+                THEN 'structured_output_validation'
+            WHEN lower(error_message) ~
+                 '(^|[^a-z])timeout(error)?([^a-z]|$)|timed.?out'
+                THEN 'upstream_timeout'
+            WHEN lower(error_message) ~
+                 '(integrity|constraint|duplicate.?key|foreign.?key)'
+                THEN 'database_integrity'
+            WHEN lower(error_message) ~ '(cancelled|canceled)'
+                THEN 'cancellation'
+            ELSE 'unknown'
+        END AS cause_family,
+        encode(
+            sha256(convert_to(error_message, 'UTF8')),
+            'hex'
+        ) AS error_digest
+    FROM {schema}.async_operations
+    WHERE bank_id = $1
+      AND operation_id = ANY($2::uuid[])
+      AND error_message IS NOT NULL
+      AND error_message <> ''
+) AS classified
+GROUP BY cause_family, error_digest
+ORDER BY cause_family, error_digest
 """
 QUEUE_BLOCKER_PREDICATE = """(
     status = 'processing'
@@ -847,8 +910,13 @@ def _exact_drain_failure_evidence(
         category = "provider_capacity"
     elif _exact_drain_phase_one_query_timeout_stage(safe_error) is not None:
         category = "phase_one_timeout"
-    elif "timeouterror" in lowered or "statement timeout" in lowered:
-        category = "operation_error"
+    elif "statement timeout" in lowered or "sqlstate 57014" in lowered:
+        category = "database_statement_timeout"
+    elif "timeouterror" in lowered or re.search(
+        r"(^|[^a-z])timeout([^a-z]|$)|timed.?out",
+        lowered,
+    ) is not None:
+        category = "upstream_timeout"
     elif EXACT_DRAIN_TRANSPORT_ERROR.search(safe_error) is not None:
         category = "provider_transport"
     elif not safe_error:
@@ -1306,6 +1374,63 @@ async def read_safe_operation_rows(
     return [_mapping(row) for row in rows]
 
 
+async def read_failure_classifications(
+    connection: Any,
+    *,
+    schema: str,
+    operation_ids: Sequence[str],
+) -> list[dict[str, Any]]:
+    """Return closed failure causes and digests without returning error text."""
+    quoted_schema = _quoted_identifier(schema, "database schema")
+    try:
+        identifiers = [uuid.UUID(value) for value in operation_ids]
+    except (AttributeError, TypeError, ValueError) as error:
+        raise OperationRecoveryError("operation ID set is invalid") from error
+    if not identifiers or len(identifiers) != len(set(identifiers)):
+        raise OperationRecoveryError("operation ID set is invalid")
+    rows = await connection.fetch(
+        FAILURE_CLASSIFICATION_QUERY.format(schema=quoted_schema),
+        "engineering",
+        identifiers,
+    )
+    classifications = []
+    for row_value in rows:
+        row = _mapping(row_value)
+        cause_family = row.get("cause_family")
+        error_digest = row.get("error_digest")
+        occurrence_count = row.get("occurrence_count")
+        if (
+            cause_family not in FAILURE_CAUSE_FAMILIES
+            or not isinstance(error_digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", error_digest) is None
+            or type(occurrence_count) is not int
+            or occurrence_count < 1
+        ):
+            raise OperationRecoveryError(
+                "operation-recovery failure classification is invalid"
+            )
+        classifications.append(
+            {
+                "cause_family": cause_family,
+                "error_digest": error_digest,
+                "occurrence_count": occurrence_count,
+            }
+        )
+    if classifications != sorted(
+        classifications,
+        key=lambda item: (item["cause_family"], item["error_digest"]),
+    ) or len(
+        {
+            (item["cause_family"], item["error_digest"])
+            for item in classifications
+        }
+    ) != len(classifications):
+        raise OperationRecoveryError(
+            "operation-recovery failure classification is invalid"
+        )
+    return classifications
+
+
 def exact_drain_worker_id(plan_digest: str) -> str:
     """Derive the private worker identity from an approved plan digest."""
     if not isinstance(plan_digest, str) or not re.fullmatch(
@@ -1448,7 +1573,7 @@ def install_exact_drain_runtime_guards(
     plan = getattr(adapter, "_plan", {})
     records_worker_lifecycle = (
         isinstance(plan, Mapping)
-        and plan.get("progress_schema_version") in {3, 4}
+        and plan.get("progress_schema_version") in {3, 4, 5}
     )
     upstream_memory_initialize = getattr(memory_engine_type, "initialize", None)
     if not callable(upstream_run) or (
@@ -1505,12 +1630,34 @@ def install_exact_drain_runtime_guards(
         "operation_attempt_timeout_seconds",
         None,
     )
+    operation_attempt_timeout_disposition = getattr(
+        adapter,
+        "operation_attempt_timeout_disposition",
+        "worker-fail-stop",
+    )
     if operation_attempt_timeout_seconds is not None and (
         type(operation_attempt_timeout_seconds) not in {int, float}
         or operation_attempt_timeout_seconds <= 0
     ):
         raise OperationRecoveryError(
             "exact drain operation-attempt timeout authority is invalid"
+        )
+    if operation_attempt_timeout_disposition not in {
+        "worker-fail-stop",
+        "task-retry-after-quiescence",
+    }:
+        raise OperationRecoveryError(
+            "exact drain operation-attempt timeout disposition is invalid"
+        )
+    retry_deadlines_after_quiescence = (
+        operation_attempt_timeout_disposition
+        == "task-retry-after-quiescence"
+    )
+    if retry_deadlines_after_quiescence and not callable(
+        getattr(adapter, "schedule_retry", None)
+    ):
+        raise OperationRecoveryError(
+            "exact drain operation-attempt retry seam is unavailable"
         )
     phase_one_nested_stage_prefixes = getattr(
         adapter,
@@ -1659,6 +1806,7 @@ def install_exact_drain_runtime_guards(
         )
         last_stage: str | None = None
         phase_one_deadline: float | None = None
+        retry_deadline_message: str | None = None
         operation_attempt_deadline = (
             None
             if operation_attempt_timeout_seconds is None
@@ -1668,10 +1816,26 @@ def install_exact_drain_runtime_guards(
             while True:
                 stage = getattr(holder, "stage", None)
                 now = time.monotonic()
+                if execution.done():
+                    if isinstance(stage, str) and stage != last_stage:
+                        try:
+                            adapter.record_upstream_stage(
+                                task.operation_id,
+                                stage,
+                            )
+                        except BaseException:
+                            request_exact_worker_shutdown(poller)
+                            raise
+                    return await execution
                 if (
                     operation_attempt_deadline is not None
                     and now >= operation_attempt_deadline
                 ):
+                    if retry_deadlines_after_quiescence:
+                        retry_deadline_message = (
+                            EXACT_DRAIN_OPERATION_ATTEMPT_TIMEOUT_MESSAGE
+                        )
+                        break
                     request_exact_worker_shutdown(poller)
                     raise OperationRecoveryError(
                         EXACT_DRAIN_OPERATION_ATTEMPT_TIMEOUT_MESSAGE
@@ -1695,6 +1859,11 @@ def install_exact_drain_runtime_guards(
                     phase_one_deadline is not None
                     and now >= phase_one_deadline
                 ):
+                    if retry_deadlines_after_quiescence:
+                        retry_deadline_message = (
+                            EXACT_DRAIN_PHASE_ONE_DEADLINE_TIMEOUT_MESSAGE
+                        )
+                        break
                     request_exact_worker_shutdown(poller)
                     raise OperationRecoveryError(
                         EXACT_DRAIN_PHASE_ONE_DEADLINE_TIMEOUT_MESSAGE
@@ -1768,6 +1937,7 @@ def install_exact_drain_runtime_guards(
                         error = OperationRecoveryError(
                             "exact drain task did not quiesce after cancellation"
                         )
+                        request_exact_worker_shutdown(poller)
                         try:
                             record_runtime_failure(
                                 task.operation_id,
@@ -1797,6 +1967,27 @@ def install_exact_drain_runtime_guards(
                         "exact drain task cleanup ended with %s",
                         type(error).__name__,
                     )
+        if retry_deadline_message is not None:
+            try:
+                await adapter.schedule_retry(
+                    poller._backend,
+                    task.operation_id,
+                    datetime.now(timezone.utc),
+                    retry_deadline_message,
+                    getattr(task, "schema", None),
+                )
+            except BaseException as error:
+                try:
+                    record_runtime_failure(
+                        task.operation_id,
+                        stage="failure.retry-persistence",
+                        category="terminal_state_persistence",
+                        error=error,
+                    )
+                finally:
+                    request_exact_worker_shutdown(poller)
+                raise
+            return None
 
     async def claim_exact_batch(
         poller: Any,
@@ -4569,11 +4760,11 @@ def exact_drain_runtime_evidence(
     provider_runtime_root: str | Path,
     runtime_package_root: str | Path,
     *,
-    schema_version: int = 11,
+    schema_version: int = 12,
 ) -> tuple[str, bytes]:
     """Bind runtime sources and retain prevalidated provider bootstrap bytes."""
     if type(schema_version) is not int or schema_version not in {
-        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12
     }:
         raise OperationRecoveryError(
             "exact drain runtime evidence schema version is invalid"
@@ -4688,6 +4879,14 @@ def exact_drain_runtime_evidence(
             sources["phase-repair-contract"] = (
                 EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V7_DIGEST
             )
+        elif schema_version == 12:
+            if snapshot["schema_version"] != 7:
+                raise OperationRecoveryError(
+                    "exact drain full-query repair snapshot is required"
+                )
+            sources["phase-repair-contract"] = (
+                EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V8_DIGEST
+            )
     for name, source in provider_sources.items():
         sources[f"provider/{name}"] = hashlib.sha256(source).hexdigest()
     package_entries = _exact_drain_package_entries(package_root)
@@ -4738,7 +4937,7 @@ def exact_drain_runtime_digest(
     provider_runtime_root: str | Path,
     runtime_package_root: str | Path,
     *,
-    schema_version: int = 11,
+    schema_version: int = 12,
 ) -> str:
     """Bind the worker entrypoint, claim seam, and provider patch sources."""
     runtime_digest, _provider_bootstrap = exact_drain_runtime_evidence(
@@ -4815,7 +5014,7 @@ class ExactDrainClaimAdapter:
         if (
             terminal_reconciliation
             and verified.get("schema_version")
-            in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11}
+            in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
             and terminal_status_evidence is None
         ):
             raise OperationRecoveryError(
@@ -4824,11 +5023,11 @@ class ExactDrainClaimAdapter:
         self._clock = clock
         self._maximum_retry_delay_seconds = (
             verified["execution_window"]["maximum_retry_delay_seconds"]
-            if verified.get("schema_version") in {10, 11}
+            if verified.get("schema_version") in {10, 11, 12}
             else None
         )
         if verified.get("schema_version") in {
-            2, 3, 4, 5, 6, 7, 8, 9, 10, 11
+            2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12
         }:
             if authorization is None:
                 raise OperationRecoveryError(
@@ -4857,24 +5056,29 @@ class ExactDrainClaimAdapter:
         self.phase_one_timeout_seconds = (
             verified["phase_one_timeout_seconds"]
             if verified.get("schema_version")
-            in {3, 4, 5, 6, 7, 8, 9, 10, 11}
+            in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
             else None
         )
         self.phase_one_statement_timeout_seconds = (
             verified["phase_one_statement_timeout_seconds"]
             if verified.get("schema_version")
-            in {3, 4, 5, 6, 7, 8, 9, 10, 11}
+            in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
             else None
         )
         self.operation_attempt_timeout_seconds = (
             verified["operation_attempt_timeout_seconds"]
-            if verified.get("schema_version") == 11
+            if verified.get("schema_version") in {11, 12}
             else None
         )
         self.phase_one_nested_stage_prefixes = (
             tuple(verified["phase_one_nested_stage_prefixes"])
-            if verified.get("schema_version") == 11
+            if verified.get("schema_version") in {11, 12}
             else ()
+        )
+        self.operation_attempt_timeout_disposition = (
+            verified["operation_attempt_timeout_disposition"]
+            if verified.get("schema_version") == 12
+            else "worker-fail-stop"
         )
         self._cleanup_deadline: float | None = None
         self._terminal_reconciliation_deadline: float | None = None
@@ -5135,7 +5339,7 @@ class ExactDrainClaimAdapter:
     ) -> None:
         if self._progress_recorder is None:
             return
-        if self._plan.get("progress_schema_version") in {2, 3, 4}:
+        if self._plan.get("progress_schema_version") in {2, 3, 4, 5}:
             self._progress_recorder.task_outcome(
                 operation_id,
                 status=status,
@@ -5154,7 +5358,7 @@ class ExactDrainClaimAdapter:
         """Persist a worker lifecycle stage when the plan binds it."""
         if (
             self._progress_recorder is not None
-            and self._plan.get("progress_schema_version") in {3, 4}
+            and self._plan.get("progress_schema_version") in {3, 4, 5}
         ):
             self._progress_recorder.worker_stage(
                 status=status,
@@ -5170,7 +5374,7 @@ class ExactDrainClaimAdapter:
         """Persist a closed worker-level failure without changing DB state."""
         if (
             self._progress_recorder is not None
-            and self._plan.get("progress_schema_version") in {3, 4}
+            and self._plan.get("progress_schema_version") in {3, 4, 5}
             and getattr(self._progress_recorder, "_worker_status", None)
             != "failed"
         ):
@@ -5358,7 +5562,7 @@ class ExactDrainClaimAdapter:
             )
         if self._progress_recorder is None:
             return
-        if self._plan.get("progress_schema_version") not in {2, 3, 4}:
+        if self._plan.get("progress_schema_version") not in {2, 3, 4, 5}:
             self.record_upstream_stage(operation_id, stage)
             return
         message = str(error_message)
@@ -5958,6 +6162,11 @@ class ExactDrainClaimAdapter:
                         observed_at=observed_at,
                     )
                 if retry_ceiling:
+                    terminal_error = (
+                        "operation-recovery exact drain retry ceiling reached"
+                        if error_message is None
+                        else _postgres_safe_error_text(error_message)
+                    )
                     result = await connection.execute(
                         """
                         UPDATE public.async_operations
@@ -5972,7 +6181,7 @@ class ExactDrainClaimAdapter:
                           AND worker_id = $3
                         """,
                         identifier,
-                        "operation-recovery exact drain retry ceiling reached",
+                        terminal_error,
                         self._worker_id,
                     )
                 elif error_message is None:
@@ -6033,7 +6242,10 @@ class ExactDrainClaimAdapter:
                     failure_message,
                     retryable=not retry_ceiling,
                     category_override=(
-                        "retry_ceiling" if retry_ceiling else None
+                        "retry_ceiling"
+                        if retry_ceiling
+                        and self._plan.get("progress_schema_version") != 5
+                        else None
                     ),
                 )
             ),
@@ -6500,6 +6712,15 @@ async def read_exact_drain_status(
             bank_id="engineering",
             operation_ids=cohort_ids,
         )
+        failure_classifications = (
+            await read_failure_classifications(
+                connection,
+                schema=schema,
+                operation_ids=selected_ids,
+            )
+            if verified["schema_version"] == 12
+            else []
+        )
         outside_rows = await connection.fetch(
             """
             SELECT bank_id,
@@ -6588,7 +6809,7 @@ async def read_exact_drain_status(
         for row in outside_rows
     ]
     body = {
-        "schema_version": 1,
+        "schema_version": 2 if verified["schema_version"] == 12 else 1,
         "kind": "operation-recovery-exact-drain-status",
         "plan_digest": verified["plan_digest"],
         "generation_before": generation_before,
@@ -6597,6 +6818,11 @@ async def read_exact_drain_status(
         "selected_status_counts": selected_status_counts,
         "preserved_status_counts": preserved_status_counts,
         "outside_nonterminal_counts": outside,
+        **(
+            {"failure_classifications": failure_classifications}
+            if verified["schema_version"] == 12
+            else {}
+        ),
         "observed_at": int(time.time()),
     }
     return verify_exact_drain_status(
@@ -7253,7 +7479,7 @@ async def apply_post_abort_recovery_transaction(
             item["operation_id"]: item
             for item in verified["retry_recovery"]["operations"]
         }
-        if verified["schema_version"] in {10, 11}
+        if verified["schema_version"] in {10, 11, 12}
         else {}
     )
     if retry_by_id and set(retry_by_id) != set(selected):
@@ -7356,7 +7582,7 @@ async def apply_post_abort_recovery_transaction(
             "worker_id IS NOT NULL "
             "AND encode(sha256(convert_to(worker_id, 'UTF8')), 'hex') = $3 "
             "AND claimed_at IS NOT NULL"
-            if verified["schema_version"] in {5, 6, 7, 8, 9, 10, 11}
+            if verified["schema_version"] in {5, 6, 7, 8, 9, 10, 11, 12}
             else "worker_id IS NULL AND claimed_at IS NULL"
         )
         result = await connection.execute(
@@ -7396,7 +7622,7 @@ async def apply_post_abort_recovery_transaction(
             selected_identifiers,
             bank_id,
             verified["reference_worker_id_digest"],
-            verified["schema_version"] in {7, 9, 10, 11},
+            verified["schema_version"] in {7, 9, 10, 11, 12},
         )
         if result != f"UPDATE {len(selected)}":
             raise OperationRecoveryError(
@@ -7549,7 +7775,7 @@ async def rollback_post_abort_recovery_transaction(
             item = selected[operation_id]
             row = preimage_by_id[operation_id]
             allowed_preimage_statuses = {"processing", "failed"}
-            if verified["schema_version"] in {7, 9, 10, 11}:
+            if verified["schema_version"] in {7, 9, 10, 11, 12}:
                 allowed_preimage_statuses.add("pending")
             if (
                 row.get("status") != item["expected_status"]

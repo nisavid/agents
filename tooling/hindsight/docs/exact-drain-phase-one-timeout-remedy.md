@@ -471,3 +471,42 @@ tamper rejection; payload-redacted progress; and unchanged golden verification
 for plan schemas 1-10 and progress schemas 1-3. Only after those tests and
 candidate verification pass should a fresh schema-11 exact-drain plan be
 offered for approval.
+
+## Schema 12 interruption and evidence repair
+
+Schema 12 preserves schema 11's split provider queue/execution deadlines and
+raises the progress contract to schema 5. It changes the operation-attempt and
+Phase 1 timeout disposition from worker fail-stop to task retry after bounded
+quiescence. The runtime cancels the child task, waits for the existing bounded
+shutdown proof, records a retryable task outcome, and continues the exact
+drain. If the child completed before timeout observation, completion wins. A
+nonquiescent child still fails closed without releasing ownership.
+
+Provider cancellation is not a provider fault. Progress schema 5 records
+`queue_cancelled` and `execution_cancelled` separately, removes the request
+from the active set, and leaves provider failure and timeout counters
+unchanged. Interrupted monitor projections freeze request ages at the last
+authenticated observation and mark surviving active requests stale.
+
+Retry-ceiling evidence preserves the underlying closed cause. A plain upstream
+`TimeoutError` is recorded as `upstream_timeout`; a PostgreSQL statement
+timeout is `database_statement_timeout`. The terminal database status artifact
+uses schema 2 and adds a server-side, payload-free classification projection
+containing only `cause_family`, `error_digest`, and `occurrence_count`. The
+classifier's cause-family vocabulary is closed and raw exception text never
+crosses the monitor boundary.
+
+Schema 12 also represents one final authenticated recovery from epoch two to
+epoch three. The post-abort transaction resets only failed exact-worker rows;
+unowned pending rows are preserved. The subsequent exact plan selects the full
+pending set and binds the epoch-three retry lineage. The cumulative ceiling is
+sixteen attempts per operation, and no epoch-four recovery is accepted.
+The controller and worker reject `--resume` for a nonterminal schema-11
+application journal. Recovery must use the authenticated schema-12
+epoch-two-to-three transaction; terminal reconciliation may still close an
+already terminal schema-11 run without restarting task execution.
+
+Schemas 1 through 11 and progress schemas 1 through 4 remain immutable
+historical contracts. Schema-12 behavior requires a rebuilt candidate, fresh
+runtime and contract digests, a new post-abort plan where recovery is needed,
+a fresh exact-drain plan, and explicit approval of each mutation plan.

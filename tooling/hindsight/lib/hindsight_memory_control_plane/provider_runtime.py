@@ -1180,6 +1180,10 @@ class _ProviderRuntime:
                     )(**kwargs)
                 finally:
                     _PROVIDER_REQUEST_DIGEST.reset(request_context)
+            except asyncio.CancelledError:
+                if progress_recorder is not None and request_digest is not None:
+                    progress_recorder.provider_cancelled(request_digest)
+                raise
             except BaseException as exc:
                 failover = should_failover(exc)
                 if progress_recorder is not None and request_digest is not None:

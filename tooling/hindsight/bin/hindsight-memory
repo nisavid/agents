@@ -8497,7 +8497,7 @@ def _operation_recovery_validate_exact_provider_policy(
 ) -> None:
     validate_exact_drain_provider_policy(
         policy,
-        plan_schema_version=11,
+        plan_schema_version=12,
     )
 
 
@@ -8558,7 +8558,7 @@ def _operation_recovery_validate_exact_worker_provider_runtime(
 def _operation_recovery_exact_runtime_digest(
     args: argparse.Namespace,
     *,
-    schema_version: int = 11,
+    schema_version: int = 12,
 ) -> str:
     return exact_drain_runtime_digest(
         args.worker_runtime,
@@ -8593,9 +8593,9 @@ def _operation_recovery_exact_recovery_context(
         ),
         allow_expired=True,
     )
-    if recovery_plan["schema_version"] not in {10, 11}:
+    if recovery_plan["schema_version"] not in {10, 11, 12}:
         raise OperationRecoveryError(
-            "exact drain recovery handoff requires post-abort schema 10 or 11"
+            "exact drain recovery handoff requires post-abort schema 10 or later"
         )
     if Path(recovery_plan["rollback_receipt_path"]).exists():
         raise OperationRecoveryError(
@@ -8785,7 +8785,7 @@ def operation_recovery_drain_plan_command(args: argparse.Namespace) -> int:
     )
     worker_runtime_digest = _operation_recovery_exact_runtime_digest(
         args,
-        schema_version=11,
+        schema_version=12,
     )
     recovery_context = _operation_recovery_exact_recovery_context(
         args,
@@ -8806,7 +8806,7 @@ def operation_recovery_drain_plan_command(args: argparse.Namespace) -> int:
         )
         if (
             recovery_context is None
-            or recovery_plan["schema_version"] not in {10, 11}
+            or recovery_plan["schema_version"] not in {10, 11, 12}
             or recovery_plan["plan_digest"]
             != recovery_context["post_abort_plan_digest"]
         ):
@@ -9235,7 +9235,7 @@ def _operation_recovery_post_abort_assert_reference_worker_stopped(
     plan: Mapping[str, Any],
 ) -> None:
     if (
-        plan["schema_version"] in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11}
+        plan["schema_version"] in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
         and _operation_recovery_exact_journal_worker_active(
             plan["reference_application_journal"]
         )
@@ -9259,7 +9259,7 @@ def _operation_recovery_post_abort_assert_reference_source_stopped(
         authorization != plan["reference_application_authorization"]
         or journal != plan["reference_application_journal"]
         or (
-            plan["schema_version"] in {3, 4, 5, 6, 7, 8, 9, 10, 11}
+            plan["schema_version"] in {3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
             and _operation_recovery_post_abort_reference_progress_digest(
                 plan["reference_plan"],
                 journal,
@@ -9321,7 +9321,7 @@ def _operation_recovery_exact_execution_lease_projection(
     now: int | None = None,
 ) -> Mapping[str, Any]:
     if plan.get("schema_version") not in {
-        2, 3, 4, 5, 6, 7, 8, 9, 10, 11
+        2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12
     }:
         return {}
     window_seconds = exact_drain_execution_window_seconds(plan)
@@ -9356,7 +9356,7 @@ def _operation_recovery_assert_exact_execution_lease(
     now: int | None = None,
 ) -> int | None:
     if plan.get("schema_version") not in {
-        2, 3, 4, 5, 6, 7, 8, 9, 10, 11
+        2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12
     }:
         return None
     execution_deadline = exact_drain_execution_deadline(plan, authorization)
@@ -9382,7 +9382,7 @@ def operation_recovery_drain_status_command(args: argparse.Namespace) -> int:
             authorization = (
                 _operation_recovery_exact_authorization(plan)
                 if plan.get("schema_version")
-                in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11}
+                in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
                 and Path(plan["authorization_receipt_path"]).exists()
                 else None
             )
@@ -9393,7 +9393,7 @@ def operation_recovery_drain_status_command(args: argparse.Namespace) -> int:
                 "status": (
                     "authorization-only"
                     if plan.get("schema_version")
-                    in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11}
+                    in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
                     and authorization is not None
                     else "awaiting-approval"
                 ),
@@ -9406,6 +9406,15 @@ def operation_recovery_drain_status_command(args: argparse.Namespace) -> int:
                 "outside_nonterminal_counts": live[
                     "outside_nonterminal_counts"
                 ],
+                **(
+                    {
+                        "failure_classifications": live[
+                            "failure_classifications"
+                        ]
+                    }
+                    if live.get("schema_version") == 2
+                    else {}
+                ),
                 "status_digest": live["status_digest"],
             }
             application_path = Path(plan["application_receipt_path"])
@@ -9763,6 +9772,8 @@ def _operation_recovery_assert_terminal_progress(
 
 def _operation_recovery_read_monitor_progress(
     plan: Mapping[str, Any],
+    *,
+    freeze_ages_at_observed_at: bool = False,
 ) -> Mapping[str, Any]:
     """Tolerate a bounded race with the worker's atomic progress replacement."""
     for attempt in range(3):
@@ -9771,6 +9782,7 @@ def _operation_recovery_read_monitor_progress(
                 Path(plan["progress_artifact_path"]),
                 plan_digest=plan["plan_digest"],
                 progress_schema_version=plan.get("progress_schema_version", 1),
+                freeze_ages_at_observed_at=freeze_ages_at_observed_at,
             )
         except OperationRecoveryError as error:
             if (
@@ -9790,7 +9802,7 @@ def _operation_recovery_exact_progress_closed_lease_expiry(
 ) -> bool:
     """Authenticate a child-closed execution-window failure."""
     if (
-        plan.get("progress_schema_version") not in {3, 4}
+        plan.get("progress_schema_version") not in {3, 4, 5}
         or not Path(plan["progress_artifact_path"]).is_file()
     ):
         return False
@@ -9992,6 +10004,14 @@ def operation_recovery_drain_apply_command(args: argparse.Namespace) -> int:
                 journal_resume
                 and _operation_recovery_exact_status_is_terminal(before)
             )
+            if (
+                journal_resume
+                and plan["schema_version"] == 11
+                and not terminal_reconciliation
+            ):
+                raise OperationRecoveryError(
+                    "schema-11 interrupted exact drain requires post-abort recovery"
+                )
             profile_environment: Mapping[str, str] = {}
             if not terminal_reconciliation:
                 if authorization is not None:
@@ -10333,7 +10353,7 @@ def operation_recovery_drain_apply_command(args: argparse.Namespace) -> int:
                                 timeout=(
                                     plan["transaction_timeout_seconds"]
                                     if plan.get("schema_version")
-                                    in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11}
+                                    in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
                                     else EXACT_DRAIN_TRANSACTION_TIMEOUT_SECONDS
                                 )
                             )
@@ -10435,7 +10455,7 @@ def operation_recovery_drain_monitor_command(args: argparse.Namespace) -> int:
         or application_path.exists()
         or (
             plan.get("schema_version")
-            in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11}
+            in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
             and Path(plan["authorization_receipt_path"]).exists()
         )
     ):
@@ -10446,7 +10466,7 @@ def operation_recovery_drain_monitor_command(args: argparse.Namespace) -> int:
                 "status": (
                     "authorization-only"
                     if plan.get("schema_version")
-                    in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11}
+                    in {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12}
                     and authorization is not None
                     else "not-started"
                 ),
@@ -10547,6 +10567,22 @@ def operation_recovery_drain_monitor_command(args: argparse.Namespace) -> int:
                 "exact drain terminal progress differs"
             )
         monitor_status = "terminal"
+    if monitor_status == "interrupted":
+        frozen = _operation_recovery_read_monitor_progress(
+            plan,
+            freeze_ages_at_observed_at=True,
+        )
+        if frozen["progress_digest"] != progress["progress_digest"]:
+            raise OperationRecoveryError(
+                "exact drain progress changed while reading"
+            )
+        progress = {
+            **frozen,
+            "active_provider_requests": [
+                {**item, "stale": True}
+                for item in frozen["active_provider_requests"]
+            ],
+        }
     expected_tasks = {
         (
             item["operation_id"],
@@ -10588,7 +10624,7 @@ def operation_recovery_drain_monitor_command(args: argparse.Namespace) -> int:
             "progress_digest": progress["progress_digest"],
             **(
                 {}
-                if plan.get("progress_schema_version") not in {3, 4}
+                if plan.get("progress_schema_version") not in {3, 4, 5}
                 else {
                     "worker_status": progress["worker_status"],
                     "worker_stage": progress["worker_stage"],
@@ -10613,6 +10649,15 @@ def operation_recovery_drain_monitor_command(args: argparse.Namespace) -> int:
                     "outside_nonterminal_counts": terminal_status[
                         "outside_nonterminal_counts"
                     ],
+                    **(
+                        {
+                            "failure_classifications": terminal_status[
+                                "failure_classifications"
+                            ]
+                        }
+                        if terminal_status.get("schema_version") == 2
+                        else {}
+                    ),
                     "terminal_status_digest": terminal_status[
                         "status_digest"
                     ],
@@ -10811,26 +10856,27 @@ def operation_recovery_post_abort_plan_command(args: argparse.Namespace) -> int:
         allow_expired=True,
     )
     reference_context = reference.get("recovery_context")
-    epoch_two_recovery = (
-        reference["schema_version"] in {10, 11}
+    chained_recovery = (
+        reference["schema_version"] in {10, 11, 12}
         and isinstance(reference_context, Mapping)
-        and reference_context.get("schema_version") == 1
+        and reference_context.get("schema_version") in {1, 2}
         and reference_context.get("origin") == "post-abort"
-        and reference_context.get("recovery_epoch") == 1
+        and reference_context.get("recovery_epoch")
+        == reference_context.get("schema_version")
     )
     prior_recovery_plan_path = getattr(
         args,
         "prior_recovery_plan",
         None,
     )
-    if epoch_two_recovery != (prior_recovery_plan_path is not None):
+    if chained_recovery != (prior_recovery_plan_path is not None):
         raise OperationRecoveryError(
-            "operation-recovery epoch-two prior recovery handoff differs"
+            "operation-recovery chained prior recovery handoff differs"
         )
     prior_recovery_plan = None
     prior_recovery_application = None
     prior_recovery_verification = None
-    if epoch_two_recovery:
+    if chained_recovery:
         prior_recovery_plan = verify_post_abort_recovery_plan(
             _operation_recovery_read_private_json(
                 prior_recovery_plan_path,
@@ -10861,7 +10907,7 @@ def operation_recovery_post_abort_plan_command(args: argparse.Namespace) -> int:
             )
         )
         if (
-            prior_recovery_plan["schema_version"] not in {10, 11}
+            prior_recovery_plan["schema_version"] not in {10, 11, 12}
             or prior_recovery_plan["plan_digest"]
             != reference_context["post_abort_plan_digest"]
             or prior_recovery_plan["retry_recovery_digest"]
@@ -11023,9 +11069,15 @@ def operation_recovery_post_abort_plan_command(args: argparse.Namespace) -> int:
             else prior_recovery_plan["retry_recovery"]
         ),
         schema_version=(
-            11
-            if snapshot["installation_authority"].get("schema_version") == 2
-            else 10
+            12
+            if isinstance(reference_context, Mapping)
+            and reference_context.get("schema_version") == 2
+            else (
+                11
+                if snapshot["installation_authority"].get("schema_version")
+                == 2
+                else 10
+            )
         ),
     )
     current_binding = read_pg0_registration("systalyze")

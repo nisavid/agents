@@ -37,6 +37,7 @@ from hindsight_memory_control_plane.operation_recovery_runtime import (  # noqa:
     CLAIM_RELEASE_EVIDENCE_QUERY,
     ExactDrainClaimAdapter,
     ExactDrainWorkerMainShutdownBridge,
+    FAILURE_CLASSIFICATION_QUERY,
     SAFE_OPERATION_QUERY,
     apply_requeue_transaction,
     apply_post_abort_recovery_transaction,
@@ -47,6 +48,7 @@ from hindsight_memory_control_plane.operation_recovery_runtime import (  # noqa:
     install_exact_drain_runtime_guards,
     live_row_digest,
     read_global_queue_blockers,
+    read_failure_classifications,
     read_claim_release_evidence,
     read_snapshot,
     rollback_requeue_transaction,
@@ -1123,7 +1125,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         self.assertEqual(
             evidence["failure"],
             {
-                "category": "operation_error",
+                "category": "upstream_timeout",
                 "retryable": False,
                 "http_status": None,
                 "error_digest": hashlib.sha256(b"TimeoutError").hexdigest(),
@@ -1193,6 +1195,10 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
             retryable=False,
         )
         upstream = classify("TimeoutError", retryable=True)
+        database = classify(
+            "DatabaseError: canceling statement due to statement timeout",
+            retryable=True,
+        )
         attempt = classify(
             operation_recovery_runtime.EXACT_DRAIN_OPERATION_ATTEMPT_TIMEOUT_MESSAGE,
             retryable=False,
@@ -1209,7 +1215,8 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
             stored_phase_one_deadline["category"],
             "phase_one_timeout",
         )
-        self.assertEqual(upstream["category"], "operation_error")
+        self.assertEqual(upstream["category"], "upstream_timeout")
+        self.assertEqual(database["category"], "database_statement_timeout")
         self.assertEqual(attempt["category"], "operation_attempt_timeout")
         self.assertTrue(queue["retryable"])
         self.assertTrue(execution["retryable"])
@@ -1223,6 +1230,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
             phase_one,
             phase_one_deadline,
             upstream,
+            database,
             attempt,
         ):
             self.assertIsNone(evidence["http_status"])
@@ -1306,6 +1314,83 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         self.assertEqual(evidence["status"], "failed")
         self.assertEqual(evidence["stage"], "retry-ceiling")
         self.assertEqual(evidence["failure"]["category"], "retry_ceiling")
+        self.assertIs(evidence["failure"]["retryable"], False)
+
+    def test_schema_five_retry_ceiling_preserves_the_underlying_cause(self):
+        adapter = self._current_exact_drain_adapter()
+        adapter._plan = {**adapter._plan, "progress_schema_version": 5}
+        operation_id, selected = next(iter(adapter._selected.items()))
+        adapter._started_ids.add(operation_id)
+        adapter._verify_unstarted_state = AsyncMock()
+        adapter._configure_mutation_transaction = AsyncMock()
+        outcomes = []
+        update_arguments = []
+
+        class Recorder:
+            def task_outcome(self, *arguments, **keywords):
+                outcomes.append((arguments, keywords))
+
+        adapter._progress_recorder = Recorder()
+        row = {
+            "operation_type": selected["operation_type"],
+            "status": "processing",
+            "worker_id": adapter._worker_id,
+            "retry_count": adapter._max_retries,
+            "task_payload_digest": selected["task_payload_digest"],
+            "checkpoint_facts_committed": False,
+            "checkpoint_committed_document_count": 0,
+            "checkpoint_unit_ids_count": 0,
+            "checkpoint_stage": "unavailable",
+            "checkpoint_processed": 0,
+            "checkpoint_total": 0,
+        }
+
+        class Transaction:
+            async def __aenter__(self):
+                return None
+
+            async def __aexit__(self, *_arguments):
+                return None
+
+        class Connection:
+            def transaction(self):
+                return Transaction()
+
+            async def fetchrow(self, *_arguments):
+                return dict(row)
+
+            async def execute(self, statement, *arguments):
+                if "UPDATE public.async_operations" in statement:
+                    update_arguments.append(arguments)
+                    row["status"] = "failed"
+                    return "UPDATE 1"
+                return "SET"
+
+        class Context:
+            async def __aenter__(self):
+                return Connection()
+
+            async def __aexit__(self, *_arguments):
+                return None
+
+        class Backend:
+            def acquire(self):
+                return Context()
+
+        asyncio.run(
+            adapter.schedule_retry(
+                Backend(),
+                operation_id,
+                None,
+                "TimeoutError",
+                "public",
+            )
+        )
+
+        self.assertEqual(update_arguments[0][1], "TimeoutError")
+        _arguments, evidence = outcomes[0]
+        self.assertEqual(evidence["stage"], "retry-ceiling")
+        self.assertEqual(evidence["failure"]["category"], "upstream_timeout")
         self.assertIs(evidence["failure"]["retryable"], False)
 
     def test_schema10_retry_and_defer_enforce_the_plan_bound_delay(self):
@@ -3400,6 +3485,227 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
             asyncio.run(exercise())
         self.assertEqual(events, ["shutdown", "cancelled"])
 
+    def test_schema_twelve_operation_deadline_retries_after_quiescence(self):
+        events = []
+        retries = []
+
+        class Adapter(_ControlConnectionAdapterMixin):
+            operation_attempt_timeout_seconds = 0.01
+            operation_attempt_timeout_disposition = (
+                "task-retry-after-quiescence"
+            )
+            phase_one_nested_stage_prefixes = ("llm.",)
+
+            def record_upstream_stage(self, _operation_id, _stage):
+                return None
+
+            async def schedule_retry(
+                self,
+                backend,
+                operation_id,
+                retry_at,
+                error_message,
+                schema,
+            ):
+                retries.append(
+                    (
+                        backend,
+                        operation_id,
+                        retry_at,
+                        error_message,
+                        schema,
+                    )
+                )
+
+        class WorkerPoller(_RunCapableWorkerPoller):
+            _backend = "exact-backend"
+
+            def __init__(self):
+                self._shutdown = asyncio.Event()
+
+            async def _claim_batch_for_schema_inner(self, *_arguments):
+                return []
+
+            async def _claim_batch_for_schema(self, schema, reserved, shared):
+                return await self._claim_batch_for_schema_inner(
+                    schema, reserved, shared
+                )
+
+            async def _execute_task_inner(self, _task, holder):
+                holder.stage = "retain.phase2.insert_facts"
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    events.append("cancelled")
+
+        install_exact_drain_runtime_guards(
+            type("PostgreSQLOps", (), {}),
+            WorkerPoller,
+            type("MemoryEngine", (), {}),
+            Adapter(),
+            request_worker_shutdown=lambda: events.append("shutdown"),
+        )
+
+        async def exercise():
+            poller = WorkerPoller()
+            result = await poller._execute_task_inner(
+                SimpleNamespace(operation_id="operation-1", schema=None),
+                SimpleNamespace(stage="queued.retain"),
+            )
+            return poller, result
+
+        poller, result = asyncio.run(exercise())
+
+        self.assertIsNone(result)
+        self.assertFalse(poller._shutdown.is_set())
+        self.assertEqual(events, ["cancelled"])
+        self.assertEqual(len(retries), 1)
+        backend, operation_id, retry_at, error_message, schema = retries[0]
+        self.assertEqual(backend, "exact-backend")
+        self.assertEqual(operation_id, "operation-1")
+        self.assertIsNotNone(retry_at.tzinfo)
+        self.assertEqual(
+            error_message,
+            operation_recovery_runtime.EXACT_DRAIN_OPERATION_ATTEMPT_TIMEOUT_MESSAGE,
+        )
+        self.assertIsNone(schema)
+
+    def test_schema_twelve_completed_task_wins_at_deadline_boundary(self):
+        class Adapter(_ControlConnectionAdapterMixin):
+            operation_attempt_timeout_seconds = 0.5
+            operation_attempt_timeout_disposition = (
+                "task-retry-after-quiescence"
+            )
+            phase_one_nested_stage_prefixes = ("llm.",)
+
+            def record_upstream_stage(self, _operation_id, _stage):
+                return None
+
+            async def schedule_retry(self, *_arguments):
+                raise AssertionError("completed task was retried")
+
+        class WorkerPoller(_RunCapableWorkerPoller):
+            _backend = "exact-backend"
+
+            def __init__(self):
+                self._shutdown = asyncio.Event()
+
+            async def _claim_batch_for_schema_inner(self, *_arguments):
+                return []
+
+            async def _claim_batch_for_schema(self, schema, reserved, shared):
+                return await self._claim_batch_for_schema_inner(
+                    schema, reserved, shared
+                )
+
+            async def _execute_task_inner(self, _task, _holder):
+                return "completed"
+
+        install_exact_drain_runtime_guards(
+            type("PostgreSQLOps", (), {}),
+            WorkerPoller,
+            type("MemoryEngine", (), {}),
+            Adapter(),
+            request_worker_shutdown=lambda: None,
+        )
+
+        def completed_task(coroutine):
+            coroutine.close()
+            future = asyncio.get_running_loop().create_future()
+            future.set_result("completed")
+            return future
+
+        async def exercise():
+            with (
+                patch(
+                    "hindsight_memory_control_plane."
+                    "operation_recovery_runtime.asyncio.create_task",
+                    side_effect=completed_task,
+                ),
+                patch(
+                    "hindsight_memory_control_plane."
+                    "operation_recovery_runtime.time.monotonic",
+                    side_effect=[10.0, 11.0],
+                ),
+            ):
+                poller = WorkerPoller()
+                result = await poller._execute_task_inner(
+                    SimpleNamespace(operation_id="operation-1", schema=None),
+                    SimpleNamespace(stage="retain.phase2.insert_facts"),
+                )
+                return poller, result
+
+        poller, result = asyncio.run(exercise())
+        self.assertEqual(result, "completed")
+        self.assertFalse(poller._shutdown.is_set())
+
+    def test_schema_twelve_phase_one_deadline_retries_after_quiescence(self):
+        retries = []
+        events = []
+
+        class Adapter(_ControlConnectionAdapterMixin):
+            phase_one_timeout_seconds = 0.01
+            operation_attempt_timeout_disposition = (
+                "task-retry-after-quiescence"
+            )
+            phase_one_nested_stage_prefixes = ("llm.",)
+
+            def record_upstream_stage(self, _operation_id, _stage):
+                return None
+
+            async def schedule_retry(self, *arguments):
+                retries.append(arguments)
+
+        class WorkerPoller(_RunCapableWorkerPoller):
+            _backend = "exact-backend"
+
+            def __init__(self):
+                self._shutdown = asyncio.Event()
+
+            async def _claim_batch_for_schema_inner(self, *_arguments):
+                return []
+
+            async def _claim_batch_for_schema(self, schema, reserved, shared):
+                return await self._claim_batch_for_schema_inner(
+                    schema, reserved, shared
+                )
+
+            async def _execute_task_inner(self, _task, holder):
+                holder.stage = "retain.phase1.candidates"
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    events.append("cancelled")
+
+        install_exact_drain_runtime_guards(
+            type("PostgreSQLOps", (), {}),
+            WorkerPoller,
+            type("MemoryEngine", (), {}),
+            Adapter(),
+            request_worker_shutdown=lambda: events.append("shutdown"),
+        )
+
+        async def exercise():
+            poller = WorkerPoller()
+            result = await poller._execute_task_inner(
+                SimpleNamespace(operation_id="operation-1", schema="public"),
+                SimpleNamespace(stage="queued.retain"),
+            )
+            return poller, result
+
+        poller, result = asyncio.run(exercise())
+
+        self.assertIsNone(result)
+        self.assertFalse(poller._shutdown.is_set())
+        self.assertEqual(events, ["cancelled"])
+        self.assertEqual(len(retries), 1)
+        self.assertEqual(retries[0][0:2], ("exact-backend", "operation-1"))
+        self.assertEqual(
+            retries[0][3],
+            operation_recovery_runtime.EXACT_DRAIN_PHASE_ONE_DEADLINE_TIMEOUT_MESSAGE,
+        )
+        self.assertEqual(retries[0][4], "public")
+
     def test_phase_one_timeout_never_releases_before_task_quiescence(self):
         release_calls = []
         stages = []
@@ -5303,6 +5609,91 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         self.assertIn("task_payload_digest", select_list)
         self.assertIn("worker_id_digest", select_list)
         self.assertIn("error_digest", select_list)
+
+    def test_failure_classifier_returns_only_closed_payload_free_causes(self):
+        operation_id = "00000000-0000-4000-8000-000000000001"
+
+        class Connection:
+            def __init__(self):
+                self.fetch_calls = []
+
+            async def fetch(self, query, *arguments):
+                self.fetch_calls.append((query, arguments))
+                return [
+                    {
+                        "cause_family": "unknown",
+                        "error_digest": "b" * 64,
+                        "occurrence_count": 1,
+                    },
+                    {
+                        "cause_family": "upstream_timeout",
+                        "error_digest": "a" * 64,
+                        "occurrence_count": 2,
+                    },
+                ]
+
+        connection = Connection()
+        evidence = asyncio.run(
+            read_failure_classifications(
+                connection,
+                schema="public",
+                operation_ids=[operation_id],
+            )
+        )
+
+        self.assertEqual(
+            evidence,
+            [
+                {
+                    "cause_family": "unknown",
+                    "error_digest": "b" * 64,
+                    "occurrence_count": 1,
+                },
+                {
+                    "cause_family": "upstream_timeout",
+                    "error_digest": "a" * 64,
+                    "occurrence_count": 2,
+                },
+            ],
+        )
+        query, arguments = connection.fetch_calls[0]
+        self.assertEqual(arguments[0], "engineering")
+        self.assertEqual(str(arguments[1][0]), operation_id)
+        select_list = query.split("FROM \"public\".async_operations")[0]
+        self.assertNotIn("error_message AS", select_list)
+        self.assertIn("cause_family", select_list)
+        self.assertIn("error_digest", select_list)
+        self.assertIn("occurrence_count", query)
+        self.assertIn("database_statement_timeout", query)
+        self.assertIn("provider_execution_timeout", query)
+        self.assertIn("upstream_timeout", query)
+
+    def test_failure_classifier_rejects_open_or_malformed_output(self):
+        operation_id = "00000000-0000-4000-8000-000000000001"
+
+        class Connection:
+            async def fetch(self, *_arguments):
+                return [
+                    {
+                        "cause_family": "raw_exception_text",
+                        "error_digest": "a" * 64,
+                        "occurrence_count": 1,
+                    }
+                ]
+
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "failure classification is invalid",
+        ):
+            asyncio.run(
+                read_failure_classifications(
+                    Connection(),
+                    schema="public",
+                    operation_ids=[operation_id],
+                )
+            )
+
+        self.assertNotIn("error_message AS", FAILURE_CLASSIFICATION_QUERY)
 
     def test_global_queue_blockers_share_the_apply_guard_and_are_payload_free(self):
         class BlockerConnection(FakeConnection):

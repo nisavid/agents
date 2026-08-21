@@ -2010,7 +2010,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 retry_attempt=1,
                 scope="retain_extract_facts",
             )
-            if plan.get("progress_schema_version") == 4:
+            if plan.get("progress_schema_version") in {4, 5}:
                 recorder.provider_executing(active_request)
             diagnostic_operation = plan["selected_operations"][0]["operation_id"]
             recorder.task_stage(
@@ -2069,8 +2069,25 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                         result = command(
                             SimpleNamespace(plan=str(root / "plan.json"))
                         )
+                interrupted_captured = {}
+                original_worker_active = globals_[
+                    "_operation_recovery_exact_journal_worker_active"
+                ]
+                globals_[
+                    "_operation_recovery_exact_journal_worker_active"
+                ] = lambda _journal: False
+                globals_["_print_result"] = (
+                    lambda value: interrupted_captured.update(value) or 0
+                )
+                interrupted_result = command(
+                    SimpleNamespace(plan=str(root / "plan.json"))
+                )
+                globals_[
+                    "_operation_recovery_exact_journal_worker_active"
+                ] = original_worker_active
+                globals_["_print_result"] = replacements["_print_result"]
                 terminal_body = {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "kind": "operation-recovery-exact-drain-status",
                     "plan_digest": plan["plan_digest"],
                     "generation_before": "systalyze:public:200",
@@ -2079,6 +2096,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                     "selected_status_counts": {"completed": 43},
                     "preserved_status_counts": {"completed": 5},
                     "outside_nonterminal_counts": [],
+                    "failure_classifications": [],
                     "observed_at": plan["created_at"] + 1,
                 }
                 terminal = {
@@ -2180,6 +2198,18 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
 
         self.assertEqual(result, 0)
         self.assertEqual(captured["status"], "running")
+        self.assertEqual(interrupted_result, 0)
+        self.assertEqual(interrupted_captured["status"], "interrupted")
+        self.assertEqual(
+            interrupted_captured["active_provider_requests"][0]["stale"],
+            True,
+        )
+        self.assertEqual(
+            interrupted_captured["active_provider_requests"][0][
+                "execution_age_seconds"
+            ],
+            0.0,
+        )
         self.assertEqual(captured["worker_status"], "starting")
         self.assertEqual(captured["worker_stage"], "progress.created")
         self.assertIsNone(captured["worker_failure_stage"])
@@ -2234,6 +2264,10 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
         self.assertEqual(
             terminal_captured["selected_status_counts"],
             {"completed": 43},
+        )
+        self.assertEqual(
+            terminal_captured["failure_classifications"],
+            [],
         )
         self.assertEqual(
             terminal_captured["terminal_status_digest"],
@@ -2486,12 +2520,12 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             self.assertEqual(result["status"], "planned")
             self.assertEqual(result["authority"], "unapproved-plan")
             self.assertEqual(result["selected_operation_count"], 43)
-            self.assertEqual(runtime_schemas, [11])
+            self.assertEqual(runtime_schemas, [12])
             plan, create_only = written[args.output]
             self.assertIs(create_only, True)
             self.assertIs(plan["mutation_authorized"], False)
-            self.assertEqual(plan["schema_version"], 11)
-            self.assertEqual(plan["progress_schema_version"], 4)
+            self.assertEqual(plan["schema_version"], 12)
+            self.assertEqual(plan["progress_schema_version"], 5)
             serialized = json.dumps(plan, sort_keys=True)
             self.assertNotIn('"task_payload":', serialized)
             self.assertNotIn('"worker_id":', serialized)
@@ -6862,6 +6896,58 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
         ):
             worker["parser"]().parse_args()
 
+    def test_schema_eleven_resume_worker_interface_is_unavailable(self):
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        now = int(time.time())
+        with tempfile.TemporaryDirectory(
+            dir="/private/tmp",
+            prefix="schema-eleven-worker-resume-",
+        ) as directory:
+            root = Path(directory)
+            root.chmod(0o700)
+            plan = self.controller["create_exact_drain_plan"](
+                fixtures.cohort(),
+                fixtures.drain_snapshot(observed_at=now),
+                candidate_release=recovery_fixtures.release_identity(),
+                rollback_backup=recovery_fixtures.drain_backup_evidence(),
+                rollback_backup_path=str(root / "backup.age"),
+                provider_policy_digest="9" * 64,
+                effective_profile_digest="7" * 64,
+                worker_runtime_digest="8" * 64,
+                authorization_receipt_path=str(root / "authorization.json"),
+                application_receipt_path=str(root / "application.json"),
+                status_artifact_path=str(root / "status.json"),
+                verification_receipt_path=str(root / "verification.json"),
+                created_at=now,
+                schema_version=11,
+            )
+            plan_path = root / "plan.json"
+            plan_path.write_text(json.dumps(plan), encoding="utf-8")
+            plan_path.chmod(0o600)
+            worker = runpy.run_path(
+                str(ROOT / "bin" / "hindsight-exact-drain-worker")
+            )
+            arguments = [
+                "hindsight-exact-drain-worker",
+                "--plan",
+                str(plan_path),
+                "--provider-policy",
+                str(root / "invalid-policy"),
+                "--provider-runtime-root",
+                str(root / "invalid-provider-runtime"),
+                "--worker-runtime",
+                str(root / "invalid-worker-runtime"),
+                "--resume",
+            ]
+            with (
+                patch.object(sys, "argv", arguments),
+                self.assertRaisesRegex(
+                    worker["OperationRecoveryError"],
+                    "schema-11 interrupted exact drain requires post-abort recovery",
+                ),
+            ):
+                worker["main"]()
+
     def test_expired_execution_lease_rejects_before_provider_activation(self):
         fixtures = recovery_fixtures.OperationRecoveryContractTest()
         execution_window_seconds = fixtures.drain_plan()["execution_window"][
@@ -6975,7 +7061,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             }
         )
         status_body = {
-            "schema_version": 1,
+            "schema_version": 2,
             "kind": "operation-recovery-exact-drain-status",
             "plan_digest": plan["plan_digest"],
             "generation_before": "systalyze:public:200",
@@ -6984,6 +7070,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             "selected_status_counts": {"completed": 43},
             "preserved_status_counts": {"completed": 5},
             "outside_nonterminal_counts": [],
+            "failure_classifications": [],
             "observed_at": now + 1,
         }
         terminal_status = {
@@ -7902,7 +7989,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 }
             )
             status_body = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "kind": "operation-recovery-exact-drain-status",
                 "plan_digest": plan["plan_digest"],
                 "generation_before": "systalyze:public:200",
@@ -7911,6 +7998,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 "selected_status_counts": {"completed": 43},
                 "preserved_status_counts": {"completed": 5},
                 "outside_nonterminal_counts": [],
+                "failure_classifications": [],
                 "observed_at": now + 1,
             }
             terminal_status = {
@@ -8139,6 +8227,90 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 retained_authorization["authorized_at"],
                 authorization["authorized_at"],
             )
+
+    def test_schema_eleven_interrupted_worker_requires_post_abort_recovery(self):
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        now = int(time.time())
+        with tempfile.TemporaryDirectory(
+            dir="/private/tmp",
+            prefix="schema-eleven-interrupted-drain-",
+        ) as directory:
+            root = Path(directory)
+            root.chmod(0o700)
+            plan = self.controller["create_exact_drain_plan"](
+                fixtures.cohort(),
+                fixtures.drain_snapshot(observed_at=now),
+                candidate_release=recovery_fixtures.release_identity(),
+                rollback_backup=recovery_fixtures.drain_backup_evidence(),
+                rollback_backup_path=str(root / "backup.age"),
+                provider_policy_digest="9" * 64,
+                effective_profile_digest="7" * 64,
+                worker_runtime_digest="8" * 64,
+                authorization_receipt_path=str(root / "auth.json"),
+                application_receipt_path=str(root / "application.json"),
+                status_artifact_path=str(root / "status.json"),
+                verification_receipt_path=str(root / "verify.json"),
+                created_at=now,
+                schema_version=11,
+            )
+            authorization = recovery_fixtures.exact_drain_authorization(plan)
+            journal = recovery_fixtures.exact_drain_application_journal(plan)
+            plan_path = root / "plan.json"
+            for path, value in (
+                (plan_path, plan),
+                (Path(plan["authorization_receipt_path"]), authorization),
+                (Path(plan["application_receipt_path"]), journal),
+            ):
+                path.write_text(json.dumps(value), encoding="utf-8")
+                path.chmod(0o600)
+            live = {
+                "generation_before": plan["pre_generation"],
+                "selected_status_counts": {
+                    "processing": plan["selected_operation_count"]
+                },
+                "preserved_status_counts": plan["preserved_status_counts"],
+                "outside_nonterminal_counts": [],
+                "status_digest": "6" * 64,
+            }
+
+            class Manager:
+                def _lock(self):
+                    return nullcontext()
+
+            command = self.controller["operation_recovery_drain_apply_command"]
+            globals_ = command.__globals__
+            replacements = {
+                "_operation_recovery_candidate": (
+                    lambda _args: plan["candidate_release"]
+                ),
+                "_portable_manager": lambda _args: Manager(),
+                "_operation_recovery_lock": lambda _manager: nullcontext(),
+                "_operation_recovery_exact_journal_worker_active": (
+                    lambda _journal: False
+                ),
+                "_assert_recovery_services_stopped": lambda _manager: None,
+                "_operation_recovery_assert_exact_backup": lambda _plan: None,
+                "_operation_recovery_read_exact_drain_status": (
+                    lambda _args, _plan: _immediate(live)
+                ),
+            }
+            originals = {key: globals_[key] for key in replacements}
+            globals_.update(replacements)
+            args = SimpleNamespace(
+                plan=str(plan_path),
+                approval_digest=plan["plan_digest"],
+                provider_policy="providers.json",
+                provider_runtime_root="provider-runtime",
+                worker_runtime="worker-runtime",
+            )
+            try:
+                with self.assertRaisesRegex(
+                    Exception,
+                    "schema-11 interrupted exact drain requires post-abort recovery",
+                ):
+                    command(args)
+            finally:
+                globals_.update(originals)
 
     def test_exact_drain_apply_does_not_launch_at_the_execution_lease_boundary(self):
         fixtures = recovery_fixtures.OperationRecoveryContractTest()
@@ -9213,7 +9385,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 )
             journal = journals[-1]
             status_body = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "kind": "operation-recovery-exact-drain-status",
                 "plan_digest": plan["plan_digest"],
                 "generation_before": "systalyze:public:250",
@@ -9222,6 +9394,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 "selected_status_counts": {"completed": 43},
                 "preserved_status_counts": {"completed": 5},
                 "outside_nonterminal_counts": [],
+                "failure_classifications": [],
                 "observed_at": now + 1,
             }
             terminal = {

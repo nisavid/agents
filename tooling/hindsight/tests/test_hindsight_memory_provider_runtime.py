@@ -1332,12 +1332,17 @@ print("accepted")
             LLMProvider, _CodexLLM, MultiLLMProvider = self.install(
                 policy_value=value,
             )
-            member = LLMProvider(
-                "lmstudio",
-                "",
-                "http://inference.example.test:13305/v1",
-                "private-fallback-model",
-            )
+            with mock.patch.object(
+                provider_runtime,
+                "_split_timeout",
+                return_value=1_200,
+            ):
+                member = LLMProvider(
+                    "lmstudio",
+                    "",
+                    "http://inference.example.test:13305/v1",
+                    "private-fallback-model",
+                )
             first_entered = asyncio.Event()
             release = asyncio.Event()
 
@@ -1387,6 +1392,223 @@ print("accepted")
                 for request in active["active_provider_requests"]
             ),
             ["executing", "queued", "queued"],
+        )
+
+    def test_split_progress_cancels_queued_request_without_provider_failure(self) -> None:
+        value = split_timeout_policy_data()
+        value["failover_order"] = ["fallback"]
+        value["members"] = [value["members"][2]]
+        value["members"][0]["max_concurrent"] = 2
+        value["members"][0]["queue_timeout_seconds"] = 2
+        value["members"][0]["execution_timeout_seconds"] = 2
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+            progress_path = Path(directory) / "progress.json"
+            recorder = ExactDrainProgressRecorder(
+                path=progress_path,
+                plan_digest="a" * 64,
+                worker_pid=os.getpid(),
+                worker_start_time="darwin:1000:1",
+                worker_attempt=1,
+                selected_operations=[],
+                progress_schema_version=5,
+            )
+            provider_runtime.set_exact_drain_progress_recorder(recorder)
+            self.addCleanup(
+                provider_runtime.set_exact_drain_progress_recorder,
+                None,
+            )
+            LLMProvider, _CodexLLM, MultiLLMProvider = self.install(
+                policy_value=value,
+            )
+            with mock.patch.object(
+                provider_runtime,
+                "_split_timeout",
+                return_value=1_200,
+            ):
+                member = LLMProvider(
+                    "lmstudio",
+                    "",
+                    "http://inference.example.test:13305/v1",
+                    "private-fallback-model",
+                )
+            entered = 0
+            two_entered = asyncio.Event()
+            release = asyncio.Event()
+
+            async def blocked_call(**_kwargs):
+                nonlocal entered
+                entered += 1
+                if entered == 2:
+                    two_entered.set()
+                await release.wait()
+                return "done"
+
+            member.operation = blocked_call
+            provider = MultiLLMProvider()
+            provider._members = [member]
+
+            async def scenario():
+                pending = [
+                    asyncio.create_task(
+                        provider._dispatch(
+                            "call",
+                            scope="retain_extract_facts",
+                        )
+                    )
+                    for _index in range(3)
+                ]
+                await two_entered.wait()
+                for _index in range(100):
+                    active = read_exact_drain_progress(
+                        progress_path,
+                        plan_digest="a" * 64,
+                        progress_schema_version=5,
+                    )
+                    states = sorted(
+                        request["state"]
+                        for request in active["active_provider_requests"]
+                    )
+                    if states == ["executing", "executing", "queued"]:
+                        break
+                    await asyncio.sleep(0)
+                else:
+                    self.fail("provider requests did not reach the queue")
+                pending[2].cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await pending[2]
+                after_cancel = read_exact_drain_progress(
+                    progress_path,
+                    plan_digest="a" * 64,
+                    progress_schema_version=5,
+                )
+                release.set()
+                results = await asyncio.gather(*pending[:2])
+                finished = read_exact_drain_progress(
+                    progress_path,
+                    plan_digest="a" * 64,
+                    progress_schema_version=5,
+                )
+                return after_cancel, finished, results
+
+            with mock.patch.object(
+                provider_runtime,
+                "_split_timeout",
+                return_value=1_200,
+            ):
+                after_cancel, finished, results = asyncio.run(
+                    asyncio.wait_for(scenario(), timeout=2.5)
+                )
+
+        self.assertEqual(results, ["done", "done"])
+        self.assertEqual(len(after_cancel["active_provider_requests"]), 2)
+        self.assertEqual(after_cancel["provider_counters"][0]["failed"], 0)
+        self.assertEqual(
+            after_cancel["provider_counters"][0]["queue_cancelled"],
+            1,
+        )
+        self.assertEqual(
+            after_cancel["provider_counters"][0]["execution_cancelled"],
+            0,
+        )
+        self.assertEqual(finished["active_provider_requests"], [])
+        self.assertEqual(finished["provider_counters"][0]["started"], 3)
+        self.assertEqual(finished["provider_counters"][0]["succeeded"], 2)
+        self.assertEqual(
+            finished["provider_counters"][0]["queue_cancelled"],
+            1,
+        )
+        self.assertEqual(
+            finished["provider_counters"][0]["execution_cancelled"],
+            0,
+        )
+        self.assertEqual(finished["provider_counters"][0]["failed"], 0)
+
+    def test_split_progress_cancels_executing_request_without_provider_failure(
+        self,
+    ) -> None:
+        value = split_timeout_policy_data()
+        value["failover_order"] = ["fallback"]
+        value["members"] = [value["members"][2]]
+        value["members"][0]["max_concurrent"] = 2
+        value["members"][0]["queue_timeout_seconds"] = 2
+        value["members"][0]["execution_timeout_seconds"] = 2
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+            progress_path = Path(directory) / "progress.json"
+            recorder = ExactDrainProgressRecorder(
+                path=progress_path,
+                plan_digest="a" * 64,
+                worker_pid=os.getpid(),
+                worker_start_time="darwin:1000:1",
+                worker_attempt=1,
+                selected_operations=[],
+                progress_schema_version=5,
+            )
+            provider_runtime.set_exact_drain_progress_recorder(recorder)
+            self.addCleanup(
+                provider_runtime.set_exact_drain_progress_recorder,
+                None,
+            )
+            LLMProvider, _CodexLLM, MultiLLMProvider = self.install(
+                policy_value=value,
+            )
+            with mock.patch.object(
+                provider_runtime,
+                "_split_timeout",
+                return_value=1_200,
+            ):
+                member = LLMProvider(
+                    "lmstudio",
+                    "",
+                    "http://inference.example.test:13305/v1",
+                    "private-fallback-model",
+                )
+            entered = asyncio.Event()
+
+            async def blocked_call(**_kwargs):
+                entered.set()
+                await asyncio.Event().wait()
+
+            member.operation = blocked_call
+            provider = MultiLLMProvider()
+            provider._members = [member]
+
+            async def scenario():
+                pending = asyncio.create_task(
+                    provider._dispatch(
+                        "call",
+                        scope="retain_extract_facts",
+                    )
+                )
+                await entered.wait()
+                pending.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await pending
+                return read_exact_drain_progress(
+                    progress_path,
+                    plan_digest="a" * 64,
+                    progress_schema_version=5,
+                )
+
+            with mock.patch.object(
+                provider_runtime,
+                "_split_timeout",
+                return_value=1_200,
+            ):
+                after_cancel = asyncio.run(
+                    asyncio.wait_for(scenario(), timeout=2.5)
+                )
+
+        self.assertEqual(after_cancel["active_provider_requests"], [])
+        self.assertEqual(after_cancel["provider_counters"][0]["started"], 1)
+        self.assertEqual(after_cancel["provider_counters"][0]["succeeded"], 0)
+        self.assertEqual(after_cancel["provider_counters"][0]["failed"], 0)
+        self.assertEqual(
+            after_cancel["provider_counters"][0]["queue_cancelled"],
+            0,
+        )
+        self.assertEqual(
+            after_cancel["provider_counters"][0]["execution_cancelled"],
+            1,
         )
 
     def test_split_concurrency_two_executes_two_and_queues_third(self) -> None:

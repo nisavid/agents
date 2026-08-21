@@ -329,14 +329,18 @@ processing rows; completed rows and all other cohort rows remain digest-exact.
 It advances recovery epoch zero to one. Within that transaction, failed rows
 may reset once while pending and processing rows preserve their retry counts.
 
-Schema 11 permits one final recovery from a schema 10 exact plan at epoch one.
-Every reference-selected row must be failed and owned by that exact worker. The
-operator must provide `--prior-recovery-plan`; planning authenticates that
-plan's application and verification receipts and carries its complete retry
-ledger into the epoch-one-to-two transition. The chained per-operation ledger
-caps cumulative attempts at twelve, including the four attempts newly made
-available by the reset. A schema 11 exact plan at epoch two cannot be recovered
-again, so an epoch-three reset is not representable.
+Schema 11 permits an authenticated recovery from epoch one to epoch two.
+Schema 12 permits one final recovery from epoch two to epoch three. For either
+chained transition, the operator must provide `--prior-recovery-plan`;
+planning authenticates the complete prior retry ledger and its application and
+verification receipts. A chained recovery selects only failed rows from the
+reference exact plan, so still-pending unowned rows remain unchanged. The next
+exact-drain plan nevertheless selects the complete pending set. The epoch-three
+ledger caps cumulative attempts at sixteen, including the four attempts made
+available by the final reset. Epoch four is not representable.
+An existing nonterminal schema-11 application journal is not resumable. The
+controller and worker require the authenticated schema-12 post-abort recovery
+path; terminal reconciliation remains available without restarting task work.
 
 A current exact-drain plan uses a fixed, nonrenewing execution window instead
 of the legacy 24-hour lease. Planning recomputes the window from the selected
@@ -350,6 +354,23 @@ accounted for separately.
 Current-plan retry and defer timestamps must be timezone-aware, no more than
 one hour ahead, and strictly before the absolute execution deadline. The
 worker rejects an out-of-window timestamp instead of clamping or persisting it.
+
+Schema 12 treats operation-attempt and Phase 1 deadlines as retryable task
+outcomes after bounded child-task quiescence. A task that completed before the
+deadline observation wins the boundary race. Cancellation while a provider
+request is queued or executing closes that request as cancellation rather than
+as a provider failure or timeout. If an operation reaches its retry ceiling,
+the terminal row and progress artifact preserve the underlying closed cause
+instead of replacing it with a generic retry-ceiling cause.
+
+Schema-12 status artifacts expose a closed, payload-free failure projection.
+Each entry contains only `cause_family`, `error_digest`, and
+`occurrence_count`. The server-side classifier distinguishes operation and
+Phase 1 deadlines, database statement timeouts, provider queue and execution
+timeouts, provider authentication/capacity/request/transport failures,
+structured-output validation, upstream timeouts, database integrity failures,
+cancellation, and unknown failures. Raw error text is never returned by the
+status or monitor surface.
 
 After post-abort verification, add `--recovery-plan "$POST_ABORT_PLAN"` to the
 next read-only `operation-recovery drain plan` command. The fresh plan then

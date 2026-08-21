@@ -17,7 +17,6 @@ import tempfile
 import urllib.parse
 from contextlib import contextmanager
 from dataclasses import dataclass
-from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Dict, IO, Iterator, List, Optional, Sequence, Tuple
 
@@ -60,21 +59,30 @@ TRUSTED_SYSTEM_EXECUTABLES = {
 }
 TRUSTED_COMMAND_PATH = "/usr/bin:/bin"
 MACOS_CREDENTIAL_HELPER = "git-credential-osxkeychain"
-LINUX_CREDENTIAL_HELPERS = (
-    ("git-credential-manager", "secretservice"),
-    ("git-credential-libsecret", None),
-)
+LINUX_CREDENTIAL_HELPER = "git-credential-cache"
 WINDOWS_GCM_HELPERS = (
     Path("mingw64/bin/git-credential-manager.exe"),
     Path("mingw64/bin/git-credential-manager-core.exe"),
 )
-LINUX_SECRET_SERVICE_PROBE = Path("/usr/bin/gdbus")
 WINDOWS_GIT_RUNTIME = {
     "git": Path("cmd/git.exe"),
     "ssh": Path("usr/bin/ssh.exe"),
     "false": Path("usr/bin/false.exe"),
     "shell": Path("usr/bin/sh.exe"),
 }
+WINDOWS_REPLACEMENT_RIGHTS = (
+    "DeleteSubdirectoriesAndFiles",
+    "Delete",
+    "ChangePermissions",
+    "TakeOwnership",
+)
+WINDOWS_MUTATION_RIGHTS = (
+    "WriteData",
+    "AppendData",
+    "WriteExtendedAttributes",
+    "WriteAttributes",
+    *WINDOWS_REPLACEMENT_RIGHTS,
+)
 TRUSTED_HELPER_PATH_RE = re.compile(r"^/[A-Za-z0-9_./+:-]+$")
 TRUSTED_WINDOWS_BUNDLE_PATH_RE = re.compile(
     r"^(?:[A-Za-z]:[\\/]|/)[A-Za-z0-9_./\\+(): -]+$"
@@ -158,145 +166,24 @@ def _require_trusted_credential_helper(path: Path) -> str:
 
 def _require_linux_credential_provider(
     exec_path: Path,
-) -> tuple[str, str | None]:
-    for name, credential_store in LINUX_CREDENTIAL_HELPERS:
-        candidates = (
-            exec_path / name,
-            Path("/usr/bin") / name,
-            Path("/usr/local/bin") / name,
-            Path("/usr/local/share/gcm-core") / name,
-        )
-        for candidate in candidates:
-            try:
-                helper = _trusted_root_owned_executable(
-                    candidate,
-                    allowed_path=TRUSTED_HELPER_PATH_RE,
-                    reject_set_id=True,
-                )
-                return helper, credential_store
-            except OSError:
-                continue
+) -> str:
+    candidates = (
+        exec_path / LINUX_CREDENTIAL_HELPER,
+        Path("/usr/bin") / LINUX_CREDENTIAL_HELPER,
+    )
+    for candidate in candidates:
+        try:
+            return _trusted_root_owned_executable(
+                candidate,
+                allowed_path=TRUSTED_HELPER_PATH_RE,
+                reject_set_id=True,
+            )
+        except OSError:
+            continue
     raise PolicyGate(
         "HTTPS_CREDENTIAL_PROVIDER_UNAVAILABLE",
-        provider="linux-gcm-or-libsecret",
+        provider="linux-credential-cache",
     )
-
-
-def _linux_secret_service_probe(env: dict[str, str]) -> tuple[str, str]:
-    try:
-        executable = _trusted_root_owned_executable(
-            LINUX_SECRET_SERVICE_PROBE,
-            allowed_path=TRUSTED_HELPER_PATH_RE,
-            reject_set_id=True,
-        )
-        alias = subprocess.run(
-            [
-                executable,
-                "call",
-                "--session",
-                "--dest",
-                "org.freedesktop.secrets",
-                "--object-path",
-                "/org/freedesktop/secrets",
-                "--method",
-                "org.freedesktop.Secret.Service.ReadAlias",
-                "default",
-            ],
-            env=env,
-            stdin=subprocess.DEVNULL,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=5,
-        )
-        if alias.returncode != 0:
-            raise OSError("Secret Service alias is unavailable")
-        match = re.fullmatch(r"\(objectpath '([^']+)',\)\n?", alias.stdout)
-        if match is None or match.group(1) == "/":
-            raise OSError("Secret Service default collection is unavailable")
-        locked = subprocess.run(
-            [
-                executable,
-                "call",
-                "--session",
-                "--dest",
-                "org.freedesktop.secrets",
-                "--object-path",
-                match.group(1),
-                "--method",
-                "org.freedesktop.DBus.Properties.Get",
-                "org.freedesktop.Secret.Collection",
-                "Locked",
-            ],
-            env=env,
-            stdin=subprocess.DEVNULL,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=5,
-        )
-        if locked.returncode != 0:
-            raise OSError("Secret Service lock state is unavailable")
-        return alias.stdout, locked.stdout
-    except (OSError, subprocess.TimeoutExpired) as error:
-        raise PolicyGate(
-            "HTTPS_CREDENTIAL_PROVIDER_UNAVAILABLE",
-            provider="linux-unlocked-secretservice",
-        ) from error
-
-
-def _validated_linux_secret_service_environment() -> dict[str, str]:
-    try:
-        runtime_value = os.environ["XDG_RUNTIME_DIR"]
-        runtime = Path(runtime_value)
-        if (
-            not runtime.is_absolute()
-            or TRUSTED_HELPER_PATH_RE.fullmatch(str(runtime)) is None
-        ):
-            raise OSError("runtime directory path is not closed")
-        resolved_runtime = runtime.resolve(strict=True)
-        runtime_metadata = resolved_runtime.lstat()
-        if (
-            resolved_runtime != runtime
-            or not stat.S_ISDIR(runtime_metadata.st_mode)
-            or runtime_metadata.st_uid != os.geteuid()
-            or stat.S_IMODE(runtime_metadata.st_mode) & 0o077
-        ):
-            raise OSError("runtime directory is not private")
-        bus = runtime / "bus"
-        bus_metadata = bus.lstat()
-        if (
-            bus.resolve(strict=True) != bus
-            or not stat.S_ISSOCK(bus_metadata.st_mode)
-            or bus_metadata.st_uid != os.geteuid()
-        ):
-            raise OSError("session bus is not trusted")
-        address = os.environ["DBUS_SESSION_BUS_ADDRESS"]
-        if address != f"unix:path={bus}":
-            raise OSError("session bus address is not closed")
-    except (KeyError, OSError) as error:
-        raise PolicyGate(
-            "HTTPS_CREDENTIAL_PROVIDER_UNAVAILABLE",
-            provider="linux-unlocked-secretservice",
-        ) from error
-
-    env = {
-        "DBUS_SESSION_BUS_ADDRESS": address,
-        "LANG": "C",
-        "LC_ALL": "C",
-        "PATH": TRUSTED_COMMAND_PATH,
-        "XDG_RUNTIME_DIR": str(runtime),
-    }
-    _alias, locked = _linux_secret_service_probe(env)
-    if re.fullmatch(r"\(<false>,\)\n?", locked) is None:
-        raise PolicyGate(
-            "HTTPS_CREDENTIAL_PROVIDER_UNAVAILABLE",
-            provider="linux-unlocked-secretservice",
-        )
-    return {
-        "DBUS_SESSION_BUS_ADDRESS": address,
-        "XDG_RUNTIME_DIR": str(runtime),
-    }
 
 
 def _trusted_windows_bundled_executable(path: Path, root: Path) -> str:
@@ -320,11 +207,25 @@ def _trusted_windows_bundled_executable(path: Path, root: Path) -> str:
         if current == resolved_root:
             break
         current = current.parent
+    program_files_root = resolved_root.parent
+    _windows_path_has_protected_acl(program_files_root)
+    anchor = Path(resolved_root.anchor)
+    current = program_files_root.parent
+    while True:
+        _windows_path_has_protected_acl(current, replacement_only=True)
+        if current == anchor:
+            break
+        if current == current.parent:
+            raise OSError("Windows filesystem trust anchor is unavailable")
+        current = current.parent
     return str(resolved)
 
 
-@lru_cache(maxsize=64)
-def _windows_path_has_protected_acl(path: Path) -> None:
+def _windows_path_has_protected_acl(
+    path: Path,
+    *,
+    replacement_only: bool = False,
+) -> None:
     if os.name != "nt":
         return
     try:
@@ -348,6 +249,15 @@ def _windows_path_has_protected_acl(path: Path) -> None:
             or not powershell.is_file()
         ):
             raise OSError("trusted PowerShell is unavailable")
+        rights = (
+            WINDOWS_REPLACEMENT_RIGHTS
+            if replacement_only
+            else WINDOWS_MUTATION_RIGHTS
+        )
+        rights_expression = " -bor ".join(
+            "[System.Security.AccessControl.FileSystemRights]::" + right
+            for right in rights
+        )
         script = (
             "$ErrorActionPreference='Stop';"
             "$trusted=@('S-1-5-18','S-1-5-32-544',"
@@ -356,12 +266,7 @@ def _windows_path_has_protected_acl(path: Path) -> None:
             "$owner=([System.Security.Principal.NTAccount]$acl.Owner).Translate("
             "[System.Security.Principal.SecurityIdentifier]).Value;"
             "if($trusted -notcontains $owner){exit 1};"
-            "$write=[System.Security.AccessControl.FileSystemRights]::Write -bor "
-            "[System.Security.AccessControl.FileSystemRights]::Modify -bor "
-            "[System.Security.AccessControl.FileSystemRights]::FullControl -bor "
-            "[System.Security.AccessControl.FileSystemRights]::Delete -bor "
-            "[System.Security.AccessControl.FileSystemRights]::ChangePermissions -bor "
-            "[System.Security.AccessControl.FileSystemRights]::TakeOwnership;"
+            f"$write={rights_expression};"
             "foreach($ace in $acl.Access){"
             "if($ace.AccessControlType -ne 'Allow'){continue};"
             "if(($ace.PropagationFlags -band "
@@ -397,6 +302,21 @@ def _windows_path_has_protected_acl(path: Path) -> None:
             raise OSError("Windows path ACL is mutable")
     except (OSError, subprocess.TimeoutExpired) as error:
         raise OSError("Windows path ACL is not trusted") from error
+
+
+def _windows_path_identity(path: Path) -> tuple[int, int, int, int, int, int]:
+    resolved = path.resolve(strict=True)
+    if resolved != path.absolute():
+        raise OSError("Windows runtime path is redirected")
+    metadata = resolved.lstat()
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
 
 
 def _windows_git_install_roots() -> tuple[Path, ...]:
@@ -839,9 +759,30 @@ class GitRepository:
         runtime = _trusted_git_runtime()
         self.git_executable = runtime.git_executable
         self._windows_git_root = runtime.windows_root
+        self._windows_runtime_identities: dict[
+            Path,
+            tuple[int, int, int, int, int, int],
+        ] = {}
         if sys.platform == "win32":
             askpass = _credential_helper_config(runtime.askpass)
             ssh_command = _credential_helper_config(runtime.ssh_executable)
+            runtime_paths = {
+                Path(runtime.git_executable),
+                Path(runtime.ssh_executable),
+                Path(runtime.askpass),
+                Path(runtime.shell),
+                *(Path(path) for path in runtime.command_path.split(";")),
+            }
+            if runtime.windows_root is not None:
+                runtime_paths.update(
+                    {
+                        runtime.windows_root,
+                        runtime.windows_root.parent,
+                        Path(runtime.windows_root.anchor),
+                    }
+                )
+            for runtime_path in runtime_paths:
+                self._bind_windows_runtime_identity(runtime_path)
         else:
             askpass = runtime.askpass
             ssh_command = runtime.ssh_executable
@@ -911,6 +852,21 @@ class GitRepository:
         self.env[f"GIT_CONFIG_VALUE_{index}"] = value
         self.env["GIT_CONFIG_COUNT"] = str(index + 1)
 
+    def _bind_windows_runtime_identity(self, path: Path) -> None:
+        resolved = path.resolve(strict=True)
+        self._windows_runtime_identities[resolved] = _windows_path_identity(
+            resolved
+        )
+
+    def _verify_windows_runtime_identity(self) -> None:
+        for path, expected in self._windows_runtime_identities.items():
+            try:
+                observed = _windows_path_identity(path)
+            except OSError as error:
+                raise PolicyGate("TRUSTED_WINDOWS_RUNTIME_CHANGED") from error
+            if observed != expected:
+                raise PolicyGate("TRUSTED_WINDOWS_RUNTIME_CHANGED")
+
     def enable_https_credentials(self, endpoint: str) -> None:
         """Bind one trusted noninteractive provider for one HTTPS execution."""
         _validate_transport_endpoint(endpoint, self.path)
@@ -926,28 +882,14 @@ class GitRepository:
             )
             helper_config = _credential_helper_config(helper)
         elif sys.platform.startswith("linux"):
-            helper, credential_store = _require_linux_credential_provider(
-                exec_path
-            )
-            if (
-                credential_store == "secretservice"
-                or Path(helper).name == "git-credential-libsecret"
-            ):
-                self.env.update(
-                    _validated_linux_secret_service_environment()
-                )
+            helper = _require_linux_credential_provider(exec_path)
             helper_config = _credential_helper_config(helper)
-            if credential_store is not None:
-                self.env["GCM_CREDENTIAL_STORE"] = credential_store
-                self._append_command_config(
-                    "credential.credentialStore",
-                    credential_store,
-                )
         elif sys.platform == "win32":
             helper = _require_windows_credential_provider(
                 self._windows_git_root
             )
             helper_config = _credential_helper_config(helper)
+            self._bind_windows_runtime_identity(Path(helper))
             self.env["GCM_CREDENTIAL_STORE"] = "wincredman"
             self._append_command_config(
                 "credential.credentialStore",
@@ -982,6 +924,7 @@ class GitRepository:
             if set(env_overrides) != {"VERSIONKEEPING_PUBLICATION_ENDPOINT"}:
                 raise PolicyGate("GIT_CONFIG_ENVIRONMENT_OVERRIDE_REJECTED")
             env.update(env_overrides)
+        self._verify_windows_runtime_identity()
         try:
             completed = subprocess.run(
                 [self.git_executable, *args],
@@ -999,6 +942,7 @@ class GitRepository:
                 operation=args[0] if args else "git",
                 timeout_seconds=self.timeout_seconds,
             ) from error
+        self._verify_windows_runtime_identity()
         if check and completed.returncode != 0 and completed.returncode not in allowed:
             raise RuntimeError(
                 f"git command failed ({completed.returncode}): "

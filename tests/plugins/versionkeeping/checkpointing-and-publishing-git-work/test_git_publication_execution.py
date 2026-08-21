@@ -597,6 +597,24 @@ class PublicationExecutionTests(unittest.TestCase):
         )
         self.assertNotIn(secret, json.dumps(result))
 
+    def test_http_transport_config_does_not_block_local_publication(self) -> None:
+        git(
+            self.repo,
+            "config",
+            "http.https://example.com.sslVerify",
+            "false",
+        )
+        git(self.repo, "config", "http.extraHeader", "X-Test: local-only")
+
+        result = execute(self.repo, self.plan)
+
+        self.assertEqual(result["status"], "verified")
+        self.assertTrue(result["push_attempted"])
+        self.assertEqual(
+            git(self.remote, "rev-parse", "refs/heads/topic"),
+            self.source,
+        )
+
     def test_url_specific_tls_override_blocks_before_https_credentials(self) -> None:
         git(
             self.repo,
@@ -605,24 +623,22 @@ class PublicationExecutionTests(unittest.TestCase):
             "false",
         )
 
-        with mock.patch.object(
-            adapter.GitRepository,
-            "enable_https_credentials",
-        ) as enable_credentials:
-            result = execute(self.repo, self.plan)
+        with adapter.GitRepository(self.repo) as repository:
+            with mock.patch.object(
+                adapter,
+                "_require_trusted_credential_helper",
+            ) as require_trusted:
+                with self.assertRaises(adapter.PolicyGate) as raised:
+                    repository.enable_https_credentials(
+                        "https://github.com/example/repository.git"
+                    )
 
-        self.assertEqual(result["status"], "blocked")
-        self.assertFalse(result["push_attempted"])
+        self.assertEqual(raised.exception.code, "UNSAFE_GIT_CONFIGURATION")
         self.assertEqual(
-            result["reasons"],
-            [
-                {
-                    "code": "UNSAFE_GIT_CONFIGURATION",
-                    "evidence": {"config_classes": ["http.*.ssl*"]},
-                }
-            ],
+            raised.exception.evidence,
+            {"config_classes": ["http.*.ssl*"]},
         )
-        enable_credentials.assert_not_called()
+        require_trusted.assert_not_called()
 
     def test_endpoint_change_after_review_blocks_before_push(self) -> None:
         changed = self.root / "changed.git"

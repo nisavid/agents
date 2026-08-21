@@ -240,7 +240,8 @@ class RemoteRefDeletionTests(unittest.TestCase):
             command = args[0] if args else kwargs.get("args")
             if (
                 command
-                and command[0] == "git"
+                and command[0]
+                == str(publication_adapter.TRUSTED_SYSTEM_EXECUTABLES["git"])
                 and "push" in command
                 and ":refs/heads/topic" in command
             ):
@@ -264,7 +265,12 @@ class RemoteRefDeletionTests(unittest.TestCase):
 
         def recording_run(*args, **kwargs):
             command = args[0] if args else kwargs.get("args")
-            if command and command[0] == "git" and kwargs.get("cwd") == str(self.repo):
+            if (
+                command
+                and command[0]
+                == str(publication_adapter.TRUSTED_SYSTEM_EXECUTABLES["git"])
+                and kwargs.get("cwd") == str(self.repo)
+            ):
                 observed.append((command, kwargs["env"]))
             return real_run(*args, **kwargs)
 

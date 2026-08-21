@@ -119,7 +119,11 @@ class PublicationExecutionTests(unittest.TestCase):
 
         def recording_run(*args, **kwargs):
             command = args[0] if args else kwargs.get("args")
-            if command and command[0] == "git" and kwargs.get("cwd") == str(self.repo):
+            if (
+                command
+                and command[0] == str(adapter.TRUSTED_SYSTEM_EXECUTABLES["git"])
+                and kwargs.get("cwd") == str(self.repo)
+            ):
                 observed.append((command, kwargs["env"]))
             return real_run(*args, **kwargs)
 
@@ -334,7 +338,11 @@ class PublicationExecutionTests(unittest.TestCase):
         def timeout_push(*args, **kwargs):
             nonlocal push_calls
             command = args[0] if args else kwargs.get("args")
-            if command and command[0] == "git" and "push" in command:
+            if (
+                command
+                and command[0] == str(adapter.TRUSTED_SYSTEM_EXECUTABLES["git"])
+                and "push" in command
+            ):
                 push_calls += 1
                 raise subprocess.TimeoutExpired(command, kwargs["timeout"])
             return real_run(*args, **kwargs)

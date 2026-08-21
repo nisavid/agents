@@ -30,9 +30,9 @@ RECOVERY_QUARANTINE_PREFIX = ".source-lineage-quarantine-"
 MAX_RECOVERY_QUARANTINE_ATTEMPTS = 128
 TRANSACTION_MARKER = "owner"
 TRANSACTION_CONTRACT = "coordinated-source-skill-lineage-transaction-v1"
-TRUSTED_VALIDATOR_SIZE = 101_935
+TRUSTED_VALIDATOR_SIZE = 103_566
 TRUSTED_VALIDATOR_SHA256 = (
-    "1ec23918ce64e762b6b5bfe9b6315179e41cb6a7454705983ebc676126be19bc"
+    "c8300588dc1d63cf9078b24fd4a06e266f54b007e7ce27a682c72bbf81b98a4f"
 )
 MATERIALIZE_TIMEOUT_SECONDS = 30.0
 PROCESS_REAP_TIMEOUT_SECONDS = 1.0
@@ -689,11 +689,18 @@ def _candidate_projection_seed(source: dict) -> tuple[str, list[dict]]:
         "package_projection_contract",
         "packages",
         "packages_sha256",
+        "refreshed_at_utc",
         "repository_id",
     }
     lineage.require(
         type(candidate) is dict
-        and {"basis", "package_projection_contract", "packages", "repository_id"}
+        and {
+            "basis",
+            "package_projection_contract",
+            "packages",
+            "refreshed_at_utc",
+            "repository_id",
+        }
         <= set(candidate)
         <= candidate_fields
         and candidate["repository_id"] == "nisavid/agents"
@@ -703,8 +710,10 @@ def _candidate_projection_seed(source: dict) -> tuple[str, list[dict]]:
     basis = candidate["basis"]
     lineage.require(
         type(basis) is dict
-        and set(basis) == {"commit_sha1", "tree_sha1"}
+        and set(basis) == {"commit_sha1", "committed_at_utc", "tree_sha1"}
         and basis["commit_sha1"] == lineage.CANDIDATE_COMMIT_SHA1
+        and basis["committed_at_utc"] == lineage.CANDIDATE_COMMITTED_AT_UTC
+        and candidate["refreshed_at_utc"] == lineage.CANDIDATE_REFRESHED_AT_UTC
         and basis["tree_sha1"] == lineage.CANDIDATE_TREE_SHA1,
         diagnostic,
     )

@@ -2,7 +2,9 @@
 
 Status: evidence snapshot for issue [#49](https://github.com/nisavid/agents/issues/49); no contribution disposition is decided here
 
-Research date: 2026-08-18
+Research inventory observed at: 2026-08-18T06:07:48Z
+
+Candidate projection refreshed at: 2026-08-21T13:22:47Z
 
 ## Boundary
 
@@ -15,6 +17,11 @@ tree `b626f958d4d88c3de75ead85748e62eea5ad482b`; it is historical evidence, not
 the current candidate identity. The coordinated-release map still invalidates
 dependent evidence when reconciliation changes candidate bytes
 ([#41](https://github.com/nisavid/agents/issues/41)).
+
+External-source research retains its August 18 observation time. Repository-owned
+`ivan-*` current snapshots and candidate package projections were rebound to the
+August 21 candidate at the separate refresh time above. Initial-host manifests
+retain their own observation timestamps.
 
 This report distinguishes:
 

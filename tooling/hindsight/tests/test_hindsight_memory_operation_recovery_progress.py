@@ -3,6 +3,7 @@ import json
 import os
 import stat
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -1155,6 +1156,67 @@ class ExactDrainProgressTest(unittest.TestCase):
                 }
             ],
         )
+
+    def test_schema_five_provider_cancellation_finishes_under_one_lock(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+            path = Path(directory) / "exact-drain-progress.json"
+            recorder = ExactDrainProgressRecorder(
+                path=path,
+                plan_digest="a" * 64,
+                worker_pid=1234,
+                worker_start_time="darwin:1000:1",
+                worker_attempt=1,
+                selected_operations=[],
+                progress_schema_version=5,
+                clock=lambda: 1000.0,
+            )
+            request = recorder.provider_started(
+                "hatchery",
+                retry_attempt=1,
+                scope="retain_extract_facts",
+            )
+            original_finished = recorder.provider_finished
+            competing_lock_acquisitions = []
+
+            def finish_with_competing_transition(
+                request_digest,
+                *,
+                outcome,
+                failed_over=False,
+            ):
+                def probe_lock():
+                    acquired = recorder._lock.acquire(blocking=False)
+                    competing_lock_acquisitions.append(acquired)
+                    if acquired:
+                        recorder._lock.release()
+
+                competitor = threading.Thread(target=probe_lock)
+                competitor.start()
+                competitor.join()
+                if competing_lock_acquisitions[-1]:
+                    recorder.provider_executing(request_digest)
+                return original_finished(
+                    request_digest,
+                    outcome=outcome,
+                    failed_over=failed_over,
+                )
+
+            recorder.provider_finished = finish_with_competing_transition
+            recorder.provider_cancelled(request)
+            progress = read_exact_drain_progress(
+                path,
+                plan_digest="a" * 64,
+                progress_schema_version=5,
+                now=1001.0,
+            )
+
+        self.assertEqual(competing_lock_acquisitions, [False])
+        self.assertEqual(progress["active_provider_requests"], [])
+        counter = progress["provider_counters"][0]
+        self.assertEqual(counter["queue_cancelled"], 1)
+        self.assertEqual(counter["execution_cancelled"], 0)
 
     def test_progress_schema_four_preserves_legacy_queued_cancellation_rejection(
         self,

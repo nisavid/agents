@@ -339,6 +339,11 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
             ("TimeoutError: connection unavailable", "upstream_timeout"),
             ("server error '400'", "provider_bad_request"),
             ("status_code='400'", "provider_bad_request"),
+            ("status-400", "provider_bad_request"),
+            ("status.400", "provider_bad_request"),
+            ("status_400", "provider_bad_request"),
+            ("error-400", "provider_bad_request"),
+            ("error_400", "provider_bad_request"),
             ("ReadTimeoutError", "upstream_timeout"),
         )
 
@@ -3005,6 +3010,128 @@ asyncio.run(exercise())
                         live_row_digest(after[operation_id]),
                         live_row_digest(before[operation_id]),
                     )
+
+                recovered_snapshot = create_live_snapshot(
+                    plan["reference_plan"]["cohort"],
+                    [after[operation_id] for operation_id in cohort_ids],
+                    generation_before=post_generation,
+                    generation_after=post_generation,
+                    installation_authority=plan[
+                        "installation_authority"
+                    ],
+                    observed_at=int(time.time()),
+                )
+                controller = runpy.run_path(
+                    str(ROOT / "bin" / "hindsight-memory")
+                )
+                helper = controller[
+                    "_operation_recovery_exact_recovery_context"
+                ]
+                globals_ = helper.__globals__
+                recovery_path = "/private/tmp/epoch-3-recovery.json"
+                application = {
+                    "post_generation": post_generation,
+                    "receipt_digest": "3" * 64,
+                }
+                verification = {
+                    "evidence": {"generation": post_generation},
+                    "receipt_digest": "4" * 64,
+                }
+                documents = {
+                    recovery_path: plan,
+                    plan["application_receipt_path"]: application,
+                    plan["verification_receipt_path"]: verification,
+                }
+                replacements = {
+                    "_operation_recovery_read_private_json": (
+                        lambda path, _label: documents[str(path)]
+                    ),
+                    "_operation_recovery_validate_application": (
+                        lambda _value, *, plan: application
+                    ),
+                    "_operation_recovery_post_abort_validate_verification": (
+                        lambda _value, *, plan, application, authority: (
+                            verification
+                        )
+                    ),
+                }
+                originals = {
+                    key: globals_[key] for key in replacements
+                }
+                globals_.update(replacements)
+                try:
+                    context = helper(
+                        SimpleNamespace(recovery_plan=recovery_path),
+                        snapshot=recovered_snapshot,
+                        candidate_release=plan["candidate_release"],
+                    )
+                    self.assertEqual(context["schema_version"], 3)
+                    self.assertEqual(context["recovery_epoch"], 3)
+                    self.assertEqual(
+                        context["post_abort_plan_digest"],
+                        plan["plan_digest"],
+                    )
+
+                    for label, operation_id, field, value in (
+                        (
+                            "pending-next-retry",
+                            pending_id,
+                            "next_retry_at",
+                            "2026-08-21T00:00:00.000000Z",
+                        ),
+                        (
+                            "processing-retry-count",
+                            processing_id,
+                            "retry_count",
+                            2,
+                        ),
+                        (
+                            "processing-error-digest",
+                            processing_id,
+                            "error_digest",
+                            "9" * 64,
+                        ),
+                    ):
+                        with self.subTest(drift=label):
+                            drifted = deepcopy(recovered_snapshot)
+                            row = next(
+                                item
+                                for item in drifted["operations"]
+                                if item["operation_id"] == operation_id
+                            )
+                            row[field] = value
+                            row["row_digest"] = recovery_fixtures.digest(
+                                {
+                                    key: item
+                                    for key, item in row.items()
+                                    if key != "row_digest"
+                                }
+                            )
+                            drifted["snapshot_digest"] = (
+                                recovery_fixtures.digest(
+                                    {
+                                        key: item
+                                        for key, item in drifted.items()
+                                        if key != "snapshot_digest"
+                                    }
+                                )
+                            )
+                            recovery_fixtures.verify_live_snapshot(drifted)
+                            with self.assertRaisesRegex(
+                                OperationRecoveryError,
+                                "recovery handoff differs",
+                            ):
+                                helper(
+                                    SimpleNamespace(
+                                        recovery_plan=recovery_path
+                                    ),
+                                    snapshot=drifted,
+                                    candidate_release=plan[
+                                        "candidate_release"
+                                    ],
+                                )
+                finally:
+                    globals_.update(originals)
 
                 rollback_generations = (
                     await rollback_post_abort_recovery_transaction(

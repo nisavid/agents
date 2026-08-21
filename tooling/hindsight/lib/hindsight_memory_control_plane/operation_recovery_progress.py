@@ -1051,28 +1051,21 @@ class ExactDrainProgressRecorder:
 
     def provider_cancelled(self, request_digest: str) -> None:
         """Close one cancelled request without reporting a provider fault."""
-        if self.progress_schema_version == 5:
-            with self._lock:
-                active = self._active.get(request_digest)
-                if active is None:
-                    raise OperationRecoveryError(
-                        "exact drain progress request is unknown"
-                    )
-                outcome = (
-                    "queue_cancelled"
-                    if active.get("state") == "queued"
-                    else "execution_cancelled"
-                )
-            self.provider_finished(request_digest, outcome=outcome)
-            return
         with self._lock:
             active = self._active.get(request_digest)
             if active is None:
                 raise OperationRecoveryError(
                     "exact drain progress request is unknown"
                 )
-            legacy_outcome = "failed"
-        self.provider_finished(request_digest, outcome=legacy_outcome)
+            if self.progress_schema_version == 5:
+                outcome = (
+                    "queue_cancelled"
+                    if active.get("state") == "queued"
+                    else "execution_cancelled"
+                )
+            else:
+                outcome = "failed"
+            self.provider_finished(request_digest, outcome=outcome)
 
     def cooldown(self, provider_id: str, *, until: float, reason: str) -> None:
         if reason not in {"usage_limit", "terminal_auth", "transport"}:

@@ -611,6 +611,7 @@ CASE
         THEN 'provider_capacity'
     WHEN lower(error_message) ~ (
          '(bad.?request|client.?error|'
+         || 'status.?400|error.?400|'
          || '(client|server)[[:space:]]+error[[:space:]]+["'']?'
          || '400([^0-9]|$)|'
          || '(status|error)(_code|[[:space:]]+code)?'
@@ -6496,7 +6497,10 @@ class ExactDrainClaimAdapter:
         schema: str | None,
     ) -> None:
         """Schedule one exact owned retry without relinquishing authority."""
-        if not isinstance(error_message, str):
+        if not isinstance(error_message, str) or (
+            getattr(self, "_plan", {}).get("progress_schema_version") == 5
+            and not error_message.strip()
+        ):
             raise OperationRecoveryError(
                 "operation-recovery exact drain retry error is invalid"
             )
@@ -6517,7 +6521,10 @@ class ExactDrainClaimAdapter:
         schema: str | None,
     ) -> None:
         """Defer one exact owned row while consuming its retry budget."""
-        if not isinstance(reason, str):
+        if not isinstance(reason, str) or (
+            getattr(self, "_plan", {}).get("progress_schema_version") == 5
+            and not reason.strip()
+        ):
             raise OperationRecoveryError(
                 "operation-recovery exact drain defer reason is invalid"
             )
@@ -6683,7 +6690,10 @@ class ExactDrainClaimAdapter:
         schema: str | None,
     ) -> None:
         """Fail one exact owned row under the preserved-row guard."""
-        if not isinstance(error_message, str):
+        if not isinstance(error_message, str) or (
+            getattr(self, "_plan", {}).get("progress_schema_version") == 5
+            and not error_message.strip()
+        ):
             raise OperationRecoveryError(
                 "operation-recovery exact drain terminal error is invalid"
             )

@@ -1537,6 +1537,91 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         self.assertEqual(evidence["failure"]["error_digest"], "a" * 64)
         self.assertIs(evidence["failure"]["retryable"], False)
 
+    def test_schema_five_rejects_empty_direct_failure_causes(self):
+        adapter = self._current_exact_drain_adapter()
+        adapter._plan = {**adapter._plan, "progress_schema_version": 5}
+        operation_id = next(iter(adapter._selected))
+
+        class Backend:
+            def acquire(self):
+                raise AssertionError("empty cause reached PostgreSQL")
+
+        invocations = {
+            "retry": lambda value: adapter.schedule_retry(
+                Backend(), operation_id, None, value, "public"
+            ),
+            "defer": lambda value: adapter.defer_operation(
+                Backend(), operation_id, None, value, "public"
+            ),
+            "fail": lambda value: adapter.mark_failed(
+                Backend(), operation_id, value, "public"
+            ),
+        }
+        for name, invoke in invocations.items():
+            for value in ("", " \n"):
+                with (
+                    self.subTest(name=name, value=repr(value)),
+                    self.assertRaisesRegex(
+                        OperationRecoveryError,
+                        "error is invalid|reason is invalid",
+                    ),
+                ):
+                    asyncio.run(invoke(value))
+
+    def test_legacy_direct_failure_cause_validation_remains_compatible(self):
+        adapter = self._current_exact_drain_adapter()
+        adapter._plan = {**adapter._plan, "progress_schema_version": 4}
+        operation_id = next(iter(adapter._selected))
+        adapter._reschedule_owned_task = AsyncMock()
+        adapter._terminalize_owned_task = AsyncMock()
+        backend = object()
+
+        asyncio.run(
+            adapter.schedule_retry(
+                backend,
+                operation_id,
+                None,
+                "",
+                "public",
+            )
+        )
+        asyncio.run(
+            adapter.defer_operation(
+                backend,
+                operation_id,
+                None,
+                "",
+                "public",
+            )
+        )
+        asyncio.run(
+            adapter.mark_failed(
+                backend,
+                operation_id,
+                "",
+                "public",
+            )
+        )
+
+        self.assertEqual(adapter._reschedule_owned_task.await_count, 2)
+        self.assertEqual(
+            adapter._reschedule_owned_task.await_args_list[0].kwargs[
+                "error_message"
+            ],
+            "",
+        )
+        self.assertIsNone(
+            adapter._reschedule_owned_task.await_args_list[1].kwargs[
+                "error_message"
+            ]
+        )
+        self.assertEqual(
+            adapter._terminalize_owned_task.await_args.kwargs[
+                "error_message"
+            ],
+            "",
+        )
+
     def test_schema10_retry_and_defer_enforce_the_plan_bound_delay(self):
         observed_at = int(time.time())
         maximum_delay = 3_600
@@ -6118,6 +6203,11 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
             ),
             ("server error '400'", "provider_bad_request"),
             ("status_code='400'", "provider_bad_request"),
+            ("status-400", "provider_bad_request"),
+            ("status.400", "provider_bad_request"),
+            ("status_400", "provider_bad_request"),
+            ("error-400", "provider_bad_request"),
+            ("error_400", "provider_bad_request"),
             ("ReadTimeoutError", "upstream_timeout"),
         )
         for message, expected in cases:

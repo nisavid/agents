@@ -4389,15 +4389,68 @@ EXPECTED_OPERATION_RECOVERY_INSTALLATION = {
         "c8d125204fcf93d842cf835580906c533e3c166e6dd66f4cd3860bec7b71e275"
     ),
     "install_state_digest": (
-        "3cfbfe44b24ed889155db7de92f845567354e5df352baa8af9c3289aaaabc54a"
+        "a2619ff50ee184162cc437cf84765e9fc7850c22d94f9c3ca5d2bcd5f8f6b8f6"
     ),
     "binding_generation_digest": (
         "4a72234b6a00ebd4476155dfdb684f2c6f043591bbaf8d51f6d04dfd20c5bd43"
     ),
     "recorded_data_identity_digest": (
-        "8a3a00e9bc8f44ad48067c089f4b1ff8eb55fc5dca07c84f5718f6f1f08c6b47"
+        "f050d75a369a0411e22005d9e0ee0e3c53c22e26ed89b2c7cbc7411abd38d7d2"
     ),
     "postgres_system_identifier": "7659746962107358086",
+}
+
+EXPECTED_OPERATION_RECOVERY_REBIND_HANDOFF = {
+    "plan_path": (
+        "/Users/ivan/.local/state/hindsight-control-plane/"
+        "data-identity-rebind/plans/20260820T210337Z-661910a.json"
+    ),
+    "schema_version": 1,
+    "kind": "operation-recovery-verified-data-identity-rebind-handoff",
+    "plan_digest": (
+        "615ca611f06f38fad93a9157681c02398ef4344409c752f82f4fed28a70aede0"
+    ),
+    "authorization_receipt_digest": (
+        "1c1023aafacbdb7cee7352801c566da664b783f6cd2b52f4c9b279cbe1eed354"
+    ),
+    "application_receipt_digest": (
+        "b5741ab6fd8e29bffe348ed836a0c16c5df0b04973f4a490365d8e0ca8ecfb08"
+    ),
+    "verification_receipt_digest": (
+        "a539e4db2f9e8a3e7dd954f097e8b61431ff65685cf5256b741ad83382c29c47"
+    ),
+    "rollback_bundle_digest": (
+        "02318c2b3c6cfe7d57a339080df10343213fd96be9158b08715877920d35ba37"
+    ),
+    "installation_state_digest_before": (
+        "3cfbfe44b24ed889155db7de92f845567354e5df352baa8af9c3289aaaabc54a"
+    ),
+    "installation_state_digest_after": (
+        "a2619ff50ee184162cc437cf84765e9fc7850c22d94f9c3ca5d2bcd5f8f6b8f6"
+    ),
+    "binding_generation_digest": (
+        "4a72234b6a00ebd4476155dfdb684f2c6f043591bbaf8d51f6d04dfd20c5bd43"
+    ),
+    "current_release_digest": (
+        "c8d125204fcf93d842cf835580906c533e3c166e6dd66f4cd3860bec7b71e275"
+    ),
+    "old_data_identity_digest": (
+        "8a3a00e9bc8f44ad48067c089f4b1ff8eb55fc5dca07c84f5718f6f1f08c6b47"
+    ),
+    "reference_observed_data_identity_digest": (
+        "1c7bcaca4c1fb01f7a2b4b44a7eea662b1f7180ba6097d3f8ed507c7f58bd5ce"
+    ),
+    "new_data_identity_digest": (
+        "f050d75a369a0411e22005d9e0ee0e3c53c22e26ed89b2c7cbc7411abd38d7d2"
+    ),
+    "postgres_system_identifier": "7659746962107358086",
+    "database_continuity_digest": (
+        "6be52bae2d9935d0ff8d4184468cb0d1b7095972a95831327391d5d1f1937326"
+    ),
+    "post_evidence_digest": (
+        "2c913e73e31c9057b51a7396e5071d8fdc5f540ef4ea2d3cfc4a9c172245a548"
+    ),
+    "verified_at": 1787260204,
 }
 
 EXPECTED_OPERATION_RECOVERY_SOURCE_BACKUP = {
@@ -5046,6 +5099,169 @@ def _assert_recovery_services_stopped(
             )
 
 
+def _operation_recovery_verified_rebind_handoff(
+    manager: PortableInstallationManager,
+    state: Mapping[str, Any],
+) -> dict[str, Any]:
+    expected = EXPECTED_OPERATION_RECOVERY_REBIND_HANDOFF
+
+    def validate_sources(source_plan):
+        try:
+            checked = manager._validate_verified_rebind_upgrade_handoff(
+                source_plan,
+                state,
+            )
+            rollback, _prior_state = (
+                manager._validate_rebind_rollback_bundle(checked)
+            )
+            authorized = manager._validate_rebind_authorization_receipt(
+                checked
+            )
+            applied = manager._validate_rebind_application_receipt(
+                checked,
+                authorized,
+            )
+            verified = manager._validate_rebind_verification_receipt(
+                checked,
+                applied,
+            )
+        except PortableInstallError as error:
+            raise OperationRecoveryError(
+                "operation-recovery data-identity rebind handoff is invalid"
+            ) from error
+        return checked, rollback, authorized, applied, verified
+
+    pinned_sources = []
+    try:
+        plan_source = _operation_recovery_pin_private_json(
+            expected["plan_path"],
+            "operation-recovery data-identity rebind plan",
+        )
+        pinned_sources.append(plan_source)
+        plan = plan_source["value"]
+        if not isinstance(plan, Mapping):
+            raise OperationRecoveryError(
+                "operation-recovery data-identity rebind handoff is invalid"
+            )
+        artifact_fields = (
+            (
+                "rollback_bundle_path",
+                "operation-recovery data-identity rollback bundle",
+            ),
+            (
+                "authorization_receipt_path",
+                "operation-recovery data-identity authorization receipt",
+            ),
+            (
+                "application_receipt_path",
+                "operation-recovery data-identity application receipt",
+            ),
+            (
+                "verification_receipt_path",
+                "operation-recovery data-identity verification receipt",
+            ),
+        )
+        for field, label in artifact_fields:
+            path_value = plan.get(field)
+            if type(path_value) is not str:
+                raise OperationRecoveryError(
+                    "operation-recovery data-identity rebind handoff is invalid"
+                )
+            pinned_sources.append(
+                _operation_recovery_pin_private_json(path_value, label)
+            )
+        frozen_sources = tuple(
+            source["value"] for source in pinned_sources
+        )
+        for _pass in range(2):
+            validated_sources = validate_sources(
+                strict_json_loads(plan_source["body"])
+            )
+            if any(
+                not hmac.compare_digest(digest(checked), digest(frozen))
+                for checked, frozen in zip(
+                    validated_sources,
+                    frozen_sources,
+                    strict=True,
+                )
+            ):
+                raise OperationRecoveryError(
+                    "operation-recovery data-identity rebind sources differ"
+                )
+        (
+            checked_plan,
+            rollback_bundle,
+            authorization,
+            application,
+            verification,
+        ) = frozen_sources
+        body = {
+            "schema_version": 1,
+            "kind": (
+                "operation-recovery-verified-data-identity-rebind-handoff"
+            ),
+            "plan_digest": checked_plan["plan_digest"],
+            "authorization_receipt_digest": authorization[
+                "receipt_digest"
+            ],
+            "application_receipt_digest": application[
+                "application_receipt_digest"
+            ],
+            "verification_receipt_digest": verification[
+                "verification_receipt_digest"
+            ],
+            "rollback_bundle_digest": rollback_bundle[
+                "rollback_bundle_digest"
+            ],
+            "installation_state_digest_before": checked_plan[
+                "installation_state_digest"
+            ],
+            "installation_state_digest_after": checked_plan[
+                "expected_post_state_digest"
+            ],
+            "binding_generation_digest": checked_plan[
+                "binding_generation_digest"
+            ],
+            "current_release_digest": checked_plan[
+                "current_release_digest"
+            ],
+            "old_data_identity_digest": checked_plan[
+                "old_data_identity_digest"
+            ],
+            "reference_observed_data_identity_digest": expected[
+                "reference_observed_data_identity_digest"
+            ],
+            "new_data_identity_digest": checked_plan[
+                "new_data_identity_digest"
+            ],
+            "postgres_system_identifier": verification[
+                "postgres_system_identifier"
+            ],
+            "database_continuity_digest": verification[
+                "database_continuity_digest"
+            ],
+            "post_evidence_digest": verification[
+                "post_evidence_digest"
+            ],
+            "verified_at": verification["verified_at"],
+        }
+        if body != {
+            key: value
+            for key, value in expected.items()
+            if key != "plan_path"
+        }:
+            raise OperationRecoveryError(
+                "operation-recovery data-identity rebind handoff differs"
+            )
+        result = {**body, "handoff_digest": digest(body)}
+        for source in pinned_sources:
+            _operation_recovery_verify_pinned_private_json(source)
+        return result
+    finally:
+        for source in reversed(pinned_sources):
+            os.close(source["descriptor"])
+
+
 def _operation_recovery_authority(
     args: argparse.Namespace,
     *,
@@ -5067,7 +5283,18 @@ def _operation_recovery_authority(
             expected_data_identity_digest=observed_identity,
         )
         profile_id = manager._data_identity_profile()
-        return state, state_bytes, observed_identity, bindings, profile_id
+        rebind_handoff = _operation_recovery_verified_rebind_handoff(
+            manager,
+            state,
+        )
+        return (
+            state,
+            state_bytes,
+            observed_identity,
+            bindings,
+            profile_id,
+            rebind_handoff,
+        )
 
     if lock_installer:
         with manager._lock():
@@ -5077,6 +5304,7 @@ def _operation_recovery_authority(
                 observed_identity,
                 bindings,
                 profile_id,
+                rebind_handoff,
             ) = capture()
     else:
         (
@@ -5085,11 +5313,13 @@ def _operation_recovery_authority(
             observed_identity,
             bindings,
             profile_id,
+            rebind_handoff,
         ) = capture()
     current = state.get("current")
     if not isinstance(current, Mapping):
         raise OperationRecoveryError("installed release authority is invalid")
     authority = {
+        "schema_version": 2,
         "consumer_id": manager.config.consumer_id,
         "profile_id": profile_id,
         "schema": "public",
@@ -5101,6 +5331,7 @@ def _operation_recovery_authority(
         "recorded_data_identity_digest": state.get("data_identity_digest"),
         "observed_data_identity_digest": observed_identity,
         "postgres_system_identifier": postgres_system_identifier,
+        "data_identity_rebind_handoff": rebind_handoff,
     }
     expected = EXPECTED_OPERATION_RECOVERY_INSTALLATION
     for key in (
@@ -5119,7 +5350,7 @@ def _operation_recovery_authority(
     if (
         authority["profile_id"] != "systalyze"
         or authority["observed_data_identity_digest"]
-        == authority["recorded_data_identity_digest"]
+        != authority["recorded_data_identity_digest"]
     ):
         raise OperationRecoveryError(
             "operation-recovery data identity boundary is invalid"
@@ -5378,6 +5609,82 @@ def _operation_recovery_fd_sha256(descriptor: int) -> str:
         value.update(chunk)
     os.lseek(descriptor, 0, os.SEEK_SET)
     return value.hexdigest()
+
+
+def _operation_recovery_pin_private_json(
+    path_value: str | Path,
+    label: str,
+) -> dict[str, Any]:
+    path = Path(path_value)
+    descriptor = _open_operation_recovery_artifact(path, label)
+    try:
+        metadata = os.fstat(descriptor)
+        if metadata.st_size > 16 * 1024 * 1024:
+            raise OperationRecoveryError(f"{label} is not private")
+        body = bytearray()
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        while len(body) <= metadata.st_size:
+            chunk = os.read(
+                descriptor,
+                min(1024 * 1024, metadata.st_size + 1 - len(body)),
+            )
+            if not chunk:
+                break
+            body.extend(chunk)
+        after = os.fstat(descriptor)
+        if (
+            len(body) != metadata.st_size
+            or after.st_size != metadata.st_size
+            or (after.st_dev, after.st_ino)
+            != (metadata.st_dev, metadata.st_ino)
+        ):
+            raise OperationRecoveryError(f"{label} changed while pinning")
+        frozen = bytes(body)
+        try:
+            value = strict_json_loads(frozen)
+        except (StrictJsonError, UnicodeError, ValueError) as error:
+            raise OperationRecoveryError(f"{label} is unreadable") from error
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        return {
+            "body": frozen,
+            "descriptor": descriptor,
+            "identity": (metadata.st_dev, metadata.st_ino),
+            "label": label,
+            "path": path,
+            "sha256": hashlib.sha256(frozen).hexdigest(),
+            "value": value,
+        }
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _operation_recovery_verify_pinned_private_json(
+    source: Mapping[str, Any],
+) -> None:
+    descriptor = source["descriptor"]
+    identity = source["identity"]
+    label = source["label"]
+    try:
+        path_identity = _operation_recovery_artifact_identity(
+            str(source["path"])
+        )
+        metadata = os.fstat(descriptor)
+        observed = _operation_recovery_fd_sha256(descriptor)
+    except (OSError, OperationRecoveryError) as error:
+        raise OperationRecoveryError(
+            f"{label} changed while pinned"
+        ) from error
+    if (
+        path_identity != identity
+        or (metadata.st_dev, metadata.st_ino) != identity
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) & 0o077
+        or metadata.st_nlink != 1
+        or not hmac.compare_digest(observed, source["sha256"])
+    ):
+        raise OperationRecoveryError(f"{label} changed while pinned")
 
 
 def _create_pinned_recovery_root(path: Path) -> tuple[int, tuple[int, int]]:
@@ -10505,7 +10812,7 @@ def operation_recovery_post_abort_plan_command(args: argparse.Namespace) -> int:
     )
     reference_context = reference.get("recovery_context")
     epoch_two_recovery = (
-        reference["schema_version"] == 10
+        reference["schema_version"] in {10, 11}
         and isinstance(reference_context, Mapping)
         and reference_context.get("schema_version") == 1
         and reference_context.get("origin") == "post-abort"
@@ -10554,7 +10861,7 @@ def operation_recovery_post_abort_plan_command(args: argparse.Namespace) -> int:
             )
         )
         if (
-            prior_recovery_plan["schema_version"] != 10
+            prior_recovery_plan["schema_version"] not in {10, 11}
             or prior_recovery_plan["plan_digest"]
             != reference_context["post_abort_plan_digest"]
             or prior_recovery_plan["retry_recovery_digest"]
@@ -10715,7 +11022,11 @@ def operation_recovery_post_abort_plan_command(args: argparse.Namespace) -> int:
             if prior_recovery_plan is None
             else prior_recovery_plan["retry_recovery"]
         ),
-        schema_version=11 if epoch_two_recovery else 10,
+        schema_version=(
+            11
+            if snapshot["installation_authority"].get("schema_version") == 2
+            else 10
+        ),
     )
     current_binding = read_pg0_registration("systalyze")
     current_binding.pop("_password")

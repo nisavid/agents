@@ -480,6 +480,32 @@ INSTALLATION_AUTHORITY_KEYS = frozenset(
         "postgres_system_identifier",
     }
 )
+DATA_IDENTITY_REBIND_HANDOFF_KEYS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "plan_digest",
+        "authorization_receipt_digest",
+        "application_receipt_digest",
+        "verification_receipt_digest",
+        "rollback_bundle_digest",
+        "installation_state_digest_before",
+        "installation_state_digest_after",
+        "binding_generation_digest",
+        "current_release_digest",
+        "old_data_identity_digest",
+        "reference_observed_data_identity_digest",
+        "new_data_identity_digest",
+        "postgres_system_identifier",
+        "database_continuity_digest",
+        "post_evidence_digest",
+        "verified_at",
+        "handoff_digest",
+    }
+)
+INSTALLATION_AUTHORITY_V2_KEYS = INSTALLATION_AUTHORITY_KEYS | frozenset(
+    {"schema_version", "data_identity_rebind_handoff"}
+)
 LIVE_OPERATION_KEYS = frozenset(
     {
         "operation_id",
@@ -1546,10 +1572,117 @@ def verify_cohort_manifest(value: Any) -> Mapping[str, Any]:
     return {**body, "cohort_digest": cohort["cohort_digest"]}
 
 
-def _installation_authority(value: Any) -> dict[str, Any]:
-    authority = _closed(
+def _data_identity_rebind_handoff(value: Any) -> dict[str, Any]:
+    handoff = _closed(
         _normalized(value),
-        INSTALLATION_AUTHORITY_KEYS,
+        DATA_IDENTITY_REBIND_HANDOFF_KEYS,
+        "operation-recovery data-identity rebind handoff",
+    )
+    body = {
+        "schema_version": _integer(
+            handoff["schema_version"],
+            "data-identity rebind handoff schema version",
+        ),
+        "kind": _text(
+            handoff["kind"],
+            "data-identity rebind handoff kind",
+            maximum=128,
+        ),
+        "plan_digest": _sha(
+            handoff["plan_digest"],
+            "data-identity rebind plan digest",
+        ),
+        "authorization_receipt_digest": _sha(
+            handoff["authorization_receipt_digest"],
+            "data-identity rebind authorization receipt digest",
+        ),
+        "application_receipt_digest": _sha(
+            handoff["application_receipt_digest"],
+            "data-identity rebind application receipt digest",
+        ),
+        "verification_receipt_digest": _sha(
+            handoff["verification_receipt_digest"],
+            "data-identity rebind verification receipt digest",
+        ),
+        "rollback_bundle_digest": _sha(
+            handoff["rollback_bundle_digest"],
+            "data-identity rebind rollback bundle digest",
+        ),
+        "installation_state_digest_before": _sha(
+            handoff["installation_state_digest_before"],
+            "data-identity rebind pre-state digest",
+        ),
+        "installation_state_digest_after": _sha(
+            handoff["installation_state_digest_after"],
+            "data-identity rebind post-state digest",
+        ),
+        "binding_generation_digest": _sha(
+            handoff["binding_generation_digest"],
+            "data-identity rebind binding generation digest",
+        ),
+        "current_release_digest": _sha(
+            handoff["current_release_digest"],
+            "data-identity rebind current release digest",
+        ),
+        "old_data_identity_digest": _sha(
+            handoff["old_data_identity_digest"],
+            "data-identity rebind old identity digest",
+        ),
+        "reference_observed_data_identity_digest": _sha(
+            handoff["reference_observed_data_identity_digest"],
+            "data-identity rebind reference observed identity digest",
+        ),
+        "new_data_identity_digest": _sha(
+            handoff["new_data_identity_digest"],
+            "data-identity rebind new identity digest",
+        ),
+        "postgres_system_identifier": _text(
+            handoff["postgres_system_identifier"],
+            "data-identity rebind PostgreSQL system identifier",
+            maximum=32,
+        ),
+        "database_continuity_digest": _sha(
+            handoff["database_continuity_digest"],
+            "data-identity rebind database continuity digest",
+        ),
+        "post_evidence_digest": _sha(
+            handoff["post_evidence_digest"],
+            "data-identity rebind post-evidence digest",
+        ),
+        "verified_at": _integer(
+            handoff["verified_at"],
+            "data-identity rebind verified-at",
+        ),
+    }
+    handoff_digest = _sha(
+        handoff["handoff_digest"],
+        "data-identity rebind handoff digest",
+    )
+    if (
+        body["schema_version"] != 1
+        or body["kind"]
+        != "operation-recovery-verified-data-identity-rebind-handoff"
+        or body["old_data_identity_digest"]
+        == body["new_data_identity_digest"]
+        or body["verified_at"] < 0
+        or handoff_digest != digest(body)
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery data-identity rebind handoff is invalid"
+        )
+    return {**body, "handoff_digest": handoff_digest}
+
+
+def _installation_authority(value: Any) -> dict[str, Any]:
+    normalized = _normalized(value)
+    if not isinstance(normalized, Mapping):
+        raise OperationRecoveryError(
+            "operation-recovery installation authority must be an object"
+        )
+    is_v2 = set(normalized) == INSTALLATION_AUTHORITY_V2_KEYS
+    authority = _closed(
+        normalized,
+        INSTALLATION_AUTHORITY_V2_KEYS if is_v2 else INSTALLATION_AUTHORITY_KEYS,
         "operation-recovery installation authority",
     )
     checked = {
@@ -1588,18 +1721,111 @@ def _installation_authority(value: Any) -> dict[str, Any]:
             maximum=32,
         ),
     }
+    if is_v2:
+        rebind_handoff = _data_identity_rebind_handoff(
+            authority["data_identity_rebind_handoff"]
+        )
+        checked = {
+            "schema_version": _integer(
+                authority["schema_version"],
+                "installation authority schema version",
+            ),
+            **checked,
+            "data_identity_rebind_handoff": rebind_handoff,
+        }
     if (
         checked["profile_id"] != "systalyze"
         or checked["schema"] != "public"
         or checked["bank_id"] != "engineering"
         or VERSION.fullmatch(checked["installed_release_version"]) is None
-        or checked["recorded_data_identity_digest"]
-        == checked["observed_data_identity_digest"]
+        or (
+            not is_v2
+            and checked["recorded_data_identity_digest"]
+            == checked["observed_data_identity_digest"]
+        )
+        or (
+            is_v2
+            and (
+                checked["schema_version"] != 2
+                or checked["recorded_data_identity_digest"]
+                != checked["observed_data_identity_digest"]
+                or checked["install_state_digest"]
+                != rebind_handoff["installation_state_digest_after"]
+                or checked["binding_generation_digest"]
+                != rebind_handoff["binding_generation_digest"]
+                or checked["current_release_digest"]
+                != rebind_handoff["current_release_digest"]
+                or checked["recorded_data_identity_digest"]
+                != rebind_handoff["new_data_identity_digest"]
+                or checked["postgres_system_identifier"]
+                != rebind_handoff["postgres_system_identifier"]
+            )
+        )
     ):
         raise OperationRecoveryError(
             "operation-recovery installation authority is invalid"
         )
     return checked
+
+
+def _post_abort_installation_authority_matches(
+    reference: Mapping[str, Any],
+    current: Mapping[str, Any],
+    *,
+    schema_version: int,
+) -> bool:
+    if current == reference:
+        return True
+    if schema_version != 11 or current.get("schema_version") != 2:
+        return False
+    handoff = current.get("data_identity_rebind_handoff")
+    if not isinstance(handoff, Mapping):
+        return False
+    return (
+        all(
+            reference[key] == current[key]
+            for key in (
+                "consumer_id",
+                "profile_id",
+                "schema",
+                "bank_id",
+                "binding_generation_digest",
+                "installed_release_version",
+                "current_release_digest",
+                "postgres_system_identifier",
+            )
+        )
+        and reference["install_state_digest"]
+        == handoff["installation_state_digest_before"]
+        and current["install_state_digest"]
+        == handoff["installation_state_digest_after"]
+        and reference["binding_generation_digest"]
+        == handoff["binding_generation_digest"]
+        and reference["current_release_digest"]
+        == handoff["current_release_digest"]
+        and reference["recorded_data_identity_digest"]
+        == handoff["old_data_identity_digest"]
+        and reference["observed_data_identity_digest"]
+        == handoff["reference_observed_data_identity_digest"]
+        and current["recorded_data_identity_digest"]
+        == handoff["new_data_identity_digest"]
+        and current["observed_data_identity_digest"]
+        == handoff["new_data_identity_digest"]
+        and reference["postgres_system_identifier"]
+        == handoff["postgres_system_identifier"]
+    )
+
+
+def _assert_installation_authority_schema(
+    authority: Mapping[str, Any],
+    *,
+    plan_schema_version: int,
+) -> None:
+    if "schema_version" in authority and plan_schema_version != 11:
+        raise OperationRecoveryError(
+            "operation-recovery verified rebind authority requires "
+            "schema 11"
+        )
 
 
 def _live_operation(value: Any) -> dict[str, Any]:
@@ -1917,6 +2143,10 @@ def create_requeue_plan(
             "operation-recovery plan has no retryable operations"
         )
     authority = snapshot["installation_authority"]
+    _assert_installation_authority_schema(
+        authority,
+        plan_schema_version=1,
+    )
     backup = _backup(
         rollback_backup,
         "operation-recovery rollback backup",
@@ -2120,6 +2350,10 @@ def verify_requeue_plan(
     if not allow_expired and observed_at >= expires_at:
         raise OperationRecoveryError("operation-recovery requeue plan expired")
     authority = _installation_authority(plan["installation_authority"])
+    _assert_installation_authority_schema(
+        authority,
+        plan_schema_version=1,
+    )
     backup = _backup(
         plan["rollback_backup"],
         "operation-recovery rollback backup",
@@ -2830,6 +3064,10 @@ def create_exact_drain_plan(
             "operation-recovery exact drain pending set is invalid"
         )
     authority = snapshot["installation_authority"]
+    _assert_installation_authority_schema(
+        authority,
+        plan_schema_version=schema_version,
+    )
     backup = _backup(
         rollback_backup,
         "operation-recovery exact drain backup",
@@ -3218,6 +3456,10 @@ def verify_exact_drain_plan(
         expected_source_kind="verified-live-pg0-backup",
     )
     authority = _installation_authority(plan["installation_authority"])
+    _assert_installation_authority_schema(
+        authority,
+        plan_schema_version=schema_version,
+    )
     source_authority = backup["source_authority"]
     artifact_paths = {
         "rollback_backup_path": _absolute_path(
@@ -3690,7 +3932,7 @@ def _post_abort_v10_retry_recovery(
 ) -> dict[str, Any]:
     recovery_epoch_before = (
         reference_plan["recovery_context"]["recovery_epoch"]
-        if reference_plan["schema_version"] == 10
+        if reference_plan["schema_version"] in {10, 11}
         else 0
     )
     if recovery_epoch_before != 0:
@@ -3938,7 +4180,7 @@ def _post_abort_v11_retry_recovery(
 ) -> dict[str, Any]:
     context = reference_plan.get("recovery_context")
     if (
-        reference_plan["schema_version"] != 10
+        reference_plan["schema_version"] not in {10, 11}
         or not isinstance(context, Mapping)
         or context.get("schema_version") != 1
         or context.get("origin") != "post-abort"
@@ -4110,11 +4352,22 @@ def _post_abort_v10_contract(
     current = {
         item["operation_id"]: item for item in snapshot["operations"]
     }
+    if (
+        schema_version == 11
+        and snapshot["installation_authority"].get("schema_version") != 2
+    ):
+        raise OperationRecoveryError(
+            "operation-recovery schema-11 recovery requires verified "
+            "rebind authority"
+        )
     reference_preserved_ids = set(reference_snapshot) - set(reference_selected)
     if (
         snapshot["cohort_digest"] != reference_plan["cohort_digest"]
-        or snapshot["installation_authority"]
-        != reference_plan["installation_authority"]
+        or not _post_abort_installation_authority_matches(
+            reference_plan["installation_authority"],
+            snapshot["installation_authority"],
+            schema_version=schema_version,
+        )
         or snapshot["generation_before"] != snapshot["generation_after"]
         or set(current) != set(reference_snapshot)
         or snapshot["status_counts"].get("cancelled", 0)
@@ -4264,7 +4517,7 @@ def _post_abort_v10_contract(
             selected,
             current,
         )
-        if schema_version == 10
+        if schema_version == 10 or prior_retry_recovery is None
         else _post_abort_v11_retry_recovery(
             reference_plan,
             selected,
@@ -4697,6 +4950,10 @@ def create_post_abort_recovery_plan(
         raise OperationRecoveryError(
             "operation-recovery post-abort creation schema is invalid"
         )
+    _assert_installation_authority_schema(
+        snapshot["installation_authority"],
+        plan_schema_version=schema_version,
+    )
     (
         selected,
         worker_digest,
@@ -4880,6 +5137,10 @@ def verify_post_abort_recovery_plan(
             "schema 10 or later"
         )
     snapshot = verify_live_snapshot(plan["live_snapshot"])
+    _assert_installation_authority_schema(
+        snapshot["installation_authority"],
+        plan_schema_version=schema_version,
+    )
     reference_authorization = (
         None
         if schema_version == 1
@@ -4973,7 +5234,13 @@ def verify_post_abort_recovery_plan(
             retry_recovery = _verified_post_abort_retry_recovery(
                 plan["retry_recovery"],
                 expected_schema_version=(
-                    1 if schema_version == 10 else 2
+                    1
+                    if schema_version == 10
+                    or (
+                        isinstance(plan["retry_recovery"], Mapping)
+                        and plan["retry_recovery"].get("schema_version") == 1
+                    )
+                    else 2
                 ),
             )
             retry_recovery_digest = _sha(
@@ -5514,6 +5781,10 @@ def create_global_queue_blocker_classification(
             "migration generation changed during queue blocker classification"
         )
     authority = _installation_authority(installation_authority)
+    _assert_installation_authority_schema(
+        authority,
+        plan_schema_version=1,
+    )
     if authority != plan["installation_authority"]:
         raise OperationRecoveryError(
             "operation-recovery queue blocker authority differs"
@@ -5676,6 +5947,13 @@ def verify_global_queue_blocker_classification(
         raise OperationRecoveryError(
             "operation-recovery queue blocker classification is invalid"
         )
+    authority = _installation_authority(
+        classification["installation_authority"]
+    )
+    _assert_installation_authority_schema(
+        authority,
+        plan_schema_version=1,
+    )
     body = {
         "schema_version": 1,
         "kind": "operation-recovery-global-queue-blocker-classification",
@@ -5713,9 +5991,7 @@ def verify_global_queue_blocker_classification(
             classification["reference_selected_operation_ids_digest"],
             "queue blocker selected operation IDs digest",
         ),
-        "installation_authority": _installation_authority(
-            classification["installation_authority"]
-        ),
+        "installation_authority": authority,
         "profile_id": "systalyze",
         "schema": "public",
         "generation_before": before,
@@ -5923,6 +6199,10 @@ def create_claim_release_plan(
     )
     candidate = _candidate_release(candidate_release)
     authority = _installation_authority(installation_authority)
+    _assert_installation_authority_schema(
+        authority,
+        plan_schema_version=2,
+    )
     reference = verify_requeue_plan(
         reference_plan,
         now=planned_at,
@@ -6194,15 +6474,18 @@ def verify_claim_release_plan(
             "operation-recovery claim-release plan expired"
         )
     paths = _claim_release_artifact_paths(plan)
+    authority = _installation_authority(plan["installation_authority"])
+    _assert_installation_authority_schema(
+        authority,
+        plan_schema_version=2,
+    )
     body = {
         "schema_version": 2,
         "kind": "operation-recovery-claim-release-plan",
         "authority": "unapproved-plan",
         "mutation_authorized": False,
         "candidate_release": _candidate_release(plan["candidate_release"]),
-        "installation_authority": _installation_authority(
-            plan["installation_authority"]
-        ),
+        "installation_authority": authority,
         "predecessor_classification_digest": _sha(
             plan["predecessor_classification_digest"],
             "predecessor classification digest",

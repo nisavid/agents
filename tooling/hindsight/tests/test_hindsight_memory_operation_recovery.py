@@ -213,6 +213,41 @@ def installation_authority() -> dict:
     }
 
 
+def rebound_installation_authority() -> dict:
+    body = {
+        "schema_version": 1,
+        "kind": "operation-recovery-verified-data-identity-rebind-handoff",
+        "plan_digest": "a" * 64,
+        "authorization_receipt_digest": "b" * 64,
+        "application_receipt_digest": "c" * 64,
+        "verification_receipt_digest": "d" * 64,
+        "rollback_bundle_digest": "e" * 64,
+        "installation_state_digest_before": "f" * 64,
+        "installation_state_digest_after": "6" * 64,
+        "binding_generation_digest": "1" * 64,
+        "current_release_digest": "2" * 64,
+        "old_data_identity_digest": "4" * 64,
+        "reference_observed_data_identity_digest": "5" * 64,
+        "new_data_identity_digest": "7" * 64,
+        "postgres_system_identifier": "7659746962107358086",
+        "database_continuity_digest": "8" * 64,
+        "post_evidence_digest": "9" * 64,
+        "verified_at": 1_786_820_204,
+    }
+    authority = installation_authority()
+    authority.update(
+        schema_version=2,
+        install_state_digest=body["installation_state_digest_after"],
+        recorded_data_identity_digest=body["new_data_identity_digest"],
+        observed_data_identity_digest=body["new_data_identity_digest"],
+        data_identity_rebind_handoff={
+            **body,
+            "handoff_digest": digest(body),
+        },
+    )
+    return authority
+
+
 def operation_rows() -> list[dict]:
     rows = []
     position = 0
@@ -3214,6 +3249,322 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 ):
                     create(invalid)
 
+    def test_post_abort_v11_supports_verified_rebind_epoch_zero_to_one(self):
+        reference = self.drain_plan(
+            snapshot=self.drain_snapshot(
+                completed_positions=set(range(7)),
+                observed_at=1_786_390_000,
+            ),
+            created_at=1_786_390_001,
+        )
+        interrupted = self.post_abort_v10_snapshot(reference)
+        interrupted["installation_authority"] = (
+            rebound_installation_authority()
+        )
+        interrupted["snapshot_digest"] = digest(
+            {
+                key: value
+                for key, value in interrupted.items()
+                if key != "snapshot_digest"
+            }
+        )
+        backup = rollback_backup_evidence()
+        backup["source_authority"]["data_identity_digest"] = interrupted[
+            "installation_authority"
+        ]["observed_data_identity_digest"]
+        for key in ("generation_before", "generation_after"):
+            backup["source_authority"][key] = interrupted[key]
+        backup["source_authority_digest"] = digest(
+            backup["source_authority"]
+        )
+
+        plan = create_post_abort_recovery_plan(
+            reference,
+            interrupted,
+            candidate_release=release_identity(),
+            rollback_backup=backup,
+            rollback_encryption=rollback_encryption(),
+            rollback_backup_path="/private/tmp/v11-epoch1-backup.age",
+            rollback_bundle_path="/private/tmp/v11-epoch1-bundle.age",
+            authorization_receipt_path="/private/tmp/v11-epoch1-auth.json",
+            application_receipt_path="/private/tmp/v11-epoch1-app.json",
+            verification_receipt_path="/private/tmp/v11-epoch1-verify.json",
+            rollback_receipt_path="/private/tmp/v11-epoch1-rollback.json",
+            reference_application_authorization=(
+                exact_drain_authorization(reference)
+            ),
+            reference_application_journal=(
+                exact_drain_application_journal(reference)
+            ),
+            reference_application_progress_digest="d" * 64,
+            schema_version=11,
+            created_at=1_786_390_500,
+        )
+
+        retry = plan["retry_recovery"]
+        self.assertEqual(plan["schema_version"], 11)
+        self.assertEqual(retry["schema_version"], 1)
+        self.assertEqual(retry["recovery_epoch_before"], 0)
+        self.assertEqual(retry["recovery_epoch_after"], 1)
+        self.assertEqual(retry["recovery_epoch_ceiling"], 1)
+        self.assertNotIn("prior_retry_recovery", retry)
+        self.assertNotIn("prior_retry_recovery_digest", retry)
+        self.assertEqual(
+            verify_post_abort_recovery_plan(plan, now=plan["created_at"]),
+            plan,
+        )
+
+        selected = {
+            item["operation_id"]: item
+            for item in plan["selected_operations"]
+        }
+        retry_after = {
+            item["operation_id"]: item["retry_count_after"]
+            for item in retry["operations"]
+        }
+        recovered_rows = deepcopy(interrupted["operations"])
+        for row in recovered_rows:
+            operation_id = row["operation_id"]
+            if operation_id not in selected:
+                continue
+            expected_status = selected[operation_id]["expected_status"]
+            row.update(
+                current_status="pending",
+                updated_at="2026-08-20T14:00:00.000000Z",
+                retry_count=retry_after[operation_id],
+                worker_id_present=False,
+                worker_id_digest=None,
+                claimed_at=None,
+            )
+            if expected_status == "failed":
+                row.update(
+                    completed_at=None,
+                    next_retry_at=None,
+                    error_category="none",
+                    error_digest=None,
+                )
+            row["row_digest"] = digest(
+                {
+                    key: value
+                    for key, value in row.items()
+                    if key != "row_digest"
+                }
+            )
+        recovered_snapshot = {
+            **interrupted,
+            "generation_before": "systalyze:public:81710",
+            "generation_after": "systalyze:public:81710",
+            "operations": recovered_rows,
+            "observed_at": 1_786_820_400,
+            "status_counts": {
+                status: sum(
+                    item["current_status"] == status
+                    for item in recovered_rows
+                )
+                for status in recovery_contract.OPERATION_STATUSES
+            },
+        }
+        recovered_snapshot["snapshot_digest"] = digest(
+            {
+                key: value
+                for key, value in recovered_snapshot.items()
+                if key != "snapshot_digest"
+            }
+        )
+        pending_ids = {
+            item["operation_id"]
+            for item in recovered_rows
+            if item["current_status"] == "pending"
+        }
+        recovery_context = {
+            "schema_version": 1,
+            "kind": "operation-recovery-exact-drain-recovery-context",
+            "origin": "post-abort",
+            "generation": recovered_snapshot["generation_before"],
+            "recovery_epoch": 1,
+            "candidate_release_digest": release_identity()["release_digest"],
+            "selected_operation_ids_digest": digest(sorted(pending_ids)),
+            "initial_origin_digest": None,
+            "post_abort_selected_operation_ids_digest": digest(
+                sorted(selected)
+            ),
+            "post_abort_plan_digest": plan["plan_digest"],
+            "post_abort_application_receipt_digest": "a" * 64,
+            "post_abort_verification_receipt_digest": "b" * 64,
+            "retry_recovery_digest": plan["retry_recovery_digest"],
+            "selected_checkpoint_set_digest": plan[
+                "selected_checkpoint_set_digest"
+            ],
+            "preserved_row_set_digest": plan["preserved_row_set_digest"],
+        }
+        fresh_backup = drain_backup_evidence()
+        fresh_backup["source_authority"]["data_identity_digest"] = (
+            recovered_snapshot["installation_authority"][
+                "observed_data_identity_digest"
+            ]
+        )
+        for key in ("generation_before", "generation_after"):
+            fresh_backup["source_authority"][key] = recovered_snapshot[key]
+        fresh_backup["source_authority_digest"] = digest(
+            fresh_backup["source_authority"]
+        )
+        fresh = recovery_contract.create_exact_drain_plan(
+            self.cohort(),
+            recovered_snapshot,
+            candidate_release=release_identity(),
+            rollback_backup=fresh_backup,
+            rollback_backup_path="/private/tmp/v11-epoch1-drain-backup.age",
+            provider_policy_digest="9" * 64,
+            effective_profile_digest="7" * 64,
+            worker_runtime_digest="8" * 64,
+            authorization_receipt_path=(
+                "/private/tmp/v11-epoch1-drain-auth.json"
+            ),
+            application_receipt_path=(
+                "/private/tmp/v11-epoch1-drain-app.json"
+            ),
+            status_artifact_path=(
+                "/private/tmp/v11-epoch1-drain-status.json"
+            ),
+            verification_receipt_path=(
+                "/private/tmp/v11-epoch1-drain-verify.json"
+            ),
+            recovery_context=recovery_context,
+            schema_version=11,
+            created_at=1_786_820_500,
+        )
+        self.assertEqual(fresh["schema_version"], 11)
+        self.assertEqual(fresh["recovery_context"]["schema_version"], 1)
+        self.assertEqual(fresh["recovery_context"]["recovery_epoch"], 1)
+
+        second_rows = deepcopy(recovered_rows)
+        second_worker_digest = hashlib.sha256(
+            (
+                "operation-recovery-exact-drain-"
+                f"{fresh['plan_digest'][:12]}"
+            ).encode()
+        ).hexdigest()
+        fresh_selected_ids = {
+            item["operation_id"] for item in fresh["selected_operations"]
+        }
+        for row in second_rows:
+            if row["operation_id"] not in fresh_selected_ids:
+                continue
+            row.update(
+                current_status="failed",
+                updated_at="2026-08-20T15:00:00.000000Z",
+                completed_at="2026-08-20T15:00:00.000000Z",
+                retry_count=3,
+                next_retry_at=None,
+                worker_id_present=True,
+                worker_id_digest=second_worker_digest,
+                claimed_at="2026-08-20T14:00:00.000000Z",
+                error_category="provider_transport",
+                error_digest="c" * 64,
+            )
+            row["row_digest"] = digest(
+                {
+                    key: value
+                    for key, value in row.items()
+                    if key != "row_digest"
+                }
+            )
+        second_snapshot = {
+            **recovered_snapshot,
+            "generation_before": "systalyze:public:81711",
+            "generation_after": "systalyze:public:81711",
+            "operations": second_rows,
+            "status_counts": {
+                status: sum(
+                    item["current_status"] == status for item in second_rows
+                )
+                for status in recovery_contract.OPERATION_STATUSES
+            },
+            "observed_at": 1_786_824_000,
+        }
+        second_snapshot["snapshot_digest"] = digest(
+            {
+                key: value
+                for key, value in second_snapshot.items()
+                if key != "snapshot_digest"
+            }
+        )
+        second_backup = rollback_backup_evidence()
+        second_backup["source_authority"]["data_identity_digest"] = (
+            second_snapshot["installation_authority"][
+                "observed_data_identity_digest"
+            ]
+        )
+        for key in ("generation_before", "generation_after"):
+            second_backup["source_authority"][key] = second_snapshot[key]
+        second_backup["source_authority_digest"] = digest(
+            second_backup["source_authority"]
+        )
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "retry recovery is invalid",
+        ):
+            create_post_abort_recovery_plan(
+                fresh,
+                second_snapshot,
+                candidate_release=release_identity(),
+                rollback_backup=second_backup,
+                rollback_encryption=rollback_encryption(),
+                rollback_backup_path="/private/tmp/v11-omit-backup.age",
+                rollback_bundle_path="/private/tmp/v11-omit-bundle.age",
+                authorization_receipt_path="/private/tmp/v11-omit-auth.json",
+                application_receipt_path="/private/tmp/v11-omit-app.json",
+                verification_receipt_path=(
+                    "/private/tmp/v11-omit-verify.json"
+                ),
+                rollback_receipt_path=(
+                    "/private/tmp/v11-omit-rollback.json"
+                ),
+                reference_application_authorization=(
+                    exact_drain_authorization(fresh)
+                ),
+                reference_application_journal=(
+                    exact_drain_application_journal(fresh)
+                ),
+                reference_application_progress_digest="d" * 64,
+                schema_version=11,
+                created_at=1_786_824_100,
+            )
+        epoch_two = create_post_abort_recovery_plan(
+            fresh,
+            second_snapshot,
+            candidate_release=release_identity(),
+            rollback_backup=second_backup,
+            rollback_encryption=rollback_encryption(),
+            rollback_backup_path="/private/tmp/v11-chain-backup.age",
+            rollback_bundle_path="/private/tmp/v11-chain-bundle.age",
+            authorization_receipt_path="/private/tmp/v11-chain-auth.json",
+            application_receipt_path="/private/tmp/v11-chain-app.json",
+            verification_receipt_path="/private/tmp/v11-chain-verify.json",
+            rollback_receipt_path="/private/tmp/v11-chain-rollback.json",
+            reference_application_authorization=(
+                exact_drain_authorization(fresh)
+            ),
+            reference_application_journal=(
+                exact_drain_application_journal(fresh)
+            ),
+            reference_application_progress_digest="d" * 64,
+            prior_retry_recovery=retry,
+            schema_version=11,
+            created_at=1_786_824_100,
+        )
+        self.assertEqual(
+            epoch_two["retry_recovery"]["recovery_epoch_after"],
+            2,
+        )
+        self.assertEqual(
+            verify_post_abort_recovery_plan(
+                epoch_two,
+                now=epoch_two["created_at"],
+            ),
+            epoch_two,
+        )
+
     def test_exact_drain_binds_verified_post_abort_retry_lineage(self):
         reference = self.drain_plan(
             snapshot=self.drain_snapshot(
@@ -3462,6 +3813,34 @@ class OperationRecoveryContractTest(unittest.TestCase):
         second_backup["source_authority_digest"] = digest(
             second_backup["source_authority"]
         )
+        rebound_second_interrupted = dict(
+            create_live_snapshot(
+                self.cohort(),
+                second_rows,
+                generation_before="systalyze:public:81701",
+                generation_after="systalyze:public:81701",
+                installation_authority=rebound_installation_authority(),
+                observed_at=1_786_829_500,
+            )
+        )
+        rebound_second_backup = deepcopy(second_backup)
+        rebound_second_backup["source_authority"][
+            "data_identity_digest"
+        ] = rebound_second_interrupted["installation_authority"][
+            "observed_data_identity_digest"
+        ]
+        rebound_second_backup["source_authority_digest"] = digest(
+            rebound_second_backup["source_authority"]
+        )
+        tampered_rebind = deepcopy(rebound_second_interrupted)
+        tampered_rebind["installation_authority"][
+            "data_identity_rebind_handoff"
+        ]["post_evidence_digest"] = "0" * 64
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "data-identity rebind handoff is invalid",
+        ):
+            verify_live_snapshot(tampered_rebind)
         with self.assertRaisesRegex(
             OperationRecoveryError,
             "retry recovery is invalid",
@@ -3488,11 +3867,118 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 created_at=1_786_829_600,
             )
 
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "verified rebind authority requires schema 11",
+        ):
+            create_post_abort_recovery_plan(
+                plan,
+                rebound_second_interrupted,
+                candidate_release=release_identity(),
+                rollback_backup=rebound_second_backup,
+                rollback_encryption=rollback_encryption(),
+                rollback_backup_path="/private/tmp/v10-rebind-backup.age",
+                rollback_bundle_path="/private/tmp/v10-rebind-bundle.age",
+                authorization_receipt_path="/private/tmp/v10-rebind-auth.json",
+                application_receipt_path="/private/tmp/v10-rebind-app.json",
+                verification_receipt_path="/private/tmp/v10-rebind-verify.json",
+                rollback_receipt_path="/private/tmp/v10-rebind-rollback.json",
+                reference_application_authorization=(
+                    exact_drain_authorization(plan)
+                ),
+                reference_application_journal=(
+                    exact_drain_application_journal(plan)
+                ),
+                reference_application_progress_digest="d" * 64,
+                schema_version=10,
+                created_at=1_786_829_600,
+            )
+
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "schema-11 recovery requires verified rebind authority",
+        ):
+            create_post_abort_recovery_plan(
+                plan,
+                second_interrupted,
+                candidate_release=release_identity(),
+                rollback_backup=second_backup,
+                rollback_encryption=rollback_encryption(),
+                rollback_backup_path="/private/tmp/v11-legacy-backup.age",
+                rollback_bundle_path="/private/tmp/v11-legacy-bundle.age",
+                authorization_receipt_path="/private/tmp/v11-legacy-auth.json",
+                application_receipt_path="/private/tmp/v11-legacy-app.json",
+                verification_receipt_path="/private/tmp/v11-legacy-verify.json",
+                rollback_receipt_path="/private/tmp/v11-legacy-rollback.json",
+                reference_application_authorization=(
+                    exact_drain_authorization(plan)
+                ),
+                reference_application_journal=(
+                    exact_drain_application_journal(plan)
+                ),
+                reference_application_progress_digest="d" * 64,
+                prior_retry_recovery=recovery_plan["retry_recovery"],
+                schema_version=11,
+                created_at=1_786_829_600,
+            )
+
+        mismatched_authority = rebound_installation_authority()
+        mismatched_handoff = mismatched_authority[
+            "data_identity_rebind_handoff"
+        ]
+        mismatched_handoff[
+            "reference_observed_data_identity_digest"
+        ] = "0" * 64
+        mismatched_handoff["handoff_digest"] = digest(
+            {
+                key: value
+                for key, value in mismatched_handoff.items()
+                if key != "handoff_digest"
+            }
+        )
+        mismatched_snapshot = dict(
+            create_live_snapshot(
+                self.cohort(),
+                second_rows,
+                generation_before="systalyze:public:81701",
+                generation_after="systalyze:public:81701",
+                installation_authority=mismatched_authority,
+                observed_at=1_786_829_500,
+            )
+        )
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "post-abort row set is invalid",
+        ):
+            create_post_abort_recovery_plan(
+                plan,
+                mismatched_snapshot,
+                candidate_release=release_identity(),
+                rollback_backup=rebound_second_backup,
+                rollback_encryption=rollback_encryption(),
+                rollback_backup_path="/private/tmp/v11-mismatch-backup.age",
+                rollback_bundle_path="/private/tmp/v11-mismatch-bundle.age",
+                authorization_receipt_path="/private/tmp/v11-mismatch-auth.json",
+                application_receipt_path="/private/tmp/v11-mismatch-app.json",
+                verification_receipt_path="/private/tmp/v11-mismatch-verify.json",
+                rollback_receipt_path="/private/tmp/v11-mismatch-rollback.json",
+                reference_application_authorization=(
+                    exact_drain_authorization(plan)
+                ),
+                reference_application_journal=(
+                    exact_drain_application_journal(plan)
+                ),
+                reference_application_progress_digest="d" * 64,
+                prior_retry_recovery=recovery_plan["retry_recovery"],
+                schema_version=11,
+                created_at=1_786_829_600,
+            )
+
         epoch_two_recovery = create_post_abort_recovery_plan(
             plan,
-            second_interrupted,
+            rebound_second_interrupted,
             candidate_release=release_identity(),
-            rollback_backup=second_backup,
+            rollback_backup=rebound_second_backup,
             rollback_encryption=rollback_encryption(),
             rollback_backup_path="/private/tmp/v11-epoch2-backup.age",
             rollback_bundle_path="/private/tmp/v11-epoch2-bundle.age",
@@ -3605,7 +4091,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
             for item in epoch_two_recovery["selected_operations"]
         }
         epoch_two_recovered_rows = []
-        for item in second_interrupted["operations"]:
+        for item in rebound_second_interrupted["operations"]:
             row = {
                 "operation_id": item["operation_id"],
                 "bank_id": "engineering",
@@ -3647,7 +4133,7 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 epoch_two_recovered_rows,
                 generation_before="systalyze:public:81702",
                 generation_after="systalyze:public:81702",
-                installation_authority=installation_authority(),
+                installation_authority=rebound_installation_authority(),
                 observed_at=1_786_829_700,
             )
         )
@@ -3683,6 +4169,11 @@ class OperationRecoveryContractTest(unittest.TestCase):
             ],
         }
         epoch_two_drain_backup = drain_backup_evidence()
+        epoch_two_drain_backup["source_authority"][
+            "data_identity_digest"
+        ] = epoch_two_recovered_snapshot["installation_authority"][
+            "observed_data_identity_digest"
+        ]
         for key in ("generation_before", "generation_after"):
             epoch_two_drain_backup["source_authority"][key] = (
                 epoch_two_recovered_snapshot[key]
@@ -3690,6 +4181,37 @@ class OperationRecoveryContractTest(unittest.TestCase):
         epoch_two_drain_backup["source_authority_digest"] = digest(
             epoch_two_drain_backup["source_authority"]
         )
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "verified rebind authority requires schema 11",
+        ):
+            recovery_contract.create_exact_drain_plan(
+                self.cohort(),
+                epoch_two_recovered_snapshot,
+                candidate_release=release_identity(),
+                rollback_backup=epoch_two_drain_backup,
+                rollback_backup_path=(
+                    "/private/tmp/v10-rebind-drain-backup.age"
+                ),
+                provider_policy_digest="9" * 64,
+                effective_profile_digest="7" * 64,
+                worker_runtime_digest="8" * 64,
+                authorization_receipt_path=(
+                    "/private/tmp/v10-rebind-drain-auth.json"
+                ),
+                application_receipt_path=(
+                    "/private/tmp/v10-rebind-drain-app.json"
+                ),
+                status_artifact_path=(
+                    "/private/tmp/v10-rebind-drain-status.json"
+                ),
+                verification_receipt_path=(
+                    "/private/tmp/v10-rebind-drain-verify.json"
+                ),
+                recovery_context=epoch_two_context,
+                created_at=1_786_829_701,
+                schema_version=10,
+            )
         epoch_two_plan = recovery_contract.create_exact_drain_plan(
             self.cohort(),
             epoch_two_recovered_snapshot,
@@ -3743,11 +4265,16 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 epoch_three_rows,
                 generation_before="systalyze:public:81703",
                 generation_after="systalyze:public:81703",
-                installation_authority=installation_authority(),
+                installation_authority=rebound_installation_authority(),
                 observed_at=1_786_829_900,
             )
         )
         epoch_three_backup = rollback_backup_evidence()
+        epoch_three_backup["source_authority"][
+            "data_identity_digest"
+        ] = epoch_three_interrupted["installation_authority"][
+            "observed_data_identity_digest"
+        ]
         for key in ("generation_before", "generation_after"):
             epoch_three_backup["source_authority"][key] = (
                 epoch_three_interrupted[key]
@@ -5587,6 +6114,78 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 verification_receipt_path="/private/tmp/verification.json",
                 rollback_receipt_path="/private/tmp/rollback-receipt.json",
                 created_at=1_785_401_100,
+            )
+
+    def test_legacy_queue_guard_artifacts_reject_verified_rebind_authority(self):
+        classification = self.queue_blocker_classification()
+        tampered_classification = deepcopy(classification)
+        tampered_classification["installation_authority"] = (
+            rebound_installation_authority()
+        )
+        tampered_classification["classification_digest"] = digest(
+            {
+                key: value
+                for key, value in tampered_classification.items()
+                if key != "classification_digest"
+            }
+        )
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "verified rebind authority requires schema 11",
+        ):
+            verify_global_queue_blocker_classification(
+                tampered_classification,
+                now=tampered_classification["observed_at"],
+            )
+
+        predecessor, live, nonclaim_digests = self.claim_release_inputs(
+            live_generation="systalyze:public:123"
+        )
+        reference_plan = self.requeue_plan()
+        plan = create_claim_release_plan(
+            predecessor,
+            live,
+            reference_plan=reference_plan,
+            permitted_blocker_rows=self.permitted_blocker_rows(
+                reference_plan
+            ),
+            nonclaim_state_digests=nonclaim_digests,
+            candidate_release=release_identity(),
+            installation_authority=installation_authority(),
+            rollback_encryption=rollback_encryption(),
+            rollback_bundle_path="/private/tmp/rebind-guard.bundle.json",
+            authorization_receipt_path=(
+                "/private/tmp/rebind-guard.authorization.json"
+            ),
+            application_receipt_path=(
+                "/private/tmp/rebind-guard.application.json"
+            ),
+            verification_receipt_path=(
+                "/private/tmp/rebind-guard.verification.json"
+            ),
+            rollback_receipt_path=(
+                "/private/tmp/rebind-guard.rollback.json"
+            ),
+            created_at=live["observed_at"],
+        )
+        tampered_plan = deepcopy(plan)
+        tampered_plan["installation_authority"] = (
+            rebound_installation_authority()
+        )
+        tampered_plan["plan_digest"] = digest(
+            {
+                key: value
+                for key, value in tampered_plan.items()
+                if key != "plan_digest"
+            }
+        )
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "verified rebind authority requires schema 11",
+        ):
+            verify_claim_release_plan(
+                tampered_plan,
+                now=tampered_plan["created_at"],
             )
 
     def test_claim_release_permits_a_bound_cancelled_reference_row(self):

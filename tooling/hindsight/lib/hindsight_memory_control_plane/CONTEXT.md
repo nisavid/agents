@@ -38,13 +38,17 @@ Retry and defer timestamps are accepted only when they are timezone-aware, no fa
 _Avoid_: Approval lifetime, renewable lease
 
 **Recovery epoch**:
-The single bounded transition consumed by a verified post-abort recovery transaction. That transaction may release exact-worker-owned pending or processing rows and may reset exact-worker-owned failed rows for one fresh attempt cycle. The epoch always advances from zero to one and cannot be replayed or renewed.
+A monotonic transition consumed by a verified post-abort recovery transaction. That transaction may release exact-worker-owned pending or processing rows and may reset exact-worker-owned failed rows for one fresh attempt cycle. Schema 10 permits zero to one under unchanged legacy installation authority. Schema 11 carries verified data-identity rebind authority and permits either the first zero-to-one transition or one additional one-to-two transition when the prior retry lineage is authenticated. No transition can be replayed or renewed.
 _Avoid_: Retry count, worker attempt
 
 **Retry lineage**:
-The digest-bound record of each selected row's persisted retry count, consumed attempts, available attempts after the one permitted recovery, cumulative ceiling, and whether that recovery reset the failed row.
+The digest-bound record of each selected row's persisted retry count, consumed attempts, available attempts after each permitted recovery, cumulative ceiling, and whether that recovery reset the failed row.
 _Avoid_: Provider retry policy, execution window
 
 **Recovery handoff**:
 The closed link from a verified post-abort plan and its application and verification receipts into a fresh exact-drain plan. It binds the recovery epoch, exact recovered IDs, checkpoint digests, preserved rows, generation, and candidate release without carrying task payloads or raw errors.
 _Avoid_: Resume token, renewed authorization
+
+**Verified data-identity rebind handoff**:
+The closed proof that an approved rebind moved one installation from an exact prior state and durable data identity to an exact verified post-state and durable data identity while preserving the reference plan's observed legacy identity, binding generation, release, PostgreSQL system identifier, and database continuity. Only schema 11 recovery may bridge those two installation authorities.
+_Avoid_: Ordinary installation verification, dual identity acceptance

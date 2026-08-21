@@ -133,6 +133,364 @@ class OperationRecoveryCliTest(unittest.TestCase):
     def setUpClass(cls):
         cls.controller = runpy.run_path(str(ROOT / "bin" / "hindsight-memory"))
 
+    def test_operation_recovery_rebind_handoff_binds_verified_receipts(self):
+        helper = self.controller[
+            "_operation_recovery_verified_rebind_handoff"
+        ]
+        globals_ = helper.__globals__
+        original = globals_["EXPECTED_OPERATION_RECOVERY_REBIND_HANDOFF"]
+        self.assertEqual(
+            original["reference_observed_data_identity_digest"],
+            "1c7bcaca4c1fb01f7a2b4b44a7eea662b1f7180ba6097d3f8ed507c7f58bd5ce",
+        )
+        with tempfile.TemporaryDirectory(
+            dir="/private/tmp",
+            prefix="operation-recovery-rebind-handoff-",
+        ) as directory:
+            root = Path(directory)
+            root.chmod(0o700)
+            plan_path = root / "plan.json"
+            rollback_path = root / "rollback.json"
+            authorization_path = root / "authorization.json"
+            application_path = root / "application.json"
+            verification_path = root / "verification.json"
+            plan_document = {
+                "plan_digest": original["plan_digest"],
+                "installation_state_digest": original[
+                    "installation_state_digest_before"
+                ],
+                "expected_post_state_digest": original[
+                    "installation_state_digest_after"
+                ],
+                "binding_generation_digest": original[
+                    "binding_generation_digest"
+                ],
+                "current_release_digest": original[
+                    "current_release_digest"
+                ],
+                "old_data_identity_digest": original[
+                    "old_data_identity_digest"
+                ],
+                "new_data_identity_digest": original[
+                    "new_data_identity_digest"
+                ],
+                "rollback_bundle_path": str(rollback_path),
+                "authorization_receipt_path": str(authorization_path),
+                "application_receipt_path": str(application_path),
+                "verification_receipt_path": str(verification_path),
+            }
+            plan_path.write_text(
+                json.dumps(plan_document) + "\n",
+                encoding="utf-8",
+            )
+            plan_path.chmod(0o600)
+            expected = deepcopy(original)
+            expected["plan_path"] = str(plan_path)
+            globals_["EXPECTED_OPERATION_RECOVERY_REBIND_HANDOFF"] = expected
+            checked_plan = plan_document
+            rollback_bundle = {
+                "rollback_bundle_digest": expected[
+                    "rollback_bundle_digest"
+                ]
+            }
+            authorization = {
+                "receipt_digest": expected[
+                    "authorization_receipt_digest"
+                ]
+            }
+            application = {
+                "application_receipt_digest": expected[
+                    "application_receipt_digest"
+                ]
+            }
+            verification = {
+                "verification_receipt_digest": expected[
+                    "verification_receipt_digest"
+                ],
+                "postgres_system_identifier": expected[
+                    "postgres_system_identifier"
+                ],
+                "database_continuity_digest": expected[
+                    "database_continuity_digest"
+                ],
+                "post_evidence_digest": expected[
+                    "post_evidence_digest"
+                ],
+                "verified_at": expected["verified_at"],
+            }
+            for path, value in (
+                (rollback_path, rollback_bundle),
+                (authorization_path, authorization),
+                (application_path, application),
+                (verification_path, verification),
+            ):
+                path.write_text(json.dumps(value) + "\n", encoding="utf-8")
+                path.chmod(0o600)
+
+            def read_receipt(path):
+                return json.loads(path.read_text(encoding="utf-8"))
+
+            def validate_handoff(value, state):
+                if value != plan_document or state != {}:
+                    raise self.controller["PortableInstallError"](
+                        "verified rebind plan drifted"
+                    )
+                return checked_plan
+
+            def validate_rollback(value):
+                if value is not checked_plan:
+                    raise self.controller["PortableInstallError"](
+                        "verified rebind rollback chain differs"
+                    )
+                receipt = read_receipt(rollback_path)
+                if receipt != rollback_bundle:
+                    raise self.controller["PortableInstallError"](
+                        "verified rebind rollback drifted"
+                    )
+                return rollback_bundle, {}
+
+            def validate_authorization(value):
+                if value is not checked_plan:
+                    raise self.controller["PortableInstallError"](
+                        "verified rebind plan chain differs"
+                    )
+                receipt = read_receipt(authorization_path)
+                if receipt != authorization:
+                    raise self.controller["PortableInstallError"](
+                        "verified rebind authorization drifted"
+                    )
+                return authorization
+
+            def validate_application(value, checked_authorization):
+                if (
+                    value is not checked_plan
+                    or checked_authorization is not authorization
+                ):
+                    raise self.controller["PortableInstallError"](
+                        "verified rebind application chain differs"
+                    )
+                receipt = read_receipt(application_path)
+                if receipt != application:
+                    raise self.controller["PortableInstallError"](
+                        "verified rebind application drifted"
+                    )
+                return application
+
+            def validate_verification(value, checked_application):
+                if (
+                    value is not checked_plan
+                    or checked_application is not application
+                ):
+                    raise self.controller["PortableInstallError"](
+                        "verified rebind verification chain differs"
+                    )
+                receipt = read_receipt(verification_path)
+                if receipt != verification:
+                    raise self.controller["PortableInstallError"](
+                        "verified rebind verification drifted"
+                    )
+                return verification
+
+            manager = Mock()
+            manager._validate_verified_rebind_upgrade_handoff.side_effect = (
+                validate_handoff
+            )
+            manager._validate_rebind_rollback_bundle.side_effect = (
+                validate_rollback
+            )
+            manager._validate_rebind_authorization_receipt.side_effect = (
+                validate_authorization
+            )
+            manager._validate_rebind_application_receipt.side_effect = (
+                validate_application
+            )
+            manager._validate_rebind_verification_receipt.side_effect = (
+                validate_verification
+            )
+            try:
+                handoff = helper(manager, {})
+                body = {
+                    key: value
+                    for key, value in expected.items()
+                    if key != "plan_path"
+                }
+                self.assertEqual(handoff, {
+                    **body,
+                    "handoff_digest": self.controller["digest"](body),
+                })
+                self.assertEqual(
+                    manager._validate_verified_rebind_upgrade_handoff.call_args_list,
+                    [call(plan_document, {}), call(plan_document, {})],
+                )
+                self.assertEqual(
+                    manager._validate_rebind_rollback_bundle.call_args_list,
+                    [call(checked_plan), call(checked_plan)],
+                )
+                self.assertEqual(
+                    manager._validate_rebind_authorization_receipt.call_args_list,
+                    [call(checked_plan), call(checked_plan)],
+                )
+                self.assertEqual(
+                    manager._validate_rebind_application_receipt.call_args_list,
+                    [
+                        call(checked_plan, authorization),
+                        call(checked_plan, authorization),
+                    ],
+                )
+                self.assertEqual(
+                    manager._validate_rebind_verification_receipt.call_args_list,
+                    [
+                        call(checked_plan, application),
+                        call(checked_plan, application),
+                    ],
+                )
+                authorization_path.write_text(
+                    json.dumps({"receipt_digest": "0" * 64}) + "\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(
+                    self.controller["OperationRecoveryError"],
+                    "data-identity rebind handoff is invalid",
+                ):
+                    helper(manager, {})
+
+                def reset_sources():
+                    for path, value in (
+                        (plan_path, plan_document),
+                        (rollback_path, rollback_bundle),
+                        (authorization_path, authorization),
+                        (application_path, application),
+                        (verification_path, verification),
+                    ):
+                        path.write_text(
+                            json.dumps(value) + "\n",
+                            encoding="utf-8",
+                        )
+
+                invocations = {}
+
+                def mutate_on_second(name, path, value):
+                    invocations[name] = invocations.get(name, 0) + 1
+                    if invocations[name] == 2:
+                        path.write_text(
+                            json.dumps(value) + "\n",
+                            encoding="utf-8",
+                        )
+
+                def validate_handoff_with_plan_drift(value, state):
+                    checked = validate_handoff(value, state)
+                    mutate_on_second(
+                        "plan",
+                        plan_path,
+                        {"plan_digest": "0" * 64},
+                    )
+                    return checked
+
+                def validate_rollback_with_drift(value):
+                    checked = validate_rollback(value)
+                    mutate_on_second(
+                        "rollback",
+                        rollback_path,
+                        {"rollback_bundle_digest": "0" * 64},
+                    )
+                    return checked
+
+                def validate_authorization_with_drift(value):
+                    checked = validate_authorization(value)
+                    mutate_on_second(
+                        "authorization",
+                        authorization_path,
+                        {"receipt_digest": "0" * 64},
+                    )
+                    return checked
+
+                def validate_application_with_drift(
+                    value,
+                    checked_authorization,
+                ):
+                    checked = validate_application(
+                        value,
+                        checked_authorization,
+                    )
+                    mutate_on_second(
+                        "application",
+                        application_path,
+                        {"application_receipt_digest": "0" * 64},
+                    )
+                    return checked
+
+                def validate_verification_with_drift(
+                    value,
+                    checked_application,
+                ):
+                    checked = validate_verification(
+                        value,
+                        checked_application,
+                    )
+                    mutate_on_second(
+                        "verification",
+                        verification_path,
+                        {"verification_receipt_digest": "0" * 64},
+                    )
+                    return checked
+
+                drift_cases = (
+                    (
+                        "rollback",
+                        manager._validate_rebind_rollback_bundle,
+                        validate_rollback_with_drift,
+                    ),
+                    (
+                        "authorization",
+                        manager._validate_rebind_authorization_receipt,
+                        validate_authorization_with_drift,
+                    ),
+                    (
+                        "application",
+                        manager._validate_rebind_application_receipt,
+                        validate_application_with_drift,
+                    ),
+                    (
+                        "verification",
+                        manager._validate_rebind_verification_receipt,
+                        validate_verification_with_drift,
+                    ),
+                    (
+                        "plan",
+                        manager._validate_verified_rebind_upgrade_handoff,
+                        validate_handoff_with_plan_drift,
+                    ),
+                )
+                for name, mocked_validator, callback in drift_cases:
+                    with self.subTest(drift=name):
+                        reset_sources()
+                        invocations.clear()
+                        manager._validate_verified_rebind_upgrade_handoff.side_effect = (
+                            validate_handoff
+                        )
+                        manager._validate_rebind_rollback_bundle.side_effect = (
+                            validate_rollback
+                        )
+                        manager._validate_rebind_authorization_receipt.side_effect = (
+                            validate_authorization
+                        )
+                        manager._validate_rebind_application_receipt.side_effect = (
+                            validate_application
+                        )
+                        manager._validate_rebind_verification_receipt.side_effect = (
+                            validate_verification
+                        )
+                        mocked_validator.side_effect = callback
+                        with self.assertRaisesRegex(
+                            self.controller["OperationRecoveryError"],
+                            "changed while pinned",
+                        ):
+                            helper(manager, {})
+            finally:
+                globals_["EXPECTED_OPERATION_RECOVERY_REBIND_HANDOFF"] = (
+                    original
+                )
+
     def test_exact_drain_status_rejects_non_object_plan_roots(self):
         command = self.controller["operation_recovery_drain_status_command"]
         globals_ = command.__globals__
@@ -208,6 +566,8 @@ class OperationRecoveryCliTest(unittest.TestCase):
     def _schema_10_recovery_handoff(
         self,
         root: Path,
+        *,
+        schema_version: int = 10,
     ) -> tuple[dict, dict, dict, Path]:
         fixtures = recovery_fixtures.OperationRecoveryContractTest()
         now = int(time.time())
@@ -246,6 +606,17 @@ class OperationRecoveryCliTest(unittest.TestCase):
                 if key != "snapshot_digest"
             }
         )
+        if schema_version == 11:
+            interrupted["installation_authority"] = (
+                recovery_fixtures.rebound_installation_authority()
+            )
+            interrupted["snapshot_digest"] = self.controller["digest"](
+                {
+                    key: value
+                    for key, value in interrupted.items()
+                    if key != "snapshot_digest"
+                }
+            )
         recovery_backup_path = root / "recovery-backup.age"
         recovery_backup_path.write_bytes(b"synthetic-recovery-backup")
         recovery_backup_path.chmod(0o600)
@@ -257,6 +628,11 @@ class OperationRecoveryCliTest(unittest.TestCase):
             recovery_backup["source_authority"][key] = interrupted[
                 "generation_before"
             ]
+        recovery_backup["source_authority"]["data_identity_digest"] = (
+            interrupted["installation_authority"][
+                "observed_data_identity_digest"
+            ]
+        )
         recovery_backup["source_authority_digest"] = self.controller[
             "digest"
         ](recovery_backup["source_authority"])
@@ -286,6 +662,7 @@ class OperationRecoveryCliTest(unittest.TestCase):
                 recovery_fixtures.exact_drain_application_journal(reference)
             ),
             reference_application_progress_digest="f" * 64,
+            schema_version=schema_version,
             created_at=now - 79,
         )
         selected_ids = {
@@ -344,7 +721,9 @@ class OperationRecoveryCliTest(unittest.TestCase):
                 generation_before=post_generation,
                 generation_after=post_generation,
                 installation_authority=(
-                    recovery_fixtures.installation_authority()
+                    recovery_fixtures.rebound_installation_authority()
+                    if schema_version == 11
+                    else recovery_fixtures.installation_authority()
                 ),
                 observed_at=now - 60,
             )
@@ -2177,7 +2556,10 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 recovered_snapshot,
                 documents,
                 prior_recovery_path,
-            ) = self._schema_10_recovery_handoff(root)
+            ) = self._schema_10_recovery_handoff(
+                root,
+                schema_version=11,
+            )
             prior_application = documents[
                 prior_recovery["application_receipt_path"]
             ]
@@ -2229,6 +2611,11 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 ],
             }
             exact_backup = recovery_fixtures.drain_backup_evidence()
+            exact_backup["source_authority"]["data_identity_digest"] = (
+                recovered_snapshot["installation_authority"][
+                    "observed_data_identity_digest"
+                ]
+            )
             for key in ("generation_before", "generation_after"):
                 exact_backup["source_authority"][key] = recovered_snapshot[key]
             exact_backup["source_authority_digest"] = self.controller[
@@ -2249,7 +2636,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 verification_receipt_path=str(root / "exact-verify.json"),
                 recovery_context=recovery_context,
                 created_at=now - 59,
-                schema_version=10,
+                schema_version=11,
             )
             worker_digest = hashlib.sha256(
                 (
@@ -2301,7 +2688,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                     generation_before="systalyze:public:81701",
                     generation_after="systalyze:public:81701",
                     installation_authority=(
-                        recovery_fixtures.installation_authority()
+                        recovery_fixtures.rebound_installation_authority()
                     ),
                     observed_at=now - 20,
                 )
@@ -2313,6 +2700,9 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             backup["artifact_sha256"] = hashlib.sha256(
                 rollback_path.read_bytes()
             ).hexdigest()
+            backup["source_authority"]["data_identity_digest"] = interrupted[
+                "installation_authority"
+            ]["observed_data_identity_digest"]
             for key in ("generation_before", "generation_after"):
                 backup["source_authority"][key] = interrupted[key]
             backup["source_authority_digest"] = self.controller["digest"](
@@ -3108,6 +3498,45 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             self.assertNotIn('"task_payload":', serialized)
             self.assertNotIn('"worker_id":', serialized)
             self.assertNotIn('"error_message":', serialized)
+
+            rebound_snapshot = deepcopy(snapshot)
+            rebound_snapshot["installation_authority"] = (
+                recovery_fixtures.rebound_installation_authority()
+            )
+            rebound_snapshot["snapshot_digest"] = self.controller["digest"](
+                {
+                    key: value
+                    for key, value in rebound_snapshot.items()
+                    if key != "snapshot_digest"
+                }
+            )
+            rebound_backup = deepcopy(backup)
+            rebound_backup["source_authority"]["data_identity_digest"] = (
+                rebound_snapshot["installation_authority"][
+                    "observed_data_identity_digest"
+                ]
+            )
+            rebound_backup["source_authority_digest"] = self.controller[
+                "digest"
+            ](rebound_backup["source_authority"])
+            documents["snapshot"] = rebound_snapshot
+            documents["backup"] = rebound_backup
+            written.clear()
+            globals_.update(replacements)
+            try:
+                rebound_result = command(args)
+            finally:
+                globals_.update(originals)
+                documents["snapshot"] = snapshot
+                documents["backup"] = backup
+            self.assertEqual(rebound_result["status"], "planned")
+            rebound_plan, create_only = written[args.output]
+            self.assertIs(create_only, True)
+            self.assertEqual(rebound_plan["schema_version"], 11)
+            self.assertEqual(
+                rebound_plan["retry_recovery"]["schema_version"],
+                1,
+            )
 
             reference_sources = [
                 args.reference_plan,

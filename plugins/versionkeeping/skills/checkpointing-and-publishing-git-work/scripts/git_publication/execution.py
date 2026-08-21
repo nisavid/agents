@@ -304,6 +304,7 @@ def execute_repository(
                     expected_fingerprint=destination["endpoint_fingerprint"],
                     observed_fingerprint=endpoint_fingerprint,
                 )
+            repo.enable_https_credentials(endpoint)
             default_branch_ref = _probe_default_branch(repo, endpoint, object_format)
             if default_branch_ref != destination["default_branch_ref"]:
                 raise PolicyGate(

@@ -27,7 +27,7 @@
       "mode": 420
     },
     "skills/checkpointing-and-publishing-git-work/references/publication-execution.md": {
-      "sha256": "3cb89bbf88ad7181d60c360556eedb49dda6c80c470dc95c50a19bbe43131211",
+      "sha256": "4ece52fd240cf080138db935b27c240c6e84bf90b176c0f4d0d122c7e10cc466",
       "mode": 420
     },
     "skills/checkpointing-and-publishing-git-work/references/terminal-cleanup.md": {
@@ -51,7 +51,7 @@
       "mode": 420
     },
     "skills/checkpointing-and-publishing-git-work/scripts/git_publication/adapter.py": {
-      "sha256": "2a1345c99a56c1854a79f2cde8ed0a3f4e2e6cfc8f8410e22123cc96543c36ca",
+      "sha256": "563d5b4ec8f0531b2eac19b6d5cb67a4bfad49c159db681f1bf27c72778aa3bc",
       "mode": 420
     },
     "skills/checkpointing-and-publishing-git-work/scripts/git_publication/core.py": {
@@ -63,7 +63,7 @@
       "mode": 420
     },
     "skills/checkpointing-and-publishing-git-work/scripts/git_publication/execution.py": {
-      "sha256": "64c9ef6e2e4c2c863335e4d80e156498efea8b125e0324e230711894d7657d82",
+      "sha256": "dbbc3fa3b46f8de8b333eb38affbeda9113675c071d116ff0ee0efb05dd0b30c",
       "mode": 420
     },
     "skills/checkpointing-and-publishing-git-work/scripts/plan_git_publication.py": {

@@ -69,20 +69,16 @@ def commit(repo: Path, name: str) -> str:
     return git(repo, "rev-parse", "HEAD")
 
 
-def write_credential_helper(
-    path: Path,
-    username: str,
-    password: str,
-) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        "#!/bin/sh\n"
-        "if [ \"$1\" = get ]; then\n"
-        f"  printf '%s\\n' 'username={username}' 'password={password}'\n"
-        "fi\n",
-        encoding="utf-8",
-    )
-    path.chmod(0o700)
+TEST_CREDENTIAL_USERNAME_ENV = "VERSIONKEEPING_TEST_CREDENTIAL_USERNAME"
+TEST_CREDENTIAL_SECRET_ENV = "VERSIONKEEPING_TEST_CREDENTIAL_SECRET"
+TEST_CREDENTIAL_HELPER = Path(__file__).with_name("credential-helper.sh").resolve()
+
+
+def credential_helper_environment(username: str, secret: str) -> dict[str, str]:
+    return {
+        TEST_CREDENTIAL_USERNAME_ENV: username,
+        TEST_CREDENTIAL_SECRET_ENV: secret,
+    }
 
 
 def request(start: str, source: str) -> dict:
@@ -206,6 +202,7 @@ def authenticated_https_endpoint(
 
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    tls.minimum_version = ssl.TLSVersion.TLSv1_2
     tls.load_cert_chain(certificate, private_key)
     server.socket = tls.wrap_socket(server.socket, server_side=True)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -1079,8 +1076,10 @@ class PublicationExecutionTests(unittest.TestCase):
     def test_authenticated_https_transport_keeps_credentials_inside_git(self) -> None:
         username = "versionkeeping-test"
         secret = "credential-secret-745bad"
-        helper = self.root / "credential-helper"
-        write_credential_helper(helper, username, secret)
+        helper = TEST_CREDENTIAL_HELPER
+        helper_text = TEST_CREDENTIAL_HELPER.read_text(encoding="utf-8")
+        self.assertNotIn(username, helper_text)
+        self.assertNotIn(secret, helper_text)
 
         with authenticated_https_endpoint(
             self.root,
@@ -1089,6 +1088,9 @@ class PublicationExecutionTests(unittest.TestCase):
             self.start,
         ) as (endpoint, certificate, authorized):
             with adapter.GitRepository(self.repo) as repository:
+                repository.env.update(
+                    credential_helper_environment(username, secret)
+                )
                 repository._append_command_config(
                     "http.sslCAInfo",
                     str(certificate),
@@ -1125,13 +1127,7 @@ class PublicationExecutionTests(unittest.TestCase):
     def test_windows_gcm_config_keeps_credentials_inside_git(self) -> None:
         username = "versionkeeping-win32"
         secret = "credential-secret-win32-07a91d"
-        helper = (
-            self.root
-            / "win32"
-            / "Program Files"
-            / "git-credential-manager.exe"
-        )
-        write_credential_helper(helper, username, secret)
+        helper = TEST_CREDENTIAL_HELPER
 
         with authenticated_https_endpoint(
             self.root,
@@ -1140,6 +1136,9 @@ class PublicationExecutionTests(unittest.TestCase):
             self.start,
         ) as (endpoint, certificate, authorized):
             with adapter.GitRepository(self.repo) as repository:
+                repository.env.update(
+                    credential_helper_environment(username, secret)
+                )
                 repository._append_command_config(
                     "http.sslCAInfo",
                     str(certificate),
@@ -1304,13 +1303,15 @@ class PublicationExecutionTests(unittest.TestCase):
         fingerprint = self.plan["destination"]["endpoint_fingerprint"]
         username = "versionkeeping-test"
         secret = "credential-secret-65db51"
-        helper = self.root / "credential-helper-for-receipt"
-        write_credential_helper(helper, username, secret)
+        helper = TEST_CREDENTIAL_HELPER
         planned = plan_repository(self.repo, request(self.start, self.source))
         observed = {}
         original_enable = adapter.GitRepository.enable_https_credentials
 
         def enable_credentials(repository, endpoint, certificate):
+            repository.env.update(
+                credential_helper_environment(username, secret)
+            )
             repository._append_command_config(
                 "http.sslCAInfo",
                 str(certificate),

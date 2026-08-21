@@ -92,18 +92,6 @@ class RequestTests(unittest.TestCase):
             "gpg.ssh.defaultKeyCommand": "gpg.ssh.defaultKeyCommand",
             "credential.helper": "credential.*.helper",
             "credential.example.com.helper": "credential.*.helper",
-            "http.sslVerify": "http.*.ssl*",
-            "http.https://example.com.sslCAInfo": "http.*.ssl*",
-            "http.https://example.com.sslCAPath": "http.*.ssl*",
-            "http.https://example.com.sslVerify": "http.*.ssl*",
-            "http.extraHeader": "http.*.credentialSource",
-            "http.https://example.com.extraHeader": "http.*.credentialSource",
-            "http.cookieFile": "http.*.credentialSource",
-            "http.emptyAuth": "http.*.credentialSource",
-            "http.delegation": "http.*.credentialSource",
-            "http.sslCert": "http.*.credentialSource",
-            "http.sslKey": "http.*.credentialSource",
-            "http.sslCertPasswordProtected": "http.*.credentialSource",
             "diff.external": "diff.external",
             "diff.attack.command": "diff.*.(command|textconv)",
             "diff.attack.textconv": "diff.*.(command|textconv)",
@@ -123,6 +111,29 @@ class RequestTests(unittest.TestCase):
                     config_class,
                 )
         self.assertIsNone(adapter._unsafe_git_config_class("remote.origin.url"))
+
+    def test_https_credential_configuration_classes_are_closed(self):
+        cases = {
+            "http.sslVerify": "http.*.ssl*",
+            "http.https://example.com.sslCAInfo": "http.*.ssl*",
+            "http.https://example.com.sslCAPath": "http.*.ssl*",
+            "http.https://example.com.sslVerify": "http.*.ssl*",
+            "http.extraHeader": "http.*.credentialSource",
+            "http.https://example.com.extraHeader": "http.*.credentialSource",
+            "http.cookieFile": "http.*.credentialSource",
+            "http.emptyAuth": "http.*.credentialSource",
+            "http.delegation": "http.*.credentialSource",
+            "http.sslCert": "http.*.credentialSource",
+            "http.sslKey": "http.*.credentialSource",
+            "http.sslCertPasswordProtected": "http.*.credentialSource",
+        }
+        for key, config_class in cases.items():
+            with self.subTest(key=key):
+                self.assertEqual(
+                    adapter._unsafe_https_git_config_class(key),
+                    config_class,
+                )
+                self.assertIsNone(adapter._unsafe_git_config_class(key))
 
     def test_transport_protocol_allowlist_preserves_https_and_ssh(self):
         for endpoint in (

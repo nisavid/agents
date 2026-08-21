@@ -17,7 +17,7 @@ import tempfile
 import urllib.parse
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, IO, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, IO, Iterator, List, Optional, Sequence, Tuple
 
 from .core import (
     AbsentTarget,
@@ -166,18 +166,6 @@ def _unsafe_git_config_class(key: str) -> str | None:
         return "gpg.*.program"
     if re.fullmatch(r"credential(?:\..+)?\.helper", normalized):
         return "credential.*.helper"
-    if re.fullmatch(
-        r"http(?:\..+)?\.ssl(?:verify|cainfo|capath)",
-        normalized,
-    ):
-        return "http.*.ssl*"
-    if re.fullmatch(
-        r"http(?:\..+)?\."
-        r"(?:extraheader|cookiefile|emptyauth|delegation|"
-        r"sslcert|sslkey|sslcertpasswordprotected)",
-        normalized,
-    ):
-        return "http.*.credentialSource"
     if re.fullmatch(r"diff\..+\.(?:command|textconv)", normalized):
         return "diff.*.(command|textconv)"
     if re.fullmatch(r"difftool\..+\.cmd", normalized):
@@ -192,6 +180,23 @@ def _unsafe_git_config_class(key: str) -> str | None:
         return "url.*.(insteadOf|pushInsteadOf)"
     if re.fullmatch(r"submodule\..+\.update", normalized):
         return "submodule.*.update"
+    return None
+
+
+def _unsafe_https_git_config_class(key: str) -> str | None:
+    normalized = key.lower()
+    if re.fullmatch(
+        r"http(?:\..+)?\.ssl(?:verify|cainfo|capath)",
+        normalized,
+    ):
+        return "http.*.ssl*"
+    if re.fullmatch(
+        r"http(?:\..+)?\."
+        r"(?:extraheader|cookiefile|emptyauth|delegation|"
+        r"sslcert|sslkey|sslcertpasswordprotected)",
+        normalized,
+    ):
+        return "http.*.credentialSource"
     return None
 
 
@@ -462,6 +467,14 @@ class GitRepository:
             return
         if self._https_credentials_enabled:
             return
+        unsafe_classes = self._configured_classes(
+            _unsafe_https_git_config_class,
+        )
+        if unsafe_classes:
+            raise PolicyGate(
+                "UNSAFE_GIT_CONFIGURATION",
+                config_classes=sorted(unsafe_classes),
+            )
         if sys.platform != "darwin":
             raise PolicyGate(
                 "HTTPS_CREDENTIAL_PROVIDER_UNAVAILABLE",
@@ -564,19 +577,24 @@ class GitRepository:
                 "UNSAFE_GIT_CONFIGURATION",
                 config_classes=sorted(include_classes),
             )
-        inventory = self._config_key_inventory(includes=True)
-        unsafe_classes = {
-            config_class
-            for scope, _origin, key in inventory
-            if scope != "command"
-            if (config_class := _unsafe_git_config_class(key)) is not None
-        }
+        unsafe_classes = self._configured_classes(_unsafe_git_config_class)
         if unsafe_classes:
             raise PolicyGate(
                 "UNSAFE_GIT_CONFIGURATION",
                 config_classes=sorted(unsafe_classes),
             )
         self._policy_established = True
+
+    def _configured_classes(
+        self,
+        classifier: Callable[[str], str | None],
+    ) -> set[str]:
+        return {
+            config_class
+            for scope, _origin, key in self._config_key_inventory(includes=True)
+            if scope != "command"
+            if (config_class := classifier(key)) is not None
+        }
 
     def run(
         self,

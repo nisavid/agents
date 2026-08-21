@@ -51,7 +51,7 @@
       "mode": 420
     },
     "skills/checkpointing-and-publishing-git-work/scripts/git_publication/adapter.py": {
-      "sha256": "33dc447f654bc328ba7274fa4fa8cb078058e97121c4f41b9233d26c6430469b",
+      "sha256": "884e17cb0738e5b018ce9ed989b48fb82fe4128bb02af7bfb7c69f842c22d129",
       "mode": 420
     },
     "skills/checkpointing-and-publishing-git-work/scripts/git_publication/core.py": {

@@ -685,6 +685,16 @@ class PublicationExecutionTests(unittest.TestCase):
             adapter.WINDOWS_MUTATION_RIGHTS,
         )
 
+    def test_windows_bundle_path_grammar_admits_only_a_closed_drive_root(
+        self,
+    ) -> None:
+        self.assertIsNotNone(
+            adapter.TRUSTED_WINDOWS_BUNDLE_PATH_RE.fullmatch("C:\\")
+        )
+        self.assertIsNone(
+            adapter.TRUSTED_WINDOWS_BUNDLE_PATH_RE.fullmatch("C:\\bad;path")
+        )
+
     def test_windows_acl_probe_passes_the_path_through_its_closed_environment(
         self,
     ) -> None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -102,6 +103,70 @@ def test_candidate_identity_binds_missing_tracked_blob(tmp_path: Path) -> None:
     assert transport.candidate_content_identity(
         first, error_factory=RuntimeError
     ) != transport.candidate_content_identity(second, error_factory=RuntimeError)
+
+
+def test_phase7_candidate_identity_never_executes_repository_fsmonitor(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    home = tmp_path / "home"
+    repository.mkdir()
+    home.mkdir()
+    environment = {
+        "PATH": os.environ["PATH"],
+        "HOME": str(home),
+        "XDG_CONFIG_HOME": str(tmp_path / "xdg"),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    subprocess.run(
+        ["git", "-C", str(repository), "init", "--quiet"],
+        env=environment,
+        check=True,
+    )
+    (repository / "payload").write_bytes(b"candidate bytes\n")
+    subprocess.run(
+        ["git", "-C", str(repository), "add", "payload"],
+        env=environment,
+        check=True,
+    )
+
+    marker = tmp_path / "fsmonitor-invoked"
+    fsmonitor = tmp_path / "fsmonitor"
+    fsmonitor.write_text(
+        '#!/bin/sh\nprintf invoked > "$1"\nprintf "2\\n"\n',
+        encoding="utf-8",
+    )
+    fsmonitor.chmod(0o700)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repository),
+            "config",
+            "core.fsmonitor",
+            f"{fsmonitor} {marker}",
+        ],
+        env=environment,
+        check=True,
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts/phase7_compatibility_projection.py"),
+            "--public-root",
+            str(repository),
+            "--expected-public-candidate-sha256",
+            "0" * 64,
+        ],
+        env=environment,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert marker.exists() is False
 
 
 def test_unsigned_host_receipts_cannot_reach_task_witness_authority(

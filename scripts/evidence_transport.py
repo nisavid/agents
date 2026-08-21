@@ -552,6 +552,93 @@ def attempt_history(
     return sorted(history)
 
 
+_CANDIDATE_GIT_ENV_ALLOWLIST = {
+    "COMSPEC",
+    "HOME",
+    "LOGNAME",
+    "PATH",
+    "PATHEXT",
+    "SHELL",
+    "SYSTEMROOT",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "USER",
+}
+_CANDIDATE_GIT_CONFIG = (
+    ("core.hooksPath", os.devnull),
+    ("core.fsmonitor", "false"),
+    ("core.attributesFile", os.devnull),
+    ("core.excludesFile", os.devnull),
+    ("core.worktree", "."),
+    ("core.untrackedCache", "false"),
+    ("credential.helper", ""),
+    ("protocol.allow", "never"),
+    ("protocol.ext.allow", "never"),
+    ("protocol.file.allow", "never"),
+    ("protocol.https.allow", "never"),
+    ("protocol.ssh.allow", "never"),
+    ("gc.auto", "0"),
+    ("maintenance.auto", "false"),
+)
+
+
+def _candidate_git_environment() -> dict[str, str]:
+    environment = {
+        name: value
+        for name, value in os.environ.items()
+        if name in _CANDIDATE_GIT_ENV_ALLOWLIST
+    }
+    environment.update(
+        {
+            "GIT_ASKPASS": "false",
+            "GIT_ATTR_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_NO_LAZY_FETCH": "1",
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_PAGER": "cat",
+            "GIT_PROTOCOL_FROM_USER": "0",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_LITERAL_PATHSPECS": "1",
+            "GCM_INTERACTIVE": "never",
+            "LC_ALL": "C",
+            "SSH_ASKPASS_REQUIRE": "never",
+        }
+    )
+    environment["GIT_CONFIG_COUNT"] = str(len(_CANDIDATE_GIT_CONFIG))
+    for index, (key, value) in enumerate(_CANDIDATE_GIT_CONFIG):
+        environment[f"GIT_CONFIG_KEY_{index}"] = key
+        environment[f"GIT_CONFIG_VALUE_{index}"] = value
+    return environment
+
+
+def _run_candidate_git(
+    root: Path,
+    arguments: list[str],
+    *,
+    error_factory: ErrorFactory,
+    operation: str,
+) -> bytes:
+    try:
+        result = subprocess.run(
+            ["git", "--work-tree=.", *arguments],
+            cwd=root,
+            env=_candidate_git_environment(),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise error_factory(f"cannot {operation}") from error
+    if result.returncode != 0:
+        _raise(error_factory, f"cannot {operation}")
+    return result.stdout
+
+
 def candidate_content_identity(
     root: Path,
     *,
@@ -579,28 +666,24 @@ def candidate_content_identity(
         raise error_factory("cannot inspect the candidate root") from error
     if not stat.S_ISDIR(root_status.st_mode):
         _raise(error_factory, "candidate root is unsafe")
-    result = subprocess.run(
-        ["git", "ls-files", "-co", "--exclude-standard", "-z"],
-        cwd=root,
-        capture_output=True,
-        check=False,
+    inventory = _run_candidate_git(
+        root,
+        ["ls-files", "-co", "--exclude-standard", "-z"],
+        error_factory=error_factory,
+        operation="enumerate the candidate",
     )
-    if result.returncode != 0:
-        _raise(error_factory, "cannot enumerate the candidate")
-    index_result = subprocess.run(
-        ["git", "ls-files", "--stage", "-z"],
-        cwd=root,
-        capture_output=True,
-        check=False,
+    index_inventory = _run_candidate_git(
+        root,
+        ["ls-files", "--stage", "-z"],
+        error_factory=error_factory,
+        operation="enumerate the candidate index",
     )
-    if index_result.returncode != 0:
-        _raise(error_factory, "cannot enumerate the candidate index")
 
-    files = sorted(item for item in result.stdout.split(b"\0") if item)
+    files = sorted(item for item in inventory.split(b"\0") if item)
     if len(files) != len(set(files)):
         _raise(error_factory, "candidate path inventory is ambiguous")
     indexed: dict[bytes, tuple[bytes, bytes]] = {}
-    for record in index_result.stdout.split(b"\0"):
+    for record in index_inventory.split(b"\0"):
         if not record:
             continue
         metadata, separator, encoded = record.partition(b"\t")

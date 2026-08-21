@@ -394,10 +394,10 @@ def _windows_paths_have_protected_acls(
             "if(($ace.PropagationFlags -band "
             "[System.Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0)"
             "{continue};"
+            "if(($ace.FileSystemRights -band $write) -eq 0){continue};"
             "$sid=$ace.IdentityReference.Translate("
             "[System.Security.Principal.SecurityIdentifier]).Value;"
-            "if(($ace.FileSystemRights -band $write) -ne 0 -and "
-            "$trusted -notcontains $sid){exit 1}"
+            "if($trusted -notcontains $sid){exit 1}"
             "}};exit 0"
         )
         completed = _run_windows_acl_probe(

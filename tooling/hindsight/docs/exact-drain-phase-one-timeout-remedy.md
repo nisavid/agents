@@ -24,7 +24,9 @@ one. Planning requires the authenticated schema 10 recovery plan and its
 application and verification receipts, chains the prior retry ledger with the
 reference snapshot's preserved-row retry counts, advances epoch one to two,
 and caps cumulative attempts at twelve per operation. The resulting schema 11
-exact plan cannot authorize another post-abort recovery.
+exact plan cannot authorize another schema-11 post-abort recovery. One final
+authenticated schema-12 recovery may advance epoch two to three under the
+bounded contract described below.
 
 ## Conclusion
 
@@ -50,7 +52,9 @@ failure:
 - Most importantly, this run is already a verified post-abort handoff at
   recovery epoch 1. Schema 10 permits post-abort retry recovery only from epoch
   0 and seals epoch 1 as the ceiling. An elective abort would therefore leave
-  no supported second post-abort recovery under the current contract
+  no supported second post-abort recovery under that plan-bound schema-10
+  contract. The final schema-12 recovery described below was not present in
+  the bound candidate and requires a rebuilt candidate and fresh approval
   (`tooling/hindsight/lib/hindsight_memory_control_plane/operation_recovery.py:3392-3408`,
   `tooling/hindsight/lib/hindsight_memory_control_plane/operation_recovery.py:3444-3453`).
 
@@ -218,9 +222,10 @@ faster or to clear a retryable timeout.
 If the attempt becomes terminal, run the supported exact-drain verification and
 payload-free classification before unloading the one-shot job. If it becomes
 interrupted, preserve its receipts and checkpoints and **do not attempt another
-post-abort recovery with the current schema**. The current plan's recovery
+post-abort recovery with that attempt's schema-10 candidate**. Its recovery
 context is already epoch 1; schema 10 rejects a post-abort plan whose reference
-epoch is not zero
+epoch is not zero. A later schema-12 recovery remains a separate rebuilt,
+authenticated, and freshly approved path
 (`tooling/hindsight/lib/hindsight_memory_control_plane/operation_recovery.py:3392-3405`).
 
 ## Later bounded repair

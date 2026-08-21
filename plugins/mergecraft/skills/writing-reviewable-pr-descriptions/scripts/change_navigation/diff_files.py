@@ -26,6 +26,10 @@ GROUP_RE = re.compile(
     r"(implementation|test|documentation|generated|other) "
     r'(file|files)"[^>]*></picture>$'
 )
+OMISSION_RE = re.compile(
+    r"^- \*\*([1-9]\d*) files omitted from this bounded inventory\.\*\* "
+    r"\[View the complete immutable comparison\]\((https://github\.com/[^ )]+)\)$"
+)
 FileLine = Tuple[int, str]
 
 
@@ -55,6 +59,7 @@ def validate_diff_file_items(
     expected_files: Optional[int],
     summary_metrics: dict[str, Metric],
     expected_identity: Identity | None,
+    bounded: bool = False,
 ) -> None:
     _validate_expansion_grammar(block, errors)
     groups = _groups(block)
@@ -74,6 +79,7 @@ def validate_diff_file_items(
             unique_files,
             semantics_by_file,
             identities,
+            bounded,
         )
     _validate_summary_totals(
         groups,
@@ -81,6 +87,7 @@ def validate_diff_file_items(
         summary_metrics,
         expected_files,
         unique_files,
+        bounded,
     )
     if expected_identity is None and len(identities) > 1:
         errors.append("all Diff file links must target one repository and PR")
@@ -110,6 +117,7 @@ def _validate_group(
     unique_files: set[FileKey],
     semantics_by_file: dict[FileKey, set[tuple[str, str | None]]],
     identities: set[Identity],
+    bounded: bool = False,
 ) -> None:
     group_files = _collect_group_files(
         group,
@@ -119,8 +127,8 @@ def _validate_group(
         semantics_by_file,
         identities,
     )
-    _validate_group_shape(group, errors, group_files)
-    _validate_group_metrics(group, errors, summary_metrics)
+    _validate_group_shape(group, errors, group_files, bounded)
+    _validate_group_metrics(group, errors, summary_metrics, bounded)
 
 
 def _collect_group_files(
@@ -151,9 +159,9 @@ def _collect_group_files(
 
 
 def _validate_group_shape(
-    group: Group, errors: list[str], group_files: list[FileKey]
+    group: Group, errors: list[str], group_files: list[FileKey], bounded: bool = False
 ) -> None:
-    if len(group.file_lines) != group.expected_files:
+    if not bounded and len(group.file_lines) != group.expected_files:
         errors.append(
             f"Diff {group.category} group claims {group.expected_files} files "
             f"but lists {len(group.file_lines)}"
@@ -178,11 +186,14 @@ def _validate_group_shape(
 
 
 def _validate_group_metrics(
-    group: Group, errors: list[str], summary_metrics: dict[str, Metric]
+    group: Group,
+    errors: list[str],
+    summary_metrics: dict[str, Metric],
+    bounded: bool = False,
 ) -> None:
     file_totals = atomic_totals(group.file_lines)
     group_totals = (group.additions, group.deletions)
-    if file_totals != group_totals:
+    if not bounded and file_totals != group_totals:
         errors.append(
             f"Diff {group.category} group claims {group.additions} additions and "
             f"{group.deletions} deletions but its file badges total "
@@ -201,6 +212,7 @@ def _validate_summary_totals(
     summary_metrics: dict[str, Metric],
     expected_files: Optional[int],
     unique_files: set[FileKey],
+    bounded: bool,
 ) -> None:
     positive_groups = {
         group.category: (group.additions, group.deletions)
@@ -209,7 +221,11 @@ def _validate_summary_totals(
     }
     if positive_groups != summary_metrics:
         errors.append("Diff summary categories do not match expanded category totals")
-    if expected_files is not None and len(unique_files) != expected_files:
+    if (
+        expected_files is not None
+        and not bounded
+        and len(unique_files) != expected_files
+    ):
         errors.append(
             f"Diff summary claims {expected_files} files but expansion lists "
             f"{len(unique_files)} unique files"
@@ -263,6 +279,19 @@ def manifest_rows(block: list[str]) -> list[dict[str, object]]:
     return rows
 
 
+def category_file_counts(block: list[str]) -> dict[str, int]:
+    """Return the file count claimed by each rendered category group."""
+    return {group.category: group.expected_files for group in _groups(block)}
+
+
+def omission_record(block: list[str]) -> tuple[int, str] | None:
+    records = [OMISSION_RE.fullmatch(line) for line in block]
+    matches = [match for match in records if match]
+    if len(matches) != 1:
+        return None
+    return int(matches[0].group(1)), matches[0].group(2)
+
+
 def _groups(block: list[str]) -> list[Group]:
     groups: list[Group] = []
     current: Optional[Group] = None
@@ -294,11 +323,23 @@ def _validate_expansion_grammar(block: list[str], errors: list[str]) -> None:
         errors.append("Diff expansion needs the exact canonical taxonomy note")
         return
     content = content[:-1]
+    omission_indexes = [
+        index for index, line in enumerate(content) if OMISSION_RE.fullmatch(line)
+    ]
+    if omission_indexes and (
+        len(omission_indexes) != 1 or omission_indexes[0] != len(content) - 1
+    ):
+        errors.append(
+            "Diff omission record must appear exactly once after all category rows"
+        )
     expecting_group = True
     for line in content:
         if GROUP_RE.fullmatch(line):
             expecting_group = False
         elif line.startswith("  - ") and not expecting_group:
+            continue
+        elif OMISSION_RE.fullmatch(line) and not expecting_group:
+            expecting_group = True
             continue
         else:
             errors.append(f"Diff expansion contains unsupported content: {line}")

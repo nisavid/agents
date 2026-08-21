@@ -476,9 +476,9 @@ ATLAS_EXTENSION_CONTRACT = {
 }
 EXPECTED_ATLAS_PROSE_SHA256 = {
     "design": "23b642b37ced3407c84ad2b1ca6da430d95dd68a674f7daceede3a1b297af441",
-    "writer": "d52b65fc8e729fdd33c7e3f33173a45712068ff413b386c328508fbe18fd47bf",
+    "writer": "c29521dd91805e53fcf26ef429e13555cc17b61caf7e1f87e30d2c6871e43686",
     "body": "3c59ae1b4ec197b0cd4c41624a39c597744bea4fd5333b1ed81e7f2c8d6753c4",
-    "navigation": "7d7cb0ea53a24b962f3298d73c38294f065c6e49543d00d2e8370cb490f68e3b",
+    "navigation": "c748a6c555374fa72022e49446f489f8c5477da4fae799bbb15a854a23f6c27c",
 }
 RELEASE_VERSION = "1.0.0"
 MARKDOWN_LINK_RE = re.compile(r"\[[^\]]+\]\(([^)]+)\)")

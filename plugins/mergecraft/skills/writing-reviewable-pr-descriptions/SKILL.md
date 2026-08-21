@@ -37,6 +37,10 @@ Generated forge text is no substitute.
 5. Create their versioned content-addressed review-input manifest, binding
    identity, pushed refs/OIDs, title/body digest, Diff rows, stack, and all
    baseline-fragment dispositions. Use the publisher PR-number token for create.
+   For diffs over 100 files, additionally bind the first 100 deterministic Git
+   target paths, omitted count, and immutable comparison URL; render only those
+   rows plus the canonical omission record. Smaller bodies remain complete and
+   every body stays at or below 65,536 characters.
 6. Validate the complete pair and prove unauthorized fields equal their live
    preimage:
 

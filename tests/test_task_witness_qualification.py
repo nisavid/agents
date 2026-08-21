@@ -4,6 +4,7 @@ import contextlib
 import copy
 import ctypes
 import fcntl
+import gc
 import hashlib
 import importlib.util
 import io
@@ -989,9 +990,22 @@ class TaskWitnessQualificationTests(unittest.TestCase):
 
     def test_suite_driver_binds_bounded_underlying_output(self) -> None:
         driver = load_suite_driver_module()
+        captured: dict[str, bytes] = {}
+        run_with_captured_descriptors = driver._run_with_captured_descriptors
+
+        def observe_capture(suite):
+            result, stdout_raw, stderr_raw = run_with_captured_descriptors(suite)
+            captured["stdout"] = stdout_raw
+            captured["stderr"] = stderr_raw
+            return result, stdout_raw, stderr_raw
+
+        class DeferredStderr:
+            def __del__(self) -> None:
+                os.write(2, b"prior-gc-stderr")
 
         class Writing(unittest.TestCase):
             def runTest(self) -> None:
+                gc.collect()
                 os.write(1, b"out")
                 os.write(2, b"err")
                 subprocess.run(
@@ -1006,39 +1020,55 @@ class TaskWitnessQualificationTests(unittest.TestCase):
                 )
                 self.assertGreaterEqual(ctypes.CDLL(None).printf(b"native-out"), 0)
 
-        self.assertGreaterEqual(ctypes.CDLL(None).printf(b"prior-native-out"), 0)
-        with (
-            mock.patch.object(
-                driver,
-                "QUALIFICATION_RUNNER_SELECTORS",
-                (selectors := ("one",)),
-            ),
-            mock.patch.object(
-                driver,
-                "SUITE_SELECTORS",
-                {"qualification-runner-contract": selectors},
-            ),
-            mock.patch.object(
-                driver,
-                "SUITE_EXPECTED_COUNTS",
-                {"qualification-runner-contract": 1},
-            ),
-            mock.patch.object(
-                driver,
-                "_qualification_runner_suite",
-                return_value=unittest.TestSuite((Writing(),)),
-            ),
-        ):
-            value = driver._execute_suite(
-                "qualification-runner-contract",
-                REPOSITORY,
-            )
+        collection_was_enabled = gc.isenabled()
+        gc.disable()
+        deferred = DeferredStderr()
+        deferred.cycle = deferred
+        del deferred
+        try:
+            self.assertGreaterEqual(ctypes.CDLL(None).printf(b"prior-native-out"), 0)
+            with (
+                mock.patch.object(
+                    driver,
+                    "QUALIFICATION_RUNNER_SELECTORS",
+                    (selectors := ("one",)),
+                ),
+                mock.patch.object(
+                    driver,
+                    "SUITE_SELECTORS",
+                    {"qualification-runner-contract": selectors},
+                ),
+                mock.patch.object(
+                    driver,
+                    "SUITE_EXPECTED_COUNTS",
+                    {"qualification-runner-contract": 1},
+                ),
+                mock.patch.object(
+                    driver,
+                    "_qualification_runner_suite",
+                    return_value=unittest.TestSuite((Writing(),)),
+                ),
+                mock.patch.object(
+                    driver,
+                    "_run_with_captured_descriptors",
+                    side_effect=observe_capture,
+                ),
+            ):
+                value = driver._execute_suite(
+                    "qualification-runner-contract",
+                    REPOSITORY,
+                )
+        finally:
+            if collection_was_enabled:
+                gc.enable()
         self.assertEqual(value["detail_stdout_length"], 22)
+        self.assertEqual(captured["stdout"], b"outchild-outnative-out")
         self.assertEqual(
             value["detail_stdout_sha256"],
             hashlib.sha256(b"outchild-outnative-out").hexdigest(),
         )
         self.assertEqual(value["detail_stderr_length"], 12)
+        self.assertEqual(captured["stderr"], b"errchild-err")
         self.assertEqual(
             value["detail_stderr_sha256"],
             hashlib.sha256(b"errchild-err").hexdigest(),

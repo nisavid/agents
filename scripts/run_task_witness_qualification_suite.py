@@ -7,6 +7,7 @@ import contextlib
 import ctypes
 import errno
 import fcntl
+import gc
 import hashlib
 import importlib.util
 import io
@@ -3764,6 +3765,11 @@ def _finish_capture_cleanup(
 def _run_with_captured_descriptors(
     suite: unittest.TestSuite,
 ) -> tuple[unittest.TestResult, bytes, bytes]:
+    gc.collect()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    _flush_native_stdio()
+
     def high_duplicate(descriptor: int) -> int:
         try:
             return fcntl.fcntl(descriptor, fcntl.F_DUPFD_CLOEXEC, 64)

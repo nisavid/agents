@@ -2175,7 +2175,7 @@ def test_production_candidate_requires_clean_exact_git_head(tmp_path: Path):
         raise AssertionError("dirty production candidate was accepted")
 
 
-def test_candidate_git_observer_ignores_path_and_fsmonitor_executables(
+def test_candidate_git_observer_blocks_path_fsmonitor_and_filter_executables(
     monkeypatch, tmp_path: Path
 ):
     runner = load_runner()
@@ -2204,7 +2204,12 @@ def test_candidate_git_observer_ignores_path_and_fsmonitor_executables(
         check=True,
     )
     (repository / "file.txt").write_text("frozen\n")
-    subprocess.run([git, "add", "file.txt"], cwd=repository, check=True)
+    (repository / ".gitattributes").write_text("file.txt filter=candidate\n")
+    subprocess.run(
+        [git, "add", ".gitattributes", "file.txt"],
+        cwd=repository,
+        check=True,
+    )
     subprocess.run(
         [git, "commit", "-qm", "test: freeze fixture"],
         cwd=repository,
@@ -2255,6 +2260,29 @@ def test_candidate_git_observer_ignores_path_and_fsmonitor_executables(
 
     assert not path_marker.exists()
     assert not fsmonitor_marker.exists()
+
+    filter_marker = tmp_path / "candidate-filter-ran"
+    candidate_filter = tmp_path / "candidate-filter"
+    candidate_filter.write_text(
+        "#!/bin/sh\n"
+        f"printf 'executed\\n' >> '{filter_marker}'\n"
+        "exec /bin/cat\n",
+        encoding="utf-8",
+    )
+    candidate_filter.chmod(0o700)
+    subprocess.run(
+        [git, "config", "filter.candidate.clean", str(candidate_filter)],
+        cwd=repository,
+        check=True,
+    )
+
+    with pytest.raises(
+        runner.EvaluationError,
+        match="unsafe candidate Git configuration",
+    ):
+        runner.validate_production_candidate(repository, output, revision)
+
+    assert not filter_marker.exists()
 
 
 def test_candidate_snapshot_uses_safe_python39_extraction_and_retains_git_evidence(

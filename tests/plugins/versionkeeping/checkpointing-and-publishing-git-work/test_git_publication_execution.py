@@ -511,10 +511,15 @@ class PublicationExecutionTests(unittest.TestCase):
                 },
                 clear=False,
             ):
-                with adapter.GitRepository(self.repo) as repository:
-                    observed_git = repository.git_executable
-                    observed_env = repository.env
+                with mock.patch.object(
+                    adapter,
+                    "_windows_paths_have_protected_acls",
+                ) as acl_probe:
+                    with adapter.GitRepository(self.repo) as repository:
+                        observed_git = repository.git_executable
+                        observed_env = repository.env
 
+        acl_probe.assert_called_once()
         self.assertEqual(observed_git, str(executables["git"].resolve()))
         self.assertEqual(
             observed_env["GIT_ASKPASS"],
@@ -661,7 +666,7 @@ class PublicationExecutionTests(unittest.TestCase):
 
         with mock.patch.object(
             adapter,
-            "_windows_path_has_protected_acl",
+            "_windows_paths_have_protected_acls",
             side_effect=OSError("mutable ACL"),
             create=True,
         ):
@@ -695,18 +700,22 @@ class PublicationExecutionTests(unittest.TestCase):
             adapter._run_windows_acl_probe(
                 powershell,
                 windows_directory,
-                candidate,
-                "Get-Acl -LiteralPath $env:VERSIONKEEPING_ACL_PATH",
+                ((candidate, False),),
+                "ConvertFrom-Json $env:VERSIONKEEPING_ACL_REQUESTS",
             )
 
         self.assertEqual(
             run.call_args.args[0][-1],
-            "Get-Acl -LiteralPath $env:VERSIONKEEPING_ACL_PATH",
+            "ConvertFrom-Json $env:VERSIONKEEPING_ACL_REQUESTS",
         )
         self.assertNotIn(str(candidate), run.call_args.args[0])
         self.assertEqual(
-            run.call_args.kwargs["env"]["VERSIONKEEPING_ACL_PATH"],
-            str(candidate),
+            json.loads(
+                run.call_args.kwargs["env"][
+                    "VERSIONKEEPING_ACL_REQUESTS"
+                ]
+            ),
+            [{"path": str(candidate), "replacement_only": False}],
         )
 
     def test_windows_bundle_checks_the_program_files_trust_anchor(self) -> None:
@@ -718,17 +727,17 @@ class PublicationExecutionTests(unittest.TestCase):
 
         with mock.patch.object(
             adapter,
-            "_windows_path_has_protected_acl",
-            side_effect=lambda path, **kwargs: observed.append((path, kwargs)),
+            "_windows_paths_have_protected_acls",
+            side_effect=lambda requests: observed.extend(requests),
         ):
             adapter._trusted_windows_bundled_executable(
                 executable,
                 git_root,
             )
 
-        self.assertIn((git_root.parent, {}), observed)
+        self.assertIn((git_root.parent, False), observed)
         self.assertIn(
-            (Path(git_root.anchor), {"replacement_only": True}),
+            (Path(git_root.anchor), True),
             observed,
         )
 

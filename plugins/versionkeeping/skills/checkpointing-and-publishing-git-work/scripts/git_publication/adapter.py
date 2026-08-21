@@ -232,7 +232,39 @@ def _require_linux_credential_provider(
     )
 
 
-def _trusted_windows_bundled_executable(path: Path, root: Path) -> str:
+def _windows_bundle_acl_requests(
+    path: Path,
+    root: Path,
+) -> tuple[tuple[Path, bool], ...]:
+    requests = []
+    current = path
+    while True:
+        requests.append((current, False))
+        if current == root:
+            break
+        if current == current.parent:
+            raise OSError("Windows Git trust root is unavailable")
+        current = current.parent
+    program_files_root = root.parent
+    requests.append((program_files_root, False))
+    anchor = Path(root.anchor)
+    current = program_files_root.parent
+    while True:
+        requests.append((current, True))
+        if current == anchor:
+            break
+        if current == current.parent:
+            raise OSError("Windows filesystem trust anchor is unavailable")
+        current = current.parent
+    return tuple(requests)
+
+
+def _trusted_windows_bundled_executable(
+    path: Path,
+    root: Path,
+    *,
+    check_acls: bool = True,
+) -> str:
     if (
         not path.is_absolute()
         or not root.is_absolute()
@@ -247,30 +279,17 @@ def _trusted_windows_bundled_executable(path: Path, root: Path) -> str:
     metadata = path.lstat()
     if path.is_symlink() or not stat.S_ISREG(metadata.st_mode):
         raise OSError("executable file is not trusted")
-    current = resolved
-    while True:
-        _windows_path_has_protected_acl(current)
-        if current == resolved_root:
-            break
-        current = current.parent
-    program_files_root = resolved_root.parent
-    _windows_path_has_protected_acl(program_files_root)
-    anchor = Path(resolved_root.anchor)
-    current = program_files_root.parent
-    while True:
-        _windows_path_has_protected_acl(current, replacement_only=True)
-        if current == anchor:
-            break
-        if current == current.parent:
-            raise OSError("Windows filesystem trust anchor is unavailable")
-        current = current.parent
+    if check_acls:
+        _windows_paths_have_protected_acls(
+            _windows_bundle_acl_requests(resolved, resolved_root)
+        )
     return str(resolved)
 
 
 def _run_windows_acl_probe(
     powershell: Path,
     windows_directory: Path,
-    path: Path,
+    requests: tuple[tuple[Path, bool], ...],
     script: str,
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
@@ -285,24 +304,48 @@ def _run_windows_acl_probe(
         env={
             "PATH": str(powershell.parent),
             "SYSTEMROOT": str(windows_directory),
-            "VERSIONKEEPING_ACL_PATH": str(path),
+            "VERSIONKEEPING_ACL_REQUESTS": json.dumps(
+                [
+                    {
+                        "path": str(path),
+                        "replacement_only": replacement_only,
+                    }
+                    for path, replacement_only in requests
+                ],
+                separators=(",", ":"),
+            ),
             "WINDIR": str(windows_directory),
         },
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
-        timeout=5,
+        timeout=20,
     )
 
 
-def _windows_path_has_protected_acl(
-    path: Path,
-    *,
-    replacement_only: bool = False,
+def _windows_paths_have_protected_acls(
+    requests: Sequence[tuple[Path, bool]],
 ) -> None:
     if os.name != "nt":
         return
     try:
+        merged_requests: dict[Path, bool] = {}
+        for path, replacement_only in requests:
+            previous = merged_requests.get(path)
+            merged_requests[path] = (
+                replacement_only
+                if previous is None
+                else previous and replacement_only
+            )
+        closed_requests = tuple(merged_requests.items())
+        if not closed_requests:
+            raise OSError("Windows ACL request is empty")
+        if any(
+            not path.is_absolute()
+            or TRUSTED_WINDOWS_BUNDLE_PATH_RE.fullmatch(str(path)) is None
+            for path, _replacement_only in closed_requests
+        ):
+            raise OSError("Windows ACL request is not closed")
         import ctypes
 
         buffer = ctypes.create_unicode_buffer(32768)
@@ -323,24 +366,29 @@ def _windows_path_has_protected_acl(
             or not powershell.is_file()
         ):
             raise OSError("trusted PowerShell is unavailable")
-        rights = (
-            WINDOWS_REPLACEMENT_RIGHTS
-            if replacement_only
-            else WINDOWS_MUTATION_RIGHTS
-        )
-        rights_expression = " -bor ".join(
+        replacement_rights = " -bor ".join(
             "[System.Security.AccessControl.FileSystemRights]::" + right
-            for right in rights
+            for right in WINDOWS_REPLACEMENT_RIGHTS
+        )
+        mutation_rights = " -bor ".join(
+            "[System.Security.AccessControl.FileSystemRights]::" + right
+            for right in WINDOWS_MUTATION_RIGHTS
         )
         script = (
             "$ErrorActionPreference='Stop';"
             "$trusted=@('S-1-5-18','S-1-5-32-544',"
             "'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464');"
-            "$acl=Get-Acl -LiteralPath $env:VERSIONKEEPING_ACL_PATH;"
+            f"$replacement={replacement_rights};"
+            f"$mutation={mutation_rights};"
+            "$requests=ConvertFrom-Json -InputObject "
+            "$env:VERSIONKEEPING_ACL_REQUESTS;"
+            "foreach($request in @($requests)){"
+            "$acl=Get-Acl -LiteralPath ([string]$request.path);"
             "$owner=([System.Security.Principal.NTAccount]$acl.Owner).Translate("
             "[System.Security.Principal.SecurityIdentifier]).Value;"
             "if($trusted -notcontains $owner){exit 1};"
-            f"$write={rights_expression};"
+            "$write=$mutation;"
+            "if([bool]$request.replacement_only){$write=$replacement};"
             "foreach($ace in $acl.Access){"
             "if($ace.AccessControlType -ne 'Allow'){continue};"
             "if(($ace.PropagationFlags -band "
@@ -350,18 +398,26 @@ def _windows_path_has_protected_acl(
             "[System.Security.Principal.SecurityIdentifier]).Value;"
             "if(($ace.FileSystemRights -band $write) -ne 0 -and "
             "$trusted -notcontains $sid){exit 1}"
-            "};exit 0"
+            "}};exit 0"
         )
         completed = _run_windows_acl_probe(
             powershell,
             windows_directory,
-            path,
+            closed_requests,
             script,
         )
         if completed.returncode != 0:
             raise OSError("Windows path ACL is mutable")
     except (OSError, subprocess.TimeoutExpired) as error:
         raise OSError("Windows path ACL is not trusted") from error
+
+
+def _windows_path_has_protected_acl(
+    path: Path,
+    *,
+    replacement_only: bool = False,
+) -> None:
+    _windows_paths_have_protected_acls(((path, replacement_only),))
 
 
 def _windows_path_identity(path: Path) -> tuple[int, int, int, int, int, int]:
@@ -477,7 +533,11 @@ def _windows_machine_program_files_roots() -> tuple[Path, ...]:
     return tuple(candidates)
 
 
-def _windows_trusted_command_path(git_root: Path) -> str:
+def _windows_trusted_command_path(
+    git_root: Path,
+    *,
+    check_acls: bool = True,
+) -> str:
     directories = []
     for relative in (Path("cmd"), Path("mingw64/bin"), Path("usr/bin")):
         path = git_root / relative
@@ -488,9 +548,19 @@ def _windows_trusted_command_path(git_root: Path) -> str:
             or not resolved.is_dir()
         ):
             raise OSError("trusted command directory is redirected")
-        _windows_path_has_protected_acl(resolved)
-        directories.append(str(resolved))
-    return ";".join(directories)
+        directories.append(resolved)
+    if check_acls:
+        _windows_paths_have_protected_acls(
+            tuple(
+                request
+                for directory in directories
+                for request in _windows_bundle_acl_requests(
+                    directory,
+                    git_root,
+                )
+            )
+        )
+    return ";".join(str(directory) for directory in directories)
 
 
 def _require_windows_credential_provider(git_root: Path | None) -> str:
@@ -536,11 +606,37 @@ def _trusted_git_runtime() -> _TrustedGitRuntime:
 
     for root in _windows_git_install_roots():
         try:
-            executables = {
-                name: _trusted_windows_bundled_executable(root / relative, root)
+            executable_paths = {
+                name: root / relative
                 for name, relative in WINDOWS_GIT_RUNTIME.items()
             }
-            command_path = _windows_trusted_command_path(root)
+            executables = {
+                name: _trusted_windows_bundled_executable(
+                    path,
+                    root,
+                    check_acls=False,
+                )
+                for name, path in executable_paths.items()
+            }
+            command_directories = tuple(
+                root / relative
+                for relative in (
+                    Path("cmd"),
+                    Path("mingw64/bin"),
+                    Path("usr/bin"),
+                )
+            )
+            command_path = _windows_trusted_command_path(
+                root,
+                check_acls=False,
+            )
+            _windows_paths_have_protected_acls(
+                tuple(
+                    request
+                    for path in (*executable_paths.values(), *command_directories)
+                    for request in _windows_bundle_acl_requests(path, root)
+                )
+            )
         except OSError:
             continue
         return _TrustedGitRuntime(

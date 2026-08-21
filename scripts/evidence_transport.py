@@ -556,8 +556,6 @@ _CANDIDATE_GIT_ENV_ALLOWLIST = {
     "COMSPEC",
     "HOME",
     "LOGNAME",
-    "PATHEXT",
-    "SHELL",
     "SYSTEMROOT",
     "TEMP",
     "TMP",
@@ -580,6 +578,49 @@ _CANDIDATE_GIT_CONFIG = (
     ("gc.auto", "0"),
     ("maintenance.auto", "false"),
 )
+_CANDIDATE_GIT_OVERRIDDEN_CONFIG_KEYS = frozenset(
+    key.lower() for key, _value in _CANDIDATE_GIT_CONFIG
+)
+
+
+def _unsafe_candidate_git_config_class(key: str) -> str | None:
+    normalized = key.lower()
+    if normalized in _CANDIDATE_GIT_OVERRIDDEN_CONFIG_KEYS:
+        return None
+    exact = {
+        "core.alternaterefscommand": "core.alternateRefsCommand",
+        "core.askpass": "core.askPass",
+        "core.gitproxy": "core.gitProxy",
+        "core.sshcommand": "core.sshCommand",
+        "diff.external": "diff.external",
+        "gpg.program": "gpg.program",
+        "gpg.ssh.defaultkeycommand": "gpg.ssh.defaultKeyCommand",
+        "interactive.difffilter": "interactive.diffFilter",
+    }
+    if normalized in exact:
+        return exact[normalized]
+    patterns = (
+        (r"include(?:if)?\..+", "include*.path"),
+        (r"protocol(?:\.[^.]+)?\.allow", "protocol.*.allow"),
+        (r"filter\..+\.(?:clean|smudge|process)", "filter.*.(clean|smudge|process)"),
+        (r"hook\..+\.command", "hook.*.command"),
+        (r"gpg\..+\.program", "gpg.*.program"),
+        (r"credential(?:\..+)?\.helper", "credential.*.helper"),
+        (r"diff\..+\.(?:command|textconv)", "diff.*.(command|textconv)"),
+        (r"difftool\..+\.cmd", "difftool.*.cmd"),
+        (r"merge\..+\.driver", "merge.*.driver"),
+        (r"mergetool\..+\.cmd", "mergetool.*.cmd"),
+        (
+            r"remote\..+\.(?:vcs|uploadpack|receivepack)",
+            "remote.*.(vcs|uploadpack|receivepack)",
+        ),
+        (r"url\..+\.(?:insteadof|pushinsteadof)", "url.*.(insteadOf|pushInsteadOf)"),
+        (r"submodule\..+\.update", "submodule.*.update"),
+    )
+    for pattern, config_class in patterns:
+        if re.fullmatch(pattern, normalized):
+            return config_class
+    return None
 
 
 def _candidate_git_environment() -> dict[str, str]:
@@ -595,16 +636,20 @@ def _candidate_git_environment() -> dict[str, str]:
             "GIT_CONFIG_GLOBAL": os.devnull,
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_EDITOR": "true",
             "GIT_NO_LAZY_FETCH": "1",
             "GIT_NO_REPLACE_OBJECTS": "1",
             "GIT_OPTIONAL_LOCKS": "0",
             "GIT_PAGER": "cat",
             "GIT_PROTOCOL_FROM_USER": "0",
+            "GIT_SEQUENCE_EDITOR": "true",
             "GIT_TERMINAL_PROMPT": "0",
             "GIT_LITERAL_PATHSPECS": "1",
             "GCM_INTERACTIVE": "never",
+            "LANG": "C",
             "LC_ALL": "C",
             "PATH": "/usr/bin:/bin",
+            "SHELL": "/bin/sh",
             "SSH_ASKPASS_REQUIRE": "never",
         }
     )
@@ -642,7 +687,7 @@ def _trusted_candidate_git_executable(*, error_factory: ErrorFactory) -> str:
     return str(resolved)
 
 
-def run_candidate_git(
+def _run_candidate_git_raw(
     root: Path,
     arguments: list[str],
     *,
@@ -675,6 +720,98 @@ def run_candidate_git(
     if result.returncode != 0:
         _raise(error_factory, f"cannot {operation}")
     return result.stdout
+
+
+def _candidate_git_config_key_inventory(
+    root: Path,
+    *,
+    includes: bool,
+    error_factory: ErrorFactory,
+) -> list[tuple[str, str, str]]:
+    raw = _run_candidate_git_raw(
+        root,
+        [
+            "config",
+            "--null",
+            "--show-origin",
+            "--show-scope",
+            "--includes" if includes else "--no-includes",
+            "--name-only",
+            "--list",
+        ],
+        error_factory=error_factory,
+        operation="inspect candidate Git configuration",
+    )
+    try:
+        fields = raw.decode("utf-8", errors="strict").split("\0")
+    except UnicodeDecodeError as error:
+        raise error_factory("candidate Git configuration is malformed") from error
+    if fields and fields[-1] == "":
+        fields.pop()
+    if len(fields) % 3 != 0:
+        _raise(error_factory, "candidate Git configuration is malformed")
+    return [
+        (fields[index], fields[index + 1], fields[index + 2])
+        for index in range(0, len(fields), 3)
+    ]
+
+
+def _establish_inert_candidate_git_policy(
+    root: Path,
+    *,
+    error_factory: ErrorFactory,
+) -> None:
+    without_includes = _candidate_git_config_key_inventory(
+        root,
+        includes=False,
+        error_factory=error_factory,
+    )
+    include_classes = {
+        config_class
+        for scope, _origin, key in without_includes
+        if scope != "command"
+        if (config_class := _unsafe_candidate_git_config_class(key))
+        == "include*.path"
+    }
+    if include_classes:
+        _raise(
+            error_factory,
+            "unsafe candidate Git configuration: "
+            + ",".join(sorted(include_classes)),
+        )
+    inventory = _candidate_git_config_key_inventory(
+        root,
+        includes=True,
+        error_factory=error_factory,
+    )
+    unsafe_classes = {
+        config_class
+        for scope, _origin, key in inventory
+        if scope != "command"
+        if (config_class := _unsafe_candidate_git_config_class(key)) is not None
+    }
+    if unsafe_classes:
+        _raise(
+            error_factory,
+            "unsafe candidate Git configuration: "
+            + ",".join(sorted(unsafe_classes)),
+        )
+
+
+def run_candidate_git(
+    root: Path,
+    arguments: list[str],
+    *,
+    error_factory: ErrorFactory,
+    operation: str,
+) -> bytes:
+    _establish_inert_candidate_git_policy(root, error_factory=error_factory)
+    return _run_candidate_git_raw(
+        root,
+        arguments,
+        error_factory=error_factory,
+        operation=operation,
+    )
 
 
 def candidate_content_identity(

@@ -267,6 +267,34 @@ def _trusted_windows_bundled_executable(path: Path, root: Path) -> str:
     return str(resolved)
 
 
+def _run_windows_acl_probe(
+    powershell: Path,
+    windows_directory: Path,
+    path: Path,
+    script: str,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            str(powershell),
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            script,
+        ],
+        env={
+            "PATH": str(powershell.parent),
+            "SYSTEMROOT": str(windows_directory),
+            "VERSIONKEEPING_ACL_PATH": str(path),
+            "WINDIR": str(windows_directory),
+        },
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=5,
+    )
+
+
 def _windows_path_has_protected_acl(
     path: Path,
     *,
@@ -308,7 +336,7 @@ def _windows_path_has_protected_acl(
             "$ErrorActionPreference='Stop';"
             "$trusted=@('S-1-5-18','S-1-5-32-544',"
             "'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464');"
-            "$acl=Get-Acl -LiteralPath $args[0];"
+            "$acl=Get-Acl -LiteralPath $env:VERSIONKEEPING_ACL_PATH;"
             "$owner=([System.Security.Principal.NTAccount]$acl.Owner).Translate("
             "[System.Security.Principal.SecurityIdentifier]).Value;"
             "if($trusted -notcontains $owner){exit 1};"
@@ -324,25 +352,11 @@ def _windows_path_has_protected_acl(
             "$trusted -notcontains $sid){exit 1}"
             "};exit 0"
         )
-        completed = subprocess.run(
-            [
-                str(powershell),
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                script,
-                str(path),
-            ],
-            env={
-                "PATH": str(powershell.parent),
-                "SYSTEMROOT": str(windows_directory),
-                "WINDIR": str(windows_directory),
-            },
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=5,
+        completed = _run_windows_acl_probe(
+            powershell,
+            windows_directory,
+            path,
+            script,
         )
         if completed.returncode != 0:
             raise OSError("Windows path ACL is mutable")

@@ -91,9 +91,13 @@ modern macOS, Linux, and Windows through closed platform-provider sets:
   installation, with the `wincredman` store forced through GCM's environment
   contract and at command scope.
 
-Unix providers and every directory in their absolute ancestry must be
-root-owned, non-writable by group or other, non-symlinked, and free of shell
-metacharacters; each helper must be a regular, executable, non-set-id file.
+The Linux provider and both its lexical and resolved directory ancestries must
+be root-owned, non-writable by group or other, and free of shell
+metacharacters; only a root-owned package symlink may redirect the helper. The
+macOS helper must be a regular, executable, non-set-id file at Git's absolute
+exec path. A helper that does not also satisfy the root-owned ancestry contract
+is admitted only when the trusted `/usr/bin/codesign` verifies Apple's exact
+`git-credential-osxkeychain` requirement.
 On Windows, Git, SSH, the non-prompting askpass command, the shell, the closed
 command path, and GCM must all resolve without redirection inside the same
 machine-registered Git for Windows installation under the operating system's

@@ -300,17 +300,17 @@
   "source_byte_identity": {
     "aggregate_sha256_by_set": {
       "current_control_set": "d0489389b7215d2f17342e430450d551989e9d445ad843475af0b0caa2feeba7",
-      "direct_release_owned_tests": "3070c733e5edd96ca5ca4f050a8da6d844c76aed4451b61d20f987e4a1a85cde",
+      "direct_release_owned_tests": "950ff7152f64b4f3d86fc4daa6bfa988de0556f8df15c9fe571fdd6bb67a8ca4",
       "public_release_registration": "e3e97ca609e4806d3d6445f0f9e4b07a6cac739fa828f6d5f432824511e8390e",
       "release_documentation": "7ea203d49d02481f1ab666dbf9a9d1e152d86d0ce7120ab98c057b1a563048c0",
-      "release_integration": "270ca6433743bb58140bc22743bf181fa4947ff87ff9c1e96bd0c94757d9c114",
-      "release_integration_tests": "d9584150fe9fb7009026d6db951aae56553c4e5d9f70a94b89985c70ec739c09",
+      "release_integration": "8956fc7030e7ca847d63fd5852c996d6e484de5865312b1d054fac3597b0ebce",
+      "release_integration_tests": "f833d070511fd7714236e0afff5018616551e7154c77c99f7b0fea22111e53d8",
       "release_validator": "4cce02a06b055e10fa1a05ea123279ac3c16ba3e94c562bf1a94523f940667cc",
       "tw0": "3559210111eaab4a310bd4db2b3ce7133aeff4bde35dbb4821db5bb2fc5fc0b3",
       "tw1_client": "5cfaa63fa55edaaf891e6e52cbbc9eaaaa72baf4e15beee0eb6509396c3fb37d",
       "tw2_control_plane": "dc841c2ab600dec76cca0e3c0690b1b08f8d230d2006297ccc450960a2e6c0fe",
       "tw4_migration_evidence": "1c2c85bd317af0c0fcdeb2f642c435af50e620948d3dd99a6af974cedf34059c",
-      "tw4_qualification_contract": "a3b440ce6a7092fbb639b99b0014e9db20563c3128a1897c03cb79b3d8e47540"
+      "tw4_qualification_contract": "211bcf5f4e0064b7df75b35e5ccc68086edb15f63696e926af71fbdba69bcd76"
     },
     "algorithm": "sha256",
     "entries": [
@@ -716,7 +716,7 @@
       },
       {
         "path": "tests/test_task_witness_qualification.py",
-        "sha256": "872dbc49eaa20c6cc0e787b809151891811a35b7c32798994ece899a24354e88"
+        "sha256": "2e8ad8338ad20e1c7adb348b1c8effbe6673cf06e451f9c4e138a0e9de1298b0"
       }
     ],
     "framing": "path-utf8-nul-sha256-hex-nul-v1"

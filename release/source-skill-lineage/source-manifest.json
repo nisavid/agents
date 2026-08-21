@@ -110,7 +110,7 @@
     "packages_sha256": "sha256:ed6726c4a1749f216f936b59b94263c18ac2dfe3e349fce9bc1a9bb4f33f07c5",
     "repository_id": "nisavid/agents"
   },
-  "content_sha256": "sha256:2b83fcd5767ba66e4613b21950f63251d1ced2201189dac88aa80183c1404a27",
+  "content_sha256": "sha256:9ff281acf5526196bd6bf5e43d8c23fab230dc2a488057392524b40c027865b1",
   "contract": "coordinated-source-skill-manifest-v1",
   "observed_at_utc": "2026-08-18T06:07:48Z",
   "schema_version": 1,
@@ -423,7 +423,7 @@
     {
       "authority": {
         "kind": "git",
-        "refresh_ref": "b47f03519068b858cf0c070b5d331ee053ef6b7b",
+        "refresh_ref": "8ec465ea915c6759a3693ac8515f0ee3901b8a4f",
         "repository_url": "https://github.com/nisavid/agents",
         "skill_root": "plugins/artifact-customs"
       },
@@ -447,7 +447,7 @@
         "summary": "The package gained release, projection, and contract material after its original candidate baseline."
       },
       "current": {
-        "commit_sha1": "b47f03519068b858cf0c070b5d331ee053ef6b7b",
+        "commit_sha1": "8ec465ea915c6759a3693ac8515f0ee3901b8a4f",
         "entry_count": 24,
         "license": {
           "attribution_requirement": "none",
@@ -472,7 +472,7 @@
     {
       "authority": {
         "kind": "git",
-        "refresh_ref": "b47f03519068b858cf0c070b5d331ee053ef6b7b",
+        "refresh_ref": "8ec465ea915c6759a3693ac8515f0ee3901b8a4f",
         "repository_url": "https://github.com/nisavid/agents",
         "skill_root": "plugins/mergecraft"
       },
@@ -496,8 +496,8 @@
         "summary": "The package gained post-baseline privacy and publication corrections."
       },
       "current": {
-        "commit_sha1": "b47f03519068b858cf0c070b5d331ee053ef6b7b",
-        "entry_count": 63,
+        "commit_sha1": "8ec465ea915c6759a3693ac8515f0ee3901b8a4f",
+        "entry_count": 64,
         "license": {
           "attribution_requirement": "none",
           "evidence_ref": "plugins/mergecraft/LICENSE",
@@ -505,10 +505,10 @@
           "spdx_expression": "MIT",
           "status": "resolved"
         },
-        "skill_tree_sha256": "sha256:bcb12c475d86579f6014b9da765abcd44729e4f4655bf1d1d4fca2c31b57fa2c",
+        "skill_tree_sha256": "sha256:b9a7e2114e443c919c4a6a6e965744046375cb96193bef1e20f9417c2ae28251",
         "status": "resolved",
-        "total_bytes": 493803,
-        "tree_sha1": "16051c291e314a69bc34cfbcdd48de98aceb2355"
+        "total_bytes": 540847,
+        "tree_sha1": "82ef6a75c03d2794ea6c792dc348903a9ddfe51c"
       },
       "family": "ivan-authored",
       "id": "ivan-mergecraft",
@@ -527,7 +527,7 @@
     {
       "authority": {
         "kind": "git",
-        "refresh_ref": "b47f03519068b858cf0c070b5d331ee053ef6b7b",
+        "refresh_ref": "8ec465ea915c6759a3693ac8515f0ee3901b8a4f",
         "repository_url": "https://github.com/nisavid/agents",
         "skill_root": "plugins/rolecasting"
       },
@@ -551,7 +551,7 @@
         "summary": "The package gained runtime evidence and qualification boundaries after its original baseline."
       },
       "current": {
-        "commit_sha1": "b47f03519068b858cf0c070b5d331ee053ef6b7b",
+        "commit_sha1": "8ec465ea915c6759a3693ac8515f0ee3901b8a4f",
         "entry_count": 43,
         "license": {
           "attribution_requirement": "none",
@@ -575,7 +575,7 @@
     {
       "authority": {
         "kind": "git",
-        "refresh_ref": "b47f03519068b858cf0c070b5d331ee053ef6b7b",
+        "refresh_ref": "8ec465ea915c6759a3693ac8515f0ee3901b8a4f",
         "repository_url": "https://github.com/nisavid/agents",
         "skill_root": "plugins/task-witness"
       },
@@ -599,8 +599,8 @@
         "summary": "The runtime gained migration, qualification, and deployment authority after its original baseline."
       },
       "current": {
-        "commit_sha1": "b47f03519068b858cf0c070b5d331ee053ef6b7b",
-        "entry_count": 12,
+        "commit_sha1": "8ec465ea915c6759a3693ac8515f0ee3901b8a4f",
+        "entry_count": 13,
         "license": {
           "attribution_requirement": "none",
           "evidence_ref": "LICENSE",
@@ -608,10 +608,10 @@
           "spdx_expression": "MIT",
           "status": "resolved"
         },
-        "skill_tree_sha256": "sha256:559586ca53256f08babeb08129571d819d5024c0c855f870a37113d56a870cf8",
+        "skill_tree_sha256": "sha256:17b468cc4ca71075f20f40f334d342171ad7564e604df48d48b271ce932d6d85",
         "status": "resolved",
-        "total_bytes": 1334184,
-        "tree_sha1": "eac00106ab6a1b3ae6a1bbffd5e7904083d5199b"
+        "total_bytes": 1335867,
+        "tree_sha1": "4ce4650fe524dfa817e715715bd7528639e0de04"
       },
       "family": "ivan-authored",
       "id": "ivan-task-witness",
@@ -620,7 +620,7 @@
     {
       "authority": {
         "kind": "git",
-        "refresh_ref": "b47f03519068b858cf0c070b5d331ee053ef6b7b",
+        "refresh_ref": "8ec465ea915c6759a3693ac8515f0ee3901b8a4f",
         "repository_url": "https://github.com/nisavid/agents",
         "skill_root": "plugins/tricritical"
       },
@@ -644,7 +644,7 @@
         "summary": "The package gained evidence, projection, and source-resource bindings after its original baseline."
       },
       "current": {
-        "commit_sha1": "b47f03519068b858cf0c070b5d331ee053ef6b7b",
+        "commit_sha1": "8ec465ea915c6759a3693ac8515f0ee3901b8a4f",
         "entry_count": 113,
         "license": {
           "attribution_requirement": "notice-required",
@@ -673,7 +673,7 @@
     {
       "authority": {
         "kind": "git",
-        "refresh_ref": "b47f03519068b858cf0c070b5d331ee053ef6b7b",
+        "refresh_ref": "8ec465ea915c6759a3693ac8515f0ee3901b8a4f",
         "repository_url": "https://github.com/nisavid/agents",
         "skill_root": "plugins/versionkeeping"
       },
@@ -697,7 +697,7 @@
         "summary": "The package gained publication safety corrections after its original baseline."
       },
       "current": {
-        "commit_sha1": "b47f03519068b858cf0c070b5d331ee053ef6b7b",
+        "commit_sha1": "8ec465ea915c6759a3693ac8515f0ee3901b8a4f",
         "entry_count": 28,
         "license": {
           "attribution_requirement": "none",
@@ -706,10 +706,10 @@
           "spdx_expression": "MIT",
           "status": "resolved"
         },
-        "skill_tree_sha256": "sha256:a88da9cdc73d72b42153f837923157b2761cde3e22d055e2c2896d7e3df0c1f3",
+        "skill_tree_sha256": "sha256:0ffc4575a0ffe15373f2eba555a044175ee21e19035bf1fcafbe13c6d47be369",
         "status": "resolved",
-        "total_bytes": 313444,
-        "tree_sha1": "f95e14a276c6586874ba48c91ccc9fd34f62d924"
+        "total_bytes": 340115,
+        "tree_sha1": "c46a89caa6a6bc842fe69eb2ff0037df1d75832c"
       },
       "family": "ivan-authored",
       "id": "ivan-versionkeeping",

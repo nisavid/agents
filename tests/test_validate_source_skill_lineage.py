@@ -979,6 +979,27 @@ class ValidateSourceSkillLineageTests(unittest.TestCase):
         )
         self.assert_rejected("research report evidence drift")
 
+    def test_rejects_rehashed_stale_candidate_report(self) -> None:
+        raw = (REPOSITORY / RESEARCH_REPORT).read_bytes()
+        stale = raw.replace(
+            self.module.CANDIDATE_COMMIT_SHA1.encode("ascii"),
+            b"0" * 40,
+            1,
+        )
+        self.assertNotEqual(stale, raw)
+        with (
+            mock.patch.object(
+                self.module,
+                "RESEARCH_REPORT_SHA256",
+                "sha256:" + hashlib.sha256(stale).hexdigest(),
+            ),
+            self.assertRaisesRegex(
+                self.module.LineageError,
+                "research report candidate boundary drift",
+            ),
+        ):
+            self.module._validate_research_report_bytes(stale)
+
     def test_rejects_candidate_package_projection_drift(self) -> None:
         manifest = self.load(SOURCE_MANIFEST)
         package = manifest["candidate"]["packages"][0]
@@ -1004,6 +1025,17 @@ class ValidateSourceSkillLineageTests(unittest.TestCase):
         self.rewrite_digest(manifest)
         self.write(SOURCE_MANIFEST, manifest)
         self.assert_rejected("candidate package Git tree identity")
+
+    def test_rejects_candidate_source_snapshot_drift(self) -> None:
+        manifest = self.load(SOURCE_MANIFEST)
+        mergecraft = next(
+            source
+            for source in manifest["sources"]
+            if source["id"] == "ivan-mergecraft"
+        )
+        mergecraft["current"]["commit_sha1"] = "0" * 40
+        self.write_source_generation(manifest)
+        self.assert_rejected("candidate source snapshot drift")
 
     def _assert_tree_capture_limit(
         self,

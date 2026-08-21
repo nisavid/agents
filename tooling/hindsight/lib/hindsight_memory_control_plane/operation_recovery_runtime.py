@@ -6596,6 +6596,7 @@ class ExactDrainClaimAdapter:
                 "operation-recovery exact drain terminal row is outside plan"
             )
         observed_status: str | None = None
+        completion_ready = False
         async with self._mutation_connection(backend) as connection:
             async with self._serializable_mutation_transaction(connection):
                 await self._verify_unstarted_state(connection)
@@ -6680,6 +6681,9 @@ class ExactDrainClaimAdapter:
                     )
                 self._started_ids.add(str(identifier))
                 self._initial_guard_complete = True
+                completion_ready = await self._selected_rows_are_terminal(
+                    connection
+                )
         self._record_task_outcome(
             str(identifier),
             status=observed_status,
@@ -6697,6 +6701,8 @@ class ExactDrainClaimAdapter:
             ),
             checkpoint=_exact_drain_checkpoint_evidence(row),
         )
+        if completion_ready:
+            self._signal_completion()
 
     async def mark_completed(
         self,
@@ -6814,6 +6820,49 @@ class ExactDrainClaimAdapter:
             sort_keys=True,
         )
 
+    async def _selected_rows_are_terminal(self, connection: Any) -> bool:
+        statuses = await connection.fetch(
+            """
+            SELECT operation_id::text AS operation_id,
+                   status,
+                   encode(
+                       sha256(convert_to(task_payload::text, 'UTF8')),
+                       'hex'
+                   ) AS task_payload_digest
+            FROM public.async_operations
+            WHERE operation_id = ANY($1::uuid[])
+              AND bank_id = 'engineering'
+            ORDER BY operation_id
+            """,
+            self._identifiers,
+        )
+        if len(statuses) != len(self._selected):
+            raise OperationRecoveryError(
+                "operation-recovery exact drain selected row set changed"
+            )
+        for status_row in statuses:
+            item = self._selected.get(status_row["operation_id"])
+            if (
+                item is None
+                or status_row["task_payload_digest"]
+                != item["task_payload_digest"]
+            ):
+                raise OperationRecoveryError(
+                    "operation-recovery exact drain claim row drifted"
+                )
+        terminal = {"completed", "failed", "cancelled"}
+        return all(row["status"] in terminal for row in statuses)
+
+    def _signal_completion(self) -> None:
+        if self._completion_signalled or self._completion_callback is None:
+            return
+        self._completion_signalled = True
+        self.record_worker_stage(
+            status="running",
+            stage="worker.shutdown.requested",
+        )
+        self._completion_callback()
+
     async def claim_tasks(
         self,
         connection: Any,
@@ -6902,43 +6951,8 @@ class ExactDrainClaimAdapter:
             row["task_payload"] = self._canonical_task_payload(row)
         if not chosen:
             self._initial_guard_complete = True
-            statuses = await connection.fetch(
-                """
-                SELECT operation_id::text AS operation_id,
-                       status,
-                       encode(
-                           sha256(convert_to(task_payload::text, 'UTF8')),
-                           'hex'
-                       ) AS task_payload_digest
-                FROM public.async_operations
-                WHERE operation_id = ANY($1::uuid[])
-                  AND bank_id = 'engineering'
-                ORDER BY operation_id
-                """,
-                self._identifiers,
-            )
-            terminal = {"completed", "failed", "cancelled"}
-            if len(statuses) != len(self._selected):
-                raise OperationRecoveryError(
-                    "operation-recovery exact drain selected row set changed"
-                )
-            for status_row in statuses:
-                item = self._selected.get(status_row["operation_id"])
-                if (
-                    item is None
-                    or status_row["task_payload_digest"]
-                    != item["task_payload_digest"]
-                ):
-                    raise OperationRecoveryError(
-                        "operation-recovery exact drain claim row drifted"
-                    )
-            if (
-                not self._completion_signalled
-                and all(row["status"] in terminal for row in statuses)
-                and self._completion_callback is not None
-            ):
-                self._completion_signalled = True
-                self._completion_callback()
+            if await self._selected_rows_are_terminal(connection):
+                self._signal_completion()
             return []
         chosen_ids = [row["operation_id"] for row in chosen]
         result = await connection.execute(

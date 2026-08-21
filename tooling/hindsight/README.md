@@ -450,6 +450,12 @@ the same closed worker evidence. This distinguishes import, provider
 activation, API import, guard installation, worker-main, and memory-engine
 initialization failures without retaining raw exception text or task payloads.
 
+After a selected operation commits a terminal outcome, the exact-drain adapter
+rechecks the complete selected set inside the same serialized transaction. If
+every selected row is terminal, it records the committed outcome and
+`worker.shutdown.requested` before requesting worker shutdown. Completion does
+not depend on a later claim or on claim capacity becoming available.
+
 If an exact task cannot persist its terminal state, progress records the closed
 stage `failure.terminal-state` and failure category
 `terminal_state_persistence` before requesting worker shutdown. If a cancelled

@@ -983,6 +983,22 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
             async def fetchrow(self, *_arguments, **_keywords):
                 return dict(row)
 
+            async def fetch(self, *_arguments, **_keywords):
+                return [
+                    {
+                        "operation_id": selected_id,
+                        "status": (
+                            row["status"]
+                            if selected_id == operation_id
+                            else "pending"
+                        ),
+                        "task_payload_digest": selected_item[
+                            "task_payload_digest"
+                        ],
+                    }
+                    for selected_id, selected_item in adapter._selected.items()
+                ]
+
             async def execute(self, *_arguments, **_keywords):
                 statement = _arguments[0]
                 statements.append(statement)
@@ -1028,6 +1044,103 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
             statements[0],
             "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
         )
+
+    def test_final_terminal_outcome_requests_completion_without_later_claim(self):
+        events = []
+        adapter = self._current_exact_drain_adapter()
+        operation_id, selected = next(iter(adapter._selected.items()))
+        adapter._selected = {operation_id: selected}
+        adapter._identifiers = [uuid.UUID(operation_id)]
+        adapter._started_ids.add(operation_id)
+        adapter._verify_unstarted_state = AsyncMock()
+        adapter._configure_mutation_transaction = AsyncMock()
+        adapter._completion_callback = lambda: events.append("shutdown")
+        adapter._plan = {**adapter._plan, "progress_schema_version": 5}
+
+        class ProgressRecorder:
+            _worker_status = "running"
+
+            def task_outcome(self, *_arguments, **_keywords):
+                events.append("progress")
+
+            def worker_stage(self, *, status, stage):
+                events.append((status, stage))
+
+        adapter._progress_recorder = ProgressRecorder()
+        row = {
+            "operation_type": selected["operation_type"],
+            "status": "processing",
+            "worker_id": adapter._worker_id,
+            "task_payload_digest": selected["task_payload_digest"],
+            "checkpoint_facts_committed": False,
+            "checkpoint_committed_document_count": 0,
+            "checkpoint_unit_ids_count": 0,
+            "checkpoint_stage": None,
+            "checkpoint_processed": 0,
+            "checkpoint_total": 0,
+        }
+
+        class Transaction:
+            async def __aenter__(self):
+                return None
+
+            async def __aexit__(self, *_arguments):
+                events.append("commit")
+                return None
+
+        class Connection:
+            def transaction(self):
+                return Transaction()
+
+            async def fetchrow(self, *_arguments):
+                return dict(row)
+
+            async def fetch(self, *_arguments):
+                return [
+                    {
+                        "operation_id": selected_id,
+                        "status": (
+                            row["status"]
+                            if selected_id == operation_id
+                            else "pending"
+                        ),
+                        "task_payload_digest": selected_item[
+                            "task_payload_digest"
+                        ],
+                    }
+                    for selected_id, selected_item in adapter._selected.items()
+                ]
+
+            async def execute(self, statement, *_arguments):
+                if "UPDATE public.async_operations" in statement:
+                    row["status"] = "failed"
+                    return "UPDATE 1"
+                return "SET"
+
+        class Backend:
+            @asynccontextmanager
+            async def acquire(self):
+                yield Connection()
+
+        asyncio.run(
+            adapter.mark_failed(
+                Backend(),
+                operation_id,
+                "provider request failed",
+                "public",
+            )
+        )
+
+        self.assertEqual(
+            events,
+            [
+                "commit",
+                "progress",
+                ("running", "worker.shutdown.requested"),
+                "shutdown",
+            ],
+        )
+        self.assertTrue(adapter._completion_signalled)
 
     def test_terminal_failure_records_closed_cause_and_committed_checkpoint(self):
         adapter = self._current_exact_drain_adapter()
@@ -1085,6 +1198,22 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
 
             async def fetchrow(self, *_arguments):
                 return dict(row)
+
+            async def fetch(self, *_arguments):
+                return [
+                    {
+                        "operation_id": selected_id,
+                        "status": (
+                            row["status"]
+                            if selected_id == operation_id
+                            else "pending"
+                        ),
+                        "task_payload_digest": selected_item[
+                            "task_payload_digest"
+                        ],
+                    }
+                    for selected_id, selected_item in adapter._selected.items()
+                ]
 
             async def execute(self, statement, *_arguments):
                 if "UPDATE public.async_operations" in statement:

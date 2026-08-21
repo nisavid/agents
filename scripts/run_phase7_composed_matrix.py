@@ -9,13 +9,12 @@ import copy
 import hashlib
 import json
 import os
-import stat
 import subprocess
 import sys
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -91,69 +90,30 @@ def _immutable_candidate_snapshot(
 ) -> Iterator[tuple[Path, str]]:
     """Capture the exact candidate bytes once and execute only that snapshot."""
 
-    listed = subprocess.run(
-        ["git", "ls-files", "-co", "--exclude-standard", "-z"],
-        cwd=public_root,
-        capture_output=True,
-        check=False,
-    )
-    if listed.returncode != 0:
-        raise ComposedEvidenceError("cannot enumerate the public candidate")
-    encoded_paths = sorted(item for item in listed.stdout.split(b"\0") if item)
     temporary = tempfile.TemporaryDirectory(prefix="phase7-public-snapshot-")
     snapshot = Path(temporary.name).resolve() / "candidate"
     snapshot.mkdir(mode=0o700)
-    digest = hashlib.sha256()
     captured_files: list[Path] = []
+
+    def capture_file(relative: Path, content: bytes | None, executable: bool) -> None:
+        if content is None:
+            return
+        target = snapshot.joinpath(*relative.parts)
+        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        private_atomic_write(
+            target,
+            content,
+            error_factory=ComposedEvidenceError,
+        )
+        os.chmod(target, 0o500 if executable else 0o400)
+        captured_files.append(target)
+
     try:
-        for encoded_path in encoded_paths:
-            try:
-                relative_text = encoded_path.decode("utf-8")
-            except UnicodeDecodeError as error:
-                raise ComposedEvidenceError(
-                    "public candidate path is not UTF-8"
-                ) from error
-            relative = PurePosixPath(relative_text)
-            if (
-                relative.is_absolute()
-                or relative.as_posix() != relative_text
-                or any(part in {"", ".", ".."} for part in relative.parts)
-            ):
-                raise ComposedEvidenceError("public candidate path is unsafe")
-            source = public_root.joinpath(*relative.parts)
-            if not source.exists() and not source.is_symlink():
-                digest.update(hashlib.sha256(b"deleted").hexdigest().encode("ascii"))
-                digest.update(b"  ")
-                digest.update(encoded_path)
-                digest.update(b"\n")
-                continue
-            try:
-                before = source.lstat()
-                if source.is_symlink() or not stat.S_ISREG(before.st_mode):
-                    raise ComposedEvidenceError(
-                        "public candidate contains an unsafe entry"
-                    )
-                content = source.read_bytes()
-                after = source.lstat()
-            except OSError as error:
-                raise ComposedEvidenceError(
-                    "public candidate changed while captured"
-                ) from error
-            if before != after:
-                raise ComposedEvidenceError("public candidate changed while captured")
-            digest.update(hashlib.sha256(content).hexdigest().encode("ascii"))
-            digest.update(b"  ")
-            digest.update(encoded_path)
-            digest.update(b"\n")
-            target = snapshot.joinpath(*relative.parts)
-            target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            private_atomic_write(
-                target,
-                content,
-                error_factory=ComposedEvidenceError,
-            )
-            os.chmod(target, 0o500 if before.st_mode & 0o111 else 0o400)
-            captured_files.append(target)
+        captured_identity = candidate_content_identity(
+            public_root,
+            error_factory=ComposedEvidenceError,
+            capture_file=capture_file,
+        )
         for directory in sorted(
             (path for path in snapshot.rglob("*") if path.is_dir()),
             key=lambda path: len(path.parts),
@@ -161,7 +121,7 @@ def _immutable_candidate_snapshot(
         ):
             os.chmod(directory, 0o500)
         os.chmod(snapshot, 0o500)
-        yield snapshot, digest.hexdigest()
+        yield snapshot, captured_identity
     finally:
         try:
             os.chmod(snapshot, 0o700)

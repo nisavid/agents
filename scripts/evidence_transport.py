@@ -552,9 +552,33 @@ def attempt_history(
     return sorted(history)
 
 
-def candidate_content_identity(root: Path, *, error_factory: ErrorFactory) -> str:
+def candidate_content_identity(
+    root: Path,
+    *,
+    error_factory: ErrorFactory,
+    capture_file: Callable[[PurePosixPath, bytes | None, bool], None] | None = None,
+) -> str:
     """Bind every tracked or unignored candidate file by path and exact bytes."""
 
+    def stable_file_identity(status: os.stat_result) -> tuple[int, ...]:
+        return (
+            status.st_dev,
+            status.st_ino,
+            status.st_mode,
+            status.st_nlink,
+            status.st_uid,
+            status.st_gid,
+            status.st_size,
+            status.st_mtime_ns,
+            status.st_ctime_ns,
+        )
+
+    try:
+        root_status = root.lstat()
+    except OSError as error:
+        raise error_factory("cannot inspect the candidate root") from error
+    if not stat.S_ISDIR(root_status.st_mode):
+        _raise(error_factory, "candidate root is unsafe")
     result = subprocess.run(
         ["git", "ls-files", "-co", "--exclude-standard", "-z"],
         cwd=root,
@@ -563,9 +587,41 @@ def candidate_content_identity(root: Path, *, error_factory: ErrorFactory) -> st
     )
     if result.returncode != 0:
         _raise(error_factory, "cannot enumerate the candidate")
+    index_result = subprocess.run(
+        ["git", "ls-files", "--stage", "-z"],
+        cwd=root,
+        capture_output=True,
+        check=False,
+    )
+    if index_result.returncode != 0:
+        _raise(error_factory, "cannot enumerate the candidate index")
+
     files = sorted(item for item in result.stdout.split(b"\0") if item)
+    if len(files) != len(set(files)):
+        _raise(error_factory, "candidate path inventory is ambiguous")
+    indexed: dict[bytes, tuple[bytes, bytes]] = {}
+    for record in index_result.stdout.split(b"\0"):
+        if not record:
+            continue
+        metadata, separator, encoded = record.partition(b"\t")
+        fields = metadata.split(b" ")
+        if separator != b"\t" or len(fields) != 3 or not encoded:
+            _raise(error_factory, "candidate index entry is malformed")
+        mode, object_id, stage = fields
+        if (
+            stage != b"0"
+            or mode not in {b"100644", b"100755"}
+            or len(object_id) not in {40, 64}
+            or any(byte not in b"0123456789abcdef" for byte in object_id)
+            or encoded in indexed
+        ):
+            _raise(error_factory, "candidate index entry is unsafe")
+        indexed[encoded] = (mode, object_id)
+    if set(indexed).difference(files):
+        _raise(error_factory, "candidate index inventory is inconsistent")
+
     digest = hashlib.sha256()
-    digest.update(b"candidate-content-identity-v2\0")
+    digest.update(b"candidate-content-identity-v3\0")
     digest.update(len(files).to_bytes(8, "big"))
     for encoded in files:
         try:
@@ -580,14 +636,59 @@ def candidate_content_identity(root: Path, *, error_factory: ErrorFactory) -> st
         ):
             _raise(error_factory, "candidate path is not canonical")
         path = root / relative
-        digest.update(b"D" if not path.exists() and not path.is_symlink() else b"F")
+        digest.update(b"R")
         digest.update(len(encoded).to_bytes(8, "big"))
         digest.update(encoded)
-        if not path.exists() and not path.is_symlink():
+
+        index_entry = indexed.get(encoded)
+        if index_entry is None:
+            digest.update(b"U")
+        else:
+            index_mode, index_object_id = index_entry
+            digest.update(b"T")
+            digest.update(index_mode)
+            digest.update(len(index_object_id).to_bytes(1, "big"))
+            digest.update(index_object_id)
+
+        try:
+            before = path.lstat()
+        except FileNotFoundError:
+            if index_entry is None:
+                _raise(error_factory, "candidate changed while enumerated")
+            digest.update(b"M")
+            if capture_file is not None:
+                assert index_entry is not None
+                capture_file(parsed, None, index_entry[0] == b"100755")
             continue
-        if path.is_symlink() or not path.is_file():
+        except OSError as error:
+            raise error_factory("cannot inspect candidate entry") from error
+        if not stat.S_ISREG(before.st_mode):
             _raise(error_factory, "candidate contains an unsafe entry")
-        digest.update(hashlib.sha256(path.read_bytes()).digest())
+        parent = root
+        for part in parsed.parts[:-1]:
+            parent /= part
+            try:
+                parent_status = parent.lstat()
+            except OSError as error:
+                raise error_factory("cannot inspect candidate ancestry") from error
+            if not stat.S_ISDIR(parent_status.st_mode):
+                _raise(error_factory, "candidate contains an unsafe ancestor")
+        try:
+            content = path.read_bytes()
+            after = path.lstat()
+        except OSError as error:
+            raise error_factory("candidate changed while read") from error
+        if (
+            stable_file_identity(before) != stable_file_identity(after)
+            or not stat.S_ISREG(after.st_mode)
+        ):
+            _raise(error_factory, "candidate changed while read")
+        actual_mode = b"100755" if before.st_mode & 0o111 else b"100644"
+        digest.update(b"F")
+        digest.update(actual_mode)
+        digest.update(hashlib.sha256(content).digest())
+        if capture_file is not None:
+            capture_file(parsed, content, actual_mode == b"100755")
     return digest.hexdigest()
 
 

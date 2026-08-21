@@ -63,6 +63,47 @@ def test_candidate_identity_distinguishes_newline_path_record_collision(
     assert one_file_identity != two_file_identity
 
 
+def test_candidate_identity_binds_executable_mode(tmp_path: Path) -> None:
+    transport = load("scripts/evidence_transport.py", "security_mode_transport")
+    regular = tmp_path / "regular"
+    executable = tmp_path / "executable"
+    initialize_candidate(regular)
+    initialize_candidate(executable)
+
+    for candidate, mode in ((regular, 0o644), (executable, 0o755)):
+        payload = candidate / "payload"
+        payload.write_bytes(b"same bytes\n")
+        payload.chmod(mode)
+        subprocess.run(["git", "add", "payload"], cwd=candidate, check=True)
+
+    assert transport.candidate_content_identity(
+        regular, error_factory=RuntimeError
+    ) != transport.candidate_content_identity(executable, error_factory=RuntimeError)
+
+
+def test_candidate_identity_binds_missing_tracked_blob(tmp_path: Path) -> None:
+    transport = load("scripts/evidence_transport.py", "security_index_transport")
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    initialize_candidate(first)
+    initialize_candidate(second)
+
+    for candidate, content in ((first, b"first\n"), (second, b"second\n")):
+        payload = candidate / "payload"
+        payload.write_bytes(content)
+        subprocess.run(["git", "add", "payload"], cwd=candidate, check=True)
+        subprocess.run(
+            ["git", "update-index", "--skip-worktree", "payload"],
+            cwd=candidate,
+            check=True,
+        )
+        payload.unlink()
+
+    assert transport.candidate_content_identity(
+        first, error_factory=RuntimeError
+    ) != transport.candidate_content_identity(second, error_factory=RuntimeError)
+
+
 def test_unsigned_host_receipts_cannot_reach_task_witness_authority(
     monkeypatch,
 ) -> None:

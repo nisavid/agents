@@ -695,37 +695,70 @@ class PublicationExecutionTests(unittest.TestCase):
             adapter.TRUSTED_WINDOWS_BUNDLE_PATH_RE.fullmatch("C:\\bad;path")
         )
 
-    def test_windows_acl_probe_passes_the_path_through_its_closed_environment(
+    def test_windows_acl_policy_accepts_read_only_untrusted_identity(
         self,
     ) -> None:
-        powershell = Path(r"C:\Windows\System32\powershell.exe")
-        windows_directory = Path(r"C:\Windows")
-        candidate = Path(r"C:\Program Files\Git\cmd\git.exe")
+        adapter._require_windows_acl_trust(
+            "S-1-5-32-544",
+            ((0, 0, 0x00120089, "S-1-5-32-545"),),
+            replacement_only=False,
+        )
 
-        with mock.patch.object(
-            adapter.subprocess,
-            "run",
-            return_value=subprocess.CompletedProcess([], 0),
-        ) as run:
-            adapter._run_windows_acl_probe(
-                powershell,
-                windows_directory,
-                ((candidate, False),),
-                "ConvertFrom-Json $env:VERSIONKEEPING_ACL_REQUESTS",
+    def test_windows_acl_policy_rejects_untrusted_owner(self) -> None:
+        with self.assertRaisesRegex(OSError, "owner is mutable"):
+            adapter._require_windows_acl_trust(
+                "S-1-5-21-1-2-3-1001",
+                (),
+                replacement_only=False,
             )
 
-        self.assertEqual(
-            run.call_args.args[0][-1],
-            "ConvertFrom-Json $env:VERSIONKEEPING_ACL_REQUESTS",
-        )
-        self.assertNotIn(str(candidate), run.call_args.args[0])
-        self.assertEqual(
-            json.loads(
-                run.call_args.kwargs["env"][
-                    "VERSIONKEEPING_ACL_REQUESTS"
-                ]
+    def test_windows_acl_policy_rejects_untrusted_mutation_rights(
+        self,
+    ) -> None:
+        with self.assertRaisesRegex(OSError, "grants mutation rights"):
+            adapter._require_windows_acl_trust(
+                "S-1-5-18",
+                (
+                    (
+                        adapter.WINDOWS_ACCESS_ALLOWED_ACE_TYPE,
+                        0,
+                        adapter.WINDOWS_MUTATION_MASK,
+                        "S-1-5-32-545",
+                    ),
+                ),
+                replacement_only=False,
+            )
+
+    def test_windows_acl_policy_ignores_inherit_only_mutation_rights(
+        self,
+    ) -> None:
+        adapter._require_windows_acl_trust(
+            "S-1-5-18",
+            (
+                (
+                    adapter.WINDOWS_ACCESS_ALLOWED_ACE_TYPE,
+                    adapter.WINDOWS_INHERIT_ONLY_ACE,
+                    adapter.WINDOWS_MUTATION_MASK,
+                    "S-1-5-32-545",
+                ),
             ),
-            [{"path": str(candidate), "replacement_only": False}],
+            replacement_only=False,
+        )
+
+    def test_windows_acl_policy_limits_drive_root_to_replacement_rights(
+        self,
+    ) -> None:
+        adapter._require_windows_acl_trust(
+            "S-1-5-18",
+            (
+                (
+                    adapter.WINDOWS_ACCESS_ALLOWED_ACE_TYPE,
+                    0,
+                    adapter.WINDOWS_WRITE_DATA,
+                    "S-1-5-32-545",
+                ),
+            ),
+            replacement_only=True,
         )
 
     def test_windows_bundle_checks_the_program_files_trust_anchor(self) -> None:

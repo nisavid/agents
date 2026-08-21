@@ -89,7 +89,7 @@ WINDOWS_MUTATION_RIGHTS = (
 )
 TRUSTED_HELPER_PATH_RE = re.compile(r"^/[A-Za-z0-9_./+:-]+$")
 TRUSTED_WINDOWS_BUNDLE_PATH_RE = re.compile(
-    r"^(?:[A-Za-z]:[\\/]|/)[A-Za-z0-9_./\\+(): -]+$"
+    r"^(?:[A-Za-z]:[\\/]|/)[A-Za-z0-9_./\\+(): -]*$"
 )
 GIT_SUBPROCESS_ENV_ALLOWLIST = {
     "ALL_PROXY",

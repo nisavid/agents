@@ -846,11 +846,13 @@ def test_claude_adapter_empties_model_visible_capabilities(monkeypatch, tmp_path
         raise AssertionError("Claude init event without a capability key was accepted")
 
     events[0]["tools"] = []
-    events[0]["mcp_servers"] = [{"name": "forbidden"}]
+    provider_secret = "provider-stdout-secret-must-not-be-public"
+    events[0]["mcp_servers"] = [{"name": provider_secret}]
     try:
         adapter.execute(b"{}", tmp_path)
     except runner.TransportFailure as error:
         assert "model-access capability surface is not empty" in str(error)
+        assert provider_secret not in str(error)
     else:
         raise AssertionError("Claude MCP surface was accepted")
 

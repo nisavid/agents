@@ -3944,6 +3944,53 @@ class OperationRecoveryContractTest(unittest.TestCase):
         rebound_second_backup["source_authority_digest"] = digest(
             rebound_second_backup["source_authority"]
         )
+        schema_eleven_release_rows = deepcopy(second_rows)
+        release_only_id = min(plan_selected_ids)
+        for item in schema_eleven_release_rows:
+            if item["operation_id"] == release_only_id:
+                item.update(
+                    status="pending",
+                    completed_at=None,
+                    next_retry_at="2026-08-20T14:09:00.000000Z",
+                )
+                break
+        schema_eleven_release_snapshot = dict(
+            create_live_snapshot(
+                self.cohort(),
+                schema_eleven_release_rows,
+                generation_before="systalyze:public:81701",
+                generation_after="systalyze:public:81701",
+                installation_authority=rebound_installation_authority(),
+                observed_at=1_786_829_500,
+            )
+        )
+        with self.assertRaisesRegex(
+            OperationRecoveryError,
+            "post-abort retry recovery is invalid",
+        ):
+            create_post_abort_recovery_plan(
+                plan,
+                schema_eleven_release_snapshot,
+                candidate_release=release_identity(),
+                rollback_backup=rebound_second_backup,
+                rollback_encryption=rollback_encryption(),
+                rollback_backup_path="/private/tmp/v11-release-backup.age",
+                rollback_bundle_path="/private/tmp/v11-release-bundle.age",
+                authorization_receipt_path="/private/tmp/v11-release-auth.json",
+                application_receipt_path="/private/tmp/v11-release-app.json",
+                verification_receipt_path="/private/tmp/v11-release-verify.json",
+                rollback_receipt_path="/private/tmp/v11-release-rollback.json",
+                reference_application_authorization=(
+                    exact_drain_authorization(plan)
+                ),
+                reference_application_journal=(
+                    exact_drain_application_journal(plan)
+                ),
+                reference_application_progress_digest="d" * 64,
+                prior_retry_recovery=recovery_plan["retry_recovery"],
+                schema_version=11,
+                created_at=1_786_829_600,
+            )
         tampered_rebind = deepcopy(rebound_second_interrupted)
         tampered_rebind["installation_authority"][
             "data_identity_rebind_handoff"

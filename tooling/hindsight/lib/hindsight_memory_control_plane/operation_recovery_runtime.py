@@ -123,6 +123,9 @@ EXACT_DRAIN_EXECUTION_LEASE_ERROR_DIGEST = hashlib.sha256(
 EXACT_DRAIN_OPERATION_ATTEMPT_TIMEOUT_MESSAGE = (
     "operation-recovery exact drain operation attempt exceeded its deadline"
 )
+EXACT_DRAIN_RETRY_CEILING_MESSAGE = (
+    "operation-recovery exact drain retry ceiling reached"
+)
 EXACT_DRAIN_PHASE_ONE_DEADLINE_TIMEOUT_MESSAGE = (
     "exact drain retain phase one exceeded its deadline"
 )
@@ -606,11 +609,17 @@ CASE
     WHEN lower(error_message) ~
          '(capacity|quota|rate.?limit|usage.?limit|429|exhaust)'
         THEN 'provider_capacity'
-    WHEN lower(error_message) ~
-         '(bad.?request|client.?error|status.?400|error.?400)'
+    WHEN lower(error_message) ~ (
+         '(bad.?request|client.?error|'
+         || '(client|server)[[:space:]]+error[[:space:]]+["'']?'
+         || '400([^0-9]|$)|'
+         || '(status|error)(_code|[[:space:]]+code)?'
+         || '[ =:''"]+400([^0-9]|$))'
+    )
         THEN 'provider_bad_request'
-    WHEN lower(error_message) ~
-         '(^|[^a-z])timeout(error)?([^a-z]|$)|timed.?out'
+    WHEN lower(error_message) LIKE '%timeouterror%'
+        OR lower(error_message) ~
+           '(^|[^a-z])timeout([^a-z]|$)|timed.?out'
         THEN 'upstream_timeout'
     WHEN lower(error_message) ~
          '(connect|network|transport|unavailable|hatchery|502|503|504)'
@@ -897,6 +906,44 @@ def _exact_drain_failure_evidence(
         else int(status_match.group(1) or status_match.group(2))
     )
     lowered = safe_error.casefold()
+    if progress_schema_version != 5:
+        if category_override is not None:
+            category = category_override
+        elif safe_error == "provider_queue_timeout":
+            category = "provider_queue_timeout"
+        elif safe_error == "provider_execution_timeout":
+            category = "provider_execution_timeout"
+        elif safe_error == EXACT_DRAIN_OPERATION_ATTEMPT_TIMEOUT_MESSAGE:
+            category = "operation_attempt_timeout"
+        elif safe_error in {
+            EXACT_DRAIN_PHASE_ONE_DEADLINE_TIMEOUT_MESSAGE,
+            EXACT_DRAIN_PHASE_ONE_DEADLINE_TIMEOUT_ERROR,
+        }:
+            category = "phase_one_timeout"
+        elif http_status == 400:
+            category = "provider_bad_request"
+        elif EXACT_DRAIN_AUTHENTICATION_ERROR.search(safe_error) is not None:
+            category = "provider_authentication"
+        elif EXACT_DRAIN_CAPACITY_ERROR.search(safe_error) is not None:
+            category = "provider_capacity"
+        elif _exact_drain_phase_one_query_timeout_stage(safe_error) is not None:
+            category = "phase_one_timeout"
+        elif "timeouterror" in lowered or "statement timeout" in lowered:
+            category = "operation_error"
+        elif EXACT_DRAIN_TRANSPORT_ERROR.search(safe_error) is not None:
+            category = "provider_transport"
+        elif not safe_error:
+            category = "unclassified_empty"
+        else:
+            category = "operation_error"
+        return {
+            "category": category,
+            "retryable": retryable,
+            "http_status": http_status,
+            "error_digest": hashlib.sha256(
+                safe_error.encode("utf-8")
+            ).hexdigest(),
+        }
     if category_override is not None:
         category = category_override
     elif safe_error == "provider_queue_timeout":
@@ -913,11 +960,7 @@ def _exact_drain_failure_evidence(
     elif _exact_drain_phase_one_query_timeout_stage(safe_error) is not None:
         category = "phase_one_timeout"
     elif "statement timeout" in lowered or "sqlstate 57014" in lowered:
-        category = (
-            "database_statement_timeout"
-            if progress_schema_version == 5
-            else "operation_error"
-        )
+        category = "database_statement_timeout"
     elif EXACT_DRAIN_AUTHENTICATION_ERROR.search(safe_error) is not None:
         category = "provider_authentication"
     elif EXACT_DRAIN_CAPACITY_ERROR.search(safe_error) is not None:
@@ -928,7 +971,7 @@ def _exact_drain_failure_evidence(
         re.IGNORECASE,
     ) is not None:
         category = "provider_bad_request"
-    elif progress_schema_version == 5 and (
+    elif (
         "timeouterror" in lowered
         or re.search(
             r"(^|[^a-z])timeout([^a-z]|$)|timed.?out",
@@ -937,8 +980,6 @@ def _exact_drain_failure_evidence(
         is not None
     ):
         category = "upstream_timeout"
-    elif progress_schema_version != 5 and "timeouterror" in lowered:
-        category = "operation_error"
     elif re.search(
         r"(^|[^a-z])timeout([^a-z]|$)|timed.?out",
         lowered,
@@ -2043,10 +2084,10 @@ def install_exact_drain_runtime_guards(
                         timeout=cancellation_timeout_seconds,
                     )
                     if not done:
+                        claim_release_disabled = True
                         nonquiescence_error = OperationRecoveryError(
                             "exact drain task did not quiesce after cancellation"
                         )
-                        request_exact_worker_shutdown(poller)
                         try:
                             record_runtime_failure(
                                 task.operation_id,
@@ -2059,7 +2100,10 @@ def install_exact_drain_runtime_guards(
                                 "exact drain nonquiescent evidence failed with %s",
                                 type(evidence_error).__name__,
                             )
-                        claim_release_disabled = True
+                        try:
+                            request_exact_worker_shutdown(poller)
+                        except BaseException as shutdown_error:
+                            raise nonquiescence_error from shutdown_error
                         raise nonquiescence_error
                     await execution
                 except asyncio.CancelledError:
@@ -6077,6 +6121,12 @@ class ExactDrainClaimAdapter:
                         UPDATE public.async_operations
                         SET status = 'failed',
                             next_retry_at = NULL,
+                            error_message = CASE
+                                WHEN error_message IS NULL
+                                     OR error_message = ''
+                                    THEN $3
+                                ELSE error_message
+                            END,
                             completed_at = NOW(),
                             updated_at = NOW()
                         WHERE operation_id = ANY($1::uuid[])
@@ -6086,6 +6136,7 @@ class ExactDrainClaimAdapter:
                         """,
                         exhausted,
                         self._worker_id,
+                        EXACT_DRAIN_RETRY_CEILING_MESSAGE,
                     )
                 else:
                     result = await connection.execute(
@@ -6103,7 +6154,7 @@ class ExactDrainClaimAdapter:
                         """,
                         exhausted,
                         self._worker_id,
-                        "operation-recovery exact drain retry ceiling reached",
+                        EXACT_DRAIN_RETRY_CEILING_MESSAGE,
                     )
                 if result != f"UPDATE {len(exhausted)}":
                     raise OperationRecoveryError(
@@ -6124,22 +6175,31 @@ class ExactDrainClaimAdapter:
                 for item in rows
                 if item["operation_id"] == identifier
             )
-            failure = (
-                _exact_drain_closed_cause_evidence(
+            if (
+                self._plan.get("progress_schema_version") == 5
+                and row["error_cause_family"] == "unclassified_empty"
+            ):
+                failure = _exact_drain_failure_evidence(
+                    EXACT_DRAIN_RETRY_CEILING_MESSAGE,
+                    retryable=False,
+                    category_override="retry_ceiling",
+                    progress_schema_version=5,
+                )
+            elif self._plan.get("progress_schema_version") == 5:
+                failure = _exact_drain_closed_cause_evidence(
                     row["error_cause_family"],
                     row["error_digest"],
                     retryable=False,
                 )
-                if self._plan.get("progress_schema_version") == 5
-                else _exact_drain_failure_evidence(
-                    "operation-recovery exact drain retry ceiling reached",
+            else:
+                failure = _exact_drain_failure_evidence(
+                    EXACT_DRAIN_RETRY_CEILING_MESSAGE,
                     retryable=False,
                     category_override="retry_ceiling",
                     progress_schema_version=self._plan[
                         "progress_schema_version"
                     ],
                 )
-            )
             self._record_task_outcome(
                 str(identifier),
                 status="failed",
@@ -6335,7 +6395,7 @@ class ExactDrainClaimAdapter:
                     )
                 if retry_ceiling:
                     terminal_error = (
-                        "operation-recovery exact drain retry ceiling reached"
+                        EXACT_DRAIN_RETRY_CEILING_MESSAGE
                         if error_message is None
                         else _postgres_safe_error_text(error_message)
                     )
@@ -6399,7 +6459,7 @@ class ExactDrainClaimAdapter:
                 self._started_ids.add(str(identifier))
                 self._initial_guard_complete = True
         failure_message = (
-            "operation-recovery exact drain retry ceiling reached"
+            EXACT_DRAIN_RETRY_CEILING_MESSAGE
             if retry_ceiling and error_message is None
             else error_message
         )
@@ -6465,7 +6525,12 @@ class ExactDrainClaimAdapter:
             backend,
             operation_id,
             exec_date,
-            error_message=None,
+            error_message=(
+                reason
+                if getattr(self, "_plan", {}).get("progress_schema_version")
+                == 5
+                else None
+            ),
             schema=schema,
         )
 

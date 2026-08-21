@@ -1362,7 +1362,9 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         self.assertEqual(evidence["failure"]["category"], "retry_ceiling")
         self.assertIs(evidence["failure"]["retryable"], False)
 
-    def test_schema_five_retry_ceiling_preserves_the_underlying_cause(self):
+    def test_schema_five_retry_and_defer_ceiling_preserve_underlying_cause(
+        self,
+    ):
         adapter = self._current_exact_drain_adapter()
         adapter._plan = {**adapter._plan, "progress_schema_version": 5}
         operation_id, selected = next(iter(adapter._selected.items()))
@@ -1439,6 +1441,25 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         self.assertEqual(evidence["failure"]["category"], "upstream_timeout")
         self.assertIs(evidence["failure"]["retryable"], False)
 
+        row["status"] = "processing"
+        update_arguments.clear()
+        outcomes.clear()
+        asyncio.run(
+            adapter.defer_operation(
+                Backend(),
+                operation_id,
+                None,
+                "ReadTimeoutError",
+                "public",
+            )
+        )
+
+        self.assertEqual(update_arguments[0][1], "ReadTimeoutError")
+        _arguments, evidence = outcomes[0]
+        self.assertEqual(evidence["stage"], "retry-ceiling")
+        self.assertEqual(evidence["failure"]["category"], "upstream_timeout")
+        self.assertIs(evidence["failure"]["retryable"], False)
+
     def test_schema_five_resume_retry_ceiling_preserves_stored_cause(self):
         adapter = self._current_exact_drain_adapter()
         adapter._plan = {**adapter._plan, "progress_schema_version": 5}
@@ -1504,10 +1525,11 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         self.assertEqual(asyncio.run(adapter.recover_own_tasks(Backend())), 1)
 
         exhausted_update, exhausted_arguments = update_calls[-1]
-        self.assertNotIn("error_message =", exhausted_update)
-        self.assertNotIn(
-            "operation-recovery exact drain retry ceiling reached",
-            exhausted_arguments,
+        self.assertIn("error_message = CASE", exhausted_update)
+        self.assertIn("ELSE error_message", exhausted_update)
+        self.assertEqual(
+            exhausted_arguments[2],
+            operation_recovery_runtime.EXACT_DRAIN_RETRY_CEILING_MESSAGE,
         )
         _arguments, evidence = outcomes[-1]
         self.assertEqual(evidence["stage"], "retry-ceiling")
@@ -3890,6 +3912,117 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         )
         self.assertEqual(retries[0][4], "public")
 
+    def test_schema_twelve_nonquiescence_stays_fail_closed_when_shutdown_fails(
+        self,
+    ):
+        guard_globals = install_exact_drain_runtime_guards.__globals__
+        original_cancellation_timeout = guard_globals[
+            "EXACT_DRAIN_TASK_CANCELLATION_TIMEOUT_SECONDS"
+        ]
+        guard_globals["EXACT_DRAIN_TASK_CANCELLATION_TIMEOUT_SECONDS"] = 0.0
+        try:
+            for shutdown_case in ("unavailable", "raises"):
+                with self.subTest(shutdown_case=shutdown_case):
+                    retries = []
+                    releases = []
+
+                    class Adapter(_ControlConnectionAdapterMixin):
+                        operation_attempt_timeout_seconds = 0.001
+                        operation_attempt_timeout_disposition = (
+                            "task-retry-after-quiescence"
+                        )
+                        phase_one_nested_stage_prefixes = ("llm.",)
+
+                        def record_upstream_stage(
+                            self,
+                            _operation_id,
+                            _stage,
+                        ):
+                            return None
+
+                        async def schedule_retry(self, *arguments):
+                            retries.append(arguments)
+
+                        async def release_own_tasks(self, _backend):
+                            releases.append(True)
+                            return 1
+
+                    class WorkerPoller(_RunCapableWorkerPoller):
+                        _backend = "exact-backend"
+
+                        def __init__(self):
+                            self._shutdown = asyncio.Event()
+
+                        async def _claim_batch_for_schema_inner(
+                            self,
+                            *_arguments,
+                        ):
+                            return []
+
+                        async def _claim_batch_for_schema(
+                            self,
+                            schema,
+                            reserved,
+                            shared,
+                        ):
+                            return await self._claim_batch_for_schema_inner(
+                                schema,
+                                reserved,
+                                shared,
+                            )
+
+                        async def _execute_task_inner(self, _task, _holder):
+                            ignored = False
+                            while True:
+                                try:
+                                    await asyncio.Event().wait()
+                                except asyncio.CancelledError:
+                                    if ignored:
+                                        raise
+                                    ignored = True
+
+                    def raising_shutdown():
+                        raise RuntimeError("shutdown bridge failed")
+
+                    install_exact_drain_runtime_guards(
+                        type("PostgreSQLOps", (), {}),
+                        WorkerPoller,
+                        type("MemoryEngine", (), {}),
+                        Adapter(),
+                        request_worker_shutdown=(
+                            None
+                            if shutdown_case == "unavailable"
+                            else raising_shutdown
+                        ),
+                    )
+
+                    async def exercise():
+                        poller = WorkerPoller()
+                        task = SimpleNamespace(
+                            operation_id="operation-1",
+                            schema="public",
+                        )
+                        holder = SimpleNamespace(stage="queued.retain")
+                        with self.assertRaisesRegex(
+                            OperationRecoveryError,
+                            "did not quiesce",
+                        ) as raised:
+                            await poller._execute_task_inner(task, holder)
+                        self.assertIsNotNone(raised.exception.__cause__)
+                        with self.assertRaisesRegex(
+                            OperationRecoveryError,
+                            "claim release is disabled",
+                        ):
+                            await poller.release_own_tasks()
+
+                    asyncio.run(exercise())
+                    self.assertEqual(retries, [])
+                    self.assertEqual(releases, [])
+        finally:
+            guard_globals["EXACT_DRAIN_TASK_CANCELLATION_TIMEOUT_SECONDS"] = (
+                original_cancellation_timeout
+            )
+
     def test_phase_one_timeout_never_releases_before_task_quiescence(self):
         release_calls = []
         stages = []
@@ -5983,6 +6116,9 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
                 "TimeoutError: connection unavailable",
                 "upstream_timeout",
             ),
+            ("server error '400'", "provider_bad_request"),
+            ("status_code='400'", "provider_bad_request"),
+            ("ReadTimeoutError", "upstream_timeout"),
         )
         for message, expected in cases:
             with self.subTest(message=message):
@@ -6013,6 +6149,33 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
                 for item in ordered_sql_outcomes
             ),
         )
+
+    def test_legacy_failure_classifier_remains_frozen(self):
+        cases = (
+            ("bad request", "operation_error"),
+            ("client error", "operation_error"),
+            ("client error 400: quota exhausted", "provider_bad_request"),
+            ("Client error '400 Unauthorized'", "provider_bad_request"),
+            ("unauthorized statement timeout", "provider_authentication"),
+            ("request timed out", "operation_error"),
+            ("TimeoutError", "operation_error"),
+            ("statement timeout", "operation_error"),
+            ("status 400", "provider_bad_request"),
+        )
+        for progress_schema_version in (1, 2, 3, 4):
+            for message, expected in cases:
+                with self.subTest(
+                    progress_schema_version=progress_schema_version,
+                    message=message,
+                ):
+                    evidence = (
+                        operation_recovery_runtime._exact_drain_failure_evidence(
+                            message,
+                            retryable=True,
+                            progress_schema_version=progress_schema_version,
+                        )
+                    )
+                    self.assertEqual(evidence["category"], expected)
 
     def test_failure_classifier_rejects_open_or_malformed_output(self):
         operation_id = "00000000-0000-4000-8000-000000000001"

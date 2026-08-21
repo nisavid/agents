@@ -39,6 +39,8 @@ from hindsight_memory_control_plane.operation_recovery import (  # noqa: E402
 )
 from hindsight_memory_control_plane.operation_recovery_runtime import (  # noqa: E402
     CLAIM_RELEASE_BLOCKER_KEYS,
+    EXACT_DRAIN_RETRY_CEILING_MESSAGE,
+    FAILURE_CAUSE_FAMILY_SQL,
     ExactDrainClaimAdapter,
     QUEUE_BLOCKER_GUARD_CONTRACT_DIGEST,
     QUEUE_BLOCKER_GUARD_CONTRACT_VERSION,
@@ -47,6 +49,7 @@ from hindsight_memory_control_plane.operation_recovery_runtime import (  # noqa:
     apply_requeue_transaction,
     apply_post_abort_recovery_transaction,
     exact_drain_worker_id,
+    _exact_drain_failure_evidence,
     live_row_digest,
     read_claim_release_evidence,
     read_claim_release_preimage,
@@ -324,6 +327,43 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
 
         asyncio.run(exercise())
 
+    def test_failure_classifier_sql_matches_progress_classifier(self):
+        cases = (
+            ("400 unauthorized request timeout", "provider_authentication"),
+            ("client error 400: quota exhausted", "provider_capacity"),
+            ("status 400: request timeout", "provider_bad_request"),
+            (
+                "DatabaseError: statement timeout; status 400",
+                "database_statement_timeout",
+            ),
+            ("TimeoutError: connection unavailable", "upstream_timeout"),
+            ("server error '400'", "provider_bad_request"),
+            ("status_code='400'", "provider_bad_request"),
+            ("ReadTimeoutError", "upstream_timeout"),
+        )
+
+        async def exercise():
+            connection = await self._connect()
+            try:
+                for message, expected in cases:
+                    with self.subTest(message=message):
+                        sql_category = await connection.fetchval(
+                            f"SELECT {FAILURE_CAUSE_FAMILY_SQL} "
+                            "FROM (SELECT $1::text AS error_message) AS failure",
+                            message,
+                        )
+                        progress = _exact_drain_failure_evidence(
+                            message,
+                            retryable=True,
+                            progress_schema_version=5,
+                        )
+                        self.assertEqual(sql_category, expected)
+                        self.assertEqual(progress["category"], expected)
+            finally:
+                await connection.close()
+
+        asyncio.run(exercise())
+
     def test_exact_drain_resolver_supports_the_bound_legacy_entity_schema(self):
         try:
             import hindsight_api
@@ -370,7 +410,7 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
                 provider_root,
                 candidate_library,
             )
-            self.assertEqual(snapshot["schema_version"], 6)
+            self.assertEqual(snapshot["schema_version"], 7)
             script = """
 import asyncio
 import json
@@ -718,6 +758,7 @@ asyncio.run(exercise())
         self,
         connection,
         *,
+        plan_schema_version=12,
         completed_positions=None,
         embedded_operation_id_mismatch=False,
         embedded_bank_id_mismatch=False,
@@ -868,18 +909,39 @@ asyncio.run(exercise())
             status_artifact_path="/private/tmp/drain-status.json",
             verification_receipt_path="/private/tmp/drain-verification.json",
             created_at=int(time.time()),
+            schema_version=plan_schema_version,
         )
         return plan, cohort_ids, unexpected_id
 
     async def _post_abort_case(self, connection, *, schema_version=4):
         reference, cohort_ids, unexpected_id = await self._exact_drain_case(
             connection,
+            plan_schema_version=10,
             completed_positions=(
                 {0, 1, 42, 43, 46, 47}
                 if schema_version in {6, 7, 8, 9}
                 else None
             ),
         )
+        legacy_reference_body = {
+            key: deepcopy(value)
+            for key, value in reference.items()
+            if key
+            not in {
+                "plan_digest",
+                "execution_window",
+                "recovery_context",
+                "recovery_context_digest",
+            }
+        }
+        legacy_reference_body["schema_version"] = 9
+        legacy_reference_body["execution_lease_seconds"] = (
+            recovery_fixtures.recovery_contract.EXACT_DRAIN_EXECUTION_LEASE_SECONDS
+        )
+        reference = {
+            **legacy_reference_body,
+            "plan_digest": recovery_fixtures.digest(legacy_reference_body),
+        }
         selected = reference["selected_operations"]
         processing_count = {
             2: 4,
@@ -1258,6 +1320,7 @@ asyncio.run(exercise())
     async def _post_abort_v10_case(self, connection):
         reference, cohort_ids, unexpected_id = await self._exact_drain_case(
             connection,
+            plan_schema_version=10,
             completed_positions={0, 1, 2, 42, 43, 46, 47},
         )
         selected = sorted(
@@ -1395,10 +1458,312 @@ asyncio.run(exercise())
             unexpected_id,
         )
 
+    async def _post_abort_v12_epoch_three_case(self, connection):
+        (
+            epoch_one_recovery,
+            cohort_ids,
+            _epoch_one_selected_ids,
+            _completed_ids,
+            unexpected_id,
+        ) = await self._post_abort_v10_case(connection)
+        await apply_post_abort_recovery_transaction(
+            connection,
+            profile_id="systalyze",
+            schema="public",
+            bank_id="engineering",
+            plan=epoch_one_recovery,
+        )
+        cohort = epoch_one_recovery["reference_plan"]["cohort"]
+        candidate = epoch_one_recovery["candidate_release"]
+
+        async def snapshot_current():
+            rows = await read_safe_operation_rows(
+                connection,
+                schema="public",
+                bank_id="engineering",
+                operation_ids=cohort_ids,
+            )
+            generation = await connection.fetchval(
+                "SELECT generation "
+                "FROM public.hindsight_migration_generation "
+                "WHERE singleton"
+            )
+            return create_live_snapshot(
+                cohort,
+                rows,
+                generation_before=f"systalyze:public:{generation}",
+                generation_after=f"systalyze:public:{generation}",
+                installation_authority=(
+                    recovery_fixtures.rebound_installation_authority()
+                ),
+                observed_at=int(time.time()),
+            )
+
+        def backup_for_snapshot(factory, snapshot):
+            backup = factory()
+            source = backup["source_authority"]
+            source["data_identity_digest"] = snapshot[
+                "installation_authority"
+            ]["observed_data_identity_digest"]
+            source["generation_before"] = snapshot["generation_before"]
+            source["generation_after"] = snapshot["generation_after"]
+            backup["source_authority_digest"] = recovery_fixtures.digest(
+                source
+            )
+            return backup
+
+        def recovery_context(recovery, snapshot, epoch):
+            selected_ids = sorted(
+                item["operation_id"]
+                for item in snapshot["operations"]
+                if item["current_status"] == "pending"
+            )
+            recovered_ids = sorted(
+                item["operation_id"]
+                for item in recovery["selected_operations"]
+            )
+            return {
+                "schema_version": epoch,
+                "kind": "operation-recovery-exact-drain-recovery-context",
+                "origin": "post-abort",
+                "generation": snapshot["generation_before"],
+                "recovery_epoch": epoch,
+                "candidate_release_digest": candidate["release_digest"],
+                "selected_operation_ids_digest": (
+                    recovery_fixtures.digest(selected_ids)
+                ),
+                "initial_origin_digest": None,
+                "post_abort_selected_operation_ids_digest": (
+                    recovery_fixtures.digest(recovered_ids)
+                ),
+                "post_abort_plan_digest": recovery["plan_digest"],
+                "post_abort_application_receipt_digest": "a" * 64,
+                "post_abort_verification_receipt_digest": "b" * 64,
+                "retry_recovery_digest": recovery[
+                    "retry_recovery_digest"
+                ],
+                "selected_checkpoint_set_digest": recovery[
+                    "selected_checkpoint_set_digest"
+                ],
+                "preserved_row_set_digest": recovery[
+                    "preserved_row_set_digest"
+                ],
+            }
+
+        def exact_plan(recovery, snapshot, epoch):
+            return create_exact_drain_plan(
+                cohort,
+                snapshot,
+                candidate_release=candidate,
+                rollback_backup=backup_for_snapshot(
+                    recovery_fixtures.drain_backup_evidence,
+                    snapshot,
+                ),
+                rollback_backup_path=(
+                    f"/private/tmp/epoch-{epoch}-drain-backup.age"
+                ),
+                provider_policy_digest="9" * 64,
+                effective_profile_digest="7" * 64,
+                worker_runtime_digest="8" * 64,
+                authorization_receipt_path=(
+                    f"/private/tmp/epoch-{epoch}-drain-auth.json"
+                ),
+                application_receipt_path=(
+                    f"/private/tmp/epoch-{epoch}-drain-app.json"
+                ),
+                status_artifact_path=(
+                    f"/private/tmp/epoch-{epoch}-drain-status.json"
+                ),
+                verification_receipt_path=(
+                    f"/private/tmp/epoch-{epoch}-drain-verify.json"
+                ),
+                recovery_context=recovery_context(
+                    recovery,
+                    snapshot,
+                    epoch,
+                ),
+                created_at=snapshot["observed_at"],
+                schema_version=11,
+            )
+
+        epoch_one_snapshot = await snapshot_current()
+        epoch_one_plan = exact_plan(
+            epoch_one_recovery,
+            epoch_one_snapshot,
+            1,
+        )
+        epoch_one_ids = sorted(
+            item["operation_id"]
+            for item in epoch_one_plan["selected_operations"]
+        )
+        epoch_one_worker = exact_drain_worker_id(
+            epoch_one_plan["plan_digest"]
+        )
+        await connection.execute(
+            """
+            UPDATE public.async_operations
+            SET status = 'failed', retry_count = 3,
+                next_retry_at = NULL,
+                error_message = 'provider transport timeout',
+                worker_id = $2, claimed_at = NOW(),
+                completed_at = NOW(), updated_at = NOW()
+            WHERE operation_id = ANY($1::uuid[])
+            """,
+            epoch_one_ids,
+            epoch_one_worker,
+        )
+        epoch_two_interrupted = await snapshot_current()
+        epoch_two_recovery = create_post_abort_recovery_plan(
+            epoch_one_plan,
+            epoch_two_interrupted,
+            candidate_release=candidate,
+            rollback_backup=backup_for_snapshot(
+                recovery_fixtures.rollback_backup_evidence,
+                epoch_two_interrupted,
+            ),
+            rollback_encryption=recovery_fixtures.rollback_encryption(),
+            rollback_backup_path="/private/tmp/epoch-2-backup.age",
+            rollback_bundle_path="/private/tmp/epoch-2-bundle.age",
+            authorization_receipt_path="/private/tmp/epoch-2-auth.json",
+            application_receipt_path="/private/tmp/epoch-2-app.json",
+            verification_receipt_path="/private/tmp/epoch-2-verify.json",
+            rollback_receipt_path="/private/tmp/epoch-2-rollback.json",
+            reference_application_authorization=(
+                recovery_fixtures.exact_drain_authorization(epoch_one_plan)
+            ),
+            reference_application_journal=(
+                recovery_fixtures.exact_drain_application_journal(
+                    epoch_one_plan
+                )
+            ),
+            reference_application_progress_digest="c" * 64,
+            prior_retry_recovery=epoch_one_recovery["retry_recovery"],
+            schema_version=11,
+            created_at=epoch_two_interrupted["observed_at"],
+        )
+        await apply_post_abort_recovery_transaction(
+            connection,
+            profile_id="systalyze",
+            schema="public",
+            bank_id="engineering",
+            plan=epoch_two_recovery,
+        )
+
+        epoch_two_snapshot = await snapshot_current()
+        epoch_two_plan = exact_plan(
+            epoch_two_recovery,
+            epoch_two_snapshot,
+            2,
+        )
+        epoch_two_ids = sorted(
+            item["operation_id"]
+            for item in epoch_two_plan["selected_operations"]
+        )
+        pending_id, processing_id = epoch_two_ids[:2]
+        failed_ids = epoch_two_ids[2:]
+        epoch_two_worker = exact_drain_worker_id(
+            epoch_two_plan["plan_digest"]
+        )
+        await connection.execute(
+            """
+            UPDATE public.async_operations
+            SET status = 'failed', retry_count = 3,
+                next_retry_at = NULL,
+                error_message = 'TimeoutError',
+                worker_id = $2, claimed_at = NOW(),
+                completed_at = NOW(), updated_at = NOW()
+            WHERE operation_id = ANY($1::uuid[])
+            """,
+            failed_ids,
+            epoch_two_worker,
+        )
+        await connection.execute(
+            """
+            UPDATE public.async_operations
+            SET status = 'pending', retry_count = 1,
+                next_retry_at = NOW(),
+                error_message = 'TimeoutError',
+                worker_id = $2, claimed_at = NOW(),
+                completed_at = NULL, updated_at = NOW()
+            WHERE operation_id = $1::uuid
+            """,
+            pending_id,
+            epoch_two_worker,
+        )
+        await connection.execute(
+            """
+            UPDATE public.async_operations
+            SET status = 'processing', retry_count = 1,
+                next_retry_at = NULL,
+                error_message = 'TimeoutError',
+                worker_id = $2, claimed_at = NOW(),
+                completed_at = NULL, updated_at = NOW()
+            WHERE operation_id = $1::uuid
+            """,
+            processing_id,
+            epoch_two_worker,
+        )
+        epoch_three_interrupted = await snapshot_current()
+        epoch_three_recovery = create_post_abort_recovery_plan(
+            epoch_two_plan,
+            epoch_three_interrupted,
+            candidate_release=candidate,
+            rollback_backup=backup_for_snapshot(
+                recovery_fixtures.rollback_backup_evidence,
+                epoch_three_interrupted,
+            ),
+            rollback_encryption=recovery_fixtures.rollback_encryption(),
+            rollback_backup_path="/private/tmp/epoch-3-backup.age",
+            rollback_bundle_path="/private/tmp/epoch-3-bundle.age",
+            authorization_receipt_path="/private/tmp/epoch-3-auth.json",
+            application_receipt_path="/private/tmp/epoch-3-app.json",
+            verification_receipt_path="/private/tmp/epoch-3-verify.json",
+            rollback_receipt_path="/private/tmp/epoch-3-rollback.json",
+            reference_application_authorization=(
+                recovery_fixtures.exact_drain_authorization(epoch_two_plan)
+            ),
+            reference_application_journal=(
+                recovery_fixtures.exact_drain_application_journal(
+                    epoch_two_plan
+                )
+            ),
+            reference_application_progress_digest="d" * 64,
+            prior_retry_recovery=epoch_two_recovery["retry_recovery"],
+            schema_version=12,
+            created_at=epoch_three_interrupted["observed_at"],
+        )
+        return (
+            epoch_three_recovery,
+            cohort_ids,
+            pending_id,
+            processing_id,
+            unexpected_id,
+        )
+
     async def _legacy_post_abort_case(self, connection):
         reference, cohort_ids, unexpected_id = await self._exact_drain_case(
-            connection
+            connection,
+            plan_schema_version=10,
         )
+        legacy_reference_body = {
+            key: deepcopy(value)
+            for key, value in reference.items()
+            if key
+            not in {
+                "plan_digest",
+                "execution_window",
+                "recovery_context",
+                "recovery_context_digest",
+            }
+        }
+        legacy_reference_body["schema_version"] = 9
+        legacy_reference_body["execution_lease_seconds"] = (
+            recovery_fixtures.recovery_contract.EXACT_DRAIN_EXECUTION_LEASE_SECONDS
+        )
+        reference = {
+            **legacy_reference_body,
+            "plan_digest": recovery_fixtures.digest(legacy_reference_body),
+        }
         selected = reference["selected_operations"]
         processing = [
             item for item in selected if item["operation_type"] == "retain"
@@ -2540,6 +2905,144 @@ asyncio.run(exercise())
                 self.assertEqual(
                     live_row_digest(after[unexpected_id]),
                     live_row_digest(before[unexpected_id]),
+                )
+            finally:
+                await connection.close()
+
+        asyncio.run(exercise())
+
+    def test_post_abort_v12_epoch_three_applies_and_rolls_back_release_only_rows(
+        self,
+    ):
+        async def exercise():
+            connection = await self._connect()
+            try:
+                (
+                    plan,
+                    cohort_ids,
+                    pending_id,
+                    processing_id,
+                    unexpected_id,
+                ) = await self._post_abort_v12_epoch_three_case(connection)
+                observed_ids = [*cohort_ids, unexpected_id]
+                before = {
+                    row["operation_id"]: row
+                    for row in await read_safe_operation_rows(
+                        connection,
+                        schema="public",
+                        bank_id="engineering",
+                        operation_ids=observed_ids,
+                    )
+                }
+                preimage = await read_selected_preimage(
+                    connection,
+                    schema="public",
+                    selected_operations=plan["selected_operations"],
+                )
+                expected_status = {
+                    item["operation_id"]: item["expected_status"]
+                    for item in plan["selected_operations"]
+                }
+                self.assertEqual(plan["schema_version"], 12)
+                self.assertEqual(
+                    plan["selected_status_counts"],
+                    {"failed": 37, "pending": 1, "processing": 1},
+                )
+                generation_prefix, generation_value = plan[
+                    "pre_generation"
+                ].rsplit(":", 1)
+                post_generation = (
+                    f"{generation_prefix}:{int(generation_value) + 1}"
+                )
+                rollback_generation = (
+                    f"{generation_prefix}:{int(generation_value) + 2}"
+                )
+
+                generations = await apply_post_abort_recovery_transaction(
+                    connection,
+                    profile_id="systalyze",
+                    schema="public",
+                    bank_id="engineering",
+                    plan=plan,
+                )
+                after = {
+                    row["operation_id"]: row
+                    for row in await read_safe_operation_rows(
+                        connection,
+                        schema="public",
+                        bank_id="engineering",
+                        operation_ids=observed_ids,
+                    )
+                }
+                self.assertEqual(
+                    generations,
+                    (plan["pre_generation"], post_generation),
+                )
+                for operation_id, status in expected_status.items():
+                    self.assertEqual(after[operation_id]["status"], "pending")
+                    self.assertFalse(after[operation_id]["worker_id_present"])
+                    self.assertIsNone(after[operation_id]["claimed_at"])
+                    if status == "failed":
+                        self.assertEqual(after[operation_id]["retry_count"], 0)
+                        self.assertEqual(
+                            after[operation_id]["error_category"],
+                            "none",
+                        )
+                        self.assertIsNone(after[operation_id]["error_digest"])
+                    else:
+                        self.assertEqual(
+                            after[operation_id]["retry_count"],
+                            before[operation_id]["retry_count"],
+                        )
+                        self.assertEqual(
+                            after[operation_id]["error_digest"],
+                            before[operation_id]["error_digest"],
+                        )
+                self.assertEqual(expected_status[pending_id], "pending")
+                self.assertEqual(expected_status[processing_id], "processing")
+                for operation_id in set(observed_ids) - set(expected_status):
+                    self.assertEqual(
+                        live_row_digest(after[operation_id]),
+                        live_row_digest(before[operation_id]),
+                    )
+
+                rollback_generations = (
+                    await rollback_post_abort_recovery_transaction(
+                        connection,
+                        profile_id="systalyze",
+                        schema="public",
+                        bank_id="engineering",
+                        plan=plan,
+                        application={"post_generation": post_generation},
+                        rollback_record={
+                            "pre_generation": post_generation,
+                            "post_generation": rollback_generation,
+                        },
+                        preimage=preimage,
+                    )
+                )
+                restored = {
+                    row["operation_id"]: row
+                    for row in await read_safe_operation_rows(
+                        connection,
+                        schema="public",
+                        bank_id="engineering",
+                        operation_ids=observed_ids,
+                    )
+                }
+                self.assertEqual(
+                    rollback_generations,
+                    (post_generation, rollback_generation),
+                )
+                self.assertEqual(
+                    {
+                        key: live_row_digest(value)
+                        for key, value in restored.items()
+                    },
+                    {
+                        key: live_row_digest(value)
+                        for key, value in before.items()
+                    },
                 )
             finally:
                 await connection.close()
@@ -3696,7 +4199,7 @@ asyncio.run(exercise())
                 await adapter.schedule_retry(
                     Backend(),
                     operation_id,
-                    datetime(2026, 1, 1),
+                    datetime.now(timezone.utc),
                     "provider unavailable",
                     "public",
                 )
@@ -3740,7 +4243,7 @@ asyncio.run(exercise())
                 await resumed.defer_operation(
                     Backend(),
                     operation_id,
-                    datetime(2026, 1, 1),
+                    datetime.now(timezone.utc),
                     "dependency warming",
                     None,
                 )
@@ -3928,7 +4431,7 @@ asyncio.run(exercise())
                     worker_start_time="postgres-test-worker",
                     worker_attempt=1,
                     selected_operations=plan["selected_operations"],
-                    progress_schema_version=2,
+                    progress_schema_version=plan["progress_schema_version"],
                 )
                 await self._bind_disposable_exact_drain_identity(
                     adapter,
@@ -3996,7 +4499,7 @@ asyncio.run(exercise())
                 progress = read_exact_drain_progress(
                     progress_path,
                     plan_digest=plan["plan_digest"],
-                    progress_schema_version=2,
+                    progress_schema_version=plan["progress_schema_version"],
                 )
                 task = next(
                     item
@@ -4005,7 +4508,7 @@ asyncio.run(exercise())
                 )
                 self.assertEqual(
                     task["failure"]["category"],
-                    "phase_one_timeout",
+                    "upstream_timeout",
                 )
                 self.assertIs(task["failure"]["retryable"], False)
                 self.assertEqual(
@@ -4431,7 +4934,7 @@ asyncio.run(exercise())
 
                 self.assertEqual(await adapter.recover_own_tasks(Backend()), 1)
                 state = await connection.fetchrow(
-                    "SELECT status, worker_id, retry_count "
+                    "SELECT status, worker_id, retry_count, error_message "
                     "FROM public.async_operations "
                     "WHERE operation_id = $1::uuid",
                     selected_id,
@@ -4441,6 +4944,10 @@ asyncio.run(exercise())
                 self.assertEqual(
                     state["retry_count"],
                     plan["worker_max_retries"],
+                )
+                self.assertEqual(
+                    state["error_message"],
+                    EXACT_DRAIN_RETRY_CEILING_MESSAGE,
                 )
                 selected_outcomes = [
                     item

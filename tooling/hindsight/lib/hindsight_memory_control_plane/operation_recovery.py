@@ -4336,6 +4336,7 @@ def _post_abort_v11_retry_recovery(
     ordinary_attempt_ceiling = reference_plan["worker_max_attempts"]
     recovery_epoch_before = context["recovery_epoch"]
     recovery_epoch_after = recovery_epoch_before + 1
+    release_only_recovery = recovery_epoch_before == 2
     maximum_cumulative_attempts = (
         ordinary_attempt_ceiling * (recovery_epoch_after + 1)
     )
@@ -4353,14 +4354,26 @@ def _post_abort_v11_retry_recovery(
         != ordinary_attempt_ceiling
         or prior_retry_recovery["maximum_cumulative_attempts"]
         != ordinary_attempt_ceiling * (recovery_epoch_before + 1)
-        or not selected_ids.issubset(reference_selected)
+        or (
+            release_only_recovery
+            and not selected_ids.issubset(reference_selected)
+        )
+        or (
+            not release_only_recovery
+            and selected_ids != set(reference_selected)
+        )
         or not set(prior_by_id).issubset(reference_selected)
         or digest(sorted(prior_by_id))
         != context.get("post_abort_selected_operation_ids_digest")
         or digest(sorted(reference_selected))
         != context.get("selected_operation_ids_digest")
         or any(
-            item["expected_status"] not in {"failed", "pending", "processing"}
+            item["expected_status"]
+            not in (
+                {"failed", "pending", "processing"}
+                if release_only_recovery
+                else {"failed"}
+            )
             for item in selected
         )
     ):

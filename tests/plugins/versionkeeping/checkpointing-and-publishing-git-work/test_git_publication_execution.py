@@ -680,6 +680,35 @@ class PublicationExecutionTests(unittest.TestCase):
             adapter.WINDOWS_MUTATION_RIGHTS,
         )
 
+    def test_windows_acl_probe_passes_the_path_through_its_closed_environment(
+        self,
+    ) -> None:
+        powershell = Path(r"C:\Windows\System32\powershell.exe")
+        windows_directory = Path(r"C:\Windows")
+        candidate = Path(r"C:\Program Files\Git\cmd\git.exe")
+
+        with mock.patch.object(
+            adapter.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0),
+        ) as run:
+            adapter._run_windows_acl_probe(
+                powershell,
+                windows_directory,
+                candidate,
+                "Get-Acl -LiteralPath $env:VERSIONKEEPING_ACL_PATH",
+            )
+
+        self.assertEqual(
+            run.call_args.args[0][-1],
+            "Get-Acl -LiteralPath $env:VERSIONKEEPING_ACL_PATH",
+        )
+        self.assertNotIn(str(candidate), run.call_args.args[0])
+        self.assertEqual(
+            run.call_args.kwargs["env"]["VERSIONKEEPING_ACL_PATH"],
+            str(candidate),
+        )
+
     def test_windows_bundle_checks_the_program_files_trust_anchor(self) -> None:
         git_root = self.root.resolve() / "Program Files" / "Git"
         executable = git_root / adapter.WINDOWS_GIT_RUNTIME["git"]

@@ -56,7 +56,7 @@ PROVIDER_OUTCOMES_V5 = PROVIDER_OUTCOMES_V4 | {
     "queue_cancelled",
     "execution_cancelled",
 }
-TASK_FAILURE_CATEGORIES = frozenset(
+TASK_FAILURE_CATEGORIES_V4 = frozenset(
     {
         "phase_one_timeout",
         "provider_queue_timeout",
@@ -66,8 +66,6 @@ TASK_FAILURE_CATEGORIES = frozenset(
         "provider_authentication",
         "provider_capacity",
         "provider_transport",
-        "upstream_timeout",
-        "database_statement_timeout",
         "retry_ceiling",
         "terminal_state_persistence",
         "nonquiescent_shutdown",
@@ -77,7 +75,14 @@ TASK_FAILURE_CATEGORIES = frozenset(
         "worker_initialization_timeout",
     }
 )
-WORKER_FAILURE_CATEGORIES = TASK_FAILURE_CATEGORIES | {
+TASK_FAILURE_CATEGORIES_V5 = TASK_FAILURE_CATEGORIES_V4 | {
+    "upstream_timeout",
+    "database_statement_timeout",
+}
+WORKER_FAILURE_CATEGORIES_V4 = TASK_FAILURE_CATEGORIES_V4 | {
+    "execution_lease_expired"
+}
+WORKER_FAILURE_CATEGORIES_V5 = TASK_FAILURE_CATEGORIES_V5 | {
     "execution_lease_expired"
 }
 
@@ -124,7 +129,7 @@ def _identifier(value: Any, label: str) -> str:
 def _validated_failure(
     value: Any,
     *,
-    categories: frozenset[str] = TASK_FAILURE_CATEGORIES,
+    categories: frozenset[str],
 ) -> dict[str, Any] | None:
     if value is None:
         return None
@@ -152,6 +157,24 @@ def _validated_failure(
             "exact drain failure error digest",
         ),
     }
+
+
+def _failure_categories(
+    progress_schema_version: int,
+    *,
+    worker: bool = False,
+) -> frozenset[str]:
+    if progress_schema_version == 5:
+        return (
+            WORKER_FAILURE_CATEGORIES_V5
+            if worker
+            else TASK_FAILURE_CATEGORIES_V5
+        )
+    return (
+        WORKER_FAILURE_CATEGORIES_V4
+        if worker
+        else TASK_FAILURE_CATEGORIES_V4
+    )
 
 
 def _validated_checkpoint(value: Any) -> dict[str, Any] | None:
@@ -694,7 +717,10 @@ class ExactDrainProgressRecorder:
             )
         checked_failure = _validated_failure(
             failure,
-            categories=WORKER_FAILURE_CATEGORIES,
+            categories=_failure_categories(
+                self.progress_schema_version,
+                worker=True,
+            ),
         )
         if (
             checked_failure is None
@@ -783,7 +809,10 @@ class ExactDrainProgressRecorder:
             raise OperationRecoveryError(
                 "exact drain progress task outcome is invalid"
             )
-        checked_failure = _validated_failure(failure)
+        checked_failure = _validated_failure(
+            failure,
+            categories=_failure_categories(self.progress_schema_version),
+        )
         checked_checkpoint = _validated_checkpoint(checkpoint)
         with self._lock:
             task = self._tasks.get(operation_id)
@@ -831,7 +860,10 @@ class ExactDrainProgressRecorder:
             raise OperationRecoveryError(
                 "exact drain progress runtime failure is invalid"
             )
-        checked_failure = _validated_failure(failure)
+        checked_failure = _validated_failure(
+            failure,
+            categories=_failure_categories(self.progress_schema_version),
+        )
         if checked_failure is None:
             raise OperationRecoveryError(
                 "exact drain progress runtime failure is invalid"
@@ -1039,12 +1071,7 @@ class ExactDrainProgressRecorder:
                 raise OperationRecoveryError(
                     "exact drain progress request is unknown"
                 )
-            legacy_outcome = (
-                "queue_timed_out"
-                if self.progress_schema_version == 4
-                and active.get("state") == "queued"
-                else "failed"
-            )
+            legacy_outcome = "failed"
         self.provider_finished(request_digest, outcome=legacy_outcome)
 
     def cooldown(self, provider_id: str, *, until: float, reason: str) -> None:
@@ -1323,7 +1350,10 @@ def _validated_progress(
         worker_failure_stage = result.get("worker_failure_stage")
         worker_failure = _validated_failure(
             result.get("worker_failure"),
-            categories=WORKER_FAILURE_CATEGORIES,
+            categories=_failure_categories(
+                progress_schema_version,
+                worker=True,
+            ),
         )
         worker_exit_code = result.get("worker_exit_code")
         worker_stage_started_at = _timestamp(
@@ -1400,7 +1430,10 @@ def _validated_progress(
             raise OperationRecoveryError("exact drain progress task stage is invalid")
         if progress_schema_version in {2, 3, 4, 5}:
             failure_stage = item.get("failure_stage")
-            failure = _validated_failure(item.get("failure"))
+            failure = _validated_failure(
+                item.get("failure"),
+                categories=_failure_categories(progress_schema_version),
+            )
             _validated_checkpoint(item.get("checkpoint"))
             if (
                 (failure is None) != (failure_stage is None)

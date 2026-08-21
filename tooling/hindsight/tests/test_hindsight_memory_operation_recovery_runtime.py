@@ -1125,7 +1125,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         self.assertEqual(
             evidence["failure"],
             {
-                "category": "upstream_timeout",
+                "category": "operation_error",
                 "retryable": False,
                 "http_status": None,
                 "error_digest": hashlib.sha256(b"TimeoutError").hexdigest(),
@@ -1175,33 +1175,50 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         )
         self.assertEqual(openai_bad_request["http_status"], 400)
 
-    def test_schema_eleven_timeout_failures_have_distinct_closed_categories(self):
+    def test_schema_five_timeout_failures_have_distinct_closed_categories(self):
         classify = operation_recovery_runtime._exact_drain_failure_evidence
 
-        queue = classify("provider_queue_timeout", retryable=True)
-        execution = classify("provider_execution_timeout", retryable=True)
+        queue = classify(
+            "provider_queue_timeout",
+            retryable=True,
+            progress_schema_version=5,
+        )
+        execution = classify(
+            "provider_execution_timeout",
+            retryable=True,
+            progress_schema_version=5,
+        )
         phase_one = classify(
             "RetryTaskAt: TimeoutError: operation-recovery exact drain "
             "phase-one query timed out at retain.phase1.candidates.fuzzy.1/2",
             retryable=True,
+            progress_schema_version=5,
         )
         phase_one_deadline = classify(
             "exact drain retain phase one exceeded its deadline",
             retryable=False,
+            progress_schema_version=5,
         )
         stored_phase_one_deadline = classify(
             "OperationRecoveryError: exact drain retain phase one exceeded "
             "its deadline",
             retryable=False,
+            progress_schema_version=5,
         )
-        upstream = classify("TimeoutError", retryable=True)
+        upstream = classify(
+            "TimeoutError",
+            retryable=True,
+            progress_schema_version=5,
+        )
         database = classify(
             "DatabaseError: canceling statement due to statement timeout",
             retryable=True,
+            progress_schema_version=5,
         )
         attempt = classify(
             operation_recovery_runtime.EXACT_DRAIN_OPERATION_ATTEMPT_TIMEOUT_MESSAGE,
             retryable=False,
+            progress_schema_version=5,
         )
 
         self.assertEqual(queue["category"], "provider_queue_timeout")
@@ -1238,6 +1255,24 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
                 set(evidence),
                 {"category", "retryable", "http_status", "error_digest"},
             )
+
+    def test_legacy_progress_schemas_keep_timeout_categories_immutable(self):
+        classify = operation_recovery_runtime._exact_drain_failure_evidence
+
+        for progress_schema_version in (1, 2, 3, 4):
+            with self.subTest(progress_schema_version=progress_schema_version):
+                upstream = classify(
+                    "TimeoutError",
+                    retryable=True,
+                    progress_schema_version=progress_schema_version,
+                )
+                database = classify(
+                    "DatabaseError: canceling statement due to statement timeout",
+                    retryable=True,
+                    progress_schema_version=progress_schema_version,
+                )
+                self.assertEqual(upstream["category"], "operation_error")
+                self.assertEqual(database["category"], "operation_error")
 
     def test_retry_ceiling_records_the_terminal_disposition(self):
         adapter = self._current_exact_drain_adapter()
@@ -5667,6 +5702,28 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         self.assertIn("database_statement_timeout", query)
         self.assertIn("provider_execution_timeout", query)
         self.assertIn("upstream_timeout", query)
+
+    def test_failure_classifier_precedence_matches_progress_classifier(self):
+        ordered_sql_outcomes = (
+            "THEN 'database_statement_timeout'",
+            "THEN 'provider_authentication'",
+            "THEN 'provider_capacity'",
+            "THEN 'provider_bad_request'",
+            "THEN 'upstream_timeout'",
+            "THEN 'provider_transport'",
+        )
+        positions = [
+            FAILURE_CLASSIFICATION_QUERY.index(outcome)
+            for outcome in ordered_sql_outcomes
+        ]
+
+        self.assertEqual(positions, sorted(positions))
+        evidence = operation_recovery_runtime._exact_drain_failure_evidence(
+            "TimeoutError: connection unavailable",
+            retryable=True,
+            progress_schema_version=5,
+        )
+        self.assertEqual(evidence["category"], "upstream_timeout")
 
     def test_failure_classifier_rejects_open_or_malformed_output(self):
         operation_id = "00000000-0000-4000-8000-000000000001"

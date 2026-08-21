@@ -10567,7 +10567,7 @@ def operation_recovery_drain_monitor_command(args: argparse.Namespace) -> int:
                 "exact drain terminal progress differs"
             )
         monitor_status = "terminal"
-    if monitor_status == "interrupted":
+    if monitor_status == "interrupted" and plan.get("schema_version") == 12:
         frozen = _operation_recovery_read_monitor_progress(
             plan,
             freeze_ages_at_observed_at=True,

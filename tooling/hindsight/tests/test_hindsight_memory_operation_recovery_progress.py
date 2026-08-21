@@ -527,6 +527,90 @@ class ExactDrainProgressTest(unittest.TestCase):
         self.assertTrue(task["checkpoint"]["facts_committed"])
         self.assertEqual(task["checkpoint"]["processed"], 14)
 
+    def test_legacy_progress_schemas_reject_schema_five_failure_categories(
+        self,
+    ) -> None:
+        for progress_schema_version in (2, 3, 4):
+            with self.subTest(progress_schema_version=progress_schema_version):
+                with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+                    operation_id = "00000000-0000-4000-8000-000000000001"
+                    recorder = ExactDrainProgressRecorder(
+                        path=Path(directory) / "exact-drain-progress.json",
+                        plan_digest="a" * 64,
+                        worker_pid=1234,
+                        worker_start_time="darwin:1000:1",
+                        worker_attempt=1,
+                        selected_operations=[
+                            {
+                                "operation_id": operation_id,
+                                "operation_type": "retain",
+                                "row_digest": "b" * 64,
+                            }
+                        ],
+                        progress_schema_version=progress_schema_version,
+                        clock=lambda: 1000.0,
+                    )
+                    with self.assertRaisesRegex(
+                        OperationRecoveryError,
+                        "failure evidence is invalid",
+                    ):
+                        recorder.task_outcome(
+                            operation_id,
+                            status="failed",
+                            stage="failed",
+                            failure={
+                                "category": "upstream_timeout",
+                                "retryable": False,
+                                "http_status": None,
+                                "error_digest": "c" * 64,
+                            },
+                            checkpoint=None,
+                        )
+
+    def test_schema_five_accepts_richer_timeout_failure_categories(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+            operation_id = "00000000-0000-4000-8000-000000000001"
+            recorder = ExactDrainProgressRecorder(
+                path=Path(directory) / "exact-drain-progress.json",
+                plan_digest="a" * 64,
+                worker_pid=1234,
+                worker_start_time="darwin:1000:1",
+                worker_attempt=1,
+                selected_operations=[
+                    {
+                        "operation_id": operation_id,
+                        "operation_type": "retain",
+                        "row_digest": "b" * 64,
+                    }
+                ],
+                progress_schema_version=5,
+                clock=lambda: 1000.0,
+            )
+            recorder.task_outcome(
+                operation_id,
+                status="failed",
+                stage="failed",
+                failure={
+                    "category": "upstream_timeout",
+                    "retryable": False,
+                    "http_status": None,
+                    "error_digest": "c" * 64,
+                },
+                checkpoint=None,
+            )
+
+            progress = read_exact_drain_progress(
+                recorder.path,
+                plan_digest="a" * 64,
+                progress_schema_version=5,
+                now=1001.0,
+            )
+
+        self.assertEqual(
+            progress["tasks"][0]["failure"]["category"],
+            "upstream_timeout",
+        )
+
     def test_create_only_commit_survives_post_rename_interruption(self) -> None:
         with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
             path = Path(directory) / "archive.json"
@@ -1071,6 +1155,84 @@ class ExactDrainProgressTest(unittest.TestCase):
                 }
             ],
         )
+
+    def test_progress_schema_four_preserves_legacy_queued_cancellation_rejection(
+        self,
+    ) -> None:
+        ticks = iter((1000.0, 1001.0))
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+            path = Path(directory) / "exact-drain-progress.json"
+            recorder = ExactDrainProgressRecorder(
+                path=path,
+                plan_digest="a" * 64,
+                worker_pid=1234,
+                worker_start_time="darwin:1000:1",
+                worker_attempt=1,
+                selected_operations=[],
+                progress_schema_version=4,
+                clock=lambda: next(ticks),
+            )
+            request = recorder.provider_started(
+                "hatchery",
+                retry_attempt=1,
+                scope="retain_extract_facts",
+            )
+            with self.assertRaisesRegex(
+                OperationRecoveryError,
+                "provider outcome is invalid",
+            ):
+                recorder.provider_cancelled(request)
+            progress = read_exact_drain_progress(
+                path,
+                plan_digest="a" * 64,
+                progress_schema_version=4,
+                now=1002.0,
+            )
+
+        counter = progress["provider_counters"][0]
+        self.assertEqual(
+            progress["active_provider_requests"][0]["state"],
+            "queued",
+        )
+        self.assertEqual(counter["failed"], 0)
+        self.assertEqual(counter["queue_timed_out"], 0)
+        self.assertEqual(counter["execution_timed_out"], 0)
+
+    def test_progress_schema_four_preserves_legacy_executing_cancellation_failure(
+        self,
+    ) -> None:
+        ticks = iter((1000.0, 1001.0, 1002.0, 1003.0))
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+            path = Path(directory) / "exact-drain-progress.json"
+            recorder = ExactDrainProgressRecorder(
+                path=path,
+                plan_digest="a" * 64,
+                worker_pid=1234,
+                worker_start_time="darwin:1000:1",
+                worker_attempt=1,
+                selected_operations=[],
+                progress_schema_version=4,
+                clock=lambda: next(ticks),
+            )
+            request = recorder.provider_started(
+                "hatchery",
+                retry_attempt=1,
+                scope="retain_extract_facts",
+            )
+            recorder.provider_executing(request)
+            recorder.provider_cancelled(request)
+            progress = read_exact_drain_progress(
+                path,
+                plan_digest="a" * 64,
+                progress_schema_version=4,
+                now=1003.0,
+            )
+
+        counter = progress["provider_counters"][0]
+        self.assertEqual(progress["active_provider_requests"], [])
+        self.assertEqual(counter["failed"], 1)
+        self.assertEqual(counter["queue_timed_out"], 0)
+        self.assertEqual(counter["execution_timed_out"], 0)
 
     def test_progress_schema_four_rejects_success_before_gate_admission(self) -> None:
         ticks = iter((1000.0, 1001.0))

@@ -642,6 +642,21 @@ class OperationRecoveryContractTest(unittest.TestCase):
         with self.assertRaises(OperationRecoveryError):
             recovery_contract.verify_exact_drain_status(tampered, plan=plan)
 
+        non_integer_schema = deepcopy(status)
+        non_integer_schema["schema_version"] = 2.0
+        non_integer_schema["status_digest"] = digest(
+            {
+                key: value
+                for key, value in non_integer_schema.items()
+                if key != "status_digest"
+            }
+        )
+        with self.assertRaises(OperationRecoveryError):
+            recovery_contract.verify_exact_drain_status(
+                non_integer_schema,
+                plan=plan,
+            )
+
     def test_exact_drain_execution_window_is_closed_and_recomputed(self):
         plan = self.drain_plan(schema_version=11)
         cases = {}

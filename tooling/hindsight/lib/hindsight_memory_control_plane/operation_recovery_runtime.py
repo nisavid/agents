@@ -616,14 +616,14 @@ FROM (
                  '(bad.?request|client.?error|status.?400|error.?400)'
                 THEN 'provider_bad_request'
             WHEN lower(error_message) ~
+                 '(^|[^a-z])timeout(error)?([^a-z]|$)|timed.?out'
+                THEN 'upstream_timeout'
+            WHEN lower(error_message) ~
                  '(connect|network|transport|unavailable|hatchery|502|503|504)'
                 THEN 'provider_transport'
             WHEN lower(error_message) ~
                  '(validation|invalid.?json|json.?decode|structured.?output|schema)'
                 THEN 'structured_output_validation'
-            WHEN lower(error_message) ~
-                 '(^|[^a-z])timeout(error)?([^a-z]|$)|timed.?out'
-                THEN 'upstream_timeout'
             WHEN lower(error_message) ~
                  '(integrity|constraint|duplicate.?key|foreign.?key)'
                 THEN 'database_integrity'
@@ -865,7 +865,12 @@ def _exact_drain_failure_evidence(
     *,
     retryable: bool,
     category_override: str | None = None,
+    progress_schema_version: int = 5,
 ) -> dict[str, Any]:
+    if progress_schema_version not in {1, 2, 3, 4, 5}:
+        raise OperationRecoveryError(
+            "exact drain progress schema version is invalid"
+        )
     if category_override not in {
         None,
         "retry_ceiling",
@@ -923,6 +928,11 @@ def _exact_drain_failure_evidence(
         category = "unclassified_empty"
     else:
         category = "operation_error"
+    if progress_schema_version != 5 and category in {
+        "upstream_timeout",
+        "database_statement_timeout",
+    }:
+        category = "operation_error"
     return {
         "category": category,
         "retryable": retryable,
@@ -933,6 +943,8 @@ def _exact_drain_failure_evidence(
 
 def exact_drain_worker_failure_evidence(
     error: BaseException,
+    *,
+    progress_schema_version: int = 5,
 ) -> dict[str, Any]:
     """Return a closed retry projection for a worker-level failure."""
     if not isinstance(error, BaseException):
@@ -966,17 +978,20 @@ def exact_drain_worker_failure_evidence(
         evidence = _exact_drain_failure_evidence(
             message,
             retryable=False,
+            progress_schema_version=progress_schema_version,
         )
     elif _exact_drain_worker_initialization_timed_out(error, message):
         evidence = _exact_drain_failure_evidence(
             typed_message,
             retryable=False,
+            progress_schema_version=progress_schema_version,
         )
         evidence["category"] = "worker_initialization_timeout"
     else:
         evidence = _exact_drain_failure_evidence(
             typed_message,
             retryable=False,
+            progress_schema_version=progress_schema_version,
         )
     if evidence["category"] == "phase_one_timeout" and not phase_one_deadline:
         evidence["category"] = "worker_initialization_timeout"
@@ -5380,7 +5395,12 @@ class ExactDrainClaimAdapter:
         ):
             self._progress_recorder.worker_failure(
                 exit_code=exit_code,
-                failure=exact_drain_worker_failure_evidence(error),
+                failure=exact_drain_worker_failure_evidence(
+                    error,
+                    progress_schema_version=self._plan[
+                        "progress_schema_version"
+                    ],
+                ),
             )
 
     def _assert_execution_lease(self) -> float | None:
@@ -5578,6 +5598,9 @@ class ExactDrainClaimAdapter:
                 typed_message,
                 retryable=retryable,
                 category_override=category,
+                progress_schema_version=self._plan[
+                    "progress_schema_version"
+                ],
             ),
         )
 
@@ -5972,6 +5995,9 @@ class ExactDrainClaimAdapter:
                     "operation-recovery exact drain retry ceiling reached",
                     retryable=False,
                     category_override="retry_ceiling",
+                    progress_schema_version=self._plan[
+                        "progress_schema_version"
+                    ],
                 ),
                 checkpoint=_exact_drain_checkpoint_evidence(row),
             )
@@ -6247,6 +6273,9 @@ class ExactDrainClaimAdapter:
                         and self._plan.get("progress_schema_version") != 5
                         else None
                     ),
+                    progress_schema_version=self._plan[
+                        "progress_schema_version"
+                    ],
                 )
             ),
             checkpoint=_exact_drain_checkpoint_evidence(row),
@@ -6413,6 +6442,9 @@ class ExactDrainClaimAdapter:
                 else _exact_drain_failure_evidence(
                     error_message,
                     retryable=False,
+                    progress_schema_version=self._plan[
+                        "progress_schema_version"
+                    ],
                 )
             ),
             checkpoint=_exact_drain_checkpoint_evidence(row),

@@ -2274,6 +2274,126 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             terminal["status_digest"],
         )
 
+    def test_schema_eleven_interrupted_monitor_preserves_dynamic_legacy_projection(self):
+        command = self.controller["operation_recovery_drain_monitor_command"]
+        globals_ = command.__globals__
+        fixtures = recovery_fixtures.OperationRecoveryContractTest()
+        with tempfile.TemporaryDirectory(
+            dir="/private/tmp",
+            prefix="exact-drain-legacy-monitor-",
+        ) as directory:
+            root = Path(directory)
+            now = int(time.time())
+            plan = recovery_fixtures.recovery_contract.create_exact_drain_plan(
+                fixtures.cohort(),
+                fixtures.drain_snapshot(observed_at=now),
+                candidate_release=recovery_fixtures.release_identity(),
+                rollback_backup=recovery_fixtures.drain_backup_evidence(),
+                rollback_backup_path=str(root / "rollback.age"),
+                provider_policy_digest="9" * 64,
+                effective_profile_digest="7" * 64,
+                worker_runtime_digest="8" * 64,
+                authorization_receipt_path=str(root / "authorization.json"),
+                application_receipt_path=str(root / "application.json"),
+                status_artifact_path=str(root / "status.json"),
+                verification_receipt_path=str(root / "verification.json"),
+                created_at=now,
+                schema_version=11,
+            )
+            start_time = self.controller["_process_start_time"](os.getpid())
+            authorization = self.controller[
+                "_operation_recovery_exact_receipt"
+            ](
+                {
+                    "schema_version": 1,
+                    "kind": (
+                        "operation-recovery-exact-drain-authorization-receipt"
+                    ),
+                    "plan_digest": plan["plan_digest"],
+                    "approval_digest": plan["plan_digest"],
+                    "candidate_release": plan["candidate_release"],
+                    "provider_policy_digest": plan[
+                        "provider_policy_digest"
+                    ],
+                    "worker_runtime_digest": plan["worker_runtime_digest"],
+                    "authorized_at": plan["created_at"],
+                }
+            )
+            journal = self.controller["_operation_recovery_exact_receipt"](
+                {
+                    "schema_version": 1,
+                    "kind": (
+                        "operation-recovery-exact-drain-application-journal"
+                    ),
+                    "plan_digest": plan["plan_digest"],
+                    "authorization_receipt_digest": authorization[
+                        "receipt_digest"
+                    ],
+                    "started_at": authorization["authorized_at"],
+                    "worker_pid": os.getpid(),
+                    "worker_start_time": start_time,
+                    "worker_attempt": 1,
+                }
+            )
+            recorder = ExactDrainProgressRecorder(
+                path=Path(plan["progress_artifact_path"]),
+                plan_digest=plan["plan_digest"],
+                worker_pid=os.getpid(),
+                worker_start_time=start_time,
+                worker_attempt=1,
+                selected_operations=plan["selected_operations"],
+                progress_schema_version=4,
+                clock=lambda: 1000.0,
+            )
+            recorder.provider_started(
+                "hatchery",
+                retry_attempt=1,
+                scope="retain_extract_facts",
+            )
+            progress = read_exact_drain_progress(
+                Path(plan["progress_artifact_path"]),
+                plan_digest=plan["plan_digest"],
+                progress_schema_version=4,
+                now=1001.0,
+            )
+            Path(plan["application_receipt_path"]).touch()
+            documents = {
+                str(root / "plan.json"): plan,
+                plan["authorization_receipt_path"]: authorization,
+                plan["application_receipt_path"]: journal,
+            }
+            freeze_arguments = []
+            captured = {}
+
+            def read_progress(_plan, *, freeze_ages_at_observed_at=False):
+                freeze_arguments.append(freeze_ages_at_observed_at)
+                return progress
+
+            replacements = {
+                "_operation_recovery_candidate": lambda _args: plan[
+                    "candidate_release"
+                ],
+                "_operation_recovery_read_private_json": (
+                    lambda path, _label: documents[str(path)]
+                ),
+                "_operation_recovery_read_monitor_progress": read_progress,
+                "_operation_recovery_exact_journal_worker_active": (
+                    lambda _journal: False
+                ),
+                "_print_result": lambda value: captured.update(value) or 0,
+            }
+            originals = {key: globals_[key] for key in replacements}
+            globals_.update(replacements)
+            try:
+                result = command(SimpleNamespace(plan=str(root / "plan.json")))
+            finally:
+                globals_.update(originals)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(captured["status"], "interrupted")
+        self.assertEqual(freeze_arguments, [False])
+        self.assertNotIn("stale", captured["active_provider_requests"][0])
+
     def test_exact_drain_monitor_reports_not_started_without_run_artifacts(self):
         command = self.controller["operation_recovery_drain_monitor_command"]
         globals_ = command.__globals__

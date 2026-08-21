@@ -5673,8 +5673,9 @@ def verify_exact_drain_status(
     plan: Mapping[str, Any],
 ) -> Mapping[str, Any]:
     verified_plan = verify_exact_drain_plan(plan, allow_expired=True)
-    status_schema_version = (
-        value.get("schema_version") if isinstance(value, Mapping) else None
+    status_schema_version = _integer(
+        value.get("schema_version") if isinstance(value, Mapping) else None,
+        "exact drain status schema version",
     )
     keys = frozenset(
         {

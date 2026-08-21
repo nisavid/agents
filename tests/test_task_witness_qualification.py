@@ -1067,8 +1067,8 @@ class TaskWitnessQualificationTests(unittest.TestCase):
             value["detail_stdout_sha256"],
             hashlib.sha256(b"outchild-outnative-out").hexdigest(),
         )
-        self.assertEqual(value["detail_stderr_length"], 12)
         self.assertEqual(captured["stderr"], b"errchild-err")
+        self.assertEqual(value["detail_stderr_length"], 12)
         self.assertEqual(
             value["detail_stderr_sha256"],
             hashlib.sha256(b"errchild-err").hexdigest(),

@@ -87,6 +87,35 @@ WINDOWS_MUTATION_RIGHTS = (
     "WriteAttributes",
     *WINDOWS_REPLACEMENT_RIGHTS,
 )
+WINDOWS_TRUSTED_SIDS = frozenset(
+    {
+        "S-1-5-18",  # LocalSystem
+        "S-1-5-32-544",  # BUILTIN\Administrators
+        # NT SERVICE\TrustedInstaller
+        "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464",
+    }
+)
+WINDOWS_ACCESS_ALLOWED_ACE_TYPE = 0
+WINDOWS_ACCESS_ALLOWED_COMPOUND_ACE_TYPE = 4
+WINDOWS_ACCESS_ALLOWED_OBJECT_ACE_TYPE = 5
+WINDOWS_ACCESS_ALLOWED_CALLBACK_ACE_TYPE = 9
+WINDOWS_ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE = 11
+WINDOWS_ACCESS_ALLOWED_ACE_TYPES = frozenset(
+    {
+        WINDOWS_ACCESS_ALLOWED_ACE_TYPE,
+        WINDOWS_ACCESS_ALLOWED_COMPOUND_ACE_TYPE,
+        WINDOWS_ACCESS_ALLOWED_OBJECT_ACE_TYPE,
+        WINDOWS_ACCESS_ALLOWED_CALLBACK_ACE_TYPE,
+        WINDOWS_ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE,
+    }
+)
+WINDOWS_NON_ALLOW_ACE_TYPES = frozenset(
+    {1, 2, 3, 6, 7, 8, 10, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21}
+)
+WINDOWS_INHERIT_ONLY_ACE = 0x08
+WINDOWS_WRITE_DATA = 0x00000002
+WINDOWS_REPLACEMENT_MASK = 0x000D0040
+WINDOWS_MUTATION_MASK = 0x000D0156
 TRUSTED_HELPER_PATH_RE = re.compile(r"^/[A-Za-z0-9_./+:-]+$")
 TRUSTED_WINDOWS_BUNDLE_PATH_RE = re.compile(
     r"^(?:[A-Za-z]:[\\/]|/)[A-Za-z0-9_./\\+(): -]*$"
@@ -286,41 +315,150 @@ def _trusted_windows_bundled_executable(
     return str(resolved)
 
 
-def _run_windows_acl_probe(
-    powershell: Path,
-    windows_directory: Path,
-    requests: tuple[tuple[Path, bool], ...],
-    script: str,
-) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        [
-            str(powershell),
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            script,
-        ],
-        env={
-            "PATH": str(powershell.parent),
-            "SYSTEMROOT": str(windows_directory),
-            "VERSIONKEEPING_ACL_REQUESTS": json.dumps(
-                [
-                    {
-                        "path": str(path),
-                        "replacement_only": replacement_only,
-                    }
-                    for path, replacement_only in requests
-                ],
-                separators=(",", ":"),
-            ),
-            "WINDIR": str(windows_directory),
-        },
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        timeout=20,
+def _windows_sid_string(
+    advapi32: Any,
+    kernel32: Any,
+    sid: Any,
+) -> str:
+    import ctypes
+
+    rendered = ctypes.c_void_p()
+    if not advapi32.ConvertSidToStringSidW(sid, ctypes.byref(rendered)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        return ctypes.wstring_at(rendered.value)
+    finally:
+        kernel32.LocalFree(rendered)
+
+
+def _windows_acl_snapshot(
+    path: Path,
+) -> tuple[str, tuple[tuple[int, int, int, str], ...]]:
+    import ctypes
+    from ctypes import wintypes
+
+    class _Acl(ctypes.Structure):
+        _fields_ = (
+            ("AclRevision", wintypes.BYTE),
+            ("Sbz1", wintypes.BYTE),
+            ("AclSize", wintypes.WORD),
+            ("AceCount", wintypes.WORD),
+            ("Sbz2", wintypes.WORD),
+        )
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    pointer = ctypes.POINTER(ctypes.c_void_p)
+    advapi32.GetNamedSecurityInfoW.argtypes = (
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        pointer,
+        pointer,
+        pointer,
+        pointer,
+        pointer,
     )
+    advapi32.GetNamedSecurityInfoW.restype = wintypes.DWORD
+    advapi32.GetAce.argtypes = (
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        pointer,
+    )
+    advapi32.GetAce.restype = wintypes.BOOL
+    advapi32.ConvertSidToStringSidW.argtypes = (ctypes.c_void_p, pointer)
+    advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = (ctypes.c_void_p,)
+    kernel32.LocalFree.restype = ctypes.c_void_p
+
+    owner = ctypes.c_void_p()
+    dacl = ctypes.c_void_p()
+    descriptor = ctypes.c_void_p()
+    status = advapi32.GetNamedSecurityInfoW(
+        str(path),
+        1,  # SE_FILE_OBJECT
+        0x00000001 | 0x00000004,  # OWNER and DACL security information
+        ctypes.byref(owner),
+        None,
+        ctypes.byref(dacl),
+        None,
+        ctypes.byref(descriptor),
+    )
+    if status != 0:
+        raise ctypes.WinError(status)
+    try:
+        if owner.value is None or dacl.value is None:
+            raise OSError("Windows path has an unbounded security descriptor")
+        owner_sid = _windows_sid_string(advapi32, kernel32, owner)
+        acl = ctypes.cast(dacl, ctypes.POINTER(_Acl)).contents
+        aces = []
+        for index in range(acl.AceCount):
+            ace = ctypes.c_void_p()
+            if not advapi32.GetAce(dacl, index, ctypes.byref(ace)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            header = ctypes.string_at(ace, 4)
+            ace_type = header[0]
+            ace_flags = header[1]
+            ace_size = int.from_bytes(header[2:4], "little")
+            if ace_size < 8:
+                raise OSError("Windows path ACL contains a malformed ACE")
+            if ace_type in WINDOWS_NON_ALLOW_ACE_TYPES:
+                continue
+            if ace_type not in WINDOWS_ACCESS_ALLOWED_ACE_TYPES:
+                raise OSError("Windows path ACL contains an unknown ACE")
+            raw = ctypes.string_at(ace, ace_size)
+            access_mask = int.from_bytes(raw[4:8], "little")
+            if ace_type in {
+                WINDOWS_ACCESS_ALLOWED_ACE_TYPE,
+                WINDOWS_ACCESS_ALLOWED_CALLBACK_ACE_TYPE,
+            }:
+                sid_offset = 8
+            elif ace_type == WINDOWS_ACCESS_ALLOWED_COMPOUND_ACE_TYPE:
+                sid_offset = 12
+            else:
+                if ace_size < 12:
+                    raise OSError("Windows path ACL contains a malformed ACE")
+                object_flags = int.from_bytes(raw[8:12], "little")
+                sid_offset = 12
+                if object_flags & 0x1:  # ACE_OBJECT_TYPE_PRESENT
+                    sid_offset += 16
+                if object_flags & 0x2:  # ACE_INHERITED_OBJECT_TYPE_PRESENT
+                    sid_offset += 16
+            if sid_offset >= ace_size:
+                raise OSError("Windows path ACL contains a malformed ACE")
+            sid = ctypes.c_void_p(ace.value + sid_offset)
+            aces.append(
+                (
+                    ace_type,
+                    ace_flags,
+                    access_mask,
+                    _windows_sid_string(advapi32, kernel32, sid),
+                )
+            )
+        return owner_sid, tuple(aces)
+    finally:
+        if descriptor.value is not None:
+            kernel32.LocalFree(descriptor)
+
+
+def _require_windows_acl_trust(
+    owner_sid: str,
+    aces: Sequence[tuple[int, int, int, str]],
+    *,
+    replacement_only: bool,
+) -> None:
+    if owner_sid not in WINDOWS_TRUSTED_SIDS:
+        raise OSError("Windows path ACL owner is mutable")
+    mutation_mask = (
+        WINDOWS_REPLACEMENT_MASK if replacement_only else WINDOWS_MUTATION_MASK
+    )
+    for ace_type, ace_flags, access_mask, sid in aces:
+        if ace_type not in WINDOWS_ACCESS_ALLOWED_ACE_TYPES:
+            raise OSError("Windows path ACL contains an unknown allow ACE")
+        if ace_flags & WINDOWS_INHERIT_ONLY_ACE:
+            continue
+        if access_mask & mutation_mask and sid not in WINDOWS_TRUSTED_SIDS:
+            raise OSError("Windows path ACL grants mutation rights")
 
 
 def _windows_paths_have_protected_acls(
@@ -346,74 +484,14 @@ def _windows_paths_have_protected_acls(
             for path, _replacement_only in closed_requests
         ):
             raise OSError("Windows ACL request is not closed")
-        import ctypes
-
-        buffer = ctypes.create_unicode_buffer(32768)
-        length = ctypes.windll.kernel32.GetWindowsDirectoryW(buffer, len(buffer))
-        if length == 0 or length >= len(buffer):
-            raise OSError("Windows directory is unavailable")
-        windows_directory = Path(buffer.value)
-        powershell = (
-            windows_directory
-            / "System32"
-            / "WindowsPowerShell"
-            / "v1.0"
-            / "powershell.exe"
-        )
-        if (
-            TRUSTED_WINDOWS_BUNDLE_PATH_RE.fullmatch(str(powershell)) is None
-            or powershell.resolve(strict=True) != powershell.absolute()
-            or not powershell.is_file()
-        ):
-            raise OSError("trusted PowerShell is unavailable")
-        replacement_rights = " -bor ".join(
-            "[System.Security.AccessControl.FileSystemRights]::" + right
-            for right in WINDOWS_REPLACEMENT_RIGHTS
-        )
-        mutation_rights = " -bor ".join(
-            "[System.Security.AccessControl.FileSystemRights]::" + right
-            for right in WINDOWS_MUTATION_RIGHTS
-        )
-        script = (
-            "$ErrorActionPreference='Stop';trap { exit 12 };"
-            "$trusted=@('S-1-5-18','S-1-5-32-544',"
-            "'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464');"
-            f"$replacement={replacement_rights};"
-            f"$mutation={mutation_rights};"
-            "$requests=ConvertFrom-Json -InputObject "
-            "$env:VERSIONKEEPING_ACL_REQUESTS;"
-            "foreach($request in @($requests)){"
-            "$acl=Get-Acl -LiteralPath ([string]$request.path);"
-            "$owner=$acl.GetOwner("
-            "[System.Security.Principal.SecurityIdentifier]).Value;"
-            "if($trusted -notcontains $owner){exit 10};"
-            "$write=$mutation;"
-            "if([bool]$request.replacement_only){$write=$replacement};"
-            "$rules=$acl.GetAccessRules($true,$true,"
-            "[System.Security.Principal.SecurityIdentifier]);"
-            "foreach($ace in $rules){"
-            "if($ace.AccessControlType -ne 'Allow'){continue};"
-            "if(($ace.PropagationFlags -band "
-            "[System.Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0)"
-            "{continue};"
-            "if(($ace.FileSystemRights -band $write) -eq 0){continue};"
-            "$sid=$ace.IdentityReference.Value;"
-            "if($trusted -notcontains $sid){exit 11}"
-            "}};exit 0"
-        )
-        completed = _run_windows_acl_probe(
-            powershell,
-            windows_directory,
-            closed_requests,
-            script,
-        )
-        if completed.returncode == 10:
-            raise OSError("Windows path ACL owner is mutable")
-        if completed.returncode == 11:
-            raise OSError("Windows path ACL grants mutation rights")
-        if completed.returncode != 0:
-            raise OSError("Windows path ACL probe failed")
-    except (OSError, subprocess.TimeoutExpired) as error:
+        for path, replacement_only in closed_requests:
+            owner_sid, aces = _windows_acl_snapshot(path)
+            _require_windows_acl_trust(
+                owner_sid,
+                aces,
+                replacement_only=replacement_only,
+            )
+    except OSError as error:
         raise OSError("Windows path ACL is not trusted") from error
 
 

@@ -67,8 +67,6 @@ GIT_SUBPROCESS_ENV_ALLOWLIST = {
     "HTTP_PROXY",
     "LOGNAME",
     "NO_PROXY",
-    "SSL_CERT_DIR",
-    "SSL_CERT_FILE",
     "SSH_AUTH_SOCK",
     "SYSTEMROOT",
     "TEMP",
@@ -82,71 +80,60 @@ GIT_SUBPROCESS_ENV_ALLOWLIST = {
 }
 
 
+def _trusted_root_owned_executable(
+    path: Path,
+    *,
+    allowed_path: re.Pattern[str] | None = None,
+    reject_set_id: bool = False,
+) -> str:
+    if allowed_path is not None and allowed_path.fullmatch(str(path)) is None:
+        raise OSError("executable path is not closed")
+    resolved = path.resolve(strict=True)
+    if resolved != path:
+        raise OSError("executable path is redirected")
+    for parent in resolved.parents:
+        metadata = parent.lstat()
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != 0
+            or stat.S_IMODE(metadata.st_mode) & 0o022
+        ):
+            raise OSError("executable ancestry is mutable")
+    metadata = resolved.lstat()
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != 0
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+        or stat.S_IMODE(metadata.st_mode) & 0o111 == 0
+        or reject_set_id and metadata.st_mode & (stat.S_ISUID | stat.S_ISGID)
+    ):
+        raise OSError("executable file is not trusted")
+    return str(resolved)
+
+
 def _trusted_system_executable(name: str) -> str:
-    path = TRUSTED_SYSTEM_EXECUTABLES[name]
     try:
-        resolved = path.resolve(strict=True)
-        if resolved != path:
-            raise OSError("system executable is redirected")
-        for parent in (Path("/"), Path("/usr"), Path("/usr/bin")):
-            metadata = parent.lstat()
-            if (
-                not stat.S_ISDIR(metadata.st_mode)
-                or metadata.st_uid != 0
-                or stat.S_IMODE(metadata.st_mode) & 0o022
-            ):
-                raise OSError("system executable ancestry is mutable")
-        metadata = resolved.lstat()
+        return _trusted_root_owned_executable(TRUSTED_SYSTEM_EXECUTABLES[name])
     except OSError as error:
         raise PolicyGate(
             f"TRUSTED_{name.upper()}_EXECUTABLE_UNAVAILABLE"
         ) from error
-    if (
-        not stat.S_ISREG(metadata.st_mode)
-        or metadata.st_uid != 0
-        or stat.S_IMODE(metadata.st_mode) & 0o022
-        or stat.S_IMODE(metadata.st_mode) & 0o111 == 0
-    ):
-        raise PolicyGate(f"TRUSTED_{name.upper()}_EXECUTABLE_UNAVAILABLE")
-    return str(resolved)
 
 
 def _require_trusted_credential_helper(path: Path) -> str:
     try:
-        if (
-            not path.is_absolute()
-            or TRUSTED_HELPER_PATH_RE.fullmatch(str(path)) is None
-        ):
-            raise OSError("credential helper path is not closed")
-        resolved = path.resolve(strict=True)
-        if resolved != path:
-            raise OSError("credential helper path is redirected")
-        metadata = resolved.lstat()
-        for parent in resolved.parents:
-            parent_metadata = parent.lstat()
-            if (
-                not stat.S_ISDIR(parent_metadata.st_mode)
-                or parent_metadata.st_uid != 0
-                or stat.S_IMODE(parent_metadata.st_mode) & 0o022
-            ):
-                raise OSError("credential helper ancestry is mutable")
+        if not path.is_absolute():
+            raise OSError("credential helper path is not absolute")
+        return _trusted_root_owned_executable(
+            path,
+            allowed_path=TRUSTED_HELPER_PATH_RE,
+            reject_set_id=True,
+        )
     except OSError as error:
         raise PolicyGate(
             "HTTPS_CREDENTIAL_PROVIDER_UNAVAILABLE",
             provider="macos-osxkeychain",
         ) from error
-    if (
-        not stat.S_ISREG(metadata.st_mode)
-        or metadata.st_uid != 0
-        or stat.S_IMODE(metadata.st_mode) & 0o022
-        or stat.S_IMODE(metadata.st_mode) & 0o111 == 0
-        or metadata.st_mode & (stat.S_ISUID | stat.S_ISGID)
-    ):
-        raise PolicyGate(
-            "HTTPS_CREDENTIAL_PROVIDER_UNAVAILABLE",
-            provider="macos-osxkeychain",
-        )
-    return str(resolved)
 
 
 def _unsafe_git_config_class(key: str) -> str | None:
@@ -179,6 +166,18 @@ def _unsafe_git_config_class(key: str) -> str | None:
         return "gpg.*.program"
     if re.fullmatch(r"credential(?:\..+)?\.helper", normalized):
         return "credential.*.helper"
+    if re.fullmatch(
+        r"http(?:\..+)?\.ssl(?:verify|cainfo|capath)",
+        normalized,
+    ):
+        return "http.*.ssl*"
+    if re.fullmatch(
+        r"http(?:\..+)?\."
+        r"(?:extraheader|cookiefile|emptyauth|delegation|"
+        r"sslcert|sslkey|sslcertpasswordprotected)",
+        normalized,
+    ):
+        return "http.*.credentialSource"
     if re.fullmatch(r"diff\..+\.(?:command|textconv)", normalized):
         return "diff.*.(command|textconv)"
     if re.fullmatch(r"difftool\..+\.cmd", normalized):

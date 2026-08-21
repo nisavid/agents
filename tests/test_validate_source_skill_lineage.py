@@ -3774,6 +3774,7 @@ class RefreshSourceSkillLineageTests(unittest.TestCase):
                 "-c",
                 "user.email=lineage@example.invalid",
                 "commit",
+                "--allow-empty",
                 "--quiet",
                 "-m",
                 "test: bind receipt fixture",
@@ -13559,35 +13560,7 @@ module.write(repository)
 
     def test_external_receipt_is_create_new_and_binds_committed_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
-            clone = self.clone_refresh_fixture(temporary_directory, include_tests=True)
-            subprocess.run(
-                [
-                    "/usr/bin/git",
-                    "add",
-                    "--",
-                    str(LINEAGE_ROOT),
-                    str(RESEARCH_REPORT),
-                    "scripts",
-                    "tests",
-                ],
-                cwd=clone,
-                check=True,
-            )
-            subprocess.run(
-                [
-                    "/usr/bin/git",
-                    "-c",
-                    "user.name=Lineage Test",
-                    "-c",
-                    "user.email=lineage@example.invalid",
-                    "commit",
-                    "--quiet",
-                    "-m",
-                    "test: bind lineage artifacts",
-                ],
-                cwd=clone,
-                check=True,
-            )
+            clone = self.committed_receipt_fixture(temporary_directory)
             output = self.stable_receipt_output("bound-artifacts")
             command = [
                 sys.executable,
@@ -15360,35 +15333,7 @@ module.write(repository)
 
     def test_receipt_summary_uses_the_same_committed_artifact_generation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
-            clone = self.clone_refresh_fixture(temporary_directory, include_tests=True)
-            subprocess.run(
-                [
-                    "/usr/bin/git",
-                    "add",
-                    "--",
-                    str(LINEAGE_ROOT),
-                    str(RESEARCH_REPORT),
-                    "scripts",
-                    "tests",
-                ],
-                cwd=clone,
-                check=True,
-            )
-            subprocess.run(
-                [
-                    "/usr/bin/git",
-                    "-c",
-                    "user.name=Lineage Test",
-                    "-c",
-                    "user.email=lineage@example.invalid",
-                    "commit",
-                    "--quiet",
-                    "-m",
-                    "test: bind lineage artifacts",
-                ],
-                cwd=clone,
-                check=True,
-            )
+            clone = self.committed_receipt_fixture(temporary_directory)
             output = self.stable_receipt_output("generation-bound")
             with mock.patch.object(
                 self.refresher.lineage,
@@ -15781,35 +15726,7 @@ module.write(repository)
 
     def test_receipt_ignores_git_replacement_objects(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
-            clone = self.clone_refresh_fixture(temporary_directory, include_tests=True)
-            subprocess.run(
-                [
-                    "/usr/bin/git",
-                    "add",
-                    "--",
-                    str(LINEAGE_ROOT),
-                    str(RESEARCH_REPORT),
-                    "scripts",
-                    "tests",
-                ],
-                cwd=clone,
-                check=True,
-            )
-            subprocess.run(
-                [
-                    "/usr/bin/git",
-                    "-c",
-                    "user.name=Lineage Test",
-                    "-c",
-                    "user.email=lineage@example.invalid",
-                    "commit",
-                    "--quiet",
-                    "-m",
-                    "test: bind replacement-object receipt fixture",
-                ],
-                cwd=clone,
-                check=True,
-            )
+            clone = self.committed_receipt_fixture(temporary_directory)
             validator_path = clone / "scripts/validate_source_skill_lineage.py"
             validator_raw = validator_path.read_bytes()
             original_blob = subprocess.run(
@@ -16012,35 +15929,7 @@ module.write(repository)
 
     def test_receipt_rejects_open_parent_relocated_inside_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
-            clone = self.clone_refresh_fixture(temporary_directory, include_tests=True)
-            subprocess.run(
-                [
-                    "/usr/bin/git",
-                    "add",
-                    "--",
-                    str(LINEAGE_ROOT),
-                    str(RESEARCH_REPORT),
-                    "scripts",
-                    "tests",
-                ],
-                cwd=clone,
-                check=True,
-            )
-            subprocess.run(
-                [
-                    "/usr/bin/git",
-                    "-c",
-                    "user.name=Lineage Test",
-                    "-c",
-                    "user.email=lineage@example.invalid",
-                    "commit",
-                    "--quiet",
-                    "-m",
-                    "test: bind lineage artifacts",
-                ],
-                cwd=clone,
-                check=True,
-            )
+            clone = self.committed_receipt_fixture(temporary_directory)
             linked = Path(temporary_directory) / "linked"
             subprocess.run(
                 [
@@ -16115,35 +16004,7 @@ module.write(repository)
 
     def test_receipt_publication_and_cleanup_stay_bound_to_open_parent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
-            clone = self.clone_refresh_fixture(temporary_directory, include_tests=True)
-            subprocess.run(
-                [
-                    "/usr/bin/git",
-                    "add",
-                    "--",
-                    str(LINEAGE_ROOT),
-                    str(RESEARCH_REPORT),
-                    "scripts",
-                    "tests",
-                ],
-                cwd=clone,
-                check=True,
-            )
-            subprocess.run(
-                [
-                    "/usr/bin/git",
-                    "-c",
-                    "user.name=Lineage Test",
-                    "-c",
-                    "user.email=lineage@example.invalid",
-                    "commit",
-                    "--quiet",
-                    "-m",
-                    "test: bind lineage artifacts",
-                ],
-                cwd=clone,
-                check=True,
-            )
+            clone = self.committed_receipt_fixture(temporary_directory)
 
             output = self.stable_receipt_output("descriptor-bound")
             stable_parent = output.parent.resolve(strict=True)
@@ -16276,35 +16137,7 @@ module.write(repository)
 
     def test_receipt_derives_tree_from_commit_and_rejects_head_drift(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
-            clone = self.clone_refresh_fixture(temporary_directory, include_tests=True)
-            subprocess.run(
-                [
-                    "/usr/bin/git",
-                    "add",
-                    "--",
-                    str(LINEAGE_ROOT),
-                    str(RESEARCH_REPORT),
-                    "scripts",
-                    "tests",
-                ],
-                cwd=clone,
-                check=True,
-            )
-            subprocess.run(
-                [
-                    "/usr/bin/git",
-                    "-c",
-                    "user.name=Lineage Test",
-                    "-c",
-                    "user.email=lineage@example.invalid",
-                    "commit",
-                    "--quiet",
-                    "-m",
-                    "test: bind lineage artifacts",
-                ],
-                cwd=clone,
-                check=True,
-            )
+            clone = self.committed_receipt_fixture(temporary_directory)
             commit = subprocess.run(
                 ["/usr/bin/git", "rev-parse", "HEAD"],
                 cwd=clone,

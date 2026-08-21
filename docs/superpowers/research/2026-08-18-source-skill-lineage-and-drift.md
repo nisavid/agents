@@ -6,11 +6,14 @@ Research date: 2026-08-18
 
 ## Boundary
 
-The inspected release candidate is commit
+The refreshed release-candidate boundary is commit
+[`8ec465ea915c6759a3693ac8515f0ee3901b8a4f`](https://github.com/nisavid/agents/commit/8ec465ea915c6759a3693ac8515f0ee3901b8a4f),
+tree `acd75254067861dc33ef4a754734138ae3c37af3`. The research began from the
+older candidate snapshot
 [`b47f03519068b858cf0c070b5d331ee053ef6b7b`](https://github.com/nisavid/agents/commit/b47f03519068b858cf0c070b5d331ee053ef6b7b),
-tree `b626f958d4d88c3de75ead85748e62eea5ad482b`. It remains provisional:
-the coordinated-release map requires a final source refresh before qualification
-and invalidates dependent evidence when reconciliation changes candidate bytes
+tree `b626f958d4d88c3de75ead85748e62eea5ad482b`; it is historical evidence, not
+the current candidate identity. The coordinated-release map still invalidates
+dependent evidence when reconciliation changes candidate bytes
 ([#41](https://github.com/nisavid/agents/issues/41)).
 
 This report distinguishes:
@@ -43,14 +46,14 @@ available through the public repository API. Commit
 imports the reviewed successor into the current candidate lineage, but does not
 name an immutable external source revision for the imported bytes.
 
-| Distribution | Predecessor subtree | Imported subtree at `ddd07d7d` | Candidate subtree at `b47f0351` | Recorded drift after import |
-| --- | --- | --- | --- | --- |
-| Rolecasting | `993557c22d72cfaa54c543f4dcee323e2517ba8e` | `d4cdbaee1642cc0c388e49410e5332e3a74be1d1` | `d4cdbaee1642cc0c388e49410e5332e3a74be1d1` | None in the package subtree |
-| Tricritical | `d1e5482fac3a17bffc9c4d20c4c3ad047ecc5b16` | `1b09c3a5b5a5c46b52c59e3328275c5615c54573` | `db58756a31a98fc8be81a226230a1eb9cef02df6` | Shared skill resources projected at `256c55df` |
-| Versionkeeping | `5674ccdad4ed56165bea349d3e2151172d1f8741` | `0c6e2c27dcc4d7dabb78e2a756ff5bc4d9f1dfe7` | `f95e14a276c6586874ba48c91ccc9fd34f62d924` | Default-branch push gate at `b318173d` |
-| Mergecraft | `2f905f0d9544d29811ab8951d935a8ce7d10d277` | `5c0eeaeba279764a9e3bbe165deb45c00eebde7b` | `16051c291e314a69bc34cfbcdd48de98aceb2355` | Secret redaction and CodeQL fixes at `aa247b4e` and `07238215` |
-| Artifact Customs | `1df6df911ee3744e498db4144b67408bd929f5af` | `f874b4d7ee36c49ac09098fcacf7fa9c2601d1e4` | `f874b4d7ee36c49ac09098fcacf7fa9c2601d1e4` | None in the package subtree |
-| Task Witness | absent | `eac00106ab6a1b3ae6a1bbffd5e7904083d5199b` | `eac00106ab6a1b3ae6a1bbffd5e7904083d5199b` | Qualification support changed outside the package subtree |
+| Distribution | Predecessor subtree | Imported subtree at `ddd07d7d` | Research snapshot at `b47f0351` | Refreshed candidate at `8ec465ea` | Recorded drift through the refreshed candidate |
+| --- | --- | --- | --- | --- | --- |
+| Rolecasting | `993557c22d72cfaa54c543f4dcee323e2517ba8e` | `d4cdbaee1642cc0c388e49410e5332e3a74be1d1` | `d4cdbaee1642cc0c388e49410e5332e3a74be1d1` | `d4cdbaee1642cc0c388e49410e5332e3a74be1d1` | None in the package subtree |
+| Tricritical | `d1e5482fac3a17bffc9c4d20c4c3ad047ecc5b16` | `1b09c3a5b5a5c46b52c59e3328275c5615c54573` | `db58756a31a98fc8be81a226230a1eb9cef02df6` | `db58756a31a98fc8be81a226230a1eb9cef02df6` | Shared skill resources were projected after import |
+| Versionkeeping | `5674ccdad4ed56165bea349d3e2151172d1f8741` | `0c6e2c27dcc4d7dabb78e2a756ff5bc4d9f1dfe7` | `f95e14a276c6586874ba48c91ccc9fd34f62d924` | `c46a89caa6a6bc842fe69eb2ff0037df1d75832c` | Publication safety and closed Git-operation ownership changed after the baseline |
+| Mergecraft | `2f905f0d9544d29811ab8951d935a8ce7d10d277` | `5c0eeaeba279764a9e3bbe165deb45c00eebde7b` | `16051c291e314a69bc34cfbcdd48de98aceb2355` | `82ef6a75c03d2794ea6c792dc348903a9ddfe51c` | Publication, review, identity, and evidence boundaries changed after the baseline |
+| Artifact Customs | `1df6df911ee3744e498db4144b67408bd929f5af` | `f874b4d7ee36c49ac09098fcacf7fa9c2601d1e4` | `f874b4d7ee36c49ac09098fcacf7fa9c2601d1e4` | `f874b4d7ee36c49ac09098fcacf7fa9c2601d1e4` | None in the package subtree |
+| Task Witness | absent | `eac00106ab6a1b3ae6a1bbffd5e7904083d5199b` | `eac00106ab6a1b3ae6a1bbffd5e7904083d5199b` | `4ce4650fe524dfa817e715715bd7528639e0de04` | Qualification, capture, and deployment-control behavior changed after the initial implementation |
 
 The five predecessor-to-import deltas are material: 27 Rolecasting files, 12
 Tricritical files, 5 Versionkeeping files, 14 Mergecraft files, and 16 Artifact
@@ -377,9 +380,11 @@ private evidence by opaque authority ID and digest only.
    and manager state privately. Capture active discovery precedence separately
    from mere file presence.
 6. Repeat source-ref resolution, source manifests, candidate identities, and
-   installed-host manifests after the first pass. Accept the snapshot only if
-   both passes agree byte-for-byte on membership and content and the host
-   manager state did not change.
+   installed-host route manifests after the first pass. Accept the public route
+   snapshot only if both passes agree byte-for-byte on membership and content.
+   `capture-host` does not observe or attest private manager-registry state;
+   binding that state to the two passes is deferred to issue
+   [#53](https://github.com/nisavid/agents/issues/53).
 7. Validate that every ledger source points to an immutable source manifest,
    every installed observation points to one host manifest and exhaustively
    partitions its registry IDs into observed and unobserved membership, every
@@ -398,6 +403,7 @@ repository-relative source root, including `.`. `capture-host` accepts a
 private path map and a profile-bound discovery-precedence reason, reads every
 selected skill route twice, preserves canonical skill IDs, and emits only the
 pathless installed-host document and canonical public precedence template.
+It does not assert that private manager-registry or lock state stayed stable.
 Validation requires each route's IDs to belong to its source, requires every
 installed source's registry skill IDs to be explicitly observed or unobserved,
 and keeps route presence distinct from active discovery precedence. `write`

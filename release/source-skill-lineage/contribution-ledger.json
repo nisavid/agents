@@ -1,5 +1,5 @@
 {
-  "content_sha256": "sha256:518ea08bc5d627fdd3cd3894fb173e3d30201d681aad257ba6c595a431302242",
+  "content_sha256": "sha256:b58ffe17e1125a3c7e632d41607ce76cf6e1ae99a8d2772c15931b0e1c6bbe76",
   "contract": "coordinated-source-skill-contribution-ledger-v1",
   "contributions": [
     {
@@ -620,6 +620,6 @@
   "schema_version": 1,
   "source_manifest": {
     "path": "release/source-skill-lineage/source-manifest.json",
-    "sha256": "sha256:ff5811c43234416571b8ba27ab89c73f589f0c3865f9be68210841723e859503"
+    "sha256": "sha256:964a37115670c65ac3453663347b9c97336f736b5923d2c4056424f1f04785c0"
   }
 }

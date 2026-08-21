@@ -71,7 +71,7 @@ RESEARCH_REPORT = Path(
     "docs/superpowers/research/2026-08-18-source-skill-lineage-and-drift.md"
 )
 RESEARCH_REPORT_SHA256 = (
-    "sha256:ad78e315fa54ccac4278b41327f779fd3346ffac80a7d87a6220099400c816f6"
+    "sha256:b4b9e359a084a2b75c84804c91586c544df187b750be86393a4dc181505127ea"
 )
 LINEAGE_TREE = {
     LINEAGE_ROOT / "installed-hosts",
@@ -187,7 +187,7 @@ SOURCE_FAMILIES = (
     "superpowers",
 )
 SOURCE_EVIDENCE_INVENTORY_SHA256 = (
-    "sha256:cd5914580ddc126d39be684f0c0e60c73755233f417496f988d34d8eff4e225b"
+    "sha256:648c043304b03df238a9c89b15e2eb89197bea37ebceb3e9c9821f123fe1ae93"
 )
 CONTRIBUTION_EVIDENCE_INVENTORY_SHA256 = (
     "sha256:39f38d726521bb242e7694f18c74432998f2c2670241e7b4e3d1fbb13b2182f1"
@@ -1844,6 +1844,21 @@ def _validate_research_report_bytes(raw: bytes) -> bytes:
         "sha256:" + hashlib.sha256(raw).hexdigest() == RESEARCH_REPORT_SHA256,
         "source-lineage research report evidence drift",
     )
+    candidate_marker = (
+        "The refreshed release-candidate boundary is commit\n"
+        f"[`{CANDIDATE_COMMIT_SHA1}`]"
+        f"(https://github.com/nisavid/agents/commit/{CANDIDATE_COMMIT_SHA1}),\n"
+        f"tree `{CANDIDATE_TREE_SHA1}`."
+    )
+    require(
+        candidate_marker in report
+        and f"| Refreshed candidate at `{CANDIDATE_COMMIT_SHA1[:8]}` |" in report
+        and all(
+            f"`{tree_sha1}`" in report
+            for tree_sha1 in CANDIDATE_PACKAGE_GIT_TREES.values()
+        ),
+        "source-lineage research report candidate boundary drift",
+    )
     return raw
 
 
@@ -2265,6 +2280,30 @@ def validate_source_manifest(
     validated = {
         item["id"]: _validate_source(item, SOURCE_FAMILIES) for item in sources
     }
+    candidate_commit = value["candidate"]["basis"]["commit_sha1"]
+    candidate_packages = {
+        package["id"]: package for package in value["candidate"]["packages"]
+    }
+    for distribution_id in DISTRIBUTIONS:
+        source = validated[f"ivan-{distribution_id}"]
+        package = candidate_packages[distribution_id]
+        current = source["current"]
+        require(
+            source["authority"]
+            == {
+                "kind": "git",
+                "refresh_ref": candidate_commit,
+                "repository_url": "https://github.com/nisavid/agents",
+                "skill_root": package["plugin_root"],
+            }
+            and current["status"] == "resolved"
+            and current["commit_sha1"] == candidate_commit
+            and current["tree_sha1"] == package["git_tree_sha1"]
+            and current["skill_tree_sha256"] == package["package_tree_sha256"]
+            and current["entry_count"] == package["entry_count"]
+            and current["total_bytes"] == package["total_bytes"],
+            "candidate source snapshot drift",
+        )
     require(
         {item["family"] for item in sources} == set(SOURCE_FAMILIES),
         "source family coverage drift",

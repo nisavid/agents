@@ -92,12 +92,21 @@ The executor first installs an empty command-scope `credential.helper` to clear
 all ambient helpers, retains the existing rejection of repository or worktree
 `credential.*.helper` configuration, and then appends only that validated
 absolute helper path for HTTPS execution. `GIT_ASKPASS=false` and
-`GIT_TERMINAL_PROMPT=0` remain in force. Credential bytes travel only between
-Git and the system helper through Git's credential protocol: they are never
-read by the planner or executor and never enter arguments, diagnostics, plans,
-receipts, or repository configuration. SSH and ancestry-guarded local
-endpoints do not enable a credential helper and retain their existing
-contracts.
+`GIT_TERMINAL_PROMPT=0` remain in force. Before helper activation, any
+repository or worktree `http.*.sslVerify`, `http.*.sslCAInfo`, or
+`http.*.sslCAPath` override blocks, including URL-qualified forms; ambient
+`SSL_CERT_FILE`, `SSL_CERT_DIR`, and `GIT_SSL_*` variables are also removed.
+This prevents a narrower Git configuration or process environment from
+weakening TLS beneath the authenticated endpoint. Repository and worktree HTTP
+headers, cookie files, empty-auth or delegation settings, and client-certificate
+settings also block as unsupported credential sources; their values are never
+read into diagnostics.
+
+Credential bytes travel only between Git and the system helper through Git's
+credential protocol: they are never read by the planner or executor and never
+enter arguments, diagnostics, plans, receipts, or repository configuration.
+SSH and ancestry-guarded local endpoints do not enable a credential helper and
+retain their existing contracts.
 
 ## Terminal Remote-Ref Deletion
 

@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import base64
 import hashlib
+import http.server
 import json
 import os
 import shlex
+import ssl
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+from contextlib import contextmanager
 from io import StringIO
 from pathlib import Path
 from unittest import mock
@@ -91,6 +96,105 @@ def reviewed_plan(plan: dict) -> tuple[bytes, str]:
 def execute(repo: Path, plan: dict) -> dict:
     plan_bytes, digest = reviewed_plan(plan)
     return execute_repository(repo, plan_bytes, digest)
+
+
+@contextmanager
+def authenticated_https_endpoint(
+    root: Path,
+    username: str,
+    password: str,
+    advertised_sha: str,
+):
+    openssl_config = root / "openssl.cnf"
+    certificate = root / "certificate.pem"
+    private_key = root / "private-key.pem"
+    openssl_config.write_text(
+        "[req]\n"
+        "distinguished_name=subject\n"
+        "x509_extensions=extensions\n"
+        "prompt=no\n"
+        "[subject]\n"
+        "CN=127.0.0.1\n"
+        "[extensions]\n"
+        "subjectAltName=IP:127.0.0.1\n"
+        "keyUsage=digitalSignature,keyEncipherment\n"
+        "extendedKeyUsage=serverAuth\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        [
+            "/usr/bin/openssl",
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            str(private_key),
+            "-out",
+            str(certificate),
+            "-days",
+            "1",
+            "-config",
+            str(openssl_config),
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    )
+    expected_authorization = "Basic " + base64.b64encode(
+        f"{username}:{password}".encode("utf-8")
+    ).decode("ascii")
+    authorized = threading.Event()
+
+    def packet(payload: bytes) -> bytes:
+        return f"{len(payload) + 4:04x}".encode("ascii") + payload
+
+    service = b"# service=git-upload-pack\n"
+    head = (
+        f"{advertised_sha} HEAD\0symref=HEAD:refs/heads/main\n".encode("ascii")
+    )
+    branch = f"{advertised_sha} refs/heads/main\n".encode("ascii")
+    advertisement = (
+        packet(service) + b"0000" + packet(head) + packet(branch) + b"0000"
+    )
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.headers.get("Authorization") != expected_authorization:
+                self.send_response(401)
+                self.send_header("WWW-Authenticate", 'Basic realm="versionkeeping"')
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            authorized.set()
+            body = advertisement
+            self.send_response(200)
+            self.send_header(
+                "Content-Type",
+                "application/x-git-upload-pack-advertisement",
+            )
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    tls.load_cert_chain(certificate, private_key)
+    server.socket = tls.wrap_socket(server.socket, server_side=True)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address
+        yield f"https://{host}:{port}/repository.git", certificate, authorized
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
 
 
 class PublicationExecutionTests(unittest.TestCase):
@@ -177,6 +281,59 @@ class PublicationExecutionTests(unittest.TestCase):
             "git-credential-osxkeychain",
         )
 
+    @unittest.skipUnless(sys.platform == "darwin", "requires macOS")
+    def test_authenticated_https_transport_keeps_credentials_inside_git(self) -> None:
+        username = "versionkeeping-test"
+        secret = "credential-secret-745bad"
+        helper = self.root / "credential-helper"
+        helper.write_text(
+            "#!/bin/sh\n"
+            "if [ \"$1\" = get ]; then\n"
+            f"  printf '%s\\n' 'username={username}' 'password={secret}'\n"
+            "fi\n",
+            encoding="utf-8",
+        )
+        helper.chmod(0o700)
+
+        with authenticated_https_endpoint(
+            self.root,
+            username,
+            secret,
+            self.start,
+        ) as (endpoint, certificate, authorized):
+            with adapter.GitRepository(self.repo) as repository:
+                repository._append_command_config(
+                    "http.sslCAInfo",
+                    str(certificate),
+                )
+                with mock.patch.object(adapter.sys, "platform", "darwin"):
+                    with mock.patch.object(
+                        adapter,
+                        "_require_trusted_credential_helper",
+                        return_value=str(helper),
+                    ):
+                        repository.enable_https_credentials(endpoint)
+                result = adapter._run_endpoint(
+                    repository,
+                    endpoint,
+                    ["ls-remote", "--heads"],
+                )
+                config = {
+                    key: value
+                    for key, value in repository.env.items()
+                    if key.startswith("GIT_CONFIG_")
+                }
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            result.stderr.replace(secret, "<redacted>"),
+        )
+        self.assertTrue(authorized.is_set())
+        self.assertNotIn(secret, result.stdout)
+        self.assertNotIn(secret, result.stderr)
+        self.assertNotIn(secret, json.dumps(config))
+
     def test_user_owned_osxkeychain_lookalike_is_unavailable(self) -> None:
         helper_root = self.root / "untrusted-git-core"
         helper_root.mkdir()
@@ -249,20 +406,28 @@ class PublicationExecutionTests(unittest.TestCase):
         run_endpoint.assert_not_called()
 
     def test_https_plan_receipt_and_command_config_are_credential_free(self) -> None:
-        endpoint = "https://example.invalid/repository.git"
         fingerprint = self.plan["destination"]["endpoint_fingerprint"]
-        trusted_helper = (
-            "/Library/Developer/CommandLineTools/usr/libexec/git-core/"
-            "git-credential-osxkeychain"
+        username = "versionkeeping-test"
+        secret = "credential-secret-65db51"
+        helper = self.root / "credential-helper-for-receipt"
+        helper.write_text(
+            "#!/bin/sh\n"
+            "if [ \"$1\" = get ]; then\n"
+            f"  printf '%s\\n' 'username={username}' 'password={secret}'\n"
+            "fi\n",
+            encoding="utf-8",
         )
-        secret = "github-token-secret-65db51"
-        original_output = adapter.GitRepository.output
+        helper.chmod(0o700)
+        planned = plan_repository(self.repo, request(self.start, self.source))
         observed = {}
+        original_enable = adapter.GitRepository.enable_https_credentials
 
-        def output(repository, args, allowed=()):
-            if args == ["--exec-path"]:
-                return str(Path(trusted_helper).parent)
-            return original_output(repository, args, allowed)
+        def enable_credentials(repository, endpoint, certificate):
+            repository._append_command_config(
+                "http.sslCAInfo",
+                str(certificate),
+            )
+            return original_enable(repository, endpoint)
 
         def successful_push(repository, endpoint, prefix, suffix=(), **_kwargs):
             observed["config"] = {
@@ -271,20 +436,38 @@ class PublicationExecutionTests(unittest.TestCase):
                 if key.startswith("GIT_CONFIG_")
             }
             observed["command"] = [*prefix, *suffix]
-            return subprocess.CompletedProcess(["git", "push"], 0, "", "")
+            result = adapter._run_endpoint(
+                repository,
+                endpoint,
+                ["ls-remote", "--heads"],
+            )
+            observed["stdout"] = result.stdout
+            observed["stderr"] = result.stderr
+            return result
 
-        with mock.patch.dict(os.environ, {"GITHUB_TOKEN": secret}, clear=False):
-            planned = plan_repository(self.repo, request(self.start, self.source))
+        with authenticated_https_endpoint(
+            self.root,
+            username,
+            secret,
+            self.start,
+        ) as (endpoint, certificate, authorized):
             with mock.patch.object(adapter.sys, "platform", "darwin"):
                 with mock.patch.object(
-                    adapter.GitRepository,
-                    "output",
-                    output,
+                    adapter,
+                    "_require_trusted_credential_helper",
+                    return_value=str(helper),
                 ):
                     with mock.patch.object(
-                        adapter,
-                        "_require_trusted_credential_helper",
-                        return_value=trusted_helper,
+                        adapter.GitRepository,
+                        "enable_https_credentials",
+                        autospec=True,
+                        side_effect=lambda repository, selected_endpoint: (
+                            enable_credentials(
+                                repository,
+                                selected_endpoint,
+                                certificate,
+                            )
+                        ),
                     ):
                         with mock.patch.object(
                             execution,
@@ -312,6 +495,7 @@ class PublicationExecutionTests(unittest.TestCase):
 
         self.assertEqual(planned["status"], "ready")
         self.assertEqual(receipt["status"], "verified")
+        self.assertTrue(authorized.is_set())
         self.assertNotIn(secret, json.dumps(planned))
         self.assertNotIn(secret, json.dumps(receipt))
         self.assertNotIn(secret, json.dumps(observed))
@@ -340,6 +524,8 @@ class PublicationExecutionTests(unittest.TestCase):
             "GIT_SSL_NO_VERIFY": "true",
             "GIT_SSL_CAINFO": "/hostile/ca.pem",
             "GIT_SSL_CAPATH": "/hostile/ca-directory",
+            "SSL_CERT_FILE": "/hostile/openssl-ca.pem",
+            "SSL_CERT_DIR": "/hostile/openssl-ca-directory",
             "GIT_ASKPASS": "/hostile/askpass",
             "GIT_SSH_COMMAND": "ssh -F /hostile/config",
         }
@@ -383,6 +569,8 @@ class PublicationExecutionTests(unittest.TestCase):
         self.assertNotIn("GIT_SSL_NO_VERIFY", env)
         self.assertNotIn("GIT_SSL_CAINFO", env)
         self.assertNotIn("GIT_SSL_CAPATH", env)
+        self.assertNotIn("SSL_CERT_FILE", env)
+        self.assertNotIn("SSL_CERT_DIR", env)
         self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
         self.assertEqual(env["GIT_ASKPASS"], "false")
         self.assertIn("BatchMode=yes", env["GIT_SSH_COMMAND"])
@@ -408,6 +596,33 @@ class PublicationExecutionTests(unittest.TestCase):
             "UNSAFE_GIT_CONFIGURATION",
         )
         self.assertNotIn(secret, json.dumps(result))
+
+    def test_url_specific_tls_override_blocks_before_https_credentials(self) -> None:
+        git(
+            self.repo,
+            "config",
+            "http.https://github.com.sslVerify",
+            "false",
+        )
+
+        with mock.patch.object(
+            adapter.GitRepository,
+            "enable_https_credentials",
+        ) as enable_credentials:
+            result = execute(self.repo, self.plan)
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertFalse(result["push_attempted"])
+        self.assertEqual(
+            result["reasons"],
+            [
+                {
+                    "code": "UNSAFE_GIT_CONFIGURATION",
+                    "evidence": {"config_classes": ["http.*.ssl*"]},
+                }
+            ],
+        )
+        enable_credentials.assert_not_called()
 
     def test_endpoint_change_after_review_blocks_before_push(self) -> None:
         changed = self.root / "changed.git"

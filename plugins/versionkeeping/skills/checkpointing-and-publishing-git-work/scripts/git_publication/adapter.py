@@ -51,50 +51,61 @@ SCP_ENDPOINT_RE = re.compile(
     r"(?P<path>[^:\s][^\s]*)"
 )
 DEFAULT_GIT_TIMEOUT_SECONDS = 30
-SCRUBBED_GIT_ENV_NAMES = {
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    "GIT_ASKPASS",
-    "GIT_ATTR_NOSYSTEM",
-    "GIT_CEILING_DIRECTORIES",
-    "GIT_COMMON_DIR",
-    "GIT_CONFIG",
-    "GIT_CONFIG_GLOBAL",
-    "GIT_CONFIG_NOSYSTEM",
-    "GIT_CONFIG_PARAMETERS",
-    "GIT_CONFIG_SYSTEM",
-    "GIT_DIR",
-    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
-    "GIT_EDITOR",
-    "GIT_EXEC_PATH",
-    "GIT_EXTERNAL_DIFF",
-    "GIT_FLUSH",
-    "GIT_GLOB_PATHSPECS",
-    "GIT_ICASE_PATHSPECS",
-    "GIT_INDEX_FILE",
-    "GIT_INTERNAL_SUPER_PREFIX",
-    "GIT_LITERAL_PATHSPECS",
-    "GIT_NAMESPACE",
-    "GIT_NOGLOB_PATHSPECS",
-    "GIT_OBJECT_DIRECTORY",
-    "GIT_OPTIONAL_LOCKS",
-    "GIT_PREFIX",
-    "GIT_PROTOCOL",
-    "GIT_PROTOCOL_FROM_USER",
-    "GIT_QUARANTINE_PATH",
-    "GIT_REPLACE_REF_BASE",
-    "GIT_SEQUENCE_EDITOR",
-    "GIT_SHALLOW_FILE",
-    "GIT_SSL_CAINFO",
-    "GIT_SSL_CAPATH",
-    "GIT_SSL_NO_VERIFY",
-    "GIT_SSH",
-    "GIT_SSH_COMMAND",
-    "GIT_SSH_VARIANT",
-    "GIT_SUPER_PREFIX",
-    "GIT_WORK_TREE",
-    "SSH_ASKPASS",
-    "VERSIONKEEPING_PUBLICATION_ENDPOINT",
+TRUSTED_SYSTEM_EXECUTABLES = {
+    "git": Path("/usr/bin/git"),
+    "ssh": Path("/usr/bin/ssh"),
 }
+TRUSTED_COMMAND_PATH = "/usr/bin:/bin"
+GIT_SUBPROCESS_ENV_ALLOWLIST = {
+    "ALL_PROXY",
+    "COMSPEC",
+    "HOME",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "LOGNAME",
+    "NO_PROXY",
+    "SSL_CERT_DIR",
+    "SSL_CERT_FILE",
+    "SSH_AUTH_SOCK",
+    "SYSTEMROOT",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "USER",
+    "all_proxy",
+    "https_proxy",
+    "http_proxy",
+    "no_proxy",
+}
+
+
+def _trusted_system_executable(name: str) -> str:
+    path = TRUSTED_SYSTEM_EXECUTABLES[name]
+    try:
+        resolved = path.resolve(strict=True)
+        if resolved != path:
+            raise OSError("system executable is redirected")
+        for parent in (Path("/"), Path("/usr"), Path("/usr/bin")):
+            metadata = parent.lstat()
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != 0
+                or stat.S_IMODE(metadata.st_mode) & 0o022
+            ):
+                raise OSError("system executable ancestry is mutable")
+        metadata = resolved.lstat()
+    except OSError as error:
+        raise PolicyGate(
+            f"TRUSTED_{name.upper()}_EXECUTABLE_UNAVAILABLE"
+        ) from error
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != 0
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+        or stat.S_IMODE(metadata.st_mode) & 0o111 == 0
+    ):
+        raise PolicyGate(f"TRUSTED_{name.upper()}_EXECUTABLE_UNAVAILABLE")
+    return str(resolved)
 
 
 def _unsafe_git_config_class(key: str) -> str | None:
@@ -336,6 +347,8 @@ class GitRepository:
     def __init__(self, path: Path, timeout_seconds: int = DEFAULT_GIT_TIMEOUT_SECONDS):
         self.path = Path(path)
         self.timeout_seconds = timeout_seconds
+        self.git_executable = _trusted_system_executable("git")
+        ssh_executable = _trusted_system_executable("ssh")
         self._empty_hooks = tempfile.TemporaryDirectory(
             prefix="versionkeeping-empty-hooks-"
         )
@@ -344,11 +357,7 @@ class GitRepository:
         self.env = {
             key: value
             for key, value in os.environ.items()
-            if key not in SCRUBBED_GIT_ENV_NAMES
-            and not key.startswith("GIT_CONFIG_KEY_")
-            and not key.startswith("GIT_CONFIG_VALUE_")
-            and not key.startswith("GIT_TRACE")
-            and key != "GIT_CONFIG_COUNT"
+            if key in GIT_SUBPROCESS_ENV_ALLOWLIST
         }
         self.env.update(
             {
@@ -360,15 +369,21 @@ class GitRepository:
                 "GIT_EDITOR": "true",
                 "GIT_NO_LAZY_FETCH": "1",
                 "GIT_NO_REPLACE_OBJECTS": "1",
+                "GIT_OPTIONAL_LOCKS": "0",
                 "GIT_PAGER": "cat",
+                "GIT_PROTOCOL_FROM_USER": "0",
                 "GIT_SEQUENCE_EDITOR": "true",
                 "GIT_SSH_COMMAND": (
-                    "ssh -oBatchMode=yes -oConnectionAttempts=1 "
+                    f"{ssh_executable} -oBatchMode=yes -oConnectionAttempts=1 "
                     f"-oConnectTimeout={timeout_seconds}"
                 ),
+                "GIT_SSH_VARIANT": "ssh",
                 "GIT_TERMINAL_PROMPT": "0",
                 "GCM_INTERACTIVE": "never",
+                "LANG": "C",
                 "LC_ALL": "C",
+                "PATH": TRUSTED_COMMAND_PATH,
+                "SHELL": "/bin/sh",
                 "SSH_ASKPASS_REQUIRE": "never",
             }
         )
@@ -411,17 +426,12 @@ class GitRepository:
     ) -> subprocess.CompletedProcess:
         env = self.env.copy()
         if env_overrides:
-            if any(
-                key == "GIT_CONFIG_COUNT"
-                or key.startswith("GIT_CONFIG_KEY_")
-                or key.startswith("GIT_CONFIG_VALUE_")
-                for key in env_overrides
-            ):
+            if set(env_overrides) != {"VERSIONKEEPING_PUBLICATION_ENDPOINT"}:
                 raise PolicyGate("GIT_CONFIG_ENVIRONMENT_OVERRIDE_REJECTED")
             env.update(env_overrides)
         try:
             completed = subprocess.run(
-                ["git", *args],
+                [self.git_executable, *args],
                 cwd=str(self.path),
                 env=env,
                 stdin=subprocess.DEVNULL,

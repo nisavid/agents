@@ -2173,6 +2173,88 @@ def test_production_candidate_requires_clean_exact_git_head(tmp_path: Path):
         raise AssertionError("dirty production candidate was accepted")
 
 
+def test_candidate_git_observer_ignores_path_and_fsmonitor_executables(
+    monkeypatch, tmp_path: Path
+):
+    runner = load_runner()
+    repository = tmp_path / "repository"
+    output = tmp_path / "evidence"
+    repository.mkdir()
+    git = "/usr/bin/git"
+    subprocess.run([git, "init", "-q"], cwd=repository, check=True)
+    subprocess.run(
+        [git, "config", "user.name", "Eval Fixture"], cwd=repository, check=True
+    )
+    subprocess.run(
+        [git, "config", "user.email", "eval-fixture@example.invalid"],
+        cwd=repository,
+        check=True,
+    )
+    subprocess.run(
+        [
+            git,
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/nisavid/agents",
+        ],
+        cwd=repository,
+        check=True,
+    )
+    (repository / "file.txt").write_text("frozen\n")
+    subprocess.run([git, "add", "file.txt"], cwd=repository, check=True)
+    subprocess.run(
+        [git, "commit", "-qm", "test: freeze fixture"],
+        cwd=repository,
+        check=True,
+    )
+    revision = subprocess.run(
+        [git, "rev-parse", "HEAD"],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    path_marker = tmp_path / "candidate-path-git-ran"
+    candidate_bin = tmp_path / "candidate-bin"
+    candidate_bin.mkdir()
+    candidate_git = candidate_bin / "git"
+    candidate_git.write_text(
+        "#!/bin/sh\n"
+        f"printf 'executed\\n' >> '{path_marker}'\n"
+        "exec /usr/bin/git \"$@\"\n",
+        encoding="utf-8",
+    )
+    candidate_git.chmod(0o700)
+    fsmonitor_marker = tmp_path / "candidate-fsmonitor-ran"
+    fsmonitor = tmp_path / "candidate-fsmonitor"
+    fsmonitor.write_text(
+        "#!/bin/sh\n"
+        f"printf 'executed\\n' >> '{fsmonitor_marker}'\n",
+        encoding="utf-8",
+    )
+    fsmonitor.chmod(0o700)
+    subprocess.run(
+        [git, "config", "core.fsmonitor", str(fsmonitor)],
+        cwd=repository,
+        check=True,
+    )
+    monkeypatch.setenv("PATH", str(candidate_bin))
+
+    runner.validate_production_candidate(repository, output, revision)
+    temporary, _snapshot, _source = runner.materialize_candidate_snapshot(
+        repository,
+        output,
+        revision,
+        "https://github.com/nisavid/agents",
+    )
+    temporary.cleanup()
+
+    assert not path_marker.exists()
+    assert not fsmonitor_marker.exists()
+
+
 def test_candidate_snapshot_uses_safe_python39_extraction_and_retains_git_evidence(
     tmp_path: Path,
 ):

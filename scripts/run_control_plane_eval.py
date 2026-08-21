@@ -50,6 +50,7 @@ from evidence_transport import (  # noqa: E402
     safe_provider_failure_message,
     safe_regular_file,
     safe_relative_path,
+    run_candidate_git,
     strict_json_bytes,
 )
 
@@ -2989,41 +2990,47 @@ def validate_production_candidate(repo: Path, output: Path, revision: str) -> No
         raise EvaluationError(
             "production evidence output must be outside the candidate repository"
         )
-    head = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=repo,
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    ).stdout.strip()
+    head = candidate_git_text(repo, ["rev-parse", "HEAD"], "read candidate HEAD")
+    head = head.strip()
     if revision != head:
         raise EvaluationError(
             "candidate revision does not equal the checked-out Git HEAD"
         )
-    status = subprocess.run(
-        ["git", "status", "--porcelain", "--untracked-files=all"],
-        cwd=repo,
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    ).stdout
+    status = candidate_git_text(
+        repo,
+        ["status", "--porcelain", "--untracked-files=all"],
+        "read candidate status",
+    )
     if status:
         raise EvaluationError(
             "production candidate repository is not a frozen clean checkout"
         )
 
 
+def candidate_git_bytes(repo: Path, arguments: list[str], operation: str) -> bytes:
+    return run_candidate_git(
+        repo,
+        arguments,
+        error_factory=EvaluationError,
+        operation=operation,
+    )
+
+
+def candidate_git_text(repo: Path, arguments: list[str], operation: str) -> str:
+    try:
+        return candidate_git_bytes(repo, arguments, operation).decode(
+            "utf-8", errors="strict"
+        )
+    except UnicodeDecodeError as error:
+        raise EvaluationError(f"cannot {operation}") from error
+
+
 def normalized_remote(repo: Path) -> str:
-    remote = subprocess.run(
-        ["git", "config", "--get", "remote.origin.url"],
-        cwd=repo,
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    ).stdout.strip()
+    remote = candidate_git_text(
+        repo,
+        ["config", "--get", "remote.origin.url"],
+        "read candidate origin",
+    ).strip()
     if not remote:
         raise EvaluationError("candidate repository has no origin remote")
     return canonical_repository_origin(remote)
@@ -3048,14 +3055,11 @@ def canonical_repository_origin(origin: str) -> str:
 
 
 def git_value(repo: Path, expression: str) -> str:
-    return subprocess.run(
-        ["git", "rev-parse", "--verify", expression],
-        cwd=repo,
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    ).stdout.strip()
+    return candidate_git_text(
+        repo,
+        ["rev-parse", "--verify", expression],
+        "resolve candidate object",
+    ).strip()
 
 
 def materialize_candidate_snapshot(
@@ -3072,29 +3076,23 @@ def materialize_candidate_snapshot(
     declared_remote = canonical_repository_origin(declared_repository)
     if observed_remote != declared_remote:
         raise EvaluationError("candidate repository does not match origin remote")
-    archive = subprocess.run(
-        ["git", "archive", "--format=tar", commit],
-        cwd=repo,
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    ).stdout
+    archive = candidate_git_bytes(
+        repo,
+        ["archive", "--format=tar", commit],
+        "archive candidate tree",
+    )
     archive_relpath = "artifacts/source/candidate-git-tree.tar"
     write_frozen(output / archive_relpath, archive)
-    commit_object = subprocess.run(
-        ["git", "cat-file", "commit", commit],
-        cwd=repo,
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    ).stdout
-    tree_listing = subprocess.run(
-        ["git", "ls-tree", "-r", "-z", commit],
-        cwd=repo,
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    ).stdout
+    commit_object = candidate_git_bytes(
+        repo,
+        ["cat-file", "commit", commit],
+        "read candidate commit",
+    )
+    tree_listing = candidate_git_bytes(
+        repo,
+        ["ls-tree", "-r", "-z", commit],
+        "read candidate tree",
+    )
     source_objects = {
         "archive_inventory_sha256": canonical_digest(archive_inventory(archive)),
         "commit": commit,

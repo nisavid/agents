@@ -121,6 +121,47 @@ class GraphiteTransportTests(unittest.TestCase):
         self.assertEqual(closed["commit.gpgSign"], "false")
         self.assertEqual(closed["tag.gpgSign"], "false")
 
+    def test_submission_never_executes_candidate_path_git_gt_or_ssh(self) -> None:
+        self.initialize_git_repository()
+        candidate_bin = Path(self.temporary.name) / "candidate-bin"
+        candidate_bin.mkdir()
+        marker = Path(self.temporary.name) / "candidate-executable-ran"
+
+        def executable(name: str, body: str) -> Path:
+            path = candidate_bin / name
+            path.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
+            path.chmod(0o700)
+            return path
+
+        marker_argument = shlex.quote(str(marker))
+        executable("git", f"printf 'git\\n' >> {marker_argument}\nexit 0")
+        executable("gt", f"printf 'gt\\n' >> {marker_argument}\nexit 0")
+
+        with mock.patch.dict(os.environ, {"PATH": str(candidate_bin)}):
+            GRAPHITE._run(["git", "status", "--short"], cwd=self.root)
+            try:
+                GRAPHITE._run(["gt", "--version"], cwd=self.root)
+            except GRAPHITE.GraphiteTransportError:
+                pass
+
+        self.assertFalse(marker.exists())
+
+        (candidate_bin / "git").unlink()
+        (candidate_bin / "git").symlink_to("/usr/bin/git")
+        executable("ssh", f"printf 'ssh\\n' >> {marker_argument}\nexit 1")
+        with mock.patch.dict(os.environ, {"PATH": str(candidate_bin)}):
+            with self.assertRaises(GRAPHITE.GraphiteTransportError):
+                GRAPHITE._run(
+                    [
+                        "git",
+                        "ls-remote",
+                        "ssh://git@127.0.0.1:1/repository",
+                    ],
+                    cwd=self.root,
+                )
+
+        self.assertFalse(marker.exists())
+
     def test_transport_protocol_allowlist_preserves_https_and_ssh(self) -> None:
         for endpoint in (
             "https://example.com/acme/app.git",

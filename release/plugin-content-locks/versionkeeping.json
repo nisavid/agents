@@ -51,7 +51,7 @@
       "mode": 420
     },
     "skills/checkpointing-and-publishing-git-work/scripts/git_publication/adapter.py": {
-      "sha256": "032d680706800a1ebce1adce8a7d4bc94cfb9346f3a61ec37b23cd5f00190666",
+      "sha256": "2a1345c99a56c1854a79f2cde8ed0a3f4e2e6cfc8f8410e22123cc96543c36ca",
       "mode": 420
     },
     "skills/checkpointing-and-publishing-git-work/scripts/git_publication/core.py": {
@@ -99,7 +99,7 @@
       "mode": 420
     },
     "skills/using-persistent-git-worktrees/scripts/validate_worktree_target.py": {
-      "sha256": "7c024950f3cc339355d0279ec2c3b051f22800b9717dee11a9484a00bb4a8eae",
+      "sha256": "257b490aa539a26058d4f931404350742c1c934eb6ec20d3906f67fe7be0e409",
       "mode": 420
     },
     "topology.json": {

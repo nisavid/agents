@@ -3075,6 +3075,24 @@ with tempfile.TemporaryDirectory() as raw_directory:
         encoding="utf-8",
     )
     fake_gt.chmod(0o700)
+
+    original_graphite_environment = graphite._environment
+
+    def graphite_probe_environment():
+        environment = original_graphite_environment()
+        environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+        return environment
+
+    def bind_graphite_probe_executable(arguments, _root):
+        executable = Path(arguments[0]).name
+        if executable == "git":
+            return [str(fake_git), *arguments[1:]]
+        if executable == "gt":
+            return [str(fake_gt), *arguments[1:]]
+        return arguments
+
+    graphite._environment = graphite_probe_environment
+    graphite._bind_executable = bind_graphite_probe_executable
     os.environ["PATH"] = f"{fake_bin}:{os.environ['PATH']}"
     os.environ["MERGECRAFT_PROBE_STATES"] = str(state_path)
     os.environ["MERGECRAFT_PROBE_COUNT"] = str(count_path)

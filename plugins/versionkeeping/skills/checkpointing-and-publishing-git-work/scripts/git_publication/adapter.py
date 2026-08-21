@@ -375,7 +375,7 @@ def _windows_paths_have_protected_acls(
             for right in WINDOWS_MUTATION_RIGHTS
         )
         script = (
-            "$ErrorActionPreference='Stop';"
+            "$ErrorActionPreference='Stop';trap { exit 12 };"
             "$trusted=@('S-1-5-18','S-1-5-32-544',"
             "'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464');"
             f"$replacement={replacement_rights};"
@@ -386,7 +386,7 @@ def _windows_paths_have_protected_acls(
             "$acl=Get-Acl -LiteralPath ([string]$request.path);"
             "$owner=([System.Security.Principal.NTAccount]$acl.Owner).Translate("
             "[System.Security.Principal.SecurityIdentifier]).Value;"
-            "if($trusted -notcontains $owner){exit 1};"
+            "if($trusted -notcontains $owner){exit 10};"
             "$write=$mutation;"
             "if([bool]$request.replacement_only){$write=$replacement};"
             "foreach($ace in $acl.Access){"
@@ -397,7 +397,7 @@ def _windows_paths_have_protected_acls(
             "if(($ace.FileSystemRights -band $write) -eq 0){continue};"
             "$sid=$ace.IdentityReference.Translate("
             "[System.Security.Principal.SecurityIdentifier]).Value;"
-            "if($trusted -notcontains $sid){exit 1}"
+            "if($trusted -notcontains $sid){exit 11}"
             "}};exit 0"
         )
         completed = _run_windows_acl_probe(
@@ -406,8 +406,12 @@ def _windows_paths_have_protected_acls(
             closed_requests,
             script,
         )
+        if completed.returncode == 10:
+            raise OSError("Windows path ACL owner is mutable")
+        if completed.returncode == 11:
+            raise OSError("Windows path ACL grants mutation rights")
         if completed.returncode != 0:
-            raise OSError("Windows path ACL is mutable")
+            raise OSError("Windows path ACL probe failed")
     except (OSError, subprocess.TimeoutExpired) as error:
         raise OSError("Windows path ACL is not trusted") from error
 

@@ -498,9 +498,11 @@ crosses the monitor boundary.
 
 Schema 12 also represents one final authenticated recovery from epoch two to
 epoch three. The post-abort transaction resets only failed exact-worker rows;
-unowned pending rows are preserved. The subsequent exact plan selects the full
-pending set and binds the epoch-three retry lineage. The cumulative ceiling is
-sixteen attempts per operation, and no epoch-four recovery is accepted.
+owned pending or processing rows are released without resetting retry counts
+or stored causes, and unowned pending rows are preserved. The subsequent exact
+plan selects the full pending set and binds the epoch-three retry lineage. The
+cumulative ceiling is sixteen attempts per operation, and no epoch-four
+recovery is accepted.
 The controller and worker reject `--resume` for a nonterminal schema-11
 application journal. Recovery must use the authenticated schema-12
 epoch-two-to-three transaction; terminal reconciliation may still close an

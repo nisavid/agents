@@ -18,6 +18,7 @@ import time
 import tracemalloc
 from types import SimpleNamespace
 import unittest
+import uuid
 
 from tooling.hindsight.tests import (
     test_hindsight_memory_operation_recovery as recovery_fixtures,
@@ -1274,6 +1275,16 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
                 self.assertEqual(upstream["category"], "operation_error")
                 self.assertEqual(database["category"], "operation_error")
 
+                transport = classify(
+                    "request timeout while contacting Hatchery",
+                    retryable=True,
+                    progress_schema_version=progress_schema_version,
+                )
+                self.assertEqual(
+                    transport["category"],
+                    "provider_transport",
+                )
+
     def test_retry_ceiling_records_the_terminal_disposition(self):
         adapter = self._current_exact_drain_adapter()
         adapter._plan = {**adapter._plan, "progress_schema_version": 2}
@@ -1426,6 +1437,82 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         _arguments, evidence = outcomes[0]
         self.assertEqual(evidence["stage"], "retry-ceiling")
         self.assertEqual(evidence["failure"]["category"], "upstream_timeout")
+        self.assertIs(evidence["failure"]["retryable"], False)
+
+    def test_schema_five_resume_retry_ceiling_preserves_stored_cause(self):
+        adapter = self._current_exact_drain_adapter()
+        adapter._plan = {**adapter._plan, "progress_schema_version": 5}
+        adapter._resume = True
+        adapter._verify_initial_state = AsyncMock()
+        adapter._configure_mutation_transaction = AsyncMock()
+        operation_id, selected = next(iter(adapter._selected.items()))
+        outcomes = []
+        update_calls = []
+
+        class Recorder:
+            def task_outcome(self, *arguments, **keywords):
+                outcomes.append((arguments, keywords))
+
+        adapter._progress_recorder = Recorder()
+        row = {
+            "operation_id": uuid.UUID(operation_id),
+            "operation_type": selected["operation_type"],
+            "retry_count": adapter._max_retries,
+            "task_payload_digest": selected["task_payload_digest"],
+            "error_cause_family": "upstream_timeout",
+            "error_digest": "a" * 64,
+            "checkpoint_facts_committed": False,
+            "checkpoint_committed_document_count": 0,
+            "checkpoint_unit_ids_count": 0,
+            "checkpoint_stage": "unavailable",
+            "checkpoint_processed": 0,
+            "checkpoint_total": 0,
+        }
+
+        class Transaction:
+            async def __aenter__(self):
+                return None
+
+            async def __aexit__(self, *_arguments):
+                return None
+
+        class Connection:
+            def transaction(self):
+                return Transaction()
+
+            async def fetch(self, *_arguments):
+                return [dict(row)]
+
+            async def execute(self, statement, *arguments):
+                if "UPDATE public.async_operations" in statement:
+                    update_calls.append((statement, arguments))
+                    identifiers = arguments[0]
+                    return f"UPDATE {len(identifiers)}"
+                return "SET"
+
+        class Context:
+            async def __aenter__(self):
+                return Connection()
+
+            async def __aexit__(self, *_arguments):
+                return None
+
+        class Backend:
+            def acquire(self):
+                return Context()
+
+        self.assertEqual(asyncio.run(adapter.recover_own_tasks(Backend())), 1)
+
+        exhausted_update, exhausted_arguments = update_calls[-1]
+        self.assertNotIn("error_message =", exhausted_update)
+        self.assertNotIn(
+            "operation-recovery exact drain retry ceiling reached",
+            exhausted_arguments,
+        )
+        _arguments, evidence = outcomes[-1]
+        self.assertEqual(evidence["stage"], "retry-ceiling")
+        self.assertEqual(evidence["failure"]["category"], "upstream_timeout")
+        self.assertEqual(evidence["failure"]["error_digest"], "a" * 64)
         self.assertIs(evidence["failure"]["retryable"], False)
 
     def test_schema10_retry_and_defer_enforce_the_plan_bound_delay(self):
@@ -3605,6 +3692,68 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         )
         self.assertIsNone(schema)
 
+    def test_schema_twelve_deadline_retries_after_translated_cancellation(self):
+        retries = []
+
+        class Adapter(_ControlConnectionAdapterMixin):
+            operation_attempt_timeout_seconds = 0.01
+            operation_attempt_timeout_disposition = (
+                "task-retry-after-quiescence"
+            )
+            phase_one_nested_stage_prefixes = ("llm.",)
+
+            def record_upstream_stage(self, _operation_id, _stage):
+                return None
+
+            async def schedule_retry(self, *arguments):
+                retries.append(arguments)
+
+        class WorkerPoller(_RunCapableWorkerPoller):
+            _backend = "exact-backend"
+
+            def __init__(self):
+                self._shutdown = asyncio.Event()
+
+            async def _claim_batch_for_schema_inner(self, *_arguments):
+                return []
+
+            async def _claim_batch_for_schema(self, schema, reserved, shared):
+                return await self._claim_batch_for_schema_inner(
+                    schema, reserved, shared
+                )
+
+            async def _execute_task_inner(self, _task, _holder):
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError as error:
+                    raise OperationRecoveryError(
+                        "upstream translated cancellation"
+                    ) from error
+
+        shutdowns = []
+        install_exact_drain_runtime_guards(
+            type("PostgreSQLOps", (), {}),
+            WorkerPoller,
+            type("MemoryEngine", (), {}),
+            Adapter(),
+            request_worker_shutdown=lambda: shutdowns.append(True),
+        )
+
+        async def exercise():
+            poller = WorkerPoller()
+            result = await poller._execute_task_inner(
+                SimpleNamespace(operation_id="operation-1", schema="public"),
+                SimpleNamespace(stage="queued.retain"),
+            )
+            return poller, result
+
+        poller, result = asyncio.run(exercise())
+
+        self.assertIsNone(result)
+        self.assertFalse(poller._shutdown.is_set())
+        self.assertEqual(shutdowns, [])
+        self.assertEqual(len(retries), 1)
+
     def test_schema_twelve_completed_task_wins_at_deadline_boundary(self):
         class Adapter(_ControlConnectionAdapterMixin):
             operation_attempt_timeout_seconds = 0.5
@@ -4796,6 +4945,115 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         ):
             asyncio.run(claim("systalyze:public:123"))
 
+    def test_schema_twelve_terminal_reconciliation_binds_failure_causes(self):
+        adapter = object.__new__(ExactDrainClaimAdapter)
+        operation_id = "00000000-0000-4000-8000-000000000001"
+        classifications = [
+            {
+                "cause_family": "upstream_timeout",
+                "error_digest": "a" * 64,
+                "occurrence_count": 1,
+            }
+        ]
+        adapter._plan = {
+            "schema_version": 12,
+            "plan_digest": "1" * 64,
+            "pre_generation": "systalyze:public:123",
+            "installation_authority": {
+                "postgres_system_identifier": "7659746962107358086",
+            },
+            "rollback_backup": {
+                "source_authority": {
+                    "binding": {
+                        "database": "hindsight",
+                        "user": "hindsight",
+                        "data_dir": "/private/tmp",
+                        "port": 54329,
+                    }
+                }
+            },
+        }
+        adapter._selected = {
+            operation_id: {
+                "operation_type": "retain",
+                "task_payload_digest": "b" * 64,
+                "row_digest": "c" * 64,
+            }
+        }
+        adapter._preserved = {}
+        adapter._identifiers = [uuid.UUID(operation_id)]
+        adapter._resume = True
+        adapter._terminal_reconciliation = True
+        adapter._worker_digest = "d" * 64
+        adapter._started_ids = set()
+        adapter._pending_progress_stages = {}
+        status_body = {
+            "schema_version": 2,
+            "kind": "operation-recovery-exact-drain-status",
+            "plan_digest": "1" * 64,
+            "generation_before": "systalyze:public:123",
+            "generation_after": "systalyze:public:123",
+            "selected_operation_count": 1,
+            "selected_status_counts": {"failed": 1},
+            "preserved_status_counts": {},
+            "outside_nonterminal_counts": [],
+            "failure_classifications": classifications,
+            "observed_at": 1_000,
+        }
+        adapter._terminal_status_evidence = {
+            "generation": "systalyze:public:123",
+            "observed_at": 1_000,
+            "status_digest": recovery_fixtures.digest(status_body),
+        }
+
+        class Connection:
+            async def fetchrow(self, _query):
+                return {
+                    "database": "hindsight",
+                    "database_user": "hindsight",
+                    "data_directory": "/private/tmp",
+                    "port": 54329,
+                    "address": None,
+                    "system_identifier": "7659746962107358086",
+                }
+
+            async def fetch(self, *_arguments):
+                return []
+
+        row = {
+            "operation_id": operation_id,
+            "operation_type": "retain",
+            "task_payload_digest": "b" * 64,
+            "worker_id_digest": "d" * 64,
+            "status": "failed",
+        }
+        read_classifications = AsyncMock(return_value=classifications)
+        with (
+            patch(
+                "hindsight_memory_control_plane.operation_recovery_runtime."
+                "read_generation",
+                new=AsyncMock(return_value="systalyze:public:123"),
+            ),
+            patch(
+                "hindsight_memory_control_plane.operation_recovery_runtime."
+                "read_safe_operation_rows",
+                new=AsyncMock(return_value=[row]),
+            ),
+            patch(
+                "hindsight_memory_control_plane.operation_recovery_runtime."
+                "read_failure_classifications",
+                new=read_classifications,
+            ),
+            patch(
+                "hindsight_memory_control_plane.operation_recovery_runtime."
+                "live_row_digest",
+                return_value="e" * 64,
+            ),
+        ):
+            asyncio.run(adapter._verify_initial_state(Connection()))
+
+        read_classifications.assert_awaited_once()
+
     def test_terminal_reconciliation_rechecks_before_every_no_work_claim(self):
         adapter = object.__new__(ExactDrainClaimAdapter)
         adapter._worker_id = "exact-worker"
@@ -5704,26 +5962,57 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         self.assertIn("upstream_timeout", query)
 
     def test_failure_classifier_precedence_matches_progress_classifier(self):
-        ordered_sql_outcomes = (
-            "THEN 'database_statement_timeout'",
-            "THEN 'provider_authentication'",
-            "THEN 'provider_capacity'",
-            "THEN 'provider_bad_request'",
-            "THEN 'upstream_timeout'",
-            "THEN 'provider_transport'",
+        cases = (
+            (
+                "400 unauthorized request timeout",
+                "provider_authentication",
+            ),
+            (
+                "client error 400: quota exhausted",
+                "provider_capacity",
+            ),
+            (
+                "status 400: request timeout",
+                "provider_bad_request",
+            ),
+            (
+                "DatabaseError: statement timeout; status 400",
+                "database_statement_timeout",
+            ),
+            (
+                "TimeoutError: connection unavailable",
+                "upstream_timeout",
+            ),
         )
-        positions = [
-            FAILURE_CLASSIFICATION_QUERY.index(outcome)
-            for outcome in ordered_sql_outcomes
-        ]
+        for message, expected in cases:
+            with self.subTest(message=message):
+                evidence = (
+                    operation_recovery_runtime._exact_drain_failure_evidence(
+                        message,
+                        retryable=True,
+                        progress_schema_version=5,
+                    )
+                )
+                self.assertEqual(evidence["category"], expected)
 
-        self.assertEqual(positions, sorted(positions))
-        evidence = operation_recovery_runtime._exact_drain_failure_evidence(
-            "TimeoutError: connection unavailable",
-            retryable=True,
-            progress_schema_version=5,
+        ordered_sql_outcomes = tuple(
+            f"THEN '{category}'"
+            for category in (
+                "database_statement_timeout",
+                "provider_authentication",
+                "provider_capacity",
+                "provider_bad_request",
+                "upstream_timeout",
+                "provider_transport",
+            )
         )
-        self.assertEqual(evidence["category"], "upstream_timeout")
+        self.assertEqual(
+            [FAILURE_CLASSIFICATION_QUERY.index(item) for item in ordered_sql_outcomes],
+            sorted(
+                FAILURE_CLASSIFICATION_QUERY.index(item)
+                for item in ordered_sql_outcomes
+            ),
+        )
 
     def test_failure_classifier_rejects_open_or_malformed_output(self):
         operation_id = "00000000-0000-4000-8000-000000000001"

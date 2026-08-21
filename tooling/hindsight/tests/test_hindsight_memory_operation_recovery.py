@@ -4385,24 +4385,35 @@ class OperationRecoveryContractTest(unittest.TestCase):
             ).encode()
         ).hexdigest()
         epoch_three_rows = deepcopy(epoch_two_recovered_rows)
-        preserved_pending_id = min(epoch_two_selected_ids)
+        owned_pending_id = min(epoch_two_selected_ids)
         for item in epoch_three_rows:
-            if (
-                item["operation_id"] not in epoch_two_selected_ids
-                or item["operation_id"] == preserved_pending_id
-            ):
+            if item["operation_id"] not in epoch_two_selected_ids:
                 continue
-            item.update(
-                status="failed",
-                updated_at="2026-08-20T14:30:00.000000Z",
-                completed_at="2026-08-20T14:30:00.000000Z",
-                retry_count=3,
-                worker_id_present=True,
-                worker_id_digest=epoch_three_worker_digest,
-                claimed_at="2026-08-20T14:25:00.000000Z",
-                error_category="provider_transport",
-                error_digest="1" * 64,
-            )
+            if item["operation_id"] == owned_pending_id:
+                item.update(
+                    status="pending",
+                    updated_at="2026-08-20T14:30:00.000000Z",
+                    completed_at=None,
+                    retry_count=1,
+                    next_retry_at="2026-08-20T14:29:00.000000Z",
+                    worker_id_present=True,
+                    worker_id_digest=epoch_three_worker_digest,
+                    claimed_at="2026-08-20T14:25:00.000000Z",
+                    error_category="provider_transport",
+                    error_digest="2" * 64,
+                )
+            else:
+                item.update(
+                    status="failed",
+                    updated_at="2026-08-20T14:30:00.000000Z",
+                    completed_at="2026-08-20T14:30:00.000000Z",
+                    retry_count=3,
+                    worker_id_present=True,
+                    worker_id_digest=epoch_three_worker_digest,
+                    claimed_at="2026-08-20T14:25:00.000000Z",
+                    error_category="provider_transport",
+                    error_digest="1" * 64,
+                )
         epoch_three_interrupted = dict(
             create_live_snapshot(
                 self.cohort(),
@@ -4479,8 +4490,8 @@ class OperationRecoveryContractTest(unittest.TestCase):
         )
         epoch_three_retry = epoch_three_recovery["retry_recovery"]
         self.assertEqual(epoch_three_recovery["schema_version"], 12)
-        self.assertNotIn(
-            preserved_pending_id,
+        self.assertIn(
+            owned_pending_id,
             {
                 item["operation_id"]
                 for item in epoch_three_recovery["selected_operations"]
@@ -4488,13 +4499,21 @@ class OperationRecoveryContractTest(unittest.TestCase):
         )
         self.assertEqual(
             epoch_three_recovery["selected_status_counts"],
-            {"failed": len(epoch_two_selected_ids) - 1},
+            {"failed": len(epoch_two_selected_ids) - 1, "pending": 1},
         )
         self.assertEqual(epoch_three_retry["schema_version"], 3)
         self.assertEqual(epoch_three_retry["recovery_epoch_before"], 2)
         self.assertEqual(epoch_three_retry["recovery_epoch_after"], 3)
         self.assertEqual(epoch_three_retry["recovery_epoch_ceiling"], 3)
         self.assertEqual(epoch_three_retry["maximum_cumulative_attempts"], 16)
+        owned_pending_retry = next(
+            item
+            for item in epoch_three_retry["operations"]
+            if item["operation_id"] == owned_pending_id
+        )
+        self.assertFalse(owned_pending_retry["reset_applied"])
+        self.assertEqual(owned_pending_retry["retry_count_before"], 1)
+        self.assertEqual(owned_pending_retry["retry_count_after"], 1)
         self.assertEqual(
             verify_post_abort_recovery_plan(
                 epoch_three_recovery,
@@ -4548,18 +4567,27 @@ class OperationRecoveryContractTest(unittest.TestCase):
                 "error_digest": item["error_digest"],
             }
             if item["operation_id"] in epoch_three_selected_ids:
-                row.update(
-                    status="pending",
-                    updated_at="2026-08-20T14:40:00.000000Z",
-                    completed_at=None,
-                    retry_count=0,
-                    next_retry_at=None,
-                    worker_id_present=False,
-                    worker_id_digest=None,
-                    claimed_at=None,
-                    error_category="none",
-                    error_digest=None,
-                )
+                if item["operation_id"] == owned_pending_id:
+                    row.update(
+                        status="pending",
+                        updated_at="2026-08-20T14:40:00.000000Z",
+                        worker_id_present=False,
+                        worker_id_digest=None,
+                        claimed_at=None,
+                    )
+                else:
+                    row.update(
+                        status="pending",
+                        updated_at="2026-08-20T14:40:00.000000Z",
+                        completed_at=None,
+                        retry_count=0,
+                        next_retry_at=None,
+                        worker_id_present=False,
+                        worker_id_digest=None,
+                        claimed_at=None,
+                        error_category="none",
+                        error_digest=None,
+                    )
             epoch_three_recovered_rows.append(row)
         epoch_three_recovered_snapshot = dict(
             create_live_snapshot(

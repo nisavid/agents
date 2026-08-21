@@ -4359,7 +4359,10 @@ def _post_abort_v11_retry_recovery(
         != context.get("post_abort_selected_operation_ids_digest")
         or digest(sorted(reference_selected))
         != context.get("selected_operation_ids_digest")
-        or any(item["expected_status"] != "failed" for item in selected)
+        or any(
+            item["expected_status"] not in {"failed", "pending", "processing"}
+            for item in selected
+        )
     ):
         raise OperationRecoveryError(
             "operation-recovery post-abort retry recovery is invalid"
@@ -4378,15 +4381,20 @@ def _post_abort_v11_retry_recovery(
             if prior is not None
             else reference_retry_count
         )
+        reset_applied = item["expected_status"] == "failed"
         attempts_consumed_during_reference = (
-            retry_count_before - reference_retry_count + 1
+            retry_count_before
+            - reference_retry_count
+            + int(item["expected_status"] in {"processing", "failed"})
         )
         attempts_consumed_before = (
             prior_attempts_consumed
             + attempts_consumed_during_reference
         )
-        retry_count_after = 0
-        attempts_available_after = ordinary_attempt_ceiling
+        retry_count_after = 0 if reset_applied else retry_count_before
+        attempts_available_after = (
+            ordinary_attempt_ceiling - retry_count_after
+        )
         cumulative_attempt_ceiling = (
             attempts_consumed_before + attempts_available_after
         )
@@ -4404,7 +4412,9 @@ def _post_abort_v11_retry_recovery(
             <= reference_retry_count
             <= retry_count_before
             <= ordinary_retry_ceiling
-            or attempts_consumed_during_reference < 1
+            or attempts_consumed_during_reference
+            < int(item["expected_status"] in {"processing", "failed"})
+            or attempts_available_after < 1
             or cumulative_attempt_ceiling > maximum_cumulative_attempts
         ):
             raise OperationRecoveryError(
@@ -4413,7 +4423,7 @@ def _post_abort_v11_retry_recovery(
         operations.append(
             {
                 "operation_id": operation_id,
-                "expected_status": "failed",
+                "expected_status": item["expected_status"],
                 "reference_retry_count": reference_retry_count,
                 "retry_count_before": retry_count_before,
                 "retry_count_after": retry_count_after,
@@ -4424,7 +4434,7 @@ def _post_abort_v11_retry_recovery(
                 "attempts_consumed_before": attempts_consumed_before,
                 "attempts_available_after": attempts_available_after,
                 "cumulative_attempt_ceiling": cumulative_attempt_ceiling,
-                "reset_applied": True,
+                "reset_applied": reset_applied,
             }
         )
     return {
@@ -4437,7 +4447,9 @@ def _post_abort_v11_retry_recovery(
         "ordinary_attempt_ceiling": ordinary_attempt_ceiling,
         "maximum_cumulative_attempts": maximum_cumulative_attempts,
         "operation_count": len(operations),
-        "failed_reset_count": len(operations),
+        "failed_reset_count": sum(
+            item["reset_applied"] for item in operations
+        ),
         "prior_retry_recovery": prior_retry_recovery,
         "prior_retry_recovery_digest": prior_digest,
         "operations": operations,

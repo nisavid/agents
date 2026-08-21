@@ -6523,6 +6523,55 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
         self.assertTrue(progress["worker_failure"]["retryable"])
         self.assertNotIn("secret-value", json.dumps(progress))
 
+    def test_exact_drain_worker_uses_bound_legacy_failure_schema(self):
+        worker = runpy.run_path(
+            str(ROOT / "bin" / "hindsight-exact-drain-worker")
+        )
+        with tempfile.TemporaryDirectory(
+            dir="/private/tmp",
+            prefix="exact-drain-worker-legacy-failure-",
+        ) as directory:
+            path = Path(directory) / "progress.json"
+            recorder = ExactDrainProgressRecorder(
+                path=path,
+                plan_digest="a" * 64,
+                worker_pid=1234,
+                worker_start_time="darwin:1000:1",
+                worker_attempt=1,
+                selected_operations=[
+                    {
+                        "operation_id": (
+                            "00000000-0000-4000-8000-000000000001"
+                        ),
+                        "operation_type": "retain",
+                        "row_digest": "b" * 64,
+                    }
+                ],
+                progress_schema_version=4,
+                clock=lambda: 1000.0,
+            )
+            globals_ = worker["run"].__globals__
+            globals_["_WORKER_PROGRESS_RECORDER"] = recorder
+            recorder.worker_stage(
+                status="starting",
+                stage="worker.memory.initialize",
+            )
+
+            def fail_before_claim():
+                raise RuntimeError("request timeout secret-value")
+
+            globals_["main"] = fail_before_claim
+            self.assertEqual(worker["run"](), 2)
+            progress = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(progress["worker_status"], "failed")
+        self.assertEqual(
+            progress["worker_failure"]["category"],
+            "provider_transport",
+        )
+        self.assertTrue(progress["worker_failure"]["retryable"])
+        self.assertNotIn("secret-value", json.dumps(progress))
+
     def test_exact_drain_worker_gate_binds_parent_artifacts_before_activation(self):
         fixtures = recovery_fixtures.OperationRecoveryContractTest()
         now = int(time.time())

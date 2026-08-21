@@ -527,7 +527,15 @@ def run() -> int:
         ):
             print(f"hindsight-exact-drain-worker: {error}", file=sys.stderr)
             return 2
-        failure = exact_drain_worker_failure_evidence(error)
+        progress_schema_version = getattr(
+            recorder,
+            "progress_schema_version",
+            5,
+        )
+        failure = exact_drain_worker_failure_evidence(
+            error,
+            progress_schema_version=progress_schema_version,
+        )
         failure_stage = getattr(recorder, "_worker_stage", _WORKER_STAGE)
         if getattr(recorder, "progress_schema_version", None) in {3, 4, 5}:
             try:

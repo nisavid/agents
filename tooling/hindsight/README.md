@@ -333,11 +333,12 @@ Schema 11 permits an authenticated recovery from epoch one to epoch two.
 Schema 12 permits one final recovery from epoch two to epoch three. For either
 chained transition, the operator must provide `--prior-recovery-plan`;
 planning authenticates the complete prior retry ledger and its application and
-verification receipts. A chained recovery selects only failed rows from the
-reference exact plan, so still-pending unowned rows remain unchanged. The next
-exact-drain plan nevertheless selects the complete pending set. The epoch-three
-ledger caps cumulative attempts at sixteen, including the four attempts made
-available by the final reset. Epoch four is not representable.
+verification receipts. A chained recovery resets only failed rows from the
+reference exact plan. Owned pending or processing rows are released without
+resetting their retry counts or stored causes, while still-pending unowned rows
+remain unchanged. The next exact-drain plan selects the complete pending set.
+The epoch-three ledger caps cumulative attempts at sixteen, including the four
+attempts made available by the final reset. Epoch four is not representable.
 An existing nonterminal schema-11 application journal is not resumable. The
 controller and worker require the authenticated schema-12 post-abort recovery
 path; terminal reconciliation remains available without restarting task work.

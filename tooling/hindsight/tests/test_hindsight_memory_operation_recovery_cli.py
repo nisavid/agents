@@ -5610,6 +5610,16 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                             for position in range(201)
                         ]
 
+                class FaultConnection(Connection):
+                    def __init__(self, now, error):
+                        super().__init__(now)
+                        self.error = error
+
+                    async def fetch(self, _query, *_arguments, timeout):
+                        if timeout != 125.0:
+                            raise AssertionError("client deadline differs")
+                        raise self.error
+
                 def projection(values):
                     return [
                         (item.entity_id, item.canonical_name, item.entity_kind)
@@ -5702,6 +5712,48 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                             full_resolver._task_key()
                         ]
                     ]
+
+                    async def capture_timeout(strategy, error):
+                        timeout_resolver = EntityResolver(pool=None)
+                        resolve = getattr(
+                            timeout_resolver,
+                            f"_resolve_entities_batch_{{strategy}}",
+                        )
+                        try:
+                            await resolve(
+                                FaultConnection(now, error),
+                                "engineering",
+                                entities[:1],
+                                now,
+                            )
+                        except BaseException as observed:
+                            return {{
+                                "type": type(observed).__name__,
+                                "message": str(observed),
+                                "cause_type": type(observed.__cause__).__name__,
+                            }}
+                        raise AssertionError("phase-one timeout was swallowed")
+
+                    timeouts = {{}}
+                    for strategy in ("trigram", "full"):
+                        sqlstate_timeout_error = RuntimeError("query cancelled")
+                        sqlstate_timeout_error.sqlstate = "57014"
+                        timeouts[strategy] = {{
+                            "client": await capture_timeout(
+                                strategy,
+                                TimeoutError(),
+                            ),
+                            "statement": await capture_timeout(
+                                strategy,
+                                RuntimeError(
+                                    "canceling statement due to statement timeout"
+                                ),
+                            ),
+                            "sqlstate": await capture_timeout(
+                                strategy,
+                                sqlstate_timeout_error,
+                            ),
+                        }}
                     guarded_pattern = GuardedTrigramPattern(
                         resolver_module._TRGM_WORD
                     )
@@ -5763,6 +5815,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                             batch_bound_max_input_length
                         ),
                         "over_budget_empty": over_budget == {{}},
+                        "timeouts": timeouts,
                     }}
 
                 print(json.dumps(asyncio.run(exercise()), sort_keys=True))
@@ -5824,6 +5877,24 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 0,
             )
             self.assertTrue(observed["over_budget_empty"])
+            for strategy, stage in (
+                ("trigram", r"fuzzy\.1/1"),
+                ("full", "full"),
+            ):
+                for key, cause_type in (
+                    ("client", "TimeoutError"),
+                    ("statement", "RuntimeError"),
+                    ("sqlstate", "RuntimeError"),
+                ):
+                    with self.subTest(strategy=strategy, fault=key):
+                        timeout = observed["timeouts"][strategy][key]
+                        self.assertEqual(timeout["type"], "TimeoutError")
+                        self.assertEqual(timeout["cause_type"], cause_type)
+                        self.assertRegex(
+                            timeout["message"],
+                            r"^operation-recovery exact drain phase-one query "
+                            rf"timed out at retain\.phase1\.candidates\.{stage}$",
+                        )
 
     def test_exact_drain_metadata_ceiling_precedes_file_read(self):
         read_version = self.controller[

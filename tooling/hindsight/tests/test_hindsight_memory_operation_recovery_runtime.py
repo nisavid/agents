@@ -56,6 +56,10 @@ from hindsight_memory_control_plane.operation_recovery_runtime import (  # noqa:
 from hindsight_memory_control_plane.operation_recovery import (  # noqa: E402
     OperationRecoveryError,
 )
+from hindsight_memory_control_plane.operation_recovery_progress import (
+    ExactDrainProgressRecorder,
+    read_exact_drain_progress,
+)
 
 
 class _RunCapableWorkerPoller:
@@ -161,6 +165,54 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
                     "utf-8"
                 )
             ).hexdigest(),
+        )
+
+    def test_worker_failure_classifies_bare_timeout(self):
+        evidence = exact_drain_worker_failure_evidence(TimeoutError())
+
+        self.assertEqual(
+            evidence["category"],
+            "worker_initialization_timeout",
+        )
+        self.assertTrue(evidence["retryable"])
+        self.assertIsNone(evidence["http_status"])
+        self.assertEqual(
+            evidence["error_digest"],
+            hashlib.sha256(b"TimeoutError").hexdigest(),
+        )
+
+    def test_worker_failure_classifies_database_timeouts_as_retryable(self):
+        sqlstate_timeout = RuntimeError("query canceled")
+        sqlstate_timeout.sqlstate = "57014"
+
+        for error in (
+            RuntimeError("canceling statement due to statement timeout"),
+            sqlstate_timeout,
+        ):
+            with self.subTest(error=str(error)):
+                evidence = exact_drain_worker_failure_evidence(error)
+
+                self.assertEqual(
+                    evidence["category"],
+                    "worker_initialization_timeout",
+                )
+                self.assertTrue(evidence["retryable"])
+                self.assertIsNone(evidence["http_status"])
+
+    def test_worker_failure_preserves_phase_one_deadline_category(self):
+        message = (
+            operation_recovery_runtime.EXACT_DRAIN_PHASE_ONE_DEADLINE_TIMEOUT_MESSAGE
+        )
+        evidence = exact_drain_worker_failure_evidence(
+            OperationRecoveryError(message)
+        )
+
+        self.assertEqual(evidence["category"], "phase_one_timeout")
+        self.assertFalse(evidence["retryable"])
+        self.assertIsNone(evidence["http_status"])
+        self.assertEqual(
+            evidence["error_digest"],
+            hashlib.sha256(message.encode("utf-8")).hexdigest(),
         )
 
     def test_postgres_safe_error_text_bounds_work_before_encoding(self):
@@ -981,16 +1033,29 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         adapter._started_ids.add(operation_id)
         adapter._verify_unstarted_state = AsyncMock()
         adapter._configure_mutation_transaction = AsyncMock()
-        outcomes = []
-
-        class Recorder:
-            def task_stage(self, *arguments, **keywords):
-                outcomes.append(("legacy", arguments, keywords))
-
-            def task_outcome(self, *arguments, **keywords):
-                outcomes.append(("outcome", arguments, keywords))
-
-        adapter._progress_recorder = Recorder()
+        progress_directory = tempfile.TemporaryDirectory(dir="/private/tmp")
+        self.addCleanup(progress_directory.cleanup)
+        progress_path = Path(progress_directory.name) / "progress.json"
+        adapter._progress_recorder = ExactDrainProgressRecorder(
+            path=progress_path,
+            plan_digest=adapter._plan["plan_digest"],
+            worker_pid=1234,
+            worker_start_time="darwin:1000:1",
+            worker_attempt=1,
+            selected_operations=[
+                {
+                    "operation_id": operation_id,
+                    "operation_type": selected["operation_type"],
+                    "row_digest": selected["row_digest"],
+                }
+            ],
+            progress_schema_version=2,
+        )
+        adapter._progress_recorder.task_stage(
+            operation_id,
+            status="processing",
+            stage="batch_retain.sub_batch.1",
+        )
         row = {
             "operation_type": selected["operation_type"],
             "status": "processing",
@@ -1044,23 +1109,32 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
             )
         )
 
-        self.assertEqual(len(outcomes), 1)
-        kind, arguments, evidence = outcomes[0]
-        self.assertEqual(kind, "outcome")
-        self.assertEqual(arguments, (operation_id,))
+        evidence = read_exact_drain_progress(
+            progress_path,
+            plan_digest=adapter._plan["plan_digest"],
+            progress_schema_version=2,
+        )["tasks"][0]
         self.assertEqual(evidence["status"], "failed")
         self.assertEqual(evidence["stage"], "failed")
         self.assertEqual(
+            evidence["failure_stage"],
+            "batch_retain.sub_batch.1",
+        )
+        self.assertEqual(
             evidence["failure"],
             {
-                "category": "phase_one_timeout",
+                "category": "operation_error",
                 "retryable": False,
                 "http_status": None,
                 "error_digest": hashlib.sha256(b"TimeoutError").hexdigest(),
             },
         )
         self.assertEqual(
-            evidence["checkpoint"],
+            {
+                key: value
+                for key, value in evidence["checkpoint"].items()
+                if key != "checkpoint_digest"
+            },
             {
                 "facts_committed": True,
                 "committed_document_count": 1,
@@ -1070,6 +1144,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
                 "total": 14,
             },
         )
+        self.assertNotIn("TimeoutError", progress_path.read_text(encoding="utf-8"))
 
     def test_failure_evidence_classifies_provider_bad_request_without_url_port(self):
         classify = operation_recovery_runtime._exact_drain_failure_evidence
@@ -1103,6 +1178,21 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
 
         queue = classify("provider_queue_timeout", retryable=True)
         execution = classify("provider_execution_timeout", retryable=True)
+        phase_one = classify(
+            "RetryTaskAt: TimeoutError: operation-recovery exact drain "
+            "phase-one query timed out at retain.phase1.candidates.fuzzy.1/2",
+            retryable=True,
+        )
+        phase_one_deadline = classify(
+            "exact drain retain phase one exceeded its deadline",
+            retryable=False,
+        )
+        stored_phase_one_deadline = classify(
+            "OperationRecoveryError: exact drain retain phase one exceeded "
+            "its deadline",
+            retryable=False,
+        )
+        upstream = classify("TimeoutError", retryable=True)
         attempt = classify(
             operation_recovery_runtime.EXACT_DRAIN_OPERATION_ATTEMPT_TIMEOUT_MESSAGE,
             retryable=False,
@@ -1110,11 +1200,31 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
 
         self.assertEqual(queue["category"], "provider_queue_timeout")
         self.assertEqual(execution["category"], "provider_execution_timeout")
+        self.assertEqual(phase_one["category"], "phase_one_timeout")
+        self.assertEqual(
+            phase_one_deadline["category"],
+            "phase_one_timeout",
+        )
+        self.assertEqual(
+            stored_phase_one_deadline["category"],
+            "phase_one_timeout",
+        )
+        self.assertEqual(upstream["category"], "operation_error")
         self.assertEqual(attempt["category"], "operation_attempt_timeout")
         self.assertTrue(queue["retryable"])
         self.assertTrue(execution["retryable"])
+        self.assertTrue(phase_one["retryable"])
+        self.assertFalse(phase_one_deadline["retryable"])
+        self.assertTrue(upstream["retryable"])
         self.assertFalse(attempt["retryable"])
-        for evidence in (queue, execution, attempt):
+        for evidence in (
+            queue,
+            execution,
+            phase_one,
+            phase_one_deadline,
+            upstream,
+            attempt,
+        ):
             self.assertIsNone(evidence["http_status"])
             self.assertEqual(
                 set(evidence),

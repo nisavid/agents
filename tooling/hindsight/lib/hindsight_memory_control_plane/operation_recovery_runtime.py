@@ -121,6 +121,20 @@ EXACT_DRAIN_EXECUTION_LEASE_ERROR_DIGEST = hashlib.sha256(
 EXACT_DRAIN_OPERATION_ATTEMPT_TIMEOUT_MESSAGE = (
     "operation-recovery exact drain operation attempt exceeded its deadline"
 )
+EXACT_DRAIN_PHASE_ONE_DEADLINE_TIMEOUT_MESSAGE = (
+    "exact drain retain phase one exceeded its deadline"
+)
+EXACT_DRAIN_PHASE_ONE_DEADLINE_TIMEOUT_ERROR = (
+    f"{OperationRecoveryError.__name__}: "
+    f"{EXACT_DRAIN_PHASE_ONE_DEADLINE_TIMEOUT_MESSAGE}"
+)
+EXACT_DRAIN_PHASE_ONE_QUERY_TIMEOUT_PREFIX = (
+    "operation-recovery exact drain phase-one query timed out"
+)
+EXACT_DRAIN_PHASE_ONE_QUERY_TIMEOUT = re.compile(
+    re.escape(EXACT_DRAIN_PHASE_ONE_QUERY_TIMEOUT_PREFIX)
+    + r" at (retain\.phase1\.[A-Za-z0-9._:/=-]{1,112})(?:\s|$)"
+)
 EXACT_DRAIN_OAUTH_LOCATORS = {
     "work-codex": "oauth-home:work",
     "personal-codex": "oauth-home:personal",
@@ -763,6 +777,26 @@ def _postgres_safe_error_text(value: str) -> str:
     )
 
 
+def _exact_drain_phase_one_query_timeout_stage(
+    error_message: str,
+) -> str | None:
+    if not isinstance(error_message, str):
+        return None
+    matched = EXACT_DRAIN_PHASE_ONE_QUERY_TIMEOUT.search(error_message)
+    return None if matched is None else matched.group(1)
+
+
+def _exact_drain_worker_initialization_timed_out(
+    error: BaseException,
+    message: str,
+) -> bool:
+    return (
+        isinstance(error, TimeoutError)
+        or getattr(error, "sqlstate", None) == "57014"
+        or "statement timeout" in message.casefold()
+    )
+
+
 def _exact_drain_failure_evidence(
     error_message: str,
     *,
@@ -800,14 +834,21 @@ def _exact_drain_failure_evidence(
         category = "provider_execution_timeout"
     elif safe_error == EXACT_DRAIN_OPERATION_ATTEMPT_TIMEOUT_MESSAGE:
         category = "operation_attempt_timeout"
+    elif safe_error in {
+        EXACT_DRAIN_PHASE_ONE_DEADLINE_TIMEOUT_MESSAGE,
+        EXACT_DRAIN_PHASE_ONE_DEADLINE_TIMEOUT_ERROR,
+    }:
+        category = "phase_one_timeout"
     elif http_status == 400:
         category = "provider_bad_request"
     elif EXACT_DRAIN_AUTHENTICATION_ERROR.search(safe_error) is not None:
         category = "provider_authentication"
     elif EXACT_DRAIN_CAPACITY_ERROR.search(safe_error) is not None:
         category = "provider_capacity"
-    elif "timeouterror" in lowered or "statement timeout" in lowered:
+    elif _exact_drain_phase_one_query_timeout_stage(safe_error) is not None:
         category = "phase_one_timeout"
+    elif "timeouterror" in lowered or "statement timeout" in lowered:
+        category = "operation_error"
     elif EXACT_DRAIN_TRANSPORT_ERROR.search(safe_error) is not None:
         category = "provider_transport"
     elif not safe_error:
@@ -836,6 +877,10 @@ def exact_drain_worker_failure_evidence(
         if message
         else type(error).__name__
     )
+    phase_one_deadline = (
+        isinstance(error, OperationRecoveryError)
+        and message == EXACT_DRAIN_PHASE_ONE_DEADLINE_TIMEOUT_MESSAGE
+    )
     if (
         isinstance(error, OperationRecoveryError)
         and message == EXACT_DRAIN_EXECUTION_LEASE_EXPIRED_MESSAGE
@@ -849,17 +894,23 @@ def exact_drain_worker_failure_evidence(
     elif (
         isinstance(error, OperationRecoveryError)
         and message == EXACT_DRAIN_OPERATION_ATTEMPT_TIMEOUT_MESSAGE
-    ):
+    ) or phase_one_deadline:
         evidence = _exact_drain_failure_evidence(
             message,
             retryable=False,
         )
+    elif _exact_drain_worker_initialization_timed_out(error, message):
+        evidence = _exact_drain_failure_evidence(
+            typed_message,
+            retryable=False,
+        )
+        evidence["category"] = "worker_initialization_timeout"
     else:
         evidence = _exact_drain_failure_evidence(
             typed_message,
             retryable=False,
         )
-    if evidence["category"] == "phase_one_timeout":
+    if evidence["category"] == "phase_one_timeout" and not phase_one_deadline:
         evidence["category"] = "worker_initialization_timeout"
     elif evidence["category"] == "operation_error":
         evidence["category"] = "worker_initialization"
@@ -1646,7 +1697,7 @@ def install_exact_drain_runtime_guards(
                 ):
                     request_exact_worker_shutdown(poller)
                     raise OperationRecoveryError(
-                        "exact drain retain phase one exceeded its deadline"
+                        EXACT_DRAIN_PHASE_ONE_DEADLINE_TIMEOUT_MESSAGE
                     )
                 if isinstance(stage, str) and stage != last_stage:
                     try:
@@ -2637,7 +2688,19 @@ def _patch_exact_drain_entity_resolver(
                 await conn.execute(
                     "SET LOCAL statement_timeout = '120s'"
                 )
-                return await conn.fetch(*arguments, timeout=125.0)
+                try:
+                    return await conn.fetch(*arguments, timeout=125.0)
+                except Exception as error:
+                    if (
+                        isinstance(error, TimeoutError)
+                        or getattr(error, "sqlstate", None) == "57014"
+                        or "statement timeout" in str(error).casefold()
+                    ):
+                        raise TimeoutError(
+                            "operation-recovery exact drain phase-one query "
+                            f"timed out at {stage}"
+                        ) from error
+                    raise
 
         # Query ALL candidates for this bank
 ''',
@@ -2714,7 +2777,19 @@ def _patch_exact_drain_entity_resolver(
                 await conn.execute(
                     \"SET LOCAL statement_timeout = '120s'\"
                 )
-                return await conn.fetch(*arguments, timeout=125.0)
+                try:
+                    return await conn.fetch(*arguments, timeout=125.0)
+                except Exception as error:
+                    if (
+                        isinstance(error, TimeoutError)
+                        or getattr(error, \"sqlstate\", None) == \"57014\"
+                        or \"statement timeout\" in str(error).casefold()
+                    ):
+                        raise TimeoutError(
+                            \"operation-recovery exact drain phase-one query \"
+                            f\"timed out at {stage}\"
+                        ) from error
+                    raise
 
         entity_texts = list(set(e[\"text\"] for e in entities_data))
 """,

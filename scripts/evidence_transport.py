@@ -650,9 +650,19 @@ def _run_candidate_git(
     operation: str,
 ) -> bytes:
     executable = _trusted_candidate_git_executable(error_factory=error_factory)
+    closed_configuration = [
+        component
+        for key, value in _CANDIDATE_GIT_CONFIG
+        for component in ("-c", f"{key}={value}")
+    ]
     try:
         result = subprocess.run(
-            [executable, "--work-tree=.", *arguments],
+            [
+                executable,
+                "--work-tree=.",
+                *closed_configuration,
+                *arguments,
+            ],
             cwd=root,
             env=_candidate_git_environment(),
             stdin=subprocess.DEVNULL,

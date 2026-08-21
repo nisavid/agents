@@ -84,10 +84,8 @@ modern macOS, Linux, and Windows through closed platform-provider sets:
 
 - macOS uses `git-credential-osxkeychain` from the trusted system Git exec
   directory;
-- Linux prefers a system-installed `git-credential-manager` with the
-  `secretservice` store forced through GCM's environment contract and at
-  command scope, then falls back to a
-  system-installed `git-credential-libsecret`; and
+- Linux uses the system Git installation's memory-only
+  `git-credential-cache`; and
 - Windows uses `git-credential-manager.exe` (or the allowlisted legacy
   `git-credential-manager-core.exe`) only from the selected Git for Windows
   installation, with the `wincredman` store forced through GCM's environment
@@ -105,11 +103,11 @@ locations instead of ambient `PATH` or directory environment variables. Paths
 containing command syntax are rejected, and helper paths are escaped before
 entering command-scope Git configuration. A missing, redirected, mutable, or
 unsupported provider yields
-`HTTPS_CREDENTIAL_PROVIDER_UNAVAILABLE` before any push attempt. Linux hosts
-must have either GCM or libsecret plus a private user runtime directory, its
-exact session-bus socket, and an already-unlocked default Secret Service
-collection. The executor validates that session before retaining only its D-Bus
-address and runtime directory; it never bootstraps or unlocks a store.
+`HTTPS_CREDENTIAL_PROVIDER_UNAVAILABLE` before any push attempt. A Linux
+credential must already be present in Git's user-private memory cache. The
+executor neither starts an interactive acquisition flow nor reads a persistent
+desktop secret store whose API may request an unlock prompt; a cache miss fails
+closed.
 
 The executor first installs an empty command-scope `credential.helper` to clear
 all ambient helpers, rejects every repository or worktree `credential.*`

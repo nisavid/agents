@@ -140,6 +140,40 @@ EXACT_DRAIN_PHASE_ONE_QUERY_TIMEOUT = re.compile(
     re.escape(EXACT_DRAIN_PHASE_ONE_QUERY_TIMEOUT_PREFIX)
     + r" at (retain\.phase1\.[A-Za-z0-9._:/=-]{1,112})(?:\s|$)"
 )
+EXACT_DRAIN_SCHEMA_FIVE_SENTINELS = (
+    (
+        "operation_attempt_deadline",
+        "operation_attempt_timeout",
+        (EXACT_DRAIN_OPERATION_ATTEMPT_TIMEOUT_MESSAGE.casefold(),),
+    ),
+    (
+        "phase_one_deadline",
+        "phase_one_timeout",
+        (
+            EXACT_DRAIN_PHASE_ONE_DEADLINE_TIMEOUT_MESSAGE.casefold(),
+            EXACT_DRAIN_PHASE_ONE_QUERY_TIMEOUT_PREFIX.casefold(),
+        ),
+    ),
+    (
+        "database_statement_timeout",
+        "database_statement_timeout",
+        ("statement timeout", "sqlstate 57014"),
+    ),
+    (
+        "provider_queue_timeout",
+        "provider_queue_timeout",
+        ("provider_queue_timeout",),
+    ),
+    (
+        "provider_execution_timeout",
+        "provider_execution_timeout",
+        ("provider_execution_timeout",),
+    ),
+)
+EXACT_DRAIN_BAD_REQUEST_SHORTHAND_PATTERN = (
+    r"bad.?request|client.?error|"
+    r"status.?400([^0-9]|$)|error.?400([^0-9]|$)"
+)
 EXACT_DRAIN_OAUTH_LOCATORS = {
     "work-codex": "oauth-home:work",
     "personal-codex": "oauth-home:personal",
@@ -218,6 +252,34 @@ def _exact_drain_error_is_transient(error_message: Any) -> bool:
         and EXACT_DRAIN_CAPACITY_ERROR.search(error_message) is None
         and EXACT_DRAIN_TRANSPORT_ERROR.search(error_message) is not None
     )
+
+
+def _exact_drain_schema_five_sentinel(
+    error_message: str,
+) -> tuple[str, str] | None:
+    lowered = error_message.casefold()
+    for cause_family, category, markers in EXACT_DRAIN_SCHEMA_FIVE_SENTINELS:
+        if any(marker in lowered for marker in markers):
+            return cause_family, category
+    return None
+
+
+def _exact_drain_schema_five_sentinel_sql() -> str:
+    cases = []
+    for cause_family, _category, markers in EXACT_DRAIN_SCHEMA_FIVE_SENTINELS:
+        predicates = []
+        for marker in markers:
+            escaped_marker = marker.replace("'", "''")
+            predicates.append(
+                "strpos(lower(error_message), "
+                f"'{escaped_marker}') > 0"
+            )
+        cases.append(
+            "    WHEN "
+            + "\n        OR ".join(predicates)
+            + f"\n        THEN '{cause_family}'"
+        )
+    return "\n".join(cases)
 
 
 def exact_drain_platform_environment() -> dict[str, str]:
@@ -586,23 +648,9 @@ WHERE bank_id = $1
   AND ($4::text[] IS NULL OR status = ANY($4::text[]))
 ORDER BY created_at, operation_id
 """
-FAILURE_CAUSE_FAMILY_SQL = """
+FAILURE_CAUSE_FAMILY_SQL = f"""
 CASE
-    WHEN lower(error_message) LIKE
-         '%operation-recovery exact drain operation attempt exceeded%'
-        THEN 'operation_attempt_deadline'
-    WHEN lower(error_message) LIKE
-         '%exact drain retain phase one exceeded%'
-        OR lower(error_message) LIKE
-           '%operation-recovery exact drain phase-one query timed out%'
-        THEN 'phase_one_deadline'
-    WHEN lower(error_message) LIKE '%statement timeout%'
-        OR lower(error_message) LIKE '%sqlstate 57014%'
-        THEN 'database_statement_timeout'
-    WHEN lower(error_message) LIKE '%provider_queue_timeout%'
-        THEN 'provider_queue_timeout'
-    WHEN lower(error_message) LIKE '%provider_execution_timeout%'
-        THEN 'provider_execution_timeout'
+{_exact_drain_schema_five_sentinel_sql()}
     WHEN lower(error_message) ~
          '(auth|credential|token|unauthori[sz]ed|forbidden|401|403)'
         THEN 'provider_authentication'
@@ -610,8 +658,7 @@ CASE
          '(capacity|quota|rate.?limit|usage.?limit|429|exhaust)'
         THEN 'provider_capacity'
     WHEN lower(error_message) ~ (
-         '(bad.?request|client.?error|'
-         || 'status.?400|error.?400|'
+         '({EXACT_DRAIN_BAD_REQUEST_SHORTHAND_PATTERN}|'
          || '(client|server)[[:space:]]+error[[:space:]]+["'']?'
          || '400([^0-9]|$)|'
          || '(status|error)(_code|[[:space:]]+code)?'
@@ -945,29 +992,17 @@ def _exact_drain_failure_evidence(
                 safe_error.encode("utf-8")
             ).hexdigest(),
         }
+    sentinel = _exact_drain_schema_five_sentinel(safe_error)
     if category_override is not None:
         category = category_override
-    elif safe_error == "provider_queue_timeout":
-        category = "provider_queue_timeout"
-    elif safe_error == "provider_execution_timeout":
-        category = "provider_execution_timeout"
-    elif safe_error == EXACT_DRAIN_OPERATION_ATTEMPT_TIMEOUT_MESSAGE:
-        category = "operation_attempt_timeout"
-    elif safe_error in {
-        EXACT_DRAIN_PHASE_ONE_DEADLINE_TIMEOUT_MESSAGE,
-        EXACT_DRAIN_PHASE_ONE_DEADLINE_TIMEOUT_ERROR,
-    }:
-        category = "phase_one_timeout"
-    elif _exact_drain_phase_one_query_timeout_stage(safe_error) is not None:
-        category = "phase_one_timeout"
-    elif "statement timeout" in lowered or "sqlstate 57014" in lowered:
-        category = "database_statement_timeout"
+    elif sentinel is not None:
+        _cause_family, category = sentinel
     elif EXACT_DRAIN_AUTHENTICATION_ERROR.search(safe_error) is not None:
         category = "provider_authentication"
     elif EXACT_DRAIN_CAPACITY_ERROR.search(safe_error) is not None:
         category = "provider_capacity"
     elif http_status == 400 or re.search(
-        r"bad.?request|client.?error|status.?400|error.?400",
+        EXACT_DRAIN_BAD_REQUEST_SHORTHAND_PATTERN,
         safe_error,
         re.IGNORECASE,
     ) is not None:

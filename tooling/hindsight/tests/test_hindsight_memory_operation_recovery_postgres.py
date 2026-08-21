@@ -329,28 +329,81 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
 
     def test_failure_classifier_sql_matches_progress_classifier(self):
         cases = (
-            ("400 unauthorized request timeout", "provider_authentication"),
-            ("client error 400: quota exhausted", "provider_capacity"),
-            ("status 400: request timeout", "provider_bad_request"),
+            (
+                "400 unauthorized request timeout",
+                "provider_authentication",
+                "provider_authentication",
+            ),
+            (
+                "client error 400: quota exhausted",
+                "provider_capacity",
+                "provider_capacity",
+            ),
+            (
+                "status 400: request timeout",
+                "provider_bad_request",
+                "provider_bad_request",
+            ),
             (
                 "DatabaseError: statement timeout; status 400",
                 "database_statement_timeout",
+                "database_statement_timeout",
             ),
-            ("TimeoutError: connection unavailable", "upstream_timeout"),
-            ("server error '400'", "provider_bad_request"),
-            ("status_code='400'", "provider_bad_request"),
-            ("status-400", "provider_bad_request"),
-            ("status.400", "provider_bad_request"),
-            ("status_400", "provider_bad_request"),
-            ("error-400", "provider_bad_request"),
-            ("error_400", "provider_bad_request"),
-            ("ReadTimeoutError", "upstream_timeout"),
+            (
+                "TimeoutError: connection unavailable",
+                "upstream_timeout",
+                "upstream_timeout",
+            ),
+            (
+                "OperationRecoveryError: provider_queue_timeout\n\n"
+                "Traceback: request timeout after 401 response",
+                "provider_queue_timeout",
+                "provider_queue_timeout",
+            ),
+            (
+                "wrapped provider_execution_timeout failure",
+                "provider_execution_timeout",
+                "provider_execution_timeout",
+            ),
+            (
+                "OperationRecoveryError: operation-recovery exact drain "
+                "operation attempt exceeded its deadline\n\nTraceback: timeout",
+                "operation_attempt_deadline",
+                "operation_attempt_timeout",
+            ),
+            (
+                "OperationRecoveryError: exact drain retain phase one "
+                "exceeded its deadline\n\nTraceback: timeout",
+                "phase_one_deadline",
+                "phase_one_timeout",
+            ),
+            (
+                "server error '400'",
+                "provider_bad_request",
+                "provider_bad_request",
+            ),
+            (
+                "status_code='400'",
+                "provider_bad_request",
+                "provider_bad_request",
+            ),
+            ("status-400", "provider_bad_request", "provider_bad_request"),
+            ("status.400", "provider_bad_request", "provider_bad_request"),
+            ("status_400", "provider_bad_request", "provider_bad_request"),
+            ("error-400", "provider_bad_request", "provider_bad_request"),
+            ("error_400", "provider_bad_request", "provider_bad_request"),
+            (
+                "error 4000 rows timed out",
+                "upstream_timeout",
+                "upstream_timeout",
+            ),
+            ("ReadTimeoutError", "upstream_timeout", "upstream_timeout"),
         )
 
         async def exercise():
             connection = await self._connect()
             try:
-                for message, expected in cases:
+                for message, expected_sql, expected_progress in cases:
                     with self.subTest(message=message):
                         sql_category = await connection.fetchval(
                             f"SELECT {FAILURE_CAUSE_FAMILY_SQL} "
@@ -362,8 +415,10 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
                             retryable=True,
                             progress_schema_version=5,
                         )
-                        self.assertEqual(sql_category, expected)
-                        self.assertEqual(progress["category"], expected)
+                        self.assertEqual(sql_category, expected_sql)
+                        self.assertEqual(
+                            progress["category"], expected_progress
+                        )
             finally:
                 await connection.close()
 

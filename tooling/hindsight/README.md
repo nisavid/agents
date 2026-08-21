@@ -329,14 +329,16 @@ processing rows; completed rows and all other cohort rows remain digest-exact.
 It advances recovery epoch zero to one. Within that transaction, failed rows
 may reset once while pending and processing rows preserve their retry counts.
 
-Schema 11 permits an authenticated recovery from epoch one to epoch two.
-Schema 12 permits one final recovery from epoch two to epoch three. For either
-chained transition, the operator must provide `--prior-recovery-plan`;
-planning authenticates the complete prior retry ledger and its application and
-verification receipts. A chained recovery resets only failed rows from the
-reference exact plan. Owned pending or processing rows are released without
-resetting their retry counts or stored causes, while still-pending unowned rows
-remain unchanged. The next exact-drain plan selects the complete pending set.
+Schema 11 permits an authenticated recovery from epoch one to epoch two. It
+requires every row selected by the reference exact plan to be failed and resets
+only those failed rows. Schema 12 permits one final recovery from epoch two to
+epoch three. It may select failed rows plus owned pending or processing rows
+from the reference exact plan. Failed rows reset; owned pending or processing
+rows release without resetting their retry counts or stored causes, while
+still-pending unowned rows remain unchanged. For either chained transition,
+the operator must provide `--prior-recovery-plan`; planning authenticates the
+complete prior retry ledger and its application and verification receipts. The
+next exact-drain plan selects the complete pending set.
 The epoch-three ledger caps cumulative attempts at sixteen, including the four
 attempts made available by the final reset. Epoch four is not representable.
 An existing nonterminal schema-11 application journal is not resumable. The

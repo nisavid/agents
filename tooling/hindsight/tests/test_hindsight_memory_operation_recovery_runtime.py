@@ -6201,6 +6201,25 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
                 "TimeoutError: connection unavailable",
                 "upstream_timeout",
             ),
+            (
+                "OperationRecoveryError: provider_queue_timeout\n\n"
+                "Traceback: request timeout after 401 response",
+                "provider_queue_timeout",
+            ),
+            (
+                "wrapped provider_execution_timeout failure",
+                "provider_execution_timeout",
+            ),
+            (
+                "OperationRecoveryError: operation-recovery exact drain "
+                "operation attempt exceeded its deadline\n\nTraceback: timeout",
+                "operation_attempt_timeout",
+            ),
+            (
+                "OperationRecoveryError: exact drain retain phase one "
+                "exceeded its deadline\n\nTraceback: timeout",
+                "phase_one_timeout",
+            ),
             ("server error '400'", "provider_bad_request"),
             ("status_code='400'", "provider_bad_request"),
             ("status-400", "provider_bad_request"),
@@ -6208,6 +6227,7 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
             ("status_400", "provider_bad_request"),
             ("error-400", "provider_bad_request"),
             ("error_400", "provider_bad_request"),
+            ("error 4000 rows timed out", "upstream_timeout"),
             ("ReadTimeoutError", "upstream_timeout"),
         )
         for message, expected in cases:
@@ -6224,7 +6244,11 @@ class OperationRecoveryRuntimeTest(unittest.TestCase):
         ordered_sql_outcomes = tuple(
             f"THEN '{category}'"
             for category in (
+                "operation_attempt_deadline",
+                "phase_one_deadline",
                 "database_statement_timeout",
+                "provider_queue_timeout",
+                "provider_execution_timeout",
                 "provider_authentication",
                 "provider_capacity",
                 "provider_bad_request",

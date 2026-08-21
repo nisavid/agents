@@ -94,10 +94,10 @@ modern macOS, Linux, and Windows through closed platform-provider sets:
 The Linux provider and both its lexical and resolved directory ancestries must
 be root-owned, non-writable by group or other, and free of shell
 metacharacters; only a root-owned package symlink may redirect the helper. The
-macOS helper must be a regular, executable, non-set-id file at Git's absolute
-exec path. A helper that does not also satisfy the root-owned ancestry contract
-is admitted only when the trusted `/usr/bin/codesign` verifies Apple's exact
-`git-credential-osxkeychain` requirement.
+macOS candidates are limited to Git's absolute exec path and closed system
+Command Line Tools locations. Each candidate and its ancestry must satisfy the
+same root-owned, non-writable contract, and the trusted `/usr/bin/codesign` must
+also verify Apple's exact `git-credential-osxkeychain` requirement.
 On Windows, Git, SSH, the non-prompting askpass command, the shell, the closed
 command path, and GCM must all resolve without redirection inside the same
 machine-registered Git for Windows installation under the operating system's

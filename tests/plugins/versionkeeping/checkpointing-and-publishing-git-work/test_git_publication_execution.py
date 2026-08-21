@@ -351,7 +351,7 @@ class PublicationExecutionTests(unittest.TestCase):
         )
         self.assertNotIn("credential.credentialStore", dict(closed_config))
 
-    def test_macos_accepts_the_apple_signed_helper_when_ancestry_is_mutable(
+    def test_macos_rejects_an_apple_signed_helper_when_ancestry_is_mutable(
         self,
     ) -> None:
         helper = self.root.resolve() / adapter.MACOS_CREDENTIAL_HELPER
@@ -372,13 +372,59 @@ class PublicationExecutionTests(unittest.TestCase):
             side_effect=trust_executable,
         ):
             with mock.patch.object(
-                adapter.subprocess,
-                "run",
-                return_value=subprocess.CompletedProcess([], 0),
-            ) as run:
-                trusted = adapter._require_trusted_credential_helper(helper)
+                adapter,
+                "MACOS_SYSTEM_CREDENTIAL_HELPERS",
+                (),
+                create=True,
+            ):
+                with mock.patch.object(adapter.subprocess, "run") as run:
+                    with self.assertRaises(adapter.PolicyGate) as raised:
+                        adapter._require_trusted_credential_helper(helper)
 
-        self.assertEqual(trusted, str(helper.resolve()))
+        self.assertEqual(
+            raised.exception.code,
+            "HTTPS_CREDENTIAL_PROVIDER_UNAVAILABLE",
+        )
+        run.assert_not_called()
+
+    def test_macos_uses_an_immutable_apple_signed_system_helper(self) -> None:
+        selected_helper = self.root.resolve() / adapter.MACOS_CREDENTIAL_HELPER
+        system_helper = Path(
+            "/Library/Developer/CommandLineTools/usr/libexec/git-core/"
+            + adapter.MACOS_CREDENTIAL_HELPER
+        )
+        codesign = "/usr/bin/codesign"
+
+        def trust_executable(path, **_kwargs):
+            if path == selected_helper:
+                raise OSError("mutable selected toolchain")
+            if path == system_helper:
+                return str(system_helper)
+            if path == adapter.MACOS_CODESIGN:
+                return codesign
+            raise AssertionError(f"unexpected trust candidate: {path}")
+
+        with mock.patch.object(
+            adapter,
+            "_trusted_root_owned_executable",
+            side_effect=trust_executable,
+        ):
+            with mock.patch.object(
+                adapter,
+                "MACOS_SYSTEM_CREDENTIAL_HELPERS",
+                (system_helper,),
+                create=True,
+            ):
+                with mock.patch.object(
+                    adapter.subprocess,
+                    "run",
+                    return_value=subprocess.CompletedProcess([], 0),
+                ) as run:
+                    trusted = adapter._require_trusted_credential_helper(
+                        selected_helper
+                    )
+
+        self.assertEqual(trusted, str(system_helper))
         self.assertEqual(run.call_args.args[0][0], codesign)
         self.assertIn("anchor apple", " ".join(run.call_args.args[0]))
         self.assertEqual(run.call_args.kwargs["env"], {"PATH": "/usr/bin:/bin"})
@@ -389,9 +435,9 @@ class PublicationExecutionTests(unittest.TestCase):
         helper.chmod(0o755)
 
         def trust_executable(path, **_kwargs):
-            if path == helper:
-                raise OSError("mutable ancestry")
-            return str(path)
+            if path in {helper, adapter.MACOS_CODESIGN}:
+                return str(path)
+            raise OSError("untrusted candidate")
 
         with mock.patch.object(
             adapter,
@@ -1148,10 +1194,16 @@ class PublicationExecutionTests(unittest.TestCase):
                     "output",
                     return_value=str(helper_root),
                 ):
-                    with self.assertRaises(adapter.PolicyGate) as raised:
-                        repository.enable_https_credentials(
-                            "https://github.com/example/repository.git"
-                        )
+                    with mock.patch.object(
+                        adapter,
+                        "MACOS_SYSTEM_CREDENTIAL_HELPERS",
+                        (),
+                        create=True,
+                    ):
+                        with self.assertRaises(adapter.PolicyGate) as raised:
+                            repository.enable_https_credentials(
+                                "https://github.com/example/repository.git"
+                            )
 
         self.assertEqual(
             raised.exception.code,

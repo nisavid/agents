@@ -556,7 +556,6 @@ _CANDIDATE_GIT_ENV_ALLOWLIST = {
     "COMSPEC",
     "HOME",
     "LOGNAME",
-    "PATH",
     "PATHEXT",
     "SHELL",
     "SYSTEMROOT",
@@ -605,6 +604,7 @@ def _candidate_git_environment() -> dict[str, str]:
             "GIT_LITERAL_PATHSPECS": "1",
             "GCM_INTERACTIVE": "never",
             "LC_ALL": "C",
+            "PATH": "/usr/bin:/bin",
             "SSH_ASKPASS_REQUIRE": "never",
         }
     )
@@ -615,6 +615,33 @@ def _candidate_git_environment() -> dict[str, str]:
     return environment
 
 
+def _trusted_candidate_git_executable(*, error_factory: ErrorFactory) -> str:
+    executable = Path("/usr/bin/git")
+    try:
+        resolved = executable.resolve(strict=True)
+        if resolved != executable:
+            _raise(error_factory, "trusted Git executable is unavailable")
+        for path in (Path("/"), Path("/usr"), Path("/usr/bin")):
+            metadata = path.lstat()
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != 0
+                or stat.S_IMODE(metadata.st_mode) & 0o022
+            ):
+                _raise(error_factory, "trusted Git executable is unavailable")
+        metadata = resolved.lstat()
+    except OSError as error:
+        raise error_factory("trusted Git executable is unavailable") from error
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != 0
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+        or stat.S_IMODE(metadata.st_mode) & 0o111 == 0
+    ):
+        _raise(error_factory, "trusted Git executable is unavailable")
+    return str(resolved)
+
+
 def _run_candidate_git(
     root: Path,
     arguments: list[str],
@@ -622,9 +649,10 @@ def _run_candidate_git(
     error_factory: ErrorFactory,
     operation: str,
 ) -> bytes:
+    executable = _trusted_candidate_git_executable(error_factory=error_factory)
     try:
         result = subprocess.run(
-            ["git", "--work-tree=.", *arguments],
+            [executable, "--work-tree=.", *arguments],
             cwd=root,
             env=_candidate_git_environment(),
             stdin=subprocess.DEVNULL,

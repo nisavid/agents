@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -150,6 +151,61 @@ def test_phase7_candidate_identity_never_executes_repository_fsmonitor(
         env=environment,
         check=True,
     )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts/phase7_compatibility_projection.py"),
+            "--public-root",
+            str(repository),
+            "--expected-public-candidate-sha256",
+            "0" * 64,
+        ],
+        env=environment,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert marker.exists() is False
+
+
+def test_phase7_candidate_identity_never_searches_candidate_for_git(
+    tmp_path: Path,
+) -> None:
+    trusted_git = shutil.which("git", path="/usr/bin:/bin")
+    assert trusted_git is not None
+    repository = tmp_path / "repository"
+    home = tmp_path / "home"
+    repository.mkdir()
+    home.mkdir()
+    environment = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": str(home),
+        "XDG_CONFIG_HOME": str(tmp_path / "xdg"),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    subprocess.run(
+        [trusted_git, "-C", str(repository), "init", "--quiet"],
+        env=environment,
+        check=True,
+    )
+    (repository / "payload").write_bytes(b"candidate bytes\n")
+    subprocess.run(
+        [trusted_git, "-C", str(repository), "add", "payload"],
+        env=environment,
+        check=True,
+    )
+
+    marker = home / "native-marker"
+    candidate_git = repository / "git"
+    candidate_git.write_text(
+        '#!/bin/sh\nprintf invoked > "$HOME/native-marker"\nexit 1\n',
+        encoding="utf-8",
+    )
+    candidate_git.chmod(0o700)
+    environment["PATH"] = ".:/usr/bin:/bin"
 
     completed = subprocess.run(
         [

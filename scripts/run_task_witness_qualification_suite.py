@@ -3884,6 +3884,7 @@ def _run_with_captured_descriptors(
         stderr_drain.start()
         sys.stdout.flush()
         sys.stderr.flush()
+        _flush_native_stdio()
         redirected_stdout = True
         _install_capture_descriptor(
             stdout_write,

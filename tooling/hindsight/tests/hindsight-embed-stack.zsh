@@ -217,12 +217,14 @@ default_startup_timeouts="$tmp_dir/default-startup-timeouts"
 (
   unset HINDSIGHT_EMBED_DAEMON_WAIT_SECONDS
   unset HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS
+  unset HINDSIGHT_EMBED_STATUS_PROBE_TIMEOUT_SECONDS
   source "$rendered_stack_lib"
   hindsight_stack_load_config
   print -r -- "daemon:$HINDSIGHT_EMBED_DAEMON_WAIT_SECONDS" >"$default_startup_timeouts"
   print -r -- "command:$HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS" >>"$default_startup_timeouts"
+  print -r -- "status:$HINDSIGHT_EMBED_STATUS_PROBE_TIMEOUT_SECONDS" >>"$default_startup_timeouts"
 )
-[[ "$(<"$default_startup_timeouts")" == $'daemon:300\ncommand:300' ]] || {
+[[ "$(<"$default_startup_timeouts")" == $'daemon:300\ncommand:300\nstatus:5' ]] || {
   print -ru2 -- "stack defaults do not cover the embedded daemon's bounded startup contract"
   exit 1
 }
@@ -329,7 +331,7 @@ credential_scope_results="$tmp_dir/credential-scope-results"
   export TEST_MINT_AUTHORITY=test-mint-authority
   export TEST_UI_ACCESS_KEY=test-ui-access-key
   source "$rendered_stack_lib"
-  for credential_scope in none api ui-proxy broker; do
+  for credential_scope in none api ui-proxy broker controller; do
     print -rn -- "${credential_scope}:"
     hindsight_stack_run_with_credential_scope "$credential_scope" \
       /bin/zsh -c '
@@ -344,7 +346,7 @@ credential_scope_results="$tmp_dir/credential-scope-results"
   done
 ) > "$credential_scope_results"
 [[ "$(<"$credential_scope_results")" == \
-  $'none:0:0:0:0:0:0:0:0:0\napi:0:0:0:1:0:0:1:0:0\nui-proxy:0:0:0:0:1:1:0:1:1\nbroker:1:1:0:0:0:0:0:0:0' ]] || {
+  $'none:0:0:0:0:0:0:0:0:0\napi:0:0:0:1:0:0:1:0:0\nui-proxy:0:0:0:0:1:1:0:1:1\nbroker:1:1:0:0:0:0:0:0:0\ncontroller:1:0:0:0:0:0:0:0:0' ]] || {
   print -ru2 -- "managed child credential scopes exceeded their authority"
   exit 1
 }
@@ -363,7 +365,7 @@ authorized_credential_scope_results="$tmp_dir/authorized-credential-scope-result
   export HINDSIGHT_MINT_AUTHORITY=ambient-mint-authority
   export HINDSIGHT_UI_ACCESS_KEY=ambient-ui-access-key
   source "$rendered_stack_lib"
-  for credential_scope in none api ui-proxy broker preflight; do
+  for credential_scope in none api ui-proxy broker controller preflight; do
     print -rn -- "${credential_scope}:"
     hindsight_stack_run_with_credential_scope "$credential_scope" \
       /bin/zsh -f -c '
@@ -380,7 +382,7 @@ authorized_credential_scope_results="$tmp_dir/authorized-credential-scope-result
   done
 ) > "$authorized_credential_scope_results"
 [[ "$(<"$authorized_credential_scope_results")" == \
-  $'none:0000000000\napi:0000000100\nui-proxy:0000000011\nbroker:1100000000\npreflight:1110000000' ]] || {
+  $'none:0000000000\napi:0000000100\nui-proxy:0000000011\nbroker:1100000000\ncontroller:1000000000\npreflight:1110000000' ]] || {
   print -ru2 -- "managed child scopes retained unauthorized credential destinations"
   exit 1
 }
@@ -394,11 +396,14 @@ component_credential_scopes="$tmp_dir/component-credential-scopes"
   export TEST_DATA_PLANE_TOKEN=test-data-plane-token
   export TEST_MINT_AUTHORITY=test-mint-authority
   export TEST_UI_ACCESS_KEY=test-ui-access-key
+  export HINDSIGHT_EMBED_CONTROL_SERVER="$tmp_dir/managed-control-server.py"
+  export HINDSIGHT_EMBED_DESIRED_STATE_DIR="$tmp_dir/managed-desired-state"
   source "$rendered_stack_lib"
   hindsight_stack_load_config() { return 0 }
   hindsight_stack_ensure_profile_ports() { return 0 }
   hindsight_stack_daemon_status() { return 0 }
   hindsight_stack_ui_running() { return 1 }
+  hindsight_stack_prepare_ui_package() { return 0 }
   hindsight_stack_run_bounded_with_credential_scope() {
     print -r -- "$1" >> "$component_credential_scopes"
   }
@@ -519,6 +524,29 @@ if (
   print -ru2 -- "stack accepted a nonnumeric lifecycle command timeout"
   exit 1
 fi
+
+for valid_status_timeout in 1 30; do
+  (
+    export HINDSIGHT_EMBED_STATUS_PROBE_TIMEOUT_SECONDS="$valid_status_timeout"
+    source "$rendered_stack_lib"
+    hindsight_stack_load_config
+  ) >/dev/null 2>&1 || {
+    print -ru2 -- \
+      "stack rejected status probe timeout boundary ${valid_status_timeout}"
+    exit 1
+  }
+done
+for invalid_status_timeout in 0 00 +5 31 not-a-timeout; do
+  if (
+    export HINDSIGHT_EMBED_STATUS_PROBE_TIMEOUT_SECONDS="$invalid_status_timeout"
+    source "$rendered_stack_lib"
+    hindsight_stack_load_config
+  ) >/dev/null 2>&1; then
+    print -ru2 -- \
+      "stack accepted invalid status probe timeout ${invalid_status_timeout}"
+    exit 1
+  fi
+done
 
 for invalid_base_port in 07979 +7979 0 65536; do
   if (
@@ -656,6 +684,28 @@ fi
   exit 1
 }
 
+managed_control_start_events="$tmp_dir/managed-control-start-events"
+(
+  source "$rendered_stack_lib"
+  HINDSIGHT_EMBED_CONTROL_SERVER="$tmp_dir/managed-control-server.py"
+  HINDSIGHT_EMBED_DESIRED_STATE_DIR="$tmp_dir/managed-desired-state"
+  HINDSIGHT_EMBED_CONTROL_PORT=7878
+  HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS=30
+  HINDSIGHT_EMBED_PYTHON=/managed/python
+  hindsight_stack_load_config() { return 0 }
+  hindsight_stack_runtime_active() { return 0 }
+  hindsight_stack_preflight_runtime_credentials() { return 0 }
+  hindsight_stack_run_bounded() {
+    print -rl -- "$@" >"$managed_control_start_events"
+  }
+  hindsight_stack_control_start
+)
+[[ "$(paste -sd, - <"$managed_control_start_events")" == \
+  "30,/managed/python,-I,$tmp_dir/managed-control-server.py,start,--port,7878,--desired-state-dir,$tmp_dir/managed-desired-state" ]] || {
+  print -ru2 -- "active control start bypassed the managed desired-state wrapper"
+  exit 1
+}
+
 daemon_launcher_handoff="$tmp_dir/daemon-launcher-handoff"
 daemon_launcher_status=0
 (
@@ -705,6 +755,7 @@ hardened_ui_restart_events="$tmp_dir/hardened-ui-restart-events"
   hindsight_stack_load_config() { return 0 }
   hindsight_stack_runtime_active() { return 0 }
   hindsight_stack_preflight_runtime_credentials() { return 0 }
+  hindsight_stack_prepare_ui_package() { return 0 }
   hindsight_stack_daemon_status() { return 0 }
   hindsight_stack_ui_running() { return 0 }
   hindsight_stack_ui_status() { return 1 }
@@ -720,6 +771,27 @@ hardened_ui_restart_events="$tmp_dir/hardened-ui-restart-events"
 )
 [[ "$(<"$hardened_ui_restart_events")" == $'stop\nwait:ui\nstart' ]] || {
   print -ru2 -- "active UI start did not replace a running unauthenticated control plane"
+  exit 1
+}
+
+authenticated_ui_status_events="$tmp_dir/authenticated-ui-status-events"
+authenticated_ui_status=0
+(
+  source "$rendered_stack_lib"
+  hindsight_stack_runtime_active() { return 0 }
+  hindsight_stack_run_bounded() {
+    print -r -- upstream-status >>"$authenticated_ui_status_events"
+    return 1
+  }
+  hindsight_stack_ui_auth_probe() {
+    print -r -- auth-probe >>"$authenticated_ui_status_events"
+    return 0
+  }
+  hindsight_stack_ui_status_probe 30
+) || authenticated_ui_status=$?
+(( authenticated_ui_status == 0 )) &&
+  [[ "$(<"$authenticated_ui_status_events")" == auth-probe ]] || {
+  print -ru2 -- "active UI status trusted the unauthenticated upstream status probe"
   exit 1
 }
 
@@ -760,15 +832,20 @@ start_all_events="$tmp_dir/start-all-events"
   hindsight_stack_require_runtime_helpers() { return 0 }
   hindsight_stack_validate_fleet() { print -r -- validate >>"$start_all_events" }
   hindsight_stack_initialize_desired_state() { print -r -- initialize >>"$start_all_events" }
+  hindsight_stack_reconcile_harness_authority() { print -r -- pre >>"$start_all_events" }
+  hindsight_stack_record_harness_authority() { print -r -- post >>"$start_all_events" }
   hindsight_stack_broker_status() { return 0 }
   hindsight_stack_broker_identity_matches() { return 0 }
   hindsight_stack_wait_broker() { print -r -- broker >>"$start_all_events" }
   hindsight_stack_control_status() { return 0 }
   hindsight_stack_wait_control() { print -r -- control >>"$start_all_events" }
-  hindsight_stack_for_each_profile() { print -r -- profiles >>"$start_all_events" }
+  hindsight_stack_for_each_profile() {
+    [[ "$1" == hindsight_stack_daemon_desired_running ]] && return 0
+    print -r -- profiles >>"$start_all_events"
+  }
   hindsight_stack_start_all
 )
-[[ "$(<"$start_all_events")" == $'validate\ninitialize\nbroker\ncontrol\nprofiles' ]] || {
+[[ "$(<"$start_all_events")" == $'validate\ninitialize\npre\nbroker\ncontrol\nprofiles\npost' ]] || {
   print -ru2 -- "stack start did not initialize desired state after validation and before starts"
   exit 1
 }
@@ -784,16 +861,282 @@ active_start_all_events="$tmp_dir/active-start-all-events"
   hindsight_stack_preflight_runtime_credentials() { return 0 }
   hindsight_stack_validate_fleet() { print -r -- validate >>"$active_start_all_events" }
   hindsight_stack_initialize_desired_state() { print -r -- initialize >>"$active_start_all_events" }
+  hindsight_stack_reconcile_harness_authority() { print -r -- pre >>"$active_start_all_events" }
+  hindsight_stack_record_harness_authority() { print -r -- post >>"$active_start_all_events" }
   hindsight_stack_broker_status() { return 0 }
   hindsight_stack_broker_identity_matches() { return 0 }
   hindsight_stack_wait_broker() { print -r -- broker >>"$active_start_all_events" }
   hindsight_stack_control_status() { return 0 }
   hindsight_stack_wait_control() { print -r -- control >>"$active_start_all_events" }
-  hindsight_stack_for_each_profile() { print -r -- profiles >>"$active_start_all_events" }
+  hindsight_stack_for_each_profile() {
+    [[ "$1" == hindsight_stack_daemon_desired_running ]] && return 0
+    print -r -- profiles >>"$active_start_all_events"
+  }
   hindsight_stack_start_all
 )
-[[ "$(<"$active_start_all_events")" == $'validate\ninitialize\ncontrol\nprofiles\nbroker' ]] || {
+[[ "$(<"$active_start_all_events")" == $'validate\ninitialize\npre\ncontrol\nprofiles\nbroker\npost' ]] || {
   print -ru2 -- "active stack start did not bring up the data plane before broker verification"
+  exit 1
+}
+
+harness_authority_events="$tmp_dir/harness-authority-events"
+for lifecycle_function in hindsight_stack_reconcile_once hindsight_stack_start_all; do
+  : >"$harness_authority_events"
+  lifecycle_status=0
+  (
+    source "$rendered_stack_lib"
+    hindsight_stack_load_config() { return 0 }
+    hindsight_stack_preflight_runtime_credentials() { return 0 }
+    hindsight_stack_require_current_user() { return 0 }
+    hindsight_stack_require_tools() { return 0 }
+    hindsight_stack_require_runtime_helpers() { return 0 }
+    hindsight_stack_validate_fleet() { return 0 }
+    hindsight_stack_initialize_desired_state() { return 0 }
+    hindsight_stack_reconcile_harness_authority() {
+      print -r -- authority >>"$harness_authority_events"
+      return 23
+    }
+    hindsight_stack_disable_harness_authority() {
+      print -r -- disable >>"$harness_authority_events"
+    }
+    hindsight_stack_record_harness_authority() {
+      print -r -- post >>"$harness_authority_events"
+    }
+    hindsight_stack_runtime_active() {
+      print -r -- runtime >>"$harness_authority_events"
+      return 1
+    }
+    hindsight_stack_reconcile_broker() {
+      print -r -- broker >>"$harness_authority_events"
+    }
+    hindsight_stack_reconcile_control() {
+      print -r -- control >>"$harness_authority_events"
+    }
+    hindsight_stack_reconcile_profile() {
+      print -r -- profile >>"$harness_authority_events"
+    }
+    hindsight_stack_start_broker_dependency() {
+      print -r -- broker >>"$harness_authority_events"
+    }
+    hindsight_stack_start_control_dependency() {
+      print -r -- control >>"$harness_authority_events"
+    }
+    hindsight_stack_start_profile() {
+      print -r -- profile >>"$harness_authority_events"
+    }
+    hindsight_stack_for_each_profile() {
+      if [[ "$1" == hindsight_stack_daemon_desired_running ]]; then
+        return 0
+      fi
+      "$1"
+    }
+    "$lifecycle_function"
+  ) >/dev/null 2>&1 || lifecycle_status=$?
+  (( lifecycle_status == 0 )) &&
+    [[ "$(<"$harness_authority_events")" == \
+      $'authority\ndisable\nruntime\nbroker\ncontrol\nprofile\npost' ]] || {
+    print -ru2 -- "${lifecycle_function} did not recover dependencies before restoring fail-closed harness authority"
+    exit 1
+  }
+done
+
+post_start_order_events="$tmp_dir/post-start-order-events"
+post_start_ready="$tmp_dir/post-start-ready"
+post_start_reconciler="$tmp_dir/post-start-reconciler"
+cat >"$post_start_reconciler" <<'ZSH'
+#!/usr/bin/env zsh
+if [[ "$1" == post-start ]]; then
+  [[ -e "$HINDSIGHT_TEST_POST_START_READY" ]] || exit 97
+fi
+print -r -- "$1" >>"$HINDSIGHT_TEST_POST_START_EVENTS"
+ZSH
+chmod 700 "$post_start_reconciler"
+(
+  source "$rendered_stack_lib"
+  export HINDSIGHT_MEMORY_HARNESS_RECONCILER="$post_start_reconciler"
+  export HINDSIGHT_MEMORY_HARNESS_RECONCILE_CONFIG="$tmp_dir/absent-pre-activation-config.json"
+  export HINDSIGHT_TEST_POST_START_EVENTS="$post_start_order_events"
+  export HINDSIGHT_TEST_POST_START_READY="$post_start_ready"
+  hindsight_stack_load_config() { return 0 }
+  hindsight_stack_preflight_runtime_credentials() { return 0 }
+  hindsight_stack_require_current_user() { return 0 }
+  hindsight_stack_require_tools() { return 0 }
+  hindsight_stack_require_runtime_helpers() { return 0 }
+  hindsight_stack_validate_fleet() { return 0 }
+  hindsight_stack_initialize_desired_state() { return 0 }
+  hindsight_stack_validate_trusted_executable() { return 0 }
+  hindsight_stack_run_bounded_with_credential_scope() { shift 2; "$@" }
+  hindsight_stack_runtime_active() { return 1 }
+  hindsight_stack_start_broker_dependency() { return 0 }
+  hindsight_stack_start_control_dependency() { return 0 }
+  hindsight_stack_for_each_profile() { touch "$post_start_ready" }
+  hindsight_stack_start_all
+)
+[[ "$(<"$post_start_order_events")" == $'pre-start\npost-start' ]] || {
+  print -ru2 -- "stack did not run local reconciliation before startup and server reconciliation after readiness"
+  exit 1
+}
+
+stopped_reconcile_post_marker="$tmp_dir/stopped-reconcile-post"
+stopped_reconcile_disable_marker="$tmp_dir/stopped-reconcile-disable"
+(
+  source "$rendered_stack_lib"
+  hindsight_stack_load_config() { return 0 }
+  hindsight_stack_preflight_runtime_credentials() { return 0 }
+  hindsight_stack_require_current_user() { return 0 }
+  hindsight_stack_require_tools() { return 0 }
+  hindsight_stack_validate_fleet() { return 0 }
+  hindsight_stack_initialize_desired_state() { return 0 }
+  hindsight_stack_reconcile_harness_authority() { return 0 }
+  hindsight_stack_runtime_active() { return 1 }
+  hindsight_stack_reconcile_broker() { return 0 }
+  hindsight_stack_reconcile_control() { return 0 }
+  hindsight_stack_for_each_profile() {
+    [[ "$1" != hindsight_stack_daemon_desired_running ]]
+  }
+  hindsight_stack_record_harness_authority() {
+    touch "$stopped_reconcile_post_marker"
+  }
+  hindsight_stack_disable_harness_authority() {
+    touch "$stopped_reconcile_disable_marker"
+  }
+  if hindsight_stack_reconcile_once; then
+    print -ru2 -- "supervisor reconcile accepted intentionally stopped daemon"
+    exit 1
+  fi
+)
+[[ ! -e "$stopped_reconcile_post_marker" ]] || {
+  print -ru2 -- "supervisor reconcile recorded server authority while a daemon was intentionally stopped"
+  exit 1
+}
+[[ -e "$stopped_reconcile_disable_marker" ]] || {
+  print -ru2 -- "supervisor reconcile did not disable hooks for intentionally stopped daemon"
+  exit 1
+}
+
+stopped_start_post_marker="$tmp_dir/stopped-start-post"
+stopped_start_disable_marker="$tmp_dir/stopped-start-disable"
+(
+  source "$rendered_stack_lib"
+  hindsight_stack_load_config() { return 0 }
+  hindsight_stack_preflight_runtime_credentials() { return 0 }
+  hindsight_stack_require_current_user() { return 0 }
+  hindsight_stack_require_tools() { return 0 }
+  hindsight_stack_require_runtime_helpers() { return 0 }
+  hindsight_stack_validate_fleet() { return 0 }
+  hindsight_stack_initialize_desired_state() { return 0 }
+  hindsight_stack_reconcile_harness_authority() { return 0 }
+  hindsight_stack_runtime_active() { return 1 }
+  hindsight_stack_start_broker_dependency() { return 0 }
+  hindsight_stack_start_control_dependency() { return 0 }
+  hindsight_stack_for_each_profile() {
+    [[ "$1" != hindsight_stack_daemon_desired_running ]]
+  }
+  hindsight_stack_record_harness_authority() {
+    touch "$stopped_start_post_marker"
+  }
+  hindsight_stack_disable_harness_authority() {
+    touch "$stopped_start_disable_marker"
+  }
+  if hindsight_stack_start_all; then
+    print -ru2 -- "stack start accepted intentionally stopped daemon"
+    exit 1
+  fi
+)
+[[ ! -e "$stopped_start_post_marker" ]] || {
+  print -ru2 -- "stack start recorded server authority while a daemon was intentionally stopped"
+  exit 1
+}
+[[ -e "$stopped_start_disable_marker" ]] || {
+  print -ru2 -- "stack start did not disable hooks for intentionally stopped daemon"
+  exit 1
+}
+
+runtime_failure_events="$tmp_dir/runtime-failure-events"
+for runtime_failure in \
+  start-api \
+  start-broker \
+  reconcile-api \
+  reconcile-broker; do
+  : >"$runtime_failure_events"
+  (
+    source "$rendered_stack_lib"
+    hindsight_stack_load_config() { return 0 }
+    hindsight_stack_preflight_runtime_credentials() { return 0 }
+    hindsight_stack_require_current_user() { return 0 }
+    hindsight_stack_require_tools() { return 0 }
+    hindsight_stack_require_runtime_helpers() { return 0 }
+    hindsight_stack_validate_fleet() { return 0 }
+    hindsight_stack_initialize_desired_state() { return 0 }
+    hindsight_stack_reconcile_harness_authority() { return 0 }
+    hindsight_stack_record_harness_authority() {
+      print -r -- post >>"$runtime_failure_events"
+    }
+    hindsight_stack_disable_harness_authority() {
+      print -r -- disable >>"$runtime_failure_events"
+    }
+    hindsight_stack_runtime_active() { return 0 }
+    hindsight_stack_start_control_dependency() { return 0 }
+    hindsight_stack_start_broker_dependency() {
+      [[ "$runtime_failure" != start-broker ]]
+    }
+    hindsight_stack_reconcile_control() { return 0 }
+    hindsight_stack_reconcile_broker() {
+      [[ "$runtime_failure" != reconcile-broker ]]
+    }
+    hindsight_stack_for_each_profile() {
+      case "$1:$runtime_failure" in
+        hindsight_stack_start_profile:start-api)
+          return 1
+          ;;
+        hindsight_stack_reconcile_profile:reconcile-api)
+          return 1
+          ;;
+        hindsight_stack_daemon_desired_running:*)
+          return 0
+          ;;
+      esac
+      return 0
+    }
+    lifecycle=hindsight_stack_start_all
+    [[ "$runtime_failure" == reconcile-* ]] &&
+      lifecycle=hindsight_stack_reconcile_once
+    if "$lifecycle"; then
+      print -ru2 -- "lifecycle accepted ${runtime_failure} failure"
+      exit 1
+    fi
+  )
+  [[ "$(<"$runtime_failure_events")" == disable ]] || {
+    print -ru2 -- \
+      "lifecycle did not fail closed for ${runtime_failure}: $(<"$runtime_failure_events")"
+    exit 1
+  }
+done
+
+stop_fail_closed_events="$tmp_dir/stop-fail-closed-events"
+(
+  source "$rendered_stack_lib"
+  hindsight_stack_load_config() { return 0 }
+  hindsight_stack_require_current_user() { return 0 }
+  hindsight_stack_require_tools() { return 0 }
+  hindsight_stack_require_runtime_helpers() { return 0 }
+  hindsight_stack_disable_harness_authority() {
+    print -r -- disable >>"$stop_fail_closed_events"
+  }
+  hindsight_stack_for_each_profile_for_stop() {
+    print -r -- profiles >>"$stop_fail_closed_events"
+  }
+  hindsight_stack_broker_stop() {
+    print -r -- broker >>"$stop_fail_closed_events"
+  }
+  hindsight_stack_control_stop() {
+    print -r -- control >>"$stop_fail_closed_events"
+  }
+  hindsight_stack_wait_stopped_for() { return 0 }
+  hindsight_stack_stop_all
+)
+[[ "$(<"$stop_fail_closed_events")" == $'disable\nprofiles\nbroker\ncontrol' ]] || {
+  print -ru2 -- "managed stop did not disable hooks before quiescing runtime"
   exit 1
 }
 
@@ -813,6 +1156,72 @@ while IFS= read -r probe_call; do
     exit 1
   }
 done < "$probe_timeout_calls"
+
+status_probe_calls="$tmp_dir/status-probe-calls"
+(
+  export HOME="$test_home"
+  export HINDSIGHT_EMBED_STATE_DIR="$tmp_dir/status-probe-state"
+  export HINDSIGHT_EMBED_PROFILE="present-profile"
+  export HINDSIGHT_EMBED_PRIMARY_PROFILE="present-profile"
+  export HINDSIGHT_EMBED_FLEET_PROFILES="present-profile"
+  source "$rendered_stack_lib"
+  HINDSIGHT_EMBED_LIFECYCLE_COMMAND_TIMEOUT_SECONDS=300
+  HINDSIGHT_EMBED_STATUS_PROBE_TIMEOUT_SECONDS=5
+  hindsight_stack_broker_status() {
+    print -r -- "broker:$1" >> "$status_probe_calls"
+  }
+  hindsight_stack_broker_identity_matches() { return 0 }
+  hindsight_stack_control_status() {
+    print -r -- "control:$1" >> "$status_probe_calls"
+  }
+  hindsight_stack_daemon_status() {
+    print -r -- "daemon:$1" >> "$status_probe_calls"
+    return 1
+  }
+  hindsight_stack_daemon_running() {
+    print -r -- "daemon-running:$1" >> "$status_probe_calls"
+    return 1
+  }
+  hindsight_stack_ui_status() {
+    print -r -- "ui:$1" >> "$status_probe_calls"
+    return 1
+  }
+  hindsight_stack_ui_running() {
+    print -r -- "ui-running:$1" >> "$status_probe_calls"
+    return 1
+  }
+  hindsight_stack_desired_state() {
+    print -r -- stopped
+  }
+  hindsight_stack_sidecar_names() {
+    print -r -- test-sidecar
+  }
+  hindsight_stack_sidecar_status() {
+    print -r -- "sidecar:$2" >> "$status_probe_calls"
+  }
+  hindsight_stack_sidecar_port() {
+    print -r -- 19000
+  }
+  hindsight_stack_status_report >/dev/null
+)
+while IFS= read -r status_probe_call; do
+  [[ "${status_probe_call#*:}" == 5 ]] || {
+    print -ru2 -- \
+      "status report used the lifecycle timeout for a health probe: ${status_probe_call}"
+    exit 1
+  }
+done < "$status_probe_calls"
+[[ -s "$status_probe_calls" ]] || {
+  print -ru2 -- "status report did not issue bounded component probes"
+  exit 1
+}
+for required_status_probe in daemon-running:5 ui-running:5 sidecar:5; do
+  rg -F -x -q "$required_status_probe" "$status_probe_calls" || {
+    print -ru2 -- \
+      "status report did not exercise bounded ${required_status_probe%%:*} fallback"
+    exit 1
+  }
+done
 
 ui_wait_calls="$tmp_dir/ui-wait-calls"
 (
@@ -1743,6 +2152,23 @@ rg -F -q 'api=stopped@7979 ui=stopped@17979' "$intentional_status" || {
 }
 
 corrupt_desired_state="$desired_state_root/profiles/present-profile/daemon"
+for malformed_desired_state in \
+  running \
+  stopped \
+  $'running\n\n' \
+  $' running\n' \
+  $'running \n'; do
+  /usr/bin/printf '%s' "$malformed_desired_state" > "$corrupt_desired_state"
+  if (
+    export HOME="$test_home"
+    export HINDSIGHT_EMBED_DESIRED_STATE_DIR="$desired_state_root"
+    source "$rendered_stack_lib"
+    hindsight_stack_desired_state daemon present-profile
+  ) >/dev/null 2>&1; then
+    print -ru2 -- "desired-state reader accepted noncanonical bytes"
+    exit 1
+  fi
+done
 print -r -- invalid > "$corrupt_desired_state"
 if (
   export HOME="$test_home"

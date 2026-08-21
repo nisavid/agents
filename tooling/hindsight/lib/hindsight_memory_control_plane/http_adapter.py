@@ -14,7 +14,7 @@ import socket
 import ssl
 import threading
 import time
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 from uuid import UUID
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlsplit
@@ -28,7 +28,13 @@ from urllib.request import (
 
 from .action_contracts import ACTION_METHODS, ARTIFACT_ACTION_KINDS
 from .adapters import AdapterError, AuthenticationError, RollbackBundle, validate_runtime_request
-from .canonical import StrictJsonError, canonical_bytes, digest, strict_json_loads
+from .canonical import (
+    DIGEST,
+    StrictJsonError,
+    canonical_bytes,
+    digest,
+    strict_json_loads,
+)
 from .endpoint_host import is_bare_endpoint_host
 from .inventory import _resolved_artifact
 from .model import BankRef, EndpointIdentity, Inventory
@@ -438,6 +444,13 @@ class HttpAdapter:
             raise AdapterError("endpoint identity does not match selected inventory")
         return identity
 
+    def inventory_identity(self) -> Mapping[str, str]:
+        """Return the validated controller inventory identity without payload data."""
+        return {
+            "inventory_digest": self._inventory.inventory_digest,
+            "artifact_digest": self._inventory.artifact_digest,
+        }
+
     def snapshot(self) -> Mapping[str, Any]:
         raw_compatibility = self._request("GET", self.READ_PATHS["read_compatibility"])
         if not isinstance(raw_compatibility, Mapping) or set(raw_compatibility) != {"compatibility"}:
@@ -719,6 +732,858 @@ class HttpAdapter:
             raise AdapterError("migration generation response is invalid")
         return generation
 
+    def record_controller_state(
+        self,
+        state: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        expected = {
+            "configuration_digest",
+            "hook_digest",
+            "schedule_digest",
+        }
+        if (
+            not isinstance(state, Mapping)
+            or set(state) != expected
+            or any(
+                not isinstance(state[key], str)
+                or re.fullmatch(r"[0-9a-f]{64}", state[key]) is None
+                for key in expected
+            )
+        ):
+            raise AdapterError("controller state is invalid")
+        payload = {key: state[key] for key in sorted(expected)}
+        try:
+            value = self._request(
+                "POST",
+                "/v1/migration/controller-state",
+                payload,
+            )
+        except AuthenticationError:
+            raise
+        except AdapterError:
+            raise AdapterError("controller state response is invalid") from None
+        if not isinstance(value, Mapping) or set(value) != {
+            "generation",
+            "changed",
+        }:
+            raise AdapterError("controller state response is invalid")
+        generation = value["generation"]
+        changed = value["changed"]
+        try:
+            encoded_generation = generation.encode("utf-8")
+        except (AttributeError, UnicodeEncodeError):
+            raise AdapterError("controller state response is invalid") from None
+        if (
+            not isinstance(generation, str)
+            or not generation
+            or len(encoded_generation) > 256
+            or not generation.isprintable()
+            or type(changed) is not bool
+        ):
+            raise AdapterError("controller state response is invalid")
+        return {"generation": generation, "changed": changed}
+
+    def read_replay_document(
+        self,
+        bank: BankRef,
+        document_id: str,
+    ) -> Mapping[str, Any]:
+        if (
+            not isinstance(bank, BankRef)
+            or bank.profile_id != self.endpoint.profile_id
+            or not isinstance(document_id, str)
+            or not document_id
+            or len(document_id.encode("utf-8")) > 4096
+            or any(character in document_id for character in "\r\n\0")
+        ):
+            raise AdapterError("replay document reference is invalid")
+        response = self._request(
+            "GET",
+            f"{self._bank_path(bank)}/documents/"
+            f"{quote(document_id, safe='')}",
+        )
+        allowed = {
+            "id",
+            "bank_id",
+            "original_text",
+            "content_hash",
+            "created_at",
+            "updated_at",
+            "memory_unit_count",
+            "nodes_by_fact_type",
+            "tags",
+            "document_metadata",
+            "retain_params",
+            "observation_scopes",
+        }
+        required = {
+            "id",
+            "bank_id",
+            "original_text",
+            "created_at",
+            "updated_at",
+            "memory_unit_count",
+            "tags",
+        }
+        if (
+            not isinstance(response, Mapping)
+            or not required <= set(response) <= allowed
+            or response["id"] != document_id
+            or response["bank_id"] != bank.bank_id
+        ):
+            raise AdapterError("replay document response is invalid")
+        original_text = response["original_text"]
+        if (
+            not isinstance(original_text, str)
+            or not original_text
+            or len(original_text.encode("utf-8")) > self.MAX_DISCOVERY_BYTES
+        ):
+            raise AdapterError("replay document original text is unavailable")
+        for timestamp_field in ("created_at", "updated_at"):
+            if not self._aware_timestamp(response[timestamp_field]):
+                raise AdapterError("replay document response is invalid")
+        memory_unit_count = response["memory_unit_count"]
+        tags = response["tags"]
+        if (
+            type(memory_unit_count) is not int
+            or memory_unit_count < 0
+            or not isinstance(tags, list)
+            or any(
+                not isinstance(tag, str)
+                or not tag
+                or len(tag.encode("utf-8")) > 256
+                or any(character in tag for character in "\r\n\0")
+                for tag in tags
+            )
+        ):
+            raise AdapterError("replay document response is invalid")
+        for field in ("document_metadata", "retain_params"):
+            value = response.get(field)
+            if value is not None and not isinstance(value, Mapping):
+                raise AdapterError("replay document response is invalid")
+        try:
+            normalized = strict_json_loads(canonical_bytes(dict(response)))
+        except (StrictJsonError, TypeError, ValueError):
+            raise AdapterError("replay document response is invalid") from None
+        return normalized
+
+    def list_replay_document_ids(self, bank: BankRef) -> list[str]:
+        if (
+            not isinstance(bank, BankRef)
+            or bank.profile_id != self.endpoint.profile_id
+        ):
+            raise AdapterError("replay bank reference is invalid")
+        identifiers: list[str] = []
+        for item in self._read_items(f"{self._bank_path(bank)}/documents"):
+            if not isinstance(item, Mapping):
+                raise AdapterError("replay document inventory is invalid")
+            identifier = item.get("id", item.get("document_id"))
+            if (
+                not isinstance(identifier, str)
+                or not identifier
+                or len(identifier.encode("utf-8")) > 4096
+                or any(character in identifier for character in "\r\n\0")
+                or (
+                    item.get("bank_id") is not None
+                    and item["bank_id"] != bank.bank_id
+                )
+            ):
+                raise AdapterError("replay document inventory is invalid")
+            identifiers.append(identifier)
+        if len(identifiers) != len(set(identifiers)):
+            raise AdapterError("replay document inventory is duplicated")
+        return sorted(identifiers)
+
+    def find_replay_document(
+        self,
+        bank: BankRef,
+        document_id: str,
+    ) -> Mapping[str, Any] | None:
+        try:
+            return self.read_replay_document(bank, document_id)
+        except EndpointNotFoundError:
+            return None
+
+    def read_replay_operation(
+        self,
+        bank: BankRef,
+        operation_id: str,
+    ) -> Mapping[str, str]:
+        if (
+            not isinstance(bank, BankRef)
+            or bank.profile_id != self.endpoint.profile_id
+            or not isinstance(operation_id, str)
+        ):
+            raise AdapterError("replay operation reference is invalid")
+        try:
+            parsed_operation_id = UUID(operation_id)
+        except (TypeError, ValueError, AttributeError):
+            raise AdapterError("replay operation reference is invalid") from None
+        if str(parsed_operation_id) != operation_id:
+            raise AdapterError("replay operation reference is invalid")
+        try:
+            response = self._request(
+                "GET",
+                f"{self._bank_path(bank)}/operations/{operation_id}",
+            )
+        except EndpointNotFoundError:
+            return {"operation_id": operation_id, "status": "not_found"}
+        status = response.get("status") if isinstance(response, Mapping) else None
+        response_id = (
+            response.get("operation_id", response.get("id"))
+            if isinstance(response, Mapping)
+            else None
+        )
+        if (
+            status not in {
+                "pending",
+                "processing",
+                "completed",
+                "failed",
+                "cancelled",
+            }
+            or response_id != operation_id
+        ):
+            raise AdapterError("replay operation response is invalid")
+        return {"operation_id": operation_id, "status": status}
+
+    @staticmethod
+    def replay_operation_status_error_is_transient(
+        error: Exception,
+    ) -> bool:
+        return isinstance(error, AdapterError) and str(error) in {
+            "endpoint request failed",
+            "endpoint request timed out",
+        }
+
+    def read_replay_processing_evidence(
+        self,
+        source_bank: BankRef,
+        target_bank: BankRef,
+        descriptors: Sequence[Mapping[str, Any]],
+    ) -> Mapping[str, Any]:
+        if (
+            not isinstance(source_bank, BankRef)
+            or not isinstance(target_bank, BankRef)
+            or source_bank.profile_id != self.endpoint.profile_id
+            or target_bank.profile_id != self.endpoint.profile_id
+            or source_bank.bank_id != "codex"
+            or target_bank.bank_id != "engineering"
+            or not isinstance(descriptors, Sequence)
+            or isinstance(descriptors, (str, bytes))
+            or not descriptors
+        ):
+            raise AdapterError("replay processing evidence request is invalid")
+        snapshot = self.read_migration_inventory(source_bank, target_bank)
+        target_documents = {
+            item["document_id"]: item
+            for item in snapshot["banks"]["candidate"]["documents"]
+        }
+        evidence_documents: list[dict[str, Any]] = []
+        expected_targets: list[str] = []
+        for descriptor in descriptors:
+            target_id = (
+                descriptor.get("target_document_id")
+                if isinstance(descriptor, Mapping)
+                else None
+            )
+            if (
+                not isinstance(target_id, str)
+                or target_id in expected_targets
+                or target_id not in target_documents
+            ):
+                raise AdapterError(
+                    "replay processing evidence is incomplete"
+                )
+            expected_targets.append(target_id)
+            document = target_documents[target_id]
+            memory_count = document.get("memory_unit_count")
+            embedded_count = document.get(
+                "embedded_memory_unit_count"
+            )
+            if (
+                type(memory_count) is not int
+                or memory_count < 1
+                or type(embedded_count) is not int
+                or embedded_count != memory_count
+            ):
+                raise AdapterError(
+                    "replay target processing is incomplete"
+                )
+            evidence_documents.append(
+                {
+                    "target_document_id": target_id,
+                    "memory_unit_count": memory_count,
+                    "embedded_memory_unit_count": embedded_count,
+                }
+            )
+
+        representative: dict[str, Any] | None = None
+        for target_id in expected_targets:
+            document = self.read_replay_document(target_bank, target_id)
+            text = " ".join(document["original_text"].split())
+            query = text[:1024].strip()
+            if not query:
+                continue
+            response = self._request(
+                "POST",
+                f"{self._bank_path(target_bank)}/memories/recall",
+                {
+                    "query": query,
+                    "types": ["world", "experience", "observation"],
+                    "budget": "high",
+                    "max_tokens": 8192,
+                    "trace": True,
+                },
+            )
+            results = (
+                response.get("results")
+                if isinstance(response, Mapping)
+                else None
+            )
+            if (
+                not isinstance(results, list)
+                or len(results) > self.MAX_DISCOVERY_ITEMS
+            ):
+                raise AdapterError(
+                    "replay semantic verification response is invalid"
+                )
+            result_projection: list[dict[str, str | None]] = []
+            for result in results:
+                if not isinstance(result, Mapping):
+                    raise AdapterError(
+                        "replay semantic verification response is invalid"
+                    )
+                result_id = result.get("id")
+                document_id = result.get("document_id")
+                if (
+                    not isinstance(result_id, str)
+                    or not result_id
+                    or (
+                        document_id is not None
+                        and not isinstance(document_id, str)
+                    )
+                ):
+                    raise AdapterError(
+                        "replay semantic verification response is invalid"
+                    )
+                result_projection.append(
+                    {
+                        "id": result_id,
+                        "document_id": document_id,
+                    }
+                )
+            if any(
+                result["document_id"] == target_id
+                for result in result_projection
+            ):
+                representative = {
+                    "target_document_id": target_id,
+                    "query_digest": digest(query),
+                    "result_count": len(result_projection),
+                    "result_projection_digest": digest(
+                        result_projection
+                    ),
+                }
+                break
+        if representative is None:
+            raise AdapterError(
+                "replay representative semantic recall failed"
+            )
+        body = {
+            "schema_version": 1,
+            "snapshot_generation": snapshot["snapshot_generation"],
+            "documents": evidence_documents,
+            "representative_recall": representative,
+        }
+        return {
+            **body,
+            "processing_evidence_digest": digest(body),
+        }
+
+    def delete_replay_source_bank(
+        self,
+        bank: BankRef,
+    ) -> Mapping[str, Any]:
+        if (
+            not isinstance(bank, BankRef)
+            or bank.profile_id != self.endpoint.profile_id
+            or bank.bank_id != "codex"
+        ):
+            raise AdapterError("replay closeout requires exact codex bank")
+        response = self._request("DELETE", self._bank_path(bank))
+        if (
+            not isinstance(response, Mapping)
+            or set(response) != {"success", "message", "deleted_count"}
+            or response["success"] is not True
+            or not isinstance(response["message"], str)
+            or type(response["deleted_count"]) is not int
+            or response["deleted_count"] < 0
+        ):
+            raise AdapterError("replay bank deletion response is invalid")
+        return {
+            "bank_id": "codex",
+            "deleted_count": response["deleted_count"],
+        }
+
+    def conditional_replay_closeout(
+        self,
+        authority: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        expected_request = {
+            "schema_version",
+            "expected_generation",
+            "expected_bank_ids",
+            "source_documents",
+            "replay_plan_digest",
+            "verification_digest",
+            "backup_evidence_digest",
+            "closeout_plan_digest",
+        }
+        if (
+            not isinstance(authority, Mapping)
+            or set(authority) != expected_request
+        ):
+            raise AdapterError("replay closeout authority is invalid")
+        try:
+            request_body = strict_json_loads(
+                canonical_bytes(dict(authority))
+            )
+        except (StrictJsonError, TypeError, ValueError):
+            raise AdapterError(
+                "replay closeout authority is invalid"
+            ) from None
+        response = self._request(
+            "POST",
+            "/v1/migration/replay-closeout",
+            request_body,
+        )
+        expected_response = {
+            "schema_version",
+            "status",
+            "deleted_bank_id",
+            "deleted_count",
+            "pre_delete_generation",
+            "post_delete_generation",
+            "remaining_bank_ids",
+            "cleanup_status",
+            "replay_plan_digest",
+            "verification_digest",
+            "backup_evidence_digest",
+            "closeout_plan_digest",
+        }
+        if (
+            not isinstance(response, Mapping)
+            or set(response) != expected_response
+            or response["schema_version"] != 1
+            or response["status"] != "deleted"
+            or response["deleted_bank_id"] != "codex"
+            or type(response["deleted_count"]) is not int
+            or response["deleted_count"] < 0
+            or response["cleanup_status"]
+            not in {"completed", "degraded", "deferred"}
+            or not isinstance(response["remaining_bank_ids"], list)
+            or response["remaining_bank_ids"]
+            != sorted(response["remaining_bank_ids"])
+            or "codex" in response["remaining_bank_ids"]
+            or any(
+                response[field] != request_body[field]
+                for field in (
+                    "replay_plan_digest",
+                    "verification_digest",
+                    "backup_evidence_digest",
+                    "closeout_plan_digest",
+                )
+            )
+        ):
+            raise AdapterError("replay closeout response is invalid")
+        for field in (
+            "pre_delete_generation",
+            "post_delete_generation",
+        ):
+            value = response[field]
+            if (
+                not isinstance(value, str)
+                or not value
+                or len(value.encode("utf-8")) > 256
+                or not value.isprintable()
+            ):
+                raise AdapterError("replay closeout response is invalid")
+        return strict_json_loads(canonical_bytes(dict(response)))
+
+    def list_replay_bank_ids(self) -> list[str]:
+        response = self._request(
+            "GET",
+            f"/v1/{quote(self.endpoint.tenant, safe='')}/banks",
+        )
+        banks = response.get("banks") if isinstance(response, Mapping) else None
+        if not isinstance(banks, list):
+            raise AdapterError("replay bank inventory is invalid")
+        identifiers: list[str] = []
+        for bank in banks:
+            identifier = bank.get("bank_id") if isinstance(bank, Mapping) else None
+            if (
+                not isinstance(identifier, str)
+                or not identifier
+                or len(identifier.encode("utf-8")) > 4096
+                or any(character in identifier for character in "\r\n\0")
+            ):
+                raise AdapterError("replay bank inventory is invalid")
+            identifiers.append(identifier)
+        if len(identifiers) != len(set(identifiers)):
+            raise AdapterError("replay bank inventory is duplicated")
+        return sorted(identifiers)
+
+    def submit_replay_document(
+        self,
+        bank: BankRef,
+        item: Mapping[str, Any],
+    ) -> Mapping[str, str]:
+        allowed = {
+            "content",
+            "document_id",
+            "timestamp",
+            "context",
+            "metadata",
+            "tags",
+            "observation_scopes",
+            "strategy",
+            "update_mode",
+        }
+        if (
+            not isinstance(bank, BankRef)
+            or bank.profile_id != self.endpoint.profile_id
+            or not isinstance(item, Mapping)
+            or not {"content", "document_id"} <= set(item) <= allowed
+            or item.get("update_mode") != "replace"
+        ):
+            raise AdapterError("replay retain item is invalid")
+        content = item["content"]
+        document_id = item["document_id"]
+        if (
+            not isinstance(content, str)
+            or not content
+            or len(content.encode("utf-8")) > self.MAX_DISCOVERY_BYTES
+            or not isinstance(document_id, str)
+            or not document_id
+            or len(document_id.encode("utf-8")) > 4096
+            or any(character in document_id for character in "\r\n\0")
+        ):
+            raise AdapterError("replay retain item is invalid")
+        metadata = item.get("metadata")
+        if metadata is not None and (
+            not isinstance(metadata, Mapping)
+            or any(
+                not isinstance(key, str) or not isinstance(value, str)
+                for key, value in metadata.items()
+            )
+        ):
+            raise AdapterError("replay retain item is invalid")
+        tags = item.get("tags")
+        if tags is not None and (
+            not isinstance(tags, list)
+            or any(not isinstance(tag, str) or not tag for tag in tags)
+        ):
+            raise AdapterError("replay retain item is invalid")
+        observation_scopes = item.get("observation_scopes")
+        if observation_scopes is not None and not (
+            isinstance(observation_scopes, str)
+            or (
+                isinstance(observation_scopes, list)
+                and all(
+                    isinstance(scope, list)
+                    and scope
+                    and all(
+                        isinstance(tag, str) and tag
+                        for tag in scope
+                    )
+                    for scope in observation_scopes
+                )
+            )
+        ):
+            raise AdapterError("replay retain item is invalid")
+        try:
+            normalized_item = strict_json_loads(canonical_bytes(dict(item)))
+        except (StrictJsonError, TypeError, ValueError):
+            raise AdapterError("replay retain item is invalid") from None
+        response = self._request(
+            "POST",
+            f"{self._bank_path(bank)}/memories",
+            {"items": [normalized_item], "async": True},
+        )
+        expected_response = {
+            "success",
+            "bank_id",
+            "items_count",
+            "async",
+            "operation_id",
+        }
+        if (
+            not isinstance(response, Mapping)
+            or set(response) != expected_response
+            or response.get("success") is not True
+            or response.get("bank_id") != bank.bank_id
+            or response.get("items_count") != 1
+            or response.get("async") is not True
+        ):
+            raise AdapterError("replay retain response is invalid")
+        operation_id = response.get("operation_id")
+        try:
+            parsed_operation_id = UUID(operation_id)
+        except (TypeError, ValueError, AttributeError):
+            raise AdapterError("replay retain response is invalid") from None
+        if str(parsed_operation_id) != operation_id:
+            raise AdapterError("replay retain response is invalid")
+        return {"operation_id": operation_id}
+
+    def submit_generic_import_document(
+        self,
+        bank: BankRef,
+        item: Mapping[str, Any],
+        *,
+        expected_generation: str,
+        expected_bank_set_digest: str,
+        plan_digest: str,
+        item_digest: str,
+    ) -> Mapping[str, str]:
+        """Atomically submit one controller-owned document."""
+        if not isinstance(item, Mapping):
+            raise AdapterError("generic import conditional retain conflict")
+        document_id = item.get("document_id")
+        metadata = item.get("metadata")
+        allowed_item_keys = {
+            "content",
+            "document_id",
+            "timestamp",
+            "metadata",
+            "tags",
+        }
+        if (
+            bank != BankRef("systalyze", "engineering")
+            or set(item) != allowed_item_keys
+            or not isinstance(document_id, str)
+            or not document_id.startswith("generic-import:")
+            or not isinstance(metadata, Mapping)
+            or metadata.get("generic_import_plan_digest") != plan_digest
+            or metadata.get("generic_import_item_digest") != item_digest
+            or not isinstance(expected_generation, str)
+            or not expected_generation
+            or not isinstance(expected_bank_set_digest, str)
+            or DIGEST.fullmatch(expected_bank_set_digest) is None
+            or not isinstance(plan_digest, str)
+            or DIGEST.fullmatch(plan_digest) is None
+            or not isinstance(item_digest, str)
+            or DIGEST.fullmatch(item_digest) is None
+        ):
+            raise AdapterError("generic import conditional retain conflict")
+        try:
+            normalized_item = strict_json_loads(
+                canonical_bytes(dict(item))
+            )
+        except (StrictJsonError, TypeError, ValueError):
+            raise AdapterError(
+                "generic import conditional retain conflict"
+            ) from None
+        response = self._request(
+            "POST",
+            "/v1/migration/generic-import-retain",
+            {
+                **normalized_item,
+                "schema_version": 1,
+                "expected_generation": expected_generation,
+                "expected_bank_set_digest": expected_bank_set_digest,
+                "plan_digest": plan_digest,
+                "item_digest": item_digest,
+                "bank_id": "engineering",
+            },
+        )
+        if (
+            not isinstance(response, Mapping)
+            or set(response)
+            != {
+                "schema_version",
+                "status",
+                "operation_id",
+                "pre_generation",
+                "accepted_generation",
+            }
+            or type(response["schema_version"]) is not int
+            or response["schema_version"] != 1
+            or response["status"] != "accepted"
+            or response["pre_generation"] != expected_generation
+            or not isinstance(response["accepted_generation"], str)
+            or not response["accepted_generation"]
+            or len(response["accepted_generation"].encode("utf-8")) > 256
+            or any(
+                character in response["accepted_generation"]
+                for character in "\r\n\0"
+            )
+            or response["accepted_generation"] == expected_generation
+        ):
+            raise AdapterError("generic import conditional retain response is invalid")
+        operation_id = response.get("operation_id")
+        try:
+            parsed_operation_id = UUID(operation_id)
+        except (TypeError, ValueError, AttributeError):
+            raise AdapterError(
+                "generic import conditional retain response is invalid"
+            ) from None
+        if str(parsed_operation_id) != operation_id:
+            raise AdapterError(
+                "generic import conditional retain response is invalid"
+            )
+        return {"operation_id": operation_id}
+
+    def read_generic_import_processing_evidence(
+        self,
+        bank: BankRef,
+        document_ids: Sequence[str],
+    ) -> Mapping[str, Any]:
+        if (
+            bank != BankRef("systalyze", "engineering")
+            or not isinstance(document_ids, Sequence)
+            or isinstance(document_ids, (str, bytes))
+            or not document_ids
+            or any(
+                not isinstance(document_id, str)
+                or re.fullmatch(
+                    r"generic-import:[0-9a-f]{64}",
+                    document_id,
+                )
+                is None
+                for document_id in document_ids
+            )
+            or list(document_ids) != sorted(document_ids)
+            or len(document_ids) != len(set(document_ids))
+        ):
+            raise AdapterError(
+                "generic import processing evidence request is invalid"
+            )
+        response = self._request(
+            "POST",
+            "/v1/migration/generic-import-processing",
+            {
+                "bank_id": "engineering",
+                "document_ids": list(document_ids),
+            },
+        )
+        if (
+            not isinstance(response, Mapping)
+            or set(response)
+            != {
+                "schema_version",
+                "generation_before",
+                "generation_after",
+                "documents",
+            }
+            or type(response["schema_version"]) is not int
+            or response["schema_version"] != 1
+            or response["generation_before"] != response["generation_after"]
+            or not isinstance(response["documents"], list)
+            or [
+                item.get("target_document_id")
+                for item in response["documents"]
+                if isinstance(item, Mapping)
+            ]
+            != list(document_ids)
+        ):
+            raise AdapterError(
+                "generic import processing evidence is invalid"
+            )
+        for item in response["documents"]:
+            if (
+                not isinstance(item, Mapping)
+                or set(item)
+                != {
+                    "target_document_id",
+                    "memory_unit_count",
+                    "embedded_memory_unit_count",
+                }
+                or type(item["memory_unit_count"]) is not int
+                or item["memory_unit_count"] < 1
+                or type(item["embedded_memory_unit_count"]) is not int
+                or item["embedded_memory_unit_count"]
+                != item["memory_unit_count"]
+            ):
+                raise AdapterError(
+                    "generic import processing evidence is incomplete"
+                )
+        representative: dict[str, Any] | None = None
+        for document_id in document_ids:
+            document = self.read_replay_document(bank, document_id)
+            query = " ".join(document["original_text"].split())[:1024].strip()
+            if not query:
+                continue
+            recall = self._request(
+                "POST",
+                f"{self._bank_path(bank)}/memories/recall",
+                {
+                    "query": query,
+                    "types": ["world", "experience", "observation"],
+                    "budget": "high",
+                    "max_tokens": 8192,
+                    "trace": True,
+                },
+            )
+            results = (
+                recall.get("results")
+                if isinstance(recall, Mapping)
+                else None
+            )
+            if (
+                not isinstance(results, list)
+                or len(results) > self.MAX_DISCOVERY_ITEMS
+                or any(not isinstance(result, Mapping) for result in results)
+            ):
+                raise AdapterError(
+                    "generic import semantic evidence is invalid"
+                )
+            result_projection = [
+                {
+                    "id": result.get("id"),
+                    "document_id": result.get("document_id"),
+                }
+                for result in results
+            ]
+            if any(
+                not isinstance(result["id"], str)
+                or (
+                    result["document_id"] is not None
+                    and not isinstance(result["document_id"], str)
+                )
+                for result in result_projection
+            ):
+                raise AdapterError(
+                    "generic import semantic evidence is invalid"
+                )
+            if any(
+                result["document_id"] == document_id
+                for result in result_projection
+            ):
+                representative = {
+                    "target_document_id": document_id,
+                    "query_digest": digest(query),
+                    "result_count": len(result_projection),
+                    "result_projection_digest": digest(result_projection),
+                }
+                break
+        if representative is None:
+            raise AdapterError(
+                "generic import representative semantic recall failed"
+            )
+        body = strict_json_loads(
+            canonical_bytes(
+                {
+                    **dict(response),
+                    "representative_recall": representative,
+                }
+            )
+        )
+        return {
+            **body,
+            "processing_evidence_digest": digest(body),
+        }
+
     @classmethod
     def _migration_versions(cls, value: Any) -> Mapping[str, Any]:
         if not isinstance(value, Mapping):
@@ -814,13 +1679,77 @@ class HttpAdapter:
         versions = self._migration_versions(
             self._request("GET", "/version", deadline=deadline)
         )
+        snapshot = self._request(
+            "GET",
+            "/v1/migration/snapshot?"
+            + urlencode(
+                {
+                    "source_bank": source_bank.bank_id,
+                    "candidate_bank": candidate_bank.bank_id,
+                }
+            ),
+            deadline=deadline,
+        )
+        if (
+            not isinstance(snapshot, Mapping)
+            or set(snapshot)
+            != {
+                "schema_version",
+                "generation_before",
+                "generation_after",
+                "controller_state",
+                "banks",
+            }
+            or snapshot.get("schema_version") != 1
+            or snapshot.get("generation_before")
+            != snapshot.get("generation_after")
+            or not isinstance(snapshot.get("banks"), Mapping)
+            or set(snapshot["banks"]) != {"source", "candidate"}
+        ):
+            raise AdapterError("migration server snapshot is invalid")
+        snapshot_generation = snapshot["generation_before"]
+        try:
+            generation_bytes = snapshot_generation.encode("utf-8")
+        except (AttributeError, UnicodeEncodeError):
+            raise AdapterError("migration server snapshot is invalid") from None
+        if (
+            not isinstance(snapshot_generation, str)
+            or not snapshot_generation
+            or len(generation_bytes) > 256
+            or not snapshot_generation.isprintable()
+        ):
+            raise AdapterError("migration server snapshot is invalid")
+        controller_state = snapshot["controller_state"]
+        controller_state_keys = {
+            "configuration_digest",
+            "hook_digest",
+            "schedule_digest",
+        }
+        if (
+            not isinstance(controller_state, Mapping)
+            or set(controller_state) != controller_state_keys
+            or any(
+                not isinstance(controller_state[key], str)
+                or re.fullmatch(r"[0-9a-f]{64}", controller_state[key])
+                is None
+                for key in controller_state_keys
+            )
+        ):
+            raise AdapterError("migration controller state is invalid")
         banks: dict[str, Any] = {}
         hooks: list[dict[str, Any]] = []
         schedules: list[dict[str, Any]] = []
         active_operations: list[dict[str, Any]] = []
         for role, bank in (("source", source_bank), ("candidate", candidate_bank)):
-            bank_snapshot, bank_hooks, bank_schedules, bank_operations = self._read_migration_bank(
-                role, bank, deadline=deadline
+            (
+                bank_snapshot,
+                bank_hooks,
+                bank_schedules,
+                bank_operations,
+            ) = self._normalize_migration_bank_snapshot(
+                role,
+                bank,
+                snapshot["banks"][role],
             )
             banks[role] = bank_snapshot
             hooks.extend(bank_hooks)
@@ -832,6 +1761,11 @@ class HttpAdapter:
             "endpoint": self.endpoint.to_dict(),
             "provider_identity": self._declared_provider_identity(),
             "versions": versions,
+            "snapshot_generation": snapshot_generation,
+            "controller_state": {
+                key: controller_state[key]
+                for key in sorted(controller_state_keys)
+            },
             "banks": banks,
             "operations": {"idle": not active_operations, "active": active_operations},
             "hooks": sorted(hooks, key=lambda item: (item["bank_role"], item["hook_id"])),
@@ -847,9 +1781,12 @@ class HttpAdapter:
             or set(value)
             != {
                 "schema_version", "endpoint", "provider_identity", "versions",
-                "banks", "operations", "hooks", "schedules",
+                "snapshot_generation", "controller_state", "banks",
+                "operations", "hooks", "schedules",
             }
             or value.get("schema_version") != 1
+            or not isinstance(value.get("snapshot_generation"), str)
+            or not isinstance(value.get("controller_state"), Mapping)
             or not isinstance(value.get("banks"), Mapping)
             or set(value["banks"]) != {"source", "candidate"}
             or not isinstance(value.get("operations"), Mapping)
@@ -865,7 +1802,8 @@ class HttpAdapter:
         }
         document_keys = {
             "document_id", "updated_at", "content_digest", "created_at",
-            "text_length", "memory_unit_count", "tags",
+            "text_length", "memory_unit_count",
+            "embedded_memory_unit_count", "tags",
             "document_metadata", "retain_params",
         }
         for bank in value["banks"].values():
@@ -1098,10 +2036,22 @@ class HttpAdapter:
         created_at = item.get("created_at")
         if created_at is not None and not HttpAdapter._aware_timestamp(created_at):
             raise AdapterError("migration document timestamp is invalid")
-        for field in ("text_length", "memory_unit_count"):
+        for field in (
+            "text_length",
+            "memory_unit_count",
+            "embedded_memory_unit_count",
+        ):
             value = item.get(field)
             if value is not None and (type(value) is not int or value < 0):
                 raise AdapterError("migration document counter is invalid")
+        metadata_digest = item.get("document_metadata_digest")
+        retain_params_digest = item.get("retain_params_digest")
+        for value in (metadata_digest, retain_params_digest):
+            if value is not None and (
+                not isinstance(value, str)
+                or re.fullmatch(r"[0-9a-f]{64}", value) is None
+            ):
+                raise AdapterError("migration document digest is invalid")
         return {
             "document_id": identifier,
             "updated_at": updated_at,
@@ -1109,12 +2059,23 @@ class HttpAdapter:
             "created_at": created_at,
             "text_length": item.get("text_length"),
             "memory_unit_count": item.get("memory_unit_count"),
+            "embedded_memory_unit_count": item.get(
+                "embedded_memory_unit_count"
+            ),
             "tags": HttpAdapter._safe_migration_tags(item.get("tags", [])),
             "document_metadata": {
-                "content_digest": digest(item.get("document_metadata"))
+                "content_digest": (
+                    metadata_digest
+                    if metadata_digest is not None
+                    else digest(item.get("document_metadata"))
+                )
             },
             "retain_params": {
-                "content_digest": digest(item.get("retain_params"))
+                "content_digest": (
+                    retain_params_digest
+                    if retain_params_digest is not None
+                    else digest(item.get("retain_params"))
+                )
             },
         }
 
@@ -1157,133 +2118,123 @@ class HttpAdapter:
             "content_digest": hashlib.sha256(content.encode("utf-8")).hexdigest(),
         }
 
-    def _read_migration_bank(
-        self, role: str, bank: BankRef, *, deadline: float
-    ):
-        base = self._bank_path(bank)
-        config = self._safe_config(
-            self._request("GET", f"{base}/config", deadline=deadline)
-        )
-        if config["bank_id"] != bank.bank_id:
-            raise AdapterError("bank configuration response identity drifted")
-        stats = self._migration_stats(
-            self._request("GET", f"{base}/stats", deadline=deadline),
-            expected_bank_id=bank.bank_id,
-        )
-        scopes, scopes_digest = self._migration_scopes(
-            self._request(
-                "GET", f"{base}/observations/scopes", deadline=deadline
-            )
-        )
-        tags = self._safe_migration_tags(
-            self._read_items(f"{base}/tags", deadline=deadline)
-        )
-        documents = [
-            self._migration_document(item)
-            for item in self._read_items(
-                f"{base}/documents", deadline=deadline
-            )
-        ]
-        document_ids = [item["document_id"] for item in documents]
-        if len(document_ids) != len(set(document_ids)):
-            raise AdapterError("migration document response identity is duplicated")
-        raw_models = self._read_items(
-            f"{base}/mental-models?detail=full",
-            total_required=False,
-            deadline=deadline,
-        )
-        models = self._closed_content_records(
-            raw_models, collection="models", identity_label="model_id"
-        )
-        directives = self._closed_content_records(
-            self._read_items(
-                f"{base}/directives?active_only=false",
-                total_required=False,
-                deadline=deadline,
-            ),
-            collection="directives",
-            identity_label="directive_id",
-        )
-        webhooks_response = self._request(
-            "GET", f"{base}/webhooks", deadline=deadline
-        )
-        invalidations = [
-            self._migration_invalidation(item)
-            for item in self._read_items(
-                f"{base}/memories/list?state=invalidated", deadline=deadline
-            )
-        ]
-        invalidation_ids = [item["item_id"] for item in invalidations]
-        if len(invalidation_ids) != len(set(invalidation_ids)):
-            raise AdapterError("invalidated memory response identity is duplicated")
+    @staticmethod
+    def _snapshot_json(value: Any, label: str) -> Any:
+        if not isinstance(value, str):
+            return value
+        try:
+            return strict_json_loads(value.encode("utf-8"))
+        except (StrictJsonError, UnicodeEncodeError):
+            raise AdapterError(f"{label} is invalid") from None
+
+    def _snapshot_operations(
+        self,
+        role: str,
+        value: Any,
+    ) -> list[dict[str, Any]]:
+        if not isinstance(value, list):
+            raise AdapterError("migration operation response is invalid")
         active: list[dict[str, Any]] = []
         operation_ids: set[str] = set()
-        for status in ("pending", "processing"):
-            for operation in self._read_items(
-                f"{base}/operations?{urlencode({'status': status})}",
-                collection="operations",
-                limit=100,
-                deadline=deadline,
-            ):
-                if not isinstance(operation, Mapping) or not isinstance(operation.get("id"), str):
-                    raise AdapterError("migration operation response is invalid")
-                operation_id = operation["id"]
-                updated_at = operation.get("updated_at")
-                if (
-                    self.ROLLBACK_ID.fullmatch(operation_id) is None
-                    or not self._aware_timestamp(updated_at)
-                    or operation_id in operation_ids
-                ):
-                    raise AdapterError("migration operation response is invalid")
-                operation_ids.add(operation_id)
-                active.append(
-                    {
-                        "bank_role": role,
-                        "operation_id": operation_id,
-                        "status": status,
-                        "updated_at": updated_at,
-                    }
-                )
-        if not isinstance(webhooks_response.get("items"), list):
-            raise AdapterError("webhook response is invalid")
-        hooks = []
-        hook_ids: set[str] = set()
-        for item in webhooks_response["items"]:
+        for operation in value:
+            if not isinstance(operation, Mapping):
+                raise AdapterError("migration operation response is invalid")
+            operation_id = operation.get("id")
+            status = operation.get("status")
+            updated_at = operation.get("updated_at")
             if (
-                not isinstance(item, Mapping)
-                or not isinstance(item.get("id"), str)
-                or self.ROLLBACK_ID.fullmatch(item["id"]) is None
-                or item["id"] in hook_ids
-                or not {"target", "activation", "config"} <= set(item)
+                not isinstance(operation_id, str)
+                or self.ROLLBACK_ID.fullmatch(operation_id) is None
+                or status not in {"pending", "processing"}
+                or not self._aware_timestamp(updated_at)
+                or operation_id in operation_ids
+            ):
+                raise AdapterError("migration operation response is invalid")
+            operation_ids.add(operation_id)
+            active.append(
+                {
+                    "bank_role": role,
+                    "operation_id": operation_id,
+                    "status": status,
+                    "updated_at": updated_at,
+                }
+            )
+        return active
+
+    def _snapshot_hooks(
+        self,
+        role: str,
+        value: Any,
+    ) -> list[dict[str, Any]]:
+        if not isinstance(value, list):
+            raise AdapterError("webhook response is invalid")
+        hooks: list[dict[str, Any]] = []
+        hook_ids: set[str] = set()
+        for item in value:
+            if not isinstance(item, Mapping):
+                raise AdapterError("webhook response is invalid")
+            hook_id = item.get("id")
+            if (
+                not isinstance(hook_id, str)
+                or self.ROLLBACK_ID.fullmatch(hook_id) is None
+                or hook_id in hook_ids
+                or not isinstance(item.get("target_digest"), str)
+                or DIGEST.fullmatch(item["target_digest"]) is None
+                or not isinstance(item.get("config_digest"), str)
+                or DIGEST.fullmatch(item["config_digest"]) is None
+                or type(item.get("enabled")) is not bool
             ):
                 raise AdapterError("webhook response is invalid")
-            hook_ids.add(item["id"])
-            try:
-                representation = {
-                    "target_digest": digest(item["target"]),
-                    "activation_digest": digest(item["activation"]),
-                    "config_digest": digest(item["config"]),
+            hook_ids.add(hook_id)
+            event_types = self._snapshot_json(
+                item.get("event_types"),
+                "webhook event types",
+            )
+            if not isinstance(event_types, list):
+                raise AdapterError("webhook response is invalid")
+            representation = {
+                "target_digest": item["target_digest"],
+                "activation_digest": digest(
+                    {
+                        "enabled": item["enabled"],
+                        "event_types": event_types,
+                    }
+                ),
+                "config_digest": item["config_digest"],
+            }
+            hooks.append(
+                {
+                    "bank_role": role,
+                    "hook_id": hook_id,
+                    "registration_digest": digest(representation),
+                    "registration": representation,
                 }
-                registration_digest = digest(representation)
-            except (StrictJsonError, TypeError, ValueError):
-                raise AdapterError("webhook response is invalid") from None
-            hooks.append({
-                "bank_role": role,
-                "hook_id": item["id"],
-                "registration_digest": registration_digest,
-                "registration": representation,
-            })
-        schedules = []
-        for raw_item in raw_models:
-            if not isinstance(raw_item, Mapping):
-                raise AdapterError("mental model response is invalid")
-            model_id = raw_item.get("model_id", raw_item.get("id"))
+            )
+        return hooks
+
+    def _snapshot_schedules(
+        self,
+        role: str,
+        value: Any,
+    ) -> list[dict[str, Any]]:
+        if not isinstance(value, list):
+            raise AdapterError("mental model response is invalid")
+        schedules: list[dict[str, Any]] = []
+        for raw_item in value:
+            model_id = (
+                raw_item.get("model_id")
+                if isinstance(raw_item, Mapping)
+                else None
+            )
             if (
                 not isinstance(model_id, str)
                 or self.ROLLBACK_ID.fullmatch(model_id) is None
             ):
                 raise AdapterError("mental model response identity is invalid")
-            trigger = raw_item.get("trigger")
+            trigger = self._snapshot_json(
+                raw_item.get("trigger"),
+                "mental model trigger",
+            )
             if trigger is not None:
                 if not isinstance(trigger, Mapping):
                     raise AdapterError("mental model trigger is invalid")
@@ -1294,6 +2245,76 @@ class HttpAdapter:
                         "trigger_digest": digest(trigger),
                     }
                 )
+        return schedules
+
+    def _normalize_migration_bank_snapshot(
+        self,
+        role: str,
+        bank: BankRef,
+        raw: Any,
+    ) -> tuple[
+        Mapping[str, Any],
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+        list[dict[str, Any]],
+    ]:
+        raw_keys = {
+            "config",
+            "stats",
+            "scopes",
+            "tags",
+            "documents",
+            "models",
+            "directives",
+            "invalidated_memories",
+            "webhooks",
+            "operations",
+        }
+        if not isinstance(raw, Mapping) or set(raw) != raw_keys:
+            raise AdapterError("migration server bank snapshot is invalid")
+        config = self._safe_config(raw["config"])
+        if config["bank_id"] != bank.bank_id:
+            raise AdapterError("bank configuration response identity drifted")
+        stats = self._migration_stats(
+            raw["stats"],
+            expected_bank_id=bank.bank_id,
+        )
+        scopes, scopes_digest = self._migration_scopes(raw["scopes"])
+        tags = self._safe_migration_tags(raw["tags"])
+        if not isinstance(raw["documents"], list):
+            raise AdapterError("migration document response is invalid")
+        documents = [
+            self._migration_document(item) for item in raw["documents"]
+        ]
+        document_ids = [item["document_id"] for item in documents]
+        if len(document_ids) != len(set(document_ids)):
+            raise AdapterError(
+                "migration document response identity is duplicated"
+            )
+        if not isinstance(raw["models"], list):
+            raise AdapterError("mental model response is invalid")
+        models = self._snapshot_content_records(
+            raw["models"],
+            collection="models",
+            identity_label="model_id",
+            allowed_extra=frozenset({"trigger"}),
+        )
+        if not isinstance(raw["directives"], list):
+            raise AdapterError("directive response is invalid")
+        directives = self._snapshot_content_records(
+            raw["directives"],
+            collection="directives",
+            identity_label="directive_id",
+        )
+        if not isinstance(raw["invalidated_memories"], list):
+            raise AdapterError("invalidated memory response is invalid")
+        invalidations = self._snapshot_invalidations(
+            raw["invalidated_memories"]
+        )
+
+        active = self._snapshot_operations(role, raw["operations"])
+        hooks = self._snapshot_hooks(role, raw["webhooks"])
+        schedules = self._snapshot_schedules(role, raw["models"])
         return (
             {
                 "bank_ref": bank.to_dict(),
@@ -1311,6 +2332,86 @@ class HttpAdapter:
             schedules,
             active,
         )
+
+    @classmethod
+    def _snapshot_content_records(
+        cls,
+        value: Any,
+        *,
+        collection: str,
+        identity_label: str,
+        allowed_extra: frozenset[str] = frozenset(),
+    ) -> list[dict[str, str]]:
+        if not isinstance(value, list):
+            raise AdapterError(f"{collection} response is invalid")
+        result: list[dict[str, str]] = []
+        identities: set[str] = set()
+        allowed = {identity_label, "content_digest"} | set(allowed_extra)
+        for item in value:
+            if not isinstance(item, Mapping) or not set(item) <= allowed:
+                raise AdapterError(f"{collection} response is invalid")
+            identifier = item.get(identity_label)
+            content_digest = item.get("content_digest")
+            if (
+                not isinstance(identifier, str)
+                or cls.ROLLBACK_ID.fullmatch(identifier) is None
+                or identifier in identities
+                or not isinstance(content_digest, str)
+                or re.fullmatch(r"[0-9a-f]{64}", content_digest) is None
+            ):
+                raise AdapterError(f"{collection} response is invalid")
+            identities.add(identifier)
+            result.append(
+                {
+                    identity_label: identifier,
+                    "content_digest": content_digest,
+                }
+            )
+        return sorted(result, key=lambda item: item[identity_label])
+
+    @classmethod
+    def _snapshot_invalidations(
+        cls,
+        value: Any,
+    ) -> list[dict[str, str]]:
+        if not isinstance(value, list):
+            raise AdapterError("invalidated memory response is invalid")
+        result: list[dict[str, str]] = []
+        identities: set[str] = set()
+        expected = {
+            "item_id",
+            "document_id",
+            "content_digest",
+            "reason_digest",
+        }
+        for item in value:
+            if not isinstance(item, Mapping) or set(item) != expected:
+                raise AdapterError("invalidated memory response is invalid")
+            item_id = item["item_id"]
+            document_id = item["document_id"]
+            if (
+                not isinstance(item_id, str)
+                or cls.ROLLBACK_ID.fullmatch(item_id) is None
+                or item_id in identities
+                or not isinstance(document_id, str)
+                or cls.ROLLBACK_ID.fullmatch(document_id) is None
+                or any(
+                    not isinstance(item[field], str)
+                    or re.fullmatch(r"[0-9a-f]{64}", item[field]) is None
+                    for field in ("content_digest", "reason_digest")
+                )
+            ):
+                raise AdapterError("invalidated memory response is invalid")
+            identities.add(item_id)
+            result.append(
+                {
+                    "item_id": item_id,
+                    "source_document_id": document_id,
+                    "reason_digest": item["reason_digest"],
+                    "content_digest": item["content_digest"],
+                }
+            )
+        return sorted(result, key=lambda item: item["item_id"])
 
     def export_template(self): return self._request("GET", "/v1/templates/export")
 
@@ -1727,8 +2828,8 @@ class HttpAdapter:
             or response.get("api_version") != SUPPORTED_RUNTIME_VERSION
             or not isinstance(response.get("features"), Mapping)
             or response["features"].get("worker") is not True
-            or response["features"].get("audit_log") is not False
-            or response["features"].get("llm_trace") is not False
+            or type(response["features"].get("audit_log")) is not bool
+            or type(response["features"].get("llm_trace")) is not bool
         ):
             raise AdapterError(
                 "runtime Hindsight version, worker, or privacy features "

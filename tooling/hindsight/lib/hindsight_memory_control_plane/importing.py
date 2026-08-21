@@ -281,6 +281,158 @@ class ReconcileResult:
     target_bank: BankRef
 
 
+def import_item_from_dict(value: Mapping[str, Any]) -> ImportItem:
+    expected = {
+        "item_id",
+        "source_kind",
+        "source_native_id",
+        "timestamp",
+        "provenance",
+        "content",
+        "content_digest",
+        "tags",
+        "intended_scope",
+        "relationships",
+        "coverage",
+    }
+    if not isinstance(value, Mapping) or set(value) != expected:
+        raise ImportValidationError("import item artifact keys are closed")
+    coverage = value["coverage"]
+    if (
+        not isinstance(coverage, Mapping)
+        or set(coverage) != {"disposition", "reason"}
+        or any(
+            not isinstance(value[key], str)
+            for key in (
+                "item_id",
+                "source_kind",
+                "source_native_id",
+                "timestamp",
+                "content",
+                "content_digest",
+                "intended_scope",
+            )
+        )
+        or not isinstance(value["provenance"], Mapping)
+        or not isinstance(value["tags"], list)
+        or not isinstance(value["relationships"], list)
+        or any(not isinstance(tag, str) for tag in value["tags"])
+        or any(
+            not isinstance(relationship, str)
+            for relationship in value["relationships"]
+        )
+        or not isinstance(coverage["disposition"], str)
+        or not isinstance(coverage["reason"], str)
+    ):
+        raise ImportValidationError("import item artifact is invalid")
+    item = ImportItem(
+        value["item_id"],
+        value["source_kind"],
+        value["source_native_id"],
+        value["timestamp"],
+        value["provenance"],
+        value["content"],
+        value["content_digest"],
+        tuple(value["tags"]),
+        value["intended_scope"],
+        tuple(value["relationships"]),
+        coverage["disposition"],
+        coverage["reason"],
+    )
+    _validate_import_item(item)
+    return item
+
+
+def projection_from_dict(value: Mapping[str, Any]) -> ImportProjection:
+    expected = {
+        "schema_version",
+        "items",
+        "pending_item_ids",
+        "skipped_item_ids",
+        "skip_evidence",
+        "projection_digest",
+    }
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != expected
+        or type(value["schema_version"]) is not int
+        or value["schema_version"] != 1
+        or not isinstance(value["items"], list)
+        or not isinstance(value["pending_item_ids"], list)
+        or not isinstance(value["skipped_item_ids"], list)
+        or not isinstance(value["skip_evidence"], list)
+        or any(
+            not isinstance(item_id, str)
+            for item_id in (
+                value["pending_item_ids"] + value["skipped_item_ids"]
+            )
+        )
+        or any(
+            not isinstance(evidence, Mapping)
+            for evidence in value["skip_evidence"]
+        )
+    ):
+        raise ImportValidationError("import projection artifact is invalid")
+    items = tuple(import_item_from_dict(item) for item in value["items"])
+    by_id = {item.item_id: item for item in items}
+    try:
+        pending = tuple(by_id[item_id] for item_id in value["pending_item_ids"])
+    except (KeyError, TypeError):
+        raise ImportValidationError(
+            "import projection pending items are invalid"
+        ) from None
+    projection = ImportProjection(
+        1,
+        items,
+        pending,
+        tuple(value["skipped_item_ids"]),
+        tuple(value["skip_evidence"]),
+        value["projection_digest"],
+    )
+    validate_projection(projection)
+    return projection
+
+
+def import_plan_from_dict(value: Mapping[str, Any]) -> ImportPlan:
+    expected = {
+        "schema_version",
+        "projection_digest",
+        "coverage_digest",
+        "controller_plan_digest",
+        "target_bank",
+        "actions",
+        "plan_digest",
+    }
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != expected
+        or type(value["schema_version"]) is not int
+        or value["schema_version"] != 1
+        or not isinstance(value["target_bank"], Mapping)
+        or set(value["target_bank"]) != {"profile_id", "bank_id"}
+        or any(
+            not isinstance(value["target_bank"][key], str)
+            for key in ("profile_id", "bank_id")
+        )
+        or not isinstance(value["actions"], list)
+    ):
+        raise ImportValidationError("import plan artifact is invalid")
+    plan = ImportPlan(
+        1,
+        value["projection_digest"],
+        value["coverage_digest"],
+        value["controller_plan_digest"],
+        BankRef(
+            value["target_bank"]["profile_id"],
+            value["target_bank"]["bank_id"],
+        ),
+        tuple(value["actions"]),
+        value["plan_digest"],
+    )
+    _validate_import_plan(plan)
+    return plan
+
+
 def _read_lines(path: str | Path) -> tuple[Path, list[str], int]:
     source = Path(path).expanduser()
     source = Path(os.path.abspath(source))
@@ -868,7 +1020,10 @@ def build_import_plan(
 ) -> ImportPlan:
     validate_projection(projection)
     _sha(controller_plan_digest, "controller plan digest")
-    if not isinstance(target_bank, BankRef):
+    if (
+        not isinstance(target_bank, BankRef)
+        or target_bank.endpoint is not None
+    ):
         raise ImportValidationError("target bank must be a canonical bank reference")
     coverage = [
         {"item_id": item.item_id, "disposition": item.coverage_disposition, "reason": item.coverage_reason}
@@ -905,7 +1060,10 @@ def build_import_plan(
 def _validate_import_plan(plan: ImportPlan) -> None:
     if not isinstance(plan, ImportPlan) or type(plan.schema_version) is not int or plan.schema_version != 1:
         raise ImportValidationError("import plan schema is invalid")
-    if not isinstance(plan.target_bank, BankRef):
+    if (
+        not isinstance(plan.target_bank, BankRef)
+        or plan.target_bank.endpoint is not None
+    ):
         raise ImportValidationError("import plan target bank is invalid")
     for key in ("projection_digest", "coverage_digest", "controller_plan_digest", "plan_digest"):
         _sha(getattr(plan, key), f"import plan {key}")

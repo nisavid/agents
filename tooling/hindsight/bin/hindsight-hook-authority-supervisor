@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+"""Keep Hindsight hooks disabled while a legacy runtime is active."""
+
+from __future__ import annotations
+
+import json
+import hashlib
+import os
+from pathlib import Path
+import re
+import signal
+import stat
+import subprocess
+import sys
+import time
+from typing import Any
+
+
+_DIGEST = re.compile(r"[0-9a-f]{64}\Z")
+_stopping = False
+
+
+def _stop(_signum: int, _frame: Any) -> None:
+    global _stopping
+    _stopping = True
+
+
+def _strict_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise RuntimeError("duplicate JSON key")
+        value[key] = item
+    return value
+
+
+def _read_record(
+    path: Path,
+    label: str,
+    expected_mode: int,
+) -> tuple[dict[str, Any], bytes]:
+    descriptor = os.open(
+        path,
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) != expected_mode
+            or metadata.st_nlink != 1
+            or metadata.st_size > 16 * 1024 * 1024
+        ):
+            raise RuntimeError(f"{label} is not protected")
+        payload = os.read(descriptor, metadata.st_size + 1)
+        if len(payload) != metadata.st_size:
+            raise RuntimeError(f"{label} changed while reading")
+    finally:
+        os.close(descriptor)
+    value = json.loads(payload, object_pairs_hook=_strict_object)
+    if not isinstance(value, dict):
+        raise RuntimeError(f"{label} is invalid")
+    return value, payload
+
+
+def _protected_controller(path: Path, expected_digest: str) -> None:
+    descriptor = os.open(
+        path,
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        metadata = os.fstat(descriptor)
+        observed = path.lstat()
+        payload = os.read(descriptor, metadata.st_size + 1)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or (metadata.st_dev, metadata.st_ino)
+            != (observed.st_dev, observed.st_ino)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o500
+            or metadata.st_nlink != 1
+            or hashlib.sha256(payload).hexdigest() != expected_digest
+        ):
+            raise RuntimeError("hook authority controller is invalid")
+    finally:
+        os.close(descriptor)
+
+
+def main() -> int:
+    release = Path(__file__).resolve(strict=True).parent.parent
+    install_root = release.parent.parent
+    reconciler_raw = os.environ.get(
+        "HINDSIGHT_MEMORY_HARNESS_RECONCILER",
+    )
+    config_raw = os.environ.get(
+        "HINDSIGHT_MEMORY_HARNESS_RECONCILE_CONFIG",
+    )
+    poll_raw = os.environ.get("HINDSIGHT_EMBED_POLL_SECONDS", "15")
+    authority_digest = os.environ.get(
+        "HINDSIGHT_HOOK_AUTHORITY_RELEASE_DIGEST",
+        "",
+    )
+    controller_digest = os.environ.get(
+        "HINDSIGHT_HOOK_AUTHORITY_CONTROLLER_SHA256",
+        "",
+    )
+    controller = release / "bin" / "hindsight-memory"
+    if (
+        not reconciler_raw
+        or not config_raw
+        or "\x00" in reconciler_raw + config_raw
+        or not Path(reconciler_raw).is_absolute()
+        or not Path(config_raw).is_absolute()
+        or re.fullmatch(r"[1-9][0-9]{0,2}", poll_raw) is None
+        or not 1 <= int(poll_raw) <= 300
+        or _DIGEST.fullmatch(authority_digest) is None
+        or _DIGEST.fullmatch(controller_digest) is None
+        or not release.name.endswith(f"-{authority_digest[:16]}")
+    ):
+        raise RuntimeError("hook authority supervisor environment is invalid")
+    _protected_controller(controller, controller_digest)
+    reconciler = Path(reconciler_raw)
+    reconcile_config = Path(config_raw)
+    poll_seconds = int(poll_raw)
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(signum, _stop)
+
+    def disable() -> bool:
+        _protected_controller(controller, controller_digest)
+        completed = subprocess.run(
+            (str(reconciler), "disable", str(reconcile_config)),
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            cwd="/",
+            env={
+                "HINDSIGHT_HOOK_AUTHORITY_CONTROLLER": str(controller),
+                "HOME": str(Path.home()),
+                "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+            },
+            timeout=30,
+        )
+        return completed.returncode == 0
+
+    legacy_runtime = False
+    while not _stopping:
+        if legacy_runtime and not disable():
+            print(
+                "hindsight-hook-authority-supervisor: could not disable "
+                "hooks while the legacy runtime remains active; hooks may "
+                "remain active",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            active, _active_raw = _read_record(
+                install_root / "active.json",
+                "active release record",
+                0o600,
+            )
+            authority_path = install_root / "hook-authority.json"
+            authority, authority_raw = _read_record(
+                authority_path,
+                "hook authority record",
+                0o500,
+            )
+            state, _state_raw = _read_record(
+                install_root / "install-state.json",
+                "installation state",
+                0o600,
+            )
+            current = state.get("current")
+            owned = state.get("owned_install_files")
+            releases = state.get("releases")
+            active_identity = (
+                {
+                    key: current.get(key)
+                    for key in ("version", "release_digest", "release_path")
+                }
+                if isinstance(current, dict)
+                else None
+            )
+            if (
+                set(active)
+                != {"version", "release_digest", "release_path"}
+                or active != active_identity
+                or not isinstance(active.get("release_digest"), str)
+                or _DIGEST.fullmatch(active["release_digest"]) is None
+                or not isinstance(owned, dict)
+                or owned.get(str(authority_path))
+                != hashlib.sha256(authority_raw).hexdigest()
+                or not isinstance(releases, dict)
+                or releases.get(authority.get("release_digest")) != authority
+                or authority.get("release_digest") != authority_digest
+                or _DIGEST.fullmatch(authority_digest) is None
+            ):
+                raise RuntimeError("managed release authority is invalid")
+        except (
+            FileNotFoundError,
+            json.JSONDecodeError,
+            OSError,
+            RuntimeError,
+        ) as error:
+            if not legacy_runtime:
+                if not disable():
+                    print(
+                        "hindsight-hook-authority-supervisor: could not "
+                        "disable hooks after authority validation failed; "
+                        "hooks may remain active",
+                        file=sys.stderr,
+                    )
+            print(
+                "hindsight-hook-authority-supervisor: "
+                f"authority validation failed ({type(error).__name__})",
+                file=sys.stderr,
+            )
+            return 1
+        observed_legacy_runtime = (
+            active["release_digest"] != authority["release_digest"]
+        )
+        if observed_legacy_runtime and not legacy_runtime:
+            if not disable():
+                print(
+                    "hindsight-hook-authority-supervisor: could not disable "
+                    "hooks during the legacy runtime transition; hooks may "
+                    "remain active",
+                    file=sys.stderr,
+                )
+                return 1
+        legacy_runtime = observed_legacy_runtime
+        deadline = time.monotonic() + poll_seconds
+        while not _stopping and time.monotonic() < deadline:
+            time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except (
+        FileNotFoundError,
+        json.JSONDecodeError,
+        OSError,
+        RuntimeError,
+        subprocess.SubprocessError,
+    ):
+        print(
+            "hindsight-hook-authority-supervisor: fail-closed supervision failed",
+            file=sys.stderr,
+        )
+        raise SystemExit(1) from None

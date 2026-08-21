@@ -941,8 +941,7 @@ class ClaudeCliAdapter:
             }
             if any(model_access_surface.values()):
                 raise EvaluationError(
-                    "Claude model-access capability surface is not empty: "
-                    f"{model_access_surface}"
+                    "Claude model-access capability surface is not empty"
                 )
             transport_result = TransportResult(
                 response=response_text.encode(),

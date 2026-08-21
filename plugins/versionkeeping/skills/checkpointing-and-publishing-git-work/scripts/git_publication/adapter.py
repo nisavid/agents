@@ -63,6 +63,13 @@ MACOS_CODESIGN = Path("/usr/bin/codesign")
 MACOS_CREDENTIAL_REQUIREMENT = (
     '=identifier "com.apple.git-credential-osxkeychain" and anchor apple'
 )
+MACOS_SYSTEM_CREDENTIAL_HELPERS = (
+    Path(
+        "/Library/Developer/CommandLineTools/usr/libexec/git-core/"
+        + MACOS_CREDENTIAL_HELPER
+    ),
+    Path("/usr/libexec/git-core") / MACOS_CREDENTIAL_HELPER,
+)
 LINUX_CREDENTIAL_HELPER = "git-credential-cache"
 WINDOWS_GCM_HELPERS = (
     Path("mingw64/bin/git-credential-manager.exe"),
@@ -196,23 +203,17 @@ def _require_trusted_credential_helper(path: Path) -> str:
     try:
         if not path.is_absolute():
             raise OSError("credential helper path is not absolute")
-        try:
-            return _trusted_root_owned_executable(
-                path,
-                allowed_path=TRUSTED_HELPER_PATH_RE,
-                reject_set_id=True,
-            )
-        except OSError:
-            resolved = path.resolve(strict=True)
-            metadata = resolved.lstat()
-            if (
-                resolved != path
-                or not stat.S_ISREG(metadata.st_mode)
-                or stat.S_IMODE(metadata.st_mode) & 0o111 == 0
-                or metadata.st_mode & (stat.S_ISUID | stat.S_ISGID)
-            ):
-                raise OSError("credential helper file is not trusted")
-            codesign = _trusted_root_owned_executable(MACOS_CODESIGN)
+        codesign = _trusted_root_owned_executable(MACOS_CODESIGN)
+        candidates = dict.fromkeys((path, *MACOS_SYSTEM_CREDENTIAL_HELPERS))
+        for candidate in candidates:
+            try:
+                helper = _trusted_root_owned_executable(
+                    candidate,
+                    allowed_path=TRUSTED_HELPER_PATH_RE,
+                    reject_set_id=True,
+                )
+            except OSError:
+                continue
             completed = subprocess.run(
                 [
                     codesign,
@@ -220,7 +221,7 @@ def _require_trusted_credential_helper(path: Path) -> str:
                     "--strict",
                     "--test-requirement",
                     MACOS_CREDENTIAL_REQUIREMENT,
-                    str(resolved),
+                    helper,
                 ],
                 env={"PATH": TRUSTED_COMMAND_PATH},
                 stdin=subprocess.DEVNULL,
@@ -228,10 +229,10 @@ def _require_trusted_credential_helper(path: Path) -> str:
                 stderr=subprocess.DEVNULL,
                 timeout=5,
             )
-            if completed.returncode != 0:
-                raise OSError("credential helper signature is not trusted")
-            return str(resolved)
-    except OSError as error:
+            if completed.returncode == 0:
+                return helper
+        raise OSError("credential helper is not trusted")
+    except (OSError, subprocess.TimeoutExpired) as error:
         raise PolicyGate(
             "HTTPS_CREDENTIAL_PROVIDER_UNAVAILABLE",
             provider="macos-osxkeychain",

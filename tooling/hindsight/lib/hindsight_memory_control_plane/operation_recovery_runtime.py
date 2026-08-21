@@ -44,6 +44,7 @@ from .operation_recovery import (
     EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V6_DIGEST,
     EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V7_DIGEST,
     EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V8_DIGEST,
+    EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V9_DIGEST,
     EXACT_DRAIN_TRANSACTION_TIMEOUT_SECONDS,
     EXPECTED_CLAIM_RELEASE_ROW_COUNT,
     EXPECTED_OPERATION_COUNTS,
@@ -3475,8 +3476,12 @@ def _patch_exact_drain_postgresql_ops(source: bytes) -> bytes:
     return text.encode("utf-8")
 
 
-def _patch_exact_drain_memory_engine(source: bytes) -> bytes:
-    """Preserve task error type and stop retrying deterministic HTTP 400s."""
+def _patch_exact_drain_memory_engine(
+    source: bytes,
+    *,
+    idempotent_missing_mental_model: bool = False,
+) -> bytes:
+    """Apply exact-drain task failure and idempotency repairs."""
     try:
         text = source.decode("utf-8")
     except UnicodeDecodeError as error:
@@ -3559,6 +3564,19 @@ def _patch_exact_drain_memory_engine(source: bytes) -> bytes:
                     f"exact drain candidate {label} source differs"
                 )
             text = text.replace(old, new)
+    if idempotent_missing_mental_model:
+        text = _replace_exact_drain_source_fragment(
+            text,
+            "        if refreshed is None:\n"
+            "            raise ValueError(f\"Mental model {mental_model_id} not found in bank {bank_id}\")\n",
+            "        if refreshed is None:\n"
+            "            logger.info(\n"
+            "                f\"[REFRESH_MENTAL_MODEL_TASK] Mental model {mental_model_id} \"\n"
+            "                f\"in bank {bank_id} target is already absent; completing idempotently\"\n"
+            "            )\n"
+            "            return\n",
+            "idempotent missing mental model refresh",
+        )
     try:
         compile(text, "hindsight_api/engine/memory_engine.py", "exec")
     except SyntaxError as error:
@@ -3961,7 +3979,7 @@ def assemble_exact_drain_candidate_runtime_snapshot(
                 require_candidate_patch=False,
             )
         )
-        if snapshot["schema_version"] not in {2, 3, 4, 5, 6, 7}:
+        if snapshot["schema_version"] not in {2, 3, 4, 5, 6, 7, 8}:
             raise OperationRecoveryError(
                 "exact drain candidate runtime snapshot already exists"
             )
@@ -4071,7 +4089,10 @@ def assemble_exact_drain_candidate_runtime_snapshot(
             _patch_exact_drain_postgresql_ops(postgresql_ops_source)
         ),
         EXACT_DRAIN_CANDIDATE_MEMORY_ENGINE_PATH.as_posix(): (
-            _patch_exact_drain_memory_engine(memory_engine_source)
+            _patch_exact_drain_memory_engine(
+                memory_engine_source,
+                idempotent_missing_mental_model=True,
+            )
         ),
         EXACT_DRAIN_CANDIDATE_POLLER_PATH.as_posix(): (
             _patch_exact_drain_poller(poller_source)
@@ -4122,7 +4143,7 @@ def assemble_exact_drain_candidate_runtime_snapshot(
             }
         )
     manifest = {
-        "schema_version": 7,
+        "schema_version": 8,
         "kind": "exact-drain-candidate-runtime-snapshot",
         "sources": provider_evidence,
         "candidate_patches": candidate_patch_evidence,
@@ -4332,7 +4353,7 @@ def _verify_exact_drain_candidate_runtime_snapshot(
             raise OperationRecoveryError(
                 "exact drain candidate runtime snapshot differs"
             )
-    elif schema_version in {3, 4, 5, 6, 7}:
+    elif schema_version in {3, 4, 5, 6, 7, 8}:
         hindsight_root = runtime_root / "hindsight"
         _exact_drain_trusted_directory(
             hindsight_root,
@@ -4350,7 +4371,7 @@ def _verify_exact_drain_candidate_runtime_snapshot(
             "ops_postgresql.original.py",
             "ops_postgresql.py",
         }
-        if schema_version in {5, 6, 7}:
+        if schema_version in {5, 6, 7, 8}:
             expected_names |= {
                 "memory_engine.original.py",
                 "memory_engine.py",
@@ -4377,10 +4398,10 @@ def _verify_exact_drain_candidate_runtime_snapshot(
                     ),
                     cooccurrence_query_batch_size=(
                         EXACT_DRAIN_COOCCURRENCE_QUERY_BATCH_SIZE
-                        if schema_version in {6, 7}
+                        if schema_version in {6, 7, 8}
                         else None
                     ),
-                    full_strategy_repair=(schema_version == 7),
+                    full_strategy_repair=(schema_version in {7, 8}),
                 ),
                 "entity resolver",
             ),
@@ -4391,13 +4412,18 @@ def _verify_exact_drain_candidate_runtime_snapshot(
                 "PostgreSQL ops",
             ),
         ]
-        if schema_version in {5, 6, 7}:
+        if schema_version in {5, 6, 7, 8}:
             patch_specs.extend(
                 [
                     (
                         EXACT_DRAIN_CANDIDATE_MEMORY_ENGINE_PATH,
                         "memory_engine",
-                        _patch_exact_drain_memory_engine,
+                        lambda source: _patch_exact_drain_memory_engine(
+                            source,
+                            idempotent_missing_mental_model=(
+                                schema_version == 8
+                            ),
+                        ),
                         "memory engine",
                     ),
                     (
@@ -4947,11 +4973,11 @@ def exact_drain_runtime_evidence(
     provider_runtime_root: str | Path,
     runtime_package_root: str | Path,
     *,
-    schema_version: int = 12,
+    schema_version: int = 13,
 ) -> tuple[str, bytes]:
     """Bind runtime sources and retain prevalidated provider bootstrap bytes."""
     if type(schema_version) is not int or schema_version not in {
-        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13
     }:
         raise OperationRecoveryError(
             "exact drain runtime evidence schema version is invalid"
@@ -5074,6 +5100,14 @@ def exact_drain_runtime_evidence(
             sources["phase-repair-contract"] = (
                 EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V8_DIGEST
             )
+        elif schema_version == 13:
+            if snapshot["schema_version"] != 8:
+                raise OperationRecoveryError(
+                    "exact drain idempotent-refresh repair snapshot is required"
+                )
+            sources["phase-repair-contract"] = (
+                EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V9_DIGEST
+            )
     for name, source in provider_sources.items():
         sources[f"provider/{name}"] = hashlib.sha256(source).hexdigest()
     package_entries = _exact_drain_package_entries(package_root)
@@ -5124,7 +5158,7 @@ def exact_drain_runtime_digest(
     provider_runtime_root: str | Path,
     runtime_package_root: str | Path,
     *,
-    schema_version: int = 12,
+    schema_version: int = 13,
 ) -> str:
     """Bind the worker entrypoint, claim seam, and provider patch sources."""
     runtime_digest, _provider_bootstrap = exact_drain_runtime_evidence(

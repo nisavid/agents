@@ -164,6 +164,15 @@ EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V8 = {
 EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V8_DIGEST = digest(
     EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V8
 )
+EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V9 = {
+    **EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V8,
+    "schema_version": 9,
+    "candidate_runtime_snapshot_schema_version": 8,
+    "missing_mental_model_refresh_disposition": "idempotent-completion",
+}
+EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V9_DIGEST = digest(
+    EXACT_DRAIN_PHASE_REPAIR_CONTRACT_V9
+)
 EXACT_DRAIN_FAILURE_EVIDENCE_CONTRACT = {
     "schema_version": 1,
     "progress_schema_version": 2,

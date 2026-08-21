@@ -475,7 +475,7 @@ class OperationRecoveryPostgresTest(unittest.TestCase):
                 provider_root,
                 candidate_library,
             )
-            self.assertEqual(snapshot["schema_version"], 7)
+            self.assertEqual(snapshot["schema_version"], 8)
             script = """
 import asyncio
 import json

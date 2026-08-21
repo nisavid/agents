@@ -4419,7 +4419,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 )
             )
             self.assertRegex(snapshot["snapshot_digest"], r"^[0-9a-f]{64}$")
-            self.assertEqual(snapshot["schema_version"], 7)
+            self.assertEqual(snapshot["schema_version"], 8)
             patched_resolver = resolver.read_text(encoding="utf-8")
             self.assertNotEqual(resolver.read_bytes(), original_resolver)
             trigram_source = patched_resolver.split(
@@ -4469,6 +4469,15 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
             ).read_text(encoding="utf-8")
             self.assertIn(
                 "_operation_recovery_http_status(e) == 400",
+                memory_engine_source,
+            )
+            self.assertIn(
+                "target is already absent; completing idempotently",
+                memory_engine_source,
+            )
+            self.assertNotIn(
+                "        if refreshed is None:\n"
+                "            raise ValueError(f\"Mental model {mental_model_id} not found in bank {bank_id}\")",
                 memory_engine_source,
             )
             self.assertTrue(
@@ -4752,7 +4761,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 "exact-drain-candidate-runtime-snapshot",
             )
             self.assertRegex(value["snapshot_digest"], r"^[0-9a-f]{64}$")
-            self.assertEqual(value["schema_version"], 7)
+            self.assertEqual(value["schema_version"], 8)
             self.assertNotIn(str(provider_root), result.stdout)
             verified, sources = (
                 operation_recovery_runtime.
@@ -4834,7 +4843,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                     candidate_library,
                 )
             )
-            self.assertEqual(recovered["schema_version"], 7)
+            self.assertEqual(recovered["schema_version"], 8)
             self.assertNotEqual(resolver.read_bytes(), original)
             with self.assertRaisesRegex(Exception, "already exists"):
                 operation_recovery_runtime.assemble_exact_drain_candidate_runtime_snapshot(
@@ -4898,7 +4907,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                     candidate_library,
                 )
             )
-            self.assertEqual(recovered["schema_version"], 7)
+            self.assertEqual(recovered["schema_version"], 8)
 
     def test_exact_drain_snapshot_failure_boundaries_are_retryable(self):
         for boundary in (
@@ -5058,7 +5067,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                     provider_root,
                     candidate_library,
                 )
-                self.assertEqual(recovered["schema_version"], 7)
+                self.assertEqual(recovered["schema_version"], 8)
                 self.assertNotEqual(resolver.read_bytes(), original)
                 self.assertFalse(
                     (
@@ -5145,7 +5154,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 provider_root,
                 candidate_library,
             )
-            self.assertEqual(recovered["schema_version"], 7)
+            self.assertEqual(recovered["schema_version"], 8)
             self.assertFalse(recovery_path.exists())
 
     def test_exact_drain_recovery_marker_partial_write_is_retryable(self):
@@ -5221,7 +5230,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                 provider_root,
                 candidate_library,
             )
-            self.assertEqual(recovered["schema_version"], 7)
+            self.assertEqual(recovered["schema_version"], 8)
             self.assertNotEqual(resolver.read_bytes(), original)
 
     def test_exact_drain_recovery_marker_fault_matrix_is_retryable(self):
@@ -5388,7 +5397,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                         provider_root,
                         candidate_library,
                     )
-                    self.assertEqual(recovered["schema_version"], 7)
+                    self.assertEqual(recovered["schema_version"], 8)
                     self.assertNotEqual(resolver.read_bytes(), original)
 
     def test_exact_drain_recovery_marker_restoration_faults_are_retryable(self):
@@ -5581,7 +5590,7 @@ raise SystemExit(command(SimpleNamespace(plan="plan.json")))
                     provider_root,
                     candidate_library,
                 )
-                self.assertEqual(recovered["schema_version"], 7)
+                self.assertEqual(recovered["schema_version"], 8)
                 self.assertFalse(recovery_path.exists())
 
     def test_exact_drain_phase_repair_preserves_trigram_resolution_behavior(self):

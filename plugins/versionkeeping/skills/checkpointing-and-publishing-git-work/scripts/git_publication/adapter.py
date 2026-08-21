@@ -58,7 +58,24 @@ TRUSTED_SYSTEM_EXECUTABLES = {
 }
 TRUSTED_COMMAND_PATH = "/usr/bin:/bin"
 MACOS_CREDENTIAL_HELPER = "git-credential-osxkeychain"
+LINUX_CREDENTIAL_HELPERS = (
+    ("git-credential-manager", "secretservice"),
+    ("git-credential-libsecret", None),
+)
+WINDOWS_GCM_HELPERS = (
+    Path("mingw64/bin/git-credential-manager.exe"),
+    Path("mingw64/bin/git-credential-manager-core.exe"),
+)
+WINDOWS_GIT_RUNTIME = {
+    "git": Path("cmd/git.exe"),
+    "ssh": Path("usr/bin/ssh.exe"),
+    "false": Path("usr/bin/false.exe"),
+    "shell": Path("usr/bin/sh.exe"),
+}
 TRUSTED_HELPER_PATH_RE = re.compile(r"^/[A-Za-z0-9_./+:-]+$")
+TRUSTED_WINDOWS_BUNDLE_PATH_RE = re.compile(
+    r"^(?:[A-Za-z]:[\\/]|/)[A-Za-z0-9_./\\+(): -]+$"
+)
 GIT_SUBPROCESS_ENV_ALLOWLIST = {
     "ALL_PROXY",
     "COMSPEC",
@@ -112,6 +129,18 @@ def _trusted_root_owned_executable(
 
 
 def _trusted_system_executable(name: str) -> str:
+    if sys.platform == "win32":
+        for root in _windows_git_install_roots():
+            try:
+                return _trusted_windows_bundled_executable(
+                    root / WINDOWS_GIT_RUNTIME[name],
+                    root,
+                )
+            except OSError:
+                continue
+        raise PolicyGate(
+            f"TRUSTED_{name.upper()}_EXECUTABLE_UNAVAILABLE"
+        )
     try:
         return _trusted_root_owned_executable(TRUSTED_SYSTEM_EXECUTABLES[name])
     except OSError as error:
@@ -134,6 +163,150 @@ def _require_trusted_credential_helper(path: Path) -> str:
             "HTTPS_CREDENTIAL_PROVIDER_UNAVAILABLE",
             provider="macos-osxkeychain",
         ) from error
+
+
+def _require_linux_credential_provider(
+    exec_path: Path,
+) -> tuple[str, str | None]:
+    for name, credential_store in LINUX_CREDENTIAL_HELPERS:
+        candidates = (
+            exec_path / name,
+            Path("/usr/bin") / name,
+            Path("/usr/local/bin") / name,
+            Path("/usr/local/share/gcm-core") / name,
+        )
+        for candidate in candidates:
+            try:
+                helper = _trusted_root_owned_executable(
+                    candidate,
+                    allowed_path=TRUSTED_HELPER_PATH_RE,
+                    reject_set_id=True,
+                )
+                return helper, credential_store
+            except OSError:
+                continue
+    raise PolicyGate(
+        "HTTPS_CREDENTIAL_PROVIDER_UNAVAILABLE",
+        provider="linux-gcm-or-libsecret",
+    )
+
+
+def _trusted_windows_bundled_executable(path: Path, root: Path) -> str:
+    if (
+        not path.is_absolute()
+        or not root.is_absolute()
+        or TRUSTED_WINDOWS_BUNDLE_PATH_RE.fullmatch(str(path)) is None
+        or TRUSTED_WINDOWS_BUNDLE_PATH_RE.fullmatch(str(root)) is None
+    ):
+        raise OSError("executable path is not closed")
+    resolved_root = root.resolve(strict=True)
+    resolved = path.resolve(strict=True)
+    if resolved_root not in resolved.parents or resolved != path.absolute():
+        raise OSError("executable path is outside the trusted Git installation")
+    metadata = path.lstat()
+    if path.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+        raise OSError("executable file is not trusted")
+    return str(resolved)
+
+
+def _windows_git_install_roots() -> tuple[Path, ...]:
+    if os.name == "nt":
+        candidates = _windows_registered_git_roots()
+    else:
+        candidates = []
+        for variable in ("ProgramFiles", "ProgramFiles(x86)"):
+            if value := os.environ.get(variable):
+                candidates.append(Path(value) / "Git")
+        if value := os.environ.get("LOCALAPPDATA"):
+            candidates.append(Path(value) / "Programs" / "Git")
+    roots = []
+    for candidate in candidates:
+        if (
+            not candidate.is_absolute()
+            or TRUSTED_WINDOWS_BUNDLE_PATH_RE.fullmatch(str(candidate)) is None
+        ):
+            continue
+        try:
+            resolved = candidate.resolve(strict=True)
+        except OSError:
+            continue
+        if resolved != candidate.absolute():
+            continue
+        if resolved not in roots:
+            roots.append(resolved)
+    return tuple(roots)
+
+
+def _windows_registered_git_roots() -> list[Path]:
+    try:
+        import winreg
+    except ImportError:
+        return []
+    candidates = []
+    locations = (
+        (winreg.HKEY_LOCAL_MACHINE, winreg.KEY_WOW64_64KEY),
+        (winreg.HKEY_LOCAL_MACHINE, winreg.KEY_WOW64_32KEY),
+        (winreg.HKEY_CURRENT_USER, 0),
+    )
+    for hive, view in locations:
+        try:
+            with winreg.OpenKey(
+                hive,
+                r"SOFTWARE\GitForWindows",
+                0,
+                winreg.KEY_READ | view,
+            ) as key:
+                value, value_type = winreg.QueryValueEx(key, "InstallPath")
+        except OSError:
+            continue
+        if value_type == winreg.REG_SZ and isinstance(value, str):
+            candidates.append(Path(value))
+    return candidates
+
+
+def _windows_trusted_command_path(git_executable: Path) -> str:
+    git_root = git_executable.resolve(strict=True).parent.parent
+    directories = []
+    try:
+        for relative in (Path("cmd"), Path("mingw64/bin"), Path("usr/bin")):
+            path = git_root / relative
+            resolved = path.resolve(strict=True)
+            if (
+                git_root not in resolved.parents
+                or resolved != path.absolute()
+                or not resolved.is_dir()
+            ):
+                raise OSError("trusted command directory is redirected")
+            directories.append(str(resolved))
+    except OSError as error:
+        raise PolicyGate("TRUSTED_COMMAND_PATH_UNAVAILABLE") from error
+    return ";".join(directories)
+
+
+def _require_windows_credential_provider(git_executable: Path) -> str:
+    git_path = git_executable.resolve(strict=True)
+    if git_path.name.lower() != "git.exe" or git_path.parent.name.lower() != "cmd":
+        raise PolicyGate(
+            "HTTPS_CREDENTIAL_PROVIDER_UNAVAILABLE",
+            provider="windows-gcm",
+        )
+    git_root = git_path.parent.parent
+    for relative in WINDOWS_GCM_HELPERS:
+        try:
+            return _trusted_windows_bundled_executable(
+                git_root / relative,
+                git_root,
+            )
+        except OSError:
+            continue
+    raise PolicyGate(
+        "HTTPS_CREDENTIAL_PROVIDER_UNAVAILABLE",
+        provider="windows-gcm",
+    )
+
+
+def _credential_helper_config(path: str) -> str:
+    return re.sub(r"([\t ()])", r"\\\1", Path(path).as_posix())
 
 
 def _unsafe_git_config_class(key: str) -> str | None:
@@ -394,6 +567,20 @@ class GitRepository:
         self.timeout_seconds = timeout_seconds
         self.git_executable = _trusted_system_executable("git")
         ssh_executable = _trusted_system_executable("ssh")
+        if sys.platform == "win32":
+            askpass = _credential_helper_config(
+                _trusted_system_executable("false")
+            )
+            shell = _trusted_system_executable("shell")
+            command_path = _windows_trusted_command_path(
+                Path(self.git_executable)
+            )
+            ssh_command = _credential_helper_config(ssh_executable)
+        else:
+            askpass = "false"
+            shell = "/bin/sh"
+            command_path = TRUSTED_COMMAND_PATH
+            ssh_command = ssh_executable
         self._empty_hooks = tempfile.TemporaryDirectory(
             prefix="versionkeeping-empty-hooks-"
         )
@@ -407,7 +594,7 @@ class GitRepository:
         }
         self.env.update(
             {
-                "GIT_ASKPASS": "false",
+                "GIT_ASKPASS": askpass,
                 "GIT_ATTR_NOSYSTEM": "1",
                 "GIT_CONFIG_GLOBAL": os.devnull,
                 "GIT_CONFIG_NOSYSTEM": "1",
@@ -420,7 +607,7 @@ class GitRepository:
                 "GIT_PROTOCOL_FROM_USER": "0",
                 "GIT_SEQUENCE_EDITOR": "true",
                 "GIT_SSH_COMMAND": (
-                    f"{ssh_executable} -oBatchMode=yes -oConnectionAttempts=1 "
+                    f"{ssh_command} -oBatchMode=yes -oConnectionAttempts=1 "
                     f"-oConnectTimeout={timeout_seconds}"
                 ),
                 "GIT_SSH_VARIANT": "ssh",
@@ -428,8 +615,8 @@ class GitRepository:
                 "GCM_INTERACTIVE": "never",
                 "LANG": "C",
                 "LC_ALL": "C",
-                "PATH": TRUSTED_COMMAND_PATH,
-                "SHELL": "/bin/sh",
+                "PATH": command_path,
+                "SHELL": shell,
                 "SSH_ASKPASS_REQUIRE": "never",
             }
         )
@@ -467,24 +654,38 @@ class GitRepository:
             return
         if self._https_credentials_enabled:
             return
-        unsafe_classes = self._configured_classes(
-            _unsafe_https_git_config_class,
-        )
-        if unsafe_classes:
-            raise PolicyGate(
-                "UNSAFE_GIT_CONFIGURATION",
-                config_classes=sorted(unsafe_classes),
+        self._reject_configured_classes(_unsafe_https_git_config_class)
+        exec_path = Path(self.output(["--exec-path"]))
+        if sys.platform == "darwin":
+            helper = _require_trusted_credential_helper(
+                exec_path / MACOS_CREDENTIAL_HELPER
             )
-        if sys.platform != "darwin":
+            helper_config = _credential_helper_config(helper)
+        elif sys.platform.startswith("linux"):
+            helper, credential_store = _require_linux_credential_provider(
+                exec_path
+            )
+            helper_config = _credential_helper_config(helper)
+            if credential_store is not None:
+                self._append_command_config(
+                    "credential.credentialStore",
+                    credential_store,
+                )
+        elif sys.platform == "win32":
+            helper = _require_windows_credential_provider(
+                Path(self.git_executable)
+            )
+            helper_config = _credential_helper_config(helper)
+            self._append_command_config(
+                "credential.credentialStore",
+                "wincredman",
+            )
+        else:
             raise PolicyGate(
                 "HTTPS_CREDENTIAL_PROVIDER_UNAVAILABLE",
-                provider="macos-osxkeychain",
+                provider="platform-credential-provider",
             )
-        exec_path = Path(self.output(["--exec-path"]))
-        helper = _require_trusted_credential_helper(
-            exec_path / MACOS_CREDENTIAL_HELPER
-        )
-        self._append_command_config("credential.helper", helper)
+        self._append_command_config("credential.helper", helper_config)
         self._https_credentials_enabled = True
 
     def __enter__(self) -> "GitRepository":
@@ -577,12 +778,7 @@ class GitRepository:
                 "UNSAFE_GIT_CONFIGURATION",
                 config_classes=sorted(include_classes),
             )
-        unsafe_classes = self._configured_classes(_unsafe_git_config_class)
-        if unsafe_classes:
-            raise PolicyGate(
-                "UNSAFE_GIT_CONFIGURATION",
-                config_classes=sorted(unsafe_classes),
-            )
+        self._reject_configured_classes(_unsafe_git_config_class)
         self._policy_established = True
 
     def _configured_classes(
@@ -595,6 +791,17 @@ class GitRepository:
             if scope != "command"
             if (config_class := classifier(key)) is not None
         }
+
+    def _reject_configured_classes(
+        self,
+        classifier: Callable[[str], str | None],
+    ) -> None:
+        unsafe_classes = self._configured_classes(classifier)
+        if unsafe_classes:
+            raise PolicyGate(
+                "UNSAFE_GIT_CONFIGURATION",
+                config_classes=sorted(unsafe_classes),
+            )
 
     def run(
         self,

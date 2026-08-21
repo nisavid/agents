@@ -80,19 +80,37 @@ remote name is discovery metadata, not a publication actuator.
 ## Authenticated HTTPS Boundary
 
 The ordinary publication executor supports noninteractive HTTPS credentials on
-macOS through one closed provider: the `git-credential-osxkeychain` binary in
-the trusted `/usr/bin/git --exec-path` directory. Before enabling it, the
-executor requires the helper and every directory in its absolute ancestry to
-be root-owned, non-writable by group or other, non-symlinked, and free of shell
-metacharacters; the helper itself must be a regular, executable, non-set-id
-file. A missing, redirected, mutable, or unsupported provider yields
-`HTTPS_CREDENTIAL_PROVIDER_UNAVAILABLE` before any push attempt.
+modern macOS, Linux, and Windows through closed platform-provider sets:
+
+- macOS uses `git-credential-osxkeychain` from the trusted system Git exec
+  directory;
+- Linux prefers a system-installed `git-credential-manager` with the
+  `secretservice` store forced at command scope, then falls back to a
+  system-installed `git-credential-libsecret`; and
+- Windows uses `git-credential-manager.exe` (or the allowlisted legacy
+  `git-credential-manager-core.exe`) only from the selected Git for Windows
+  installation, with the `wincredman` store forced at command scope.
+
+Unix providers and every directory in their absolute ancestry must be
+root-owned, non-writable by group or other, non-symlinked, and free of shell
+metacharacters; each helper must be a regular, executable, non-set-id file.
+On Windows, Git, SSH, the non-prompting askpass command, the shell, the closed
+command path, and GCM must all resolve without redirection inside the same
+registered Git for Windows installation. The executor reads the machine or
+per-user `GitForWindows` installation registration instead of ambient `PATH` or
+directory environment variables. Paths containing command syntax are rejected,
+and helper paths are escaped before entering command-scope Git configuration. A
+missing, redirected, mutable, or unsupported provider yields
+`HTTPS_CREDENTIAL_PROVIDER_UNAVAILABLE` before any push attempt. Linux hosts
+must have either GCM plus a usable Secret Service session or libsecret already
+installed and provisioned; the executor never bootstraps or unlocks a store.
 
 The executor first installs an empty command-scope `credential.helper` to clear
 all ambient helpers, retains the existing rejection of repository or worktree
-`credential.*.helper` configuration, and then appends only that validated
-absolute helper path for HTTPS execution. `GIT_ASKPASS=false` and
-`GIT_TERMINAL_PROMPT=0` remain in force. Before helper activation, any
+`credential.*.helper` configuration, and then appends only the validated
+platform helper for HTTPS execution. A closed askpass command,
+`GIT_TERMINAL_PROMPT=0`, and `GCM_INTERACTIVE=never` remain in force. Before
+helper activation, any
 repository or worktree `http.*.sslVerify`, `http.*.sslCAInfo`, or
 `http.*.sslCAPath` override blocks, including URL-qualified forms; ambient
 `SSL_CERT_FILE`, `SSL_CERT_DIR`, and `GIT_SSL_*` variables are also removed.

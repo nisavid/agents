@@ -67,6 +67,22 @@ def commit(repo: Path, name: str) -> str:
     return git(repo, "rev-parse", "HEAD")
 
 
+def write_credential_helper(
+    path: Path,
+    username: str,
+    password: str,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = get ]; then\n"
+        f"  printf '%s\\n' 'username={username}' 'password={password}'\n"
+        "fi\n",
+        encoding="utf-8",
+    )
+    path.chmod(0o700)
+
+
 def request(start: str, source: str) -> dict:
     return {
         "schema_version": 2,
@@ -261,6 +277,212 @@ class PublicationExecutionTests(unittest.TestCase):
         )
         self.assertNotIn(secret, json.dumps(closed_config))
 
+    def test_linux_https_uses_trusted_gcm_with_secret_service(self) -> None:
+        trusted_helper = "/usr/lib/git-core/git-credential-manager"
+
+        with adapter.GitRepository(self.repo) as repository:
+            with mock.patch.object(adapter.sys, "platform", "linux"):
+                with mock.patch.object(
+                    repository,
+                    "output",
+                    return_value=str(Path(trusted_helper).parent),
+                ):
+                    with mock.patch.object(
+                        adapter,
+                        "_trusted_root_owned_executable",
+                        side_effect=lambda path, **_kwargs: (
+                            trusted_helper
+                            if path == Path(trusted_helper)
+                            else (_ for _ in ()).throw(OSError("untrusted"))
+                        ),
+                    ):
+                        repository.enable_https_credentials(
+                            "https://github.com/example/repository.git"
+                        )
+
+            config_count = int(repository.env["GIT_CONFIG_COUNT"])
+            closed_config = [
+                (
+                    repository.env[f"GIT_CONFIG_KEY_{index}"],
+                    repository.env[f"GIT_CONFIG_VALUE_{index}"],
+                )
+                for index in range(config_count)
+            ]
+
+        self.assertEqual(
+            [value for key, value in closed_config if key == "credential.helper"],
+            ["", trusted_helper],
+        )
+        self.assertIn(
+            ("credential.credentialStore", "secretservice"),
+            closed_config,
+        )
+
+    def test_linux_https_falls_back_to_trusted_libsecret(self) -> None:
+        trusted_helper = "/usr/lib/git-core/git-credential-libsecret"
+
+        with adapter.GitRepository(self.repo) as repository:
+            with mock.patch.object(adapter.sys, "platform", "linux"):
+                with mock.patch.object(
+                    repository,
+                    "output",
+                    return_value=str(Path(trusted_helper).parent),
+                ):
+                    with mock.patch.object(
+                        adapter,
+                        "_trusted_root_owned_executable",
+                        side_effect=lambda path, **_kwargs: (
+                            trusted_helper
+                            if path == Path(trusted_helper)
+                            else (_ for _ in ()).throw(OSError("untrusted"))
+                        ),
+                    ):
+                        repository.enable_https_credentials(
+                            "https://github.com/example/repository.git"
+                        )
+
+            config_count = int(repository.env["GIT_CONFIG_COUNT"])
+            closed_config = [
+                (
+                    repository.env[f"GIT_CONFIG_KEY_{index}"],
+                    repository.env[f"GIT_CONFIG_VALUE_{index}"],
+                )
+                for index in range(config_count)
+            ]
+
+        self.assertEqual(
+            [value for key, value in closed_config if key == "credential.helper"],
+            ["", trusted_helper],
+        )
+        self.assertNotIn("credential.credentialStore", dict(closed_config))
+
+    def test_windows_https_uses_gcm_from_the_trusted_git_installation(self) -> None:
+        git_root = self.root / "Program Files" / "Git"
+        git_executable = git_root / "cmd" / "git.exe"
+        trusted_helper = (
+            git_root / "mingw64" / "bin" / "git-credential-manager.exe"
+        )
+        git_executable.parent.mkdir(parents=True)
+        trusted_helper.parent.mkdir(parents=True)
+        git_executable.write_bytes(b"git")
+        trusted_helper.write_bytes(b"gcm")
+
+        with adapter.GitRepository(self.repo) as repository:
+            repository.git_executable = str(git_executable)
+            with mock.patch.object(adapter.sys, "platform", "win32"):
+                with mock.patch.object(
+                    repository,
+                    "_configured_classes",
+                    return_value=set(),
+                ):
+                    with mock.patch.object(
+                        repository,
+                        "output",
+                        return_value=str(
+                            git_root / "mingw64" / "libexec" / "git-core"
+                        ),
+                    ):
+                        repository.enable_https_credentials(
+                            "https://github.com/example/repository.git"
+                        )
+
+            config_count = int(repository.env["GIT_CONFIG_COUNT"])
+            closed_config = [
+                (
+                    repository.env[f"GIT_CONFIG_KEY_{index}"],
+                    repository.env[f"GIT_CONFIG_VALUE_{index}"],
+                )
+                for index in range(config_count)
+            ]
+
+        helpers = [
+            value for key, value in closed_config if key == "credential.helper"
+        ]
+        self.assertEqual(helpers[0], "")
+        self.assertEqual(
+            helpers[1],
+            str(trusted_helper.resolve()).replace(" ", "\\ "),
+        )
+        self.assertIn(
+            ("credential.credentialStore", "wincredman"),
+            closed_config,
+        )
+
+    def test_windows_repository_uses_only_the_bundled_git_runtime(self) -> None:
+        program_files = self.root.resolve() / "Program Files"
+        git_root = program_files / "Git"
+        executables = {
+            "git": git_root / "cmd" / "git.exe",
+            "ssh": git_root / "usr" / "bin" / "ssh.exe",
+            "false": git_root / "usr" / "bin" / "false.exe",
+            "shell": git_root / "usr" / "bin" / "sh.exe",
+        }
+        for executable in executables.values():
+            executable.parent.mkdir(parents=True, exist_ok=True)
+            executable.write_bytes(b"trusted")
+        (git_root / "mingw64" / "bin").mkdir(parents=True)
+
+        with mock.patch.object(adapter.sys, "platform", "win32"):
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "ProgramFiles": str(program_files),
+                    "ProgramFiles(x86)": str(self.root / "Program Files (x86)"),
+                    "LOCALAPPDATA": str(self.root / "LocalAppData"),
+                },
+                clear=False,
+            ):
+                with adapter.GitRepository(self.repo) as repository:
+                    observed_git = repository.git_executable
+                    observed_env = repository.env
+
+        self.assertEqual(observed_git, str(executables["git"].resolve()))
+        self.assertEqual(
+            observed_env["GIT_ASKPASS"],
+            str(executables["false"].resolve()).replace(" ", "\\ "),
+        )
+        self.assertEqual(
+            observed_env["SHELL"],
+            str(executables["shell"].resolve()),
+        )
+        self.assertIn(
+            str(executables["ssh"].resolve()).replace(" ", "\\ "),
+            observed_env["GIT_SSH_COMMAND"],
+        )
+        self.assertEqual(
+            observed_env["PATH"],
+            ";".join(
+                str((git_root / relative).resolve())
+                for relative in ("cmd", "mingw64/bin", "usr/bin")
+            ),
+        )
+
+    def test_windows_repository_rejects_command_shaped_install_roots(self) -> None:
+        program_files = self.root.resolve() / "Program Files;untrusted"
+        git_root = program_files / "Git"
+        for relative in adapter.WINDOWS_GIT_RUNTIME.values():
+            executable = git_root / relative
+            executable.parent.mkdir(parents=True, exist_ok=True)
+            executable.write_bytes(b"untrusted")
+
+        with mock.patch.object(adapter.sys, "platform", "win32"):
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "ProgramFiles": str(program_files),
+                    "ProgramFiles(x86)": str(self.root / "missing-x86"),
+                    "LOCALAPPDATA": str(self.root / "missing-local"),
+                },
+                clear=False,
+            ):
+                with self.assertRaises(adapter.PolicyGate) as raised:
+                    adapter.GitRepository(self.repo)
+
+        self.assertEqual(
+            raised.exception.code,
+            "TRUSTED_GIT_EXECUTABLE_UNAVAILABLE",
+        )
+
     @unittest.skipUnless(sys.platform == "darwin", "requires macOS")
     def test_system_macos_osxkeychain_provider_is_trusted(self) -> None:
         with adapter.GitRepository(self.repo) as repository:
@@ -286,14 +508,7 @@ class PublicationExecutionTests(unittest.TestCase):
         username = "versionkeeping-test"
         secret = "credential-secret-745bad"
         helper = self.root / "credential-helper"
-        helper.write_text(
-            "#!/bin/sh\n"
-            "if [ \"$1\" = get ]; then\n"
-            f"  printf '%s\\n' 'username={username}' 'password={secret}'\n"
-            "fi\n",
-            encoding="utf-8",
-        )
-        helper.chmod(0o700)
+        write_credential_helper(helper, username, secret)
 
         with authenticated_https_endpoint(
             self.root,
@@ -334,6 +549,76 @@ class PublicationExecutionTests(unittest.TestCase):
         self.assertNotIn(secret, result.stderr)
         self.assertNotIn(secret, json.dumps(config))
 
+    @unittest.skipUnless(sys.platform == "darwin", "requires macOS Git and TLS")
+    def test_gcm_platform_configs_keep_credentials_inside_git(self) -> None:
+        git(self.repo, "config", "credential.credentialStore", "plaintext")
+        for platform in ("linux", "win32"):
+            with self.subTest(platform=platform):
+                username = f"versionkeeping-{platform}"
+                secret = f"credential-secret-{platform}-07a91d"
+                helper = (
+                    self.root
+                    / platform
+                    / "Program Files"
+                    / "git-credential-manager.exe"
+                )
+                write_credential_helper(helper, username, secret)
+
+                with authenticated_https_endpoint(
+                    self.root,
+                    username,
+                    secret,
+                    self.start,
+                ) as (endpoint, certificate, authorized):
+                    with adapter.GitRepository(self.repo) as repository:
+                        repository._append_command_config(
+                            "http.sslCAInfo",
+                            str(certificate),
+                        )
+                        selector = (
+                            "_require_linux_credential_provider"
+                            if platform == "linux"
+                            else "_require_windows_credential_provider"
+                        )
+                        with mock.patch.object(adapter.sys, "platform", platform):
+                            with mock.patch.object(
+                                adapter,
+                                selector,
+                                return_value=(
+                                    (str(helper), "secretservice")
+                                    if platform == "linux"
+                                    else str(helper)
+                                ),
+                            ):
+                                repository.enable_https_credentials(endpoint)
+                        selected_store = repository.output(
+                            ["config", "--get", "credential.credentialStore"]
+                        )
+                        result = adapter._run_endpoint(
+                            repository,
+                            endpoint,
+                            ["ls-remote", "--heads"],
+                        )
+                        config = {
+                            key: value
+                            for key, value in repository.env.items()
+                            if key.startswith("GIT_CONFIG_")
+                        }
+
+                self.assertEqual(
+                    result.returncode,
+                    0,
+                    result.stderr.replace(secret, "<redacted>"),
+                )
+                self.assertTrue(authorized.is_set())
+                self.assertEqual(
+                    selected_store,
+                    "secretservice" if platform == "linux" else "wincredman",
+                )
+                self.assertNotIn(secret, result.stdout)
+                self.assertNotIn(secret, result.stderr)
+                self.assertNotIn(secret, json.dumps(config))
+
     def test_user_owned_osxkeychain_lookalike_is_unavailable(self) -> None:
         helper_root = self.root / "untrusted-git-core"
         helper_root.mkdir()
@@ -363,7 +648,7 @@ class PublicationExecutionTests(unittest.TestCase):
         )
         self.assertNotIn(str(helper_root), str(raised.exception))
 
-    def test_https_provider_unavailable_blocks_before_push(self) -> None:
+    def test_linux_https_provider_unavailable_blocks_before_push(self) -> None:
         endpoint = "https://example.invalid/repository.git"
         fingerprint = self.plan["destination"]["endpoint_fingerprint"]
 
@@ -399,25 +684,50 @@ class PublicationExecutionTests(unittest.TestCase):
             [
                 {
                     "code": "HTTPS_CREDENTIAL_PROVIDER_UNAVAILABLE",
-                    "evidence": {"provider": "macos-osxkeychain"},
+                    "evidence": {"provider": "linux-gcm-or-libsecret"},
                 }
             ],
         )
         run_endpoint.assert_not_called()
+
+    def test_windows_https_provider_unavailable_blocks_before_use(self) -> None:
+        git_root = self.root / "Program Files" / "Git"
+        git_executable = git_root / "cmd" / "git.exe"
+        git_executable.parent.mkdir(parents=True)
+        git_executable.write_bytes(b"git")
+
+        with adapter.GitRepository(self.repo) as repository:
+            repository.git_executable = str(git_executable)
+            with mock.patch.object(adapter.sys, "platform", "win32"):
+                with mock.patch.object(
+                    repository,
+                    "_configured_classes",
+                    return_value=set(),
+                ):
+                    with mock.patch.object(
+                        repository,
+                        "output",
+                        return_value=str(
+                            git_root / "mingw64" / "libexec" / "git-core"
+                        ),
+                    ):
+                        with self.assertRaises(adapter.PolicyGate) as raised:
+                            repository.enable_https_credentials(
+                                "https://github.com/example/repository.git"
+                            )
+
+        self.assertEqual(
+            raised.exception.code,
+            "HTTPS_CREDENTIAL_PROVIDER_UNAVAILABLE",
+        )
+        self.assertEqual(raised.exception.evidence, {"provider": "windows-gcm"})
 
     def test_https_plan_receipt_and_command_config_are_credential_free(self) -> None:
         fingerprint = self.plan["destination"]["endpoint_fingerprint"]
         username = "versionkeeping-test"
         secret = "credential-secret-65db51"
         helper = self.root / "credential-helper-for-receipt"
-        helper.write_text(
-            "#!/bin/sh\n"
-            "if [ \"$1\" = get ]; then\n"
-            f"  printf '%s\\n' 'username={username}' 'password={secret}'\n"
-            "fi\n",
-            encoding="utf-8",
-        )
-        helper.chmod(0o700)
+        write_credential_helper(helper, username, secret)
         planned = plan_repository(self.repo, request(self.start, self.source))
         observed = {}
         original_enable = adapter.GitRepository.enable_https_credentials

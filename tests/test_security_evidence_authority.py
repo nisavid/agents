@@ -170,6 +170,73 @@ def test_phase7_candidate_identity_never_executes_repository_fsmonitor(
     assert marker.exists() is False
 
 
+def test_candidate_identity_closes_fsmonitor_without_config_environment_support(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    transport = load("scripts/evidence_transport.py", "legacy_git_identity_transport")
+    trusted_git = shutil.which("git", path="/usr/bin:/bin")
+    assert trusted_git is not None
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    environment = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": str(tmp_path / "home"),
+        "GIT_CONFIG_NOSYSTEM": "1",
+    }
+    subprocess.run(
+        [trusted_git, "-C", str(repository), "init", "--quiet"],
+        env=environment,
+        check=True,
+    )
+    (repository / "payload").write_bytes(b"candidate bytes\n")
+    subprocess.run(
+        [trusted_git, "-C", str(repository), "add", "payload"],
+        env=environment,
+        check=True,
+    )
+    marker = tmp_path / "legacy-git-fsmonitor-invoked"
+    fsmonitor = tmp_path / "fsmonitor"
+    fsmonitor.write_text(
+        '#!/bin/sh\nprintf invoked > "$1"\nprintf "2\\n"\n',
+        encoding="utf-8",
+    )
+    fsmonitor.chmod(0o700)
+    subprocess.run(
+        [
+            trusted_git,
+            "-C",
+            str(repository),
+            "config",
+            "core.fsmonitor",
+            f"{fsmonitor} {marker}",
+        ],
+        env=environment,
+        check=True,
+    )
+
+    current_environment = transport._candidate_git_environment
+
+    def without_config_environment() -> dict[str, str]:
+        isolated = current_environment()
+        for name in tuple(isolated):
+            if name == "GIT_CONFIG_COUNT" or name.startswith(
+                ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
+            ):
+                isolated.pop(name)
+        return isolated
+
+    monkeypatch.setattr(
+        transport,
+        "_candidate_git_environment",
+        without_config_environment,
+    )
+
+    transport.candidate_content_identity(repository, error_factory=RuntimeError)
+
+    assert marker.exists() is False
+
+
 def test_phase7_candidate_identity_never_searches_candidate_for_git(
     tmp_path: Path,
 ) -> None:

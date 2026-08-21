@@ -113,6 +113,209 @@ class PublicationExecutionTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tempdir.cleanup()
 
+    def test_macos_https_uses_only_the_trusted_osxkeychain_provider(self) -> None:
+        trusted_helper = (
+            "/Library/Developer/CommandLineTools/usr/libexec/git-core/"
+            "git-credential-osxkeychain"
+        )
+        secret = "credential-secret-9fb4c7"
+
+        with adapter.GitRepository(self.repo) as repository:
+            with mock.patch.object(adapter.sys, "platform", "darwin"):
+                with mock.patch.object(
+                    repository,
+                    "output",
+                    return_value=str(Path(trusted_helper).parent),
+                ):
+                    with mock.patch.object(
+                        adapter,
+                        "_require_trusted_credential_helper",
+                        return_value=trusted_helper,
+                    ) as require_trusted:
+                        with mock.patch.dict(
+                            os.environ,
+                            {"VERSIONKEEPING_TEST_CREDENTIAL": secret},
+                            clear=False,
+                        ):
+                            repository.enable_https_credentials(
+                                "https://github.com/example/repository.git"
+                            )
+
+            config_count = int(repository.env["GIT_CONFIG_COUNT"])
+            closed_config = [
+                (
+                    repository.env[f"GIT_CONFIG_KEY_{index}"],
+                    repository.env[f"GIT_CONFIG_VALUE_{index}"],
+                )
+                for index in range(config_count)
+            ]
+
+        require_trusted.assert_called_once_with(Path(trusted_helper))
+        self.assertEqual(
+            [value for key, value in closed_config if key == "credential.helper"],
+            ["", trusted_helper],
+        )
+        self.assertNotIn(secret, json.dumps(closed_config))
+
+    @unittest.skipUnless(sys.platform == "darwin", "requires macOS")
+    def test_system_macos_osxkeychain_provider_is_trusted(self) -> None:
+        with adapter.GitRepository(self.repo) as repository:
+            repository.enable_https_credentials(
+                "https://github.com/example/repository.git"
+            )
+            config_count = int(repository.env["GIT_CONFIG_COUNT"])
+            helpers = [
+                repository.env[f"GIT_CONFIG_VALUE_{index}"]
+                for index in range(config_count)
+                if repository.env[f"GIT_CONFIG_KEY_{index}"]
+                == "credential.helper"
+            ]
+
+        self.assertEqual(helpers[0], "")
+        self.assertEqual(
+            Path(helpers[1]).name,
+            "git-credential-osxkeychain",
+        )
+
+    def test_user_owned_osxkeychain_lookalike_is_unavailable(self) -> None:
+        helper_root = self.root / "untrusted-git-core"
+        helper_root.mkdir()
+        helper = helper_root / "git-credential-osxkeychain"
+        helper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        helper.chmod(0o755)
+
+        with adapter.GitRepository(self.repo) as repository:
+            with mock.patch.object(adapter.sys, "platform", "darwin"):
+                with mock.patch.object(
+                    repository,
+                    "output",
+                    return_value=str(helper_root),
+                ):
+                    with self.assertRaises(adapter.PolicyGate) as raised:
+                        repository.enable_https_credentials(
+                            "https://github.com/example/repository.git"
+                        )
+
+        self.assertEqual(
+            raised.exception.code,
+            "HTTPS_CREDENTIAL_PROVIDER_UNAVAILABLE",
+        )
+        self.assertEqual(
+            raised.exception.evidence,
+            {"provider": "macos-osxkeychain"},
+        )
+        self.assertNotIn(str(helper_root), str(raised.exception))
+
+    def test_https_provider_unavailable_blocks_before_push(self) -> None:
+        endpoint = "https://example.invalid/repository.git"
+        fingerprint = self.plan["destination"]["endpoint_fingerprint"]
+
+        with mock.patch.object(adapter.sys, "platform", "linux"):
+            with mock.patch.object(
+                execution,
+                "_endpoint",
+                return_value=(endpoint, fingerprint),
+            ):
+                with mock.patch.object(
+                    execution,
+                    "_probe_default_branch",
+                    return_value=self.plan["destination"]["default_branch_ref"],
+                ):
+                    with mock.patch.object(
+                        execution,
+                        "_probe_ref",
+                        side_effect=(self.start, self.source),
+                    ):
+                        with mock.patch.object(
+                            execution,
+                            "_run_endpoint",
+                            return_value=subprocess.CompletedProcess(
+                                ["git", "push"], 0, "", ""
+                            ),
+                        ) as run_endpoint:
+                            result = execute(self.repo, self.plan)
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertFalse(result["push_attempted"])
+        self.assertEqual(
+            result["reasons"],
+            [
+                {
+                    "code": "HTTPS_CREDENTIAL_PROVIDER_UNAVAILABLE",
+                    "evidence": {"provider": "macos-osxkeychain"},
+                }
+            ],
+        )
+        run_endpoint.assert_not_called()
+
+    def test_https_plan_receipt_and_command_config_are_credential_free(self) -> None:
+        endpoint = "https://example.invalid/repository.git"
+        fingerprint = self.plan["destination"]["endpoint_fingerprint"]
+        trusted_helper = (
+            "/Library/Developer/CommandLineTools/usr/libexec/git-core/"
+            "git-credential-osxkeychain"
+        )
+        secret = "github-token-secret-65db51"
+        original_output = adapter.GitRepository.output
+        observed = {}
+
+        def output(repository, args, allowed=()):
+            if args == ["--exec-path"]:
+                return str(Path(trusted_helper).parent)
+            return original_output(repository, args, allowed)
+
+        def successful_push(repository, endpoint, prefix, suffix=(), **_kwargs):
+            observed["config"] = {
+                key: value
+                for key, value in repository.env.items()
+                if key.startswith("GIT_CONFIG_")
+            }
+            observed["command"] = [*prefix, *suffix]
+            return subprocess.CompletedProcess(["git", "push"], 0, "", "")
+
+        with mock.patch.dict(os.environ, {"GITHUB_TOKEN": secret}, clear=False):
+            planned = plan_repository(self.repo, request(self.start, self.source))
+            with mock.patch.object(adapter.sys, "platform", "darwin"):
+                with mock.patch.object(
+                    adapter.GitRepository,
+                    "output",
+                    output,
+                ):
+                    with mock.patch.object(
+                        adapter,
+                        "_require_trusted_credential_helper",
+                        return_value=trusted_helper,
+                    ):
+                        with mock.patch.object(
+                            execution,
+                            "_endpoint",
+                            return_value=(endpoint, fingerprint),
+                        ):
+                            with mock.patch.object(
+                                execution,
+                                "_probe_default_branch",
+                                return_value=self.plan["destination"][
+                                    "default_branch_ref"
+                                ],
+                            ):
+                                with mock.patch.object(
+                                    execution,
+                                    "_probe_ref",
+                                    side_effect=(self.start, self.source),
+                                ):
+                                    with mock.patch.object(
+                                        execution,
+                                        "_run_endpoint",
+                                        side_effect=successful_push,
+                                    ):
+                                        receipt = execute(self.repo, self.plan)
+
+        self.assertEqual(planned["status"], "ready")
+        self.assertEqual(receipt["status"], "verified")
+        self.assertNotIn(secret, json.dumps(planned))
+        self.assertNotIn(secret, json.dumps(receipt))
+        self.assertNotIn(secret, json.dumps(observed))
+
     def test_executes_once_through_captured_endpoint_alias_and_verifies(self) -> None:
         real_run = subprocess.run
         observed = []

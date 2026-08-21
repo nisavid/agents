@@ -77,6 +77,28 @@ It resolves the current push URL without printing it and binds an ephemeral
 config-env remote alias to the captured endpoint string. A normal configured
 remote name is discovery metadata, not a publication actuator.
 
+## Authenticated HTTPS Boundary
+
+The ordinary publication executor supports noninteractive HTTPS credentials on
+macOS through one closed provider: the `git-credential-osxkeychain` binary in
+the trusted `/usr/bin/git --exec-path` directory. Before enabling it, the
+executor requires the helper and every directory in its absolute ancestry to
+be root-owned, non-writable by group or other, non-symlinked, and free of shell
+metacharacters; the helper itself must be a regular, executable, non-set-id
+file. A missing, redirected, mutable, or unsupported provider yields
+`HTTPS_CREDENTIAL_PROVIDER_UNAVAILABLE` before any push attempt.
+
+The executor first installs an empty command-scope `credential.helper` to clear
+all ambient helpers, retains the existing rejection of repository or worktree
+`credential.*.helper` configuration, and then appends only that validated
+absolute helper path for HTTPS execution. `GIT_ASKPASS=false` and
+`GIT_TERMINAL_PROMPT=0` remain in force. Credential bytes travel only between
+Git and the system helper through Git's credential protocol: they are never
+read by the planner or executor and never enter arguments, diagnostics, plans,
+receipts, or repository configuration. SSH and ancestry-guarded local
+endpoints do not enable a credential helper and retain their existing
+contracts.
+
 ## Terminal Remote-Ref Deletion
 
 Remote-ref deletion is a separate planner and executor surface owned by this

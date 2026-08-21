@@ -12,6 +12,7 @@ import re
 import secrets
 import stat
 import subprocess
+import sys
 import tempfile
 import urllib.parse
 from contextlib import contextmanager
@@ -56,6 +57,8 @@ TRUSTED_SYSTEM_EXECUTABLES = {
     "ssh": Path("/usr/bin/ssh"),
 }
 TRUSTED_COMMAND_PATH = "/usr/bin:/bin"
+MACOS_CREDENTIAL_HELPER = "git-credential-osxkeychain"
+TRUSTED_HELPER_PATH_RE = re.compile(r"^/[A-Za-z0-9_./+:-]+$")
 GIT_SUBPROCESS_ENV_ALLOWLIST = {
     "ALL_PROXY",
     "COMSPEC",
@@ -105,6 +108,44 @@ def _trusted_system_executable(name: str) -> str:
         or stat.S_IMODE(metadata.st_mode) & 0o111 == 0
     ):
         raise PolicyGate(f"TRUSTED_{name.upper()}_EXECUTABLE_UNAVAILABLE")
+    return str(resolved)
+
+
+def _require_trusted_credential_helper(path: Path) -> str:
+    try:
+        if (
+            not path.is_absolute()
+            or TRUSTED_HELPER_PATH_RE.fullmatch(str(path)) is None
+        ):
+            raise OSError("credential helper path is not closed")
+        resolved = path.resolve(strict=True)
+        if resolved != path:
+            raise OSError("credential helper path is redirected")
+        metadata = resolved.lstat()
+        for parent in resolved.parents:
+            parent_metadata = parent.lstat()
+            if (
+                not stat.S_ISDIR(parent_metadata.st_mode)
+                or parent_metadata.st_uid != 0
+                or stat.S_IMODE(parent_metadata.st_mode) & 0o022
+            ):
+                raise OSError("credential helper ancestry is mutable")
+    except OSError as error:
+        raise PolicyGate(
+            "HTTPS_CREDENTIAL_PROVIDER_UNAVAILABLE",
+            provider="macos-osxkeychain",
+        ) from error
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != 0
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+        or stat.S_IMODE(metadata.st_mode) & 0o111 == 0
+        or metadata.st_mode & (stat.S_ISUID | stat.S_ISGID)
+    ):
+        raise PolicyGate(
+            "HTTPS_CREDENTIAL_PROVIDER_UNAVAILABLE",
+            provider="macos-osxkeychain",
+        )
     return str(resolved)
 
 
@@ -354,6 +395,7 @@ class GitRepository:
         )
         self.hooks_path = Path(self._empty_hooks.name).resolve()
         self._policy_established = False
+        self._https_credentials_enabled = False
         self.env = {
             key: value
             for key, value in os.environ.items()
@@ -407,6 +449,31 @@ class GitRepository:
         for index, (key, value) in enumerate(closed_config):
             self.env[f"GIT_CONFIG_KEY_{index}"] = key
             self.env[f"GIT_CONFIG_VALUE_{index}"] = value
+
+    def _append_command_config(self, key: str, value: str) -> None:
+        index = int(self.env["GIT_CONFIG_COUNT"])
+        self.env[f"GIT_CONFIG_KEY_{index}"] = key
+        self.env[f"GIT_CONFIG_VALUE_{index}"] = value
+        self.env["GIT_CONFIG_COUNT"] = str(index + 1)
+
+    def enable_https_credentials(self, endpoint: str) -> None:
+        """Bind one trusted noninteractive provider for one HTTPS execution."""
+        _validate_transport_endpoint(endpoint, self.path)
+        if urllib.parse.urlsplit(endpoint).scheme.lower() != "https":
+            return
+        if self._https_credentials_enabled:
+            return
+        if sys.platform != "darwin":
+            raise PolicyGate(
+                "HTTPS_CREDENTIAL_PROVIDER_UNAVAILABLE",
+                provider="macos-osxkeychain",
+            )
+        exec_path = Path(self.output(["--exec-path"]))
+        helper = _require_trusted_credential_helper(
+            exec_path / MACOS_CREDENTIAL_HELPER
+        )
+        self._append_command_config("credential.helper", helper)
+        self._https_credentials_enabled = True
 
     def __enter__(self) -> "GitRepository":
         return self

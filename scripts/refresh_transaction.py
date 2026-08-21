@@ -3,8 +3,10 @@
 Each destination remains a normal public file and every visible update uses an
 atomic replacement in that file's directory.  A sequence of replacements at
 independent paths cannot be crash-atomic without changing that public shape;
-this module restores all pre-call bytes after detected failures, but an abrupt
-process or power loss between replacements can still expose a committed prefix.
+this module restores all pre-call bytes after detected failures by default, but
+an abrupt process or power loss between replacements can still expose a
+committed prefix.  A specialized single-file caller may instead supply durable
+recovery callbacks and retain the committed value after an ambiguous failure.
 """
 
 from __future__ import annotations
@@ -687,11 +689,40 @@ def replace_generated_artifacts(
     *,
     recheck: Callable[[frozenset[Path]], None],
     verify: Callable[[], None],
+    before_replace: Callable[[], None] | None = None,
+    replacement_started: Callable[[], None] | None = None,
+    rollback_on_failure: bool = True,
 ) -> None:
-    """Commit staged replacements and restore every preimage on detected failure."""
+    """Commit descriptor-confined replacements with explicit failure recovery.
+
+    The default restores every preimage after a detected failure.  Recovery
+    callbacks and rollback opt-out are intentionally limited to one artifact;
+    disabling rollback requires callbacks both before and immediately before
+    the replacement attempt.
+    """
 
     if not replacements:
         raise RefreshTransactionError("generated artifact plan must not be empty")
+    if type(rollback_on_failure) is not bool:
+        raise RefreshTransactionError("generated artifact plan is invalid")
+    for callback in (before_replace, replacement_started):
+        if callback is not None and not callable(callback):
+            raise RefreshTransactionError("generated artifact plan is invalid")
+    uses_single_target_controls = (
+        before_replace is not None
+        or replacement_started is not None
+        or not rollback_on_failure
+    )
+    if uses_single_target_controls and len(replacements) != 1:
+        raise RefreshTransactionError(
+            "single generated artifact controls require exactly one replacement"
+        )
+    if not rollback_on_failure and (
+        before_replace is None or replacement_started is None
+    ):
+        raise RefreshTransactionError(
+            "non-rollback replacement requires both recovery callbacks"
+        )
     for destination, (content, mode) in replacements.items():
         if not isinstance(content, bytes) or type(mode) is not int or mode < 0:
             raise RefreshTransactionError("generated artifact plan is invalid")
@@ -727,6 +758,17 @@ def replace_generated_artifacts(
                     preimages[target],
                 )
                 _require_staged(root, root_descriptor, temporary)
+                if before_replace is not None:
+                    before_replace()
+                    _require_preimage(
+                        root,
+                        root_descriptor,
+                        target,
+                        preimages[target],
+                    )
+                    _require_staged(root, root_descriptor, temporary)
+                if replacement_started is not None:
+                    replacement_started()
                 try:
                     os.replace(
                         temporary.name,
@@ -768,7 +810,7 @@ def replace_generated_artifacts(
                 )
             verify()
         except BaseException:
-            if committed:
+            if committed and rollback_on_failure:
                 _rollback(root, root_descriptor, committed, preimages)
             raise
     finally:

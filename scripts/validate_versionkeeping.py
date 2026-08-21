@@ -10,7 +10,6 @@ import os
 import re
 import shutil
 import stat
-import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -25,6 +24,8 @@ from agent_plugins_standard import (  # noqa: E402
     load_agent_plugin_manifest,
     validate_skill_resource_links,
 )
+from evidence_transport import run_candidate_git  # noqa: E402
+from refresh_transaction import replace_generated_artifacts  # noqa: E402
 
 PLUGIN_RELATIVE = Path("plugins/versionkeeping")
 EVAL_RELATIVE = Path("evals/versionkeeping")
@@ -1122,14 +1123,6 @@ class ContentLockRecoveryArtifact:
     directory: Path
 
 
-@dataclass(frozen=True)
-class LockReplacementIdentity:
-    """The exact lock path identity that this writer installed."""
-
-    entry: InputEntry
-    metadata: tuple[int, ...]
-
-
 def input_metadata_identity(metadata: os.stat_result) -> tuple[int, ...]:
     return (
         metadata.st_dev,
@@ -1203,18 +1196,6 @@ def capture_input_entry(path: Path) -> tuple[InputEntry, bytes | None]:
             None,
         )
     return InputEntry("special", mode, None), None
-
-
-def capture_lock_replacement_identity(path: Path) -> LockReplacementIdentity:
-    before = path.lstat()
-    entry, _ = capture_input_entry(path)
-    after = path.lstat()
-    require(
-        entry.kind == "regular"
-        and input_metadata_identity(before) == input_metadata_identity(after),
-        "semantic content lock replacement identity changed while snapshotting",
-    )
-    return LockReplacementIdentity(entry, input_metadata_identity(after))
 
 
 def snapshot_tree(root: Path) -> tuple[tuple[str, InputEntry], ...]:
@@ -1378,18 +1359,23 @@ def _private_directory(path: Path) -> None:
 def content_lock_recovery_root(repo_root: Path) -> Path:
     """Return the private, shared-Git-dir recovery root for this worktree."""
     repo_root = repo_root.resolve(strict=True)
-    result = subprocess.run(
-        ["git", "-C", str(repo_root), "rev-parse", "--git-common-dir"],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
+    raw_common_dir = run_candidate_git(
+        repo_root,
+        ["rev-parse", "--git-common-dir"],
+        error_factory=ContractError,
+        operation="locate semantic content lock recovery storage",
     )
+    try:
+        common_dir_value = raw_common_dir.decode("utf-8", errors="strict").strip()
+    except UnicodeDecodeError as error:
+        raise ContractError(
+            "semantic content lock recovery storage is unavailable"
+        ) from error
     require(
-        result.returncode == 0 and bool(result.stdout.strip()),
+        bool(common_dir_value),
         "semantic content lock recovery storage is unavailable",
     )
-    common_dir = Path(result.stdout.strip())
+    common_dir = Path(common_dir_value)
     if not common_dir.is_absolute():
         common_dir = repo_root / common_dir
     common_dir = common_dir.absolute()
@@ -1505,40 +1491,43 @@ def replace_content_lock_atomically(
     mode: int,
     snapshot: ContentLockWriteSnapshot,
 ) -> None:
-    require(
-        not path.parent.is_symlink() and path.parent.is_dir(),
-        "semantic content lock parent is invalid",
-    )
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.",
-        dir=path.parent,
-    )
-    temporary = Path(temporary_name)
     recovery: ContentLockRecoveryArtifact | None = None
     replacement_may_have_occurred = False
-    try:
-        os.fchmod(descriptor, mode)
-        with os.fdopen(descriptor, "wb") as file:
-            file.write(content)
-            file.flush()
-            os.fsync(file.fileno())
+
+    def recheck(_temporary_paths: frozenset[Path]) -> None:
         require_content_lock_write_snapshot_unchanged(repo_root, snapshot)
+
+    def preserve_recovery() -> None:
+        nonlocal recovery
         recovery = preserve_prior_content_lock_recovery(repo_root, snapshot)
-        require_content_lock_write_snapshot_unchanged(repo_root, snapshot)
+        try:
+            require_content_lock_write_snapshot_unchanged(repo_root, snapshot)
+        except BaseException:
+            discard_content_lock_recovery(recovery)
+            recovery = None
+            raise
+
+    def mark_replacement_started() -> None:
+        nonlocal replacement_may_have_occurred
         replacement_may_have_occurred = True
-        os.replace(temporary, path)
-        replacement_identity = capture_lock_replacement_identity(path)
-        require(
-            replacement_identity.entry
-            == InputEntry("regular", mode, hashlib.sha256(content).hexdigest()),
-            "semantic content lock replacement identity is invalid",
-        )
-        _fsync_directory(path.parent)
+
+    def verify_replacement() -> None:
         require_content_lock_write_snapshot_after_replacement(
             repo_root,
             snapshot,
             content,
             mode,
+        )
+
+    try:
+        replace_generated_artifacts(
+            repo_root,
+            {path: (content, mode)},
+            recheck=recheck,
+            before_replace=preserve_recovery,
+            replacement_started=mark_replacement_started,
+            verify=verify_replacement,
+            rollback_on_failure=False,
         )
     except BaseException as error:
         if replacement_may_have_occurred and recovery is not None:
@@ -1550,9 +1539,6 @@ def replace_content_lock_atomically(
         if recovery is not None:
             discard_content_lock_recovery(recovery)
         raise
-    finally:
-        if temporary.exists():
-            temporary.unlink()
     if recovery is not None:
         discard_content_lock_recovery(recovery)
 

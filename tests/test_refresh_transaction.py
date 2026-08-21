@@ -241,6 +241,42 @@ class RefreshTransactionTests(unittest.TestCase):
             self.assertEqual(path.stat().st_mode & 0o777, mode)
         self.assertEqual(set(self.root.iterdir()), set(originals))
 
+    def test_single_target_controls_reject_multiple_replacements(self) -> None:
+        second = self.root / "second.json"
+
+        with self.assertRaisesRegex(
+            RefreshTransactionError,
+            "single generated artifact",
+        ):
+            replace_generated_artifacts(
+                self.root,
+                {
+                    self.destination: (b"first replacement\n", 0o644),
+                    second: (b"second replacement\n", 0o644),
+                },
+                recheck=lambda _temporary_paths: None,
+                verify=lambda: None,
+                before_replace=lambda: None,
+            )
+
+        self.assertFalse(self.destination.exists())
+        self.assertFalse(second.exists())
+
+    def test_disabling_rollback_requires_recovery_callbacks(self) -> None:
+        with self.assertRaisesRegex(
+            RefreshTransactionError,
+            "recovery callbacks",
+        ):
+            replace_generated_artifacts(
+                self.root,
+                {self.destination: (b"replacement\n", 0o644)},
+                recheck=lambda _temporary_paths: None,
+                verify=lambda: None,
+                rollback_on_failure=False,
+            )
+
+        self.assertFalse(self.destination.exists())
+
     def test_late_parent_drift_rolls_back_through_retained_directory(self) -> None:
         generated = self.root / "generated"
         generated.mkdir()

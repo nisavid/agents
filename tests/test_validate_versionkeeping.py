@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import copy
 import json
+import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -55,7 +57,7 @@ class ValidateVersionkeepingTests(unittest.TestCase):
 
     def validate(self, *arguments: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(VALIDATOR), str(self.repo), *arguments],
+            [sys.executable, "-B", str(VALIDATOR), str(self.repo), *arguments],
             text=True,
             capture_output=True,
             check=False,
@@ -330,6 +332,37 @@ class ValidateVersionkeepingTests(unittest.TestCase):
         self.assertIn("destructive discard semantic contract drift", result.stderr)
         self.assertEqual(lock.read_bytes(), original_lock)
 
+    def test_write_lock_rejects_symlinked_release_ancestor_without_external_residue(
+        self,
+    ) -> None:
+        skill = self.repo / CONFLICT_ROOT / "SKILL.md"
+        skill.write_text(
+            skill.read_text().replace(
+                "The recipient rereads live state",
+                "The receiving owner rereads live state",
+            )
+        )
+        release = self.repo / "release"
+        external_release = Path(self.tempdir.name) / "outside-release"
+        release.rename(external_release)
+        release.symlink_to(external_release, target_is_directory=True)
+        external_lock = external_release / "plugin-content-locks/versionkeeping.json"
+        original_content = external_lock.read_bytes()
+        original_inode = external_lock.stat().st_ino
+        original_entries = sorted(
+            path.name for path in external_lock.parent.iterdir()
+        )
+
+        result = self.validate("--write-content-lock")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(external_lock.read_bytes(), original_content)
+        self.assertEqual(external_lock.stat().st_ino, original_inode)
+        self.assertEqual(
+            sorted(path.name for path in external_lock.parent.iterdir()),
+            original_entries,
+        )
+
     def test_write_lock_rejects_drift_before_atomic_replacement(self) -> None:
         terminal = self.repo / CHECKPOINT_ROOT / "references/terminal-cleanup.md"
         corpus = self.repo / EVAL_ROOT / "corpus.json"
@@ -523,10 +556,21 @@ class ValidateVersionkeepingTests(unittest.TestCase):
         original_replace = validate_versionkeeping.os.replace
         replace_calls = 0
 
-        def replace_then_raise(source: str | Path, destination: str | Path) -> None:
+        def replace_then_raise(
+            source: str | Path,
+            destination: str | Path,
+            *,
+            src_dir_fd: int | None = None,
+            dst_dir_fd: int | None = None,
+        ) -> None:
             nonlocal replace_calls
             replace_calls += 1
-            original_replace(source, destination)
+            original_replace(
+                source,
+                destination,
+                src_dir_fd=src_dir_fd,
+                dst_dir_fd=dst_dir_fd,
+            )
             raise OSError("replacement result is ambiguous")
 
         with (
@@ -688,6 +732,28 @@ class ValidateVersionkeepingTests(unittest.TestCase):
 
         self.assertEqual(result, 1)
         self.assertEqual(lock.read_bytes(), original_lock)
+
+    def test_content_lock_recovery_never_executes_candidate_path_git(self) -> None:
+        candidate_bin = Path(self.tempdir.name) / "candidate-bin"
+        candidate_bin.mkdir()
+        marker = Path(self.tempdir.name) / "candidate-git-ran"
+        fake_git = candidate_bin / "git"
+        fake_git.write_text(
+            "#!/bin/sh\n"
+            f"printf 'executed\\n' >> {shlex.quote(str(marker))}\n"
+            f"printf '%s\\n' {shlex.quote(str(self.repo / '.git'))}\n",
+            encoding="utf-8",
+        )
+        fake_git.chmod(0o700)
+
+        with mock.patch.dict(os.environ, {"PATH": str(candidate_bin)}):
+            recovery = validate_versionkeeping.content_lock_recovery_root(self.repo)
+
+        self.assertEqual(
+            recovery.parent,
+            self.repo / ".git/versionkeeping-content-lock-recovery",
+        )
+        self.assertFalse(marker.exists())
 
     def test_write_lock_rejects_symlinked_private_recovery_storage_before_replace(
         self,
@@ -1079,6 +1145,7 @@ class ValidateVersionkeepingTests(unittest.TestCase):
         result = subprocess.run(
             [
                 sys.executable,
+                "-B",
                 str(VALIDATOR),
                 str(self.repo),
                 "--write-content-lock",
